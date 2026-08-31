@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720">
+  <rect x="1" y="1" width="1198" height="718" rx="3" fill="#fafafa" stroke="#d6dde6" stroke-width="2"/>
+  <path d="M1 88.5h1198" stroke="#dde1e6"/>
+  <circle cx="40" cy="44" r="10" fill="#ff5f57"/>
+  <circle cx="76" cy="44" r="10" fill="#febc2e"/>
+  <circle cx="112" cy="44" r="10" fill="#28c840"/>
+  <text x="170" y="52" fill="#69707b" font-family="Inter, sans-serif" font-size="24">github.com/fayazara/Screendrop</text>
+  <circle cx="66" cy="166" r="14" fill="none" stroke="#22252a" stroke-width="3"/>
+  <circle cx="66" cy="166" r="7" fill="#22252a"/>
+  <text x="100" y="178" fill="#22252a" font-family="Inter, sans-serif" font-size="40">Screendrop</text>
+  <rect x="48" y="218" width="1104" height="62" rx="12" fill="#f0f2f5"/>
+  <g fill="#22252a" font-family="Inter, sans-serif" font-size="25">
+    <path d="M49 345h17l-6 10H43z"/>
+    <text x="82" y="357">Screendrop project file 1</text>
+    <path d="M49 413h17l-6 10H43z"/>
+    <text x="82" y="425">Screendrop project file 2</text>
+    <path d="M49 481h17l-6 10H43z"/>
+    <text x="82" y="493">Screendrop project file 3</text>
+    <path d="M49 549h17l-6 10H43z"/>
+    <text x="82" y="561">Screendrop project file 4</text>
+    <path d="M49 617h17l-6 10H43z"/>
+    <text x="82" y="629">Screendrop project file 5</text>
+    <path d="M49 685h17l-6 10H43z"/>
+    <text x="82" y="697">Screendrop project file 6</text>
+  </g>
+  <g stroke="#d8dce1">
+    <path d="M43 372h1109M43 440h1109M43 508h1109M43 576h1109M43 644h1109M43 712h1109"/>
+  </g>
+</svg>

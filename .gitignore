@@ -1,0 +1,5 @@
+/target/
+*.log
+
+# Local clone of the macOS reference app (github.com/fayazara/Screendrop)
+/Screendrop/

@@ -1,0 +1,7 @@
+{
+  "uuid": "screendrop-input@com.screendrop",
+  "name": "Screendrop Input Capture",
+  "description": "Records pointer motion, clicks, and shortcut keys only while a Screendrop recording is active.",
+  "shell-version": ["48", "49", "50"],
+  "version": 1
+}

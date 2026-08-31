@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Screendrop
+Comment=Capture and annotate screenshots
+Exec=screendrop
+Icon=com.screendrop.Screendrop
+Terminal=false
+Categories=Graphics;Utility;
+StartupNotify=true
+StartupWMClass=com.screendrop.Screendrop
