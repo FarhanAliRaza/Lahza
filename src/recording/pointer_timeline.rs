@@ -421,10 +421,10 @@ fn timeline_samples(
         });
     }
 
-    let mut editor_start = 0.0;
+    let mut slot_start = 0.0;
     for (index, segment) in clip_timeline.segments.iter().enumerate() {
         if let Some(mut seed) = source_sample_at(segment.source_start, &source_samples) {
-            seed.time = editor_start;
+            seed.time = slot_start + segment.gap_before;
             seed.kind = PointerStreamKind::Travel;
             seed.button = None;
             ranked.push(EditedPointerEvent {
@@ -433,7 +433,7 @@ fn timeline_samples(
                 order: index,
             });
         }
-        editor_start += segment.editor_duration();
+        slot_start += segment.slot_duration();
     }
 
     ranked.sort_by(|left, right| {

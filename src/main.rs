@@ -41,6 +41,23 @@ struct Assets {
     base: PathBuf,
 }
 
+fn asset_directory() -> PathBuf {
+    if let Some(path) = std::env::var_os("SCREENDROP_ASSETS") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(prefix) = executable.parent().and_then(|bin| bin.parent()) {
+            let installed = prefix.join("share/screendrop/assets");
+            if installed.is_dir() {
+                return installed;
+            }
+        }
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
+}
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         fs::read(self.base.join(path))
@@ -530,6 +547,17 @@ struct CropSnapshot {
     path: PathBuf,
     dimensions: (u32, u32),
     annotations: Vec<AnnotationMark>,
+}
+
+/// Drag-to-reorder for a timeline clip. Armed on clip mouse-down, it only
+/// becomes `active` (and suppresses playhead scrubbing) after the pointer
+/// travels past a small threshold, so plain clicks keep seeking.
+#[derive(Clone, Copy)]
+struct VideoMoveDrag {
+    clip_id: Uuid,
+    start_x: Pixels,
+    current_x: Pixels,
+    active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1156,7 +1184,9 @@ fn fitted_image_bounds(
     } else {
         0.0
     };
-    let inset = 8.0 + padding as f32 * 2.0 + border_width;
+    // Zero padding means the capture reaches the canvas edge; only the
+    // border adds space beyond the user's padding setting.
+    let inset = padding as f32 * 2.0 + border_width;
     let x_inset = inset + if has_capture { 0.0 } else { 60.0 };
     let y_inset = inset + if has_capture { 0.0 } else { 30.0 };
     let available_width = ((canvas.size.width / px(1.0)) - x_inset * 2.0).max(1.0);
@@ -1217,6 +1247,7 @@ struct Studio {
     video_playback_generation: Arc<AtomicU64>,
     video_seek_drag: Option<(Pixels, f64)>,
     video_trim_drag: Option<VideoTrimDrag>,
+    video_move_drag: Option<VideoMoveDrag>,
     video_zoom_cues: Vec<ZoomCue>,
     video_selected_zoom_cue: Option<Uuid>,
     video_zoom_drag: Option<VideoZoomDrag>,
@@ -1469,6 +1500,7 @@ impl Studio {
             video_playback_generation: Arc::new(AtomicU64::new(0)),
             video_seek_drag: None,
             video_trim_drag: None,
+            video_move_drag: None,
             video_zoom_cues: Vec::new(),
             video_selected_zoom_cue: None,
             video_zoom_drag: None,
@@ -1893,6 +1925,7 @@ impl Studio {
         self.video_preview_path = edited_preview;
         self.video_seek_drag = None;
         self.video_trim_drag = None;
+        self.video_move_drag = None;
         self.video_zoom_cues = zoom_cues;
         self.video_selected_zoom_cue = None;
         self.video_zoom_drag = None;
@@ -1997,6 +2030,59 @@ impl Studio {
         self.video_clip_timeline = drag.original_timeline;
         self.video_duration = self.video_clip_timeline.duration();
         self.apply_video_clip_timeline(requested, selected, true, cx);
+    }
+
+    /// Where the dragged clip's content would start in editor time, given
+    /// the drag's pixel displacement. The scale is frozen at the drag's
+    /// current duration so the conversion is stable throughout the gesture.
+    fn video_move_new_start(&self, drag: &VideoMoveDrag) -> Option<f64> {
+        let range = self.video_clip_timeline.editor_range(drag.clip_id)?;
+        let content_width = self.video_timeline_viewport_width() * self.video_timeline_zoom;
+        if content_width <= 0.0 || self.video_duration <= 0.0 {
+            return None;
+        }
+        let seconds_per_pixel = self.video_duration / content_width;
+        let delta = ((drag.current_x - drag.start_x) / px(1.0)) as f64 * seconds_per_pixel;
+        // Allow extending past the end by up to the current duration, and
+        // snap to clip boundaries so gaps close seamlessly.
+        let mut new_start = (range.start + delta).clamp(0.0, self.video_duration);
+        let clip_length = range.end - range.start;
+        let snap = 8.0 * seconds_per_pixel;
+        let starts = self.video_clip_timeline.clip_starts();
+        let mut candidates = vec![0.0];
+        for (index, segment) in self.video_clip_timeline.segments.iter().enumerate() {
+            if segment.id == drag.clip_id {
+                continue;
+            }
+            // Snap this clip's head to a neighbor's tail, or its tail to a
+            // neighbor's head.
+            candidates.push(starts[index] + segment.editor_duration());
+            candidates.push(starts[index] - clip_length);
+        }
+        if let Some(best) = candidates
+            .into_iter()
+            .filter(|candidate| *candidate >= 0.0 && (new_start - candidate).abs() < snap)
+            .min_by(|left, right| {
+                (new_start - left)
+                    .abs()
+                    .total_cmp(&(new_start - right).abs())
+            })
+        {
+            new_start = best;
+        }
+        Some(new_start)
+    }
+
+    fn commit_video_move_drag(&mut self, drag: VideoMoveDrag, cx: &mut Context<Self>) {
+        let Some(new_start) = self.video_move_new_start(&drag) else {
+            return;
+        };
+        if let Some(timeline) = self
+            .video_clip_timeline
+            .repositioning(drag.clip_id, new_start)
+        {
+            self.apply_video_clip_timeline(timeline, Some(drag.clip_id), true, cx);
+        }
     }
 
     fn begin_video_zoom_drag(
@@ -4062,7 +4148,7 @@ impl Studio {
         let (capture_width, capture_height) = image::image_dimensions(capture_path)
             .map_err(|error| format!("Could not read capture: {error}"))?;
         let shortest = capture_width.min(capture_height) as f32;
-        let padding = shortest * (0.02 + self.padding as f32 * 0.002);
+        let padding = shortest * (self.padding as f32 * 0.0025);
         let content_width = capture_width as f32 + padding * 2.0;
         let content_height = capture_height as f32 + padding * 2.0;
         let (canvas_width_f, canvas_height_f) = if self.aspect_ratio == 0 {
@@ -5920,31 +6006,143 @@ impl Studio {
         let timeline_content_width = timeline_viewport_width * timeline_zoom;
         let timeline_bounds = self.video_timeline_bounds.clone();
         let selected_clip = self.video_selected_clip;
+        let move_drag = self.video_move_drag.filter(|drag| drag.active);
+        // While dragging, the clip's ghost follows the pointer (snapped the
+        // same way the drop will land) so the destination — including a gap
+        // past the end of the timeline — is always visible.
+        let move_ghost = move_drag.and_then(|drag| {
+            let range = self.video_clip_timeline.editor_range(drag.clip_id)?;
+            let new_start = self.video_move_new_start(&drag)?;
+            let scale = timeline_content_width / timeline_duration;
+            Some((
+                (new_start * scale) as f32,
+                (((range.end - range.start) * scale).max(3.0)) as f32,
+            ))
+        });
+        // Time ruler: adaptive tick step targeting ~80px between labels.
+        let ruler_step = {
+            let raw = 80.0 * timeline_duration / timeline_content_width.max(1.0);
+            [
+                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
+            ]
+            .into_iter()
+            .find(|step| *step >= raw)
+            .unwrap_or(600.0)
+        };
+        let mut ruler_marks: Vec<AnyElement> = Vec::new();
+        let mut ruler_tick = 0.0;
+        while ruler_tick <= timeline_duration + 1e-6 {
+            let x = (ruler_tick / timeline_duration * timeline_content_width) as f32;
+            ruler_marks.push(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .bottom_0()
+                    .w(px(1.0))
+                    .h(px(5.0))
+                    .bg(hsla(0.0, 0.0, 0.0, 0.30))
+                    .into_any_element(),
+            );
+            let label = if ruler_step < 1.0 {
+                format!("{ruler_tick:.1}")
+            } else {
+                Self::video_timecode(ruler_tick)
+            };
+            ruler_marks.push(
+                div()
+                    .absolute()
+                    .left(px(x + 5.0))
+                    .top(px(1.0))
+                    .text_xs()
+                    .text_color(muted())
+                    .child(label)
+                    .into_any_element(),
+            );
+            let half = ruler_tick + ruler_step / 2.0;
+            if half <= timeline_duration {
+                let half_x = (half / timeline_duration * timeline_content_width) as f32;
+                ruler_marks.push(
+                    div()
+                        .absolute()
+                        .left(px(half_x))
+                        .bottom_0()
+                        .w(px(1.0))
+                        .h(px(3.0))
+                        .bg(hsla(0.0, 0.0, 0.0, 0.15))
+                        .into_any_element(),
+                );
+            }
+            ruler_tick += ruler_step;
+        }
         let clip_lane: Vec<AnyElement> = self
             .video_clip_timeline
             .segments
             .iter()
-            .map(|clip| {
+            .flat_map(|clip| {
                 let clip_id = clip.id;
+                let dragging = move_drag.is_some_and(|drag| drag.clip_id == clip_id);
                 let width = (clip.editor_duration() / timeline_duration * timeline_content_width)
                     .max(3.0) as f32;
-                div()
+                // A clip's leading gap renders as an empty stretch of track.
+                let spacer = (clip.gap_before > 0.0).then(|| {
+                    div()
+                        .h_full()
+                        .w(px(
+                            (clip.gap_before / timeline_duration * timeline_content_width) as f32
+                        ))
+                        .flex_none()
+                        .into_any_element()
+                });
+                let clip_element = div()
                     .id(("video-clip", clip_id.as_u128() as u64))
                     .h_full()
                     .w(px(width))
                     .flex_none()
-                    .border_1()
+                    .when(dragging, |this| this.opacity(0.4))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            // Arm a potential reorder drag; the seek-bar's own
+                            // mouse-down still runs (no stop_propagation) so a
+                            // plain click keeps moving the playhead.
+                            this.video_move_drag = Some(VideoMoveDrag {
+                                clip_id,
+                                start_x: event.position.x,
+                                current_x: event.position.x,
+                                active: false,
+                            });
+                            this.video_selected_clip = Some(clip_id);
+                            this.video_selected_zoom_cue = None;
+                            cx.notify();
+                        }),
+                    )
+                    // All clips share one bright fill (they come from the
+                    // same source recording); a gap is just bare track.
+                    // Selection is shown by a light ring alone.
+                    .rounded_md()
+                    .border_2()
                     .border_color(if selected_clip == Some(clip_id) {
-                        blue()
+                        hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
                     } else {
-                        line()
+                        hsla(0.0, 0.0, 0.0, 0.0)
                     })
-                    .bg(if selected_clip == Some(clip_id) {
-                        hsla(211.0 / 360.0, 0.85, 0.82, 1.0)
-                    } else {
-                        hsla(0.0, 0.0, 0.91, 1.0)
-                    })
+                    .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
                     .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(hsla(0.0, 0.0, 1.0, 0.92))
+                    .when(width >= 52.0, |this| {
+                        let label = if (clip.speed - 1.0).abs() > f64::EPSILON {
+                            format!("{:.1}s · {}×", clip.editor_duration(), clip.speed)
+                        } else {
+                            format!("{:.1}s", clip.editor_duration())
+                        };
+                        this.child(label)
+                    })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         // Selection only: the seek bar's mouse-down already
@@ -5963,7 +6161,7 @@ impl Studio {
                                 .top_0()
                                 .w(px(10.0))
                                 .h_full()
-                                .bg(hsla(211.0 / 360.0, 0.95, 0.55, 0.72))
+                                .bg(hsla(0.0, 0.0, 1.0, 0.5))
                                 .cursor(CursorStyle::ResizeLeftRight)
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -5986,7 +6184,7 @@ impl Studio {
                                 .top_0()
                                 .w(px(10.0))
                                 .h_full()
-                                .bg(hsla(211.0 / 360.0, 0.95, 0.55, 0.72))
+                                .bg(hsla(0.0, 0.0, 1.0, 0.5))
                                 .cursor(CursorStyle::ResizeLeftRight)
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -6002,13 +6200,15 @@ impl Studio {
                                 ),
                         )
                     })
-                    .into_any_element()
+                    .into_any_element();
+                spacer.into_iter().chain(std::iter::once(clip_element))
             })
             .collect();
         let selected_zoom_cue = self.video_selected_zoom_cue;
         let mut zoom_lane: Vec<AnyElement> = Vec::new();
-        let mut segment_editor_start = 0.0;
+        let mut segment_slot_start = 0.0;
         for (segment_index, segment) in self.video_clip_timeline.segments.iter().enumerate() {
+            let segment_editor_start = segment_slot_start + segment.gap_before;
             for cue in self.video_zoom_cues.iter().filter(|cue| cue.is_enabled) {
                 let overlap_start = cue.start.max(segment.source_start);
                 let overlap_end = cue.end.min(segment.source_end);
@@ -6038,16 +6238,16 @@ impl Studio {
                         .w(px(width as f32))
                         .h(px(24.0))
                         .rounded_md()
-                        .border_1()
+                        .border_2()
                         .border_color(if selected {
-                            hsla(0.0, 0.0, 1.0, 1.0)
+                            hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
                         } else {
-                            blue()
+                            hsla(0.0, 0.0, 0.0, 0.0)
                         })
                         .bg(if selected {
-                            hsla(211.0 / 360.0, 0.88, 0.53, 1.0)
+                            hsla(271.0 / 360.0, 0.72, 0.56, 1.0)
                         } else {
-                            hsla(211.0 / 360.0, 0.88, 0.68, 1.0)
+                            hsla(271.0 / 360.0, 0.72, 0.62, 1.0)
                         })
                         .text_color(rgb(0xffffff))
                         .text_xs()
@@ -6140,7 +6340,7 @@ impl Studio {
                         .into_any_element(),
                 );
             }
-            segment_editor_start += segment.editor_duration();
+            segment_slot_start += segment.slot_duration();
         }
 
         div()
@@ -6161,6 +6361,19 @@ impl Studio {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let mut changed = this.update_slider_drag(event);
                 if event.dragging() {
+                    if let Some(drag) = this.video_move_drag.as_mut() {
+                        drag.current_x = event.position.x;
+                        // Reordering while a preview render is in flight is
+                        // safe: the next apply supersedes it via the
+                        // generation token, so don't gate on video_edit_busy.
+                        if !drag.active && (drag.current_x - drag.start_x).abs() > px(6.0) {
+                            drag.active = true;
+                            this.video_seek_drag = None;
+                        }
+                        if drag.active {
+                            changed = true;
+                        }
+                    }
                     if this.video_zoom_drag.is_some() {
                         this.update_video_zoom_drag(event.position.x);
                         changed = true;
@@ -6184,6 +6397,14 @@ impl Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if let Some(drag) = this.video_move_drag.take() {
+                        if drag.active {
+                            this.commit_video_move_drag(drag, cx);
+                            this.slider_drag = None;
+                            cx.notify();
+                            return;
+                        }
+                    }
                     if this.video_zoom_drag.is_some() {
                         this.commit_video_zoom_drag(cx);
                     } else if this.video_trim_drag.is_some() {
@@ -6563,7 +6784,7 @@ impl Studio {
                         div()
                             .flex_1()
                             .min_w(px(320.0))
-                            .h(px(62.0))
+                            .h(px(90.0))
                             .flex()
                             .flex_col()
                             .justify_center()
@@ -6571,14 +6792,72 @@ impl Studio {
                             .cursor(CursorStyle::ResizeLeftRight)
                             .child(
                                 div()
+                                    .id("video-ruler")
+                                    .relative()
+                                    .w_full()
+                                    .h(px(16.0))
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .left(px(-(timeline_scroll as f32)))
+                                            .top_0()
+                                            .w(px(timeline_content_width as f32))
+                                            .h_full()
+                                            .children(ruler_marks)
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .left(px((timeline_content_width * progress)
+                                                        as f32
+                                                        - 5.0))
+                                                    .top(px(2.0))
+                                                    .w(px(10.0))
+                                                    .h(px(13.0))
+                                                    .rounded_sm()
+                                                    .bg(ink()),
+                                            ),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.pause_video_playback();
+                                            this.video_trim_drag = None;
+                                            this.video_zoom_drag = None;
+                                            let target = this
+                                                .video_timeline_bounds
+                                                .lock()
+                                                .ok()
+                                                .and_then(|bounds| *bounds)
+                                                .map(|bounds| {
+                                                    let local = ((event.position.x
+                                                        - bounds.origin.x)
+                                                        / px(1.0))
+                                                        as f64;
+                                                    ((this.video_timeline_scroll + local)
+                                                        / (this.video_timeline_viewport_width()
+                                                            * this.video_timeline_zoom))
+                                                        .clamp(0.0, 1.0)
+                                                        * this.video_duration
+                                                })
+                                                .unwrap_or(this.video_position);
+                                            this.video_position = target;
+                                            this.video_seek_drag = Some((event.position.x, target));
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
                                     .id("video-seek-bar")
                                     .relative()
                                     .w_full()
-                                    .h(px(22.0))
+                                    .h(px(34.0))
                                     .flex()
                                     .overflow_hidden()
                                     .rounded_lg()
-                                    .bg(rgb(0xd9dadd))
+                                    .bg(rgb(0xECEDF1))
                                     .child(
                                         div()
                                             .absolute()
@@ -6591,27 +6870,40 @@ impl Studio {
                                             .child(
                                                 div()
                                                     .absolute()
-                                                    .left_0()
-                                                    .bottom_0()
-                                                    .h(px(3.0))
-                                                    .w(px(
-                                                        (timeline_content_width * progress) as f32
-                                                    ))
-                                                    .rounded_full()
-                                                    .bg(blue()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .absolute()
                                                     .left(px((timeline_content_width * progress)
                                                         as f32
-                                                        - 7.0))
-                                                    .top(px(4.0))
-                                                    .size(px(14.0))
-                                                    .rounded_full()
-                                                    .bg(rgb(0xffffff))
-                                                    .border_1()
-                                                    .border_color(blue()),
+                                                        - 1.0))
+                                                    .top_0()
+                                                    .w(px(2.0))
+                                                    .h_full()
+                                                    .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.85)),
+                                            )
+                                            .when_some(
+                                                move_ghost,
+                                                |this, (ghost_left, ghost_width)| {
+                                                    this.child(
+                                                        div()
+                                                            .absolute()
+                                                            .left(px(ghost_left))
+                                                            .top_0()
+                                                            .h_full()
+                                                            .w(px(ghost_width))
+                                                            .rounded_md()
+                                                            .border_2()
+                                                            .border_color(hsla(
+                                                                222.0 / 360.0,
+                                                                0.2,
+                                                                0.15,
+                                                                0.8,
+                                                            ))
+                                                            .bg(hsla(
+                                                                217.0 / 360.0,
+                                                                0.9,
+                                                                0.6,
+                                                                0.35,
+                                                            )),
+                                                    )
+                                                },
                                             ),
                                     )
                                     .child(
@@ -6693,7 +6985,7 @@ impl Studio {
                                     .flex_none()
                                     .overflow_hidden()
                                     .rounded_lg()
-                                    .bg(rgb(0xe8edf5))
+                                    .bg(rgb(0xECEDF1))
                                     .child(
                                         div()
                                             .absolute()
@@ -6711,7 +7003,7 @@ impl Studio {
                                                     .top_0()
                                                     .w(px(2.0))
                                                     .h_full()
-                                                    .bg(hsla(211.0 / 360.0, 0.95, 0.45, 0.72)),
+                                                    .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
                                             ),
                                     )
                                     .when(self.video_zoom_cues.is_empty(), |this| {
@@ -6722,7 +7014,7 @@ impl Studio {
                                                 .top(px(7.0))
                                                 .text_xs()
                                                 .text_color(muted())
-                                                .child("Zoom animations appear here"),
+                                                .child("Add a zoom to animate the viewport"),
                                         )
                                     }),
                             ),
@@ -7807,7 +8099,7 @@ fn main() {
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("screendroprec"));
     Application::new()
         .with_assets(Assets {
-            base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
+            base: asset_directory(),
         })
         .run(move |cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);

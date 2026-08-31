@@ -236,36 +236,64 @@ fn render_clip_timeline(
         ));
     }
 
+    // Gaps between clips render as black video with silent audio. Every
+    // chain is normalized to one pixel/sample format so concat accepts the
+    // generated fillers alongside the source segments.
+    use std::fmt::Write as _;
+    let frame_rate = if info.frame_rate.is_finite() && info.frame_rate > 0.0 {
+        info.frame_rate
+    } else {
+        30.0
+    };
     let mut filter = String::new();
-    for (index, clip) in timeline.segments.iter().enumerate() {
-        use std::fmt::Write as _;
+    let mut chains: Vec<usize> = Vec::new();
+    let mut label = 0usize;
+    for clip in timeline.segments.iter() {
+        if clip.gap_before > 0.0 {
+            write!(
+                filter,
+                "color=c=black:s={}x{}:r={:.6}:d={:.9},format=yuv420p,setsar=1[v{label}];",
+                info.width, info.height, frame_rate, clip.gap_before
+            )
+            .expect("writing to String cannot fail");
+            if info.has_audio {
+                write!(
+                    filter,
+                    "anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{:.9}[a{label}];",
+                    clip.gap_before
+                )
+                .expect("writing to String cannot fail");
+            }
+            chains.push(label);
+            label += 1;
+        }
         write!(
             filter,
-            "[0:v]trim=start={:.9}:end={:.9},setpts=(PTS-STARTPTS)/{:.9}[v{index}];",
+            "[0:v]trim=start={:.9}:end={:.9},setpts=(PTS-STARTPTS)/{:.9},format=yuv420p,setsar=1[v{label}];",
             clip.source_start, clip.source_end, clip.speed
         )
         .expect("writing to String cannot fail");
         if info.has_audio {
             write!(
                 filter,
-                "[0:a]atrim=start={:.9}:end={:.9},asetpts=PTS-STARTPTS,atempo={:.9}[a{index}];",
+                "[0:a]atrim=start={:.9}:end={:.9},asetpts=PTS-STARTPTS,atempo={:.9},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{label}];",
                 clip.source_start, clip.source_end, clip.speed
             )
             .expect("writing to String cannot fail");
         }
+        chains.push(label);
+        label += 1;
     }
-    for index in 0..timeline.segments.len() {
-        use std::fmt::Write as _;
+    for index in &chains {
         write!(filter, "[v{index}]").expect("writing to String cannot fail");
         if info.has_audio {
             write!(filter, "[a{index}]").expect("writing to String cannot fail");
         }
     }
-    use std::fmt::Write as _;
     write!(
         filter,
         "concat=n={}:v=1:a={}[video]{}",
-        timeline.segments.len(),
+        chains.len(),
         u8::from(info.has_audio),
         if info.has_audio { "[audio]" } else { "" }
     )
@@ -721,6 +749,61 @@ mod tests {
         assert!((info.duration - 1.5).abs() < 0.2, "{}", info.duration);
         let final_frame = decode_frame(&preview, 1.4, 160, 90).unwrap();
         assert!(final_frame.rgba.iter().any(|value| *value != 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edited_preview_renders_reordered_clips() {
+        let Some((root, path)) = test_video_with_audio() else {
+            eprintln!("FFmpeg unavailable; skipping reorder preview integration test");
+            return;
+        };
+        // Play the tail of the recording before its head.
+        let timeline = RecordingClipTimeline::new(vec![
+            crate::recording::clips::RecordingClipSegment::new(2.0, 3.0),
+            crate::recording::clips::RecordingClipSegment::new(0.0, 1.5),
+        ]);
+        assert_eq!(timeline.normalized(3.0), timeline);
+        let preview = root.join("reordered.mkv");
+        render_clip_preview(&path, &preview, &timeline).unwrap();
+        let info = probe_media(&preview).unwrap();
+        assert!((info.duration - 2.5).abs() < 0.2, "{}", info.duration);
+        let final_frame = decode_frame(&preview, 2.3, 160, 90).unwrap();
+        assert!(final_frame.rgba.iter().any(|value| *value != 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edited_preview_renders_gaps_as_black_filler() {
+        let Some((root, path)) = test_video_with_audio() else {
+            eprintln!("FFmpeg unavailable; skipping gap preview integration test");
+            return;
+        };
+        let mut spaced = crate::recording::clips::RecordingClipSegment::new(2.0, 3.0);
+        spaced.gap_before = 1.0;
+        let timeline = RecordingClipTimeline::new(vec![
+            crate::recording::clips::RecordingClipSegment::new(0.0, 1.0),
+            spaced,
+        ]);
+        assert!((timeline.duration() - 3.0).abs() < 1e-9);
+        let preview = root.join("gapped.mkv");
+        render_clip_preview(&path, &preview, &timeline).unwrap();
+        let info = probe_media(&preview).unwrap();
+        assert!(info.has_audio);
+        assert!((info.duration - 3.0).abs() < 0.2, "{}", info.duration);
+        // The gap between one and two seconds decodes as pure black.
+        let gap_frame = decode_frame(&preview, 1.5, 160, 90).unwrap();
+        let max_luma = gap_frame
+            .rgba
+            .chunks(4)
+            .flat_map(|pixel| pixel[..3].iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert!(max_luma < 32, "gap frame not black (max {max_luma})");
+        // Content after the gap still decodes.
+        let content_frame = decode_frame(&preview, 2.5, 160, 90).unwrap();
+        assert!(content_frame.rgba.iter().any(|value| *value > 64));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -24,6 +24,10 @@ pub struct RecordingClipSegment {
     pub source_end: f64,
     #[serde(default = "default_speed")]
     pub speed: f64,
+    /// Empty timeline seconds before this clip plays. Gaps render as black
+    /// video with silent audio, and let clips sit anywhere on the timeline.
+    #[serde(default)]
+    pub gap_before: f64,
 }
 
 impl RecordingClipSegment {
@@ -39,6 +43,7 @@ impl RecordingClipSegment {
             source_start,
             source_end,
             speed: 1.0,
+            gap_before: 0.0,
         }
     }
 
@@ -48,6 +53,11 @@ impl RecordingClipSegment {
 
     pub fn editor_duration(&self) -> f64 {
         self.duration() / self.speed.max(Self::MINIMUM_SPEED)
+    }
+
+    /// Timeline seconds this clip occupies including its leading gap.
+    pub fn slot_duration(&self) -> f64 {
+        self.gap_before + self.editor_duration()
     }
 }
 
@@ -113,10 +123,13 @@ impl RecordingClipTimeline {
     pub fn duration(&self) -> f64 {
         self.segments
             .iter()
-            .map(RecordingClipSegment::editor_duration)
+            .map(RecordingClipSegment::slot_duration)
             .sum()
     }
 
+    /// Repairs invalid data (non-finite values, overlaps, duplicate ids)
+    /// while preserving the user's playback order, so reordered clips
+    /// survive normalization.
     pub fn normalized(&self, source_duration: f64) -> Self {
         let safe_duration = finite_nonnegative(source_duration);
         let mut seen_ids = std::collections::HashSet::new();
@@ -142,30 +155,110 @@ impl RecordingClipTimeline {
                         RecordingClipSegment::MINIMUM_SPEED,
                         RecordingClipSegment::MAXIMUM_SPEED,
                     ),
+                    gap_before: {
+                        let gap = finite_nonnegative(segment.gap_before);
+                        // Snap float dust to zero so adjacent clips stay
+                        // seamless instead of flashing a one-frame gap.
+                        if gap < 0.01 {
+                            0.0
+                        } else {
+                            gap
+                        }
+                    },
                 })
             })
             .collect();
-        segments.sort_by(|left, right| {
-            left.source_start
-                .total_cmp(&right.source_start)
-                .then_with(|| left.source_end.total_cmp(&right.source_end))
-        });
 
+        // Overlap repair walks the segments in source order, but the clamps
+        // are applied in place so the playback order stays untouched.
+        let mut order: Vec<usize> = (0..segments.len()).collect();
+        order.sort_by(|&left, &right| {
+            segments[left]
+                .source_start
+                .total_cmp(&segments[right].source_start)
+                .then_with(|| {
+                    segments[left]
+                        .source_end
+                        .total_cmp(&segments[right].source_end)
+                })
+        });
         let mut previous_end: f64 = 0.0;
-        segments.retain_mut(|segment| {
+        let mut dropped = vec![false; segments.len()];
+        for &index in &order {
+            let segment = &mut segments[index];
             segment.source_start = segment.source_start.max(previous_end);
             if segment.duration() < RecordingClipSegment::MINIMUM_DURATION {
-                false
+                dropped[index] = true;
             } else {
                 previous_end = segment.source_end;
-                true
             }
-        });
+        }
+        let mut keep = dropped.into_iter();
+        segments.retain(|_| !keep.next().unwrap_or(false));
+
         if segments.is_empty() && safe_duration > 0.0 {
             Self::full(safe_duration)
         } else {
             Self::new(segments)
         }
+    }
+
+    /// Editor-time start of each clip's content (after its leading gap),
+    /// keyed by vec index.
+    pub fn clip_starts(&self) -> Vec<f64> {
+        let mut starts = Vec::with_capacity(self.segments.len());
+        let mut cursor = 0.0;
+        for segment in &self.segments {
+            starts.push(cursor + segment.gap_before);
+            cursor += segment.slot_duration();
+        }
+        starts
+    }
+
+    /// Places `segment_id` so its content starts at `new_editor_start`,
+    /// keeping every other clip where it is. Clips are re-sorted by their
+    /// timeline position and gaps are rebuilt from the resulting layout, so
+    /// dragging a clip can open a gap, close one, or hop across neighbors.
+    pub fn repositioning(&self, segment_id: Uuid, new_editor_start: f64) -> Option<Self> {
+        let starts = self.clip_starts();
+        let index = self
+            .segments
+            .iter()
+            .position(|item| item.id == segment_id)?;
+        let mut placed: Vec<(f64, bool, &RecordingClipSegment)> = self
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(item_index, segment)| {
+                let dragged = item_index == index;
+                let start = if dragged {
+                    finite_nonnegative(new_editor_start)
+                } else {
+                    starts[item_index]
+                };
+                (start, dragged, segment)
+            })
+            .collect();
+        // The dragged clip wins ties: dropping it exactly on another clip's
+        // start means "play before that clip".
+        placed.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| right.1.cmp(&left.1))
+        });
+
+        let mut cursor = 0.0;
+        let segments = placed
+            .into_iter()
+            .map(|(start, _, segment)| {
+                let mut segment = segment.clone();
+                segment.gap_before = (start - cursor).max(0.0);
+                cursor += segment.slot_duration();
+                segment
+            })
+            .collect();
+        let next = Self::new(segments);
+        (next != *self).then_some(next)
     }
 
     pub fn location_at(&self, editor_time: f64) -> Option<ClipLocation> {
@@ -174,9 +267,12 @@ impl RecordingClipTimeline {
             return None;
         }
         let clamped = finite_or(editor_time, 0.0).clamp(0.0, duration);
-        let mut editor_start = 0.0;
+        let mut slot_start = 0.0;
         for (index, segment) in self.segments.iter().enumerate() {
+            let editor_start = slot_start + segment.gap_before;
             let editor_end = editor_start + segment.editor_duration();
+            // A time inside this clip's leading gap resolves to the clip's
+            // head, so the playhead never points at nothing.
             if clamped < editor_end || index + 1 == self.segments.len() {
                 let offset = (clamped - editor_start).clamp(0.0, segment.editor_duration());
                 let source_offset = (offset * segment.speed).min(segment.duration());
@@ -188,7 +284,7 @@ impl RecordingClipTimeline {
                     source_time: segment.source_start + source_offset,
                 });
             }
-            editor_start = editor_end;
+            slot_start += segment.slot_duration();
         }
         None
     }
@@ -201,15 +297,15 @@ impl RecordingClipTimeline {
 
     /// Inclusive lookup used for playhead placement, matching the Swift app.
     pub fn editor_time_for_source(&self, source_time: f64) -> Option<f64> {
-        let mut editor_start = 0.0;
+        let mut slot_start = 0.0;
         for segment in &self.segments {
             if source_time >= segment.source_start - EPSILON
                 && source_time <= segment.source_end + EPSILON
             {
                 let offset = (source_time - segment.source_start).clamp(0.0, segment.duration());
-                return Some(editor_start + offset / segment.speed);
+                return Some(slot_start + segment.gap_before + offset / segment.speed);
             }
-            editor_start += segment.editor_duration();
+            slot_start += segment.slot_duration();
         }
         None
     }
@@ -217,24 +313,29 @@ impl RecordingClipTimeline {
     /// Half-open lookup for discrete events, preventing an event on an
     /// outgoing clip's end boundary from leaking into the following clip.
     pub fn editor_time_for_event(&self, source_time: f64) -> Option<f64> {
-        let mut editor_start = 0.0;
+        let mut slot_start = 0.0;
         for segment in &self.segments {
             if source_time >= segment.source_start && source_time < segment.source_end {
-                return Some(editor_start + (source_time - segment.source_start) / segment.speed);
+                return Some(
+                    slot_start
+                        + segment.gap_before
+                        + (source_time - segment.source_start) / segment.speed,
+                );
             }
-            editor_start += segment.editor_duration();
+            slot_start += segment.slot_duration();
         }
         None
     }
 
+    /// Editor-time range of the clip's content, excluding its leading gap.
     pub fn editor_range(&self, segment_id: Uuid) -> Option<Range<f64>> {
-        let mut editor_start = 0.0;
+        let mut slot_start = 0.0;
         for segment in &self.segments {
-            let editor_end = editor_start + segment.editor_duration();
+            let editor_start = slot_start + segment.gap_before;
             if segment.id == segment_id {
-                return Some(editor_start..editor_end);
+                return Some(editor_start..editor_start + segment.editor_duration());
             }
-            editor_start = editor_end;
+            slot_start += segment.slot_duration();
         }
         None
     }
@@ -254,12 +355,14 @@ impl RecordingClipTimeline {
             source_start: segment.source_start,
             source_end: source_time,
             speed: segment.speed,
+            gap_before: segment.gap_before,
         };
         let trailing = RecordingClipSegment {
             id: trailing_id,
             source_start: source_time,
             source_end: segment.source_end,
             speed: segment.speed,
+            gap_before: 0.0,
         };
         let mut segments = self.segments.clone();
         segments.splice(
@@ -308,15 +411,22 @@ impl RecordingClipTimeline {
             .position(|clip| clip.id == segment_id)?;
         let original = &self.segments[index];
         let source_delta = editor_delta * original.speed;
-        let previous_end = index
-            .checked_sub(1)
-            .map(|previous| self.segments[previous].source_end)
-            .unwrap_or(0.0);
+        // Clips can be reordered on the timeline, so trim bounds come from
+        // the nearest neighbors in SOURCE space, not adjacent vec entries.
+        let previous_end = self
+            .segments
+            .iter()
+            .filter(|clip| clip.id != segment_id)
+            .map(|clip| clip.source_end)
+            .filter(|&end| end <= original.source_start + EPSILON)
+            .fold(0.0, f64::max);
         let next_start = self
             .segments
-            .get(index + 1)
-            .map(|next| next.source_start)
-            .unwrap_or_else(|| finite_nonnegative(source_duration));
+            .iter()
+            .filter(|clip| clip.id != segment_id)
+            .map(|clip| clip.source_start)
+            .filter(|&start| start >= original.source_end - EPSILON)
+            .fold(finite_nonnegative(source_duration), f64::min);
         let mut replacement = original.clone();
         match edge {
             ClipEdge::Leading => {
@@ -365,6 +475,7 @@ impl RecordingClipTimeline {
                     source_start: start,
                     source_end: end,
                     speed: segment.speed,
+                    gap_before: if kept_id { 0.0 } else { segment.gap_before },
                 });
                 kept_id = true;
             }
@@ -397,8 +508,9 @@ impl RecordingClipTimeline {
             return Vec::new();
         }
         let mut result = Vec::new();
-        let mut editor_offset = 0.0;
+        let mut slot_offset = 0.0;
         for segment in &self.segments {
+            let editor_offset = slot_offset + segment.gap_before;
             let overlap_start = source_start.max(segment.source_start);
             let overlap_end = source_end.min(segment.source_end);
             if overlap_end > overlap_start {
@@ -412,7 +524,7 @@ impl RecordingClipTimeline {
                         + (overlap_end - segment.source_start) / segment.speed,
                 });
             }
-            editor_offset += segment.editor_duration();
+            slot_offset += segment.slot_duration();
         }
         result
     }
@@ -423,6 +535,7 @@ impl RecordingClipTimeline {
                 only.source_start.abs() < EPSILON
                     && (only.source_end - source_duration).abs() < EPSILON
                     && (only.speed - 1.0).abs() < EPSILON
+                    && only.gap_before.abs() < EPSILON
             })
     }
 }
@@ -483,20 +596,58 @@ mod tests {
                 source_start: 4.0,
                 source_end: 8.0,
                 speed: 99.0,
+                gap_before: 0.0,
             },
             RecordingClipSegment {
                 id: shared,
                 source_start: 1.0,
                 source_end: 5.0,
                 speed: f64::NAN,
+                gap_before: -3.0,
             },
         ])
         .normalized(10.0);
-        assert_eq!(timeline.segments[0].source_start, 1.0);
-        assert_eq!(timeline.segments[0].speed, 1.0);
-        assert_eq!(timeline.segments[1].source_start, 5.0);
-        assert_eq!(timeline.segments[1].speed, 16.0);
+        // Overlap repair happens in source order (the 1..5 clip keeps its
+        // range; the 4..8 clip is clamped to start at 5) while the user's
+        // playback order is preserved.
+        assert_eq!(timeline.segments[0].source_start, 5.0);
+        assert_eq!(timeline.segments[0].speed, 16.0);
+        assert_eq!(timeline.segments[1].source_start, 1.0);
+        assert_eq!(timeline.segments[1].source_end, 5.0);
+        assert_eq!(timeline.segments[1].speed, 1.0);
         assert_ne!(timeline.segments[0].id, timeline.segments[1].id);
+        // The invalid negative gap was repaired to zero.
+        assert_eq!(timeline.segments[1].gap_before, 0.0);
+    }
+
+    #[test]
+    fn repositioning_creates_gaps_extends_timeline_and_reorders() {
+        let timeline = RecordingClipTimeline::new(vec![
+            segment(0.0, 2.0, 1.0),
+            segment(2.0, 5.0, 1.0),
+            segment(5.0, 9.0, 1.0),
+        ]);
+        let last = timeline.segments[2].id;
+
+        // Dragging the last clip further right opens a gap and grows the
+        // timeline past the source duration.
+        let spaced = timeline.repositioning(last, 8.0).expect("gap move");
+        assert_eq!(spaced.segments[2].gap_before, 3.0);
+        assert_eq!(spaced.duration(), 12.0);
+        assert_eq!(spaced.editor_range(last), Some(8.0..12.0));
+        // The gap resolves to the clip's head; times inside the clip map on.
+        assert_eq!(spaced.source_time_at(6.0), 5.0);
+        assert_eq!(spaced.source_time_at(9.0), 6.0);
+        assert_eq!(spaced.normalized(9.0), spaced);
+
+        // Dragging it to the front hops across both other clips.
+        let fronted = spaced.repositioning(last, 0.0).expect("reorder move");
+        assert_eq!(fronted.segments[0].id, last);
+        assert_eq!(fronted.segments[0].gap_before, 0.0);
+        assert_eq!(fronted.duration(), 9.0);
+
+        // Repositioning to the same spot is a no-op.
+        assert!(fronted.repositioning(last, 0.0).is_none());
     }
 
     #[test]

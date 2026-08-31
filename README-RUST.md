@@ -4,6 +4,16 @@ This directory contains the Linux-first Rust and GPUI port of Screendrop. The
 original macOS Swift application remains in `Screendrop/` as the behavioral and
 visual reference.
 
+## Download a Debian package
+
+Every push to `main` produces a `.deb` in the GitHub Actions run artifacts.
+Pushing a version tag such as `v0.1.0` also creates a GitHub Release and attaches
+the package to it. Install a downloaded package on Debian or Ubuntu with:
+
+```bash
+sudo apt install ./screendrop_0.1.0_amd64.deb
+```
+
 ## Capture shortcut
 
 While Screendrop is running, press **Ctrl+Shift+3** from any application. Linux
