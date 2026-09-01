@@ -797,12 +797,112 @@ pub fn synthesize_zoom_cues(capture: &PointerCaptureFile, duration: f64) -> Vec<
     merged
 }
 
+/// Builds a synthetic pointer capture for an animated screenshot: the cursor
+/// glides between the given stops (evenly spaced across `duration`) and
+/// clicks at each one, so the usual click-zoom synthesis and cursor
+/// reconstruction apply to a still image.
+pub fn walkthrough_capture(stops: &[NormalizedPoint], duration: f64) -> PointerCaptureFile {
+    use crate::recording::model::{PointerPressEvent, PointerTravelKind, PointerTravelSample};
+    let mut capture = PointerCaptureFile::default();
+    if stops.is_empty() || !duration.is_finite() || duration <= 0.0 {
+        return capture;
+    }
+    const SAMPLE_RATE: f64 = 60.0;
+    let stop_times: Vec<f64> = (0..stops.len())
+        .map(|index| duration * (index as f64 + 1.0) / (stops.len() as f64 + 1.0))
+        .collect();
+    let sample = |time: f64, point: NormalizedPoint| PointerTravelSample {
+        time,
+        x: point.x,
+        y: point.y,
+        kind: PointerTravelKind::Move,
+        artwork_id: None,
+    };
+    // Appear a little before the first stop, already heading toward it.
+    let lead_in = (stop_times[0] * 0.6).max(0.15);
+    let entry = NormalizedPoint {
+        x: (stops[0].x - 0.08).clamp(0.0, 1.0),
+        y: (stops[0].y + 0.10).clamp(0.0, 1.0),
+    };
+    let mut segments: Vec<(f64, NormalizedPoint, f64, NormalizedPoint)> =
+        vec![(stop_times[0] - lead_in, entry, stop_times[0], stops[0])];
+    for index in 1..stops.len() {
+        // Dwell on the previous stop, then travel to the next one.
+        let dwell = (stop_times[index] - stop_times[index - 1]) * 0.45;
+        segments.push((
+            stop_times[index - 1] + dwell,
+            stops[index - 1],
+            stop_times[index],
+            stops[index],
+        ));
+    }
+    for (start, from, end, to) in segments {
+        let steps = ((end - start) * SAMPLE_RATE).ceil().max(2.0) as usize;
+        for step in 0..=steps {
+            let t = step as f64 / steps as f64;
+            let eased = t * t * (3.0 - 2.0 * t);
+            capture.travel.push(sample(
+                start + (end - start) * t,
+                NormalizedPoint {
+                    x: lerp(from.x, to.x, eased),
+                    y: lerp(from.y, to.y, eased),
+                }
+                .clamped(),
+            ));
+        }
+    }
+    for (index, stop) in stops.iter().enumerate() {
+        for (phase, offset) in [(PressPhase::Down, 0.0), (PressPhase::Up, 0.09)] {
+            capture.presses.push(PointerPressEvent {
+                time: (stop_times[index] + offset).min(duration),
+                x: stop.x,
+                y: stop.y,
+                button: 0,
+                phase,
+                artwork_id: None,
+            });
+        }
+    }
+    capture.is_sanitized = true;
+    capture
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::recording::model::{
         PointerCaptureFile, PointerPressEvent, PointerTravelKind, PointerTravelSample,
     };
+
+    #[test]
+    fn walkthrough_capture_visits_stops_in_order_with_clicks() {
+        let stops = [
+            NormalizedPoint { x: 0.2, y: 0.3 },
+            NormalizedPoint { x: 0.8, y: 0.4 },
+            NormalizedPoint { x: 0.5, y: 0.8 },
+        ];
+        let capture = walkthrough_capture(&stops, 6.0);
+        let downs: Vec<_> = capture
+            .presses
+            .iter()
+            .filter(|press| press.phase == PressPhase::Down)
+            .collect();
+        assert_eq!(downs.len(), 3);
+        assert!((downs[0].time - 1.5).abs() < 1e-9 && (downs[2].time - 4.5).abs() < 1e-9);
+        assert!(capture
+            .travel
+            .windows(2)
+            .all(|pair| pair[1].time >= pair[0].time));
+        let at_second_stop = capture
+            .travel
+            .iter()
+            .min_by(|a, b| (a.time - 3.0).abs().total_cmp(&(b.time - 3.0).abs()))
+            .unwrap();
+        assert!((at_second_stop.x - 0.8).abs() < 0.02 && (at_second_stop.y - 0.4).abs() < 0.02);
+        let cues = synthesize_zoom_cues(&capture, 6.0);
+        assert!(!cues.is_empty());
+        assert!(walkthrough_capture(&[], 6.0).travel.is_empty());
+    }
 
     fn down(time: f64, x: f64, y: f64) -> PointerPressEvent {
         PointerPressEvent {

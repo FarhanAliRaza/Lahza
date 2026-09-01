@@ -108,6 +108,7 @@ impl Studio {
             watermark: (self.watermark_enabled && !self.watermark.text.trim().is_empty())
                 .then(|| self.watermark.clone()),
             pointer: self.pointer_style,
+            camera: self.camera_overlay,
         }
     }
 
@@ -126,7 +127,8 @@ impl Studio {
 
     /// Whether the open scene has a reconstructed cursor to follow.
     fn scene_has_pointer(&self) -> bool {
-        self.video_project.is_some() && !self.video_pointer_timeline.is_empty()
+        (self.video_project.is_some() && !self.video_pointer_timeline.is_empty())
+            || (self.animation_active && self.has_walkthrough())
     }
 
     // ------------------------------------------------------------------
@@ -1041,6 +1043,7 @@ impl Studio {
 
     pub(crate) fn exit_animation(&mut self) {
         self.pause_video_playback();
+        self.walkthrough_mode = false;
         self.animation_active = false;
         self.video_playing = false;
         self.video_position = 0.0;
@@ -1079,7 +1082,11 @@ impl Studio {
         self.video_source_duration = duration;
         self.video_clip_timeline = RecordingClipTimeline::full(duration);
         self.video_position = self.video_position.min(duration);
-        self.rebuild_video_motion_timelines();
+        if self.has_walkthrough() {
+            self.rebuild_walkthrough();
+        } else {
+            self.rebuild_video_motion_timelines();
+        }
     }
 
     pub(crate) fn apply_motion_preset(&mut self, preset: MotionPreset) {
@@ -1170,9 +1177,23 @@ impl Studio {
             }
             return true;
         }
+        if self.walkthrough_mode && matches!(keystroke.key.as_str(), "enter" | "escape") {
+            self.walkthrough_mode = false;
+            self.toast = Some(if self.walkthrough_stops.is_empty() {
+                "Cursor walkthrough cancelled".into()
+            } else {
+                "Cursor walkthrough ready · press play".into()
+            });
+            return true;
+        }
         match keystroke.key.as_str() {
             "space" => {
                 self.toggle_animation_playback(cx);
+                true
+            }
+            "m" => {
+                let position = self.video_position;
+                self.add_motion_region_at(position, cx);
                 true
             }
             "left" => {
@@ -1409,8 +1430,11 @@ impl Studio {
                     )
                     .child(
                         canvas(
-                            move |bounds, _, _| {
+                            move |bounds, window, _| {
                                 if let Ok(mut stored) = timeline_bounds.lock() {
+                                    if *stored != Some(bounds) {
+                                        window.refresh();
+                                    }
                                     *stored = Some(bounds);
                                 }
                             },
@@ -1511,6 +1535,63 @@ impl Studio {
                                 cx.notify();
                             }))
                     })),
+            )
+            .child(Self::inspector_label("Cursor walkthrough"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("walkthrough-toggle")
+                            .px_3()
+                            .h(px(30.0))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .bg(if self.walkthrough_mode {
+                                orange(false)
+                            } else {
+                                rgb(0xf0f0f1).into()
+                            })
+                            .text_color(if self.walkthrough_mode {
+                                rgb(0xffffff).into()
+                            } else {
+                                ink()
+                            })
+                            .cursor_pointer()
+                            .child(if self.walkthrough_mode {
+                                "Placing stops… (Enter to finish)"
+                            } else if self.has_walkthrough() {
+                                "Add more stops"
+                            } else {
+                                "Place cursor stops"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.walkthrough_mode = !this.walkthrough_mode;
+                                this.video_selected_zoom_cue = None;
+                                this.scene_selection = crate::scene_ui::SceneSelection::Scene;
+                                if this.walkthrough_mode {
+                                    this.pause_video_playback();
+                                    this.toast = Some(
+                                        "Click the spots the cursor should visit, in order".into(),
+                                    );
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.has_walkthrough(), |this| {
+                        this.child(self.small_button(
+                            "walkthrough-clear",
+                            "Clear path",
+                            true,
+                            cx,
+                            |this, _| this.clear_walkthrough(),
+                        ))
+                    }),
             )
             .child(Self::inspector_label("Export as"))
             .child(self.segmented(
@@ -1700,6 +1781,7 @@ impl Studio {
             pointer: self
                 .video_pointer_synthesized
                 .then(|| self.video_pointer_timeline.clone()),
+            camera: self.video_camera_path.clone(),
         };
         self.prompt_and_run_scene_export(source, request, suggested_name, cx);
     }
@@ -1744,7 +1826,15 @@ impl Studio {
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
         request.overlay = self.annotation_overlay_source();
-        self.prompt_and_run_scene_export(SceneSource::Image(image), request, suggested_name, cx);
+        self.prompt_and_run_scene_export(
+            SceneSource::Image {
+                image,
+                pointer: self.animation_pointer_timeline(),
+            },
+            request,
+            suggested_name,
+            cx,
+        );
     }
 
     fn prompt_and_run_scene_export(

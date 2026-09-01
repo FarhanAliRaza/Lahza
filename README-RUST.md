@@ -51,13 +51,16 @@ surface (padding, corners, border, shadow), and a camera. Camera motion is
 edited as orange regions on the timeline's motion lane rather than keyframes:
 
 - Recordings open with regions synthesized from clicks. Double-click the lane
-  to add one, drag its edges to retime it, and use the inspector to change
+  (or press M) to add one, drag its edges to retime it, and use the inspector to change
   its style (hold, zoom in, zoom out), magnification, target (cursor, auto,
   pinned), focus point, and pan destination. Click the video to set the
   focus.
 - Screenshots start static. **Animate** turns the capture into a 3–10 second
-  scene with presets (slow zoom, pan, focus, sweep) that expand into the same
-  editable regions.
+  scene with presets (slow zoom, pan, focus, sweep, 3D tilt, floating card)
+  that expand into the same editable regions, and a cursor walkthrough that
+  animates a synthetic pointer through the spots you click.
+- A webcam clip added to a recording project appears as a picture-in-picture
+  bubble with its own corner, size, shape, mirroring, and shadow.
 
 The media surface is a 3D object: click it to select it, drag to move,
 Shift-drag to tilt, Ctrl-drag to spin, scroll to scale, and double-click to

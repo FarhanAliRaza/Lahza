@@ -170,6 +170,94 @@ impl Default for Watermark {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CameraShape {
+    #[default]
+    Circle,
+    Rounded,
+    Square,
+}
+
+impl CameraShape {
+    pub const ALL: [CameraShape; 3] = [
+        CameraShape::Circle,
+        CameraShape::Rounded,
+        CameraShape::Square,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CameraShape::Circle => "Circle",
+            CameraShape::Rounded => "Rounded",
+            CameraShape::Square => "Square",
+        }
+    }
+}
+
+/// Picture-in-picture placement of the camera (webcam) clip.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CameraOverlay {
+    pub enabled: bool,
+    pub position: WatermarkPosition,
+    /// Diameter as a percent of the canvas height (10-60).
+    pub size: u8,
+    pub shape: CameraShape,
+    pub mirror: bool,
+    /// Distance from the canvas edge as a percent of the canvas height.
+    pub margin: u8,
+    pub shadow: bool,
+}
+
+impl Default for CameraOverlay {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: WatermarkPosition::BottomRight,
+            size: 24,
+            shape: CameraShape::Circle,
+            mirror: false,
+            margin: 4,
+            shadow: true,
+        }
+    }
+}
+
+impl CameraOverlay {
+    /// The overlay rect on a canvas of this size.
+    pub fn rect(&self, canvas_width: f64, canvas_height: f64) -> Rect {
+        let side = canvas_height * (self.size.clamp(10, 60) as f64 / 100.0);
+        let margin = canvas_height * (self.margin.min(20) as f64 / 100.0);
+        let x = match self.position {
+            WatermarkPosition::TopLeft | WatermarkPosition::BottomLeft => margin,
+            WatermarkPosition::TopRight | WatermarkPosition::BottomRight => {
+                canvas_width - margin - side
+            }
+        };
+        let y = match self.position {
+            WatermarkPosition::TopLeft | WatermarkPosition::TopRight => margin,
+            WatermarkPosition::BottomLeft | WatermarkPosition::BottomRight => {
+                canvas_height - margin - side
+            }
+        };
+        Rect {
+            x,
+            y,
+            width: side,
+            height: side,
+        }
+    }
+
+    pub fn radius(&self, rect: Rect) -> f64 {
+        match self.shape {
+            CameraShape::Circle => rect.width * 0.5,
+            CameraShape::Rounded => rect.width * 0.18,
+            CameraShape::Square => rect.width * 0.03,
+        }
+    }
+}
+
 /// How the reconstructed cursor is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -224,6 +312,8 @@ pub struct SceneStyle {
     pub transform: SceneTransform,
     pub watermark: Option<Watermark>,
     pub pointer: PointerStyle,
+    /// How a camera clip is placed; the clip itself lives in the project.
+    pub camera: CameraOverlay,
 }
 
 impl Default for SceneStyle {
@@ -245,6 +335,7 @@ impl Default for SceneStyle {
             transform: SceneTransform::IDENTITY,
             watermark: None,
             pointer: PointerStyle::default(),
+            camera: CameraOverlay::default(),
         }
     }
 }
@@ -637,6 +728,8 @@ pub struct FrameInput<'a> {
     pub overlay: Option<&'a RgbaImage>,
     pub viewport: ViewportFrame,
     pub pointer: Option<&'a PointerOverlay>,
+    /// Camera (webcam) frame for this time, drawn as picture-in-picture.
+    pub camera: Option<&'a RgbaImage>,
 }
 
 struct CardLayer {
@@ -742,6 +835,11 @@ impl SceneCompositor {
         );
         if let Some(pointer) = input.pointer {
             self.paint_pointer(&mut output, &projection, pointer, input.viewport);
+        }
+        if let Some(camera) = input.camera {
+            if self.style.camera.enabled {
+                self.paint_camera(&mut output, camera);
+            }
         }
         if let Some(watermark) = self.watermark.as_ref() {
             blend_layer(&mut output, watermark);
@@ -877,6 +975,87 @@ impl SceneCompositor {
                     sample[3] =
                         (sample[3] as f64 + (255.0 - sample[3] as f64) * alpha).round() as u8;
                 }
+                blend_pixel(
+                    output,
+                    x,
+                    y,
+                    [sample[0], sample[1], sample[2]],
+                    coverage * sample[3] as f64 / 255.0,
+                );
+            }
+        }
+    }
+
+    /// Picture-in-picture camera: cover-fitted, optionally mirrored, masked
+    /// to the configured shape, with a soft shadow underneath.
+    fn paint_camera(&self, output: &mut RgbaImage, camera: &RgbaImage) {
+        if camera.width() == 0 || camera.height() == 0 {
+            return;
+        }
+        let overlay = self.style.camera;
+        let rect = overlay.rect(self.width as f64, self.height as f64);
+        let radius = overlay.radius(rect);
+        if overlay.shadow {
+            let width = self.width as usize;
+            let height = self.height as usize;
+            let mut mask = vec![0.0f32; width * height];
+            let offset = rect.height * 0.06;
+            let x0 = (rect.x - 2.0).floor().max(0.0) as usize;
+            let y0 = (rect.y + offset - 2.0).floor().max(0.0) as usize;
+            let x1 = ((rect.right() + 2.0).ceil().max(0.0) as usize).min(width);
+            let y1 = ((rect.bottom() + offset + 2.0).ceil().max(0.0) as usize).min(height);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let u = (x as f64 + 0.5 - rect.x) / rect.width;
+                    let v = (y as f64 + 0.5 - offset - rect.y) / rect.height;
+                    let distance = rounded_rect_distance(u, v, rect.width, rect.height, radius);
+                    mask[y * width + x] = (0.5 - distance).clamp(0.0, 1.0) as f32;
+                }
+            }
+            let box_radius = box_radius_for(rect.height * 0.05 * 0.5 + 1.0);
+            let mut scratch = vec![0.0f32; width * height];
+            for _ in 0..3 {
+                box_blur_horizontal(&mask, &mut scratch, width, height, box_radius);
+                box_blur_vertical(&scratch, &mut mask, width, height, box_radius);
+            }
+            for y in 0..height {
+                for x in 0..width {
+                    let alpha = mask[y * width + x] as f64 * 0.35;
+                    if alpha > 0.001 {
+                        blend_pixel(output, x as u32, y as u32, [0, 0, 0], alpha);
+                    }
+                }
+            }
+        }
+        // Cover-fit: scale the frame so the square is filled, crop the rest.
+        let frame_width = camera.width() as f64;
+        let frame_height = camera.height() as f64;
+        let scale = (rect.width / frame_width).max(rect.height / frame_height);
+        let scaled_width = frame_width * scale;
+        let scaled_height = frame_height * scale;
+        let offset_x = (rect.width - scaled_width) * 0.5;
+        let offset_y = (rect.height - scaled_height) * 0.5;
+        let x0 = rect.x.floor().max(0.0) as u32;
+        let y0 = rect.y.floor().max(0.0) as u32;
+        let x1 = (rect.right().ceil().max(0.0) as u32).min(self.width);
+        let y1 = (rect.bottom().ceil().max(0.0) as u32).min(self.height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let local_x = x as f64 + 0.5 - rect.x;
+                let local_y = y as f64 + 0.5 - rect.y;
+                let u = local_x / rect.width;
+                let v = local_y / rect.height;
+                let coverage = (0.5 - rounded_rect_distance(u, v, rect.width, rect.height, radius))
+                    .clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let mut sx = (local_x - offset_x) / scale - 0.5;
+                if overlay.mirror {
+                    sx = frame_width - 1.0 - sx;
+                }
+                let sy = (local_y - offset_y) / scale - 0.5;
+                let sample = sample_bilinear(camera, sx, sy);
                 blend_pixel(
                     output,
                     x,
@@ -1606,6 +1785,7 @@ mod tests {
             overlay: None,
             viewport: ViewportFrame::default(),
             pointer: None,
+            camera: None,
         })
     }
 
@@ -1697,6 +1877,7 @@ mod tests {
             overlay: None,
             viewport,
             pointer: None,
+            camera: None,
         });
         assert_eq!(output.get_pixel(5, 5).0, [255, 0, 0, 255]);
         assert_eq!(output.get_pixel(94, 94).0, [255, 0, 0, 255]);
@@ -1783,6 +1964,7 @@ mod tests {
                 ..ViewportFrame::default()
             },
             pointer: None,
+            camera: None,
         });
         assert_ne!(flat.as_raw(), tilted.as_raw());
         let flat_again = compose(&compositor, &checker(120, 120));
@@ -1846,9 +2028,97 @@ mod tests {
             overlay: Some(&overlay),
             viewport: ViewportFrame::default(),
             pointer: None,
+            camera: None,
         });
         assert_eq!(output.get_pixel(50, 50).0, [255, 0, 0, 255]);
         assert_eq!(output.get_pixel(10, 10).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn camera_overlay_is_cover_fitted_mirrored_and_masked() {
+        let style = SceneStyle {
+            camera: CameraOverlay {
+                enabled: true,
+                position: WatermarkPosition::BottomRight,
+                size: 40,
+                shape: CameraShape::Circle,
+                mirror: true,
+                margin: 5,
+                shadow: true,
+            },
+            ..flat_style(0x000000)
+        };
+        let compositor = SceneCompositor::new(&style, 200, 200, 200, 200).unwrap();
+        let white = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        // Camera frame: left half red, right half green (wider than tall).
+        let camera = RgbaImage::from_fn(160, 90, |x, _| {
+            if x < 80 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 255, 0, 255])
+            }
+        });
+        let output = compositor.compose(FrameInput {
+            source: &white,
+            overlay: None,
+            viewport: ViewportFrame::default(),
+            pointer: Some(&PointerOverlay {
+                frame: PointerFrame {
+                    location: NormalizedPoint { x: 0.1, y: 0.1 },
+                    artwork_id: None,
+                    magnification: 1.0,
+                    tilt_degrees: 0.0,
+                    opacity: 0.0,
+                    blur_radius: 0.0,
+                    press: None,
+                },
+            }),
+            camera: Some(&camera),
+        });
+        let rect = style.camera.rect(200.0, 200.0);
+        let cx = rect.x + rect.width * 0.5;
+        let cy = rect.y + rect.height * 0.5;
+        // Mirrored: the camera's left half (red) appears on the right.
+        assert_eq!(
+            output
+                .get_pixel((cx + rect.width * 0.3) as u32, cy as u32)
+                .0,
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            output
+                .get_pixel((cx - rect.width * 0.3) as u32, cy as u32)
+                .0,
+            [0, 255, 0, 255]
+        );
+        // Circle mask: the square's corner is not camera colour.
+        let corner = output
+            .get_pixel((rect.x + 2.0) as u32, (rect.y + 2.0) as u32)
+            .0;
+        assert!(
+            corner != [255, 0, 0, 255] && corner != [0, 255, 0, 255],
+            "{corner:?}"
+        );
+        // Disabled camera paints nothing.
+        let disabled = SceneStyle {
+            camera: CameraOverlay {
+                enabled: false,
+                ..style.camera
+            },
+            ..style.clone()
+        };
+        let compositor = SceneCompositor::new(&disabled, 200, 200, 200, 200).unwrap();
+        let output = compositor.compose(FrameInput {
+            source: &white,
+            overlay: None,
+            viewport: ViewportFrame::default(),
+            pointer: None,
+            camera: Some(&camera),
+        });
+        assert_eq!(
+            output.get_pixel(cx as u32, cy as u32).0,
+            [255, 255, 255, 255]
+        );
     }
 
     #[test]
@@ -1878,6 +2148,7 @@ mod tests {
             overlay: None,
             viewport: ViewportFrame::default(),
             pointer: Some(&pointer),
+            camera: None,
         });
         let media = compositor.geometry().media;
         let center = (
@@ -1908,6 +2179,7 @@ mod tests {
             overlay: None,
             viewport: ViewportFrame::default(),
             pointer: Some(&pointer),
+            camera: None,
         });
         assert_eq!(
             output.get_pixel(center.0 + 3, center.1 + 3).0,

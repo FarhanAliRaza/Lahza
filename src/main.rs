@@ -39,7 +39,7 @@ use recording::{
     native::{NativeRecorder, RecordingOptions},
     pointer_timeline::PointerTimeline,
     presets::PresetLibrary,
-    scene::{PointerStyle, SceneStyle, SceneTransform, Watermark},
+    scene::{CameraOverlay, PointerStyle, SceneStyle, SceneTransform, Watermark},
     session::{RecordingController, RecordingState},
     video::{
         decode_frame, load_or_rebuild_poster, probe_media, render_clip_preview, DecodedFrame,
@@ -1307,6 +1307,16 @@ struct Studio {
     video_removed_presses: Vec<f64>,
     video_selected_press: Option<f64>,
     annotation_drag: Option<AnnotationDrag>,
+    camera_overlay: CameraOverlay,
+    video_camera_path: Option<PathBuf>,
+    camera_frame_rgba: Option<Arc<image::RgbaImage>>,
+    camera_decoded_time: f64,
+    camera_decode_token: u64,
+    camera_decode_in_flight: bool,
+    /// Synthetic cursor for animated screenshots.
+    animation_pointer_capture: PointerCaptureFile,
+    walkthrough_stops: Vec<recording::model::NormalizedPoint>,
+    walkthrough_mode: bool,
     focus_handle: FocusHandle,
     wallpaper_tab: usize,
     library_tab: usize,
@@ -1609,6 +1619,15 @@ impl Studio {
             video_removed_presses: Vec::new(),
             video_selected_press: None,
             annotation_drag: None,
+            camera_overlay: CameraOverlay::default(),
+            video_camera_path: None,
+            camera_frame_rgba: None,
+            camera_decoded_time: -1.0,
+            camera_decode_token: 0,
+            camera_decode_in_flight: false,
+            animation_pointer_capture: PointerCaptureFile::default(),
+            walkthrough_stops: Vec::new(),
+            walkthrough_mode: false,
             focus_handle: cx.focus_handle(),
             wallpaper_tab: 2,
             library_tab: 1,
@@ -1946,6 +1965,8 @@ impl Studio {
         self.video_redo_stack.clear();
         self.video_selected_clip = None;
         self.video_selected_zoom_cue = None;
+        self.video_camera_path = None;
+        self.camera_frame_rgba = None;
         // Recording motion must not leak into a later screenshot animation.
         self.video_zoom_cues.clear();
         self.video_viewport_timeline = ViewportTimeline::default();
@@ -2079,10 +2100,7 @@ impl Studio {
         self.video_timeline_zoom = 1.0;
         self.video_timeline_scroll = 0.0;
         // Scene settings and Screendrop extras saved with this project.
-        let session = self
-            .video_project
-            .as_ref()
-            .expect("project was just opened");
+        let session = self.video_project.clone().expect("project was just opened");
         let saved_style = session
             .read_edit_field::<SceneStyle>("scene")
             .ok()
@@ -2109,6 +2127,10 @@ impl Studio {
         self.video_audio_levels.clear();
         self.video_thumbnails.clear();
         self.video_extras_pending = true;
+        let camera_path = session.camera_path();
+        self.video_camera_path = camera_path.is_file().then_some(camera_path);
+        self.camera_frame_rgba = None;
+        self.camera_decoded_time = -1.0;
         self.scene_selection = SceneSelection::Scene;
         self.media_drag = None;
         self.preview_cache = PreviewCache::default();
@@ -2476,8 +2498,29 @@ impl Studio {
     fn rebuild_video_motion_timelines(&mut self) {
         let Some(session) = self.video_project.as_ref() else {
             if self.animation_active {
-                self.video_viewport_timeline =
-                    ViewportTimeline::build_static(&self.video_zoom_cues, self.video_duration);
+                if self.animation_pointer_capture.presses.is_empty() {
+                    self.video_viewport_timeline =
+                        ViewportTimeline::build_static(&self.video_zoom_cues, self.video_duration);
+                } else {
+                    let (width, height) = self.captured_dimensions.unwrap_or((1200, 720));
+                    let clips = RecordingClipTimeline::full(self.video_duration);
+                    let pointer = PointerTimeline::build_with_clip_timeline(
+                        self.animation_pointer_capture.clone(),
+                        self.video_duration,
+                        width as f64,
+                        height as f64,
+                        None,
+                        None,
+                        Some(&clips),
+                    );
+                    self.video_viewport_timeline = ViewportTimeline::build(
+                        &self.video_zoom_cues,
+                        &pointer,
+                        &clips,
+                        &self.animation_pointer_capture,
+                    );
+                    self.video_pointer_timeline = pointer;
+                }
             }
             return;
         };
@@ -3010,6 +3053,10 @@ impl Studio {
                 }
                 self.video_zoom_cues.clear();
                 self.animation_preset = None;
+                self.walkthrough_stops.clear();
+                self.walkthrough_mode = false;
+                self.animation_pointer_capture = PointerCaptureFile::default();
+                self.video_pointer_timeline = PointerTimeline::default();
                 self.toast = Some("Screenshot captured — editing controls are active".into());
             }
             Err(error) => {
@@ -3696,6 +3743,10 @@ impl Studio {
             }
             "s" => {
                 self.split_video_clip(cx);
+                true
+            }
+            "m" => {
+                self.add_video_zoom_at_playhead(cx);
                 true
             }
             "delete" | "backspace" => {
@@ -5723,7 +5774,13 @@ impl Studio {
                                     } else {
                                         event.position
                                     };
-                                    if animation_active
+                                    if animation_active && this.walkthrough_mode {
+                                        if let Some(point) =
+                                            this.media_point_at(event.position, bounds)
+                                        {
+                                            this.add_walkthrough_stop(point);
+                                        }
+                                    } else if animation_active
                                         && (select_tool || this.video_selected_zoom_cue.is_some())
                                     {
                                         // Motion mode: clicks choose the focus of the
@@ -5885,10 +5942,16 @@ impl Studio {
             self.video_extras_pending = false;
             self.spawn_video_extras(cx);
         }
+        self.ensure_camera_frame(cx);
         let viewport = window.viewport_size();
         let inspector_width = if self.inspector_visible { 316.0 } else { 0.0 };
         let available_width = (viewport.width - px(112.0 + inspector_width)).max(px(320.0));
-        let available_height = (viewport.height - px(372.0)).max(px(220.0));
+        let camera_lane_height = if self.video_camera_path.is_some() {
+            26.0
+        } else {
+            0.0
+        };
+        let available_height = (viewport.height - px(372.0 + camera_lane_height)).max(px(220.0));
         let (video_canvas_width, video_canvas_height) =
             self.preview_canvas_size(available_width, available_height);
         let video_canvas = self.scene_canvas(video_canvas_width, video_canvas_height, cx);
@@ -5995,6 +6058,7 @@ impl Studio {
         }
         ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
         let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
+        let camera_lane = self.camera_lane(timeline_scroll, timeline_content_width, progress);
         let clip_lane: Vec<AnyElement> = self
             .video_clip_timeline
             .segments
@@ -6580,7 +6644,7 @@ impl Studio {
                     )
                     .child(
                         div()
-                            .h(px(148.0))
+                            .h(px(148.0 + camera_lane_height))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -6590,7 +6654,7 @@ impl Studio {
                                 div()
                                     .flex_1()
                                     .min_w(px(320.0))
-                                    .h(px(126.0))
+                                    .h(px(126.0 + camera_lane_height))
                                     .flex()
                                     .flex_col()
                                     .justify_center()
@@ -6724,10 +6788,16 @@ impl Studio {
                                             )
                                             .child(
                                                 canvas(
-                                                    move |bounds, _, _| {
+                                                    move |bounds, window, _| {
                                                         if let Ok(mut stored) =
                                                             timeline_bounds.lock()
                                                         {
+                                                            // Lanes are laid out with the
+                                                            // previous width; redraw once
+                                                            // the real width is known.
+                                                            if *stored != Some(bounds) {
+                                                                window.refresh();
+                                                            }
                                                             *stored = Some(bounds);
                                                         }
                                                     },
@@ -6801,6 +6871,7 @@ impl Studio {
                                             )),
                                     )
                                     .child(motion_track)
+                                    .when_some(camera_lane, |this, lane| this.child(lane))
                                     .when_some(audio_lane, |this, lane| this.child(lane)),
                             ),
                     ),

@@ -9,7 +9,10 @@ use gpui::{
     PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, Window,
 };
 use image::RgbaImage;
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     annotations_svg, blue, cached_render_image, ink, line, muted,
@@ -91,11 +94,13 @@ pub(crate) enum SceneSlider {
     WatermarkOpacity,
     DefaultZoom,
     AnnotationTransition,
+    CameraSize,
+    CameraMargin,
 }
 
 impl SceneSlider {
     const BASE: usize = 100;
-    const ALL: [SceneSlider; 17] = [
+    const ALL: [SceneSlider; 19] = [
         SceneSlider::Scale,
         SceneSlider::PositionX,
         SceneSlider::PositionY,
@@ -113,6 +118,8 @@ impl SceneSlider {
         SceneSlider::WatermarkOpacity,
         SceneSlider::DefaultZoom,
         SceneSlider::AnnotationTransition,
+        SceneSlider::CameraSize,
+        SceneSlider::CameraMargin,
     ];
 
     pub(crate) fn id(self) -> usize {
@@ -143,6 +150,8 @@ impl SceneSlider {
             SceneSlider::WatermarkOpacity => "Opacity",
             SceneSlider::DefaultZoom => "Auto zoom",
             SceneSlider::AnnotationTransition => "Transition",
+            SceneSlider::CameraSize => "Size",
+            SceneSlider::CameraMargin => "Margin",
         }
     }
 
@@ -158,6 +167,8 @@ impl SceneSlider {
             SceneSlider::WatermarkSize | SceneSlider::WatermarkOpacity => (0.0, 100.0),
             SceneSlider::DefaultZoom => (1.0, 4.0),
             SceneSlider::AnnotationTransition => (0.0, 2.0),
+            SceneSlider::CameraSize => (10.0, 60.0),
+            SceneSlider::CameraMargin => (0.0, 20.0),
         }
     }
 
@@ -171,6 +182,8 @@ impl SceneSlider {
             SceneSlider::WatermarkOpacity => 70.0,
             SceneSlider::DefaultZoom => 2.0,
             SceneSlider::AnnotationTransition => 0.35,
+            SceneSlider::CameraSize => 24.0,
+            SceneSlider::CameraMargin => 4.0,
             _ => 0.0,
         }
     }
@@ -197,6 +210,7 @@ impl SceneSlider {
             SceneSlider::RotationX | SceneSlider::RotationY | SceneSlider::RotationZ => 1.0,
             SceneSlider::Perspective | SceneSlider::AnchorX | SceneSlider::AnchorY => 0.05,
             SceneSlider::AnnotationTransition => 0.05,
+            SceneSlider::CameraMargin => 1.0,
             _ => 2.0,
         }
     }
@@ -226,6 +240,8 @@ impl SceneSlider {
                 .and_then(|mark| mark.timing)
                 .map(|timing| timing.transition)
                 .unwrap_or(0.35),
+            SceneSlider::CameraSize => studio.camera_overlay.size as f64,
+            SceneSlider::CameraMargin => studio.camera_overlay.margin as f64,
         }
     }
 
@@ -249,6 +265,8 @@ impl SceneSlider {
             SceneSlider::WatermarkSize => studio.watermark.size = value.round() as u8,
             SceneSlider::WatermarkOpacity => studio.watermark.opacity = value.round() as u8,
             SceneSlider::DefaultZoom => studio.default_motion_zoom = value,
+            SceneSlider::CameraSize => studio.camera_overlay.size = value.round() as u8,
+            SceneSlider::CameraMargin => studio.camera_overlay.margin = value.round() as u8,
             SceneSlider::AnnotationTransition => {
                 let duration = studio.video_duration;
                 if let Some(mark) = studio
@@ -370,6 +388,7 @@ impl Studio {
             self.watermark = watermark;
         }
         self.pointer_style = style.pointer;
+        self.camera_overlay = style.camera;
     }
 
     /// Autosaves scene settings into the recording's edit draft when they
@@ -638,11 +657,21 @@ impl Studio {
         } else {
             None
         };
-        let has_pointer = self.video_project.is_some() && self.video_pointer_synthesized;
+        let has_pointer = (self.video_project.is_some() && self.video_pointer_synthesized)
+            || (self.animation_active && self.has_walkthrough());
+        let camera = if self.video_project.is_some() && self.camera_overlay.enabled {
+            self.camera_frame_rgba.clone()
+        } else {
+            None
+        };
         let key = PreviewKey {
             style: style.clone(),
             canvas,
-            source: Arc::as_ptr(&source) as usize,
+            source: Arc::as_ptr(&source) as usize
+                ^ camera
+                    .as_ref()
+                    .map(|frame| (Arc::as_ptr(frame) as usize).rotate_left(17))
+                    .unwrap_or(0),
             time_bits: time.to_bits(),
             overlay: overlay
                 .as_ref()
@@ -677,6 +706,7 @@ impl Studio {
             overlay: overlay.as_ref().map(|(_, layer)| layer.as_ref()),
             viewport,
             pointer: pointer.as_ref(),
+            camera: camera.as_deref(),
         });
         let image = cached_render_image(frame);
         self.preview_cache.frame = Some((key, image.clone()));
@@ -684,15 +714,350 @@ impl Studio {
     }
 
     /// Whether the screenshot preview must show the compositor's frame: the
-    /// style needs it, or an animated tilt is currently bending the media.
+    /// style needs it, an animated tilt is bending the media, or a cursor
+    /// walkthrough has to be drawn.
     pub(crate) fn preview_needs_compositor(&self) -> bool {
         self.scene_style().needs_composited_preview()
             || (self.animation_active
-                && !self
-                    .video_viewport_timeline
-                    .frame_at(self.video_position)
-                    .tilt
-                    .is_zero())
+                && (self.has_walkthrough()
+                    || !self
+                        .video_viewport_timeline
+                        .frame_at(self.video_position)
+                        .tilt
+                        .is_zero()))
+    }
+
+    pub(crate) fn has_walkthrough(&self) -> bool {
+        !self.animation_pointer_capture.presses.is_empty()
+    }
+
+    /// The synthetic cursor for an animated screenshot, if one was authored.
+    pub(crate) fn animation_pointer_timeline(
+        &self,
+    ) -> Option<crate::recording::pointer_timeline::PointerTimeline> {
+        if !self.animation_active || !self.has_walkthrough() {
+            return None;
+        }
+        Some(self.video_pointer_timeline.clone())
+    }
+
+    /// Normalized media coordinates under a canvas position (through the
+    /// projection and the current viewport crop).
+    pub(crate) fn media_point_at(
+        &self,
+        position: Point<Pixels>,
+        canvas: Bounds<Pixels>,
+    ) -> Option<NormalizedPoint> {
+        let (_, projection) =
+            self.preview_projection(f32::from(canvas.size.width), f32::from(canvas.size.height));
+        let local_x = f32::from(position.x - canvas.origin.x) as f64;
+        let local_y = f32::from(position.y - canvas.origin.y) as f64;
+        let (u, v) = projection.unproject(local_x, local_y);
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+        let viewport = if self.video_project.is_some() || self.animation_active {
+            self.video_viewport_timeline.frame_at(self.video_position)
+        } else {
+            ViewportFrame::default()
+        };
+        let (left, top, visible) = crate::recording::viewport::visible_rect(viewport);
+        Some(
+            NormalizedPoint {
+                x: left + u * visible,
+                y: top + v * visible,
+            }
+            .clamped(),
+        )
+    }
+
+    /// Adds a cursor-walkthrough stop and regenerates the synthetic cursor
+    /// and its click zooms.
+    pub(crate) fn add_walkthrough_stop(&mut self, point: NormalizedPoint) {
+        self.walkthrough_stops.push(point);
+        self.rebuild_walkthrough();
+        self.toast = Some(
+            format!(
+                "Cursor stop {} added · Enter to finish",
+                self.walkthrough_stops.len()
+            )
+            .into(),
+        );
+    }
+
+    pub(crate) fn rebuild_walkthrough(&mut self) {
+        let duration = self.video_duration;
+        self.animation_pointer_capture =
+            crate::recording::viewport::walkthrough_capture(&self.walkthrough_stops, duration);
+        let default_zoom = self.default_motion_zoom;
+        let mut cues = crate::recording::viewport::synthesize_zoom_cues(
+            &self.animation_pointer_capture,
+            duration,
+        );
+        for cue in &mut cues {
+            cue.zoom = default_zoom.clamp(1.0, 4.0);
+        }
+        if !cues.is_empty() || self.walkthrough_stops.is_empty() {
+            self.video_zoom_cues = cues;
+        }
+        self.video_selected_zoom_cue = None;
+        self.animation_preset = None;
+        self.rebuild_video_motion_timelines();
+    }
+
+    pub(crate) fn clear_walkthrough(&mut self) {
+        self.walkthrough_stops.clear();
+        self.walkthrough_mode = false;
+        self.animation_pointer_capture = Default::default();
+        self.video_pointer_timeline = Default::default();
+        self.rebuild_video_motion_timelines();
+    }
+
+    // ------------------------------------------------------------------
+    // Camera overlay
+    // ------------------------------------------------------------------
+
+    /// Keeps the camera preview frame close to the playhead (decoded on a
+    /// background thread; at most one decode in flight).
+    pub(crate) fn ensure_camera_frame(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.video_camera_path.clone() else {
+            return;
+        };
+        if !self.camera_overlay.enabled || self.camera_decode_in_flight {
+            return;
+        }
+        let source_time = self.video_clip_timeline.source_time_at(self.video_position);
+        if self.camera_frame_rgba.is_some() && (self.camera_decoded_time - source_time).abs() < 0.12
+        {
+            return;
+        }
+        self.camera_decode_in_flight = true;
+        self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
+        let token = self.camera_decode_token;
+        let task = cx.background_executor().spawn(async move {
+            crate::recording::video::decode_frame(&path, source_time, 640, 640)
+                .ok()
+                .and_then(|frame| RgbaImage::from_raw(frame.width, frame.height, frame.rgba))
+        });
+        cx.spawn(async move |weak, cx| {
+            let frame = task.await;
+            let _ = weak.update(cx, |this, cx| {
+                this.camera_decode_in_flight = false;
+                if this.camera_decode_token != token {
+                    return;
+                }
+                if let Some(frame) = frame {
+                    this.camera_frame_rgba = Some(Arc::new(frame));
+                    this.camera_decoded_time = source_time;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn import_camera_clip(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.video_project.clone() else {
+            return;
+        };
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |weak, cx| {
+            let selected = match prompt.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(source) = selected else {
+                return;
+            };
+            let destination = session.camera_path();
+            let copy = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::recording::video::probe_media(&source)
+                        .map_err(|error| error.to_string())?;
+                    std::fs::copy(&source, &destination).map_err(|error| error.to_string())?;
+                    Ok::<PathBuf, String>(destination)
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                match copy {
+                    Ok(path) => {
+                        this.video_camera_path = Some(path);
+                        this.camera_frame_rgba = None;
+                        this.camera_overlay.enabled = true;
+                        if let Ok(mut manifest) = session.read_manifest() {
+                            manifest.includes_camera = true;
+                            let _ = session.write_manifest(&manifest);
+                        }
+                        this.toast = Some("Camera clip added to the project".into());
+                    }
+                    Err(error) => {
+                        this.toast = Some(format!("Could not add camera clip: {error}").into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn remove_camera_clip(&mut self) {
+        if let Some(path) = self.video_camera_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.camera_frame_rgba = None;
+        if let Some(session) = self.video_project.as_ref() {
+            if let Ok(mut manifest) = session.read_manifest() {
+                manifest.includes_camera = false;
+                let _ = session.write_manifest(&manifest);
+            }
+        }
+        self.toast = Some("Camera clip removed".into());
+    }
+
+    pub(crate) fn camera_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_camera = self.video_camera_path.is_some();
+        let overlay = self.camera_overlay;
+        let position_index = WatermarkPosition::ALL
+            .iter()
+            .position(|position| *position == overlay.position)
+            .unwrap_or(3);
+        let shape_index = crate::recording::scene::CameraShape::ALL
+            .iter()
+            .position(|shape| *shape == overlay.shape)
+            .unwrap_or(0);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(Self::scene_section_title("Camera"))
+            .when(!has_camera, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted())
+                        .child("Add a webcam clip recorded alongside this screen capture to show it as a picture-in-picture bubble."),
+                )
+                .child(self.small_button(
+                    "camera-add",
+                    "Add camera clip…",
+                    self.export_progress.is_none(),
+                    cx,
+                    |this, cx| this.import_camera_clip(cx),
+                ))
+            })
+            .when(has_camera, |this| {
+                this.child(self.scene_toggle_row(
+                    "camera-enabled",
+                    "Show camera",
+                    overlay.enabled,
+                    cx,
+                    |this| this.camera_overlay.enabled = !this.camera_overlay.enabled,
+                ))
+                .child(self.segmented(
+                    "camera-position",
+                    &["Top left", "Top right", "Bottom left", "Bottom right"],
+                    position_index,
+                    |this, index| this.camera_overlay.position = WatermarkPosition::ALL[index],
+                    cx,
+                ))
+                .child(self.segmented(
+                    "camera-shape",
+                    &["Circle", "Rounded", "Square"],
+                    shape_index,
+                    |this, index| {
+                        this.camera_overlay.shape = crate::recording::scene::CameraShape::ALL[index]
+                    },
+                    cx,
+                ))
+                .child(self.scene_slider_row(SceneSlider::CameraSize, cx))
+                .child(self.scene_slider_row(SceneSlider::CameraMargin, cx))
+                .child(self.scene_toggle_row(
+                    "camera-mirror",
+                    "Mirror",
+                    overlay.mirror,
+                    cx,
+                    |this| this.camera_overlay.mirror = !this.camera_overlay.mirror,
+                ))
+                .child(self.scene_toggle_row(
+                    "camera-shadow",
+                    "Shadow",
+                    overlay.shadow,
+                    cx,
+                    |this| this.camera_overlay.shadow = !this.camera_overlay.shadow,
+                ))
+                .child(self.small_button(
+                    "camera-remove",
+                    "Remove camera clip",
+                    self.export_progress.is_none(),
+                    cx,
+                    |this, _| this.remove_camera_clip(),
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// Timeline lane showing the camera clip's presence.
+    pub(crate) fn camera_lane(
+        &self,
+        timeline_scroll: f64,
+        timeline_content_width: f64,
+        progress: f64,
+    ) -> Option<AnyElement> {
+        let path = self.video_camera_path.as_ref()?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "camera".into());
+        let enabled = self.camera_overlay.enabled;
+        Some(
+            div()
+                .relative()
+                .w_full()
+                .h(px(22.0))
+                .flex_none()
+                .overflow_hidden()
+                .rounded_lg()
+                .bg(rgb(0xECEDF1))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-(timeline_scroll as f32)))
+                        .top(px(3.0))
+                        .w(px(timeline_content_width as f32))
+                        .h(px(16.0))
+                        .rounded_md()
+                        .bg(if enabled {
+                            hsla(271.0 / 360.0, 0.6, 0.55, 1.0)
+                        } else {
+                            hsla(271.0 / 360.0, 0.2, 0.7, 1.0)
+                        })
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .child(format!("Camera · {name}")),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px((timeline_content_width * progress - timeline_scroll)
+                            as f32
+                            - 1.0))
+                        .top_0()
+                        .w(px(2.0))
+                        .h_full()
+                        .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// True when GPUI can paint annotations directly over the preview (no
@@ -2465,6 +2830,7 @@ impl Studio {
             overlay: None,
             viewport: ViewportFrame::default(),
             pointer: None,
+            camera: None,
         });
         frame
             .save(destination)
@@ -2631,6 +2997,7 @@ impl Studio {
             })
             .child(self.watermark_section(cx))
             .child(self.pointer_section(cx))
+            .child(self.camera_section(cx))
             .child(self.audio_section(cx))
             .child(self.export_section(cx))
             .child(div().mt_2().pt_3().border_t_1().border_color(line()))

@@ -80,7 +80,11 @@ preview, and exported output must agree.
   the cursor when it is unavailable.
 - [x] Optional system-audio and microphone sources share the native media clock,
   mix into an Opus track, survive pause/resume, and are recorded in the manifest.
-- [ ] Optional camera master and device selection.
+- [ ] Optional camera master and device selection. A camera clip can be
+  added to a project from a file (`camera.mkv`), is cut with the same clip
+  timeline as the master, and is composited as a picture-in-picture bubble
+  (corner, size, circle/rounded/square, mirror, margin, shadow) in preview
+  and export; live camera capture and device selection remain.
 
 ## Studio and export
 
@@ -135,8 +139,11 @@ preview, and exported output must agree.
 - [x] A screenshot opens static; **Animate** turns it into a timed scene
   (3/5/8/10 s) edited with the same motion lane, inspector, and exporter as a
   recording.
-- [x] Presets (slow zoom in/out, pan left/right, focus, sweep) expand into
-  ordinary editable motion regions.
+- [x] Presets (slow zoom in/out, pan left/right, focus, sweep, 3D tilt,
+  floating card) expand into ordinary editable motion regions.
+- [x] Cursor walkthrough: click the spots a synthetic cursor should visit;
+  the cursor glides between them with clicks, click zooms are synthesized,
+  and the cursor is drawn by the same reconstruction as recordings.
 - [x] Annotations are flattened onto the capture before compositing so the
   animated export matches the static one.
 - [x] MP4, WebM, and looping GIF export with progress and cancellation.

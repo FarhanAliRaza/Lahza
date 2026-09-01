@@ -195,8 +195,14 @@ pub enum SceneSource {
         clips: RecordingClipTimeline,
         /// Reconstructed cursor in editor time, when the master is cursor-free.
         pointer: Option<PointerTimeline>,
+        /// Camera (webcam) clip recorded alongside the master, if any.
+        camera: Option<PathBuf>,
     },
-    Image(RgbaImage),
+    Image {
+        image: RgbaImage,
+        /// Synthetic cursor walkthrough in editor time, if any.
+        pointer: Option<PointerTimeline>,
+    },
 }
 
 pub struct SceneExportRequest {
@@ -247,27 +253,70 @@ enum PreparedSource {
         audio: Option<PathBuf>,
         pointer: Option<PointerTimeline>,
         temporary: Option<PathBuf>,
+        camera: Option<VideoFrameStream>,
+        camera_temporary: Option<PathBuf>,
     },
-    Image(RgbaImage),
+    Image {
+        image: RgbaImage,
+        pointer: Option<PointerTimeline>,
+    },
 }
 
 impl PreparedSource {
     fn dimensions(&self) -> (u32, u32) {
         match self {
             PreparedSource::Video { stream, .. } => stream.dimensions(),
-            PreparedSource::Image(image) => (image.width(), image.height()),
+            PreparedSource::Image { image, .. } => (image.width(), image.height()),
         }
     }
 
     fn cleanup(&mut self) {
         if let PreparedSource::Video {
-            stream, temporary, ..
+            stream,
+            temporary,
+            camera,
+            camera_temporary,
+            ..
         } = self
         {
             stream.stop();
+            if let Some(camera) = camera.as_mut() {
+                camera.stop();
+            }
             if let Some(path) = temporary.take() {
                 let _ = fs::remove_file(path);
             }
+            if let Some(path) = camera_temporary.take() {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Opens the camera clip cut with the same clip timeline as the master so
+/// both streams advance in lockstep in editor time.
+fn prepare_camera(
+    camera: &Path,
+    clips: &RecordingClipTimeline,
+    destination: &Path,
+    frame_rate: f64,
+) -> Result<(VideoFrameStream, Option<PathBuf>), VideoError> {
+    let info = probe_media(camera)?;
+    let clips = clips.normalized(info.duration);
+    let (playback, temporary) = if clips.is_unedited(info.duration) {
+        (camera.to_path_buf(), None)
+    } else {
+        let temporary = temporary_sibling(destination, "camera.mkv");
+        render_clip_preview(camera, &temporary, &clips)?;
+        (temporary.clone(), Some(temporary))
+    };
+    match VideoFrameStream::open_with_frame_rate(&playback, 0.0, 1280, 1280, Some(frame_rate)) {
+        Ok(stream) => Ok((stream, temporary)),
+        Err(error) => {
+            if let Some(path) = temporary {
+                let _ = fs::remove_file(path);
+            }
+            Err(error)
         }
     }
 }
@@ -307,16 +356,17 @@ fn prepare_source(
     frame_rate: f64,
 ) -> Result<PreparedSource, VideoError> {
     match source {
-        SceneSource::Image(image) => {
+        SceneSource::Image { image, pointer } => {
             if image.width() == 0 || image.height() == 0 {
                 return Err(VideoError::InvalidMedia("the image is empty".into()));
             }
-            Ok(PreparedSource::Image(image))
+            Ok(PreparedSource::Image { image, pointer })
         }
         SceneSource::Video {
             media,
             clips,
             pointer,
+            camera,
         } => {
             let info = probe_media(&media)?;
             let clips = clips.normalized(info.duration);
@@ -347,11 +397,26 @@ fn prepare_source(
             let audio =
                 (info.has_audio && request.include_audio && request.format.supports_audio())
                     .then(|| playback);
+            let (camera, camera_temporary) = match camera
+                .filter(|_| request.style.camera.enabled)
+                .map(|path| prepare_camera(&path, &clips, &request.destination, frame_rate))
+            {
+                Some(Ok((stream, temporary))) => (Some(stream), temporary),
+                Some(Err(error)) => {
+                    if let Some(path) = temporary {
+                        let _ = fs::remove_file(path);
+                    }
+                    return Err(error);
+                }
+                None => (None, None),
+            };
             Ok(PreparedSource::Video {
                 stream,
                 audio,
                 pointer,
                 temporary,
+                camera,
+                camera_temporary,
             })
         }
     }
@@ -380,7 +445,7 @@ fn encode(
 
     let audio = match prepared {
         PreparedSource::Video { audio, .. } => audio.clone(),
-        PreparedSource::Image(_) => None,
+        PreparedSource::Image { .. } => None,
     };
     let temporary = temporary_sibling(&request.destination, request.format.extension());
     let mut command = Command::new("ffmpeg");
@@ -472,6 +537,7 @@ fn encode(
         .ok_or_else(|| VideoError::Decode("FFmpeg encoder did not accept frame input".into()))?;
 
     let mut last_video_frame: Option<RgbaImage> = None;
+    let mut last_camera_frame: Option<RgbaImage> = None;
     let mut write_error: Option<VideoError> = None;
     for index in 0..total_frames {
         if progress.is_cancelled() {
@@ -483,10 +549,28 @@ fn encode(
         }
         let time = index as f64 / frame_rate;
         let (source_frame, pointer_overlay): (&RgbaImage, Option<PointerOverlay>) = match prepared {
-            PreparedSource::Image(image) => (&*image, None),
+            PreparedSource::Image { image, pointer } => (
+                &*image,
+                pointer
+                    .as_ref()
+                    .and_then(|pointer| pointer.frame_at(time))
+                    .map(|frame| PointerOverlay { frame }),
+            ),
             PreparedSource::Video {
-                stream, pointer, ..
+                stream,
+                pointer,
+                camera,
+                ..
             } => {
+                if let Some(camera) = camera.as_mut() {
+                    if let Ok(Some(frame)) = camera.next_frame() {
+                        if let Some(image) =
+                            RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+                        {
+                            last_camera_frame = Some(image);
+                        }
+                    }
+                }
                 match stream.next_frame() {
                     Ok(Some(frame)) => {
                         if let Some(image) =
@@ -521,6 +605,7 @@ fn encode(
             overlay: overlay.as_deref(),
             viewport,
             pointer: pointer_overlay.as_ref(),
+            camera: last_camera_frame.as_ref(),
         });
         if let Err(error) = stdin.write_all(output.as_raw()) {
             write_error = Some(VideoError::Decode(format!(
@@ -682,7 +767,14 @@ mod tests {
         );
         request.frame_rate = 10.0;
         let image = RgbaImage::from_pixel(64, 36, Rgba([200, 30, 30, 255]));
-        let result = export_scene(SceneSource::Image(image), &mut request, &progress);
+        let result = export_scene(
+            SceneSource::Image {
+                image,
+                pointer: None,
+            },
+            &mut request,
+            &progress,
+        );
         assert!(matches!(result, Err(VideoError::Cancelled)));
         assert!(!destination.exists());
         fs::remove_dir_all(root).unwrap();
@@ -726,7 +818,15 @@ mod tests {
                     Arc::new(layer)
                 })
             }));
-            export_scene(SceneSource::Image(image.clone()), &mut request, &progress).unwrap();
+            export_scene(
+                SceneSource::Image {
+                    image: image.clone(),
+                    pointer: None,
+                },
+                &mut request,
+                &progress,
+            )
+            .unwrap();
             assert!((progress.fraction() - 1.0).abs() < 1e-9);
             let info = probe_media(&destination).unwrap();
             assert_eq!((info.width, info.height), (expected_width, 180));
@@ -774,11 +874,32 @@ mod tests {
             clips.duration(),
         );
         request.frame_rate = 12.0;
+        let camera = root.join("camera.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=green:size=96x72:rate=12:duration=2",
+                "-c:v",
+                "ffv1",
+                "-y",
+            ])
+            .arg(&camera)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        request.style.camera.size = 40;
+        request.style.camera.margin = 2;
+        request.style.camera.shadow = false;
         export_scene(
             SceneSource::Video {
                 media,
                 clips,
                 pointer: None,
+                camera: Some(camera),
             },
             &mut request,
             &progress,
@@ -787,6 +908,17 @@ mod tests {
         let info = probe_media(&destination).unwrap();
         assert_eq!((info.width, info.height), (320, 180));
         assert!(info.has_audio);
+        // The green camera bubble sits in the bottom-right corner.
+        let frame = crate::recording::video::decode_frame(&destination, 0.5, 320, 180).unwrap();
+        let rect = request.style.camera.rect(320.0, 180.0);
+        let cx = (rect.x + rect.width * 0.5) as usize;
+        let cy = (rect.y + rect.height * 0.5) as usize;
+        let pixel = &frame.rgba[(cy * 320 + cx) * 4..(cy * 320 + cx) * 4 + 3];
+        // FFmpeg's "green" is (0, 128, 0).
+        assert!(
+            pixel[1] > 100 && pixel[0] < 60 && pixel[2] < 60,
+            "{pixel:?}"
+        );
         assert!((info.duration - 1.0).abs() < 0.3, "{}", info.duration);
         // The gradient background is visible in the canvas corner.
         let frame = crate::recording::video::decode_frame(&destination, 0.5, 320, 180).unwrap();
