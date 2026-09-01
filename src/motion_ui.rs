@@ -101,10 +101,18 @@ impl Studio {
             border_color: BORDER_COLORS[self.border_color.min(BORDER_COLORS.len() - 1)],
             border_opacity: self.border_opacity,
             aspect: (self.aspect_ratio != 0).then(|| self.selected_canvas_ratio() as f64),
+            background_blur: self.background_blur,
+            background_noise: self.background_noise,
+            vignette: self.vignette,
+            transform: self.scene_transform.clamped(),
+            watermark: (self.watermark_enabled && !self.watermark.text.trim().is_empty())
+                .then(|| self.watermark.clone()),
+            pointer: self.pointer_style,
         }
     }
 
-    /// Export height: the media's own height, kept within 720p–4K.
+    /// Export height from the resolution picker (Original keeps the media's
+    /// own height within 720p–4K).
     fn export_canvas_height(&self) -> u32 {
         let height = if self.video_project.is_some() {
             self.video_source_size.1
@@ -113,7 +121,7 @@ impl Studio {
                 .map(|(_, height)| height)
                 .unwrap_or(1080)
         };
-        (height.clamp(720, 2160) / 2) * 2
+        self.export_resolution.canvas_height(height)
     }
 
     /// Whether the open scene has a reconstructed cursor to follow.
@@ -152,7 +160,7 @@ impl Studio {
             .video_pointer_timeline
             .location_at(editor_time)
             .unwrap_or(NormalizedPoint { x: 0.5, y: 0.5 });
-        let mut cue = ZoomCue::pinned(start, end, 2.0, point);
+        let mut cue = ZoomCue::pinned(start, end, self.default_motion_zoom, point);
         if self.scene_has_pointer() {
             cue.anchor_mode = ZoomAnchorMode::PointerAnchor;
             cue.bounds_bias = 0.25;
@@ -249,8 +257,14 @@ impl Studio {
         if self.video_edit_busy {
             return;
         }
-        let capture = session.read_pointer_capture().unwrap_or_default();
-        let generated = synthesize_zoom_cues(&capture, self.video_source_duration);
+        let _ = session;
+        let capture = self.filtered_pointer_capture();
+        let mut generated = synthesize_zoom_cues(&capture, self.video_source_duration);
+        for cue in &mut generated {
+            cue.zoom = self
+                .default_motion_zoom
+                .clamp(ZoomCue::MINIMUM_ZOOM, ZoomCue::MAXIMUM_ZOOM);
+        }
         if generated == self.video_zoom_cues {
             self.toast = Some("Motion already matches the automatic suggestion".into());
             cx.notify();
@@ -510,7 +524,7 @@ impl Studio {
             .into_any_element()
     }
 
-    fn small_button(
+    pub(crate) fn small_button(
         &self,
         id: &'static str,
         label: &'static str,
@@ -715,6 +729,103 @@ impl Studio {
                     cx,
                 ))
                 .child(self.motion_zoom_slider(cue.zoom, cx))
+                .when(self.inspector_level >= 2, |this| {
+                    let easing_index = crate::scene_ui::easing_index(cue.easing);
+                    let has_tilt = cue.tilt.is_some();
+                    this.child(Self::inspector_label("Easing (ramps and pans)"))
+                        .child(self.segmented(
+                            "motion-easing",
+                            &["Smooth", "Linear", "Snappy", "Cinematic"],
+                            easing_index,
+                            |this, index| {
+                                this.edit_selected_region(|cue| {
+                                    cue.easing =
+                                        crate::recording::viewport::MotionEasing::ALL[index]
+                                });
+                            },
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted())
+                                        .w(px(40.0))
+                                        .child("Start"),
+                                )
+                                .child(self.small_button(
+                                    "motion-start-earlier",
+                                    "−0.1s",
+                                    !edit_busy,
+                                    cx,
+                                    |this, _| {
+                                        this.edit_selected_region(|cue| {
+                                            cue.start = (cue.start - 0.1).max(0.0)
+                                        });
+                                    },
+                                ))
+                                .child(self.small_button(
+                                    "motion-start-later",
+                                    "+0.1s",
+                                    !edit_busy,
+                                    cx,
+                                    |this, _| {
+                                        this.edit_selected_region(|cue| {
+                                            cue.start = (cue.start + 0.1)
+                                                .min(cue.end - ZoomCue::MINIMUM_DURATION)
+                                        });
+                                    },
+                                ))
+                                .child(div().text_xs().text_color(muted()).w(px(30.0)).child("End"))
+                                .child(self.small_button(
+                                    "motion-end-earlier",
+                                    "−0.1s",
+                                    !edit_busy,
+                                    cx,
+                                    |this, _| {
+                                        this.edit_selected_region(|cue| {
+                                            cue.end = (cue.end - 0.1)
+                                                .max(cue.start + ZoomCue::MINIMUM_DURATION)
+                                        });
+                                    },
+                                ))
+                                .child(self.small_button(
+                                    "motion-end-later",
+                                    "+0.1s",
+                                    !edit_busy,
+                                    cx,
+                                    |this, _| {
+                                        let limit = this.video_source_duration;
+                                        this.edit_selected_region(|cue| {
+                                            cue.end = (cue.end + 0.1).min(limit)
+                                        });
+                                    },
+                                )),
+                        )
+                        .child(self.scene_toggle_row(
+                            "motion-tilt-toggle",
+                            "3D tilt while active",
+                            has_tilt,
+                            cx,
+                            |this| {
+                                this.edit_selected_region(|cue| {
+                                    cue.tilt = if cue.tilt.is_some() {
+                                        None
+                                    } else {
+                                        Some(crate::recording::viewport::Tilt {
+                                            x: 8.0,
+                                            y: -18.0,
+                                            z: 0.0,
+                                        })
+                                    };
+                                });
+                            },
+                        ))
+                })
                 .when(has_pointer, |this| {
                     this.child(Self::inspector_label("Target"))
                         .child(self.segmented(
@@ -1046,6 +1157,10 @@ impl Studio {
         if !self.animation_active || self.editing_text.is_some() || self.crop_active {
             return false;
         }
+        // A focused watermark field owns every key, including space.
+        if self.handle_watermark_key(event) {
+            return true;
+        }
         let keystroke = &event.keystroke;
         if (keystroke.modifiers.control || keystroke.modifiers.platform) && keystroke.key == "z" {
             if keystroke.modifiers.shift {
@@ -1127,6 +1242,8 @@ impl Studio {
             tick += ruler_step;
         }
         let track = self.motion_track(self.video_timeline_scroll, content_width, progress, cx);
+        let annotation_track =
+            self.annotation_track(self.video_timeline_scroll, content_width, progress, cx);
         div()
             .w_full()
             .flex_none()
@@ -1315,6 +1432,7 @@ impl Studio {
                     ),
             )
             .child(track)
+            .when_some(annotation_track, |this, lane| this.child(lane))
             .into_any_element()
     }
 
@@ -1517,7 +1635,7 @@ impl Studio {
         svg.push_str(&self.annotations_svg(0.0, 0.0, width, height, stroke_scale));
         svg.push_str("</svg>");
         let mut options = resvg::usvg::Options::default();
-        options.fontdb_mut().load_system_fonts();
+        options.fontdb = crate::recording::scene::shared_fontdb();
         let tree = resvg::usvg::Tree::from_str(&svg, &options)
             .map_err(|error| format!("Could not flatten annotations: {error}"))?;
         let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
@@ -1565,16 +1683,17 @@ impl Studio {
                 format.extension()
             ))
             .to_string();
-        let request = SceneExportRequest {
-            destination: Default::default(),
+        let mut request = SceneExportRequest::new(
+            Default::default(),
             format,
-            frame_rate: format.default_frame_rate(),
-            canvas_height: self.export_canvas_height(),
-            style: self.scene_style(),
-            viewport: self.video_viewport_timeline.clone(),
-            duration: self.video_duration,
-            loop_forever: true,
-        };
+            self.export_canvas_height(),
+            self.scene_style(),
+            self.video_viewport_timeline.clone(),
+            self.video_duration,
+        );
+        request.frame_rate = self.export_frame_rate;
+        request.loop_forever = self.export_loop;
+        request.include_audio = !self.video_audio_muted;
         let source = SceneSource::Video {
             media: session.screen_path(),
             clips: self.video_clip_timeline.clone(),
@@ -1595,13 +1714,17 @@ impl Studio {
         if !self.animation_active || self.video_duration <= 0.0 {
             return;
         }
-        let image = match self.render_annotated_capture() {
-            Ok(image) => image,
-            Err(error) => {
-                self.toast = Some(format!("Export failed: {error}").into());
-                cx.notify();
-                return;
-            }
+        // Annotations travel as a timed overlay so entrance and exit effects
+        // render frame by frame; the media itself is the processed capture.
+        if let Err(error) = self.rebuild_redactions() {
+            self.toast = Some(format!("Export failed: {error}").into());
+            cx.notify();
+            return;
+        }
+        let Some(image) = self.capture_rgba.as_ref().map(|image| (**image).clone()) else {
+            self.toast = Some("Capture an image first".into());
+            cx.notify();
+            return;
         };
         let format = self.export_format;
         let suggested_name = chrono::Local::now()
@@ -1610,16 +1733,17 @@ impl Studio {
                 format.extension()
             ))
             .to_string();
-        let request = SceneExportRequest {
-            destination: Default::default(),
+        let mut request = SceneExportRequest::new(
+            Default::default(),
             format,
-            frame_rate: format.default_frame_rate(),
-            canvas_height: self.export_canvas_height(),
-            style: self.scene_style(),
-            viewport: self.video_viewport_timeline.clone(),
-            duration: self.video_duration,
-            loop_forever: true,
-        };
+            self.export_canvas_height(),
+            self.scene_style(),
+            self.video_viewport_timeline.clone(),
+            self.video_duration,
+        );
+        request.frame_rate = self.export_frame_rate;
+        request.loop_forever = self.export_loop;
+        request.overlay = self.annotation_overlay_source();
         self.prompt_and_run_scene_export(SceneSource::Image(image), request, suggested_name, cx);
     }
 
@@ -1685,8 +1809,9 @@ impl Studio {
         self.toast = None;
         let format_label = request.format.label();
         let destination = request.destination.clone();
+        let mut request = request;
         let task = cx.background_executor().spawn(async move {
-            export_scene(source, &request, &progress).map_err(|error| error.to_string())
+            export_scene(source, &mut request, &progress).map_err(|error| error.to_string())
         });
         // Keep the progress bar fresh while the background render runs.
         cx.spawn(async move |weak, cx| loop {

@@ -1,12 +1,12 @@
 use futures_util::StreamExt;
 use gpui::{
     canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
-    radians, rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource,
-    Background, Bounds, BoxShadow, ContentMask, Context, CursorStyle, FocusHandle, FontWeight,
-    Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollDelta,
+    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, Background, Bounds,
+    BoxShadow, ContentMask, Context, CursorStyle, FocusHandle, FontWeight, Hsla, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollDelta,
     ScrollWheelEvent, SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions,
-    Transformation, UnderlineStyle, Window, WindowBounds, WindowDecorations, WindowOptions,
+    UnderlineStyle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::fmt::Write as _;
 use std::{
@@ -23,25 +23,29 @@ use uuid::Uuid;
 
 mod motion_ui;
 mod recording;
+mod scene_ui;
+mod timed;
 
-use motion_ui::{MotionPick, BORDER_COLORS, MOTION_ZOOM_SLIDER};
+use scene_ui::{AnnotationDrag, MediaDrag, PreviewCache, SceneSelection};
+use serde::{Deserialize, Serialize};
+use timed::AnnotationTiming;
+
+use motion_ui::{MotionPick, MOTION_ZOOM_SLIDER};
 
 use recording::{
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
-    export::{ExportFormat, ExportProgress},
-    model::{NormalizedPoint, RecordingSession},
+    export::{ExportFormat, ExportProgress, ExportResolution},
+    model::{PointerCaptureFile, RecordingSession},
     native::{NativeRecorder, RecordingOptions},
-    overlays::pointer_press_effect_geometry,
     pointer_timeline::PointerTimeline,
-    scene::SceneGeometry,
+    presets::PresetLibrary,
+    scene::{PointerStyle, SceneStyle, SceneTransform, Watermark},
     session::{RecordingController, RecordingState},
     video::{
         decode_frame, load_or_rebuild_poster, probe_media, render_clip_preview, DecodedFrame,
         SynchronizedPlaybackStream,
     },
-    viewport::{
-        synthesize_zoom_cues, visible_rect, MotionPreset, ViewportTimeline, ZoomAnchorMode, ZoomCue,
-    },
+    viewport::{synthesize_zoom_cues, visible_rect, MotionPreset, ViewportTimeline, ZoomCue},
 };
 
 struct Assets {
@@ -464,7 +468,7 @@ impl Tool {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct AnnotationMark {
     tool: Tool,
     start: NormPoint,
@@ -481,9 +485,13 @@ struct AnnotationMark {
     bold: bool,
     italic: bool,
     underline: bool,
+    /// When the scene is animated: when and how the mark appears.
+    timing: Option<AnnotationTiming>,
+    /// Painted opacity (animation applies its fade here).
+    opacity: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct NormPoint {
     x: f32,
     y: f32,
@@ -787,7 +795,7 @@ fn paint_annotation(
 ) -> Bounds<Pixels> {
     let bounds = mark_screen_bounds(mark, image);
     let mut rendered_bounds = bounds;
-    let color = Hsla::from(rgb(mark.color));
+    let color = Hsla::from(rgb(mark.color)).opacity(mark.opacity.clamp(0.0, 1.0));
     let clear = hsla(0.0, 0.0, 0.0, 0.0);
     match mark.tool {
         Tool::Rectangle => window.paint_quad(quad(
@@ -1266,6 +1274,39 @@ struct Studio {
     animation_duration: f64,
     animation_preset: Option<MotionPreset>,
     motion_pick: MotionPick,
+    background_blur: u8,
+    background_noise: u8,
+    vignette: u8,
+    scene_transform: SceneTransform,
+    watermark: Watermark,
+    watermark_enabled: bool,
+    watermark_editing: bool,
+    pointer_style: PointerStyle,
+    scene_selection: SceneSelection,
+    media_drag: Option<MediaDrag>,
+    scene_canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    preview_cache: PreviewCache,
+    /// RGBA copies of what the preview shows, for the compositor.
+    video_frame_rgba: Option<Arc<image::RgbaImage>>,
+    capture_rgba: Option<Arc<image::RgbaImage>>,
+    persisted_scene_style: Option<SceneStyle>,
+    persisted_extras: Option<RecordingExtras>,
+    export_resolution: ExportResolution,
+    export_frame_rate: f64,
+    export_loop: bool,
+    preset_library: PresetLibrary,
+    /// 0 quick, 1 customize, 2 advanced.
+    inspector_level: usize,
+    default_motion_zoom: f64,
+    video_audio_levels: Vec<f32>,
+    video_audio_muted: bool,
+    video_thumbnails: Vec<Arc<RenderImage>>,
+    video_extras_pending: bool,
+    video_extras_token: u64,
+    video_press_times: Vec<f64>,
+    video_removed_presses: Vec<f64>,
+    video_selected_press: Option<f64>,
+    annotation_drag: Option<AnnotationDrag>,
     focus_handle: FocusHandle,
     wallpaper_tab: usize,
     library_tab: usize,
@@ -1311,6 +1352,15 @@ struct Studio {
     zoom: u8,
     toast: Option<SharedString>,
     slider_drag: Option<SliderDrag>,
+}
+
+/// Screendrop-specific recording settings stored beside the Swift edit
+/// fields in the project's edit document.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RecordingExtras {
+    audio_muted: bool,
+    removed_press_times: Vec<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1528,6 +1578,37 @@ impl Studio {
             animation_duration: 5.0,
             animation_preset: None,
             motion_pick: MotionPick::Focus,
+            background_blur: 0,
+            background_noise: 0,
+            vignette: 0,
+            scene_transform: SceneTransform::IDENTITY,
+            watermark: Watermark::default(),
+            watermark_enabled: false,
+            watermark_editing: false,
+            pointer_style: PointerStyle::default(),
+            scene_selection: SceneSelection::Scene,
+            media_drag: None,
+            scene_canvas_bounds: scene_ui::scene_canvas_bounds_store(),
+            preview_cache: PreviewCache::default(),
+            video_frame_rgba: None,
+            capture_rgba: None,
+            persisted_scene_style: None,
+            persisted_extras: None,
+            export_resolution: ExportResolution::Original,
+            export_frame_rate: 30.0,
+            export_loop: true,
+            preset_library: PresetLibrary::load(),
+            inspector_level: 1,
+            default_motion_zoom: 2.0,
+            video_audio_levels: Vec::new(),
+            video_audio_muted: false,
+            video_thumbnails: Vec::new(),
+            video_extras_pending: false,
+            video_extras_token: 0,
+            video_press_times: Vec::new(),
+            video_removed_presses: Vec::new(),
+            video_selected_press: None,
+            annotation_drag: None,
             focus_handle: cx.focus_handle(),
             wallpaper_tab: 2,
             library_tab: 1,
@@ -1587,6 +1668,34 @@ impl Studio {
             }
         }
         studio
+    }
+
+    /// Keeps an RGBA copy of the shown video frame for the compositor.
+    fn set_video_frame(&mut self, pixels: image::RgbaImage) {
+        self.video_frame_rgba = Some(Arc::new(pixels.clone()));
+        self.video_frame = Some(cached_render_image(pixels));
+    }
+
+    /// Keeps an RGBA copy of the shown capture for the compositor.
+    fn set_capture_image(&mut self, image: image::RgbaImage) {
+        self.capture_rgba = Some(Arc::new(image.clone()));
+        self.displayed_capture_image = Some(cached_render_image(image));
+    }
+
+    /// The pointer capture with individually removed clicks filtered out.
+    fn filtered_pointer_capture(&self) -> PointerCaptureFile {
+        let mut capture = self
+            .video_project
+            .as_ref()
+            .and_then(|session| session.read_pointer_capture().ok())
+            .unwrap_or_default();
+        if !self.video_removed_presses.is_empty() {
+            let removed = &self.video_removed_presses;
+            capture
+                .presses
+                .retain(|press| !removed.iter().any(|time| (press.time - *time).abs() < 1e-6));
+        }
+        capture
     }
 
     fn displayed_recording_elapsed(&self) -> Duration {
@@ -1947,7 +2056,7 @@ impl Studio {
         self.video_source_size = (manifest.pixel_width.max(1), manifest.pixel_height.max(1));
         self.motion_pick = MotionPick::Focus;
         self.video_project = Some(session);
-        self.video_frame = Some(cached_render_image(poster));
+        self.set_video_frame(poster);
         self.video_pointer_timeline = pointer_timeline;
         self.video_viewport_timeline = viewport_timeline;
         self.video_pointer_synthesized = manifest.pointer_synthesized;
@@ -1969,6 +2078,43 @@ impl Studio {
         self.video_zoom_drag = None;
         self.video_timeline_zoom = 1.0;
         self.video_timeline_scroll = 0.0;
+        // Scene settings and Screendrop extras saved with this project.
+        let session = self
+            .video_project
+            .as_ref()
+            .expect("project was just opened");
+        let saved_style = session
+            .read_edit_field::<SceneStyle>("scene")
+            .ok()
+            .flatten();
+        let saved_extras = session
+            .read_edit_field::<RecordingExtras>("screendropExtras")
+            .ok()
+            .flatten();
+        self.video_press_times = pointer_capture
+            .presses
+            .iter()
+            .filter(|press| press.phase == recording::model::PressPhase::Down)
+            .map(|press| press.time)
+            .collect();
+        if let Some(style) = saved_style.as_ref() {
+            self.apply_scene_style(style);
+        }
+        self.persisted_scene_style = saved_style;
+        let extras = saved_extras.clone().unwrap_or_default();
+        self.video_audio_muted = extras.audio_muted;
+        self.video_removed_presses = extras.removed_press_times;
+        self.persisted_extras = saved_extras;
+        self.video_selected_press = None;
+        self.video_audio_levels.clear();
+        self.video_thumbnails.clear();
+        self.video_extras_pending = true;
+        self.scene_selection = SceneSelection::Scene;
+        self.media_drag = None;
+        self.preview_cache = PreviewCache::default();
+        if !self.video_removed_presses.is_empty() {
+            self.rebuild_video_motion_timelines();
+        }
         Ok(())
     }
 
@@ -2264,50 +2410,6 @@ impl Studio {
         cx.notify();
     }
 
-    /// Turns a click on the video preview into a pinned zoom target for the
-    /// selected cue. The click lands in viewport space, so it is mapped back
-    /// through the camera's current pan/zoom into source coordinates.
-    fn pin_selected_zoom_cue_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.video_selected_zoom_cue.is_none() {
-            return;
-        }
-        let Some(bounds) = self.video_media_bounds.lock().ok().and_then(|value| *value) else {
-            return;
-        };
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
-            return;
-        }
-        let local_x = f64::from((position.x - bounds.origin.x) / bounds.size.width);
-        let local_y = f64::from((position.y - bounds.origin.y) / bounds.size.height);
-        if !(0.0..=1.0).contains(&local_x) || !(0.0..=1.0).contains(&local_y) {
-            return;
-        }
-        let frame = self.video_viewport_timeline.frame_at(self.video_position);
-        let (viewport_left, viewport_top, visible) = visible_rect(frame);
-        let target = NormalizedPoint {
-            x: viewport_left + local_x * visible,
-            y: viewport_top + local_y * visible,
-        }
-        .clamped();
-        match self.motion_pick {
-            MotionPick::Focus => {
-                self.mutate_selected_zoom_cue(cx, |cue| {
-                    cue.anchor_mode = ZoomAnchorMode::PinnedAnchor;
-                    cue.pinned_point = target;
-                });
-                self.toast = Some("Focus point set".into());
-            }
-            MotionPick::PanEnd => {
-                self.mutate_selected_zoom_cue(cx, |cue| {
-                    cue.anchor_mode = ZoomAnchorMode::PinnedAnchor;
-                    cue.pan_to = Some(target);
-                });
-                self.toast = Some("Pan destination set".into());
-            }
-        }
-        cx.notify();
-    }
-
     fn add_video_zoom_at_playhead(&mut self, cx: &mut Context<Self>) {
         let position = self.video_position;
         self.add_motion_region_at(position, cx);
@@ -2379,8 +2481,8 @@ impl Studio {
             }
             return;
         };
-        let capture = session.read_pointer_capture().unwrap_or_default();
         let manifest = session.read_manifest().unwrap_or_default();
+        let capture = self.filtered_pointer_capture();
         let pointer = PointerTimeline::build_with_clip_timeline(
             capture.clone(),
             self.video_source_duration,
@@ -2621,7 +2723,7 @@ impl Studio {
                         if let Some(pixels) =
                             image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
                         {
-                            this.video_frame = Some(cached_render_image(pixels));
+                            this.set_video_frame(pixels);
                         }
                     }
                     if let Some(result) = terminal {
@@ -2674,7 +2776,7 @@ impl Studio {
                         if let Some(pixels) =
                             image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
                         {
-                            this.video_frame = Some(cached_render_image(pixels));
+                            this.set_video_frame(pixels);
                         }
                     }
                     Err(error) => {
@@ -2879,265 +2981,18 @@ impl Studio {
             )
     }
 
-    fn video_composite_canvas(
-        &self,
-        frame: Option<Arc<RenderImage>>,
-        canvas_width: Pixels,
-        canvas_height: Pixels,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let media_bounds = self.video_media_bounds.clone();
-        let solid = SOLID_BACKGROUNDS[self.color_index.min(SOLID_BACKGROUNDS.len() - 1)].1;
-        let gradient =
-            GRADIENT_BACKGROUNDS[self.gradient_index.min(GRADIENT_BACKGROUNDS.len() - 1)];
-        let (gradient_base, gradient_overlay) = gradient_layers(gradient);
-        let background: Background = match self.wallpaper_tab {
-            0 => rgb(solid).into(),
-            1 => gradient_base,
-            _ => rgb(0x111214).into(),
-        };
-        let style = self.scene_style();
-        let geometry = SceneGeometry::layout(
-            f64::from(canvas_width),
-            f64::from(canvas_height),
-            self.video_source_size.0 as f64,
-            self.video_source_size.1 as f64,
-            &style,
-        );
-        let bounds = Bounds {
-            origin: point(px(geometry.media.x as f32), px(geometry.media.y as f32)),
-            size: size(
-                px(geometry.media.width as f32),
-                px(geometry.media.height as f32),
-            ),
-        };
-        let border_width = px(geometry.border_width as f32);
-        let radius = px(geometry.radius as f32);
-        let border_tint = Hsla::from(rgb(
-            BORDER_COLORS[self.border_color.min(BORDER_COLORS.len() - 1)]
-        ))
-        .opacity(self.border_opacity as f32 / 100.0);
-        let shadows = geometry.shadow.map(|shadow| {
-            vec![BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, shadow.opacity as f32),
-                offset: point(px(0.0), px(shadow.offset_y as f32)),
-                blur_radius: px(shadow.blur_radius as f32),
-                spread_radius: px(0.0),
-            }]
-        });
-        let card_x = bounds.origin.x - border_width;
-        let card_y = bounds.origin.y - border_width;
-        let card_width = bounds.size.width + border_width * 2.0;
-        let card_height = bounds.size.height + border_width * 2.0;
-        let pointer_frame = self.video_pointer_timeline.frame_at(self.video_position);
-        let viewport_frame = self.video_viewport_timeline.frame_at(self.video_position);
-        let viewport_zoom = viewport_frame.magnification.max(1.0);
-        let (viewport_left, viewport_top, _) = visible_rect(viewport_frame);
-        let media_width = bounds.size.width * viewport_zoom as f32;
-        let media_height = bounds.size.height * viewport_zoom as f32;
-        let media_left = -(media_width * viewport_left as f32);
-        let media_top = -(media_height * viewport_top as f32);
-        let pointer_visual = self
-            .video_pointer_synthesized
-            .then_some(pointer_frame)
-            .flatten();
-
-        div()
-            .w(canvas_width)
-            .h(canvas_height)
-            .flex_none()
-            .relative()
-            .overflow_hidden()
-            .rounded(px(10.0))
-            .shadow_lg()
-            .bg(background)
-            .when(self.wallpaper_tab == 1, |this| {
-                this.child(div().absolute().inset_0().bg(gradient_overlay))
-            })
-            .when(
-                self.wallpaper_tab == 2 && self.custom_wallpaper.is_none(),
-                |this| {
-                    this.child(
-                        img(self.wallpaper_asset)
-                            .absolute()
-                            .inset_0()
-                            .size_full()
-                            .object_fit(ObjectFit::Cover),
-                    )
-                },
-            )
-            .when_some(
-                (self.wallpaper_tab == 2)
-                    .then(|| self.custom_wallpaper.clone())
-                    .flatten(),
-                |this, path| {
-                    this.child(
-                        img(path)
-                            .absolute()
-                            .inset_0()
-                            .size_full()
-                            .object_fit(ObjectFit::Cover),
-                    )
-                },
-            )
-            .when_some(shadows, |this, shadows| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left(card_x)
-                        .top(card_y)
-                        .w(card_width)
-                        .h(card_height)
-                        .rounded(radius + border_width)
-                        .shadow(shadows),
-                )
-            })
-            .when(self.border && self.border_thickness > 0, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left(card_x)
-                        .top(card_y)
-                        .w(card_width)
-                        .h(card_height)
-                        .rounded(radius + border_width)
-                        .bg(border_tint),
-                )
-            })
-            .child(
-                div()
-                    .absolute()
-                    .left(bounds.origin.x)
-                    .top(bounds.origin.y)
-                    .w(bounds.size.width)
-                    .h(bounds.size.height)
-                    .overflow_hidden()
-                    .rounded(radius)
-                    .bg(rgb(0x111214))
-                    .child(
-                        canvas(
-                            move |bounds, _, _| {
-                                if let Ok(mut stored) = media_bounds.lock() {
-                                    *stored = Some(bounds);
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.pin_selected_zoom_cue_at(event.position, cx);
-                        }),
-                    )
-                    .when_some(frame, |this, frame| {
-                        this.child(
-                            img(frame)
-                                .absolute()
-                                .left(media_left)
-                                .top(media_top)
-                                .w(media_width)
-                                .h(media_height)
-                                .object_fit(ObjectFit::Contain)
-                                .rounded(radius),
-                        )
-                    })
-                    .when_some(pointer_visual.clone(), |this, pointer| {
-                        let x = (pointer.location.x - viewport_left) * f64::from(media_width);
-                        let y = (pointer.location.y - viewport_top) * f64::from(media_height);
-                        let cursor_size = (25.0 * pointer.magnification).clamp(15.0, 34.0) as f32;
-                        this.child(
-                            svg()
-                                .path("icons/mouse-pointer.svg")
-                                .with_transformation(Transformation::rotate(radians(
-                                    pointer.tilt_degrees.to_radians() as f32,
-                                )))
-                                .absolute()
-                                .left(px(x as f32 - 3.0))
-                                .top(px(y as f32 - 3.0))
-                                .size(px(cursor_size))
-                                .opacity(pointer.opacity as f32),
-                        )
-                    })
-                    .when_some(
-                        pointer_visual.and_then(|pointer| pointer.press),
-                        |this, press| {
-                            let x = (press.location.x - viewport_left) * f64::from(media_width);
-                            let y = (press.location.y - viewport_top) * f64::from(media_height);
-                            let geometry = pointer_press_effect_geometry(
-                                press.progress,
-                                bounds.size.height.into(),
-                                viewport_zoom,
-                            );
-                            this.child(canvas(
-                                move |_, _, _| (),
-                                move |canvas_bounds, _, window, _| {
-                                    let center = point(
-                                        canvas_bounds.origin.x + px(x as f32),
-                                        canvas_bounds.origin.y + px(y as f32),
-                                    );
-                                    window.paint_quad(quad(
-                                        Bounds {
-                                            origin: point(
-                                                center.x - px(geometry.impact_radius as f32),
-                                                center.y - px(geometry.impact_radius as f32),
-                                            ),
-                                            size: size(
-                                                px((geometry.impact_radius * 2.0) as f32),
-                                                px((geometry.impact_radius * 2.0) as f32),
-                                            ),
-                                        },
-                                        px(geometry.impact_radius as f32),
-                                        hsla(
-                                            211.0 / 360.0,
-                                            1.0,
-                                            0.5,
-                                            geometry.impact_opacity as f32,
-                                        ),
-                                        px(0.0),
-                                        hsla(0.0, 0.0, 0.0, 0.0),
-                                        Default::default(),
-                                    ));
-                                    window.paint_quad(quad(
-                                        Bounds {
-                                            origin: point(
-                                                center.x - px(geometry.ripple_radius as f32),
-                                                center.y - px(geometry.ripple_radius as f32),
-                                            ),
-                                            size: size(
-                                                px((geometry.ripple_radius * 2.0) as f32),
-                                                px((geometry.ripple_radius * 2.0) as f32),
-                                            ),
-                                        },
-                                        px(geometry.ripple_radius as f32),
-                                        hsla(0.0, 0.0, 0.0, 0.0),
-                                        px(geometry.ripple_line_width as f32),
-                                        hsla(
-                                            211.0 / 360.0,
-                                            1.0,
-                                            0.5,
-                                            geometry.ripple_opacity as f32,
-                                        ),
-                                        Default::default(),
-                                    ));
-                                },
-                            ))
-                        },
-                    ),
-            )
-            .into_any_element()
-    }
-
     fn finish_capture_request(&mut self, result: Result<PathBuf, String>) {
         self.capturing = false;
         match result {
             Ok(path) => {
                 self.captured_dimensions = image::image_dimensions(&path).ok();
-                self.displayed_capture_image = image::open(&path)
-                    .ok()
-                    .map(|image| cached_render_image(image.to_rgba8()));
+                self.displayed_capture_image = None;
+                self.capture_rgba = None;
+                if let Ok(image) = image::open(&path) {
+                    self.set_capture_image(image.to_rgba8());
+                }
+                self.scene_selection = SceneSelection::Scene;
+                self.media_drag = None;
                 self.captured_path = Some(path);
                 self.processed_capture_path = None;
                 self.annotations.clear();
@@ -3394,7 +3249,7 @@ impl Studio {
         self.captured_path = Some(destination);
         self.captured_dimensions = Some((right - left, bottom - top));
         self.processed_capture_path = None;
-        self.displayed_capture_image = Some(cached_render_image(cropped));
+        self.set_capture_image(cropped);
         self.crop_active = false;
         self.crop_rect = CropRect::UNIT;
         self.crop_aspect = 0;
@@ -3425,7 +3280,7 @@ impl Studio {
         self.captured_dimensions = Some(snapshot.dimensions);
         self.annotations = snapshot.annotations;
         self.processed_capture_path = None;
-        self.displayed_capture_image = Some(cached_render_image(image));
+        self.set_capture_image(image);
         self.selected_annotation = None;
         self.editing_text = None;
         let _ = self.rebuild_redactions();
@@ -3472,6 +3327,9 @@ impl Studio {
                 }
             }
             MOTION_ZOOM_SLIDER => self.set_motion_zoom_slider(value),
+            id if id >= 100 => {
+                self.set_scene_slider(id, value);
+            }
             6 => {
                 self.text_font_size = value.clamp(10, 96) as f32;
                 let selected = self.selected_annotation;
@@ -3678,6 +3536,10 @@ impl Studio {
             bold: self.text_bold,
             italic: self.text_italic,
             underline: self.text_underline,
+            timing: self.animation_active.then(|| {
+                AnnotationTiming::for_tool(self.tool, self.video_position, self.video_duration)
+            }),
+            opacity: 1.0,
         };
 
         if self.tool == Tool::Number {
@@ -3803,6 +3665,9 @@ impl Studio {
     }
 
     fn handle_video_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.handle_watermark_key(event) {
+            return true;
+        }
         let keystroke = &event.keystroke;
         if (keystroke.modifiers.control || keystroke.modifiers.platform) && keystroke.key == "z" {
             if keystroke.modifiers.shift {
@@ -3834,7 +3699,17 @@ impl Studio {
                 true
             }
             "delete" | "backspace" => {
-                self.delete_selected_video_edit(cx);
+                if self.video_selected_press.is_some() {
+                    self.remove_selected_press(cx);
+                } else {
+                    self.delete_selected_video_edit(cx);
+                }
+                true
+            }
+            "escape" => {
+                self.video_selected_zoom_cue = None;
+                self.video_selected_press = None;
+                self.scene_selection = SceneSelection::Scene;
                 true
             }
             _ => false,
@@ -3842,6 +3717,9 @@ impl Studio {
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent) -> bool {
+        if self.handle_watermark_key(event) {
+            return true;
+        }
         if self.crop_active {
             match event.keystroke.key.as_str() {
                 "escape" => self.cancel_crop(),
@@ -3963,7 +3841,7 @@ impl Studio {
         output
             .save(&destination)
             .map_err(|error| error.to_string())?;
-        self.displayed_capture_image = Some(cached_render_image(output));
+        self.set_capture_image(output);
         if let Some(previous) = self.processed_capture_path.replace(destination) {
             if previous
                 .file_name()
@@ -3987,9 +3865,31 @@ impl Studio {
         capture_height: u32,
         stroke_scale: f32,
     ) -> String {
+        annotations_svg(
+            &self.annotations,
+            x,
+            y,
+            capture_width,
+            capture_height,
+            stroke_scale,
+        )
+    }
+}
+
+/// SVG fragment with every visible annotation in `marks`, positioned
+/// relative to a capture drawn at (`x`, `y`) with the given pixel size. The
+/// fragment closes the `<g>` opened by the caller.
+fn annotations_svg(
+    marks: &[AnnotationMark],
+    x: f32,
+    y: f32,
+    capture_width: u32,
+    capture_height: u32,
+    stroke_scale: f32,
+) -> String {
+    {
         let mut svg = String::new();
-        let highlights: Vec<_> = self
-            .annotations
+        let highlights: Vec<_> = marks
             .iter()
             .filter(|mark| mark.tool == Tool::Highlight)
             .collect();
@@ -4005,12 +3905,15 @@ impl Studio {
             svg.push_str("\"/>");
         }
 
-        for mark in self.annotations.iter().filter(|mark| {
+        for mark in marks.iter().filter(|mark| {
             !matches!(
                 mark.tool,
                 Tool::Select | Tool::Blur | Tool::Pixelate | Tool::Highlight
             )
         }) {
+            if mark.opacity < 0.999 {
+                let _ = write!(svg, "<g opacity=\"{:.3}\">", mark.opacity.clamp(0.0, 1.0));
+            }
             let sx = x + mark.start.x * capture_width as f32;
             let sy = y + mark.start.y * capture_height as f32;
             let ex = x + mark.end.x * capture_width as f32;
@@ -4085,13 +3988,21 @@ impl Studio {
                 }
                 _ => {}
             }
+            if mark.opacity < 0.999 {
+                svg.push_str("</g>");
+            }
         }
         svg.push_str("</g>");
         svg
     }
+}
 
+impl Studio {
     fn render_export(&mut self, destination: &std::path::Path) -> Result<(), String> {
         self.rebuild_redactions()?;
+        if self.scene_style().needs_composited_preview() {
+            return self.render_composited_export(destination);
+        }
         let capture_path = self
             .processed_capture_path
             .as_ref()
@@ -4183,7 +4094,7 @@ impl Studio {
         svg.push_str("</svg>");
 
         let mut options = resvg::usvg::Options::default();
-        options.fontdb_mut().load_system_fonts();
+        options.fontdb = crate::recording::scene::shared_fontdb();
         let tree = resvg::usvg::Tree::from_str(&svg, &options)
             .map_err(|error| format!("Could not build export: {error}"))?;
         let mut pixmap = resvg::tiny_skia::Pixmap::new(canvas_width, canvas_height)
@@ -5271,6 +5182,7 @@ impl Studio {
         cx: &mut Context<Self>,
         canvas_width: Pixels,
         canvas_height: Pixels,
+        composited: Option<Arc<RenderImage>>,
     ) -> impl IntoElement {
         let solid = SOLID_BACKGROUNDS[self.color_index.min(SOLID_BACKGROUNDS.len() - 1)].1;
         let gradient =
@@ -5359,6 +5271,23 @@ impl Studio {
             annotations.push(draft);
         }
         let committed_count = self.annotations.len();
+        // Animated scenes paint each mark at its state for the playhead time.
+        let (annotations, painted_indices): (Vec<AnnotationMark>, Vec<usize>) =
+            if self.animation_active {
+                let time = self.video_position;
+                let mut marks = Vec::new();
+                let mut indices = Vec::new();
+                for (index, mark) in annotations.iter().enumerate() {
+                    if let Some(animated) = timed::animated_mark(mark, time) {
+                        marks.push(animated);
+                        indices.push(index);
+                    }
+                }
+                (marks, indices)
+            } else {
+                let indices = (0..annotations.len()).collect();
+                (annotations, indices)
+            };
         let selected_annotation = self.selected_annotation;
         let editing_text = self.editing_text;
         let caret_visible = self.caret_visible;
@@ -5387,6 +5316,14 @@ impl Studio {
             (1.0, 0.0, 0.0)
         };
         let media_bounds_store = self.video_media_bounds.clone();
+        let scene_bounds_store = self.scene_canvas_bounds.clone();
+        // A composited preview lays the media out with the compositor's own
+        // geometry, so annotations and hit testing must follow that rect.
+        let composited_style = composited.is_some().then(|| self.scene_style());
+        let composited_active = composited.is_some();
+        // Under a 3D transform the compositor draws the annotations too.
+        let paint_gpui_annotations = self.annotations_paint_flat();
+        let select_tool = self.tool == Tool::Select;
         let zoomed = move |bounds: Bounds<Pixels>| Bounds {
             origin: point(
                 bounds.origin.x - bounds.size.width * view_zoom * view_left,
@@ -5642,30 +5579,68 @@ impl Studio {
                     )
                 },
             )
+            .when_some(composited, |this, image| {
+                this.child(img(image).absolute().inset_0().size_full())
+            })
             .child(
                 canvas(
                     move |_, _, _| annotations,
                     move |bounds, annotations, window, cx| {
-                        let image_bounds = fitted_image_bounds(
-                            bounds,
-                            has_capture,
-                            captured_dimensions,
-                            padding,
-                            border,
-                            border_thickness,
-                        );
+                        let image_bounds = match composited_style.as_ref() {
+                            Some(style) => {
+                                let (source_width, source_height) =
+                                    captured_dimensions.unwrap_or((1200, 720));
+                                let media = recording::scene::SceneGeometry::layout(
+                                    f64::from(bounds.size.width),
+                                    f64::from(bounds.size.height),
+                                    source_width as f64,
+                                    source_height as f64,
+                                    style,
+                                )
+                                .media;
+                                Bounds {
+                                    origin: point(
+                                        bounds.origin.x + px(media.x as f32),
+                                        bounds.origin.y + px(media.y as f32),
+                                    ),
+                                    size: size(px(media.width as f32), px(media.height as f32)),
+                                }
+                            }
+                            None => fitted_image_bounds(
+                                bounds,
+                                has_capture,
+                                captured_dimensions,
+                                padding,
+                                border,
+                                border_thickness,
+                            ),
+                        };
                         if let Ok(mut stored) = media_bounds_store.lock() {
                             *stored = Some(image_bounds);
                         }
+                        if let Ok(mut stored) = scene_bounds_store.lock() {
+                            *stored = Some(bounds);
+                        }
                         let paint_bounds = zoomed(image_bounds);
+                        // While animating, drawing happens in the zoomed view.
+                        let interaction_bounds = if animation_active {
+                            paint_bounds
+                        } else {
+                            image_bounds
+                        };
+                        let painted_indices = painted_indices.clone();
                         let annotation_bounds = window.with_content_mask(
                             Some(ContentMask {
                                 bounds: image_bounds,
                             }),
                             |window| {
+                                if !paint_gpui_annotations {
+                                    return Vec::new();
+                                }
                                 paint_highlights(&annotations, paint_bounds, window);
                                 let mut annotation_bounds = Vec::with_capacity(annotations.len());
-                                for (index, mark) in annotations.iter().enumerate() {
+                                for (painted, mark) in annotations.iter().enumerate() {
+                                    let index = painted_indices[painted];
                                     let rendered_bounds = paint_annotation(
                                         mark,
                                         paint_bounds,
@@ -5730,28 +5705,81 @@ impl Studio {
                                     || if crop_active {
                                         !crop_hit_bounds.contains(&event.position)
                                     } else {
-                                        !image_bounds.contains(&event.position)
+                                        !bounds.contains(&event.position)
                                     }
                                 {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
                                     this.focus_handle.focus(window);
-                                    if animation_active {
-                                        // Motion mode: clicks choose the focus.
-                                        if this.video_selected_zoom_cue.is_some() {
-                                            this.pin_selected_zoom_cue_at(event.position, cx);
-                                        } else {
-                                            this.toast = Some(
-                                                "Select a motion region to set its focus".into(),
+                                    // Drawing through a projected preview lands where
+                                    // the pointer is on the card, not on the canvas.
+                                    let flat = if composited_active {
+                                        this.flat_pointer_position(
+                                            event.position,
+                                            bounds,
+                                            interaction_bounds,
+                                        )
+                                    } else {
+                                        event.position
+                                    };
+                                    if animation_active
+                                        && (select_tool || this.video_selected_zoom_cue.is_some())
+                                    {
+                                        // Motion mode: clicks choose the focus of the
+                                        // selected region, otherwise manipulate the media.
+                                        if !this.scene_pointer_down(
+                                            event.position,
+                                            bounds,
+                                            &event.modifiers,
+                                            event.click_count,
+                                            cx,
+                                        ) && this.video_selected_zoom_cue.is_none()
+                                        {
+                                            this.selected_annotation = None;
+                                        }
+                                    } else if animation_active {
+                                        // Drawing tools place timed marks at the playhead.
+                                        this.pause_video_playback();
+                                        if interaction_bounds.contains(&flat) {
+                                            this.pointer_down(
+                                                flat,
+                                                interaction_bounds,
+                                                &annotation_bounds,
                                             );
                                         }
                                     } else if this.crop_active {
                                         this.crop_pointer_down(event.position, image_bounds);
-                                    } else {
-                                        this.pointer_down(
+                                    } else if !paint_gpui_annotations && select_tool {
+                                        // Transformed media: select moves the card.
+                                        this.scene_pointer_down(
                                             event.position,
-                                            image_bounds,
+                                            bounds,
+                                            &event.modifiers,
+                                            event.click_count,
+                                            cx,
+                                        );
+                                    } else if select_tool {
+                                        if image_bounds.contains(&event.position) {
+                                            this.pointer_down(
+                                                event.position,
+                                                image_bounds,
+                                                &annotation_bounds,
+                                            );
+                                        }
+                                        if this.selected_annotation.is_none() {
+                                            this.scene_pointer_down(
+                                                event.position,
+                                                bounds,
+                                                &event.modifiers,
+                                                event.click_count,
+                                                cx,
+                                            );
+                                        }
+                                    } else if interaction_bounds.contains(&flat) {
+                                        this.pointer_down(
+                                            flat,
+                                            interaction_bounds,
                                             &annotation_bounds,
                                         );
                                     }
@@ -5766,13 +5794,27 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
-                                    if animation_active {
+                                    if this.media_drag.is_some() {
+                                        this.update_media_drag(event.position);
+                                        cx.notify();
+                                        return;
+                                    }
+                                    if animation_active && select_tool {
                                         return;
                                     }
                                     if this.crop_active {
                                         this.crop_pointer_move(event.position, image_bounds);
                                     } else {
-                                        this.pointer_move(event.position, image_bounds);
+                                        let flat = if composited_active {
+                                            this.flat_pointer_position(
+                                                event.position,
+                                                bounds,
+                                                interaction_bounds,
+                                            )
+                                        } else {
+                                            event.position
+                                        };
+                                        this.pointer_move(flat, interaction_bounds);
                                     }
                                     cx.notify();
                                 });
@@ -5783,12 +5825,22 @@ impl Studio {
                                 return;
                             }
                             entity.update(cx, |this, cx| {
-                                if animation_active {
+                                this.end_media_drag();
+                                let flat = if composited_active {
+                                    this.flat_pointer_position(
+                                        event.position,
+                                        bounds,
+                                        interaction_bounds,
+                                    )
+                                } else {
+                                    event.position
+                                };
+                                if animation_active && select_tool {
                                     this.pointer_is_down = false;
                                 } else if this.crop_active {
                                     this.crop_drag = None;
                                     this.pointer_is_down = false;
-                                } else if this.pointer_up(event.position, image_bounds) {
+                                } else if this.pointer_up(flat, interaction_bounds) {
                                     if let Err(error) = this.rebuild_redactions() {
                                         this.toast = Some(
                                             format!("Could not render redaction: {error}").into(),
@@ -5811,6 +5863,15 @@ impl Studio {
                 self.tool != Tool::Text && self.editing_text.is_none(),
                 |this| this.cursor_crosshair(),
             )
+            .when(self.scene_selection == SceneSelection::Media, |this| {
+                this.cursor(CursorStyle::OpenHand)
+            })
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                if this.scene_scroll(event) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
     }
 
     fn render_video(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -5819,71 +5880,29 @@ impl Studio {
         if window.focused(cx).is_none() {
             self.focus_handle.focus(window);
         }
-        let frame = self.video_frame.clone();
+        self.autosave_scene_style();
+        if self.video_extras_pending {
+            self.video_extras_pending = false;
+            self.spawn_video_extras(cx);
+        }
         let viewport = window.viewport_size();
         let inspector_width = if self.inspector_visible { 316.0 } else { 0.0 };
         let available_width = (viewport.width - px(112.0 + inspector_width)).max(px(320.0));
-        let available_height = (viewport.height - px(336.0)).max(px(220.0));
+        let available_height = (viewport.height - px(372.0)).max(px(220.0));
         let (video_canvas_width, video_canvas_height) =
             self.preview_canvas_size(available_width, available_height);
-        let video_canvas =
-            self.video_composite_canvas(frame.clone(), video_canvas_width, video_canvas_height, cx);
+        let video_canvas = self.scene_canvas(video_canvas_width, video_canvas_height, cx);
         let recording_controls = self.recording_controls(cx);
-        let fill_tabs = self.segmented(
-            "video-fill-type",
-            &["Color", "Gradient", "Wallpaper"],
-            self.wallpaper_tab,
-            |this, value| this.wallpaper_tab = value,
-            cx,
-        );
-        let wallpaper_sources = self.segmented(
-            "video-fill-library",
-            &["Recent", "UIHSSN", "Fayazara"],
-            self.library_tab,
-            |this, value| this.library_tab = value,
-            cx,
-        );
-        let fill_picker = self.fill_picker(cx);
         let motion_panel = self.motion_inspector(cx);
-        let show_scene_panel = motion_panel.is_none();
-        let motion_overview = self.motion_overview_section(cx);
+        let transform_panel = if motion_panel.is_none() {
+            self.transform_inspector(cx)
+        } else {
+            None
+        };
+        let show_scene_panel = motion_panel.is_none() && transform_panel.is_none();
+        let scene_panel = show_scene_panel.then(|| self.video_scene_panel(cx));
         let export_format_picker = self.export_format_picker(cx);
         let export_overlay = self.export_status_overlay(cx);
-        let padding_control = self.slider_row(
-            "Padding",
-            self.padding,
-            "%",
-            |this, value| this.padding = value,
-            cx,
-        );
-        let corner_control = self.slider_row(
-            "Corners",
-            self.corners,
-            "%",
-            |this, value| this.corners = value,
-            cx,
-        );
-        let shadow_control = self.slider_row(
-            "Shadow",
-            self.shadow,
-            "%",
-            |this, value| this.shadow = value,
-            cx,
-        );
-        let shadow_styles = self.segmented(
-            "video-shadow-style",
-            &["Soft", "Long", "Glow", "Crisp"],
-            self.shadow_style,
-            |this, value| this.shadow_style = value,
-            cx,
-        );
-        let aspect_controls = self.segmented(
-            "video-aspect-ratio",
-            &["Auto", "1:1", "4:3", "3:2", "16:9"],
-            self.aspect_ratio,
-            |this, value| this.aspect_ratio = value,
-            cx,
-        );
         let playing = self.video_playing;
         let progress = if self.video_duration > 0.0 {
             (self.video_position / self.video_duration).clamp(0.0, 1.0)
@@ -5974,6 +5993,8 @@ impl Studio {
             }
             ruler_tick += ruler_step;
         }
+        ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
+        let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
         let clip_lane: Vec<AnyElement> = self
             .video_clip_timeline
             .segments
@@ -6035,13 +6056,26 @@ impl Studio {
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(hsla(0.0, 0.0, 1.0, 0.92))
+                    .children(self.clip_thumbnails(
+                        clip.source_start,
+                        clip.source_end,
+                        clip.speed,
+                        width,
+                        34.0,
+                    ))
                     .when(width >= 52.0, |this| {
                         let label = if (clip.speed - 1.0).abs() > f64::EPSILON {
                             format!("{:.1}s · {}×", clip.editor_duration(), clip.speed)
                         } else {
                             format!("{:.1}s", clip.editor_duration())
                         };
-                        this.child(label)
+                        this.child(
+                            div()
+                                .px_2()
+                                .rounded_md()
+                                .bg(hsla(0.0, 0.0, 0.0, 0.35))
+                                .child(label),
+                        )
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -6123,7 +6157,11 @@ impl Studio {
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let mut changed = this.update_slider_drag(event);
-                if event.dragging() {
+                if event.dragging() && this.media_drag.is_some() {
+                    if this.update_media_drag(event.position) {
+                        changed = true;
+                    }
+                } else if event.dragging() {
                     if let Some(drag) = this.video_move_drag.as_mut() {
                         drag.current_x = event.position.x;
                         // Reordering while a preview render is in flight is
@@ -6160,6 +6198,9 @@ impl Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if this.end_media_drag() {
+                        cx.notify();
+                    }
                     if let Some(drag) = this.video_move_drag.take() {
                         if drag.active {
                             this.commit_video_move_drag(drag, cx);
@@ -6539,7 +6580,7 @@ impl Studio {
                     )
                     .child(
                         div()
-                            .h(px(112.0))
+                            .h(px(148.0))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -6549,7 +6590,7 @@ impl Studio {
                                 div()
                                     .flex_1()
                                     .min_w(px(320.0))
-                                    .h(px(90.0))
+                                    .h(px(126.0))
                                     .flex()
                                     .flex_col()
                                     .justify_center()
@@ -6759,7 +6800,8 @@ impl Studio {
                                                 },
                                             )),
                                     )
-                                    .child(motion_track),
+                                    .child(motion_track)
+                                    .when_some(audio_lane, |this, lane| this.child(lane)),
                             ),
                     ),
             )
@@ -6781,108 +6823,8 @@ impl Studio {
                         .flex_col()
                         .gap_3()
                         .when_some(motion_panel, |this, panel| this.child(panel))
-                        .when(show_scene_panel, |this| {
-                            this.child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_3()
-                                    .child(motion_overview)
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::BOLD)
-                                            .child("Background"),
-                                    )
-                                    .child(fill_tabs)
-                                    .when(self.wallpaper_tab == 2, |this| {
-                                        this.child(wallpaper_sources)
-                                    })
-                                    .child(fill_picker)
-                                    .child(
-                                        div()
-                                            .mt_2()
-                                            .pt_3()
-                                            .border_t_1()
-                                            .border_color(line())
-                                            .text_sm()
-                                            .font_weight(FontWeight::BOLD)
-                                            .child("Layout"),
-                                    )
-                                    .child(padding_control)
-                                    .child(corner_control)
-                                    .child(shadow_control)
-                                    .child(
-                                        div().text_xs().text_color(muted()).child("Shadow style"),
-                                    )
-                                    .child(shadow_styles)
-                                    .child(
-                                        div().text_xs().text_color(muted()).child("Aspect ratio"),
-                                    )
-                                    .child(aspect_controls)
-                                    .child(
-                                        div()
-                                            .mt_2()
-                                            .pt_3()
-                                            .border_t_1()
-                                            .border_color(line())
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .child("Border"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("video-border-toggle")
-                                                    .w(px(38.0))
-                                                    .h(px(22.0))
-                                                    .p(px(2.0))
-                                                    .rounded_full()
-                                                    .cursor_pointer()
-                                                    .bg(if self.border {
-                                                        blue()
-                                                    } else {
-                                                        Hsla::from(rgb(0xd4d5d8))
-                                                    })
-                                                    .flex()
-                                                    .justify_end()
-                                                    .when(!self.border, |this| this.justify_start())
-                                                    .child(
-                                                        div()
-                                                            .size(px(18.0))
-                                                            .rounded_full()
-                                                            .bg(rgb(0xffffff)),
-                                                    )
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.border = !this.border;
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    )
-                                    .when(self.border, |this| {
-                                        this.child(self.slider_row(
-                                            "Thickness",
-                                            self.border_thickness,
-                                            "%",
-                                            |this, value| this.border_thickness = value,
-                                            cx,
-                                        ))
-                                        .child(
-                                            self.slider_row(
-                                                "Opacity",
-                                                self.border_opacity,
-                                                "%",
-                                                |this, value| this.border_opacity = value,
-                                                cx,
-                                            ),
-                                        )
-                                    }),
-                            )
-                        }),
+                        .when_some(transform_panel, |this, panel| this.child(panel))
+                        .when_some(scene_panel, |this, panel| this.child(panel)),
                 )
             })
             .when_some(export_overlay, |this, overlay| this.child(overlay))
@@ -6916,7 +6858,15 @@ impl Render for Studio {
         let viewport = window.viewport_size();
         let inspector_width = if self.inspector_visible { 316.0 } else { 0.0 };
         let available_canvas_width = (viewport.width - px(112.0 + inspector_width)).max(px(1.0));
-        let animation_strip_height = if self.animation_active { 118.0 } else { 0.0 };
+        let animation_strip_height = if self.animation_active {
+            if self.annotations.is_empty() {
+                118.0
+            } else {
+                154.0
+            }
+        } else {
+            0.0
+        };
         let available_canvas_height =
             (viewport.height - px(212.0 + animation_strip_height)).max(px(1.0));
         let (canvas_width, canvas_height) =
@@ -6933,6 +6883,17 @@ impl Render for Studio {
         };
         let screenshot_export_overlay = self.export_status_overlay(cx);
         let animation_strip = self.animation_active.then(|| self.animation_strip(cx));
+        let composited = if self.preview_needs_compositor() {
+            self.scene_preview_image(canvas_width, canvas_height)
+        } else {
+            None
+        };
+        let screenshot_transform_panel = self.transform_inspector(cx);
+        let screenshot_timing_panel = self.annotation_timing_inspector(cx);
+        let screenshot_effects = self.effects_section(cx);
+        let screenshot_watermark = self.watermark_section(cx);
+        let screenshot_export = self.animation_active.then(|| self.export_section(cx));
+        let screenshot_presets = self.preset_library_section(cx);
         let tool_help = format!("{} — {}", self.tool.label(), self.tool.help_text());
         let annotation_styles = self.annotation_style_controls(cx);
         let tabs = self.segmented(
@@ -7239,10 +7200,14 @@ impl Render for Studio {
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let mut changed = this.update_slider_drag(event);
-                if this.animation_active && event.dragging() {
+                if event.dragging() && this.media_drag.is_some() {
+                    changed |= this.update_media_drag(event.position);
+                } else if this.animation_active && event.dragging() {
                     if this.video_zoom_drag.is_some() {
                         this.update_video_zoom_drag(event.position.x);
                         changed = true;
+                    } else if this.annotation_drag.is_some() {
+                        changed |= this.update_annotation_drag(event.position.x);
                     } else if let Some((start_x, start_position)) = this.video_seek_drag {
                         let delta = (event.position.x - start_x) / px(1.0);
                         let content_width =
@@ -7260,6 +7225,8 @@ impl Render for Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.end_media_drag();
+                    this.end_annotation_drag();
                     if this.video_zoom_drag.is_some() {
                         this.commit_video_zoom_drag(cx);
                     }
@@ -7515,7 +7482,12 @@ impl Render for Studio {
                                     .items_center()
                                     .justify_center()
                                     .gap_4()
-                                    .child(self.mock_capture(cx, canvas_width, canvas_height))
+                                    .child(self.mock_capture(
+                                        cx,
+                                        canvas_width,
+                                        canvas_height,
+                                        composited.clone(),
+                                    ))
                                     .when_some(animation_strip, |this, strip| {
                                         this.child(div().w(canvas_width).child(strip))
                                     }),
@@ -7566,7 +7538,10 @@ impl Render for Studio {
                             .gap_3()
                             .when_some(animation_section, |this, section| this.child(section))
                             .when_some(screenshot_motion_panel, |this, panel| this.child(panel))
+                            .when_some(screenshot_transform_panel, |this, panel| this.child(panel))
+                            .when_some(screenshot_timing_panel, |this, panel| this.child(panel))
                             .child(background_preset_picker)
+                            .child(screenshot_presets)
                             .child(
                                 div()
                                     .mt_2()
@@ -7895,6 +7870,9 @@ impl Render for Studio {
                                 cx,
                             ))
                             })
+                            .child(screenshot_effects)
+                            .child(screenshot_watermark)
+                            .when_some(screenshot_export, |this, section| this.child(section))
                             .when(self.crop_active, |this| {
                                 this.opacity(0.52).child(
                                     div()

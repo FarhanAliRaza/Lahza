@@ -59,10 +59,24 @@ edited as orange regions on the timeline's motion lane rather than keyframes:
   scene with presets (slow zoom, pan, focus, sweep) that expand into the same
   editable regions.
 
+The media surface is a 3D object: click it to select it, drag to move,
+Shift-drag to tilt, Ctrl-drag to spin, scroll to scale, and double-click to
+reset; the Transform panel exposes scale, position, X/Y/Z rotation,
+perspective, and anchor with per-value reset plus Fit, Fill, and Actual size.
+Backgrounds gain blur, grain, and vignette, and a text watermark can sit in
+any corner. Recordings also get a pointer panel (cursor size, shadow, idle
+hiding, click effects and colour, removable clicks), an audio lane with a
+mute toggle, and clip thumbnails. Annotations in an animated screenshot are
+timed (draggable lane, entrance and exit effects such as draw-on and
+type-on). The inspector has Quick, Customize, and Advanced levels, and any
+look can be saved to a personal preset library.
+
 Export renders the whole scene, not only the source clip, with the same
-compositor that drives the preview. MP4 (H.264/AAC), WebM (VP9/Opus), and
-looping GIF are available for both recordings and animated screenshots;
-FFmpeg is required and progress can be cancelled.
+compositor that drives the preview (the preview *is* the compositor's
+output). MP4 (H.264/AAC), WebM (VP9/Opus), and looping GIF are available for
+both recordings and animated screenshots at original, 720p, 1080p, 1440p, or
+4K, 30 or 60 fps, with a size estimate; FFmpeg is required and progress can
+be cancelled.
 
 ## Native video recording
 

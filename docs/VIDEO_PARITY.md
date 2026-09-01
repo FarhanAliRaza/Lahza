@@ -102,7 +102,13 @@ preview, and exported output must agree.
 - [ ] Camera/background/aspect controls. The video canvas now lives in the
   standard Screendrop shell and uses the shared color/gradient/wallpaper
   library, padding, corners, four shadow styles, aspect presets, border, and
-  collapsible inspector. Camera composition remains.
+  collapsible inspector. The preview is the compositor's own output, so
+  background blur, grain, vignette, watermark, and the 3D media transform
+  (scale, position, X/Y/Z rotation, perspective, anchor, with drag, tilt,
+  spin, scroll-to-scale, corner handles, and double-click reset) look the
+  same in the editor and in the file. Scene settings autosave into the
+  project's edit document under `scene`. Camera composition remains (no
+  camera master is recorded yet).
 - [x] Preview and export share the same immutable pointer and viewport timelines.
   `recording::export::export_scene` renders the full scene (background,
   padding, corners, border, shadow, camera motion, reconstructed cursor and
@@ -110,8 +116,19 @@ preview, and exported output must agree.
   MP4 (H.264/AAC), WebM (VP9/Opus), or GIF with FFmpeg. Layout is derived
   from `SceneGeometry`, which the preview canvas also uses.
 - [ ] Timestamped export with progress, cancellation, and stale-render detection.
-  Frame-level progress and cancellation are implemented; stale-render
-  detection remains.
+  Frame-level progress, cancellation, resolution presets (original, 720p,
+  1080p, 1440p, 4K), 30/60 fps, GIF looping, audio include/mute, and a size
+  estimate are implemented; stale-render detection remains.
+- [x] Pointer inspector: show/hide cursor, cursor size, cursor shadow, hide
+  when idle, click effects and colour; click markers on the ruler select
+  individual presses, which can be removed (persisted as
+  `screendropExtras.removedPressTimes`).
+- [x] Audio lane with an RMS waveform mapped through the clip timeline and a
+  mute toggle; clip thumbnails sampled from the master.
+- [x] Preset library (`~/.config/screendrop/presets.json`) saving background,
+  layout, border, shadow, effects, pointer look, aspect, and default zoom
+  strength for screenshots and recordings; Quick / Customize / Advanced
+  inspector levels.
 
 ## Animated screenshots
 
@@ -123,7 +140,14 @@ preview, and exported output must agree.
 - [x] Annotations are flattened onto the capture before compositing so the
   animated export matches the static one.
 - [x] MP4, WebM, and looping GIF export with progress and cancellation.
-- [ ] Timed annotations, 3D transforms, and background blur/noise.
+- [x] Timed annotations: marks placed while animating get a start/end,
+  entrance (cut, fade, pop, slide, draw-on, type-on) and exit (cut, fade,
+  shrink, slide) with a draggable annotation lane and a timing inspector;
+  the exporter renders them frame by frame through the same animation code
+  as the preview.
+- [x] 3D transforms and tilt presets (3D tilt, floating card); motion
+  regions can carry an animated tilt and an easing curve.
+- [x] Background blur, noise, vignette, and a text watermark.
 
 Rust video support must not be described as complete until all required rows are
 implemented and a manual Swift-versus-Rust behavior pass has been recorded.

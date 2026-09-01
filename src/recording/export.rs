@@ -11,16 +11,100 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use super::{
     clips::RecordingClipTimeline,
     pointer_timeline::PointerTimeline,
-    scene::{PointerOverlay, SceneCompositor, SceneStyle},
+    scene::{FrameInput, PointerOverlay, SceneCompositor, SceneStyle},
     video::{probe_media, render_clip_preview, VideoError, VideoFrameStream},
     viewport::ViewportTimeline,
 };
+
+/// Output height presets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExportResolution {
+    /// The media's own height, kept within 720p–4K.
+    #[default]
+    Original,
+    Hd720,
+    Hd1080,
+    Qhd1440,
+    Uhd2160,
+}
+
+impl ExportResolution {
+    pub const ALL: [ExportResolution; 5] = [
+        ExportResolution::Original,
+        ExportResolution::Hd720,
+        ExportResolution::Hd1080,
+        ExportResolution::Qhd1440,
+        ExportResolution::Uhd2160,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportResolution::Original => "Original",
+            ExportResolution::Hd720 => "720p",
+            ExportResolution::Hd1080 => "1080p",
+            ExportResolution::Qhd1440 => "1440p",
+            ExportResolution::Uhd2160 => "4K",
+        }
+    }
+
+    pub fn canvas_height(self, source_height: u32) -> u32 {
+        let height = match self {
+            ExportResolution::Original => source_height.clamp(720, 2160),
+            ExportResolution::Hd720 => 720,
+            ExportResolution::Hd1080 => 1080,
+            ExportResolution::Qhd1440 => 1440,
+            ExportResolution::Uhd2160 => 2160,
+        };
+        (height / 2) * 2
+    }
+}
+
+/// Rough output size for the export panel, from typical bits per pixel of
+/// each encoder at the settings used here.
+pub fn estimate_size_bytes(
+    format: ExportFormat,
+    width: u32,
+    height: u32,
+    frame_rate: f64,
+    duration: f64,
+) -> u64 {
+    let pixels_per_second = width as f64 * height as f64 * frame_rate.max(1.0);
+    let bits_per_pixel = match format {
+        ExportFormat::Mp4 => 0.09,
+        ExportFormat::WebM => 0.06,
+        ExportFormat::Gif => 0.45,
+    };
+    let audio_bits = match format {
+        ExportFormat::Mp4 => 192_000.0,
+        ExportFormat::WebM => 128_000.0,
+        ExportFormat::Gif => 0.0,
+    };
+    ((pixels_per_second * bits_per_pixel + audio_bits) * duration.max(0.0) / 8.0) as u64
+}
+
+pub fn format_size(bytes: u64) -> String {
+    let bytes = bytes as f64;
+    if bytes >= 1_073_741_824.0 {
+        format!("{:.1} GB", bytes / 1_073_741_824.0)
+    } else if bytes >= 1_048_576.0 {
+        format!("{:.0} MB", bytes / 1_048_576.0)
+    } else {
+        format!("{:.0} KB", (bytes / 1024.0).max(1.0))
+    }
+}
+
+/// Produces the media-space overlay (e.g. timed annotations) for a frame
+/// time; returning the same `Arc` for unchanged frames avoids re-rendering.
+pub type OverlaySource = Box<dyn FnMut(f64) -> Option<Arc<RgbaImage>> + Send>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportFormat {
@@ -127,6 +211,34 @@ pub struct SceneExportRequest {
     pub duration: f64,
     /// GIF only: loop forever instead of playing once.
     pub loop_forever: bool,
+    /// Keep the recording's audio track (when the format supports it).
+    pub include_audio: bool,
+    /// Per-frame media-space overlay, such as timed annotations.
+    pub overlay: Option<OverlaySource>,
+}
+
+impl SceneExportRequest {
+    pub fn new(
+        destination: PathBuf,
+        format: ExportFormat,
+        canvas_height: u32,
+        style: SceneStyle,
+        viewport: ViewportTimeline,
+        duration: f64,
+    ) -> Self {
+        Self {
+            destination,
+            format,
+            frame_rate: format.default_frame_rate(),
+            canvas_height,
+            style,
+            viewport,
+            duration,
+            loop_forever: true,
+            include_audio: true,
+            overlay: None,
+        }
+    }
 }
 
 enum PreparedSource {
@@ -164,7 +276,7 @@ impl PreparedSource {
 /// FFmpeg succeeds; cancelling removes every partial file.
 pub fn export_scene(
     source: SceneSource,
-    request: &SceneExportRequest,
+    request: &mut SceneExportRequest,
     progress: &ExportProgress,
 ) -> Result<(), VideoError> {
     let frame_rate = if request.frame_rate.is_finite() {
@@ -232,7 +344,9 @@ fn prepare_source(
                     return Err(error);
                 }
             };
-            let audio = (info.has_audio && request.format.supports_audio()).then(|| playback);
+            let audio =
+                (info.has_audio && request.include_audio && request.format.supports_audio())
+                    .then(|| playback);
             Ok(PreparedSource::Video {
                 stream,
                 audio,
@@ -245,7 +359,7 @@ fn prepare_source(
 
 fn encode(
     prepared: &mut PreparedSource,
-    request: &SceneExportRequest,
+    request: &mut SceneExportRequest,
     frame_rate: f64,
     total_frames: u64,
     progress: &ExportProgress,
@@ -401,7 +515,13 @@ fn encode(
             }
         };
         let viewport = request.viewport.frame_at(time);
-        let output = compositor.compose(source_frame, viewport, pointer_overlay.as_ref());
+        let overlay = request.overlay.as_mut().and_then(|source| source(time));
+        let output = compositor.compose(FrameInput {
+            source: source_frame,
+            overlay: overlay.as_deref(),
+            viewport,
+            pointer: pointer_overlay.as_ref(),
+        });
         if let Err(error) = stdin.write_all(output.as_raw()) {
             write_error = Some(VideoError::Decode(format!(
                 "FFmpeg stopped accepting frames: {error}"
@@ -513,6 +633,7 @@ mod tests {
             border_color: 0xffc928,
             border_opacity: 100,
             aspect: Some(16.0 / 9.0),
+            ..SceneStyle::default()
         }
     }
 
@@ -534,23 +655,34 @@ mod tests {
     }
 
     #[test]
+    fn resolution_presets_and_size_estimates_are_sane() {
+        assert_eq!(ExportResolution::Original.canvas_height(900), 900);
+        assert_eq!(ExportResolution::Original.canvas_height(300), 720);
+        assert_eq!(ExportResolution::Uhd2160.canvas_height(300), 2160);
+        let small = estimate_size_bytes(ExportFormat::Mp4, 1280, 720, 30.0, 10.0);
+        let large = estimate_size_bytes(ExportFormat::Mp4, 1920, 1080, 60.0, 10.0);
+        assert!(small > 0 && large > small);
+        assert_eq!(format_size(2 * 1_048_576), "2 MB");
+        assert_eq!(format_size(512), "1 KB");
+    }
+
+    #[test]
     fn cancelled_export_produces_no_file() {
         let root = test_root("cancel");
         let destination = root.join("cancelled.gif");
         let progress = ExportProgress::default();
         progress.cancel();
-        let request = SceneExportRequest {
-            destination: destination.clone(),
-            format: ExportFormat::Gif,
-            frame_rate: 10.0,
-            canvas_height: 90,
-            style: style(),
-            viewport: ViewportTimeline::default(),
-            duration: 1.0,
-            loop_forever: true,
-        };
+        let mut request = SceneExportRequest::new(
+            destination.clone(),
+            ExportFormat::Gif,
+            90,
+            style(),
+            ViewportTimeline::default(),
+            1.0,
+        );
+        request.frame_rate = 10.0;
         let image = RgbaImage::from_pixel(64, 36, Rgba([200, 30, 30, 255]));
-        let result = export_scene(SceneSource::Image(image), &request, &progress);
+        let result = export_scene(SceneSource::Image(image), &mut request, &progress);
         assert!(matches!(result, Err(VideoError::Cancelled)));
         assert!(!destination.exists());
         fs::remove_dir_all(root).unwrap();
@@ -571,17 +703,30 @@ mod tests {
         for (format, expected_width) in [(ExportFormat::Gif, 320), (ExportFormat::Mp4, 320)] {
             let destination = root.join(format!("animated.{}", format.extension()));
             let progress = ExportProgress::default();
-            let request = SceneExportRequest {
-                destination: destination.clone(),
+            let mut request = SceneExportRequest::new(
+                destination.clone(),
                 format,
-                frame_rate: 10.0,
-                canvas_height: 180,
-                style: style(),
-                viewport: viewport.clone(),
-                duration: 1.0,
-                loop_forever: true,
-            };
-            export_scene(SceneSource::Image(image.clone()), &request, &progress).unwrap();
+                180,
+                style(),
+                viewport.clone(),
+                1.0,
+            );
+            request.frame_rate = 10.0;
+            // A timed overlay: red square for the first half only.
+            let mut calls = 0usize;
+            request.overlay = Some(Box::new(move |time: f64| {
+                calls += 1;
+                (time < 0.5).then(|| {
+                    let mut layer = RgbaImage::new(160, 90);
+                    for y in 30..60 {
+                        for x in 60..100 {
+                            layer.put_pixel(x, y, Rgba([255, 0, 0, 255]));
+                        }
+                    }
+                    Arc::new(layer)
+                })
+            }));
+            export_scene(SceneSource::Image(image.clone()), &mut request, &progress).unwrap();
             assert!((progress.fraction() - 1.0).abs() < 1e-9);
             let info = probe_media(&destination).unwrap();
             assert_eq!((info.width, info.height), (expected_width, 180));
@@ -620,23 +765,22 @@ mod tests {
         );
         let destination = root.join("scene.mp4");
         let progress = ExportProgress::default();
-        let request = SceneExportRequest {
-            destination: destination.clone(),
-            format: ExportFormat::Mp4,
-            frame_rate: 12.0,
-            canvas_height: 180,
-            style: style(),
+        let mut request = SceneExportRequest::new(
+            destination.clone(),
+            ExportFormat::Mp4,
+            180,
+            style(),
             viewport,
-            duration: clips.duration(),
-            loop_forever: false,
-        };
+            clips.duration(),
+        );
+        request.frame_rate = 12.0;
         export_scene(
             SceneSource::Video {
                 media,
                 clips,
                 pointer: None,
             },
-            &request,
+            &mut request,
             &progress,
         )
         .unwrap();

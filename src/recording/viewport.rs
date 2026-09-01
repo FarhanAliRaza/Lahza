@@ -27,10 +27,26 @@ const MOTION_PROFILE: SpringConstant = SpringConstant {
     inertia: 2.25,
 };
 
+/// Animated 3D rotation (degrees) added to the authored scene transform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Tilt {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Tilt {
+    pub fn is_zero(&self) -> bool {
+        self.x.abs() < 1e-9 && self.y.abs() < 1e-9 && self.z.abs() < 1e-9
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewportFrame {
     pub magnification: f64,
     pub anchor: NormalizedPoint,
+    pub tilt: Tilt,
 }
 
 impl Default for ViewportFrame {
@@ -38,6 +54,7 @@ impl Default for ViewportFrame {
         Self {
             magnification: 1.0,
             anchor: NormalizedPoint { x: 0.5, y: 0.5 },
+            tilt: Tilt::default(),
         }
     }
 }
@@ -78,6 +95,9 @@ impl ViewportTimeline {
         let mut amount = DampedSpring::new(1.0);
         let mut anchor_x = DampedSpring::new(0.5);
         let mut anchor_y = DampedSpring::new(0.5);
+        let mut tilt_x = DampedSpring::new(0.0);
+        let mut tilt_y = DampedSpring::new(0.0);
+        let mut tilt_z = DampedSpring::new(0.0);
         let mut previous_cue = None;
         let mut frames = Vec::with_capacity(frame_count);
         let cue_clusters: Vec<Vec<FocusCluster>> = cues
@@ -117,6 +137,7 @@ impl ViewportTimeline {
                     .unwrap_or(ZoomAnchorMode::PinnedAnchor),
                 active.map(|cue| cue.bounds_bias).unwrap_or(0.0),
             );
+            let target_tilt = active.map(|cue| cue.tilt_at(progress)).unwrap_or_default();
             let cue_id = active.map(|cue| cue.id);
             let changed = cue_id != previous_cue;
             let should_snap = changed
@@ -129,7 +150,13 @@ impl ViewportTimeline {
                 amount.snap(target_magnification);
                 anchor_x.snap(target_anchor.x);
                 anchor_y.snap(target_anchor.y);
+                tilt_x.snap(target_tilt.x);
+                tilt_y.snap(target_tilt.y);
+                tilt_z.snap(target_tilt.z);
             } else if frame_index > 0 {
+                tilt_x.step(target_tilt.x, MOTION_PROFILE, dt);
+                tilt_y.step(target_tilt.y, MOTION_PROFILE, dt);
+                tilt_z.step(target_tilt.z, MOTION_PROFILE, dt);
                 // Cap's renderer pre-aims while scale is visually identity.
                 // This prevents a late diagonal pan as an incoming zoom ramps.
                 if amount.position <= 1.000_5 && target_magnification > 1.0 {
@@ -152,6 +179,11 @@ impl ViewportTimeline {
                     },
                     magnification,
                 ),
+                tilt: Tilt {
+                    x: tilt_x.position,
+                    y: tilt_y.position,
+                    z: tilt_z.position,
+                },
             });
             previous_cue = cue_id;
         }
@@ -179,6 +211,11 @@ impl ViewportTimeline {
             anchor: NormalizedPoint {
                 x: lerp(left.anchor.x, right.anchor.x, fraction),
                 y: lerp(left.anchor.y, right.anchor.y, fraction),
+            },
+            tilt: Tilt {
+                x: lerp(left.tilt.x, right.tilt.x, fraction),
+                y: lerp(left.tilt.y, right.tilt.y, fraction),
+                z: lerp(left.tilt.z, right.tilt.z, fraction),
             },
         }
     }
@@ -387,6 +424,52 @@ impl MotionStyle {
     }
 }
 
+/// Shape of the zoom/pan ramps inside a region. `Hold` regions always use
+/// the camera spring; easing only affects animated ramps.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MotionEasing {
+    #[default]
+    Smooth,
+    Linear,
+    Snappy,
+    Cinematic,
+}
+
+impl MotionEasing {
+    pub const ALL: [MotionEasing; 4] = [
+        MotionEasing::Smooth,
+        MotionEasing::Linear,
+        MotionEasing::Snappy,
+        MotionEasing::Cinematic,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MotionEasing::Smooth => "Smooth",
+            MotionEasing::Linear => "Linear",
+            MotionEasing::Snappy => "Snappy",
+            MotionEasing::Cinematic => "Cinematic",
+        }
+    }
+
+    pub fn apply(self, t: f64) -> f64 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            MotionEasing::Smooth => t * t * (3.0 - 2.0 * t),
+            MotionEasing::Linear => t,
+            MotionEasing::Snappy => 1.0 - (1.0 - t).powi(4),
+            MotionEasing::Cinematic => {
+                if t < 0.5 {
+                    16.0 * t.powi(5)
+                } else {
+                    1.0 - (-2.0 * t + 2.0).powi(5) / 2.0
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZoomCue {
@@ -407,6 +490,12 @@ pub struct ZoomCue {
     /// this point across the region (Ken Burns style).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pan_to: Option<NormalizedPoint>,
+    /// Ramp shape for zoom in/out and pan.
+    #[serde(default)]
+    pub easing: MotionEasing,
+    /// Optional 3D tilt of the media surface while the region is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tilt: Option<Tilt>,
 }
 
 impl ZoomCue {
@@ -429,6 +518,8 @@ impl ZoomCue {
             skips_easing: false,
             motion: MotionStyle::Hold,
             pan_to: None,
+            easing: MotionEasing::Smooth,
+            tilt: None,
         }
     }
 
@@ -450,8 +541,26 @@ impl ZoomCue {
         let zoom = self.zoom.max(1.0);
         match self.motion {
             MotionStyle::Hold => zoom,
-            MotionStyle::ZoomIn => 1.0 + (zoom - 1.0) * smoothstep(progress),
-            MotionStyle::ZoomOut => zoom - (zoom - 1.0) * smoothstep(progress),
+            MotionStyle::ZoomIn => 1.0 + (zoom - 1.0) * self.easing.apply(progress),
+            MotionStyle::ZoomOut => zoom - (zoom - 1.0) * self.easing.apply(progress),
+        }
+    }
+
+    /// Tilt target while the region is active. Ramped regions ease the tilt
+    /// in alongside the zoom so the card settles as the move completes.
+    pub fn tilt_at(&self, progress: f64) -> Tilt {
+        let Some(tilt) = self.tilt else {
+            return Tilt::default();
+        };
+        let t = match self.motion {
+            MotionStyle::Hold => 1.0,
+            MotionStyle::ZoomIn => self.easing.apply(progress),
+            MotionStyle::ZoomOut => 1.0 - self.easing.apply(progress),
+        };
+        Tilt {
+            x: tilt.x * t,
+            y: tilt.y * t,
+            z: tilt.z * t,
         }
     }
 
@@ -460,7 +569,7 @@ impl ZoomCue {
         match self.pan_to {
             None => base,
             Some(destination) => {
-                let t = smoothstep(progress);
+                let t = self.easing.apply(progress);
                 NormalizedPoint {
                     x: lerp(base.x, destination.x, t),
                     y: lerp(base.y, destination.y, t),
@@ -477,7 +586,12 @@ impl ZoomCue {
             MotionStyle::ZoomOut => "Out ",
         };
         let pan = if self.pan_to.is_some() { " Pan" } else { "" };
-        format!("{motion}{:.1}×{pan}", self.zoom)
+        let tilt = if self.tilt.is_some_and(|tilt| !tilt.is_zero()) {
+            " 3D"
+        } else {
+            ""
+        };
+        format!("{motion}{:.1}×{pan}{tilt}", self.zoom)
     }
 
     fn around_press(time: f64, point: NormalizedPoint, duration: f64) -> Option<Self> {
@@ -505,13 +619,10 @@ impl ZoomCue {
             skips_easing: false,
             motion: MotionStyle::Hold,
             pan_to: None,
+            easing: MotionEasing::Smooth,
+            tilt: None,
         })
     }
-}
-
-fn smoothstep(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 /// One-click motion recipes for animated screenshots and quick recording
@@ -524,16 +635,20 @@ pub enum MotionPreset {
     PanRight,
     FocusCenter,
     Sweep,
+    Tilt3D,
+    FloatingCard,
 }
 
 impl MotionPreset {
-    pub const ALL: [MotionPreset; 6] = [
+    pub const ALL: [MotionPreset; 8] = [
         MotionPreset::SlowZoomIn,
         MotionPreset::SlowZoomOut,
         MotionPreset::PanLeft,
         MotionPreset::PanRight,
         MotionPreset::FocusCenter,
         MotionPreset::Sweep,
+        MotionPreset::Tilt3D,
+        MotionPreset::FloatingCard,
     ];
 
     pub fn label(self) -> &'static str {
@@ -544,6 +659,8 @@ impl MotionPreset {
             MotionPreset::PanRight => "Pan right",
             MotionPreset::FocusCenter => "Focus",
             MotionPreset::Sweep => "Sweep",
+            MotionPreset::Tilt3D => "3D tilt",
+            MotionPreset::FloatingCard => "Floating card",
         }
     }
 
@@ -592,6 +709,42 @@ impl MotionPreset {
                 cue.pan_to = Some(NormalizedPoint { x: 0.7, y: 0.7 });
                 cue.skips_easing = true;
                 vec![cue]
+            }
+            MotionPreset::Tilt3D => {
+                // Start tilted away, settle flat while easing in slightly.
+                let mut cue = ZoomCue::pinned(0.0, duration, 1.15, center);
+                cue.motion = MotionStyle::ZoomOut;
+                cue.easing = MotionEasing::Cinematic;
+                cue.tilt = Some(Tilt {
+                    x: 10.0,
+                    y: -24.0,
+                    z: 0.0,
+                });
+                cue.skips_easing = true;
+                vec![cue]
+            }
+            MotionPreset::FloatingCard => {
+                // Alternate gentle tilts so the card appears to float.
+                let segments = ((duration / 2.5).round() as usize).clamp(2, 6);
+                let step = duration / segments as f64;
+                (0..segments)
+                    .map(|index| {
+                        let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
+                        let start = index as f64 * step;
+                        let end = if index + 1 == segments {
+                            duration
+                        } else {
+                            start + step
+                        };
+                        let mut cue = ZoomCue::pinned(start, end, 1.08, center);
+                        cue.tilt = Some(Tilt {
+                            x: 4.0 * sign,
+                            y: 9.0 * sign,
+                            z: 1.5 * sign,
+                        });
+                        cue
+                    })
+                    .collect()
             }
         }
     }
@@ -829,6 +982,8 @@ mod tests {
             skips_easing: false,
             motion: MotionStyle::Hold,
             pan_to: None,
+            easing: MotionEasing::Smooth,
+            tilt: None,
         };
         let viewport = ViewportTimeline::build(&[cue], &pointer, &clips, &capture);
         let before_dead_zone_exit = viewport.frame_at(1.5).anchor.x;
@@ -885,10 +1040,44 @@ mod tests {
     }
 
     #[test]
+    fn tilt_presets_animate_rotation_smoothly() {
+        let cues = MotionPreset::Tilt3D.cues(4.0);
+        let viewport = ViewportTimeline::build_static(&cues, 4.0);
+        let start = viewport.frame_at(0.0).tilt;
+        let end = viewport.frame_at(4.0).tilt;
+        assert!(start.y < -15.0, "{start:?}");
+        assert!(end.y.abs() < 2.0, "{end:?}");
+        let mut previous = viewport.frame_at(0.0).tilt.y;
+        for index in 1..=(4.0 * STEP_RATE) as usize {
+            let current = viewport.frame_at(index as f64 / STEP_RATE).tilt.y;
+            assert!((current - previous).abs() < 0.5);
+            previous = current;
+        }
+        let floating = MotionPreset::FloatingCard.cues(6.0);
+        assert!(floating.len() >= 2);
+        assert!(floating.iter().all(|cue| cue.tilt.is_some()));
+    }
+
+    #[test]
+    fn easing_curves_are_monotonic_and_bounded() {
+        for easing in MotionEasing::ALL {
+            let mut previous = easing.apply(0.0);
+            assert!(previous.abs() < 1e-9);
+            for step in 1..=100 {
+                let current = easing.apply(step as f64 / 100.0);
+                assert!(current >= previous - 1e-9, "{easing:?}");
+                previous = current;
+            }
+            assert!((previous - 1.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn visible_rect_is_clamped_inside_the_media() {
         let (left, top, visible) = visible_rect(ViewportFrame {
             magnification: 2.0,
             anchor: NormalizedPoint { x: 0.0, y: 1.0 },
+            tilt: Tilt::default(),
         });
         assert_eq!(visible, 0.5);
         assert_eq!(left, 0.0);

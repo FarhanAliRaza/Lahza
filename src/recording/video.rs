@@ -343,6 +343,88 @@ fn render_clip_timeline(
     Ok(())
 }
 
+/// Root-mean-square loudness per bucket across the whole file (0..1), for
+/// the timeline's audio lane. Files without audio produce an empty list.
+pub fn audio_levels(path: &Path, buckets: usize) -> Result<Vec<f32>, VideoError> {
+    let info = probe_media(path)?;
+    if !info.has_audio || buckets == 0 || info.duration <= 0.0 {
+        return Ok(Vec::new());
+    }
+    const SAMPLE_RATE: usize = 8_000;
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
+        .output()?;
+    if !output.status.success() {
+        return Err(VideoError::Decode(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let samples: Vec<f32> = output
+        .stdout
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / i16::MAX as f32)
+        .collect();
+    let expected = (info.duration * SAMPLE_RATE as f64) as usize;
+    let total = samples.len().max(expected).max(1);
+    let mut levels = vec![0.0f32; buckets];
+    for (index, level) in levels.iter_mut().enumerate() {
+        let start = index * total / buckets;
+        let end = ((index + 1) * total / buckets).min(samples.len());
+        if end > start && start < samples.len() {
+            let slice = &samples[start..end];
+            let energy: f32 = slice.iter().map(|value| value * value).sum();
+            *level = (energy / slice.len() as f32).sqrt();
+        }
+    }
+    let peak = levels.iter().cloned().fold(0.0f32, f32::max);
+    if peak > 0.0 {
+        for level in &mut levels {
+            *level = (*level / peak).clamp(0.0, 1.0);
+        }
+    }
+    Ok(levels)
+}
+
+/// `count` evenly spaced thumbnails at `height` pixels, for the clip lane.
+pub fn decode_thumbnails(
+    path: &Path,
+    count: usize,
+    height: u32,
+) -> Result<Vec<image::RgbaImage>, VideoError> {
+    let info = probe_media(path)?;
+    if count == 0 || info.duration <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let height = (height.max(8) / 2) * 2;
+    let width = ((height as f64 * info.width as f64 / info.height as f64).round() as u32).max(2);
+    let width = (width / 2) * 2;
+    let interval = info.duration / count as f64;
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-an", "-vf"])
+        .arg(format!(
+            "fps=1/{interval:.6}:start_time=0,scale={width}:{height}:flags=area,format=rgba"
+        ))
+        .args(["-frames:v"])
+        .arg(count.to_string())
+        .args(["-f", "rawvideo", "pipe:1"])
+        .output()?;
+    if !output.status.success() {
+        return Err(VideoError::Decode(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let frame_bytes = frame_byte_count(width, height)?;
+    Ok(output
+        .stdout
+        .chunks_exact(frame_bytes)
+        .filter_map(|chunk| image::RgbaImage::from_raw(width, height, chunk.to_vec()))
+        .collect())
+}
+
 pub struct VideoFrameStream {
     child: Child,
     stdout: ChildStdout,
@@ -822,6 +904,26 @@ mod tests {
         let content_frame = decode_frame(&preview, 2.5, 160, 90).unwrap();
         assert!(content_frame.rgba.iter().any(|value| *value > 64));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_levels_and_thumbnails_describe_the_media() {
+        let Some((root, path)) = test_video_with_audio() else {
+            eprintln!("FFmpeg unavailable; skipping audio level test");
+            return;
+        };
+        let levels = audio_levels(&path, 12).unwrap();
+        assert_eq!(levels.len(), 12);
+        assert!(levels.iter().any(|level| *level > 0.5));
+        assert!(levels.iter().all(|level| (0.0..=1.0).contains(level)));
+        let thumbnails = decode_thumbnails(&path, 4, 36).unwrap();
+        assert!(!thumbnails.is_empty() && thumbnails.len() <= 4);
+        assert_eq!(thumbnails[0].height(), 36);
+        assert!(thumbnails[0].pixels().any(|pixel| pixel[0] > 0));
+        let silent = test_video().unwrap();
+        assert!(audio_levels(&silent.1, 8).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(silent.0).unwrap();
     }
 
     #[test]
