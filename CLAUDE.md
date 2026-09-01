@@ -10,6 +10,10 @@ sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libxkbcommon-dev libxkbcommon-x11-dev
 ```
 
+At runtime `ffmpeg`/`ffprobe` are required for recording preview, motion
+export (MP4/WebM/GIF), and the export integration tests; `gst-play-1.0` is
+needed for synchronized video playback in the editor.
+
 ## Build
 
 ```bash

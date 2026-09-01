@@ -31,6 +31,7 @@ pub enum VideoError {
     Probe(String),
     Decode(String),
     InvalidMedia(String),
+    Cancelled,
 }
 
 impl std::fmt::Display for VideoError {
@@ -40,6 +41,7 @@ impl std::fmt::Display for VideoError {
             Self::Probe(error) => write!(formatter, "could not inspect video: {error}"),
             Self::Decode(error) => write!(formatter, "could not decode video: {error}"),
             Self::InvalidMedia(error) => error.fmt(formatter),
+            Self::Cancelled => write!(formatter, "export cancelled"),
         }
     }
 }
@@ -473,11 +475,26 @@ impl VideoFrameStream {
         maximum_width: u32,
         maximum_height: u32,
     ) -> Result<Self, VideoError> {
+        Self::open_with_frame_rate(path, start_time, maximum_width, maximum_height, None)
+    }
+
+    /// Streams frames at a constant `frame_rate` (FFmpeg duplicates or drops
+    /// source frames), so frame `n` is exactly at `start_time + n / rate`.
+    pub fn open_with_frame_rate(
+        path: &Path,
+        start_time: f64,
+        maximum_width: u32,
+        maximum_height: u32,
+        frame_rate: Option<f64>,
+    ) -> Result<Self, VideoError> {
         let info = probe_media(path)?;
         let (width, height) =
             fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
         let start_time = start_time.clamp(0.0, info.duration);
-        let frame_rate = info.frame_rate.clamp(1.0, 120.0);
+        let frame_rate = frame_rate
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+            .unwrap_or(info.frame_rate)
+            .clamp(1.0, 120.0);
         let mut child = Command::new("ffmpeg")
             .args(["-v", "error", "-ss"])
             .arg(format!("{start_time:.6}"))

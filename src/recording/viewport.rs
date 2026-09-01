@@ -8,6 +8,16 @@ use super::{
     pointer_timeline::PointerTimeline,
 };
 
+/// Normalized rectangle of the media a viewport frame shows:
+/// `(left, top, visible_fraction)`. Preview, focus picking, and export all
+/// derive the crop from this single definition.
+pub fn visible_rect(frame: ViewportFrame) -> (f64, f64, f64) {
+    let visible = 1.0 / frame.magnification.max(1.0);
+    let left = (frame.anchor.x - visible * 0.5).clamp(0.0, 1.0 - visible);
+    let top = (frame.anchor.y - visible * 0.5).clamp(0.0, 1.0 - visible);
+    (left, top, visible)
+}
+
 const STEP_RATE: f64 = 120.0;
 const CLUSTER_WIDTH_RATIO: f64 = 0.5;
 const CLUSTER_HEIGHT_RATIO: f64 = 0.7;
@@ -39,6 +49,20 @@ pub struct ViewportTimeline {
 }
 
 impl ViewportTimeline {
+    /// Viewport motion for media without pointer data (animated screenshots).
+    pub fn build_static(cues: &[ZoomCue], duration: f64) -> Self {
+        Self::build(
+            cues,
+            &PointerTimeline::default(),
+            &RecordingClipTimeline::full(duration),
+            &PointerCaptureFile::default(),
+        )
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.duration
+    }
+
     pub fn build(
         cues: &[ZoomCue],
         pointer: &PointerTimeline,
@@ -65,15 +89,24 @@ impl ViewportTimeline {
             let editor_time = (frame_index as f64 * dt).min(duration);
             let source_time = clips.source_time_at(editor_time);
             let active = active_cue(source_time, cues);
-            let target_magnification = active.map(|cue| cue.zoom.max(1.0)).unwrap_or(1.0);
+            let progress = active
+                .map(|cue| cue.progress_at(source_time))
+                .unwrap_or(0.0);
+            let target_magnification = active
+                .map(|cue| cue.magnification_at(progress))
+                .unwrap_or(1.0);
             let raw_target = active
-                .and_then(|cue| match cue.anchor_mode {
-                    ZoomAnchorMode::PinnedAnchor => Some(cue.pinned_point),
-                    ZoomAnchorMode::PointerAnchor | ZoomAnchorMode::SmartAnchor => {
-                        let cue_index = cues.iter().position(|candidate| candidate.id == cue.id)?;
-                        cluster_center_at(&cue_clusters[cue_index], editor_time)
-                            .or(Some(cue.pinned_point))
-                    }
+                .and_then(|cue| {
+                    let base = match cue.anchor_mode {
+                        ZoomAnchorMode::PinnedAnchor => Some(cue.pinned_point),
+                        ZoomAnchorMode::PointerAnchor | ZoomAnchorMode::SmartAnchor => {
+                            let cue_index =
+                                cues.iter().position(|candidate| candidate.id == cue.id)?;
+                            cluster_center_at(&cue_clusters[cue_index], editor_time)
+                                .or(Some(cue.pinned_point))
+                        }
+                    }?;
+                    Some(cue.anchor_at(base, progress))
                 })
                 .unwrap_or(NormalizedPoint { x: 0.5, y: 0.5 });
             let target_anchor = bounded_anchor(
@@ -327,6 +360,33 @@ pub enum ZoomAnchorMode {
     PinnedAnchor,
 }
 
+/// How a motion region's magnification evolves across its time range.
+///
+/// `Hold` is the classic click zoom: the camera springs to the target at the
+/// region start and springs back when it ends. `ZoomIn`/`ZoomOut` ramp the
+/// target across the whole region for slow, cinematic moves.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MotionStyle {
+    #[default]
+    Hold,
+    ZoomIn,
+    ZoomOut,
+}
+
+impl MotionStyle {
+    pub const ALL: [MotionStyle; 3] =
+        [MotionStyle::Hold, MotionStyle::ZoomIn, MotionStyle::ZoomOut];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MotionStyle::Hold => "Hold",
+            MotionStyle::ZoomIn => "Zoom in",
+            MotionStyle::ZoomOut => "Zoom out",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZoomCue {
@@ -340,10 +400,85 @@ pub struct ZoomCue {
     pub is_enabled: bool,
     pub is_implicit: bool,
     pub skips_easing: bool,
+    /// Magnification envelope. Older projects omit it and behave as `Hold`.
+    #[serde(default)]
+    pub motion: MotionStyle,
+    /// Optional pan destination: the anchor glides from its base target to
+    /// this point across the region (Ken Burns style).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pan_to: Option<NormalizedPoint>,
 }
 
 impl ZoomCue {
     pub const MINIMUM_DURATION: f64 = 0.5;
+    pub const MINIMUM_ZOOM: f64 = 1.0;
+    pub const MAXIMUM_ZOOM: f64 = 4.0;
+
+    /// A pinned, held region: the standard building block of manual motion.
+    pub fn pinned(start: f64, end: f64, zoom: f64, point: NormalizedPoint) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            start,
+            end,
+            zoom: zoom.clamp(Self::MINIMUM_ZOOM, Self::MAXIMUM_ZOOM),
+            anchor_mode: ZoomAnchorMode::PinnedAnchor,
+            pinned_point: point.clamped(),
+            bounds_bias: 0.0,
+            is_enabled: true,
+            is_implicit: false,
+            skips_easing: false,
+            motion: MotionStyle::Hold,
+            pan_to: None,
+        }
+    }
+
+    pub fn duration(&self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
+
+    /// 0 at the region start, 1 at its end (in source time).
+    pub fn progress_at(&self, source_time: f64) -> f64 {
+        let duration = self.duration();
+        if duration <= 0.0 {
+            return 1.0;
+        }
+        ((source_time - self.start) / duration).clamp(0.0, 1.0)
+    }
+
+    /// Target magnification for the given progress through the region.
+    pub fn magnification_at(&self, progress: f64) -> f64 {
+        let zoom = self.zoom.max(1.0);
+        match self.motion {
+            MotionStyle::Hold => zoom,
+            MotionStyle::ZoomIn => 1.0 + (zoom - 1.0) * smoothstep(progress),
+            MotionStyle::ZoomOut => zoom - (zoom - 1.0) * smoothstep(progress),
+        }
+    }
+
+    /// Target anchor for the given progress, applying an optional pan.
+    pub fn anchor_at(&self, base: NormalizedPoint, progress: f64) -> NormalizedPoint {
+        match self.pan_to {
+            None => base,
+            Some(destination) => {
+                let t = smoothstep(progress);
+                NormalizedPoint {
+                    x: lerp(base.x, destination.x, t),
+                    y: lerp(base.y, destination.y, t),
+                }
+                .clamped()
+            }
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let motion = match self.motion {
+            MotionStyle::Hold => "",
+            MotionStyle::ZoomIn => "In ",
+            MotionStyle::ZoomOut => "Out ",
+        };
+        let pan = if self.pan_to.is_some() { " Pan" } else { "" };
+        format!("{motion}{:.1}×{pan}", self.zoom)
+    }
 
     fn around_press(time: f64, point: NormalizedPoint, duration: f64) -> Option<Self> {
         // Keep automatic click zooms deliberately short. The cue's `end` is
@@ -368,7 +503,97 @@ impl ZoomCue {
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            motion: MotionStyle::Hold,
+            pan_to: None,
         })
+    }
+}
+
+fn smoothstep(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// One-click motion recipes for animated screenshots and quick recording
+/// polish. Every preset expands into ordinary editable regions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MotionPreset {
+    SlowZoomIn,
+    SlowZoomOut,
+    PanLeft,
+    PanRight,
+    FocusCenter,
+    Sweep,
+}
+
+impl MotionPreset {
+    pub const ALL: [MotionPreset; 6] = [
+        MotionPreset::SlowZoomIn,
+        MotionPreset::SlowZoomOut,
+        MotionPreset::PanLeft,
+        MotionPreset::PanRight,
+        MotionPreset::FocusCenter,
+        MotionPreset::Sweep,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MotionPreset::SlowZoomIn => "Slow zoom in",
+            MotionPreset::SlowZoomOut => "Slow zoom out",
+            MotionPreset::PanLeft => "Pan left",
+            MotionPreset::PanRight => "Pan right",
+            MotionPreset::FocusCenter => "Focus",
+            MotionPreset::Sweep => "Sweep",
+        }
+    }
+
+    /// Regions covering a scene of `duration` seconds.
+    pub fn cues(self, duration: f64) -> Vec<ZoomCue> {
+        if !duration.is_finite() || duration < ZoomCue::MINIMUM_DURATION {
+            return Vec::new();
+        }
+        let center = NormalizedPoint { x: 0.5, y: 0.5 };
+        let lead = (duration * 0.06).min(0.4);
+        match self {
+            MotionPreset::SlowZoomIn => {
+                let mut cue = ZoomCue::pinned(0.0, duration, 1.6, center);
+                cue.motion = MotionStyle::ZoomIn;
+                vec![cue]
+            }
+            MotionPreset::SlowZoomOut => {
+                let mut cue = ZoomCue::pinned(0.0, duration, 1.6, center);
+                cue.motion = MotionStyle::ZoomOut;
+                vec![cue]
+            }
+            MotionPreset::PanLeft => {
+                let mut cue =
+                    ZoomCue::pinned(0.0, duration, 1.4, NormalizedPoint { x: 0.75, y: 0.5 });
+                cue.pan_to = Some(NormalizedPoint { x: 0.25, y: 0.5 });
+                cue.skips_easing = true;
+                vec![cue]
+            }
+            MotionPreset::PanRight => {
+                let mut cue =
+                    ZoomCue::pinned(0.0, duration, 1.4, NormalizedPoint { x: 0.25, y: 0.5 });
+                cue.pan_to = Some(NormalizedPoint { x: 0.75, y: 0.5 });
+                cue.skips_easing = true;
+                vec![cue]
+            }
+            MotionPreset::FocusCenter => {
+                let start = (duration * 0.25).max(lead);
+                let end = (duration * 0.8)
+                    .max(start + ZoomCue::MINIMUM_DURATION)
+                    .min(duration);
+                vec![ZoomCue::pinned(start, end, 1.8, center)]
+            }
+            MotionPreset::Sweep => {
+                let mut cue =
+                    ZoomCue::pinned(0.0, duration, 1.7, NormalizedPoint { x: 0.3, y: 0.3 });
+                cue.pan_to = Some(NormalizedPoint { x: 0.7, y: 0.7 });
+                cue.skips_easing = true;
+                vec![cue]
+            }
+        }
     }
 }
 
@@ -602,11 +827,71 @@ mod tests {
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            motion: MotionStyle::Hold,
+            pan_to: None,
         };
         let viewport = ViewportTimeline::build(&[cue], &pointer, &clips, &capture);
         let before_dead_zone_exit = viewport.frame_at(1.5).anchor.x;
         let after_dead_zone_exit = viewport.frame_at(3.0).anchor.x;
         assert!(before_dead_zone_exit < 0.45);
         assert!(after_dead_zone_exit > before_dead_zone_exit + 0.15);
+    }
+
+    #[test]
+    fn older_projects_without_motion_fields_still_load() {
+        let json = r#"{"id":"8f5b4a0e-8f1e-4f4d-9c33-2b6b4f2f1a11","start":1.0,"end":3.0,"zoom":2.0,
+            "anchorMode":"pinnedAnchor","pinnedPoint":{"x":0.2,"y":0.3},"boundsBias":0.0,
+            "isEnabled":true,"isImplicit":false,"skipsEasing":false}"#;
+        let cue: ZoomCue = serde_json::from_str(json).unwrap();
+        assert_eq!(cue.motion, MotionStyle::Hold);
+        assert_eq!(cue.pan_to, None);
+        let round_trip = serde_json::to_string(&cue).unwrap();
+        assert!(!round_trip.contains("panTo"));
+        assert!(round_trip.contains("\"motion\":\"hold\""));
+    }
+
+    #[test]
+    fn zoom_in_region_ramps_smoothly_across_its_duration() {
+        let cues = MotionPreset::SlowZoomIn.cues(5.0);
+        let viewport = ViewportTimeline::build_static(&cues, 5.0);
+        let early = viewport.frame_at(0.5).magnification;
+        let middle = viewport.frame_at(2.5).magnification;
+        let late = viewport.frame_at(4.9).magnification;
+        assert!(early < middle && middle < late, "{early} {middle} {late}");
+        assert!(early < 1.15, "{early}");
+        assert!(late > 1.5, "{late}");
+        let mut previous = viewport.frame_at(0.0).magnification;
+        for index in 1..=(5.0 * STEP_RATE) as usize {
+            let current = viewport.frame_at(index as f64 / STEP_RATE).magnification;
+            assert!((current - previous).abs() < 0.02);
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn pan_region_glides_the_anchor_between_its_points() {
+        let cues = MotionPreset::PanRight.cues(4.0);
+        let viewport = ViewportTimeline::build_static(&cues, 4.0);
+        let start = viewport.frame_at(0.05).anchor.x;
+        let end = viewport.frame_at(3.95).anchor.x;
+        assert!(start < 0.45, "{start}");
+        assert!(end > 0.55, "{end}");
+        let mut previous = viewport.frame_at(0.0).anchor.x;
+        for index in 1..=(4.0 * STEP_RATE) as usize {
+            let current = viewport.frame_at(index as f64 / STEP_RATE).anchor.x;
+            assert!((current - previous).abs() < 0.02);
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn visible_rect_is_clamped_inside_the_media() {
+        let (left, top, visible) = visible_rect(ViewportFrame {
+            magnification: 2.0,
+            anchor: NormalizedPoint { x: 0.0, y: 1.0 },
+        });
+        assert_eq!(visible, 0.5);
+        assert_eq!(left, 0.0);
+        assert_eq!(top, 0.5);
     }
 }

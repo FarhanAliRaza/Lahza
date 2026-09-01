@@ -707,6 +707,8 @@ mod tests {
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            motion: Default::default(),
+            pan_to: None,
         };
 
         session

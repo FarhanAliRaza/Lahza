@@ -21,20 +21,27 @@ use std::{
 };
 use uuid::Uuid;
 
+mod motion_ui;
 mod recording;
+
+use motion_ui::{MotionPick, BORDER_COLORS, MOTION_ZOOM_SLIDER};
 
 use recording::{
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
+    export::{ExportFormat, ExportProgress},
     model::{NormalizedPoint, RecordingSession},
     native::{NativeRecorder, RecordingOptions},
     overlays::pointer_press_effect_geometry,
     pointer_timeline::PointerTimeline,
+    scene::SceneGeometry,
     session::{RecordingController, RecordingState},
     video::{
-        decode_frame, export_clip_timeline, load_or_rebuild_poster, probe_media,
-        render_clip_preview, DecodedFrame, SynchronizedPlaybackStream,
+        decode_frame, load_or_rebuild_poster, probe_media, render_clip_preview, DecodedFrame,
+        SynchronizedPlaybackStream,
     },
-    viewport::{synthesize_zoom_cues, ViewportTimeline, ZoomAnchorMode, ZoomCue},
+    viewport::{
+        synthesize_zoom_cues, visible_rect, MotionPreset, ViewportTimeline, ZoomAnchorMode, ZoomCue,
+    },
 };
 
 struct Assets {
@@ -109,12 +116,6 @@ fn xml_escape(value: &str) -> String {
 fn timestamped_export_name() -> String {
     chrono::Local::now()
         .format("Screendrop-%Y-%m-%d_%H-%M-%S-%3f.png")
-        .to_string()
-}
-
-fn timestamped_video_export_name() -> String {
-    chrono::Local::now()
-        .format("Screendrop-%Y-%m-%d_%H-%M-%S.mp4")
         .to_string()
 }
 
@@ -1255,6 +1256,16 @@ struct Studio {
     video_timeline_scroll: f64,
     video_timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     video_media_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    /// Pixel size of the open recording's master, for scene layout.
+    video_source_size: (u32, u32),
+    export_format: ExportFormat,
+    export_progress: Option<Arc<ExportProgress>>,
+    export_label: SharedString,
+    /// Screenshot motion mode: the video motion state drives a still image.
+    animation_active: bool,
+    animation_duration: f64,
+    animation_preset: Option<MotionPreset>,
+    motion_pick: MotionPick,
     focus_handle: FocusHandle,
     wallpaper_tab: usize,
     library_tab: usize,
@@ -1328,6 +1339,7 @@ impl Studio {
     fn new(
         window_handle: AnyWindowHandle,
         initial_recording: Option<PathBuf>,
+        initial_image: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let caret_blink_task = cx.spawn(async move |weak, cx| loop {
@@ -1508,6 +1520,14 @@ impl Studio {
             video_timeline_scroll: 0.0,
             video_timeline_bounds: Arc::new(Mutex::new(None)),
             video_media_bounds: Arc::new(Mutex::new(None)),
+            video_source_size: (1280, 720),
+            export_format: ExportFormat::Mp4,
+            export_progress: None,
+            export_label: SharedString::default(),
+            animation_active: false,
+            animation_duration: 5.0,
+            animation_preset: None,
+            motion_pick: MotionPick::Focus,
             focus_handle: cx.focus_handle(),
             wallpaper_tab: 2,
             library_tab: 1,
@@ -1554,6 +1574,13 @@ impl Studio {
             toast: None,
             slider_drag: None,
         };
+        if let Some(path) = initial_image {
+            if path.is_file() {
+                studio.finish_capture_request(Ok(path));
+            } else {
+                studio.toast = Some(format!("Could not open {}", path.display()).into());
+            }
+        }
         if let Some(directory) = initial_recording {
             if let Err(error) = studio.open_video_project(directory) {
                 studio.toast = Some(error.into());
@@ -1810,6 +1837,13 @@ impl Studio {
         self.video_redo_stack.clear();
         self.video_selected_clip = None;
         self.video_selected_zoom_cue = None;
+        // Recording motion must not leak into a later screenshot animation.
+        self.video_zoom_cues.clear();
+        self.video_viewport_timeline = ViewportTimeline::default();
+        self.video_pointer_timeline = PointerTimeline::default();
+        self.video_duration = 0.0;
+        self.video_source_duration = 0.0;
+        self.video_clip_timeline = RecordingClipTimeline::default();
         self.toast = None;
         cx.notify();
     }
@@ -1834,9 +1868,8 @@ impl Studio {
                 match this.open_video_project(path.clone()) {
                     Ok(()) => this.toast = None,
                     Err(error) => {
-                        this.toast = Some(
-                            format!("Could not open {}: {error}", path.display()).into(),
-                        );
+                        this.toast =
+                            Some(format!("Could not open {}: {error}", path.display()).into());
                     }
                 }
                 cx.notify();
@@ -1908,6 +1941,11 @@ impl Studio {
                 .map_err(|error| format!("Could not build edited preview: {error}"))?;
             Some(preview_path)
         };
+        if self.animation_active {
+            self.exit_animation();
+        }
+        self.video_source_size = (manifest.pixel_width.max(1), manifest.pixel_height.max(1));
+        self.motion_pick = MotionPick::Focus;
         self.video_project = Some(session);
         self.video_frame = Some(cached_render_image(poster));
         self.video_pointer_timeline = pointer_timeline;
@@ -2184,13 +2222,19 @@ impl Studio {
     }
 
     fn persist_video_zoom_cues(&mut self, cx: &mut Context<Self>) {
+        self.persist_video_zoom_cues_quiet();
+        cx.notify();
+    }
+
+    /// Autosaves the motion lane; screenshot animations have no project
+    /// package yet and simply keep their regions in memory.
+    fn persist_video_zoom_cues_quiet(&mut self) {
         let Some(session) = self.video_project.as_ref() else {
             return;
         };
         if let Err(error) = session.write_zoom_cues_draft(&self.video_zoom_cues) {
-            self.toast = Some(format!("Could not autosave zoom edit: {error}").into());
+            self.toast = Some(format!("Could not autosave motion edit: {error}").into());
         }
-        cx.notify();
     }
 
     fn delete_selected_video_zoom(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2216,25 +2260,7 @@ impl Studio {
         cx: &mut Context<Self>,
         mutate: impl FnOnce(&mut ZoomCue),
     ) {
-        if self.video_edit_busy {
-            return;
-        }
-        let Some(selected) = self.video_selected_zoom_cue else {
-            return;
-        };
-        let original = self.video_zoom_cues.clone();
-        let Some(cue) = self.video_zoom_cues.iter_mut().find(|cue| cue.id == selected) else {
-            return;
-        };
-        mutate(cue);
-        if self.video_zoom_cues == original {
-            return;
-        }
-        self.video_undo_stack
-            .push(VideoEditSnapshot::Zoom(original));
-        self.video_redo_stack.clear();
-        self.rebuild_video_motion_timelines();
-        self.persist_video_zoom_cues(cx);
+        self.edit_selected_region(mutate);
         cx.notify();
     }
 
@@ -2257,61 +2283,34 @@ impl Studio {
             return;
         }
         let frame = self.video_viewport_timeline.frame_at(self.video_position);
-        let visible = 1.0 / frame.magnification.max(1.0);
-        let viewport_left = (frame.anchor.x - visible * 0.5).clamp(0.0, 1.0 - visible);
-        let viewport_top = (frame.anchor.y - visible * 0.5).clamp(0.0, 1.0 - visible);
+        let (viewport_left, viewport_top, visible) = visible_rect(frame);
         let target = NormalizedPoint {
             x: viewport_left + local_x * visible,
             y: viewport_top + local_y * visible,
-        };
-        self.mutate_selected_zoom_cue(cx, |cue| {
-            cue.anchor_mode = ZoomAnchorMode::PinnedAnchor;
-            cue.pinned_point = target.clamped();
-        });
-        self.toast = Some("Zoom target pinned".into());
+        }
+        .clamped();
+        match self.motion_pick {
+            MotionPick::Focus => {
+                self.mutate_selected_zoom_cue(cx, |cue| {
+                    cue.anchor_mode = ZoomAnchorMode::PinnedAnchor;
+                    cue.pinned_point = target;
+                });
+                self.toast = Some("Focus point set".into());
+            }
+            MotionPick::PanEnd => {
+                self.mutate_selected_zoom_cue(cx, |cue| {
+                    cue.anchor_mode = ZoomAnchorMode::PinnedAnchor;
+                    cue.pan_to = Some(target);
+                });
+                self.toast = Some("Pan destination set".into());
+            }
+        }
         cx.notify();
     }
 
     fn add_video_zoom_at_playhead(&mut self, cx: &mut Context<Self>) {
-        if self.video_edit_busy || self.video_source_duration < ZoomCue::MINIMUM_DURATION {
-            return;
-        }
-        let source_time = self
-            .video_clip_timeline
-            .source_time_at(self.video_position)
-            .clamp(0.0, self.video_source_duration);
-        let mut start = (source_time - 0.3).max(0.0);
-        let end = (source_time + 2.5).min(self.video_source_duration);
-        if end - start < ZoomCue::MINIMUM_DURATION {
-            start = (end - ZoomCue::MINIMUM_DURATION).max(0.0);
-        }
-        let pinned_point = self
-            .video_pointer_timeline
-            .location_at(self.video_position)
-            .unwrap_or_default();
-        let original = self.video_zoom_cues.clone();
-        let cue = ZoomCue {
-            id: Uuid::new_v4(),
-            start,
-            end,
-            zoom: 2.0,
-            anchor_mode: ZoomAnchorMode::PointerAnchor,
-            pinned_point,
-            bounds_bias: 0.25,
-            is_enabled: true,
-            is_implicit: false,
-            skips_easing: false,
-        };
-        self.video_selected_zoom_cue = Some(cue.id);
-        self.video_selected_clip = None;
-        self.video_zoom_cues.push(cue);
-        self.video_zoom_cues
-            .sort_by(|left, right| left.start.total_cmp(&right.start));
-        self.video_undo_stack
-            .push(VideoEditSnapshot::Zoom(original));
-        self.video_redo_stack.clear();
-        self.rebuild_video_motion_timelines();
-        self.persist_video_zoom_cues(cx);
+        let position = self.video_position;
+        self.add_motion_region_at(position, cx);
     }
 
     fn undo_video_edit(&mut self, cx: &mut Context<Self>) {
@@ -2374,6 +2373,10 @@ impl Studio {
 
     fn rebuild_video_motion_timelines(&mut self) {
         let Some(session) = self.video_project.as_ref() else {
+            if self.animation_active {
+                self.video_viewport_timeline =
+                    ViewportTimeline::build_static(&self.video_zoom_cues, self.video_duration);
+            }
             return;
         };
         let capture = session.read_pointer_capture().unwrap_or_default();
@@ -2547,78 +2550,6 @@ impl Studio {
         self.apply_video_clip_timeline(timeline, Some(selected), true, cx);
     }
 
-    fn export_video_recording(&mut self, cx: &mut Context<Self>) {
-        if self.video_edit_busy {
-            self.toast = Some("Wait for the current edit to finish".into());
-            cx.notify();
-            return;
-        }
-        let Some(session) = self.video_project.clone() else {
-            return;
-        };
-        // Export is the single "keep my work" action: promote the autosaved
-        // edit draft to the project before rendering the file.
-        if let Err(error) = session.commit_draft() {
-            self.toast = Some(format!("Could not save recording edits: {error}").into());
-            cx.notify();
-            return;
-        }
-        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-        let suggested_name = timestamped_video_export_name();
-        let prompt = cx.prompt_for_new_path(&directory, Some(&suggested_name));
-        cx.spawn(async move |weak, cx| {
-            let selected = match prompt.await {
-                Ok(Ok(destination)) => Ok(destination),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            let destination = match selected {
-                Ok(Some(path)) => path,
-                Ok(None) => {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.toast = Some("Export cancelled".into());
-                        cx.notify();
-                    });
-                    return;
-                }
-                Err(error) => {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.toast = Some(format!("Export failed: {error}").into());
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-            let Ok(timeline) = weak.update(cx, |this, cx| {
-                this.pause_video_playback();
-                this.video_edit_busy = true;
-                this.toast = Some("Exporting video…".into());
-                cx.notify();
-                this.video_clip_timeline.clone()
-            }) else {
-                return;
-            };
-            let source = session.screen_path();
-            let export_destination = destination.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    export_clip_timeline(&source, &export_destination, &timeline)
-                        .map_err(|error| error.to_string())
-                })
-                .await;
-            let _ = weak.update(cx, |this, cx| {
-                this.video_edit_busy = false;
-                this.toast = Some(match result {
-                    Ok(()) => format!("Exported video to {}", destination.display()).into(),
-                    Err(error) => format!("Export failed: {error}").into(),
-                });
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn start_video_playback(&mut self, cx: &mut Context<Self>) {
         if self.video_playing || self.video_duration <= 0.0 || self.video_edit_busy {
             return;
@@ -2719,12 +2650,14 @@ impl Studio {
     }
 
     fn seek_video(&mut self, position: f64, cx: &mut Context<Self>) {
-        let Some(path) = self.video_playback_path() else {
-            return;
-        };
+        let playback_path = self.video_playback_path();
         self.pause_video_playback();
         let position = position.clamp(0.0, self.video_duration);
         self.video_position = position;
+        let Some(path) = playback_path else {
+            cx.notify();
+            return;
+        };
         let generation = self.video_playback_generation.clone();
         let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
         let task = cx.background_executor().spawn(async move {
@@ -2776,10 +2709,6 @@ impl Studio {
             })
             .map(|clip| clip.speed)
             .unwrap_or(1.0);
-        let selected_cue = self
-            .video_selected_zoom_cue
-            .and_then(|id| self.video_zoom_cues.iter().find(|cue| cue.id == id))
-            .cloned();
         div()
             .flex()
             .items_center()
@@ -2798,7 +2727,12 @@ impl Studio {
                             .on_click(cx.listener(|this, _, _, cx| this.undo_video_edit(cx)))
                     })
                     .opacity(if can_undo { 1.0 } else { 0.35 })
-                    .child(svg().path("icons/undo.svg").size(px(17.0)).text_color(ink())),
+                    .child(
+                        svg()
+                            .path("icons/undo.svg")
+                            .size(px(17.0))
+                            .text_color(ink()),
+                    ),
             )
             .child(
                 div()
@@ -2814,7 +2748,12 @@ impl Studio {
                             .on_click(cx.listener(|this, _, _, cx| this.redo_video_edit(cx)))
                     })
                     .opacity(if can_redo { 1.0 } else { 0.35 })
-                    .child(svg().path("icons/redo.svg").size(px(17.0)).text_color(ink())),
+                    .child(
+                        svg()
+                            .path("icons/redo.svg")
+                            .size(px(17.0))
+                            .text_color(ink()),
+                    ),
             )
             .child(
                 div()
@@ -2851,7 +2790,7 @@ impl Studio {
                             )
                     })
                     .opacity(if edit_busy { 0.35 } else { 1.0 })
-                    .child("+ Zoom"),
+                    .child("+ Motion"),
             )
             .child(
                 div()
@@ -2869,7 +2808,12 @@ impl Studio {
                             )
                     })
                     .opacity(if can_delete { 1.0 } else { 0.35 })
-                    .child(svg().path("icons/trash.svg").size(px(16.0)).text_color(ink())),
+                    .child(
+                        svg()
+                            .path("icons/trash.svg")
+                            .size(px(16.0))
+                            .text_color(ink()),
+                    ),
             )
             .child(
                 div()
@@ -2933,103 +2877,6 @@ impl Studio {
                             .child("+"),
                     ),
             )
-            .when_some(selected_cue, |this, cue| {
-                let zoom = cue.zoom;
-                let anchor_label = match cue.anchor_mode {
-                    ZoomAnchorMode::PointerAnchor => "Follows cursor",
-                    ZoomAnchorMode::SmartAnchor => "Auto",
-                    ZoomAnchorMode::PinnedAnchor => "Pinned",
-                };
-                let next_mode = match cue.anchor_mode {
-                    ZoomAnchorMode::PointerAnchor => ZoomAnchorMode::SmartAnchor,
-                    ZoomAnchorMode::SmartAnchor => ZoomAnchorMode::PinnedAnchor,
-                    ZoomAnchorMode::PinnedAnchor => ZoomAnchorMode::PointerAnchor,
-                };
-                this.child(div().ml_2().w(px(1.0)).h(px(22.0)).bg(line()))
-                    .child(
-                        div()
-                            .ml_1()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .text_sm()
-                            .child("Zoom")
-                            .child(
-                                div()
-                                    .id("video-zoom-level-down")
-                                    .size(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .when(zoom > 1.5 && !edit_busy, |this| {
-                                        this.cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.mutate_selected_zoom_cue(cx, |cue| {
-                                                    cue.zoom = (cue.zoom - 0.5).max(1.5);
-                                                })
-                                            }))
-                                    })
-                                    .child("−"),
-                            )
-                            .child(
-                                div()
-                                    .w(px(34.0))
-                                    .text_center()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(format!("{zoom:.1}×")),
-                            )
-                            .child(
-                                div()
-                                    .id("video-zoom-level-up")
-                                    .size(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .when(zoom < 4.0 && !edit_busy, |this| {
-                                        this.cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.mutate_selected_zoom_cue(cx, |cue| {
-                                                    cue.zoom = (cue.zoom + 0.5).min(4.0);
-                                                })
-                                            }))
-                                    })
-                                    .child("+"),
-                            )
-                            .child(
-                                div()
-                                    .id("video-zoom-anchor-mode")
-                                    .ml_1()
-                                    .px_3()
-                                    .h(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .rounded_md()
-                                    .bg(rgb(0xe7f1ff))
-                                    .text_sm()
-                                    .when(!edit_busy, |this| {
-                                        this.cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xd8e8fd)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.mutate_selected_zoom_cue(cx, |cue| {
-                                                    cue.anchor_mode = next_mode;
-                                                })
-                                            }))
-                                    })
-                                    .child(anchor_label),
-                            )
-                            .child(
-                                div()
-                                    .ml_1()
-                                    .text_xs()
-                                    .text_color(muted())
-                                    .child("Click the video to pin the zoom target"),
-                            ),
-                    )
-            })
     }
 
     fn video_composite_canvas(
@@ -3049,46 +2896,32 @@ impl Studio {
             1 => gradient_base,
             _ => rgb(0x111214).into(),
         };
-        let bounds = fitted_image_bounds(
-            Bounds {
-                origin: point(px(0.0), px(0.0)),
-                size: size(canvas_width, canvas_height),
-            },
-            true,
-            Some((1280, 720)),
-            self.padding,
-            self.border,
-            self.border_thickness,
+        let style = self.scene_style();
+        let geometry = SceneGeometry::layout(
+            f64::from(canvas_width),
+            f64::from(canvas_height),
+            self.video_source_size.0 as f64,
+            self.video_source_size.1 as f64,
+            &style,
         );
-        let border_width = if self.border {
-            px(self.border_thickness as f32 * 0.48)
-        } else {
-            px(0.0)
+        let bounds = Bounds {
+            origin: point(px(geometry.media.x as f32), px(geometry.media.y as f32)),
+            size: size(
+                px(geometry.media.width as f32),
+                px(geometry.media.height as f32),
+            ),
         };
-        let radius = px(self.corners as f32 * 0.64);
-        let border_colors = [0xffc928, 0x22b45d, 0x22bfc2, 0x3678ef, 0x8c4ce8, 0xec3d87];
+        let border_width = px(geometry.border_width as f32);
+        let radius = px(geometry.radius as f32);
         let border_tint = Hsla::from(rgb(
-            border_colors[self.border_color.min(border_colors.len() - 1)]
+            BORDER_COLORS[self.border_color.min(BORDER_COLORS.len() - 1)]
         ))
         .opacity(self.border_opacity as f32 / 100.0);
-        let strength = self.shadow as f32 / 100.0;
-        let (radius_scale, offset_scale, opacity_scale) = match self.shadow_style {
-            0 => (1.0, 0.3, 1.0),
-            1 => (1.2, 0.9, 0.85),
-            2 => (1.6, 0.0, 0.7),
-            _ => (0.8, 0.2, 1.1),
-        };
-        let shadow_radius = 85.0 * strength * radius_scale;
-        let shadows = (self.shadow > 0).then(|| {
+        let shadows = geometry.shadow.map(|shadow| {
             vec![BoxShadow {
-                color: hsla(
-                    0.0,
-                    0.0,
-                    0.0,
-                    ((0.08 + strength * 1.35).min(0.35) * opacity_scale).min(0.5),
-                ),
-                offset: point(px(0.0), px(shadow_radius * offset_scale)),
-                blur_radius: px(shadow_radius),
+                color: hsla(0.0, 0.0, 0.0, shadow.opacity as f32),
+                offset: point(px(0.0), px(shadow.offset_y as f32)),
+                blur_radius: px(shadow.blur_radius as f32),
                 spread_radius: px(0.0),
             }]
         });
@@ -3098,13 +2931,8 @@ impl Studio {
         let card_height = bounds.size.height + border_width * 2.0;
         let pointer_frame = self.video_pointer_timeline.frame_at(self.video_position);
         let viewport_frame = self.video_viewport_timeline.frame_at(self.video_position);
-        let viewport_zoom = viewport_frame.magnification;
-        let viewport_anchor = (viewport_frame.anchor.x, viewport_frame.anchor.y);
-        let visible_fraction = 1.0 / viewport_zoom;
-        let viewport_left =
-            (viewport_anchor.0 - visible_fraction * 0.5).clamp(0.0, 1.0 - visible_fraction);
-        let viewport_top =
-            (viewport_anchor.1 - visible_fraction * 0.5).clamp(0.0, 1.0 - visible_fraction);
+        let viewport_zoom = viewport_frame.magnification.max(1.0);
+        let (viewport_left, viewport_top, _) = visible_rect(viewport_frame);
         let media_width = bounds.size.width * viewport_zoom as f32;
         let media_height = bounds.size.height * viewport_zoom as f32;
         let media_left = -(media_width * viewport_left as f32);
@@ -3321,6 +3149,12 @@ impl Studio {
                 self.crop_rect = CropRect::UNIT;
                 self.annotation_draft = None;
                 self.selected_annotation = None;
+                // A new capture starts static; its motion regions start fresh.
+                if self.animation_active {
+                    self.exit_animation();
+                }
+                self.video_zoom_cues.clear();
+                self.animation_preset = None;
                 self.toast = Some("Screenshot captured — editing controls are active".into());
             }
             Err(error) => {
@@ -3336,7 +3170,10 @@ impl Studio {
             3 => 3.0 / 2.0,
             4 => 16.0 / 9.0,
             _ => self
-                .captured_dimensions
+                .video_project
+                .as_ref()
+                .map(|_| self.video_source_size)
+                .or(self.captured_dimensions)
                 .filter(|(_, height)| *height > 0)
                 .map(|(width, height)| width as f32 / height as f32)
                 .unwrap_or(5.0 / 3.0),
@@ -3634,6 +3471,7 @@ impl Studio {
                     mark.density = self.redaction_strength as f32 / 100.0;
                 }
             }
+            MOTION_ZOOM_SLIDER => self.set_motion_zoom_slider(value),
             6 => {
                 self.text_font_size = value.clamp(10, 96) as f32;
                 let selected = self.selected_annotation;
@@ -4138,90 +3976,18 @@ impl Studio {
         Ok(())
     }
 
-    fn render_export(&mut self, destination: &std::path::Path) -> Result<(), String> {
-        self.rebuild_redactions()?;
-        let capture_path = self
-            .processed_capture_path
-            .as_ref()
-            .or(self.captured_path.as_ref())
-            .ok_or_else(|| "Capture an image first".to_string())?;
-        let (capture_width, capture_height) = image::image_dimensions(capture_path)
-            .map_err(|error| format!("Could not read capture: {error}"))?;
-        let shortest = capture_width.min(capture_height) as f32;
-        let padding = shortest * (self.padding as f32 * 0.0025);
-        let content_width = capture_width as f32 + padding * 2.0;
-        let content_height = capture_height as f32 + padding * 2.0;
-        let (canvas_width_f, canvas_height_f) = if self.aspect_ratio == 0 {
-            (content_width, content_height)
-        } else {
-            let ratio = self.selected_canvas_ratio();
-            if content_width / content_height > ratio {
-                (content_width, content_width / ratio)
-            } else {
-                (content_height * ratio, content_height)
-            }
-        };
-        let canvas_width = canvas_width_f.ceil() as u32;
-        let canvas_height = canvas_height_f.ceil() as u32;
-        let x = (canvas_width as f32 - capture_width as f32) / 2.0;
-        let y = (canvas_height as f32 - capture_height as f32) / 2.0;
-        let radius = shortest * 0.12 * (self.corners as f32 / 100.0);
-        let stroke_scale = shortest / 800.0;
-        let border_width = if self.border {
-            shortest * (0.002 + 0.078 * self.border_thickness as f32 / 100.0)
-        } else {
-            0.0
-        };
-        let border_colors = [0xffc928, 0x22b45d, 0x22bfc2, 0x3678ef, 0x8c4ce8, 0xec3d87];
-        let border_color = border_colors[self.border_color.min(border_colors.len() - 1)];
-        let capture_href = xml_escape(&capture_path.to_string_lossy());
-        let mut svg = format!(
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{canvas_width}" height="{canvas_height}" viewBox="0 0 {canvas_width} {canvas_height}"><defs><clipPath id="captureClip"><rect x="{x}" y="{y}" width="{capture_width}" height="{capture_height}" rx="{radius}"/></clipPath>"#
-        );
-        if self.wallpaper_tab == 1 {
-            let gradient =
-                GRADIENT_BACKGROUNDS[self.gradient_index.min(GRADIENT_BACKGROUNDS.len() - 1)];
-            let _ = write!(
-                svg,
-                "<linearGradient id=\"pageFill\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0\" stop-color=\"#{:06x}\"/><stop offset=\".5\" stop-color=\"#{:06x}\"/><stop offset=\"1\" stop-color=\"#{:06x}\"/></linearGradient>",
-                gradient.colors[0], gradient.colors[1], gradient.colors[2]
-            );
-        }
-        let shadow_strength = self.shadow as f32 / 100.0;
-        let (blur, dy, opacity) = match self.shadow_style {
-            0 => (40.0, 8.0, 0.24),
-            1 => (52.0, 34.0, 0.28),
-            2 => (62.0, 0.0, 0.20),
-            _ => (20.0, 10.0, 0.34),
-        };
-        let _ = write!(svg, "<filter id=\"dropShadow\" x=\"-50%\" y=\"-50%\" width=\"200%\" height=\"220%\"><feGaussianBlur stdDeviation=\"{}\"/><feOffset dy=\"{}\"/><feComponentTransfer><feFuncA type=\"linear\" slope=\"{}\"/></feComponentTransfer></filter></defs>", blur * shadow_strength, dy * shadow_strength, opacity * shadow_strength);
-
-        match self.wallpaper_tab {
-            0 => {
-                let color = SOLID_BACKGROUNDS[self.color_index.min(SOLID_BACKGROUNDS.len() - 1)].1;
-                let _ = write!(
-                    svg,
-                    "<rect width=\"100%\" height=\"100%\" fill=\"#{color:06x}\"/>"
-                );
-            }
-            1 => svg.push_str("<rect width=\"100%\" height=\"100%\" fill=\"url(#pageFill)\"/>"),
-            _ => {
-                // Resolve bundled wallpapers against the same asset root the
-                // live preview uses, never the process working directory.
-                let wallpaper = self.custom_wallpaper.clone().unwrap_or_else(|| {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("assets")
-                        .join(self.wallpaper_asset)
-                });
-                let href = xml_escape(&wallpaper.to_string_lossy());
-                let _ = write!(svg, "<image href=\"{href}\" width=\"{canvas_width}\" height=\"{canvas_height}\" preserveAspectRatio=\"xMidYMid slice\"/>");
-            }
-        }
-        if self.shadow > 0 {
-            let _ = write!(svg, "<rect x=\"{x}\" y=\"{y}\" width=\"{capture_width}\" height=\"{capture_height}\" rx=\"{radius}\" fill=\"black\" filter=\"url(#dropShadow)\"/>");
-        }
-        let _ = write!(svg, "<image href=\"{capture_href}\" x=\"{x}\" y=\"{y}\" width=\"{capture_width}\" height=\"{capture_height}\" preserveAspectRatio=\"none\" clip-path=\"url(#captureClip)\"/><g clip-path=\"url(#captureClip)\">");
-
+    /// SVG fragment with every visible annotation, positioned relative to a
+    /// capture drawn at (`x`, `y`) with the given pixel size. Shared by the
+    /// static PNG export and the animated export's flattened frame.
+    fn annotations_svg(
+        &self,
+        x: f32,
+        y: f32,
+        capture_width: u32,
+        capture_height: u32,
+        stroke_scale: f32,
+    ) -> String {
+        let mut svg = String::new();
         let highlights: Vec<_> = self
             .annotations
             .iter()
@@ -4320,6 +4086,95 @@ impl Studio {
                 _ => {}
             }
         }
+        svg.push_str("</g>");
+        svg
+    }
+
+    fn render_export(&mut self, destination: &std::path::Path) -> Result<(), String> {
+        self.rebuild_redactions()?;
+        let capture_path = self
+            .processed_capture_path
+            .as_ref()
+            .or(self.captured_path.as_ref())
+            .ok_or_else(|| "Capture an image first".to_string())?;
+        let (capture_width, capture_height) = image::image_dimensions(capture_path)
+            .map_err(|error| format!("Could not read capture: {error}"))?;
+        let shortest = capture_width.min(capture_height) as f32;
+        let padding = shortest * (self.padding as f32 * 0.0025);
+        let content_width = capture_width as f32 + padding * 2.0;
+        let content_height = capture_height as f32 + padding * 2.0;
+        let (canvas_width_f, canvas_height_f) = if self.aspect_ratio == 0 {
+            (content_width, content_height)
+        } else {
+            let ratio = self.selected_canvas_ratio();
+            if content_width / content_height > ratio {
+                (content_width, content_width / ratio)
+            } else {
+                (content_height * ratio, content_height)
+            }
+        };
+        let canvas_width = canvas_width_f.ceil() as u32;
+        let canvas_height = canvas_height_f.ceil() as u32;
+        let x = (canvas_width as f32 - capture_width as f32) / 2.0;
+        let y = (canvas_height as f32 - capture_height as f32) / 2.0;
+        let radius = shortest * 0.12 * (self.corners as f32 / 100.0);
+        let stroke_scale = shortest / 800.0;
+        let border_width = if self.border {
+            shortest * (0.002 + 0.078 * self.border_thickness as f32 / 100.0)
+        } else {
+            0.0
+        };
+        let border_colors = [0xffc928, 0x22b45d, 0x22bfc2, 0x3678ef, 0x8c4ce8, 0xec3d87];
+        let border_color = border_colors[self.border_color.min(border_colors.len() - 1)];
+        let capture_href = xml_escape(&capture_path.to_string_lossy());
+        let mut svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{canvas_width}" height="{canvas_height}" viewBox="0 0 {canvas_width} {canvas_height}"><defs><clipPath id="captureClip"><rect x="{x}" y="{y}" width="{capture_width}" height="{capture_height}" rx="{radius}"/></clipPath>"#
+        );
+        if self.wallpaper_tab == 1 {
+            let gradient =
+                GRADIENT_BACKGROUNDS[self.gradient_index.min(GRADIENT_BACKGROUNDS.len() - 1)];
+            let _ = write!(
+                svg,
+                "<linearGradient id=\"pageFill\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0\" stop-color=\"#{:06x}\"/><stop offset=\".5\" stop-color=\"#{:06x}\"/><stop offset=\"1\" stop-color=\"#{:06x}\"/></linearGradient>",
+                gradient.colors[0], gradient.colors[1], gradient.colors[2]
+            );
+        }
+        let shadow_strength = self.shadow as f32 / 100.0;
+        let (blur, dy, opacity) = match self.shadow_style {
+            0 => (40.0, 8.0, 0.24),
+            1 => (52.0, 34.0, 0.28),
+            2 => (62.0, 0.0, 0.20),
+            _ => (20.0, 10.0, 0.34),
+        };
+        let _ = write!(svg, "<filter id=\"dropShadow\" x=\"-50%\" y=\"-50%\" width=\"200%\" height=\"220%\"><feGaussianBlur stdDeviation=\"{}\"/><feOffset dy=\"{}\"/><feComponentTransfer><feFuncA type=\"linear\" slope=\"{}\"/></feComponentTransfer></filter></defs>", blur * shadow_strength, dy * shadow_strength, opacity * shadow_strength);
+
+        match self.wallpaper_tab {
+            0 => {
+                let color = SOLID_BACKGROUNDS[self.color_index.min(SOLID_BACKGROUNDS.len() - 1)].1;
+                let _ = write!(
+                    svg,
+                    "<rect width=\"100%\" height=\"100%\" fill=\"#{color:06x}\"/>"
+                );
+            }
+            1 => svg.push_str("<rect width=\"100%\" height=\"100%\" fill=\"url(#pageFill)\"/>"),
+            _ => {
+                // Resolve bundled wallpapers against the same asset root the
+                // live preview uses, never the process working directory.
+                let wallpaper = self.custom_wallpaper.clone().unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("assets")
+                        .join(self.wallpaper_asset)
+                });
+                let href = xml_escape(&wallpaper.to_string_lossy());
+                let _ = write!(svg, "<image href=\"{href}\" width=\"{canvas_width}\" height=\"{canvas_height}\" preserveAspectRatio=\"xMidYMid slice\"/>");
+            }
+        }
+        if self.shadow > 0 {
+            let _ = write!(svg, "<rect x=\"{x}\" y=\"{y}\" width=\"{capture_width}\" height=\"{capture_height}\" rx=\"{radius}\" fill=\"black\" filter=\"url(#dropShadow)\"/>");
+        }
+        let _ = write!(svg, "<image href=\"{capture_href}\" x=\"{x}\" y=\"{y}\" width=\"{capture_width}\" height=\"{capture_height}\" preserveAspectRatio=\"none\" clip-path=\"url(#captureClip)\"/><g clip-path=\"url(#captureClip)\">");
+
+        svg.push_str(&self.annotations_svg(x, y, capture_width, capture_height, stroke_scale));
         svg.push_str("</g>");
         if border_width > 0.0 && self.border_opacity > 0 {
             let opacity = self.border_opacity as f32 / 100.0;
@@ -5521,6 +5376,27 @@ impl Studio {
             .or_else(|| self.captured_path.clone());
         let displayed_capture_image = self.displayed_capture_image.clone();
         let needs_path_fallback = displayed_capture_image.is_none();
+        let animation_active = self.animation_active;
+        // While animating, the still image is cropped by the same viewport
+        // the exporter uses; annotations move with it.
+        let (view_zoom, view_left, view_top) = if animation_active {
+            let frame = self.video_viewport_timeline.frame_at(self.video_position);
+            let (left, top, _) = visible_rect(frame);
+            (frame.magnification.max(1.0) as f32, left as f32, top as f32)
+        } else {
+            (1.0, 0.0, 0.0)
+        };
+        let media_bounds_store = self.video_media_bounds.clone();
+        let zoomed = move |bounds: Bounds<Pixels>| Bounds {
+            origin: point(
+                bounds.origin.x - bounds.size.width * view_zoom * view_left,
+                bounds.origin.y - bounds.size.height * view_zoom * view_top,
+            ),
+            size: size(
+                bounds.size.width * view_zoom,
+                bounds.size.height * view_zoom,
+            ),
+        };
         div()
             .id("editable-canvas")
             .w(canvas_width)
@@ -5625,12 +5501,9 @@ impl Studio {
                                     .text_color(ink())
                                     .child("Nothing captured yet"),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(muted())
-                                    .child("Take a screenshot, record your screen, or open a saved recording"),
-                            )
+                            .child(div().text_sm().text_color(muted()).child(
+                                "Take a screenshot, record your screen, or open a saved recording",
+                            ))
                             .child(
                                 div()
                                     .mt_2()
@@ -5720,7 +5593,7 @@ impl Studio {
                                             })),
                                     ),
                             )
-                    })
+                    }),
             )
             .when_some(displayed_capture_image, |this, image| {
                 this.child(
@@ -5734,7 +5607,11 @@ impl Studio {
                         .rounded(corner_radius)
                         .child(
                             img(image)
-                                .size_full()
+                                .absolute()
+                                .left(-(image_width * view_zoom * view_left))
+                                .top(-(image_height * view_zoom * view_top))
+                                .w(image_width * view_zoom)
+                                .h(image_height * view_zoom)
                                 .object_fit(ObjectFit::Contain)
                                 .rounded(corner_radius),
                         ),
@@ -5777,17 +5654,21 @@ impl Studio {
                             border,
                             border_thickness,
                         );
+                        if let Ok(mut stored) = media_bounds_store.lock() {
+                            *stored = Some(image_bounds);
+                        }
+                        let paint_bounds = zoomed(image_bounds);
                         let annotation_bounds = window.with_content_mask(
                             Some(ContentMask {
                                 bounds: image_bounds,
                             }),
                             |window| {
-                                paint_highlights(&annotations, image_bounds, window);
+                                paint_highlights(&annotations, paint_bounds, window);
                                 let mut annotation_bounds = Vec::with_capacity(annotations.len());
                                 for (index, mark) in annotations.iter().enumerate() {
                                     let rendered_bounds = paint_annotation(
                                         mark,
-                                        image_bounds,
+                                        paint_bounds,
                                         index >= committed_count,
                                         editing_text == Some(index) && caret_visible,
                                         window,
@@ -5856,7 +5737,16 @@ impl Studio {
                                 }
                                 entity.update(cx, |this, cx| {
                                     this.focus_handle.focus(window);
-                                    if this.crop_active {
+                                    if animation_active {
+                                        // Motion mode: clicks choose the focus.
+                                        if this.video_selected_zoom_cue.is_some() {
+                                            this.pin_selected_zoom_cue_at(event.position, cx);
+                                        } else {
+                                            this.toast = Some(
+                                                "Select a motion region to set its focus".into(),
+                                            );
+                                        }
+                                    } else if this.crop_active {
                                         this.crop_pointer_down(event.position, image_bounds);
                                     } else {
                                         this.pointer_down(
@@ -5876,6 +5766,9 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if animation_active {
+                                        return;
+                                    }
                                     if this.crop_active {
                                         this.crop_pointer_move(event.position, image_bounds);
                                     } else {
@@ -5890,7 +5783,9 @@ impl Studio {
                                 return;
                             }
                             entity.update(cx, |this, cx| {
-                                if this.crop_active {
+                                if animation_active {
+                                    this.pointer_is_down = false;
+                                } else if this.crop_active {
                                     this.crop_drag = None;
                                     this.pointer_is_down = false;
                                 } else if this.pointer_up(event.position, image_bounds) {
@@ -5949,6 +5844,11 @@ impl Studio {
             cx,
         );
         let fill_picker = self.fill_picker(cx);
+        let motion_panel = self.motion_inspector(cx);
+        let show_scene_panel = motion_panel.is_none();
+        let motion_overview = self.motion_overview_section(cx);
+        let export_format_picker = self.export_format_picker(cx);
+        let export_overlay = self.export_status_overlay(cx);
         let padding_control = self.slider_row(
             "Padding",
             self.padding,
@@ -6088,7 +5988,7 @@ impl Studio {
                     div()
                         .h_full()
                         .w(px(
-                            (clip.gap_before / timeline_duration * timeline_content_width) as f32
+                            (clip.gap_before / timeline_duration * timeline_content_width) as f32,
                         ))
                         .flex_none()
                         .into_any_element()
@@ -6204,144 +6104,7 @@ impl Studio {
                 spacer.into_iter().chain(std::iter::once(clip_element))
             })
             .collect();
-        let selected_zoom_cue = self.video_selected_zoom_cue;
-        let mut zoom_lane: Vec<AnyElement> = Vec::new();
-        let mut segment_slot_start = 0.0;
-        for (segment_index, segment) in self.video_clip_timeline.segments.iter().enumerate() {
-            let segment_editor_start = segment_slot_start + segment.gap_before;
-            for cue in self.video_zoom_cues.iter().filter(|cue| cue.is_enabled) {
-                let overlap_start = cue.start.max(segment.source_start);
-                let overlap_end = cue.end.min(segment.source_end);
-                if overlap_end - overlap_start <= f64::EPSILON {
-                    continue;
-                }
-                let cue_id = cue.id;
-                let editor_start =
-                    segment_editor_start + (overlap_start - segment.source_start) / segment.speed;
-                let editor_end =
-                    segment_editor_start + (overlap_end - segment.source_start) / segment.speed;
-                let left = editor_start / timeline_duration * timeline_content_width;
-                let width = ((editor_end - editor_start) / timeline_duration
-                    * timeline_content_width)
-                    .max(24.0);
-                let selected = selected_zoom_cue == Some(cue_id);
-                let zoom = cue.zoom;
-                zoom_lane.push(
-                    div()
-                        .id((
-                            "video-zoom-cue",
-                            (cue_id.as_u128() as u64).wrapping_add(segment_index as u64),
-                        ))
-                        .absolute()
-                        .left(px(left as f32))
-                        .top(px(3.0))
-                        .w(px(width as f32))
-                        .h(px(24.0))
-                        .rounded_md()
-                        .border_2()
-                        .border_color(if selected {
-                            hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
-                        } else {
-                            hsla(0.0, 0.0, 0.0, 0.0)
-                        })
-                        .bg(if selected {
-                            hsla(271.0 / 360.0, 0.72, 0.56, 1.0)
-                        } else {
-                            hsla(271.0 / 360.0, 0.72, 0.62, 1.0)
-                        })
-                        .text_color(rgb(0xffffff))
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor(CursorStyle::PointingHand)
-                        .child(format!("{zoom:.1}×"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.video_selected_zoom_cue = Some(cue_id);
-                            this.video_selected_clip = None;
-                            this.seek_video(editor_start, cx);
-                            cx.notify();
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.begin_video_zoom_drag(
-                                    cue_id,
-                                    VideoZoomDragKind::Move,
-                                    editor_start,
-                                    editor_end,
-                                    event.position.x,
-                                );
-                                cx.notify();
-                            }),
-                        )
-                        .when(selected, |this| {
-                            this.child(
-                                div()
-                                    .id((
-                                        "video-zoom-leading",
-                                        cue_id.as_u128() as u64 ^ segment_index as u64,
-                                    ))
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .w(px(10.0))
-                                    .h_full()
-                                    .rounded_l_md()
-                                    .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.begin_video_zoom_drag(
-                                                cue_id,
-                                                VideoZoomDragKind::Leading,
-                                                editor_start,
-                                                editor_end,
-                                                event.position.x,
-                                            );
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id((
-                                        "video-zoom-trailing",
-                                        cue_id.as_u128() as u64 ^ !(segment_index as u64),
-                                    ))
-                                    .absolute()
-                                    .right_0()
-                                    .top_0()
-                                    .w(px(10.0))
-                                    .h_full()
-                                    .rounded_r_md()
-                                    .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.begin_video_zoom_drag(
-                                                cue_id,
-                                                VideoZoomDragKind::Trailing,
-                                                editor_start,
-                                                editor_end,
-                                                event.position.x,
-                                            );
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                        })
-                        .into_any_element(),
-                );
-            }
-            segment_slot_start += segment.slot_duration();
-        }
+        let motion_track = self.motion_track(timeline_scroll, timeline_content_width, progress, cx);
 
         div()
             .size_full()
@@ -6412,7 +6175,13 @@ impl Studio {
                     } else if this.video_seek_drag.take().is_some() {
                         this.seek_video(this.video_position, cx);
                     }
-                    this.slider_drag = None;
+                    if this
+                        .slider_drag
+                        .take()
+                        .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER)
+                    {
+                        this.persist_video_zoom_cues(cx);
+                    }
                 }),
             )
             .child(
@@ -6574,6 +6343,7 @@ impl Studio {
                                         this.open_video_project_dialog(cx)
                                     })),
                             )
+                            .child(export_format_picker)
                             .child(
                                 div()
                                     .id("video-export")
@@ -6593,9 +6363,9 @@ impl Studio {
                                             .text_color(ink()),
                                     )
                                     .child("Export")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.export_video_recording(cx)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_video_recording(cx)
+                                    })),
                             )
                             .child(div().w(px(1.0)).h(px(22.0)).bg(line()))
                             .child(div().text_sm().text_color(muted()).child(project_name))
@@ -6707,69 +6477,64 @@ impl Studio {
                                     ),
                             )
                             .child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .text_xs()
-                                            .child(
-                                                div()
-                                                    .id("video-timeline-zoom-out")
-                                                    .size(px(28.0))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded_md()
-                                                    .cursor_pointer()
-                                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                                    .child("−")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.zoom_video_timeline(
-                                                            1.0 / 1.25,
-                                                            this.video_position,
-                                                        );
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("video-timeline-fit")
-                                                    .w(px(42.0))
-                                                    .text_center()
-                                                    .cursor_pointer()
-                                                    .child(format!("{timeline_zoom:.1}×"))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.video_timeline_zoom = 1.0;
-                                                        this.video_timeline_scroll = 0.0;
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("video-timeline-zoom-in")
-                                                    .size(px(28.0))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded_md()
-                                                    .cursor_pointer()
-                                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                                    .child("+")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.zoom_video_timeline(
-                                                            1.25,
-                                                            this.video_position,
-                                                        );
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    ),
+                                div().flex_1().flex().items_center().justify_end().child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .id("video-timeline-zoom-out")
+                                                .size(px(28.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(rgb(0xeeeeef)))
+                                                .child("−")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.zoom_video_timeline(
+                                                        1.0 / 1.25,
+                                                        this.video_position,
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("video-timeline-fit")
+                                                .w(px(42.0))
+                                                .text_center()
+                                                .cursor_pointer()
+                                                .child(format!("{timeline_zoom:.1}×"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.video_timeline_zoom = 1.0;
+                                                    this.video_timeline_scroll = 0.0;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("video-timeline-zoom-in")
+                                                .size(px(28.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(rgb(0xeeeeef)))
+                                                .child("+")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.zoom_video_timeline(
+                                                        1.25,
+                                                        this.video_position,
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                ),
                             ),
                     )
                     .child(
@@ -6780,52 +6545,54 @@ impl Studio {
                             .items_center()
                             .justify_center()
                             .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(320.0))
-                            .h(px(90.0))
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .gap_1()
-                            .cursor(CursorStyle::ResizeLeftRight)
                             .child(
                                 div()
-                                    .id("video-ruler")
-                                    .relative()
-                                    .w_full()
-                                    .h(px(16.0))
-                                    .flex_none()
-                                    .overflow_hidden()
+                                    .flex_1()
+                                    .min_w(px(320.0))
+                                    .h(px(90.0))
+                                    .flex()
+                                    .flex_col()
+                                    .justify_center()
+                                    .gap_1()
+                                    .cursor(CursorStyle::ResizeLeftRight)
                                     .child(
                                         div()
-                                            .absolute()
-                                            .left(px(-(timeline_scroll as f32)))
-                                            .top_0()
-                                            .w(px(timeline_content_width as f32))
-                                            .h_full()
-                                            .children(ruler_marks)
+                                            .id("video-ruler")
+                                            .relative()
+                                            .w_full()
+                                            .h(px(16.0))
+                                            .flex_none()
+                                            .overflow_hidden()
                                             .child(
                                                 div()
                                                     .absolute()
-                                                    .left(px((timeline_content_width * progress)
-                                                        as f32
-                                                        - 5.0))
-                                                    .top(px(2.0))
-                                                    .w(px(10.0))
-                                                    .h(px(13.0))
-                                                    .rounded_sm()
-                                                    .bg(ink()),
-                                            ),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                            this.pause_video_playback();
-                                            this.video_trim_drag = None;
-                                            this.video_zoom_drag = None;
-                                            let target = this
+                                                    .left(px(-(timeline_scroll as f32)))
+                                                    .top_0()
+                                                    .w(px(timeline_content_width as f32))
+                                                    .h_full()
+                                                    .children(ruler_marks)
+                                                    .child(
+                                                        div()
+                                                            .absolute()
+                                                            .left(px((timeline_content_width
+                                                                * progress)
+                                                                as f32
+                                                                - 5.0))
+                                                            .top(px(2.0))
+                                                            .w(px(10.0))
+                                                            .h(px(13.0))
+                                                            .rounded_sm()
+                                                            .bg(ink()),
+                                                    ),
+                                            )
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, event: &MouseDownEvent, _, cx| {
+                                                        this.pause_video_playback();
+                                                        this.video_trim_drag = None;
+                                                        this.video_zoom_drag = None;
+                                                        let target = this
                                                 .video_timeline_bounds
                                                 .lock()
                                                 .ok()
@@ -6842,89 +6609,100 @@ impl Studio {
                                                         * this.video_duration
                                                 })
                                                 .unwrap_or(this.video_position);
-                                            this.video_position = target;
-                                            this.video_seek_drag = Some((event.position.x, target));
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("video-seek-bar")
-                                    .relative()
-                                    .w_full()
-                                    .h(px(34.0))
-                                    .flex()
-                                    .overflow_hidden()
-                                    .rounded_lg()
-                                    .bg(rgb(0xECEDF1))
+                                                        this.video_position = target;
+                                                        this.video_seek_drag =
+                                                            Some((event.position.x, target));
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            ),
+                                    )
                                     .child(
                                         div()
-                                            .absolute()
-                                            .left(px(-(timeline_scroll as f32)))
-                                            .top_0()
-                                            .w(px(timeline_content_width as f32))
-                                            .h_full()
+                                            .id("video-seek-bar")
+                                            .relative()
+                                            .w_full()
+                                            .h(px(34.0))
                                             .flex()
-                                            .children(clip_lane)
+                                            .overflow_hidden()
+                                            .rounded_lg()
+                                            .bg(rgb(0xECEDF1))
                                             .child(
                                                 div()
                                                     .absolute()
-                                                    .left(px((timeline_content_width * progress)
-                                                        as f32
-                                                        - 1.0))
+                                                    .left(px(-(timeline_scroll as f32)))
                                                     .top_0()
-                                                    .w(px(2.0))
+                                                    .w(px(timeline_content_width as f32))
                                                     .h_full()
-                                                    .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.85)),
-                                            )
-                                            .when_some(
-                                                move_ghost,
-                                                |this, (ghost_left, ghost_width)| {
-                                                    this.child(
+                                                    .flex()
+                                                    .children(clip_lane)
+                                                    .child(
                                                         div()
                                                             .absolute()
-                                                            .left(px(ghost_left))
+                                                            .left(px((timeline_content_width
+                                                                * progress)
+                                                                as f32
+                                                                - 1.0))
                                                             .top_0()
+                                                            .w(px(2.0))
                                                             .h_full()
-                                                            .w(px(ghost_width))
-                                                            .rounded_md()
-                                                            .border_2()
-                                                            .border_color(hsla(
+                                                            .bg(hsla(
                                                                 222.0 / 360.0,
                                                                 0.2,
                                                                 0.15,
-                                                                0.8,
-                                                            ))
-                                                            .bg(hsla(
-                                                                217.0 / 360.0,
-                                                                0.9,
-                                                                0.6,
-                                                                0.35,
+                                                                0.85,
                                                             )),
                                                     )
-                                                },
-                                            ),
-                                    )
-                                    .child(
-                                        canvas(
-                                            move |bounds, _, _| {
-                                                if let Ok(mut stored) = timeline_bounds.lock() {
-                                                    *stored = Some(bounds);
-                                                }
-                                            },
-                                            |_, _, _, _| {},
-                                        )
-                                        .absolute()
-                                        .size_full(),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                            this.pause_video_playback();
-                                            this.video_trim_drag = None;
-                                            this.video_zoom_drag = None;
-                                            let target = this
+                                                    .when_some(
+                                                        move_ghost,
+                                                        |this, (ghost_left, ghost_width)| {
+                                                            this.child(
+                                                                div()
+                                                                    .absolute()
+                                                                    .left(px(ghost_left))
+                                                                    .top_0()
+                                                                    .h_full()
+                                                                    .w(px(ghost_width))
+                                                                    .rounded_md()
+                                                                    .border_2()
+                                                                    .border_color(hsla(
+                                                                        222.0 / 360.0,
+                                                                        0.2,
+                                                                        0.15,
+                                                                        0.8,
+                                                                    ))
+                                                                    .bg(hsla(
+                                                                        217.0 / 360.0,
+                                                                        0.9,
+                                                                        0.6,
+                                                                        0.35,
+                                                                    )),
+                                                            )
+                                                        },
+                                                    ),
+                                            )
+                                            .child(
+                                                canvas(
+                                                    move |bounds, _, _| {
+                                                        if let Ok(mut stored) =
+                                                            timeline_bounds.lock()
+                                                        {
+                                                            *stored = Some(bounds);
+                                                        }
+                                                    },
+                                                    |_, _, _, _| {},
+                                                )
+                                                .absolute()
+                                                .size_full(),
+                                            )
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, event: &MouseDownEvent, _, cx| {
+                                                        this.pause_video_playback();
+                                                        this.video_trim_drag = None;
+                                                        this.video_zoom_drag = None;
+                                                        let target = this
                                                 .video_timeline_bounds
                                                 .lock()
                                                 .ok()
@@ -6941,84 +6719,48 @@ impl Studio {
                                                         * this.video_duration
                                                 })
                                                 .unwrap_or(this.video_position);
-                                            this.video_position = target;
-                                            this.video_seek_drag = Some((event.position.x, target));
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .on_scroll_wheel(cx.listener(
-                                        |this, event: &ScrollWheelEvent, _, cx| {
-                                            let delta = match event.delta {
-                                                ScrollDelta::Pixels(delta) => (
-                                                    (delta.x / px(1.0)) as f64,
-                                                    (delta.y / px(1.0)) as f64,
+                                                        this.video_position = target;
+                                                        this.video_seek_drag =
+                                                            Some((event.position.x, target));
+                                                        cx.notify();
+                                                    },
                                                 ),
-                                                ScrollDelta::Lines(delta) => {
-                                                    (delta.x as f64 * 16.0, delta.y as f64 * 16.0)
-                                                }
-                                            };
-                                            if event.modifiers.control || event.modifiers.platform {
-                                                let factor = 2_f64.powf(delta.1 / 220.0);
-                                                this.zoom_video_timeline(
-                                                    factor,
-                                                    this.video_position,
-                                                );
-                                            } else {
-                                                let pan = if delta.0.abs() > delta.1.abs() {
-                                                    -delta.0
-                                                } else {
-                                                    -delta.1
-                                                };
-                                                this.pan_video_timeline(pan);
-                                            }
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        },
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("video-zoom-track")
-                                    .relative()
-                                    .w_full()
-                                    .h(px(30.0))
-                                    .flex_none()
-                                    .overflow_hidden()
-                                    .rounded_lg()
-                                    .bg(rgb(0xECEDF1))
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left(px(-(timeline_scroll as f32)))
-                                            .top_0()
-                                            .w(px(timeline_content_width as f32))
-                                            .h_full()
-                                            .children(zoom_lane)
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .left(px((timeline_content_width * progress)
-                                                        as f32
-                                                        - 1.0))
-                                                    .top_0()
-                                                    .w(px(2.0))
-                                                    .h_full()
-                                                    .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
-                                            ),
+                                            )
+                                            .on_scroll_wheel(cx.listener(
+                                                |this, event: &ScrollWheelEvent, _, cx| {
+                                                    let delta = match event.delta {
+                                                        ScrollDelta::Pixels(delta) => (
+                                                            (delta.x / px(1.0)) as f64,
+                                                            (delta.y / px(1.0)) as f64,
+                                                        ),
+                                                        ScrollDelta::Lines(delta) => (
+                                                            delta.x as f64 * 16.0,
+                                                            delta.y as f64 * 16.0,
+                                                        ),
+                                                    };
+                                                    if event.modifiers.control
+                                                        || event.modifiers.platform
+                                                    {
+                                                        let factor = 2_f64.powf(delta.1 / 220.0);
+                                                        this.zoom_video_timeline(
+                                                            factor,
+                                                            this.video_position,
+                                                        );
+                                                    } else {
+                                                        let pan = if delta.0.abs() > delta.1.abs() {
+                                                            -delta.0
+                                                        } else {
+                                                            -delta.1
+                                                        };
+                                                        this.pan_video_timeline(pan);
+                                                    }
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                },
+                                            )),
                                     )
-                                    .when(self.video_zoom_cues.is_empty(), |this| {
-                                        this.child(
-                                            div()
-                                                .absolute()
-                                                .left(px(10.0))
-                                                .top(px(7.0))
-                                                .text_xs()
-                                                .text_color(muted())
-                                                .child("Add a zoom to animate the viewport"),
-                                        )
-                                    }),
+                                    .child(motion_track),
                             ),
-                    )
                     ),
             )
             .when(self.inspector_visible, |this| {
@@ -7038,92 +6780,112 @@ impl Studio {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::BOLD)
-                                .child("Background"),
-                        )
-                        .child(fill_tabs)
-                        .when(self.wallpaper_tab == 2, |this| {
-                            this.child(wallpaper_sources)
-                        })
-                        .child(fill_picker)
-                        .child(
-                            div()
-                                .mt_2()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(line())
-                                .text_sm()
-                                .font_weight(FontWeight::BOLD)
-                                .child("Layout"),
-                        )
-                        .child(padding_control)
-                        .child(corner_control)
-                        .child(shadow_control)
-                        .child(div().text_xs().text_color(muted()).child("Shadow style"))
-                        .child(shadow_styles)
-                        .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
-                        .child(aspect_controls)
-                        .child(
-                            div()
-                                .mt_2()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(line())
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::BOLD)
-                                        .child("Border"),
-                                )
-                                .child(
-                                    div()
-                                        .id("video-border-toggle")
-                                        .w(px(38.0))
-                                        .h(px(22.0))
-                                        .p(px(2.0))
-                                        .rounded_full()
-                                        .cursor_pointer()
-                                        .bg(if self.border {
-                                            blue()
-                                        } else {
-                                            Hsla::from(rgb(0xd4d5d8))
-                                        })
-                                        .flex()
-                                        .justify_end()
-                                        .when(!self.border, |this| this.justify_start())
+                        .when_some(motion_panel, |this, panel| this.child(panel))
+                        .when(show_scene_panel, |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(motion_overview)
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("Background"),
+                                    )
+                                    .child(fill_tabs)
+                                    .when(self.wallpaper_tab == 2, |this| {
+                                        this.child(wallpaper_sources)
+                                    })
+                                    .child(fill_picker)
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .pt_3()
+                                            .border_t_1()
+                                            .border_color(line())
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("Layout"),
+                                    )
+                                    .child(padding_control)
+                                    .child(corner_control)
+                                    .child(shadow_control)
+                                    .child(
+                                        div().text_xs().text_color(muted()).child("Shadow style"),
+                                    )
+                                    .child(shadow_styles)
+                                    .child(
+                                        div().text_xs().text_color(muted()).child("Aspect ratio"),
+                                    )
+                                    .child(aspect_controls)
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .pt_3()
+                                            .border_t_1()
+                                            .border_color(line())
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .child("Border"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("video-border-toggle")
+                                                    .w(px(38.0))
+                                                    .h(px(22.0))
+                                                    .p(px(2.0))
+                                                    .rounded_full()
+                                                    .cursor_pointer()
+                                                    .bg(if self.border {
+                                                        blue()
+                                                    } else {
+                                                        Hsla::from(rgb(0xd4d5d8))
+                                                    })
+                                                    .flex()
+                                                    .justify_end()
+                                                    .when(!self.border, |this| this.justify_start())
+                                                    .child(
+                                                        div()
+                                                            .size(px(18.0))
+                                                            .rounded_full()
+                                                            .bg(rgb(0xffffff)),
+                                                    )
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.border = !this.border;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                    .when(self.border, |this| {
+                                        this.child(self.slider_row(
+                                            "Thickness",
+                                            self.border_thickness,
+                                            "%",
+                                            |this, value| this.border_thickness = value,
+                                            cx,
+                                        ))
                                         .child(
-                                            div().size(px(18.0)).rounded_full().bg(rgb(0xffffff)),
+                                            self.slider_row(
+                                                "Opacity",
+                                                self.border_opacity,
+                                                "%",
+                                                |this, value| this.border_opacity = value,
+                                                cx,
+                                            ),
                                         )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.border = !this.border;
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .when(self.border, |this| {
-                            this.child(self.slider_row(
-                                "Thickness",
-                                self.border_thickness,
-                                "%",
-                                |this, value| this.border_thickness = value,
-                                cx,
-                            ))
-                            .child(self.slider_row(
-                                "Opacity",
-                                self.border_opacity,
-                                "%",
-                                |this, value| this.border_opacity = value,
-                                cx,
-                            ))
+                                    }),
+                            )
                         }),
                 )
             })
+            .when_some(export_overlay, |this, overlay| this.child(overlay))
             .when_some(self.toast.clone(), |this, toast| {
                 this.child(
                     div()
@@ -7154,10 +6916,23 @@ impl Render for Studio {
         let viewport = window.viewport_size();
         let inspector_width = if self.inspector_visible { 316.0 } else { 0.0 };
         let available_canvas_width = (viewport.width - px(112.0 + inspector_width)).max(px(1.0));
-        let available_canvas_height = (viewport.height - px(212.0)).max(px(1.0));
+        let animation_strip_height = if self.animation_active { 118.0 } else { 0.0 };
+        let available_canvas_height =
+            (viewport.height - px(212.0 + animation_strip_height)).max(px(1.0));
         let (canvas_width, canvas_height) =
             self.preview_canvas_size(available_canvas_width, available_canvas_height);
         let tool_grid = self.tool_grid(cx);
+        let animate_button = self.animate_toolbar_button(cx);
+        let animation_section = self
+            .animation_active
+            .then(|| self.animation_inspector_section(cx));
+        let screenshot_motion_panel = if self.animation_active {
+            self.motion_inspector(cx)
+        } else {
+            None
+        };
+        let screenshot_export_overlay = self.export_status_overlay(cx);
+        let animation_strip = self.animation_active.then(|| self.animation_strip(cx));
         let tool_help = format!("{} — {}", self.tool.label(), self.tool.help_text());
         let annotation_styles = self.annotation_style_controls(cx);
         let tabs = self.segmented(
@@ -7288,6 +7063,10 @@ impl Render for Studio {
                 if this.captured_path.is_none() {
                     this.toast = Some("Capture an image first".into());
                     cx.notify();
+                    return;
+                }
+                if this.animation_active {
+                    this.export_animated_screenshot(cx);
                     return;
                 }
                 let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
@@ -7447,6 +7226,10 @@ impl Render for Studio {
             .flex_col()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.handle_animation_key(event, cx) {
+                    cx.notify();
+                    return;
+                }
                 if this.handle_key(event) {
                     if this.processed_capture_path.is_some() {
                         let _ = this.rebuild_redactions();
@@ -7455,17 +7238,42 @@ impl Render for Studio {
                 }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if this.update_slider_drag(event) {
+                let mut changed = this.update_slider_drag(event);
+                if this.animation_active && event.dragging() {
+                    if this.video_zoom_drag.is_some() {
+                        this.update_video_zoom_drag(event.position.x);
+                        changed = true;
+                    } else if let Some((start_x, start_position)) = this.video_seek_drag {
+                        let delta = (event.position.x - start_x) / px(1.0);
+                        let content_width =
+                            this.video_timeline_viewport_width() * this.video_timeline_zoom;
+                        this.video_position = (start_position
+                            + delta as f64 / content_width * this.video_duration)
+                            .clamp(0.0, this.video_duration);
+                        changed = true;
+                    }
+                }
+                if changed {
                     cx.notify();
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if this.video_zoom_drag.is_some() {
+                        this.commit_video_zoom_drag(cx);
+                    }
+                    this.video_seek_drag = None;
                     let rebuild = this.slider_drag.is_some_and(|drag| drag.slider_id == 5);
+                    let motion_slider = this
+                        .slider_drag
+                        .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER);
                     this.slider_drag = None;
                     if rebuild {
                         let _ = this.rebuild_redactions();
+                    }
+                    if motion_slider {
+                        this.persist_video_zoom_cues(cx);
                     }
                     cx.notify();
                 }),
@@ -7610,6 +7418,7 @@ impl Render for Studio {
                                 this.child(recording_controls)
                                     .child(capture)
                                     .child(crop)
+                                    .child(animate_button)
                                     .child(open_recording)
                                     .child(save)
                                     .child(finish_button)
@@ -7702,9 +7511,14 @@ impl Render for Studio {
                                     .size_full()
                                     .p_6()
                                     .flex()
+                                    .flex_col()
                                     .items_center()
                                     .justify_center()
-                                    .child(self.mock_capture(cx, canvas_width, canvas_height)),
+                                    .gap_4()
+                                    .child(self.mock_capture(cx, canvas_width, canvas_height))
+                                    .when_some(animation_strip, |this, strip| {
+                                        this.child(div().w(canvas_width).child(strip))
+                                    }),
                             )
                             .child(
                                 div()
@@ -7729,6 +7543,9 @@ impl Render for Studio {
                                         .text_color(rgb(0xffffff))
                                         .child(toast),
                                 )
+                            })
+                            .when_some(screenshot_export_overlay, |this, overlay| {
+                                this.child(overlay)
                             }),
                     )
                     .child(
@@ -7747,6 +7564,8 @@ impl Render for Studio {
                             .flex()
                             .flex_col()
                             .gap_3()
+                            .when_some(animation_section, |this, section| this.child(section))
+                            .when_some(screenshot_motion_panel, |this, panel| this.child(panel))
                             .child(background_preset_picker)
                             .child(
                                 div()
@@ -8093,10 +7912,23 @@ impl Render for Studio {
 }
 
 fn main() {
-    let initial_recording = std::env::args_os()
-        .skip(1)
-        .map(PathBuf::from)
-        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("screendroprec"));
+    let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let initial_recording = arguments
+        .iter()
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("screendroprec"))
+        .cloned();
+    // `screendrop shot.png` opens an existing image in the screenshot editor.
+    let initial_image = arguments
+        .iter()
+        .find(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|extension| extension.to_ascii_lowercase())
+                .is_some_and(|extension| {
+                    matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp")
+                })
+        })
+        .cloned();
     Application::new()
         .with_assets(Assets {
             base: asset_directory(),
@@ -8118,8 +7950,14 @@ fn main() {
                 },
                 move |window, cx| {
                     let window_handle = window.window_handle();
-                    let studio =
-                        cx.new(|cx| Studio::new(window_handle, initial_recording.clone(), cx));
+                    let studio = cx.new(|cx| {
+                        Studio::new(
+                            window_handle,
+                            initial_recording.clone(),
+                            initial_image.clone(),
+                            cx,
+                        )
+                    });
                     let weak = studio.downgrade();
                     window.on_window_should_close(cx, move |window, cx| {
                         weak.update(cx, |studio, cx| {

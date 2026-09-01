@@ -44,6 +44,26 @@ in native Wayland sessions and under X11/XWayland.
 cargo run
 ```
 
+## Motion editing and export
+
+Screenshots and recordings share one scene model: a background, the media
+surface (padding, corners, border, shadow), and a camera. Camera motion is
+edited as orange regions on the timeline's motion lane rather than keyframes:
+
+- Recordings open with regions synthesized from clicks. Double-click the lane
+  to add one, drag its edges to retime it, and use the inspector to change
+  its style (hold, zoom in, zoom out), magnification, target (cursor, auto,
+  pinned), focus point, and pan destination. Click the video to set the
+  focus.
+- Screenshots start static. **Animate** turns the capture into a 3–10 second
+  scene with presets (slow zoom, pan, focus, sweep) that expand into the same
+  editable regions.
+
+Export renders the whole scene, not only the source clip, with the same
+compositor that drives the preview. MP4 (H.264/AAC), WebM (VP9/Opus), and
+looping GIF are available for both recordings and animated screenshots;
+FFmpeg is required and progress can be cancelled.
+
 ## Native video recording
 
 Video recording uses the desktop ScreenCast portal and its restricted

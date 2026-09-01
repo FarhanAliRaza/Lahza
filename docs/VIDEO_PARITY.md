@@ -56,8 +56,14 @@ preview, and exported output must agree.
   2.5 s transitive join tolerance, 1 s tail exclusion, 0.8 s trailing guard,
   and 1.5× default magnification.
 - [x] Pointer, smart, and pinned anchor modes represented as project data.
-- [ ] Editable add/remove/move/resize/enable controls with undo/redo.
-- [ ] Deterministic 120 Hz viewport spring used by both preview and export.
+- [x] Editable add/remove/move/resize/enable controls with undo/redo. Motion
+  regions live on an orange timeline lane: double-click adds one at that
+  time, edges retime it, and the selection-aware inspector edits its style
+  (hold, zoom in, zoom out), magnification, target mode, focus point, pan
+  destination, and enabled state.
+- [x] Deterministic 120 Hz viewport spring used by both preview and export.
+  `ViewportTimeline` is the single camera source; the GPUI preview and the
+  CPU `SceneCompositor` read the same `visible_rect` per frame.
 - [ ] Bounds-aware framing and long-travel comfort widening.
 - [ ] Clip cuts and speed changes preserve continuous camera motion.
 
@@ -97,8 +103,27 @@ preview, and exported output must agree.
   standard Screendrop shell and uses the shared color/gradient/wallpaper
   library, padding, corners, four shadow styles, aspect presets, border, and
   collapsible inspector. Camera composition remains.
-- [ ] Preview and export share the same immutable pointer and viewport timelines.
+- [x] Preview and export share the same immutable pointer and viewport timelines.
+  `recording::export::export_scene` renders the full scene (background,
+  padding, corners, border, shadow, camera motion, reconstructed cursor and
+  click pulses) through `recording::scene::SceneCompositor`, then encodes
+  MP4 (H.264/AAC), WebM (VP9/Opus), or GIF with FFmpeg. Layout is derived
+  from `SceneGeometry`, which the preview canvas also uses.
 - [ ] Timestamped export with progress, cancellation, and stale-render detection.
+  Frame-level progress and cancellation are implemented; stale-render
+  detection remains.
+
+## Animated screenshots
+
+- [x] A screenshot opens static; **Animate** turns it into a timed scene
+  (3/5/8/10 s) edited with the same motion lane, inspector, and exporter as a
+  recording.
+- [x] Presets (slow zoom in/out, pan left/right, focus, sweep) expand into
+  ordinary editable motion regions.
+- [x] Annotations are flattened onto the capture before compositing so the
+  animated export matches the static one.
+- [x] MP4, WebM, and looping GIF export with progress and cancellation.
+- [ ] Timed annotations, 3D transforms, and background blur/noise.
 
 Rust video support must not be described as complete until all required rows are
 implemented and a manual Swift-versus-Rust behavior pass has been recorded.
