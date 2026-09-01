@@ -133,6 +133,19 @@ preview, and exported output must agree.
   layout, border, shadow, effects, pointer look, aspect, and default zoom
   strength for screenshots and recordings; Quick / Customize / Advanced
   inspector levels.
+- [x] Timed annotations on recordings: the screenshot drawing tools (text,
+  rectangle, filled rectangle, ellipse, line, arrow, pen, number, highlight)
+  work on the recording canvas, through the viewport crop and the 3D
+  projection. Each mark has a start/end on a stacking annotation lane with
+  entrance and exit effects; marks persist as `annotations` in the edit
+  document and export as a per-frame overlay through the same compositor
+  path the preview uses (verified by an FFmpeg integration test). Blur and
+  pixelate stay screenshot-only because they are baked into the still.
+- [x] Template gallery (`recording::templates`): eight curated looks that
+  set background, layout, 3D pose, motion preset with easing, and timed
+  captions; applied to a screenshot they create the animated scene, applied
+  to a recording they restyle it and add an intro while keeping later motion
+  regions. Template captions are ordinary annotations afterwards.
 
 ## Animated screenshots
 

@@ -376,6 +376,7 @@ mod tests {
             bold: false,
             italic: false,
             underline: false,
+            from_template: false,
             timing: Some(AnnotationTiming {
                 start: 1.0,
                 end: 3.0,

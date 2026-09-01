@@ -24,6 +24,7 @@ use uuid::Uuid;
 mod motion_ui;
 mod recording;
 mod scene_ui;
+mod template_ui;
 mod timed;
 
 use scene_ui::{AnnotationDrag, MediaDrag, PreviewCache, SceneSelection};
@@ -401,7 +402,8 @@ fn gradient_layers(preset: GradientPreset) -> (Background, Background) {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 enum Tool {
     Select,
     Rectangle,
@@ -468,7 +470,8 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct AnnotationMark {
     tool: Tool,
     start: NormPoint,
@@ -489,9 +492,45 @@ struct AnnotationMark {
     timing: Option<AnnotationTiming>,
     /// Painted opacity (animation applies its fade here).
     opacity: f32,
+    /// Placed by a template; replaced when another template is applied.
+    from_template: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+impl Default for AnnotationMark {
+    fn default() -> Self {
+        Self {
+            tool: Tool::Rectangle,
+            start: NormPoint::default(),
+            end: NormPoint::default(),
+            points: Vec::new(),
+            number: 1,
+            color: ANNOTATION_COLORS[1].1,
+            stroke_width: 4.0,
+            density: 0.5,
+            text: String::new(),
+            font_size: 24.0,
+            font_family: 0,
+            text_alignment: 0,
+            bold: false,
+            italic: false,
+            underline: false,
+            timing: None,
+            opacity: 1.0,
+            from_template: false,
+        }
+    }
+}
+
+/// Annotations plus their undo history, so the screenshot editor's marks
+/// survive a detour through the recording editor (which has its own set).
+#[derive(Clone, Debug, Default)]
+struct AnnotationWorkspace {
+    marks: Vec<AnnotationMark>,
+    undo: Vec<Vec<AnnotationMark>>,
+    redo: Vec<Vec<AnnotationMark>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct NormPoint {
     x: f32,
     y: f32,
@@ -785,7 +824,7 @@ fn mark_hit_bounds(mark: &AnnotationMark, image: Bounds<Pixels>) -> Bounds<Pixel
     )
 }
 
-fn paint_annotation(
+pub(crate) fn paint_annotation(
     mark: &AnnotationMark,
     image: Bounds<Pixels>,
     is_draft: bool,
@@ -1027,7 +1066,11 @@ fn paint_annotation(
     rendered_bounds
 }
 
-fn paint_highlights(marks: &[AnnotationMark], image: Bounds<Pixels>, window: &mut Window) {
+pub(crate) fn paint_highlights(
+    marks: &[AnnotationMark],
+    image: Bounds<Pixels>,
+    window: &mut Window,
+) {
     let holes: Vec<_> = marks
         .iter()
         .filter(|mark| mark.tool == Tool::Highlight)
@@ -1291,6 +1334,10 @@ struct Studio {
     capture_rgba: Option<Arc<image::RgbaImage>>,
     persisted_scene_style: Option<SceneStyle>,
     persisted_extras: Option<RecordingExtras>,
+    /// Annotations last written to the recording's edit draft.
+    persisted_annotations: Option<Vec<AnnotationMark>>,
+    /// The screenshot editor's annotations while a recording is open.
+    screenshot_annotations: AnnotationWorkspace,
     export_resolution: ExportResolution,
     export_frame_rate: f64,
     export_loop: bool,
@@ -1604,6 +1651,8 @@ impl Studio {
             capture_rgba: None,
             persisted_scene_style: None,
             persisted_extras: None,
+            persisted_annotations: None,
+            screenshot_annotations: AnnotationWorkspace::default(),
             export_resolution: ExportResolution::Original,
             export_frame_rate: 30.0,
             export_loop: true,
@@ -1715,6 +1764,54 @@ impl Studio {
                 .retain(|press| !removed.iter().any(|time| (press.time - *time).abs() < 1e-6));
         }
         capture
+    }
+
+    /// Whether annotations carry timing: recordings always do, screenshots
+    /// only once they are animated.
+    fn scene_is_timed(&self) -> bool {
+        self.animation_active || self.video_project.is_some()
+    }
+
+    /// Pixel size of the media annotations are drawn on.
+    fn media_dimensions(&self) -> Option<(u32, u32)> {
+        if self.video_project.is_some() {
+            Some(self.video_source_size)
+        } else {
+            self.captured_dimensions
+        }
+    }
+
+    /// Installs the recording's annotations (the screenshot's were stashed
+    /// when the project opened).
+    fn enter_video_annotations(&mut self, marks: Vec<AnnotationMark>) {
+        self.stop_editing_text();
+        self.annotations = marks;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.persisted_annotations = Some(self.annotations.clone());
+        self.reset_annotation_interaction();
+    }
+
+    fn reset_annotation_interaction(&mut self) {
+        self.selected_annotation = None;
+        self.editing_text = None;
+        self.annotation_draft = None;
+        self.annotation_drag = None;
+        self.selection_last_point = None;
+        self.selection_resizing = false;
+        self.pointer_is_down = false;
+        self.tool = Tool::Select;
+    }
+
+    /// Restores the screenshot editor's annotations after a recording closes.
+    fn leave_video_annotations(&mut self) {
+        self.stop_editing_text();
+        let workspace = std::mem::take(&mut self.screenshot_annotations);
+        self.annotations = workspace.marks;
+        self.undo_stack = workspace.undo;
+        self.redo_stack = workspace.redo;
+        self.persisted_annotations = None;
+        self.reset_annotation_interaction();
     }
 
     fn displayed_recording_elapsed(&self) -> Duration {
@@ -1958,6 +2055,8 @@ impl Studio {
     /// project's draft file, so reopening the recording restores them.
     fn close_video_editor(&mut self, cx: &mut Context<Self>) {
         self.pause_video_playback();
+        self.autosave_scene_style();
+        self.leave_video_annotations();
         self.video_project = None;
         self.video_frame = None;
         self.video_preview_path = None;
@@ -2076,6 +2175,13 @@ impl Studio {
         }
         self.video_source_size = (manifest.pixel_width.max(1), manifest.pixel_height.max(1));
         self.motion_pick = MotionPick::Focus;
+        if self.video_project.is_none() {
+            self.screenshot_annotations = AnnotationWorkspace {
+                marks: std::mem::take(&mut self.annotations),
+                undo: std::mem::take(&mut self.undo_stack),
+                redo: std::mem::take(&mut self.redo_stack),
+            };
+        }
         self.video_project = Some(session);
         self.set_video_frame(poster);
         self.video_pointer_timeline = pointer_timeline;
@@ -2109,6 +2215,11 @@ impl Studio {
             .read_edit_field::<RecordingExtras>("screendropExtras")
             .ok()
             .flatten();
+        let saved_annotations = session
+            .read_edit_field::<Vec<AnnotationMark>>("annotations")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         self.video_press_times = pointer_capture
             .presses
             .iter()
@@ -2123,6 +2234,7 @@ impl Studio {
         self.video_audio_muted = extras.audio_muted;
         self.video_removed_presses = extras.removed_press_times;
         self.persisted_extras = saved_extras;
+        self.enter_video_annotations(saved_annotations);
         self.video_selected_press = None;
         self.video_audio_levels.clear();
         self.video_thumbnails.clear();
@@ -3445,7 +3557,7 @@ impl Studio {
 
     fn fit_text_box_to_content(&mut self, index: usize) {
         let aspect = self
-            .captured_dimensions
+            .media_dimensions()
             .map(|(width, height)| width as f32 / height.max(1) as f32)
             .unwrap_or(16.0 / 9.0)
             .max(0.1);
@@ -3583,10 +3695,11 @@ impl Studio {
             bold: self.text_bold,
             italic: self.text_italic,
             underline: self.text_underline,
-            timing: self.animation_active.then(|| {
+            timing: self.scene_is_timed().then(|| {
                 AnnotationTiming::for_tool(self.tool, self.video_position, self.video_duration)
             }),
             opacity: 1.0,
+            from_template: false,
         };
 
         if self.tool == Tool::Number {
@@ -3715,13 +3828,47 @@ impl Studio {
         if self.handle_watermark_key(event) {
             return true;
         }
+        // Typing into a text annotation owns the keyboard.
+        if self.editing_text.is_some() {
+            return self.handle_key(event);
+        }
         let keystroke = &event.keystroke;
         if (keystroke.modifiers.control || keystroke.modifiers.platform) && keystroke.key == "z" {
             if keystroke.modifiers.shift {
-                self.redo_video_edit(cx);
-            } else {
+                if !self.redo_annotations() {
+                    self.redo_video_edit(cx);
+                }
+            } else if !self.undo_annotations() {
                 self.undo_video_edit(cx);
             }
+            return true;
+        }
+        if matches!(keystroke.key.as_str(), "delete" | "backspace") {
+            if let Some(index) = self.selected_annotation.take() {
+                if index < self.annotations.len() {
+                    self.record_annotation_undo();
+                    self.annotations.remove(index);
+                    self.toast = Some("Annotation removed".into());
+                }
+                return true;
+            }
+        }
+        if keystroke.key == "escape"
+            && (self.selected_annotation.is_some() || self.tool != Tool::Select)
+        {
+            self.selected_annotation = None;
+            self.annotation_draft = None;
+            self.tool = Tool::Select;
+            return true;
+        }
+        if keystroke.key == "v" && !keystroke.modifiers.control && !keystroke.modifiers.platform {
+            self.tool = Tool::Select;
+            return true;
+        }
+        if keystroke.key == "t" && !keystroke.modifiers.control && !keystroke.modifiers.platform {
+            self.tool = Tool::Text;
+            self.selected_annotation = None;
+            self.toast = Some("Text tool: click the recording to place a caption".into());
             return true;
         }
         match keystroke.key.as_str() {
@@ -4024,10 +4171,16 @@ fn annotations_svg(
                     let weight = if mark.bold { "700" } else { "400" };
                     let style = if mark.italic { "italic" } else { "normal" };
                     let decoration = if mark.underline { "underline" } else { "none" };
+                    // Fallbacks keep the export sans-serif on machines
+                    // without the preferred face installed.
                     let family = match mark.font_family {
-                        1 => "DejaVu Sans Condensed",
-                        2 => "Ubuntu",
-                        _ => "Noto Sans",
+                        1 => {
+                            "DejaVu Sans Condensed, DejaVu Sans, Liberation Sans Narrow, sans-serif"
+                        }
+                        2 => "Ubuntu, Cantarell, Noto Sans, DejaVu Sans, sans-serif",
+                        _ => {
+                            "Noto Sans, Inter, DejaVu Sans, Liberation Sans, Cantarell, sans-serif"
+                        }
                     };
                     let (text_x, anchor) = match mark.text_alignment {
                         1 => (left + width / 2.0, "middle"),
@@ -4323,40 +4476,140 @@ impl Studio {
             .p_1()
             .rounded_lg()
             .bg(rgb(0xf4f4f5))
-            .children(Tool::ALL.into_iter().map(|(tool, icon)| {
-                let selected = self.tool == tool;
+            .children(
+                Tool::ALL
+                    .into_iter()
+                    .filter(|(tool, _)| {
+                        // Redactions are baked into the still image; a recording
+                        // draws its overlays live, so those two tools stay out.
+                        self.video_project.is_none() || !matches!(tool, Tool::Blur | Tool::Pixelate)
+                    })
+                    .map(|(tool, icon)| {
+                        let selected = self.tool == tool;
+                        div()
+                            .id(icon)
+                            .w(px(42.0))
+                            .h(px(42.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .text_color(if selected { ink() } else { muted() })
+                            .bg(if selected {
+                                rgb(0xe2e3e5)
+                            } else {
+                                rgb(0xf4f4f5)
+                            })
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0xe8e9eb)))
+                            .child(svg().path(icon).size(px(20.0)).text_color(if selected {
+                                blue()
+                            } else {
+                                ink()
+                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.stop_editing_text();
+                                this.tool = tool;
+                                if tool != Tool::Select {
+                                    this.selected_annotation = None;
+                                    this.editing_text = None;
+                                }
+                                this.toast = Some(format!("{:?} tool selected", tool).into());
+                                cx.notify();
+                            }))
+                    }),
+            )
+    }
+
+    /// Recording inspector: drawing tools with a one-line hint.
+    pub(crate) fn video_annotate_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hint = if self.annotations.is_empty() {
+            "Pick a tool and draw on the recording. Marks appear at the playhead and animate in."
+                .to_string()
+        } else {
+            format!("{} — {}", self.tool.label(), self.tool.help_text())
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
                 div()
-                    .id(icon)
-                    .w(px(42.0))
-                    .h(px(42.0))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .text_color(if selected { ink() } else { muted() })
-                    .bg(if selected {
-                        rgb(0xe2e3e5)
-                    } else {
-                        rgb(0xf4f4f5)
-                    })
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0xe8e9eb)))
-                    .child(svg().path(icon).size(px(20.0)).text_color(if selected {
-                        blue()
-                    } else {
-                        ink()
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.stop_editing_text();
-                        this.tool = tool;
-                        if tool != Tool::Select {
-                            this.selected_annotation = None;
-                            this.editing_text = None;
-                        }
-                        this.toast = Some(format!("{:?} tool selected", tool).into());
-                        cx.notify();
-                    }))
-            }))
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Annotate"),
+                    )
+                    .when(!self.annotations.is_empty(), |this| {
+                        this.child(div().text_xs().text_color(muted()).child(format!(
+                            "{} mark{}",
+                            self.annotations.len(),
+                            if self.annotations.len() == 1 { "" } else { "s" }
+                        )))
+                    }),
+            )
+            .child(self.tool_grid(cx))
+            .child(div().text_xs().text_color(muted()).child(hint))
+            .into_any_element()
+    }
+
+    /// Inspector shown while an annotation is selected or a drawing tool is
+    /// active in the recording editor: tools, style, then timing.
+    fn video_annotation_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selected = self
+            .selected_annotation
+            .filter(|index| *index < self.annotations.len());
+        if selected.is_none() && self.tool == Tool::Select {
+            return None;
+        }
+        let timing = self.annotation_timing_inspector(cx);
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(self.video_annotate_section(cx))
+                .child(self.annotation_style_controls(cx))
+                .when_some(timing, |this, panel| this.child(panel))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(selected.is_some(), |this| {
+                            this.child(self.small_button(
+                                "video-annotation-delete",
+                                "Delete mark",
+                                true,
+                                cx,
+                                |this, _| {
+                                    if let Some(index) = this.selected_annotation.take() {
+                                        if index < this.annotations.len() {
+                                            this.record_annotation_undo();
+                                            this.annotations.remove(index);
+                                        }
+                                    }
+                                },
+                            ))
+                        })
+                        .child(self.small_button(
+                            "video-annotation-done",
+                            "Done",
+                            true,
+                            cx,
+                            |this, _| {
+                                this.stop_editing_text();
+                                this.selected_annotation = None;
+                                this.tool = Tool::Select;
+                            },
+                        )),
+                )
+                .into_any_element(),
+        )
     }
 
     fn segmented<F>(
@@ -5951,18 +6204,30 @@ impl Studio {
         } else {
             0.0
         };
-        let available_height = (viewport.height - px(372.0 + camera_lane_height)).max(px(220.0));
+        let annotation_lane_height = if self.annotations.is_empty() {
+            0.0
+        } else {
+            self.annotation_lane_height() + 4.0
+        };
+        let lane_extra = camera_lane_height + annotation_lane_height;
+        let available_height = (viewport.height - px(372.0 + lane_extra)).max(px(220.0));
         let (video_canvas_width, video_canvas_height) =
             self.preview_canvas_size(available_width, available_height);
         let video_canvas = self.scene_canvas(video_canvas_width, video_canvas_height, cx);
         let recording_controls = self.recording_controls(cx);
         let motion_panel = self.motion_inspector(cx);
-        let transform_panel = if motion_panel.is_none() {
+        let annotation_panel = if motion_panel.is_none() {
+            self.video_annotation_panel(cx)
+        } else {
+            None
+        };
+        let transform_panel = if motion_panel.is_none() && annotation_panel.is_none() {
             self.transform_inspector(cx)
         } else {
             None
         };
-        let show_scene_panel = motion_panel.is_none() && transform_panel.is_none();
+        let show_scene_panel =
+            motion_panel.is_none() && annotation_panel.is_none() && transform_panel.is_none();
         let scene_panel = show_scene_panel.then(|| self.video_scene_panel(cx));
         let export_format_picker = self.export_format_picker(cx);
         let export_overlay = self.export_status_overlay(cx);
@@ -6203,6 +6468,8 @@ impl Studio {
             })
             .collect();
         let motion_track = self.motion_track(timeline_scroll, timeline_content_width, progress, cx);
+        let annotation_track =
+            self.annotation_track(timeline_scroll, timeline_content_width, progress, cx);
 
         div()
             .size_full()
@@ -6221,7 +6488,11 @@ impl Studio {
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let mut changed = this.update_slider_drag(event);
-                if event.dragging() && this.media_drag.is_some() {
+                if event.dragging() && this.annotation_drag.is_some() {
+                    if this.update_annotation_drag(event.position.x) {
+                        changed = true;
+                    }
+                } else if event.dragging() && this.media_drag.is_some() {
                     if this.update_media_drag(event.position) {
                         changed = true;
                     }
@@ -6263,6 +6534,9 @@ impl Studio {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.end_media_drag() {
+                        cx.notify();
+                    }
+                    if this.end_annotation_drag() {
                         cx.notify();
                     }
                     if let Some(drag) = this.video_move_drag.take() {
@@ -6644,7 +6918,7 @@ impl Studio {
                     )
                     .child(
                         div()
-                            .h(px(148.0 + camera_lane_height))
+                            .h(px(148.0 + lane_extra))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -6654,7 +6928,7 @@ impl Studio {
                                 div()
                                     .flex_1()
                                     .min_w(px(320.0))
-                                    .h(px(126.0 + camera_lane_height))
+                                    .h(px(126.0 + lane_extra))
                                     .flex()
                                     .flex_col()
                                     .justify_center()
@@ -6871,6 +7145,7 @@ impl Studio {
                                             )),
                                     )
                                     .child(motion_track)
+                                    .when_some(annotation_track, |this, lane| this.child(lane))
                                     .when_some(camera_lane, |this, lane| this.child(lane))
                                     .when_some(audio_lane, |this, lane| this.child(lane)),
                             ),
@@ -6894,6 +7169,7 @@ impl Studio {
                         .flex_col()
                         .gap_3()
                         .when_some(motion_panel, |this, panel| this.child(panel))
+                        .when_some(annotation_panel, |this, panel| this.child(panel))
                         .when_some(transform_panel, |this, panel| this.child(panel))
                         .when_some(scene_panel, |this, panel| this.child(panel)),
                 )
@@ -6965,6 +7241,7 @@ impl Render for Studio {
         let screenshot_watermark = self.watermark_section(cx);
         let screenshot_export = self.animation_active.then(|| self.export_section(cx));
         let screenshot_presets = self.preset_library_section(cx);
+        let screenshot_templates = self.template_gallery_section(cx);
         let tool_help = format!("{} — {}", self.tool.label(), self.tool.help_text());
         let annotation_styles = self.annotation_style_controls(cx);
         let tabs = self.segmented(
@@ -7611,6 +7888,7 @@ impl Render for Studio {
                             .when_some(screenshot_motion_panel, |this, panel| this.child(panel))
                             .when_some(screenshot_transform_panel, |this, panel| this.child(panel))
                             .when_some(screenshot_timing_panel, |this, panel| this.child(panel))
+                            .child(screenshot_templates)
                             .child(background_preset_picker)
                             .child(screenshot_presets)
                             .child(

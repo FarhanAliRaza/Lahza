@@ -4,9 +4,10 @@
 //! export options, the preset library, and timed annotations.
 
 use gpui::{
-    canvas, div, hsla, img, point, prelude::*, px, quad, rgb, size, AnyElement, Bounds, Context,
-    CursorStyle, FontWeight, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
-    PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, Window,
+    canvas, div, hsla, img, point, prelude::*, px, quad, rgb, size, AnyElement, Bounds,
+    ContentMask, Context, CursorStyle, FontWeight, Hsla, KeyDownEvent, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage,
+    ScrollDelta, ScrollWheelEvent, Window,
 };
 use image::RgbaImage;
 use std::{
@@ -15,7 +16,8 @@ use std::{
 };
 
 use crate::{
-    annotations_svg, blue, cached_render_image, ink, line, muted,
+    annotations_svg, blue, cached_render_image, ink, line, muted, paint_annotation,
+    paint_highlights,
     recording::{
         export::{estimate_size_bytes, format_size, ExportFormat, ExportResolution},
         model::NormalizedPoint,
@@ -27,7 +29,7 @@ use crate::{
         viewport::{MotionEasing, ViewportFrame},
     },
     timed::{self, AnnotationTiming, EntranceEffect, ExitEffect},
-    AnnotationMark, SliderDrag, Studio, BACKGROUND_PRESETS,
+    AnnotationMark, SliderDrag, Studio, Tool, BACKGROUND_PRESETS,
 };
 
 /// Which part of the scene the inspector is editing.
@@ -420,6 +422,17 @@ impl Studio {
             }
             self.persisted_extras = Some(extras);
         }
+        // Annotations save once an interaction settles, not per drag frame.
+        let interacting = self.pointer_is_down
+            || self.annotation_draft.is_some()
+            || self.annotation_drag.is_some()
+            || self.editing_text.is_some();
+        if !interacting && self.persisted_annotations.as_ref() != Some(&self.annotations) {
+            if let Err(error) = session.write_edit_field("annotations", &self.annotations) {
+                self.toast = Some(format!("Could not autosave annotations: {error}").into());
+            }
+            self.persisted_annotations = Some(self.annotations.clone());
+        }
     }
 
     pub(crate) fn set_scene_slider(&mut self, id: usize, value: u8) -> bool {
@@ -609,11 +622,11 @@ impl Studio {
     /// Flattened annotation layer for the current time when the media is
     /// transformed (GPUI cannot paint annotations through a 3D projection).
     fn preview_overlay(&mut self, time: f64) -> Option<(u64, Arc<RgbaImage>)> {
-        if self.video_project.is_some() || self.annotations.is_empty() {
+        if self.annotations.is_empty() {
             return None;
         }
-        let (width, height) = self.captured_dimensions?;
-        let marks = if self.animation_active {
+        let (width, height) = self.media_dimensions()?;
+        let marks = if self.scene_is_timed() {
             timed::active_marks(&self.annotations, time)
         } else {
             self.annotations.clone()
@@ -1064,7 +1077,7 @@ impl Studio {
     /// authored transform and no animated tilt).
     pub(crate) fn annotations_paint_flat(&self) -> bool {
         self.scene_transform.is_identity()
-            && (!self.animation_active
+            && (!self.scene_is_timed()
                 || self
                     .video_viewport_timeline
                     .frame_at(self.video_position)
@@ -1295,10 +1308,37 @@ impl Studio {
         let image = self.scene_preview_image(canvas_width, canvas_height);
         let bounds_store = self.scene_canvas_bounds.clone();
         let media_bounds_store = self.video_media_bounds.clone();
-        let (_, projection) =
+        let (geometry, projection) =
             self.preview_projection(f32::from(canvas_width), f32::from(canvas_height));
         let show_handles = self.scene_selection == SceneSelection::Media;
         let picking = self.video_selected_zoom_cue.is_some();
+        let entity = cx.entity();
+        let time = self.video_position;
+        // Annotations paint flat over the media rect; a transformed card
+        // hands them to the compositor instead (see `scene_preview_image`).
+        let paint_flat = self.annotations_paint_flat();
+        let select_tool = self.tool == Tool::Select;
+        let text_cursor = self.tool == Tool::Text || self.editing_text.is_some();
+        let committed_count = self.annotations.len();
+        let mut marks = self.annotations.clone();
+        if let Some(draft) = self.annotation_draft.clone() {
+            marks.push(draft);
+        }
+        let mut painted = Vec::with_capacity(marks.len());
+        let mut painted_indices = Vec::with_capacity(marks.len());
+        for (index, mark) in marks.iter().enumerate() {
+            if let Some(animated) = timed::animated_mark(mark, time) {
+                painted.push(animated);
+                painted_indices.push(index);
+            }
+        }
+        let selected_annotation = self.selected_annotation;
+        let editing_text = self.editing_text;
+        let caret_visible = self.caret_visible;
+        let frame = self.video_viewport_timeline.frame_at(time);
+        let (view_left, view_top, _) = crate::recording::viewport::visible_rect(frame);
+        let view_zoom = frame.magnification.max(1.0) as f32;
+        let media_rect = geometry.media;
         div()
             .id("scene-canvas")
             .w(canvas_width)
@@ -1318,53 +1358,194 @@ impl Studio {
                         if let Ok(mut stored) = bounds_store.lock() {
                             *stored = Some(bounds);
                         }
+                        let media = Bounds {
+                            origin: point(
+                                bounds.origin.x + px(media_rect.x as f32),
+                                bounds.origin.y + px(media_rect.y as f32),
+                            ),
+                            size: size(px(media_rect.width as f32), px(media_rect.height as f32)),
+                        };
                         if let Ok(mut stored) = media_bounds_store.lock() {
-                            *stored = Some(Bounds {
-                                origin: point(
-                                    bounds.origin.x + px(projection.bounds.x as f32),
-                                    bounds.origin.y + px(projection.bounds.y as f32),
-                                ),
-                                size: size(
-                                    px(projection.bounds.width as f32),
-                                    px(projection.bounds.height as f32),
-                                ),
-                            });
+                            *stored = Some(media);
                         }
-                        bounds
+                        (bounds, media)
                     },
-                    move |_, bounds, window, _| {
-                        if !show_handles {
-                            return;
+                    move |_, (bounds, media), window, cx| {
+                        // The full media through the current viewport crop.
+                        let interaction_bounds = Bounds {
+                            origin: point(
+                                media.origin.x - media.size.width * view_zoom * view_left as f32,
+                                media.origin.y - media.size.height * view_zoom * view_top as f32,
+                            ),
+                            size: size(media.size.width * view_zoom, media.size.height * view_zoom),
+                        };
+                        let annotation_bounds = window.with_content_mask(
+                            Some(ContentMask { bounds: media }),
+                            |window| {
+                                if !paint_flat {
+                                    return Vec::new();
+                                }
+                                paint_highlights(&painted, interaction_bounds, window);
+                                let mut rendered = Vec::with_capacity(painted.len());
+                                for (slot, mark) in painted.iter().enumerate() {
+                                    let index = painted_indices[slot];
+                                    let rendered_bounds = paint_annotation(
+                                        mark,
+                                        interaction_bounds,
+                                        index >= committed_count,
+                                        editing_text == Some(index) && caret_visible,
+                                        window,
+                                        cx,
+                                    );
+                                    rendered.push(rendered_bounds);
+                                    if selected_annotation == Some(index) {
+                                        window.paint_quad(quad(
+                                            rendered_bounds,
+                                            px(3.0),
+                                            hsla(0.0, 0.0, 0.0, 0.0),
+                                            px(2.0),
+                                            rgb(0x2997ff),
+                                            Default::default(),
+                                        ));
+                                        window.paint_quad(quad(
+                                            Bounds {
+                                                origin: point(
+                                                    rendered_bounds.origin.x
+                                                        + rendered_bounds.size.width
+                                                        - px(5.0),
+                                                    rendered_bounds.origin.y
+                                                        + rendered_bounds.size.height
+                                                        - px(5.0),
+                                                ),
+                                                size: size(px(10.0), px(10.0)),
+                                            },
+                                            px(5.0),
+                                            rgb(0xffffff),
+                                            px(2.0),
+                                            rgb(0x2997ff),
+                                            Default::default(),
+                                        ));
+                                    }
+                                }
+                                rendered
+                            },
+                        );
+                        if show_handles {
+                            paint_selection_handles(&projection, bounds, window);
                         }
-                        paint_selection_handles(&projection, bounds, window);
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |event: &MouseDownEvent, _, window, cx| {
+                                if event.button != MouseButton::Left
+                                    || !bounds.contains(&event.position)
+                                {
+                                    return;
+                                }
+                                entity.update(cx, |this, cx| {
+                                    this.focus_handle.focus(window);
+                                    let flat = this.flat_pointer_position(
+                                        event.position,
+                                        bounds,
+                                        interaction_bounds,
+                                    );
+                                    if this.video_selected_zoom_cue.is_some() {
+                                        // A selected motion region takes focus picks.
+                                        this.scene_pointer_down(
+                                            event.position,
+                                            bounds,
+                                            &event.modifiers,
+                                            event.click_count,
+                                            cx,
+                                        );
+                                    } else if !select_tool {
+                                        this.pause_video_playback();
+                                        if interaction_bounds.contains(&flat) {
+                                            this.pointer_down(
+                                                flat,
+                                                interaction_bounds,
+                                                &annotation_bounds,
+                                            );
+                                        }
+                                    } else {
+                                        if interaction_bounds.contains(&flat)
+                                            && !this.annotations.is_empty()
+                                        {
+                                            this.pointer_down(
+                                                flat,
+                                                interaction_bounds,
+                                                &annotation_bounds,
+                                            );
+                                        }
+                                        if this.selected_annotation.is_some() {
+                                            this.video_selected_zoom_cue = None;
+                                            this.video_selected_press = None;
+                                            this.scene_selection = SceneSelection::Scene;
+                                        } else {
+                                            this.toast = None;
+                                            this.scene_pointer_down(
+                                                event.position,
+                                                bounds,
+                                                &event.modifiers,
+                                                event.click_count,
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |event: &MouseMoveEvent, _, _, cx| {
+                                if !event.dragging() {
+                                    return;
+                                }
+                                entity.update(cx, |this, cx| {
+                                    if this.media_drag.is_some() || !this.pointer_is_down {
+                                        return;
+                                    }
+                                    let flat = this.flat_pointer_position(
+                                        event.position,
+                                        bounds,
+                                        interaction_bounds,
+                                    );
+                                    this.pointer_move(flat, interaction_bounds);
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
+                            if event.button != MouseButton::Left {
+                                return;
+                            }
+                            entity.update(cx, |this, cx| {
+                                if !this.pointer_is_down {
+                                    return;
+                                }
+                                let flat = this.flat_pointer_position(
+                                    event.position,
+                                    bounds,
+                                    interaction_bounds,
+                                );
+                                this.pointer_up(flat, interaction_bounds);
+                                cx.notify();
+                            });
+                        });
                     },
                 )
                 .absolute()
                 .size_full(),
             )
-            .when(show_handles || picking, |this| {
+            .when(text_cursor, |this| this.cursor(CursorStyle::IBeam))
+            .when(!select_tool && !text_cursor, |this| this.cursor_crosshair())
+            .when(select_tool && (show_handles || picking), |this| {
                 this.cursor(if picking {
                     CursorStyle::Crosshair
                 } else {
                     CursorStyle::OpenHand
                 })
             })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    let Some(bounds) = this.scene_canvas_bounds.lock().ok().and_then(|b| *b) else {
-                        return;
-                    };
-                    this.scene_pointer_down(
-                        event.position,
-                        bounds,
-                        &event.modifiers,
-                        event.click_count,
-                        cx,
-                    );
-                    cx.notify();
-                }),
-            )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 if this.scene_scroll(event) {
                     cx.stop_propagation();
@@ -2233,6 +2414,8 @@ impl Studio {
         }
         let duration = self.video_duration.max(f64::EPSILON);
         let selected = self.selected_annotation;
+        let rows = self.annotation_lane_rows();
+        let lane_height = self.annotation_lane_height();
         let mut regions: Vec<AnyElement> = Vec::new();
         for (index, mark) in self.annotations.iter().enumerate() {
             let timing = mark.timing.unwrap_or(AnnotationTiming {
@@ -2242,19 +2425,27 @@ impl Studio {
             });
             let left = timing.start / duration * timeline_content_width;
             let width = ((timing.end - timing.start) / duration * timeline_content_width).max(20.0);
+            let top =
+                3.0 + rows.get(index).copied().unwrap_or(0) as f32 * Self::ANNOTATION_ROW_HEIGHT;
             let is_selected = selected == Some(index);
             let whole = mark.timing.is_none();
-            let label = format!(
-                "{}{}",
-                mark.tool.label(),
-                if whole { " · whole scene" } else { "" }
-            );
+            let name = if mark.tool == Tool::Text && !mark.text.trim().is_empty() {
+                let text = mark.text.trim();
+                if text.chars().count() > 28 {
+                    format!("{}…", text.chars().take(27).collect::<String>())
+                } else {
+                    text.to_string()
+                }
+            } else {
+                mark.tool.label().to_string()
+            };
+            let label = format!("{name}{}", if whole { " · whole scene" } else { "" });
             regions.push(
                 div()
                     .id(("annotation-region", index))
                     .absolute()
                     .left(px(left as f32))
-                    .top(px(3.0))
+                    .top(px(top))
                     .w(px(width as f32))
                     .h(px(22.0))
                     .rounded_md()
@@ -2350,7 +2541,7 @@ impl Studio {
                 .id("annotation-track")
                 .relative()
                 .w_full()
-                .h(px(28.0))
+                .h(px(lane_height))
                 .flex_none()
                 .overflow_hidden()
                 .rounded_lg()
@@ -2386,6 +2577,64 @@ impl Studio {
                 )
                 .into_any_element(),
         )
+    }
+
+    const ANNOTATION_ROW_HEIGHT: f32 = 24.0;
+    const ANNOTATION_MAX_ROWS: usize = 3;
+
+    /// Row each annotation occupies on the lane so overlapping marks stack
+    /// instead of hiding each other (greedy, capped at a few rows).
+    pub(crate) fn annotation_lane_rows(&self) -> Vec<usize> {
+        let duration = self.video_duration.max(f64::EPSILON);
+        let mut row_ends: Vec<f64> = Vec::new();
+        let mut rows = Vec::with_capacity(self.annotations.len());
+        let mut order: Vec<usize> = (0..self.annotations.len()).collect();
+        let span = |mark: &AnnotationMark| {
+            mark.timing
+                .map(|timing| (timing.start, timing.end))
+                .unwrap_or((0.0, duration))
+        };
+        order.sort_by(|a, b| {
+            span(&self.annotations[*a])
+                .0
+                .total_cmp(&span(&self.annotations[*b]).0)
+        });
+        let mut assigned = vec![0usize; self.annotations.len()];
+        for index in order {
+            let (start, end) = span(&self.annotations[index]);
+            let row = row_ends
+                .iter()
+                .position(|row_end| *row_end <= start + 1e-6)
+                .unwrap_or_else(|| {
+                    if row_ends.len() < Self::ANNOTATION_MAX_ROWS {
+                        row_ends.push(f64::NEG_INFINITY);
+                        row_ends.len() - 1
+                    } else {
+                        // Every row is busy: share the one that frees up first.
+                        row_ends
+                            .iter()
+                            .enumerate()
+                            .min_by(|a, b| a.1.total_cmp(b.1))
+                            .map(|(row, _)| row)
+                            .unwrap_or(0)
+                    }
+                });
+            row_ends[row] = row_ends[row].max(end);
+            assigned[index] = row;
+        }
+        rows.extend(assigned);
+        rows
+    }
+
+    /// Height of the annotation lane for the current stacking.
+    pub(crate) fn annotation_lane_height(&self) -> f32 {
+        let rows = self
+            .annotation_lane_rows()
+            .into_iter()
+            .max()
+            .map(|row| row + 1)
+            .unwrap_or(1);
+        6.0 + rows as f32 * Self::ANNOTATION_ROW_HEIGHT
     }
 
     fn select_annotation_for_timing(&mut self, index: usize) {
@@ -2473,7 +2722,7 @@ impl Studio {
 
     /// Timing panel for the selected annotation in an animated screenshot.
     pub(crate) fn annotation_timing_inspector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.animation_active {
+        if !self.scene_is_timed() {
             return None;
         }
         let index = self.selected_annotation?;
@@ -2691,7 +2940,7 @@ impl Studio {
         if self.annotations.is_empty() {
             return None;
         }
-        let (width, height) = self.captured_dimensions?;
+        let (width, height) = self.media_dimensions()?;
         let marks = self.annotations.clone();
         let mut cache: Option<(u64, Arc<RgbaImage>)> = None;
         Some(Box::new(move |time: f64| {
@@ -2847,6 +3096,8 @@ impl Studio {
             .child(self.inspector_level_picker(cx));
         if level == 0 {
             panel = panel
+                .child(self.template_gallery_section(cx))
+                .child(self.video_annotate_section(cx))
                 .child(self.preset_library_section(cx))
                 .child(div().text_sm().font_weight(FontWeight::BOLD).child("Looks"))
                 .child(self.quick_presets_row(cx))
@@ -2864,6 +3115,8 @@ impl Studio {
             return panel.into_any_element();
         }
         panel = panel
+            .child(self.template_gallery_section(cx))
+            .child(self.video_annotate_section(cx))
             .child(self.motion_overview_section(cx))
             .child(
                 div()

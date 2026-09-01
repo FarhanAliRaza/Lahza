@@ -69,10 +69,22 @@ perspective, and anchor with per-value reset plus Fit, Fill, and Actual size.
 Backgrounds gain blur, grain, and vignette, and a text watermark can sit in
 any corner. Recordings also get a pointer panel (cursor size, shadow, idle
 hiding, click effects and colour, removable clicks), an audio lane with a
-mute toggle, and clip thumbnails. Annotations in an animated screenshot are
-timed (draggable lane, entrance and exit effects such as draw-on and
-type-on). The inspector has Quick, Customize, and Advanced levels, and any
-look can be saved to a personal preset library.
+mute toggle, and clip thumbnails. Annotations are timed in both editors:
+draw text, arrows, shapes, numbers, and highlights straight onto a recording
+(or an animated screenshot) and each mark gets a start and end on its own
+lane, plus entrance and exit effects such as draw-on, type-on, pop, and
+slide. Marks follow the camera and the 3D card, and export renders them
+frame by frame with the same code as the preview. Recordings persist their
+marks in the project's edit document. The inspector has Quick, Customize,
+and Advanced levels, and any look can be saved to a personal preset library.
+
+**Templates** bundle a look, motion, and captions into one click: Product
+launch, Feature spotlight, Tutorial steps, Social square, Changelog,
+Cinematic, Minimal dark, and Store listing. On a screenshot a template turns
+the still into a short animated scene; on a recording it restyles the scene
+and adds an intro (motion plus captions) while keeping later motion regions.
+Every caption stays an ordinary annotation you can retext, move, retime, or
+delete.
 
 Export renders the whole scene, not only the source clip, with the same
 compositor that drives the preview (the preview *is* the compositor's

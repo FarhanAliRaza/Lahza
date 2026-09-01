@@ -894,6 +894,11 @@ mod tests {
         request.style.camera.size = 40;
         request.style.camera.margin = 2;
         request.style.camera.shadow = false;
+        // Timed annotations travel as an overlay: the whole media turns red
+        // for the first half second only (so the check holds under zoom).
+        request.overlay = Some(Box::new(|time: f64| {
+            (time < 0.5).then(|| Arc::new(RgbaImage::from_pixel(320, 180, Rgba([255, 0, 0, 255]))))
+        }));
         export_scene(
             SceneSource::Video {
                 media,
@@ -920,6 +925,23 @@ mod tests {
             "{pixel:?}"
         );
         assert!((info.duration - 1.0).abs() < 0.3, "{}", info.duration);
+        // The overlay lands on the media, cropped and projected like the frame.
+        let media = crate::recording::scene::SceneGeometry::layout(
+            320.0,
+            180.0,
+            320.0,
+            180.0,
+            &request.style,
+        )
+        .media;
+        let frame = crate::recording::video::decode_frame(&destination, 0.2, 320, 180).unwrap();
+        let ox = (media.x + media.width * 0.5) as usize;
+        let oy = (media.y + media.height * 0.5) as usize;
+        let pixel = &frame.rgba[(oy * 320 + ox) * 4..(oy * 320 + ox) * 4 + 3];
+        assert!(
+            pixel[0] > 180 && pixel[1] < 80 && pixel[2] < 80,
+            "overlay missing at {ox},{oy}: {pixel:?}"
+        );
         // The gradient background is visible in the canvas corner.
         let frame = crate::recording::video::decode_frame(&destination, 0.5, 320, 180).unwrap();
         let corner = &frame.rgba[..4];

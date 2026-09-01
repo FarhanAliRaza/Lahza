@@ -1465,7 +1465,7 @@ impl Studio {
         let duration_index = ANIMATION_DURATIONS
             .iter()
             .position(|value| (*value - self.animation_duration).abs() < 1e-9)
-            .unwrap_or(1);
+            .unwrap_or(usize::MAX);
         let selected_preset = self.animation_preset;
         let format_index = ExportFormat::ALL
             .iter()
@@ -1775,6 +1775,7 @@ impl Studio {
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
         request.include_audio = !self.video_audio_muted;
+        request.overlay = self.annotation_overlay_source();
         let source = SceneSource::Video {
             media: session.screen_path(),
             clips: self.video_clip_timeline.clone(),
