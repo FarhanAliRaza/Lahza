@@ -251,6 +251,7 @@ impl<B: RecorderBackend> RecordingController<B> {
         manifest.press_effects_baked = false;
         manifest.includes_system_audio = self.backend.includes_system_audio();
         manifest.includes_microphone = self.backend.includes_microphone();
+        manifest.includes_camera = self.backend.includes_camera();
         manifest.pointer_synthesized = self.backend.pointer_synthesized();
         if let Some(probe) = probe_media_with_retry(&session.screen_path(), Duration::from_secs(5))
         {

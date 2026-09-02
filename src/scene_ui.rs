@@ -1441,7 +1441,9 @@ impl Studio {
             })
             .child(
                 canvas(
-                    move |bounds, _, _| {
+                    // The hitbox lets occluding overlays (dialogs) shadow the
+                    // raw mouse listeners registered in paint.
+                    move |bounds, window, _| {
                         if let Ok(mut stored) = bounds_store.lock() {
                             *stored = Some(bounds);
                         }
@@ -1455,9 +1457,10 @@ impl Studio {
                         if let Ok(mut stored) = media_bounds_store.lock() {
                             *stored = Some(media);
                         }
-                        (bounds, media)
+                        let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
+                        (bounds, media, hitbox)
                     },
-                    move |_, (bounds, media), window, cx| {
+                    move |_, (bounds, media, hitbox), window, cx| {
                         // The full media through the current viewport crop.
                         let interaction_bounds = Bounds {
                             origin: point(
@@ -1537,6 +1540,7 @@ impl Studio {
                             move |event: &MouseDownEvent, _, window, cx| {
                                 if event.button != MouseButton::Left
                                     || !bounds.contains(&event.position)
+                                    || !hitbox.is_hovered(window)
                                 {
                                     return;
                                 }

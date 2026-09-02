@@ -1,8 +1,8 @@
 use futures_util::StreamExt;
 use gpui::{
     canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
-    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, Background, Bounds,
-    BoxShadow, ContentMask, Context, CursorStyle, FocusHandle, FontWeight, Hsla, IntoElement,
+    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp, Background,
+    Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle, FontWeight, Hsla, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollWheelEvent,
     SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions, UnderlineStyle, Window,
@@ -149,6 +149,29 @@ async fn capture_with_system_picker() -> Result<PathBuf, String> {
         .uri()
         .to_file_path()
         .map_err(|_| "The screenshot portal returned a non-file URI".to_string())
+}
+
+/// Runs the system screenshot picker with the Studio window out of the way.
+/// GNOME freezes the screen when its picker opens, so a Studio window that is
+/// still on top ends up inside the shot and covers the area being selected.
+async fn capture_behind_window(
+    window_handle: Option<AnyWindowHandle>,
+    cx: &mut AsyncApp,
+) -> Result<PathBuf, String> {
+    if let Some(window_handle) = window_handle {
+        let _ = window_handle.update(cx, |_, window, _| window.minimize_window());
+        // Give the compositor time to finish the minimize animation before
+        // the portal snapshots the screen.
+        Timer::after(Duration::from_millis(400)).await;
+    }
+    let result = capture_with_system_picker().await;
+    if let Some(window_handle) = window_handle {
+        let _ = window_handle.update(cx, |_, window, cx| {
+            window.activate_window();
+            cx.activate(true);
+        });
+    }
+    result
 }
 
 const SOLID_BACKGROUNDS: [(&str, u32); 16] = [
@@ -1308,7 +1331,11 @@ struct Studio {
     recording_session_path: Option<PathBuf>,
     record_system_audio: bool,
     record_microphone: bool,
+    record_camera: bool,
     video_project: Option<RecordingSession>,
+    /// Directory of the recording closed by switching to Static or Motion,
+    /// so the Video tab returns to it instead of asking again.
+    last_video_project: Option<PathBuf>,
     video_frame: Option<Arc<RenderImage>>,
     video_pointer_timeline: PointerTimeline,
     video_viewport_timeline: ViewportTimeline,
@@ -1318,6 +1345,11 @@ struct Studio {
     video_position: f64,
     video_playing: bool,
     video_edit_busy: bool,
+    /// Pending clip speed while the speed dialog is open; applied only on OK.
+    video_speed_draft: Option<f64>,
+    /// Counts preview renders so a superseded render's result is dropped
+    /// while playback and seeks stay independent of in-flight renders.
+    video_preview_render_generation: u64,
     video_clip_timeline: RecordingClipTimeline,
     video_selected_clip: Option<Uuid>,
     video_undo_stack: Vec<VideoEditSnapshot>,
@@ -1438,7 +1470,6 @@ struct Studio {
     selection_last_point: Option<Point<Pixels>>,
     selection_resizing: bool,
     pointer_is_down: bool,
-    zoom: u8,
     toast: Option<SharedString>,
     slider_drag: Option<SliderDrag>,
 }
@@ -1561,8 +1592,7 @@ impl Studio {
                         continue;
                     }
 
-                    let capture_result = capture_with_system_picker().await;
-                    let captured = capture_result.is_ok();
+                    let capture_result = capture_behind_window(Some(window_handle), cx).await;
                     if weak
                         .update(cx, |this, cx| {
                             this.finish_capture_request(capture_result);
@@ -1571,12 +1601,6 @@ impl Studio {
                         .is_err()
                     {
                         break;
-                    }
-                    if captured {
-                        let _ = window_handle.update(cx, |_, window, cx| {
-                            window.activate_window();
-                            cx.activate(true);
-                        });
                     }
                 }
                 Ok(())
@@ -1633,7 +1657,9 @@ impl Studio {
             recording_session_path: None,
             record_system_audio: false,
             record_microphone: false,
+            record_camera: false,
             video_project: None,
+            last_video_project: None,
             video_frame: None,
             video_pointer_timeline: PointerTimeline::default(),
             video_viewport_timeline: ViewportTimeline::default(),
@@ -1643,6 +1669,8 @@ impl Studio {
             video_position: 0.0,
             video_playing: false,
             video_edit_busy: false,
+            video_speed_draft: None,
+            video_preview_render_generation: 0,
             video_clip_timeline: RecordingClipTimeline::default(),
             video_selected_clip: None,
             video_undo_stack: Vec::new(),
@@ -1752,7 +1780,6 @@ impl Studio {
             selection_last_point: None,
             selection_resizing: false,
             pointer_is_down: false,
-            zoom: 72,
             toast: None,
             slider_drag: None,
         };
@@ -1888,6 +1915,7 @@ impl Studio {
         let options = RecordingOptions {
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
+            camera: self.record_camera,
         };
         let task = cx.background_executor().spawn(async move {
             let mut controller = RecordingController::new(NativeRecorder::with_options(options));
@@ -2090,7 +2118,10 @@ impl Studio {
         self.pause_video_playback();
         self.autosave_scene_style();
         self.leave_video_annotations();
-        self.video_project = None;
+        self.video_preview_render_generation += 1;
+        self.video_edit_busy = false;
+        self.video_speed_draft = None;
+        self.last_video_project = self.video_project.take().map(|session| session.directory);
         self.video_frame = None;
         self.video_preview_path = None;
         self.video_undo_stack.clear();
@@ -2166,6 +2197,8 @@ impl Studio {
                 .map_err(|error| format!("Could not decode recording preview: {error}"))?;
         self.video_playback_generation
             .fetch_add(1, Ordering::SeqCst);
+        // Drop any preview render still running for the previous project.
+        self.video_preview_render_generation += 1;
         let source_duration = media
             .as_ref()
             .map(|media| media.duration)
@@ -2733,8 +2766,8 @@ impl Studio {
         let previous_preview = self.video_preview_path.take();
         self.toast = Some("Updating video and audio preview…".into());
         let source = session.screen_path();
-        let generation = self.video_playback_generation.clone();
-        let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.video_preview_render_generation += 1;
+        let token = self.video_preview_render_generation;
         let destination = session.directory.join(format!(".edit-preview-{token}.mkv"));
         let task = cx.background_executor().spawn(async move {
             render_clip_preview(&source, &destination, &timeline)
@@ -2743,13 +2776,13 @@ impl Studio {
         });
         cx.spawn(async move |weak, cx| {
             let result = task.await;
-            if generation.load(Ordering::SeqCst) != token {
-                if let Ok(path) = result {
-                    let _ = fs::remove_file(path);
-                }
-                return;
-            }
             let _ = weak.update(cx, |this, cx| {
+                if this.video_preview_render_generation != token {
+                    if let Ok(path) = result {
+                        let _ = fs::remove_file(path);
+                    }
+                    return;
+                }
                 this.video_edit_busy = false;
                 match result {
                     Ok(path) => {
@@ -2832,10 +2865,14 @@ impl Studio {
         else {
             return;
         };
-        clip.speed = speed.clamp(
+        let speed = speed.clamp(
             RecordingClipSegment::MINIMUM_SPEED,
             RecordingClipSegment::MAXIMUM_SPEED,
         );
+        if (clip.speed - speed).abs() < 0.001 {
+            return;
+        }
+        clip.speed = speed;
         let timeline = self.video_clip_timeline.replacing(clip);
         self.apply_video_clip_timeline(timeline, Some(selected), true, cx);
     }
@@ -2982,6 +3019,174 @@ impl Studio {
         format!("{:02}:{:02}", seconds / 60, seconds % 60)
     }
 
+    /// Modal that previews a clip speed change before rendering it once.
+    fn video_speed_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let draft = self.video_speed_draft?;
+        let selected = self.video_selected_clip?;
+        let clip = self
+            .video_clip_timeline
+            .segments
+            .iter()
+            .find(|clip| clip.id == selected)?
+            .clone();
+        let current_speed = clip.speed;
+        let mut changed = clip.clone();
+        changed.speed = draft;
+        let new_timeline = self.video_clip_timeline.replacing(changed.clone());
+        let old_end = self.video_clip_timeline.duration();
+        let new_end = new_timeline.duration();
+        let seconds = |value: f64| format!("{value:.1}s");
+        let row = |label: &'static str, before: String, after: String| {
+            div()
+                .flex()
+                .justify_between()
+                .text_sm()
+                .child(div().text_color(muted()).child(label))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().text_color(muted()).child(before))
+                        .child("→")
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(after)),
+                )
+        };
+        let step = |id: &'static str, glyph: &'static str, enabled: bool, increase: bool| {
+            div()
+                .id(id)
+                .size(px(32.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(rgb(0xf3f3f4))
+                .opacity(if enabled { 1.0 } else { 0.35 })
+                .when(enabled, |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.bg(rgb(0xe4e4e7)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(draft) = this.video_speed_draft {
+                                this.video_speed_draft = Some(Self::next_clip_speed(draft, increase));
+                                cx.notify();
+                            }
+                        }))
+                })
+                .child(glyph)
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px_4()
+                .h(px(32.0))
+                .flex()
+                .items_center()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .when(primary, |this| {
+                    this.bg(rgb(0x2563eb))
+                        .text_color(rgb(0xffffff))
+                        .hover(|style| style.bg(rgb(0x1d4ed8)))
+                })
+                .when(!primary, |this| this.hover(|style| style.bg(rgb(0xeeeeef))))
+                .child(label)
+        };
+        let unchanged = (draft - current_speed).abs() < 0.001;
+        Some(
+            div()
+                .id("video-speed-dialog-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(hsla(0.0, 0.0, 0.0, 0.25))
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.video_speed_draft = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("video-speed-dialog")
+                        .occlude()
+                        .w(px(320.0))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(rgb(0xffffff))
+                        .shadow_lg()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Clip speed"))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_3()
+                                .child(step(
+                                    "video-speed-dialog-down",
+                                    "−",
+                                    draft > RecordingClipSegment::MINIMUM_SPEED,
+                                    false,
+                                ))
+                                .child(
+                                    div()
+                                        .w(px(64.0))
+                                        .text_center()
+                                        .text_lg()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(format!("{draft}×")),
+                                )
+                                .child(step(
+                                    "video-speed-dialog-up",
+                                    "+",
+                                    draft < RecordingClipSegment::MAXIMUM_SPEED,
+                                    true,
+                                )),
+                        )
+                        .child(row(
+                            "Clip length",
+                            seconds(clip.editor_duration()),
+                            seconds(changed.editor_duration()),
+                        ))
+                        .child(row(
+                            "Video ends at",
+                            Self::video_timecode(old_end),
+                            Self::video_timecode(new_end),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .pt_1()
+                                .child(button("video-speed-cancel", "Cancel", false).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.video_speed_draft = None;
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(
+                                    button("video-speed-apply", "Apply", true)
+                                        .opacity(if unchanged { 0.5 } else { 1.0 })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.video_speed_draft = None;
+                                            if !unchanged {
+                                                this.set_selected_video_clip_speed(draft, cx);
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                ),
+        )
+        .map(IntoElement::into_any_element)
+    }
+
     fn video_edit_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let edit_busy = self.video_edit_busy;
         let can_delete = (self.video_selected_zoom_cue.is_some()
@@ -3063,64 +3268,29 @@ impl Studio {
             )
             .child(
                 div()
+                    .id("video-speed")
                     .ml_2()
+                    .px_3()
+                    .h(px(32.0))
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap_2()
+                    .rounded_md()
                     .text_sm()
+                    .when(self.video_selected_clip.is_some() && !edit_busy, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(rgb(0xeeeeef)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.video_speed_draft = Some(selected_speed);
+                                cx.notify();
+                            }))
+                    })
+                    .opacity(if edit_busy { 0.35 } else { 1.0 })
                     .child("Speed")
                     .child(
                         div()
-                            .id("video-speed-down")
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .when(
-                                selected_speed > RecordingClipSegment::MINIMUM_SPEED && !edit_busy,
-                                |this| {
-                                    this.cursor_pointer()
-                                        .hover(|style| style.bg(rgb(0xeeeeef)))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_selected_video_clip_speed(
-                                                Self::next_clip_speed(selected_speed, false),
-                                                cx,
-                                            )
-                                        }))
-                                },
-                            )
-                            .child("−"),
-                    )
-                    .child(
-                        div()
-                            .w(px(44.0))
-                            .text_center()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(format!("{selected_speed}×")),
-                    )
-                    .child(
-                        div()
-                            .id("video-speed-up")
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .when(
-                                selected_speed < RecordingClipSegment::MAXIMUM_SPEED && !edit_busy,
-                                |this| {
-                                    this.cursor_pointer()
-                                        .hover(|style| style.bg(rgb(0xeeeeef)))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_selected_video_clip_speed(
-                                                Self::next_clip_speed(selected_speed, true),
-                                                cx,
-                                            )
-                                        }))
-                                },
-                            )
-                            .child("+"),
                     ),
             )
     }
@@ -3842,6 +4012,18 @@ impl Studio {
         if self.handle_watermark_key(event) {
             return true;
         }
+        // The speed dialog owns the keyboard: Escape cancels, Enter applies.
+        if let Some(draft) = self.video_speed_draft {
+            match event.keystroke.key.as_str() {
+                "escape" => self.video_speed_draft = None,
+                "enter" => {
+                    self.video_speed_draft = None;
+                    self.set_selected_video_clip_speed(draft, cx);
+                }
+                _ => {}
+            }
+            return true;
+        }
         // Typing into a text annotation owns the keyboard.
         if self.editing_text.is_some() {
             return self.handle_key(event);
@@ -4334,8 +4516,9 @@ impl Studio {
         self.capturing = true;
         self.toast = Some("Choose a screen, window, or area in the system picker".into());
         cx.notify();
+        let window_handle = cx.active_window();
         cx.spawn(async move |weak, cx| {
-            let result = capture_with_system_picker().await;
+            let result = capture_behind_window(window_handle, cx).await;
             weak.update(cx, |this, cx| {
                 this.finish_capture_request(result);
                 cx.notify();
@@ -4977,73 +5160,74 @@ impl Studio {
             })
     }
 
+    /// A toolbar toggle for one recording source (system audio, mic, webcam).
+    fn record_source_toggle(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        enabled: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .h(px(34.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_lg()
+            .text_xs()
+            .cursor_pointer()
+            .bg(if enabled {
+                rgb(0xe5f2ff)
+            } else {
+                rgb(0xf3f3f4)
+            })
+            .border_1()
+            .border_color(if enabled { blue() } else { line() })
+            .child(
+                svg()
+                    .path(icon)
+                    .size(px(15.0))
+                    .text_color(if enabled { blue() } else { muted() }),
+            )
+            .on_click(on_click)
+    }
+
     fn recording_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.recording_state == RecordingState::Idle {
-            let system_audio = self.record_system_audio;
-            let microphone = self.record_microphone;
             return div()
                 .id("recording-setup-controls")
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(
-                    div()
-                        .id("record-system-audio")
-                        .h(px(34.0))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .rounded_lg()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(if system_audio {
-                            rgb(0xe5f2ff)
-                        } else {
-                            rgb(0xf3f3f4)
-                        })
-                        .border_1()
-                        .border_color(if system_audio { blue() } else { line() })
-                        .child(
-                            svg()
-                                .path("icons/volume.svg")
-                                .size(px(15.0))
-                                .text_color(if system_audio { blue() } else { muted() }),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.record_system_audio = !this.record_system_audio;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .id("record-microphone")
-                        .h(px(34.0))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .rounded_lg()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(if microphone {
-                            rgb(0xe5f2ff)
-                        } else {
-                            rgb(0xf3f3f4)
-                        })
-                        .border_1()
-                        .border_color(if microphone { blue() } else { line() })
-                        .child(
-                            svg()
-                                .path("icons/microphone.svg")
-                                .size(px(15.0))
-                                .text_color(if microphone { blue() } else { muted() }),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.record_microphone = !this.record_microphone;
-                            cx.notify();
-                        })),
-                )
+                .child(self.record_source_toggle(
+                    "record-system-audio",
+                    "icons/volume.svg",
+                    self.record_system_audio,
+                    cx.listener(|this, _, _, cx| {
+                        this.record_system_audio = !this.record_system_audio;
+                        cx.notify();
+                    }),
+                ))
+                .child(self.record_source_toggle(
+                    "record-microphone",
+                    "icons/microphone.svg",
+                    self.record_microphone,
+                    cx.listener(|this, _, _, cx| {
+                        this.record_microphone = !this.record_microphone;
+                        cx.notify();
+                    }),
+                ))
+                .child(self.record_source_toggle(
+                    "record-camera",
+                    "icons/video.svg",
+                    self.record_camera,
+                    cx.listener(|this, _, _, cx| {
+                        this.record_camera = !this.record_camera;
+                        cx.notify();
+                    }),
+                ))
                 .child(
                     div()
                         .id("toolbar-record")
@@ -5773,8 +5957,12 @@ impl Studio {
             })
             .child(
                 canvas(
-                    move |_, _, _| annotations,
-                    move |bounds, annotations, window, cx| {
+                    // The hitbox lets occluding overlays (dialogs) shadow the
+                    // raw mouse listeners registered below.
+                    move |bounds, window, _| {
+                        (annotations, window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal))
+                    },
+                    move |bounds, (annotations, hitbox), window, cx| {
                         let image_bounds = match composited_style.as_ref() {
                             Some(style) => {
                                 let (source_width, source_height) =
@@ -5905,6 +6093,7 @@ impl Studio {
                                     ),
                                 };
                                 if event.button != MouseButton::Left
+                                    || !hitbox.is_hovered(window)
                                     || if crop_active {
                                         !crop_hit_bounds.contains(&event.position)
                                     } else {
@@ -6116,6 +6305,7 @@ impl Studio {
         let canvas_area = self.canvas_area(video_canvas, cx);
         let timeline = self.timeline_bar(cx);
         let sidebar = self.inspector_visible.then(|| self.sidebar(cx));
+        let speed_dialog = self.video_speed_dialog(cx);
 
         div()
             .size_full()
@@ -6227,6 +6417,9 @@ impl Studio {
                     )
                     .when_some(sidebar, |this, sidebar| this.child(sidebar)),
             )
+            .when_some(speed_dialog, |this, dialog| {
+                this.child(gpui::deferred(dialog).with_priority(1))
+            })
             .into_any_element()
     }
 }

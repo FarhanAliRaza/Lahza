@@ -160,7 +160,16 @@ impl Studio {
                     self.toggle_animation(cx);
                 }
             }
-            EditorMode::Video => self.open_video_project_dialog(cx),
+            EditorMode::Video => match self.last_video_project.clone() {
+                Some(directory) => {
+                    if let Err(error) = self.open_video_project(directory.clone()) {
+                        self.last_video_project = None;
+                        self.toast =
+                            Some(format!("Could not open {}: {error}", directory.display()).into());
+                    }
+                }
+                None => self.open_video_project_dialog(cx),
+            },
         }
         cx.notify();
     }
@@ -324,18 +333,6 @@ impl Studio {
             .justify_center()
             .bg(rgb(0xf3f3f4))
             .child(canvas)
-            .when(self.editor_mode() == EditorMode::Static, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left(px(16.0))
-                        .bottom(px(12.0))
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(muted())
-                        .child(format!("{}%", self.zoom)),
-                )
-            })
             .when_some(toast, |this, toast| {
                 this.child(
                     div()
