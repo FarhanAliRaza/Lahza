@@ -1,4 +1,7 @@
-# Screendrop (Rust/GPUI)
+# Lahza (Rust/GPUI)
+
+The app is named Lahza ("moment" in Urdu); the crate, binary, app id, and
+session extension keep the historical `screendrop` identifiers.
 
 Linux-first screenshot and recording studio. The macOS Swift app in `Screendrop/` is a reference only — don't build it.
 
@@ -10,11 +13,19 @@ sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libxkbcommon-dev libxkbcommon-x11-dev
 ```
 
+At runtime `ffmpeg`/`ffprobe` are required for recording preview, motion
+export (MP4/WebM/GIF), and the export integration tests; `gst-play-1.0` is
+needed for synchronized video playback in the editor.
+
 ## Build
 
 ```bash
 cargo build --release
 ```
+
+`just install` builds the release binary, stops any running instance, and
+replaces `~/.local/bin/screendrop`; use it after every change so the launched
+app is the new build. `just run` does the same and launches the app.
 
 ## Install (desktop integration)
 
@@ -27,7 +38,7 @@ PATH. User-local install:
 install -Dm755 target/release/screendrop ~/.local/bin/screendrop
 install -Dm644 packaging/com.screendrop.Screendrop.desktop \
   ~/.local/share/applications/com.screendrop.Screendrop.desktop
-install -Dm644 Screendrop.png \
+install -Dm644 Lahza.png \
   ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
 update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor
@@ -44,3 +55,22 @@ gnome-extensions enable screendrop-input@com.screendrop
 ```
 
 Requires logging out and back in so GNOME Shell discovers it.
+
+## Performance
+
+Every editor interaction re-renders on the UI thread, so treat performance
+as part of correctness when building features:
+
+- Measure before optimizing: time the stages of a change at the preview
+  canvas size (roughly 1080 px wide) and keep an interactive tick under
+  ~16 ms. Anything dragged or animated must not rebuild work whose inputs
+  did not change.
+- `SceneCompositor` caches layers (background, vignette, watermark, card)
+  and `rebuild` reuses those from a previous compositor; the preview renders
+  a half-size proxy while a slider or the media is dragged. Extend these
+  paths instead of adding per-frame full-canvas work.
+- Blurs go through `blur_plane`, which downsamples for large sigmas; use it
+  rather than new full-resolution passes.
+- Prefer per-row loops over raw buffers to per-pixel `get_pixel`/`f64`
+  math in hot loops, and keep the media paint (`paint_media`) in mind: it
+  runs every playback frame.

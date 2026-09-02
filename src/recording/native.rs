@@ -66,6 +66,10 @@ pub trait RecorderBackend {
         false
     }
 
+    fn includes_camera(&self) -> bool {
+        false
+    }
+
     fn pointer_synthesized(&self) -> bool {
         false
     }
@@ -75,6 +79,8 @@ pub trait RecorderBackend {
 pub struct RecordingOptions {
     pub system_audio: bool,
     pub microphone: bool,
+    /// Record the default webcam alongside the screen into `camera.mkv`.
+    pub camera: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +92,7 @@ struct SharedState {
     output: Option<PathBuf>,
     failure: Option<String>,
     pointer_synthesized: bool,
+    camera_recorded: bool,
 }
 
 impl Default for SharedState {
@@ -98,6 +105,7 @@ impl Default for SharedState {
             output: None,
             failure: None,
             pointer_synthesized: false,
+            camera_recorded: false,
         }
     }
 }
@@ -247,6 +255,15 @@ impl RecorderBackend for NativeRecorder {
         self.options.microphone
     }
 
+    fn includes_camera(&self) -> bool {
+        self.options.camera
+            && self
+                .state
+                .lock()
+                .map(|state| state.camera_recorded)
+                .unwrap_or(false)
+    }
+
     fn pointer_synthesized(&self) -> bool {
         self.state
             .lock()
@@ -361,6 +378,11 @@ fn run_worker(
             input_capture.attach_pipewire(pointer_remote.as_raw_fd(), node, input_mapping)?;
         }
 
+        let camera = if options.camera {
+            Some(default_camera_device()?)
+        } else {
+            None
+        };
         let mut segments = Vec::new();
         let mut child = Some(spawn_segment(
             &output,
@@ -368,8 +390,9 @@ fn run_worker(
             remote.as_raw_fd(),
             node,
             options,
+            camera.as_deref(),
         )?);
-        segments.push(segment_path(&output, 0));
+        segments.push(0);
         let mut active_ranges = Vec::new();
         let mut active_range_start = Some(monotonic_ns());
         {
@@ -378,7 +401,7 @@ fn run_worker(
             shared.paused = false;
             shared.started_at = Some(Instant::now());
             shared.elapsed = Duration::ZERO;
-            shared.output = Some(segments[0].clone());
+            shared.output = Some(segment_path(&output, 0));
             shared.failure = None;
         }
         let _ = ready.send(Ok(()));
@@ -423,10 +446,17 @@ fn run_worker(
                         Err("recording is not paused".into())
                     } else {
                         let index = segments.len();
-                        match spawn_segment(&output, index, remote.as_raw_fd(), node, options) {
+                        match spawn_segment(
+                            &output,
+                            index,
+                            remote.as_raw_fd(),
+                            node,
+                            options,
+                            camera.as_deref(),
+                        ) {
                             Ok(next) => {
                                 let path = segment_path(&output, index);
-                                segments.push(path.clone());
+                                segments.push(index);
                                 child = Some(next);
                                 active_range_start = Some(monotonic_ns());
                                 let mut shared =
@@ -452,7 +482,29 @@ fn run_worker(
                         if let Some(mut running) = child.take() {
                             finalize_child(&mut running)?;
                         }
-                        finalize_segments(&segments, &output)?;
+                        let screen_segments: Vec<_> = segments
+                            .iter()
+                            .map(|index| segment_path(&output, *index))
+                            .collect();
+                        finalize_segments(&screen_segments, &output)?;
+                        let camera_recorded = if camera.is_some() {
+                            let camera_output = camera_path(&output);
+                            let camera_segments: Vec<_> = segments
+                                .iter()
+                                .map(|index| camera_segment_path(&output, *index))
+                                .collect();
+                            // A webcam that produced no frames must not fail
+                            // the screen recording; the editor just omits it.
+                            match finalize_segments(&camera_segments, &camera_output) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    eprintln!("Webcam recording was dropped: {error}");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
                         let pointer_synthesized = input_capture
                             .finish(&active_ranges, input_mapping, &input_destination)
                             .unwrap_or(false);
@@ -464,6 +516,7 @@ fn run_worker(
                         shared.paused = false;
                         shared.output = Some(output.clone());
                         shared.pointer_synthesized = pointer_synthesized;
+                        shared.camera_recorded = camera_recorded;
                         Ok(output.clone())
                     })();
                     let _ = reply.send(result);
@@ -485,6 +538,32 @@ fn run_worker(
 
 fn segment_path(output: &Path, index: usize) -> PathBuf {
     output.with_file_name(format!("screen-segment-{index:04}.mkv"))
+}
+
+fn camera_segment_path(output: &Path, index: usize) -> PathBuf {
+    output.with_file_name(format!("camera-segment-{index:04}.mkv"))
+}
+
+fn camera_path(output: &Path) -> PathBuf {
+    output.with_file_name(super::model::RecordingSession::CAMERA_FILE)
+}
+
+/// The V4L2 device node of the first webcam GStreamer can capture from.
+fn default_camera_device() -> Result<String, String> {
+    gst::init().map_err(|error| format!("could not initialize GStreamer: {error}"))?;
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Video/Source"), None);
+    monitor
+        .start()
+        .map_err(|_| "could not enumerate webcams".to_string())?;
+    let device = monitor.devices().iter().find_map(|device| {
+        let properties = device.properties()?;
+        ["device.path", "api.v4l2.path"]
+            .iter()
+            .find_map(|key| properties.get::<String>(*key).ok())
+    });
+    monitor.stop();
+    device.ok_or_else(|| "no webcam was found; unplug and replug it or turn the camera off".into())
 }
 
 struct SegmentPipeline {
@@ -524,6 +603,7 @@ fn spawn_segment(
     portal_fd: i32,
     node: u32,
     options: RecordingOptions,
+    camera_device: Option<&str>,
 ) -> Result<SegmentPipeline, String> {
     let path = segment_path(output, index);
     let _ = fs::remove_file(&path);
@@ -556,6 +636,21 @@ fn spawn_segment(
             "pulsesrc do-timestamp=true ! audioconvert ! audioresample ! \
              queue ! audio_mix. ",
         );
+    }
+    if let Some(device) = camera_device {
+        // The webcam shares the screen pipeline's clock, so both files carry
+        // the same running-time stamps and stay aligned in the editor.
+        let camera_segment = camera_segment_path(output, index);
+        let _ = fs::remove_file(&camera_segment);
+        description.push_str(&format!(
+            "v4l2src device=\"{}\" do-timestamp=true ! videoconvert ! \
+             queue max-size-buffers=4 leaky=downstream ! \
+             vp8enc deadline=1 cpu-used=8 threads=2 target-bitrate=4000000 \
+             keyframe-max-dist=60 ! queue ! matroskamux ! \
+             filesink location=\"{}\" ",
+            device,
+            camera_segment.display()
+        ));
     }
 
     let pipeline = gst::parse::launch(&description)
@@ -711,6 +806,7 @@ mod tests {
         let mut recorder = NativeRecorder::with_options(RecordingOptions {
             system_audio: true,
             microphone: true,
+            camera: false,
         });
         recorder.start_recording(&output).unwrap();
         thread::sleep(Duration::from_secs(1));

@@ -56,8 +56,14 @@ preview, and exported output must agree.
   2.5 s transitive join tolerance, 1 s tail exclusion, 0.8 s trailing guard,
   and 1.5× default magnification.
 - [x] Pointer, smart, and pinned anchor modes represented as project data.
-- [ ] Editable add/remove/move/resize/enable controls with undo/redo.
-- [ ] Deterministic 120 Hz viewport spring used by both preview and export.
+- [x] Editable add/remove/move/resize/enable controls with undo/redo. Motion
+  regions live on an orange timeline lane: double-click adds one at that
+  time, edges retime it, and the selection-aware inspector edits its style
+  (hold, zoom in, zoom out), magnification, target mode, focus point, pan
+  destination, and enabled state.
+- [x] Deterministic 120 Hz viewport spring used by both preview and export.
+  `ViewportTimeline` is the single camera source; the GPUI preview and the
+  CPU `SceneCompositor` read the same `visible_rect` per frame.
 - [ ] Bounds-aware framing and long-travel comfort widening.
 - [ ] Clip cuts and speed changes preserve continuous camera motion.
 
@@ -74,7 +80,11 @@ preview, and exported output must agree.
   the cursor when it is unavailable.
 - [x] Optional system-audio and microphone sources share the native media clock,
   mix into an Opus track, survive pause/resume, and are recorded in the manifest.
-- [ ] Optional camera master and device selection.
+- [ ] Optional camera master and device selection. A camera clip can be
+  added to a project from a file (`camera.mkv`), is cut with the same clip
+  timeline as the master, and is composited as a picture-in-picture bubble
+  (corner, size, circle/rounded/square, mirror, margin, shadow) in preview
+  and export; live camera capture and device selection remain.
 
 ## Studio and export
 
@@ -96,9 +106,68 @@ preview, and exported output must agree.
 - [ ] Camera/background/aspect controls. The video canvas now lives in the
   standard Screendrop shell and uses the shared color/gradient/wallpaper
   library, padding, corners, four shadow styles, aspect presets, border, and
-  collapsible inspector. Camera composition remains.
-- [ ] Preview and export share the same immutable pointer and viewport timelines.
+  collapsible inspector. The preview is the compositor's own output, so
+  background blur, grain, vignette, watermark, and the 3D media transform
+  (scale, position, X/Y/Z rotation, perspective, anchor, with drag, tilt,
+  spin, scroll-to-scale, corner handles, and double-click reset) look the
+  same in the editor and in the file. Scene settings autosave into the
+  project's edit document under `scene`. Camera composition remains (no
+  camera master is recorded yet).
+- [x] Preview and export share the same immutable pointer and viewport timelines.
+  `recording::export::export_scene` renders the full scene (background,
+  padding, corners, border, shadow, camera motion, reconstructed cursor and
+  click pulses) through `recording::scene::SceneCompositor`, then encodes
+  MP4 (H.264/AAC), WebM (VP9/Opus), or GIF with FFmpeg. Layout is derived
+  from `SceneGeometry`, which the preview canvas also uses.
 - [ ] Timestamped export with progress, cancellation, and stale-render detection.
+  Frame-level progress, cancellation, resolution presets (original, 720p,
+  1080p, 1440p, 4K), 30/60 fps, GIF looping, audio include/mute, and a size
+  estimate are implemented; stale-render detection remains.
+- [x] Pointer inspector: show/hide cursor, cursor size, cursor shadow, hide
+  when idle, click effects and colour; click markers on the ruler select
+  individual presses, which can be removed (persisted as
+  `screendropExtras.removedPressTimes`).
+- [x] Audio lane with an RMS waveform mapped through the clip timeline and a
+  mute toggle; clip thumbnails sampled from the master.
+- [x] Preset library (`~/.config/screendrop/presets.json`) saving background,
+  layout, border, shadow, effects, pointer look, aspect, and default zoom
+  strength for screenshots and recordings; Quick / Customize / Advanced
+  inspector levels.
+- [x] Timed annotations on recordings: the screenshot drawing tools (text,
+  rectangle, filled rectangle, ellipse, line, arrow, pen, number, highlight)
+  work on the recording canvas, through the viewport crop and the 3D
+  projection. Each mark has a start/end on a stacking annotation lane with
+  entrance and exit effects; marks persist as `annotations` in the edit
+  document and export as a per-frame overlay through the same compositor
+  path the preview uses (verified by an FFmpeg integration test). Blur and
+  pixelate stay screenshot-only because they are baked into the still.
+- [x] Template gallery (`recording::templates`): eight curated looks that
+  set background, layout, 3D pose, motion preset with easing, and timed
+  captions; applied to a screenshot they create the animated scene, applied
+  to a recording they restyle it and add an intro while keeping later motion
+  regions. Template captions are ordinary annotations afterwards.
+
+## Animated screenshots
+
+- [x] A screenshot opens static; **Animate** turns it into a timed scene
+  (3/5/8/10 s) edited with the same motion lane, inspector, and exporter as a
+  recording.
+- [x] Presets (slow zoom in/out, pan left/right, focus, sweep, 3D tilt,
+  floating card) expand into ordinary editable motion regions.
+- [x] Cursor walkthrough: click the spots a synthetic cursor should visit;
+  the cursor glides between them with clicks, click zooms are synthesized,
+  and the cursor is drawn by the same reconstruction as recordings.
+- [x] Annotations are flattened onto the capture before compositing so the
+  animated export matches the static one.
+- [x] MP4, WebM, and looping GIF export with progress and cancellation.
+- [x] Timed annotations: marks placed while animating get a start/end,
+  entrance (cut, fade, pop, slide, draw-on, type-on) and exit (cut, fade,
+  shrink, slide) with a draggable annotation lane and a timing inspector;
+  the exporter renders them frame by frame through the same animation code
+  as the preview.
+- [x] 3D transforms and tilt presets (3D tilt, floating card); motion
+  regions can carry an animated tilt and an easing curve.
+- [x] Background blur, noise, vignette, and a text watermark.
 
 Rust video support must not be described as complete until all required rows are
 implemented and a manual Swift-versus-Rust behavior pass has been recorded.

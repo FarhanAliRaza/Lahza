@@ -509,7 +509,10 @@ fn poll_pipewire_cursor(
                             std::mem::size_of::<libspa_sys::spa_meta_cursor>(),
                         )
                             as *const libspa_sys::spa_meta_cursor;
-                        if !cursor.is_null() && libspa_sys::spa_meta_cursor_is_valid(cursor) {
+                        // `spa_meta_cursor_is_valid` is a static inline in the
+                        // SPA headers and is not emitted by every bindgen
+                        // build; its definition is simply a non-zero id.
+                        if !cursor.is_null() && (*cursor).id != 0 {
                             record_pipewire_position(
                                 &listener_state,
                                 origin.0 + f64::from((*cursor).position.x),

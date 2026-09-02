@@ -37,7 +37,7 @@ impl RecordingSession {
         fs::create_dir_all(&root)?;
         let stamp: DateTime<Local> = Local::now();
         let name = format!(
-            "Screendrop_{}_{}.{}",
+            "Lahza_{}_{}.{}",
             stamp.format("%Y-%m-%d-%H-%M-%S"),
             &Uuid::new_v4().simple().to_string()[..6],
             SESSION_EXTENSION
@@ -221,6 +221,44 @@ impl RecordingSession {
         object.insert(
             "zoomCues".into(),
             serde_json::to_value(cues)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        );
+        let version = object
+            .get("formatVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .max(5);
+        object.insert("formatVersion".into(), serde_json::json!(version));
+        self.write_draft_document(&document)
+    }
+
+    /// Reads one top-level field of the effective edit document.
+    pub fn read_edit_field<T: DeserializeOwned>(&self, key: &str) -> io::Result<Option<T>> {
+        let Some(document) = self.effective_edit_document()? else {
+            return Ok(None);
+        };
+        let Some(value) = document.get(key).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// Autosaves one top-level field without re-encoding unrelated settings.
+    pub fn write_edit_field<T: Serialize>(&self, key: &str, value: &T) -> io::Result<()> {
+        let mut document = self
+            .effective_edit_document()?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let object = document.as_object_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "edit document must be an object",
+            )
+        })?;
+        object.insert(
+            key.to_string(),
+            serde_json::to_value(value)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         );
         let version = object
@@ -707,6 +745,10 @@ mod tests {
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            motion: Default::default(),
+            pan_to: None,
+            easing: Default::default(),
+            tilt: None,
         };
 
         session

@@ -1,4 +1,4 @@
-# Screendrop for Linux
+# Lahza for Linux
 
 This directory contains the Linux-first Rust and GPUI port of Screendrop. The
 original macOS Swift application remains in `Screendrop/` as the behavioral and
@@ -24,13 +24,56 @@ shortcut.
 
 GNOME requires a host build to have the matching
 `com.screendrop.Screendrop.desktop` entry and a discoverable `screendrop`
-executable. For a user-local development install:
+executable, so a plain `cargo install` is not enough. See
+[Build and install from source](#build-and-install-from-source) below.
+
+## Build and install from source
+
+Install the build dependencies on Ubuntu:
 
 ```bash
-cargo build
-install -Dm755 target/debug/screendrop ~/.local/bin/screendrop
+sudo apt install -y build-essential pkg-config libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev libpipewire-0.3-dev libspa-0.2-dev \
+  libclang-dev libxkbcommon-dev libxkbcommon-x11-dev ffmpeg \
+  gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
+`ffmpeg`/`ffprobe` are required at runtime for recording preview and motion
+export, and `gst-play-1.0` (from `gstreamer1.0-tools`) for synchronized
+video playback in the editor.
+
+With [`just`](https://github.com/casey/just) installed, `just install-desktop`
+does the whole first-time install, and `just install` rebuilds and replaces
+the binary after every change (it stops any running instance first).
+Equivalent manual commands:
+
+```bash
+cargo build --release
+install -Dm755 target/release/screendrop ~/.local/bin/screendrop
 install -Dm644 packaging/com.screendrop.Screendrop.desktop \
   ~/.local/share/applications/com.screendrop.Screendrop.desktop
+install -Dm644 Lahza.png \
+  ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
+update-desktop-database ~/.local/share/applications
+gtk-update-icon-cache -t ~/.local/share/icons/hicolor
+```
+
+If you previously ran `cargo install --path .`, remove that copy so the
+desktop entry and `PATH` resolve to the freshly installed binary, and quit
+any running instance so the next launch picks up the new build:
+
+```bash
+cargo uninstall screendrop
+pkill -x screendrop
+which -a screendrop   # should list only ~/.local/bin/screendrop
+```
+
+To uninstall:
+
+```bash
+rm -f ~/.local/bin/screendrop \
+  ~/.local/share/applications/com.screendrop.Screendrop.desktop \
+  ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
 update-desktop-database ~/.local/share/applications
 ```
 
@@ -43,6 +86,59 @@ in native Wayland sessions and under X11/XWayland.
 ```bash
 cargo run
 ```
+
+## Motion editing and export
+
+Screenshots and recordings share one scene model: a background, the media
+surface (padding, corners, border, shadow), and a camera. Camera motion is
+edited as orange regions on the timeline's motion lane rather than keyframes:
+
+- Recordings open with regions synthesized from clicks. Double-click the lane
+  (or press M) to add one, drag its edges to retime it, and use the inspector to change
+  its style (hold, zoom in, zoom out), magnification, target (cursor, auto,
+  pinned), focus point, and pan destination. Click the video to set the
+  focus.
+- An animated screenshot can grow into a sequence: **+ Add image** in the
+  Animation section appends another image as its own scene with its own
+  duration, motion, and captions. Playback flows from one scene into the
+  next and export renders them back to back.
+- Screenshots start static. **Animate** turns the capture into a 3–10 second
+  scene with presets (slow zoom, pan, focus, sweep, 3D tilt, floating card)
+  that expand into the same editable regions, and a cursor walkthrough that
+  animates a synthetic pointer through the spots you click.
+- A webcam clip added to a recording project appears as a picture-in-picture
+  bubble with its own corner, size, shape, mirroring, and shadow.
+
+The media surface is a 3D object: click it to select it, drag to move,
+Shift-drag to tilt, Ctrl-drag to spin, scroll to scale, and double-click to
+reset; the Transform panel exposes scale, position, X/Y/Z rotation,
+perspective, and anchor with per-value reset plus Fit, Fill, and Actual size.
+Backgrounds gain blur, grain, and vignette, and a text watermark can sit in
+any corner. Recordings also get a pointer panel (cursor size, shadow, idle
+hiding, click effects and colour, removable clicks), an audio lane with a
+mute toggle, and clip thumbnails. Annotations are timed in both editors:
+draw text, arrows, shapes, numbers, and highlights straight onto a recording
+(or an animated screenshot) and each mark gets a start and end on its own
+lane, plus entrance and exit effects such as draw-on, type-on, pop, and
+slide. Marks follow the camera and the 3D card, and export renders them
+frame by frame with the same code as the preview. Recordings persist their
+marks in the project's edit document. The inspector has Quick, Customize,
+and Advanced levels, and any look can be saved to a personal preset library.
+
+**Templates** bundle a look, motion, and captions into one click: Product
+launch, Feature spotlight, Tutorial steps, Social square, Changelog,
+Cinematic, Minimal dark, and Store listing. On a screenshot a template turns
+the still into a short animated scene; on a recording it restyles the scene
+and adds an intro (motion plus captions) while keeping later motion regions.
+Every caption stays an ordinary annotation you can retext, move, retime, or
+delete.
+
+Export renders the whole scene, not only the source clip, with the same
+compositor that drives the preview (the preview *is* the compositor's
+output). MP4 (H.264/AAC), WebM (VP9/Opus), and looping GIF are available for
+both recordings and animated screenshots at original, 720p, 1080p, 1440p, or
+4K, 30 or 60 fps, with a size estimate; FFmpeg is required and progress can
+be cancelled.
 
 ## Native video recording
 
