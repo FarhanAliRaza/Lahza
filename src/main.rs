@@ -6027,9 +6027,6 @@ impl Studio {
                                         cx.notify();
                                         return;
                                     }
-                                    if animation_active && select_tool {
-                                        return;
-                                    }
                                     if this.crop_active {
                                         this.crop_pointer_move(event.position, image_bounds);
                                     } else {
@@ -6064,9 +6061,7 @@ impl Studio {
                                 } else {
                                     event.position
                                 };
-                                if animation_active && select_tool {
-                                    this.pointer_is_down = false;
-                                } else if this.crop_active {
+                                if this.crop_active {
                                     this.crop_drag = None;
                                     this.pointer_is_down = false;
                                 } else if this.pointer_up(flat, interaction_bounds) {
