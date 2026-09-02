@@ -20,6 +20,10 @@ needed for synchronized video playback in the editor.
 cargo build --release
 ```
 
+`just install` builds the release binary, stops any running instance, and
+replaces `~/.local/bin/screendrop`; use it after every change so the launched
+app is the new build. `just run` does the same and launches the app.
+
 ## Install (desktop integration)
 
 A plain `cargo install` is NOT enough: the global capture shortcut (Ctrl+Shift+3)
@@ -48,3 +52,22 @@ gnome-extensions enable screendrop-input@com.screendrop
 ```
 
 Requires logging out and back in so GNOME Shell discovers it.
+
+## Performance
+
+Every editor interaction re-renders on the UI thread, so treat performance
+as part of correctness when building features:
+
+- Measure before optimizing: time the stages of a change at the preview
+  canvas size (roughly 1080 px wide) and keep an interactive tick under
+  ~16 ms. Anything dragged or animated must not rebuild work whose inputs
+  did not change.
+- `SceneCompositor` caches layers (background, vignette, watermark, card)
+  and `rebuild` reuses those from a previous compositor; the preview renders
+  a half-size proxy while a slider or the media is dragged. Extend these
+  paths instead of adding per-frame full-canvas work.
+- Blurs go through `blur_plane`, which downsamples for large sigmas; use it
+  rather than new full-resolution passes.
+- Prefer per-row loops over raw buffers to per-pixel `get_pixel`/`f64`
+  math in hot loops, and keep the media paint (`paint_media`) in mind: it
+  runs every playback frame.

@@ -205,6 +205,16 @@ pub enum SceneSource {
     },
 }
 
+/// A further image scene encoded right after the main source, with its
+/// own camera motion, duration, and timed overlay.
+pub struct ImageSegment {
+    pub image: RgbaImage,
+    pub pointer: Option<PointerTimeline>,
+    pub viewport: ViewportTimeline,
+    pub duration: f64,
+    pub overlay: Option<OverlaySource>,
+}
+
 pub struct SceneExportRequest {
     pub destination: PathBuf,
     pub format: ExportFormat,
@@ -221,6 +231,8 @@ pub struct SceneExportRequest {
     pub include_audio: bool,
     /// Per-frame media-space overlay, such as timed annotations.
     pub overlay: Option<OverlaySource>,
+    /// Image scenes that follow the main source back to back.
+    pub followers: Vec<ImageSegment>,
 }
 
 impl SceneExportRequest {
@@ -243,8 +255,13 @@ impl SceneExportRequest {
             loop_forever: true,
             include_audio: true,
             overlay: None,
+            followers: Vec::new(),
         }
     }
+}
+
+fn frames_for(duration: f64, frame_rate: f64) -> u64 {
+    ((duration * frame_rate).ceil() as u64).max(1)
 }
 
 enum PreparedSource {
@@ -338,14 +355,20 @@ pub fn export_scene(
             "the scene has no duration to export".into(),
         ));
     }
-    let total_frames = ((request.duration * frame_rate).ceil() as u64).max(1);
+    let main_frames = frames_for(request.duration, frame_rate);
+    let total_frames = main_frames
+        + request
+            .followers
+            .iter()
+            .map(|segment| frames_for(segment.duration, frame_rate))
+            .sum::<u64>();
     progress.reset(total_frames);
     if progress.is_cancelled() {
         return Err(VideoError::Cancelled);
     }
 
     let mut prepared = prepare_source(source, request, frame_rate)?;
-    let result = encode(&mut prepared, request, frame_rate, total_frames, progress);
+    let result = encode(&mut prepared, request, frame_rate, main_frames, progress);
     prepared.cleanup();
     result
 }
@@ -426,7 +449,7 @@ fn encode(
     prepared: &mut PreparedSource,
     request: &mut SceneExportRequest,
     frame_rate: f64,
-    total_frames: u64,
+    main_frames: u64,
     progress: &ExportProgress,
 ) -> Result<(), VideoError> {
     let (source_width, source_height) = prepared.dimensions();
@@ -539,7 +562,7 @@ fn encode(
     let mut last_video_frame: Option<RgbaImage> = None;
     let mut last_camera_frame: Option<RgbaImage> = None;
     let mut write_error: Option<VideoError> = None;
-    for index in 0..total_frames {
+    for index in 0..main_frames {
         if progress.is_cancelled() {
             drop(stdin);
             let _ = child.kill();
@@ -614,6 +637,58 @@ fn encode(
             break;
         }
         progress.completed.store(index + 1, Ordering::Relaxed);
+    }
+    // Follower scenes continue in the same stream; each gets a compositor
+    // for its own media size on the shared canvas.
+    let mut written = main_frames;
+    'followers: for segment in request.followers.iter_mut() {
+        if write_error.is_some() {
+            break;
+        }
+        let compositor = match SceneCompositor::new(
+            &request.style,
+            canvas_width,
+            canvas_height,
+            segment.image.width(),
+            segment.image.height(),
+        ) {
+            Ok(compositor) => compositor,
+            Err(error) => {
+                write_error = Some(VideoError::InvalidMedia(error));
+                break;
+            }
+        };
+        for index in 0..frames_for(segment.duration, frame_rate) {
+            if progress.is_cancelled() {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&temporary);
+                return Err(VideoError::Cancelled);
+            }
+            let time = index as f64 / frame_rate;
+            let pointer_overlay = segment
+                .pointer
+                .as_ref()
+                .and_then(|pointer| pointer.frame_at(time))
+                .map(|frame| PointerOverlay { frame });
+            let overlay = segment.overlay.as_mut().and_then(|source| source(time));
+            let output = compositor.compose(FrameInput {
+                source: &segment.image,
+                overlay: overlay.as_deref(),
+                viewport: segment.viewport.frame_at(time),
+                pointer: pointer_overlay.as_ref(),
+                camera: None,
+            });
+            if let Err(error) = stdin.write_all(output.as_raw()) {
+                write_error = Some(VideoError::Decode(format!(
+                    "FFmpeg stopped accepting frames: {error}"
+                )));
+                break 'followers;
+            }
+            written += 1;
+            progress.completed.store(written, Ordering::Relaxed);
+        }
     }
     drop(stdin);
     let output = child.wait_with_output()?;
@@ -840,6 +915,52 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_sequence_exports_scenes_back_to_back() {
+        if !ffmpeg_available() {
+            eprintln!("FFmpeg unavailable; skipping sequence export test");
+            return;
+        }
+        let root = test_root("sequence");
+        let first = RgbaImage::from_pixel(160, 90, Rgba([200, 40, 40, 255]));
+        // A follower with a different size and aspect shares the canvas.
+        let second = RgbaImage::from_pixel(90, 120, Rgba([40, 40, 200, 255]));
+        let cues = MotionPreset::SlowZoomIn.cues(1.0);
+        let destination = root.join("sequence.mp4");
+        let progress = ExportProgress::default();
+        let mut request = SceneExportRequest::new(
+            destination.clone(),
+            ExportFormat::Mp4,
+            180,
+            style(),
+            ViewportTimeline::build_static(&cues, 1.0),
+            1.0,
+        );
+        request.frame_rate = 10.0;
+        let follower_cues = MotionPreset::PanRight.cues(1.5);
+        request.followers.push(ImageSegment {
+            image: second,
+            pointer: None,
+            viewport: ViewportTimeline::build_static(&follower_cues, 1.5),
+            duration: 1.5,
+            overlay: None,
+        });
+        export_scene(
+            SceneSource::Image {
+                image: first,
+                pointer: None,
+            },
+            &mut request,
+            &progress,
+        )
+        .unwrap();
+        assert!((progress.fraction() - 1.0).abs() < 1e-9);
+        let info = probe_media(&destination).unwrap();
+        assert_eq!((info.width, info.height), (320, 180));
+        assert!((info.duration - 2.5).abs() < 0.25, "{}", info.duration);
         fs::remove_dir_all(root).unwrap();
     }
 

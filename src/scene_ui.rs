@@ -26,7 +26,7 @@ use crate::{
             render_svg_layer, MediaProjection, PointerOverlay, SceneCompositor, SceneGeometry,
             SceneStyle, SceneTransform, WatermarkPosition,
         },
-        viewport::{MotionEasing, ViewportFrame},
+        viewport::{MotionEasing, ViewportFrame, ViewportTimeline},
     },
     timed::{self, AnnotationTiming, EntranceEffect, ExitEffect},
     AnnotationMark, SliderDrag, Studio, Tool, BACKGROUND_PRESETS,
@@ -627,7 +627,8 @@ impl Studio {
         }
         let (width, height) = self.media_dimensions()?;
         let marks = if self.scene_is_timed() {
-            timed::active_marks(&self.annotations, time)
+            let viewport = self.video_viewport_timeline.frame_at(time);
+            timed::active_marks(&self.annotations, time, viewport)
         } else {
             self.annotations.clone()
         };
@@ -649,9 +650,17 @@ impl Studio {
         canvas_height: Pixels,
     ) -> Option<Arc<RenderImage>> {
         let source = self.preview_source()?;
+        // While a slider or the media is being dragged, compose a half-size
+        // proxy that the canvas scales up; the full-size frame is rendered
+        // once the drag ends. Interactive edits stay smooth this way.
+        let proxy = if self.slider_drag.is_some() || self.media_drag.is_some() {
+            0.5
+        } else {
+            1.0
+        };
         let canvas = (
-            (f32::from(canvas_width).round() as u32).max(2),
-            (f32::from(canvas_height).round() as u32).max(2),
+            (f32::from(canvas_width) * proxy).round().max(2.0) as u32,
+            (f32::from(canvas_height) * proxy).round().max(2.0) as u32,
         );
         let style = self.scene_style();
         let source_size = (source.width(), source.height());
@@ -704,9 +713,15 @@ impl Studio {
             None => true,
         };
         if rebuild {
-            let compositor =
-                SceneCompositor::new(&style, canvas.0, canvas.1, source_size.0, source_size.1)
-                    .ok()?;
+            let compositor = match self.preview_cache.compositor.as_ref() {
+                Some((_, _, _, previous)) => {
+                    previous.rebuild(&style, canvas.0, canvas.1, source_size.0, source_size.1)
+                }
+                None => {
+                    SceneCompositor::new(&style, canvas.0, canvas.1, source_size.0, source_size.1)
+                }
+            }
+            .ok()?;
             self.preview_cache.compositor = Some((style.clone(), canvas, source_size, compositor));
         }
         let pointer = has_pointer
@@ -730,14 +745,9 @@ impl Studio {
     /// style needs it, an animated tilt is bending the media, or a cursor
     /// walkthrough has to be drawn.
     pub(crate) fn preview_needs_compositor(&self) -> bool {
-        self.scene_style().needs_composited_preview()
-            || (self.animation_active
-                && (self.has_walkthrough()
-                    || !self
-                        .video_viewport_timeline
-                        .frame_at(self.video_position)
-                        .tilt
-                        .is_zero()))
+        // GPUI cannot clip the zoomed still to a rounded rect, so animated
+        // scenes always show the composited frame export produces.
+        self.scene_style().needs_composited_preview() || self.animation_active
     }
 
     pub(crate) fn has_walkthrough(&self) -> bool {
@@ -1159,10 +1169,21 @@ impl Studio {
         let canvas_size = (f32::from(canvas.size.width), f32::from(canvas.size.height));
         let (_, projection) = self.preview_projection(canvas_size.0, canvas_size.1);
         let inside = projection.contains(local_x as f64, local_y as f64);
-        // A selected motion region turns clicks into focus picks.
+        // A selected motion region turns clicks into focus picks; pressing
+        // on a marker drags that marker instead of the default pick.
         if self.video_selected_zoom_cue.is_some() && inside {
             let (u, v) = projection.unproject(local_x as f64, local_y as f64);
-            self.pin_focus_at_media(u, v, cx);
+            let pick = self
+                .motion_markers()
+                .into_iter()
+                .find(|(_, mu, mv)| {
+                    let (mx, my) = projection.project(*mu, *mv);
+                    (mx - local_x as f64).hypot(my - local_y as f64) <= MOTION_MARKER_HIT
+                })
+                .map(|(pick, _, _)| pick)
+                .unwrap_or(self.motion_pick);
+            self.focus_drag = Some(pick);
+            self.pin_focus_at_media(u, v, pick, cx);
             return true;
         }
         if self.scene_selection == SceneSelection::Media {
@@ -1266,8 +1287,78 @@ impl Studio {
         true
     }
 
+    /// The selected region's focus and pan-end markers as (pick, u, v) in
+    /// the visible crop's coordinates, for painting and hit-testing.
+    fn motion_markers(&self) -> Vec<(crate::motion_ui::MotionPick, f64, f64)> {
+        let Some(cue) = self
+            .video_selected_zoom_cue
+            .and_then(|id| self.video_zoom_cues.iter().find(|cue| cue.id == id))
+        else {
+            return Vec::new();
+        };
+        let frame = self.video_viewport_timeline.frame_at(self.video_position);
+        let (left, top, visible) = crate::recording::viewport::visible_rect(frame);
+        let to_visible = |p: NormalizedPoint| ((p.x - left) / visible, (p.y - top) / visible);
+        let focus = match cue.anchor_mode {
+            crate::recording::viewport::ZoomAnchorMode::PinnedAnchor => cue.pinned_point,
+            _ => frame.anchor,
+        };
+        let (u, v) = to_visible(focus);
+        let mut markers = vec![(crate::motion_ui::MotionPick::Focus, u, v)];
+        if let Some(pan) = cue.pan_to {
+            let (u, v) = to_visible(pan);
+            markers.push((crate::motion_ui::MotionPick::PanEnd, u, v));
+        }
+        markers
+    }
+
+    /// Canvas-local marker positions (is_focus, point) to paint while a
+    /// region is selected and playback is paused; empty otherwise.
+    pub(crate) fn motion_marker_points(
+        &self,
+        projection: &MediaProjection,
+    ) -> Vec<(bool, Point<Pixels>)> {
+        if self.video_selected_zoom_cue.is_none() || self.video_playing {
+            return Vec::new();
+        }
+        self.motion_markers()
+            .into_iter()
+            .map(|(pick, u, v)| {
+                let (x, y) = projection.project(u, v);
+                (
+                    pick == crate::motion_ui::MotionPick::Focus,
+                    point(px(x as f32), px(y as f32)),
+                )
+            })
+            .collect()
+    }
+
+    /// Moves the marker being dragged to the pointer, clamped to the media.
+    pub(crate) fn drag_motion_marker(
+        &mut self,
+        position: Point<Pixels>,
+        canvas: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pick) = self.focus_drag else {
+            return;
+        };
+        let local_x = f32::from(position.x - canvas.origin.x);
+        let local_y = f32::from(position.y - canvas.origin.y);
+        let (_, projection) =
+            self.preview_projection(f32::from(canvas.size.width), f32::from(canvas.size.height));
+        let (u, v) = projection.unproject(local_x as f64, local_y as f64);
+        self.pin_focus_at_media(u.clamp(0.0, 1.0), v.clamp(0.0, 1.0), pick, cx);
+    }
+
     /// Sets the selected region's focus (or pan end) from media coordinates.
-    pub(crate) fn pin_focus_at_media(&mut self, u: f64, v: f64, cx: &mut Context<Self>) {
+    pub(crate) fn pin_focus_at_media(
+        &mut self,
+        u: f64,
+        v: f64,
+        pick: crate::motion_ui::MotionPick,
+        cx: &mut Context<Self>,
+    ) {
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
             return;
         }
@@ -1278,7 +1369,7 @@ impl Studio {
             y: top + v * visible,
         }
         .clamped();
-        match self.motion_pick {
+        match pick {
             crate::motion_ui::MotionPick::Focus => {
                 self.mutate_selected_zoom_cue(cx, |cue| {
                     cue.anchor_mode = crate::recording::viewport::ZoomAnchorMode::PinnedAnchor;
@@ -1312,6 +1403,7 @@ impl Studio {
             self.preview_projection(f32::from(canvas_width), f32::from(canvas_height));
         let show_handles = self.scene_selection == SceneSelection::Media;
         let picking = self.video_selected_zoom_cue.is_some();
+        let markers = self.motion_marker_points(&projection);
         let entity = cx.entity();
         let time = self.video_position;
         // Annotations paint flat over the media rect; a transformed card
@@ -1391,7 +1483,11 @@ impl Studio {
                                     let index = painted_indices[slot];
                                     let rendered_bounds = paint_annotation(
                                         mark,
-                                        interaction_bounds,
+                                        if mark.pinned {
+                                            media
+                                        } else {
+                                            interaction_bounds
+                                        },
                                         index >= committed_count,
                                         editing_text == Some(index) && caret_visible,
                                         window,
@@ -1432,6 +1528,14 @@ impl Studio {
                         );
                         if show_handles {
                             paint_selection_handles(&projection, bounds, window);
+                        }
+                        if !markers.is_empty() {
+                            window.with_content_mask(
+                                Some(ContentMask { bounds: media }),
+                                |window| {
+                                    paint_motion_markers(&markers, bounds, window);
+                                },
+                            );
                         }
                         window.on_mouse_event({
                             let entity = entity.clone();
@@ -1502,6 +1606,10 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if this.focus_drag.is_some() {
+                                        this.drag_motion_marker(event.position, bounds, cx);
+                                        return;
+                                    }
                                     if this.media_drag.is_some() || !this.pointer_is_down {
                                         return;
                                     }
@@ -1520,6 +1628,7 @@ impl Studio {
                                 return;
                             }
                             entity.update(cx, |this, cx| {
+                                this.focus_drag = None;
                                 if !this.pointer_is_down {
                                     return;
                                 }
@@ -2475,6 +2584,10 @@ impl Studio {
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
                             this.select_annotation_for_timing(index);
+                            // Clicking a region also moves the playhead there.
+                            if let Some(target) = this.motion_timeline_time_at(event.position.x) {
+                                this.seek_video(target, cx);
+                            }
                             this.begin_annotation_drag(
                                 index,
                                 AnnotationDragKind::Move,
@@ -2792,6 +2905,20 @@ impl Studio {
                         }
                     },
                 ))
+                .child(self.scene_toggle_row(
+                    "annotation-pinned",
+                    "Pin to frame",
+                    mark.pinned,
+                    cx,
+                    |this| {
+                        if let Some(mark) = this
+                            .selected_annotation
+                            .and_then(|index| this.annotations.get_mut(index))
+                        {
+                            mark.pinned = !mark.pinned;
+                        }
+                    },
+                ))
                 .when(!whole, |this| {
                     this.child(
                         div()
@@ -2937,14 +3064,31 @@ impl Studio {
     pub(crate) fn annotation_overlay_source(
         &self,
     ) -> Option<crate::recording::export::OverlaySource> {
-        if self.annotations.is_empty() {
+        let (width, height) = self.media_dimensions()?;
+        overlay_source_for(
+            self.annotations.clone(),
+            self.video_viewport_timeline.clone(),
+            width,
+            height,
+        )
+    }
+}
+
+/// Overlay renderer for `marks` on media of the given size, animated and
+/// pinned through `viewport`.
+pub(crate) fn overlay_source_for(
+    marks: Vec<AnnotationMark>,
+    viewport: ViewportTimeline,
+    width: u32,
+    height: u32,
+) -> Option<crate::recording::export::OverlaySource> {
+    {
+        if marks.is_empty() {
             return None;
         }
-        let (width, height) = self.media_dimensions()?;
-        let marks = self.annotations.clone();
         let mut cache: Option<(u64, Arc<RgbaImage>)> = None;
         Some(Box::new(move |time: f64| {
-            let active = timed::active_marks(&marks, time);
+            let active = timed::active_marks(&marks, time, viewport.frame_at(time));
             if active.is_empty() {
                 return None;
             }
@@ -2981,6 +3125,62 @@ pub(crate) fn render_annotation_layer(
     ));
     svg.push_str("</svg>");
     render_svg_layer(&svg, width, height).ok()
+}
+
+/// Canvas-pixel radius within which a press grabs a motion marker.
+const MOTION_MARKER_HIT: f64 = 14.0;
+
+/// Paints the focus (filled) and pan-end (hollow) markers of the selected
+/// motion region, joined by a line when both exist.
+pub(crate) fn paint_motion_markers(
+    markers: &[(bool, Point<Pixels>)],
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let orange = hsla(24.0 / 360.0, 0.95, 0.55, 1.0);
+    let at = |p: Point<Pixels>| point(bounds.origin.x + p.x, bounds.origin.y + p.y);
+    if markers.len() == 2 {
+        let mut builder = PathBuilder::stroke(px(1.5));
+        builder.move_to(at(markers[0].1));
+        builder.line_to(at(markers[1].1));
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, orange);
+        }
+    }
+    for (is_focus, position) in markers {
+        let center = at(*position);
+        let radius = if *is_focus { 10.0 } else { 8.0 };
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(center.x - px(radius), center.y - px(radius)),
+                size: size(px(radius * 2.0), px(radius * 2.0)),
+            },
+            px(radius),
+            if *is_focus {
+                hsla(24.0 / 360.0, 0.95, 0.55, 0.35)
+            } else {
+                hsla(0.0, 0.0, 0.0, 0.0)
+            },
+            px(2.0),
+            if *is_focus {
+                hsla(0.0, 0.0, 1.0, 1.0)
+            } else {
+                orange
+            },
+            Default::default(),
+        ));
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(center.x - px(3.0), center.y - px(3.0)),
+                size: size(px(6.0), px(6.0)),
+            },
+            px(3.0),
+            orange,
+            px(0.0),
+            hsla(0.0, 0.0, 0.0, 0.0),
+            Default::default(),
+        ));
+    }
 }
 
 fn paint_selection_handles(

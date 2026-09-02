@@ -760,6 +760,45 @@ impl SceneCompositor {
         source_width: u32,
         source_height: u32,
     ) -> Result<Self, String> {
+        Self::build(
+            style,
+            canvas_width,
+            canvas_height,
+            source_width,
+            source_height,
+            None,
+        )
+    }
+
+    /// Like [`new`](Self::new), but reuses the rendered background, vignette
+    /// and watermark layers of `previous` when their inputs did not change,
+    /// so interactive edits of one setting only redo that setting's work.
+    pub fn rebuild(
+        &self,
+        style: &SceneStyle,
+        canvas_width: u32,
+        canvas_height: u32,
+        source_width: u32,
+        source_height: u32,
+    ) -> Result<Self, String> {
+        Self::build(
+            style,
+            canvas_width,
+            canvas_height,
+            source_width,
+            source_height,
+            Some(self),
+        )
+    }
+
+    fn build(
+        style: &SceneStyle,
+        canvas_width: u32,
+        canvas_height: u32,
+        source_width: u32,
+        source_height: u32,
+        previous: Option<&Self>,
+    ) -> Result<Self, String> {
         if canvas_width == 0 || canvas_height == 0 {
             return Err("scene canvas must be at least one pixel".into());
         }
@@ -770,21 +809,44 @@ impl SceneCompositor {
             source_height as f64,
             style,
         );
-        let mut background = render_background(&style.background, canvas_width, canvas_height)?;
-        if style.background_blur > 0 {
-            let sigma = style.background_blur as f64 / 100.0 * 40.0 * geometry.ui_scale;
-            blur_image(&mut background, sigma);
-        }
-        if style.background_noise > 0 {
-            apply_noise(&mut background, style.background_noise as f64 / 100.0);
-        }
-        let vignette = (style.vignette > 0)
-            .then(|| vignette_map(canvas_width, canvas_height, style.vignette as f64 / 100.0));
-        let watermark = style
-            .watermark
-            .as_ref()
-            .filter(|watermark| !watermark.text.trim().is_empty())
-            .and_then(|watermark| render_watermark(watermark, canvas_width, canvas_height).ok());
+        let previous = previous
+            .filter(|previous| previous.width == canvas_width && previous.height == canvas_height);
+        let background = match previous.filter(|previous| {
+            previous.style.background == style.background
+                && previous.style.background_blur == style.background_blur
+                && previous.style.background_noise == style.background_noise
+                && previous.geometry.ui_scale == geometry.ui_scale
+        }) {
+            Some(previous) => previous.background.clone(),
+            None => {
+                let mut background =
+                    render_background(&style.background, canvas_width, canvas_height)?;
+                if style.background_blur > 0 {
+                    let sigma = style.background_blur as f64 / 100.0 * 40.0 * geometry.ui_scale;
+                    blur_image(&mut background, sigma);
+                }
+                if style.background_noise > 0 {
+                    apply_noise(&mut background, style.background_noise as f64 / 100.0);
+                }
+                background
+            }
+        };
+        let vignette = match previous.filter(|previous| previous.style.vignette == style.vignette) {
+            Some(previous) => previous.vignette.clone(),
+            None => (style.vignette > 0)
+                .then(|| vignette_map(canvas_width, canvas_height, style.vignette as f64 / 100.0)),
+        };
+        let watermark =
+            match previous.filter(|previous| previous.style.watermark == style.watermark) {
+                Some(previous) => previous.watermark.clone(),
+                None => style
+                    .watermark
+                    .as_ref()
+                    .filter(|watermark| !watermark.text.trim().is_empty())
+                    .and_then(|watermark| {
+                        render_watermark(watermark, canvas_width, canvas_height).ok()
+                    }),
+            };
         Ok(Self {
             style: style.clone(),
             geometry,
@@ -1012,12 +1074,7 @@ impl SceneCompositor {
                     mask[y * width + x] = (0.5 - distance).clamp(0.0, 1.0) as f32;
                 }
             }
-            let box_radius = box_radius_for(rect.height * 0.05 * 0.5 + 1.0);
-            let mut scratch = vec![0.0f32; width * height];
-            for _ in 0..3 {
-                box_blur_horizontal(&mask, &mut scratch, width, height, box_radius);
-                box_blur_vertical(&scratch, &mut mask, width, height, box_radius);
-            }
+            blur_plane(&mut mask, width, height, rect.height * 0.05 * 0.5 + 1.0);
             for y in 0..height {
                 for x in 0..width {
                     let alpha = mask[y * width + x] as f64 * 0.35;
@@ -1327,26 +1384,65 @@ fn blur_image(image: &mut RgbaImage, sigma: f64) {
     }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let box_radius = box_radius_for(sigma);
-    let mut channels: Vec<Vec<f32>> = (0..3)
-        .map(|channel| {
-            image
-                .pixels()
-                .map(|pixel| pixel[channel] as f32)
-                .collect::<Vec<f32>>()
-        })
-        .collect();
-    let mut scratch = vec![0.0f32; width * height];
-    for channel in channels.iter_mut() {
-        for _ in 0..3 {
-            box_blur_horizontal(channel, &mut scratch, width, height, box_radius);
-            box_blur_vertical(&scratch, channel, width, height, box_radius);
+    let factor = blur_downsample_factor(sigma);
+    if factor == 1 {
+        let mut channels: Vec<Vec<f32>> = (0..3)
+            .map(|channel| {
+                image
+                    .pixels()
+                    .map(|pixel| pixel[channel] as f32)
+                    .collect::<Vec<f32>>()
+            })
+            .collect();
+        for channel in channels.iter_mut() {
+            blur_plane(channel, width, height, sigma);
+        }
+        for (index, pixel) in image.pixels_mut().enumerate() {
+            pixel[0] = channels[0][index].round().clamp(0.0, 255.0) as u8;
+            pixel[1] = channels[1][index].round().clamp(0.0, 255.0) as u8;
+            pixel[2] = channels[2][index].round().clamp(0.0, 255.0) as u8;
+        }
+        return;
+    }
+    // Large sigma: average blocks straight out of the RGBA buffer, blur the
+    // small planes, and write the upsampled result straight back.
+    let small_width = width.div_ceil(factor);
+    let small_height = height.div_ceil(factor);
+    let mut small = vec![vec![0.0f32; small_width * small_height]; 3];
+    let raw = image.as_raw();
+    for sy in 0..small_height {
+        for sx in 0..small_width {
+            let x_end = ((sx + 1) * factor).min(width);
+            let y_end = ((sy + 1) * factor).min(height);
+            let mut sum = [0.0f32; 3];
+            for y in sy * factor..y_end {
+                for x in sx * factor..x_end {
+                    let offset = (y * width + x) * 4;
+                    sum[0] += raw[offset] as f32;
+                    sum[1] += raw[offset + 1] as f32;
+                    sum[2] += raw[offset + 2] as f32;
+                }
+            }
+            let count = ((x_end - sx * factor) * (y_end - sy * factor)) as f32;
+            for channel in 0..3 {
+                small[channel][sy * small_width + sx] = sum[channel] / count;
+            }
         }
     }
-    for (index, pixel) in image.pixels_mut().enumerate() {
-        pixel[0] = channels[0][index].round().clamp(0.0, 255.0) as u8;
-        pixel[1] = channels[1][index].round().clamp(0.0, 255.0) as u8;
-        pixel[2] = channels[2][index].round().clamp(0.0, 255.0) as u8;
+    for plane in small.iter_mut() {
+        blur_plane(plane, small_width, small_height, sigma / factor as f64);
+    }
+    let raw: &mut [u8] = image.as_mut();
+    for channel in 0..3 {
+        upsample_bilinear(
+            &small[channel],
+            small_width,
+            small_height,
+            factor,
+            width,
+            height,
+            |index, value| raw[index * 4 + channel] = value.round().clamp(0.0, 255.0) as u8,
+        );
     }
 }
 
@@ -1358,14 +1454,17 @@ fn box_radius_for(sigma: f64) -> usize {
 
 /// Deterministic film grain.
 fn apply_noise(image: &mut RgbaImage, amount: f64) {
-    let strength = amount.clamp(0.0, 1.0) * 48.0;
-    let width = image.width();
-    for (index, pixel) in image.pixels_mut().enumerate() {
-        let x = (index as u32 % width) as u64;
-        let y = (index as u32 / width) as u64;
-        let noise = (hash_noise(x, y) * 2.0 - 1.0) * strength;
-        for channel in 0..3 {
-            pixel[channel] = (pixel[channel] as f64 + noise).round().clamp(0.0, 255.0) as u8;
+    let strength = (amount.clamp(0.0, 1.0) * 48.0) as f32;
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let raw: &mut [u8] = image.as_mut();
+    for y in 0..height {
+        let row = &mut raw[y * width * 4..(y + 1) * width * 4];
+        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+            let noise = (hash_noise(x as u64, y as u64) as f32 * 2.0 - 1.0) * strength;
+            for channel in pixel.iter_mut().take(3) {
+                *channel = (*channel as f32 + noise).round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
 }
@@ -1509,15 +1608,7 @@ fn paint_shadow(
         }
     }
     // A CSS blur radius corresponds to a Gaussian with sigma = radius / 2.
-    let sigma = shadow.blur_radius * 0.5;
-    if sigma > 0.5 {
-        let box_radius = box_radius_for(sigma);
-        let mut scratch = vec![0.0f32; width * height];
-        for _ in 0..3 {
-            box_blur_horizontal(&mask, &mut scratch, width, height, box_radius);
-            box_blur_vertical(&scratch, &mut mask, width, height, box_radius);
-        }
-    }
+    blur_plane(&mut mask, width, height, shadow.blur_radius * 0.5);
     for y in 0..height {
         for x in 0..width {
             let alpha = mask[y * width + x] as f64 * shadow.opacity;
@@ -1528,37 +1619,125 @@ fn paint_shadow(
     }
 }
 
+/// Gaussian-like blur (three box passes) of one f32 plane. Large sigmas are
+/// blurred on a downsampled copy and bilinearly upsampled back: the result is
+/// visually identical (the blur removes everything finer than the
+/// downsample) and the cost stops growing with sigma.
+fn blur_plane(plane: &mut [f32], width: usize, height: usize, sigma: f64) {
+    if sigma <= 0.5 || width == 0 || height == 0 {
+        return;
+    }
+    let factor = blur_downsample_factor(sigma);
+    if factor == 1 {
+        let box_radius = box_radius_for(sigma);
+        let mut scratch = vec![0.0f32; width * height];
+        for _ in 0..3 {
+            box_blur_horizontal(plane, &mut scratch, width, height, box_radius);
+            box_blur_vertical(&scratch, plane, width, height, box_radius);
+        }
+        return;
+    }
+    let small_width = width.div_ceil(factor);
+    let small_height = height.div_ceil(factor);
+    let mut small = vec![0.0f32; small_width * small_height];
+    for sy in 0..small_height {
+        for sx in 0..small_width {
+            let x_end = ((sx + 1) * factor).min(width);
+            let y_end = ((sy + 1) * factor).min(height);
+            let mut sum = 0.0f32;
+            for y in sy * factor..y_end {
+                sum += plane[y * width + sx * factor..y * width + x_end]
+                    .iter()
+                    .sum::<f32>();
+            }
+            let count = ((x_end - sx * factor) * (y_end - sy * factor)) as f32;
+            small[sy * small_width + sx] = sum / count;
+        }
+    }
+    blur_plane(&mut small, small_width, small_height, sigma / factor as f64);
+    upsample_bilinear(
+        &small,
+        small_width,
+        small_height,
+        factor,
+        width,
+        height,
+        |index, value| plane[index] = value,
+    );
+}
+
+/// Downsampling applied before blurring with `sigma`, keeping the effective
+/// sigma on the small image around 2.5 px or more.
+fn blur_downsample_factor(sigma: f64) -> usize {
+    ((sigma / 2.5).floor() as usize).clamp(1, 16)
+}
+
+/// Bilinearly stretches `small` (a `factor`-times downsampled plane) back to
+/// `width` × `height`, handing each output pixel's index and value to `write`.
+fn upsample_bilinear(
+    small: &[f32],
+    small_width: usize,
+    small_height: usize,
+    factor: usize,
+    width: usize,
+    height: usize,
+    mut write: impl FnMut(usize, f32),
+) {
+    let scale = 1.0 / factor as f32;
+    let max_x = (small_width - 1) as f32;
+    let max_y = (small_height - 1) as f32;
+    // Horizontal weights repeat per column, so compute them once.
+    let columns: Vec<(usize, usize, f32)> = (0..width)
+        .map(|x| {
+            let fx = ((x as f32 + 0.5) * scale - 0.5).clamp(0.0, max_x);
+            let x0 = fx.floor() as usize;
+            (x0, (x0 + 1).min(small_width - 1), fx - x0 as f32)
+        })
+        .collect();
+    for y in 0..height {
+        let fy = ((y as f32 + 0.5) * scale - 0.5).clamp(0.0, max_y);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(small_height - 1);
+        let ty = fy - y0 as f32;
+        let row0 = &small[y0 * small_width..(y0 + 1) * small_width];
+        let row1 = &small[y1 * small_width..(y1 + 1) * small_width];
+        for (x, &(x0, x1, tx)) in columns.iter().enumerate() {
+            let top = row0[x0] + (row0[x1] - row0[x0]) * tx;
+            let bottom = row1[x0] + (row1[x1] - row1[x0]) * tx;
+            write(y * width + x, top + (bottom - top) * ty);
+        }
+    }
+}
+
+/// Box blur along a row/column with clamp-to-edge sampling, so borders keep
+/// their brightness instead of fading toward black.
 fn box_blur_horizontal(src: &[f32], dst: &mut [f32], width: usize, height: usize, radius: usize) {
     let window = (radius * 2 + 1) as f32;
     for y in 0..height {
         let row = &src[y * width..(y + 1) * width];
-        let mut sum: f32 = row.iter().take(radius + 1).sum();
+        let last = width - 1;
+        let mut sum: f32 =
+            (0..=radius).map(|dx| row[dx.min(last)]).sum::<f32>() + row[0] * radius as f32;
         for x in 0..width {
             dst[y * width + x] = sum / window;
-            if x + radius + 1 < width {
-                sum += row[x + radius + 1];
-            }
-            if x >= radius {
-                sum -= row[x - radius];
-            }
+            sum += row[(x + radius + 1).min(last)];
+            sum -= row[x.saturating_sub(radius)];
         }
     }
 }
 
 fn box_blur_vertical(src: &[f32], dst: &mut [f32], width: usize, height: usize, radius: usize) {
     let window = (radius * 2 + 1) as f32;
+    let last = height - 1;
     for x in 0..width {
-        let mut sum: f32 = (0..(radius + 1).min(height))
-            .map(|y| src[y * width + x])
-            .sum();
+        let mut sum: f32 = (0..=radius)
+            .map(|dy| src[dy.min(last) * width + x])
+            .sum::<f32>()
+            + src[x] * radius as f32;
         for y in 0..height {
             dst[y * width + x] = sum / window;
-            if y + radius + 1 < height {
-                sum += src[(y + radius + 1) * width + x];
-            }
-            if y >= radius {
-                sum -= src[(y - radius) * width + x];
-            }
+            sum += src[(y + radius + 1).min(last) * width + x];
+            sum -= src[y.saturating_sub(radius) * width + x];
         }
     }
 }
@@ -2185,5 +2364,23 @@ mod tests {
             output.get_pixel(center.0 + 3, center.1 + 3).0,
             [255, 255, 255, 255]
         );
+    }
+}
+
+#[cfg(test)]
+mod box_blur_edge_tests {
+    use super::*;
+
+    #[test]
+    fn box_blur_keeps_flat_image_flat_at_edges() {
+        let (w, h) = (40usize, 30usize);
+        let src = vec![200.0f32; w * h];
+        let mut tmp = vec![0.0f32; w * h];
+        let mut out = vec![0.0f32; w * h];
+        box_blur_horizontal(&src, &mut tmp, w, h, 7);
+        box_blur_vertical(&tmp, &mut out, w, h, 7);
+        for v in out {
+            assert!((v - 200.0).abs() < 0.01, "edge darkened: {v}");
+        }
     }
 }

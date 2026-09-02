@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
+use crate::recording::viewport::{visible_rect, ViewportFrame};
 use crate::{AnnotationMark, NormPoint, Tool};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -284,11 +285,40 @@ pub fn animated_mark(mark: &AnnotationMark, time: f64) -> Option<AnnotationMark>
     Some(animated)
 }
 
-/// Every mark visible at `time`, already animated.
-pub fn active_marks(marks: &[AnnotationMark], time: f64) -> Vec<AnnotationMark> {
+/// A pinned mark expressed in media coordinates for `viewport`, so painting
+/// it through the viewport crop leaves it fixed on the frame. Unpinned marks
+/// pass through unchanged.
+pub fn in_media_space(mark: AnnotationMark, viewport: ViewportFrame) -> AnnotationMark {
+    if !mark.pinned {
+        return mark;
+    }
+    let (left, top, visible) = visible_rect(viewport);
+    let mut mapped = mark;
+    let map = |point: NormPoint| NormPoint {
+        x: left as f32 + point.x * visible as f32,
+        y: top as f32 + point.y * visible as f32,
+    };
+    mapped.start = map(mapped.start);
+    mapped.end = map(mapped.end);
+    for point in &mut mapped.points {
+        *point = map(*point);
+    }
+    mapped.font_size *= visible as f32;
+    mapped.stroke_width *= visible as f32;
+    mapped
+}
+
+/// Every mark visible at `time`, animated and in media coordinates for
+/// `viewport`.
+pub fn active_marks(
+    marks: &[AnnotationMark],
+    time: f64,
+    viewport: ViewportFrame,
+) -> Vec<AnnotationMark> {
     marks
         .iter()
         .filter_map(|mark| animated_mark(mark, time))
+        .map(|mark| in_media_space(mark, viewport))
         .collect()
 }
 
@@ -385,7 +415,26 @@ mod tests {
                 transition: 0.5,
             }),
             opacity: 1.0,
+            pinned: false,
         }
+    }
+
+    #[test]
+    fn pinned_marks_follow_the_viewport_crop() {
+        let mut pinned = mark(Tool::Text);
+        pinned.pinned = true;
+        pinned.timing = None;
+        let viewport = ViewportFrame {
+            magnification: 2.0,
+            anchor: crate::recording::model::NormalizedPoint { x: 0.75, y: 0.75 },
+            ..ViewportFrame::default()
+        };
+        let mapped = in_media_space(pinned.clone(), viewport);
+        assert!((mapped.start.x - 0.6).abs() < 1e-6 && (mapped.start.y - 0.6).abs() < 1e-6);
+        assert!((mapped.end.x - 0.8).abs() < 1e-6);
+        assert!((mapped.font_size - 12.0).abs() < 1e-6);
+        pinned.pinned = false;
+        assert_eq!(in_media_space(pinned.clone(), viewport), pinned);
     }
 
     #[test]

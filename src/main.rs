@@ -494,6 +494,9 @@ struct AnnotationMark {
     opacity: f32,
     /// Placed by a template; replaced when another template is applied.
     from_template: bool,
+    /// Anchored to the visible frame instead of the media, so camera motion
+    /// pans beneath it (captions, step numbers).
+    pinned: bool,
 }
 
 impl Default for AnnotationMark {
@@ -517,8 +520,28 @@ impl Default for AnnotationMark {
             timing: None,
             opacity: 1.0,
             from_template: false,
+            pinned: false,
         }
     }
+}
+
+/// One image of an animated scene sequence: everything the editor needs to
+/// bring it back, stored while another image is being edited.
+#[derive(Clone)]
+struct ImageScene {
+    path: PathBuf,
+    processed_path: Option<PathBuf>,
+    dimensions: (u32, u32),
+    rgba: Arc<image::RgbaImage>,
+    render: Arc<RenderImage>,
+    annotations: Vec<AnnotationMark>,
+    zoom_cues: Vec<ZoomCue>,
+    duration: f64,
+    preset: Option<MotionPreset>,
+    pointer_capture: PointerCaptureFile,
+    walkthrough_stops: Vec<recording::model::NormalizedPoint>,
+    viewport: ViewportTimeline,
+    pointer: Option<PointerTimeline>,
 }
 
 /// Annotations plus their undo history, so the screenshot editor's marks
@@ -1327,6 +1350,8 @@ struct Studio {
     pointer_style: PointerStyle,
     scene_selection: SceneSelection,
     media_drag: Option<MediaDrag>,
+    /// Which motion marker (focus or pan end) the pointer is dragging.
+    focus_drag: Option<MotionPick>,
     scene_canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     preview_cache: PreviewCache,
     /// RGBA copies of what the preview shows, for the compositor.
@@ -1364,6 +1389,10 @@ struct Studio {
     animation_pointer_capture: PointerCaptureFile,
     walkthrough_stops: Vec<recording::model::NormalizedPoint>,
     walkthrough_mode: bool,
+    /// Animated screenshot sequence; empty while a single image is edited.
+    /// The scene at `image_scene_index` is the one live in the editor.
+    image_scenes: Vec<ImageScene>,
+    image_scene_index: usize,
     focus_handle: FocusHandle,
     wallpaper_tab: usize,
     library_tab: usize,
@@ -1645,6 +1674,7 @@ impl Studio {
             pointer_style: PointerStyle::default(),
             scene_selection: SceneSelection::Scene,
             media_drag: None,
+            focus_drag: None,
             scene_canvas_bounds: scene_ui::scene_canvas_bounds_store(),
             preview_cache: PreviewCache::default(),
             video_frame_rgba: None,
@@ -1677,6 +1707,8 @@ impl Studio {
             animation_pointer_capture: PointerCaptureFile::default(),
             walkthrough_stops: Vec::new(),
             walkthrough_mode: false,
+            image_scenes: Vec::new(),
+            image_scene_index: 0,
             focus_handle: cx.focus_handle(),
             wallpaper_tab: 2,
             library_tab: 1,
@@ -3165,6 +3197,8 @@ impl Studio {
                 }
                 self.video_zoom_cues.clear();
                 self.animation_preset = None;
+                self.image_scenes.clear();
+                self.image_scene_index = 0;
                 self.walkthrough_stops.clear();
                 self.walkthrough_mode = false;
                 self.animation_pointer_capture = PointerCaptureFile::default();
@@ -3700,6 +3734,7 @@ impl Studio {
             }),
             opacity: 1.0,
             from_template: false,
+            pinned: false,
         };
 
         if self.tool == Tool::Number {
@@ -3735,13 +3770,36 @@ impl Studio {
         }
     }
 
+    /// The on-screen frame rect for pinned marks, recovered from the zoomed
+    /// interaction rect `image` and the current viewport crop.
+    fn pinned_bounds(&self, image: Bounds<Pixels>) -> Bounds<Pixels> {
+        if !self.scene_is_timed() {
+            return image;
+        }
+        let frame = self.video_viewport_timeline.frame_at(self.video_position);
+        let (left, top, visible) = visible_rect(frame);
+        let size = size(
+            image.size.width * visible as f32,
+            image.size.height * visible as f32,
+        );
+        Bounds {
+            origin: point(
+                image.origin.x + image.size.width * left as f32,
+                image.origin.y + image.size.height * top as f32,
+            ),
+            size,
+        }
+    }
+
     fn pointer_move(&mut self, position: Point<Pixels>, image: Bounds<Pixels>) {
         if self.tool == Tool::Select {
             if let (Some(index), Some(last)) = (self.selected_annotation, self.selection_last_point)
             {
-                let dx = (position.x - last.x) / image.size.width;
-                let dy = (position.y - last.y) / image.size.height;
+                let frame = self.pinned_bounds(image);
                 if let Some(mark) = self.annotations.get_mut(index) {
+                    let image = if mark.pinned { frame } else { image };
+                    let dx = (position.x - last.x) / image.size.width;
+                    let dy = (position.y - last.y) / image.size.height;
                     if self.selection_resizing && mark.tool != Tool::Pen {
                         mark.end = screen_to_norm(position, image);
                     } else {
@@ -4796,6 +4854,55 @@ impl Studio {
             }))
     }
 
+    /// Sidebar field showing the selected text mark's content; clicking it
+    /// starts editing, and keystrokes then go to the mark as on the canvas.
+    fn annotation_text_field(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let editing = self.editing_text == Some(index);
+        let text = self
+            .annotations
+            .get(index)
+            .map(|mark| mark.text.clone())
+            .unwrap_or_default();
+        let empty = text.is_empty();
+        div()
+            .id("annotation-text-field")
+            .w_full()
+            .h(px(32.0))
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if editing {
+                rgb(0x2997ff)
+            } else {
+                rgb(0xd9d9dc)
+            })
+            .bg(rgb(0xffffff))
+            .flex()
+            .items_center()
+            .text_sm()
+            .text_color(if empty && !editing { muted() } else { ink() })
+            .cursor(CursorStyle::IBeam)
+            .child(if editing {
+                format!("{text}{}", if self.caret_visible { "|" } else { " " })
+            } else if empty {
+                "Click to type".to_string()
+            } else {
+                text
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if index < this.annotations.len() {
+                    this.record_annotation_undo();
+                    this.selected_annotation = Some(index);
+                    this.editing_text = Some(index);
+                    this.caret_visible = true;
+                    this.tool = Tool::Select;
+                    this.toast = Some("Type text; Enter commits, Escape cancels".into());
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     fn annotation_style_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
         let target_tool = self
             .selected_annotation
@@ -4959,6 +5066,10 @@ impl Studio {
                     .map(|mark| mark.font_size)
                     .unwrap_or(self.text_font_size);
                 this.child(div().text_xs().text_color(muted()).child("Text"))
+                    .when_some(
+                        self.selected_annotation.filter(|_| selected_text.is_some()),
+                        |this, index| this.child(self.annotation_text_field(index, cx)),
+                    )
                     .child(div().flex().gap_1().children(
                         ["Pro", "Compact", "Rounded"].into_iter().enumerate().map(
                             |(index, label)| {
@@ -5628,6 +5739,14 @@ impl Studio {
         // Under a 3D transform the compositor draws the annotations too.
         let paint_gpui_annotations = self.annotations_paint_flat();
         let select_tool = self.tool == Tool::Select;
+        // Focus / pan-end markers of the selected motion region.
+        let motion_markers = if animation_active {
+            let (_, projection) =
+                self.preview_projection(f32::from(canvas_width), f32::from(canvas_height));
+            self.motion_marker_points(&projection)
+        } else {
+            Vec::new()
+        };
         let zoomed = move |bounds: Bounds<Pixels>| Bounds {
             origin: point(
                 bounds.origin.x - bounds.size.width * view_zoom * view_left,
@@ -5947,7 +6066,11 @@ impl Studio {
                                     let index = painted_indices[painted];
                                     let rendered_bounds = paint_annotation(
                                         mark,
-                                        paint_bounds,
+                                        if mark.pinned {
+                                            image_bounds
+                                        } else {
+                                            paint_bounds
+                                        },
                                         index >= committed_count,
                                         editing_text == Some(index) && caret_visible,
                                         window,
@@ -5987,6 +6110,16 @@ impl Studio {
                                 annotation_bounds
                             },
                         );
+                        if !motion_markers.is_empty() {
+                            window.with_content_mask(
+                                Some(ContentMask {
+                                    bounds: image_bounds,
+                                }),
+                                |window| {
+                                    scene_ui::paint_motion_markers(&motion_markers, bounds, window)
+                                },
+                            );
+                        }
                         if crop_active {
                             paint_crop_overlay(crop_rect, image_bounds, crop_aspect_locked, window);
                         }
@@ -6104,6 +6237,11 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if this.focus_drag.is_some() {
+                                        this.drag_motion_marker(event.position, bounds, cx);
+                                        cx.notify();
+                                        return;
+                                    }
                                     if this.media_drag.is_some() {
                                         this.update_media_drag(event.position);
                                         cx.notify();
@@ -6135,6 +6273,7 @@ impl Studio {
                                 return;
                             }
                             entity.update(cx, |this, cx| {
+                                this.focus_drag = None;
                                 this.end_media_drag();
                                 let flat = if composited_active {
                                     this.flat_pointer_position(

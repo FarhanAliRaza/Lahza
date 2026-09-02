@@ -151,6 +151,8 @@ impl TemplateMark {
             text_alignment: self.alignment,
             timing: Some(self.timing.clamped(scene_duration)),
             from_template: true,
+            // Captions overlay the frame; the camera moves beneath them.
+            pinned: true,
             ..AnnotationMark::default()
         }
     }
@@ -578,6 +580,7 @@ mod tests {
                 assert!(timing.start >= 0.0 && timing.end <= template.duration + 1e-9);
                 assert!(timing.duration() >= AnnotationTiming::MINIMUM_DURATION);
                 assert!(mark.from_template);
+                assert!(mark.pinned);
                 assert!(mark.start.x >= 0.0 && mark.end.x <= 1.0);
                 assert!(mark.start.y >= 0.0 && mark.end.y <= 1.0);
                 if mark.tool == Tool::Text {

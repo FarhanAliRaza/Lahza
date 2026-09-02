@@ -24,13 +24,56 @@ shortcut.
 
 GNOME requires a host build to have the matching
 `com.screendrop.Screendrop.desktop` entry and a discoverable `screendrop`
-executable. For a user-local development install:
+executable, so a plain `cargo install` is not enough. See
+[Build and install from source](#build-and-install-from-source) below.
+
+## Build and install from source
+
+Install the build dependencies on Ubuntu:
 
 ```bash
-cargo build
-install -Dm755 target/debug/screendrop ~/.local/bin/screendrop
+sudo apt install -y build-essential pkg-config libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev libpipewire-0.3-dev libspa-0.2-dev \
+  libclang-dev libxkbcommon-dev libxkbcommon-x11-dev ffmpeg \
+  gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
+`ffmpeg`/`ffprobe` are required at runtime for recording preview and motion
+export, and `gst-play-1.0` (from `gstreamer1.0-tools`) for synchronized
+video playback in the editor.
+
+With [`just`](https://github.com/casey/just) installed, `just install-desktop`
+does the whole first-time install, and `just install` rebuilds and replaces
+the binary after every change (it stops any running instance first).
+Equivalent manual commands:
+
+```bash
+cargo build --release
+install -Dm755 target/release/screendrop ~/.local/bin/screendrop
 install -Dm644 packaging/com.screendrop.Screendrop.desktop \
   ~/.local/share/applications/com.screendrop.Screendrop.desktop
+install -Dm644 Screendrop.png \
+  ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
+update-desktop-database ~/.local/share/applications
+gtk-update-icon-cache -t ~/.local/share/icons/hicolor
+```
+
+If you previously ran `cargo install --path .`, remove that copy so the
+desktop entry and `PATH` resolve to the freshly installed binary, and quit
+any running instance so the next launch picks up the new build:
+
+```bash
+cargo uninstall screendrop
+pkill -x screendrop
+which -a screendrop   # should list only ~/.local/bin/screendrop
+```
+
+To uninstall:
+
+```bash
+rm -f ~/.local/bin/screendrop \
+  ~/.local/share/applications/com.screendrop.Screendrop.desktop \
+  ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
 update-desktop-database ~/.local/share/applications
 ```
 
@@ -55,6 +98,10 @@ edited as orange regions on the timeline's motion lane rather than keyframes:
   its style (hold, zoom in, zoom out), magnification, target (cursor, auto,
   pinned), focus point, and pan destination. Click the video to set the
   focus.
+- An animated screenshot can grow into a sequence: **+ Add image** in the
+  Animation section appends another image as its own scene with its own
+  duration, motion, and captions. Playback flows from one scene into the
+  next and export renders them back to back.
 - Screenshots start static. **Animate** turns the capture into a 3–10 second
   scene with presets (slow zoom, pan, focus, sweep, 3D tilt, floating card)
   that expand into the same editable regions, and a cursor walkthrough that

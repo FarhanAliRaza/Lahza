@@ -17,7 +17,10 @@ use crate::{
     blue, ink, line, muted,
     recording::{
         clips::RecordingClipTimeline,
-        export::{export_scene, ExportFormat, ExportProgress, SceneExportRequest, SceneSource},
+        export::{
+            export_scene, ExportFormat, ExportProgress, ImageSegment, SceneExportRequest,
+            SceneSource,
+        },
         model::NormalizedPoint,
         scene::{SceneBackground, SceneStyle},
         viewport::{
@@ -25,8 +28,8 @@ use crate::{
             ZoomCue,
         },
     },
-    xml_escape, SliderDrag, Studio, VideoEditSnapshot, VideoZoomDragKind, GRADIENT_BACKGROUNDS,
-    SOLID_BACKGROUNDS,
+    xml_escape, ImageScene, SliderDrag, Studio, VideoEditSnapshot, VideoZoomDragKind,
+    GRADIENT_BACKGROUNDS, SOLID_BACKGROUNDS,
 };
 
 /// Border swatches shared by the inspector, the preview, and export.
@@ -356,13 +359,17 @@ impl Studio {
                             this.video_selected_zoom_cue = Some(cue_id);
                             this.video_selected_clip = None;
                             this.motion_pick = MotionPick::Focus;
-                            this.seek_video(editor_start, cx);
                             cx.notify();
                         }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
+                                // Clicking a region also moves the playhead there.
+                                if let Some(target) = this.motion_timeline_time_at(event.position.x)
+                                {
+                                    this.seek_video(target, cx);
+                                }
                                 this.begin_video_zoom_drag(
                                     cue_id,
                                     VideoZoomDragKind::Move,
@@ -1132,7 +1139,13 @@ impl Studio {
                 .update(cx, |this, cx| {
                     let next = this.video_position + elapsed;
                     this.video_position = if next >= this.video_duration {
-                        // Animated screenshots loop, like the exported GIF.
+                        // A sequence continues into the next image; a single
+                        // scene loops, like the exported GIF.
+                        if this.image_scenes.len() > 1 {
+                            let next_index = (this.image_scene_index + 1) % this.image_scenes.len();
+                            this.store_current_scene();
+                            this.load_image_scene(next_index);
+                        }
                         0.0
                     } else {
                         next
@@ -1311,6 +1324,20 @@ impl Studio {
                                 self.video_position, self.video_duration
                             )),
                     )
+                    .when(self.image_scenes.len() > 1, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ink())
+                                .child(format!(
+                                    "Scene {} of {} · {:.1}s total",
+                                    self.image_scene_index + 1,
+                                    self.image_scenes.len(),
+                                    self.sequence_duration()
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .id("animation-undo")
@@ -1493,6 +1520,51 @@ impl Studio {
                         cx,
                         |this, _| this.exit_animation(),
                     )),
+            )
+            .child(Self::inspector_label("Scenes"))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .children((0..self.image_scenes.len().max(1)).map(|index| {
+                        let selected = index == self.image_scene_index;
+                        div()
+                            .id(("image-scene", index))
+                            .min_w(px(30.0))
+                            .h(px(30.0))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .bg(if selected { blue() } else { rgb(0xf0f0f1).into() })
+                            .text_color(if selected { rgb(0xffffff).into() } else { ink() })
+                            .cursor_pointer()
+                            .child(format!("{}", index + 1))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.switch_image_scene(index, cx);
+                            }))
+                    }))
+                    .child(self.small_button(
+                        "image-scene-add",
+                        "+ Add image",
+                        true,
+                        cx,
+                        |this, cx| this.add_image_scene_dialog(cx),
+                    ))
+                    .when(self.image_scenes.len() > 1, |this| {
+                        this.child(self.small_button(
+                            "image-scene-remove",
+                            "Remove scene",
+                            true,
+                            cx,
+                            |this, cx| this.remove_image_scene(cx),
+                        ))
+                    }),
             )
             .child(Self::inspector_label("Duration"))
             .child(self.segmented(
@@ -1827,15 +1899,223 @@ impl Studio {
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
         request.overlay = self.annotation_overlay_source();
-        self.prompt_and_run_scene_export(
-            SceneSource::Image {
-                image,
-                pointer: self.animation_pointer_timeline(),
-            },
-            request,
-            suggested_name,
-            cx,
-        );
+        let mut source = SceneSource::Image {
+            image,
+            pointer: self.animation_pointer_timeline(),
+        };
+        // A sequence always exports from its first image, whichever one is
+        // being edited; the rest follow back to back.
+        if self.image_scenes.len() > 1 {
+            self.store_current_scene();
+            let mut segments = self.image_scenes.iter().map(Self::image_segment);
+            let first = segments.next().expect("sequence has scenes");
+            request.viewport = first.viewport;
+            request.duration = first.duration;
+            request.overlay = first.overlay;
+            source = SceneSource::Image {
+                image: first.image,
+                pointer: first.pointer,
+            };
+            request.followers = segments.collect();
+        }
+        self.prompt_and_run_scene_export(source, request, suggested_name, cx);
+    }
+
+    fn image_segment(scene: &ImageScene) -> ImageSegment {
+        ImageSegment {
+            image: (*scene.rgba).clone(),
+            pointer: scene.pointer.clone(),
+            viewport: scene.viewport.clone(),
+            duration: scene.duration,
+            overlay: crate::scene_ui::overlay_source_for(
+                scene.annotations.clone(),
+                scene.viewport.clone(),
+                scene.dimensions.0,
+                scene.dimensions.1,
+            ),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Image scene sequence
+    // ------------------------------------------------------------------
+
+    /// The live image and its scene as a storable entry.
+    fn current_image_scene(&self) -> Option<ImageScene> {
+        Some(ImageScene {
+            path: self.captured_path.clone()?,
+            processed_path: self.processed_capture_path.clone(),
+            dimensions: self.captured_dimensions?,
+            rgba: self.capture_rgba.clone()?,
+            render: self.displayed_capture_image.clone()?,
+            annotations: self.annotations.clone(),
+            zoom_cues: self.video_zoom_cues.clone(),
+            duration: self.animation_duration,
+            preset: self.animation_preset,
+            pointer_capture: self.animation_pointer_capture.clone(),
+            walkthrough_stops: self.walkthrough_stops.clone(),
+            viewport: self.video_viewport_timeline.clone(),
+            pointer: self.animation_pointer_timeline(),
+        })
+    }
+
+    /// Writes the live scene back into the sequence.
+    pub(crate) fn store_current_scene(&mut self) {
+        let Some(scene) = self.current_image_scene() else {
+            return;
+        };
+        if let Some(slot) = self.image_scenes.get_mut(self.image_scene_index) {
+            *slot = scene;
+        } else {
+            self.image_scenes.push(scene);
+            self.image_scene_index = self.image_scenes.len() - 1;
+        }
+    }
+
+    /// Makes the sequence entry at `index` the live scene. Playback state
+    /// is left alone so a running sequence flows into the next image.
+    pub(crate) fn load_image_scene(&mut self, index: usize) {
+        let Some(scene) = self.image_scenes.get(index).cloned() else {
+            return;
+        };
+        self.stop_editing_text();
+        self.image_scene_index = index;
+        self.captured_path = Some(scene.path);
+        self.processed_capture_path = scene.processed_path;
+        self.captured_dimensions = Some(scene.dimensions);
+        self.capture_rgba = Some(scene.rgba);
+        self.displayed_capture_image = Some(scene.render);
+        self.annotations = scene.annotations;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.crop_undo_stack.clear();
+        self.crop_redo_stack.clear();
+        self.crop_active = false;
+        self.video_zoom_cues = scene.zoom_cues;
+        self.animation_duration = scene.duration;
+        self.animation_preset = scene.preset;
+        self.animation_pointer_capture = scene.pointer_capture;
+        self.walkthrough_stops = scene.walkthrough_stops;
+        self.walkthrough_mode = false;
+        self.video_duration = scene.duration;
+        self.video_source_duration = scene.duration;
+        self.video_clip_timeline = RecordingClipTimeline::full(scene.duration);
+        self.video_position = 0.0;
+        self.video_selected_zoom_cue = None;
+        self.video_zoom_drag = None;
+        self.video_seek_drag = None;
+        self.video_undo_stack.clear();
+        self.video_redo_stack.clear();
+        self.reset_annotation_interaction();
+        self.rebuild_video_motion_timelines();
+    }
+
+    pub(crate) fn switch_image_scene(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == self.image_scene_index || index >= self.image_scenes.len() {
+            return;
+        }
+        self.pause_video_playback();
+        self.store_current_scene();
+        self.load_image_scene(index);
+        cx.notify();
+    }
+
+    /// Picks an image file and appends it to the sequence as a new scene.
+    pub(crate) fn add_image_scene_dialog(&mut self, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Add image scene".into()),
+        });
+        cx.spawn(async move |weak, cx| {
+            let selected = match prompt.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(path) = selected else {
+                return;
+            };
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    image::open(&path)
+                        .map(|image| (path, image.to_rgba8()))
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                match loaded {
+                    Ok((path, image)) => this.add_image_scene(path, image),
+                    Err(error) => this.toast = Some(format!("Could not add image: {error}").into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn add_image_scene(&mut self, path: std::path::PathBuf, image: RgbaImage) {
+        if !self.animation_active || image.width() == 0 || image.height() == 0 {
+            return;
+        }
+        self.pause_video_playback();
+        self.store_current_scene();
+        let duration = self.animation_duration;
+        let preset = self.animation_preset.unwrap_or(MotionPreset::SlowZoomIn);
+        let zoom_cues = preset.cues(duration);
+        let viewport = ViewportTimeline::build_static(&zoom_cues, duration);
+        let dimensions = (image.width(), image.height());
+        let rgba = Arc::new(image.clone());
+        self.image_scenes.push(ImageScene {
+            path,
+            processed_path: None,
+            dimensions,
+            render: crate::cached_render_image(image),
+            rgba,
+            annotations: Vec::new(),
+            zoom_cues,
+            duration,
+            preset: Some(preset),
+            pointer_capture: Default::default(),
+            walkthrough_stops: Vec::new(),
+            viewport,
+            pointer: None,
+        });
+        let index = self.image_scenes.len() - 1;
+        self.load_image_scene(index);
+        self.toast = Some(format!("Scene {} added", index + 1).into());
+    }
+
+    /// Drops the live scene from the sequence and shows its neighbour.
+    pub(crate) fn remove_image_scene(&mut self, cx: &mut Context<Self>) {
+        if self.image_scenes.len() < 2 || self.image_scene_index >= self.image_scenes.len() {
+            return;
+        }
+        self.pause_video_playback();
+        self.image_scenes.remove(self.image_scene_index);
+        let index = self.image_scene_index.min(self.image_scenes.len() - 1);
+        self.load_image_scene(index);
+        self.toast = Some("Scene removed".into());
+        cx.notify();
+    }
+
+    /// Total length of the sequence in seconds.
+    pub(crate) fn sequence_duration(&self) -> f64 {
+        if self.image_scenes.len() < 2 {
+            return self.video_duration;
+        }
+        self.image_scenes
+            .iter()
+            .enumerate()
+            .map(|(index, scene)| {
+                if index == self.image_scene_index {
+                    self.video_duration
+                } else {
+                    scene.duration
+                }
+            })
+            .sum()
     }
 
     fn prompt_and_run_scene_export(
