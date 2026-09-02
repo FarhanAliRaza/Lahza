@@ -4,13 +4,14 @@ use gpui::{
     rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, Background, Bounds,
     BoxShadow, ContentMask, Context, CursorStyle, FocusHandle, FontWeight, Hsla, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollDelta,
-    ScrollWheelEvent, SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions,
-    UnderlineStyle, Window, WindowBounds, WindowDecorations, WindowOptions,
+    PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollWheelEvent,
+    SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions, UnderlineStyle, Window,
+    WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::fmt::Write as _;
 use std::{
     borrow::Cow,
+    collections::HashSet,
     fs,
     path::PathBuf,
     sync::{
@@ -22,13 +23,16 @@ use std::{
 use uuid::Uuid;
 
 mod motion_ui;
+mod preset_cards;
 mod recording;
 mod scene_ui;
+mod shell_ui;
 mod template_ui;
 mod timed;
 
 use scene_ui::{AnnotationDrag, MediaDrag, PreviewCache, SceneSelection};
 use serde::{Deserialize, Serialize};
+use shell_ui::InspectorTab;
 use timed::AnnotationTiming;
 
 use motion_ui::{MotionPick, MOTION_ZOOM_SLIDER};
@@ -120,7 +124,7 @@ fn xml_escape(value: &str) -> String {
 
 fn timestamped_export_name() -> String {
     chrono::Local::now()
-        .format("Screendrop-%Y-%m-%d_%H-%M-%S-%3f.png")
+        .format("Lahza-%Y-%m-%d_%H-%M-%S-%3f.png")
         .to_string()
 }
 
@@ -288,7 +292,7 @@ const BACKGROUND_PRESETS: [BackgroundPreset; 5] = [
         corners: 2,
         shadow_style: 1,
         aspect_ratio: 0,
-        border: true,
+        border: false,
         border_color: 3,
         border_thickness: 12,
         border_opacity: 30,
@@ -1409,7 +1413,6 @@ struct Studio {
     border_thickness: u8,
     border_opacity: u8,
     border: bool,
-    camera_open: bool,
     crop_active: bool,
     crop_rect: CropRect,
     crop_aspect: usize,
@@ -1418,9 +1421,9 @@ struct Studio {
     crop_redo_stack: Vec<CropSnapshot>,
     inspector_visible: bool,
     background_preset: Option<usize>,
-    background_preset_menu_open: bool,
-    background_expanded: bool,
-    border_expanded: bool,
+    inspector_tab: InspectorTab,
+    /// Collapsible inspector sections currently open.
+    open_sections: HashSet<&'static str>,
     capturing: bool,
     captured_path: Option<PathBuf>,
     processed_capture_path: Option<PathBuf>,
@@ -1687,7 +1690,7 @@ impl Studio {
             export_frame_rate: 30.0,
             export_loop: true,
             preset_library: PresetLibrary::load(),
-            inspector_level: 1,
+            inspector_level: 0,
             default_motion_zoom: 2.0,
             video_audio_levels: Vec::new(),
             video_audio_muted: false,
@@ -1724,8 +1727,7 @@ impl Studio {
             corners: 2,
             border_thickness: 12,
             border_opacity: 30,
-            border: true,
-            camera_open: false,
+            border: false,
             crop_active: false,
             crop_rect: CropRect::UNIT,
             crop_aspect: 0,
@@ -1734,9 +1736,8 @@ impl Studio {
             crop_redo_stack: Vec::new(),
             inspector_visible: true,
             background_preset: Some(0),
-            background_preset_menu_open: false,
-            background_expanded: true,
-            border_expanded: true,
+            inspector_tab: InspectorTab::Design,
+            open_sections: HashSet::from(["pointer", "camera", "audio"]),
             capturing: false,
             captured_path: None,
             processed_capture_path: None,
@@ -2983,8 +2984,6 @@ impl Studio {
 
     fn video_edit_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let edit_busy = self.video_edit_busy;
-        let can_undo = !self.video_undo_stack.is_empty() && !edit_busy;
-        let can_redo = !self.video_redo_stack.is_empty() && !edit_busy;
         let can_delete = (self.video_selected_zoom_cue.is_some()
             || self.video_clip_timeline.segments.len() > 1)
             && !edit_busy;
@@ -3002,48 +3001,6 @@ impl Studio {
             .flex()
             .items_center()
             .gap_1()
-            .child(
-                div()
-                    .id("video-undo")
-                    .size(px(32.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(can_undo, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                            .on_click(cx.listener(|this, _, _, cx| this.undo_video_edit(cx)))
-                    })
-                    .opacity(if can_undo { 1.0 } else { 0.35 })
-                    .child(
-                        svg()
-                            .path("icons/undo.svg")
-                            .size(px(17.0))
-                            .text_color(ink()),
-                    ),
-            )
-            .child(
-                div()
-                    .id("video-redo")
-                    .size(px(32.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(can_redo, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                            .on_click(cx.listener(|this, _, _, cx| this.redo_video_edit(cx)))
-                    })
-                    .opacity(if can_redo { 1.0 } else { 0.35 })
-                    .child(
-                        svg()
-                            .path("icons/redo.svg")
-                            .size(px(17.0))
-                            .text_color(ink()),
-                    ),
-            )
             .child(
                 div()
                     .id("video-split")
@@ -3246,7 +3203,6 @@ impl Studio {
         self.border_thickness = preset.border_thickness;
         self.border_opacity = preset.border_opacity;
         self.background_preset = Some(index);
-        self.background_preset_menu_open = false;
         self.toast = Some(format!("{} preset applied", preset.name).into());
     }
 
@@ -4389,118 +4345,6 @@ impl Studio {
         .detach();
     }
 
-    fn toolbar_button(
-        &self,
-        label: &'static str,
-        icon: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id(label)
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .h(px(36.0))
-            .rounded_lg()
-            .text_sm()
-            .text_color(ink())
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(0xf0f1f3)))
-            .child(svg().path(icon).size(px(17.0)).text_color(ink()))
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.stop_editing_text();
-                match label {
-                    "Capture" => this.begin_screen_capture(cx),
-                    "Crop" => {
-                        if this.crop_active {
-                            this.cancel_crop();
-                        } else {
-                            this.begin_crop();
-                        }
-                    }
-                    "Open project" => this.open_video_project_dialog(cx),
-                    "Save" => {
-                        if this.captured_path.is_none() {
-                            this.toast = Some("Capture an image first".into());
-                            cx.notify();
-                            return;
-                        }
-                        let directory =
-                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-                        let suggested_name = timestamped_export_name();
-                        let prompt = cx.prompt_for_new_path(&directory, Some(&suggested_name));
-                        cx.spawn(async move |weak, cx| {
-                            let selected = match prompt.await {
-                                Ok(Ok(destination)) => Ok(destination),
-                                Ok(Err(error)) => Err(error.to_string()),
-                                Err(error) => Err(error.to_string()),
-                            };
-                            weak.update(cx, |this, cx| {
-                                this.toast = Some(match selected {
-                                    Ok(Some(path)) => match this.render_export(&path) {
-                                        Ok(()) => {
-                                            format!("Saved edited image to {}", path.display())
-                                                .into()
-                                        }
-                                        Err(error) => format!("Save failed: {error}").into(),
-                                    },
-                                    Ok(None) => "Save cancelled".into(),
-                                    Err(error) => format!("Save failed: {error}").into(),
-                                });
-                                cx.notify();
-                            })
-                            .ok();
-                        })
-                        .detach();
-                    }
-                    _ => {}
-                }
-                cx.notify();
-            }))
-    }
-
-    fn section_header(
-        &self,
-        title: &'static str,
-        open: bool,
-        toggle: impl Fn(&mut Studio) + 'static,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id(title)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .h(px(42.0))
-            .px_1()
-            .border_t_1()
-            .border_color(line())
-            .cursor_pointer()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .text_color(muted())
-                    .child("×")
-                    .child(if open { "⌄" } else { "›" }),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                toggle(this);
-                cx.notify();
-            }))
-    }
-
     fn toggle(&self, enabled: bool) -> impl IntoElement {
         div()
             .w(px(38.0))
@@ -4613,61 +4457,6 @@ impl Studio {
             .child(self.tool_grid(cx))
             .child(div().text_xs().text_color(muted()).child(hint))
             .into_any_element()
-    }
-
-    /// Inspector shown while an annotation is selected or a drawing tool is
-    /// active in the recording editor: tools, style, then timing.
-    fn video_annotation_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let selected = self
-            .selected_annotation
-            .filter(|index| *index < self.annotations.len());
-        if selected.is_none() && self.tool == Tool::Select {
-            return None;
-        }
-        let timing = self.annotation_timing_inspector(cx);
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(self.video_annotate_section(cx))
-                .child(self.annotation_style_controls(cx))
-                .when_some(timing, |this, panel| this.child(panel))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .when(selected.is_some(), |this| {
-                            this.child(self.small_button(
-                                "video-annotation-delete",
-                                "Delete mark",
-                                true,
-                                cx,
-                                |this, _| {
-                                    if let Some(index) = this.selected_annotation.take() {
-                                        if index < this.annotations.len() {
-                                            this.record_annotation_undo();
-                                            this.annotations.remove(index);
-                                        }
-                                    }
-                                },
-                            ))
-                        })
-                        .child(self.small_button(
-                            "video-annotation-done",
-                            "Done",
-                            true,
-                            cx,
-                            |this, _| {
-                                this.stop_editing_text();
-                                this.selected_annotation = None;
-                                this.tool = Tool::Select;
-                            },
-                        )),
-                )
-                .into_any_element(),
-        )
     }
 
     fn segmented<F>(
@@ -4831,31 +4620,6 @@ impl Studio {
             )
     }
 
-    fn swatch<F>(
-        id: &'static str,
-        color: u32,
-        selected: bool,
-        on_select: F,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement
-    where
-        F: Fn(&mut Studio) + 'static,
-    {
-        div()
-            .id(id)
-            .size(px(26.0))
-            .rounded_md()
-            .bg(rgb(color))
-            .cursor_pointer()
-            .when(selected, |this| this.border_2().border_color(blue()))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                on_select(this);
-                cx.notify();
-            }))
-    }
-
-    /// Sidebar field showing the selected text mark's content; clicking it
-    /// starts editing, and keystrokes then go to the mark as on the canvas.
     fn annotation_text_field(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let editing = self.editing_text == Some(index);
         let text = self
@@ -5246,7 +5010,6 @@ impl Studio {
                                 .size(px(15.0))
                                 .text_color(if system_audio { blue() } else { muted() }),
                         )
-                        .child("System audio")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.record_system_audio = !this.record_system_audio;
                             cx.notify();
@@ -5276,7 +5039,6 @@ impl Studio {
                                 .size(px(15.0))
                                 .text_color(if microphone { blue() } else { muted() }),
                         )
-                        .child("Microphone")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.record_microphone = !this.record_microphone;
                             cx.notify();
@@ -5687,13 +5449,19 @@ impl Studio {
         }
         let committed_count = self.annotations.len();
         // Animated scenes paint each mark at its state for the playhead time.
+        let selected_annotation = self.selected_annotation;
+        let editing_text = self.editing_text;
         let (annotations, painted_indices): (Vec<AnnotationMark>, Vec<usize>) =
             if self.animation_active {
                 let time = self.video_position;
                 let mut marks = Vec::new();
                 let mut indices = Vec::new();
                 for (index, mark) in annotations.iter().enumerate() {
-                    if let Some(animated) = timed::animated_mark(mark, time) {
+                    if let Some(animated) = timed::editor_mark(
+                        mark,
+                        time,
+                        selected_annotation == Some(index) || editing_text == Some(index),
+                    ) {
                         marks.push(animated);
                         indices.push(index);
                     }
@@ -5703,8 +5471,6 @@ impl Studio {
                 let indices = (0..annotations.len()).collect();
                 (annotations, indices)
             };
-        let selected_annotation = self.selected_annotation;
-        let editing_text = self.editing_text;
         let caret_visible = self.caret_visible;
         let crop_active = self.crop_active;
         let crop_rect = self.crop_rect;
@@ -6170,16 +5936,30 @@ impl Studio {
                                         && (select_tool || this.video_selected_zoom_cue.is_some())
                                     {
                                         // Motion mode: clicks choose the focus of the
-                                        // selected region, otherwise manipulate the media.
-                                        if !this.scene_pointer_down(
-                                            event.position,
-                                            bounds,
-                                            &event.modifiers,
-                                            event.click_count,
-                                            cx,
-                                        ) && this.video_selected_zoom_cue.is_none()
+                                        // selected region; otherwise they pick an
+                                        // annotation first and fall back to the media.
+                                        if this.video_selected_zoom_cue.is_none()
+                                            && interaction_bounds.contains(&flat)
+                                            && !this.annotations.is_empty()
                                         {
-                                            this.selected_annotation = None;
+                                            this.pointer_down(
+                                                flat,
+                                                interaction_bounds,
+                                                &annotation_bounds,
+                                            );
+                                        }
+                                        if this.selected_annotation.is_some() {
+                                            this.video_selected_press = None;
+                                            this.scene_selection = SceneSelection::Scene;
+                                        } else {
+                                            this.toast = None;
+                                            this.scene_pointer_down(
+                                                event.position,
+                                                bounds,
+                                                &event.modifiers,
+                                                event.click_count,
+                                                cx,
+                                            );
                                         }
                                     } else if animation_active {
                                         // Drawing tools place timed marks at the playhead.
@@ -6335,280 +6115,12 @@ impl Studio {
             self.spawn_video_extras(cx);
         }
         self.ensure_camera_frame(cx);
-        let viewport = window.viewport_size();
-        let inspector_width = if self.inspector_visible { 316.0 } else { 0.0 };
-        let available_width = (viewport.width - px(112.0 + inspector_width)).max(px(320.0));
-        let camera_lane_height = if self.video_camera_path.is_some() {
-            26.0
-        } else {
-            0.0
-        };
-        let annotation_lane_height = if self.annotations.is_empty() {
-            0.0
-        } else {
-            self.annotation_lane_height() + 4.0
-        };
-        let lane_extra = camera_lane_height + annotation_lane_height;
-        let available_height = (viewport.height - px(372.0 + lane_extra)).max(px(220.0));
-        let (video_canvas_width, video_canvas_height) =
-            self.preview_canvas_size(available_width, available_height);
-        let video_canvas = self.scene_canvas(video_canvas_width, video_canvas_height, cx);
-        let recording_controls = self.recording_controls(cx);
-        let motion_panel = self.motion_inspector(cx);
-        let annotation_panel = if motion_panel.is_none() {
-            self.video_annotation_panel(cx)
-        } else {
-            None
-        };
-        let transform_panel = if motion_panel.is_none() && annotation_panel.is_none() {
-            self.transform_inspector(cx)
-        } else {
-            None
-        };
-        let show_scene_panel =
-            motion_panel.is_none() && annotation_panel.is_none() && transform_panel.is_none();
-        let scene_panel = show_scene_panel.then(|| self.video_scene_panel(cx));
-        let export_format_picker = self.export_format_picker(cx);
-        let export_overlay = self.export_status_overlay(cx);
-        let playing = self.video_playing;
-        let progress = if self.video_duration > 0.0 {
-            (self.video_position / self.video_duration).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let project_name = self
-            .video_project
-            .as_ref()
-            .and_then(|session| session.directory.file_stem())
-            .and_then(|value| value.to_str())
-            .unwrap_or("Recording")
-            .to_string();
-        let current_time = Self::video_timecode(self.video_position);
-        let duration = Self::video_timecode(self.video_duration);
-        let timeline_duration = self.video_duration.max(f64::EPSILON);
-        let timeline_zoom = self.video_timeline_zoom;
-        let timeline_scroll = self.video_timeline_scroll;
-        let timeline_viewport_width = self.video_timeline_viewport_width();
-        let timeline_content_width = timeline_viewport_width * timeline_zoom;
-        let timeline_bounds = self.video_timeline_bounds.clone();
-        let selected_clip = self.video_selected_clip;
-        let move_drag = self.video_move_drag.filter(|drag| drag.active);
-        // While dragging, the clip's ghost follows the pointer (snapped the
-        // same way the drop will land) so the destination — including a gap
-        // past the end of the timeline — is always visible.
-        let move_ghost = move_drag.and_then(|drag| {
-            let range = self.video_clip_timeline.editor_range(drag.clip_id)?;
-            let new_start = self.video_move_new_start(&drag)?;
-            let scale = timeline_content_width / timeline_duration;
-            Some((
-                (new_start * scale) as f32,
-                (((range.end - range.start) * scale).max(3.0)) as f32,
-            ))
-        });
-        // Time ruler: adaptive tick step targeting ~80px between labels.
-        let ruler_step = {
-            let raw = 80.0 * timeline_duration / timeline_content_width.max(1.0);
-            [
-                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
-            ]
-            .into_iter()
-            .find(|step| *step >= raw)
-            .unwrap_or(600.0)
-        };
-        let mut ruler_marks: Vec<AnyElement> = Vec::new();
-        let mut ruler_tick = 0.0;
-        while ruler_tick <= timeline_duration + 1e-6 {
-            let x = (ruler_tick / timeline_duration * timeline_content_width) as f32;
-            ruler_marks.push(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .bottom_0()
-                    .w(px(1.0))
-                    .h(px(5.0))
-                    .bg(hsla(0.0, 0.0, 0.0, 0.30))
-                    .into_any_element(),
-            );
-            let label = if ruler_step < 1.0 {
-                format!("{ruler_tick:.1}")
-            } else {
-                Self::video_timecode(ruler_tick)
-            };
-            ruler_marks.push(
-                div()
-                    .absolute()
-                    .left(px(x + 5.0))
-                    .top(px(1.0))
-                    .text_xs()
-                    .text_color(muted())
-                    .child(label)
-                    .into_any_element(),
-            );
-            let half = ruler_tick + ruler_step / 2.0;
-            if half <= timeline_duration {
-                let half_x = (half / timeline_duration * timeline_content_width) as f32;
-                ruler_marks.push(
-                    div()
-                        .absolute()
-                        .left(px(half_x))
-                        .bottom_0()
-                        .w(px(1.0))
-                        .h(px(3.0))
-                        .bg(hsla(0.0, 0.0, 0.0, 0.15))
-                        .into_any_element(),
-                );
-            }
-            ruler_tick += ruler_step;
-        }
-        ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
-        let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
-        let camera_lane = self.camera_lane(timeline_scroll, timeline_content_width, progress);
-        let clip_lane: Vec<AnyElement> = self
-            .video_clip_timeline
-            .segments
-            .iter()
-            .flat_map(|clip| {
-                let clip_id = clip.id;
-                let dragging = move_drag.is_some_and(|drag| drag.clip_id == clip_id);
-                let width = (clip.editor_duration() / timeline_duration * timeline_content_width)
-                    .max(3.0) as f32;
-                // A clip's leading gap renders as an empty stretch of track.
-                let spacer = (clip.gap_before > 0.0).then(|| {
-                    div()
-                        .h_full()
-                        .w(px(
-                            (clip.gap_before / timeline_duration * timeline_content_width) as f32,
-                        ))
-                        .flex_none()
-                        .into_any_element()
-                });
-                let clip_element = div()
-                    .id(("video-clip", clip_id.as_u128() as u64))
-                    .h_full()
-                    .w(px(width))
-                    .flex_none()
-                    .when(dragging, |this| this.opacity(0.4))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            // Arm a potential reorder drag; the seek-bar's own
-                            // mouse-down still runs (no stop_propagation) so a
-                            // plain click keeps moving the playhead.
-                            this.video_move_drag = Some(VideoMoveDrag {
-                                clip_id,
-                                start_x: event.position.x,
-                                current_x: event.position.x,
-                                active: false,
-                            });
-                            this.video_selected_clip = Some(clip_id);
-                            this.video_selected_zoom_cue = None;
-                            cx.notify();
-                        }),
-                    )
-                    // All clips share one bright fill (they come from the
-                    // same source recording); a gap is just bare track.
-                    // Selection is shown by a light ring alone.
-                    .rounded_md()
-                    .border_2()
-                    .border_color(if selected_clip == Some(clip_id) {
-                        hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
-                    } else {
-                        hsla(0.0, 0.0, 0.0, 0.0)
-                    })
-                    .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(hsla(0.0, 0.0, 1.0, 0.92))
-                    .children(self.clip_thumbnails(
-                        clip.source_start,
-                        clip.source_end,
-                        clip.speed,
-                        width,
-                        34.0,
-                    ))
-                    .when(width >= 52.0, |this| {
-                        let label = if (clip.speed - 1.0).abs() > f64::EPSILON {
-                            format!("{:.1}s · {}×", clip.editor_duration(), clip.speed)
-                        } else {
-                            format!("{:.1}s", clip.editor_duration())
-                        };
-                        this.child(
-                            div()
-                                .px_2()
-                                .rounded_md()
-                                .bg(hsla(0.0, 0.0, 0.0, 0.35))
-                                .child(label),
-                        )
-                    })
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        // Selection only: the seek bar's mouse-down already
-                        // moved the playhead to the clicked spot; seeking to
-                        // the clip head here would yank the playhead back.
-                        this.video_selected_clip = Some(clip_id);
-                        this.video_selected_zoom_cue = None;
-                        cx.notify();
-                    }))
-                    .when(selected_clip == Some(clip_id), |this| {
-                        this.child(
-                            div()
-                                .id(("video-trim-leading", clip_id.as_u128() as u64))
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .w(px(10.0))
-                                .h_full()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.5))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.begin_video_trim(
-                                            clip_id,
-                                            ClipEdge::Leading,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id(("video-trim-trailing", clip_id.as_u128() as u64))
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .w(px(10.0))
-                                .h_full()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.5))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.begin_video_trim(
-                                            clip_id,
-                                            ClipEdge::Trailing,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                    })
-                    .into_any_element();
-                spacer.into_iter().chain(std::iter::once(clip_element))
-            })
-            .collect();
-        let motion_track = self.motion_track(timeline_scroll, timeline_content_width, progress, cx);
-        let annotation_track =
-            self.annotation_track(timeline_scroll, timeline_content_width, progress, cx);
+        let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
+        let video_canvas = self.scene_canvas(canvas_width, canvas_height, cx);
+        let top_bar = self.top_bar(cx);
+        let canvas_area = self.canvas_area(video_canvas, cx);
+        let timeline = self.timeline_bar(cx);
+        let sidebar = self.inspector_visible.then(|| self.sidebar(cx));
 
         div()
             .size_full()
@@ -6702,633 +6214,24 @@ impl Studio {
                     }
                 }),
             )
-            .child(
-                div()
-                    .h(px(42.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .bg(rgb(0xf4f4f5))
-                    .border_b_1()
-                    .border_color(line())
-                    .child(
-                        div()
-                            .id("video-titlebar-drag-region")
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Screendrop")
-                            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                                if event.click_count >= 2 {
-                                    window.zoom_window();
-                                } else {
-                                    window.start_window_move();
-                                }
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("video-window-minimize")
-                            .w(px(46.0))
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xe5e5e7)))
-                            .child(
-                                svg()
-                                    .path("icons/minimize.svg")
-                                    .size(px(16.0))
-                                    .text_color(ink()),
-                            )
-                            .on_click(|_, window, _| window.minimize_window()),
-                    )
-                    .child(
-                        div()
-                            .id("video-window-maximize")
-                            .w(px(46.0))
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xe5e5e7)))
-                            .child(
-                                svg()
-                                    .path("icons/maximize.svg")
-                                    .size(px(16.0))
-                                    .text_color(ink()),
-                            )
-                            .on_click(|_, window, _| window.zoom_window()),
-                    )
-                    .child(
-                        div()
-                            .id("video-window-close")
-                            .w(px(46.0))
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xd92d3a)).text_color(rgb(0xffffff)))
-                            .child(
-                                svg()
-                                    .path("icons/close.svg")
-                                    .size(px(16.0))
-                                    .text_color(ink()),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.pause_video_playback();
-                                if this.recording_state == RecordingState::Idle {
-                                    window.remove_window();
-                                } else {
-                                    this.request_window_close(window.window_handle(), cx);
-                                }
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(58.0))
-                    .flex_none()
-                    .px_5()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(rgb(0xffffff))
-                    .border_b_1()
-                    .border_color(line())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("video-back-to-screenshot")
-                                    .px_3()
-                                    .h(px(32.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .rounded_md()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                    .child(
-                                        svg()
-                                            .path("icons/capture.svg")
-                                            .size(px(15.0))
-                                            .text_color(ink()),
-                                    )
-                                    .child("Screenshot")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.close_video_editor(cx)),
-                                    ),
-                            )
-                            .child(div().w(px(1.0)).h(px(22.0)).bg(line()))
-                            .child(recording_controls),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("video-open-recording")
-                                    .px_3()
-                                    .h(px(32.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .rounded_md()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                    .child(
-                                        svg()
-                                            .path("icons/play.svg")
-                                            .size(px(15.0))
-                                            .text_color(ink()),
-                                    )
-                                    .child("Open project")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_video_project_dialog(cx)
-                                    })),
-                            )
-                            .child(export_format_picker)
-                            .child(
-                                div()
-                                    .id("video-export")
-                                    .px_3()
-                                    .h(px(32.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .rounded_md()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                    .child(
-                                        svg()
-                                            .path("icons/upload.svg")
-                                            .size(px(15.0))
-                                            .text_color(ink()),
-                                    )
-                                    .child("Export")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.export_video_recording(cx)
-                                    })),
-                            )
-                            .child(div().w(px(1.0)).h(px(22.0)).bg(line()))
-                            .child(div().text_sm().text_color(muted()).child(project_name))
-                            .child(
-                                div()
-                                    .id("video-sidebar-toggle")
-                                    .size(px(34.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .when(!self.inspector_visible, |this| this.bg(rgb(0xe7f1ff)))
-                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                    .child(
-                                        svg().path("icons/sidebar.svg").size(px(18.0)).text_color(
-                                            if self.inspector_visible {
-                                                muted()
-                                            } else {
-                                                blue()
-                                            },
-                                        ),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.inspector_visible = !this.inspector_visible;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
+            .child(top_bar)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
-                    .p_8()
-                    .when(self.inspector_visible, |this| this.pr(px(348.0)))
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgb(0xf3f3f4))
-                    .child(video_canvas),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .px_6()
-                    .when(self.inspector_visible, |this| this.pr(px(340.0)))
-                    .flex()
-                    .flex_col()
-                    .bg(rgb(0xffffff))
-                    .border_t_1()
-                    .border_color(line())
                     .child(
                         div()
-                            .h(px(46.0))
-                            .flex_none()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
                             .flex()
-                            .items_center()
-                            .gap_3()
-                            .border_b_1()
-                            .border_color(line())
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .child(self.video_edit_controls(cx)),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .id("video-play-pause")
-                                            .size(px(34.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_full()
-                                            .bg(ink())
-                                            .cursor_pointer()
-                                            .child(
-                                                svg()
-                                                    .path(if playing {
-                                                        "icons/pause.svg"
-                                                    } else {
-                                                        "icons/play.svg"
-                                                    })
-                                                    .size(px(15.0))
-                                                    .text_color(rgb(0xffffff)),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if playing {
-                                                    this.pause_video_playback();
-                                                } else {
-                                                    this.start_video_playback(cx);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(format!("{current_time} / {duration}")),
-                                    ),
-                            )
-                            .child(
-                                div().flex_1().flex().items_center().justify_end().child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_xs()
-                                        .child(
-                                            div()
-                                                .id("video-timeline-zoom-out")
-                                                .size(px(28.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_md()
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(rgb(0xeeeeef)))
-                                                .child("−")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.zoom_video_timeline(
-                                                        1.0 / 1.25,
-                                                        this.video_position,
-                                                    );
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("video-timeline-fit")
-                                                .w(px(42.0))
-                                                .text_center()
-                                                .cursor_pointer()
-                                                .child(format!("{timeline_zoom:.1}×"))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.video_timeline_zoom = 1.0;
-                                                    this.video_timeline_scroll = 0.0;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("video-timeline-zoom-in")
-                                                .size(px(28.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_md()
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(rgb(0xeeeeef)))
-                                                .child("+")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.zoom_video_timeline(
-                                                        1.25,
-                                                        this.video_position,
-                                                    );
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                ),
-                            ),
+                            .flex_col()
+                            .child(canvas_area)
+                            .child(timeline),
                     )
-                    .child(
-                        div()
-                            .h(px(148.0 + lane_extra))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(320.0))
-                                    .h(px(126.0 + lane_extra))
-                                    .flex()
-                                    .flex_col()
-                                    .justify_center()
-                                    .gap_1()
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                                    .child(
-                                        div()
-                                            .id("video-ruler")
-                                            .relative()
-                                            .w_full()
-                                            .h(px(16.0))
-                                            .flex_none()
-                                            .overflow_hidden()
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .left(px(-(timeline_scroll as f32)))
-                                                    .top_0()
-                                                    .w(px(timeline_content_width as f32))
-                                                    .h_full()
-                                                    .children(ruler_marks)
-                                                    .child(
-                                                        div()
-                                                            .absolute()
-                                                            .left(px((timeline_content_width
-                                                                * progress)
-                                                                as f32
-                                                                - 5.0))
-                                                            .top(px(2.0))
-                                                            .w(px(10.0))
-                                                            .h(px(13.0))
-                                                            .rounded_sm()
-                                                            .bg(ink()),
-                                                    ),
-                                            )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, event: &MouseDownEvent, _, cx| {
-                                                        this.pause_video_playback();
-                                                        this.video_trim_drag = None;
-                                                        this.video_zoom_drag = None;
-                                                        let target = this
-                                                .video_timeline_bounds
-                                                .lock()
-                                                .ok()
-                                                .and_then(|bounds| *bounds)
-                                                .map(|bounds| {
-                                                    let local = ((event.position.x
-                                                        - bounds.origin.x)
-                                                        / px(1.0))
-                                                        as f64;
-                                                    ((this.video_timeline_scroll + local)
-                                                        / (this.video_timeline_viewport_width()
-                                                            * this.video_timeline_zoom))
-                                                        .clamp(0.0, 1.0)
-                                                        * this.video_duration
-                                                })
-                                                .unwrap_or(this.video_position);
-                                                        this.video_position = target;
-                                                        this.video_seek_drag =
-                                                            Some((event.position.x, target));
-                                                        cx.notify();
-                                                    },
-                                                ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("video-seek-bar")
-                                            .relative()
-                                            .w_full()
-                                            .h(px(34.0))
-                                            .flex()
-                                            .overflow_hidden()
-                                            .rounded_lg()
-                                            .bg(rgb(0xECEDF1))
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .left(px(-(timeline_scroll as f32)))
-                                                    .top_0()
-                                                    .w(px(timeline_content_width as f32))
-                                                    .h_full()
-                                                    .flex()
-                                                    .children(clip_lane)
-                                                    .child(
-                                                        div()
-                                                            .absolute()
-                                                            .left(px((timeline_content_width
-                                                                * progress)
-                                                                as f32
-                                                                - 1.0))
-                                                            .top_0()
-                                                            .w(px(2.0))
-                                                            .h_full()
-                                                            .bg(hsla(
-                                                                222.0 / 360.0,
-                                                                0.2,
-                                                                0.15,
-                                                                0.85,
-                                                            )),
-                                                    )
-                                                    .when_some(
-                                                        move_ghost,
-                                                        |this, (ghost_left, ghost_width)| {
-                                                            this.child(
-                                                                div()
-                                                                    .absolute()
-                                                                    .left(px(ghost_left))
-                                                                    .top_0()
-                                                                    .h_full()
-                                                                    .w(px(ghost_width))
-                                                                    .rounded_md()
-                                                                    .border_2()
-                                                                    .border_color(hsla(
-                                                                        222.0 / 360.0,
-                                                                        0.2,
-                                                                        0.15,
-                                                                        0.8,
-                                                                    ))
-                                                                    .bg(hsla(
-                                                                        217.0 / 360.0,
-                                                                        0.9,
-                                                                        0.6,
-                                                                        0.35,
-                                                                    )),
-                                                            )
-                                                        },
-                                                    ),
-                                            )
-                                            .child(
-                                                canvas(
-                                                    move |bounds, window, _| {
-                                                        if let Ok(mut stored) =
-                                                            timeline_bounds.lock()
-                                                        {
-                                                            // Lanes are laid out with the
-                                                            // previous width; redraw once
-                                                            // the real width is known.
-                                                            if *stored != Some(bounds) {
-                                                                window.refresh();
-                                                            }
-                                                            *stored = Some(bounds);
-                                                        }
-                                                    },
-                                                    |_, _, _, _| {},
-                                                )
-                                                .absolute()
-                                                .size_full(),
-                                            )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, event: &MouseDownEvent, _, cx| {
-                                                        this.pause_video_playback();
-                                                        this.video_trim_drag = None;
-                                                        this.video_zoom_drag = None;
-                                                        let target = this
-                                                .video_timeline_bounds
-                                                .lock()
-                                                .ok()
-                                                .and_then(|bounds| *bounds)
-                                                .map(|bounds| {
-                                                    let local = ((event.position.x
-                                                        - bounds.origin.x)
-                                                        / px(1.0))
-                                                        as f64;
-                                                    ((this.video_timeline_scroll + local)
-                                                        / (this.video_timeline_viewport_width()
-                                                            * this.video_timeline_zoom))
-                                                        .clamp(0.0, 1.0)
-                                                        * this.video_duration
-                                                })
-                                                .unwrap_or(this.video_position);
-                                                        this.video_position = target;
-                                                        this.video_seek_drag =
-                                                            Some((event.position.x, target));
-                                                        cx.notify();
-                                                    },
-                                                ),
-                                            )
-                                            .on_scroll_wheel(cx.listener(
-                                                |this, event: &ScrollWheelEvent, _, cx| {
-                                                    let delta = match event.delta {
-                                                        ScrollDelta::Pixels(delta) => (
-                                                            (delta.x / px(1.0)) as f64,
-                                                            (delta.y / px(1.0)) as f64,
-                                                        ),
-                                                        ScrollDelta::Lines(delta) => (
-                                                            delta.x as f64 * 16.0,
-                                                            delta.y as f64 * 16.0,
-                                                        ),
-                                                    };
-                                                    if event.modifiers.control
-                                                        || event.modifiers.platform
-                                                    {
-                                                        let factor = 2_f64.powf(delta.1 / 220.0);
-                                                        this.zoom_video_timeline(
-                                                            factor,
-                                                            this.video_position,
-                                                        );
-                                                    } else {
-                                                        let pan = if delta.0.abs() > delta.1.abs() {
-                                                            -delta.0
-                                                        } else {
-                                                            -delta.1
-                                                        };
-                                                        this.pan_video_timeline(pan);
-                                                    }
-                                                    cx.stop_propagation();
-                                                    cx.notify();
-                                                },
-                                            )),
-                                    )
-                                    .child(motion_track)
-                                    .when_some(annotation_track, |this, lane| this.child(lane))
-                                    .when_some(camera_lane, |this, lane| this.child(lane))
-                                    .when_some(audio_lane, |this, lane| this.child(lane)),
-                            ),
-                    ),
+                    .when_some(sidebar, |this, sidebar| this.child(sidebar)),
             )
-            .when(self.inspector_visible, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top(px(100.0))
-                        .bottom_0()
-                        .w(px(316.0))
-                        .id("video-inspector-scroll")
-                        .overflow_y_scroll()
-                        .bg(panel())
-                        .border_l_1()
-                        .border_color(line())
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .when_some(motion_panel, |this, panel| this.child(panel))
-                        .when_some(annotation_panel, |this, panel| this.child(panel))
-                        .when_some(transform_panel, |this, panel| this.child(panel))
-                        .when_some(scene_panel, |this, panel| this.child(panel)),
-                )
-            })
-            .when_some(export_overlay, |this, overlay| this.child(overlay))
-            .when_some(self.toast.clone(), |this, toast| {
-                this.child(
-                    div()
-                        .absolute()
-                        .bottom(px(120.0))
-                        .left(px(220.0))
-                        .px_4()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(hsla(220.0 / 360.0, 0.2, 0.12, 0.9))
-                        .text_sm()
-                        .text_color(rgb(0xffffff))
-                        .child(toast),
-                )
-            })
             .into_any_element()
     }
 }
@@ -7338,336 +6241,25 @@ impl Render for Studio {
         if self.video_project.is_some() {
             return self.render_video(window, cx);
         }
-        // 316px inspector + 32px workspace padding on each side + 24px page
-        // padding on each side. The vertical budget similarly excludes the
-        // 58px toolbar and both layers of padding.
-        let viewport = window.viewport_size();
-        let inspector_width = if self.inspector_visible { 316.0 } else { 0.0 };
-        let available_canvas_width = (viewport.width - px(112.0 + inspector_width)).max(px(1.0));
-        let animation_strip_height = if self.animation_active {
-            if self.annotations.is_empty() {
-                118.0
-            } else {
-                154.0
-            }
-        } else {
-            0.0
-        };
-        let available_canvas_height =
-            (viewport.height - px(212.0 + animation_strip_height)).max(px(1.0));
-        let (canvas_width, canvas_height) =
-            self.preview_canvas_size(available_canvas_width, available_canvas_height);
-        let tool_grid = self.tool_grid(cx);
-        let animate_button = self.animate_toolbar_button(cx);
-        let animation_section = self
-            .animation_active
-            .then(|| self.animation_inspector_section(cx));
-        let screenshot_motion_panel = if self.animation_active {
-            self.motion_inspector(cx)
-        } else {
-            None
-        };
-        let screenshot_export_overlay = self.export_status_overlay(cx);
-        let animation_strip = self.animation_active.then(|| self.animation_strip(cx));
+        let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
         let composited = if self.preview_needs_compositor() {
             self.scene_preview_image(canvas_width, canvas_height)
         } else {
             None
         };
-        let screenshot_transform_panel = self.transform_inspector(cx);
-        let screenshot_timing_panel = self.annotation_timing_inspector(cx);
-        let screenshot_effects = self.effects_section(cx);
-        let screenshot_watermark = self.watermark_section(cx);
-        let screenshot_export = self.animation_active.then(|| self.export_section(cx));
-        let screenshot_presets = self.preset_library_section(cx);
-        let screenshot_templates = self.template_gallery_section(cx);
-        let tool_help = format!("{} — {}", self.tool.label(), self.tool.help_text());
-        let annotation_styles = self.annotation_style_controls(cx);
-        let tabs = self.segmented(
-            "fill-type",
-            &["Color", "Gradient", "Wallpaper"],
-            self.wallpaper_tab,
-            |this, value| this.wallpaper_tab = value,
-            cx,
-        );
-        let wallpaper_sources = self.segmented(
-            "fill-library",
-            &["Recent", "UIHSSN", "Fayazara"],
-            self.library_tab,
-            |this, value| this.library_tab = value,
-            cx,
-        );
-        let fill_picker = self.fill_picker(cx);
-        let capture = self.toolbar_button(
-            if self.capturing {
-                "Capturing…"
-            } else {
-                "Capture"
-            },
-            "icons/capture.svg",
-            cx,
-        );
-        let recording_controls = self.recording_controls(cx);
-        let crop = self.toolbar_button("Crop", "icons/crop.svg", cx);
-        let open_recording = self.toolbar_button("Open project", "icons/play.svg", cx);
-        let save = self.toolbar_button("Save", "icons/save.svg", cx);
-        let can_undo =
-            !self.crop_active && (!self.undo_stack.is_empty() || !self.crop_undo_stack.is_empty());
-        let can_redo =
-            !self.crop_active && (!self.redo_stack.is_empty() || !self.crop_redo_stack.is_empty());
-        let undo_button = div()
-            .id("toolbar-undo")
-            .w(px(34.0))
-            .h(px(34.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_color(if can_undo {
-                ink()
-            } else {
-                Hsla::from(rgb(0xb8bbc0))
-            })
-            .when(can_undo, |this| {
-                this.cursor_pointer().hover(|style| style.bg(rgb(0xeeeeef)))
-            })
-            .child(
-                svg()
-                    .path("icons/undo.svg")
-                    .size(px(18.0))
-                    .text_color(if can_undo {
-                        ink()
-                    } else {
-                        Hsla::from(rgb(0xb8bbc0))
-                    }),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.crop_active {
-                    return;
-                }
-                if this.undo_annotations() || this.undo_crop() {
-                    if this.captured_path.is_some() {
-                        let _ = this.rebuild_redactions();
-                    }
-                    this.toast = Some("Undo".into());
-                    cx.notify();
-                }
-            }));
-        let redo_button = div()
-            .id("toolbar-redo")
-            .w(px(34.0))
-            .h(px(34.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_color(if can_redo {
-                ink()
-            } else {
-                Hsla::from(rgb(0xb8bbc0))
-            })
-            .when(can_redo, |this| {
-                this.cursor_pointer().hover(|style| style.bg(rgb(0xeeeeef)))
-            })
-            .child(
-                svg()
-                    .path("icons/redo.svg")
-                    .size(px(18.0))
-                    .text_color(if can_redo {
-                        ink()
-                    } else {
-                        Hsla::from(rgb(0xb8bbc0))
-                    }),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.crop_active {
-                    return;
-                }
-                if this.redo_annotations() || this.redo_crop() {
-                    if this.captured_path.is_some() {
-                        let _ = this.rebuild_redactions();
-                    }
-                    this.toast = Some("Redo".into());
-                    cx.notify();
-                }
-            }));
-        let finish_button = div()
-            .id("toolbar-finish")
-            .w(px(34.0))
-            .h(px(34.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(0xeeeeef)))
-            .child(
-                svg()
-                    .path("icons/check.svg")
-                    .size(px(18.0))
-                    .text_color(ink()),
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.captured_path.is_none() {
-                    this.toast = Some("Capture an image first".into());
-                    cx.notify();
-                    return;
-                }
-                if this.animation_active {
-                    this.export_animated_screenshot(cx);
-                    return;
-                }
-                let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-                let suggested_name = timestamped_export_name();
-                let prompt = cx.prompt_for_new_path(&directory, Some(&suggested_name));
-                let window_handle = window.window_handle();
-                cx.spawn(async move |weak, cx| {
-                    let selected = match prompt.await {
-                        Ok(Ok(destination)) => Ok(destination),
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(error) => Err(error.to_string()),
-                    };
-                    let should_close = weak
-                        .update(cx, |this, cx| {
-                            let should_close = match selected {
-                                Ok(Some(path)) => match this.render_export(&path) {
-                                    Ok(()) => true,
-                                    Err(error) => {
-                                        this.toast = Some(format!("Save failed: {error}").into());
-                                        false
-                                    }
-                                },
-                                Ok(None) => {
-                                    this.toast = Some("Finish cancelled".into());
-                                    false
-                                }
-                                Err(error) => {
-                                    this.toast = Some(format!("Save failed: {error}").into());
-                                    false
-                                }
-                            };
-                            cx.notify();
-                            should_close
-                        })
-                        .unwrap_or(false);
-                    if should_close {
-                        let _ = window_handle.update(cx, |_, window, _| window.remove_window());
-                    }
-                })
-                .detach();
-            }));
-        let sidebar_button = div()
-            .id("toolbar-sidebar")
-            .w(px(34.0))
-            .h(px(34.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(!self.inspector_visible, |this| this.bg(rgb(0xe7f1ff)))
-            .hover(|style| style.bg(rgb(0xeeeeef)))
-            .child(svg().path("icons/sidebar.svg").size(px(18.0)).text_color(
-                if self.inspector_visible {
-                    muted()
-                } else {
-                    blue()
-                },
-            ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.inspector_visible = !this.inspector_visible;
-                cx.notify();
-            }));
-        let crop_aspects = self.segmented(
-            "crop-aspect",
-            &["Free", "Original", "1:1", "16:9", "9:16", "4:3", "3:2"],
-            self.crop_aspect,
-            |this, value| this.set_crop_aspect(value),
-            cx,
-        );
-        let crop_pixel_size = self.captured_dimensions.map(|(width, height)| {
-            format!(
-                "{} × {}",
-                (self.crop_rect.width * width as f32).round() as u32,
-                (self.crop_rect.height * height as f32).round() as u32
-            )
-        });
-        let preset_title = self
-            .background_preset
-            .and_then(|index| BACKGROUND_PRESETS.get(index))
-            .map(|preset| preset.name)
-            .unwrap_or("Presets…");
-        let selected_background_preset = self.background_preset;
-        let background_preset_picker = div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .rounded_lg()
-            .border_1()
-            .border_color(line())
-            .overflow_hidden()
-            .child(
-                div()
-                    .id("background-preset-selector")
-                    .h(px(34.0))
-                    .flex_none()
-                    .px_3()
-                    .bg(rgb(0xededee))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0xe5e5e7)))
-                    .child(preset_title)
-                    .child(if self.background_preset_menu_open {
-                        "⌃"
-                    } else {
-                        "⌄"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.background_preset_menu_open = !this.background_preset_menu_open;
-                        cx.notify();
-                    })),
-            )
-            .when(self.background_preset_menu_open, |this| {
-                this.children(
-                    BACKGROUND_PRESETS
-                        .iter()
-                        .enumerate()
-                        .map(|(index, preset)| {
-                            div()
-                                .id(("background-preset-option", index))
-                                .h(px(32.0))
-                                .flex_none()
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .text_sm()
-                                .bg(rgb(0xffffff))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0xeaf3ff)))
-                                .child(preset.name)
-                                .child(if selected_background_preset == Some(index) {
-                                    "✓"
-                                } else {
-                                    ""
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.apply_background_preset(index);
-                                    cx.notify();
-                                }))
-                        }),
-                )
-            });
+        let canvas = self
+            .mock_capture(cx, canvas_width, canvas_height, composited)
+            .into_any_element();
+        let top_bar = self.top_bar(cx);
+        let canvas_area = self.canvas_area(canvas, cx);
+        let timeline = self.animation_active.then(|| self.timeline_bar(cx));
+        let sidebar = self.inspector_visible.then(|| self.sidebar(cx));
 
         div()
             .size_full()
             .min_w(px(980.0))
             .min_h(px(680.0))
-            .bg(rgb(0xf7f7f8))
+            .bg(rgb(0xf3f3f4))
             .text_color(ink())
             .font_family("Inter")
             .flex()
@@ -7743,209 +6335,7 @@ impl Render for Studio {
                     cx.notify();
                 }),
             )
-            .child(
-                div()
-                    .h(px(42.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .bg(rgb(0xf4f4f5))
-                    .border_b_1()
-                    .border_color(line())
-                    .child(
-                        div()
-                            .id("linux-titlebar-drag-region")
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Screendrop")
-                            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                                if event.click_count >= 2 {
-                                    window.zoom_window();
-                                } else {
-                                    window.start_window_move();
-                                }
-                            })
-                            .on_click(|event, window, _| {
-                                if event.is_right_click() {
-                                    window.show_window_menu(event.position());
-                                }
-                            }),
-                    )
-                    .child(
-                        div()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .id("window-minimize")
-                                    .w(px(46.0))
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xe5e5e7)))
-                                    .child(
-                                        svg()
-                                            .path("icons/minimize.svg")
-                                            .size(px(16.0))
-                                            .text_color(ink()),
-                                    )
-                                    .on_click(|_, window, _| window.minimize_window()),
-                            )
-                            .child(
-                                div()
-                                    .id("window-maximize")
-                                    .w(px(46.0))
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xe5e5e7)))
-                                    .child(
-                                        svg()
-                                            .path("icons/maximize.svg")
-                                            .size(px(14.0))
-                                            .text_color(ink()),
-                                    )
-                                    .on_click(|_, window, _| window.zoom_window()),
-                            )
-                            .child(
-                                div()
-                                    .id("window-close")
-                                    .w(px(46.0))
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|style| {
-                                        style.bg(rgb(0xd92d3a)).text_color(rgb(0xffffff))
-                                    })
-                                    .child(
-                                        svg()
-                                            .path("icons/close.svg")
-                                            .size(px(16.0))
-                                            .text_color(ink()),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if this.recording_state == RecordingState::Idle {
-                                            window.remove_window();
-                                        } else {
-                                            this.request_window_close(window.window_handle(), cx);
-                                        }
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(58.0))
-                    .flex_none()
-                    .px_5()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(rgb(0xffffff))
-                    .border_b_1()
-                    .border_color(line())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(undo_button)
-                            .child(redo_button),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .when(!self.crop_active, |this| {
-                                this.child(recording_controls)
-                                    .child(capture)
-                                    .child(crop)
-                                    .child(animate_button)
-                                    .child(open_recording)
-                                    .child(save)
-                                    .child(finish_button)
-                                    .child(sidebar_button)
-                            })
-                            .when(self.crop_active, |this| {
-                                this.child(div().w(px(430.0)).child(crop_aspects))
-                                    .when_some(crop_pixel_size, |this, value| {
-                                        this.child(
-                                            div()
-                                                .px_2()
-                                                .text_xs()
-                                                .text_color(muted())
-                                                .child(value),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .id("crop-reset")
-                                            .px_3()
-                                            .h(px(34.0))
-                                            .flex()
-                                            .items_center()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                                            .child("Reset")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.crop_rect = CropRect::UNIT;
-                                                if let Some(ratio) = this.crop_normalized_aspect() {
-                                                    this.crop_rect = crop_rect_with_aspect(this.crop_rect, ratio);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("crop-cancel")
-                                            .px_3()
-                                            .h(px(34.0))
-                                            .flex()
-                                            .items_center()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                                            .child("Cancel")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.cancel_crop();
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("crop-apply")
-                                            .px_4()
-                                            .h(px(34.0))
-                                            .flex()
-                                            .items_center()
-                                            .rounded_md()
-                                            .bg(blue())
-                                            .text_color(rgb(0xffffff))
-                                            .cursor_pointer()
-                                            .child("Crop")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Err(error) = this.apply_crop() {
-                                                    this.toast = Some(error.into());
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                            }),
-                    ),
-            )
+            .child(top_bar)
             .child(
                 div()
                     .flex_1()
@@ -7953,425 +6343,15 @@ impl Render for Studio {
                     .flex()
                     .child(
                         div()
-                            .relative()
                             .flex_1()
                             .min_w_0()
-                            .p_8()
-                            .bg(rgb(0xf3f3f4))
-                            .child(div().absolute().inset_0().opacity(0.18).bg(rgb(0xf1f1f2)))
-                            .child(
-                                div()
-                                    .relative()
-                                    .size_full()
-                                    .p_6()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_4()
-                                    .child(self.mock_capture(
-                                        cx,
-                                        canvas_width,
-                                        canvas_height,
-                                        composited.clone(),
-                                    ))
-                                    .when_some(animation_strip, |this, strip| {
-                                        this.child(div().w(canvas_width).child(strip))
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(20.0))
-                                    .bottom(px(15.0))
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(format!("{}%", self.zoom)),
-                            )
-                            .when_some(self.toast.clone(), |this, toast| {
-                                this.child(
-                                    div()
-                                        .absolute()
-                                        .bottom(px(24.0))
-                                        .left(px(220.0))
-                                        .px_4()
-                                        .py_2()
-                                        .rounded_lg()
-                                        .bg(hsla(220.0 / 360.0, 0.2, 0.12, 0.9))
-                                        .text_sm()
-                                        .text_color(rgb(0xffffff))
-                                        .child(toast),
-                                )
-                            })
-                            .when_some(screenshot_export_overlay, |this, overlay| {
-                                this.child(overlay)
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w(px(316.0))
-                            .when(!self.inspector_visible, |this| this.hidden())
-                            .relative()
-                            .flex_none()
                             .h_full()
-                            .id("inspector-scroll")
-                            .overflow_y_scroll()
-                            .bg(panel())
-                            .border_l_1()
-                            .border_color(line())
-                            .p_4()
                             .flex()
                             .flex_col()
-                            .gap_3()
-                            .when_some(animation_section, |this, section| this.child(section))
-                            .when_some(screenshot_motion_panel, |this, panel| this.child(panel))
-                            .when_some(screenshot_transform_panel, |this, panel| this.child(panel))
-                            .when_some(screenshot_timing_panel, |this, panel| this.child(panel))
-                            .child(screenshot_templates)
-                            .child(background_preset_picker)
-                            .child(screenshot_presets)
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Tools"),
-                            )
-                            .child(tool_grid)
-                            .child(
-                                div()
-                                    .min_h(px(32.0))
-                                    .px_1()
-                                    .text_xs()
-                                    .text_color(muted())
-                                    .child(tool_help),
-                            )
-                            .child(annotation_styles)
-                            .child(
-                                div()
-                                    .mt_3()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Smart Redaction"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_none()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .id("smart-pixelate")
-                                            .flex_1()
-                                            .h(px(34.0))
-                                            .rounded_lg()
-                                            .bg(if self.tool == Tool::Pixelate {
-                                                rgb(0xdcecff)
-                                            } else {
-                                                rgb(0xeeeeef)
-                                            })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_sm()
-                                            .cursor_pointer()
-                                            .child(
-                                                svg()
-                                                    .path("icons/pixelate.svg")
-                                                    .size(px(15.0))
-                                                    .text_color(ink()),
-                                            )
-                                            .child("Pixelate")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.stop_editing_text();
-                                                this.tool = Tool::Pixelate;
-                                                this.selected_annotation = None;
-                                                this.editing_text = None;
-                                                this.toast = Some(
-                                                    "Pixelate selected — click the canvas".into(),
-                                                );
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("smart-blur")
-                                            .flex_1()
-                                            .h(px(34.0))
-                                            .rounded_lg()
-                                            .bg(if self.tool == Tool::Blur {
-                                                rgb(0xdcecff)
-                                            } else {
-                                                rgb(0xeeeeef)
-                                            })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_sm()
-                                            .cursor_pointer()
-                                            .child(
-                                                svg()
-                                                    .path("icons/blur.svg")
-                                                    .size(px(15.0))
-                                                    .text_color(ink()),
-                                            )
-                                            .child("Blur")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.stop_editing_text();
-                                                this.tool = Tool::Blur;
-                                                this.selected_annotation = None;
-                                                this.editing_text = None;
-                                                this.toast =
-                                                    Some("Blur selected — click the canvas".into());
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            .child(self.section_header(
-                                "Camera",
-                                self.camera_open,
-                                |this| this.camera_open = !this.camera_open,
-                                cx,
-                            ))
-                            .when(self.camera_open, |this| {
-                                this.child(
-                                    div()
-                                        .h(px(70.0))
-                                        .flex_none()
-                                        .rounded_lg()
-                                        .bg(rgb(0x222428))
-                                        .text_color(rgb(0xffffff))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_sm()
-                                        .child("Camera preview · no device selected"),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .h(px(42.0))
-                                    .flex_none()
-                                    .border_t_1()
-                                    .border_color(line())
-                                    .id("progressive-blur-toggle")
-                                    .text_color(muted())
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child("Progressive Blur"),
-                                    )
-                                    .child(self.toggle(false))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toast = Some(
-                                            "Progressive Blur is unavailable; no overlay was applied"
-                                                .into(),
-                                        );
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("background-section-toggle")
-                                    .h(px(42.0))
-                                    .flex_none()
-                                    .border_t_1()
-                                    .border_color(line())
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child("Background"),
-                                    )
-                                    .child(if self.background_expanded { "⌃" } else { "⌄" })
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xf1f1f2)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.background_expanded = !this.background_expanded;
-                                        if !this.background_expanded {
-                                            this.background_preset_menu_open = false;
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(self.background_expanded, |this| {
-                                this.child(div().text_xs().text_color(muted()).child("Fill library"))
-                            .child(tabs)
-                            .when(self.wallpaper_tab == 2, |this| {
-                                this.child(wallpaper_sources)
-                            })
-                            .child(fill_picker)
-                            .child(div().mt_2().text_xs().text_color(muted()).child("Layout"))
-                            .child(self.slider_row(
-                                "Padding",
-                                self.padding,
-                                "%",
-                                |this, value| this.padding = value,
-                                cx,
-                            ))
-                            .child(self.slider_row(
-                                "Shadow",
-                                self.shadow,
-                                "%",
-                                |this, value| this.shadow = value,
-                                cx,
-                            ))
-                            .child(self.slider_row(
-                                "Corners",
-                                self.corners,
-                                "%",
-                                |this, value| this.corners = value,
-                                cx,
-                            ))
-                            .child(div().text_xs().text_color(muted()).child("Shadow style"))
-                            .child(self.segmented(
-                                "shadow-style",
-                                &["Soft", "Long", "Glow", "Crisp"],
-                                self.shadow_style,
-                                |this, value| this.shadow_style = value,
-                                cx,
-                            ))
-                            .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
-                            .child(self.segmented(
-                                "aspect-ratio",
-                                &["Auto", "1:1", "4:3", "3:2", "16:9"],
-                                self.aspect_ratio,
-                                |this, value| this.aspect_ratio = value,
-                                cx,
-                            ))
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .h(px(42.0))
-                                    .flex_none()
-                                    .border_t_1()
-                                    .border_color(line())
-                                    .child(
-                                        div()
-                                            .id("border-section-toggle")
-                                            .flex_1()
-                                            .h_full()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .text_sm()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child("Border")
-                                            .child(if self.border_expanded { "⌃" } else { "⌄" })
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xf1f1f2)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.border_expanded = !this.border_expanded;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("border-enabled-toggle")
-                                            .pl_3()
-                                            .h_full()
-                                            .flex()
-                                            .items_center()
-                                            .cursor_pointer()
-                                            .child(self.toggle(self.border))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.border = !this.border;
-                                                if this.border {
-                                                    this.border_expanded = true;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            .when(self.border_expanded, |this| {
-                                this.child(div().text_xs().text_color(muted()).child("Color"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(Self::swatch(
-                                        "border-yellow",
-                                        0xffc928,
-                                        self.border_color == 0,
-                                        |this: &mut Studio| this.border_color = 0,
-                                        cx,
-                                    ))
-                                    .child(Self::swatch(
-                                        "border-green",
-                                        0x22b45d,
-                                        self.border_color == 1,
-                                        |this: &mut Studio| this.border_color = 1,
-                                        cx,
-                                    ))
-                                    .child(Self::swatch(
-                                        "border-cyan",
-                                        0x22bfc2,
-                                        self.border_color == 2,
-                                        |this: &mut Studio| this.border_color = 2,
-                                        cx,
-                                    ))
-                                    .child(Self::swatch(
-                                        "border-blue",
-                                        0x3678ef,
-                                        self.border_color == 3,
-                                        |this: &mut Studio| this.border_color = 3,
-                                        cx,
-                                    ))
-                                    .child(Self::swatch(
-                                        "border-purple",
-                                        0x8c4ce8,
-                                        self.border_color == 4,
-                                        |this: &mut Studio| this.border_color = 4,
-                                        cx,
-                                    ))
-                                    .child(Self::swatch(
-                                        "border-pink",
-                                        0xec3d87,
-                                        self.border_color == 5,
-                                        |this: &mut Studio| this.border_color = 5,
-                                        cx,
-                                    )),
-                            )
-                            .child(self.slider_row(
-                                "Thickness",
-                                self.border_thickness,
-                                "",
-                                |this, value| this.border_thickness = value,
-                                cx,
-                            ))
-                            .child(self.slider_row(
-                                "Opacity",
-                                self.border_opacity,
-                                "%",
-                                |this, value| this.border_opacity = value,
-                                cx,
-                            ))
-                            })
-                            .child(screenshot_effects)
-                            .child(screenshot_watermark)
-                            .when_some(screenshot_export, |this, section| this.child(section))
-                            .when(self.crop_active, |this| {
-                                this.opacity(0.52).child(
-                                    div()
-                                        .id("crop-inspector-blocker")
-                                        .absolute()
-                                        .inset_0()
-                                        .bg(hsla(0.0, 0.0, 1.0, 0.01))
-                                        .on_mouse_down(MouseButton::Left, |_, _, _| {}),
-                                )
-                            }),
-                    ),
+                            .child(canvas_area)
+                            .when_some(timeline, |this, timeline| this.child(timeline)),
+                    )
+                    .when_some(sidebar, |this, sidebar| this.child(sidebar)),
             )
             .into_any_element()
     }
@@ -8407,7 +6387,7 @@ fn main() {
                     window_min_size: Some(size(px(980.0), px(680.0))),
                     app_id: Some("com.screendrop.Screendrop".into()),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Screendrop".into()),
+                        title: Some("Lahza".into()),
                         appears_transparent: false,
                         traffic_light_position: None,
                     }),
@@ -8439,7 +6419,7 @@ fn main() {
                     studio
                 },
             )
-            .expect("failed to open Screendrop window");
+            .expect("failed to open Lahza window");
             cx.activate(true);
         });
 }

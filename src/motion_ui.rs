@@ -4,8 +4,8 @@
 //! workflow.
 
 use gpui::{
-    canvas, div, hsla, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight,
-    MouseButton, MouseDownEvent, Pixels, Timer,
+    div, hsla, prelude::*, px, rgb, AnyElement, Context, CursorStyle, FontWeight, MouseButton,
+    MouseDownEvent, Pixels, Timer,
 };
 use image::RgbaImage;
 use std::{
@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    blue, ink, line, muted,
+    line, muted,
     recording::{
         clips::RecordingClipTimeline,
         export::{
@@ -49,7 +49,7 @@ pub(crate) enum MotionPick {
     PanEnd,
 }
 
-fn orange(selected: bool) -> gpui::Hsla {
+pub(crate) fn orange(selected: bool) -> gpui::Hsla {
     if selected {
         hsla(24.0 / 360.0, 0.95, 0.47, 1.0)
     } else {
@@ -525,7 +525,7 @@ impl Studio {
     // Inspector
     // ------------------------------------------------------------------
 
-    fn inspector_label(text: &'static str) -> AnyElement {
+    pub(crate) fn inspector_label(text: &'static str) -> AnyElement {
         div()
             .text_xs()
             .text_color(muted())
@@ -1231,540 +1231,6 @@ impl Studio {
         }
     }
 
-    /// Timeline strip under the screenshot canvas while animation is on.
-    pub(crate) fn animation_strip(&self, cx: &mut Context<Self>) -> AnyElement {
-        let timeline_bounds = self.video_timeline_bounds.clone();
-        let duration = self.video_duration.max(f64::EPSILON);
-        let content_width = self.video_timeline_viewport_width() * self.video_timeline_zoom;
-        let progress = (self.video_position / duration).clamp(0.0, 1.0);
-        let playing = self.video_playing;
-        let busy = self.export_progress.is_some();
-        let can_undo = !self.video_undo_stack.is_empty();
-        let can_redo = !self.video_redo_stack.is_empty();
-        let has_selection = self.video_selected_zoom_cue.is_some();
-        let ruler_step = {
-            let raw = 80.0 * duration / content_width.max(1.0);
-            [0.25, 0.5, 1.0, 2.0, 5.0]
-                .into_iter()
-                .find(|step| *step >= raw)
-                .unwrap_or(10.0)
-        };
-        let mut ruler_marks: Vec<AnyElement> = Vec::new();
-        let mut tick = 0.0;
-        while tick <= duration + 1e-6 {
-            let x = (tick / duration * content_width) as f32;
-            ruler_marks.push(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .bottom_0()
-                    .w(px(1.0))
-                    .h(px(5.0))
-                    .bg(hsla(0.0, 0.0, 0.0, 0.3))
-                    .into_any_element(),
-            );
-            ruler_marks.push(
-                div()
-                    .absolute()
-                    .left(px(x + 4.0))
-                    .top(px(0.0))
-                    .text_xs()
-                    .text_color(muted())
-                    .child(format!("{tick:.1}s"))
-                    .into_any_element(),
-            );
-            tick += ruler_step;
-        }
-        let track = self.motion_track(self.video_timeline_scroll, content_width, progress, cx);
-        let annotation_track =
-            self.annotation_track(self.video_timeline_scroll, content_width, progress, cx);
-        div()
-            .w_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("animation-play-pause")
-                            .size(px(32.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(blue())
-                            .cursor_pointer()
-                            .child(
-                                svg()
-                                    .path(if playing {
-                                        "icons/pause.svg"
-                                    } else {
-                                        "icons/play.svg"
-                                    })
-                                    .size(px(16.0))
-                                    .text_color(rgb(0xffffff)),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_animation_playback(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .w(px(92.0))
-                            .text_xs()
-                            .text_color(muted())
-                            .child(format!(
-                                "{:.1}s / {:.1}s",
-                                self.video_position, self.video_duration
-                            )),
-                    )
-                    .when(self.image_scenes.len() > 1, |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(ink())
-                                .child(format!(
-                                    "Scene {} of {} · {:.1}s total",
-                                    self.image_scene_index + 1,
-                                    self.image_scenes.len(),
-                                    self.sequence_duration()
-                                )),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id("animation-undo")
-                            .size(px(30.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .opacity(if can_undo { 1.0 } else { 0.35 })
-                            .when(can_undo, |this| {
-                                this.cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.undo_video_edit(cx);
-                                        cx.notify();
-                                    }))
-                            })
-                            .child(
-                                svg()
-                                    .path("icons/undo.svg")
-                                    .size(px(16.0))
-                                    .text_color(ink()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("animation-redo")
-                            .size(px(30.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .opacity(if can_redo { 1.0 } else { 0.35 })
-                            .when(can_redo, |this| {
-                                this.cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.redo_video_edit(cx);
-                                        cx.notify();
-                                    }))
-                            })
-                            .child(
-                                svg()
-                                    .path("icons/redo.svg")
-                                    .size(px(16.0))
-                                    .text_color(ink()),
-                            ),
-                    )
-                    .child(self.small_button(
-                        "animation-add-motion",
-                        "+ Motion",
-                        !busy,
-                        cx,
-                        |this, cx| {
-                            let position = this.video_position;
-                            this.add_motion_region_at(position, cx);
-                        },
-                    ))
-                    .when(has_selection, |this| {
-                        this.child(
-                            div()
-                                .id("animation-delete-motion")
-                                .size(px(30.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0xfee2e2)))
-                                .child(
-                                    svg()
-                                        .path("icons/trash.svg")
-                                        .size(px(15.0))
-                                        .text_color(ink()),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_selected_video_zoom(cx);
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().size(px(10.0)).rounded_full().bg(orange(false)))
-                            .child(div().text_xs().text_color(muted()).child("Motion")),
-                    ),
-            )
-            .child(
-                div()
-                    .id("animation-ruler")
-                    .relative()
-                    .w_full()
-                    .h(px(18.0))
-                    .flex_none()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(-(self.video_timeline_scroll as f32)))
-                            .top_0()
-                            .w(px(content_width as f32))
-                            .h_full()
-                            .children(ruler_marks)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px((content_width * progress) as f32 - 5.0))
-                                    .top(px(2.0))
-                                    .size(px(10.0))
-                                    .rounded_full()
-                                    .bg(hsla(222.0 / 360.0, 0.2, 0.15, 1.0)),
-                            ),
-                    )
-                    .child(
-                        canvas(
-                            move |bounds, window, _| {
-                                if let Ok(mut stored) = timeline_bounds.lock() {
-                                    if *stored != Some(bounds) {
-                                        window.refresh();
-                                    }
-                                    *stored = Some(bounds);
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .size_full(),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.pause_video_playback();
-                            this.video_zoom_drag = None;
-                            if let Some(target) = this.motion_timeline_time_at(event.position.x) {
-                                this.video_position = target;
-                                this.video_seek_drag = Some((event.position.x, target));
-                            }
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child(track)
-            .when_some(annotation_track, |this, lane| this.child(lane))
-            .into_any_element()
-    }
-
-    /// Inspector section for animated screenshots: duration and presets.
-    pub(crate) fn animation_inspector_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let duration_index = ANIMATION_DURATIONS
-            .iter()
-            .position(|value| (*value - self.animation_duration).abs() < 1e-9)
-            .unwrap_or(usize::MAX);
-        let selected_preset = self.animation_preset;
-        let format_index = ExportFormat::ALL
-            .iter()
-            .position(|format| *format == self.export_format)
-            .unwrap_or(0);
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Animation"),
-                    )
-                    .child(self.small_button(
-                        "animation-static",
-                        "Back to static",
-                        true,
-                        cx,
-                        |this, _| this.exit_animation(),
-                    )),
-            )
-            .child(Self::inspector_label("Scenes"))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_1()
-                    .children((0..self.image_scenes.len().max(1)).map(|index| {
-                        let selected = index == self.image_scene_index;
-                        div()
-                            .id(("image-scene", index))
-                            .min_w(px(30.0))
-                            .h(px(30.0))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if selected { blue() } else { rgb(0xf0f0f1).into() })
-                            .text_color(if selected { rgb(0xffffff).into() } else { ink() })
-                            .cursor_pointer()
-                            .child(format!("{}", index + 1))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.switch_image_scene(index, cx);
-                            }))
-                    }))
-                    .child(self.small_button(
-                        "image-scene-add",
-                        "+ Add image",
-                        true,
-                        cx,
-                        |this, cx| this.add_image_scene_dialog(cx),
-                    ))
-                    .when(self.image_scenes.len() > 1, |this| {
-                        this.child(self.small_button(
-                            "image-scene-remove",
-                            "Remove scene",
-                            true,
-                            cx,
-                            |this, cx| this.remove_image_scene(cx),
-                        ))
-                    }),
-            )
-            .child(Self::inspector_label("Duration"))
-            .child(self.segmented(
-                "animation-duration",
-                &["3 s", "5 s", "8 s", "10 s"],
-                duration_index,
-                |this, index| this.set_animation_duration(ANIMATION_DURATIONS[index]),
-                cx,
-            ))
-            .child(Self::inspector_label("Preset"))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(MotionPreset::ALL.into_iter().enumerate().map(|(index, preset)| {
-                        let selected = selected_preset == Some(preset);
-                        div()
-                            .id(("animation-preset", index))
-                            .px_3()
-                            .h(px(30.0))
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if selected { orange(false) } else { rgb(0xf0f0f1).into() })
-                            .text_color(if selected { rgb(0xffffff).into() } else { ink() })
-                            .cursor_pointer()
-                            .hover(move |style| {
-                                if selected {
-                                    style
-                                } else {
-                                    style.bg(rgb(0xe4e4e7))
-                                }
-                            })
-                            .child(preset.label())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.apply_motion_preset(preset);
-                                cx.notify();
-                            }))
-                    })),
-            )
-            .child(Self::inspector_label("Cursor walkthrough"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("walkthrough-toggle")
-                            .px_3()
-                            .h(px(30.0))
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if self.walkthrough_mode {
-                                orange(false)
-                            } else {
-                                rgb(0xf0f0f1).into()
-                            })
-                            .text_color(if self.walkthrough_mode {
-                                rgb(0xffffff).into()
-                            } else {
-                                ink()
-                            })
-                            .cursor_pointer()
-                            .child(if self.walkthrough_mode {
-                                "Placing stops… (Enter to finish)"
-                            } else if self.has_walkthrough() {
-                                "Add more stops"
-                            } else {
-                                "Place cursor stops"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.walkthrough_mode = !this.walkthrough_mode;
-                                this.video_selected_zoom_cue = None;
-                                this.scene_selection = crate::scene_ui::SceneSelection::Scene;
-                                if this.walkthrough_mode {
-                                    this.pause_video_playback();
-                                    this.toast = Some(
-                                        "Click the spots the cursor should visit, in order".into(),
-                                    );
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.has_walkthrough(), |this| {
-                        this.child(self.small_button(
-                            "walkthrough-clear",
-                            "Clear path",
-                            true,
-                            cx,
-                            |this, _| this.clear_walkthrough(),
-                        ))
-                    }),
-            )
-            .child(Self::inspector_label("Export as"))
-            .child(self.segmented(
-                "animation-export-format",
-                &["MP4", "WebM", "GIF"],
-                format_index,
-                |this, index| this.export_format = ExportFormat::ALL[index],
-                cx,
-            ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("Finish exports the animation. Double-click the motion lane to add a region, drag its edges to retime it."),
-            )
-            .child(div().h(px(1.0)).bg(line()))
-            .into_any_element()
-    }
-
-    /// The toolbar toggle that switches a screenshot between static and
-    /// motion editing.
-    pub(crate) fn animate_toolbar_button(&self, cx: &mut Context<Self>) -> AnyElement {
-        let active = self.animation_active;
-        div()
-            .id("toolbar-animate")
-            .px_3()
-            .h(px(34.0))
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded_md()
-            .text_sm()
-            .cursor_pointer()
-            .when(active, |this| {
-                this.bg(hsla(24.0 / 360.0, 0.95, 0.94, 1.0))
-                    .text_color(hsla(24.0 / 360.0, 0.9, 0.35, 1.0))
-            })
-            .hover(move |style| {
-                if active {
-                    style.bg(hsla(24.0 / 360.0, 0.95, 0.9, 1.0))
-                } else {
-                    style.bg(rgb(0xeeeeef))
-                }
-            })
-            .child(
-                svg()
-                    .path("icons/play.svg")
-                    .size(px(15.0))
-                    .text_color(if active {
-                        hsla(24.0 / 360.0, 0.9, 0.4, 1.0)
-                    } else {
-                        ink()
-                    }),
-            )
-            .child(if active { "Animating" } else { "Animate" })
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_animation(cx)))
-            .into_any_element()
-    }
-
-    /// Format picker for the recording editor's top bar.
-    pub(crate) fn export_format_picker(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.export_progress.is_some();
-        div()
-            .flex()
-            .items_center()
-            .h(px(32.0))
-            .p(px(3.0))
-            .rounded_md()
-            .bg(rgb(0xf0f0f1))
-            .opacity(if busy { 0.5 } else { 1.0 })
-            .children(
-                ExportFormat::ALL
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, format)| {
-                        let selected = self.export_format == format;
-                        div()
-                            .id(("export-format", index))
-                            .px_2()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .rounded_sm()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if selected { ink() } else { muted() })
-                            .when(selected, |this| this.bg(rgb(0xffffff)).shadow_sm())
-                            .when(!busy, |this| {
-                                this.cursor_pointer().on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.export_format = format;
-                                        cx.notify();
-                                    },
-                                ))
-                            })
-                            .child(format.label())
-                    }),
-            )
-            .into_any_element()
-    }
-
     // ------------------------------------------------------------------
     // Export
     // ------------------------------------------------------------------
@@ -1831,10 +1297,7 @@ impl Studio {
         }
         let format = self.export_format;
         let suggested_name = chrono::Local::now()
-            .format(&format!(
-                "Screendrop-%Y-%m-%d_%H-%M-%S.{}",
-                format.extension()
-            ))
+            .format(&format!("Lahza-%Y-%m-%d_%H-%M-%S.{}", format.extension()))
             .to_string();
         let mut request = SceneExportRequest::new(
             Default::default(),
@@ -1884,7 +1347,7 @@ impl Studio {
         let format = self.export_format;
         let suggested_name = chrono::Local::now()
             .format(&format!(
-                "Screendrop-%Y-%m-%d_%H-%M-%S-%3f.{}",
+                "Lahza-%Y-%m-%d_%H-%M-%S-%3f.{}",
                 format.extension()
             ))
             .to_string();
@@ -2236,59 +1699,65 @@ impl Studio {
         Some(
             div()
                 .absolute()
-                .bottom(px(72.0))
-                .left(px(220.0))
-                .w(px(320.0))
-                .p_3()
-                .rounded_lg()
-                .bg(hsla(220.0 / 360.0, 0.2, 0.12, 0.94))
-                .text_color(rgb(0xffffff))
+                .bottom(px(20.0))
+                .left_0()
+                .right_0()
                 .flex()
-                .flex_col()
-                .gap_2()
+                .justify_center()
                 .child(
                     div()
+                        .w(px(320.0))
+                        .p_3()
+                        .rounded_lg()
+                        .bg(hsla(220.0 / 360.0, 0.2, 0.12, 0.94))
+                        .text_color(rgb(0xffffff))
                         .flex()
-                        .items_center()
-                        .justify_between()
+                        .flex_col()
+                        .gap_2()
                         .child(
                             div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(label),
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .id("export-cancel")
+                                        .px_2()
+                                        .h(px(24.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded_md()
+                                        .bg(hsla(0.0, 0.0, 1.0, 0.12))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.22)))
+                                        .child("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_export();
+                                            cx.notify();
+                                        })),
+                                ),
                         )
                         .child(
                             div()
-                                .id("export-cancel")
-                                .px_2()
-                                .h(px(24.0))
-                                .flex()
-                                .items_center()
-                                .rounded_md()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.12))
-                                .text_xs()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.22)))
-                                .child("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cancel_export();
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(6.0))
-                        .rounded_full()
-                        .bg(hsla(0.0, 0.0, 1.0, 0.15))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .h_full()
-                                .w(gpui::relative(fraction as f32))
+                                .w_full()
+                                .h(px(6.0))
                                 .rounded_full()
-                                .bg(orange(false)),
+                                .bg(hsla(0.0, 0.0, 1.0, 0.15))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(fraction as f32))
+                                        .rounded_full()
+                                        .bg(orange(false)),
+                                ),
                         ),
                 )
                 .into_any_element(),

@@ -59,7 +59,7 @@ jobs:
           strip "${package_root}/usr/bin/screendrop"
           install -Dm644 packaging/com.screendrop.Screendrop.desktop \
             "${package_root}/usr/share/applications/com.screendrop.Screendrop.desktop"
-          install -Dm644 Screendrop.png \
+          install -Dm644 Lahza.png \
             "${package_root}/usr/share/pixmaps/com.screendrop.Screendrop.png"
           install -d "${package_root}/usr/share/screendrop/assets"
           cp -a assets/. "${package_root}/usr/share/screendrop/assets/"

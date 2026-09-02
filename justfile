@@ -20,7 +20,7 @@ install: build
 install-desktop: install
     install -Dm644 packaging/com.screendrop.Screendrop.desktop \
       {{apps}}/com.screendrop.Screendrop.desktop
-    install -Dm644 Screendrop.png \
+    install -Dm644 Lahza.png \
       {{icons}}/512x512/apps/com.screendrop.Screendrop.png
     update-desktop-database {{apps}}
     gtk-update-icon-cache -t {{icons}}

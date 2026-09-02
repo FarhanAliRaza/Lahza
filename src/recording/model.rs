@@ -37,7 +37,7 @@ impl RecordingSession {
         fs::create_dir_all(&root)?;
         let stamp: DateTime<Local> = Local::now();
         let name = format!(
-            "Screendrop_{}_{}.{}",
+            "Lahza_{}_{}.{}",
             stamp.format("%Y-%m-%d-%H-%M-%S"),
             &Uuid::new_v4().simple().to_string()[..6],
             SESSION_EXTENSION

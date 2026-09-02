@@ -1,4 +1,7 @@
-# Screendrop (Rust/GPUI)
+# Lahza (Rust/GPUI)
+
+The app is named Lahza ("moment" in Urdu); the crate, binary, app id, and
+session extension keep the historical `screendrop` identifiers.
 
 Linux-first screenshot and recording studio. The macOS Swift app in `Screendrop/` is a reference only — don't build it.
 
@@ -35,7 +38,7 @@ PATH. User-local install:
 install -Dm755 target/release/screendrop ~/.local/bin/screendrop
 install -Dm644 packaging/com.screendrop.Screendrop.desktop \
   ~/.local/share/applications/com.screendrop.Screendrop.desktop
-install -Dm644 Screendrop.png \
+install -Dm644 Lahza.png \
   ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
 update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor

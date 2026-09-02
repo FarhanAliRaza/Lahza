@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Screendrop
-Comment=Capture and annotate screenshots
+Name=Lahza
+Comment=Screenshot and recording studio
 Exec=screendrop
 Icon=com.screendrop.Screendrop
 Terminal=false

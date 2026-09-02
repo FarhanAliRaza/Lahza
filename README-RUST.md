@@ -1,4 +1,4 @@
-# Screendrop for Linux
+# Lahza for Linux
 
 This directory contains the Linux-first Rust and GPUI port of Screendrop. The
 original macOS Swift application remains in `Screendrop/` as the behavioral and
@@ -52,7 +52,7 @@ cargo build --release
 install -Dm755 target/release/screendrop ~/.local/bin/screendrop
 install -Dm644 packaging/com.screendrop.Screendrop.desktop \
   ~/.local/share/applications/com.screendrop.Screendrop.desktop
-install -Dm644 Screendrop.png \
+install -Dm644 Lahza.png \
   ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
 update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor

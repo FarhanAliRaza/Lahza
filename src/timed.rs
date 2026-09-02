@@ -225,6 +225,16 @@ fn back_out(t: f64) -> f64 {
 
 /// The mark as it should be painted at `time`, or `None` while hidden.
 /// Marks without timing are always shown unchanged.
+/// The mark as the editor paints it: a selected or edited mark shows its
+/// full, static state so it can be seen and hit-tested while its entrance
+/// (e.g. `Type` at the playhead) would otherwise hide it.
+pub fn editor_mark(mark: &AnnotationMark, time: f64, focused: bool) -> Option<AnnotationMark> {
+    if focused {
+        return Some(mark.clone());
+    }
+    animated_mark(mark, time)
+}
+
 pub fn animated_mark(mark: &AnnotationMark, time: f64) -> Option<AnnotationMark> {
     let Some(timing) = mark.timing else {
         return Some(mark.clone());

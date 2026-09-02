@@ -191,24 +191,6 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Templates"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted())
-                            .child(format!("{} looks", templates.len())),
-                    ),
-            )
             .children(rows)
             .child(div().text_xs().text_color(muted()).child(hint))
             .into_any_element()

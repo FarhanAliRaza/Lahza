@@ -3,7 +3,7 @@ name = "screendrop"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A Linux-first screenshot and recording studio built with Rust and GPUI"
+description = "Lahza: a Linux-first screenshot and recording studio built with Rust and GPUI"
 
 [dependencies]
 ashpd = { version = "=0.12.3", default-features = false, features = ["async-std"] }

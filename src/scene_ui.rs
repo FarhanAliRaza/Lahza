@@ -444,7 +444,11 @@ impl Studio {
         true
     }
 
-    fn scene_slider_row(&self, slider: SceneSlider, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn scene_slider_row(
+        &self,
+        slider: SceneSlider,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let value = slider.get(self);
         let (min, max) = slider.range();
         let fraction = ((value - min) / (max - min)).clamp(0.0, 1.0);
@@ -564,18 +568,6 @@ impl Studio {
                     })
                     .child("×"),
             )
-            .into_any_element()
-    }
-
-    pub(crate) fn scene_section_title(title: &'static str) -> AnyElement {
-        div()
-            .mt_2()
-            .pt_3()
-            .border_t_1()
-            .border_color(line())
-            .text_sm()
-            .font_weight(FontWeight::BOLD)
-            .child(title)
             .into_any_element()
     }
 
@@ -958,7 +950,6 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(Self::scene_section_title("Camera"))
             .when(!has_camera, |this| {
                 this.child(
                     div()
@@ -1416,16 +1407,20 @@ impl Studio {
         if let Some(draft) = self.annotation_draft.clone() {
             marks.push(draft);
         }
+        let selected_annotation = self.selected_annotation;
+        let editing_text = self.editing_text;
         let mut painted = Vec::with_capacity(marks.len());
         let mut painted_indices = Vec::with_capacity(marks.len());
         for (index, mark) in marks.iter().enumerate() {
-            if let Some(animated) = timed::animated_mark(mark, time) {
+            if let Some(animated) = timed::editor_mark(
+                mark,
+                time,
+                selected_annotation == Some(index) || editing_text == Some(index),
+            ) {
                 painted.push(animated);
                 painted_indices.push(index);
             }
         }
-        let selected_annotation = self.selected_annotation;
-        let editing_text = self.editing_text;
         let caret_visible = self.caret_visible;
         let frame = self.video_viewport_timeline.frame_at(time);
         let (view_left, view_top, _) = crate::recording::viewport::visible_rect(frame);
@@ -1668,17 +1663,6 @@ impl Studio {
     // Inspector panels
     // ------------------------------------------------------------------
 
-    pub(crate) fn inspector_level_picker(&self, cx: &mut Context<Self>) -> AnyElement {
-        self.segmented(
-            "inspector-level",
-            &["Quick", "Customize", "Advanced"],
-            self.inspector_level,
-            |this, value| this.inspector_level = value,
-            cx,
-        )
-        .into_any_element()
-    }
-
     /// Transform panel for the selected media surface.
     pub(crate) fn transform_inspector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.scene_selection != SceneSelection::Media {
@@ -1801,7 +1785,6 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(Self::scene_section_title("Background effects"))
             .child(self.scene_slider_row(SceneSlider::Blur, cx))
             .child(self.scene_slider_row(SceneSlider::Noise, cx))
             .child(self.scene_slider_row(SceneSlider::Vignette, cx))
@@ -1828,35 +1811,6 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .mt_2()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(line())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Watermark"),
-                    )
-                    .child(
-                        div()
-                            .id("watermark-toggle")
-                            .cursor_pointer()
-                            .child(self.toggle(enabled))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.watermark_enabled = !this.watermark_enabled;
-                                if this.watermark_enabled && this.watermark.text.is_empty() {
-                                    this.watermark_editing = true;
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            )
             .when(enabled, |this| {
                 this.child(
                     div()
@@ -1929,7 +1883,6 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(Self::scene_section_title("Pointer"))
             .child(self.scene_toggle_row(
                 "pointer-visible",
                 "Show cursor",
@@ -2022,7 +1975,6 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(Self::scene_section_title("Audio"))
             .when(!has_audio, |this| {
                 this.child(
                     div()
@@ -2074,7 +2026,6 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(Self::scene_section_title("Export"))
             .child(self.segmented(
                 "export-section-format",
                 &["MP4", "WebM", "GIF"],
@@ -2149,13 +2100,6 @@ impl Studio {
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("My presets"),
-                    )
                     .child(self.small_button(
                         "preset-save",
                         "Save current",
@@ -3284,177 +3228,5 @@ impl Studio {
         frame
             .save(destination)
             .map_err(|error| format!("Could not save PNG: {error}"))
-    }
-
-    /// The scene panel of the recording editor at the current inspector level.
-    pub(crate) fn video_scene_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let level = self.inspector_level;
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(self.inspector_level_picker(cx));
-        if level == 0 {
-            panel = panel
-                .child(self.template_gallery_section(cx))
-                .child(self.video_annotate_section(cx))
-                .child(self.preset_library_section(cx))
-                .child(div().text_sm().font_weight(FontWeight::BOLD).child("Looks"))
-                .child(self.quick_presets_row(cx))
-                .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
-                .child(self.segmented(
-                    "video-aspect-ratio",
-                    &["Auto", "1:1", "4:3", "3:2", "16:9"],
-                    self.aspect_ratio,
-                    |this, value| this.aspect_ratio = value,
-                    cx,
-                ))
-                .child(self.scene_slider_row(SceneSlider::DefaultZoom, cx))
-                .child(self.motion_overview_section(cx))
-                .child(self.export_section(cx));
-            return panel.into_any_element();
-        }
-        panel = panel
-            .child(self.template_gallery_section(cx))
-            .child(self.video_annotate_section(cx))
-            .child(self.motion_overview_section(cx))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .child("Background"),
-            )
-            .child(self.segmented(
-                "video-fill-type",
-                &["Color", "Gradient", "Wallpaper"],
-                self.wallpaper_tab,
-                |this, value| this.wallpaper_tab = value,
-                cx,
-            ))
-            .when(self.wallpaper_tab == 2, |this| {
-                this.child(self.segmented(
-                    "video-fill-library",
-                    &["Recent", "UIHSSN", "Fayazara"],
-                    self.library_tab,
-                    |this, value| this.library_tab = value,
-                    cx,
-                ))
-            })
-            .child(self.fill_picker(cx))
-            .child(self.effects_section(cx))
-            .child(Self::scene_section_title("Layout"))
-            .child(self.slider_row(
-                "Padding",
-                self.padding,
-                "%",
-                |this, value| this.padding = value,
-                cx,
-            ))
-            .child(self.slider_row(
-                "Corners",
-                self.corners,
-                "%",
-                |this, value| this.corners = value,
-                cx,
-            ))
-            .child(self.slider_row(
-                "Shadow",
-                self.shadow,
-                "%",
-                |this, value| this.shadow = value,
-                cx,
-            ))
-            .child(div().text_xs().text_color(muted()).child("Shadow style"))
-            .child(self.segmented(
-                "video-shadow-style",
-                &["Soft", "Long", "Glow", "Crisp"],
-                self.shadow_style,
-                |this, value| this.shadow_style = value,
-                cx,
-            ))
-            .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
-            .child(self.segmented(
-                "video-aspect-ratio",
-                &["Auto", "1:1", "4:3", "3:2", "16:9"],
-                self.aspect_ratio,
-                |this, value| this.aspect_ratio = value,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .mt_2()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(line())
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Border"),
-                    )
-                    .child(
-                        div()
-                            .id("video-border-toggle")
-                            .cursor_pointer()
-                            .child(self.toggle(self.border))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.border = !this.border;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .when(self.border, |this| {
-                this.child(
-                    div().flex().items_center().gap_2().children(
-                        crate::motion_ui::BORDER_COLORS
-                            .iter()
-                            .enumerate()
-                            .map(|(index, color)| {
-                                let selected = self.border_color == index;
-                                div()
-                                    .id(("video-border-color", index))
-                                    .size(px(24.0))
-                                    .rounded_full()
-                                    .bg(rgb(*color))
-                                    .border_2()
-                                    .border_color(if selected {
-                                        ink()
-                                    } else {
-                                        Hsla::from(rgb(0xd4d5d8))
-                                    })
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.border_color = index;
-                                        cx.notify();
-                                    }))
-                            }),
-                    ),
-                )
-                .child(self.slider_row(
-                    "Thickness",
-                    self.border_thickness,
-                    "%",
-                    |this, value| this.border_thickness = value,
-                    cx,
-                ))
-                .child(self.slider_row(
-                    "Opacity",
-                    self.border_opacity,
-                    "%",
-                    |this, value| this.border_opacity = value,
-                    cx,
-                ))
-            })
-            .child(self.watermark_section(cx))
-            .child(self.pointer_section(cx))
-            .child(self.camera_section(cx))
-            .child(self.audio_section(cx))
-            .child(self.export_section(cx))
-            .child(div().mt_2().pt_3().border_t_1().border_color(line()))
-            .child(self.preset_library_section(cx));
-        panel.into_any_element()
     }
 }
