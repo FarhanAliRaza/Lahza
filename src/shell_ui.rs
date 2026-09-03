@@ -12,7 +12,9 @@ use crate::{
     blue, crop_rect_with_aspect, ink, line,
     motion_ui::{ANIMATION_DURATIONS, BORDER_COLORS},
     muted, panel,
-    recording::{clips::ClipEdge, session::RecordingState, viewport::MotionPreset},
+    recording::{
+        clips::ClipEdge, scene::WindowFrame, session::RecordingState, viewport::MotionPreset,
+    },
     scene_ui::{SceneSelection, SceneSlider},
     timestamped_export_name, CropRect, Studio, Tool, VideoMoveDrag,
 };
@@ -920,6 +922,19 @@ impl Studio {
                 |this, value| this.shadow_style = value,
                 cx,
             ))
+            .child(div().text_xs().text_color(muted()).child("Window frame"))
+            .child(
+                self.segmented(
+                    "window-frame",
+                    &["None", "Light", "Dark"],
+                    WindowFrame::ALL
+                        .iter()
+                        .position(|frame| *frame == self.window_frame)
+                        .unwrap_or(0),
+                    |this, value| this.window_frame = WindowFrame::ALL[value.min(2)],
+                    cx,
+                ),
+            )
             .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
             .child(self.segmented(
                 "aspect-ratio",

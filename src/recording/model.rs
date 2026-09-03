@@ -1,3 +1,4 @@
+use super::cursor_assets::CursorShape;
 use chrono::{DateTime, Local, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -578,6 +579,9 @@ pub struct PointerArtwork {
     pub anchor_point: NormalizedPoint,
     pub reference_width: f64,
     pub reference_height: f64,
+    /// Shape the bitmap was recognised as, when a cursor theme matched it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<CursorShape>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

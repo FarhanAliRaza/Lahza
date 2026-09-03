@@ -95,6 +95,7 @@ impl Studio {
         };
         SceneStyle {
             background,
+            window_frame: self.window_frame,
             padding: self.padding,
             corners: self.corners,
             shadow: self.shadow,

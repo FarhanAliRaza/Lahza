@@ -19,12 +19,13 @@ use crate::{
     annotations_svg, blue, cached_render_image, ink, line, muted, paint_annotation,
     paint_highlights,
     recording::{
+        cursor_assets::CursorFamily,
         export::{estimate_size_bytes, format_size, ExportFormat, ExportResolution},
         model::NormalizedPoint,
         presets::ScenePreset,
         scene::{
-            render_svg_layer, MediaProjection, PointerOverlay, SceneCompositor, SceneGeometry,
-            SceneStyle, SceneTransform, WatermarkPosition,
+            render_svg_layer, MediaProjection, PointerMotion, PointerOverlay, SceneCompositor,
+            SceneGeometry, SceneStyle, SceneTransform, WatermarkPosition,
         },
         viewport::{MotionEasing, ViewportFrame, ViewportTimeline},
     },
@@ -381,6 +382,7 @@ impl Studio {
             self.border_color = index;
         }
         self.border_opacity = style.border_opacity;
+        self.window_frame = style.window_frame;
         self.background_blur = style.background_blur;
         self.background_noise = style.background_noise;
         self.vignette = style.vignette;
@@ -1895,14 +1897,32 @@ impl Studio {
                 |this| this.pointer_style.visible = !this.pointer_style.visible,
             ))
             .when(style.visible, |this| {
-                this.child(self.scene_slider_row(SceneSlider::PointerScale, cx))
-                    .child(self.scene_toggle_row(
-                        "pointer-shadow",
-                        "Cursor shadow",
-                        style.shadow,
-                        cx,
-                        |this| this.pointer_style.shadow = !this.pointer_style.shadow,
-                    ))
+                this.child(div().text_xs().text_color(muted()).child("Style"))
+                    .child(
+                        self.segmented(
+                            "pointer-family",
+                            &["Recorded", "macOS", "Tahoe", "Windows"],
+                            CursorFamily::ALL
+                                .iter()
+                                .position(|family| *family == style.family)
+                                .unwrap_or(0),
+                            |this, value| {
+                                this.pointer_style.family = CursorFamily::ALL[value.min(3)];
+                            },
+                            cx,
+                        ),
+                    )
+                    .child(self.scene_slider_row(SceneSlider::PointerScale, cx))
+                    // Styled cursor artwork carries its own shadow.
+                    .when(style.family == CursorFamily::Recorded, |this| {
+                        this.child(self.scene_toggle_row(
+                            "pointer-shadow",
+                            "Cursor shadow",
+                            style.shadow,
+                            cx,
+                            |this| this.pointer_style.shadow = !this.pointer_style.shadow,
+                        ))
+                    })
                     .child(self.scene_toggle_row(
                         "pointer-hide-idle",
                         "Hide when idle",
@@ -1910,6 +1930,32 @@ impl Studio {
                         cx,
                         |this| {
                             this.pointer_style.hide_when_idle = !this.pointer_style.hide_when_idle
+                        },
+                    ))
+                    .child(div().text_xs().text_color(muted()).child("Movement"))
+                    .child(
+                        self.segmented(
+                            "pointer-motion",
+                            &["Rapid", "Quick", "Default", "Slow"],
+                            PointerMotion::ALL
+                                .iter()
+                                .position(|motion| *motion == style.motion)
+                                .unwrap_or(2),
+                            |this, value| {
+                                this.pointer_style.motion = PointerMotion::ALL[value.min(3)];
+                                this.rebuild_video_motion_timelines();
+                            },
+                            cx,
+                        ),
+                    )
+                    .child(self.scene_toggle_row(
+                        "pointer-loop",
+                        "Return to start at end",
+                        style.loop_to_start,
+                        cx,
+                        |this| {
+                            this.pointer_style.loop_to_start = !this.pointer_style.loop_to_start;
+                            this.rebuild_video_motion_timelines();
                         },
                     ))
             })

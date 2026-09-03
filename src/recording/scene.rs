@@ -10,10 +10,13 @@ use image::{Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use super::pointer_timeline::PointerMotion;
+
 use super::{
+    cursor_assets::{self, CursorFamily},
     model::NormalizedPoint,
     overlays::pointer_press_effect_geometry,
-    pointer_timeline::PointerFrame,
+    pointer_timeline::{PointerBitmap, PointerFrame, PointerTimelineOptions},
     viewport::{visible_rect, Tilt, ViewportFrame},
 };
 
@@ -21,6 +24,8 @@ use super::{
 /// Padding, border thickness, corner radius, and shadow spread scale linearly
 /// with the actual canvas height so the export matches the preview.
 pub const REFERENCE_CANVAS_HEIGHT: f64 = 600.0;
+/// Window title bar height at the reference canvas height.
+const TITLE_BAR_HEIGHT: f64 = 30.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -269,6 +274,29 @@ pub struct PointerStyle {
     pub click_color: u32,
     pub hide_when_idle: bool,
     pub shadow: bool,
+    /// How tightly the smoothed cursor follows the recorded pointer.
+    pub motion: PointerMotion,
+    /// Artwork the pointer is drawn with: the captured bitmap or one of the
+    /// shipped cursor styles.
+    pub family: CursorFamily,
+    /// Glide back to the starting position before the end so the video
+    /// loops cleanly.
+    pub loop_to_start: bool,
+}
+
+impl PointerStyle {
+    /// Seconds of stillness before an idle cursor fades out.
+    pub const IDLE_HIDE_DELAY: f64 = 1.5;
+
+    /// Cursor-track build options implied by this style.
+    pub fn timeline_options(self) -> PointerTimelineOptions {
+        PointerTimelineOptions {
+            fallback_artwork: None,
+            hide_after_inactivity: Some(Self::IDLE_HIDE_DELAY),
+            motion: self.motion,
+            loop_to_start: self.loop_to_start,
+        }
+    }
 }
 
 impl Default for PointerStyle {
@@ -280,15 +308,51 @@ impl Default for PointerStyle {
             click_color: 0x007aff,
             hide_when_idle: true,
             shadow: true,
+            motion: PointerMotion::Default,
+            family: CursorFamily::Recorded,
+            loop_to_start: false,
         }
     }
 }
 
 /// Everything that styles a scene except the media itself.
+/// Fake application window chrome drawn around the media: a title bar with
+/// traffic lights so zooms and pans read as happening inside a window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowFrame {
+    #[default]
+    Off,
+    Light,
+    Dark,
+}
+
+impl WindowFrame {
+    pub const ALL: [WindowFrame; 3] = [WindowFrame::Off, WindowFrame::Light, WindowFrame::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowFrame::Off => "None",
+            WindowFrame::Light => "Light",
+            WindowFrame::Dark => "Dark",
+        }
+    }
+
+    fn bar_color(self) -> Option<[u8; 3]> {
+        match self {
+            WindowFrame::Off => None,
+            WindowFrame::Light => Some([0xe9, 0xe9, 0xeb]),
+            WindowFrame::Dark => Some([0x2c, 0x2c, 0x30]),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SceneStyle {
     pub background: SceneBackground,
+    /// Window chrome (title bar) above the media.
+    pub window_frame: WindowFrame,
     /// 0-100, matches the inspector slider.
     pub padding: u8,
     /// 0-100, matches the inspector slider.
@@ -320,6 +384,7 @@ impl Default for SceneStyle {
     fn default() -> Self {
         Self {
             background: SceneBackground::default(),
+            window_frame: WindowFrame::Off,
             padding: 20,
             corners: 12,
             shadow: 40,
@@ -368,7 +433,8 @@ impl SceneStyle {
     /// True when the GPUI preview cannot reproduce the style with plain
     /// elements and must show the composited frame instead.
     pub fn needs_composited_preview(&self) -> bool {
-        !self.transform.is_identity()
+        self.window_frame != WindowFrame::Off
+            || !self.transform.is_identity()
             || self.background_blur > 0
             || self.background_noise > 0
             || self.vignette > 0
@@ -428,6 +494,8 @@ pub struct SceneGeometry {
     pub radius: f64,
     /// Border thickness in canvas pixels (0 when the border is off).
     pub border_width: f64,
+    /// Height of the window title bar above the media (0 when off).
+    pub title_height: f64,
     pub shadow: Option<ShadowSpec>,
     /// Multiplier applied to every reference-size dimension.
     pub ui_scale: f64,
@@ -450,8 +518,13 @@ impl SceneGeometry {
         // Zero padding means the media reaches the canvas edge; only the
         // border adds space beyond the user's padding setting.
         let inset = style.padding as f64 * 2.0 * ui_scale + border_width;
+        let title_height = if style.window_frame == WindowFrame::Off {
+            0.0
+        } else {
+            TITLE_BAR_HEIGHT * ui_scale
+        };
         let available_width = (canvas_width - inset * 2.0).max(1.0);
-        let available_height = (canvas_height - inset * 2.0).max(1.0);
+        let available_height = (canvas_height - inset * 2.0 - title_height).max(1.0);
         let source_width = if source_width > 0.0 {
             source_width
         } else {
@@ -467,7 +540,7 @@ impl SceneGeometry {
         let height = source_height * scale;
         let media = Rect {
             x: inset + (available_width - width) * 0.5,
-            y: inset + (available_height - height) * 0.5,
+            y: inset + title_height + (available_height - height) * 0.5,
             width,
             height,
         };
@@ -490,14 +563,52 @@ impl SceneGeometry {
             media,
             radius: style.corners as f64 * 0.64 * ui_scale,
             border_width,
+            title_height,
             shadow,
             ui_scale,
         }
     }
 
-    /// The card rect at scale 1: media plus border.
+    /// The card rect at scale 1: media, title bar, and border.
     pub fn card(&self) -> Rect {
-        self.media.inset(-self.border_width)
+        let mut card = self.media.inset(-self.border_width);
+        card.y -= self.title_height;
+        card.height += self.title_height;
+        card
+    }
+
+    /// Signed distance (media pixels) from media-normalized `(u, v)` to the
+    /// rounded card surface (media plus title bar), negative inside.
+    pub fn surface_distance(&self, u: f64, v: f64) -> f64 {
+        let height = self.media.height + self.title_height;
+        let y = (v * self.media.height + self.title_height) / height;
+        rounded_rect_distance(u, y, self.media.width, height, self.radius)
+    }
+
+    /// Normalized `v` of the title bar's top edge (0 without a frame).
+    fn title_top(&self) -> f64 {
+        if self.media.height <= 0.0 {
+            return 0.0;
+        }
+        -self.title_height / self.media.height
+    }
+
+    /// Canvas bounds of the projected card surface including the title bar.
+    fn surface_bounds(&self, projection: &MediaProjection) -> Rect {
+        let mut bounds = projection.bounds;
+        if self.title_height <= 0.0 {
+            return bounds;
+        }
+        let top = self.title_top();
+        for (x, y) in [projection.project(0.0, top), projection.project(1.0, top)] {
+            let right = bounds.right().max(x);
+            let bottom = bounds.bottom().max(y);
+            bounds.x = bounds.x.min(x);
+            bounds.y = bounds.y.min(y);
+            bounds.width = right - bounds.x;
+            bounds.height = bottom - bounds.y;
+        }
+        bounds
     }
 
     pub fn card_radius(&self) -> f64 {
@@ -622,6 +733,18 @@ impl MediaProjection {
     pub fn contains(&self, x: f64, y: f64) -> bool {
         let (u, v) = self.unproject(x, y);
         (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)
+    }
+
+    /// `(a, b, c, d)` with `u = a * x + b` and `v = c * y + d` when the
+    /// projection is a pure scale and translation.
+    fn axis_aligned(&self) -> Option<(f64, f64, f64, f64)> {
+        let m = self.inverse;
+        let pure = m[0][1].abs() < 1e-12
+            && m[1][0].abs() < 1e-12
+            && m[2][0].abs() < 1e-12
+            && m[2][1].abs() < 1e-12
+            && (m[2][2] - 1.0).abs() < 1e-9;
+        (pure && self.affine_pixel_size.is_some()).then_some((m[0][0], m[0][2], m[1][1], m[1][2]))
     }
 
     /// Media pixels (at scale 1) covered by one canvas pixel at `(x, y)`.
@@ -931,6 +1054,11 @@ impl SceneCompositor {
         if let Some(shadow) = self.geometry.shadow {
             paint_shadow(&mut pixels, &projection, self.geometry, shadow);
         }
+        if let Some(bar) = self.style.window_frame.bar_color() {
+            if self.geometry.title_height > 0.0 {
+                self.paint_title_bar(&mut pixels, &projection, bar);
+            }
+        }
         if self.geometry.border_width > 0.0 && self.style.border_opacity > 0 {
             self.paint_border(&mut pixels, &projection);
         }
@@ -941,24 +1069,62 @@ impl SceneCompositor {
         pixels
     }
 
-    /// Signed distance (media pixels) from `(u, v)` to the rounded media
-    /// rectangle, negative inside.
+    /// Signed distance (media pixels) from `(u, v)` to the media area: the
+    /// card surface cut off at the title bar, negative inside.
     fn media_distance(&self, u: f64, v: f64) -> f64 {
-        rounded_rect_distance(
-            u,
-            v,
-            self.geometry.media.width,
-            self.geometry.media.height,
-            self.geometry.radius,
-        )
+        self.geometry
+            .surface_distance(u, v)
+            .max(-v * self.geometry.media.height)
     }
 
     fn pixel_range(&self, projection: &MediaProjection, margin: f64) -> (u32, u32, u32, u32) {
-        let x0 = (projection.bounds.x - margin).floor().max(0.0) as u32;
-        let y0 = (projection.bounds.y - margin).floor().max(0.0) as u32;
-        let x1 = ((projection.bounds.right() + margin).ceil().max(0.0) as u32).min(self.width);
-        let y1 = ((projection.bounds.bottom() + margin).ceil().max(0.0) as u32).min(self.height);
+        let bounds = self.geometry.surface_bounds(projection);
+        let x0 = (bounds.x - margin).floor().max(0.0) as u32;
+        let y0 = (bounds.y - margin).floor().max(0.0) as u32;
+        let x1 = ((bounds.right() + margin).ceil().max(0.0) as u32).min(self.width);
+        let y1 = ((bounds.bottom() + margin).ceil().max(0.0) as u32).min(self.height);
         (x0, y0, x1, y1)
+    }
+
+    /// Title bar with traffic lights above the media, inside the card outline.
+    fn paint_title_bar(&self, output: &mut RgbaImage, projection: &MediaProjection, bar: [u8; 3]) {
+        const LIGHTS: [[u8; 3]; 3] = [[0xff, 0x5f, 0x57], [0xfe, 0xbc, 0x2e], [0x28, 0xc8, 0x40]];
+        let geometry = self.geometry;
+        let title = geometry.title_height;
+        let light_radius = title * 0.2;
+        let light_spacing = title * 0.67;
+        let light_start = title * 0.7;
+        let top = geometry.title_top();
+        let (x0, y0, x1, y1) = self.pixel_range(projection, 2.0);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                let (u, v) = projection.unproject(px, py);
+                if !(-0.05..=1.05).contains(&u) || v < top - 0.05 || v > 0.05 {
+                    continue;
+                }
+                let pixel_size = projection.pixel_size_at(px, py);
+                let distance = geometry
+                    .surface_distance(u, v)
+                    .max(v * geometry.media.height);
+                let coverage = (0.5 - distance / pixel_size).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                blend_pixel(output, x, y, bar, coverage);
+                let local_x = u * geometry.media.width;
+                let local_y = v * geometry.media.height + title * 0.5;
+                for (index, color) in LIGHTS.into_iter().enumerate() {
+                    let dx = local_x - (light_start + light_spacing * index as f64);
+                    let light = (dx * dx + local_y * local_y).sqrt() - light_radius;
+                    let light_coverage = (0.5 - light / pixel_size).clamp(0.0, 1.0);
+                    if light_coverage > 0.0 {
+                        blend_pixel(output, x, y, color, light_coverage * coverage);
+                    }
+                }
+            }
+        }
     }
 
     fn paint_border(&self, output: &mut RgbaImage, projection: &MediaProjection) {
@@ -966,16 +1132,17 @@ impl SceneCompositor {
         let alpha = self.style.border_opacity as f64 / 100.0;
         let border = self.geometry.border_width;
         let (x0, y0, x1, y1) = self.pixel_range(projection, border * 2.0 + 2.0);
+        let top = self.geometry.title_top() - 0.3;
         for y in y0..y1 {
             for x in x0..x1 {
                 let px = x as f64 + 0.5;
                 let py = y as f64 + 0.5;
                 let (u, v) = projection.unproject(px, py);
-                if !(-0.3..=1.3).contains(&u) || !(-0.3..=1.3).contains(&v) {
+                if !(-0.3..=1.3).contains(&u) || !(top..=1.3).contains(&v) {
                     continue;
                 }
                 let pixel_size = projection.pixel_size_at(px, py);
-                let distance = self.media_distance(u, v);
+                let distance = self.geometry.surface_distance(u, v);
                 let outer = (0.5 - (distance - border) / pixel_size).clamp(0.0, 1.0);
                 let inner = (0.5 - distance / pixel_size).clamp(0.0, 1.0);
                 let coverage = (outer - inner).max(0.0);
@@ -994,58 +1161,42 @@ impl SceneCompositor {
         overlay: Option<&RgbaImage>,
         viewport: ViewportFrame,
     ) {
-        let source_width = source.width() as f64;
-        let source_height = source.height() as f64;
-        if source_width <= 0.0 || source_height <= 0.0 {
+        if source.width() == 0 || source.height() == 0 {
             return;
         }
         let overlay = overlay.filter(|layer| layer.width() > 0 && layer.height() > 0);
         let (left, top, visible) = visible_rect(viewport);
         let (x0, y0, x1, y1) = self.pixel_range(projection, 2.0);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let px = x as f64 + 0.5;
-                let py = y as f64 + 0.5;
-                let (u, v) = projection.unproject(px, py);
-                if !(-0.05..=1.05).contains(&u) || !(-0.05..=1.05).contains(&v) {
-                    continue;
-                }
-                let pixel_size = projection.pixel_size_at(px, py);
-                let coverage = (0.5 - self.media_distance(u, v) / pixel_size).clamp(0.0, 1.0);
-                if coverage <= 0.0 {
-                    continue;
-                }
-                let media_u = left + u.clamp(0.0, 1.0) * visible;
-                let media_v = top + v.clamp(0.0, 1.0) * visible;
-                let mut sample = sample_bilinear(
-                    source,
-                    media_u * source_width - 0.5,
-                    media_v * source_height - 0.5,
-                );
-                if let Some(layer) = overlay {
-                    let over = sample_bilinear(
-                        layer,
-                        media_u * layer.width() as f64 - 0.5,
-                        media_v * layer.height() as f64 - 0.5,
-                    );
-                    let alpha = over[3] as f64 / 255.0;
-                    for channel in 0..3 {
-                        sample[channel] = (sample[channel] as f64
-                            + (over[channel] as f64 - sample[channel] as f64) * alpha)
-                            .round() as u8;
-                    }
-                    sample[3] =
-                        (sample[3] as f64 + (255.0 - sample[3] as f64) * alpha).round() as u8;
-                }
-                blend_pixel(
-                    output,
-                    x,
-                    y,
-                    [sample[0], sample[1], sample[2]],
-                    coverage * sample[3] as f64 / 255.0,
-                );
-            }
+        if x0 >= x1 || y0 >= y1 {
+            return;
         }
+        let painter = MediaPainter {
+            geometry: self.geometry,
+            projection,
+            source,
+            overlay,
+            left,
+            top,
+            visible,
+            x0,
+            x1,
+        };
+        // Every row is independent, so the rows are painted in parallel.
+        let stride = output.width() as usize * 4;
+        let buffer: &mut [u8] = output.as_mut();
+        let region = &mut buffer[y0 as usize * stride..y1 as usize * stride];
+        let threads = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 8);
+        let rows_per_chunk = ((y1 - y0) as usize).div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (index, chunk) in region.chunks_mut(rows_per_chunk * stride).enumerate() {
+                let first_row = y0 + (index * rows_per_chunk) as u32;
+                let painter = &painter;
+                scope.spawn(move || painter.paint_rows(chunk, stride, first_row));
+            }
+        });
     }
 
     /// Picture-in-picture camera: cover-fitted, optionally mirrored, masked
@@ -1195,25 +1346,287 @@ impl SceneCompositor {
             return;
         }
         let local_scale = projection.screen_scale_at(u, v);
-        // Preview draws the cursor icon at 25px on a reference-height canvas.
-        let size = (25.0 * frame.magnification).clamp(15.0, 34.0)
-            * self.geometry.ui_scale
-            * pointer_scale
-            * local_scale;
-        if style.shadow {
-            paint_cursor(
-                output,
-                clip,
-                x + size * 0.06,
-                y + size * 0.08,
-                size,
-                frame.tilt_degrees,
-                opacity * 0.35,
-                true,
-            );
+        // Canvas pixels per normalized media unit at this point.
+        let unit_scale = (
+            self.geometry.media.width * local_scale / visible,
+            self.geometry.media.height * local_scale / visible,
+        );
+        let bitmap = frame
+            .bitmap
+            .as_deref()
+            .filter(|_| style.family == CursorFamily::Recorded);
+        if let Some(bitmap) = bitmap {
+            // Captured cursors keep their on-screen proportion to the
+            // recording, boosted so 100% reads like the vector arrow.
+            let media_scale =
+                local_scale * pointer_scale * frame.magnification / visible * CAPTURED_CURSOR_BOOST;
+            let width = bitmap.reference_width * self.geometry.media.width * media_scale;
+            let height = bitmap.reference_height * self.geometry.media.height * media_scale;
+            if width < 1.0 || height < 1.0 {
+                return;
+            }
+            let placement = BitmapPlacement {
+                hotspot_x: x,
+                hotspot_y: y,
+                width,
+                height,
+                tilt_degrees: frame.tilt_degrees,
+                smear: cursor_smear(frame.velocity, unit_scale, width),
+            };
+            if style.shadow {
+                let shadow = BitmapPlacement {
+                    hotspot_x: x + height * 0.05,
+                    hotspot_y: y + height * 0.07,
+                    ..placement
+                };
+                paint_cursor_bitmap(output, clip, bitmap, shadow, opacity * 0.35, true);
+            }
+            paint_cursor_bitmap(output, clip, bitmap, placement, opacity, false);
+            return;
         }
-        paint_cursor(output, clip, x, y, size, frame.tilt_degrees, opacity, false);
+        // Styled cursors follow Cap: a fixed height relative to the media,
+        // in the chosen family's rendition of the recorded shape.  The
+        // artwork carries its own soft shadow.
+        let family = match style.family {
+            CursorFamily::Recorded => CursorFamily::MacOs,
+            family => family,
+        };
+        let shape = frame
+            .bitmap
+            .as_deref()
+            .and_then(|bitmap| bitmap.shape)
+            .unwrap_or_default();
+        let height = ASSET_CURSOR_HEIGHT * self.geometry.media.height * local_scale / visible
+            * pointer_scale
+            * frame.magnification;
+        if height < 1.0 {
+            return;
+        }
+        let Some(asset) = cursor_assets::rasterize(family, shape, height.round() as u32) else {
+            return;
+        };
+        let width = f64::from(asset.image.width());
+        let placement = BitmapPlacement {
+            hotspot_x: x,
+            hotspot_y: y,
+            width,
+            height: f64::from(asset.image.height()),
+            tilt_degrees: frame.tilt_degrees,
+            smear: cursor_smear(frame.velocity, unit_scale, width),
+        };
+        paint_cursor_bitmap(output, clip, &asset, placement, opacity, false);
     }
+}
+
+/// Paints the media surface into a band of output rows.  Untransformed
+/// media takes an integer bilinear fast path away from the surface edge;
+/// the edge band and every projected pixel use the exact per-pixel path.
+struct MediaPainter<'a> {
+    geometry: SceneGeometry,
+    projection: &'a MediaProjection,
+    source: &'a RgbaImage,
+    overlay: Option<&'a RgbaImage>,
+    left: f64,
+    top: f64,
+    visible: f64,
+    x0: u32,
+    x1: u32,
+}
+
+/// One axis of a bilinear tap: the lower texel and the 8-bit weight of the
+/// next one.
+#[derive(Clone, Copy)]
+struct Tap {
+    index: usize,
+    weight: u32,
+}
+
+fn tap(position: f64, size: u32) -> Tap {
+    let max = f64::from(size - 1);
+    let position = position.clamp(0.0, max);
+    let index = position.floor();
+    Tap {
+        index: index as usize,
+        weight: ((position - index) * 256.0).round() as u32,
+    }
+}
+
+/// Bilinear sample in 8-bit fixed point, matching `sample_bilinear`.
+fn sample_fixed(image: &RgbaImage, x: Tap, y: Tap) -> [u8; 4] {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let x1 = (x.index + 1).min(width - 1);
+    let y1 = (y.index + 1).min(height - 1);
+    let raw = image.as_raw();
+    let row0 = y.index * width * 4;
+    let row1 = y1 * width * 4;
+    let p00 = &raw[row0 + x.index * 4..row0 + x.index * 4 + 4];
+    let p10 = &raw[row0 + x1 * 4..row0 + x1 * 4 + 4];
+    let p01 = &raw[row1 + x.index * 4..row1 + x.index * 4 + 4];
+    let p11 = &raw[row1 + x1 * 4..row1 + x1 * 4 + 4];
+    let (fx, fy) = (x.weight, y.weight);
+    let mut out = [0u8; 4];
+    for channel in 0..4 {
+        let top = u32::from(p00[channel]) * (256 - fx) + u32::from(p10[channel]) * fx;
+        let bottom = u32::from(p01[channel]) * (256 - fx) + u32::from(p11[channel]) * fx;
+        out[channel] = ((top * (256 - fy) + bottom * fy + 32_768) >> 16) as u8;
+    }
+    out
+}
+
+impl MediaPainter<'_> {
+    fn media_distance(&self, u: f64, v: f64) -> f64 {
+        self.geometry
+            .surface_distance(u, v)
+            .max(-v * self.geometry.media.height)
+    }
+
+    fn paint_rows(&self, rows: &mut [u8], stride: usize, first_row: u32) {
+        let axis_aligned = self.projection.axis_aligned();
+        let source_width = f64::from(self.source.width());
+        // Column tables for the axis-aligned path: media `u` and the
+        // source tap are the same for every row.
+        let columns: Vec<(f64, Tap, Option<Tap>)> = axis_aligned
+            .map(|(a, b, _, _)| {
+                (self.x0..self.x1)
+                    .map(|x| {
+                        let u = a * (f64::from(x) + 0.5) + b;
+                        let media_u = self.left + u.clamp(0.0, 1.0) * self.visible;
+                        (
+                            u,
+                            tap(media_u * source_width - 0.5, self.source.width()),
+                            self.overlay.map(|layer| {
+                                tap(media_u * f64::from(layer.width()) - 0.5, layer.width())
+                            }),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let media = self.geometry.media;
+        let pixel_size = self.projection.affine_pixel_size.unwrap_or(1.0);
+        // Pixels this close (in media pixels) to the surface outline take
+        // the exact path so corners and edge coverage are unchanged.
+        let band = self.geometry.radius + 2.0 * pixel_size + 1.0;
+        let surface_height = media.height + self.geometry.title_height;
+
+        for (row_index, row) in rows.chunks_mut(stride).enumerate() {
+            let y = first_row + row_index as u32;
+            let py = f64::from(y) + 0.5;
+            let row_taps = axis_aligned.map(|(_, _, c, d)| {
+                let v = c * py + d;
+                let media_v = self.top + v.clamp(0.0, 1.0) * self.visible;
+                let surface_y = v * media.height + self.geometry.title_height;
+                let interior_row =
+                    v * media.height > pixel_size + 1.0 && surface_y < surface_height - band;
+                (
+                    v,
+                    interior_row,
+                    tap(
+                        media_v * f64::from(self.source.height()) - 0.5,
+                        self.source.height(),
+                    ),
+                    self.overlay.map(|layer| {
+                        tap(media_v * f64::from(layer.height()) - 0.5, layer.height())
+                    }),
+                )
+            });
+            for x in self.x0..self.x1 {
+                let pixel = &mut row[x as usize * 4..x as usize * 4 + 4];
+                if let Some((v, interior_row, source_y, overlay_y)) = row_taps {
+                    let (u, source_x, overlay_x) = columns[(x - self.x0) as usize];
+                    if !(-0.05..=1.05).contains(&u) || !(-0.05..=1.05).contains(&v) {
+                        continue;
+                    }
+                    let px = u * media.width;
+                    if interior_row && px > band && px < media.width - band {
+                        let mut sample = sample_fixed(self.source, source_x, source_y);
+                        if let (Some(layer), Some(ox), Some(oy)) =
+                            (self.overlay, overlay_x, overlay_y)
+                        {
+                            composite_over(&mut sample, sample_fixed(layer, ox, oy));
+                        }
+                        blend_fixed(pixel, sample, 256);
+                        continue;
+                    }
+                }
+                self.paint_exact(pixel, f64::from(x) + 0.5, py);
+            }
+        }
+    }
+
+    /// The original per-pixel path: exact projection, edge coverage and
+    /// floating-point sampling.
+    fn paint_exact(&self, pixel: &mut [u8], px: f64, py: f64) {
+        let (u, v) = self.projection.unproject(px, py);
+        if !(-0.05..=1.05).contains(&u) || !(-0.05..=1.05).contains(&v) {
+            return;
+        }
+        let pixel_size = self.projection.pixel_size_at(px, py);
+        let coverage = (0.5 - self.media_distance(u, v) / pixel_size).clamp(0.0, 1.0);
+        if coverage <= 0.0 {
+            return;
+        }
+        let media_u = self.left + u.clamp(0.0, 1.0) * self.visible;
+        let media_v = self.top + v.clamp(0.0, 1.0) * self.visible;
+        let mut sample = sample_bilinear(
+            self.source,
+            media_u * f64::from(self.source.width()) - 0.5,
+            media_v * f64::from(self.source.height()) - 0.5,
+        );
+        if let Some(layer) = self.overlay {
+            let over = sample_bilinear(
+                layer,
+                media_u * f64::from(layer.width()) - 0.5,
+                media_v * f64::from(layer.height()) - 0.5,
+            );
+            let alpha = f64::from(over[3]) / 255.0;
+            for channel in 0..3 {
+                sample[channel] = (f64::from(sample[channel])
+                    + (f64::from(over[channel]) - f64::from(sample[channel])) * alpha)
+                    .round() as u8;
+            }
+            sample[3] =
+                (f64::from(sample[3]) + (255.0 - f64::from(sample[3])) * alpha).round() as u8;
+        }
+        blend_slice(
+            pixel,
+            [sample[0], sample[1], sample[2]],
+            coverage * f64::from(sample[3]) / 255.0,
+        );
+    }
+}
+
+/// Straight-alpha "over" of `over` onto `under`, in place.
+fn composite_over(under: &mut [u8; 4], over: [u8; 4]) {
+    let alpha = u32::from(over[3]);
+    for channel in 0..3 {
+        under[channel] =
+            ((u32::from(under[channel]) * (255 - alpha) + u32::from(over[channel]) * alpha + 127)
+                / 255) as u8;
+    }
+    under[3] = ((u32::from(under[3]) * (255 - alpha) + 255 * alpha + 127) / 255) as u8;
+}
+
+/// Blends a straight-alpha sample onto a pixel with an 8.8 fixed-point
+/// coverage (256 = full).
+fn blend_fixed(pixel: &mut [u8], sample: [u8; 4], coverage: u32) {
+    let alpha = u32::from(sample[3]) * coverage;
+    if alpha >= 255 * 256 {
+        pixel[..4].copy_from_slice(&sample);
+        return;
+    }
+    if alpha == 0 {
+        return;
+    }
+    let scale = 255 * 256;
+    for channel in 0..3 {
+        pixel[channel] = ((u32::from(pixel[channel]) * (scale - alpha)
+            + u32::from(sample[channel]) * alpha
+            + scale / 2)
+            / scale) as u8;
+    }
+    pixel[3] = ((u32::from(pixel[3]) * (scale - alpha) + 255 * alpha + scale / 2) / scale) as u8;
 }
 
 fn rounded_rect_distance(u: f64, v: f64, width: f64, height: f64, radius: f64) -> f64 {
@@ -1243,11 +1656,14 @@ fn blend_pixel(image: &mut RgbaImage, x: u32, y: u32, color: [u8; 3], alpha: f64
     if x >= image.width() || y >= image.height() {
         return;
     }
+    blend_slice(&mut image.get_pixel_mut(x, y).0, color, alpha);
+}
+
+fn blend_slice(pixel: &mut [u8], color: [u8; 3], alpha: f64) {
     let alpha = alpha.clamp(0.0, 1.0);
     if alpha <= 0.0 {
         return;
     }
-    let pixel = image.get_pixel_mut(x, y);
     for channel in 0..3 {
         pixel[channel] = (pixel[channel] as f64
             + (color[channel] as f64 - pixel[channel] as f64) * alpha)
@@ -1579,31 +1995,22 @@ fn paint_shadow(
     let mut mask = vec![0.0f32; width * height];
     let border = geometry.border_width;
     let margin = border * 2.0 + 2.0;
-    let x0 = (projection.bounds.x - margin).floor().max(0.0) as usize;
-    let y0 = (projection.bounds.y - margin + shadow.offset_y)
-        .floor()
-        .max(0.0) as usize;
-    let x1 = ((projection.bounds.right() + margin).ceil().max(0.0) as usize).min(width);
-    let y1 = ((projection.bounds.bottom() + margin + shadow.offset_y)
-        .ceil()
-        .max(0.0) as usize)
-        .min(height);
+    let bounds = geometry.surface_bounds(projection);
+    let x0 = (bounds.x - margin).floor().max(0.0) as usize;
+    let y0 = (bounds.y - margin + shadow.offset_y).floor().max(0.0) as usize;
+    let x1 = ((bounds.right() + margin).ceil().max(0.0) as usize).min(width);
+    let y1 = ((bounds.bottom() + margin + shadow.offset_y).ceil().max(0.0) as usize).min(height);
+    let top = geometry.title_top() - 0.3;
     for y in y0..y1 {
         for x in x0..x1 {
             let px = x as f64 + 0.5;
             let py = y as f64 + 0.5 - shadow.offset_y;
             let (u, v) = projection.unproject(px, py);
-            if !(-0.3..=1.3).contains(&u) || !(-0.3..=1.3).contains(&v) {
+            if !(-0.3..=1.3).contains(&u) || !(top..=1.3).contains(&v) {
                 continue;
             }
             let pixel_size = projection.pixel_size_at(px, py);
-            let distance = rounded_rect_distance(
-                u,
-                v,
-                geometry.media.width,
-                geometry.media.height,
-                geometry.radius,
-            );
+            let distance = geometry.surface_distance(u, v);
             mask[y * width + x] = (0.5 - (distance - border) / pixel_size).clamp(0.0, 1.0) as f32;
         }
     }
@@ -1797,130 +2204,186 @@ fn paint_ring(
     }
 }
 
-/// Arrow cursor matching `icons/mouse-pointer.svg` (24-unit art box). The
-/// tip of the arrow lands exactly on the pointer location.
-const CURSOR_OUTLINE: [(f64, f64); 8] = [
-    (4.2, 2.7),
-    (4.2, 17.8),
-    (8.3, 13.7),
-    (11.55, 20.8),
-    (14.6, 19.4),
-    (11.45, 12.5),
-    (17.3, 12.5),
-    (4.2, 2.7),
-];
+/// Captured cursors are drawn larger than life so 100% reads like an
+/// editor cursor rather than a 24 px system pointer.
+const CAPTURED_CURSOR_BOOST: f64 = 2.5;
+/// Height of a styled cursor as a fraction of the media height: Cap's 60 px
+/// on a 1080 px tall screen.
+const ASSET_CURSOR_HEIGHT: f64 = 60.0 / 1080.0;
+/// Motion smear length as a fraction of the distance the cursor travels in
+/// one 60 Hz frame (Cap's default amount, Screen Studio semantics).
+const CURSOR_SMEAR_AMOUNT: f64 = 1.0;
+/// Longest smear, in cursor widths; only pathological jumps hit it.
+const CURSOR_SMEAR_MAX_WIDTHS: f64 = 4.0;
+const CURSOR_SMEAR_TAPS: usize = 21;
 
-#[allow(clippy::too_many_arguments)]
-fn paint_cursor(
+/// Canvas-space trail for a cursor moving at `velocity` (normalized media
+/// units per second) drawn `width` pixels wide.
+fn cursor_smear(velocity: (f64, f64), scale: (f64, f64), width: f64) -> (f64, f64) {
+    let smear = (
+        velocity.0 * scale.0 / 60.0 * CURSOR_SMEAR_AMOUNT,
+        velocity.1 * scale.1 / 60.0 * CURSOR_SMEAR_AMOUNT,
+    );
+    let length = smear.0.hypot(smear.1);
+    let limit = CURSOR_SMEAR_MAX_WIDTHS * width;
+    if !length.is_finite() || length < 0.5 {
+        (0.0, 0.0)
+    } else if length > limit {
+        (smear.0 * limit / length, smear.1 * limit / length)
+    } else {
+        smear
+    }
+}
+
+/// Where a cursor bitmap lands on the canvas: hotspot position, drawn size
+/// and rotation about the hotspot.
+#[derive(Clone, Copy)]
+struct BitmapPlacement {
+    hotspot_x: f64,
+    hotspot_y: f64,
+    width: f64,
+    height: f64,
+    tilt_degrees: f64,
+    /// Motion trail in canvas pixels: the cursor is smeared this far behind
+    /// its position.
+    smear: (f64, f64),
+}
+
+/// Draws a captured cursor image with its hotspot at the pointer location,
+/// resampling bilinearly in premultiplied space so scaled edges stay clean.
+fn paint_cursor_bitmap(
     image: &mut RgbaImage,
     clip: Rect,
-    tip_x: f64,
-    tip_y: f64,
-    size: f64,
-    tilt_degrees: f64,
+    bitmap: &PointerBitmap,
+    placement: BitmapPlacement,
     opacity: f64,
     shadow_only: bool,
 ) {
-    const SUPERSAMPLE: usize = 3;
-    let scale = size / 24.0;
-    let stroke = 1.7 * scale * 0.5;
-    let (sin, cos) = tilt_degrees.to_radians().sin_cos();
-    let points: Vec<(f64, f64)> = CURSOR_OUTLINE
+    let source = &bitmap.image;
+    let (source_width, source_height) = (source.width() as f64, source.height() as f64);
+    let anchor_x = bitmap.anchor.x * placement.width;
+    let anchor_y = bitmap.anchor.y * placement.height;
+    let (sin, cos) = placement.tilt_degrees.to_radians().sin_cos();
+    let corners = [
+        (0.0, 0.0),
+        (placement.width, 0.0),
+        (0.0, placement.height),
+        (placement.width, placement.height),
+    ]
+    .map(|(lx, ly)| {
+        let (lx, ly) = (lx - anchor_x, ly - anchor_y);
+        (
+            placement.hotspot_x + lx * cos - ly * sin,
+            placement.hotspot_y + lx * sin + ly * cos,
+        )
+    });
+    // A pixel shows the sprite averaged along the trail behind it, so the
+    // painted box extends opposite the motion.
+    let (smear_x, smear_y) = placement.smear;
+    let smear_length = smear_x.hypot(smear_y);
+    let taps = if smear_length < 0.5 {
+        1
+    } else {
+        CURSOR_SMEAR_TAPS
+    };
+    // The trail in the sprite's local (unrotated) frame.
+    let local_smear = (
+        smear_x * cos + smear_y * sin,
+        -smear_x * sin + smear_y * cos,
+    );
+    let min_x = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) - 1.0 - smear_x.max(0.0);
+    let max_x = corners
         .iter()
-        .map(|(x, y)| {
-            let lx = (x - CURSOR_OUTLINE[0].0) * scale;
-            let ly = (y - CURSOR_OUTLINE[0].1) * scale;
-            (tip_x + lx * cos - ly * sin, tip_y + lx * sin + ly * cos)
-        })
-        .collect();
-    let min_x = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) - stroke - 1.0;
-    let max_x = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max) + stroke + 1.0;
-    let min_y = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min) - stroke - 1.0;
-    let max_y = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max) + stroke + 1.0;
+        .map(|p| p.0)
+        .fold(f64::NEG_INFINITY, f64::max)
+        + 1.0
+        - smear_x.min(0.0);
+    let min_y = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min) - 1.0 - smear_y.max(0.0);
+    let max_y = corners
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::NEG_INFINITY, f64::max)
+        + 1.0
+        - smear_y.min(0.0);
     let x0 = min_x.floor().max(clip.x) as i64;
     let y0 = min_y.floor().max(clip.y) as i64;
     let x1 = max_x.ceil().min(clip.right()) as i64;
     let y1 = max_y.ceil().min(clip.bottom()) as i64;
-    let samples = (SUPERSAMPLE * SUPERSAMPLE) as f64;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut fill = 0.0;
-            let mut outline = 0.0;
-            for sy in 0..SUPERSAMPLE {
-                for sx in 0..SUPERSAMPLE {
-                    let px = x as f64 + (sx as f64 + 0.5) / SUPERSAMPLE as f64;
-                    let py = y as f64 + (sy as f64 + 0.5) / SUPERSAMPLE as f64;
-                    let distance = polygon_edge_distance(&points, px, py);
-                    let inside = point_in_polygon(&points, px, py);
-                    if distance <= stroke {
-                        outline += 1.0;
-                    } else if inside {
-                        fill += 1.0;
-                    }
-                }
-            }
-            if shadow_only {
-                let coverage = (fill + outline) / samples;
-                if coverage > 0.0 {
-                    blend_pixel(image, x as u32, y as u32, [0, 0, 0], coverage * opacity);
-                }
+    let scale_x = source_width / placement.width;
+    let scale_y = source_height / placement.height;
+    let sample = |sx: f64, sy: f64| -> [f64; 4] {
+        // Bilinear tap in premultiplied space; outside the image is
+        // transparent.
+        let fx = sx - 0.5;
+        let fy = sy - 0.5;
+        let ix = fx.floor();
+        let iy = fy.floor();
+        let tx = fx - ix;
+        let ty = fy - iy;
+        let mut out = [0.0; 4];
+        for (dx, dy, weight) in [
+            (0.0, 0.0, (1.0 - tx) * (1.0 - ty)),
+            (1.0, 0.0, tx * (1.0 - ty)),
+            (0.0, 1.0, (1.0 - tx) * ty),
+            (1.0, 1.0, tx * ty),
+        ] {
+            let px = ix + dx;
+            let py = iy + dy;
+            if weight <= 0.0 || px < 0.0 || py < 0.0 || px >= source_width || py >= source_height {
                 continue;
             }
-            if fill > 0.0 {
-                blend_pixel(
-                    image,
-                    x as u32,
-                    y as u32,
-                    [255, 255, 255],
-                    fill / samples * opacity,
-                );
-            }
-            if outline > 0.0 {
-                blend_pixel(
-                    image,
-                    x as u32,
-                    y as u32,
-                    [17, 17, 17],
-                    outline / samples * opacity,
-                );
+            let pixel = source.get_pixel(px as u32, py as u32);
+            for channel in 0..4 {
+                out[channel] += f64::from(pixel[channel]) * weight;
             }
         }
-    }
-}
-
-fn point_in_polygon(points: &[(f64, f64)], px: f64, py: f64) -> bool {
-    let mut inside = false;
-    let count = points.len();
-    let mut j = count - 1;
-    for i in 0..count {
-        let (xi, yi) = points[i];
-        let (xj, yj) = points[j];
-        if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
-            inside = !inside;
+        out
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            // Map the pixel centre back into the unrotated artwork box.
+            let dx = x as f64 + 0.5 - placement.hotspot_x;
+            let dy = y as f64 + 0.5 - placement.hotspot_y;
+            let lx = dx * cos + dy * sin + anchor_x;
+            let ly = -dx * sin + dy * cos + anchor_y;
+            let mut accumulated = [0.0; 4];
+            for tap_index in 0..taps {
+                let t = if taps == 1 {
+                    0.0
+                } else {
+                    tap_index as f64 / (taps - 1) as f64
+                };
+                let tx = lx + local_smear.0 * t;
+                let ty = ly + local_smear.1 * t;
+                if tx < -1.0
+                    || ty < -1.0
+                    || tx > placement.width + 1.0
+                    || ty > placement.height + 1.0
+                {
+                    continue;
+                }
+                let tapped = sample(tx * scale_x, ty * scale_y);
+                for channel in 0..4 {
+                    accumulated[channel] += tapped[channel];
+                }
+            }
+            let [r, g, b, a] = accumulated.map(|value| value / taps as f64);
+            let coverage = a / 255.0;
+            if coverage <= 0.002 {
+                continue;
+            }
+            if shadow_only {
+                blend_pixel(image, x as u32, y as u32, [0, 0, 0], coverage * opacity);
+                continue;
+            }
+            let color = [
+                (r / coverage).round().clamp(0.0, 255.0) as u8,
+                (g / coverage).round().clamp(0.0, 255.0) as u8,
+                (b / coverage).round().clamp(0.0, 255.0) as u8,
+            ];
+            blend_pixel(image, x as u32, y as u32, color, coverage * opacity);
         }
-        j = i;
     }
-    inside
-}
-
-fn polygon_edge_distance(points: &[(f64, f64)], px: f64, py: f64) -> f64 {
-    let mut best = f64::INFINITY;
-    for pair in points.windows(2) {
-        let (ax, ay) = pair[0];
-        let (bx, by) = pair[1];
-        let dx = bx - ax;
-        let dy = by - ay;
-        let length_squared = dx * dx + dy * dy;
-        let t = if length_squared > 0.0 {
-            (((px - ax) * dx + (py - ay) * dy) / length_squared).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let cx = ax + dx * t;
-        let cy = ay + dy * t;
-        best = best.min(((px - cx).powi(2) + (py - cy).powi(2)).sqrt());
-    }
-    best
 }
 
 #[cfg(test)]
@@ -1966,6 +2429,27 @@ mod tests {
             pointer: None,
             camera: None,
         })
+    }
+
+    #[test]
+    fn window_frame_draws_a_title_bar_above_the_media() {
+        let source = RgbaImage::from_pixel(80, 80, Rgba([10, 200, 30, 255]));
+        let style = SceneStyle {
+            window_frame: WindowFrame::Light,
+            ..flat_style(0x000000)
+        };
+        let compositor = SceneCompositor::new(&style, 200, 200, 80, 80).unwrap();
+        let geometry = compositor.geometry();
+        assert!(geometry.title_height > 0.0);
+        assert!((geometry.card().y - (geometry.media.y - geometry.title_height)).abs() < 1e-9);
+        let output = compose(&compositor, &source);
+        let bar_y = (geometry.media.y - geometry.title_height * 0.5) as u32;
+        let media_y = (geometry.media.y + 2.0) as u32;
+        let x = (geometry.media.x + geometry.media.width * 0.8) as u32;
+        assert_eq!(output.get_pixel(x, bar_y).0[..3], [0xe9, 0xe9, 0xeb]);
+        assert_eq!(output.get_pixel(x, media_y).0[..3], [10, 200, 30]);
+        let light_x = (geometry.media.x + geometry.title_height * 0.7) as u32;
+        assert_eq!(output.get_pixel(light_x, bar_y).0[..3], [0xff, 0x5f, 0x57]);
     }
 
     #[test]
@@ -2193,6 +2677,76 @@ mod tests {
     }
 
     #[test]
+    fn captured_cursor_bitmap_paints_with_hotspot_on_the_pointer() {
+        use crate::recording::model::PointerArtwork;
+        use crate::recording::pointer_timeline::PointerBitmap;
+        use base64::Engine;
+        // 8x8 red square, hotspot at the centre.
+        let square = RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        square.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let artwork = PointerArtwork {
+            artwork_id: "square".into(),
+            image_data_base64: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            anchor_point: NormalizedPoint { x: 0.5, y: 0.5 },
+            reference_width: 0.1,
+            reference_height: 0.1,
+            shape: None,
+        };
+        let bitmap = std::sync::Arc::new(PointerBitmap::decode(&artwork).unwrap());
+        let style = SceneStyle {
+            pointer: PointerStyle {
+                shadow: false,
+                click_effects: false,
+                ..PointerStyle::default()
+            },
+            ..flat_style(0)
+        };
+        let compositor = SceneCompositor::new(&style, 200, 200, 200, 200).unwrap();
+        let white = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        let pointer = PointerOverlay {
+            frame: PointerFrame {
+                location: NormalizedPoint { x: 0.5, y: 0.5 },
+                artwork_id: Some("square".into()),
+                bitmap: Some(bitmap),
+                magnification: 1.0,
+                tilt_degrees: 0.0,
+                opacity: 1.0,
+                blur_radius: 0.0,
+                velocity: (0.0, 0.0),
+                press: None,
+            },
+        };
+        let output = compositor.compose(FrameInput {
+            source: &white,
+            overlay: None,
+            viewport: ViewportFrame::default(),
+            pointer: Some(&pointer),
+            camera: None,
+        });
+        let geometry = compositor.geometry();
+        let centre_x = (geometry.media.x + geometry.media.width * 0.5) as u32;
+        let centre_y = (geometry.media.y + geometry.media.height * 0.5) as u32;
+        // The square is centred on the pointer: red at the centre, and the
+        // half-size is 0.05 * media * boost, so 2.5x that is white again.
+        // Bilinear upscaling feathers each edge over one source pixel.
+        assert_eq!(output.get_pixel(centre_x, centre_y).0, [255, 0, 0, 255]);
+        let half = (0.05 * geometry.media.width * CAPTURED_CURSOR_BOOST) as u32;
+        assert_eq!(
+            output.get_pixel(centre_x + half - 4, centre_y).0,
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            output.get_pixel(centre_x - half + 4, centre_y).0,
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            output.get_pixel(centre_x + half + 3, centre_y).0,
+            [255, 255, 255, 255]
+        );
+    }
+
+    #[test]
     fn overlay_blends_in_media_space() {
         let compositor = SceneCompositor::new(&flat_style(0), 100, 100, 100, 100).unwrap();
         let white = RgbaImage::from_pixel(100, 100, Rgba([255, 255, 255, 255]));
@@ -2245,10 +2799,12 @@ mod tests {
                 frame: PointerFrame {
                     location: NormalizedPoint { x: 0.1, y: 0.1 },
                     artwork_id: None,
+                    bitmap: None,
                     magnification: 1.0,
                     tilt_degrees: 0.0,
                     opacity: 0.0,
                     blur_radius: 0.0,
+                    velocity: (0.0, 0.0),
                     press: None,
                 },
             }),
@@ -2312,10 +2868,12 @@ mod tests {
             frame: PointerFrame {
                 location: NormalizedPoint { x: 0.5, y: 0.5 },
                 artwork_id: None,
+                bitmap: None,
                 magnification: 1.0,
                 tilt_degrees: 0.0,
                 opacity: 1.0,
                 blur_radius: 0.0,
+                velocity: (0.0, 0.0),
                 press: Some(PointerPressFrame {
                     location: NormalizedPoint { x: 0.5, y: 0.5 },
                     progress: 0.5,
@@ -2364,6 +2922,61 @@ mod tests {
             output.get_pixel(center.0 + 3, center.1 + 3).0,
             [255, 255, 255, 255]
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_smear_tests {
+    use super::*;
+
+    fn compose_with_velocity(velocity: (f64, f64)) -> (RgbaImage, u32, u32) {
+        let style = SceneStyle {
+            pointer: PointerStyle {
+                click_effects: false,
+                hide_when_idle: false,
+                ..PointerStyle::default()
+            },
+            ..SceneStyle::default()
+        };
+        let compositor = SceneCompositor::new(&style, 400, 300, 400, 300).unwrap();
+        let white = RgbaImage::from_pixel(400, 300, Rgba([255, 255, 255, 255]));
+        let pointer = PointerOverlay {
+            frame: PointerFrame {
+                location: NormalizedPoint { x: 0.5, y: 0.5 },
+                artwork_id: None,
+                bitmap: None,
+                magnification: 1.0,
+                tilt_degrees: 0.0,
+                opacity: 1.0,
+                blur_radius: 0.0,
+                velocity,
+                press: None,
+            },
+        };
+        let output = compositor.compose(FrameInput {
+            source: &white,
+            overlay: None,
+            viewport: ViewportFrame::default(),
+            pointer: Some(&pointer),
+            camera: None,
+        });
+        let media = compositor.geometry().media;
+        (
+            output,
+            (media.x + media.width * 0.5) as u32,
+            (media.y + media.height * 0.5) as u32,
+        )
+    }
+
+    #[test]
+    fn fast_cursor_leaves_a_trail_behind_its_motion() {
+        let (still, x, y) = compose_with_velocity((0.0, 0.0));
+        // Ten media widths per second: a long streak to the left.
+        let (moving, _, _) = compose_with_velocity((10.0, 0.0));
+        let at = |image: &RgbaImage, dx: i64| image.get_pixel((x as i64 + dx) as u32, y + 4).0;
+        // Left of the arrow is plain media when still, streaked when moving.
+        assert_eq!(at(&still, -30), at(&still, -120));
+        assert_ne!(at(&moving, -30), at(&still, -30));
     }
 }
 

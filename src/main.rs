@@ -1,12 +1,12 @@
 use futures_util::StreamExt;
 use gpui::{
     canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
-    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp, Background,
-    Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle, FontWeight, Hsla, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollWheelEvent,
-    SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions, UnderlineStyle, Window,
-    WindowBounds, WindowDecorations, WindowOptions,
+    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp,
+    Background, Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle,
+    FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage,
+    ScrollWheelEvent, SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions,
+    UnderlineStyle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::fmt::Write as _;
 use std::{
@@ -44,7 +44,7 @@ use recording::{
     native::{NativeRecorder, RecordingOptions},
     pointer_timeline::PointerTimeline,
     presets::PresetLibrary,
-    scene::{CameraOverlay, PointerStyle, SceneStyle, SceneTransform, Watermark},
+    scene::{CameraOverlay, PointerStyle, SceneStyle, SceneTransform, Watermark, WindowFrame},
     session::{RecordingController, RecordingState},
     video::{
         decode_frame, load_or_rebuild_poster, probe_media, render_clip_preview, DecodedFrame,
@@ -1445,6 +1445,7 @@ struct Studio {
     border_thickness: u8,
     border_opacity: u8,
     border: bool,
+    window_frame: WindowFrame,
     crop_active: bool,
     crop_rect: CropRect,
     crop_aspect: usize,
@@ -1756,6 +1757,7 @@ impl Studio {
             border_thickness: 12,
             border_opacity: 30,
             border: false,
+            window_frame: WindowFrame::Off,
             crop_active: false,
             crop_rect: CropRect::UNIT,
             crop_aspect: 0,
@@ -2208,13 +2210,20 @@ impl Studio {
             .effective_clip_timeline(source_duration)
             .map_err(|error| format!("Could not load recording edits: {error}"))?;
         let pointer_capture = session.read_pointer_capture().unwrap_or_default();
+        let saved_style = session
+            .read_edit_field::<SceneStyle>("scene")
+            .ok()
+            .flatten();
         let pointer_timeline = PointerTimeline::build_with_clip_timeline(
             pointer_capture.clone(),
             source_duration,
             manifest.pixel_width as f64,
             manifest.pixel_height as f64,
-            None,
-            None,
+            saved_style
+                .as_ref()
+                .map(|style| style.pointer)
+                .unwrap_or_default()
+                .timeline_options(),
             Some(&clip_timeline),
         );
         let generated_zoom_cues = synthesize_zoom_cues(&pointer_capture, source_duration);
@@ -2273,10 +2282,6 @@ impl Studio {
         self.video_timeline_scroll = 0.0;
         // Scene settings and Screendrop extras saved with this project.
         let session = self.video_project.clone().expect("project was just opened");
-        let saved_style = session
-            .read_edit_field::<SceneStyle>("scene")
-            .ok()
-            .flatten();
         let saved_extras = session
             .read_edit_field::<RecordingExtras>("screendropExtras")
             .ok()
@@ -2687,8 +2692,7 @@ impl Studio {
                         self.video_duration,
                         width as f64,
                         height as f64,
-                        None,
-                        None,
+                        self.pointer_style.timeline_options(),
                         Some(&clips),
                     );
                     self.video_viewport_timeline = ViewportTimeline::build(
@@ -2709,8 +2713,7 @@ impl Studio {
             self.video_source_duration,
             manifest.pixel_width as f64,
             manifest.pixel_height as f64,
-            None,
-            None,
+            self.pointer_style.timeline_options(),
             Some(&self.video_clip_timeline),
         );
         self.video_viewport_timeline = ViewportTimeline::build(
@@ -3066,7 +3069,8 @@ impl Studio {
                         .hover(|style| style.bg(rgb(0xe4e4e7)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(draft) = this.video_speed_draft {
-                                this.video_speed_draft = Some(Self::next_clip_speed(draft, increase));
+                                this.video_speed_draft =
+                                    Some(Self::next_clip_speed(draft, increase));
                                 cx.notify();
                             }
                         }))
@@ -5185,12 +5189,11 @@ impl Studio {
             })
             .border_1()
             .border_color(if enabled { blue() } else { line() })
-            .child(
-                svg()
-                    .path(icon)
-                    .size(px(15.0))
-                    .text_color(if enabled { blue() } else { muted() }),
-            )
+            .child(svg().path(icon).size(px(15.0)).text_color(if enabled {
+                blue()
+            } else {
+                muted()
+            }))
             .on_click(on_click)
     }
 
@@ -5960,7 +5963,10 @@ impl Studio {
                     // The hitbox lets occluding overlays (dialogs) shadow the
                     // raw mouse listeners registered below.
                     move |bounds, window, _| {
-                        (annotations, window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal))
+                        (
+                            annotations,
+                            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+                        )
                     },
                     move |bounds, (annotations, hitbox), window, cx| {
                         let image_bounds = match composited_style.as_ref() {

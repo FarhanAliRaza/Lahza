@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 pub mod clips;
+pub mod cursor_assets;
+pub mod cursor_theme;
 pub mod export;
 pub mod input;
 pub mod model;

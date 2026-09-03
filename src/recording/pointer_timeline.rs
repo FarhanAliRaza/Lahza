@@ -1,20 +1,28 @@
 use super::{
     clips::RecordingClipTimeline,
+    cursor_assets::CursorShape,
     model::{NormalizedPoint, PointerArtwork, PointerCaptureFile},
     motion::{DampedSpring, SpringConstant},
     pointer::{
         sanitize_pointer_capture, PointerSanitizeOptions, PointerStreamEvent, PointerStreamKind,
     },
 };
-use std::collections::HashMap;
+use base64::Engine;
+use image::RgbaImage;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
 
 const STEP_RATE: f64 = 120.0;
+/// How long before the end the cursor starts gliding back to where it
+/// began when loop-friendly playback is requested.
+const LOOP_RETURN_WINDOW: f64 = 0.75;
 const ANTICIPATION_WINDOW: f64 = 0.5;
 const INTERCEPT_WINDOW: f64 = 0.175;
 const PULSE_DURATION: f64 = 0.4;
 const TILT_SAMPLE_WINDOW: f64 = 0.4;
 const TILT_GAIN: f64 = 0.03;
-const TILT_WEIGHT: f64 = 0.5;
+/// Cap's default rotation amount.
+const TILT_WEIGHT: f64 = 0.15;
 const REVEAL_LEAD_WINDOW: f64 = 0.25;
 const IDLE_GAP_THRESHOLD: f64 = 4.0 / 60.0;
 const LEAD_SMOOTHING: f64 = 0.12;
@@ -40,6 +48,116 @@ const SETTLE: SpringConstant = SpringConstant {
     inertia: 0.3,
 };
 
+/// Movement style of the reconstructed cursor: how quickly the glide
+/// spring follows the recorded pointer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PointerMotion {
+    Rapid,
+    Quick,
+    #[default]
+    Default,
+    Slow,
+}
+
+impl PointerMotion {
+    pub const ALL: [PointerMotion; 4] = [
+        PointerMotion::Rapid,
+        PointerMotion::Quick,
+        PointerMotion::Default,
+        PointerMotion::Slow,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PointerMotion::Rapid => "Rapid",
+            PointerMotion::Quick => "Quick",
+            PointerMotion::Default => "Default",
+            PointerMotion::Slow => "Slow",
+        }
+    }
+
+    fn glide(self) -> SpringConstant {
+        match self {
+            PointerMotion::Rapid => SpringConstant {
+                tension: 1100.0,
+                friction: 85.0,
+                inertia: 3.0,
+            },
+            PointerMotion::Quick => SpringConstant {
+                tension: 720.0,
+                friction: 78.0,
+                inertia: 3.0,
+            },
+            PointerMotion::Default => GLIDE,
+            PointerMotion::Slow => SpringConstant {
+                tension: 260.0,
+                friction: 54.0,
+                inertia: 3.0,
+            },
+        }
+    }
+}
+
+/// Knobs that change how the baked cursor track is produced.
+#[derive(Clone, Debug, Default)]
+pub struct PointerTimelineOptions {
+    /// Artwork used for samples without a captured cursor image.
+    pub fallback_artwork: Option<PointerArtwork>,
+    /// Seconds of stillness after which the cursor fades out.
+    pub hide_after_inactivity: Option<f64>,
+    pub motion: PointerMotion,
+    /// Glide back to the first recorded position before the end.
+    pub loop_to_start: bool,
+}
+
+/// Decoded, premultiplied cursor image ready to paint.
+#[derive(Debug)]
+pub struct PointerBitmap {
+    pub id: String,
+    /// Premultiplied RGBA pixels.
+    pub image: RgbaImage,
+    /// Hotspot as a fraction of the image size.
+    pub anchor: NormalizedPoint,
+    /// Size of the cursor as it appeared on screen, as a fraction of the
+    /// recording width/height (independent of the image resolution).
+    pub reference_width: f64,
+    pub reference_height: f64,
+    pub shape: Option<CursorShape>,
+}
+
+impl PointerBitmap {
+    pub fn decode(artwork: &PointerArtwork) -> Option<Self> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(artwork.image_data_base64.as_bytes())
+            .ok()?;
+        let mut image = image::load_from_memory(&bytes).ok()?.into_rgba8();
+        if image.width() == 0 || image.height() == 0 {
+            return None;
+        }
+        for pixel in image.pixels_mut() {
+            let alpha = u32::from(pixel[3]);
+            for channel in &mut pixel.0[..3] {
+                *channel = ((u32::from(*channel) * alpha + 127) / 255) as u8;
+            }
+        }
+        Some(Self {
+            id: artwork.artwork_id.clone(),
+            image,
+            anchor: artwork.anchor_point.clamped(),
+            reference_width: artwork.reference_width,
+            reference_height: artwork.reference_height,
+            shape: artwork.shape,
+        })
+    }
+}
+
+impl PartialEq for PointerBitmap {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PointerPressFrame {
     pub location: NormalizedPoint,
@@ -50,10 +168,15 @@ pub struct PointerPressFrame {
 pub struct PointerFrame {
     pub location: NormalizedPoint,
     pub artwork_id: Option<String>,
+    /// Captured cursor image for this frame, if the recording has one.
+    pub bitmap: Option<Arc<PointerBitmap>>,
     pub magnification: f64,
     pub tilt_degrees: f64,
     pub opacity: f64,
     pub blur_radius: f64,
+    /// Smoothed cursor velocity in normalized media units per second; the
+    /// painter smears the cursor along it, as Cap and Screen Studio do.
+    pub velocity: (f64, f64),
     pub press: Option<PointerPressFrame>,
 }
 
@@ -61,8 +184,8 @@ pub struct PointerFrame {
 pub struct PointerTimeline {
     frames: Vec<PointerFrame>,
     duration: f64,
-    artwork_by_id: HashMap<String, PointerArtwork>,
-    fallback_artwork: Option<PointerArtwork>,
+    artwork_by_id: HashMap<String, Arc<PointerBitmap>>,
+    fallback_artwork: Option<Arc<PointerBitmap>>,
 }
 
 impl PointerTimeline {
@@ -73,16 +196,14 @@ impl PointerTimeline {
         duration: f64,
         recording_width: f64,
         recording_height: f64,
-        fallback_artwork: Option<PointerArtwork>,
-        hide_after_inactivity: Option<f64>,
+        options: PointerTimelineOptions,
     ) -> Self {
         Self::build_with_clip_timeline(
             capture,
             duration,
             recording_width,
             recording_height,
-            fallback_artwork,
-            hide_after_inactivity,
+            options,
             None,
         )
     }
@@ -92,10 +213,16 @@ impl PointerTimeline {
         duration: f64,
         recording_width: f64,
         recording_height: f64,
-        fallback_artwork: Option<PointerArtwork>,
-        hide_after_inactivity: Option<f64>,
+        options: PointerTimelineOptions,
         clip_timeline: Option<&RecordingClipTimeline>,
     ) -> Self {
+        let PointerTimelineOptions {
+            fallback_artwork,
+            hide_after_inactivity,
+            motion,
+            loop_to_start,
+        } = options;
+        let glide = motion.glide();
         if !duration.is_finite() || duration <= 0.0 {
             return Self::default();
         }
@@ -137,11 +264,21 @@ impl PointerTimeline {
             })
             .cloned()
             .collect();
-        let artwork_by_id = stream
+        let artwork_by_id: HashMap<_, _> = stream
             .artwork
-            .into_iter()
-            .map(|artwork| (artwork.artwork_id.clone(), artwork))
+            .iter()
+            .filter_map(|artwork| {
+                PointerBitmap::decode(artwork)
+                    .map(|bitmap| (artwork.artwork_id.clone(), Arc::new(bitmap)))
+            })
             .collect();
+        let fallback_artwork = fallback_artwork
+            .as_ref()
+            .and_then(PointerBitmap::decode)
+            .map(Arc::new);
+        let return_target = loop_to_start
+            .then(|| travel_samples.first().map(|sample| (sample.x, sample.y)))
+            .flatten();
 
         let frame_count = ((timeline_duration * STEP_RATE).ceil() as usize + 1).max(2);
         let dt = 1.0 / STEP_RATE;
@@ -153,7 +290,7 @@ impl PointerTimeline {
         let mut travel_index: isize = -1;
         let mut latest_press_index: isize = -1;
         let mut current_artwork_id = first.artwork_id.clone();
-        let mut phase_lead = GLIDE.friction / GLIDE.tension;
+        let mut phase_lead = glide.friction / glide.tension;
         let mut frames = Vec::with_capacity(frame_count);
 
         for frame_index in 0..frame_count {
@@ -181,8 +318,12 @@ impl PointerTimeline {
             };
             let mut target = (latest.x, latest.y);
             let mut approaching_press = false;
+            let returning = return_target
+                .filter(|_| timeline_duration - time <= LOOP_RETURN_WINDOW)
+                .map(|start| target = start)
+                .is_some();
             let upcoming_press_index = latest_press_index + 1;
-            if upcoming_press_index < press_samples.len() as isize {
+            if !returning && upcoming_press_index < press_samples.len() as isize {
                 let press = &press_samples[upcoming_press_index as usize];
                 let remaining = press.time - time;
                 if (0.0..=ANTICIPATION_WINDOW).contains(&remaining) {
@@ -190,16 +331,18 @@ impl PointerTimeline {
                     approaching_press = remaining <= INTERCEPT_WINDOW;
                 }
             }
-            let motion = if latest.kind == PointerStreamKind::Drag {
+            let motion = if returning {
+                GLIDE
+            } else if latest.kind == PointerStreamKind::Drag {
                 TRACK
             } else if approaching_press {
                 INTERCEPT
             } else {
-                GLIDE
+                glide
             };
             let desired_lead = motion.friction / motion.tension.max(0.000_001);
             phase_lead += (desired_lead - phase_lead) * LEAD_SMOOTHING;
-            if !approaching_press {
+            if !approaching_press && !returning {
                 if let Some(interpolated) =
                     interpolated_travel_position(&travel_samples, time + phase_lead)
                 {
@@ -212,7 +355,7 @@ impl PointerTimeline {
             let hidden = hide_after_inactivity
                 .filter(|value| *value > 0.0)
                 .is_some_and(|threshold| {
-                    if travel_index < 0 {
+                    if travel_index < 0 || returning {
                         return false;
                     }
                     let previous = &travel_samples[travel_index as usize];
@@ -244,12 +387,14 @@ impl PointerTimeline {
                     y: y_spring.position,
                 },
                 artwork_id: current_artwork_id.clone(),
+                bitmap: None,
                 // Cap treats click feedback as an independent 130ms curve,
                 // not another target on the cursor movement spring.
                 magnification: click_scale_at(&samples, time),
                 tilt_degrees: 0.0,
                 opacity: opacity_spring.position.clamp(0.0, 1.0),
                 blur_radius: blur_spring.position.max(0.0),
+                velocity: (x_spring.velocity, y_spring.velocity),
                 press,
             });
         }
@@ -276,6 +421,12 @@ impl PointerTimeline {
     }
 
     pub fn frame_at(&self, time: f64) -> Option<PointerFrame> {
+        let mut frame = self.interpolated_frame(time)?;
+        frame.bitmap = self.artwork(frame.artwork_id.as_deref()).cloned();
+        Some(frame)
+    }
+
+    fn interpolated_frame(&self, time: f64) -> Option<PointerFrame> {
         let first = self.frames.first()?.clone();
         if self.frames.len() == 1 || self.duration <= 0.0 {
             return Some(first);
@@ -298,10 +449,15 @@ impl PointerTimeline {
             } else {
                 right.artwork_id.clone()
             },
+            bitmap: None,
             magnification: lerp(left.magnification, right.magnification, fraction),
             tilt_degrees: lerp(left.tilt_degrees, right.tilt_degrees, fraction),
             opacity: lerp(left.opacity, right.opacity, fraction),
             blur_radius: lerp(left.blur_radius, right.blur_radius, fraction),
+            velocity: (
+                lerp(left.velocity.0, right.velocity.0, fraction),
+                lerp(left.velocity.1, right.velocity.1, fraction),
+            ),
             press: if fraction < 0.5 {
                 left.press.clone()
             } else {
@@ -314,7 +470,7 @@ impl PointerTimeline {
         self.frame_at(time).map(|frame| frame.location)
     }
 
-    pub fn artwork(&self, id: Option<&str>) -> Option<&PointerArtwork> {
+    pub fn artwork(&self, id: Option<&str>) -> Option<&Arc<PointerBitmap>> {
         id.and_then(|id| self.artwork_by_id.get(id))
             .or(self.fallback_artwork.as_ref())
     }
@@ -516,7 +672,13 @@ mod tests {
             presses: vec![press(0.5, 0.9, PressPhase::Down)],
             ..Default::default()
         };
-        let timeline = PointerTimeline::build(capture, 2.0, 1920.0, 1080.0, None, None);
+        let timeline = PointerTimeline::build(
+            capture,
+            2.0,
+            1920.0,
+            1080.0,
+            PointerTimelineOptions::default(),
+        );
         let frame = timeline.frame_at(0.5).expect("frame");
         let effect = frame.press.expect("press effect");
         assert!((effect.location.x - 0.9).abs() < 1e-12);
@@ -534,7 +696,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let timeline = PointerTimeline::build(capture, 1.5, 1000.0, 1000.0, None, None);
+        let timeline = PointerTimeline::build(
+            capture,
+            1.5,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions::default(),
+        );
         assert!(timeline.frame_at(0.45).unwrap().magnification < 1.0);
         assert!(timeline.frame_at(1.2).unwrap().magnification > 0.99);
     }
@@ -548,9 +716,89 @@ mod tests {
             ],
             ..Default::default()
         };
-        let timeline = PointerTimeline::build(capture, 3.0, 1000.0, 1000.0, None, Some(0.5));
+        let timeline = PointerTimeline::build(
+            capture,
+            3.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions {
+                hide_after_inactivity: Some(0.5),
+                ..Default::default()
+            },
+        );
         assert!(timeline.frame_at(1.0).unwrap().opacity < 0.1);
         assert!(timeline.frame_at(1.9).unwrap().opacity > 0.5);
+    }
+
+    #[test]
+    fn loop_to_start_returns_cursor_to_first_position_before_the_end() {
+        let capture = PointerCaptureFile {
+            travel: vec![
+                travel(0.0, 0.1, 0.1, PointerTravelKind::Move),
+                travel(0.5, 0.9, 0.9, PointerTravelKind::Move),
+            ],
+            ..Default::default()
+        };
+        let plain = PointerTimeline::build(
+            capture.clone(),
+            3.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions::default(),
+        );
+        let looped = PointerTimeline::build(
+            capture,
+            3.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions {
+                loop_to_start: true,
+                hide_after_inactivity: Some(0.5),
+                ..Default::default()
+            },
+        );
+        assert!(plain.frame_at(3.0).unwrap().location.x > 0.85);
+        let end = looped.frame_at(3.0).unwrap();
+        assert!((end.location.x - 0.1).abs() < 0.03);
+        assert!((end.location.y - 0.1).abs() < 0.03);
+        // The return glide is treated as motion so the cursor is visible.
+        assert!(end.opacity > 0.5);
+        assert!(looped.frame_at(1.5).unwrap().opacity < 0.1);
+    }
+
+    #[test]
+    fn motion_styles_order_how_quickly_the_cursor_follows() {
+        let capture = PointerCaptureFile {
+            travel: vec![
+                travel(0.0, 0.0, 0.5, PointerTravelKind::Move),
+                travel(0.05, 1.0, 0.5, PointerTravelKind::Move),
+            ],
+            ..Default::default()
+        };
+        let progress = |motion| {
+            PointerTimeline::build(
+                capture.clone(),
+                1.0,
+                1000.0,
+                1000.0,
+                PointerTimelineOptions {
+                    motion,
+                    ..Default::default()
+                },
+            )
+            .frame_at(0.12)
+            .unwrap()
+            .location
+            .x
+        };
+        let rapid = progress(PointerMotion::Rapid);
+        let quick = progress(PointerMotion::Quick);
+        let default = progress(PointerMotion::Default);
+        let slow = progress(PointerMotion::Slow);
+        assert!(
+            rapid > quick && quick > default && default > slow,
+            "{rapid} {quick} {default} {slow}"
+        );
     }
 
     #[test]
@@ -562,7 +810,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let timeline = PointerTimeline::build(capture, 1.0, 1000.0, 1000.0, None, None);
+        let timeline = PointerTimeline::build(
+            capture,
+            1.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions::default(),
+        );
         assert_eq!(timeline.frame_at(-1.0), timeline.frame_at(0.0));
         assert_eq!(timeline.frame_at(2.0), timeline.frame_at(1.0));
         assert!(timeline.frame_at(0.75).unwrap().location.x > 0.2);

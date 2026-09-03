@@ -461,7 +461,9 @@ impl SynchronizedPlaybackStream {
         let (width, height) =
             fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
         let start_time = start_time.clamp(0.0, info.duration);
-        let frame_rate = info.frame_rate.round().clamp(1.0, 120.0);
+        // Variable-rate screen captures report absurd nominal rates; the
+        // preview never needs more than 60 frames a second.
+        let frame_rate = info.frame_rate.round().clamp(1.0, 60.0);
         let sink = format!(
             "videoconvert ! videoscale method=lanczos ! videorate ! video/x-raw,format=RGBA,width={width},height={height},framerate={frame_rate:.0}/1,pixel-aspect-ratio=1/1 ! fdsink fd=1 sync=true async=false"
         );
