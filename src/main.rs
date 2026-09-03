@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use gpui::{
-    canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
-    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp,
+    anchored, canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*,
+    px, quad, rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp,
     Background, Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle,
     FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage,
@@ -41,14 +41,14 @@ use recording::{
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
     export::{ExportFormat, ExportProgress, ExportResolution},
     model::{PointerCaptureFile, RecordingSession},
-    native::{NativeRecorder, RecordingOptions},
+    native::{audio_sources, AudioSource, NativeRecorder, RecordingOptions},
     pointer_timeline::PointerTimeline,
     presets::PresetLibrary,
     scene::{CameraOverlay, PointerStyle, SceneStyle, SceneTransform, Watermark, WindowFrame},
     session::{RecordingController, RecordingState},
     video::{
-        decode_frame, load_or_rebuild_poster, probe_media, render_clip_preview, DecodedFrame,
-        SynchronizedPlaybackStream,
+        decode_frame, load_or_rebuild_poster, probe_media, render_clip_preview,
+        render_denoised_copy, DecodedFrame, SynchronizedPlaybackStream,
     },
     viewport::{synthesize_zoom_cues, visible_rect, MotionPreset, ViewportTimeline, ZoomCue},
 };
@@ -1331,6 +1331,12 @@ struct Studio {
     recording_session_path: Option<PathBuf>,
     record_system_audio: bool,
     record_microphone: bool,
+    /// Node name of the chosen microphone; `None` follows the system default.
+    record_microphone_device: Option<String>,
+    /// Description of the chosen microphone for the toolbar button.
+    microphone_label: Option<String>,
+    /// The sources listed while the microphone picker is open.
+    microphone_picker: Option<Vec<AudioSource>>,
     record_camera: bool,
     video_project: Option<RecordingSession>,
     /// Directory of the recording closed by switching to Static or Motion,
@@ -1408,6 +1414,7 @@ struct Studio {
     default_motion_zoom: f64,
     video_audio_levels: Vec<f32>,
     video_audio_muted: bool,
+    video_noise_reduction: bool,
     video_thumbnails: Vec<Arc<RenderImage>>,
     video_extras_pending: bool,
     video_extras_token: u64,
@@ -1481,6 +1488,8 @@ struct Studio {
 #[serde(rename_all = "camelCase", default)]
 struct RecordingExtras {
     audio_muted: bool,
+    /// Run the export audio through a gentle FFT denoiser.
+    noise_reduction: bool,
     removed_press_times: Vec<f64>,
 }
 
@@ -1658,6 +1667,9 @@ impl Studio {
             recording_session_path: None,
             record_system_audio: false,
             record_microphone: false,
+            record_microphone_device: None,
+            microphone_label: None,
+            microphone_picker: None,
             record_camera: false,
             video_project: None,
             last_video_project: None,
@@ -1723,6 +1735,7 @@ impl Studio {
             default_motion_zoom: 2.0,
             video_audio_levels: Vec::new(),
             video_audio_muted: false,
+            video_noise_reduction: false,
             video_thumbnails: Vec::new(),
             video_extras_pending: false,
             video_extras_token: 0,
@@ -1917,6 +1930,7 @@ impl Studio {
         let options = RecordingOptions {
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
+            microphone_device: self.record_microphone_device.clone(),
             camera: self.record_camera,
         };
         let task = cx.background_executor().spawn(async move {
@@ -2237,11 +2251,19 @@ impl Studio {
             &clip_timeline,
             &pointer_capture,
         );
+        let saved_extras = session
+            .read_edit_field::<RecordingExtras>("screendropExtras")
+            .ok()
+            .flatten();
         let preview_path = session.directory.join(".edit-preview.mkv");
         let edited_preview = if clip_timeline.is_unedited(source_duration) {
             None
         } else {
-            render_clip_preview(&session.screen_path(), &preview_path, &clip_timeline)
+            let noise_reduction = saved_extras
+                .as_ref()
+                .is_some_and(|extras| extras.noise_reduction);
+            let source = Self::media_source_for(&session, noise_reduction);
+            render_clip_preview(&source, &preview_path, &clip_timeline)
                 .map_err(|error| format!("Could not build edited preview: {error}"))?;
             Some(preview_path)
         };
@@ -2282,10 +2304,6 @@ impl Studio {
         self.video_timeline_scroll = 0.0;
         // Scene settings and Screendrop extras saved with this project.
         let session = self.video_project.clone().expect("project was just opened");
-        let saved_extras = session
-            .read_edit_field::<RecordingExtras>("screendropExtras")
-            .ok()
-            .flatten();
         let saved_annotations = session
             .read_edit_field::<Vec<AnnotationMark>>("annotations")
             .ok()
@@ -2303,6 +2321,7 @@ impl Studio {
         self.persisted_scene_style = saved_style;
         let extras = saved_extras.clone().unwrap_or_default();
         self.video_audio_muted = extras.audio_muted;
+        self.video_noise_reduction = extras.noise_reduction;
         self.video_removed_presses = extras.removed_press_times;
         self.persisted_extras = saved_extras;
         self.enter_video_annotations(saved_annotations);
@@ -2671,11 +2690,79 @@ impl Studio {
     }
 
     fn video_playback_path(&self) -> Option<PathBuf> {
-        self.video_preview_path.clone().or_else(|| {
-            self.video_project
-                .as_ref()
-                .map(|session| session.screen_path())
+        self.video_preview_path
+            .clone()
+            .or_else(|| self.video_media_source())
+    }
+
+    /// The recording the editor plays and cuts: the noise-reduced copy when
+    /// that option is on and its render has finished, else the original.
+    fn video_media_source(&self) -> Option<PathBuf> {
+        self.video_project
+            .as_ref()
+            .map(|session| Self::media_source_for(session, self.video_noise_reduction))
+    }
+
+    fn media_source_for(session: &RecordingSession, noise_reduction: bool) -> PathBuf {
+        let denoised = session.denoised_path();
+        if noise_reduction && denoised.exists() {
+            denoised
+        } else {
+            session.screen_path()
+        }
+    }
+
+    /// Flips noise reduction, rendering the denoised copy on first use and
+    /// refreshing whatever the editor is playing once it is ready.
+    fn set_video_noise_reduction(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.video_noise_reduction = enabled;
+        let Some(session) = self.video_project.clone() else {
+            return;
+        };
+        self.pause_video_playback();
+        if !enabled || session.denoised_path().exists() {
+            self.refresh_video_media_source(cx);
+            return;
+        }
+        self.video_edit_busy = true;
+        self.toast = Some("Preparing noise-reduced audio…".into());
+        let source = session.screen_path();
+        let destination = session.denoised_path();
+        let task = cx.background_executor().spawn(async move {
+            render_denoised_copy(&source, &destination).map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |weak, cx| {
+            let result = task.await;
+            let _ = weak.update(cx, |this, cx| {
+                this.video_edit_busy = false;
+                this.toast = None;
+                match result {
+                    Ok(()) => {
+                        if this.video_project.as_ref() == Some(&session) {
+                            this.refresh_video_media_source(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.video_noise_reduction = false;
+                        this.toast = Some(format!("Could not reduce noise: {error}").into());
+                    }
+                }
+                cx.notify();
+            });
         })
+        .detach();
+        cx.notify();
+    }
+
+    /// Re-renders the edited preview from the current media source, or just
+    /// re-seeks when the recording plays uncut.
+    fn refresh_video_media_source(&mut self, cx: &mut Context<Self>) {
+        if self.video_preview_path.is_some() {
+            let timeline = self.video_clip_timeline.clone();
+            self.apply_video_clip_timeline(timeline, self.video_selected_clip, false, cx);
+        } else {
+            self.seek_video(self.video_position, cx);
+        }
     }
 
     fn rebuild_video_motion_timelines(&mut self) {
@@ -2768,7 +2855,7 @@ impl Studio {
         self.video_edit_busy = true;
         let previous_preview = self.video_preview_path.take();
         self.toast = Some("Updating video and audio preview…".into());
-        let source = session.screen_path();
+        let source = Self::media_source_for(&session, self.video_noise_reduction);
         self.video_preview_render_generation += 1;
         let token = self.video_preview_render_generation;
         let destination = session.directory.join(format!(".edit-preview-{token}.mkv"));
@@ -3023,6 +3110,100 @@ impl Studio {
     }
 
     /// Modal that previews a clip speed change before rendering it once.
+    /// The transparent layer that closes the microphone menu on an outside click.
+    fn microphone_menu_backdrop(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.microphone_picker.as_ref()?;
+        Some(
+            div()
+                .id("record-microphone-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.microphone_picker = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The dropdown under the mic button: off, the system default, or a device.
+    fn microphone_menu(&self, sources: &[AudioSource], cx: &mut Context<Self>) -> AnyElement {
+        // `None` for the whole option is "no microphone".
+        let mut choices: Vec<(Option<Option<String>>, String)> = vec![
+            (None, "No microphone".to_string()),
+            (
+                Some(None),
+                sources
+                    .iter()
+                    .find(|source| source.is_default)
+                    .map(|source| format!("System default · {}", source.description))
+                    .unwrap_or_else(|| "System default".to_string()),
+            ),
+        ];
+        choices.extend(
+            sources
+                .iter()
+                .map(|source| (Some(Some(source.name.clone())), source.description.clone())),
+        );
+        let current = self
+            .record_microphone
+            .then(|| self.record_microphone_device.clone());
+        div()
+            .id("record-microphone-menu")
+            .occlude()
+            .min_w(px(260.0))
+            .p_1()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(line())
+            .shadow_lg()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .children(
+                choices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (choice, label))| {
+                        let selected = choice == current;
+                        let chosen_label = label.clone();
+                        div()
+                            .id(("record-microphone-option", index))
+                            .px_3()
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .rounded_md()
+                            .text_sm()
+                            .whitespace_nowrap()
+                            .cursor_pointer()
+                            .when(selected, |this| this.text_color(blue()))
+                            .hover(|style| style.bg(rgb(0xeeeeef)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match &choice {
+                                    None => this.record_microphone = false,
+                                    Some(device) => {
+                                        this.record_microphone = true;
+                                        this.record_microphone_device = device.clone();
+                                        this.microphone_label =
+                                            device.is_some().then(|| chosen_label.clone());
+                                    }
+                                }
+                                this.microphone_picker = None;
+                                cx.notify();
+                            }))
+                            .child(label)
+                            .when(selected, |this| this.child("✓"))
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn video_speed_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let draft = self.video_speed_draft?;
         let selected = self.video_selected_clip?;
@@ -5197,6 +5378,75 @@ impl Studio {
             .on_click(on_click)
     }
 
+    /// The mic button: shows the selected input and opens the device menu.
+    fn microphone_select(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.record_microphone;
+        let label: SharedString = if !enabled {
+            "No mic".into()
+        } else {
+            match &self.record_microphone_device {
+                None => "Default mic".into(),
+                Some(name) => self
+                    .microphone_label
+                    .clone()
+                    .unwrap_or_else(|| name.clone())
+                    .into(),
+            }
+        };
+        div()
+            .id("record-microphone")
+            .h(px(34.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_lg()
+            .text_xs()
+            .cursor_pointer()
+            .bg(if enabled {
+                rgb(0xe5f2ff)
+            } else {
+                rgb(0xf3f3f4)
+            })
+            .border_1()
+            .border_color(if enabled { blue() } else { line() })
+            .text_color(if enabled { blue() } else { muted() })
+            .child(
+                svg()
+                    .path("icons/microphone.svg")
+                    .size(px(15.0))
+                    .text_color(if enabled { blue() } else { muted() }),
+            )
+            .child(
+                div()
+                    .max_w(px(160.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(label),
+            )
+            .child(div().text_color(muted()).child("▾"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.microphone_picker = if this.microphone_picker.is_some() {
+                    None
+                } else {
+                    Some(audio_sources())
+                };
+                cx.notify();
+            }))
+            .when_some(self.microphone_picker.as_ref(), |this, sources| {
+                this.child(
+                    gpui::deferred(
+                        anchored()
+                            .offset(point(px(0.0), px(38.0)))
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(self.microphone_menu(sources, cx)),
+                    )
+                    .with_priority(2),
+                )
+            })
+    }
+
     fn recording_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.recording_state == RecordingState::Idle {
             return div()
@@ -5213,15 +5463,7 @@ impl Studio {
                         cx.notify();
                     }),
                 ))
-                .child(self.record_source_toggle(
-                    "record-microphone",
-                    "icons/microphone.svg",
-                    self.record_microphone,
-                    cx.listener(|this, _, _, cx| {
-                        this.record_microphone = !this.record_microphone;
-                        cx.notify();
-                    }),
-                ))
+                .child(self.microphone_select(cx))
                 .child(self.record_source_toggle(
                     "record-camera",
                     "icons/video.svg",
@@ -6426,6 +6668,9 @@ impl Studio {
             .when_some(speed_dialog, |this, dialog| {
                 this.child(gpui::deferred(dialog).with_priority(1))
             })
+            .when_some(self.microphone_menu_backdrop(cx), |this, backdrop| {
+                this.child(gpui::deferred(backdrop).with_priority(1))
+            })
             .into_any_element()
     }
 }
@@ -6547,6 +6792,9 @@ impl Render for Studio {
                     )
                     .when_some(sidebar, |this, sidebar| this.child(sidebar)),
             )
+            .when_some(self.microphone_menu_backdrop(cx), |this, backdrop| {
+                this.child(gpui::deferred(backdrop).with_priority(1))
+            })
             .into_any_element()
     }
 }

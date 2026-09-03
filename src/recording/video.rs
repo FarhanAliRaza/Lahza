@@ -206,6 +206,34 @@ pub fn load_or_rebuild_poster(
 /// Video PTS and audio PTS are changed together for each clip, then the
 /// resulting streams are concatenated in editor order. The source is never
 /// modified and the destination is replaced only after FFmpeg succeeds.
+/// A gentle FFT denoiser that tracks the noise floor as it goes, so it
+/// only removes steady broadband hiss and leaves speech untouched.
+pub const NOISE_REDUCTION_FILTER: &str = "afftdn=nr=20:tn=1";
+
+/// Writes a copy of `source` with the video stream untouched and the audio
+/// run through [`NOISE_REDUCTION_FILTER`], so the editor can play what the
+/// export will sound like. The file only appears once it is complete.
+pub fn render_denoised_copy(source: &Path, destination: &Path) -> Result<(), VideoError> {
+    let temporary = temporary_video_sibling(destination);
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(source)
+        .args(["-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", "-af"])
+        .arg(NOISE_REDUCTION_FILTER)
+        .args(["-c:a", "libopus", "-b:a", "160k", "-f", "matroska"])
+        .arg(&temporary)
+        .output()?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary);
+        return Err(VideoError::Decode(format!(
+            "ffmpeg could not reduce noise: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    fs::rename(&temporary, destination)?;
+    Ok(())
+}
+
 pub fn render_clip_preview(
     source: &Path,
     destination: &Path,

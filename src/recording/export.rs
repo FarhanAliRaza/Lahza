@@ -21,7 +21,9 @@ use super::{
     clips::RecordingClipTimeline,
     pointer_timeline::PointerTimeline,
     scene::{FrameInput, PointerOverlay, SceneCompositor, SceneStyle},
-    video::{probe_media, render_clip_preview, VideoError, VideoFrameStream},
+    video::{
+        probe_media, render_clip_preview, VideoError, VideoFrameStream, NOISE_REDUCTION_FILTER,
+    },
     viewport::ViewportTimeline,
 };
 
@@ -229,6 +231,8 @@ pub struct SceneExportRequest {
     pub loop_forever: bool,
     /// Keep the recording's audio track (when the format supports it).
     pub include_audio: bool,
+    /// Suppress steady background noise in the exported audio.
+    pub noise_reduction: bool,
     /// Per-frame media-space overlay, such as timed annotations.
     pub overlay: Option<OverlaySource>,
     /// Image scenes that follow the main source back to back.
@@ -254,6 +258,7 @@ impl SceneExportRequest {
             duration,
             loop_forever: true,
             include_audio: true,
+            noise_reduction: false,
             overlay: None,
             followers: Vec::new(),
         }
@@ -482,6 +487,9 @@ fn encode(
         .args(["-i", "pipe:0"]);
     if let Some(audio) = audio.as_ref() {
         command.arg("-i").arg(audio);
+        if request.noise_reduction {
+            command.args(["-af", NOISE_REDUCTION_FILTER]);
+        }
     }
     match request.format {
         ExportFormat::Mp4 => {
@@ -994,6 +1002,7 @@ mod tests {
             viewport,
             clips.duration(),
         );
+        request.noise_reduction = true;
         request.frame_rate = 12.0;
         let camera = root.join("camera.mkv");
         let status = Command::new("ffmpeg")

@@ -1311,6 +1311,7 @@ impl Studio {
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
         request.include_audio = !self.video_audio_muted;
+        request.noise_reduction = self.video_noise_reduction;
         request.overlay = self.annotation_overlay_source();
         let source = SceneSource::Video {
             media: session.screen_path(),

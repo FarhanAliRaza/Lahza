@@ -28,6 +28,8 @@ impl RecordingSession {
     pub const RENDER_STAMP_FILE: &'static str = "render.json";
     pub const POSTER_FILE: &'static str = "poster.jpg";
     pub const REPLACEMENT_AUDIO_STEM: &'static str = "audio-replacement";
+    /// Derived copy of the screen recording with noise-reduced audio.
+    pub const DENOISED_FILE: &'static str = ".audio-denoised.mkv";
 
     pub fn create() -> io::Result<Self> {
         Self::create_in(recordings_root())
@@ -46,6 +48,10 @@ impl RecordingSession {
         let directory = root.join(name);
         fs::create_dir(&directory)?;
         Ok(Self { directory })
+    }
+
+    pub fn denoised_path(&self) -> PathBuf {
+        self.directory.join(Self::DENOISED_FILE)
     }
 
     pub fn screen_path(&self) -> PathBuf {

@@ -416,6 +416,7 @@ impl Studio {
         };
         let extras = crate::RecordingExtras {
             audio_muted: self.video_audio_muted,
+            noise_reduction: self.video_noise_reduction,
             removed_press_times: self.video_removed_presses.clone(),
         };
         if self.persisted_extras.as_ref() != Some(&extras) {
@@ -2041,6 +2042,31 @@ impl Studio {
                     cx,
                     |this| this.video_audio_muted = !this.video_audio_muted,
                 ))
+            })
+            .when(has_audio && !self.video_audio_muted, |this| {
+                let enabled = self.video_noise_reduction;
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_sm().child("Reduce noise"))
+                        .child(
+                            div()
+                                .id("audio-noise-reduction")
+                                .cursor_pointer()
+                                .child(self.toggle(enabled))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_video_noise_reduction(!enabled, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted())
+                        .child("Removes steady background hiss from the preview and the export."),
+                )
             })
             .into_any_element()
     }
