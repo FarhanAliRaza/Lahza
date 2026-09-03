@@ -732,7 +732,8 @@ impl Studio {
             camera: camera.as_deref(),
         });
         let image = cached_render_image(frame);
-        self.preview_cache.frame = Some((key, image.clone()));
+        let previous = self.preview_cache.frame.replace((key, image.clone()));
+        self.retire_image(previous.map(|(_, image)| image));
         Some(image)
     }
 
@@ -3275,7 +3276,11 @@ impl Studio {
                     return;
                 }
                 this.video_audio_levels = levels;
-                this.video_thumbnails = thumbnails.into_iter().map(cached_render_image).collect();
+                let previous = std::mem::replace(
+                    &mut this.video_thumbnails,
+                    thumbnails.into_iter().map(cached_render_image).collect(),
+                );
+                this.retired_images.extend(previous);
                 cx.notify();
             });
         })

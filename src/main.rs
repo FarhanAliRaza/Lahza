@@ -38,10 +38,11 @@ use timed::AnnotationTiming;
 use motion_ui::{MotionPick, MOTION_ZOOM_SLIDER};
 
 use recording::{
+    camera_preview::{CameraFrames, CameraPreview},
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
     export::{ExportFormat, ExportProgress, ExportResolution},
     model::{PointerCaptureFile, RecordingSession},
-    native::{audio_sources, AudioSource, NativeRecorder, RecordingOptions},
+    native::{audio_sources, default_camera_device, AudioSource, NativeRecorder, RecordingOptions},
     pointer_timeline::PointerTimeline,
     presets::PresetLibrary,
     scene::{CameraOverlay, PointerStyle, SceneStyle, SceneTransform, Watermark, WindowFrame},
@@ -1338,6 +1339,14 @@ struct Studio {
     /// The sources listed while the microphone picker is open.
     microphone_picker: Option<Vec<AudioSource>>,
     record_camera: bool,
+    /// Latest webcam frame from the standalone preview or the recorder.
+    camera_frames: Arc<CameraFrames>,
+    /// Webcam pipeline while the camera is on but nothing is recording.
+    camera_preview: Option<CameraPreview>,
+    camera_frame: Option<Arc<RenderImage>>,
+    camera_frame_generation: u64,
+    camera_poll_running: bool,
+    camera_preview_expanded: bool,
     video_project: Option<RecordingSession>,
     /// Directory of the recording closed by switching to Static or Motion,
     /// so the Video tab returns to it instead of asking again.
@@ -1468,6 +1477,9 @@ struct Studio {
     captured_path: Option<PathBuf>,
     processed_capture_path: Option<PathBuf>,
     displayed_capture_image: Option<Arc<RenderImage>>,
+    /// Replaced GPU images awaiting `Window::drop_image`; the sprite atlas
+    /// never frees a `RenderImage` on its own.
+    retired_images: Vec<Arc<RenderImage>>,
     captured_dimensions: Option<(u32, u32)>,
     effect_revision: u64,
     annotations: Vec<AnnotationMark>,
@@ -1671,6 +1683,12 @@ impl Studio {
             microphone_label: None,
             microphone_picker: None,
             record_camera: false,
+            camera_frames: Arc::new(CameraFrames::default()),
+            camera_preview: None,
+            camera_frame: None,
+            camera_frame_generation: 0,
+            camera_poll_running: false,
+            camera_preview_expanded: false,
             video_project: None,
             last_video_project: None,
             video_frame: None,
@@ -1785,6 +1803,7 @@ impl Studio {
             captured_path: None,
             processed_capture_path: None,
             displayed_capture_image: None,
+            retired_images: Vec::new(),
             captured_dimensions: None,
             effect_revision: 0,
             annotations: Vec::new(),
@@ -1813,16 +1832,32 @@ impl Studio {
         studio
     }
 
+    /// Queues a no-longer-shown image for release from the GPU atlas on the
+    /// next render.
+    pub(crate) fn retire_image(&mut self, image: Option<Arc<RenderImage>>) {
+        self.retired_images.extend(image);
+    }
+
+    /// Frees every retired image's atlas tile. Must run each render, since
+    /// per-frame previews would otherwise fill VRAM within minutes.
+    fn drop_retired_images(&mut self, window: &mut Window) {
+        for image in self.retired_images.drain(..) {
+            let _ = window.drop_image(image);
+        }
+    }
+
     /// Keeps an RGBA copy of the shown video frame for the compositor.
     fn set_video_frame(&mut self, pixels: image::RgbaImage) {
         self.video_frame_rgba = Some(Arc::new(pixels.clone()));
-        self.video_frame = Some(cached_render_image(pixels));
+        let previous = self.video_frame.replace(cached_render_image(pixels));
+        self.retire_image(previous);
     }
 
     /// Keeps an RGBA copy of the shown capture for the compositor.
     fn set_capture_image(&mut self, image: image::RgbaImage) {
         self.capture_rgba = Some(Arc::new(image.clone()));
-        self.displayed_capture_image = Some(cached_render_image(image));
+        let previous = self.displayed_capture_image.replace(cached_render_image(image));
+        self.retire_image(previous);
     }
 
     /// The pointer capture with individually removed clicks filtered out.
@@ -1915,6 +1950,80 @@ impl Studio {
         }
     }
 
+    /// Whether a screenshot or recording is open for editing. The live webcam
+    /// only belongs on the empty studio; the editors show the recorded camera.
+    fn editing_media(&self) -> bool {
+        self.captured_path.is_some() || self.video_project.is_some()
+    }
+
+    /// Whether webcam frames are currently being produced for the canvas.
+    fn camera_preview_live(&self) -> bool {
+        !self.editing_media()
+            && (self.camera_preview.is_some()
+                || (self.record_camera && self.recording_state != RecordingState::Idle))
+    }
+
+    /// Runs the standalone webcam pipeline exactly when the camera toggle is
+    /// on and no recording owns the device, and polls frames while any
+    /// producer is live.
+    fn sync_camera_preview(&mut self, cx: &mut Context<Self>) {
+        let wants_standalone = self.record_camera
+            && self.recording_state == RecordingState::Idle
+            && !self.editing_media();
+        if !wants_standalone {
+            self.camera_preview = None;
+        } else if self.camera_preview.is_none() {
+            match default_camera_device()
+                .and_then(|device| CameraPreview::start(&device, self.camera_frames.clone()))
+            {
+                Ok(preview) => self.camera_preview = Some(preview),
+                Err(error) => {
+                    self.record_camera = false;
+                    self.toast = Some(format!("Webcam preview unavailable: {error}").into());
+                }
+            }
+        }
+        if !self.camera_preview_live() {
+            let frame = self.camera_frame.take();
+            self.retire_image(frame);
+            self.camera_preview_expanded = false;
+            return;
+        }
+        if self.camera_poll_running {
+            return;
+        }
+        self.camera_poll_running = true;
+        let frames = self.camera_frames.clone();
+        cx.spawn(async move |weak, cx| loop {
+            Timer::after(Duration::from_millis(33)).await;
+            let keep_polling = weak.update(cx, |this, cx| {
+                if !this.camera_preview_live() {
+                    this.camera_poll_running = false;
+                    this.camera_preview = None;
+                    let frame = this.camera_frame.take();
+                    this.retire_image(frame);
+                    cx.notify();
+                    return false;
+                }
+                if let Some((generation, frame)) = frames.newer_than(this.camera_frame_generation) {
+                    this.camera_frame_generation = generation;
+                    if let Some(pixels) =
+                        image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+                    {
+                        let previous = this.camera_frame.replace(cached_render_image(pixels));
+                        this.retire_image(previous);
+                        cx.notify();
+                    }
+                }
+                true
+            });
+            if !keep_polling.unwrap_or(false) {
+                break;
+            }
+        })
+        .detach();
+    }
+
     fn start_recording(&mut self, cx: &mut Context<Self>) {
         if self.recording_state != RecordingState::Idle || self.recording_busy {
             return;
@@ -1933,8 +2042,13 @@ impl Studio {
             microphone_device: self.record_microphone_device.clone(),
             camera: self.record_camera,
         };
+        // The recorder opens the webcam itself and mirrors it into the preview.
+        self.camera_preview = None;
+        let camera_frames = self.camera_frames.clone();
         let task = cx.background_executor().spawn(async move {
-            let mut controller = RecordingController::new(NativeRecorder::with_options(options));
+            let mut controller = RecordingController::new(
+                NativeRecorder::with_options(options).with_camera_preview(camera_frames),
+            );
             let result = controller
                 .start()
                 .map(|session| session.directory.clone())
@@ -1965,6 +2079,7 @@ impl Studio {
                         this.toast = Some(error.into());
                     }
                 }
+                this.sync_camera_preview(cx);
                 cx.notify();
             });
         })
@@ -2063,6 +2178,7 @@ impl Studio {
                 } else {
                     this.recording_controller = Some(controller);
                 }
+                this.sync_camera_preview(cx);
                 cx.notify();
             });
         })
@@ -2138,7 +2254,9 @@ impl Studio {
         self.video_edit_busy = false;
         self.video_speed_draft = None;
         self.last_video_project = self.video_project.take().map(|session| session.directory);
-        self.video_frame = None;
+        self.sync_camera_preview(cx);
+        let frame = self.video_frame.take();
+        self.retire_image(frame);
         self.video_preview_path = None;
         self.video_undo_stack.clear();
         self.video_redo_stack.clear();
@@ -2327,7 +2445,8 @@ impl Studio {
         self.enter_video_annotations(saved_annotations);
         self.video_selected_press = None;
         self.video_audio_levels.clear();
-        self.video_thumbnails.clear();
+        let thumbnails = self.video_thumbnails.drain(..).collect::<Vec<_>>();
+        self.retired_images.extend(thumbnails);
         self.video_extras_pending = true;
         let camera_path = session.camera_path();
         self.video_camera_path = camera_path.is_file().then_some(camera_path);
@@ -2335,7 +2454,8 @@ impl Studio {
         self.camera_decoded_time = -1.0;
         self.scene_selection = SceneSelection::Scene;
         self.media_drag = None;
-        self.preview_cache = PreviewCache::default();
+        let previous = std::mem::take(&mut self.preview_cache).frame;
+        self.retire_image(previous.map(|(_, image)| image));
         if !self.video_removed_presses.is_empty() {
             self.rebuild_video_motion_timelines();
         }
@@ -3485,7 +3605,8 @@ impl Studio {
         match result {
             Ok(path) => {
                 self.captured_dimensions = image::image_dimensions(&path).ok();
-                self.displayed_capture_image = None;
+                let image = self.displayed_capture_image.take();
+                self.retired_images.extend(image);
                 self.capture_rgba = None;
                 if let Ok(image) = image::open(&path) {
                     self.set_capture_image(image.to_rgba8());
@@ -3509,7 +3630,8 @@ impl Studio {
                 }
                 self.video_zoom_cues.clear();
                 self.animation_preset = None;
-                self.image_scenes.clear();
+                let scenes = self.image_scenes.drain(..).map(|scene| scene.render);
+                self.retired_images.extend(scenes);
                 self.image_scene_index = 0;
                 self.walkthrough_stops.clear();
                 self.walkthrough_mode = false;
@@ -5470,6 +5592,7 @@ impl Studio {
                     self.record_camera,
                     cx.listener(|this, _, _, cx| {
                         this.record_camera = !this.record_camera;
+                        this.sync_camera_preview(cx);
                         cx.notify();
                     }),
                 ))
@@ -6677,6 +6800,7 @@ impl Studio {
 
 impl Render for Studio {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drop_retired_images(window);
         if self.video_project.is_some() {
             return self.render_video(window, cx);
         }

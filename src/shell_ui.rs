@@ -4,7 +4,8 @@
 
 use gpui::{
     canvas, div, hsla, img, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight,
-    Hsla, MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size, Window,
+    Hsla, MouseButton, MouseDownEvent, ObjectFit, Pixels, ScrollDelta, ScrollWheelEvent, Size,
+    Window,
 };
 use std::path::PathBuf;
 
@@ -356,8 +357,80 @@ impl Studio {
                         ),
                 )
             })
+            .when_some(self.camera_preview_overlay(cx), |this, overlay| {
+                this.child(overlay)
+            })
             .when_some(export_overlay, |this, overlay| this.child(overlay))
             .into_any_element()
+    }
+
+    /// Live webcam monitor over the canvas: a round bubble in the corner, or
+    /// the whole canvas once clicked. It only reflects what the camera sees;
+    /// the recording keeps the webcam in its own file for the editor.
+    fn camera_preview_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.camera_preview_live() {
+            return None;
+        }
+        let expanded = self.camera_preview_expanded;
+        let recording = self.recording_state == RecordingState::Recording;
+        let frame = self.camera_frame.clone();
+        let inset = px(CANVAS_PADDING);
+        let bubble = px(168.0);
+        let toggle = cx.listener(|this, _, _, cx| {
+            this.camera_preview_expanded = !this.camera_preview_expanded;
+            cx.notify();
+        });
+        Some(
+            div()
+                .id("camera-preview")
+                .absolute()
+                .top(inset)
+                .right(inset)
+                .when(expanded, |this| this.bottom(inset).left(inset))
+                .when(!expanded, |this| this.size(bubble).rounded_full())
+                .when(expanded, |this| this.rounded_xl())
+                .overflow_hidden()
+                .bg(rgb(0x111214))
+                .border_2()
+                .border_color(if recording {
+                    rgb(0xe33442)
+                } else {
+                    rgb(0xffffff)
+                })
+                .shadow_lg()
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when_some(frame, |this, frame| {
+                    this.child(img(frame).size_full().object_fit(if expanded {
+                        ObjectFit::Contain
+                    } else {
+                        ObjectFit::Cover
+                    }))
+                })
+                .when(self.camera_frame.is_none(), |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xa4a6aa))
+                            .child("Starting webcam…"),
+                    )
+                })
+                .when(recording, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(px(10.0))
+                            .left(px(10.0))
+                            .size(px(10.0))
+                            .rounded_full()
+                            .bg(rgb(0xe33442)),
+                    )
+                })
+                .on_click(toggle)
+                .into_any_element(),
+        )
     }
 
     // ------------------------------------------------------------------

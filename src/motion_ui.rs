@@ -1558,7 +1558,8 @@ impl Studio {
             return;
         }
         self.pause_video_playback();
-        self.image_scenes.remove(self.image_scene_index);
+        let removed = self.image_scenes.remove(self.image_scene_index);
+        self.retire_image(Some(removed.render));
         let index = self.image_scene_index.min(self.image_scenes.len() - 1);
         self.load_image_scene(index);
         self.toast = Some("Scene removed".into());

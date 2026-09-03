@@ -1,3 +1,4 @@
+use super::camera_preview::{self, CameraFrames};
 use super::input::{monotonic_ns, ActiveRange, InputCapture, InputMapping};
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SourceType},
@@ -121,6 +122,8 @@ enum WorkerCommand {
 
 pub struct NativeRecorder {
     options: RecordingOptions,
+    /// Receives downscaled webcam frames while recording with a camera.
+    camera_preview: Option<Arc<CameraFrames>>,
     state: Arc<Mutex<SharedState>>,
     commands: Option<mpsc::Sender<WorkerCommand>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -140,10 +143,17 @@ impl NativeRecorder {
     pub fn with_options(options: RecordingOptions) -> Self {
         Self {
             options,
+            camera_preview: None,
             state: Arc::new(Mutex::new(SharedState::default())),
             commands: None,
             worker: None,
         }
+    }
+
+    /// Mirror the recorded webcam into `frames` for a live preview.
+    pub fn with_camera_preview(mut self, frames: Arc<CameraFrames>) -> Self {
+        self.camera_preview = Some(frames);
+        self
     }
 
     pub fn description() -> &'static str {
@@ -208,12 +218,22 @@ impl RecorderBackend for NativeRecorder {
         ensure_runtime()?;
         let output = output.to_path_buf();
         let options = self.options.clone();
+        let camera_preview = self.camera_preview.clone();
         let state = self.state.clone();
         let (commands_tx, commands_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("screendrop-native-recorder".into())
-            .spawn(move || run_worker(output, options, state, commands_rx, ready_tx))?;
+            .spawn(move || {
+                run_worker(
+                    output,
+                    options,
+                    camera_preview,
+                    state,
+                    commands_rx,
+                    ready_tx,
+                )
+            })?;
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.commands = Some(commands_tx);
@@ -315,6 +335,7 @@ fn ensure_runtime() -> Result<(), RecorderError> {
 fn run_worker(
     output: PathBuf,
     options: RecordingOptions,
+    camera_preview: Option<Arc<CameraFrames>>,
     state: Arc<Mutex<SharedState>>,
     commands: mpsc::Receiver<WorkerCommand>,
     ready: mpsc::Sender<Result<(), String>>,
@@ -394,6 +415,7 @@ fn run_worker(
             node,
             &options,
             camera.as_deref(),
+            camera_preview.as_ref(),
         )?);
         segments.push(0);
         let mut active_ranges = Vec::new();
@@ -456,6 +478,7 @@ fn run_worker(
                             node,
                             &options,
                             camera.as_deref(),
+                            camera_preview.as_ref(),
                         ) {
                             Ok(next) => {
                                 let path = segment_path(&output, index);
@@ -602,7 +625,7 @@ pub fn audio_sources() -> Vec<AudioSource> {
 }
 
 /// The V4L2 device node of the first webcam GStreamer can capture from.
-fn default_camera_device() -> Result<String, String> {
+pub fn default_camera_device() -> Result<String, String> {
     gst::init().map_err(|error| format!("could not initialize GStreamer: {error}"))?;
     let monitor = gst::DeviceMonitor::new();
     monitor.add_filter(Some("Video/Source"), None);
@@ -657,6 +680,7 @@ fn spawn_segment(
     node: u32,
     options: &RecordingOptions,
     camera_device: Option<&str>,
+    camera_preview: Option<&Arc<CameraFrames>>,
 ) -> Result<SegmentPipeline, String> {
     let path = segment_path(output, index);
     let _ = fs::remove_file(&path);
@@ -714,20 +738,27 @@ fn spawn_segment(
         let camera_segment = camera_segment_path(output, index);
         let _ = fs::remove_file(&camera_segment);
         description.push_str(&format!(
-            "v4l2src device=\"{}\" do-timestamp=true ! videoconvert ! \
-             queue max-size-buffers=4 leaky=downstream ! \
+            "v4l2src device=\"{}\" do-timestamp=true ! tee name=camera_tee ! \
+             videoconvert ! queue max-size-buffers=4 leaky=downstream ! \
              vp8enc deadline=1 cpu-used=8 threads=2 target-bitrate=4000000 \
              keyframe-max-dist=60 ! queue ! matroskamux ! \
              filesink location=\"{}\" ",
             device,
             camera_segment.display()
         ));
+        if camera_preview.is_some() {
+            description.push_str("camera_tee. ! ");
+            description.push_str(&camera_preview::preview_branch("camera_preview"));
+        }
     }
 
     let pipeline = gst::parse::launch(&description)
         .map_err(|error| format!("could not build GStreamer pipeline: {error}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "GStreamer did not create a pipeline".to_string())?;
+    if let Some(frames) = camera_preview.filter(|_| camera_device.is_some()) {
+        camera_preview::attach_preview(&pipeline, "camera_preview", frames.clone())?;
+    }
     let source = pipeline
         .by_name("screen_source")
         .ok_or_else(|| "GStreamer pipeline has no screen source".to_string())?;
