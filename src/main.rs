@@ -4973,10 +4973,14 @@ impl Studio {
                 div()
                     .id((control_id, index))
                     .flex_1()
+                    .min_w_0()
+                    .px_1()
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded_md()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
                     .text_xs()
                     .text_color(if selected == index { ink() } else { muted() })
                     .when(selected == index, |this| this.bg(rgb(0xffffff)).shadow_sm())
@@ -4985,7 +4989,7 @@ impl Studio {
                         on_select(this, index);
                         cx.notify();
                     }))
-                    .child((*label).to_string())
+                    .child(div().truncate().child(*label))
             }))
     }
 

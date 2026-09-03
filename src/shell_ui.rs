@@ -1386,6 +1386,12 @@ impl Studio {
             InspectorTab::Export => self.export_section(cx),
         };
         let advanced = self.inspector_level >= 2;
+        let has_advanced = match tab {
+            InspectorTab::Design => self.scene_selection == SceneSelection::Media,
+            InspectorTab::Motion => self.video_selected_zoom_cue.is_some(),
+            InspectorTab::Export => true,
+            InspectorTab::Annotate | InspectorTab::Record => false,
+        };
         let tabs = div()
             .h(px(56.0))
             .flex_none()
@@ -1486,7 +1492,7 @@ impl Studio {
                     .flex_col()
                     .child(body),
             )
-            .child(footer)
+            .when(has_advanced, |this| this.child(footer))
             .when(self.crop_active, |this| {
                 this.opacity(0.52).child(
                     div()
