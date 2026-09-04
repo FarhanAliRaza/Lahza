@@ -1,12 +1,12 @@
 use futures_util::StreamExt;
 use gpui::{
     canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
-    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp, Background,
-    Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle, FontWeight, Hsla, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollWheelEvent,
-    SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions, UnderlineStyle, Window,
-    WindowBounds, WindowDecorations, WindowOptions,
+    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp,
+    Background, Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle,
+    FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage,
+    ScrollWheelEvent, SharedString, StyledImage, Task, TextRun, Timer, TitlebarOptions,
+    UnderlineStyle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::fmt::Write as _;
 use std::{
@@ -126,6 +126,44 @@ fn timestamped_export_name() -> String {
     chrono::Local::now()
         .format("Lahza-%Y-%m-%d_%H-%M-%S-%3f.png")
         .to_string()
+}
+
+fn recent_roots() -> Vec<PathBuf> {
+    let mut roots = vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join("Videos"));
+        roots.push(home.join("Pictures"));
+    }
+    roots
+}
+
+fn recent_files(extension: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for root in recent_roots() {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_by_key(|path| fs::metadata(path).and_then(|m| m.modified()).ok());
+    files.reverse();
+    files.truncate(8);
+    files
+}
+
+fn recent_images() -> Vec<PathBuf> {
+    let mut files = recent_files("png");
+    files.extend(recent_files("jpg"));
+    files.sort_by_key(|path| fs::metadata(path).and_then(|m| m.modified()).ok());
+    files.reverse();
+    files.truncate(8);
+    files
 }
 
 fn cached_render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
@@ -1308,6 +1346,11 @@ fn fitted_image_bounds(
 }
 
 struct Studio {
+    /// The lightweight capture home shown before there is anything to edit.
+    launcher_active: bool,
+    launcher_tab: usize,
+    recent_projects: Vec<PathBuf>,
+    recent_screenshots: Vec<PathBuf>,
     tool: Tool,
     annotation_color_index: usize,
     annotation_stroke_width: f32,
@@ -1634,6 +1677,10 @@ impl Studio {
             }
         });
         let mut studio = Self {
+            launcher_active: initial_recording.is_none() && initial_image.is_none(),
+            launcher_tab: 0,
+            recent_projects: recent_files("screendroprec"),
+            recent_screenshots: recent_images(),
             tool: Tool::Select,
             annotation_color_index: 1,
             annotation_stroke_width: 4.0,
@@ -2008,6 +2055,7 @@ impl Studio {
                             this.recording_elapsed = Duration::ZERO;
                             this.recording_started_at = None;
                             this.recording_session_path = path.clone();
+                            this.launcher_active = false;
                             this.toast = path.and_then(|path| {
                                 match this.open_video_project(path.clone()) {
                                     Ok(()) => {
@@ -3066,7 +3114,8 @@ impl Studio {
                         .hover(|style| style.bg(rgb(0xe4e4e7)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(draft) = this.video_speed_draft {
-                                this.video_speed_draft = Some(Self::next_clip_speed(draft, increase));
+                                this.video_speed_draft =
+                                    Some(Self::next_clip_speed(draft, increase));
                                 cx.notify();
                             }
                         }))
@@ -3299,6 +3348,7 @@ impl Studio {
         self.capturing = false;
         match result {
             Ok(path) => {
+                self.launcher_active = false;
                 self.captured_dimensions = image::image_dimensions(&path).ok();
                 self.displayed_capture_image = None;
                 self.capture_rgba = None;
@@ -5185,12 +5235,11 @@ impl Studio {
             })
             .border_1()
             .border_color(if enabled { blue() } else { line() })
-            .child(
-                svg()
-                    .path(icon)
-                    .size(px(15.0))
-                    .text_color(if enabled { blue() } else { muted() }),
-            )
+            .child(svg().path(icon).size(px(15.0)).text_color(if enabled {
+                blue()
+            } else {
+                muted()
+            }))
             .on_click(on_click)
     }
 
@@ -5960,7 +6009,10 @@ impl Studio {
                     // The hitbox lets occluding overlays (dialogs) shadow the
                     // raw mouse listeners registered below.
                     move |bounds, window, _| {
-                        (annotations, window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal))
+                        (
+                            annotations,
+                            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+                        )
                     },
                     move |bounds, (annotations, hitbox), window, cx| {
                         let image_bounds = match composited_style.as_ref() {
@@ -6424,8 +6476,354 @@ impl Studio {
     }
 }
 
+impl Studio {
+    fn launcher_source_row(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        title: &'static str,
+        subtitle: &'static str,
+        enabled: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .h(px(52.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(if enabled { blue() } else { rgb(0x353941) })
+            .bg(if enabled {
+                rgb(0x172b40)
+            } else {
+                rgb(0x25272b)
+            })
+            .cursor_pointer()
+            .on_click(on_click)
+            .child(svg().path(icon).size(px(17.0)).text_color(if enabled {
+                rgb(0x55b1ff)
+            } else {
+                rgb(0xa3a7ae)
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(div().text_xs().text_color(rgb(0x92979f)).child(subtitle)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(2.0))
+                    .children((0..5).map(|bar| {
+                        div()
+                            .w(px(3.0))
+                            .h(px(if enabled {
+                                7.0 + (bar % 3) as f32 * 4.0
+                            } else {
+                                3.0
+                            }))
+                            .rounded_full()
+                            .bg(if enabled {
+                                rgb(0x36a7ff)
+                            } else {
+                                rgb(0x555960)
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_full()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .bg(if enabled { blue() } else { rgb(0x383b40) })
+                    .child(if enabled { "On" } else { "Off" }),
+            )
+            .into_any_element()
+    }
+
+    fn render_launcher(&self, cx: &mut Context<Self>) -> AnyElement {
+        let items = if self.launcher_tab == 1 {
+            &self.recent_projects
+        } else {
+            &self.recent_screenshots
+        };
+        let recording = self.recording_state != RecordingState::Idle;
+        div()
+            .size_full()
+            .bg(rgb(0x17181a))
+            .text_color(rgb(0xf7f7f8))
+            .font_family("Inter")
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(54.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgb(0x303237))
+                    .child(
+                        div()
+                            .size(px(28.0))
+                            .rounded_lg()
+                            .bg(rgb(0xffffff))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                svg()
+                                    .path("icons/capture.svg")
+                                    .size(px(17.0))
+                                    .text_color(rgb(0x15171a)),
+                            ),
+                    )
+                    .child(div().text_lg().font_weight(FontWeight::BOLD).child("Lahza"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x90949b))
+                            .child(if recording {
+                                self.recording_timecode()
+                            } else {
+                                "Ready".into()
+                            }),
+                    ),
+            )
+            .child(
+                div().px_4().pt_4().pb_3().flex().gap_2().children(
+                    [("Capture", 0usize), ("Projects", 1), ("Screenshots", 2)]
+                        .into_iter()
+                        .map(|(label, tab)| {
+                            div()
+                                .id(("launcher-tab", tab))
+                                .flex_1()
+                                .h(px(34.0))
+                                .rounded_lg()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .bg(if self.launcher_tab == tab {
+                                    rgb(0x33363b)
+                                } else {
+                                    rgb(0x202226)
+                                })
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.launcher_tab = tab;
+                                    cx.notify();
+                                }))
+                                .child(label)
+                        }),
+                ),
+            )
+            .child(if self.launcher_tab == 0 {
+                div()
+                    .px_4()
+                    .pb_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .grid()
+                            .grid_cols(2)
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("launcher-screenshot")
+                                    .h(px(82.0))
+                                    .rounded_xl()
+                                    .bg(blue())
+                                    .cursor_pointer()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        svg()
+                                            .path("icons/capture.svg")
+                                            .size(px(24.0))
+                                            .text_color(rgb(0xffffff)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("Screenshot"),
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.begin_screen_capture(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("launcher-record")
+                                    .h(px(82.0))
+                                    .rounded_xl()
+                                    .bg(rgb(0xe33d4b))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        svg()
+                                            .path("icons/record.svg")
+                                            .size(px(24.0))
+                                            .text_color(rgb(0xffffff)),
+                                    )
+                                    .child(div().text_sm().font_weight(FontWeight::BOLD).child(
+                                        if recording {
+                                            "Recording…"
+                                        } else {
+                                            "Record screen"
+                                        },
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if this.recording_state == RecordingState::Idle {
+                                            this.start_recording(cx)
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(self.launcher_source_row(
+                        "launcher-camera",
+                        "icons/video.svg",
+                        "Camera",
+                        "Preview and include your camera",
+                        self.record_camera,
+                        cx.listener(|this, _, _, cx| {
+                            this.record_camera = !this.record_camera;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.launcher_source_row(
+                        "launcher-mic",
+                        "icons/microphone.svg",
+                        "Microphone",
+                        "Voice input level",
+                        self.record_microphone,
+                        cx.listener(|this, _, _, cx| {
+                            this.record_microphone = !this.record_microphone;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.launcher_source_row(
+                        "launcher-system-audio",
+                        "icons/volume.svg",
+                        "System audio",
+                        "Sound playing on this computer",
+                        self.record_system_audio,
+                        cx.listener(|this, _, _, cx| {
+                            this.record_system_audio = !this.record_system_audio;
+                            cx.notify();
+                        }),
+                    ))
+                    .when(recording, |this| this.child(self.recording_controls(cx)))
+                    .into_any_element()
+            } else {
+                div()
+                    .px_4()
+                    .pb_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .when(items.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .h(px(180.0))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .text_color(rgb(0x92979f))
+                                .child(svg().path("icons/folder.svg").size(px(28.0)))
+                                .child("No recent items yet"),
+                        )
+                    })
+                    .children(items.iter().cloned().enumerate().map(|(index, path)| {
+                        let open_path = path.clone();
+                        let project = self.launcher_tab == 1;
+                        div()
+                            .id(("recent-item", index))
+                            .h(px(48.0))
+                            .px_3()
+                            .rounded_lg()
+                            .bg(rgb(0x24262a))
+                            .hover(|s| s.bg(rgb(0x303339)))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                svg()
+                                    .path(if project {
+                                        "icons/video.svg"
+                                    } else {
+                                        "icons/capture.svg"
+                                    })
+                                    .size(px(17.0))
+                                    .text_color(rgb(0x8dbff1)),
+                            )
+                            .child(
+                                div().flex_1().min_w_0().text_sm().overflow_hidden().child(
+                                    path.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("Untitled")
+                                        .to_string(),
+                                ),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(15.0))
+                                    .text_color(rgb(0x777b82)),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if project {
+                                    if let Err(error) = this.open_video_project(open_path.clone()) {
+                                        this.toast = Some(error.into());
+                                    } else {
+                                        this.launcher_active = false;
+                                    }
+                                } else {
+                                    this.finish_capture_request(Ok(open_path.clone()));
+                                }
+                                cx.notify();
+                            }))
+                    }))
+                    .into_any_element()
+            })
+            .into_any_element()
+    }
+}
+
 impl Render for Studio {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.launcher_active {
+            return self.render_launcher(cx);
+        }
         if self.video_project.is_some() {
             return self.render_video(window, cx);
         }
@@ -6568,11 +6966,21 @@ fn main() {
             base: asset_directory(),
         })
         .run(move |cx: &mut App| {
-            let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
+            let starts_in_editor = initial_recording.is_some() || initial_image.is_some();
+            let window_size = if starts_in_editor {
+                size(px(1440.0), px(900.0))
+            } else {
+                size(px(430.0), px(610.0))
+            };
+            let bounds = Bounds::centered(None, window_size, cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(980.0), px(680.0))),
+                    window_min_size: Some(if starts_in_editor {
+                        size(px(980.0), px(680.0))
+                    } else {
+                        size(px(400.0), px(560.0))
+                    }),
                     app_id: Some("com.screendrop.Screendrop".into()),
                     titlebar: Some(TitlebarOptions {
                         title: Some("Lahza".into()),
