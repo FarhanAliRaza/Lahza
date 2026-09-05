@@ -1,12 +1,14 @@
-## Lahza v0.3.0
+## Lahza v0.4.0
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
 ### Changed in this release
 
-- Internal only: the editor was split out of a single 6,000-line `main.rs` into modules that own their behavior — editing data types, annotations, crop, capture, video timeline, controls, preview canvas, launcher UI, and theme. There is no change to features or behavior; the release exists so packages track the reorganized source.
+- Cropping is no longer destructive. Reopening the crop tool restores the full capture with your selection still in place, so a crop can be widened, moved, or reset to the original image instead of only ever shrinking further. Annotations follow the change, and dragging back out to the full frame restores the original.
+- Aspect presets fit the source image rather than the previously selected preset, so switching between them repeatedly no longer shrinks the selection each time.
+- **Create something new** is now a filled button in the editor toolbar.
 
-**Upgrading from v0.2.0:** nothing to do. Presets, recordings, and `.lahzarec` projects are unchanged.
+**Upgrading from v0.3.0:** nothing to do. Presets, recordings, and `.lahzarec` projects are unchanged.
 
 ### Included
 
@@ -19,19 +21,19 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.3.0_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.0_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_0.3.0_amd64.deb
+sudo apt install ./lahza_0.4.0_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
 
-**Binary bundle:** download `lahza-0.3.0-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.4.0-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.3.0-linux-x86_64.tar.gz
-cd lahza-0.3.0-linux-x86_64
+tar -xzf lahza-0.4.0-linux-x86_64.tar.gz
+cd lahza-0.4.0-linux-x86_64
 ./install.sh
 ```
 
