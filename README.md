@@ -75,20 +75,47 @@ Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social s
 Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
 
 ```bash
-sudo apt install ./lahza_0.4.1_amd64.deb
+sudo apt install ./lahza_0.4.2_amd64.deb
 ```
 
 Launch **Lahza** from your application menu, or run `lahza`.
+
+#### Updates and older local installations
+
+Debian packages built from this source include a terminal updater:
+
+```bash
+lahza-update --check
+lahza-update --install
+```
+
+It checks the latest stable GitHub Release, downloads a newer package for your architecture, verifies its release SHA256 checksum and package metadata, and runs `sudo apt install`. APT asks for confirmation. Save your work and fully quit and reopen Lahza after installation. Checksums verify download integrity against the release; they are not independent signatures. The updater requires internet access and manages Debian installations only.
+
+Existing 0.4.1 packages do not contain this command. Until you install a release containing it, you can run `python3 packaging/lahza-update --install` from this source checkout, or download a newer `.deb` and use `sudo apt install ./<downloaded-file>.deb`. Installing a local `.deb` does not subscribe APT to GitHub Releases; automatic updates through `apt upgrade` would require a separately hosted APT repository.
+
+If the old app still opens, check for multiple installations:
+
+```bash
+type -a lahza
+dpkg-query -W lahza
+/usr/bin/lahza
+```
+
+A source or bundle install in `~/.local/bin/lahza` can take precedence over `/usr/bin/lahza`. A user launcher at `~/.local/share/applications/com.lahza.Lahza.desktop` also overrides the system launcher. Back up or remove those old local installation files if you want to use only the Debian package. New Debian package launchers explicitly select `/usr/bin/lahza`; an existing user launcher still takes precedence. New builds support `lahza --version` to identify the executable's version.
+
+The `_apt` “unsandboxed as root” notice for an unreadable Downloads directory does not mean installation failed. The updater uses an APT-readable temporary download directory. Installing a package system-wide requires `sudo`; repeating the same version does not fetch a newer GitHub release.
+
+For maintainers: increment the version in `Cargo.toml` and regenerate `Cargo.lock` for each release, then publish a matching `vX.Y.Z` tag. The release workflow validates the tag and publishes the `.deb` and `SHA256SUMS` consumed by the updater. Do not replace old release assets with changed builds under the same version.
 
 Release packages are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; build from source if the package's dependencies are unavailable. Before the first release is published, development packages are available as artifacts in successful [build workflow runs](https://github.com/FarhanAliRaza/lahza/actions/workflows/linux-deb.yml).
 
 ### Binary bundle
 
-Each release also includes `lahza-0.4.1-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
+Each release also includes `lahza-0.4.2-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
 
 ```bash
-tar -xzf lahza-0.4.1-linux-x86_64.tar.gz
-cd lahza-0.4.1-linux-x86_64
+tar -xzf lahza-0.4.2-linux-x86_64.tar.gz
+cd lahza-0.4.2-linux-x86_64
 ./install.sh
 ```
 

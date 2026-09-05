@@ -51,7 +51,9 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run tests
-        run: cargo test --release --locked
+        run: |
+          cargo test --release --locked
+          python3 -m unittest discover -s packaging/tests
 
       - name: Create DEB package
         id: package
@@ -69,8 +71,11 @@ jobs:
           package_root="dist/${package_name}"
 
           install -Dm755 target/release/lahza "${package_root}/usr/bin/lahza"
+          install -Dm755 packaging/lahza-update "${package_root}/usr/bin/lahza-update"
           strip "${package_root}/usr/bin/lahza"
           install -Dm644 packaging/com.lahza.Lahza.desktop \
+            "${package_root}/usr/share/applications/com.lahza.Lahza.desktop"
+          sed -i 's|^Exec=lahza$|Exec=/usr/bin/lahza|' \
             "${package_root}/usr/share/applications/com.lahza.Lahza.desktop"
           install -Dm644 Lahza.png \
             "${package_root}/usr/share/pixmaps/com.lahza.Lahza.png"
@@ -87,7 +92,7 @@ jobs:
           Homepage: https://github.com/FarhanAliRaza/lahza
           Section: graphics
           Priority: optional
-          Depends: ffmpeg, gstreamer1.0-libav, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-tools, gstreamer1.0-plugins-base-apps, libgstreamer1.0-0, libpipewire-0.3-0, libx11-6, libxkbcommon-x11-0, libxkbcommon0, xdg-desktop-portal
+          Depends: python3, ca-certificates, ffmpeg, gstreamer1.0-libav, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-tools, gstreamer1.0-plugins-base-apps, libgstreamer1.0-0, libpipewire-0.3-0, libx11-6, libxkbcommon-x11-0, libxkbcommon0, xdg-desktop-portal
           Description: Lahza screenshot and recording studio for Linux
            Capture, annotate, and export screenshots and screen recordings.
           EOF

@@ -1,12 +1,16 @@
-## Lahza v0.4.1
+## Lahza v0.4.2
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
 ### Changed in this release
 
-- The editor no longer announces what you can already see. Choosing a background, gradient, wallpaper, preset, or template, starting or cancelling a crop, undoing and redoing, adding or removing a scene, resetting a transform, and placing cursor-walkthrough stops used to each raise a toast; those are gone. Toasts are now reserved for results you cannot see on the canvas, such as export outcomes and errors.
+- Debian app-menu launchers now open `/usr/bin/lahza` explicitly, preventing an older executable in `~/.local/bin` from taking precedence through `PATH`.
+- Added `lahza-update --check` and `lahza-update --install` for Debian installations. The updater checks stable GitHub Releases, verifies the download against the release SHA256 checksum and package metadata, and installs newer versions through APT.
+- Added `lahza --version` to identify the executable version without opening the app.
 
-**Upgrading from v0.4.0:** nothing to do. Presets, recordings, and `.lahzarec` projects are unchanged.
+**Upgrading from v0.4.1:** install the new `.deb`, save your work, fully quit Lahza, and reopen it from the app menu. Older packages do not include the updater. If you have a user launcher at `~/.local/share/applications/com.lahza.Lahza.desktop`, it overrides the system launcher; back it up or remove it to use the Debian launcher. Presets, recordings, and `.lahzarec` projects are unchanged.
+
+For subsequent Debian updates, run `lahza-update --install` in a terminal. This is an on-demand updater; it does not enable automatic APT repository updates or update user-local binary bundles.
 
 ### Included
 
@@ -19,19 +23,19 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.1_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.2_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_0.4.1_amd64.deb
+sudo apt install ./lahza_0.4.2_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
 
-**Binary bundle:** download `lahza-0.4.1-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.4.2-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.4.1-linux-x86_64.tar.gz
-cd lahza-0.4.1-linux-x86_64
+tar -xzf lahza-0.4.2-linux-x86_64.tar.gz
+cd lahza-0.4.2-linux-x86_64
 ./install.sh
 ```
 
