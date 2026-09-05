@@ -70,12 +70,12 @@ jobs:
           Package: screendrop
           Version: ${version}
           Architecture: ${architecture}
-          Maintainer: Screendrop contributors <noreply@github.com>
-          Homepage: https://github.com/FarhanAliRaza/screendrop-rs
+          Maintainer: Lahza contributors <noreply@github.com>
+          Homepage: https://github.com/FarhanAliRaza/lahza
           Section: graphics
           Priority: optional
-          Depends: ffmpeg, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-tools, libgstreamer1.0-0, libpipewire-0.3-0, libx11-6, libxkbcommon-x11-0, libxkbcommon0, xdg-desktop-portal
-          Description: Linux screenshot and recording studio
+          Depends: ffmpeg, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-tools, gstreamer1.0-plugins-base-apps, libgstreamer1.0-0, libpipewire-0.3-0, libx11-6, libxkbcommon-x11-0, libxkbcommon0, xdg-desktop-portal
+          Description: Lahza screenshot and recording studio for Linux
            Capture, annotate, and export screenshots and screen recordings.
           EOF
 
