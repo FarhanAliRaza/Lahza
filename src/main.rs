@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -101,6 +101,17 @@ const EDITOR_WINDOW_SIZE: gpui::Size<Pixels> = gpui::Size {
     width: px(1440.0),
     height: px(900.0),
 };
+
+fn brand_wordmark(width: f32, height: f32) -> AnyElement {
+    div()
+        .relative()
+        .w(px(width))
+        .h(px(height))
+        .flex_none()
+        .child(svg().path("brand/wordmark-urdu-ink.svg").absolute().inset_0().size_full().text_color(rgb(0x272727)))
+        .child(svg().path("brand/wordmark-urdu-accent.svg").absolute().inset_0().size_full().text_color(rgb(0xd03734)))
+        .into_any_element()
+}
 
 fn ink() -> Hsla {
     hsla(220.0 / 360.0, 0.13, 0.12, 1.0)
@@ -1544,10 +1555,31 @@ enum RecordingAction {
     Discard,
 }
 
-enum PlaybackMessage {
-    Frame(DecodedFrame),
-    Finished,
-    Error(String),
+/// The decoder must keep draining GStreamer's video pipe even when scene
+/// compositing is slow, otherwise the shared pipeline can starve its audio.
+#[derive(Default)]
+struct PlaybackUpdates {
+    frame: Option<DecodedFrame>,
+    terminal: Option<Result<(), String>>,
+}
+
+#[derive(Clone, Default)]
+struct PlaybackMailbox(Arc<Mutex<PlaybackUpdates>>);
+
+impl PlaybackMailbox {
+    fn publish(&self, frame: DecodedFrame) {
+        let previous = self.0.lock().expect("playback mailbox poisoned").frame.replace(frame);
+        // Release the potentially large previous image outside the lock.
+        drop(previous);
+    }
+
+    fn finish(&self, result: Result<(), String>) {
+        self.0.lock().expect("playback mailbox poisoned").terminal = Some(result);
+    }
+
+    fn take(&self) -> PlaybackUpdates {
+        std::mem::take(&mut *self.0.lock().expect("playback mailbox poisoned"))
+    }
 }
 
 impl Studio {
@@ -3130,13 +3162,15 @@ impl Studio {
         let Some(path) = self.video_playback_path() else {
             return;
         };
+        self.finish_annotation_interaction();
         if self.video_position >= self.video_duration - 0.01 {
             self.video_position = 0.0;
         }
         let start_time = self.video_position;
         let generation = self.video_playback_generation.clone();
         let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let (sender, receiver) = mpsc::sync_channel(2);
+        let receiver = PlaybackMailbox::default();
+        let sender = receiver.clone();
         self.video_playing = true;
         self.toast = None;
 
@@ -3146,23 +3180,23 @@ impl Studio {
                     match SynchronizedPlaybackStream::open(&path, start_time, 1920, 1080) {
                         Ok(stream) => stream,
                         Err(error) => {
-                            let _ = sender.send(PlaybackMessage::Error(error.to_string()));
+                            sender.finish(Err(error.to_string()));
                             return;
                         }
                     };
-                while generation.load(Ordering::SeqCst) == token {
+                while generation.load(Ordering::SeqCst) == token
+                    && Arc::strong_count(&sender.0) > 1
+                {
                     match stream.next_frame() {
                         Ok(Some(frame)) => {
-                            if sender.send(PlaybackMessage::Frame(frame)).is_err() {
-                                break;
-                            }
+                            sender.publish(frame);
                         }
                         Ok(None) => {
-                            let _ = sender.send(PlaybackMessage::Finished);
+                            sender.finish(Ok(()));
                             break;
                         }
                         Err(error) => {
-                            let _ = sender.send(PlaybackMessage::Error(error.to_string()));
+                            sender.finish(Err(error.to_string()));
                             break;
                         }
                     }
@@ -3177,15 +3211,7 @@ impl Studio {
             if active_generation.load(Ordering::SeqCst) != token {
                 break;
             }
-            let mut latest_frame = None;
-            let mut terminal = None;
-            while let Ok(message) = receiver.try_recv() {
-                match message {
-                    PlaybackMessage::Frame(frame) => latest_frame = Some(frame),
-                    PlaybackMessage::Finished => terminal = Some(Ok(())),
-                    PlaybackMessage::Error(error) => terminal = Some(Err(error)),
-                }
-            }
+            let PlaybackUpdates { frame: latest_frame, terminal } = receiver.take();
             let terminal_received = terminal.is_some();
             if weak
                 .update(cx, |this, cx| {
@@ -3223,10 +3249,18 @@ impl Studio {
     }
 
     fn seek_video(&mut self, position: f64, cx: &mut Context<Self>) {
+        self.stop_editing_text();
         let playback_path = self.video_playback_path();
         self.pause_video_playback();
         let position = position.clamp(0.0, self.video_duration);
         self.video_position = position;
+        if self.selected_annotation.is_some_and(|index| {
+            self.annotations.get(index).is_none_or(|mark| {
+                mark.timing.is_some_and(|timing| !timing.state_at(position).visible)
+            })
+        }) {
+            self.finish_annotation_interaction();
+        }
         let Some(path) = playback_path else {
             cx.notify();
             return;
@@ -4043,6 +4077,15 @@ impl Studio {
         self.editing_text = None;
         self.annotation_draft = None;
         true
+    }
+
+    /// Return keyboard control to the timeline when leaving canvas editing.
+    fn finish_annotation_interaction(&mut self) {
+        self.stop_editing_text();
+        self.selected_annotation = None;
+        self.selection_last_point = None;
+        self.selection_resizing = false;
+        self.toast = None;
     }
 
     fn stop_editing_text(&mut self) {
@@ -7051,30 +7094,16 @@ impl Studio {
                 div()
                     .h(px(54.0))
                     .flex_none()
+                    .relative()
                     .px_4()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .justify_center()
                     .border_b_1()
                     .border_color(line())
                     .child(
-                        div()
-                            .size(px(28.0))
-                            .rounded_lg()
-                            .bg(ink())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                svg()
-                                    .path("icons/capture.svg")
-                                    .size(px(17.0))
-                                    .text_color(gpui::white()),
-                            ),
-                    )
-                    .child(div().text_lg().font_weight(FontWeight::BOLD).child("Lahza"))
-                    .child(div().flex_1())
-                    .when(!recording, |this| this.child(div().text_xs().text_color(muted()).child("Ready"))),
+                        brand_wordmark(100.0, 32.0),
+                    ),
             )
             .when(recording, |this| this.child(self.launcher_recording_panel(cx)))
             .child(
@@ -7569,6 +7598,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_keeps_draining_while_the_preview_is_stalled() {
+        let mailbox = PlaybackMailbox::default();
+        let producer = mailbox.clone();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // Ten seconds of 60 fps playback while the UI consumes nothing.
+            for index in 0..600 {
+                producer.publish(DecodedFrame {
+                    time: index as f64 / 60.0,
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0, 0, 0, 255],
+                });
+            }
+            producer.finish(Ok(()));
+            done.send(()).unwrap();
+        });
+        completed.recv_timeout(Duration::from_secs(2)).expect("preview stalled the decoder");
+        worker.join().unwrap();
+        let update = mailbox.take();
+        assert_eq!(update.frame.unwrap().time, 599.0 / 60.0);
+        assert_eq!(update.terminal, Some(Ok(())));
+        let empty = mailbox.take();
+        assert!(empty.frame.is_none() && empty.terminal.is_none());
+    }
 
     #[test]
     fn crop_aspect_and_handles_stay_inside_image() {

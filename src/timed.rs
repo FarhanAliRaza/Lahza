@@ -223,18 +223,21 @@ fn back_out(t: f64) -> f64 {
     1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)
 }
 
-/// The mark as it should be painted at `time`, or `None` while hidden.
-/// Marks without timing are always shown unchanged.
 /// The mark as the editor paints it: a selected or edited mark shows its
-/// full, static state so it can be seen and hit-tested while its entrance
-/// (e.g. `Type` at the playhead) would otherwise hide it.
+/// full, static state within its time range so its entrance animation does
+/// not prevent editing. Focus never makes a mark visible outside that range.
 pub fn editor_mark(mark: &AnnotationMark, time: f64, focused: bool) -> Option<AnnotationMark> {
+    if mark.timing.is_some_and(|timing| !timing.state_at(time).visible) {
+        return None;
+    }
     if focused {
         return Some(mark.clone());
     }
     animated_mark(mark, time)
 }
 
+/// The mark as it should be painted at `time`, or `None` while hidden.
+/// Marks without timing are always shown unchanged.
 pub fn animated_mark(mark: &AnnotationMark, time: f64) -> Option<AnnotationMark> {
     let Some(timing) = mark.timing else {
         return Some(mark.clone());
@@ -445,6 +448,22 @@ mod tests {
         assert!((mapped.font_size - 12.0).abs() < 1e-6);
         pinned.pinned = false;
         assert_eq!(in_media_space(pinned.clone(), viewport), pinned);
+    }
+
+    #[test]
+    fn focused_annotations_still_obey_their_time_range() {
+        for tool in [Tool::Rectangle, Tool::Text] {
+            let mark = mark(tool);
+            assert!(editor_mark(&mark, 0.5, true).is_none());
+            assert!(editor_mark(&mark, 3.5, true).is_none());
+            // At the entrance, focus keeps the full shape editable.
+            assert_eq!(editor_mark(&mark, 1.0, true), Some(mark.clone()));
+            assert_eq!(editor_mark(&mark, 2.0, true), Some(mark.clone()));
+            assert_eq!(editor_mark(&mark, 1.1, false), animated_mark(&mark, 1.1));
+            let mut untimed = mark;
+            untimed.timing = None;
+            assert_eq!(editor_mark(&untimed, 99.0, true), Some(untimed));
+        }
     }
 
     #[test]

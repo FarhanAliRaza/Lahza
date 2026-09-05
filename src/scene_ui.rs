@@ -1785,7 +1785,7 @@ impl Studio {
         )
     }
 
-    pub(crate) fn effects_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn background_effects_section(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .flex_col()
@@ -2697,6 +2697,7 @@ impl Studio {
                     cx.listener(|this, event: &MouseDownEvent, _, cx| {
                         this.pause_video_playback();
                         if let Some(target) = this.motion_timeline_time_at(event.position.x) {
+                            this.finish_annotation_interaction();
                             this.video_position = target;
                             this.video_seek_drag = Some((event.position.x, target));
                         }

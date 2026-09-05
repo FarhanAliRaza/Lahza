@@ -3,7 +3,7 @@
 //! timeline bar. Mode-specific code only supplies the canvas and the lanes.
 
 use gpui::{
-    canvas, div, hsla, img, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight,
+    canvas, div, hsla, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight,
     Hsla, MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size,
     Window,
 };
@@ -535,7 +535,7 @@ impl Studio {
                     .pr_3()
                     .flex()
                     .items_center()
-                    .child(img("brand/wordmark.png").h(px(22.0)).w(px(109.7)))
+                    .child(crate::brand_wordmark(87.5, 28.0))
                     .on_mouse_down(MouseButton::Left, |event, window, _| {
                         if event.click_count >= 2 {
                             window.zoom_window();
@@ -851,6 +851,10 @@ impl Studio {
                 ))
             })
             .child(self.fill_picker(cx))
+            .child(self.section_header("effects", "Background effects", None, cx))
+            .when(self.section_open("effects"), |this| {
+                this.child(self.background_effects_section(cx))
+            })
             .child(div().h(px(4.0)))
             .child(Self::tab_label("Layout"))
             .child(self.slider_row(
@@ -949,10 +953,6 @@ impl Studio {
                     |this, value| this.border_opacity = value,
                     cx,
                 ))
-            })
-            .child(self.section_header("effects", "Effects", None, cx))
-            .when(self.section_open("effects"), |this| {
-                this.child(self.effects_section(cx))
             })
             .child(self.section_header(
                 "watermark",
@@ -1452,6 +1452,7 @@ impl Studio {
     /// Seeks to the pointer's position on the ruler or the clip lane and
     /// arms a scrub drag.
     fn timeline_seek_down(&mut self, event: &MouseDownEvent) {
+        self.finish_annotation_interaction();
         self.pause_video_playback();
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
@@ -1743,8 +1744,15 @@ impl Studio {
                             .flex()
                             .flex_col()
                             .justify_center()
-                            .gap_1()
-                            .cursor(CursorStyle::ResizeLeftRight)
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .cursor(CursorStyle::ResizeLeftRight)
                             .child(
                                 div()
                                     .id("timeline-ruler")
@@ -1898,7 +1906,18 @@ impl Studio {
                             .child(motion_track)
                             .when_some(annotation_track, |this, lane| this.child(lane))
                             .when_some(camera_lane, |this, lane| this.child(lane))
-                            .when_some(audio_lane, |this, lane| this.child(lane)),
+                            .when_some(audio_lane, |this, lane| this.child(lane))
+                            // Paint one continuous playhead above every lane and gap.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px((timeline_content_width * progress - timeline_scroll) as f32 - 1.0))
+                                    .top(px(15.0))
+                                    .bottom_0()
+                                    .w(px(2.0))
+                                    .bg(ink()),
+                            ),
+                            ),
                     ),
             )
             .into_any_element()

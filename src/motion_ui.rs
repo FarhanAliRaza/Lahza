@@ -513,6 +513,7 @@ impl Studio {
                         this.seek_video(target, cx);
                         this.add_motion_region_at(target, cx);
                     } else {
+                        this.finish_annotation_interaction();
                         this.video_position = target;
                         this.video_seek_drag = Some((event.position.x, target));
                     }
@@ -1117,6 +1118,7 @@ impl Studio {
         if !self.animation_active || self.video_playing || self.video_duration <= 0.0 {
             return;
         }
+        self.finish_annotation_interaction();
         if self.video_position >= self.video_duration - 0.01 {
             self.video_position = 0.0;
         }

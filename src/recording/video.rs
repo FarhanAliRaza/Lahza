@@ -509,7 +509,7 @@ impl SynchronizedPlaybackStream {
             .arg(path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|error| {
                 VideoError::Decode(format!(
