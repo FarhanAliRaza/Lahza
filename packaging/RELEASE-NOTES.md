@@ -1,15 +1,12 @@
-## Lahza v0.2.0
+## Lahza v0.3.0
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
 ### Changed in this release
 
-- Every `screendrop` identifier is now `lahza`: the package and executable, the `com.lahza.Lahza` desktop ID and app ID, the `LAHZA_*` environment variables, the optional `lahza-input@com.lahza` GNOME helper, and the `.lahzarec` project extension.
-- The global capture shortcut (Ctrl+Shift+3) is gone. Start a capture from the launcher's **Screenshot** and **Record screen** buttons instead.
-- Export notifications now offer to open the file that was written.
-- The editor toolbar uses the Latin wordmark; the recorder window keeps the Urdu one.
+- Internal only: the editor was split out of a single 6,000-line `main.rs` into modules that own their behavior — editing data types, annotations, crop, capture, video timeline, controls, preview canvas, launcher UI, and theme. There is no change to features or behavior; the release exists so packages track the reorganized source.
 
-**Upgrading from v0.1.0:** the rename changes where Lahza looks for your data. Existing presets in `~/.config/screendrop`, recordings in `~/Videos/Screendrop`, and `.screendroprec` projects are not picked up. To keep them, rename the directories to `~/.config/lahza` and `~/Videos/Lahza` and change each project's `.screendroprec` suffix to `.lahzarec` before launching. Remove the old `com.screendrop.Screendrop` desktop entry and icon from `~/.local/share` if you installed v0.1.0 by hand.
+**Upgrading from v0.2.0:** nothing to do. Presets, recordings, and `.lahzarec` projects are unchanged.
 
 ### Included
 
@@ -22,19 +19,19 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.2.0_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.3.0_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_0.2.0_amd64.deb
+sudo apt install ./lahza_0.3.0_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
 
-**Binary bundle:** download `lahza-0.2.0-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.3.0-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.2.0-linux-x86_64.tar.gz
-cd lahza-0.2.0-linux-x86_64
+tar -xzf lahza-0.3.0-linux-x86_64.tar.gz
+cd lahza-0.3.0-linux-x86_64
 ./install.sh
 ```
 

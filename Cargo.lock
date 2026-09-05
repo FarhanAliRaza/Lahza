@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "lahza"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ashpd 0.12.3",
  "async-io",
