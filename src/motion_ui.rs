@@ -1406,6 +1406,8 @@ impl Studio {
     /// The live image and its scene as a storable entry.
     fn current_image_scene(&self) -> Option<ImageScene> {
         Some(ImageScene {
+            original_capture: self.original_capture.clone(),
+            source_crop: self.source_crop,
             path: self.captured_path.clone()?,
             processed_path: self.processed_capture_path.clone(),
             dimensions: self.captured_dimensions?,
@@ -1443,6 +1445,9 @@ impl Studio {
         };
         self.stop_editing_text();
         self.image_scene_index = index;
+        self.original_capture = scene.original_capture;
+        self.source_crop = scene.source_crop;
+        self.crop_session = None;
         self.captured_path = Some(scene.path);
         self.processed_capture_path = scene.processed_path;
         self.captured_dimensions = Some(scene.dimensions);
@@ -1531,6 +1536,8 @@ impl Studio {
         let dimensions = (image.width(), image.height());
         let rgba = Arc::new(image.clone());
         self.image_scenes.push(ImageScene {
+            original_capture: None,
+            source_crop: super::CropRect::UNIT,
             path,
             processed_path: None,
             dimensions,

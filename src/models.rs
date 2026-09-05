@@ -142,6 +142,8 @@ impl Default for AnnotationMark {
 /// bring it back, stored while another image is being edited.
 #[derive(Clone)]
 pub(crate) struct ImageScene {
+    pub(crate) original_capture: Option<CropSnapshot>,
+    pub(crate) source_crop: CropRect,
     pub(crate) path: PathBuf,
     pub(crate) processed_path: Option<PathBuf>,
     pub(crate) dimensions: (u32, u32),
@@ -228,6 +230,7 @@ pub(crate) enum CropDrag {
 
 #[derive(Clone)]
 pub(crate) struct CropSnapshot {
+    pub(crate) source_crop: CropRect,
     pub(crate) path: PathBuf,
     pub(crate) dimensions: (u32, u32),
     pub(crate) annotations: Vec<AnnotationMark>,

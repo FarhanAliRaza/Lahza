@@ -517,6 +517,9 @@ impl Studio {
                 self.annotations.clear();
                 self.undo_stack.clear();
                 self.redo_stack.clear();
+                self.original_capture = None;
+                self.source_crop = CropRect::UNIT;
+                self.crop_session = None;
                 self.crop_undo_stack.clear();
                 self.crop_redo_stack.clear();
                 self.crop_active = false;

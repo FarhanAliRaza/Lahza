@@ -9,14 +9,14 @@ use gpui::{
 };
 
 use crate::{
-    blue, crop_rect_with_aspect, ink, line,
+    blue, ink, line,
     motion_ui::{ANIMATION_DURATIONS, BORDER_COLORS},
     muted, panel,
     recording::{
         clips::ClipEdge, scene::WindowFrame, viewport::MotionPreset,
     },
     scene_ui::{SceneSelection, SceneSlider},
-    timestamped_export_name, CropRect, Studio, Tool, VideoMoveDrag,
+    timestamped_export_name, Studio, Tool, VideoMoveDrag,
 };
 
 pub(crate) const INSPECTOR_WIDTH: f32 = 316.0;
@@ -464,10 +464,7 @@ impl Studio {
             })
             .child(
                 text_button("crop-reset", "Reset").on_click(cx.listener(|this, _, _, cx| {
-                    this.crop_rect = CropRect::UNIT;
-                    if let Some(ratio) = this.crop_normalized_aspect() {
-                        this.crop_rect = crop_rect_with_aspect(this.crop_rect, ratio);
-                    }
+                    this.reset_crop();
                     cx.notify();
                 })),
             )
@@ -532,14 +529,35 @@ impl Studio {
             )
             .child(divider())
             .when(!self.crop_active, |this| {
-                this.child(self.bar_button(
-                    "bar-record-new",
-                    "icons/record.svg",
-                    Some("Create something new"),
-                    true,
-                    cx,
-                    |this, _, cx| this.open_recorder_window(cx),
-                ))
+                this.child(
+                    div()
+                        .id("bar-record-new")
+                        .ml_2()
+                        .px_3()
+                        .h(px(32.0))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .rounded_md()
+                        .bg(blue())
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x0077e6)))
+                        .child(
+                            svg()
+                                .path("icons/record.svg")
+                                .size(px(17.0))
+                                .text_color(rgb(0xffffff)),
+                        )
+                        .child("Create something new")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_recorder_window(cx);
+                            cx.notify();
+                        })),
+                )
             });
 
         let right = div()

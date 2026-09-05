@@ -40,7 +40,7 @@ mod timed;
 mod video;
 
 use annotations::{annotations_svg, paint_annotation, paint_highlights};
-use crop::{crop_rect_with_aspect, paint_crop_overlay};
+use crop::paint_crop_overlay;
 use models::{
     AnnotationMark, AnnotationWorkspace, CropDrag, CropHandle, CropRect, CropSnapshot, ImageScene,
     NormPoint, Tool, VideoEditSnapshot, VideoMoveDrag, VideoTrimDrag, VideoZoomDrag,
@@ -379,6 +379,9 @@ struct Studio {
     border_opacity: u8,
     border: bool,
     window_frame: WindowFrame,
+    original_capture: Option<CropSnapshot>,
+    source_crop: CropRect,
+    crop_session: Option<CropSnapshot>,
     crop_active: bool,
     crop_rect: CropRect,
     crop_aspect: usize,
@@ -650,6 +653,9 @@ impl Studio {
             border_opacity: 30,
             border: false,
             window_frame: WindowFrame::Off,
+            original_capture: None,
+            source_crop: CropRect::UNIT,
+            crop_session: None,
             crop_active: false,
             crop_rect: CropRect::UNIT,
             crop_aspect: 0,

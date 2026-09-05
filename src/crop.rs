@@ -4,6 +4,29 @@ use super::annotations::{norm_to_screen, screen_to_norm};
 use super::{CropDrag, CropHandle, CropRect, CropSnapshot, NormPoint, Studio, CROP_HANDLES};
 use gpui::{hsla, point, px, quad, rgb, size, Bounds, Pixels, Point, Window};
 
+fn normalized_aspect(aspect: usize, (width, height): (u32, u32)) -> Option<f32> {
+    let pixel_ratio = match aspect {
+        1 => return Some(1.0),
+        2 => 1.0,
+        3 => 16.0 / 9.0,
+        4 => 9.0 / 16.0,
+        5 => 4.0 / 3.0,
+        6 => 3.0 / 2.0,
+        _ => return None,
+    };
+    Some(pixel_ratio * height.max(1) as f32 / width.max(1) as f32)
+}
+
+fn select_aspect(rect: CropRect, aspect: Option<f32>) -> CropRect {
+    // Presets always fit the source, never the previously selected preset.
+    aspect.map_or(rect, |ratio| crop_rect_with_aspect(CropRect::UNIT, ratio))
+}
+
+fn remap_point(point: &mut NormPoint, from: CropRect, to: CropRect) {
+    point.x = (from.x + point.x * from.width - to.x) / to.width;
+    point.y = (from.y + point.y * from.height - to.y) / to.height;
+}
+
 fn crop_handle_point(handle: CropHandle, rect: CropRect) -> NormPoint {
     let (x, y) = match handle {
         CropHandle::TopLeft => (rect.x, rect.y),
@@ -243,17 +266,7 @@ pub(super) fn paint_crop_overlay(
 
 impl Studio {
     pub(super) fn crop_normalized_aspect(&self) -> Option<f32> {
-        let (width, height) = self.captured_dimensions?;
-        let pixel_ratio = match self.crop_aspect {
-            1 => width as f32 / height.max(1) as f32,
-            2 => 1.0,
-            3 => 16.0 / 9.0,
-            4 => 9.0 / 16.0,
-            5 => 4.0 / 3.0,
-            6 => 3.0 / 2.0,
-            _ => return None,
-        };
-        Some(pixel_ratio * height as f32 / width.max(1) as f32)
+        normalized_aspect(self.crop_aspect, self.captured_dimensions?)
     }
 
     pub(super) fn begin_crop(&mut self) {
@@ -261,10 +274,36 @@ impl Studio {
             self.toast = Some("Capture an image first".into());
             return;
         }
+        if self.crop_active {
+            return;
+        }
         self.stop_editing_text();
         self.selected_annotation = None;
         self.annotation_draft = None;
-        self.crop_rect = CropRect::UNIT;
+        let Some(current) = self.current_crop_snapshot() else {
+            return;
+        };
+        let selection = self.source_crop;
+        if let Some(mut original) = self.original_capture.clone() {
+            original.annotations = self.annotations.clone();
+            for mark in &mut original.annotations {
+                let remap = |point: &mut NormPoint| {
+                    remap_point(point, selection, CropRect::UNIT);
+                };
+                remap(&mut mark.start);
+                remap(&mut mark.end);
+                for point in &mut mark.points {
+                    remap(point);
+                }
+            }
+            if !self.restore_crop_snapshot(original) {
+                return;
+            }
+        } else {
+            self.original_capture = Some(current.clone());
+        }
+        self.crop_session = Some(current);
+        self.crop_rect = selection;
         self.crop_aspect = 0;
         self.crop_drag = None;
         self.crop_active = true;
@@ -272,6 +311,9 @@ impl Studio {
     }
 
     pub(super) fn cancel_crop(&mut self) {
+        if let Some(snapshot) = self.crop_session.take() {
+            self.restore_crop_snapshot(snapshot);
+        }
         self.crop_active = false;
         self.crop_rect = CropRect::UNIT;
         self.crop_aspect = 0;
@@ -282,9 +324,16 @@ impl Studio {
 
     pub(super) fn set_crop_aspect(&mut self, aspect: usize) {
         self.crop_aspect = aspect;
-        if let Some(ratio) = self.crop_normalized_aspect() {
-            self.crop_rect = crop_rect_with_aspect(self.crop_rect, ratio);
-        }
+        self.crop_rect = select_aspect(self.crop_rect, self.crop_normalized_aspect());
+        self.crop_drag = None;
+        self.pointer_is_down = false;
+    }
+
+    pub(super) fn reset_crop(&mut self) {
+        self.crop_rect = CropRect::UNIT;
+        self.crop_aspect = 0;
+        self.crop_drag = None;
+        self.pointer_is_down = false;
     }
 
     pub(super) fn crop_pointer_down(&mut self, position: Point<Pixels>, image: Bounds<Pixels>) {
@@ -382,7 +431,13 @@ impl Studio {
             .ceil()
             .clamp((top + 1) as f32, old_height as f32) as u32;
         if left == 0 && top == 0 && right == old_width && bottom == old_height {
-            self.cancel_crop();
+            if let Some(previous) = self.crop_session.take() {
+                self.crop_undo_stack.push(previous);
+                self.crop_redo_stack.clear();
+            }
+            self.crop_active = false;
+            self.reset_crop();
+            self.toast = Some("Original image restored".into());
             return Ok(());
         }
         let cropped =
@@ -390,7 +445,7 @@ impl Studio {
         let destination = std::env::temp_dir().join(format!(
             "lahza-crop-{}-{}.png",
             std::process::id(),
-            self.effect_revision + 1
+            uuid::Uuid::new_v4()
         ));
         cropped
             .save(&destination)
@@ -401,16 +456,18 @@ impl Studio {
             width: (right - left) as f32 / old_width as f32,
             height: (bottom - top) as f32 / old_height as f32,
         };
-        self.crop_undo_stack.push(CropSnapshot {
-            path: source.clone(),
-            dimensions: (old_width, old_height),
-            annotations: self.annotations.clone(),
-        });
+        if let Some(previous) = self
+            .crop_session
+            .take()
+            .or_else(|| self.current_crop_snapshot())
+        {
+            self.crop_undo_stack.push(previous);
+        }
+        self.source_crop = used;
         self.crop_redo_stack.clear();
         for mark in &mut self.annotations {
             let remap = |point: &mut NormPoint| {
-                point.x = (point.x - used.x) / used.width;
-                point.y = (point.y - used.y) / used.height;
+                remap_point(point, CropRect::UNIT, used);
             };
             remap(&mut mark.start);
             remap(&mut mark.end);
@@ -434,6 +491,7 @@ impl Studio {
 
     fn current_crop_snapshot(&self) -> Option<CropSnapshot> {
         Some(CropSnapshot {
+            source_crop: self.source_crop,
             path: self.captured_path.clone()?,
             dimensions: self.captured_dimensions?,
             annotations: self.annotations.clone(),
@@ -448,6 +506,7 @@ impl Studio {
                 return false;
             }
         };
+        self.source_crop = snapshot.source_crop;
         self.captured_path = Some(snapshot.path);
         self.captured_dimensions = Some(snapshot.dimensions);
         self.annotations = snapshot.annotations;
@@ -487,6 +546,52 @@ mod tests {
     use super::{
         crop_rect_with_aspect, move_crop_rect, resize_crop_rect, CropHandle, CropRect, NormPoint,
     };
+
+    #[test]
+    fn switching_presets_repeatedly_uses_the_full_source() {
+        for dimensions in [(1600, 900), (900, 1600), (800, 800)] {
+            let mut rect = CropRect::UNIT;
+            for _ in 0..30 {
+                for preset in [2, 3, 4, 5, 6, 1] {
+                    let ratio = super::normalized_aspect(preset, dimensions).unwrap();
+                    rect = super::select_aspect(rect, Some(ratio));
+                    assert!((rect.width / rect.height - ratio).abs() < 0.0001);
+                    assert!(rect.width == 1.0 || rect.height == 1.0);
+                    assert!(rect.right() <= 1.0 && rect.bottom() <= 1.0);
+                }
+                assert_eq!(rect.width, 1.0);
+                assert_eq!(rect.height, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn annotations_round_trip_between_original_and_successive_crops() {
+        let crops = [
+            CropRect {
+                x: 0.1,
+                y: 0.2,
+                width: 0.5,
+                height: 0.6,
+            },
+            CropRect {
+                x: 0.3,
+                y: 0.1,
+                width: 0.4,
+                height: 0.3,
+            },
+        ];
+        // Also retain marks outside the visible crop so reset reveals them.
+        for original in [NormPoint { x: 0.4, y: 0.5 }, NormPoint { x: 0.95, y: 0.05 }] {
+            let mut point = original;
+            for crop in crops {
+                super::remap_point(&mut point, CropRect::UNIT, crop);
+                super::remap_point(&mut point, crop, CropRect::UNIT);
+                assert!((point.x - original.x).abs() < 0.0001);
+                assert!((point.y - original.y).abs() < 0.0001);
+            }
+        }
+    }
 
     #[test]
     fn crop_aspect_and_handles_stay_inside_image() {
