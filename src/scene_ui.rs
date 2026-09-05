@@ -986,7 +986,7 @@ impl Studio {
                 ))
                 .child(self.segmented(
                     "camera-shape",
-                    &["Circle", "Rounded", "Square"],
+                    &["Circle", "Squircle", "Square"],
                     shape_index,
                     |this, index| {
                         this.camera_overlay.shape = crate::recording::scene::CameraShape::ALL[index]

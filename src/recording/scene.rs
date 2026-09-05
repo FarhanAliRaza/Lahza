@@ -180,21 +180,21 @@ impl Default for Watermark {
 pub enum CameraShape {
     #[default]
     Circle,
-    Rounded,
+    Squircle,
     Square,
 }
 
 impl CameraShape {
     pub const ALL: [CameraShape; 3] = [
         CameraShape::Circle,
-        CameraShape::Rounded,
+        CameraShape::Squircle,
         CameraShape::Square,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             CameraShape::Circle => "Circle",
-            CameraShape::Rounded => "Rounded",
+            CameraShape::Squircle => "Squircle",
             CameraShape::Square => "Square",
         }
     }
@@ -257,7 +257,7 @@ impl CameraOverlay {
     pub fn radius(&self, rect: Rect) -> f64 {
         match self.shape {
             CameraShape::Circle => rect.width * 0.5,
-            CameraShape::Rounded => rect.width * 0.18,
+            CameraShape::Squircle => rect.width * 0.18,
             CameraShape::Square => rect.width * 0.03,
         }
     }

@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use gpui::{
-    anchored, canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
+    canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
     rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp, WindowHandle,
     Background, Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle,
     FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -45,7 +45,7 @@ use recording::{
     export::{ExportFormat, ExportProgress, ExportResolution},
     model::{PointerCaptureFile, RecordingSession},
     camera_preview::{CameraFrames, CameraPreview},
-    native::{audio_sources, AudioSource, camera_devices, microphone_devices, NativeRecorder, RecordingOptions},
+    native::{camera_devices, microphone_devices, NativeRecorder, RecordingOptions},
     pointer_timeline::PointerTimeline,
     presets::PresetLibrary,
     scene::{CameraOverlay, PointerStyle, SceneStyle, SceneTransform, Watermark, WindowFrame},
@@ -1336,6 +1336,7 @@ struct Studio {
     /// The studio is still in the launcher's compact window and must move to
     /// an editor-sized one when the editor first renders.
     launcher_window: bool,
+    recorder_window: Option<WindowHandle<Studio>>,
     launcher_tab: usize,
     library_state: launcher_library::LibraryState,
     recent_projects: Vec<PathBuf>,
@@ -1368,7 +1369,6 @@ struct Studio {
     /// `(source name, display name)` of every microphone, refreshed with the launcher.
     microphone_devices: Vec<(String, String)>,
     launcher_mic_menu_open: bool,
-    microphone_picker: Option<Vec<AudioSource>>,
     record_camera: bool,
     /// Selected webcam device node; `None` uses the first webcam found.
     camera_device: Option<String>,
@@ -1587,6 +1587,7 @@ impl Studio {
         window_handle: AnyWindowHandle,
         initial_recording: Option<PathBuf>,
         initial_image: Option<PathBuf>,
+        register_shortcuts: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let caret_blink_task = cx.spawn(async move |weak, cx| loop {
@@ -1606,6 +1607,9 @@ impl Studio {
             }
         });
         let global_shortcut_task = cx.spawn(async move |weak, cx| {
+            if !register_shortcuts {
+                return;
+            }
             let result: Result<(), String> = async {
                 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 
@@ -1637,12 +1641,6 @@ impl Studio {
                 })?;
                 let shortcut_description = binding.trigger_description().to_string();
                 eprintln!("Global screenshot shortcut active: {shortcut_description}");
-                let _ = weak.update(cx, |this, cx| {
-                    this.toast = Some(
-                        format!("Global capture shortcut active: {shortcut_description}").into(),
-                    );
-                    cx.notify();
-                });
 
                 let mut activated = portal
                     .receive_activated()
@@ -1715,6 +1713,7 @@ impl Studio {
             window_handle,
             launcher_active: initial_recording.is_none() && initial_image.is_none(),
             launcher_window: initial_recording.is_none() && initial_image.is_none(),
+            recorder_window: None,
             launcher_tab: 0,
             library_state: launcher_library::LibraryState::default(),
             recent_projects: Vec::new(),
@@ -1745,7 +1744,6 @@ impl Studio {
             microphone_device: None,
             microphone_devices: microphone_devices(),
             launcher_mic_menu_open: false,
-            microphone_picker: None,
             record_camera: false,
             camera_device: None,
             camera_devices: camera_devices(),
@@ -3300,103 +3298,6 @@ impl Studio {
     }
 
     /// Modal that previews a clip speed change before rendering it once.
-    /// The transparent layer that closes the microphone menu on an outside click.
-    fn microphone_menu_backdrop(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.microphone_picker.as_ref()?;
-        Some(
-            div()
-                .id("record-microphone-backdrop")
-                .absolute()
-                .inset_0()
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _, _| {})
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.microphone_picker = None;
-                    cx.notify();
-                }))
-                .into_any_element(),
-        )
-    }
-
-    /// The dropdown under the mic button: off, the system default, or a device.
-    fn microphone_menu(&self, sources: &[AudioSource], cx: &mut Context<Self>) -> AnyElement {
-        // `None` for the whole option is "no microphone".
-        let mut choices: Vec<(Option<Option<String>>, String)> = vec![
-            (None, "No microphone".to_string()),
-            (
-                Some(None),
-                sources
-                    .iter()
-                    .find(|source| source.is_default)
-                    .map(|source| format!("System default · {}", source.description))
-                    .unwrap_or_else(|| "System default".to_string()),
-            ),
-        ];
-        choices.extend(
-            sources
-                .iter()
-                .map(|source| (Some(Some(source.name.clone())), source.description.clone())),
-        );
-        let current = self
-            .record_microphone
-            .then(|| self.microphone_device.clone());
-        div()
-            .id("record-microphone-menu")
-            .occlude()
-            .min_w(px(260.0))
-            .p_1()
-            .flex()
-            .flex_col()
-            .rounded_lg()
-            .bg(rgb(0xffffff))
-            .border_1()
-            .border_color(line())
-            .shadow_lg()
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .children(
-                choices
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (choice, label))| {
-                        let selected = choice == current;
-                        let chosen_label = label.clone();
-                        div()
-                            .id(("record-microphone-option", index))
-                            .px_3()
-                            .h(px(32.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .rounded_md()
-                            .text_sm()
-                            .whitespace_nowrap()
-                            .cursor_pointer()
-                            .when(selected, |this| this.text_color(blue()))
-                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                match &choice {
-                                    None => this.record_microphone = false,
-                                    Some(device) => {
-                                        this.record_microphone = true;
-                                        this.microphone_device = device.clone();
-                                        if let Some(name) = device.as_ref() {
-                                            if !this.microphone_devices.iter().any(|(id, _)| id == name) {
-                                                this.microphone_devices.push((name.clone(), chosen_label.clone()));
-                                            }
-                                        }
-                                    }
-                                }
-                                this.microphone_picker = None;
-                                cx.notify();
-                            }))
-                            .child(label)
-                            .when(selected, |this| this.child("✓"))
-                    }),
-            )
-            .into_any_element()
-    }
-
     fn video_speed_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let draft = self.video_speed_draft?;
         let selected = self.video_selected_clip?;
@@ -5555,315 +5456,6 @@ impl Studio {
     }
 
     /// A toolbar toggle for one recording source (system audio, mic, webcam).
-    fn record_source_toggle(
-        &self,
-        id: &'static str,
-        icon: &'static str,
-        enabled: bool,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .id(id)
-            .h(px(34.0))
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_1()
-            .rounded_lg()
-            .text_xs()
-            .cursor_pointer()
-            .bg(if enabled {
-                rgb(0xe5f2ff)
-            } else {
-                rgb(0xf3f3f4)
-            })
-            .border_1()
-            .border_color(if enabled { blue() } else { line() })
-            .child(svg().path(icon).size(px(15.0)).text_color(if enabled {
-                blue()
-            } else {
-                muted()
-            }))
-            .on_click(on_click)
-    }
-
-    /// The mic button: shows the selected input and opens the device menu.
-    fn microphone_select(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled = self.record_microphone;
-        let label: SharedString = if !enabled {
-            "No mic".into()
-        } else {
-            match &self.microphone_device {
-                None => "Default mic".into(),
-                Some(name) => self
-                    .microphone_devices
-                    .iter()
-                    .find(|(device, _)| device == name)
-                    .map(|(_, label)| label.clone())
-                    .unwrap_or_else(|| name.clone())
-                    .into(),
-            }
-        };
-        div()
-            .id("record-microphone")
-            .h(px(34.0))
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_1()
-            .rounded_lg()
-            .text_xs()
-            .cursor_pointer()
-            .bg(if enabled {
-                rgb(0xe5f2ff)
-            } else {
-                rgb(0xf3f3f4)
-            })
-            .border_1()
-            .border_color(if enabled { blue() } else { line() })
-            .text_color(if enabled { blue() } else { muted() })
-            .child(
-                svg()
-                    .path("icons/microphone.svg")
-                    .size(px(15.0))
-                    .text_color(if enabled { blue() } else { muted() }),
-            )
-            .child(
-                div()
-                    .max_w(px(160.0))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(label),
-            )
-            .child(div().text_color(muted()).child("▾"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.microphone_picker = if this.microphone_picker.is_some() {
-                    None
-                } else {
-                    Some(audio_sources())
-                };
-                cx.notify();
-            }))
-            .when_some(self.microphone_picker.as_ref(), |this, sources| {
-                this.child(
-                    gpui::deferred(
-                        anchored()
-                            .offset(point(px(0.0), px(38.0)))
-                            .snap_to_window_with_margin(px(8.0))
-                            .child(self.microphone_menu(sources, cx)),
-                    )
-                    .with_priority(2),
-                )
-            })
-    }
-
-    fn recording_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.recording_state == RecordingState::Idle {
-            return div()
-                .id("recording-setup-controls")
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(self.record_source_toggle(
-                    "record-system-audio",
-                    "icons/volume.svg",
-                    self.record_system_audio,
-                    cx.listener(|this, _, _, cx| {
-                        this.record_system_audio = !this.record_system_audio;
-                        cx.notify();
-                    }),
-                ))
-                .child(self.microphone_select(cx))
-                .child(self.record_source_toggle(
-                    "record-camera",
-                    "icons/video.svg",
-                    self.record_camera,
-                    cx.listener(|this, _, _, cx| {
-                        this.record_camera = !this.record_camera;
-                        this.sync_camera_preview(cx);
-                        cx.notify();
-                    }),
-                ))
-                .child(
-                    div()
-                        .id("toolbar-record")
-                        .h(px(36.0))
-                        .px_3()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .rounded_lg()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0xffe9eb)))
-                        .child(
-                            svg()
-                                .path("icons/record.svg")
-                                .size(px(17.0))
-                                .text_color(rgb(0xe33442)),
-                        )
-                        .child("Record")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.start_recording(cx);
-                            cx.notify();
-                        })),
-                );
-        }
-
-        let paused = self.recording_state == RecordingState::Paused;
-        let settling = self.recording_busy
-            || matches!(
-                self.recording_state,
-                RecordingState::Starting | RecordingState::Finishing
-            );
-        let status = match self.recording_state {
-            RecordingState::Starting => "Starting…".to_string(),
-            RecordingState::Finishing => "Saving…".to_string(),
-            _ => self.recording_timecode(),
-        };
-        let icon_color = if settling {
-            Hsla::from(rgb(0xa4a6aa))
-        } else {
-            ink()
-        };
-
-        div()
-            .id("recording-controls")
-            .h(px(40.0))
-            .px_2()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1()
-            .rounded_lg()
-            .bg(rgb(0xf3f3f4))
-            .border_1()
-            .border_color(line())
-            .child(
-                div()
-                    .w(px(10.0))
-                    .h(px(10.0))
-                    .rounded_full()
-                    .bg(if paused || settling {
-                        rgb(0x9c9fa4)
-                    } else {
-                        rgb(0xe33442)
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(62.0))
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(status),
-            )
-            .child(
-                div()
-                    .id("recording-pause-resume")
-                    .size(px(30.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(!settling, |this| {
-                        this.cursor_pointer().hover(|style| style.bg(rgb(0xe3e4e6)))
-                    })
-                    .child(
-                        svg()
-                            .path(if paused {
-                                "icons/play.svg"
-                            } else {
-                                "icons/pause.svg"
-                            })
-                            .size(px(16.0))
-                            .text_color(icon_color),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.run_recording_action(
-                            if paused {
-                                RecordingAction::Resume
-                            } else {
-                                RecordingAction::Pause
-                            },
-                            cx,
-                        );
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("recording-restart")
-                    .size(px(30.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(!settling, |this| {
-                        this.cursor_pointer().hover(|style| style.bg(rgb(0xe3e4e6)))
-                    })
-                    .child(
-                        svg()
-                            .path("icons/restart.svg")
-                            .size(px(16.0))
-                            .text_color(icon_color),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.run_recording_action(RecordingAction::Restart, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("recording-stop")
-                    .size(px(30.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(!settling, |this| {
-                        this.cursor_pointer().hover(|style| style.bg(rgb(0xe3e4e6)))
-                    })
-                    .child(
-                        svg()
-                            .path("icons/stop.svg")
-                            .size(px(16.0))
-                            .text_color(icon_color),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.run_recording_action(RecordingAction::Stop, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("recording-discard")
-                    .size(px(30.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(!settling, |this| {
-                        this.cursor_pointer().hover(|style| style.bg(rgb(0xffe4e6)))
-                    })
-                    .child(
-                        svg()
-                            .path("icons/trash.svg")
-                            .size(px(16.0))
-                            .text_color(if settling {
-                                icon_color
-                            } else {
-                                Hsla::from(rgb(0xd62f3d))
-                            }),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.run_recording_action(RecordingAction::Discard, cx);
-                        cx.notify();
-                    })),
-            )
-    }
-
     fn fill_picker(&self, cx: &mut Context<Self>) -> gpui::Div {
         let grid = div().flex().flex_none().flex_wrap().gap_2().w_full();
         match self.wallpaper_tab {
@@ -6880,9 +6472,6 @@ impl Studio {
             .when_some(speed_dialog, |this, dialog| {
                 this.child(gpui::deferred(dialog).with_priority(1))
             })
-            .when_some(self.microphone_menu_backdrop(cx), |this, backdrop| {
-                this.child(gpui::deferred(backdrop).with_priority(1))
-            })
             .into_any_element()
     }
 }
@@ -7074,6 +6663,51 @@ impl Studio {
                 )
             })
             .into_any_element()
+    }
+
+    /// A separate studio owns the capture so opening or finishing it cannot
+    /// replace the project currently being edited in this window.
+    fn open_recorder_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.recorder_window {
+            let activated = handle.update(cx, |studio, window, _| {
+                if !studio.launcher_active {
+                    return false;
+                }
+                window.activate_window();
+                true
+            });
+            if activated.unwrap_or(false) {
+                cx.activate(true);
+                return;
+            }
+        }
+        self.pause_video_playback();
+        self.finish_annotation_interaction();
+        let options = RecordingOptions {
+            system_audio: self.record_system_audio,
+            microphone: self.record_microphone,
+            microphone_device: self.microphone_device.clone(),
+            camera: self.record_camera,
+            camera_device: self.camera_device.clone(),
+        };
+        match open_studio_window(cx, false, move |window_handle, cx| {
+            cx.new(|cx| {
+                let mut studio = Studio::new(window_handle, None, None, false, cx);
+                studio.record_system_audio = options.system_audio;
+                studio.record_microphone = options.microphone;
+                studio.microphone_device = options.microphone_device;
+                studio.record_camera = options.camera;
+                studio.camera_device = options.camera_device;
+                studio
+            })
+        }) {
+            Ok(handle) => {
+                self.recorder_window = Some(handle);
+                cx.activate(true);
+            }
+            Err(error) => self.toast = Some(format!("Could not open recorder: {error}").into()),
+        }
+        cx.notify();
     }
 
     fn render_launcher(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -7493,9 +7127,6 @@ impl Render for Studio {
                     )
                     .when_some(sidebar, |this, sidebar| this.child(sidebar)),
             )
-            .when_some(self.microphone_menu_backdrop(cx), |this, backdrop| {
-                this.child(gpui::deferred(backdrop).with_priority(1))
-            })
             .into_any_element()
     }
 }
@@ -7586,6 +7217,7 @@ fn main() {
                         window_handle,
                         initial_recording.clone(),
                         initial_image.clone(),
+                        true,
                         cx,
                     )
                 })

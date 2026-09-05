@@ -13,7 +13,7 @@ use crate::{
     motion_ui::{ANIMATION_DURATIONS, BORDER_COLORS},
     muted, panel,
     recording::{
-        clips::ClipEdge, scene::WindowFrame, session::RecordingState, viewport::MotionPreset,
+        clips::ClipEdge, scene::WindowFrame, viewport::MotionPreset,
     },
     scene_ui::{SceneSelection, SceneSlider},
     timestamped_export_name, CropRect, Studio, Tool, VideoMoveDrag,
@@ -150,17 +150,24 @@ impl Studio {
                 }
             }
             EditorMode::Motion => {
+                // Videos already have a motion timeline. Open its controls
+                // without switching to screenshot animation or closing it.
+                if self.video_project.is_some() {
+                    self.select_inspector_tab(InspectorTab::Motion);
+                    self.inspector_visible = true;
+                    cx.notify();
+                    return;
+                }
                 if self.captured_path.is_none() {
                     self.toast = Some("Capture an image first".into());
                     cx.notify();
                     return;
                 }
-                if self.video_project.is_some() {
-                    self.close_video_editor(cx);
-                }
                 if !self.animation_active {
                     self.toggle_animation(cx);
                 }
+                self.select_inspector_tab(InspectorTab::Motion);
+                self.inspector_visible = true;
             }
             EditorMode::Video => match self.last_video_project.clone() {
                 Some(directory) => {
@@ -516,7 +523,6 @@ impl Studio {
 
     pub(crate) fn top_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.editor_mode();
-        let recording = self.recording_state != RecordingState::Idle;
         let export_busy = self.export_progress.is_some();
         let can_undo = self.can_undo();
         let can_redo = self.can_redo();
@@ -545,33 +551,15 @@ impl Studio {
                     }),
             )
             .child(divider())
-            .when(!recording && !self.crop_active, |this| {
+            .when(!self.crop_active, |this| {
                 this.child(self.bar_button(
-                    "bar-open",
-                    "icons/folder.svg",
-                    Some("Open"),
+                    "bar-record-new",
+                    "icons/record.svg",
+                    Some("Record new"),
                     true,
                     cx,
-                    |this, _, cx| this.open_video_project_dialog(cx),
+                    |this, _, cx| this.open_recorder_window(cx),
                 ))
-                .child(self.bar_button(
-                    "bar-capture",
-                    "icons/capture.svg",
-                    Some(if self.capturing {
-                        "Capturing…"
-                    } else {
-                        "Capture"
-                    }),
-                    !self.capturing,
-                    cx,
-                    |this, _, cx| {
-                        this.stop_editing_text();
-                        this.begin_screen_capture(cx);
-                    },
-                ))
-            })
-            .when(!self.crop_active, |this| {
-                this.child(self.recording_controls(cx))
             });
 
         let right = div()
@@ -705,7 +693,9 @@ impl Studio {
         } else if self.selected_annotation.is_some() || self.tool != Tool::Select {
             InspectorTab::Annotate
         } else if self.scene_selection == SceneSelection::Media {
-            InspectorTab::Design
+            // Transform lives in Motion; static mode has no Motion tab and
+            // falls back to Design below.
+            InspectorTab::Motion
         } else {
             self.inspector_tab
         };
@@ -824,7 +814,12 @@ impl Studio {
     }
 
     fn design_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let transform = self.transform_inspector(cx);
+        // Transform only surfaces here in static mode, where Motion is absent.
+        let transform = if self.editor_mode() == EditorMode::Static {
+            self.transform_inspector(cx)
+        } else {
+            None
+        };
         let wallpaper_tab = self.wallpaper_tab;
         let border = self.border;
         let watermark = self.watermark_enabled;
@@ -1227,10 +1222,12 @@ impl Studio {
     fn motion_tab(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.editor_mode();
         let region = self.motion_inspector(cx);
+        let transform = self.transform_inspector(cx);
         div()
             .flex()
             .flex_col()
             .gap_3()
+            .when_some(transform, |this, panel| this.child(panel))
             .when_some(region, |this, panel| this.child(panel))
             .when(mode == EditorMode::Motion, |this| {
                 this.child(self.animation_settings(cx))
