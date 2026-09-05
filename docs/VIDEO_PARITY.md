@@ -15,7 +15,6 @@ preview, and exported output must agree.
 - [ ] A recording that started is never silently lost after an encoder,
   compositor, display, sleep, or disk error.
 - [ ] Stop opens a persistent project without forcing a flattened export.
-- [ ] Global shortcut can start capture while the editor is unfocused.
 
 ## Project package
 

@@ -1,4 +1,3 @@
-use futures_util::StreamExt;
 use gpui::{
     canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
     rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp, WindowHandle,
@@ -32,6 +31,7 @@ mod scene_ui;
 mod shell_ui;
 mod template_ui;
 mod timed;
+mod notifications;
 
 use scene_ui::{AnnotationDrag, MediaDrag, PreviewCache, SceneSelection};
 use serde::{Deserialize, Serialize};
@@ -317,7 +317,6 @@ const GRADIENT_BACKGROUNDS: [GradientPreset; 16] = [
 struct BackgroundPreset {
     name: &'static str,
     wallpaper_tab: usize,
-    library_tab: usize,
     wallpaper_asset: &'static str,
     color_index: usize,
     gradient_index: usize,
@@ -336,7 +335,6 @@ const BACKGROUND_PRESETS: [BackgroundPreset; 5] = [
     BackgroundPreset {
         name: "Frosted Lake",
         wallpaper_tab: 2,
-        library_tab: 1,
         wallpaper_asset: "wallpapers/uihssn/uihssn-2.jpeg",
         color_index: 7,
         gradient_index: 0,
@@ -353,7 +351,6 @@ const BACKGROUND_PRESETS: [BackgroundPreset; 5] = [
     BackgroundPreset {
         name: "Sunset Glass",
         wallpaper_tab: 2,
-        library_tab: 1,
         wallpaper_asset: "wallpapers/uihssn/uihssn-4.jpeg",
         color_index: 4,
         gradient_index: 4,
@@ -370,7 +367,6 @@ const BACKGROUND_PRESETS: [BackgroundPreset; 5] = [
     BackgroundPreset {
         name: "Midnight",
         wallpaper_tab: 0,
-        library_tab: 1,
         wallpaper_asset: "wallpapers/uihssn/uihssn-12.jpg",
         color_index: 0,
         gradient_index: 0,
@@ -387,7 +383,6 @@ const BACKGROUND_PRESETS: [BackgroundPreset; 5] = [
     BackgroundPreset {
         name: "Clean White",
         wallpaper_tab: 0,
-        library_tab: 1,
         wallpaper_asset: "wallpapers/uihssn/uihssn-12.jpg",
         color_index: 1,
         gradient_index: 0,
@@ -404,7 +399,6 @@ const BACKGROUND_PRESETS: [BackgroundPreset; 5] = [
     BackgroundPreset {
         name: "Aurora",
         wallpaper_tab: 1,
-        library_tab: 1,
         wallpaper_asset: "wallpapers/uihssn/uihssn-12.jpg",
         color_index: 7,
         gradient_index: 6,
@@ -420,7 +414,7 @@ const BACKGROUND_PRESETS: [BackgroundPreset; 5] = [
     },
 ];
 
-const UIHSSN_WALLPAPERS: [&str; 12] = [
+const CURATED_WALLPAPERS: [&str; 17] = [
     "wallpapers/uihssn/uihssn-2.jpeg",
     "wallpapers/uihssn/uihssn-3.jpeg",
     "wallpapers/uihssn/uihssn-4.jpeg",
@@ -433,9 +427,6 @@ const UIHSSN_WALLPAPERS: [&str; 12] = [
     "wallpapers/uihssn/uihssn-12.jpg",
     "wallpapers/uihssn/uihssn-13.jpg",
     "wallpapers/uihssn/uihssn-14.jpg",
-];
-
-const FAYAZ_WALLPAPERS: [&str; 5] = [
     "wallpapers/fayaz/blue-skies.jpg",
     "wallpapers/fayaz/canyon.jpg",
     "wallpapers/fayaz/golden-gate-bridge.jpg",
@@ -1364,7 +1355,6 @@ struct Studio {
     editing_text: Option<usize>,
     caret_visible: bool,
     _caret_blink_task: Task<()>,
-    _global_shortcut_task: Task<()>,
     _recording_clock_task: Task<()>,
     recording_controller: Option<RecordingController<NativeRecorder>>,
     recording_state: RecordingState,
@@ -1491,7 +1481,6 @@ struct Studio {
     image_scene_index: usize,
     focus_handle: FocusHandle,
     wallpaper_tab: usize,
-    library_tab: usize,
     color_index: usize,
     gradient_index: usize,
     wallpaper_asset: &'static str,
@@ -1534,7 +1523,9 @@ struct Studio {
     selection_last_point: Option<Point<Pixels>>,
     selection_resizing: bool,
     pointer_is_down: bool,
-    toast: Option<SharedString>,
+    toast: Option<notifications::Notification>,
+    toast_timer: Option<Task<()>>,
+    toast_timer_id: Option<u64>,
     slider_drag: Option<SliderDrag>,
 }
 
@@ -1597,7 +1588,6 @@ impl Studio {
         window_handle: AnyWindowHandle,
         initial_recording: Option<PathBuf>,
         initial_image: Option<PathBuf>,
-        register_shortcuts: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let caret_blink_task = cx.spawn(async move |weak, cx| loop {
@@ -1614,96 +1604,6 @@ impl Studio {
                 .is_err()
             {
                 break;
-            }
-        });
-        let global_shortcut_task = cx.spawn(async move |weak, cx| {
-            if !register_shortcuts {
-                return;
-            }
-            let result: Result<(), String> = async {
-                use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
-
-                let app_id = ashpd::AppID::try_from("com.lahza.Lahza")
-                    .map_err(|error| error.to_string())?;
-                ashpd::register_host_app(app_id)
-                    .await
-                    .map_err(|error| format!("could not register Lahza's application ID: {error}"))?;
-                let portal = GlobalShortcuts::new()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let session = portal
-                    .create_session()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let shortcuts = [NewShortcut::new(
-                    "capture-screenshot",
-                    "Capture a screen, window, or area",
-                )
-                .preferred_trigger("CTRL+SHIFT+3")];
-                let request = portal
-                    .bind_shortcuts(&session, &shortcuts, None)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let bindings = request.response().map_err(|error| error.to_string())?;
-                let binding = bindings.shortcuts().first().ok_or_else(|| {
-                    "GNOME did not bind the requested shortcut; enable it in Settings → Keyboard → View and Customize Shortcuts"
-                        .to_string()
-                })?;
-                let shortcut_description = binding.trigger_description().to_string();
-                eprintln!("Global screenshot shortcut active: {shortcut_description}");
-
-                let mut activated = portal
-                    .receive_activated()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                while let Some(event) = activated.next().await {
-                    if event.shortcut_id() != "capture-screenshot" {
-                        continue;
-                    }
-                    let window_handle = weak
-                        .update(cx, |this, cx| {
-                            if this.capturing {
-                                return None;
-                            }
-                            this.capturing = true;
-                            this.toast = Some(
-                                "Choose a screen, window, or area in the system picker".into(),
-                            );
-                            cx.notify();
-                            Some(this.window_handle)
-                        })
-                        .ok()
-                        .flatten();
-                    let Some(window_handle) = window_handle else {
-                        continue;
-                    };
-
-                    let capture_result = capture_behind_window(Some(window_handle), cx).await;
-                    if weak
-                        .update(cx, |this, cx| {
-                            this.finish_capture_request(capture_result);
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-            .await;
-
-            if let Err(error) = result {
-                eprintln!("Global shortcut unavailable: {error}");
-                let _ = weak.update(cx, |this, cx| {
-                    this.toast = Some(
-                        format!(
-                            "Global shortcut unavailable: {error}. Capture still works from the toolbar."
-                        )
-                        .into(),
-                    );
-                    cx.notify();
-                });
             }
         });
         let recording_clock_task = cx.spawn(async move |weak, cx| loop {
@@ -1741,7 +1641,6 @@ impl Studio {
             editing_text: None,
             caret_visible: true,
             _caret_blink_task: caret_blink_task,
-            _global_shortcut_task: global_shortcut_task,
             _recording_clock_task: recording_clock_task,
             recording_controller: None,
             recording_state: RecordingState::Idle,
@@ -1848,10 +1747,9 @@ impl Studio {
             image_scene_index: 0,
             focus_handle: cx.focus_handle(),
             wallpaper_tab: 2,
-            library_tab: 1,
             color_index: 7,
             gradient_index: 0,
-            wallpaper_asset: UIHSSN_WALLPAPERS[0],
+            wallpaper_asset: CURATED_WALLPAPERS[0],
             custom_wallpaper: None,
             shadow_style: 1,
             aspect_ratio: 0,
@@ -1889,6 +1787,8 @@ impl Studio {
             selection_resizing: false,
             pointer_is_down: false,
             toast: None,
+            toast_timer: None,
+            toast_timer_id: None,
             slider_drag: None,
         };
         if let Some(path) = initial_image {
@@ -3650,7 +3550,6 @@ impl Studio {
     fn apply_background_preset(&mut self, index: usize) {
         let preset = BACKGROUND_PRESETS[index.min(BACKGROUND_PRESETS.len() - 1)];
         self.wallpaper_tab = preset.wallpaper_tab;
-        self.library_tab = preset.library_tab;
         self.wallpaper_asset = preset.wallpaper_asset;
         self.custom_wallpaper = None;
         self.color_index = preset.color_index;
@@ -5509,70 +5408,12 @@ impl Studio {
                         }))
                 },
             )),
-            _ if self.library_tab == 0 => {
-                let selected_path = self.custom_wallpaper.clone();
-                grid.when_some(selected_path, |this, path| {
-                    this.child(
-                        div()
-                            .id("recent-wallpaper")
-                            .w(px(84.0))
-                            .h(px(58.0))
-                            .rounded_lg()
-                            .overflow_hidden()
-                            .border_2()
-                            .border_color(blue())
-                            .child(img(path).size_full().object_fit(ObjectFit::Cover)),
-                    )
-                })
-                .child(
-                    div()
-                        .id("add-wallpaper")
-                        .w(px(84.0))
-                        .h(px(58.0))
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(line())
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_lg()
-                        .cursor_pointer()
-                        .child("+")
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            let prompt = cx.prompt_for_paths(PathPromptOptions {
-                                files: true,
-                                directories: false,
-                                multiple: false,
-                                prompt: Some("Choose wallpaper".into()),
-                            });
-                            cx.spawn(async move |weak, cx| {
-                                let selected = match prompt.await {
-                                    Ok(Ok(Some(paths))) => paths.into_iter().next(),
-                                    _ => None,
-                                };
-                                weak.update(cx, |this, cx| {
-                                    if let Some(path) = selected {
-                                        this.custom_wallpaper = Some(path);
-                                        this.toast = Some("Custom wallpaper selected".into());
-                                    }
-                                    cx.notify();
-                                })
-                                .ok();
-                            })
-                            .detach();
-                        })),
-                )
-            }
             _ => {
-                let paths: &'static [&'static str] = if self.library_tab == 1 {
-                    &UIHSSN_WALLPAPERS
-                } else {
-                    &FAYAZ_WALLPAPERS
-                };
+                let paths = &CURATED_WALLPAPERS;
                 grid.children(paths.iter().enumerate().map(|(index, path)| {
                     let path = *path;
                     div()
-                        .id(("wallpaper-tile", self.library_tab * 100 + index))
+                        .id(("wallpaper-tile", index))
                         .w(px(84.0))
                         .h(px(58.0))
                         .rounded_lg()
@@ -6699,7 +6540,7 @@ impl Studio {
         };
         match open_studio_window(cx, false, move |window_handle, cx| {
             cx.new(|cx| {
-                let mut studio = Studio::new(window_handle, None, None, false, cx);
+                let mut studio = Studio::new(window_handle, None, None, cx);
                 studio.record_system_audio = options.system_audio;
                 studio.record_microphone = options.microphone;
                 studio.microphone_device = options.microphone_device;
@@ -6994,8 +6835,8 @@ impl Studio {
     }
 }
 
-impl Render for Studio {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Studio {
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.drop_retired_images(window);
         self.sync_camera_preview(cx);
         if self.launcher_active {
@@ -7224,7 +7065,6 @@ fn main() {
                         window_handle,
                         initial_recording.clone(),
                         initial_image.clone(),
-                        true,
                         cx,
                     )
                 })

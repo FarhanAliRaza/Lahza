@@ -279,7 +279,9 @@ impl Studio {
             weak.update(cx, |this, cx| {
                 this.toast = Some(match selected {
                     Ok(Some(path)) => match this.render_export(&path) {
-                        Ok(()) => format!("Exported to {}", path.display()).into(),
+                        Ok(()) => crate::notifications::Notification::exported(
+                            format!("Exported to {}", path.display()), path,
+                        ),
                         Err(error) => format!("Export failed: {error}").into(),
                     },
                     Ok(None) => "Export cancelled".into(),
@@ -336,7 +338,6 @@ impl Studio {
     /// The canvas area with its overlays (zoom label, toast, export status).
     pub(crate) fn canvas_area(&self, canvas: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let export_overlay = self.export_status_overlay(cx);
-        let toast = self.toast.clone();
         div()
             .relative()
             .flex_1()
@@ -347,27 +348,6 @@ impl Studio {
             .justify_center()
             .bg(rgb(0xf3f3f4))
             .child(canvas)
-            .when_some(toast, |this, toast| {
-                this.child(
-                    div()
-                        .absolute()
-                        .bottom(px(20.0))
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .px_4()
-                                .py_2()
-                                .rounded_lg()
-                                .bg(hsla(220.0 / 360.0, 0.2, 0.12, 0.9))
-                                .text_sm()
-                                .text_color(rgb(0xffffff))
-                                .child(toast),
-                        ),
-                )
-            })
             .when_some(export_overlay, |this, overlay| this.child(overlay))
             .into_any_element()
     }
@@ -555,7 +535,7 @@ impl Studio {
                 this.child(self.bar_button(
                     "bar-record-new",
                     "icons/record.svg",
-                    Some("Record new"),
+                    Some("Create something new"),
                     true,
                     cx,
                     |this, _, cx| this.open_recorder_window(cx),
@@ -836,15 +816,6 @@ impl Studio {
                 |this, value| this.wallpaper_tab = value,
                 cx,
             ))
-            .when(wallpaper_tab == 2, |this| {
-                this.child(self.segmented(
-                    "fill-library",
-                    &["Recent", "UIHSSN", "Fayazara"],
-                    self.library_tab,
-                    |this, value| this.library_tab = value,
-                    cx,
-                ))
-            })
             .child(self.fill_picker(cx))
             .child(self.section_header("effects", "Background effects", None, cx))
             .when(self.section_open("effects"), |this| {

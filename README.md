@@ -13,7 +13,7 @@ Lahza means **moment** in Urdu. Built with Rust and GPUI, it brings screenshot a
 ### Capture and record
 
 - Capture a screen, window, or area through your desktop's screenshot picker.
-- Use **Ctrl+Shift+3** to capture while Lahza is running, including when another app has focus.
+- Use the **Screenshot** button in the launcher to capture a screen, window, or area.
 - Record a monitor or window through the ScreenCast portal and PipeWire.
 - Use a separate recorder window with pause, resume, restart, stop, and discard controls.
 - Include system audio, microphone audio, or both.
@@ -99,13 +99,12 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 - A Linux desktop with Vulkan support. Wayland and X11 backends are compiled in.
 - `xdg-desktop-portal` and the appropriate portal backend for your desktop.
 - PipeWire and GStreamer for recording; FFmpeg/FFprobe for preview and video export.
-- Desktop support for the screenshot, screencast, and global-shortcut portals. Picker options and shortcut availability depend on your desktop.
+- Desktop support for the screenshot and screencast portals. Picker options depend on your desktop.
 
-The desktop may ask you to approve or change the capture shortcut. On GNOME, install the desktop entry and ensure `lahza` is on `PATH`; running an uninstalled build alone is insufficient for reliable shortcut registration.
 
 ## Quick start
 
-1. Launch Lahza and press **Ctrl+Shift+3** for a screenshot, or choose **Record new** to record your screen.
+1. Launch Lahza and choose **Screenshot** or **Record screen**.
 2. Use **Design** to style the scene and **Annotate** to add marks.
 3. Select **Motion** for zooms, pans, transforms, or screenshot animation. Add a motion region at the playhead or double-click the orange lane, then select it to edit its focus and timing.
 4. Use **Export** to choose an output format and save the result.

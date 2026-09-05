@@ -28,10 +28,9 @@ app is the new build. `just run` does the same and launches the app.
 
 ## Install (desktop integration)
 
-A plain `cargo install` is NOT enough: the global capture shortcut (Ctrl+Shift+3)
-only works when GNOME can match the running app to a
-`com.lahza.Lahza.desktop` entry and find a `lahza` executable on
-PATH. User-local install:
+A plain `cargo install` is NOT enough: launching from the application menu
+needs a `com.lahza.Lahza.desktop` entry and a `lahza` executable on PATH.
+User-local install:
 
 ```bash
 install -Dm755 target/release/lahza ~/.local/bin/lahza
@@ -42,8 +41,6 @@ install -Dm644 Lahza.png \
 update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor
 ```
-
-Wayland shows a one-time system dialog to approve the shortcut on first use.
 
 ## Optional: GNOME Shell extension (typed captions)
 

@@ -354,9 +354,8 @@ impl Studio {
                 match path.strip_prefix(&bundled) {
                     Ok(relative) => {
                         let relative = relative.to_string_lossy().to_string();
-                        if let Some(asset) = crate::UIHSSN_WALLPAPERS
+                        if let Some(asset) = crate::CURATED_WALLPAPERS
                             .iter()
-                            .chain(crate::FAYAZ_WALLPAPERS.iter())
                             .find(|asset| **asset == relative)
                         {
                             self.wallpaper_asset = asset;

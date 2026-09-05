@@ -1669,7 +1669,10 @@ impl Studio {
                 this.video_edit_busy = false;
                 this.toast = Some(match result {
                     Ok(()) => {
-                        format!("Exported {format_label} to {}", destination.display()).into()
+                        crate::notifications::Notification::exported(
+                            format!("Exported {format_label} to {}", destination.display()),
+                            destination,
+                        )
                     }
                     Err(error) if error == "export cancelled" => "Export cancelled".into(),
                     Err(error) => format!("Export failed: {error}").into(),

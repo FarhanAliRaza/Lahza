@@ -29,7 +29,7 @@ cd lahza-0.1.0-linux-x86_64
 ./install.sh
 ```
 
-This installs the binary, assets, desktop entry, and icon into `~/.local`. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/lahza` from the extracted bundle, though desktop integration is needed for reliable global shortcuts. The bundle uses system libraries; it is not a statically linked or universally portable build.
+This installs the binary, assets, desktop entry, and icon into `~/.local`. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/lahza` from the extracted bundle. The bundle uses system libraries; it is not a statically linked or universally portable build.
 
 On Ubuntu, install the bundle's runtime dependencies with:
 
@@ -45,6 +45,6 @@ To verify downloaded files, download `SHA256SUMS` into the same directory and ru
 
 ### Early-release limitations
 
-Desktop capture and shortcut support depend on your compositor and portals. Editable cursor effects and automatic click zooms depend on input metadata; the optional bundled GNOME helper supplies additional input information. Live webcam capture/device selection is unfinished; camera-file overlays are supported. Recovery cannot guarantee that every interrupted recording is salvageable. Automated checks do not replace hands-on testing across Linux desktops.
+Desktop capture support depends on your compositor and portals. Editable cursor effects and automatic click zooms depend on input metadata; the optional bundled GNOME helper supplies additional input information. Live webcam capture/device selection is unfinished; camera-file overlays are supported. Recovery cannot guarantee that every interrupted recording is salvageable. Automated checks do not replace hands-on testing across Linux desktops.
 
 See the [README](https://github.com/FarhanAliRaza/lahza#readme) for features, source installation, and GNOME helper setup. Please report issues with your distribution, desktop, session type, and reproduction steps.
