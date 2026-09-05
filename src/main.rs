@@ -4763,9 +4763,7 @@ impl Studio {
                 // Resolve bundled wallpapers against the same asset root the
                 // live preview uses, never the process working directory.
                 let wallpaper = self.custom_wallpaper.clone().unwrap_or_else(|| {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("assets")
-                        .join(self.wallpaper_asset)
+                    asset_directory().join(self.wallpaper_asset)
                 });
                 let href = xml_escape(&wallpaper.to_string_lossy());
                 let _ = write!(svg, "<image href=\"{href}\" width=\"{canvas_width}\" height=\"{canvas_height}\" preserveAspectRatio=\"xMidYMid slice\"/>");

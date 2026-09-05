@@ -84,6 +84,18 @@ Release packages are built on **Ubuntu 24.04, amd64**. Compatibility with older 
 
 The application is named Lahza; the package, executable, desktop ID, and project extension retain the historical `screendrop` identifiers for compatibility.
 
+### Binary bundle
+
+Each release also includes `lahza-0.1.0-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
+
+```bash
+tar -xzf lahza-0.1.0-linux-x86_64.tar.gz
+cd lahza-0.1.0-linux-x86_64
+./install.sh
+```
+
+The installer adds the binary, assets, desktop entry, and icon under `~/.local`. Ensure `~/.local/bin` is on `PATH`. Run `./install.sh --help` for details. The bundle requires system libraries and is built on Ubuntu 24.04; it is not a static build. The release notes list runtime dependencies. `SHA256SUMS` accompanies both downloads for integrity verification.
+
 ### Desktop requirements
 
 - A Linux desktop with Vulkan support. Wayland and X11 backends are compiled in.

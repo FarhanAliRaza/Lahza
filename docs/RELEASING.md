@@ -1,6 +1,6 @@
 # Publishing a release
 
-The Linux package workflow builds on Ubuntu 24.04 for amd64. Main-branch pushes produce downloadable Actions artifacts; pushing a `v*` tag publishes a GitHub Release with the Debian package attached.
+The Linux package workflow builds on Ubuntu 24.04 for amd64. Main-branch pushes produce downloadable Actions artifacts; pushing a `v*` tag publishes a GitHub Release with the Debian package, binary bundle with a user-local installer, and SHA-256 checksums attached.
 
 Before the first release:
 

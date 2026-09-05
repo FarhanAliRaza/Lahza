@@ -1,4 +1,4 @@
-name: Build Linux DEB
+name: Build Linux Release
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build-deb:
-    name: Build Debian package
+    name: Build Linux packages
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -33,6 +33,11 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             binutils \
             jq \
+            ffmpeg \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base-apps \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-pipewire \
             libclang-dev \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
@@ -44,6 +49,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Run tests
+        run: cargo test --release --locked
+
       - name: Create DEB package
         id: package
         shell: bash
@@ -51,6 +59,10 @@ jobs:
           set -euo pipefail
 
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "screendrop") | .version')"
+          if [[ "$GITHUB_REF" == refs/tags/* && "${GITHUB_REF#refs/tags/}" != "v${version}" ]]; then
+            echo "Release tag must match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
           architecture="$(dpkg --print-architecture)"
           package_name="screendrop_${version}_${architecture}"
           package_root="dist/${package_name}"
@@ -83,6 +95,27 @@ jobs:
           echo "file=dist/${package_name}.deb" >> "$GITHUB_OUTPUT"
           echo "name=${package_name}" >> "$GITHUB_OUTPUT"
 
+      - name: Create binary bundle and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "screendrop") | .version')"
+          bundle="lahza-${version}-linux-x86_64"
+          bundle_root="dist/${bundle}"
+          install -Dm755 target/release/screendrop "${bundle_root}/bin/screendrop"
+          strip "${bundle_root}/bin/screendrop"
+          install -Dm755 packaging/install.sh "${bundle_root}/install.sh"
+          install -Dm644 README.md "${bundle_root}/README.md"
+          install -Dm644 packaging/com.screendrop.Screendrop.desktop \
+            "${bundle_root}/share/applications/com.screendrop.Screendrop.desktop"
+          install -Dm644 Lahza.png \
+            "${bundle_root}/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png"
+          install -d "${bundle_root}/share/screendrop/assets"
+          cp -a assets/. "${bundle_root}/share/screendrop/assets/"
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          cd dist
+          sha256sum *.deb *.tar.gz > SHA256SUMS
+
       - name: Inspect package
         run: |
           dpkg-deb --info "${{ steps.package.outputs.file }}"
@@ -92,12 +125,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
-          path: ${{ steps.package.outputs.file }}
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/SHA256SUMS
           if-no-files-found: error
 
-      - name: Attach DEB to GitHub release
+      - name: Publish GitHub release assets
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ steps.package.outputs.file }}
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          body_path: packaging/RELEASE-NOTES.md
           generate_release_notes: true
