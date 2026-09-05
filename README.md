@@ -124,7 +124,7 @@ sudo apt install -y build-essential pkg-config libclang-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libpipewire-0.3-dev libspa-0.2-dev \
   libxkbcommon-dev libxkbcommon-x11-dev \
-  ffmpeg gstreamer1.0-tools gstreamer1.0-pipewire \
+  ffmpeg gstreamer1.0-tools gstreamer1.0-libav gstreamer1.0-pipewire \
   gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad xdg-desktop-portal desktop-file-utils
 

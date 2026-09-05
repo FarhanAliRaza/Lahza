@@ -35,7 +35,7 @@ On Ubuntu, install the bundle's runtime dependencies with:
 
 ```bash
 sudo apt install ffmpeg gstreamer1.0-pipewire gstreamer1.0-plugins-good \
-  gstreamer1.0-tools gstreamer1.0-plugins-base-apps libgstreamer1.0-0 \
+  gstreamer1.0-tools gstreamer1.0-libav gstreamer1.0-plugins-base-apps libgstreamer1.0-0 \
   libpipewire-0.3-0 libx11-6 libxkbcommon-x11-0 libxkbcommon0 xdg-desktop-portal
 ```
 
