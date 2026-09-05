@@ -567,6 +567,56 @@ fn camera_path(output: &Path) -> PathBuf {
     output.with_file_name(super::model::RecordingSession::CAMERA_FILE)
 }
 
+/// A microphone (or other capture source) the recorder can use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioSource {
+    /// The PulseAudio/PipeWire node name passed to `pulsesrc device=`.
+    pub name: String,
+    /// The human-readable description shown in the picker.
+    pub description: String,
+    pub is_default: bool,
+}
+
+/// The capture sources GStreamer can record from, skipping output monitors.
+pub fn audio_sources() -> Vec<AudioSource> {
+    if gst::init().is_err() {
+        return Vec::new();
+    }
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Audio/Source"), None);
+    if monitor.start().is_err() {
+        return Vec::new();
+    }
+    // The PipeWire and Pulse providers each report every device, and only
+    // the former flags the default; merge duplicates by node name.
+    let mut sources: Vec<AudioSource> = Vec::new();
+    for device in monitor.devices().iter() {
+        let Some(properties) = device.properties() else {
+            continue;
+        };
+        let Ok(name) = properties.get::<String>("node.name") else {
+            continue;
+        };
+        let description = properties
+            .get::<String>("node.description")
+            .unwrap_or_else(|_| device.display_name().to_string());
+        if name.ends_with(".monitor") || description.starts_with("Monitor of ") {
+            continue;
+        }
+        let is_default = properties.get::<bool>("is-default").unwrap_or(false);
+        match sources.iter_mut().find(|source| source.name == name) {
+            Some(existing) => existing.is_default |= is_default,
+            None => sources.push(AudioSource {
+                name,
+                description,
+                is_default,
+            }),
+        }
+    }
+    monitor.stop();
+    sources
+}
+
 /// The V4L2 device node of the first webcam GStreamer can capture from.
 pub fn default_camera_device() -> Result<String, String> {
     camera_devices()
@@ -698,28 +748,41 @@ fn spawn_segment(
         portal_fd,
         node
     );
-    if options.system_audio || options.microphone {
-        description.push_str(
-            "audiomixer name=audio_mix ! audioconvert ! audioresample ! \
-             opusenc bitrate=160000 ! queue ! mux. ",
-        );
-    }
-    if options.system_audio {
-        description.push_str(
-            "pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true ! audioconvert ! \
-             audioresample ! queue ! audio_mix. ",
-        );
-    }
-    if options.microphone {
-        let device = options
-            .microphone_device
-            .as_deref()
-            .map(|name| format!("device=\"{name}\" "))
-            .unwrap_or_default();
-        description.push_str(&format!(
-            "pulsesrc {device}do-timestamp=true ! audioconvert ! audioresample ! \
-             queue ! audio_mix. "
-        ));
+    // Sources capture at the device's native 48 kHz so PipeWire does not
+    // resample for the client. A lone source feeds the encoder directly:
+    // `audiomixer` is a live element with a deadline that discards buffers
+    // arriving late and pads silence, which under encoder load clicks at
+    // every 10 ms output block. Mixing two sources needs it, so give it a
+    // latency budget large enough to absorb those stalls.
+    const ENCODE: &str = "audioconvert ! audioresample ! opusenc bitrate=160000 ! queue ! mux. ";
+    let audio_sources = [
+        options
+            .system_audio
+            .then_some("device=@DEFAULT_MONITOR@".to_string()),
+        options.microphone.then(|| {
+            options
+                .microphone_device
+                .as_deref()
+                .map(|name| format!("device=\"{name}\""))
+                .unwrap_or_default()
+        }),
+    ];
+    let audio_sources: Vec<String> = audio_sources.into_iter().flatten().collect();
+    match audio_sources.as_slice() {
+        [] => {}
+        [source] => description.push_str(&format!(
+            "pulsesrc {source} ! audio/x-raw,rate=48000 ! queue ! {ENCODE}"
+        )),
+        sources => {
+            description.push_str(&format!(
+                "audiomixer name=audio_mix latency=1000000000 ! {ENCODE}"
+            ));
+            for source in sources {
+                description.push_str(&format!(
+                    "pulsesrc {source} ! audio/x-raw,rate=48000 ! queue ! audio_mix. "
+                ));
+            }
+        }
     }
     if let Some(device) = camera_device {
         // The webcam shares the screen pipeline's clock, so both files carry

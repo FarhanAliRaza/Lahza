@@ -637,10 +637,12 @@ pub enum MotionPreset {
     Sweep,
     Tilt3D,
     FloatingCard,
+    CornerReveal,
+    TiltedScroll,
 }
 
 impl MotionPreset {
-    pub const ALL: [MotionPreset; 8] = [
+    pub const ALL: [MotionPreset; 10] = [
         MotionPreset::SlowZoomIn,
         MotionPreset::SlowZoomOut,
         MotionPreset::PanLeft,
@@ -649,6 +651,8 @@ impl MotionPreset {
         MotionPreset::Sweep,
         MotionPreset::Tilt3D,
         MotionPreset::FloatingCard,
+        MotionPreset::CornerReveal,
+        MotionPreset::TiltedScroll,
     ];
 
     pub fn label(self) -> &'static str {
@@ -661,6 +665,8 @@ impl MotionPreset {
             MotionPreset::Sweep => "Sweep",
             MotionPreset::Tilt3D => "3D tilt",
             MotionPreset::FloatingCard => "Floating card",
+            MotionPreset::CornerReveal => "Corner reveal",
+            MotionPreset::TiltedScroll => "Tilted scroll",
         }
     }
 
@@ -745,6 +751,43 @@ impl MotionPreset {
                         cue
                     })
                     .collect()
+            }
+            MotionPreset::CornerReveal => {
+                // Open tight on the top-left corner, hold, then pull back to
+                // reveal the whole frame while gliding to the centre.
+                let corner = NormalizedPoint { x: 0.22, y: 0.22 };
+                let hold_end = (duration * 0.3).max(ZoomCue::MINIMUM_DURATION);
+                let hold_end = hold_end.min(duration - ZoomCue::MINIMUM_DURATION);
+                if hold_end <= 0.0 {
+                    let mut cue = ZoomCue::pinned(0.0, duration, 2.2, corner);
+                    cue.motion = MotionStyle::ZoomOut;
+                    cue.easing = MotionEasing::Cinematic;
+                    cue.pan_to = Some(center);
+                    cue.skips_easing = true;
+                    return vec![cue];
+                }
+                let mut hold = ZoomCue::pinned(0.0, hold_end, 2.2, corner);
+                hold.skips_easing = true;
+                let mut reveal = ZoomCue::pinned(hold_end, duration, 2.2, corner);
+                reveal.motion = MotionStyle::ZoomOut;
+                reveal.easing = MotionEasing::Cinematic;
+                reveal.pan_to = Some(center);
+                reveal.skips_easing = true;
+                vec![hold, reveal]
+            }
+            MotionPreset::TiltedScroll => {
+                // A window turned in perspective while the camera scrolls
+                // down its content.
+                let mut cue =
+                    ZoomCue::pinned(0.0, duration, 1.5, NormalizedPoint { x: 0.5, y: 0.2 });
+                cue.pan_to = Some(NormalizedPoint { x: 0.5, y: 0.8 });
+                cue.tilt = Some(Tilt {
+                    x: 8.0,
+                    y: 22.0,
+                    z: 0.0,
+                });
+                cue.skips_easing = true;
+                vec![cue]
             }
         }
     }
@@ -873,6 +916,7 @@ mod tests {
     use crate::recording::model::{
         PointerCaptureFile, PointerPressEvent, PointerTravelKind, PointerTravelSample,
     };
+    use crate::recording::pointer_timeline::PointerTimelineOptions;
 
     #[test]
     fn walkthrough_capture_visits_stops_in_order_with_clicks() {
@@ -935,6 +979,31 @@ mod tests {
     }
 
     #[test]
+    fn corner_reveal_opens_zoomed_on_the_corner_and_ends_on_the_full_frame() {
+        let cues = MotionPreset::CornerReveal.cues(5.0);
+        let timeline = ViewportTimeline::build_static(&cues, 5.0);
+        let opening = timeline.frame_at(0.0);
+        assert!((opening.magnification - 2.2).abs() < 1e-6);
+        let (left, top, _) = visible_rect(opening);
+        assert!(
+            left < 1e-6 && top < 1e-6,
+            "should open on the top-left corner"
+        );
+        assert!((timeline.frame_at(1.0).magnification - 2.2).abs() < 1e-6);
+        assert!(timeline.frame_at(5.0).magnification < 1.01);
+    }
+
+    #[test]
+    fn tilted_scroll_keeps_the_tilt_while_panning_down() {
+        let cues = MotionPreset::TiltedScroll.cues(5.0);
+        let timeline = ViewportTimeline::build_static(&cues, 5.0);
+        let (start, end) = (timeline.frame_at(0.0), timeline.frame_at(5.0));
+        assert!((start.tilt.y - 22.0).abs() < 1e-6);
+        assert!((end.tilt.y - 22.0).abs() < 1e-6);
+        assert!(end.anchor.y > start.anchor.y + 0.3);
+    }
+
+    #[test]
     fn automatic_click_zoom_springs_back_to_identity_after_the_cue() {
         let capture = PointerCaptureFile {
             travel: vec![PointerTravelSample {
@@ -953,8 +1022,7 @@ mod tests {
             8.0,
             1920.0,
             1080.0,
-            None,
-            None,
+            PointerTimelineOptions::default(),
             Some(&clips),
         );
         let cues = synthesize_zoom_cues(&capture, 8.0);
@@ -1012,8 +1080,7 @@ mod tests {
             5.0,
             1920.0,
             1080.0,
-            None,
-            None,
+            PointerTimelineOptions::default(),
             Some(&clips),
         );
         let cues = synthesize_zoom_cues(&capture, 5.0);
@@ -1065,8 +1132,7 @@ mod tests {
             4.0,
             1920.0,
             1080.0,
-            None,
-            None,
+            PointerTimelineOptions::default(),
             Some(&clips),
         );
         let cue = ZoomCue {

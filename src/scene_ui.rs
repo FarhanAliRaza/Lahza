@@ -19,12 +19,13 @@ use crate::{
     annotations_svg, blue, cached_render_image, ink, line, muted, paint_annotation,
     paint_highlights,
     recording::{
+        cursor_assets::CursorFamily,
         export::{estimate_size_bytes, format_size, ExportFormat, ExportResolution},
         model::NormalizedPoint,
         presets::ScenePreset,
         scene::{
-            render_svg_layer, MediaProjection, PointerOverlay, SceneCompositor, SceneGeometry,
-            SceneStyle, SceneTransform, WatermarkPosition,
+            render_svg_layer, MediaProjection, PointerMotion, PointerOverlay, SceneCompositor,
+            SceneGeometry, SceneStyle, SceneTransform, WatermarkPosition,
         },
         viewport::{MotionEasing, ViewportFrame, ViewportTimeline},
     },
@@ -381,6 +382,7 @@ impl Studio {
             self.border_color = index;
         }
         self.border_opacity = style.border_opacity;
+        self.window_frame = style.window_frame;
         self.background_blur = style.background_blur;
         self.background_noise = style.background_noise;
         self.vignette = style.vignette;
@@ -414,6 +416,7 @@ impl Studio {
         };
         let extras = crate::RecordingExtras {
             audio_muted: self.video_audio_muted,
+            noise_reduction: self.video_noise_reduction,
             removed_press_times: self.video_removed_presses.clone(),
         };
         if self.persisted_extras.as_ref() != Some(&extras) {
@@ -729,7 +732,8 @@ impl Studio {
             camera: camera.as_deref(),
         });
         let image = cached_render_image(frame);
-        self.preview_cache.frame = Some((key, image.clone()));
+        let previous = self.preview_cache.frame.replace((key, image.clone()));
+        self.retire_image(previous.map(|(_, image)| image));
         Some(image)
     }
 
@@ -1892,14 +1896,32 @@ impl Studio {
                 |this| this.pointer_style.visible = !this.pointer_style.visible,
             ))
             .when(style.visible, |this| {
-                this.child(self.scene_slider_row(SceneSlider::PointerScale, cx))
-                    .child(self.scene_toggle_row(
-                        "pointer-shadow",
-                        "Cursor shadow",
-                        style.shadow,
-                        cx,
-                        |this| this.pointer_style.shadow = !this.pointer_style.shadow,
-                    ))
+                this.child(div().text_xs().text_color(muted()).child("Style"))
+                    .child(
+                        self.segmented(
+                            "pointer-family",
+                            &["Recorded", "macOS", "Tahoe", "Windows"],
+                            CursorFamily::ALL
+                                .iter()
+                                .position(|family| *family == style.family)
+                                .unwrap_or(0),
+                            |this, value| {
+                                this.pointer_style.family = CursorFamily::ALL[value.min(3)];
+                            },
+                            cx,
+                        ),
+                    )
+                    .child(self.scene_slider_row(SceneSlider::PointerScale, cx))
+                    // Styled cursor artwork carries its own shadow.
+                    .when(style.family == CursorFamily::Recorded, |this| {
+                        this.child(self.scene_toggle_row(
+                            "pointer-shadow",
+                            "Cursor shadow",
+                            style.shadow,
+                            cx,
+                            |this| this.pointer_style.shadow = !this.pointer_style.shadow,
+                        ))
+                    })
                     .child(self.scene_toggle_row(
                         "pointer-hide-idle",
                         "Hide when idle",
@@ -1907,6 +1929,32 @@ impl Studio {
                         cx,
                         |this| {
                             this.pointer_style.hide_when_idle = !this.pointer_style.hide_when_idle
+                        },
+                    ))
+                    .child(div().text_xs().text_color(muted()).child("Movement"))
+                    .child(
+                        self.segmented(
+                            "pointer-motion",
+                            &["Rapid", "Quick", "Default", "Slow"],
+                            PointerMotion::ALL
+                                .iter()
+                                .position(|motion| *motion == style.motion)
+                                .unwrap_or(2),
+                            |this, value| {
+                                this.pointer_style.motion = PointerMotion::ALL[value.min(3)];
+                                this.rebuild_video_motion_timelines();
+                            },
+                            cx,
+                        ),
+                    )
+                    .child(self.scene_toggle_row(
+                        "pointer-loop",
+                        "Return to start at end",
+                        style.loop_to_start,
+                        cx,
+                        |this| {
+                            this.pointer_style.loop_to_start = !this.pointer_style.loop_to_start;
+                            this.rebuild_video_motion_timelines();
                         },
                     ))
             })
@@ -1992,6 +2040,31 @@ impl Studio {
                     cx,
                     |this| this.video_audio_muted = !this.video_audio_muted,
                 ))
+            })
+            .when(has_audio && !self.video_audio_muted, |this| {
+                let enabled = self.video_noise_reduction;
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_sm().child("Reduce noise"))
+                        .child(
+                            div()
+                                .id("audio-noise-reduction")
+                                .cursor_pointer()
+                                .child(self.toggle(enabled))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_video_noise_reduction(!enabled, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted())
+                        .child("Removes steady background hiss from the preview and the export."),
+                )
             })
             .into_any_element()
     }
@@ -3197,7 +3270,11 @@ impl Studio {
                     return;
                 }
                 this.video_audio_levels = levels;
-                this.video_thumbnails = thumbnails.into_iter().map(cached_render_image).collect();
+                let previous = std::mem::replace(
+                    &mut this.video_thumbnails,
+                    thumbnails.into_iter().map(cached_render_image).collect(),
+                );
+                this.retired_images.extend(previous);
                 cx.notify();
             });
         })

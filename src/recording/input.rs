@@ -1,13 +1,16 @@
 use super::{
+    cursor_theme,
     model::{
-        KeystrokeEvent, PointerCaptureFile, PointerPressEvent, PointerTravelKind,
-        PointerTravelSample, PressPhase,
+        KeystrokeEvent, NormalizedPoint, PointerArtwork, PointerCaptureFile, PointerPressEvent,
+        PointerTravelKind, PointerTravelSample, PressPhase,
     },
     pointer::{sanitize_pointer_capture, PointerSanitizeOptions},
 };
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
+    collections::HashSet,
     ffi::{c_char, c_int, c_uint, c_ulong, c_void, CString},
     fs,
     io::{self, BufWriter, Write},
@@ -58,12 +61,26 @@ struct RawEvent {
     #[serde(default)]
     modifiers: Vec<String>,
     window: Option<[f64; 4]>,
+    /// `cursor` events: id of the cursor image now in effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artwork_id: Option<String>,
+    /// `cursor` events: base64 PNG, hotspot and bitmap size in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hotspot: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size: Option<[f64; 2]>,
 }
 
 pub struct InputCapture {
     id: String,
     control_path: PathBuf,
+    /// Pointer, button and key events from the extension or X11 poller.
     event_path: PathBuf,
+    /// Cursor images (and, without another pointer source, positions and
+    /// buttons) from the PipeWire cursor-metadata stream.
+    cursor_path: PathBuf,
     active: bool,
     extension_active: bool,
     x11_poller: Option<X11Poller>,
@@ -75,6 +92,7 @@ impl InputCapture {
     pub fn start(project_directory: &Path) -> Self {
         let id = Uuid::new_v4().simple().to_string();
         let event_path = project_directory.join("input.raw.jsonl");
+        let cursor_path = project_directory.join("input.cursor.jsonl");
         let control_path = runtime_directory().join(CONTROL_FILE);
         let request = ControlRequest {
             id: id.clone(),
@@ -93,12 +111,16 @@ impl InputCapture {
         let x11_poller = (!extension_active && !wayland)
             .then(|| X11Poller::start(event_path.clone()))
             .flatten();
-        let expects_pipewire_metadata = !extension_active && wayland;
+        // The compositor is the only source of cursor images on Wayland, so
+        // its cursor metadata is polled even when the extension supplies
+        // pointer positions.
+        let expects_pipewire_metadata = wayland;
         let active = extension_active || x11_poller.is_some() || expects_pipewire_metadata;
         Self {
             id,
             control_path,
             event_path,
+            cursor_path,
             active,
             extension_active,
             x11_poller,
@@ -121,10 +143,11 @@ impl InputCapture {
             return Ok(());
         }
         self.pipewire_poller = Some(PipeWirePoller::start(
-            self.event_path.clone(),
+            self.cursor_path.clone(),
             remote_fd,
             node,
             mapping.origin.unwrap_or((0.0, 0.0)),
+            !self.extension_active,
         )?);
         Ok(())
     }
@@ -153,12 +176,29 @@ impl InputCapture {
             poller.stop();
         }
         self.active = false;
-        let input = fs::read_to_string(&self.event_path)?;
+        let mut events: Vec<RawEvent> = Vec::new();
+        for path in [&self.event_path, &self.cursor_path] {
+            if let Ok(input) = fs::read_to_string(path) {
+                events.extend(
+                    input
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<RawEvent>(line).ok()),
+                );
+            }
+        }
+        events.sort_by_key(|event| event.mono_us);
         let mut capture = PointerCaptureFile::default();
-        for line in input.lines() {
-            let Ok(event) = serde_json::from_str::<RawEvent>(line) else {
+        // The cursor image in effect: `cursor` events mark every change and
+        // carry the image the first time an id appears.
+        let mut current_artwork: Option<String> = None;
+        for event in events {
+            if event.kind == "cursor" {
+                current_artwork = event.artwork_id.clone();
+                if let Some(artwork) = cursor_artwork(&event, mapping) {
+                    capture.artwork.push(artwork);
+                }
                 continue;
-            };
+            }
             let Some(time) = map_time(event.mono_us.saturating_mul(1_000), ranges) else {
                 continue;
             };
@@ -176,7 +216,7 @@ impl InputCapture {
                         } else {
                             PointerTravelKind::Move
                         },
-                        artwork_id: None,
+                        artwork_id: current_artwork.clone(),
                     });
                 }
                 "button" => {
@@ -196,7 +236,7 @@ impl InputCapture {
                         y,
                         button: event.button.unwrap_or(1).saturating_sub(1),
                         phase,
-                        artwork_id: None,
+                        artwork_id: current_artwork.clone(),
                     });
                 }
                 "key" => {
@@ -211,6 +251,9 @@ impl InputCapture {
                 _ => {}
             }
         }
+        // Swap captured cursors for the high-resolution versions shipped by
+        // the cursor theme so the cursor stays crisp when enlarged.
+        cursor_theme::upgrade_artwork(&mut capture.artwork);
         let sanitized = sanitize_pointer_capture(
             capture,
             PointerSanitizeOptions::for_recording(mapping.size.0, mapping.size.1),
@@ -219,6 +262,7 @@ impl InputCapture {
         let has_pointer_motion = !sanitized.travel.is_empty();
         let result = write_json_atomic(destination, &sanitized);
         let _ = fs::remove_file(&self.event_path);
+        let _ = fs::remove_file(&self.cursor_path);
         result.map(|_| has_pointer_motion)
     }
 }
@@ -295,6 +339,30 @@ fn map_time(event_ns: u64, ranges: &[ActiveRange]) -> Option<f64> {
     None
 }
 
+/// Builds the artwork record for a `cursor` event: the hotspot becomes a
+/// fraction of the bitmap and the bitmap size a fraction of the recording,
+/// so the cursor keeps its on-screen proportion whatever image replaces it.
+fn cursor_artwork(event: &RawEvent, mapping: InputMapping) -> Option<PointerArtwork> {
+    let image = event.image.clone().filter(|image| !image.is_empty())?;
+    let [width, height] = event.size?;
+    let [hot_x, hot_y] = event.hotspot?;
+    let (recording_width, recording_height) = mapping.size;
+    if width <= 0.0 || height <= 0.0 || recording_width <= 0.0 || recording_height <= 0.0 {
+        return None;
+    }
+    Some(PointerArtwork {
+        artwork_id: event.artwork_id.clone()?,
+        image_data_base64: image,
+        anchor_point: NormalizedPoint {
+            x: hot_x / width,
+            y: hot_y / height,
+        },
+        reference_width: width / recording_width,
+        reference_height: height / recording_height,
+        shape: None,
+    })
+}
+
 fn normalized_point(event: &RawEvent, mapping: InputMapping) -> Option<(f64, f64)> {
     let (x, y) = (event.x?, event.y?);
     let (origin_x, origin_y, width, height) = match mapping.origin {
@@ -328,14 +396,148 @@ struct PipeWireEventWriter {
     last_written: Option<(f64, f64)>,
     last_buttons: u8,
     last_heartbeat_us: u64,
+    /// Cursor image currently shown, keyed by a hash of its pixels.
+    artwork_id: Option<String>,
+    written_artwork: HashSet<String>,
+    /// Whether this stream is also the pointer position and button source.
+    positions: bool,
 }
 
-// Mutter includes the cursor bitmap in SPA_META_Cursor even though Screendrop
-// currently uses only its position.  Allocating just `spa_meta_cursor` causes
-// Mutter to omit the metadata altogether because the advertised buffer is too
-// small.  Match the allocation strategy used by PipeWire's video examples and
-// OBS, with room for a large HiDPI cursor.
+// Mutter includes the cursor bitmap in SPA_META_Cursor whenever the cursor
+// image changes.  Allocating just `spa_meta_cursor` causes Mutter to omit the
+// metadata altogether because the advertised buffer is too small.  Match the
+// allocation strategy used by PipeWire's video examples and OBS, with room
+// for a large HiDPI cursor.
 const MAX_CURSOR_BITMAP_EDGE: usize = 384;
+
+/// Straight-alpha RGBA copy of the cursor bitmap attached to a PipeWire
+/// buffer, or `None` when the metadata carries no (new) image.
+///
+/// # Safety
+/// `cursor` must point at a valid `spa_meta_cursor` whose bitmap, when
+/// present, lies inside the metadata allocation.
+unsafe fn pipewire_cursor_bitmap(
+    cursor: *const libspa_sys::spa_meta_cursor,
+) -> Option<(u32, u32, (i32, i32), Vec<u8>)> {
+    let bitmap_offset = (*cursor).bitmap_offset as usize;
+    if bitmap_offset < std::mem::size_of::<libspa_sys::spa_meta_cursor>() {
+        return None;
+    }
+    let bitmap = (cursor as *const u8).add(bitmap_offset) as *const libspa_sys::spa_meta_bitmap;
+    let format = (*bitmap).format;
+    let width = (*bitmap).size.width;
+    let height = (*bitmap).size.height;
+    let stride = (*bitmap).stride;
+    let data_offset = (*bitmap).offset as usize;
+    if format == 0
+        || data_offset < std::mem::size_of::<libspa_sys::spa_meta_bitmap>()
+        || width == 0
+        || height == 0
+        || width as usize > MAX_CURSOR_BITMAP_EDGE
+        || height as usize > MAX_CURSOR_BITMAP_EDGE
+        || stride < (width * 4) as i32
+    {
+        return None;
+    }
+    // Channel order of the source, as indices into an RGBA pixel.
+    let order: [usize; 4] = match format {
+        libspa_sys::SPA_VIDEO_FORMAT_RGBA | libspa_sys::SPA_VIDEO_FORMAT_RGBx => [0, 1, 2, 3],
+        libspa_sys::SPA_VIDEO_FORMAT_BGRA | libspa_sys::SPA_VIDEO_FORMAT_BGRx => [2, 1, 0, 3],
+        libspa_sys::SPA_VIDEO_FORMAT_ARGB | libspa_sys::SPA_VIDEO_FORMAT_xRGB => [1, 2, 3, 0],
+        libspa_sys::SPA_VIDEO_FORMAT_ABGR | libspa_sys::SPA_VIDEO_FORMAT_xBGR => [3, 2, 1, 0],
+        _ => return None,
+    };
+    let opaque = matches!(
+        format,
+        libspa_sys::SPA_VIDEO_FORMAT_RGBx
+            | libspa_sys::SPA_VIDEO_FORMAT_BGRx
+            | libspa_sys::SPA_VIDEO_FORMAT_xRGB
+            | libspa_sys::SPA_VIDEO_FORMAT_xBGR
+    );
+    let data = (bitmap as *const u8).add(data_offset);
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for row in 0..height as usize {
+        let line = std::slice::from_raw_parts(data.add(row * stride as usize), width as usize * 4);
+        for pixel in line.chunks_exact(4) {
+            let alpha = if opaque { 255 } else { pixel[order[3]] };
+            pixels.extend_from_slice(&[pixel[order[0]], pixel[order[1]], pixel[order[2]], alpha]);
+        }
+    }
+    Some((
+        width,
+        height,
+        ((*cursor).hotspot.x, (*cursor).hotspot.y),
+        pixels,
+    ))
+}
+
+fn cursor_artwork_id(width: u32, height: u32, hotspot: (i32, i32), pixels: &[u8]) -> String {
+    // FNV-1a over the geometry and pixels: identical cursors share an id so
+    // an arrow returning after an I-beam reuses the artwork already written.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for value in [width, height, hotspot.0 as u32, hotspot.1 as u32] {
+        value.to_le_bytes().into_iter().for_each(&mut feed);
+    }
+    pixels.iter().copied().for_each(&mut feed);
+    format!("cursor-{hash:016x}")
+}
+
+fn record_pipewire_cursor(
+    state: &Arc<std::sync::Mutex<PipeWireEventWriter>>,
+    width: u32,
+    height: u32,
+    hotspot: (i32, i32),
+    pixels: Vec<u8>,
+) {
+    let id = cursor_artwork_id(width, height, hotspot, &pixels);
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    if state.artwork_id.as_deref() == Some(id.as_str()) {
+        return;
+    }
+    // Every change is recorded; the image travels with the first occurrence.
+    let image = if state.written_artwork.contains(&id) {
+        None
+    } else {
+        let Some(image) = image::RgbaImage::from_raw(width, height, pixels) else {
+            return;
+        };
+        let mut png = std::io::Cursor::new(Vec::new());
+        if image.write_to(&mut png, image::ImageFormat::Png).is_err() {
+            return;
+        }
+        Some(base64::engine::general_purpose::STANDARD.encode(png.into_inner()))
+    };
+    let has_image = image.is_some();
+    let event = RawEvent {
+        mono_us: monotonic_ns() / 1_000,
+        kind: "cursor".into(),
+        x: None,
+        y: None,
+        button: None,
+        phase: None,
+        key: None,
+        modifiers: Vec::new(),
+        window: None,
+        artwork_id: Some(id.clone()),
+        image,
+        hotspot: Some([f64::from(hotspot.0), f64::from(hotspot.1)]),
+        size: Some([f64::from(width), f64::from(height)]),
+    };
+    if write_raw_event(&mut state.writer, event).is_err() {
+        return;
+    }
+    let _ = state.writer.flush();
+    if has_image {
+        state.written_artwork.insert(id.clone());
+    }
+    state.artwork_id = Some(id);
+}
 
 fn cursor_meta_size() -> i32 {
     (std::mem::size_of::<libspa_sys::spa_meta_cursor>()
@@ -349,6 +551,7 @@ impl PipeWirePoller {
         remote_fd: i32,
         node: u32,
         origin: (f64, f64),
+        positions: bool,
     ) -> Result<Self, String> {
         let duplicated_fd = unsafe { libc::fcntl(remote_fd, libc::F_DUPFD_CLOEXEC, 3) };
         if duplicated_fd < 0 {
@@ -364,7 +567,15 @@ impl PipeWirePoller {
         let worker = thread::Builder::new()
             .name("screendrop-wayland-pointer".into())
             .spawn(move || {
-                poll_pipewire_cursor(event_path, remote, node, origin, worker_stop, ready_tx)
+                poll_pipewire_cursor(
+                    event_path,
+                    remote,
+                    node,
+                    origin,
+                    positions,
+                    worker_stop,
+                    ready_tx,
+                )
             })
             .map_err(|error| format!("could not start Wayland pointer capture: {error}"))?;
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
@@ -393,6 +604,7 @@ fn poll_pipewire_cursor(
     remote: OwnedFd,
     node: u32,
     origin: (f64, f64),
+    positions: bool,
     stop: Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
@@ -406,6 +618,9 @@ fn poll_pipewire_cursor(
             last_written: None,
             last_buttons: 0,
             last_heartbeat_us: 0,
+            artwork_id: None,
+            written_artwork: HashSet::new(),
+            positions,
         }));
         {
             let mut state = state.lock().expect("PipeWire pointer writer poisoned");
@@ -421,6 +636,10 @@ fn poll_pipewire_cursor(
                     key: None,
                     modifiers: Vec::new(),
                     window: None,
+                    artwork_id: None,
+                    image: None,
+                    hotspot: None,
+                    size: None,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -513,6 +732,17 @@ fn poll_pipewire_cursor(
                         // SPA headers and is not emitted by every bindgen
                         // build; its definition is simply a non-zero id.
                         if !cursor.is_null() && (*cursor).id != 0 {
+                            if let Some((width, height, hotspot, pixels)) =
+                                pipewire_cursor_bitmap(cursor)
+                            {
+                                record_pipewire_cursor(
+                                    &listener_state,
+                                    width,
+                                    height,
+                                    hotspot,
+                                    pixels,
+                                );
+                            }
                             record_pipewire_position(
                                 &listener_state,
                                 origin.0 + f64::from((*cursor).position.x),
@@ -528,9 +758,13 @@ fn poll_pipewire_cursor(
 
         let mouse_state = state.clone();
         let mouse_stop = stop.clone();
-        let mouse_worker = thread::Builder::new()
-            .name("screendrop-wayland-buttons".into())
-            .spawn(move || poll_pipewire_buttons(mouse_state, mouse_stop))
+        let mouse_worker = positions
+            .then(|| {
+                thread::Builder::new()
+                    .name("screendrop-wayland-buttons".into())
+                    .spawn(move || poll_pipewire_buttons(mouse_state, mouse_stop))
+            })
+            .transpose()
             .map_err(|error| format!("could not start pointer button capture: {error}"))?;
 
         let quit_loop = mainloop.clone();
@@ -581,7 +815,9 @@ fn poll_pipewire_cursor(
             .map_err(|error| format!("could not connect PipeWire cursor stream: {error}"))?;
         mainloop.run();
         stop.store(true, Ordering::Release);
-        let _ = mouse_worker.join();
+        if let Some(worker) = mouse_worker {
+            let _ = worker.join();
+        }
         if let Ok(mut state) = state.lock() {
             let _ = state.writer.flush();
         }
@@ -599,6 +835,9 @@ fn record_pipewire_position(state: &Arc<std::sync::Mutex<PipeWireEventWriter>>, 
     let Ok(mut state) = state.lock() else {
         return;
     };
+    if !state.positions {
+        return;
+    }
     let now_us = monotonic_ns() / 1_000;
     let changed = state.last_written != Some((x, y));
     let heartbeat = now_us.saturating_sub(state.last_heartbeat_us) >= 1_000_000;
@@ -733,6 +972,10 @@ fn poll_x11_pointer(event_path: PathBuf, stop: Arc<AtomicBool>, ready: mpsc::Sen
             key: None,
             modifiers: Vec::new(),
             window: None,
+            artwork_id: None,
+            image: None,
+            hotspot: None,
+            size: None,
         },
     );
     let _ = writer.flush();
@@ -884,6 +1127,10 @@ fn write_button_transitions(
                     key: None,
                     modifiers: Vec::new(),
                     window: None,
+                    artwork_id: None,
+                    image: None,
+                    hotspot: None,
+                    size: None,
                 },
             );
         }
@@ -909,6 +1156,10 @@ fn write_pointer_travel(
             key: None,
             modifiers: Vec::new(),
             window: None,
+            artwork_id: None,
+            image: None,
+            hotspot: None,
+            size: None,
         },
     )
 }
@@ -992,6 +1243,10 @@ mod tests {
             key: None,
             modifiers: Vec::new(),
             window: Some([100.0, 200.0, 200.0, 100.0]),
+            artwork_id: None,
+            image: None,
+            hotspot: None,
+            size: None,
         };
         assert_eq!(
             normalized_point(
@@ -1003,6 +1258,103 @@ mod tests {
             ),
             Some((0.25, 0.5))
         );
+    }
+
+    #[test]
+    fn cursor_events_from_the_metadata_stream_tag_pointer_samples_by_time() {
+        use base64::Engine;
+        let directory =
+            std::env::temp_dir().join(format!("screendrop-input-merge-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let capture = InputCapture {
+            id: "test".into(),
+            control_path: directory.join("control.json"),
+            event_path: directory.join("input.raw.jsonl"),
+            cursor_path: directory.join("input.cursor.jsonl"),
+            active: true,
+            extension_active: false,
+            x11_poller: None,
+            pipewire_poller: None,
+            expects_pipewire_metadata: false,
+        };
+        let event = |mono_us: u64, kind: &str| RawEvent {
+            mono_us,
+            kind: kind.into(),
+            x: Some(10.0),
+            y: Some(10.0),
+            button: None,
+            phase: None,
+            key: None,
+            modifiers: Vec::new(),
+            window: None,
+            artwork_id: None,
+            image: None,
+            hotspot: None,
+            size: None,
+        };
+        let png = {
+            let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255]));
+            let mut png = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        };
+        let cursor = |mono_us: u64, id: &str, image: Option<String>| RawEvent {
+            artwork_id: Some(id.into()),
+            image,
+            hotspot: Some([1.0, 1.0]),
+            size: Some([4.0, 4.0]),
+            ..event(mono_us, "cursor")
+        };
+        // Positions come from one source (the extension), cursor images
+        // from the PipeWire stream; the arrow returns without its image.
+        let mut positions = Vec::new();
+        for (index, mono_us) in [1_000, 3_000, 5_000, 7_000].into_iter().enumerate() {
+            let sample = RawEvent {
+                x: Some(10.0 + index as f64 * 10.0),
+                ..event(mono_us, "move")
+            };
+            positions.push(serde_json::to_string(&sample).unwrap());
+        }
+        fs::write(&capture.event_path, positions.join("\n")).unwrap();
+        let cursors = [
+            cursor(500, "arrow", Some(png.clone())),
+            cursor(2_000, "ibeam", Some(png)),
+            cursor(6_000, "arrow", None),
+        ]
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&capture.cursor_path, cursors).unwrap();
+
+        let destination = directory.join("input.json");
+        let ranges = [ActiveRange {
+            start_ns: 0,
+            end_ns: 10_000_000,
+        }];
+        let mapping = InputMapping {
+            origin: Some((0.0, 0.0)),
+            size: (100.0, 100.0),
+        };
+        assert!(capture.finish(&ranges, mapping, &destination).unwrap());
+        let written: PointerCaptureFile =
+            serde_json::from_str(&fs::read_to_string(&destination).unwrap()).unwrap();
+        let ids: Vec<Option<String>> = written
+            .travel
+            .iter()
+            .map(|sample| sample.artwork_id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            // The sanitizer thins the second I-beam sample; the switches remain.
+            vec![
+                Some("arrow".into()),
+                Some("ibeam".into()),
+                Some("arrow".into())
+            ]
+        );
+        assert_eq!(written.artwork.len(), 2);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

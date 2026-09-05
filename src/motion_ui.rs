@@ -95,6 +95,7 @@ impl Studio {
         };
         SceneStyle {
             background,
+            window_frame: self.window_frame,
             padding: self.padding,
             corners: self.corners,
             shadow: self.shadow,
@@ -1306,6 +1307,7 @@ impl Studio {
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
         request.include_audio = !self.video_audio_muted;
+        request.noise_reduction = self.video_noise_reduction;
         request.overlay = self.annotation_overlay_source();
         let source = SceneSource::Video {
             media: session.screen_path(),
@@ -1552,7 +1554,8 @@ impl Studio {
             return;
         }
         self.pause_video_playback();
-        self.image_scenes.remove(self.image_scene_index);
+        let removed = self.image_scenes.remove(self.image_scene_index);
+        self.retire_image(Some(removed.render));
         let index = self.image_scene_index.min(self.image_scenes.len() - 1);
         self.load_image_scene(index);
         self.toast = Some("Scene removed".into());

@@ -74,3 +74,10 @@ as part of correctness when building features:
 - Prefer per-row loops over raw buffers to per-pixel `get_pixel`/`f64`
   math in hot loops, and keep the media paint (`paint_media`) in mind: it
   runs every playback frame.
+- GPU images leak unless released explicitly. GPUI never frees a
+  `RenderImage` from its sprite atlas when the `Arc` drops; only
+  `Window::drop_image` does. Never overwrite an `Arc<RenderImage>` field
+  directly: pass the old value to `Studio::retire_image`, which queues it
+  for `drop_retired_images` at the top of `render`. A per-frame producer
+  (webcam preview, video playback, scene preview) that skips this fills a
+  12 GB card in about ten minutes and hard-freezes the Wayland session.
