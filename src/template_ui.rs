@@ -76,13 +76,6 @@ impl Studio {
         self.video_selected_zoom_cue = None;
         self.video_position = 0.0;
         self.rebuild_video_motion_timelines();
-        self.toast = Some(
-            format!(
-                "{} applied — select a caption to edit its text or timing",
-                template.name
-            )
-            .into(),
-        );
         cx.notify();
     }
 

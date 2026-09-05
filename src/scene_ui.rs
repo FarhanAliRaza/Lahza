@@ -794,13 +794,6 @@ impl Studio {
     pub(crate) fn add_walkthrough_stop(&mut self, point: NormalizedPoint) {
         self.walkthrough_stops.push(point);
         self.rebuild_walkthrough();
-        self.toast = Some(
-            format!(
-                "Cursor stop {} added · Enter to finish",
-                self.walkthrough_stops.len()
-            )
-            .into(),
-        );
     }
 
     pub(crate) fn rebuild_walkthrough(&mut self) {
@@ -912,7 +905,6 @@ impl Studio {
                             manifest.includes_camera = true;
                             let _ = session.write_manifest(&manifest);
                         }
-                        this.toast = Some("Camera clip added to the project".into());
                     }
                     Err(error) => {
                         this.toast = Some(format!("Could not add camera clip: {error}").into());
@@ -935,7 +927,6 @@ impl Studio {
                 let _ = session.write_manifest(&manifest);
             }
         }
-        self.toast = Some("Camera clip removed".into());
     }
 
     pub(crate) fn camera_section(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1197,7 +1188,6 @@ impl Studio {
             if click_count >= 2 {
                 self.scene_transform = SceneTransform::IDENTITY;
                 self.media_drag = None;
-                self.toast = Some("Transform reset".into());
                 cx.notify();
                 return true;
             }
@@ -1369,14 +1359,12 @@ impl Studio {
                     cue.anchor_mode = crate::recording::viewport::ZoomAnchorMode::PinnedAnchor;
                     cue.pinned_point = target;
                 });
-                self.toast = Some("Focus point set".into());
             }
             crate::motion_ui::MotionPick::PanEnd => {
                 self.mutate_selected_zoom_cue(cx, |cue| {
                     cue.anchor_mode = crate::recording::viewport::ZoomAnchorMode::PinnedAnchor;
                     cue.pan_to = Some(target);
                 });
-                self.toast = Some("Pan destination set".into());
             }
         }
         cx.notify();
@@ -2304,7 +2292,6 @@ impl Studio {
         self.default_motion_zoom = preset.default_zoom;
         self.aspect_ratio = preset.aspect_index;
         self.background_preset = None;
-        self.toast = Some(format!("{} applied", preset.name).into());
     }
 
     pub(crate) fn delete_saved_preset(&mut self, index: usize) {
@@ -2333,7 +2320,6 @@ impl Studio {
             self.video_removed_presses.push(time);
         }
         self.rebuild_video_motion_timelines();
-        self.toast = Some("Click removed from the pointer track".into());
         cx.notify();
     }
 

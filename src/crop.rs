@@ -307,7 +307,6 @@ impl Studio {
         self.crop_aspect = 0;
         self.crop_drag = None;
         self.crop_active = true;
-        self.toast = Some("Drag the crop handles, then choose Crop".into());
     }
 
     pub(super) fn cancel_crop(&mut self) {
@@ -319,7 +318,6 @@ impl Studio {
         self.crop_aspect = 0;
         self.crop_drag = None;
         self.pointer_is_down = false;
-        self.toast = Some("Crop cancelled".into());
     }
 
     pub(super) fn set_crop_aspect(&mut self, aspect: usize) {
@@ -437,7 +435,6 @@ impl Studio {
             }
             self.crop_active = false;
             self.reset_crop();
-            self.toast = Some("Original image restored".into());
             return Ok(());
         }
         let cropped =
@@ -485,7 +482,6 @@ impl Studio {
         self.crop_drag = None;
         self.pointer_is_down = false;
         self.rebuild_redactions()?;
-        self.toast = Some(format!("Cropped to {} × {}", right - left, bottom - top).into());
         Ok(())
     }
 

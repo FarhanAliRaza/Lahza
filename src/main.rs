@@ -918,7 +918,6 @@ impl Studio {
         self.border_thickness = preset.border_thickness;
         self.border_opacity = preset.border_opacity;
         self.background_preset = Some(index);
-        self.toast = Some(format!("{} preset applied", preset.name).into());
     }
 
     fn preview_canvas_size(

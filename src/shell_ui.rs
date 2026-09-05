@@ -220,7 +220,6 @@ impl Studio {
                     if self.captured_path.is_some() {
                         let _ = self.rebuild_redactions();
                     }
-                    self.toast = Some("Undo".into());
                 }
             }
         }
@@ -241,7 +240,6 @@ impl Studio {
                     if self.captured_path.is_some() {
                         let _ = self.rebuild_redactions();
                     }
-                    self.toast = Some("Redo".into());
                 }
             }
         }

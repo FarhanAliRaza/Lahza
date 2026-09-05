@@ -649,8 +649,7 @@ impl Studio {
         let grid = div().flex().flex_none().flex_wrap().gap_2().w_full();
         match self.wallpaper_tab {
             0 => grid.children(SOLID_BACKGROUNDS.iter().enumerate().map(
-                |(index, (title, color))| {
-                    let title = *title;
+                |(index, (_, color))| {
                     div()
                         .id(("background-color", index))
                         .size(px(27.0))
@@ -663,7 +662,6 @@ impl Studio {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.color_index = index;
                             this.custom_wallpaper = None;
-                            this.toast = Some(format!("{title} background selected").into());
                             cx.notify();
                         }))
                 },
@@ -686,7 +684,6 @@ impl Studio {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.gradient_index = index;
                             this.custom_wallpaper = None;
-                            this.toast = Some(format!("{} gradient selected", preset.title).into());
                             cx.notify();
                         }))
                 },
@@ -710,7 +707,6 @@ impl Studio {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.wallpaper_asset = path;
                             this.custom_wallpaper = None;
-                            this.toast = Some("Wallpaper selected".into());
                             cx.notify();
                         }))
                 }))

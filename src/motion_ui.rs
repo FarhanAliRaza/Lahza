@@ -283,7 +283,6 @@ impl Studio {
         self.video_selected_zoom_cue = None;
         self.rebuild_video_motion_timelines();
         self.persist_video_zoom_cues(cx);
-        self.toast = Some("Motion regenerated from clicks".into());
         cx.notify();
     }
 
@@ -1042,7 +1041,6 @@ impl Studio {
             self.animation_preset = Some(preset);
         }
         self.rebuild_video_motion_timelines();
-        self.toast = Some("Animation on: pick a preset or edit the orange motion lane".into());
         cx.notify();
     }
 
@@ -1191,11 +1189,6 @@ impl Studio {
         }
         if self.walkthrough_mode && matches!(keystroke.key.as_str(), "enter" | "escape") {
             self.walkthrough_mode = false;
-            self.toast = Some(if self.walkthrough_stops.is_empty() {
-                "Cursor walkthrough cancelled".into()
-            } else {
-                "Cursor walkthrough ready · press play".into()
-            });
             return true;
         }
         match keystroke.key.as_str() {
@@ -1554,7 +1547,6 @@ impl Studio {
         });
         let index = self.image_scenes.len() - 1;
         self.load_image_scene(index);
-        self.toast = Some(format!("Scene {} added", index + 1).into());
     }
 
     /// Drops the live scene from the sequence and shows its neighbour.
@@ -1567,7 +1559,6 @@ impl Studio {
         self.retire_image(Some(removed.render));
         let index = self.image_scene_index.min(self.image_scenes.len() - 1);
         self.load_image_scene(index);
-        self.toast = Some("Scene removed".into());
         cx.notify();
     }
 
