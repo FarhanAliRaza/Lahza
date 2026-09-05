@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod camera_preview;
 pub mod clips;
 pub mod export;
 pub mod input;

@@ -1672,7 +1672,6 @@ impl Studio {
         if self.scene_selection != SceneSelection::Media {
             return None;
         }
-        let advanced = self.inspector_level >= 2;
         let transform = self.scene_transform;
         let is_identity = transform.is_identity();
         Some(
@@ -1769,10 +1768,8 @@ impl Studio {
                 .child(self.scene_slider_row(SceneSlider::RotationY, cx))
                 .child(self.scene_slider_row(SceneSlider::RotationZ, cx))
                 .child(self.scene_slider_row(SceneSlider::Perspective, cx))
-                .when(advanced, |this| {
-                    this.child(self.scene_slider_row(SceneSlider::AnchorX, cx))
-                        .child(self.scene_slider_row(SceneSlider::AnchorY, cx))
-                })
+                .child(self.scene_slider_row(SceneSlider::AnchorX, cx))
+                .child(self.scene_slider_row(SceneSlider::AnchorY, cx))
                 .child(
                     div()
                         .text_xs()
@@ -2025,7 +2022,6 @@ impl Studio {
         } else {
             0
         };
-        let advanced = self.inspector_level >= 2;
         div()
             .flex()
             .flex_col()
@@ -2047,30 +2043,28 @@ impl Studio {
                 |this, index| this.export_resolution = ExportResolution::ALL[index],
                 cx,
             ))
-            .when(advanced, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted())
-                                .w(px(72.0))
-                                .child("Frame rate"),
-                        )
-                        .child(div().flex_1().child(self.segmented(
-                            "export-frame-rate",
-                            &["30 fps", "60 fps"],
-                            fps_index,
-                            |this, index| {
-                                this.export_frame_rate = if index == 1 { 60.0 } else { 30.0 }
-                            },
-                            cx,
-                        ))),
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted())
+                            .w(px(72.0))
+                            .child("Frame rate"),
+                    )
+                    .child(div().flex_1().child(self.segmented(
+                        "export-frame-rate",
+                        &["30 fps", "60 fps"],
+                        fps_index,
+                        |this, index| {
+                            this.export_frame_rate = if index == 1 { 60.0 } else { 30.0 }
+                        },
+                        cx,
+                    ))),
+            )
             .when(format == ExportFormat::Gif, |this| {
                 this.child(self.scene_toggle_row(
                     "export-loop",

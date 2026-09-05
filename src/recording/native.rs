@@ -1,3 +1,4 @@
+use super::camera_preview::{CameraFrames, attach_preview, preview_branch};
 use super::input::{monotonic_ns, ActiveRange, InputCapture, InputMapping};
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SourceType},
@@ -75,12 +76,16 @@ pub trait RecorderBackend {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecordingOptions {
     pub system_audio: bool,
     pub microphone: bool,
-    /// Record the default webcam alongside the screen into `camera.mkv`.
+    /// PulseAudio/PipeWire source name to record from; `None` uses the default.
+    pub microphone_device: Option<String>,
+    /// Record a webcam alongside the screen into `camera.mkv`.
     pub camera: bool,
+    /// V4L2 device node to record; `None` uses the first webcam found.
+    pub camera_device: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +122,7 @@ enum WorkerCommand {
 }
 
 pub struct NativeRecorder {
+    camera_frames: Option<Arc<CameraFrames>>,
     options: RecordingOptions,
     state: Arc<Mutex<SharedState>>,
     commands: Option<mpsc::Sender<WorkerCommand>>,
@@ -136,11 +142,17 @@ impl NativeRecorder {
 
     pub fn with_options(options: RecordingOptions) -> Self {
         Self {
+            camera_frames: None,
             options,
             state: Arc::new(Mutex::new(SharedState::default())),
             commands: None,
             worker: None,
         }
+    }
+
+    pub fn with_camera_preview(mut self, frames: Arc<CameraFrames>) -> Self {
+        self.camera_frames = Some(frames);
+        self
     }
 
     pub fn description() -> &'static str {
@@ -204,13 +216,14 @@ impl RecorderBackend for NativeRecorder {
         }
         ensure_runtime()?;
         let output = output.to_path_buf();
-        let options = self.options;
+        let options = self.options.clone();
+        let camera_frames = self.camera_frames.clone();
         let state = self.state.clone();
         let (commands_tx, commands_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("screendrop-native-recorder".into())
-            .spawn(move || run_worker(output, options, state, commands_rx, ready_tx))?;
+            .spawn(move || run_worker(output, options, state, commands_rx, ready_tx, camera_frames))?;
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.commands = Some(commands_tx);
@@ -315,6 +328,7 @@ fn run_worker(
     state: Arc<Mutex<SharedState>>,
     commands: mpsc::Receiver<WorkerCommand>,
     ready: mpsc::Sender<Result<(), String>>,
+    camera_frames: Option<Arc<CameraFrames>>,
 ) {
     let result = async_io::block_on(async {
         let input_destination = output.with_file_name("input.json");
@@ -379,7 +393,10 @@ fn run_worker(
         }
 
         let camera = if options.camera {
-            Some(default_camera_device()?)
+            Some(match options.camera_device.clone() {
+                Some(device) => device,
+                None => default_camera_device()?,
+            })
         } else {
             None
         };
@@ -389,8 +406,9 @@ fn run_worker(
             segments.len(),
             remote.as_raw_fd(),
             node,
-            options,
+            &options,
             camera.as_deref(),
+            camera_frames.as_ref(),
         )?);
         segments.push(0);
         let mut active_ranges = Vec::new();
@@ -451,8 +469,9 @@ fn run_worker(
                             index,
                             remote.as_raw_fd(),
                             node,
-                            options,
+                            &options,
                             camera.as_deref(),
+            camera_frames.as_ref(),
                         ) {
                             Ok(next) => {
                                 let path = segment_path(&output, index);
@@ -549,21 +568,80 @@ fn camera_path(output: &Path) -> PathBuf {
 }
 
 /// The V4L2 device node of the first webcam GStreamer can capture from.
-fn default_camera_device() -> Result<String, String> {
-    gst::init().map_err(|error| format!("could not initialize GStreamer: {error}"))?;
+pub fn default_camera_device() -> Result<String, String> {
+    camera_devices()
+        .into_iter()
+        .next()
+        .map(|(path, _)| path)
+        .ok_or_else(|| "no webcam was found; unplug and replug it or turn the camera off".into())
+}
+
+/// Webcams GStreamer can capture from, as `(V4L2 device node, display name)`.
+pub fn camera_devices() -> Vec<(String, String)> {
+    if gst::init().is_err() {
+        return Vec::new();
+    }
     let monitor = gst::DeviceMonitor::new();
     monitor.add_filter(Some("Video/Source"), None);
-    monitor
-        .start()
-        .map_err(|_| "could not enumerate webcams".to_string())?;
-    let device = monitor.devices().iter().find_map(|device| {
-        let properties = device.properties()?;
-        ["device.path", "api.v4l2.path"]
-            .iter()
-            .find_map(|key| properties.get::<String>(*key).ok())
-    });
+    if monitor.start().is_err() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let devices = monitor
+        .devices()
+        .iter()
+        .filter_map(|device| {
+            let properties = device.properties()?;
+            let path = ["device.path", "api.v4l2.path"]
+                .iter()
+                .find_map(|key| properties.get::<String>(*key).ok())?;
+            seen.insert(path.clone())
+                .then(|| (path, device.display_name().to_string()))
+        })
+        .collect();
     monitor.stop();
-    device.ok_or_else(|| "no webcam was found; unplug and replug it or turn the camera off".into())
+    devices
+}
+
+/// Microphones GStreamer can capture from, as `(source name, display name)`.
+/// Monitor sources (system audio loopbacks) are excluded.
+pub fn microphone_devices() -> Vec<(String, String)> {
+    if gst::init().is_err() {
+        return Vec::new();
+    }
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Audio/Source"), None);
+    if monitor.start().is_err() {
+        return Vec::new();
+    }
+    // The PipeWire and PulseAudio providers both describe the same sources
+    // (raw ALSA devices are skipped: `pulsesrc` cannot open them), so keep
+    // the first entry per source name.
+    let mut seen = std::collections::HashSet::new();
+    let devices = monitor
+        .devices()
+        .iter()
+        .filter_map(|device| {
+            let properties = device.properties()?;
+            if properties.get::<String>("device.class").ok().as_deref() == Some("monitor") {
+                return None;
+            }
+            let name = properties.get::<String>("node.name").ok().or_else(|| {
+                if properties.get::<String>("device.api").ok().as_deref() != Some("pulse") {
+                    return None;
+                }
+                let element = device.create_element(None).ok()?;
+                element
+                    .has_property("device")
+                    .then(|| element.property::<Option<String>>("device"))
+                    .flatten()
+            })?;
+            seen.insert(name.clone())
+                .then(|| (name, device.display_name().to_string()))
+        })
+        .collect();
+    monitor.stop();
+    devices
 }
 
 struct SegmentPipeline {
@@ -602,8 +680,9 @@ fn spawn_segment(
     index: usize,
     portal_fd: i32,
     node: u32,
-    options: RecordingOptions,
+    options: &RecordingOptions,
     camera_device: Option<&str>,
+    camera_frames: Option<&Arc<CameraFrames>>,
 ) -> Result<SegmentPipeline, String> {
     let path = segment_path(output, index);
     let _ = fs::remove_file(&path);
@@ -632,10 +711,15 @@ fn spawn_segment(
         );
     }
     if options.microphone {
-        description.push_str(
-            "pulsesrc do-timestamp=true ! audioconvert ! audioresample ! \
-             queue ! audio_mix. ",
-        );
+        let device = options
+            .microphone_device
+            .as_deref()
+            .map(|name| format!("device=\"{name}\" "))
+            .unwrap_or_default();
+        description.push_str(&format!(
+            "pulsesrc {device}do-timestamp=true ! audioconvert ! audioresample ! \
+             queue ! audio_mix. "
+        ));
     }
     if let Some(device) = camera_device {
         // The webcam shares the screen pipeline's clock, so both files carry
@@ -643,8 +727,8 @@ fn spawn_segment(
         let camera_segment = camera_segment_path(output, index);
         let _ = fs::remove_file(&camera_segment);
         description.push_str(&format!(
-            "v4l2src device=\"{}\" do-timestamp=true ! videoconvert ! \
-             queue max-size-buffers=4 leaky=downstream ! \
+            "v4l2src device=\"{}\" do-timestamp=true ! videoconvert ! tee name=camera_tee \
+             camera_tee. ! queue max-size-buffers=4 leaky=downstream ! \
              vp8enc deadline=1 cpu-used=8 threads=2 target-bitrate=4000000 \
              keyframe-max-dist=60 ! queue ! matroskamux ! \
              filesink location=\"{}\" ",
@@ -653,10 +737,17 @@ fn spawn_segment(
         ));
     }
 
+    if camera_device.is_some() && camera_frames.is_some() {
+        description.push_str(&format!("camera_tee. ! {}", preview_branch("recording_camera_preview")));
+    }
+
     let pipeline = gst::parse::launch(&description)
         .map_err(|error| format!("could not build GStreamer pipeline: {error}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "GStreamer did not create a pipeline".to_string())?;
+    if let Some(frames) = camera_frames.filter(|_| camera_device.is_some()) {
+        attach_preview(&pipeline, "recording_camera_preview", frames.clone())?;
+    }
     let source = pipeline
         .by_name("screen_source")
         .ok_or_else(|| "GStreamer pipeline has no screen source".to_string())?;
@@ -806,7 +897,9 @@ mod tests {
         let mut recorder = NativeRecorder::with_options(RecordingOptions {
             system_audio: true,
             microphone: true,
+            microphone_device: None,
             camera: false,
+            camera_device: None,
         });
         recorder.start_recording(&output).unwrap();
         thread::sleep(Duration::from_secs(1));

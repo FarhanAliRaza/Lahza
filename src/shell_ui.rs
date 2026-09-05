@@ -6,7 +6,6 @@ use gpui::{
     canvas, div, hsla, img, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight,
     Hsla, MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size, Window,
 };
-use std::path::PathBuf;
 
 use crate::{
     blue, crop_rect_with_aspect, ink, line,
@@ -253,7 +252,12 @@ impl Studio {
             cx.notify();
             return;
         }
-        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let directory = crate::library::screenshots_root();
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.toast = Some(format!("Could not create screenshot folder: {error}").into());
+            cx.notify();
+            return;
+        }
         let suggested_name = timestamped_export_name();
         let prompt = cx.prompt_for_new_path(&directory, Some(&suggested_name));
         cx.spawn(async move |weak, cx| {
@@ -428,48 +432,6 @@ impl Studio {
                             .child(mode.label())
                             .on_click(cx.listener(move |this, _, _, cx| this.switch_mode(mode, cx)))
                     }),
-            )
-            .into_any_element()
-    }
-
-    fn window_controls(&self, cx: &mut Context<Self>) -> AnyElement {
-        let control = |id: &'static str, icon: &'static str, size: f32| {
-            div()
-                .id(id)
-                .w(px(44.0))
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .child(svg().path(icon).size(px(size)).text_color(ink()))
-        };
-        div()
-            .flex()
-            .flex_none()
-            .h_full()
-            .items_center()
-            .child(
-                control("window-minimize", "icons/minimize.svg", 16.0)
-                    .hover(|style| style.bg(rgb(0xe5e5e7)))
-                    .on_click(|_, window, _| window.minimize_window()),
-            )
-            .child(
-                control("window-maximize", "icons/maximize.svg", 14.0)
-                    .hover(|style| style.bg(rgb(0xe5e5e7)))
-                    .on_click(|_, window, _| window.zoom_window()),
-            )
-            .child(
-                control("window-close", "icons/close.svg", 16.0)
-                    .hover(|style| style.bg(rgb(0xd92d3a)).text_color(rgb(0xffffff)))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.pause_video_playback();
-                        if this.recording_state == RecordingState::Idle {
-                            window.remove_window();
-                        } else {
-                            this.request_window_close(window.window_handle(), cx);
-                        }
-                    })),
             )
             .into_any_element()
     }
@@ -703,8 +665,7 @@ impl Studio {
                         })),
                 )
             })
-            .child(divider())
-            .child(self.window_controls(cx));
+            .pr_3();
 
         div()
             .h(px(TOP_BAR_HEIGHT))
@@ -869,9 +830,6 @@ impl Studio {
             .flex_col()
             .gap_2()
             .when_some(transform, |this, panel| this.child(panel))
-            .child(Self::tab_label("Presets"))
-            .child(self.quick_presets_row(cx))
-            .child(div().h(px(4.0)))
             .child(Self::tab_label("Background"))
             .child(self.segmented(
                 "fill-type",
@@ -996,6 +954,9 @@ impl Studio {
             .when(self.section_open("watermark"), |this| {
                 this.child(self.watermark_section(cx))
             })
+            .child(div().h(px(4.0)))
+            .child(Self::tab_label("Presets"))
+            .child(self.quick_presets_row(cx))
             .child(self.section_header("saved-presets", "Saved presets", None, cx))
             .when(self.section_open("saved-presets"), |this| {
                 this.child(self.preset_library_section(cx))
@@ -1297,7 +1258,6 @@ impl Studio {
             InspectorTab::Record => self.record_tab(cx),
             InspectorTab::Export => self.export_section(cx),
         };
-        let advanced = self.inspector_level >= 2;
         let tabs = div()
             .h(px(56.0))
             .flex_none()
@@ -1351,31 +1311,6 @@ impl Studio {
                             }))
                     }),
             );
-        let footer = div()
-            .h(px(36.0))
-            .flex_none()
-            .px_4()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_t_1()
-            .border_color(line())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("Advanced options"),
-            )
-            .child(
-                div()
-                    .id("inspector-advanced")
-                    .cursor_pointer()
-                    .child(self.toggle(advanced))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.inspector_level = if advanced { 0 } else { 2 };
-                        cx.notify();
-                    })),
-            );
         div()
             .w(px(INSPECTOR_WIDTH))
             .flex_none()
@@ -1398,7 +1333,6 @@ impl Studio {
                     .flex_col()
                     .child(body),
             )
-            .child(footer)
             .when(self.crop_active, |this| {
                 this.opacity(0.52).child(
                     div()

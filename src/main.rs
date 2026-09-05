@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use gpui::{
     canvas, div, font, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
-    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp,
+    rgb, size, svg, AnyElement, AnyWindowHandle, App, Application, AssetSource, AsyncApp, WindowHandle,
     Background, Bounds, BoxShadow, ClickEvent, ContentMask, Context, CursorStyle, FocusHandle,
     FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, PathBuilder, PathPromptOptions, Pixels, Point, Render, RenderImage,
@@ -22,6 +22,9 @@ use std::{
 };
 use uuid::Uuid;
 
+mod library;
+mod launcher_library;
+mod launcher_recording;
 mod motion_ui;
 mod preset_cards;
 mod recording;
@@ -41,7 +44,8 @@ use recording::{
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
     export::{ExportFormat, ExportProgress, ExportResolution},
     model::{PointerCaptureFile, RecordingSession},
-    native::{NativeRecorder, RecordingOptions},
+    camera_preview::{CameraFrames, CameraPreview},
+    native::{camera_devices, microphone_devices, NativeRecorder, RecordingOptions},
     pointer_timeline::PointerTimeline,
     presets::PresetLibrary,
     scene::{CameraOverlay, PointerStyle, SceneStyle, SceneTransform, Watermark},
@@ -93,6 +97,11 @@ impl AssetSource for Assets {
     }
 }
 
+const EDITOR_WINDOW_SIZE: gpui::Size<Pixels> = gpui::Size {
+    width: px(1440.0),
+    height: px(900.0),
+};
+
 fn ink() -> Hsla {
     hsla(220.0 / 360.0, 0.13, 0.12, 1.0)
 }
@@ -126,44 +135,6 @@ fn timestamped_export_name() -> String {
     chrono::Local::now()
         .format("Lahza-%Y-%m-%d_%H-%M-%S-%3f.png")
         .to_string()
-}
-
-fn recent_roots() -> Vec<PathBuf> {
-    let mut roots = vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))];
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        roots.push(home.join("Videos"));
-        roots.push(home.join("Pictures"));
-    }
-    roots
-}
-
-fn recent_files(extension: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for root in recent_roots() {
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) == Some(extension) {
-                files.push(path);
-            }
-        }
-    }
-    files.sort_by_key(|path| fs::metadata(path).and_then(|m| m.modified()).ok());
-    files.reverse();
-    files.truncate(8);
-    files
-}
-
-fn recent_images() -> Vec<PathBuf> {
-    let mut files = recent_files("png");
-    files.extend(recent_files("jpg"));
-    files.sort_by_key(|path| fs::metadata(path).and_then(|m| m.modified()).ok());
-    files.reverse();
-    files.truncate(8);
-    files
 }
 
 fn cached_render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
@@ -1347,8 +1318,15 @@ fn fitted_image_bounds(
 
 struct Studio {
     /// The lightweight capture home shown before there is anything to edit.
+    /// The window currently showing this studio; replaced when the compact
+    /// launcher hands off to the full-size editor window.
+    window_handle: AnyWindowHandle,
     launcher_active: bool,
+    /// The studio is still in the launcher's compact window and must move to
+    /// an editor-sized one when the editor first renders.
+    launcher_window: bool,
     launcher_tab: usize,
+    library_state: launcher_library::LibraryState,
     recent_projects: Vec<PathBuf>,
     recent_screenshots: Vec<PathBuf>,
     tool: Tool,
@@ -1374,7 +1352,28 @@ struct Studio {
     recording_session_path: Option<PathBuf>,
     record_system_audio: bool,
     record_microphone: bool,
+    /// Selected microphone source name; `None` follows the system default.
+    microphone_device: Option<String>,
+    /// `(source name, display name)` of every microphone, refreshed with the launcher.
+    microphone_devices: Vec<(String, String)>,
+    launcher_mic_menu_open: bool,
     record_camera: bool,
+    /// Selected webcam device node; `None` uses the first webcam found.
+    camera_device: Option<String>,
+    /// `(device node, display name)` of every webcam, refreshed with the launcher.
+    camera_devices: Vec<(String, String)>,
+    launcher_camera_menu_open: bool,
+    /// Latest webcam frame from the launcher preview pipeline.
+    camera_frames: Arc<CameraFrames>,
+    /// Webcam pipeline while the launcher shows the camera and nothing records.
+    camera_preview: Option<CameraPreview>,
+    camera_frame: Option<Arc<RenderImage>>,
+    camera_frame_generation: u64,
+    camera_poll_running: bool,
+    recording_camera_enabled: bool,
+    /// Replaced GPU images awaiting `Window::drop_image`; the sprite atlas
+    /// never frees a `RenderImage` on its own.
+    retired_images: Vec<Arc<RenderImage>>,
     video_project: Option<RecordingSession>,
     /// Directory of the recording closed by switching to Static or Motion,
     /// so the Video tab returns to it instead of asking again.
@@ -1446,8 +1445,6 @@ struct Studio {
     export_frame_rate: f64,
     export_loop: bool,
     preset_library: PresetLibrary,
-    /// 0 quick, 1 customize, 2 advanced.
-    inspector_level: usize,
     default_motion_zoom: f64,
     video_audio_levels: Vec<f32>,
     video_audio_muted: bool,
@@ -1618,22 +1615,23 @@ impl Studio {
                     if event.shortcut_id() != "capture-screenshot" {
                         continue;
                     }
-                    let should_capture = weak
+                    let window_handle = weak
                         .update(cx, |this, cx| {
                             if this.capturing {
-                                return false;
+                                return None;
                             }
                             this.capturing = true;
                             this.toast = Some(
                                 "Choose a screen, window, or area in the system picker".into(),
                             );
                             cx.notify();
-                            true
+                            Some(this.window_handle)
                         })
-                        .unwrap_or(false);
-                    if !should_capture {
+                        .ok()
+                        .flatten();
+                    let Some(window_handle) = window_handle else {
                         continue;
-                    }
+                    };
 
                     let capture_result = capture_behind_window(Some(window_handle), cx).await;
                     if weak
@@ -1677,10 +1675,13 @@ impl Studio {
             }
         });
         let mut studio = Self {
+            window_handle,
             launcher_active: initial_recording.is_none() && initial_image.is_none(),
+            launcher_window: initial_recording.is_none() && initial_image.is_none(),
             launcher_tab: 0,
-            recent_projects: recent_files("screendroprec"),
-            recent_screenshots: recent_images(),
+            library_state: launcher_library::LibraryState::default(),
+            recent_projects: Vec::new(),
+            recent_screenshots: Vec::new(),
             tool: Tool::Select,
             annotation_color_index: 1,
             annotation_stroke_width: 4.0,
@@ -1704,7 +1705,20 @@ impl Studio {
             recording_session_path: None,
             record_system_audio: false,
             record_microphone: false,
+            microphone_device: None,
+            microphone_devices: microphone_devices(),
+            launcher_mic_menu_open: false,
             record_camera: false,
+            camera_device: None,
+            camera_devices: camera_devices(),
+            launcher_camera_menu_open: false,
+            camera_frames: Arc::new(CameraFrames::default()),
+            camera_preview: None,
+            camera_frame: None,
+            camera_frame_generation: 0,
+            camera_poll_running: false,
+            recording_camera_enabled: false,
+            retired_images: Vec::new(),
             video_project: None,
             last_video_project: None,
             video_frame: None,
@@ -1765,7 +1779,6 @@ impl Studio {
             export_frame_rate: 30.0,
             export_loop: true,
             preset_library: PresetLibrary::load(),
-            inspector_level: 0,
             default_motion_zoom: 2.0,
             video_audio_levels: Vec::new(),
             video_audio_muted: false,
@@ -1848,13 +1861,102 @@ impl Studio {
     /// Keeps an RGBA copy of the shown video frame for the compositor.
     fn set_video_frame(&mut self, pixels: image::RgbaImage) {
         self.video_frame_rgba = Some(Arc::new(pixels.clone()));
-        self.video_frame = Some(cached_render_image(pixels));
+        let previous = self.video_frame.replace(cached_render_image(pixels));
+        self.retire_image(previous);
+    }
+
+    /// Queues a no-longer-shown image for release from the GPU atlas on the
+    /// next render.
+    fn retire_image(&mut self, image: Option<Arc<RenderImage>>) {
+        self.retired_images.extend(image);
+    }
+
+    /// Frees every retired image's atlas tile. Must run each render, since
+    /// per-frame previews would otherwise fill VRAM within minutes.
+    fn drop_retired_images(&mut self, window: &mut Window) {
+        for image in self.retired_images.drain(..) {
+            let _ = window.drop_image(image);
+        }
+    }
+
+    fn wants_camera_preview(&self) -> bool {
+        self.launcher_active && match self.recording_state {
+            RecordingState::Idle => self.record_camera,
+            RecordingState::Starting | RecordingState::Recording | RecordingState::Paused => self.recording_camera_enabled,
+            _ => false,
+        }
+    }
+
+    /// Poll the latest frame from the standalone camera or recording pipeline.
+    fn sync_camera_preview(&mut self, cx: &mut Context<Self>) {
+        let wants_preview = self.wants_camera_preview();
+        if !wants_preview {
+            self.camera_preview = None;
+            let frame = self.camera_frame.take();
+            self.retire_image(frame);
+            return;
+        }
+        if self.recording_state != RecordingState::Idle {
+            self.camera_preview = None;
+        } else if self.camera_preview.is_none() {
+            let device = match self.camera_device.clone() {
+                Some(device) => Ok(device),
+                None => recording::native::default_camera_device(),
+            };
+            match device.and_then(|device| CameraPreview::start(&device, self.camera_frames.clone()))
+            {
+                Ok(preview) => self.camera_preview = Some(preview),
+                Err(error) => {
+                    self.record_camera = false;
+                    self.toast = Some(format!("Webcam preview unavailable: {error}").into());
+                    return;
+                }
+            }
+        }
+        if self.camera_poll_running {
+            return;
+        }
+        self.camera_poll_running = true;
+        let frames = self.camera_frames.clone();
+        cx.spawn(async move |weak, cx| loop {
+            Timer::after(Duration::from_millis(66)).await;
+            let state = weak.update(cx, |this, cx| {
+                if !this.wants_camera_preview() {
+                    this.camera_poll_running = false;
+                    let frame = this.camera_frame.take();
+                    this.retire_image(frame);
+                    cx.notify();
+                    return None;
+                }
+                Some((this.camera_frame_generation, this.camera_overlay))
+            });
+            let Ok(Some((seen, overlay))) = state else { break; };
+            let Some((generation, frame)) = frames.newer_than(seen) else { continue; };
+            // One frame at a time: discard intermediate camera frames while
+            // compositing so a slow preview never queues work or delays input.
+            let preview = cx.background_executor().spawn(async move {
+                let pixels = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)?;
+                Some(recording::scene::camera_framing_preview(&pixels, overlay))
+            }).await;
+            if weak.update(cx, |this, cx| {
+                if this.wants_camera_preview() {
+                    this.camera_frame_generation = generation;
+                    if let Some(pixels) = preview {
+                        let previous = this.camera_frame.replace(cached_render_image(pixels));
+                        this.retire_image(previous);
+                        cx.notify();
+                    }
+                }
+            }).is_err() { break; }
+        })
+        .detach();
     }
 
     /// Keeps an RGBA copy of the shown capture for the compositor.
     fn set_capture_image(&mut self, image: image::RgbaImage) {
         self.capture_rgba = Some(Arc::new(image.clone()));
-        self.displayed_capture_image = Some(cached_render_image(image));
+        let previous = self.displayed_capture_image.replace(cached_render_image(image));
+        self.retire_image(previous);
     }
 
     /// The pointer capture with individually removed clicks filtered out.
@@ -1962,10 +2064,18 @@ impl Studio {
         let options = RecordingOptions {
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
+            microphone_device: self.microphone_device.clone(),
             camera: self.record_camera,
+            camera_device: self.camera_device.clone(),
         };
+        // The recorder opens the webcam itself; release the preview's handle.
+        self.camera_preview = None;
+        self.recording_camera_enabled = options.camera;
+        let camera_frames = self.camera_frames.clone();
         let task = cx.background_executor().spawn(async move {
-            let mut controller = RecordingController::new(NativeRecorder::with_options(options));
+            let mut controller = RecordingController::new(
+                NativeRecorder::with_options(options).with_camera_preview(camera_frames),
+            );
             let result = controller
                 .start()
                 .map(|session| session.directory.clone())
@@ -6482,32 +6592,34 @@ impl Studio {
         id: &'static str,
         icon: &'static str,
         title: &'static str,
-        subtitle: &'static str,
+        subtitle: impl IntoElement,
         enabled: bool,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
         div()
             .id(id)
             .h(px(52.0))
+            .flex_none()
             .px_3()
             .flex()
             .items_center()
             .gap_3()
             .rounded_lg()
             .border_1()
-            .border_color(if enabled { blue() } else { rgb(0x353941) })
+            .border_color(if enabled { blue() } else { line() })
             .bg(if enabled {
-                rgb(0x172b40)
+                hsla(211.0 / 360.0, 0.9, 0.96, 1.0)
             } else {
-                rgb(0x25272b)
+                gpui::white()
             })
             .cursor_pointer()
             .on_click(on_click)
-            .child(svg().path(icon).size(px(17.0)).text_color(if enabled {
-                rgb(0x55b1ff)
-            } else {
-                rgb(0xa3a7ae)
-            }))
+            .child(
+                svg()
+                    .path(icon)
+                    .size(px(17.0))
+                    .text_color(if enabled { blue() } else { muted() }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -6518,28 +6630,7 @@ impl Studio {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
-                    .child(div().text_xs().text_color(rgb(0x92979f)).child(subtitle)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .gap(px(2.0))
-                    .children((0..5).map(|bar| {
-                        div()
-                            .w(px(3.0))
-                            .h(px(if enabled {
-                                7.0 + (bar % 3) as f32 * 4.0
-                            } else {
-                                3.0
-                            }))
-                            .rounded_full()
-                            .bg(if enabled {
-                                rgb(0x36a7ff)
-                            } else {
-                                rgb(0x555960)
-                            })
-                    })),
+                    .child(div().text_xs().text_color(muted()).child(subtitle)),
             )
             .child(
                 div()
@@ -6548,9 +6639,139 @@ impl Studio {
                     .rounded_full()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .bg(if enabled { blue() } else { rgb(0x383b40) })
+                    .bg(if enabled { blue() } else { line() })
+                    .text_color(if enabled { gpui::white() } else { ink() })
                     .child(if enabled { "On" } else { "Off" }),
             )
+            .into_any_element()
+    }
+
+    /// A web-style device select for a launcher row: shows the chosen entry,
+    /// opens a popup on click, and closes on a pick or a click outside.
+    fn launcher_device_select(
+        &self,
+        id: &'static str,
+        devices: &[(String, String)],
+        selected: &Option<String>,
+        open: bool,
+        set_open: impl Fn(&mut Self, bool) + 'static,
+        pick: impl Fn(&mut Self, Option<String>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = selected
+            .as_ref()
+            .and_then(|selected| {
+                devices
+                    .iter()
+                    .find(|(name, _)| name == selected)
+                    .map(|(_, label)| label.clone())
+            })
+            .unwrap_or_else(|| "System default".to_string());
+        let entries = std::iter::once((None, "System default".to_string()))
+            .chain(
+                devices
+                    .iter()
+                    .map(|(name, label)| (Some(name.clone()), label.clone())),
+            )
+            .collect::<Vec<_>>();
+        let pick = std::rc::Rc::new(pick);
+        let set_open = std::rc::Rc::new(set_open);
+        let toggle = set_open.clone();
+        div()
+            .id(id)
+            .relative()
+            .flex()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .text_color(if open { blue() } else { muted() })
+            .hover(|s| s.text_color(ink()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                toggle(this, !open);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .max_w(px(220.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(label),
+            )
+            .child(svg().path("icons/chevron-down.svg").size(px(12.0)))
+            .when(open, |this| {
+                let close = set_open.clone();
+                this.child(
+                    gpui::deferred(
+                        gpui::anchored()
+                            .position_mode(gpui::AnchoredPositionMode::Local)
+                            .position(point(px(0.0), px(22.0)))
+                            .snap_to_window_with_margin(gpui::Edges {
+                                top: px(8.0), right: px(8.0), bottom: px(8.0), left: px(8.0),
+                            })
+                            .child(div()
+                            .id((id, 1usize))
+                            .w(px(280.0))
+                            .max_h(px(240.0))
+                            .overflow_y_scroll()
+                            .py_1()
+                            .rounded_lg()
+                            .bg(gpui::white())
+                            .border_1()
+                            .border_color(line())
+                            .shadow_md()
+                            .flex()
+                            .flex_col()
+                            .text_color(ink())
+                            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                                close(this, false);
+                                cx.notify();
+                            }))
+                            .children(entries.into_iter().enumerate().map(|(index, (name, entry))| {
+                                let is_selected = *selected == name;
+                                let pick = pick.clone();
+                                div()
+                                    .id((id, index + 2))
+                                    .h(px(30.0))
+                                    .flex_none()
+                                    .px_2()
+                                    .mx_1()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(hsla(220.0 / 360.0, 0.08, 0.95, 1.0)))
+                                    .child(svg().path("icons/check.svg").size(px(13.0)).text_color(
+                                        if is_selected {
+                                            blue()
+                                        } else {
+                                            gpui::transparent_black()
+                                        },
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .font_weight(if is_selected {
+                                                FontWeight::SEMIBOLD
+                                            } else {
+                                                FontWeight::NORMAL
+                                            })
+                                            .child(entry),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        pick(this, name.clone());
+                                        cx.notify();
+                                    }))
+                            }))),
+                    )
+                    .with_priority(1),
+                )
+            })
             .into_any_element()
     }
 
@@ -6563,25 +6784,26 @@ impl Studio {
         let recording = self.recording_state != RecordingState::Idle;
         div()
             .size_full()
-            .bg(rgb(0x17181a))
-            .text_color(rgb(0xf7f7f8))
+            .bg(panel())
+            .text_color(ink())
             .font_family("Inter")
             .flex()
             .flex_col()
             .child(
                 div()
                     .h(px(54.0))
+                    .flex_none()
                     .px_4()
                     .flex()
                     .items_center()
                     .gap_3()
                     .border_b_1()
-                    .border_color(rgb(0x303237))
+                    .border_color(line())
                     .child(
                         div()
                             .size(px(28.0))
                             .rounded_lg()
-                            .bg(rgb(0xffffff))
+                            .bg(ink())
                             .flex()
                             .items_center()
                             .justify_center()
@@ -6589,27 +6811,20 @@ impl Studio {
                                 svg()
                                     .path("icons/capture.svg")
                                     .size(px(17.0))
-                                    .text_color(rgb(0x15171a)),
+                                    .text_color(gpui::white()),
                             ),
                     )
                     .child(div().text_lg().font_weight(FontWeight::BOLD).child("Lahza"))
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x90949b))
-                            .child(if recording {
-                                self.recording_timecode()
-                            } else {
-                                "Ready".into()
-                            }),
-                    ),
+                    .when(!recording, |this| this.child(div().text_xs().text_color(muted()).child("Ready"))),
             )
+            .when(recording, |this| this.child(self.launcher_recording_panel(cx)))
             .child(
-                div().px_4().pt_4().pb_3().flex().gap_2().children(
+                div().flex_none().px_4().pt_4().pb_3().flex().gap_2().children(
                     [("Capture", 0usize), ("Projects", 1), ("Screenshots", 2)]
                         .into_iter()
                         .map(|(label, tab)| {
+                            let active = self.launcher_tab == tab;
                             div()
                                 .id(("launcher-tab", tab))
                                 .flex_1()
@@ -6620,14 +6835,14 @@ impl Studio {
                                 .justify_center()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .bg(if self.launcher_tab == tab {
-                                    rgb(0x33363b)
-                                } else {
-                                    rgb(0x202226)
-                                })
+                                .bg(if active { ink() } else { gpui::white() })
+                                .text_color(if active { gpui::white() } else { ink() })
+                                .border_1()
+                                .border_color(if active { ink() } else { line() })
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.launcher_tab = tab;
+                                    this.refresh_library(cx);
                                     cx.notify();
                                 }))
                                 .child(label)
@@ -6636,13 +6851,18 @@ impl Studio {
             )
             .child(if self.launcher_tab == 0 {
                 div()
+                    .id("launcher-capture")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .px_4()
                     .pb_4()
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(
+                    .when(!recording, |this| this.child(
                         div()
+                            .flex_none()
                             .grid()
                             .grid_cols(2)
                             .gap_2()
@@ -6651,7 +6871,10 @@ impl Studio {
                                     .id("launcher-screenshot")
                                     .h(px(82.0))
                                     .rounded_xl()
-                                    .bg(blue())
+                                    .bg(gpui::white())
+                                    .border_1()
+                                    .border_color(line())
+                                    .hover(|s| s.bg(rgb(0xe5f2ff)))
                                     .cursor_pointer()
                                     .flex()
                                     .flex_col()
@@ -6662,7 +6885,7 @@ impl Studio {
                                         svg()
                                             .path("icons/capture.svg")
                                             .size(px(24.0))
-                                            .text_color(rgb(0xffffff)),
+                                            .text_color(blue()),
                                     )
                                     .child(
                                         div()
@@ -6679,7 +6902,10 @@ impl Studio {
                                     .id("launcher-record")
                                     .h(px(82.0))
                                     .rounded_xl()
-                                    .bg(rgb(0xe33d4b))
+                                    .bg(gpui::white())
+                                    .border_1()
+                                    .border_color(line())
+                                    .hover(|s| s.bg(rgb(0xffe9eb)))
                                     .cursor_pointer()
                                     .flex()
                                     .flex_col()
@@ -6690,7 +6916,7 @@ impl Studio {
                                         svg()
                                             .path("icons/record.svg")
                                             .size(px(24.0))
-                                            .text_color(rgb(0xffffff)),
+                                            .text_color(rgb(0xe33442)),
                                     )
                                     .child(div().text_sm().font_weight(FontWeight::BOLD).child(
                                         if recording {
@@ -6705,26 +6931,72 @@ impl Studio {
                                         }
                                     })),
                             ),
-                    )
+                    ))
                     .child(self.launcher_source_row(
                         "launcher-camera",
                         "icons/video.svg",
                         "Camera",
-                        "Preview and include your camera",
+                        self.launcher_device_select(
+                            "launcher-camera-select",
+                            &self.camera_devices,
+                            &self.camera_device,
+                            self.launcher_camera_menu_open,
+                            |this, open| this.launcher_camera_menu_open = open,
+                            |this, device| {
+                                if this.camera_device != device {
+                                    this.camera_device = device;
+                                    // Restart the preview on the new device.
+                                    this.camera_preview = None;
+                                }
+                                this.record_camera = true;
+                                this.launcher_camera_menu_open = false;
+                            },
+                            cx,
+                        ),
                         self.record_camera,
                         cx.listener(|this, _, _, cx| {
                             this.record_camera = !this.record_camera;
+                            if this.record_camera {
+                                this.camera_devices = camera_devices();
+                            }
                             cx.notify();
                         }),
                     ))
+                    .when_some(self.camera_frame.clone().filter(|_| !recording), |this, frame| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_1()
+                                .child(img(frame).size(px(200.0)).object_fit(ObjectFit::Contain))
+                                .child(div().text_xs().text_color(muted()).child("Camera crop · enlarged preview")),
+                        )
+                    })
                     .child(self.launcher_source_row(
                         "launcher-mic",
                         "icons/microphone.svg",
                         "Microphone",
-                        "Voice input level",
+                        self.launcher_device_select(
+                            "launcher-mic-select",
+                            &self.microphone_devices,
+                            &self.microphone_device,
+                            self.launcher_mic_menu_open,
+                            |this, open| this.launcher_mic_menu_open = open,
+                            |this, device| {
+                                this.microphone_device = device;
+                                this.record_microphone = true;
+                                this.launcher_mic_menu_open = false;
+                            },
+                            cx,
+                        ),
                         self.record_microphone,
                         cx.listener(|this, _, _, cx| {
                             this.record_microphone = !this.record_microphone;
+                            if this.record_microphone {
+                                this.microphone_devices = microphone_devices();
+                            }
                             cx.notify();
                         }),
                     ))
@@ -6739,15 +7011,28 @@ impl Studio {
                             cx.notify();
                         }),
                     ))
-                    .when(recording, |this| this.child(self.recording_controls(cx)))
                     .into_any_element()
             } else {
                 div()
+                    .id("launcher-recent")
+                    .flex_1()
+                    .min_h_0()
                     .px_4()
                     .pb_4()
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .child(
+                        div().text_xs().text_color(muted()).child(
+                            if self.launcher_tab == 1 {
+                                recording::model::recordings_root()
+                            } else {
+                                library::screenshots_root()
+                            }
+                            .display()
+                            .to_string(),
+                        ),
+                    )
                     .when(items.is_empty(), |this| {
                         this.child(
                             div()
@@ -6757,62 +7042,24 @@ impl Studio {
                                 .items_center()
                                 .justify_center()
                                 .gap_2()
-                                .text_color(rgb(0x92979f))
-                                .child(svg().path("icons/folder.svg").size(px(28.0)))
-                                .child("No recent items yet"),
+                                .text_color(muted())
+                                .child(svg().path("icons/folder.svg").size(px(28.0)).text_color(muted()))
+                                .child(if self.library_state.loading { "Loading…" } else { "No saved items yet" }),
                         )
                     })
-                    .children(items.iter().cloned().enumerate().map(|(index, path)| {
-                        let open_path = path.clone();
-                        let project = self.launcher_tab == 1;
-                        div()
-                            .id(("recent-item", index))
-                            .h(px(48.0))
-                            .px_3()
-                            .rounded_lg()
-                            .bg(rgb(0x24262a))
-                            .hover(|s| s.bg(rgb(0x303339)))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                svg()
-                                    .path(if project {
-                                        "icons/video.svg"
-                                    } else {
-                                        "icons/capture.svg"
-                                    })
-                                    .size(px(17.0))
-                                    .text_color(rgb(0x8dbff1)),
+                    .when(!items.is_empty(), |this| {
+                        this.child(
+                            gpui::uniform_list(
+                                if self.launcher_tab == 1 { "project-library" } else { "screenshot-library" },
+                                items.len(),
+                                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                    range.map(|index| this.library_row(index, cx)).collect()
+                                }),
                             )
-                            .child(
-                                div().flex_1().min_w_0().text_sm().overflow_hidden().child(
-                                    path.file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("Untitled")
-                                        .to_string(),
-                                ),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(15.0))
-                                    .text_color(rgb(0x777b82)),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if project {
-                                    if let Err(error) = this.open_video_project(open_path.clone()) {
-                                        this.toast = Some(error.into());
-                                    } else {
-                                        this.launcher_active = false;
-                                    }
-                                } else {
-                                    this.finish_capture_request(Ok(open_path.clone()));
-                                }
-                                cx.notify();
-                            }))
-                    }))
+                            .flex_1()
+                            .min_h_0(),
+                        )
+                    })
                     .into_any_element()
             })
             .into_any_element()
@@ -6821,8 +7068,28 @@ impl Studio {
 
 impl Render for Studio {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drop_retired_images(window);
+        self.sync_camera_preview(cx);
         if self.launcher_active {
             return self.render_launcher(cx);
+        }
+        if std::mem::take(&mut self.launcher_window) {
+            // GPUI cannot reliably resize a Wayland window in place, so the
+            // editor gets its own full-size window and the launcher closes.
+            let studio = cx.entity();
+            let launcher_window = self.window_handle;
+            cx.defer(move |cx| {
+                let Ok(editor_window) =
+                    open_studio_window(cx, true, move |_, _| studio.clone())
+                else {
+                    return;
+                };
+                let _ = editor_window.update(cx, |studio, _, _| {
+                    studio.window_handle = editor_window.into();
+                });
+                let _ = launcher_window.update(cx, |_, window, _| window.remove_window());
+                cx.activate(true);
+            });
         }
         if self.video_project.is_some() {
             return self.render_video(window, cx);
@@ -6943,6 +7210,55 @@ impl Render for Studio {
     }
 }
 
+/// Opens a Lahza window at the editor or compact launcher size and installs
+/// the close guard that keeps a live recording from being lost.
+fn open_studio_window(
+    cx: &mut App,
+    editor: bool,
+    build: impl FnOnce(AnyWindowHandle, &mut App) -> gpui::Entity<Studio>,
+) -> gpui::Result<WindowHandle<Studio>> {
+    let window_size = if editor {
+        EDITOR_WINDOW_SIZE
+    } else {
+        size(px(430.0), px(610.0))
+    };
+    let bounds = Bounds::centered(None, window_size, cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(if editor {
+                size(px(980.0), px(680.0))
+            } else {
+                size(px(400.0), px(560.0))
+            }),
+            app_id: Some("com.screendrop.Screendrop".into()),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Lahza".into()),
+                appears_transparent: false,
+                traffic_light_position: None,
+            }),
+            window_decorations: Some(WindowDecorations::Server),
+            ..Default::default()
+        },
+        move |window, cx| {
+            let studio = build(window.window_handle(), cx);
+            let weak = studio.downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                weak.update(cx, |studio, cx| {
+                    if studio.recording_state == RecordingState::Idle {
+                        true
+                    } else {
+                        studio.request_window_close(window.window_handle(), cx);
+                        false
+                    }
+                })
+                .unwrap_or(true)
+            });
+            studio
+        },
+    )
+}
+
 fn main() {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let initial_recording = arguments
@@ -6961,60 +7277,29 @@ fn main() {
                 })
         })
         .cloned();
+    // GNOME's Wayland compositor has no xdg-decoration protocol, so GPUI
+    // windows there get no frame at all. Run through XWayland instead, where
+    // the compositor draws its standard title bar and controls. Recording
+    // still detects a Wayland session via XDG_SESSION_TYPE.
+    if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
     Application::new()
         .with_assets(Assets {
             base: asset_directory(),
         })
         .run(move |cx: &mut App| {
             let starts_in_editor = initial_recording.is_some() || initial_image.is_some();
-            let window_size = if starts_in_editor {
-                size(px(1440.0), px(900.0))
-            } else {
-                size(px(430.0), px(610.0))
-            };
-            let bounds = Bounds::centered(None, window_size, cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(if starts_in_editor {
-                        size(px(980.0), px(680.0))
-                    } else {
-                        size(px(400.0), px(560.0))
-                    }),
-                    app_id: Some("com.screendrop.Screendrop".into()),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Lahza".into()),
-                        appears_transparent: false,
-                        traffic_light_position: None,
-                    }),
-                    window_decorations: Some(WindowDecorations::Client),
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    let window_handle = window.window_handle();
-                    let studio = cx.new(|cx| {
-                        Studio::new(
-                            window_handle,
-                            initial_recording.clone(),
-                            initial_image.clone(),
-                            cx,
-                        )
-                    });
-                    let weak = studio.downgrade();
-                    window.on_window_should_close(cx, move |window, cx| {
-                        weak.update(cx, |studio, cx| {
-                            if studio.recording_state == RecordingState::Idle {
-                                true
-                            } else {
-                                studio.request_window_close(window.window_handle(), cx);
-                                false
-                            }
-                        })
-                        .unwrap_or(true)
-                    });
-                    studio
-                },
-            )
+            open_studio_window(cx, starts_in_editor, move |window_handle, cx| {
+                cx.new(|cx| {
+                    Studio::new(
+                        window_handle,
+                        initial_recording.clone(),
+                        initial_image.clone(),
+                        cx,
+                    )
+                })
+            })
             .expect("failed to open Lahza window");
             cx.activate(true);
         });

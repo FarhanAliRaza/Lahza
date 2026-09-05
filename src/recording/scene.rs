@@ -1048,80 +1048,9 @@ impl SceneCompositor {
         }
     }
 
-    /// Picture-in-picture camera: cover-fitted, optionally mirrored, masked
-    /// to the configured shape, with a soft shadow underneath.
     fn paint_camera(&self, output: &mut RgbaImage, camera: &RgbaImage) {
-        if camera.width() == 0 || camera.height() == 0 {
-            return;
-        }
         let overlay = self.style.camera;
-        let rect = overlay.rect(self.width as f64, self.height as f64);
-        let radius = overlay.radius(rect);
-        if overlay.shadow {
-            let width = self.width as usize;
-            let height = self.height as usize;
-            let mut mask = vec![0.0f32; width * height];
-            let offset = rect.height * 0.06;
-            let x0 = (rect.x - 2.0).floor().max(0.0) as usize;
-            let y0 = (rect.y + offset - 2.0).floor().max(0.0) as usize;
-            let x1 = ((rect.right() + 2.0).ceil().max(0.0) as usize).min(width);
-            let y1 = ((rect.bottom() + offset + 2.0).ceil().max(0.0) as usize).min(height);
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let u = (x as f64 + 0.5 - rect.x) / rect.width;
-                    let v = (y as f64 + 0.5 - offset - rect.y) / rect.height;
-                    let distance = rounded_rect_distance(u, v, rect.width, rect.height, radius);
-                    mask[y * width + x] = (0.5 - distance).clamp(0.0, 1.0) as f32;
-                }
-            }
-            blur_plane(&mut mask, width, height, rect.height * 0.05 * 0.5 + 1.0);
-            for y in 0..height {
-                for x in 0..width {
-                    let alpha = mask[y * width + x] as f64 * 0.35;
-                    if alpha > 0.001 {
-                        blend_pixel(output, x as u32, y as u32, [0, 0, 0], alpha);
-                    }
-                }
-            }
-        }
-        // Cover-fit: scale the frame so the square is filled, crop the rest.
-        let frame_width = camera.width() as f64;
-        let frame_height = camera.height() as f64;
-        let scale = (rect.width / frame_width).max(rect.height / frame_height);
-        let scaled_width = frame_width * scale;
-        let scaled_height = frame_height * scale;
-        let offset_x = (rect.width - scaled_width) * 0.5;
-        let offset_y = (rect.height - scaled_height) * 0.5;
-        let x0 = rect.x.floor().max(0.0) as u32;
-        let y0 = rect.y.floor().max(0.0) as u32;
-        let x1 = (rect.right().ceil().max(0.0) as u32).min(self.width);
-        let y1 = (rect.bottom().ceil().max(0.0) as u32).min(self.height);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let local_x = x as f64 + 0.5 - rect.x;
-                let local_y = y as f64 + 0.5 - rect.y;
-                let u = local_x / rect.width;
-                let v = local_y / rect.height;
-                let coverage = (0.5 - rounded_rect_distance(u, v, rect.width, rect.height, radius))
-                    .clamp(0.0, 1.0);
-                if coverage <= 0.0 {
-                    continue;
-                }
-                let mut sx = (local_x - offset_x) / scale - 0.5;
-                if overlay.mirror {
-                    sx = frame_width - 1.0 - sx;
-                }
-                let sy = (local_y - offset_y) / scale - 0.5;
-                let sample = sample_bilinear(camera, sx, sy);
-                blend_pixel(
-                    output,
-                    x,
-                    y,
-                    [sample[0], sample[1], sample[2]],
-                    coverage * sample[3] as f64 / 255.0,
-                );
-            }
-        }
+        paint_camera_overlay(output, camera, overlay, overlay.rect(self.width as f64, self.height as f64));
     }
 
     fn paint_pointer(
@@ -1238,6 +1167,90 @@ fn unpack(color: u32) -> [u8; 3] {
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
+
+/// Enlarged framing preview using the exact crop, mask, mirror, and shadow
+/// painter used for the recording. Placement and size remain editor settings.
+pub fn camera_framing_preview(camera: &RgbaImage, overlay: CameraOverlay) -> RgbaImage {
+    let mut output = RgbaImage::from_pixel(200, 200, Rgba([251, 251, 251, 255]));
+    paint_camera_overlay(&mut output, camera, overlay, Rect {
+        x: 12.0, y: 12.0, width: 176.0, height: 176.0,
+    });
+    output
+}
+
+/// Shared cover-fit camera renderer for the launcher, editor, and export.
+fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: CameraOverlay, rect: Rect) {
+    if camera.width() == 0 || camera.height() == 0 {
+        return;
+    }
+    let radius = overlay.radius(rect);
+    if overlay.shadow {
+        let width = output.width() as usize;
+        let height = output.height() as usize;
+        let mut mask = vec![0.0f32; width * height];
+        let offset = rect.height * 0.06;
+        let x0 = (rect.x - 2.0).floor().max(0.0) as usize;
+        let y0 = (rect.y + offset - 2.0).floor().max(0.0) as usize;
+        let x1 = ((rect.right() + 2.0).ceil().max(0.0) as usize).min(width);
+        let y1 = ((rect.bottom() + offset + 2.0).ceil().max(0.0) as usize).min(height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let u = (x as f64 + 0.5 - rect.x) / rect.width;
+                let v = (y as f64 + 0.5 - offset - rect.y) / rect.height;
+                let distance = rounded_rect_distance(u, v, rect.width, rect.height, radius);
+                mask[y * width + x] = (0.5 - distance).clamp(0.0, 1.0) as f32;
+            }
+        }
+        blur_plane(&mut mask, width, height, rect.height * 0.05 * 0.5 + 1.0);
+        for y in 0..height {
+            for x in 0..width {
+                let alpha = mask[y * width + x] as f64 * 0.35;
+                if alpha > 0.001 {
+                    blend_pixel(output, x as u32, y as u32, [0, 0, 0], alpha);
+                }
+            }
+        }
+    }
+    // Cover-fit: scale the frame so the square is filled, crop the rest.
+    let frame_width = camera.width() as f64;
+    let frame_height = camera.height() as f64;
+    let scale = (rect.width / frame_width).max(rect.height / frame_height);
+    let scaled_width = frame_width * scale;
+    let scaled_height = frame_height * scale;
+    let offset_x = (rect.width - scaled_width) * 0.5;
+    let offset_y = (rect.height - scaled_height) * 0.5;
+    let x0 = rect.x.floor().max(0.0) as u32;
+    let y0 = rect.y.floor().max(0.0) as u32;
+    let x1 = (rect.right().ceil().max(0.0) as u32).min(output.width());
+    let y1 = (rect.bottom().ceil().max(0.0) as u32).min(output.height());
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let local_x = x as f64 + 0.5 - rect.x;
+            let local_y = y as f64 + 0.5 - rect.y;
+            let u = local_x / rect.width;
+            let v = local_y / rect.height;
+            let coverage = (0.5 - rounded_rect_distance(u, v, rect.width, rect.height, radius))
+                .clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let mut sx = (local_x - offset_x) / scale - 0.5;
+            if overlay.mirror {
+                sx = frame_width - 1.0 - sx;
+            }
+            let sy = (local_y - offset_y) / scale - 0.5;
+            let sample = sample_bilinear(camera, sx, sy);
+            blend_pixel(
+                output,
+                x,
+                y,
+                [sample[0], sample[1], sample[2]],
+                coverage * sample[3] as f64 / 255.0,
+            );
+        }
+    }
+}
+
 
 fn blend_pixel(image: &mut RgbaImage, x: u32, y: u32, color: [u8; 3], alpha: f64) {
     if x >= image.width() || y >= image.height() {
@@ -2211,6 +2224,40 @@ mod tests {
         });
         assert_eq!(output.get_pixel(50, 50).0, [255, 0, 0, 255]);
         assert_eq!(output.get_pixel(10, 10).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn launcher_camera_crop_matches_recording_for_every_shape_and_mirror_setting() {
+        let camera = RgbaImage::from_fn(320, 180, |x, y| {
+            Rgba([(x % 256) as u8, y as u8, 80, 255])
+        });
+        for shape in CameraShape::ALL {
+            for mirror in [false, true] {
+                let overlay = CameraOverlay {
+                    position: WatermarkPosition::TopLeft,
+                    size: 44,
+                    margin: 3,
+                    shape,
+                    mirror,
+                    shadow: false,
+                    ..CameraOverlay::default()
+                };
+                let style = SceneStyle { camera: overlay, ..flat_style(0xfbfbfb) };
+                let compositor = SceneCompositor::new(&style, 400, 400, 400, 400).unwrap();
+                let source = RgbaImage::from_pixel(400, 400, Rgba([251, 251, 251, 255]));
+                let recording = compositor.compose(FrameInput {
+                    source: &source,
+                    overlay: None,
+                    viewport: ViewportFrame::default(),
+                    pointer: None,
+                    camera: Some(&camera),
+                });
+                let preview = camera_framing_preview(&camera, overlay);
+                for (x, y, pixel) in preview.enumerate_pixels() {
+                    assert_eq!(pixel, recording.get_pixel(x, y), "{shape:?}, mirror={mirror}, ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]

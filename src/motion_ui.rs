@@ -738,103 +738,99 @@ impl Studio {
                     cx,
                 ))
                 .child(self.motion_zoom_slider(cue.zoom, cx))
-                .when(self.inspector_level >= 2, |this| {
-                    let easing_index = crate::scene_ui::easing_index(cue.easing);
-                    let has_tilt = cue.tilt.is_some();
-                    this.child(Self::inspector_label("Easing (ramps and pans)"))
-                        .child(self.segmented(
-                            "motion-easing",
-                            &["Smooth", "Linear", "Snappy", "Cinematic"],
-                            easing_index,
-                            |this, index| {
-                                this.edit_selected_region(|cue| {
-                                    cue.easing =
-                                        crate::recording::viewport::MotionEasing::ALL[index]
-                                });
-                            },
-                            cx,
-                        ))
+                .child(Self::inspector_label("Easing (ramps and pans)"))
+                .child(self.segmented(
+                    "motion-easing",
+                    &["Smooth", "Linear", "Snappy", "Cinematic"],
+                    crate::scene_ui::easing_index(cue.easing),
+                    |this, index| {
+                        this.edit_selected_region(|cue| {
+                            cue.easing =
+                                crate::recording::viewport::MotionEasing::ALL[index]
+                        });
+                    },
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted())
-                                        .w(px(40.0))
-                                        .child("Start"),
-                                )
-                                .child(self.small_button(
-                                    "motion-start-earlier",
-                                    "−0.1s",
-                                    !edit_busy,
-                                    cx,
-                                    |this, _| {
-                                        this.edit_selected_region(|cue| {
-                                            cue.start = (cue.start - 0.1).max(0.0)
-                                        });
-                                    },
-                                ))
-                                .child(self.small_button(
-                                    "motion-start-later",
-                                    "+0.1s",
-                                    !edit_busy,
-                                    cx,
-                                    |this, _| {
-                                        this.edit_selected_region(|cue| {
-                                            cue.start = (cue.start + 0.1)
-                                                .min(cue.end - ZoomCue::MINIMUM_DURATION)
-                                        });
-                                    },
-                                ))
-                                .child(div().text_xs().text_color(muted()).w(px(30.0)).child("End"))
-                                .child(self.small_button(
-                                    "motion-end-earlier",
-                                    "−0.1s",
-                                    !edit_busy,
-                                    cx,
-                                    |this, _| {
-                                        this.edit_selected_region(|cue| {
-                                            cue.end = (cue.end - 0.1)
-                                                .max(cue.start + ZoomCue::MINIMUM_DURATION)
-                                        });
-                                    },
-                                ))
-                                .child(self.small_button(
-                                    "motion-end-later",
-                                    "+0.1s",
-                                    !edit_busy,
-                                    cx,
-                                    |this, _| {
-                                        let limit = this.video_source_duration;
-                                        this.edit_selected_region(|cue| {
-                                            cue.end = (cue.end + 0.1).min(limit)
-                                        });
-                                    },
-                                )),
+                                .text_xs()
+                                .text_color(muted())
+                                .w(px(40.0))
+                                .child("Start"),
                         )
-                        .child(self.scene_toggle_row(
-                            "motion-tilt-toggle",
-                            "3D tilt while active",
-                            has_tilt,
+                        .child(self.small_button(
+                            "motion-start-earlier",
+                            "−0.1s",
+                            !edit_busy,
                             cx,
-                            |this| {
+                            |this, _| {
                                 this.edit_selected_region(|cue| {
-                                    cue.tilt = if cue.tilt.is_some() {
-                                        None
-                                    } else {
-                                        Some(crate::recording::viewport::Tilt {
-                                            x: 8.0,
-                                            y: -18.0,
-                                            z: 0.0,
-                                        })
-                                    };
+                                    cue.start = (cue.start - 0.1).max(0.0)
                                 });
                             },
                         ))
-                })
+                        .child(self.small_button(
+                            "motion-start-later",
+                            "+0.1s",
+                            !edit_busy,
+                            cx,
+                            |this, _| {
+                                this.edit_selected_region(|cue| {
+                                    cue.start = (cue.start + 0.1)
+                                        .min(cue.end - ZoomCue::MINIMUM_DURATION)
+                                });
+                            },
+                        ))
+                        .child(div().text_xs().text_color(muted()).w(px(30.0)).child("End"))
+                        .child(self.small_button(
+                            "motion-end-earlier",
+                            "−0.1s",
+                            !edit_busy,
+                            cx,
+                            |this, _| {
+                                this.edit_selected_region(|cue| {
+                                    cue.end = (cue.end - 0.1)
+                                        .max(cue.start + ZoomCue::MINIMUM_DURATION)
+                                });
+                            },
+                        ))
+                        .child(self.small_button(
+                            "motion-end-later",
+                            "+0.1s",
+                            !edit_busy,
+                            cx,
+                            |this, _| {
+                                let limit = this.video_source_duration;
+                                this.edit_selected_region(|cue| {
+                                    cue.end = (cue.end + 0.1).min(limit)
+                                });
+                            },
+                        )),
+                )
+                .child(self.scene_toggle_row(
+                    "motion-tilt-toggle",
+                    "3D tilt while active",
+                    cue.tilt.is_some(),
+                    cx,
+                    |this| {
+                        this.edit_selected_region(|cue| {
+                            cue.tilt = if cue.tilt.is_some() {
+                                None
+                            } else {
+                                Some(crate::recording::viewport::Tilt {
+                                    x: 8.0,
+                                    y: -18.0,
+                                    z: 0.0,
+                                })
+                            };
+                        });
+                    },
+                ))
                 .when(has_pointer, |this| {
                     this.child(Self::inspector_label("Target"))
                         .child(self.segmented(
