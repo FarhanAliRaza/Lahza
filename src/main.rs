@@ -1393,6 +1393,10 @@ fn open_studio_window(
 
 fn main() {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if arguments.iter().any(|argument| argument == "--version") {
+        println!("Lahza {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let initial_recording = arguments
         .iter()
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("lahzarec"))
