@@ -157,6 +157,19 @@ gnome-extensions enable lahza-input@com.lahza
 
 Log out and back in so GNOME Shell discovers the extension. It remains idle unless Lahza activates it through its runtime control file. Plain typed text is not logged. Without a successful helper connection, recording can fall back to an embedded cursor; editable pointer effects and automatic click zooms depend on available input metadata.
 
+### Source layout
+
+`src/main.rs` owns application startup, shared Studio state, and editor coordination. Editor behavior is split by responsibility:
+
+- `models.rs`: annotation, crop, and timeline editing data types.
+- `annotations.rs` and `crop.rs`: editing operations, geometry, painting, and related tests.
+- `capture.rs`: recording lifecycle, project loading, and screenshot capture.
+- `video.rs`: timeline editing and playback.
+- `controls.rs`, `preview.rs`, and `launcher.rs`: editor controls, canvas layout, and launcher UI.
+- `theme.rs`: shared colors, branding, and background presets.
+
+The existing `recording/` modules own media processing and persistence. Keep new editor features in the module that owns their behavior; use explicit imports and limit helper visibility to the callers that need it.
+
 ### Development checks
 
 ```bash
