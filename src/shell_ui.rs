@@ -541,7 +541,7 @@ impl Studio {
                     .pr_3()
                     .flex()
                     .items_center()
-                    .child(crate::brand_wordmark(87.5, 28.0))
+                    .child(crate::brand_wordmark_latin(139.5, 28.0))
                     .on_mouse_down(MouseButton::Left, |event, window, _| {
                         if event.click_count >= 2 {
                             window.zoom_window();

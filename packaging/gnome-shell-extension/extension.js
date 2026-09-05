@@ -3,10 +3,10 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const CONTROL_NAME = 'screendrop-input-control.json';
+const CONTROL_NAME = 'lahza-input-control.json';
 const SAMPLE_INTERVAL_MS = 16;
 
-export default class ScreendropInputCapture extends Extension {
+export default class LahzaInputCapture extends Extension {
     enable() {
         this._capture = null;
         this._controlPath = GLib.build_filenamev([
@@ -86,7 +86,7 @@ export default class ScreendropInputCapture extends Extension {
                 (_actor, event) => this._captureEvent(event)
             );
         } catch (error) {
-            console.error(`Screendrop input capture could not start: ${error}`);
+            console.error(`Lahza input capture could not start: ${error}`);
             this._stopCapture();
         }
     }
@@ -198,7 +198,7 @@ export default class ScreendropInputCapture extends Extension {
             this._capture.stream.put_string(`${JSON.stringify(event)}\n`, null);
             this._capture.stream.flush(null);
         } catch (error) {
-            console.error(`Screendrop input event could not be written: ${error}`);
+            console.error(`Lahza input event could not be written: ${error}`);
             this._stopCapture();
         }
     }

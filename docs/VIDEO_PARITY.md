@@ -19,7 +19,7 @@ preview, and exported output must agree.
 
 ## Project package
 
-- [x] Persistent `.screendroprec` directory rather than a bare temporary file.
+- [x] Persistent `.lahzarec` directory rather than a bare temporary file.
 - [x] Screen master, capture manifest, input sidecar, saved edit, and draft paths.
 - [x] Atomic JSON sidecar writes.
 - [ ] Camera master, replacement audio, poster, render stamp, and metadata.
@@ -71,7 +71,7 @@ preview, and exported output must agree.
 
 - [x] Select a monitor or window through the desktop ScreenCast portal.
 - [x] Consume the granted PipeWire stream without launching another application.
-- [x] Encode VP8/Matroska directly into the Screendrop project package.
+- [x] Encode VP8/Matroska directly into the Lahza project package.
 - [x] Pause and resume with finalized segments and join them on stop.
 - [x] Remove OBS/WebSocket and all profile/output-directory mutation.
 - [x] Capture pointer travel, clicks, drag state, and privacy-filtered shortcut
@@ -91,7 +91,7 @@ preview, and exported output must agree.
 - [ ] Video preview and seekable clip timeline. FFprobe media inspection,
   arbitrary seek-frame decoding, consecutive RGBA frame streaming, fitted
   preview sizing, process cleanup, and atomic poster generation are verified.
-  GPUI now opens `.screendroprec` directly and provides synchronized
+  GPUI now opens `.lahzarec` directly and provides synchronized
   GStreamer video/audio playback, play/pause, ±5-second seeking, and a
   draggable seek bar. The lane now renders and selects every retained clip;
   thumbnail sampling remains.
@@ -104,7 +104,7 @@ preview, and exported output must agree.
   scaling, 240-points/second and 100,000-pixel caps, Ctrl/Super-wheel zoom,
   wheel panning, visible zoom controls, and fit reset.
 - [ ] Camera/background/aspect controls. The video canvas now lives in the
-  standard Screendrop shell and uses the shared color/gradient/wallpaper
+  standard Lahza shell and uses the shared color/gradient/wallpaper
   library, padding, corners, four shadow styles, aspect presets, border, and
   collapsible inspector. The preview is the compositor's own output, so
   background blur, grain, vignette, watermark, and the 3D media transform
@@ -126,10 +126,10 @@ preview, and exported output must agree.
 - [x] Pointer inspector: show/hide cursor, cursor size, cursor shadow, hide
   when idle, click effects and colour; click markers on the ruler select
   individual presses, which can be removed (persisted as
-  `screendropExtras.removedPressTimes`).
+  `lahzaExtras.removedPressTimes`).
 - [x] Audio lane with an RMS waveform mapped through the clip timeline and a
   mute toggle; clip thumbnails sampled from the master.
-- [x] Preset library (`~/.config/screendrop/presets.json`) saving background,
+- [x] Preset library (`~/.config/lahza/presets.json`) saving background,
   layout, border, shadow, effects, pointer look, aspect, and default zoom
   strength for screenshots and recordings; Quick / Customize / Advanced
   inspector levels.

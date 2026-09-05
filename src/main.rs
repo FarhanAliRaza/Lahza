@@ -62,13 +62,13 @@ struct Assets {
 }
 
 fn asset_directory() -> PathBuf {
-    if let Some(path) = std::env::var_os("SCREENDROP_ASSETS") {
+    if let Some(path) = std::env::var_os("LAHZA_ASSETS") {
         return PathBuf::from(path);
     }
 
     if let Ok(executable) = std::env::current_exe() {
         if let Some(prefix) = executable.parent().and_then(|bin| bin.parent()) {
-            let installed = prefix.join("share/screendrop/assets");
+            let installed = prefix.join("share/lahza/assets");
             if installed.is_dir() {
                 return installed;
             }
@@ -110,6 +110,16 @@ fn brand_wordmark(width: f32, height: f32) -> AnyElement {
         .flex_none()
         .child(svg().path("brand/wordmark-urdu-ink.svg").absolute().inset_0().size_full().text_color(rgb(0x272727)))
         .child(svg().path("brand/wordmark-urdu-accent.svg").absolute().inset_0().size_full().text_color(rgb(0xd03734)))
+        .into_any_element()
+}
+
+/// Latin-script wordmark, used in the editor window; the recorder keeps the
+/// Urdu wordmark from `brand_wordmark`.
+fn brand_wordmark_latin(width: f32, height: f32) -> AnyElement {
+    img("brand/wordmark.png")
+        .w(px(width))
+        .h(px(height))
+        .flex_none()
         .into_any_element()
 }
 
@@ -1528,7 +1538,7 @@ struct Studio {
     slider_drag: Option<SliderDrag>,
 }
 
-/// Screendrop-specific recording settings stored beside the Swift edit
+/// Lahza-specific recording settings stored beside the Swift edit
 /// fields in the project's edit document.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1613,11 +1623,11 @@ impl Studio {
             let result: Result<(), String> = async {
                 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 
-                let app_id = ashpd::AppID::try_from("com.screendrop.Screendrop")
+                let app_id = ashpd::AppID::try_from("com.lahza.Lahza")
                     .map_err(|error| error.to_string())?;
                 ashpd::register_host_app(app_id)
                     .await
-                    .map_err(|error| format!("could not register Screendrop's application ID: {error}"))?;
+                    .map_err(|error| format!("could not register Lahza's application ID: {error}"))?;
                 let portal = GlobalShortcuts::new()
                     .await
                     .map_err(|error| error.to_string())?;
@@ -2436,7 +2446,7 @@ impl Studio {
             &pointer_capture,
         );
         let saved_extras = session
-            .read_edit_field::<RecordingExtras>("screendropExtras")
+            .read_edit_field::<RecordingExtras>("lahzaExtras")
             .ok()
             .flatten();
         let preview_path = session.directory.join(".edit-preview.mkv");
@@ -2486,7 +2496,7 @@ impl Studio {
         self.video_zoom_drag = None;
         self.video_timeline_zoom = 1.0;
         self.video_timeline_scroll = 0.0;
-        // Scene settings and Screendrop extras saved with this project.
+        // Scene settings and Lahza extras saved with this project.
         let session = self.video_project.clone().expect("project was just opened");
         let saved_annotations = session
             .read_edit_field::<Vec<AnnotationMark>>("annotations")
@@ -3817,7 +3827,7 @@ impl Studio {
         let cropped =
             image::imageops::crop_imm(&image, left, top, right - left, bottom - top).to_image();
         let destination = std::env::temp_dir().join(format!(
-            "screendrop-crop-{}-{}.png",
+            "lahza-crop-{}-{}.png",
             std::process::id(),
             self.effect_revision + 1
         ));
@@ -4519,7 +4529,7 @@ impl Studio {
         }
         self.effect_revision += 1;
         let destination = std::env::temp_dir().join(format!(
-            "screendrop-redacted-{}-{}.png",
+            "lahza-redacted-{}-{}.png",
             std::process::id(),
             self.effect_revision
         ));
@@ -4531,7 +4541,7 @@ impl Studio {
             if previous
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("screendrop-redacted-"))
+                .is_some_and(|name| name.starts_with("lahza-redacted-"))
             {
                 let _ = fs::remove_file(previous);
             }
@@ -4563,7 +4573,7 @@ impl Studio {
 
 /// SVG fragment with every visible annotation in `marks`, positioned
 /// relative to a capture drawn at (`x`, `y`) with the given pixel size. The
-/// fragment closes the `<g>` opened by the caller.
+/// fragment is self-contained; callers own any surrounding groups.
 fn annotations_svg(
     marks: &[AnnotationMark],
     x: f32,
@@ -4683,7 +4693,6 @@ fn annotations_svg(
                 svg.push_str("</g>");
             }
         }
-        svg.push_str("</g>");
         svg
     }
 }
@@ -7150,7 +7159,7 @@ fn open_studio_window(
             } else {
                 size(px(400.0), px(560.0))
             }),
-            app_id: Some("com.screendrop.Screendrop".into()),
+            app_id: Some("com.lahza.Lahza".into()),
             titlebar: Some(TitlebarOptions {
                 title: Some("Lahza".into()),
                 appears_transparent: false,
@@ -7182,9 +7191,9 @@ fn main() {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let initial_recording = arguments
         .iter()
-        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("screendroprec"))
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("lahzarec"))
         .cloned();
-    // `screendrop shot.png` opens an existing image in the screenshot editor.
+    // `lahza shot.png` opens an existing image in the screenshot editor.
     let initial_image = arguments
         .iter()
         .find(|path| {
@@ -7290,9 +7299,45 @@ mod tests {
     }
 
     #[test]
+    fn export_annotations_render_in_a_caller_owned_group() {
+        let mark = AnnotationMark {
+            tool: Tool::FilledRectangle,
+            start: NormPoint { x: 0.0, y: 0.0 },
+            end: NormPoint { x: 1.0, y: 1.0 },
+            color: 0xff0000,
+            ..AnnotationMark::default()
+        };
+        for marks in [
+            vec![],
+            vec![mark.clone()],
+            vec![AnnotationMark { opacity: 0.5, ..mark }],
+        ] {
+            let fragment = annotations_svg(&marks, 0.0, 0.0, 20, 20, 1.0);
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><defs><clipPath id="captureClip"><rect width="20" height="20"/></clipPath></defs><g clip-path="url(#captureClip)">{fragment}</g></svg>"#
+            );
+            let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
+                .expect("parse export with caller-owned annotation group");
+            let mut output = resvg::tiny_skia::Pixmap::new(20, 20).unwrap();
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::identity(),
+                &mut output.as_mut(),
+            );
+            let expected_alpha = marks
+                .first()
+                .map_or(0, |mark| (mark.opacity * 255.0).round() as u8);
+            assert_eq!(output.pixel(10, 10).unwrap().alpha(), expected_alpha);
+            let layer = scene_ui::render_annotation_layer(&marks, 20, 20)
+                .expect("render annotation layer");
+            assert_eq!(layer.get_pixel(10, 10)[3], expected_alpha);
+        }
+    }
+
+    #[test]
     fn export_renderer_includes_raster_images() {
         let source = std::env::temp_dir().join(format!(
-            "screendrop-export-raster-test-{}.png",
+            "lahza-export-raster-test-{}.png",
             std::process::id()
         ));
         image::RgbaImage::from_pixel(2, 2, image::Rgba([231, 37, 53, 255]))

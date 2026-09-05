@@ -92,16 +92,16 @@ impl PresetLibrary {
 }
 
 fn config_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("SCREENDROP_CONFIG_DIR") {
+    if let Some(root) = std::env::var_os("LAHZA_CONFIG_DIR") {
         return PathBuf::from(root);
     }
     if let Some(root) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(root).join("screendrop");
+        return PathBuf::from(root).join("lahza");
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".config").join("screendrop")
+    home.join(".config").join("lahza")
 }
 
 #[cfg(test)]
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn library_round_trips_and_names_presets_uniquely() {
         let root =
-            std::env::temp_dir().join(format!("screendrop-presets-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lahza-presets-{}", uuid::Uuid::new_v4()));
         let path = root.join("nested").join(PresetLibrary::FILE_NAME);
         let mut library = PresetLibrary::default();
         let first = library.add(ScenePreset {

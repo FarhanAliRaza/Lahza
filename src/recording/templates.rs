@@ -256,7 +256,7 @@ pub fn all() -> Vec<SceneTemplate> {
             },
             marks: vec![
                 TemplateMark::caption(
-                    "Introducing Screendrop",
+                    "Introducing Lahza",
                     0.08,
                     0.07,
                     0.84,
@@ -398,7 +398,7 @@ pub fn all() -> Vec<SceneTemplate> {
                     ExitEffect::Pop,
                 ),
                 TemplateMark::caption(
-                    "Made with Screendrop",
+                    "Made with Lahza",
                     0.1,
                     0.86,
                     0.8,

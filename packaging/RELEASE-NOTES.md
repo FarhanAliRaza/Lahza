@@ -13,13 +13,13 @@ The first release of Lahza, a native Linux screenshot, recording, and motion stu
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `screendrop_0.1.0_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.1.0_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./screendrop_0.1.0_amd64.deb
+sudo apt install ./lahza_0.1.0_amd64.deb
 ```
 
-Launch **Lahza** from your app menu, or run `screendrop`.
+Launch **Lahza** from your app menu, or run `lahza`.
 
 **Binary bundle:** download `lahza-0.1.0-linux-x86_64.tar.gz`, then run:
 
@@ -29,7 +29,7 @@ cd lahza-0.1.0-linux-x86_64
 ./install.sh
 ```
 
-This installs the binary, assets, desktop entry, and icon into `~/.local`. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/screendrop` from the extracted bundle, though desktop integration is needed for reliable global shortcuts. The bundle uses system libraries; it is not a statically linked or universally portable build.
+This installs the binary, assets, desktop entry, and icon into `~/.local`. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/lahza` from the extracted bundle, though desktop integration is needed for reliable global shortcuts. The bundle uses system libraries; it is not a statically linked or universally portable build.
 
 On Ubuntu, install the bundle's runtime dependencies with:
 

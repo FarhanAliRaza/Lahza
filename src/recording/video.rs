@@ -243,7 +243,7 @@ pub fn render_clip_preview(
 }
 
 /// Renders the same non-destructive clip composition into an MP4 suitable for
-/// sharing outside Screendrop.
+/// sharing outside Lahza.
 pub fn export_clip_timeline(
     source: &Path,
     destination: &Path,
@@ -747,7 +747,7 @@ mod tests {
 
     fn test_video() -> Option<(PathBuf, PathBuf)> {
         let root =
-            std::env::temp_dir().join(format!("screendrop-video-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lahza-video-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).ok()?;
         let path = root.join("test.mkv");
         let status = Command::new("ffmpeg")
@@ -770,7 +770,7 @@ mod tests {
 
     fn test_video_with_audio() -> Option<(PathBuf, PathBuf)> {
         let root = std::env::temp_dir().join(format!(
-            "screendrop-video-audio-test-{}",
+            "lahza-video-audio-test-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir(&root).ok()?;

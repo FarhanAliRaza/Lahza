@@ -50,7 +50,7 @@ pub fn saved_items(root: &Path, projects: bool) -> Vec<PathBuf> {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if kind.is_dir() {
-                if extension == "screendroprec" {
+                if extension == "lahzarec" {
                     if projects {
                         items.push(path);
                     }
@@ -96,7 +96,7 @@ mod tests {
     fn discovers_nested_items_and_skips_project_contents_without_truncating() {
         let root = std::env::temp_dir().join(format!("lahza-library-test-{}", std::process::id()));
         fs::create_dir_all(root.join("Screenshots/nested")).unwrap();
-        fs::create_dir_all(root.join("Videos/test.screendroprec")).unwrap();
+        fs::create_dir_all(root.join("Videos/test.lahzarec")).unwrap();
         for index in 0..12 {
             fs::write(
                 root.join(format!("Screenshots/nested/{index}.PNG")),
@@ -105,15 +105,15 @@ mod tests {
             .unwrap();
         }
         fs::write(
-            root.join("Videos/test.screendroprec/thumbnail.png"),
+            root.join("Videos/test.lahzarec/thumbnail.png"),
             b"preview",
         )
         .unwrap();
-        fs::write(root.join("not-a-project.screendroprec"), b"file").unwrap();
+        fs::write(root.join("not-a-project.lahzarec"), b"file").unwrap();
         assert_eq!(saved_items(&root, false).len(), 12);
         assert_eq!(
             saved_items(&root, true),
-            vec![root.join("Videos/test.screendroprec")]
+            vec![root.join("Videos/test.lahzarec")]
         );
         assert!(saved_items(&root.join("missing"), false).is_empty());
         fs::remove_dir_all(root).unwrap();

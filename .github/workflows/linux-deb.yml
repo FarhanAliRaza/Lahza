@@ -59,28 +59,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "screendrop") | .version')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lahza") | .version')"
           if [[ "$GITHUB_REF" == refs/tags/* && "${GITHUB_REF#refs/tags/}" != "v${version}" ]]; then
             echo "Release tag must match Cargo.toml version ${version}" >&2
             exit 1
           fi
           architecture="$(dpkg --print-architecture)"
-          package_name="screendrop_${version}_${architecture}"
+          package_name="lahza_${version}_${architecture}"
           package_root="dist/${package_name}"
 
-          install -Dm755 target/release/screendrop "${package_root}/usr/bin/screendrop"
-          strip "${package_root}/usr/bin/screendrop"
-          install -Dm644 packaging/com.screendrop.Screendrop.desktop \
-            "${package_root}/usr/share/applications/com.screendrop.Screendrop.desktop"
+          install -Dm755 target/release/lahza "${package_root}/usr/bin/lahza"
+          strip "${package_root}/usr/bin/lahza"
+          install -Dm644 packaging/com.lahza.Lahza.desktop \
+            "${package_root}/usr/share/applications/com.lahza.Lahza.desktop"
           install -Dm644 Lahza.png \
-            "${package_root}/usr/share/pixmaps/com.screendrop.Screendrop.png"
-          install -d "${package_root}/usr/share/screendrop/assets"
-          cp -a assets/. "${package_root}/usr/share/screendrop/assets/"
-          chmod -R go-w "${package_root}/usr/share/screendrop/assets"
+            "${package_root}/usr/share/pixmaps/com.lahza.Lahza.png"
+          install -d "${package_root}/usr/share/lahza/assets"
+          cp -a assets/. "${package_root}/usr/share/lahza/assets/"
+          chmod -R go-w "${package_root}/usr/share/lahza/assets"
           install -d "${package_root}/DEBIAN"
 
           cat > "${package_root}/DEBIAN/control" <<EOF
-          Package: screendrop
+          Package: lahza
           Version: ${version}
           Architecture: ${architecture}
           Maintainer: Lahza contributors <noreply@github.com>
@@ -100,19 +100,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "screendrop") | .version')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lahza") | .version')"
           bundle="lahza-${version}-linux-x86_64"
           bundle_root="dist/${bundle}"
-          install -Dm755 target/release/screendrop "${bundle_root}/bin/screendrop"
-          strip "${bundle_root}/bin/screendrop"
+          install -Dm755 target/release/lahza "${bundle_root}/bin/lahza"
+          strip "${bundle_root}/bin/lahza"
           install -Dm755 packaging/install.sh "${bundle_root}/install.sh"
           install -Dm644 README.md "${bundle_root}/README.md"
-          install -Dm644 packaging/com.screendrop.Screendrop.desktop \
-            "${bundle_root}/share/applications/com.screendrop.Screendrop.desktop"
+          install -Dm644 packaging/com.lahza.Lahza.desktop \
+            "${bundle_root}/share/applications/com.lahza.Lahza.desktop"
           install -Dm644 Lahza.png \
-            "${bundle_root}/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png"
-          install -d "${bundle_root}/share/screendrop/assets"
-          cp -a assets/. "${bundle_root}/share/screendrop/assets/"
+            "${bundle_root}/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"
+          install -d "${bundle_root}/share/lahza/assets"
+          cp -a assets/. "${bundle_root}/share/lahza/assets/"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
           cd dist
           sha256sum *.deb *.tar.gz > SHA256SUMS

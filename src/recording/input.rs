@@ -27,7 +27,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const CONTROL_FILE: &str = "screendrop-input-control.json";
+const CONTROL_FILE: &str = "lahza-input-control.json";
 
 #[derive(Clone, Copy, Debug)]
 pub struct ActiveRange {
@@ -565,7 +565,7 @@ impl PipeWirePoller {
         let worker_stop = stop.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::Builder::new()
-            .name("screendrop-wayland-pointer".into())
+            .name("lahza-wayland-pointer".into())
             .spawn(move || {
                 poll_pipewire_cursor(
                     event_path,
@@ -655,7 +655,7 @@ fn poll_pipewire_cursor(
             .map_err(|error| format!("could not connect to the portal PipeWire remote: {error}"))?;
         let stream = pipewire::stream::StreamBox::new(
             &core,
-            "Screendrop cursor metadata",
+            "Lahza cursor metadata",
             pipewire::properties::properties! {
                 *pipewire::keys::MEDIA_TYPE => "Video",
                 *pipewire::keys::MEDIA_CATEGORY => "Capture",
@@ -761,7 +761,7 @@ fn poll_pipewire_cursor(
         let mouse_worker = positions
             .then(|| {
                 thread::Builder::new()
-                    .name("screendrop-wayland-buttons".into())
+                    .name("lahza-wayland-buttons".into())
                     .spawn(move || poll_pipewire_buttons(mouse_state, mouse_stop))
             })
             .transpose()
@@ -827,7 +827,7 @@ fn poll_pipewire_cursor(
         // The receiver may already have observed a stream-state error.
         // Sending here covers failures during setup.
         // Ignore a disconnected receiver after successful startup.
-        eprintln!("Screendrop Wayland pointer capture: {error}");
+        eprintln!("Lahza Wayland pointer capture: {error}");
     }
 }
 
@@ -909,7 +909,7 @@ impl X11Poller {
         let worker_stop = stop.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::Builder::new()
-            .name("screendrop-x11-pointer".into())
+            .name("lahza-x11-pointer".into())
             .spawn(move || poll_x11_pointer(event_path, worker_stop, ready_tx))
             .ok()?;
         if ready_rx.recv_timeout(Duration::from_millis(300)).ok() != Some(true) {
@@ -1264,7 +1264,7 @@ mod tests {
     fn cursor_events_from_the_metadata_stream_tag_pointer_samples_by_time() {
         use base64::Engine;
         let directory =
-            std::env::temp_dir().join(format!("screendrop-input-merge-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lahza-input-merge-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let capture = InputCapture {
             id: "test".into(),
@@ -1361,7 +1361,7 @@ mod tests {
     #[ignore = "requires a running X11 or XWayland display"]
     fn live_linux_fallback_writes_pointer_samples() {
         let event_path = std::env::temp_dir().join(format!(
-            "screendrop-x11-pointer-{}.jsonl",
+            "lahza-x11-pointer-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
         let poller = X11Poller::start(event_path.clone()).expect("X11 pointer polling unavailable");
@@ -1375,7 +1375,7 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| { event.kind == "move" && event.x.is_some() && event.y.is_some() }));
-        if std::env::var_os("SCREENDROP_REQUIRE_MOTION").is_some() {
+        if std::env::var_os("LAHZA_REQUIRE_MOTION").is_some() {
             let mut points = events
                 .iter()
                 .filter(|event| event.kind == "move" || event.kind == "drag")

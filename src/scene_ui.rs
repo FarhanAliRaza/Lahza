@@ -420,7 +420,7 @@ impl Studio {
             removed_press_times: self.video_removed_presses.clone(),
         };
         if self.persisted_extras.as_ref() != Some(&extras) {
-            if let Err(error) = session.write_edit_field("screendropExtras", &extras) {
+            if let Err(error) = session.write_edit_field("lahzaExtras", &extras) {
                 self.toast = Some(format!("Could not autosave settings: {error}").into());
             }
             self.persisted_extras = Some(extras);
@@ -3139,7 +3139,7 @@ pub(crate) fn render_annotation_layer(
         height,
         stroke_scale,
     ));
-    svg.push_str("</svg>");
+    svg.push_str("</g></svg>");
     render_svg_layer(&svg, width, height).ok()
 }
 

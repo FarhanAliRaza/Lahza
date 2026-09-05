@@ -2,9 +2,9 @@
 Type=Application
 Name=Lahza
 Comment=Screenshot and recording studio
-Exec=screendrop
-Icon=com.screendrop.Screendrop
+Exec=lahza
+Icon=com.lahza.Lahza
 Terminal=false
 Categories=Graphics;Utility;
 StartupNotify=true
-StartupWMClass=com.screendrop.Screendrop
+StartupWMClass=com.lahza.Lahza

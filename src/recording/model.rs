@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::clips::{RecordingClipSegment, RecordingClipTimeline};
 use super::viewport::ZoomCue;
 
-pub const SESSION_EXTENSION: &str = "screendroprec";
+pub const SESSION_EXTENSION: &str = "lahzarec";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordingSession {
@@ -342,7 +342,7 @@ impl RecordingSession {
             .directory
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("Screendrop recording")
+            .unwrap_or("Lahza recording")
             .to_string())
     }
 }
@@ -408,14 +408,14 @@ fn newest_raw_recording(directory: &Path) -> io::Result<Option<PathBuf>> {
     Ok(candidates.pop().map(|(_, _, path)| path))
 }
 
-/// Where new recording projects are created. `SCREENDROP_RECORDINGS_DIR`
-/// overrides the default of `<XDG videos dir>/Screendrop` (usually
-/// `~/Videos/Screendrop`).
+/// Where new recording projects are created. `LAHZA_RECORDINGS_DIR`
+/// overrides the default of `<XDG videos dir>/Lahza` (usually
+/// `~/Videos/Lahza`).
 pub fn recordings_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("SCREENDROP_RECORDINGS_DIR") {
+    if let Some(root) = std::env::var_os("LAHZA_RECORDINGS_DIR") {
         return PathBuf::from(root);
     }
-    videos_dir().join("Screendrop")
+    videos_dir().join("Lahza")
 }
 
 fn videos_dir() -> PathBuf {
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn recovery_adopts_a_finalized_encoder_file_left_by_a_crash() {
         let root =
-            std::env::temp_dir().join(format!("screendrop-recovery-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lahza-recovery-test-{}", uuid::Uuid::new_v4()));
         let session = RecordingSession::create_in(&root).unwrap();
         let raw = session.directory.join("2026-08-24 00-01-02.mkv");
         fs::write(&raw, b"recoverable video").unwrap();
@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn draft_is_separate_until_explicit_commit_and_preserves_unknown_fields() {
-        let root = std::env::temp_dir().join(format!("screendrop-draft-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("lahza-draft-test-{}", Uuid::new_v4()));
         let session = RecordingSession::create_in(&root).unwrap();
         let saved = serde_json::json!({
             "formatVersion": 5,
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn clip_draft_matches_swift_v5_and_preserves_other_edit_fields() {
-        let root = std::env::temp_dir().join(format!("screendrop-clips-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("lahza-clips-test-{}", Uuid::new_v4()));
         let session = RecordingSession::create_in(&root).unwrap();
         session
             .write_edit_document(&serde_json::json!({
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn zoom_draft_matches_swift_v5_and_preserves_clip_edits() {
-        let root = std::env::temp_dir().join(format!("screendrop-zoom-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("lahza-zoom-test-{}", Uuid::new_v4()));
         let session = RecordingSession::create_in(&root).unwrap();
         let clip = RecordingClipTimeline::full(8.0);
         session.write_clip_timeline_draft(&clip).unwrap();
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn display_name_uses_trimmed_metadata_then_package_name() {
-        let root = std::env::temp_dir().join(format!("screendrop-name-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("lahza-name-test-{}", Uuid::new_v4()));
         let session = RecordingSession::create_in(&root).unwrap();
         let package_name = session.directory.file_stem().unwrap().to_str().unwrap();
         assert_eq!(session.display_name().unwrap(), package_name);

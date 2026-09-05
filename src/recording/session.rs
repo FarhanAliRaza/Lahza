@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn state_machine_imports_the_exact_backend_output() {
         let output =
-            std::env::temp_dir().join(format!("screendrop-test-{}.mkv", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lahza-test-{}.mkv", uuid::Uuid::new_v4()));
         fs::write(&output, b"video").unwrap();
         let backend = FakeBackend {
             active: false,
@@ -444,7 +444,7 @@ mod tests {
         };
         let mut controller = RecordingController::new(backend);
         let root = std::env::temp_dir().join(format!(
-            "screendrop-recording-test-{}",
+            "lahza-recording-test-{}",
             uuid::Uuid::new_v4()
         ));
         let pending_session = RecordingSession::create_in(&root).unwrap();
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn discard_finalizes_before_removing_the_project() {
         let output =
-            std::env::temp_dir().join(format!("screendrop-test-{}.mkv", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lahza-test-{}.mkv", uuid::Uuid::new_v4()));
         fs::write(&output, b"video").unwrap();
         let backend = FakeBackend {
             active: false,
@@ -493,7 +493,7 @@ mod tests {
         };
         let mut controller = RecordingController::new(backend);
         let root =
-            std::env::temp_dir().join(format!("screendrop-discard-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lahza-discard-test-{}", uuid::Uuid::new_v4()));
         let pending_session = RecordingSession::create_in(&root).unwrap();
         let project = pending_session.directory.clone();
 

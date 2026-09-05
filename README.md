@@ -17,7 +17,7 @@ Lahza means **moment** in Urdu. Built with Rust and GPUI, it brings screenshot a
 - Record a monitor or window through the ScreenCast portal and PipeWire.
 - Use a separate recorder window with pause, resume, restart, stop, and discard controls.
 - Include system audio, microphone audio, or both.
-- Keep recordings in editable `.screendroprec` project folders, with draft autosave and recovery of usable unfinished recordings.
+- Keep recordings in editable `.lahzarec` project folders, with draft autosave and recovery of usable unfinished recordings.
 
 ### Annotate screenshots and videos
 
@@ -75,14 +75,12 @@ Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social s
 Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
 
 ```bash
-sudo apt install ./screendrop_0.1.0_amd64.deb
+sudo apt install ./lahza_0.1.0_amd64.deb
 ```
 
-Launch **Lahza** from your application menu, or run `screendrop`.
+Launch **Lahza** from your application menu, or run `lahza`.
 
 Release packages are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; build from source if the package's dependencies are unavailable. Before the first release is published, development packages are available as artifacts in successful [build workflow runs](https://github.com/FarhanAliRaza/lahza/actions/workflows/linux-deb.yml).
-
-The application is named Lahza; the package, executable, desktop ID, and project extension retain the historical `screendrop` identifiers for compatibility.
 
 ### Binary bundle
 
@@ -103,7 +101,7 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 - PipeWire and GStreamer for recording; FFmpeg/FFprobe for preview and video export.
 - Desktop support for the screenshot, screencast, and global-shortcut portals. Picker options and shortcut availability depend on your desktop.
 
-The desktop may ask you to approve or change the capture shortcut. On GNOME, install the desktop entry and ensure `screendrop` is on `PATH`; running an uninstalled build alone is insufficient for reliable shortcut registration.
+The desktop may ask you to approve or change the capture shortcut. On GNOME, install the desktop entry and ensure `lahza` is on `PATH`; running an uninstalled build alone is insufficient for reliable shortcut registration.
 
 ## Quick start
 
@@ -136,11 +134,11 @@ cargo build --release --locked
 For a desktop install, use `just install-desktop` if you have [just](https://github.com/casey/just), or run:
 
 ```bash
-install -Dm755 target/release/screendrop ~/.local/bin/screendrop
-install -Dm644 packaging/com.screendrop.Screendrop.desktop \
-  ~/.local/share/applications/com.screendrop.Screendrop.desktop
+install -Dm755 target/release/lahza ~/.local/bin/lahza
+install -Dm644 packaging/com.lahza.Lahza.desktop \
+  ~/.local/share/applications/com.lahza.Lahza.desktop
 install -Dm644 Lahza.png \
-  ~/.local/share/icons/hicolor/512x512/apps/com.screendrop.Screendrop.png
+  ~/.local/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png
 update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor
 ```
@@ -154,8 +152,8 @@ The bundled GNOME Shell extension supplies additional pointer/click metadata and
 ```bash
 gnome-extensions pack --force --out-dir /tmp packaging/gnome-shell-extension
 gnome-extensions install --force \
-  /tmp/screendrop-input@com.screendrop.shell-extension.zip
-gnome-extensions enable screendrop-input@com.screendrop
+  /tmp/lahza-input@com.lahza.shell-extension.zip
+gnome-extensions enable lahza-input@com.lahza
 ```
 
 Log out and back in so GNOME Shell discovers the extension. It remains idle unless Lahza activates it through its runtime control file. Plain typed text is not logged. Without a successful helper connection, recording can fall back to an embedded cursor; editable pointer effects and automatic click zooms depend on available input metadata.

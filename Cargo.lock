@@ -3092,6 +3092,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "lahza"
+version = "0.1.0"
+dependencies = [
+ "ashpd 0.12.3",
+ "async-io",
+ "base64",
+ "chrono",
+ "futures-util",
+ "gpui",
+ "gstreamer",
+ "image",
+ "libc",
+ "libspa-sys",
+ "pipewire",
+ "resvg",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4929,27 +4950,6 @@ dependencies = [
  "objc-foundation",
  "objc_id",
  "once_cell",
-]
-
-[[package]]
-name = "screendrop"
-version = "0.1.0"
-dependencies = [
- "ashpd 0.12.3",
- "async-io",
- "base64",
- "chrono",
- "futures-util",
- "gpui",
- "gstreamer",
- "image",
- "libc",
- "libspa-sys",
- "pipewire",
- "resvg",
- "serde",
- "serde_json",
- "uuid",
 ]
 
 [[package]]

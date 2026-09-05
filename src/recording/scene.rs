@@ -2667,7 +2667,7 @@ mod tests {
             background_noise: 30,
             vignette: 50,
             watermark: Some(Watermark {
-                text: "Screendrop".into(),
+                text: "Lahza".into(),
                 ..Watermark::default()
             }),
             ..SceneStyle::default()

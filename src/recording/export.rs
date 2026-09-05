@@ -751,7 +751,7 @@ mod tests {
 
     fn test_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "screendrop-scene-export-{label}-{}",
+            "lahza-scene-export-{label}-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&root).unwrap();
