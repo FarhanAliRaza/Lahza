@@ -1,6 +1,15 @@
-## Lahza v0.1.0
+## Lahza v0.2.0
 
-The first release of Lahza, a native Linux screenshot, recording, and motion studio built with Rust and GPUI.
+A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
+
+### Changed in this release
+
+- Every `screendrop` identifier is now `lahza`: the package and executable, the `com.lahza.Lahza` desktop ID and app ID, the `LAHZA_*` environment variables, the optional `lahza-input@com.lahza` GNOME helper, and the `.lahzarec` project extension.
+- The global capture shortcut (Ctrl+Shift+3) is gone. Start a capture from the launcher's **Screenshot** and **Record screen** buttons instead.
+- Export notifications now offer to open the file that was written.
+- The editor toolbar uses the Latin wordmark; the recorder window keeps the Urdu one.
+
+**Upgrading from v0.1.0:** the rename changes where Lahza looks for your data. Existing presets in `~/.config/screendrop`, recordings in `~/Videos/Screendrop`, and `.screendroprec` projects are not picked up. To keep them, rename the directories to `~/.config/lahza` and `~/Videos/Lahza` and change each project's `.screendroprec` suffix to `.lahzarec` before launching. Remove the old `com.screendrop.Screendrop` desktop entry and icon from `~/.local/share` if you installed v0.1.0 by hand.
 
 ### Included
 
@@ -13,19 +22,19 @@ The first release of Lahza, a native Linux screenshot, recording, and motion stu
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.1.0_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.2.0_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_0.1.0_amd64.deb
+sudo apt install ./lahza_0.2.0_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
 
-**Binary bundle:** download `lahza-0.1.0-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.2.0-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.1.0-linux-x86_64.tar.gz
-cd lahza-0.1.0-linux-x86_64
+tar -xzf lahza-0.2.0-linux-x86_64.tar.gz
+cd lahza-0.2.0-linux-x86_64
 ./install.sh
 ```
 
