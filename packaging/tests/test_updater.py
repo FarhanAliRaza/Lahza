@@ -25,6 +25,17 @@ def release(version="0.4.2"):
 
 
 class UpdaterTests(unittest.TestCase):
+    def test_accepts_canonical_github_asset_urls(self):
+        data = {
+            "tag_name": "v0.4.1",
+            "assets": [
+                {"name": name, "browser_download_url": f"https://github.com/FarhanAliRaza/Lahza/releases/download/v0.4.1/{name}"}
+                for name in ("lahza_0.4.1_amd64.deb", "SHA256SUMS")
+            ],
+        }
+        version, name, _ = updater.release_assets(data, "amd64")
+        self.assertEqual((version, name), ("0.4.1", "lahza_0.4.1_amd64.deb"))
+
     def test_unsupported_or_missing_installation_fails_without_network(self):
         for outputs in (["arm64"], ["amd64", "deinstall ok config-files\n0.4.1"]):
             with self.subTest(outputs=outputs), \
