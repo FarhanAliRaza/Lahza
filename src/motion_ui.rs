@@ -1251,7 +1251,7 @@ impl Studio {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><image href="{href}" x="0" y="0" width="{width}" height="{height}" preserveAspectRatio="none"/><g>"#
         );
         svg.push_str(&self.annotations_svg(0.0, 0.0, width, height, stroke_scale));
-        svg.push_str("</svg>");
+        svg.push_str("</g></svg>");
         let mut options = resvg::usvg::Options::default();
         options.fontdb = crate::recording::scene::shared_fontdb();
         let tree = resvg::usvg::Tree::from_str(&svg, &options)
