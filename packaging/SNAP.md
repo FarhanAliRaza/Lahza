@@ -115,18 +115,21 @@ the upload action reports that result in the job log.
 ### Cut a release
 
 On `master`, update `packaging/RELEASE-NOTES.md` for the upcoming release and
-commit your changes. Then run from the repository root (Python 3.11+ and Git):
+commit your changes. Then run from the repository root (Just, Python 3.11+, and Git):
 
 ```bash
 # Preview the next patch release without changing files or pushing:
-python3 packaging/release.py --dry-run
+just release-check
 
 # Bump the patch version, commit, and push master plus the new tag:
-python3 packaging/release.py
+just release
 
 # Or choose an explicit version (prereleases publish to beta):
-python3 packaging/release.py 0.5.0-rc.1
+just release 0.5.0-rc.1
 ```
+
+These commands wrap `python3 packaging/release.py`; you can invoke that script
+directly if Just is not installed.
 
 The script updates the Lahza version in `Cargo.toml` and `Cargo.lock`, plus
 versioned download examples and the release-notes heading. It preserves your

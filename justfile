@@ -10,6 +10,16 @@ default:
 build:
     cargo build --release
 
+# Bump the patch version (or pass a version), commit, and publish the release tag
+[positional-arguments]
+release *args:
+    python3 packaging/release.py "$@"
+
+# Validate a release without changing files, creating a tag, or pushing
+[positional-arguments]
+release-check *args:
+    python3 packaging/release.py --dry-run "$@"
+
 # Build, stop the running app, and replace the installed binary
 install: build
     pkill -x lahza || true
