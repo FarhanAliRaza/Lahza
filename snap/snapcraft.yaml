@@ -1,0 +1,89 @@
+name: lahza
+title: Lahza
+icon: Lahza.png
+base: core24
+adopt-info: lahza
+summary: Screenshot and recording studio for Linux
+description: |
+  Capture screenshots and screen recordings, then turn them into polished
+  visuals with backgrounds, annotations, motion presets, and scene templates.
+  Edit locally and export images or videos.
+license: MIT
+grade: stable
+confinement: strict
+platforms:
+  amd64:
+
+apps:
+  lahza:
+    command: bin/lahza
+    desktop: share/applications/com.lahza.Lahza.desktop
+    extensions: [gnome]
+    environment:
+      LAHZA_ASSETS: $SNAP/share/lahza/assets
+      PIPEWIRE_CONFIG_DIR: $SNAP/usr/share/pipewire
+      PIPEWIRE_MODULE_DIR: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pipewire-0.3
+      SPA_PLUGIN_DIR: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/spa-0.2
+    plugs:
+      - home
+      - network
+      - audio-playback
+      - audio-record
+      - camera
+      - removable-media
+
+parts:
+  # Bootstrap rustup directly in the build environment. The rustup Snap is
+  # not reliably executable inside the managed CI container.
+  rust-deps:
+    plugin: nil
+    build-packages: [curl, ca-certificates]
+    override-pull: |
+      craftctl default
+      curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+        https://sh.rustup.rs --output rustup-init.sh
+      sh rustup-init.sh -y --profile minimal --default-toolchain 1.96.0 --no-modify-path
+
+  lahza:
+    plugin: rust
+    after: [rust-deps]
+    source: .
+    rust-channel: "none"
+    build-packages:
+      - pkg-config
+      - libclang-dev
+      - libgstreamer1.0-dev
+      - libgstreamer-plugins-base1.0-dev
+      - libpipewire-0.3-dev
+      - libspa-0.2-dev
+      - libxkbcommon-dev
+      - libxkbcommon-x11-dev
+    stage-packages:
+      - ffmpeg
+      - gstreamer1.0-tools
+      - gstreamer1.0-plugins-base-apps
+      - gstreamer1.0-plugins-good
+      - gstreamer1.0-libav
+      - gstreamer1.0-pipewire
+      - libpipewire-0.3-0t64
+      - libpipewire-0.3-modules
+      - libspa-0.2-modules
+      - libxkbcommon-x11-0
+    override-build: |
+      craftctl default
+      craftctl set version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+      install -Dm644 packaging/com.lahza.Lahza.desktop "$CRAFT_PART_INSTALL/share/applications/com.lahza.Lahza.desktop"
+      install -Dm644 Lahza.png "$CRAFT_PART_INSTALL/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"
+      # A themed icon name is not resolvable from the host, so point the
+      # launcher at the icon inside the snap.
+      sed -i 's|^Icon=.*|Icon=${SNAP}/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png|' \
+        "$CRAFT_PART_INSTALL/share/applications/com.lahza.Lahza.desktop"
+      install -d "$CRAFT_PART_INSTALL/share/lahza/assets"
+      cp -a assets/. "$CRAFT_PART_INSTALL/share/lahza/assets/"
+    override-prime: |
+      craftctl default
+      # Debian's alternatives links are not created when stage packages are
+      # extracted. FFmpeg needs these sonames on the normal library path.
+      for library in blas lapack; do
+        ln -sf "$library/lib$library.so.3" "$CRAFT_PRIME/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/lib$library.so.3"
+      done
