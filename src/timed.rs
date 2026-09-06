@@ -141,6 +141,22 @@ impl AnnotationTiming {
         self
     }
 
+    /// Set an exact boundary without moving the opposite edge.
+    pub fn with_boundary(self, start: bool, value: f64, scene_duration: f64) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        let mut timing = self.clamped(scene_duration);
+        if start {
+            timing.start = value.min((timing.end - Self::MINIMUM_DURATION).max(0.0));
+        } else {
+            timing.end = value
+                .max(timing.start + Self::MINIMUM_DURATION)
+                .min(scene_duration);
+        }
+        Some(timing.clamped(scene_duration))
+    }
+
     pub fn state_at(&self, time: f64) -> AnimationState {
         if !(self.start..=self.end).contains(&time) || self.duration() <= 0.0 {
             return AnimationState::HIDDEN;
@@ -429,6 +445,29 @@ mod tests {
             }),
             opacity: 1.0,
             pinned: false,
+        }
+    }
+
+    #[test]
+    fn exact_boundaries_preserve_the_other_edge_and_stay_in_the_scene() {
+        let timing = AnnotationTiming {
+            start: 1.0,
+            end: 4.0,
+            ..Default::default()
+        };
+        let edited = timing.with_boundary(true, 2.25, 5.0).unwrap();
+        assert_eq!((edited.start, edited.end), (2.25, 4.0));
+        let edited = timing.with_boundary(false, 3.75, 5.0).unwrap();
+        assert_eq!((edited.start, edited.end), (1.0, 3.75));
+        let crossed = timing.with_boundary(true, 10.0, 5.0).unwrap();
+        assert!((crossed.duration() - AnnotationTiming::MINIMUM_DURATION).abs() < 1e-9);
+        assert_eq!(crossed.end, 4.0);
+        assert_eq!(timing.with_boundary(false, 10.0, 5.0).unwrap().end, 5.0);
+        let crossed = timing.with_boundary(false, 0.0, 5.0).unwrap();
+        assert_eq!(crossed.start, 1.0);
+        assert!((crossed.duration() - AnnotationTiming::MINIMUM_DURATION).abs() < 1e-9);
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(timing.with_boundary(true, invalid, 5.0).is_none());
         }
     }
 

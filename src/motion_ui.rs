@@ -901,7 +901,7 @@ impl Studio {
                         .items_center()
                         .gap_2()
                         .child(
-                            self.small_button("motion-deselect", "Done", true, cx, |this, _| {
+                            self.small_button("motion-deselect", "Deselect", true, cx, |this, _| {
                                 this.video_selected_zoom_cue = None;
                             }),
                         )
@@ -1175,6 +1175,9 @@ impl Studio {
             return false;
         }
         // A focused watermark field owns every key, including space.
+        if self.handle_annotation_time_key(event) {
+            return true;
+        }
         if self.handle_watermark_key(event) {
             return true;
         }

@@ -4,11 +4,12 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Added a strictly confined Snap package with bundled desktop and media dependencies, built on `core24` for amd64 Linux systems.
-- Automated Debian and Snap builds, tests, checksums, GitHub release assets, and Snap Store publishing from version tags on `master`.
-- Tutorial captions now use blue instead of near-black text.
-- Refined the editor layout with a wider inspector, larger wallpaper previews, clearer tabs, and a canvas status bar.
-- Updated the application icon and added its SVG source and generation script.
+- Added exact start/end time entry for annotations, with Enter to apply, Escape to cancel, and boundaries constrained to the scene duration.
+- Reorganized the editor inspector with focused image and motion properties, collapsible advanced transforms, and clearer export controls.
+- Added timeline track labels, a scene strip for animated images, and an explicit timeline zoom label.
+- Added expandable wallpaper browsing and more compact motion preset and template browsing.
+- Limited the typewriter entrance option to text annotations.
+- Added `just release` and `just release-check` to bump versions and safely push matching release tags.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

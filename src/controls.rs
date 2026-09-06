@@ -87,11 +87,10 @@ impl Studio {
             )
     }
 
-    /// Recording inspector: drawing tools with a one-line hint.
+    /// Annotation tools shared by still and timed scenes.
     pub(crate) fn video_annotate_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let hint = if self.annotations.is_empty() {
-            "Pick a tool and draw on the recording. Marks appear at the playhead and animate in."
-                .to_string()
+            "Pick a tool and draw on the canvas.".to_string()
         } else {
             format!("{} — {}", self.tool.label(), self.tool.help_text())
         };
@@ -690,26 +689,37 @@ impl Studio {
             )),
             _ => {
                 let paths = &CURATED_WALLPAPERS;
-                grid.children(paths.iter().enumerate().map(|(index, path)| {
-                    let path = *path;
-                    div()
-                        .id(("wallpaper-tile", index))
-                        .w(px(100.0))
-                        .h(px(64.0))
-                        .rounded_lg()
-                        .overflow_hidden()
-                        .cursor_pointer()
-                        .when(
-                            self.custom_wallpaper.is_none() && self.wallpaper_asset == path,
-                            |this| this.border_2().border_color(blue()),
-                        )
-                        .child(img(path).size_full().object_fit(ObjectFit::Cover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.wallpaper_asset = path;
-                            this.custom_wallpaper = None;
-                            cx.notify();
-                        }))
-                }))
+                grid.children(
+                    paths
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, path)| {
+                            self.section_open("wallpaper-browser")
+                                || *index < 6
+                                || (self.custom_wallpaper.is_none()
+                                    && self.wallpaper_asset == **path)
+                        })
+                        .map(|(index, path)| {
+                            let path = *path;
+                            div()
+                                .id(("wallpaper-tile", index))
+                                .w(px(100.0))
+                                .h(px(64.0))
+                                .rounded_lg()
+                                .overflow_hidden()
+                                .cursor_pointer()
+                                .when(
+                                    self.custom_wallpaper.is_none() && self.wallpaper_asset == path,
+                                    |this| this.border_2().border_color(blue()),
+                                )
+                                .child(img(path).size_full().object_fit(ObjectFit::Cover))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.wallpaper_asset = path;
+                                    this.custom_wallpaper = None;
+                                    cx.notify();
+                                }))
+                        }),
+                )
             }
         }
     }

@@ -141,7 +141,7 @@ impl SceneSlider {
             SceneSlider::PositionY => "Position Y",
             SceneSlider::RotationX => "Rotate X",
             SceneSlider::RotationY => "Rotate Y",
-            SceneSlider::RotationZ => "Rotate Z",
+            SceneSlider::RotationZ => "Rotation",
             SceneSlider::Perspective => "Perspective",
             SceneSlider::AnchorX => "Anchor X",
             SceneSlider::AnchorY => "Anchor Y",
@@ -151,7 +151,7 @@ impl SceneSlider {
             SceneSlider::PointerScale => "Cursor size",
             SceneSlider::WatermarkSize => "Size",
             SceneSlider::WatermarkOpacity => "Opacity",
-            SceneSlider::DefaultZoom => "Auto zoom",
+            SceneSlider::DefaultZoom => "Default zoom",
             SceneSlider::AnnotationTransition => "Transition",
             SceneSlider::CameraSize => "Size",
             SceneSlider::CameraMargin => "Margin",
@@ -1679,11 +1679,11 @@ impl Studio {
                             div()
                                 .text_sm()
                                 .font_weight(FontWeight::BOLD)
-                                .child("Transform"),
+                                .child("Image properties"),
                         )
                         .child(self.small_button(
                             "transform-done",
-                            "Done",
+                            "Deselect",
                             true,
                             cx,
                             |this, _| this.scene_selection = SceneSelection::Scene,
@@ -1755,12 +1755,15 @@ impl Studio {
                 .child(self.scene_slider_row(SceneSlider::Scale, cx))
                 .child(self.scene_slider_row(SceneSlider::PositionX, cx))
                 .child(self.scene_slider_row(SceneSlider::PositionY, cx))
-                .child(self.scene_slider_row(SceneSlider::RotationX, cx))
-                .child(self.scene_slider_row(SceneSlider::RotationY, cx))
                 .child(self.scene_slider_row(SceneSlider::RotationZ, cx))
-                .child(self.scene_slider_row(SceneSlider::Perspective, cx))
-                .child(self.scene_slider_row(SceneSlider::AnchorX, cx))
-                .child(self.scene_slider_row(SceneSlider::AnchorY, cx))
+                .child(self.section_header("advanced-transform", "Advanced transform", None, cx))
+                .when(self.section_open("advanced-transform"), |this| {
+                    this.child(self.scene_slider_row(SceneSlider::RotationX, cx))
+                        .child(self.scene_slider_row(SceneSlider::RotationY, cx))
+                        .child(self.scene_slider_row(SceneSlider::Perspective, cx))
+                        .child(self.scene_slider_row(SceneSlider::AnchorX, cx))
+                        .child(self.scene_slider_row(SceneSlider::AnchorY, cx))
+                })
                 .child(
                     div()
                         .text_xs()
@@ -2086,6 +2089,7 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
+            .child(div().text_xs().text_color(muted()).child("Format"))
             .child(self.segmented(
                 "export-section-format",
                 &["MP4", "WebM", "GIF"],
@@ -2096,6 +2100,13 @@ impl Studio {
                 },
                 cx,
             ))
+            .child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(muted())
+                    .child("Resolution"),
+            )
             .child(self.segmented(
                 "export-resolution",
                 &["Original", "720p", "1080p", "1440p", "4K"],
@@ -2834,6 +2845,113 @@ impl Studio {
         mark.timing = Some(timing.clamped(duration));
     }
 
+    fn commit_annotation_time(&mut self) {
+        let Some((index, start, text)) = self.annotation_time_edit.take() else {
+            return;
+        };
+        if self.selected_annotation != Some(index) {
+            return;
+        }
+        let Ok(value) = text.parse::<f64>() else {
+            return;
+        };
+        if !value.is_finite() || value < 0.0 {
+            return;
+        }
+        self.record_annotation_undo();
+        self.edit_selected_timing(|timing, duration| {
+            if let Some(updated) = timing.with_boundary(start, value, duration) {
+                *timing = updated;
+            }
+        });
+    }
+
+    pub(crate) fn handle_annotation_time_key(&mut self, event: &KeyDownEvent) -> bool {
+        let Some((index, _, _)) = self.annotation_time_edit.as_ref() else {
+            return false;
+        };
+        if self.selected_annotation != Some(*index) {
+            self.annotation_time_edit = None;
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "enter" | "tab" => self.commit_annotation_time(),
+            "escape" => self.annotation_time_edit = None,
+            "backspace" => {
+                self.annotation_time_edit.as_mut().unwrap().2.pop();
+            }
+            _ => {
+                if !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt
+                {
+                    if let Some(text) = &event.keystroke.key_char {
+                        let buffer = &mut self.annotation_time_edit.as_mut().unwrap().2;
+                        if buffer.len() + text.len() <= 12
+                            && text.chars().all(|c| c.is_ascii_digit() || c == '.')
+                        {
+                            buffer.push_str(text);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn annotation_time_field(
+        &self,
+        index: usize,
+        start: bool,
+        value: f64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let draft = self
+            .annotation_time_edit
+            .as_ref()
+            .filter(|(i, leading, _)| *i == index && *leading == start);
+        div()
+            .id(if start {
+                "annotation-start-value"
+            } else {
+                "annotation-end-value"
+            })
+            .w(px(88.0))
+            .h(px(32.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(if draft.is_some() { blue() } else { line() })
+            .text_sm()
+            .cursor(CursorStyle::IBeam)
+            .child(
+                draft
+                    .map(|(_, _, text)| format!("{text}|"))
+                    .unwrap_or_else(|| format!("{value:.2} s")),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.commit_annotation_time();
+                this.stop_editing_text();
+                this.annotation_time_edit = Some((index, start, String::new()));
+                window.focus(&this.focus_handle);
+                cx.notify();
+            }))
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if this
+                    .annotation_time_edit
+                    .as_ref()
+                    .is_some_and(|(i, leading, _)| *i == index && *leading == start)
+                {
+                    this.commit_annotation_time();
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
+    }
+
     /// Timing panel for the selected annotation in an animated screenshot.
     pub(crate) fn annotation_timing_inspector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.scene_is_timed() {
@@ -2855,7 +2973,7 @@ impl Studio {
             .iter()
             .position(|effect| *effect == timing.exit)
             .unwrap_or(1);
-        let title = format!("{} timing", mark.tool.label());
+        let title = "Timing";
         Some(
             div()
                 .flex()
@@ -2883,7 +3001,7 @@ impl Studio {
                             div()
                                 .text_xs()
                                 .text_color(muted())
-                                .child(format!("{:.1}s – {:.1}s", timing.start, timing.end)),
+                                .child(format!("{:.2}s – {:.2}s", timing.start, timing.end)),
                         ),
                 )
                 .child(self.scene_toggle_row(
@@ -2908,7 +3026,7 @@ impl Studio {
                 ))
                 .child(self.scene_toggle_row(
                     "annotation-pinned",
-                    "Pin to frame",
+                    "Keep fixed on canvas",
                     mark.pinned,
                     cx,
                     |this| {
@@ -2933,27 +3051,7 @@ impl Studio {
                                     .w(px(40.0))
                                     .child("Start"),
                             )
-                            .child(self.small_button(
-                                "timing-start-earlier",
-                                "−0.25s",
-                                true,
-                                cx,
-                                |this, _| {
-                                    this.edit_selected_timing(|timing, _| timing.start -= 0.25)
-                                },
-                            ))
-                            .child(self.small_button(
-                                "timing-start-later",
-                                "+0.25s",
-                                true,
-                                cx,
-                                |this, _| {
-                                    this.edit_selected_timing(|timing, _| {
-                                        timing.start = (timing.start + 0.25)
-                                            .min(timing.end - AnnotationTiming::MINIMUM_DURATION)
-                                    })
-                                },
-                            ))
+                            .child(self.annotation_time_field(index, true, timing.start, cx))
                             .child(self.small_button(
                                 "timing-start-playhead",
                                 "At playhead",
@@ -2975,27 +3073,18 @@ impl Studio {
                             .items_center()
                             .gap_2()
                             .child(div().text_xs().text_color(muted()).w(px(40.0)).child("End"))
+                            .child(self.annotation_time_field(index, false, timing.end, cx))
                             .child(self.small_button(
-                                "timing-end-earlier",
-                                "−0.25s",
+                                "timing-end-playhead",
+                                "At playhead",
                                 true,
                                 cx,
                                 |this, _| {
+                                    let position = this.video_position;
                                     this.edit_selected_timing(|timing, _| {
-                                        timing.end = (timing.end - 0.25)
+                                        timing.end = position
                                             .max(timing.start + AnnotationTiming::MINIMUM_DURATION)
-                                    })
-                                },
-                            ))
-                            .child(self.small_button(
-                                "timing-end-later",
-                                "+0.25s",
-                                true,
-                                cx,
-                                |this, _| {
-                                    this.edit_selected_timing(|timing, duration| {
-                                        timing.end = (timing.end + 0.25).min(duration)
-                                    })
+                                    });
                                 },
                             ))
                             .child(self.small_button(
@@ -3009,6 +3098,19 @@ impl Studio {
                                     })
                                 },
                             )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted())
+                            .child("Times are in seconds. Enter to apply; Escape to cancel."),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Animation"),
                     )
                     .child(div().text_xs().text_color(muted()).child("Entrance"))
                     .child(self.segmented(
@@ -3028,7 +3130,11 @@ impl Studio {
                     ))
                     .child(self.segmented(
                         "annotation-entrance-b",
-                        &["Slide in", "Draw", "Type"],
+                        if mark.tool == Tool::Text {
+                            &["Slide in", "Draw", "Type"]
+                        } else {
+                            &["Slide in", "Draw"]
+                        },
                         if entrance_index >= 4 {
                             entrance_index - 4
                         } else {

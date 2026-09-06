@@ -385,6 +385,7 @@ impl Studio {
     }
 
     pub(super) fn stop_editing_text(&mut self) {
+        self.annotation_time_edit = None;
         let Some(index) = self.editing_text.take() else {
             return;
         };
@@ -673,6 +674,9 @@ impl Studio {
     }
 
     pub(super) fn handle_key(&mut self, event: &KeyDownEvent) -> bool {
+        if self.handle_annotation_time_key(event) {
+            return true;
+        }
         if self.handle_watermark_key(event) {
             return true;
         }

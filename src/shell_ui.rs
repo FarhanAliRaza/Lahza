@@ -22,8 +22,8 @@ use crate::{
 pub(crate) const INSPECTOR_WIDTH: f32 = 360.0;
 pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
 const CANVAS_PADDING: f32 = 40.0;
-const CANVAS_STATUS_HEIGHT: f32 = 36.0;
 const TIMELINE_CONTROLS_HEIGHT: f32 = 46.0;
+const SCENE_STRIP_HEIGHT: f32 = 42.0;
 const TIMELINE_LANES_HEIGHT: f32 = 148.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,12 +56,11 @@ pub(crate) enum InspectorTab {
 }
 
 impl InspectorTab {
-    const ALL: [InspectorTab; 5] = [
+    const ALL: [InspectorTab; 4] = [
         InspectorTab::Design,
         InspectorTab::Annotate,
         InspectorTab::Motion,
         InspectorTab::Record,
-        InspectorTab::Export,
     ];
 
     fn label(self) -> &'static str {
@@ -315,7 +314,15 @@ impl Studio {
         if self.editor_mode() == EditorMode::Static {
             0.0
         } else {
-            TIMELINE_CONTROLS_HEIGHT + TIMELINE_LANES_HEIGHT + self.timeline_lane_extra() + 1.0
+            TIMELINE_CONTROLS_HEIGHT
+                + TIMELINE_LANES_HEIGHT
+                + self.timeline_lane_extra()
+                + 1.0
+                + if self.editor_mode() == EditorMode::Motion {
+                    SCENE_STRIP_HEIGHT
+                } else {
+                    0.0
+                }
         }
     }
 
@@ -329,58 +336,27 @@ impl Studio {
         };
         let width = (viewport.width - px(CANVAS_PADDING * 2.0 + inspector)).max(px(1.0));
         let height = (viewport.height
-            - px(TOP_BAR_HEIGHT
-                + CANVAS_STATUS_HEIGHT
-                + CANVAS_PADDING * 2.0
-                + self.timeline_bar_height()))
+            - px(TOP_BAR_HEIGHT + CANVAS_PADDING * 2.0 + self.timeline_bar_height()))
         .max(px(1.0));
         self.preview_canvas_size(width, height)
     }
 
-    /// The canvas area with its overlays (zoom label, toast, export status).
+    /// The canvas workspace with its export status overlay.
     pub(crate) fn canvas_area(&self, canvas: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let export_overlay = self.export_status_overlay(cx);
         div()
+            .relative()
             .flex_1()
             .min_w_0()
             .min_h_0()
+            .overflow_hidden()
+            .p(px(CANVAS_PADDING))
             .flex()
-            .flex_col()
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .p(px(CANVAS_PADDING))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgb(0xe9ebef))
-                    .child(div().flex_none().shadow_lg().child(canvas))
-                    .when_some(export_overlay, |this, overlay| this.child(overlay)),
-            )
-            .child(
-                div()
-                    .h(px(CANVAS_STATUS_HEIGHT))
-                    .flex_none()
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_t_1()
-                    .border_color(line())
-                    .bg(panel())
-                    .text_xs()
-                    .text_color(muted())
-                    .child(if self.crop_active {
-                        "Crop preview"
-                    } else {
-                        "Canvas preview"
-                    })
-                    .child("Fit to workspace"),
-            )
+            .items_center()
+            .justify_center()
+            .bg(rgb(0xe9ebef))
+            .child(div().flex_none().shadow_lg().child(canvas))
+            .when_some(export_overlay, |this, overlay| this.child(overlay))
             .into_any_element()
     }
 
@@ -649,7 +625,12 @@ impl Studio {
                                 .hover(|style| style.bg(hsla(211.0 / 360.0, 0.95, 0.48, 1.0)))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.stop_editing_text();
-                                    this.export_current(cx);
+                                    if this.editor_mode() == EditorMode::Static {
+                                        this.export_current(cx);
+                                    } else {
+                                        this.select_inspector_tab(InspectorTab::Export);
+                                        this.inspector_visible = true;
+                                    }
                                     cx.notify();
                                 }))
                         })
@@ -777,7 +758,7 @@ impl Studio {
 
     /// Collapsible section header; `trailing` (a switch, usually) sits before
     /// the chevron and handles its own clicks.
-    fn section_header(
+    pub(crate) fn section_header(
         &self,
         id: &'static str,
         title: &'static str,
@@ -867,6 +848,9 @@ impl Studio {
         } else {
             None
         };
+        if let Some(transform) = transform {
+            return transform;
+        }
         let wallpaper_tab = self.wallpaper_tab;
         let border = self.border;
         let watermark = self.watermark_enabled;
@@ -874,7 +858,22 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .when_some(transform, |this, panel| this.child(panel))
+            .child(Self::tab_label("Canvas"))
+            .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
+            .child(self.segmented(
+                "aspect-ratio",
+                &["Auto", "1:1", "4:3", "3:2", "16:9"],
+                self.aspect_ratio,
+                |this, value| this.aspect_ratio = value,
+                cx,
+            ))
+            .child(self.slider_row(
+                "Padding",
+                self.padding,
+                "%",
+                |this, value| this.padding = value,
+                cx,
+            ))
             .child(Self::tab_label("Background"))
             .child(self.segmented(
                 "fill-type",
@@ -884,38 +883,25 @@ impl Studio {
                 cx,
             ))
             .child(self.fill_picker(cx))
+            .when(wallpaper_tab == 2, |this| {
+                this.child(self.section_header(
+                    "wallpaper-browser",
+                    "Browse all wallpapers",
+                    None,
+                    cx,
+                ))
+            })
             .child(self.section_header("effects", "Background effects", None, cx))
             .when(self.section_open("effects"), |this| {
                 this.child(self.background_effects_section(cx))
             })
             .child(div().h(px(4.0)))
-            .child(Self::tab_label("Layout"))
-            .child(self.slider_row(
-                "Padding",
-                self.padding,
-                "%",
-                |this, value| this.padding = value,
-                cx,
-            ))
+            .child(Self::tab_label("Image appearance"))
             .child(self.slider_row(
                 "Corners",
                 self.corners,
                 "%",
                 |this, value| this.corners = value,
-                cx,
-            ))
-            .child(self.slider_row(
-                "Shadow",
-                self.shadow,
-                "%",
-                |this, value| this.shadow = value,
-                cx,
-            ))
-            .child(self.segmented(
-                "shadow-style",
-                &["Soft", "Long", "Glow", "Crisp"],
-                self.shadow_style,
-                |this, value| this.shadow_style = value,
                 cx,
             ))
             .child(div().text_xs().text_color(muted()).child("Window frame"))
@@ -931,14 +917,6 @@ impl Studio {
                     cx,
                 ),
             )
-            .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
-            .child(self.segmented(
-                "aspect-ratio",
-                &["Auto", "1:1", "4:3", "3:2", "16:9"],
-                self.aspect_ratio,
-                |this, value| this.aspect_ratio = value,
-                cx,
-            ))
             .child(self.section_header(
                 "border",
                 "Border",
@@ -987,6 +965,22 @@ impl Studio {
                     cx,
                 ))
             })
+            .child(Self::tab_label("Shadow"))
+            .child(self.slider_row(
+                "Amount",
+                self.shadow,
+                "%",
+                |this, value| this.shadow = value,
+                cx,
+            ))
+            .child(div().text_xs().text_color(muted()).child("Style"))
+            .child(self.segmented(
+                "shadow-style",
+                &["Soft", "Long", "Glow", "Crisp"],
+                self.shadow_style,
+                |this, value| this.shadow_style = value,
+                cx,
+            ))
             .child(self.section_header(
                 "watermark",
                 "Watermark",
@@ -1023,7 +1017,41 @@ impl Studio {
             .flex_col()
             .gap_3()
             .child(self.video_annotate_section(cx))
-            .child(self.annotation_style_controls(cx))
+            .when(selected.is_none() && self.tool == Tool::Select, |this| {
+                this.when(!self.annotations.is_empty(), |this| {
+                    this.child(div().text_sm().text_color(muted()).child(
+                        "Select an annotation on the canvas or below to edit its properties.",
+                    ))
+                })
+                .children(self.annotations.iter().enumerate().map(|(index, mark)| {
+                    div()
+                        .id(("annotation-list", index))
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(0xf0f1f3))
+                        .text_sm()
+                        .cursor_pointer()
+                        .child(format!("{} · {}", index + 1, mark.tool.label()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.stop_editing_text();
+                            this.selected_annotation = Some(index);
+                            this.tool = Tool::Select;
+                            cx.notify();
+                        }))
+                }))
+            })
+            .when(selected.is_some() || self.tool != Tool::Select, |this| {
+                this.child(
+                    div().text_sm().font_weight(FontWeight::SEMIBOLD).child(
+                        selected
+                            .map(|index| self.annotations[index].tool.label())
+                            .unwrap_or(self.tool.label()),
+                    ),
+                )
+                .child(Self::tab_label("Appearance"))
+                .child(self.annotation_style_controls(cx))
+            })
             .when_some(timing, |this, panel| this.child(panel))
             .when(selected.is_some() || self.tool != Tool::Select, |this| {
                 this.child(
@@ -1049,7 +1077,7 @@ impl Studio {
                         })
                         .child(self.small_button(
                             "annotation-done",
-                            "Done",
+                            "Deselect",
                             true,
                             cx,
                             |this, _| {
@@ -1085,10 +1113,22 @@ impl Studio {
             ))
             .child(Self::tab_label("Motion preset"))
             .child(
+                div().text_xs().text_color(muted()).child(
+                    selected_preset
+                        .map(|preset| preset.label())
+                        .unwrap_or("Custom motion"),
+                ),
+            )
+            .child(
                 div().flex().flex_wrap().gap(px(6.0)).children(
                     MotionPreset::ALL
                         .into_iter()
                         .enumerate()
+                        .filter(|(index, preset)| {
+                            self.section_open("motion-presets")
+                                || *index < 3
+                                || selected_preset == Some(*preset)
+                        })
                         .map(|(index, preset)| {
                             let selected = selected_preset == Some(preset);
                             div()
@@ -1100,7 +1140,7 @@ impl Studio {
                                 .overflow_hidden()
                                 .border_2()
                                 .border_color(if selected {
-                                    crate::motion_ui::orange(false)
+                                    blue()
                                 } else {
                                     rgb(0xe4e4e7).into()
                                 })
@@ -1129,11 +1169,7 @@ impl Studio {
                                         .justify_center()
                                         .text_xs()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(if selected {
-                                            crate::motion_ui::orange(false)
-                                        } else {
-                                            ink()
-                                        })
+                                        .text_color(if selected { blue() } else { ink() })
                                         .child(preset.label()),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1143,7 +1179,74 @@ impl Studio {
                         }),
                 ),
             )
-            .child(Self::tab_label("Scenes"))
+            .child(self.section_header("motion-presets", "Browse all motion presets", None, cx))
+            .child(Self::tab_label("Cursor walkthrough"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("walkthrough-toggle")
+                            .px_3()
+                            .h(px(30.0))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .bg(if self.walkthrough_mode {
+                                blue()
+                            } else {
+                                rgb(0xf0f0f1).into()
+                            })
+                            .text_color(if self.walkthrough_mode {
+                                rgb(0xffffff).into()
+                            } else {
+                                ink()
+                            })
+                            .cursor_pointer()
+                            .child(if self.walkthrough_mode {
+                                "Placing stops… (Enter to finish)"
+                            } else if self.has_walkthrough() {
+                                "Add more stops"
+                            } else {
+                                "Place cursor stops"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.walkthrough_mode = !this.walkthrough_mode;
+                                this.video_selected_zoom_cue = None;
+                                this.scene_selection = SceneSelection::Scene;
+                                if this.walkthrough_mode {
+                                    this.pause_video_playback();
+                                    this.toast = Some(
+                                        "Click the spots the cursor should visit, in order".into(),
+                                    );
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.has_walkthrough(), |this| {
+                        this.child(self.small_button(
+                            "walkthrough-clear",
+                            "Clear path",
+                            true,
+                            cx,
+                            |this, _| this.clear_walkthrough(),
+                        ))
+                    }),
+            )
+            .child(div().h(px(1.0)).mt_1().bg(line()))
+            .into_any_element()
+    }
+
+    fn scene_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(div().text_xs().text_color(muted()).child("Scenes"))
             .child(
                 div()
                     .flex()
@@ -1196,85 +1299,41 @@ impl Studio {
                         ))
                     }),
             )
-            .child(Self::tab_label("Cursor walkthrough"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("walkthrough-toggle")
-                            .px_3()
-                            .h(px(30.0))
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if self.walkthrough_mode {
-                                crate::motion_ui::orange(false)
-                            } else {
-                                rgb(0xf0f0f1).into()
-                            })
-                            .text_color(if self.walkthrough_mode {
-                                rgb(0xffffff).into()
-                            } else {
-                                ink()
-                            })
-                            .cursor_pointer()
-                            .child(if self.walkthrough_mode {
-                                "Placing stops… (Enter to finish)"
-                            } else if self.has_walkthrough() {
-                                "Add more stops"
-                            } else {
-                                "Place cursor stops"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.walkthrough_mode = !this.walkthrough_mode;
-                                this.video_selected_zoom_cue = None;
-                                this.scene_selection = SceneSelection::Scene;
-                                if this.walkthrough_mode {
-                                    this.pause_video_playback();
-                                    this.toast = Some(
-                                        "Click the spots the cursor should visit, in order".into(),
-                                    );
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.has_walkthrough(), |this| {
-                        this.child(self.small_button(
-                            "walkthrough-clear",
-                            "Clear path",
-                            true,
-                            cx,
-                            |this, _| this.clear_walkthrough(),
-                        ))
-                    }),
-            )
-            .child(div().h(px(1.0)).mt_1().bg(line()))
             .into_any_element()
     }
 
     fn motion_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mode = self.editor_mode();
-        let region = self.motion_inspector(cx);
-        let transform = self.transform_inspector(cx);
+        if let Some(transform) = self.transform_inspector(cx) {
+            return transform;
+        }
+        if let Some(region) = self.motion_inspector(cx) {
+            return region;
+        }
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .when_some(transform, |this, panel| this.child(panel))
-            .when_some(region, |this, panel| this.child(panel))
-            .when(mode == EditorMode::Motion, |this| {
+            .child(Self::tab_label("Scene motion"))
+            .when(self.editor_mode() == EditorMode::Motion, |this| {
                 this.child(self.animation_settings(cx))
             })
             .child(self.motion_overview_section(cx))
             .child(self.scene_slider_row(SceneSlider::DefaultZoom, cx))
-            .child(self.section_header("templates", "Templates", None, cx))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted())
+                    .child("Starting zoom for new motion regions."),
+            )
+            .child(self.section_header("templates", "Browse templates", None, cx))
             .when(self.section_open("templates"), |this| {
-                this.child(self.template_gallery_section(cx))
+                this.child(
+                    div()
+                        .id("template-browser")
+                        .max_h(px(340.0))
+                        .overflow_y_scroll()
+                        .child(self.template_gallery_section(cx)),
+                )
             })
             .into_any_element()
     }
@@ -1307,7 +1366,43 @@ impl Studio {
             InspectorTab::Annotate => self.annotate_tab(cx),
             InspectorTab::Motion => self.motion_tab(cx),
             InspectorTab::Record => self.record_tab(cx),
-            InspectorTab::Export => self.export_section(cx),
+            InspectorTab::Export => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(Self::tab_label("Export settings"))
+                .child(self.export_section(cx))
+                .child(
+                    div()
+                        .id("export-start")
+                        .h(px(36.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .bg(blue())
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .opacity(if self.export_progress.is_some() {
+                            0.5
+                        } else {
+                            1.0
+                        })
+                        .child(if self.export_progress.is_some() {
+                            "Exporting…"
+                        } else {
+                            "Export file…"
+                        })
+                        .when(self.export_progress.is_none(), |this| {
+                            this.cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_current(cx);
+                                    cx.notify();
+                                }))
+                        }),
+                )
+                .into_any_element(),
         };
         let tabs = div()
             .h(px(64.0))
@@ -1511,6 +1606,19 @@ impl Studio {
     /// The timeline bar shared by the motion and video modes: transport and
     /// edit controls, the ruler, the clip lane, then the motion, annotation,
     /// camera, and audio lanes.
+    fn track_label(label: &'static str, height: f32) -> AnyElement {
+        div()
+            .h(px(height))
+            .flex_none()
+            .flex()
+            .items_center()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(muted())
+            .child(label)
+            .into_any_element()
+    }
+
     pub(crate) fn timeline_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let is_video = self.video_project.is_some();
         let playing = self.video_playing;
@@ -1658,6 +1766,20 @@ impl Studio {
             .bg(rgb(0xffffff))
             .border_t_1()
             .border_color(line())
+            .when(!is_video, |this| {
+                this.child(
+                    div()
+                        .id("timeline-scenes")
+                        .h(px(SCENE_STRIP_HEIGHT))
+                        .flex_none()
+                        .overflow_x_scroll()
+                        .flex()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(line())
+                        .child(self.scene_strip(cx)),
+                )
+            })
             .child(
                 div()
                     .h(px(TIMELINE_CONTROLS_HEIGHT))
@@ -1713,6 +1835,7 @@ impl Studio {
                                 .items_center()
                                 .gap_1()
                                 .text_xs()
+                                .child(div().text_color(muted()).child("Timeline zoom"))
                                 .child(
                                     div()
                                         .id("timeline-zoom-out")
@@ -1771,6 +1894,40 @@ impl Studio {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .child(
+                        div()
+                            .w(px(104.0))
+                            .pr_3()
+                            .h(px(126.0 + lane_extra))
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(Self::track_label("Time", 16.0))
+                                    .child(Self::track_label(
+                                        if is_video { "Video" } else { "Image" },
+                                        34.0,
+                                    ))
+                                    .child(Self::track_label("Motion", 30.0))
+                                    .when(annotation_track.is_some(), |this| {
+                                        this.child(Self::track_label(
+                                            "Annotations",
+                                            self.annotation_lane_height(),
+                                        ))
+                                    })
+                                    .when(camera_lane.is_some(), |this| {
+                                        this.child(Self::track_label("Camera", 22.0))
+                                    })
+                                    .when(audio_lane.is_some(), |this| {
+                                        this.child(Self::track_label("Audio", 22.0))
+                                    }),
+                            ),
+                    )
                     .child(
                         div()
                             .flex_1()

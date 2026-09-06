@@ -237,6 +237,7 @@ struct Studio {
     text_italic: bool,
     text_underline: bool,
     editing_text: Option<usize>,
+    annotation_time_edit: Option<(usize, bool, String)>,
     caret_visible: bool,
     _caret_blink_task: Task<()>,
     _recording_clock_task: Task<()>,
@@ -531,6 +532,7 @@ impl Studio {
             text_italic: false,
             text_underline: false,
             editing_text: None,
+            annotation_time_edit: None,
             caret_visible: true,
             _caret_blink_task: caret_blink_task,
             _recording_clock_task: recording_clock_task,
@@ -987,6 +989,9 @@ impl Studio {
     }
 
     fn handle_video_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.handle_annotation_time_key(event) {
+            return true;
+        }
         if self.handle_watermark_key(event) {
             return true;
         }
