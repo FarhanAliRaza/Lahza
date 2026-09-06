@@ -19,9 +19,10 @@ use crate::{
     timestamped_export_name, Studio, Tool, VideoMoveDrag,
 };
 
-pub(crate) const INSPECTOR_WIDTH: f32 = 316.0;
-pub(crate) const TOP_BAR_HEIGHT: f32 = 52.0;
-const CANVAS_PADDING: f32 = 24.0;
+pub(crate) const INSPECTOR_WIDTH: f32 = 360.0;
+pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
+const CANVAS_PADDING: f32 = 40.0;
+const CANVAS_STATUS_HEIGHT: f32 = 36.0;
 const TIMELINE_CONTROLS_HEIGHT: f32 = 46.0;
 const TIMELINE_LANES_HEIGHT: f32 = 148.0;
 
@@ -326,10 +327,13 @@ impl Studio {
         } else {
             0.0
         };
-        let width = (viewport.width - px(CANVAS_PADDING * 2.0 + inspector)).max(px(320.0));
+        let width = (viewport.width - px(CANVAS_PADDING * 2.0 + inspector)).max(px(1.0));
         let height = (viewport.height
-            - px(TOP_BAR_HEIGHT + CANVAS_PADDING * 2.0 + self.timeline_bar_height()))
-        .max(px(220.0));
+            - px(TOP_BAR_HEIGHT
+                + CANVAS_STATUS_HEIGHT
+                + CANVAS_PADDING * 2.0
+                + self.timeline_bar_height()))
+        .max(px(1.0));
         self.preview_canvas_size(width, height)
     }
 
@@ -337,16 +341,46 @@ impl Studio {
     pub(crate) fn canvas_area(&self, canvas: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let export_overlay = self.export_status_overlay(cx);
         div()
-            .relative()
             .flex_1()
+            .min_w_0()
             .min_h_0()
-            .p(px(CANVAS_PADDING))
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(0xf3f3f4))
-            .child(canvas)
-            .when_some(export_overlay, |this, overlay| this.child(overlay))
+            .flex_col()
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .p(px(CANVAS_PADDING))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0xe9ebef))
+                    .child(div().flex_none().shadow_lg().child(canvas))
+                    .when_some(export_overlay, |this, overlay| this.child(overlay)),
+            )
+            .child(
+                div()
+                    .h(px(CANVAS_STATUS_HEIGHT))
+                    .flex_none()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(line())
+                    .bg(panel())
+                    .text_xs()
+                    .text_color(muted())
+                    .child(if self.crop_active {
+                        "Crop preview"
+                    } else {
+                        "Canvas preview"
+                    })
+                    .child("Fit to workspace"),
+            )
             .into_any_element()
     }
 
@@ -516,7 +550,7 @@ impl Studio {
                     .pr_3()
                     .flex()
                     .items_center()
-                    .child(crate::brand_wordmark_latin(139.5, 28.0))
+                    .child(crate::brand_wordmark_latin(110.0, 22.0))
                     .on_mouse_down(MouseButton::Left, |event, window, _| {
                         if event.click_count >= 2 {
                             window.zoom_window();
@@ -538,19 +572,19 @@ impl Studio {
                         .items_center()
                         .gap_2()
                         .rounded_md()
-                        .bg(blue())
+                        .bg(rgb(0xf0f1f3))
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xffffff))
+                        .text_color(ink())
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x0077e6)))
+                        .hover(|style| style.bg(rgb(0xe5e7eb)))
                         .child(
                             svg()
                                 .path("icons/record.svg")
                                 .size(px(17.0))
-                                .text_color(rgb(0xffffff)),
+                                .text_color(ink()),
                         )
-                        .child("Create something new")
+                        .child("New capture")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_recorder_window(cx);
                             cx.notify();
@@ -662,15 +696,31 @@ impl Studio {
             .bg(rgb(0xffffff))
             .border_b_1()
             .border_color(line())
-            .child(left)
-            .child(drag_region("top-bar-drag-left"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .when(self.crop_active, |this| this.flex_none())
+                    .child(left)
+                    .child(drag_region("top-bar-drag-left")),
+            )
             .child(if self.crop_active {
                 self.crop_controls(cx)
             } else {
                 self.mode_switcher(cx)
             })
-            .child(drag_region("top-bar-drag-right"))
-            .child(right)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .justify_end()
+                    .child(drag_region("top-bar-drag-right"))
+                    .child(right),
+            )
             .into_any_element()
     }
 
@@ -802,9 +852,10 @@ impl Studio {
 
     fn tab_label(text: &'static str) -> AnyElement {
         div()
-            .text_xs()
+            .mt_2()
+            .text_sm()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(muted())
+            .text_color(ink())
             .child(text)
             .into_any_element()
     }
@@ -1259,11 +1310,11 @@ impl Studio {
             InspectorTab::Export => self.export_section(cx),
         };
         let tabs = div()
-            .h(px(56.0))
+            .h(px(64.0))
             .flex_none()
             .flex()
             .px_2()
-            .pt_1()
+            .py_2()
             .gap_1()
             .border_b_1()
             .border_color(line())
@@ -1284,7 +1335,7 @@ impl Studio {
                             .gap_1()
                             .rounded_md()
                             .cursor_pointer()
-                            .when(selected, |this| this.bg(rgb(0xffffff)).shadow_sm())
+                            .when(selected, |this| this.bg(rgb(0xe7f1ff)))
                             .hover(move |style| {
                                 if selected {
                                     style
@@ -1300,7 +1351,7 @@ impl Studio {
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.0))
+                                    .text_size(px(12.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(if selected { ink() } else { muted() })
                                     .child(candidate.label()),
@@ -1328,10 +1379,10 @@ impl Studio {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .p_4()
+                    .p_5()
                     .flex()
                     .flex_col()
-                    .child(body),
+                    .child(div().flex_none().w_full().child(body)),
             )
             .when(self.crop_active, |this| {
                 this.opacity(0.52).child(

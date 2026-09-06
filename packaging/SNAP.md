@@ -78,7 +78,7 @@ Host unit tests alone do not verify Snap confinement or desktop permissions.
 ## GitHub Actions releases
 
 The `Build Linux Release` workflow builds Debian packages and the Snap in
-separate jobs on pushes to `main`, pull requests, and manual workflow runs.
+separate jobs on pushes to `master`, pull requests, and manual workflow runs.
 The Snap job installs the built package under strict confinement and runs the
 synthetic recording/export smoke test before it can be published. Artifacts
 include the Snap, `SNAP-SHA256SUMS`, and the smoke-test log.
@@ -119,7 +119,7 @@ and `Cargo.lock`, commit the release changes, and push a matching tag:
 
 ```bash
 # Example for the next stable release, after updating both version files:
-git push origin main
+git push origin master
 git tag v0.4.3
 git push origin v0.4.3
 ```

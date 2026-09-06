@@ -694,8 +694,8 @@ impl Studio {
                     let path = *path;
                     div()
                         .id(("wallpaper-tile", index))
-                        .w(px(84.0))
-                        .h(px(58.0))
+                        .w(px(100.0))
+                        .h(px(64.0))
                         .rounded_lg()
                         .overflow_hidden()
                         .cursor_pointer()

@@ -219,7 +219,6 @@ fn solid(name: &str) -> SceneBackground {
 }
 
 const WHITE: u32 = 0xf5f5f5;
-const INK: u32 = 0x050506;
 const YELLOW: u32 = 0xffd12e;
 const BLUE: u32 = 0x2e7aff;
 const PINK: u32 = 0xff2e6e;
@@ -342,7 +341,7 @@ pub fn all() -> Vec<SceneTemplate> {
                     0.065,
                     0.6,
                     28.0,
-                    INK,
+                    BLUE,
                     0,
                     0.5,
                     3.9,
@@ -356,7 +355,7 @@ pub fn all() -> Vec<SceneTemplate> {
                     0.065,
                     0.6,
                     28.0,
-                    INK,
+                    BLUE,
                     0,
                     4.2,
                     7.8,

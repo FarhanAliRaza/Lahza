@@ -1,16 +1,18 @@
-## Lahza v0.4.2
+## Lahza v0.4.3
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
 ### Changed in this release
 
-- Debian app-menu launchers now open `/usr/bin/lahza` explicitly, preventing an older executable in `~/.local/bin` from taking precedence through `PATH`.
-- Added `lahza-update --check` and `lahza-update --install` for Debian installations. The updater checks stable GitHub Releases, verifies the download against the release SHA256 checksum and package metadata, and installs newer versions through APT.
-- Added `lahza --version` to identify the executable version without opening the app.
+- Added a strictly confined Snap package with bundled desktop and media dependencies, built on `core24` for amd64 Linux systems.
+- Automated Debian and Snap builds, tests, checksums, GitHub release assets, and Snap Store publishing from version tags on `master`.
+- Tutorial captions now use blue instead of near-black text.
+- Refined the editor layout with a wider inspector, larger wallpaper previews, clearer tabs, and a canvas status bar.
+- Updated the application icon and added its SVG source and generation script.
 
-**Upgrading from v0.4.1:** install the new `.deb`, save your work, fully quit Lahza, and reopen it from the app menu. Older packages do not include the updater. If you have a user launcher at `~/.local/share/applications/com.lahza.Lahza.desktop`, it overrides the system launcher; back it up or remove it to use the Debian launcher. Presets, recordings, and `.lahzarec` projects are unchanged.
+Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
-For subsequent Debian updates, run `lahza-update --install` in a terminal. This is an on-demand updater; it does not enable automatic APT repository updates or update user-local binary bundles.
+For Debian updates, run `lahza-update --install`. Snap updates are managed by snapd.
 
 ### Included
 
@@ -23,19 +25,27 @@ For subsequent Debian updates, run `lahza-update --install` in a terminal. This 
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.2_amd64.deb`, then run:
+**Snap (amd64 Linux with snapd):**
 
 ```bash
-sudo apt install ./lahza_0.4.2_amd64.deb
+sudo snap install lahza
+```
+
+The stable channel receives this version after the release workflow and Store review succeed. Microphone capture and webcam access require `sudo snap connect lahza:audio-record` and `sudo snap connect lahza:camera` respectively.
+
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.3_amd64.deb`, then run:
+
+```bash
+sudo apt install ./lahza_0.4.3_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
 
-**Binary bundle:** download `lahza-0.4.2-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.4.3-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.4.2-linux-x86_64.tar.gz
-cd lahza-0.4.2-linux-x86_64
+tar -xzf lahza-0.4.3-linux-x86_64.tar.gz
+cd lahza-0.4.3-linux-x86_64
 ./install.sh
 ```
 
