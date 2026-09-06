@@ -116,6 +116,10 @@ mod tests {
         let mut library = PresetLibrary::default();
         let first = library.add(ScenePreset {
             name: "Studio".into(),
+            style: SceneStyle {
+                shadow_color: 0x8c4ce8,
+                ..SceneStyle::default()
+            },
             ..ScenePreset::default()
         });
         let second = library.add(ScenePreset {

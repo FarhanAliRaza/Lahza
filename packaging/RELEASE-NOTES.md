@@ -4,12 +4,9 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Added exact start/end time entry for annotations, with Enter to apply, Escape to cancel, and boundaries constrained to the scene duration.
-- Reorganized the editor inspector with focused image and motion properties, collapsible advanced transforms, and clearer export controls.
-- Added timeline track labels, a scene strip for animated images, and an explicit timeline zoom label.
-- Added expandable wallpaper browsing and more compact motion preset and template browsing.
-- Limited the typewriter entrance option to text annotations.
-- Added `just release` and `just release-check` to bump versions and safely push matching release tags.
+- Added eight shadow colors across Soft, Long, Glow, and Crisp styles, with matching preview and export rendering.
+- Saved presets and projects now retain the shadow color; older projects keep their original black shadows.
+- Fixed dragging the Shadow Amount control after its label changed. Sliders now use stable targets independent of their display labels.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

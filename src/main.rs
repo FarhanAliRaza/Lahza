@@ -371,6 +371,7 @@ struct Studio {
     wallpaper_asset: &'static str,
     custom_wallpaper: Option<PathBuf>,
     shadow_style: usize,
+    shadow_color: u32,
     aspect_ratio: usize,
     border_color: usize,
     padding: u8,
@@ -646,6 +647,7 @@ impl Studio {
             wallpaper_asset: CURATED_WALLPAPERS[0],
             custom_wallpaper: None,
             shadow_style: 1,
+            shadow_color: 0x000000,
             aspect_ratio: 0,
             border_color: 3,
             padding: 8,
@@ -914,6 +916,7 @@ impl Studio {
         self.shadow = preset.shadow;
         self.corners = preset.corners;
         self.shadow_style = preset.shadow_style;
+        self.shadow_color = 0x000000;
         self.aspect_ratio = preset.aspect_ratio;
         self.border = preset.border;
         self.border_color = preset.border_color;
@@ -1175,7 +1178,8 @@ impl Studio {
             }
         }
         if self.shadow > 0 {
-            let _ = write!(svg, "<rect x=\"{x}\" y=\"{y}\" width=\"{capture_width}\" height=\"{capture_height}\" rx=\"{radius}\" fill=\"black\" filter=\"url(#dropShadow)\"/>");
+            let shadow_color = self.shadow_color;
+            let _ = write!(svg, "<rect x=\"{x}\" y=\"{y}\" width=\"{capture_width}\" height=\"{capture_height}\" rx=\"{radius}\" fill=\"#{shadow_color:06x}\" filter=\"url(#dropShadow)\"/>");
         }
         let _ = write!(svg, "<image href=\"{capture_href}\" x=\"{x}\" y=\"{y}\" width=\"{capture_width}\" height=\"{capture_height}\" preserveAspectRatio=\"none\" clip-path=\"url(#captureClip)\"/><g clip-path=\"url(#captureClip)\">");
 

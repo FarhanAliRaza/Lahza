@@ -361,6 +361,8 @@ pub struct SceneStyle {
     pub shadow: u8,
     /// 0 soft, 1 long, 2 glow, 3 crisp.
     pub shadow_style: usize,
+    /// RGB shadow tint; old projects default to black.
+    pub shadow_color: u32,
     pub border: bool,
     pub border_thickness: u8,
     pub border_color: u32,
@@ -389,6 +391,7 @@ impl Default for SceneStyle {
             corners: 12,
             shadow: 40,
             shadow_style: 0,
+            shadow_color: 0x000000,
             border: false,
             border_thickness: 20,
             border_color: 0x3678ef,
@@ -478,6 +481,7 @@ impl Rect {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowSpec {
+    pub color: [u8; 3],
     pub blur_radius: f64,
     pub offset_y: f64,
     pub opacity: f64,
@@ -553,6 +557,7 @@ impl SceneGeometry {
         };
         let shadow_radius = 85.0 * strength * radius_scale * ui_scale;
         let shadow = (style.shadow > 0).then(|| ShadowSpec {
+            color: unpack(style.shadow_color),
             blur_radius: shadow_radius,
             offset_y: shadow_radius * offset_scale,
             opacity: ((0.08 + strength * 1.35).min(0.35) * opacity_scale).min(0.5),
@@ -2033,7 +2038,7 @@ fn paint_shadow(
         for x in 0..width {
             let alpha = mask[y * width + x] as f64 * shadow.opacity;
             if alpha > 0.001 {
-                blend_pixel(image, x as u32, y as u32, [0, 0, 0], alpha);
+                blend_pixel(image, x as u32, y as u32, shadow.color, alpha);
             }
         }
     }
@@ -2442,6 +2447,66 @@ mod tests {
             pointer: None,
             camera: None,
         })
+    }
+
+    #[test]
+    fn shadow_color_defaults_for_old_projects_and_round_trips() {
+        let style = SceneStyle {
+            shadow_color: 0x8c4ce8,
+            ..SceneStyle::default()
+        };
+        let mut json = serde_json::to_value(&style).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SceneStyle>(json.clone()).unwrap(),
+            style
+        );
+        json.as_object_mut().unwrap().remove("shadowColor");
+        assert_eq!(
+            serde_json::from_value::<SceneStyle>(json)
+                .unwrap()
+                .shadow_color,
+            0x000000
+        );
+    }
+
+    #[test]
+    fn all_shadow_styles_render_the_selected_color_and_zero_disables_it() {
+        let source = RgbaImage::from_pixel(80, 80, Rgba([255, 255, 255, 255]));
+        for shadow_style in 0..4 {
+            let mut style = SceneStyle {
+                padding: 40,
+                shadow: 60,
+                shadow_style,
+                ..flat_style(0xffffff)
+            };
+            let black = compose(
+                &SceneCompositor::new(&style, 200, 200, 80, 80).unwrap(),
+                &source,
+            );
+            style.shadow_color = 0xff0000;
+            let red = compose(
+                &SceneCompositor::new(&style, 200, 200, 80, 80).unwrap(),
+                &source,
+            );
+            assert!(black
+                .pixels()
+                .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2]));
+            assert!(
+                red.pixels()
+                    .any(|pixel| pixel[0] > pixel[1] && pixel[1] == pixel[2]),
+                "style {shadow_style}"
+            );
+            assert_eq!(red.get_pixel(100, 100), source.get_pixel(40, 40));
+            assert_ne!(black, red);
+            style.shadow = 0;
+            let disabled = compose(
+                &SceneCompositor::new(&style, 200, 200, 80, 80).unwrap(),
+                &source,
+            );
+            assert!(disabled
+                .pixels()
+                .all(|pixel| pixel.0 == [255, 255, 255, 255]));
+        }
     }
 
     #[test]

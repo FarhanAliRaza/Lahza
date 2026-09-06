@@ -60,7 +60,7 @@ impl Studio {
             Vec::new()
         } else {
             vec![BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, shadow_alpha),
+                color: Hsla::from(rgb(self.shadow_color)).opacity(shadow_alpha),
                 offset: point(px(0.0), px(shadow_radius * offset_scale)),
                 blur_radius: px(shadow_radius),
                 spread_radius: px(0.0),

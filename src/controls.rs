@@ -9,7 +9,85 @@ use gpui::{
     IntoElement, MouseButton, MouseDownEvent, ObjectFit,
 };
 
+/// Stable targets shared with `Studio::set_slider_value`, independent of UI labels.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum SliderTarget {
+    Padding = 0,
+    Shadow = 1,
+    Corners = 2,
+    BorderThickness = 3,
+    BorderOpacity = 4,
+    RedactionStrength = 5,
+    FontSize = 6,
+}
+
+const SHADOW_COLORS: [(&str, u32); 8] = [
+    ("Black", 0x000000),
+    ("White", 0xffffff),
+    ("Slate", 0x475569),
+    ("Blue", 0x3678ef),
+    ("Purple", 0x8c4ce8),
+    ("Pink", 0xec3d87),
+    ("Orange", 0xff8a24),
+    ("Teal", 0x22bfc2),
+];
+
 impl Studio {
+    pub(crate) fn shadow_color_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected_name = SHADOW_COLORS
+            .iter()
+            .find(|(_, color)| *color == self.shadow_color)
+            .map(|(name, _)| (*name).to_string())
+            .unwrap_or_else(|| format!("#{:06X}", self.shadow_color));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(muted())
+                    .child("Color")
+                    .child(selected_name),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(SHADOW_COLORS.iter().enumerate().map(|(index, (_, color))| {
+                        let color = *color;
+                        let selected = self.shadow_color == color;
+                        div()
+                            .id(("shadow-color", index))
+                            .size(px(30.0))
+                            .p(px(3.0))
+                            .rounded_md()
+                            .border_2()
+                            .border_color(if selected { blue() } else { line() })
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(blue()))
+                            .child(div().size_full().rounded_sm().bg(rgb(color)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.shadow_color = color;
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .when(self.shadow == 0, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted())
+                        .child("Increase Amount to show the shadow."),
+                )
+            })
+            .into_any_element()
+    }
+
     pub(super) fn toggle(&self, enabled: bool) -> impl IntoElement {
         div()
             .w(px(38.0))
@@ -168,6 +246,7 @@ impl Studio {
 
     pub(super) fn slider_row<F>(
         &self,
+        target: SliderTarget,
         title: &'static str,
         value: u8,
         suffix: &'static str,
@@ -177,16 +256,7 @@ impl Studio {
     where
         F: Fn(&mut Studio, u8) + Clone + 'static,
     {
-        let slider_id: usize = match title {
-            "Padding" => 0,
-            "Shadow" => 1,
-            "Corners" => 2,
-            "Thickness" => 3,
-            "Opacity" => 4,
-            "Strength" => 5,
-            "Font size" => 6,
-            _ => 99,
-        };
+        let slider_id = target as usize;
         let decrease = on_change.clone();
         let increase = on_change;
         div()
@@ -470,6 +540,7 @@ impl Studio {
             })
             .when(is_redaction, |this| {
                 this.child(self.slider_row(
+                    SliderTarget::RedactionStrength,
                     "Strength",
                     selected_redaction_strength,
                     "%",
@@ -536,6 +607,7 @@ impl Studio {
                         ),
                     ))
                     .child(self.slider_row(
+                        SliderTarget::FontSize,
                         "Font size",
                         size_value.round().clamp(10.0, 96.0) as u8,
                         " pt",

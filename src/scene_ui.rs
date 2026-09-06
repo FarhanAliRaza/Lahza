@@ -372,6 +372,7 @@ impl Studio {
         self.corners = style.corners;
         self.shadow = style.shadow;
         self.shadow_style = style.shadow_style;
+        self.shadow_color = style.shadow_color & 0xffffff;
         self.border = style.border;
         self.border_thickness = style.border_thickness;
         if let Some(index) = crate::motion_ui::BORDER_COLORS

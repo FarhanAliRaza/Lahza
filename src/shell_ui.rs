@@ -9,7 +9,9 @@ use gpui::{
 };
 
 use crate::{
-    blue, ink, line,
+    blue,
+    controls::SliderTarget,
+    ink, line,
     motion_ui::{ANIMATION_DURATIONS, BORDER_COLORS},
     muted, panel,
     recording::{
@@ -868,6 +870,7 @@ impl Studio {
                 cx,
             ))
             .child(self.slider_row(
+                SliderTarget::Padding,
                 "Padding",
                 self.padding,
                 "%",
@@ -898,6 +901,7 @@ impl Studio {
             .child(div().h(px(4.0)))
             .child(Self::tab_label("Image appearance"))
             .child(self.slider_row(
+                SliderTarget::Corners,
                 "Corners",
                 self.corners,
                 "%",
@@ -951,6 +955,7 @@ impl Studio {
                     }),
                 ))
                 .child(self.slider_row(
+                    SliderTarget::BorderThickness,
                     "Thickness",
                     self.border_thickness,
                     "",
@@ -958,6 +963,7 @@ impl Studio {
                     cx,
                 ))
                 .child(self.slider_row(
+                    SliderTarget::BorderOpacity,
                     "Opacity",
                     self.border_opacity,
                     "%",
@@ -967,12 +973,14 @@ impl Studio {
             })
             .child(Self::tab_label("Shadow"))
             .child(self.slider_row(
+                SliderTarget::Shadow,
                 "Amount",
                 self.shadow,
                 "%",
                 |this, value| this.shadow = value,
                 cx,
             ))
+            .child(self.shadow_color_picker(cx))
             .child(div().text_xs().text_color(muted()).child("Style"))
             .child(self.segmented(
                 "shadow-style",

@@ -100,6 +100,7 @@ impl Studio {
             corners: self.corners,
             shadow: self.shadow,
             shadow_style: self.shadow_style,
+            shadow_color: self.shadow_color,
             border: self.border,
             border_thickness: self.border_thickness,
             border_color: BORDER_COLORS[self.border_color.min(BORDER_COLORS.len() - 1)],
