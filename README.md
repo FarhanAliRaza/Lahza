@@ -78,7 +78,7 @@ Recommended for **Ubuntu 24.04 amd64** and compatible distributions. It uses the
 Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
 
 ```bash
-sudo apt install ./lahza_0.4.6_amd64.deb
+sudo apt install ./lahza_0.4.7_amd64.deb
 ```
 
 Launch **Lahza** from your application menu, or run `lahza`.
@@ -156,11 +156,11 @@ Use `snap info lahza` to compare the installed version with the Store channels. 
 
 ### Binary bundle — alternative
 
-Each release also includes `lahza-0.4.6-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
+Each release also includes `lahza-0.4.7-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
 
 ```bash
-tar -xzf lahza-0.4.6-linux-x86_64.tar.gz
-cd lahza-0.4.6-linux-x86_64
+tar -xzf lahza-0.4.7-linux-x86_64.tar.gz
+cd lahza-0.4.7-linux-x86_64
 ./install.sh
 ```
 
