@@ -4,70 +4,10 @@
   <p><em>Lahza</em> is Urdu for "a brief moment".</p>
   <p>A native Linux studio for screenshots, screen recordings, and motion.</p>
   <p>Capture a moment. Annotate it, style it, and turn it into something worth sharing.</p>
-  <p><a href="https://snapcraft.io/lahza">Install from Snap Store</a> · <a href="https://github.com/FarhanAliRaza/lahza/releases">Other downloads</a> · <a href="https://github.com/FarhanAliRaza/lahza/issues">Report a bug</a> · <a href="#build-from-source">Build from source</a></p>
+  <p><a href="#install">Install Debian / Ubuntu package</a> · <a href="https://github.com/FarhanAliRaza/lahza/releases">All downloads</a> · <a href="https://github.com/FarhanAliRaza/lahza/issues">Report a bug</a> · <a href="#build-from-source">Build from source</a></p>
 </div>
 
 Built with Rust and GPUI, Lahza brings screenshot annotation, native screen recording, timeline editing, and animated presentations into one Linux desktop application.
-
-## Features
-
-### Capture and record
-
-- Capture a screen, window, or area through your desktop's screenshot picker.
-- Use the **Screenshot** button in the launcher to capture a screen, window, or area.
-- Record a monitor or window through the ScreenCast portal and PipeWire.
-- Use a separate recorder window with pause, resume, restart, stop, and discard controls.
-- Include system audio, microphone audio, or both.
-- Keep recordings in editable `.lahzarec` project folders, with draft autosave and recovery of usable unfinished recordings.
-
-### Annotate screenshots and videos
-
-- Draw arrows, lines, freehand strokes, rectangles, filled rectangles, and ellipses.
-- Add text, numbered steps, and highlights; obscure details with blur or pixelation.
-- Crop screenshots and undo or redo edits.
-- Give video and animated-image annotations start and end times on their own timeline lane.
-- Animate annotations with effects such as draw-on, type-on, pop, and slide.
-
-### Design the scene
-
-- Frame your media with solid colors, gradients, or wallpaper backgrounds.
-- Adjust padding, rounded corners, borders, shadows, and window frames.
-- Add background blur, grain, vignette, and a corner text watermark.
-- Position, scale, and rotate the media in 3D, with perspective and adjustable anchor points.
-- Use **Fit**, **Fill**, and **Actual size**, or save a look to your personal preset library.
-
-Perspective changes become visible when the media is tilted with Rotate X or Y. Anchor controls set the pivot for scaling and rotation.
-
-### Edit recordings
-
-- Preview recordings with synchronized audio and a seekable clip timeline.
-- Trim, split, delete, and change clip speed, with undo/redo.
-- Edit motion regions on the orange lane: timing, magnification, easing, focus, and pan destination.
-- Generate zoom regions from captured clicks, then adjust them manually.
-- Customize the reconstructed pointer, idle hiding, shadows, and click effects when input metadata is available.
-- Composite an added camera clip as picture-in-picture, with shape, corner, size, mirroring, margin, and shadow controls.
-
-### Animate still images
-
-- Select **Motion** to turn a screenshot into an animated scene.
-- Start with slow zooms, pans, center focus, sweep, 3D tilt, floating card, corner reveal, or tilted scroll presets.
-- Edit the resulting motion regions using the same controls as recordings.
-- Build a sequence of images, each with its own duration, motion, and captions.
-- Create a synthetic cursor walkthrough by choosing points on the image.
-
-For a loaded video, **Motion** opens the recording's motion controls directly.
-
-### Start from a template
-
-Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social square**, **Changelog**, **Cinematic**, **Minimal dark**, or **Store listing**. Templates combine scene styling, motion, and editable captions. On recordings, they add an intro while retaining later motion regions.
-
-### Export
-
-- Save styled screenshots as **PNG**.
-- Export recordings and animated screenshots as **MP4 (H.264/AAC)**, **WebM (VP9/Opus)**, or **looping GIF**.
-- Choose original resolution, 720p, 1080p, 1440p, or 4K, at 30 or 60 fps.
-- See a size estimate, track progress, and cancel an export.
-- Render backgrounds, media transforms, motion, pointers, and annotations through the scene compositor used by the preview.
 
 ## Install
 
@@ -173,6 +113,66 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 - PipeWire for desktop capture. The Snap bundles GStreamer, FFmpeg, and FFprobe; Debian and source installations use system media libraries and tools.
 - Desktop support for the screenshot and screencast portals. Picker options depend on your desktop.
 
+
+## Features
+
+### Capture and record
+
+- Capture a screen, window, or area through your desktop's screenshot picker.
+- Use the **Screenshot** button in the launcher to capture a screen, window, or area.
+- Record a monitor or window through the ScreenCast portal and PipeWire.
+- Use a separate recorder window with pause, resume, restart, stop, and discard controls.
+- Include system audio, microphone audio, or both.
+- Keep recordings in editable `.lahzarec` project folders, with draft autosave and recovery of usable unfinished recordings.
+
+### Annotate screenshots and videos
+
+- Draw arrows, lines, freehand strokes, rectangles, filled rectangles, and ellipses.
+- Add text, numbered steps, and highlights; obscure details with blur or pixelation.
+- Crop screenshots and undo or redo edits.
+- Give video and animated-image annotations start and end times on their own timeline lane.
+- Animate annotations with effects such as draw-on, type-on, pop, and slide.
+
+### Design the scene
+
+- Frame your media with solid colors, gradients, or wallpaper backgrounds.
+- Adjust padding, rounded corners, borders, shadows, and window frames.
+- Add background blur, grain, vignette, and a corner text watermark.
+- Position, scale, and rotate the media in 3D, with perspective and adjustable anchor points.
+- Use **Fit**, **Fill**, and **Actual size**, or save a look to your personal preset library.
+
+Perspective changes become visible when the media is tilted with Rotate X or Y. Anchor controls set the pivot for scaling and rotation.
+
+### Edit recordings
+
+- Preview recordings with synchronized audio and a seekable clip timeline.
+- Trim, split, delete, and change clip speed, with undo/redo.
+- Edit motion regions on the orange lane: timing, magnification, easing, focus, and pan destination.
+- Generate zoom regions from captured clicks, then adjust them manually.
+- Customize the reconstructed pointer, idle hiding, shadows, and click effects when input metadata is available.
+- Composite an added camera clip as picture-in-picture, with shape, corner, size, mirroring, margin, and shadow controls.
+
+### Animate still images
+
+- Select **Motion** to turn a screenshot into an animated scene.
+- Start with slow zooms, pans, center focus, sweep, 3D tilt, floating card, corner reveal, or tilted scroll presets.
+- Edit the resulting motion regions using the same controls as recordings.
+- Build a sequence of images, each with its own duration, motion, and captions.
+- Create a synthetic cursor walkthrough by choosing points on the image.
+
+For a loaded video, **Motion** opens the recording's motion controls directly.
+
+### Start from a template
+
+Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social square**, **Changelog**, **Cinematic**, **Minimal dark**, or **Store listing**. Templates combine scene styling, motion, and editable captions. On recordings, they add an intro while retaining later motion regions.
+
+### Export
+
+- Save styled screenshots as **PNG**.
+- Export recordings and animated screenshots as **MP4 (H.264/AAC)**, **WebM (VP9/Opus)**, or **looping GIF**.
+- Choose original resolution, 720p, 1080p, 1440p, or 4K, at 30 or 60 fps.
+- See a size estimate, track progress, and cancel an export.
+- Render backgrounds, media transforms, motion, pointers, and annotations through the scene compositor used by the preview.
 
 ## Quick start
 
