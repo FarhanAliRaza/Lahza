@@ -119,6 +119,7 @@ jobs:
           install -d "${bundle_root}/share/lahza/assets"
           cp -a assets/. "${bundle_root}/share/lahza/assets/"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          install -Dm755 "${bundle_root}/bin/lahza" prebuilt/lahza
           cd dist
           sha256sum *.deb *.tar.gz > SHA256SUMS
 
@@ -131,7 +132,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lahza-binary-amd64
-          path: dist/lahza-*-linux-x86_64/bin/lahza
+          # A bare file keeps no directory structure, so the Snap job's
+          # download lands exactly at prebuilt/lahza.
+          path: prebuilt/lahza
           if-no-files-found: error
 
       - name: Upload workflow artifact
