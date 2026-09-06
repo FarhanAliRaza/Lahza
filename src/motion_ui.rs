@@ -890,7 +890,9 @@ impl Studio {
             })
             .child(gpui::svg()
                 .path(if delete { "icons/trash.svg" } else { "icons/close.svg" })
-                .size(px(14.0)))
+                .size(px(14.0))
+                .flex_none()
+                .text_color(rgb(if delete { 0xb91c1c } else { 0x27272a })))
             .child(if delete { "Delete" } else { "Deselect" })
             .into_any_element()
     }
@@ -1393,13 +1395,11 @@ impl Studio {
                                 }
                             } else {
                                 if cue.transform.is_none() {
-                                    let mut motion = TransformMotion {
+                                    let motion = TransformMotion {
                                         start: initial_pose,
                                         end: initial_pose,
                                         keep_end_state: true,
                                     };
-                                    motion.end.scale = (initial_pose.scale * 1.2)
-                                        .min(crate::recording::scene::SceneTransform::MAX_SCALE);
                                     cue.transform = Some(motion);
                                 }
                                 if index == 1 {

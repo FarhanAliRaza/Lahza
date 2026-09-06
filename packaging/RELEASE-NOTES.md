@@ -10,7 +10,7 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 - Placed overlapping motion regions on separate timeline rows and made image clicks select and seek.
 - Added independent canvas text that can animate before or after the image, with matching preview and export behavior.
 - Added native text fields for annotations, watermarks, and annotation timing, including selection, clipboard editing, undo, and Unicode-aware cursor movement.
-- Removed the automatic slow zoom when entering Motion, expanded offscreen movement, and moved Delete and Deselect actions to the top of the editors with icons.
+- Removed the automatic slow zoom when entering Motion and the automatic 1.2× scale change when creating a transform. Expanded offscreen movement and moved Delete and Deselect actions to the top of the editors with visible icons.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
