@@ -33,31 +33,13 @@ apps:
       - removable-media
 
 parts:
-  # Bootstrap rustup directly in the build environment. The rustup Snap is
-  # not reliably executable inside the managed CI container.
-  rust-deps:
-    plugin: nil
-    build-packages: [curl, ca-certificates]
-    override-pull: |
-      craftctl default
-      curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
-        https://sh.rustup.rs --output rustup-init.sh
-      sh rustup-init.sh -y --profile minimal --default-toolchain 1.96.0 --no-modify-path
-
+  # The binary is compiled outside Snapcraft on an Ubuntu 24.04 host (CI's
+  # DEB job with its Rust cache, or a local `cargo build --release`) and
+  # dropped at prebuilt/lahza. Compiling inside the throwaway build VM
+  # rebuilt every crate from scratch on each run.
   lahza:
-    plugin: rust
-    after: [rust-deps]
+    plugin: nil
     source: .
-    rust-channel: "none"
-    build-packages:
-      - pkg-config
-      - libclang-dev
-      - libgstreamer1.0-dev
-      - libgstreamer-plugins-base1.0-dev
-      - libpipewire-0.3-dev
-      - libspa-0.2-dev
-      - libxkbcommon-dev
-      - libxkbcommon-x11-dev
     stage-packages:
       - ffmpeg
       - gstreamer1.0-tools
@@ -71,6 +53,8 @@ parts:
       - libxkbcommon-x11-0
     override-build: |
       craftctl default
+      test -f prebuilt/lahza || { echo "prebuilt/lahza is missing; see packaging/SNAP.md" >&2; exit 1; }
+      install -Dm755 prebuilt/lahza "$CRAFT_PART_INSTALL/bin/lahza"
       craftctl set version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
       install -Dm644 packaging/com.lahza.Lahza.desktop "$CRAFT_PART_INSTALL/share/applications/com.lahza.Lahza.desktop"
       install -Dm644 Lahza.png "$CRAFT_PART_INSTALL/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"

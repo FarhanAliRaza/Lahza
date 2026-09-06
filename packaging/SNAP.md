@@ -7,10 +7,15 @@ FFmpeg, GStreamer tools/plugins, PipeWire modules, and Lahza assets are bundled.
 
 ## Build
 
-With Snapcraft and its LXD build provider configured, build from a clean source
-copy to avoid copying Cargo's large local target directory:
+The recipe does not compile Rust. It packages a binary built on an Ubuntu
+24.04 host and placed at `prebuilt/lahza`, so CI reuses the DEB job's cached
+build instead of recompiling every crate in a fresh VM. With Snapcraft and its
+LXD build provider configured, build the binary, then build from a clean
+source copy to avoid copying Cargo's large local target directory:
 
 ```bash
+cargo build --release --locked
+install -Dm755 target/release/lahza prebuilt/lahza
 build_dir="$(mktemp -d /tmp/lahza-snap.XXXXXX)"
 rsync -a --exclude=/.git --exclude=/.agents --exclude=/.codex \
   --exclude=/target --exclude=/parts --exclude=/stage --exclude=/prime \
@@ -20,13 +25,11 @@ mkdir -p dist
 cp "$build_dir"/lahza_*.snap dist/
 ```
 
-The recipe pins Rust 1.96.0. A build-only `rust-deps` part installs upstream
-rustup directly in the managed environment, avoiding nested rustup Snap
-execution failures in CI. The setup part installs the pinned compiler, and Snapcraft supplies the GNOME
-SDK automatically; the toolchain is not included in the final package.
+Snapcraft supplies the GNOME SDK automatically; no toolchain is included in
+the final package.
 
 Docker builds need extra preparation: Canonical's `8_core24` image currently
-lacks the desktop command-chain files, Rust, and the GNOME SDK. Those resources,
+lacks the desktop command-chain files and the GNOME SDK. Those resources,
 plus the base and content-provider snaps, must be supplied explicitly. Use the
 managed LXD route above for a fresh build environment.
 

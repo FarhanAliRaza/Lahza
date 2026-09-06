@@ -127,6 +127,13 @@ jobs:
           dpkg-deb --info "${{ steps.package.outputs.file }}"
           dpkg-deb --contents "${{ steps.package.outputs.file }}"
 
+      - name: Upload release binary for the Snap build
+        uses: actions/upload-artifact@v4
+        with:
+          name: lahza-binary-amd64
+          path: dist/lahza-*-linux-x86_64/bin/lahza
+          if-no-files-found: error
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -151,6 +158,7 @@ jobs:
 
   build-snap:
     name: Build and test Snap
+    needs: build-deb
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
@@ -178,6 +186,12 @@ jobs:
               print(f"file=lahza_{version}_amd64.snap", file=output)
               print(f"channel={'beta' if '-' in version else 'stable'}", file=output)
           PY
+
+      - name: Download release binary built by the DEB job
+        uses: actions/download-artifact@v4
+        with:
+          name: lahza-binary-amd64
+          path: prebuilt
 
       - name: Build Snap in managed Ubuntu 24.04 environment
         id: snapcraft

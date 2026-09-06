@@ -3,8 +3,10 @@
 /stage/
 /prime/
 /dist/
+/prebuilt/
 /*.snap
 *.log
 
 # Local clone of the macOS reference app (github.com/fayazara/Screendrop)
 /Screendrop/
+__pycache__/
