@@ -346,6 +346,7 @@ pub fn active_marks(
 ) -> Vec<AnnotationMark> {
     marks
         .iter()
+        .filter(|mark| !mark.canvas)
         .filter_map(|mark| animated_mark(mark, time))
         .map(|mark| in_media_space(mark, viewport))
         .collect()
@@ -445,6 +446,7 @@ mod tests {
             }),
             opacity: 1.0,
             pinned: false,
+            canvas: false,
         }
     }
 

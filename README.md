@@ -18,7 +18,7 @@ Recommended for **Ubuntu 24.04 amd64** and compatible distributions. It uses the
 Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
 
 ```bash
-sudo apt install ./lahza_0.4.7_amd64.deb
+sudo apt install ./lahza_0.4.8_amd64.deb
 ```
 
 Launch **Lahza** from your application menu, or run `lahza`.
@@ -96,11 +96,11 @@ Use `snap info lahza` to compare the installed version with the Store channels. 
 
 ### Binary bundle — alternative
 
-Each release also includes `lahza-0.4.7-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
+Each release also includes `lahza-0.4.8-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
 
 ```bash
-tar -xzf lahza-0.4.7-linux-x86_64.tar.gz
-cd lahza-0.4.7-linux-x86_64
+tar -xzf lahza-0.4.8-linux-x86_64.tar.gz
+cd lahza-0.4.8-linux-x86_64
 ./install.sh
 ```
 
@@ -148,6 +148,7 @@ Perspective changes become visible when the media is tilted with Rotate X or Y. 
 - Preview recordings with synchronized audio and a seekable clip timeline.
 - Trim, split, delete, and change clip speed, with undo/redo.
 - Edit motion regions on the orange lane: timing, magnification, easing, focus, and pan destination.
+- Choose **Transform** in a motion region to animate card scale, X/Y position, and X/Y/Z rotation with separate start/end values. Choose **Both** to combine those transforms with zoom/pan. Values are relative to the scene layout. New manual transforms default to **Keep end state**; choose **Reset to layout** under **After motion** for an immediate reset. Existing regions and presets retain their previous reset behavior. A new transform starts from the pose at its start time.
 - Generate zoom regions from captured clicks, then adjust them manually.
 - Customize the reconstructed pointer, idle hiding, shadows, and click effects when input metadata is available.
 - Composite an added camera clip as picture-in-picture, with shape, corner, size, mirroring, margin, and shadow controls.
@@ -155,6 +156,8 @@ Perspective changes become visible when the media is tilted with Rotate X or Y. 
 ### Animate still images
 
 - Select **Motion** to turn a screenshot into an animated scene.
+- Trim the image independently of the scene. Use **+ 5s** on the timeline to leave room for later content; the background remains after the image ends.
+- Add text anywhere on the canvas in Motion mode. Text has its own timing and entrance/exit animation, independent of image movement and duration.
 - Start with slow zooms, pans, center focus, sweep, 3D tilt, floating card, corner reveal, or tilted scroll presets.
 - Edit the resulting motion regions using the same controls as recordings.
 - Build a sequence of images, each with its own duration, motion, and captions.

@@ -50,9 +50,9 @@ impl Default for SceneBackground {
 pub struct SceneTransform {
     /// 1.0 = fitted inside the padding.
     pub scale: f64,
-    /// Offset as a fraction of half the canvas width (-1..1).
+    /// Offset as a fraction of half the canvas width.
     pub position_x: f64,
-    /// Offset as a fraction of half the canvas height (-1..1).
+    /// Offset as a fraction of half the canvas height.
     pub position_y: f64,
     pub rotation_x: f64,
     pub rotation_y: f64,
@@ -84,6 +84,8 @@ impl SceneTransform {
     };
     pub const MIN_SCALE: f64 = 0.2;
     pub const MAX_SCALE: f64 = 4.0;
+    /// Three canvas widths/heights allows even a 4x card to leave the frame.
+    pub const MAX_POSITION: f64 = 6.0;
 
     pub fn is_identity(&self) -> bool {
         !self.has_rotation()
@@ -105,8 +107,8 @@ impl SceneTransform {
             }
         };
         self.scale = finite(self.scale, 1.0).clamp(Self::MIN_SCALE, Self::MAX_SCALE);
-        self.position_x = finite(self.position_x, 0.0).clamp(-1.5, 1.5);
-        self.position_y = finite(self.position_y, 0.0).clamp(-1.5, 1.5);
+        self.position_x = finite(self.position_x, 0.0).clamp(-Self::MAX_POSITION, Self::MAX_POSITION);
+        self.position_y = finite(self.position_y, 0.0).clamp(-Self::MAX_POSITION, Self::MAX_POSITION);
         self.rotation_x = finite(self.rotation_x, 0.0).clamp(-80.0, 80.0);
         self.rotation_y = finite(self.rotation_y, 0.0).clamp(-80.0, 80.0);
         self.rotation_z = finite(self.rotation_z, 0.0).clamp(-180.0, 180.0);
@@ -114,6 +116,18 @@ impl SceneTransform {
         self.anchor_x = finite(self.anchor_x, 0.5).clamp(0.0, 1.0);
         self.anchor_y = finite(self.anchor_y, 0.5).clamp(0.0, 1.0);
         self
+    }
+
+    /// Apply animated card placement before the legacy camera tilt.
+    pub fn with_motion(mut self, viewport: ViewportFrame) -> Self {
+        let motion = viewport.transform;
+        self.scale *= motion.scale;
+        self.position_x += motion.position_x;
+        self.position_y += motion.position_y;
+        self.rotation_x += motion.rotation_x;
+        self.rotation_y += motion.rotation_y;
+        self.rotation_z += motion.rotation_z;
+        self.with_tilt(viewport.tilt)
     }
 
     /// Adds an animated tilt on top of the authored rotation.
@@ -1008,23 +1022,39 @@ impl SceneCompositor {
     /// Projection for the authored transform plus a frame's tilt.
     pub fn projection(&self, viewport: ViewportFrame) -> MediaProjection {
         self.geometry
-            .projection(self.style.transform.with_tilt(viewport.tilt))
+            .projection(self.style.transform.with_motion(viewport))
     }
 
     /// Composes one output frame.
     pub fn compose(&self, input: FrameInput<'_>) -> RgbaImage {
-        let transform = self.style.transform.with_tilt(input.viewport.tilt);
-        let mut output = self.card_layer(transform);
+        self.compose_layers(input, true, None)
+    }
+
+    /// Canvas overlays and the background outlive the optional media layer.
+    pub fn compose_layers(
+        &self,
+        input: FrameInput<'_>,
+        media_visible: bool,
+        canvas_overlay: Option<&RgbaImage>,
+    ) -> RgbaImage {
+        let transform = self.style.transform.with_motion(input.viewport);
+        let mut output = if media_visible {
+            self.card_layer(transform)
+        } else {
+            self.background.clone()
+        };
         let projection = self.geometry.projection(transform);
-        self.paint_media(
-            &mut output,
-            &projection,
-            input.source,
-            input.overlay,
-            input.viewport,
-        );
-        if let Some(pointer) = input.pointer {
-            self.paint_pointer(&mut output, &projection, pointer, input.viewport);
+        if media_visible {
+            self.paint_media(
+                &mut output,
+                &projection,
+                input.source,
+                input.overlay,
+                input.viewport,
+            );
+            if let Some(pointer) = input.pointer {
+                self.paint_pointer(&mut output, &projection, pointer, input.viewport);
+            }
         }
         if let Some(camera) = input.camera {
             if self.style.camera.enabled {
@@ -1040,6 +1070,19 @@ impl SceneCompositor {
                 pixel[0] = (pixel[0] as f32 * factor).round() as u8;
                 pixel[1] = (pixel[1] as f32 * factor).round() as u8;
                 pixel[2] = (pixel[2] as f32 * factor).round() as u8;
+            }
+        }
+        if let Some(layer) = canvas_overlay {
+            if layer.dimensions() == output.dimensions() {
+                blend_layer(&mut output, layer);
+            } else {
+                let layer = image::imageops::resize(
+                    layer,
+                    self.width,
+                    self.height,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                blend_layer(&mut output, &layer);
             }
         }
         output
@@ -2618,6 +2661,7 @@ mod tests {
             magnification: 2.0,
             anchor: NormalizedPoint { x: 0.25, y: 0.25 },
             tilt: Tilt::default(),
+            ..ViewportFrame::default()
         };
         let output = compositor.compose(FrameInput {
             source: &checker(100, 100),
@@ -2693,6 +2737,110 @@ mod tests {
         // Outside the quad (right of the receding edge) the background shows.
         assert!(projection.bounds.right() < 296.0, "{:?}", projection.bounds);
         assert_eq!(output.get_pixel(296, 100).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn canvas_overlay_survives_hidden_and_transformed_media() {
+        let compositor = SceneCompositor::new(&flat_style(0), 100, 100, 100, 100).unwrap();
+        let source = checker(100, 100);
+        let mut overlay = RgbaImage::new(100, 100);
+        for y in 20..40 {
+            for x in 5..25 { overlay.put_pixel(x, y, Rgba([255, 255, 255, 255])); }
+        }
+        let render = |visible, transform| compositor.compose_layers(FrameInput {
+            source: &source,
+            overlay: None,
+            viewport: ViewportFrame { transform, ..ViewportFrame::default() },
+            pointer: None,
+            camera: None,
+        }, visible, Some(&overlay));
+        let hidden = render(false, SceneTransform::IDENTITY);
+        assert_eq!(hidden.get_pixel(10, 30).0, [255, 255, 255, 255]);
+        assert_eq!(hidden.get_pixel(90, 90).0, [0, 0, 0, 255]);
+        let moved = render(true, SceneTransform { position_x: 2.0, rotation_z: 30.0, ..SceneTransform::IDENTITY });
+        assert_eq!(moved.get_pixel(10, 30), hidden.get_pixel(10, 30));
+    }
+
+    #[test]
+    fn card_can_slide_fully_offscreen_and_back_from_each_edge() {
+        let compositor = SceneCompositor::new(&flat_style(0), 100, 100, 100, 100).unwrap();
+        let source = checker(100, 100);
+        for (x, y) in [(6.0, 0.0), (-6.0, 0.0), (0.0, 6.0), (0.0, -6.0)] {
+            let motion = crate::recording::viewport::TransformMotion {
+                keep_end_state: false,
+                start: SceneTransform {
+                    scale: SceneTransform::MAX_SCALE,
+                    position_x: x,
+                    position_y: y,
+                    ..SceneTransform::IDENTITY
+                },
+                end: SceneTransform::IDENTITY,
+            };
+            let render = |progress| compositor.compose(FrameInput {
+                source: &source,
+                overlay: None,
+                viewport: ViewportFrame {
+                    transform: motion.at(progress),
+                    ..ViewportFrame::default()
+                },
+                pointer: None,
+                camera: None,
+            });
+            assert!(render(0.0).pixels().all(|pixel| pixel.0 == [0, 0, 0, 255]));
+            assert!(render(0.75).pixels().any(|pixel| pixel.0 != [0, 0, 0, 255]));
+            assert_eq!(render(1.0), compose(&compositor, &source));
+        }
+    }
+
+    #[test]
+    fn animated_card_transform_moves_the_full_media_and_restores_cached_frame() {
+        let compositor = SceneCompositor::new(&flat_style(0), 100, 100, 100, 100).unwrap();
+        let source = checker(100, 100);
+        let original = compose(&compositor, &source);
+        let viewport = ViewportFrame {
+            transform: SceneTransform {
+                scale: 0.5,
+                position_x: 0.2,
+                ..SceneTransform::IDENTITY
+            },
+            ..ViewportFrame::default()
+        };
+        let output = compositor.compose(FrameInput {
+            source: &source,
+            overlay: None,
+            viewport,
+            pointer: None,
+            camera: None,
+        });
+        // The scaled card spans x=35..85 and y=25..75. Both opposite
+        // source corners survive; unlike camera zoom, scaling never crops.
+        assert_eq!(output.get_pixel(40, 30).0, [255, 0, 0, 255]);
+        assert_eq!(output.get_pixel(80, 70).0, [255, 255, 0, 255]);
+        assert_ne!(output.as_raw(), original.as_raw());
+        let (x, y) = compositor.projection(viewport).project(0.1, 0.1);
+        assert!((x - 40.0).abs() < 1e-6 && (y - 30.0).abs() < 1e-6);
+        assert_eq!(compose(&compositor, &source).as_raw(), original.as_raw());
+    }
+
+    #[test]
+    fn motion_transform_combines_with_authored_layout_and_tilt() {
+        let authored = SceneTransform {
+            scale: 0.8, position_x: 0.1, rotation_z: 10.0,
+            ..SceneTransform::IDENTITY
+        };
+        let result = authored.with_motion(ViewportFrame {
+            transform: SceneTransform {
+                scale: 1.5, position_x: 0.2, rotation_z: 20.0,
+                ..SceneTransform::IDENTITY
+            },
+            tilt: Tilt { x: 5.0, y: -8.0, z: 3.0 },
+            ..ViewportFrame::default()
+        });
+        assert!((result.scale - 1.2).abs() < 1e-9);
+        assert!((result.position_x - 0.3).abs() < 1e-9);
+        assert_eq!(result.rotation_x, 5.0);
+        assert_eq!(result.rotation_y, -8.0);
+        assert_eq!(result.rotation_z, 33.0);
     }
 
     #[test]

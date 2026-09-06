@@ -107,6 +107,8 @@ impl Studio {
         if let Some(draft) = self.annotation_draft.clone() {
             annotations.push(draft);
         }
+        let canvas_annotations = self.canvas_annotation_marks();
+        let media_visible = self.image_visible_at(self.video_position);
         let committed_count = self.annotations.len();
         // Animated scenes paint each mark at its state for the playhead time.
         let selected_annotation = self.selected_annotation;
@@ -117,6 +119,7 @@ impl Studio {
                 let mut marks = Vec::new();
                 let mut indices = Vec::new();
                 for (index, mark) in annotations.iter().enumerate() {
+                    if mark.canvas || !media_visible { continue; }
                     if let Some(animated) = timed::editor_mark(
                         mark,
                         time,
@@ -128,8 +131,8 @@ impl Studio {
                 }
                 (marks, indices)
             } else {
-                let indices = (0..annotations.len()).collect();
-                (annotations, indices)
+                annotations.into_iter().enumerate().filter(|(_, mark)| !mark.canvas)
+                    .map(|(index, mark)| (mark, index)).unzip()
             };
         let caret_visible = self.caret_visible;
         let crop_active = self.crop_active;
@@ -166,7 +169,7 @@ impl Studio {
         let paint_gpui_annotations = self.annotations_paint_flat();
         let select_tool = self.tool == Tool::Select;
         // Focus / pan-end markers of the selected motion region.
-        let motion_markers = if animation_active {
+        let motion_markers = if animation_active && media_visible {
             let (_, projection) =
                 self.preview_projection(f32::from(canvas_width), f32::from(canvas_height));
             self.motion_marker_points(&projection)
@@ -550,10 +553,11 @@ impl Studio {
                                 annotation_bounds
                             },
                         );
+                        let canvas_hits = scene_ui::paint_canvas_annotations(&canvas_annotations, selected_annotation, bounds, window, cx);
                         if !motion_markers.is_empty() {
                             window.with_content_mask(
                                 Some(ContentMask {
-                                    bounds: image_bounds,
+                                    bounds,
                                 }),
                                 |window| {
                                     scene_ui::paint_motion_markers(&motion_markers, bounds, window)
@@ -590,6 +594,11 @@ impl Studio {
                                 }
                                 entity.update(cx, |this, cx| {
                                     this.focus_handle.focus(window);
+                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits) {
+                                        cx.notify();
+                                        return;
+                                    }
+                                    if !media_visible { return; }
                                     // Drawing through a projected preview lands where
                                     // the pointer is on the card, not on the canvas.
                                     let flat = if composited_active {
@@ -692,6 +701,11 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if this.canvas_annotation_drag {
+                                        this.pointer_move(event.position, bounds);
+                                        cx.notify();
+                                        return;
+                                    }
                                     if this.focus_drag.is_some() {
                                         this.drag_motion_marker(event.position, bounds, cx);
                                         cx.notify();
@@ -725,6 +739,12 @@ impl Studio {
                                 return;
                             }
                             entity.update(cx, |this, cx| {
+                                if this.canvas_annotation_drag {
+                                    this.pointer_up(event.position, bounds);
+                                    this.canvas_annotation_drag = false;
+                                    cx.notify();
+                                    return;
+                                }
                                 this.focus_drag = None;
                                 this.end_media_drag();
                                 let flat = if composited_active {
@@ -778,11 +798,6 @@ impl Studio {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Keyboard transport (space, arrows, split) dispatches through the
-        // focused element, and nothing else in the video editor takes focus.
-        if window.focused(cx).is_none() {
-            self.focus_handle.focus(window);
-        }
         self.autosave_scene_style();
         if self.video_extras_pending {
             self.video_extras_pending = false;
@@ -807,12 +822,14 @@ impl Studio {
             .flex()
             .flex_col()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.native_text_focused(window, cx) { return; }
                 if this.capture_access_prompt.is_some() {
                     cx.stop_propagation();
                     return;
                 }
                 if this.handle_video_key(event, cx) {
+                    cx.stop_propagation();
                     cx.notify();
                 }
             }))
@@ -863,6 +880,9 @@ impl Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if this.end_motion_transform_drag() {
+                        cx.notify();
+                    }
                     if this.end_media_drag() {
                         cx.notify();
                     }
@@ -890,6 +910,14 @@ impl Studio {
                         .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER)
                     {
                         this.persist_video_zoom_cues(cx);
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.end_motion_transform_drag() {
+                        cx.notify();
                     }
                 }),
             )

@@ -215,6 +215,9 @@ pub struct ImageSegment {
     pub viewport: ViewportTimeline,
     pub duration: f64,
     pub overlay: Option<OverlaySource>,
+    pub canvas_overlay: Option<OverlaySource>,
+    pub media_start: f64,
+    pub media_end: Option<f64>,
 }
 
 pub struct SceneExportRequest {
@@ -235,6 +238,9 @@ pub struct SceneExportRequest {
     pub noise_reduction: bool,
     /// Per-frame media-space overlay, such as timed annotations.
     pub overlay: Option<OverlaySource>,
+    pub canvas_overlay: Option<OverlaySource>,
+    pub media_start: f64,
+    pub media_end: Option<f64>,
     /// Image scenes that follow the main source back to back.
     pub followers: Vec<ImageSegment>,
 }
@@ -260,6 +266,9 @@ impl SceneExportRequest {
             include_audio: true,
             noise_reduction: false,
             overlay: None,
+            canvas_overlay: None,
+            media_start: 0.0,
+            media_end: None,
             followers: Vec::new(),
         }
     }
@@ -631,13 +640,14 @@ fn encode(
         };
         let viewport = request.viewport.frame_at(time);
         let overlay = request.overlay.as_mut().and_then(|source| source(time));
-        let output = compositor.compose(FrameInput {
+        let canvas_overlay = request.canvas_overlay.as_mut().and_then(|source| source(time));
+        let output = compositor.compose_layers(FrameInput {
             source: source_frame,
             overlay: overlay.as_deref(),
             viewport,
             pointer: pointer_overlay.as_ref(),
             camera: last_camera_frame.as_ref(),
-        });
+        }, time >= request.media_start && request.media_end.is_none_or(|end| time < end), canvas_overlay.as_deref());
         if let Err(error) = stdin.write_all(output.as_raw()) {
             write_error = Some(VideoError::Decode(format!(
                 "FFmpeg stopped accepting frames: {error}"
@@ -681,13 +691,14 @@ fn encode(
                 .and_then(|pointer| pointer.frame_at(time))
                 .map(|frame| PointerOverlay { frame });
             let overlay = segment.overlay.as_mut().and_then(|source| source(time));
-            let output = compositor.compose(FrameInput {
+            let canvas_overlay = segment.canvas_overlay.as_mut().and_then(|source| source(time));
+            let output = compositor.compose_layers(FrameInput {
                 source: &segment.image,
                 overlay: overlay.as_deref(),
                 viewport: segment.viewport.frame_at(time),
                 pointer: pointer_overlay.as_ref(),
                 camera: None,
-            });
+            }, time >= segment.media_start && segment.media_end.is_none_or(|end| time < end), canvas_overlay.as_deref());
             if let Err(error) = stdin.write_all(output.as_raw()) {
                 write_error = Some(VideoError::Decode(format!(
                     "FFmpeg stopped accepting frames: {error}"
@@ -927,6 +938,52 @@ mod tests {
     }
 
     #[test]
+    fn canvas_text_exports_after_the_image_clip_ends() {
+        if !ffmpeg_available() { return; }
+        let root = test_root("late-canvas-text");
+        let destination = root.join("late.mp4");
+        let style = SceneStyle {
+            background: SceneBackground::Solid(0),
+            padding: 0, corners: 0, shadow: 0, border: false,
+            aspect: Some(16.0 / 9.0),
+            ..SceneStyle::default()
+        };
+        let mut request = SceneExportRequest::new(destination.clone(), ExportFormat::Mp4,
+            180, style, ViewportTimeline::default(), 1.2);
+        request.frame_rate = 10.0;
+        request.media_start = 0.2;
+        request.media_end = Some(0.4);
+        request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(vec![crate::AnnotationMark {
+            tool: crate::Tool::Text,
+            text: "AFTER".into(),
+            canvas: true,
+            color: 0xff0000,
+            font_size: 100.0,
+            start: crate::NormPoint { x: 0.05, y: 0.25 },
+            end: crate::NormPoint { x: 0.45, y: 0.5 },
+            timing: Some(crate::timed::AnnotationTiming {
+                start: 0.6, end: 1.2,
+                entrance: crate::timed::EntranceEffect::None,
+                exit: crate::timed::ExitEffect::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }], 16.0 / 9.0);
+        export_scene(SceneSource::Image {
+            image: RgbaImage::from_pixel(160, 90, Rgba([0, 255, 0, 255])), pointer: None,
+        }, &mut request, &ExportProgress::default()).unwrap();
+        assert!((probe_media(&destination).unwrap().duration - 1.2).abs() < 0.15);
+        let before = super::super::video::decode_frame(&destination, 0.0, 320, 180).unwrap();
+        assert!(before.rgba.chunks_exact(4).all(|p| p[0] < 10 && p[1] < 10 && p[2] < 10), "image has not started");
+        let early = super::super::video::decode_frame(&destination, 0.3, 320, 180).unwrap();
+        assert!(early.rgba.chunks_exact(4).any(|p| p[1] > 180 && p[0] < 50));
+        let late = super::super::video::decode_frame(&destination, 0.8, 320, 180).unwrap();
+        assert!(!late.rgba.chunks_exact(4).any(|p| p[1] > 180 && p[0] < 50), "image has ended");
+        assert!(late.rgba.chunks_exact(4).any(|p| p[0] > 150 && p[1] < 80), "later canvas text is visible");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn image_sequence_exports_scenes_back_to_back() {
         if !ffmpeg_available() {
             eprintln!("FFmpeg unavailable; skipping sequence export test");
@@ -955,6 +1012,9 @@ mod tests {
             viewport: ViewportTimeline::build_static(&follower_cues, 1.5),
             duration: 1.5,
             overlay: None,
+            canvas_overlay: None,
+            media_start: 0.0,
+            media_end: None,
         });
         export_scene(
             SceneSource::Image {

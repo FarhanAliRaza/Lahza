@@ -385,6 +385,7 @@ impl Studio {
     }
 
     pub(super) fn stop_editing_text(&mut self) {
+        self.watermark_editing = false;
         self.annotation_time_edit = None;
         let Some(index) = self.editing_text.take() else {
             return;
@@ -403,11 +404,13 @@ impl Studio {
     }
 
     pub(super) fn fit_text_box_to_content(&mut self, index: usize) {
+        let canvas_text = self.annotations.get(index).is_some_and(|mark| mark.canvas);
         let aspect = self
             .media_dimensions()
             .map(|(width, height)| width as f32 / height.max(1) as f32)
             .unwrap_or(16.0 / 9.0)
             .max(0.1);
+        let aspect = if canvas_text { self.selected_canvas_ratio() } else { aspect };
         let Some(mark) = self.annotations.get_mut(index) else {
             return;
         };
@@ -466,6 +469,7 @@ impl Studio {
                     .iter()
                     .enumerate()
                     .rposition(|(index, mark)| {
+                        if mark.canvas != self.canvas_annotation_drag { return false; }
                         rendered_bounds
                             .get(index)
                             .copied()
@@ -528,6 +532,7 @@ impl Studio {
             opacity: 1.0,
             from_template: false,
             pinned: false,
+            canvas: self.canvas_annotation_drag,
         };
 
         if self.tool == Tool::Number {
@@ -674,12 +679,6 @@ impl Studio {
     }
 
     pub(super) fn handle_key(&mut self, event: &KeyDownEvent) -> bool {
-        if self.handle_annotation_time_key(event) {
-            return true;
-        }
-        if self.handle_watermark_key(event) {
-            return true;
-        }
         if self.crop_active {
             match event.keystroke.key.as_str() {
                 "escape" => self.cancel_crop(),
@@ -700,38 +699,6 @@ impl Studio {
             } else {
                 self.undo_annotations() || self.undo_crop()
             };
-        }
-        if let Some(index) = self.editing_text {
-            self.caret_visible = true;
-            match event.keystroke.key.as_str() {
-                "enter" => {
-                    self.stop_editing_text();
-                }
-                "escape" => {
-                    self.stop_editing_text();
-                }
-                "backspace" => {
-                    if let Some(mark) = self.annotations.get_mut(index) {
-                        mark.text.pop();
-                    }
-                    self.fit_text_box_to_content(index);
-                }
-                _ => {
-                    if !event.keystroke.modifiers.control
-                        && !event.keystroke.modifiers.platform
-                        && !event.keystroke.modifiers.alt
-                    {
-                        if let (Some(text), Some(mark)) = (
-                            event.keystroke.key_char.as_ref(),
-                            self.annotations.get_mut(index),
-                        ) {
-                            mark.text.push_str(text);
-                        }
-                        self.fit_text_box_to_content(index);
-                    }
-                }
-            }
-            return true;
         }
 
         if matches!(event.keystroke.key.as_str(), "delete" | "backspace") {

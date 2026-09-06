@@ -30,6 +30,8 @@ mod library;
 mod models;
 mod motion_ui;
 mod notifications;
+mod text_field;
+mod text_fields_ui;
 mod preset_cards;
 mod preview;
 mod recording;
@@ -238,6 +240,7 @@ struct Studio {
     text_italic: bool,
     text_underline: bool,
     editing_text: Option<usize>,
+    text_fields: text_fields_ui::TextFields,
     annotation_time_edit: Option<(usize, bool, String)>,
     caret_visible: bool,
     _caret_blink_task: Task<()>,
@@ -314,6 +317,8 @@ struct Studio {
     /// Screenshot motion mode: the video motion state drives a still image.
     animation_active: bool,
     animation_duration: f64,
+    animation_image_start: f64,
+    animation_image_end: f64,
     animation_preset: Option<MotionPreset>,
     motion_pick: MotionPick,
     background_blur: u8,
@@ -327,7 +332,7 @@ struct Studio {
     scene_selection: SceneSelection,
     media_drag: Option<MediaDrag>,
     /// Which motion marker (focus or pan end) the pointer is dragging.
-    focus_drag: Option<MotionPick>,
+    focus_drag: Option<scene_ui::FocusDrag>,
     scene_canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     preview_cache: PreviewCache,
     /// RGBA copies of what the preview shows, for the compositor.
@@ -420,6 +425,9 @@ struct Studio {
     toast_timer: Option<Task<()>>,
     toast_timer_id: Option<u64>,
     slider_drag: Option<SliderDrag>,
+    motion_transform_drag: Option<motion_ui::MotionTransformDrag>,
+    image_trim_drag: Option<motion_ui::ImageTrimDrag>,
+    canvas_annotation_drag: bool,
 }
 
 /// Lahza-specific recording settings stored beside the Swift edit
@@ -517,6 +525,8 @@ impl Studio {
                 break;
             }
         });
+        let focus_handle = cx.focus_handle();
+        let text_fields = text_fields_ui::TextFields::new(focus_handle.clone(), cx);
         let mut studio = Self {
             window_handle,
             launcher_active: initial_recording.is_none() && initial_image.is_none(),
@@ -537,6 +547,7 @@ impl Studio {
             text_italic: false,
             text_underline: false,
             editing_text: None,
+            text_fields,
             annotation_time_edit: None,
             caret_visible: true,
             _caret_blink_task: caret_blink_task,
@@ -600,6 +611,8 @@ impl Studio {
             export_label: SharedString::default(),
             animation_active: false,
             animation_duration: 5.0,
+            animation_image_start: 0.0,
+            animation_image_end: 5.0,
             animation_preset: None,
             motion_pick: MotionPick::Focus,
             background_blur: 0,
@@ -647,7 +660,7 @@ impl Studio {
             walkthrough_mode: false,
             image_scenes: Vec::new(),
             image_scene_index: 0,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             wallpaper_tab: 2,
             color_index: 7,
             gradient_index: 0,
@@ -696,6 +709,9 @@ impl Studio {
             toast_timer: None,
             toast_timer_id: None,
             slider_drag: None,
+            motion_transform_drag: None,
+            image_trim_drag: None,
+            canvas_annotation_drag: false,
         };
         if let Some(path) = initial_image {
             if path.is_file() {
@@ -992,6 +1008,12 @@ impl Studio {
     }
 
     fn update_slider_drag(&mut self, event: &MouseMoveEvent) -> bool {
+        if self.image_trim_drag.is_some() {
+            return self.update_image_trim(event);
+        }
+        if self.motion_transform_drag.is_some() {
+            return self.update_motion_transform_drag(event);
+        }
         let Some(drag) = self.slider_drag else {
             return false;
         };
@@ -1007,12 +1029,6 @@ impl Studio {
     }
 
     fn handle_video_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        if self.handle_annotation_time_key(event) {
-            return true;
-        }
-        if self.handle_watermark_key(event) {
-            return true;
-        }
         // The speed dialog owns the keyboard: Escape cancels, Enter applies.
         if let Some(draft) = self.video_speed_draft {
             match event.keystroke.key.as_str() {
@@ -1024,10 +1040,6 @@ impl Studio {
                 _ => {}
             }
             return true;
-        }
-        // Typing into a text annotation owns the keyboard.
-        if self.editing_text.is_some() {
-            return self.handle_key(event);
         }
         let keystroke = &event.keystroke;
         if (keystroke.modifiers.control || keystroke.modifiers.platform) && keystroke.key == "z" {
@@ -1113,7 +1125,7 @@ impl Studio {
 impl Studio {
     fn render_export(&mut self, destination: &std::path::Path) -> Result<(), String> {
         self.rebuild_redactions()?;
-        if self.scene_style().needs_composited_preview() {
+        if self.scene_style().needs_composited_preview() || self.annotations.iter().any(|mark| mark.canvas) {
             return self.render_composited_export(destination);
         }
         let capture_path = self
@@ -1247,6 +1259,12 @@ impl Studio {
                 cx.activate(true);
             });
         }
+        self.sync_text_fields(window, cx);
+        // Both video and animated-still transport need an initial keyboard
+        // target, even before the user clicks the canvas.
+        if window.focused(cx).is_none() {
+            self.focus_handle.focus(window);
+        }
         if self.video_project.is_some() {
             return self.render_video(window, cx);
         }
@@ -1274,12 +1292,14 @@ impl Studio {
             .flex()
             .flex_col()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.capture_access_prompt.is_some() {
                     cx.stop_propagation();
                     return;
                 }
+                if this.native_text_focused(window, cx) { return; }
                 if this.handle_animation_key(event, cx) {
+                    cx.stop_propagation();
                     cx.notify();
                     return;
                 }
@@ -1317,6 +1337,8 @@ impl Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.end_image_trim();
+                    this.end_motion_transform_drag();
                     this.end_media_drag();
                     this.end_annotation_drag();
                     if this.video_zoom_drag.is_some() {
@@ -1340,6 +1362,8 @@ impl Studio {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.end_image_trim();
+                    this.end_motion_transform_drag();
                     let rebuild = this.slider_drag.is_some_and(|drag| drag.slider_id == 5);
                     this.slider_drag = None;
                     if rebuild {

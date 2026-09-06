@@ -6,6 +6,7 @@ use super::{
     model::{NormalizedPoint, PointerCaptureFile, PressPhase},
     motion::{DampedSpring, SpringConstant},
     pointer_timeline::PointerTimeline,
+    scene::SceneTransform,
 };
 
 /// Normalized rectangle of the media a viewport frame shows:
@@ -47,6 +48,7 @@ pub struct ViewportFrame {
     pub magnification: f64,
     pub anchor: NormalizedPoint,
     pub tilt: Tilt,
+    pub transform: SceneTransform,
 }
 
 impl Default for ViewportFrame {
@@ -55,6 +57,7 @@ impl Default for ViewportFrame {
             magnification: 1.0,
             anchor: NormalizedPoint { x: 0.5, y: 0.5 },
             tilt: Tilt::default(),
+            transform: SceneTransform::IDENTITY,
         }
     }
 }
@@ -63,6 +66,8 @@ impl Default for ViewportFrame {
 pub struct ViewportTimeline {
     frames: Vec<ViewportFrame>,
     duration: f64,
+    cues: Vec<ZoomCue>,
+    clips: RecordingClipTimeline,
 }
 
 impl ViewportTimeline {
@@ -169,9 +174,13 @@ impl ViewportTimeline {
                 amount.step(target_magnification, MOTION_PROFILE, dt);
             }
 
+            let transform = active
+                .and_then(|cue| cue.transform.map(|motion| motion.at(cue.easing.apply(progress))))
+                .unwrap_or(SceneTransform::IDENTITY);
             let magnification = amount.position.max(1.0);
             frames.push(ViewportFrame {
                 magnification,
+                transform,
                 anchor: clamp_to_frame(
                     NormalizedPoint {
                         x: anchor_x.position,
@@ -188,26 +197,32 @@ impl ViewportTimeline {
             previous_cue = cue_id;
         }
 
-        Self { frames, duration }
+        Self { frames, duration, cues: cues.to_vec(), clips: clips.clone() }
     }
 
     pub fn frame_at(&self, time: f64) -> ViewportFrame {
+        // Evaluate authored transforms at the requested time. Interpolating
+        // cached frames across a cue boundary blends with the reset pose and
+        // makes the image flash back before the animation has actually ended.
+        let source_time = self.clips.source_time_at(time.clamp(0.0, self.duration));
+        let transform = transform_at(source_time, &self.cues);
         let Some(first) = self.frames.first().copied() else {
             return ViewportFrame::default();
         };
         if self.frames.len() == 1 || self.duration <= 0.0 {
-            return first;
+            return ViewportFrame { transform, ..first };
         }
         let position = time.clamp(0.0, self.duration) * STEP_RATE;
         let index = position as usize;
         if index >= self.frames.len() - 1 {
-            return *self.frames.last().unwrap_or(&first);
+            return ViewportFrame { transform, ..*self.frames.last().unwrap_or(&first) };
         }
         let fraction = position - index as f64;
         let left = self.frames[index];
         let right = self.frames[index + 1];
         ViewportFrame {
             magnification: lerp(left.magnification, right.magnification, fraction),
+            transform,
             anchor: NormalizedPoint {
                 x: lerp(left.anchor.x, right.anchor.x, fraction),
                 y: lerp(left.anchor.y, right.anchor.y, fraction),
@@ -328,6 +343,26 @@ fn cluster_center_at(clusters: &[FocusCluster], editor_time: f64) -> Option<Norm
         .or_else(|| clusters.first())
         .copied()
         .map(FocusCluster::center)
+}
+
+/// Card motion is independent of camera zoom. A later transform replaces a
+/// held pose; a completed reset region must not resurrect an older held pose.
+pub fn transform_at(time: f64, cues: &[ZoomCue]) -> SceneTransform {
+    let transforms = || cues.iter().filter(|cue| cue.is_enabled && cue.transform.is_some());
+    let active = transforms()
+        .filter(|cue| time >= cue.start && time <= cue.end)
+        .max_by(|left, right| cue_priority(left).cmp(&cue_priority(right))
+            .then_with(|| left.start.total_cmp(&right.start)));
+    if let Some(cue) = active {
+        return cue.transform.unwrap().at(cue.easing.apply(cue.progress_at(time)));
+    }
+    transforms()
+        .filter(|cue| time > cue.end)
+        .max_by(|left, right| left.start.total_cmp(&right.start))
+        .and_then(|cue| cue.transform)
+        .filter(|motion| motion.keep_end_state)
+        .map(|motion| motion.end.clamped())
+        .unwrap_or(SceneTransform::IDENTITY)
 }
 
 fn active_cue(time: f64, cues: &[ZoomCue]) -> Option<&ZoomCue> {
@@ -470,6 +505,33 @@ impl MotionEasing {
     }
 }
 
+/// Card transforms are relative to the scene's authored placement. Outside
+/// the region the card either keeps its end pose or returns to layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TransformMotion {
+    pub start: SceneTransform,
+    pub end: SceneTransform,
+    /// False for legacy projects and presets; new manual transforms opt in.
+    pub keep_end_state: bool,
+}
+
+impl TransformMotion {
+    pub fn at(self, progress: f64) -> SceneTransform {
+        let start = self.start.clamped();
+        let end = self.end.clamped();
+        SceneTransform {
+            scale: lerp(start.scale, end.scale, progress),
+            position_x: lerp(start.position_x, end.position_x, progress),
+            position_y: lerp(start.position_y, end.position_y, progress),
+            rotation_x: lerp(start.rotation_x, end.rotation_x, progress),
+            rotation_y: lerp(start.rotation_y, end.rotation_y, progress),
+            rotation_z: lerp(start.rotation_z, end.rotation_z, progress),
+            ..SceneTransform::IDENTITY
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZoomCue {
@@ -496,6 +558,8 @@ pub struct ZoomCue {
     /// Optional 3D tilt of the media surface while the region is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tilt: Option<Tilt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<TransformMotion>,
 }
 
 impl ZoomCue {
@@ -520,6 +584,7 @@ impl ZoomCue {
             pan_to: None,
             easing: MotionEasing::Smooth,
             tilt: None,
+            transform: None,
         }
     }
 
@@ -579,6 +644,10 @@ impl ZoomCue {
         }
     }
 
+    pub fn has_camera_motion(&self) -> bool {
+        self.transform.is_none() || self.zoom > 1.0 || self.pan_to.is_some() || self.tilt.is_some()
+    }
+
     pub fn summary(&self) -> String {
         let motion = match self.motion {
             MotionStyle::Hold => "",
@@ -591,7 +660,22 @@ impl ZoomCue {
         } else {
             ""
         };
-        format!("{motion}{:.1}×{pan}{tilt}", self.zoom)
+        let mut label = format!("{motion}{:.1}×{pan}{tilt}", self.zoom);
+        if let Some(transform) = self.transform {
+            let a = transform.start;
+            let b = transform.end;
+            let mut properties = Vec::new();
+            if a.scale != 1.0 || b.scale != 1.0 { properties.push("Scale"); }
+            if a.position_x != 0.0 || b.position_x != 0.0 || a.position_y != 0.0 || b.position_y != 0.0 { properties.push("Move"); }
+            if a.has_rotation() || b.has_rotation() { properties.push("Rotate"); }
+            if properties.is_empty() { properties.push("Transform"); }
+            if self.zoom == 1.0 && self.pan_to.is_none() && self.tilt.is_none() {
+                label = properties.join(" + ");
+            } else {
+                label.push_str(&format!(" · {}", properties.join(" + ")));
+            }
+        }
+        label
     }
 
     fn around_press(time: f64, point: NormalizedPoint, duration: f64) -> Option<Self> {
@@ -621,6 +705,7 @@ impl ZoomCue {
             pan_to: None,
             easing: MotionEasing::Smooth,
             tilt: None,
+            transform: None,
         })
     }
 }
@@ -919,6 +1004,108 @@ mod tests {
     use crate::recording::pointer_timeline::PointerTimelineOptions;
 
     #[test]
+    fn card_transform_animates_endpoints_with_easing_and_random_seeks() {
+        let mut cue = ZoomCue::pinned(1.0, 3.0, 1.0, NormalizedPoint { x: 0.5, y: 0.5 });
+        let motion = TransformMotion {
+            keep_end_state: false,
+            start: SceneTransform { scale: 0.8, rotation_z: -20.0, ..SceneTransform::IDENTITY },
+            end: SceneTransform {
+                scale: 1.4,
+                position_x: 0.4,
+                position_y: -0.2,
+                rotation_x: 30.0,
+                rotation_y: -40.0,
+                rotation_z: 60.0,
+                ..SceneTransform::IDENTITY
+            },
+        };
+        cue.transform = Some(motion);
+        for easing in MotionEasing::ALL {
+            cue.easing = easing;
+            let timeline = ViewportTimeline::build_static(&[cue.clone()], 4.0);
+            for time in [3.0, 1.0, 2.0, 1.5, 2.5, 0.0, 4.0, 1.5] {
+                let frame = timeline.frame_at(time);
+                let expected = if (1.0..=3.0).contains(&time) {
+                    motion.at(easing.apply((time - 1.0) / 2.0))
+                } else { SceneTransform::IDENTITY };
+                assert_eq!(frame.transform, expected);
+                assert_eq!(frame.magnification, 1.0, "card scaling must not crop the source");
+            }
+        }
+        cue.is_enabled = false;
+        assert_eq!(ViewportTimeline::build_static(&[cue], 4.0).frame_at(2.0).transform, SceneTransform::IDENTITY);
+    }
+
+    #[test]
+    fn transform_boundaries_do_not_blend_with_reset_or_neighboring_cues() {
+        let mut cue = ZoomCue::pinned(0.013, 2.473, 1.0, NormalizedPoint { x: 0.5, y: 0.5 });
+        let pose = SceneTransform { position_x: 6.0, scale: 0.8, ..SceneTransform::IDENTITY };
+        cue.transform = Some(TransformMotion { start: pose, end: pose, ..Default::default() });
+        let mut next = cue.clone();
+        next.id = Uuid::new_v4();
+        next.start = cue.end;
+        next.end = 3.01;
+        let next_pose = SceneTransform { position_x: -6.0, ..SceneTransform::IDENTITY };
+        next.transform = Some(TransformMotion { start: next_pose, end: next_pose, ..Default::default() });
+        for cues in [vec![cue.clone()], vec![cue.clone(), next]] {
+            let timeline = ViewportTimeline::build_static(&cues, 4.0);
+            // Non-grid-aligned boundaries, in random seek order.
+            for time in [2.472999, 0.013, 2.47, 0.013001] {
+                assert_eq!(timeline.frame_at(time).transform, pose);
+            }
+            assert_eq!(timeline.frame_at(0.012999).transform, SceneTransform::IDENTITY);
+            let after = if cues.len() == 1 { SceneTransform::IDENTITY } else { next_pose };
+            assert_eq!(timeline.frame_at(2.473001).transform, after);
+        }
+    }
+
+    #[test]
+    fn held_pose_survives_camera_motion_and_is_replaced_by_later_transforms() {
+        let pose = SceneTransform { position_x: 1.5, scale: 0.8, rotation_z: 20.0, ..SceneTransform::IDENTITY };
+        let mut first = ZoomCue::pinned(0.0, 1.0, 1.0, NormalizedPoint { x: 0.5, y: 0.5 });
+        first.transform = Some(TransformMotion { end: pose, keep_end_state: true, ..Default::default() });
+        let camera = ZoomCue::pinned(1.5, 2.5, 2.0, NormalizedPoint { x: 0.5, y: 0.5 });
+        let mut later = ZoomCue::pinned(3.0, 4.0, 1.0, NormalizedPoint { x: 0.5, y: 0.5 });
+        later.transform = Some(TransformMotion { start: pose, end: SceneTransform::IDENTITY, ..Default::default() });
+        let mut cues = vec![first, camera, later];
+        let timeline = ViewportTimeline::build_static(&cues, 6.0);
+        for time in [2.0, 1.0001, 3.0, 2.99] {
+            assert_eq!(timeline.frame_at(time).transform, pose);
+        }
+        assert_eq!(timeline.frame_at(4.001).transform, SceneTransform::IDENTITY);
+        assert_eq!(timeline.frame_at(5.0).transform, SceneTransform::IDENTITY);
+        cues[2].is_enabled = false;
+        assert_eq!(ViewportTimeline::build_static(&cues, 6.0).frame_at(5.0).transform, pose);
+        cues[0].transform.as_mut().unwrap().keep_end_state = false;
+        assert_eq!(ViewportTimeline::build_static(&cues, 6.0).frame_at(2.0).transform, SceneTransform::IDENTITY);
+    }
+
+    #[test]
+    fn legacy_transform_json_resets_and_keep_end_state_round_trips() {
+        let legacy: TransformMotion = serde_json::from_str(r#"{"start":{},"end":{}}"#).unwrap();
+        assert!(!legacy.keep_end_state);
+        let held = TransformMotion { keep_end_state: true, ..legacy };
+        let json = serde_json::to_string(&held).unwrap();
+        assert_eq!(serde_json::from_str::<TransformMotion>(&json).unwrap(), held);
+    }
+
+    #[test]
+    fn transform_motion_round_trips_and_uses_edited_clip_time() {
+        let mut cue = ZoomCue::pinned(0.0, 4.0, 1.0, NormalizedPoint { x: 0.5, y: 0.5 });
+        cue.easing = MotionEasing::Linear;
+        cue.transform = Some(TransformMotion {
+            end: SceneTransform { scale: 2.0, ..SceneTransform::IDENTITY },
+            ..TransformMotion::default()
+        });
+        let restored: ZoomCue = serde_json::from_str(&serde_json::to_string(&cue).unwrap()).unwrap();
+        assert_eq!(restored, cue);
+        let mut clips = RecordingClipTimeline::full(4.0);
+        clips.segments[0].speed = 2.0;
+        let timeline = ViewportTimeline::build(&[restored], &PointerTimeline::default(), &clips, &PointerCaptureFile::default());
+        assert!((timeline.frame_at(1.0).transform.scale - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn walkthrough_capture_visits_stops_in_order_with_clicks() {
         let stops = [
             NormalizedPoint { x: 0.2, y: 0.3 },
@@ -1150,6 +1337,7 @@ mod tests {
             pan_to: None,
             easing: MotionEasing::Smooth,
             tilt: None,
+            transform: None,
         };
         let viewport = ViewportTimeline::build(&[cue], &pointer, &clips, &capture);
         let before_dead_zone_exit = viewport.frame_at(1.5).anchor.x;
@@ -1166,6 +1354,7 @@ mod tests {
         let cue: ZoomCue = serde_json::from_str(json).unwrap();
         assert_eq!(cue.motion, MotionStyle::Hold);
         assert_eq!(cue.pan_to, None);
+        assert_eq!(cue.transform, None);
         let round_trip = serde_json::to_string(&cue).unwrap();
         assert!(!round_trip.contains("panTo"));
         assert!(round_trip.contains("\"motion\":\"hold\""));
@@ -1244,6 +1433,7 @@ mod tests {
             magnification: 2.0,
             anchor: NormalizedPoint { x: 0.0, y: 1.0 },
             tilt: Tilt::default(),
+            transform: SceneTransform::IDENTITY,
         });
         assert_eq!(visible, 0.5);
         assert_eq!(left, 0.0);

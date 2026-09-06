@@ -539,6 +539,8 @@ impl Studio {
                 }
                 self.video_zoom_cues.clear();
                 self.animation_preset = None;
+                self.animation_image_start = 0.0;
+                self.animation_image_end = self.animation_duration;
                 let scenes = self.image_scenes.drain(..).map(|scene| scene.render);
                 self.retired_images.extend(scenes);
                 self.image_scene_index = 0;

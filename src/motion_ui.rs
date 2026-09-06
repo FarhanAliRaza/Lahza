@@ -5,7 +5,7 @@
 
 use gpui::{
     div, hsla, prelude::*, px, rgb, AnyElement, Context, CursorStyle, FontWeight, MouseButton,
-    MouseDownEvent, Pixels, Timer,
+    MouseDownEvent, MouseMoveEvent, Pixels, Timer,
 };
 use image::RgbaImage;
 use std::{
@@ -16,7 +16,7 @@ use std::{
 use crate::{
     line, muted,
     recording::{
-        clips::RecordingClipTimeline,
+        clips::{ClipEdge, RecordingClipTimeline},
         export::{
             export_scene, ExportFormat, ExportProgress, ImageSegment, SceneExportRequest,
             SceneSource,
@@ -25,7 +25,7 @@ use crate::{
         scene::{SceneBackground, SceneStyle},
         viewport::{
             synthesize_zoom_cues, MotionPreset, MotionStyle, ViewportTimeline, ZoomAnchorMode,
-            ZoomCue,
+            ZoomCue, TransformMotion,
         },
     },
     xml_escape, ImageScene, SliderDrag, Studio, VideoEditSnapshot, VideoZoomDragKind,
@@ -47,6 +47,322 @@ pub(crate) enum MotionPick {
     #[default]
     Focus,
     PanEnd,
+}
+
+pub(crate) const MINIMUM_IMAGE_DURATION: f64 = 0.1;
+
+/// Clip out-points are exclusive. Preview End just inside the visible interval
+/// so an endpoint shared with the image out-point does not show an empty canvas.
+fn visible_motion_endpoint(start: f64, end: f64, image_start: f64, image_end: f64, endpoint: usize) -> Option<f64> {
+    let start = start.max(image_start);
+    let end = end.min(image_end);
+    if end <= start { return None; }
+    Some(if endpoint == 0 { start } else { (end - 1e-6).max(start) })
+}
+
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImageTrimDrag {
+    start_x: Pixels,
+    original_start: f64,
+    original_end: f64,
+    edge: Option<ClipEdge>,
+    seconds_per_pixel: f64,
+    pub start: f64,
+    pub end: f64,
+}
+
+impl ImageTrimDrag {
+    fn range_at(self, x: Pixels) -> (f64, f64) {
+        if self.edge.is_none() {
+            let pixels = f64::from((x - self.start_x) / px(1.0));
+            // A click seeks and selects without nudging the clip.
+            let start = if pixels.abs() < 3.0 {
+                self.original_start
+            } else {
+                ((self.original_start + pixels * self.seconds_per_pixel) * 100.0)
+                    .round().max(0.0) / 100.0
+            };
+            return (start, start + self.original_end - self.original_start);
+        }
+        let delta = f64::from((x - self.start_x) / px(1.0)) * self.seconds_per_pixel;
+        let (start, end) = match self.edge.expect("trim edge") {
+            ClipEdge::Leading => (
+                ((self.original_start + delta) * 100.0).round().max(0.0) / 100.0,
+                self.original_end,
+            ),
+            ClipEdge::Trailing => (
+                self.original_start,
+                ((self.original_end + delta) * 100.0).round() / 100.0,
+            ),
+        };
+        match self.edge.expect("trim edge") {
+            ClipEdge::Leading => (start.min((end - MINIMUM_IMAGE_DURATION).max(0.0)), end),
+            ClipEdge::Trailing => (start, end.max(start + MINIMUM_IMAGE_DURATION)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_trim_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_preview_stays_inside_the_visible_image_and_motion() {
+        let end = visible_motion_endpoint(0.0, 2.5, 0.0, 2.5, 1).unwrap();
+        assert!(end < 2.5 && end > 2.49999);
+        assert_eq!(visible_motion_endpoint(0.0, 2.5, 1.0, 2.0, 0), Some(1.0));
+        let trimmed_end = visible_motion_endpoint(0.0, 2.5, 1.0, 2.0, 1).unwrap();
+        assert!(trimmed_end < 2.0 && trimmed_end > 1.99999);
+        assert_eq!(visible_motion_endpoint(0.0, 1.0, 2.0, 3.0, 1), None);
+    }
+
+    #[test]
+    fn leading_trim_changes_only_start_and_keeps_a_nonempty_clip() {
+        let drag = ImageTrimDrag {
+            start_x: px(100.0),
+            original_start: 1.0,
+            original_end: 4.0,
+            seconds_per_pixel: 0.01,
+            edge: Some(ClipEdge::Leading),
+            start: 1.0,
+            end: 4.0,
+        };
+        assert_eq!(drag.range_at(px(200.0)), (2.0, 4.0));
+        assert_eq!(drag.range_at(px(-200.0)), (0.0, 4.0));
+        assert_eq!(drag.range_at(px(1000.0)), (3.9, 4.0));
+        assert_eq!(drag.range_at(px(100.0)), (1.0, 4.0));
+    }
+
+    #[test]
+    fn moving_image_preserves_duration_and_clamps_only_at_zero() {
+        let drag = ImageTrimDrag {
+            start_x: px(100.0),
+            original_start: 1.0,
+            original_end: 4.0,
+            seconds_per_pixel: 0.01,
+            edge: None,
+            start: 1.0,
+            end: 4.0,
+        };
+        assert_eq!(drag.range_at(px(102.0)), (1.0, 4.0));
+        assert_eq!(drag.range_at(px(200.0)), (2.0, 5.0));
+        assert_eq!(drag.range_at(px(-500.0)), (0.0, 3.0));
+        assert_eq!(drag.range_at(px(1000.0)), (10.0, 13.0));
+        assert_eq!(drag.range_at(px(100.0)), (1.0, 4.0));
+    }
+
+    #[test]
+    fn trailing_trim_respects_a_delayed_start() {
+        let drag = ImageTrimDrag {
+            start_x: px(100.0),
+            original_start: 1.0,
+            original_end: 4.0,
+            seconds_per_pixel: 0.01,
+            edge: Some(ClipEdge::Trailing),
+            start: 1.0,
+            end: 4.0,
+        };
+        assert_eq!(drag.range_at(px(200.0)), (1.0, 5.0));
+        assert_eq!(drag.range_at(px(-500.0)), (1.0, 1.1));
+        assert_eq!(drag.range_at(px(100.0)), (1.0, 4.0));
+    }
+}
+
+/// One scrub gesture records one undo entry and saves once on release.
+pub(crate) struct MotionTransformDrag {
+    cue_id: uuid::Uuid,
+    axis: usize,
+    endpoint: usize,
+    start_x: Pixels,
+    start_value: f64,
+    original_cues: Vec<ZoomCue>,
+}
+
+fn transform_value(transform: &crate::recording::scene::SceneTransform, axis: usize) -> f64 {
+    match axis {
+        0 => transform.scale,
+        1 => transform.position_x,
+        2 => transform.position_y,
+        3 => transform.rotation_x,
+        4 => transform.rotation_y,
+        _ => transform.rotation_z,
+    }
+}
+
+fn set_transform_value(
+    transform: &mut crate::recording::scene::SceneTransform,
+    axis: usize,
+    value: f64,
+) {
+    match axis {
+        0 => transform.scale = value,
+        1 => transform.position_x = value,
+        2 => transform.position_y = value,
+        3 => transform.rotation_x = value,
+        4 => transform.rotation_y = value,
+        _ => transform.rotation_z = value,
+    }
+    *transform = transform.clamped();
+}
+
+fn scrubbed_transform_value(axis: usize, start: f64, delta: f64, precise: bool) -> f64 {
+    let sensitivity = match axis {
+        0 => 0.01,
+        1 | 2 => 0.01,
+        _ => 1.0,
+    };
+    start + delta * sensitivity * if precise { 0.1 } else { 1.0 }
+}
+
+const MOTION_ROW_HEIGHT: f32 = 30.0;
+
+#[derive(Clone, Copy, Debug)]
+struct MotionLaneRegion {
+    cue_index: usize,
+    segment_index: usize,
+    editor_start: f64,
+    editor_end: f64,
+    left: f64,
+    width: f64,
+    row: usize,
+}
+
+/// Pack the rendered intervals rather than source ranges: edits, speed,
+/// gaps, and the minimum clickable width all affect visible overlap.
+fn motion_lane_layout(
+    cues: &[ZoomCue],
+    clips: &RecordingClipTimeline,
+    duration: f64,
+    content_width: f64,
+) -> Vec<MotionLaneRegion> {
+    let mut regions = Vec::new();
+    let mut slot_start = 0.0;
+    for (segment_index, segment) in clips.segments.iter().enumerate() {
+        let segment_start = slot_start + segment.gap_before;
+        for (cue_index, cue) in cues.iter().enumerate() {
+            let start = cue.start.max(segment.source_start);
+            let end = cue.end.min(segment.source_end);
+            if end - start <= f64::EPSILON {
+                continue;
+            }
+            let editor_start = segment_start + (start - segment.source_start) / segment.speed;
+            let editor_end = segment_start + (end - segment.source_start) / segment.speed;
+            regions.push(MotionLaneRegion {
+                cue_index,
+                segment_index,
+                editor_start,
+                editor_end,
+                left: editor_start / duration.max(f64::EPSILON) * content_width,
+                width: ((editor_end - editor_start) / duration.max(f64::EPSILON) * content_width)
+                    .max(24.0),
+                row: 0,
+            });
+        }
+        slot_start += segment.slot_duration();
+    }
+    regions.sort_by(|a, b| {
+        a.editor_start
+            .total_cmp(&b.editor_start)
+            .then_with(|| a.cue_index.cmp(&b.cue_index))
+            .then_with(|| a.segment_index.cmp(&b.segment_index))
+    });
+    let mut row_ends: Vec<f64> = Vec::new();
+    for region in &mut regions {
+        let row = row_ends
+            .iter()
+            .position(|end| *end <= region.left + 1e-9)
+            .unwrap_or(row_ends.len());
+        if row == row_ends.len() {
+            row_ends.push(0.0);
+        }
+        row_ends[row] = region.left + region.width;
+        region.row = row;
+    }
+    regions
+}
+
+#[cfg(test)]
+mod motion_lane_tests {
+    use super::*;
+    use crate::recording::clips::RecordingClipSegment;
+
+    fn cue(start: f64, end: f64) -> ZoomCue {
+        ZoomCue::pinned(start, end, 2.0, NormalizedPoint { x: 0.5, y: 0.5 })
+    }
+
+    #[test]
+    fn overlapping_regions_stack_and_adjacent_regions_reuse_rows() {
+        let cues = vec![cue(2.0, 4.0), cue(0.0, 3.0), cue(1.0, 2.5), cue(3.0, 5.0)];
+        let regions = motion_lane_layout(&cues, &RecordingClipTimeline::full(5.0), 5.0, 500.0);
+        let row = |index| {
+            regions
+                .iter()
+                .find(|region| region.cue_index == index)
+                .unwrap()
+                .row
+        };
+        assert_eq!(row(1), 0);
+        assert_eq!(row(2), 1);
+        assert_eq!(row(0), 2);
+        assert_eq!(row(3), 0);
+        for a in &regions {
+            for b in &regions {
+                if a.cue_index != b.cue_index && a.row == b.row {
+                    assert!(a.left + a.width <= b.left || b.left + b.width <= a.left);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn minimum_hit_width_does_not_cover_the_next_region() {
+        let cues = vec![cue(0.0, 0.5), cue(0.5, 1.0)];
+        let clips = RecordingClipTimeline::full(10.0);
+        let narrow = motion_lane_layout(&cues, &clips, 10.0, 100.0);
+        assert_ne!(narrow[0].row, narrow[1].row);
+        let zoomed = motion_lane_layout(&cues, &clips, 10.0, 1000.0);
+        assert_eq!(zoomed[0].row, zoomed[1].row);
+    }
+
+    #[test]
+    fn rows_follow_edited_clip_order_speed_and_gaps() {
+        let mut first = RecordingClipSegment::new(5.0, 9.0);
+        first.speed = 2.0;
+        first.gap_before = 1.0;
+        let clips = RecordingClipTimeline::new(vec![first, RecordingClipSegment::new(0.0, 2.0)]);
+        let cues = vec![cue(5.0, 9.0), cue(6.0, 8.0), cue(0.0, 1.0), cue(3.0, 4.0)];
+        let regions = motion_lane_layout(&cues, &clips, clips.duration(), 500.0);
+        assert_eq!(
+            regions.len(),
+            3,
+            "removed source ranges have no visible row"
+        );
+        assert_eq!(
+            (
+                regions[0].editor_start,
+                regions[0].editor_end,
+                regions[0].row
+            ),
+            (1.0, 3.0, 0)
+        );
+        assert_eq!(
+            (
+                regions[1].editor_start,
+                regions[1].editor_end,
+                regions[1].row
+            ),
+            (1.5, 2.5, 1)
+        );
+        assert_eq!(
+            (
+                regions[2].editor_start,
+                regions[2].editor_end,
+                regions[2].row
+            ),
+            (3.0, 4.0, 0)
+        );
+    }
 }
 
 pub(crate) fn orange(selected: bool) -> gpui::Hsla {
@@ -287,7 +603,7 @@ impl Studio {
         cx.notify();
     }
 
-    fn selected_region(&self) -> Option<ZoomCue> {
+    pub(crate) fn selected_region(&self) -> Option<ZoomCue> {
         self.video_selected_zoom_cue
             .and_then(|id| self.video_zoom_cues.iter().find(|cue| cue.id == id))
             .cloned()
@@ -306,147 +622,154 @@ impl Studio {
     ) -> Vec<AnyElement> {
         let selected_zoom_cue = self.video_selected_zoom_cue;
         let mut lane: Vec<AnyElement> = Vec::new();
-        let mut segment_slot_start = 0.0;
-        for (segment_index, segment) in self.video_clip_timeline.segments.iter().enumerate() {
-            let segment_editor_start = segment_slot_start + segment.gap_before;
-            for cue in self.video_zoom_cues.iter() {
-                let overlap_start = cue.start.max(segment.source_start);
-                let overlap_end = cue.end.min(segment.source_end);
-                if overlap_end - overlap_start <= f64::EPSILON {
-                    continue;
-                }
-                let cue_id = cue.id;
-                let editor_start =
-                    segment_editor_start + (overlap_start - segment.source_start) / segment.speed;
-                let editor_end =
-                    segment_editor_start + (overlap_end - segment.source_start) / segment.speed;
-                let left = editor_start / timeline_duration * timeline_content_width;
-                let width = ((editor_end - editor_start) / timeline_duration
-                    * timeline_content_width)
-                    .max(24.0);
-                let selected = selected_zoom_cue == Some(cue_id);
-                let label = cue.summary();
-                let enabled = cue.is_enabled;
-                lane.push(
-                    div()
-                        .id((
-                            "motion-region",
-                            (cue_id.as_u128() as u64).wrapping_add(segment_index as u64),
-                        ))
-                        .absolute()
-                        .left(px(left as f32))
-                        .top(px(3.0))
-                        .w(px(width as f32))
-                        .h(px(24.0))
-                        .rounded_md()
-                        .border_2()
-                        .border_color(if selected {
-                            hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
-                        } else {
-                            hsla(0.0, 0.0, 0.0, 0.0)
-                        })
-                        .bg(orange(selected))
-                        .when(!enabled, |this| this.opacity(0.45))
-                        .text_color(rgb(0xffffff))
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .overflow_hidden()
-                        .cursor(CursorStyle::PointingHand)
-                        .when(width >= 44.0, |this| this.child(label))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.video_selected_zoom_cue = Some(cue_id);
-                            this.video_selected_clip = None;
-                            this.motion_pick = MotionPick::Focus;
+        for region in motion_lane_layout(
+            &self.video_zoom_cues,
+            &self.video_clip_timeline,
+            timeline_duration,
+            timeline_content_width,
+        ) {
+            let cue = &self.video_zoom_cues[region.cue_index];
+            let cue_id = cue.id;
+            let segment_index = region.segment_index;
+            let editor_start = region.editor_start;
+            let editor_end = region.editor_end;
+            let left = region.left;
+            let width = region.width;
+            let selected = selected_zoom_cue == Some(cue_id);
+            let label = cue.summary();
+            let enabled = cue.is_enabled;
+            lane.push(
+                div()
+                    .id((
+                        "motion-region",
+                        (cue_id.as_u128() as u64).wrapping_add(segment_index as u64),
+                    ))
+                    .absolute()
+                    .left(px(left as f32))
+                    .top(px(3.0 + region.row as f32 * MOTION_ROW_HEIGHT))
+                    .w(px(width as f32))
+                    .h(px(24.0))
+                    .rounded_md()
+                    .border_2()
+                    .border_color(if selected {
+                        hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
+                    } else {
+                        hsla(0.0, 0.0, 0.0, 0.0)
+                    })
+                    .bg(orange(selected))
+                    .when(!enabled, |this| this.opacity(0.45))
+                    .text_color(rgb(0xffffff))
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .cursor(CursorStyle::PointingHand)
+                    .when(width >= 44.0, |this| this.child(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.video_selected_zoom_cue = Some(cue_id);
+                        this.video_selected_clip = None;
+                        this.motion_pick = MotionPick::Focus;
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            // Clicking a region also moves the playhead there.
+                            if let Some(target) = this.motion_timeline_time_at(event.position.x) {
+                                this.seek_video(target, cx);
+                            }
+                            this.begin_video_zoom_drag(
+                                cue_id,
+                                VideoZoomDragKind::Move,
+                                editor_start,
+                                editor_end,
+                                event.position.x,
+                            );
                             cx.notify();
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                // Clicking a region also moves the playhead there.
-                                if let Some(target) = this.motion_timeline_time_at(event.position.x)
-                                {
-                                    this.seek_video(target, cx);
-                                }
-                                this.begin_video_zoom_drag(
-                                    cue_id,
-                                    VideoZoomDragKind::Move,
-                                    editor_start,
-                                    editor_end,
-                                    event.position.x,
-                                );
-                                cx.notify();
-                            }),
+                        }),
+                    )
+                    .when(selected, |this| {
+                        this.child(
+                            div()
+                                .id((
+                                    "motion-region-leading",
+                                    cue_id.as_u128() as u64 ^ segment_index as u64,
+                                ))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .w(px(10.0))
+                                .h_full()
+                                .rounded_l_md()
+                                .bg(hsla(0.0, 0.0, 1.0, 0.38))
+                                .cursor(CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.begin_video_zoom_drag(
+                                            cue_id,
+                                            VideoZoomDragKind::Leading,
+                                            editor_start,
+                                            editor_end,
+                                            event.position.x,
+                                        );
+                                        cx.notify();
+                                    }),
+                                ),
                         )
-                        .when(selected, |this| {
-                            this.child(
-                                div()
-                                    .id((
-                                        "motion-region-leading",
-                                        cue_id.as_u128() as u64 ^ segment_index as u64,
-                                    ))
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .w(px(10.0))
-                                    .h_full()
-                                    .rounded_l_md()
-                                    .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.begin_video_zoom_drag(
-                                                cue_id,
-                                                VideoZoomDragKind::Leading,
-                                                editor_start,
-                                                editor_end,
-                                                event.position.x,
-                                            );
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id((
-                                        "motion-region-trailing",
-                                        cue_id.as_u128() as u64 ^ !(segment_index as u64),
-                                    ))
-                                    .absolute()
-                                    .right_0()
-                                    .top_0()
-                                    .w(px(10.0))
-                                    .h_full()
-                                    .rounded_r_md()
-                                    .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.begin_video_zoom_drag(
-                                                cue_id,
-                                                VideoZoomDragKind::Trailing,
-                                                editor_start,
-                                                editor_end,
-                                                event.position.x,
-                                            );
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                        })
-                        .into_any_element(),
-                );
-            }
-            segment_slot_start += segment.slot_duration();
+                        .child(
+                            div()
+                                .id((
+                                    "motion-region-trailing",
+                                    cue_id.as_u128() as u64 ^ !(segment_index as u64),
+                                ))
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .w(px(10.0))
+                                .h_full()
+                                .rounded_r_md()
+                                .bg(hsla(0.0, 0.0, 1.0, 0.38))
+                                .cursor(CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.begin_video_zoom_drag(
+                                            cue_id,
+                                            VideoZoomDragKind::Trailing,
+                                            editor_start,
+                                            editor_end,
+                                            event.position.x,
+                                        );
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                    })
+                    .into_any_element(),
+            );
         }
         lane
+    }
+
+    pub(crate) fn motion_lane_height(&self) -> f32 {
+        let width = self.video_timeline_viewport_width() * self.video_timeline_zoom;
+        let rows = motion_lane_layout(
+            &self.video_zoom_cues,
+            &self.video_clip_timeline,
+            self.video_duration,
+            width,
+        )
+        .iter()
+        .map(|region| region.row + 1)
+        .max()
+        .unwrap_or(1);
+        rows as f32 * MOTION_ROW_HEIGHT
     }
 
     /// The motion lane container. A single click on empty lane moves the
@@ -465,7 +788,7 @@ impl Studio {
             .id("motion-track")
             .relative()
             .w_full()
-            .h(px(30.0))
+            .h(px(self.motion_lane_height()))
             .flex_none()
             .overflow_hidden()
             .rounded_lg()
@@ -532,6 +855,43 @@ impl Studio {
             .text_xs()
             .text_color(muted())
             .child(text)
+            .into_any_element()
+    }
+
+    pub(crate) fn selection_action_button(
+        &self,
+        id: &'static str,
+        delete: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Studio, &mut Context<Studio>) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .px_3()
+            .h(px(30.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .rounded_md()
+            .bg(rgb(if delete { 0xfee2e2 } else { 0xf0f0f1 }))
+            .text_color(rgb(if delete { 0xb91c1c } else { 0x27272a }))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .opacity(if enabled { 1.0 } else { 0.4 })
+            .when(enabled, |button| {
+                button.cursor_pointer()
+                    .hover(move |style| style.bg(rgb(if delete { 0xfecaca } else { 0xe4e4e7 })))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        on_click(this, cx);
+                        cx.notify();
+                    }))
+            })
+            .child(gpui::svg()
+                .path(if delete { "icons/trash.svg" } else { "icons/close.svg" })
+                .size(px(14.0)))
+            .child(if delete { "Delete" } else { "Deselect" })
             .into_any_element()
     }
 
@@ -665,6 +1025,260 @@ impl Studio {
             .into_any_element()
     }
 
+    fn preview_motion_endpoint(&mut self, endpoint: usize, cx: &mut Context<Self>) {
+        let Some(cue) = self.selected_region() else { return; };
+        let Some(start) = self.video_clip_timeline.editor_time_for_source(cue.start) else { return; };
+        let Some(end) = self.video_clip_timeline.editor_time_for_source(cue.end) else { return; };
+        let (visible_start, visible_end) = if self.animation_active && self.video_project.is_none() {
+            (self.animation_image_start, self.animation_image_end.min(self.video_duration))
+        } else {
+            (0.0, self.video_duration)
+        };
+        if let Some(time) = visible_motion_endpoint(start, end, visible_start, visible_end, endpoint) {
+            self.seek_video(time, cx);
+        }
+    }
+
+    fn begin_motion_transform_drag(&mut self, axis: usize, endpoint: usize, start_x: Pixels, cx: &mut Context<Self>) {
+        if self.video_edit_busy || self.motion_transform_drag.is_some() {
+            return;
+        }
+        let Some(cue) = self.selected_region() else {
+            return;
+        };
+        let Some(motion) = cue.transform else {
+            return;
+        };
+        self.pause_video_playback();
+        self.preview_motion_endpoint(endpoint, cx);
+        self.motion_transform_drag = Some(MotionTransformDrag {
+            cue_id: cue.id,
+            axis,
+            endpoint,
+            start_x,
+            start_value: transform_value(
+                if endpoint == 0 {
+                    &motion.start
+                } else {
+                    &motion.end
+                },
+                axis,
+            ),
+            original_cues: self.video_zoom_cues.clone(),
+        });
+    }
+
+    pub(crate) fn update_motion_transform_drag(&mut self, event: &MouseMoveEvent) -> bool {
+        let Some(drag) = self.motion_transform_drag.as_ref() else {
+            return false;
+        };
+        if !event.dragging()
+            || self.video_selected_zoom_cue != Some(drag.cue_id)
+            || self.video_edit_busy
+        {
+            return self.end_motion_transform_drag();
+        }
+        let Some(cue) = self
+            .video_zoom_cues
+            .iter_mut()
+            .find(|cue| cue.id == drag.cue_id)
+        else {
+            return false;
+        };
+        let Some(motion) = cue.transform.as_mut() else {
+            return false;
+        };
+        let transform = if drag.endpoint == 0 {
+            &mut motion.start
+        } else {
+            &mut motion.end
+        };
+        let previous = *transform;
+        let delta = f64::from((event.position.x - drag.start_x) / px(1.0));
+        set_transform_value(
+            transform,
+            drag.axis,
+            scrubbed_transform_value(drag.axis, drag.start_value, delta, event.modifiers.shift),
+        );
+        if *transform == previous {
+            return false;
+        }
+        self.rebuild_video_motion_timelines();
+        true
+    }
+
+    pub(crate) fn end_motion_transform_drag(&mut self) -> bool {
+        let Some(drag) = self.motion_transform_drag.take() else {
+            return false;
+        };
+        if drag.original_cues != self.video_zoom_cues {
+            self.video_undo_stack
+                .push(VideoEditSnapshot::Zoom(drag.original_cues));
+            self.video_redo_stack.clear();
+            self.persist_video_zoom_cues_quiet();
+        }
+        true
+    }
+
+    fn motion_transform_controls(
+        &self,
+        motion: TransformMotion,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(Self::inspector_label("Card transform"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted())
+                    .child("Position, scale, and rotation relative to scene layout."),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted())
+                    .child("Drag values left/right. Editing Start or End seeks to that endpoint. Hold Shift for fine adjustments."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(div().w(px(68.0)).flex_none())
+                    .child(div().flex_1().min_w_0().text_xs().child("Start"))
+                    .child(div().flex_1().min_w_0().text_xs().child("End")),
+            );
+        for (axis, label) in [
+            "Scale", "Move X", "Move Y", "Rotate X", "Rotate Y", "Rotate Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().w(px(68.0)).flex_none().text_xs().child(label));
+            for (endpoint, transform) in [motion.start, motion.end].into_iter().enumerate() {
+                let value = transform_value(&transform, axis);
+                let value_label = match axis {
+                    0 => format!("{value:.2}×"),
+                    1 | 2 => format!("{:.0}%", value * 50.0),
+                    _ => format!("{value:.0}°"),
+                };
+                let mut cell = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded_md()
+                    .bg(rgb(0xf1f1f2));
+                for (direction, label) in [(0, "−"), (1, "+")] {
+                    if direction == 1 {
+                        cell = cell.child(
+                            div()
+                                .id(("motion-transform-scrub", axis * 2 + endpoint))
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(30.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .cursor(CursorStyle::ResizeLeftRight)
+                                .hover(|style| style.bg(rgb(0xe4e4e7)))
+                                .child(value_label.clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        this.begin_motion_transform_drag(
+                                            axis,
+                                            endpoint,
+                                            event.position.x,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                ),
+                        );
+                    }
+                    cell = cell.child(
+                        div()
+                            .id(("motion-transform-step", axis * 4 + endpoint * 2 + direction))
+                            .w(px(22.0))
+                            .flex_none()
+                            .h(px(30.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0xe4e4e7)))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.preview_motion_endpoint(endpoint, cx);
+                                this.edit_selected_region(|cue| {
+                                    let Some(motion) = cue.transform.as_mut() else {
+                                        return;
+                                    };
+                                    let transform = if endpoint == 0 {
+                                        &mut motion.start
+                                    } else {
+                                        &mut motion.end
+                                    };
+                                    let step = if axis == 0 {
+                                        0.05
+                                    } else if axis <= 2 {
+                                        0.02
+                                    } else {
+                                        5.0
+                                    };
+                                    let delta = if direction == 0 { -step } else { step };
+                                    let value = transform_value(transform, axis) + delta;
+                                    set_transform_value(transform, axis, value);
+                                });
+                                cx.notify();
+                            })),
+                    );
+                }
+                row = row.child(cell);
+            }
+            panel = panel.child(row);
+        }
+        panel
+            .child(Self::inspector_label("After motion"))
+            .child(self.segmented(
+                "motion-transform-after",
+                &["Keep end state", "Reset to layout"],
+                if motion.keep_end_state { 0 } else { 1 },
+                |this, index| {
+                    this.edit_selected_region(|cue| {
+                        if let Some(motion) = cue.transform.as_mut() {
+                            motion.keep_end_state = index == 0;
+                        }
+                    });
+                },
+                cx,
+            ))
+            .child(self.small_button(
+                "motion-transform-reset",
+                "Reset transform",
+                !self.video_edit_busy,
+                cx,
+                |this, _| {
+                    this.edit_selected_region(|cue| {
+                        let keep_end_state = cue.transform.is_some_and(|motion| motion.keep_end_state);
+                        cue.transform = Some(TransformMotion { keep_end_state, ..Default::default() });
+                    });
+                },
+            ))
+            .into_any_element()
+    }
+
     /// Contextual panel for the selected motion region.
     pub(crate) fn motion_inspector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let cue = self.selected_region()?;
@@ -692,6 +1306,14 @@ impl Studio {
             MotionPick::PanEnd => 1,
         };
         let enabled = cue.is_enabled;
+        let has_camera = cue.has_camera_motion();
+        let kind_index = if cue.transform.is_none() {
+            0
+        } else if has_camera {
+            2
+        } else {
+            1
+        };
         let has_pan = cue.pan_to.is_some();
         let pick_hint = match (self.motion_pick, self.video_project.is_some()) {
             (MotionPick::Focus, true) => "Click the video to set the focus point",
@@ -729,26 +1351,97 @@ impl Studio {
                                 .child(format!("{:.1}s – {:.1}s", editor_start, editor_end)),
                         ),
                 )
-                .child(Self::inspector_label("Style"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(self.selection_action_button(
+                            "motion-deselect",
+                            false,
+                            true,
+                            cx,
+                            |this, _| {
+                                this.video_selected_zoom_cue = None;
+                            },
+                        ))
+                        .child(self.selection_action_button(
+                            "motion-delete",
+                            true,
+                            !edit_busy,
+                            cx,
+                            |this, cx| { this.delete_selected_video_zoom(cx); },
+                        )),
+                )
+                .child(Self::inspector_label("Animate"))
                 .child(self.segmented(
-                    "motion-style",
-                    &["Hold", "Zoom in", "Zoom out"],
-                    style_index,
+                    "motion-kind",
+                    &["Zoom / pan", "Transform", "Both"],
+                    kind_index,
                     |this, index| {
-                        this.edit_selected_region(|cue| cue.motion = MotionStyle::ALL[index]);
+                        let default_zoom = this.default_motion_zoom;
+                        let initial_pose = this.selected_region().map(|selected| {
+                            let previous: Vec<_> = this.video_zoom_cues.iter()
+                                .filter(|cue| cue.id != selected.id).cloned().collect();
+                            crate::recording::viewport::transform_at(selected.start, &previous)
+                        }).unwrap_or(crate::recording::scene::SceneTransform::IDENTITY);
+                        this.edit_selected_region(|cue| {
+                            if index == 0 {
+                                cue.transform = None;
+                                if cue.zoom <= 1.0 {
+                                    cue.zoom = default_zoom;
+                                }
+                            } else {
+                                if cue.transform.is_none() {
+                                    let mut motion = TransformMotion {
+                                        start: initial_pose,
+                                        end: initial_pose,
+                                        keep_end_state: true,
+                                    };
+                                    motion.end.scale = (initial_pose.scale * 1.2)
+                                        .min(crate::recording::scene::SceneTransform::MAX_SCALE);
+                                    cue.transform = Some(motion);
+                                }
+                                if index == 1 {
+                                    cue.zoom = 1.0;
+                                    cue.pan_to = None;
+                                    cue.tilt = None;
+                                    cue.motion = MotionStyle::Hold;
+                                } else if cue.zoom <= 1.0 {
+                                    cue.zoom = default_zoom;
+                                }
+                            }
+                        });
                     },
                     cx,
                 ))
-                .child(self.motion_zoom_slider(cue.zoom, cx))
-                .child(Self::inspector_label("Easing (ramps and pans)"))
+                .when_some(cue.transform, |panel, motion| {
+                    panel.child(self.motion_transform_controls(motion, cx))
+                })
+                .when(has_camera, |panel| {
+                    panel
+                        .child(Self::inspector_label("Style"))
+                        .child(self.segmented(
+                            "motion-style",
+                            &["Hold", "Zoom in", "Zoom out"],
+                            style_index,
+                            |this, index| {
+                                this.edit_selected_region(|cue| {
+                                    cue.motion = MotionStyle::ALL[index]
+                                });
+                            },
+                            cx,
+                        ))
+                        .child(self.motion_zoom_slider(cue.zoom, cx))
+                })
+                .child(Self::inspector_label("Easing"))
                 .child(self.segmented(
                     "motion-easing",
                     &["Smooth", "Linear", "Snappy", "Cinematic"],
                     crate::scene_ui::easing_index(cue.easing),
                     |this, index| {
                         this.edit_selected_region(|cue| {
-                            cue.easing =
-                                crate::recording::viewport::MotionEasing::ALL[index]
+                            cue.easing = crate::recording::viewport::MotionEasing::ALL[index]
                         });
                     },
                     cx,
@@ -783,8 +1476,8 @@ impl Studio {
                             cx,
                             |this, _| {
                                 this.edit_selected_region(|cue| {
-                                    cue.start = (cue.start + 0.1)
-                                        .min(cue.end - ZoomCue::MINIMUM_DURATION)
+                                    cue.start =
+                                        (cue.start + 0.1).min(cue.end - ZoomCue::MINIMUM_DURATION)
                                 });
                             },
                         ))
@@ -796,8 +1489,8 @@ impl Studio {
                             cx,
                             |this, _| {
                                 this.edit_selected_region(|cue| {
-                                    cue.end = (cue.end - 0.1)
-                                        .max(cue.start + ZoomCue::MINIMUM_DURATION)
+                                    cue.end =
+                                        (cue.end - 0.1).max(cue.start + ZoomCue::MINIMUM_DURATION)
                                 });
                             },
                         ))
@@ -814,68 +1507,71 @@ impl Studio {
                             },
                         )),
                 )
-                .child(self.scene_toggle_row(
-                    "motion-tilt-toggle",
-                    "3D tilt while active",
-                    cue.tilt.is_some(),
-                    cx,
-                    |this| {
-                        this.edit_selected_region(|cue| {
-                            cue.tilt = if cue.tilt.is_some() {
-                                None
-                            } else {
-                                Some(crate::recording::viewport::Tilt {
-                                    x: 8.0,
-                                    y: -18.0,
-                                    z: 0.0,
-                                })
-                            };
-                        });
-                    },
-                ))
-                .when(has_pointer, |this| {
-                    this.child(Self::inspector_label("Target"))
-                        .child(self.segmented(
-                            "motion-target",
-                            &["Cursor", "Auto", "Pinned"],
-                            anchor_index,
-                            |this, index| {
+                .when(has_camera, |panel| {
+                    panel
+                        .child(self.scene_toggle_row(
+                            "motion-tilt-toggle",
+                            "3D tilt while active",
+                            cue.tilt.is_some(),
+                            cx,
+                            |this| {
                                 this.edit_selected_region(|cue| {
-                                    cue.anchor_mode = match index {
-                                        0 => ZoomAnchorMode::PointerAnchor,
-                                        1 => ZoomAnchorMode::SmartAnchor,
-                                        _ => ZoomAnchorMode::PinnedAnchor,
+                                    cue.tilt = if cue.tilt.is_some() {
+                                        None
+                                    } else {
+                                        Some(crate::recording::viewport::Tilt {
+                                            x: 8.0,
+                                            y: -18.0,
+                                            z: 0.0,
+                                        })
                                     };
                                 });
                             },
+                        ))
+                        .when(has_pointer, |this| {
+                            this.child(Self::inspector_label("Target"))
+                                .child(self.segmented(
+                                    "motion-target",
+                                    &["Cursor", "Auto", "Pinned"],
+                                    anchor_index,
+                                    |this, index| {
+                                        this.edit_selected_region(|cue| {
+                                            cue.anchor_mode = match index {
+                                                0 => ZoomAnchorMode::PointerAnchor,
+                                                1 => ZoomAnchorMode::SmartAnchor,
+                                                _ => ZoomAnchorMode::PinnedAnchor,
+                                            };
+                                        });
+                                    },
+                                    cx,
+                                ))
+                        })
+                        .child(Self::inspector_label("Canvas click sets"))
+                        .child(self.segmented(
+                            "motion-pick",
+                            &["Focus point", "Pan end"],
+                            pick_index,
+                            |this, index| {
+                                this.motion_pick = if index == 0 {
+                                    MotionPick::Focus
+                                } else {
+                                    MotionPick::PanEnd
+                                };
+                            },
                             cx,
                         ))
-                })
-                .child(Self::inspector_label("Canvas click sets"))
-                .child(self.segmented(
-                    "motion-pick",
-                    &["Focus point", "Pan end"],
-                    pick_index,
-                    |this, index| {
-                        this.motion_pick = if index == 0 {
-                            MotionPick::Focus
-                        } else {
-                            MotionPick::PanEnd
-                        };
-                    },
-                    cx,
-                ))
-                .child(div().text_xs().text_color(muted()).child(pick_hint))
-                .when(has_pan, |this| {
-                    this.child(self.small_button(
-                        "motion-clear-pan",
-                        "Remove pan",
-                        !edit_busy,
-                        cx,
-                        |this, _| {
-                            this.edit_selected_region(|cue| cue.pan_to = None);
-                        },
-                    ))
+                        .child(div().text_xs().text_color(muted()).child(pick_hint))
+                        .when(has_pan, |this| {
+                            this.child(self.small_button(
+                                "motion-clear-pan",
+                                "Remove pan",
+                                !edit_busy,
+                                cx,
+                                |this, _| {
+                                    this.edit_selected_region(|cue| cue.pan_to = None);
+                                },
+                            ))
+                        })
                 })
                 .child(
                     div()
@@ -894,41 +1590,6 @@ impl Studio {
                                     });
                                     cx.notify();
                                 })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            self.small_button("motion-deselect", "Deselect", true, cx, |this, _| {
-                                this.video_selected_zoom_cue = None;
-                            }),
-                        )
-                        .child(
-                            div()
-                                .id("motion-delete")
-                                .px_3()
-                                .h(px(30.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .bg(rgb(0xfee2e2))
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xb91c1c))
-                                .opacity(if edit_busy { 0.4 } else { 1.0 })
-                                .when(!edit_busy, |this| {
-                                    this.cursor_pointer()
-                                        .hover(|style| style.bg(rgb(0xfecaca)))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.delete_selected_video_zoom(cx);
-                                            cx.notify();
-                                        }))
-                                })
-                                .child("Delete region"),
                         ),
                 )
                 .child(div().h(px(1.0)).bg(line()))
@@ -1036,10 +1697,9 @@ impl Studio {
         self.video_undo_stack.clear();
         self.video_redo_stack.clear();
         self.motion_pick = MotionPick::Focus;
+        // Opening the editor must not apply a preset or recreate deleted regions.
         if self.video_zoom_cues.is_empty() {
-            let preset = self.animation_preset.unwrap_or(MotionPreset::SlowZoomIn);
-            self.video_zoom_cues = preset.cues(self.animation_duration);
-            self.animation_preset = Some(preset);
+            self.animation_preset = None;
         }
         self.rebuild_video_motion_timelines();
         cx.notify();
@@ -1057,40 +1717,119 @@ impl Studio {
         self.video_viewport_timeline = ViewportTimeline::default();
     }
 
-    pub(crate) fn set_animation_duration(&mut self, duration: f64) {
-        if !duration.is_finite() || duration < ZoomCue::MINIMUM_DURATION {
-            return;
-        }
-        let previous = self.animation_duration.max(f64::EPSILON);
-        self.animation_duration = duration;
-        if !self.animation_active {
+    pub(crate) fn begin_image_move(&mut self, x: Pixels) {
+        self.begin_image_timing_drag(x, None);
+    }
+
+    pub(crate) fn begin_image_trim(&mut self, x: Pixels, edge: ClipEdge) {
+        self.begin_image_timing_drag(x, Some(edge));
+    }
+
+    fn begin_image_timing_drag(&mut self, x: Pixels, edge: Option<ClipEdge>) {
+        if !self.animation_active || self.video_project.is_some() || self.export_progress.is_some()
+        {
             return;
         }
         self.pause_video_playback();
-        let factor = duration / previous;
-        let original = self.video_zoom_cues.clone();
-        for cue in &mut self.video_zoom_cues {
-            cue.start = (cue.start * factor).clamp(0.0, duration);
-            cue.end = (cue.end * factor).clamp(0.0, duration);
-            if cue.end - cue.start < ZoomCue::MINIMUM_DURATION {
-                cue.end = (cue.start + ZoomCue::MINIMUM_DURATION).min(duration);
-                cue.start = (cue.end - ZoomCue::MINIMUM_DURATION).max(0.0);
-            }
+        self.video_seek_drag = None;
+        self.video_selected_zoom_cue = None;
+        self.selected_annotation = None;
+        self.scene_selection = crate::scene_ui::SceneSelection::Scene;
+        self.video_selected_clip = self
+            .video_clip_timeline
+            .segments
+            .first()
+            .map(|clip| clip.id);
+        self.image_trim_drag = Some(ImageTrimDrag {
+            start_x: x,
+            original_start: self.animation_image_start,
+            original_end: self.animation_image_end,
+            edge,
+            seconds_per_pixel: self.video_duration
+                / (self.video_timeline_viewport_width() * self.video_timeline_zoom).max(1.0),
+            start: self.animation_image_start,
+            end: self.animation_image_end,
+        });
+    }
+
+    pub(crate) fn update_image_trim(&mut self, event: &MouseMoveEvent) -> bool {
+        let Some(drag) = self.image_trim_drag.as_mut() else {
+            return false;
+        };
+        if !event.dragging() {
+            return self.end_image_trim();
         }
-        if self.video_zoom_cues != original {
-            self.video_undo_stack
-                .push(VideoEditSnapshot::Zoom(original));
+        (drag.start, drag.end) = drag.range_at(event.position.x);
+        true
+    }
+
+    pub(crate) fn end_image_trim(&mut self) -> bool {
+        let Some(drag) = self.image_trim_drag.take() else {
+            return false;
+        };
+        if (drag.start - drag.original_start).abs() > 1e-9
+            || (drag.end - drag.original_end).abs() > 1e-9
+        {
+            self.video_undo_stack.push(VideoEditSnapshot::ImageTiming {
+                scene: self.animation_duration,
+                start: drag.original_start,
+                end: drag.original_end,
+            });
             self.video_redo_stack.clear();
+            self.restore_image_timing(self.animation_duration.max(drag.end), drag.start, drag.end);
         }
-        self.video_duration = duration;
-        self.video_source_duration = duration;
-        self.video_clip_timeline = RecordingClipTimeline::full(duration);
-        self.video_position = self.video_position.min(duration);
-        if self.has_walkthrough() {
-            self.rebuild_walkthrough();
-        } else {
-            self.rebuild_video_motion_timelines();
+        true
+    }
+
+    /// Trim boundaries affect only the image layer, not other scene content.
+    pub(crate) fn restore_image_timing(&mut self, scene: f64, start: f64, end: f64) {
+        self.pause_video_playback();
+        self.animation_duration = scene;
+        self.animation_image_start = start;
+        self.animation_image_end = end;
+        self.video_duration = scene;
+        self.video_source_duration = scene;
+        self.video_clip_timeline = RecordingClipTimeline::full(scene);
+        if self.video_selected_clip.is_some() {
+            self.video_selected_clip = self
+                .video_clip_timeline
+                .segments
+                .first()
+                .map(|clip| clip.id);
         }
+        self.video_position = self.video_position.min(scene);
+        self.video_timeline_scroll = 0.0;
+        self.rebuild_video_motion_timelines();
+    }
+
+    pub(crate) fn set_animation_duration(&mut self, duration: f64) {
+        if !duration.is_finite() || duration < MINIMUM_IMAGE_DURATION {
+            return;
+        }
+        if (duration - self.animation_duration).abs() < 1e-9 {
+            return;
+        }
+        if !self.animation_active {
+            self.animation_duration = duration;
+            return;
+        }
+        self.video_undo_stack.push(VideoEditSnapshot::ImageTiming {
+            scene: self.animation_duration,
+            start: self.animation_image_start,
+            end: self.animation_image_end,
+        });
+        self.video_redo_stack.clear();
+        self.restore_image_timing(
+            duration,
+            self.animation_image_start,
+            self.animation_image_end,
+        );
+    }
+
+    pub(crate) fn image_visible_at(&self, time: f64) -> bool {
+        !self.animation_active
+            || self.video_project.is_some()
+            || (time >= self.animation_image_start && time < self.animation_image_end)
     }
 
     pub(crate) fn apply_motion_preset(&mut self, preset: MotionPreset) {
@@ -1175,13 +1914,6 @@ impl Studio {
         if !self.animation_active || self.editing_text.is_some() || self.crop_active {
             return false;
         }
-        // A focused watermark field owns every key, including space.
-        if self.handle_annotation_time_key(event) {
-            return true;
-        }
-        if self.handle_watermark_key(event) {
-            return true;
-        }
         let keystroke = &event.keystroke;
         if (keystroke.modifiers.control || keystroke.modifiers.platform) && keystroke.key == "z" {
             if keystroke.modifiers.shift {
@@ -1247,7 +1979,8 @@ impl Studio {
         let mut svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><image href="{href}" x="0" y="0" width="{width}" height="{height}" preserveAspectRatio="none"/><g>"#
         );
-        svg.push_str(&self.annotations_svg(0.0, 0.0, width, height, stroke_scale));
+        let marks: Vec<_> = self.annotations.iter().filter(|mark| !mark.canvas).cloned().collect();
+        svg.push_str(&crate::annotations_svg(&marks, 0.0, 0.0, width, height, stroke_scale));
         svg.push_str("</g></svg>");
         let mut options = resvg::usvg::Options::default();
         options.fontdb = crate::recording::scene::shared_fontdb();
@@ -1308,6 +2041,8 @@ impl Studio {
         request.include_audio = !self.video_audio_muted;
         request.noise_reduction = self.video_noise_reduction;
         request.overlay = self.annotation_overlay_source();
+        request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(
+            self.annotations.clone(), self.selected_canvas_ratio() as f64);
         let source = SceneSource::Video {
             media: session.screen_path(),
             clips: self.video_clip_timeline.clone(),
@@ -1356,9 +2091,13 @@ impl Studio {
             self.video_viewport_timeline.clone(),
             self.video_duration,
         );
+        request.media_start = self.animation_image_start;
+        request.media_end = Some(self.animation_image_end);
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
         request.overlay = self.annotation_overlay_source();
+        request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(
+            self.annotations.clone(), self.selected_canvas_ratio() as f64);
         let mut source = SceneSource::Image {
             image,
             pointer: self.animation_pointer_timeline(),
@@ -1367,11 +2106,17 @@ impl Studio {
         // being edited; the rest follow back to back.
         if self.image_scenes.len() > 1 {
             self.store_current_scene();
-            let mut segments = self.image_scenes.iter().map(Self::image_segment);
+            let first_scene = &self.image_scenes[0];
+            let (width, height) = request.style.export_canvas_size(first_scene.dimensions.0, first_scene.dimensions.1, request.canvas_height);
+            let aspect = width as f64 / height as f64;
+            let mut segments = self.image_scenes.iter().map(|scene| self.image_segment(scene, aspect));
             let first = segments.next().expect("sequence has scenes");
             request.viewport = first.viewport;
             request.duration = first.duration;
             request.overlay = first.overlay;
+            request.canvas_overlay = first.canvas_overlay;
+            request.media_start = first.media_start;
+            request.media_end = first.media_end;
             source = SceneSource::Image {
                 image: first.image,
                 pointer: first.pointer,
@@ -1381,12 +2126,15 @@ impl Studio {
         self.prompt_and_run_scene_export(source, request, suggested_name, cx);
     }
 
-    fn image_segment(scene: &ImageScene) -> ImageSegment {
+    fn image_segment(&self, scene: &ImageScene, aspect: f64) -> ImageSegment {
         ImageSegment {
             image: (*scene.rgba).clone(),
             pointer: scene.pointer.clone(),
             viewport: scene.viewport.clone(),
             duration: scene.duration,
+            media_start: scene.image_start,
+            media_end: Some(scene.image_end),
+            canvas_overlay: crate::scene_ui::canvas_overlay_source_for(scene.annotations.clone(), aspect),
             overlay: crate::scene_ui::overlay_source_for(
                 scene.annotations.clone(),
                 scene.viewport.clone(),
@@ -1413,6 +2161,8 @@ impl Studio {
             annotations: self.annotations.clone(),
             zoom_cues: self.video_zoom_cues.clone(),
             duration: self.animation_duration,
+            image_start: self.animation_image_start,
+            image_end: self.animation_image_end,
             preset: self.animation_preset,
             pointer_capture: self.animation_pointer_capture.clone(),
             walkthrough_stops: self.walkthrough_stops.clone(),
@@ -1458,6 +2208,8 @@ impl Studio {
         self.crop_active = false;
         self.video_zoom_cues = scene.zoom_cues;
         self.animation_duration = scene.duration;
+        self.animation_image_start = scene.image_start;
+        self.animation_image_end = scene.image_end;
         self.animation_preset = scene.preset;
         self.animation_pointer_capture = scene.pointer_capture;
         self.walkthrough_stops = scene.walkthrough_stops;
@@ -1527,8 +2279,8 @@ impl Studio {
         self.pause_video_playback();
         self.store_current_scene();
         let duration = self.animation_duration;
-        let preset = self.animation_preset.unwrap_or(MotionPreset::SlowZoomIn);
-        let zoom_cues = preset.cues(duration);
+        // Each new image starts without motion; presets are applied explicitly.
+        let zoom_cues = Vec::new();
         let viewport = ViewportTimeline::build_static(&zoom_cues, duration);
         let dimensions = (image.width(), image.height());
         let rgba = Arc::new(image.clone());
@@ -1543,7 +2295,9 @@ impl Studio {
             annotations: Vec::new(),
             zoom_cues,
             duration,
-            preset: Some(preset),
+            image_start: 0.0,
+            image_end: duration,
+            preset: None,
             pointer_capture: Default::default(),
             walkthrough_stops: Vec::new(),
             viewport,

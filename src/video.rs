@@ -326,6 +326,11 @@ impl Studio {
             return;
         };
         match previous {
+            VideoEditSnapshot::ImageTiming { scene, start, end } => {
+                self.video_redo_stack.push(VideoEditSnapshot::ImageTiming { scene: self.animation_duration, start: self.animation_image_start, end: self.animation_image_end });
+                self.restore_image_timing(scene, start, end);
+                cx.notify();
+            }
             VideoEditSnapshot::Clips(timeline) => {
                 self.video_redo_stack
                     .push(VideoEditSnapshot::Clips(self.video_clip_timeline.clone()));
@@ -348,6 +353,11 @@ impl Studio {
             return;
         };
         match next {
+            VideoEditSnapshot::ImageTiming { scene, start, end } => {
+                self.video_undo_stack.push(VideoEditSnapshot::ImageTiming { scene: self.animation_duration, start: self.animation_image_start, end: self.animation_image_end });
+                self.restore_image_timing(scene, start, end);
+                cx.notify();
+            }
             VideoEditSnapshot::Clips(timeline) => {
                 self.video_undo_stack
                     .push(VideoEditSnapshot::Clips(self.video_clip_timeline.clone()));

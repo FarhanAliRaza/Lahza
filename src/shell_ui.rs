@@ -309,7 +309,7 @@ impl Studio {
         } else {
             self.annotation_lane_height() + 4.0
         };
-        camera + annotations
+        camera + annotations + (self.motion_lane_height() - 30.0)
     }
 
     fn timeline_bar_height(&self) -> f32 {
@@ -713,7 +713,7 @@ impl Studio {
 
     /// The tab the inspector shows: a selection on the canvas or timeline
     /// pulls its own tab forward until it is done.
-    fn effective_tab(&self) -> InspectorTab {
+    pub(crate) fn effective_tab(&self) -> InspectorTab {
         let mode = self.editor_mode();
         let tab = if mode != EditorMode::Static
             && (self.video_selected_zoom_cue.is_some() || self.walkthrough_mode)
@@ -1024,6 +1024,41 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_3()
+            .when(selected.is_some() || self.tool != Tool::Select, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(selected.is_some(), |this| {
+                            this.child(self.selection_action_button(
+                                "annotation-delete",
+                                true,
+                                true,
+                                cx,
+                                |this, _| {
+                                    if let Some(index) = this.selected_annotation.take() {
+                                        if index < this.annotations.len() {
+                                            this.record_annotation_undo();
+                                            this.annotations.remove(index);
+                                        }
+                                    }
+                                },
+                            ))
+                        })
+                        .child(self.selection_action_button(
+                            "annotation-done",
+                            false,
+                            true,
+                            cx,
+                            |this, _| {
+                                this.stop_editing_text();
+                                this.selected_annotation = None;
+                                this.tool = Tool::Select;
+                            },
+                        )),
+                )
+            })
             .child(self.video_annotate_section(cx))
             .when(selected.is_none() && self.tool == Tool::Select, |this| {
                 this.when(!self.annotations.is_empty(), |this| {
@@ -1061,41 +1096,6 @@ impl Studio {
                 .child(self.annotation_style_controls(cx))
             })
             .when_some(timing, |this, panel| this.child(panel))
-            .when(selected.is_some() || self.tool != Tool::Select, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .when(selected.is_some(), |this| {
-                            this.child(self.small_button(
-                                "annotation-delete",
-                                "Delete mark",
-                                true,
-                                cx,
-                                |this, _| {
-                                    if let Some(index) = this.selected_annotation.take() {
-                                        if index < this.annotations.len() {
-                                            this.record_annotation_undo();
-                                            this.annotations.remove(index);
-                                        }
-                                    }
-                                },
-                            ))
-                        })
-                        .child(self.small_button(
-                            "annotation-done",
-                            "Deselect",
-                            true,
-                            cx,
-                            |this, _| {
-                                this.stop_editing_text();
-                                this.selected_annotation = None;
-                                this.tool = Tool::Select;
-                            },
-                        )),
-                )
-            })
             .into_any_element()
     }
 
@@ -1106,12 +1106,12 @@ impl Studio {
             .iter()
             .position(|value| (*value - self.animation_duration).abs() < 1e-9)
             .unwrap_or(usize::MAX);
-        let selected_preset = self.animation_preset;
+        let selected_preset = self.animation_preset.filter(|_| !self.video_zoom_cues.is_empty());
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(Self::tab_label("Duration"))
+            .child(Self::tab_label("Scene duration"))
             .child(self.segmented(
                 "animation-duration",
                 &["3 s", "5 s", "8 s", "10 s"],
@@ -1119,12 +1119,25 @@ impl Studio {
                 |this, index| this.set_animation_duration(ANIMATION_DURATIONS[index]),
                 cx,
             ))
+            .child(div().text_xs().text_color(muted()).child(format!(
+                "Image: {:.2}s – {:.2}s · Drag either edge to trim.",
+                self.image_trim_drag.map(|drag| drag.start).unwrap_or(self.animation_image_start),
+                self.image_trim_drag.map(|drag| drag.end).unwrap_or(self.animation_image_end))))
+            .child(div().flex().items_center().justify_between()
+                .child(div().text_xs().child(format!("Scene length: {:.2}s", self.animation_duration)))
+                .child(self.small_button("extend-scene", "+ 5 seconds", true, cx, |this, _| {
+                    this.set_animation_duration(this.animation_duration + 5.0);
+                })))
             .child(Self::tab_label("Motion preset"))
             .child(
                 div().text_xs().text_color(muted()).child(
                     selected_preset
                         .map(|preset| preset.label())
-                        .unwrap_or("Custom motion"),
+                        .unwrap_or(if self.video_zoom_cues.is_empty() {
+                            "No motion applied"
+                        } else {
+                            "Custom motion"
+                        }),
                 ),
             )
             .child(
@@ -1545,6 +1558,9 @@ impl Studio {
                     })
                     .child("+ Motion"),
             )
+            .child(self.small_button("timeline-extend-scene", "+ 5s", !busy, cx, |this, _| {
+                this.set_animation_duration(this.animation_duration + 5.0);
+            }))
             .child(
                 div()
                     .id("timeline-delete-motion")
@@ -1727,20 +1743,41 @@ impl Studio {
         } else {
             // An animated screenshot is one still per scene; the lane shows
             // the scene that is open.
+            let image_start = self.image_trim_drag.map(|drag| drag.start).unwrap_or(self.animation_image_start);
+            let image_end = self.image_trim_drag.map(|drag| drag.end).unwrap_or(self.animation_image_end).min(self.video_duration);
+            let image_duration = (image_end - image_start).max(0.0);
             let label = if self.image_scenes.len() > 1 {
                 format!(
-                    "Scene {} · {:.1}s",
+                    "Scene {} · {:.2}s",
                     self.image_scene_index + 1,
-                    self.video_duration
+                    image_duration
                 )
             } else {
-                format!("Image · {:.1}s", self.video_duration)
+                format!("Image · {:.2}s", image_duration)
             };
             vec![div()
+                .id("image-timeline-clip")
+                .cursor(CursorStyle::ClosedHand)
+                .absolute()
+                .left(px((timeline_content_width * image_start / timeline_duration) as f32))
+                .overflow_hidden()
                 .h_full()
-                .w(px(timeline_content_width as f32))
+                .w(px((timeline_content_width * image_duration / timeline_duration).max(32.0) as f32))
                 .flex_none()
                 .rounded_md()
+                .border_2()
+                .border_color(if self.video_selected_clip.is_some() { ink() } else { hsla(0.0, 0.0, 0.0, 0.0) })
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.focus_handle.focus(window);
+                    this.timeline_seek_down(event);
+                    this.begin_image_move(event.position.x);
+                    this.video_selected_zoom_cue = None;
+                    this.selected_annotation = None;
+                    this.scene_selection = SceneSelection::Scene;
+                    this.video_selected_clip = this.video_clip_timeline.segments.first().map(|clip| clip.id);
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
                 .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
                 .flex()
                 .items_center()
@@ -1755,6 +1792,32 @@ impl Studio {
                         .bg(hsla(0.0, 0.0, 0.0, 0.35))
                         .child(label),
                 )
+                .child(div()
+                    .id("image-trim-start")
+                    .absolute().left_0().top_0().h_full().w(px(14.0))
+                    .flex().items_center().justify_center()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .bg(hsla(0.0, 0.0, 0.0, 0.12))
+                    .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
+                    .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.begin_image_trim(event.position.x, ClipEdge::Leading);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })))
+                .child(div()
+                    .id("image-trim-end")
+                    .absolute().right_0().top_0().h_full().w(px(14.0))
+                    .flex().items_center().justify_center()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .bg(hsla(0.0, 0.0, 0.0, 0.12))
+                    .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
+                    .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.begin_image_trim(event.position.x, ClipEdge::Trailing);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })))
                 .into_any_element()]
         };
         let motion_track = self.motion_track(timeline_scroll, timeline_content_width, progress, cx);
@@ -1921,7 +1984,7 @@ impl Studio {
                                         if is_video { "Video" } else { "Image" },
                                         34.0,
                                     ))
-                                    .child(Self::track_label("Motion", 30.0))
+                                    .child(Self::track_label("Motion", self.motion_lane_height()))
                                     .when(annotation_track.is_some(), |this| {
                                         this.child(Self::track_label(
                                             "Annotations",

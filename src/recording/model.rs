@@ -759,6 +759,15 @@ mod tests {
             pan_to: None,
             easing: Default::default(),
             tilt: None,
+            transform: Some(super::super::viewport::TransformMotion {
+                end: super::super::scene::SceneTransform {
+                    scale: 1.3,
+                    position_x: 0.2,
+                    rotation_z: 15.0,
+                    ..super::super::scene::SceneTransform::IDENTITY
+                },
+                ..Default::default()
+            }),
         };
 
         session

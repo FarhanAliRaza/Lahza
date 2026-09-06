@@ -5,7 +5,7 @@ use super::{
     CURATED_WALLPAPERS, GRADIENT_BACKGROUNDS, SOLID_BACKGROUNDS,
 };
 use gpui::{
-    div, hsla, img, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight,
+    div, hsla, img, prelude::*, px, rgb, svg, AnyElement, Context, FontWeight,
     IntoElement, MouseButton, MouseDownEvent, ObjectFit,
 };
 
@@ -357,50 +357,8 @@ impl Studio {
             )
     }
 
-    pub(super) fn annotation_text_field(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let editing = self.editing_text == Some(index);
-        let text = self
-            .annotations
-            .get(index)
-            .map(|mark| mark.text.clone())
-            .unwrap_or_default();
-        let empty = text.is_empty();
-        div()
-            .id("annotation-text-field")
-            .w_full()
-            .h(px(32.0))
-            .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(if editing {
-                rgb(0x2997ff)
-            } else {
-                rgb(0xd9d9dc)
-            })
-            .bg(rgb(0xffffff))
-            .flex()
-            .items_center()
-            .text_sm()
-            .text_color(if empty && !editing { muted() } else { ink() })
-            .cursor(CursorStyle::IBeam)
-            .child(if editing {
-                format!("{text}{}", if self.caret_visible { "|" } else { " " })
-            } else if empty {
-                "Click to type".to_string()
-            } else {
-                text
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if index < this.annotations.len() {
-                    this.record_annotation_undo();
-                    this.selected_annotation = Some(index);
-                    this.editing_text = Some(index);
-                    this.caret_visible = true;
-                    this.tool = Tool::Select;
-                }
-                cx.notify();
-            }))
-            .into_any_element()
+    pub(super) fn annotation_text_field(&self, _index: usize, _cx: &mut Context<Self>) -> AnyElement {
+        self.text_fields.annotation.clone().into_any_element()
     }
 
     pub(super) fn annotation_style_controls(&self, cx: &mut Context<Self>) -> gpui::Div {

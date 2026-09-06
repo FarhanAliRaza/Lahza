@@ -110,6 +110,8 @@ pub(crate) struct AnnotationMark {
     /// Anchored to the visible frame instead of the media, so camera motion
     /// pans beneath it (captions, step numbers).
     pub(crate) pinned: bool,
+    /// Positioned on the scene canvas, independent of media placement and lifetime.
+    pub(crate) canvas: bool,
 }
 
 impl Default for AnnotationMark {
@@ -134,6 +136,7 @@ impl Default for AnnotationMark {
             opacity: 1.0,
             from_template: false,
             pinned: false,
+            canvas: false,
         }
     }
 }
@@ -152,6 +155,8 @@ pub(crate) struct ImageScene {
     pub(crate) annotations: Vec<AnnotationMark>,
     pub(crate) zoom_cues: Vec<ZoomCue>,
     pub(crate) duration: f64,
+    pub(crate) image_start: f64,
+    pub(crate) image_end: f64,
     pub(crate) preset: Option<MotionPreset>,
     pub(crate) pointer_capture: PointerCaptureFile,
     pub(crate) walkthrough_stops: Vec<recording::model::NormalizedPoint>,
@@ -276,6 +281,7 @@ pub(crate) struct VideoZoomDrag {
 
 #[derive(Clone, Debug)]
 pub(crate) enum VideoEditSnapshot {
+    ImageTiming { scene: f64, start: f64, end: f64 },
     Clips(RecordingClipTimeline),
     Zoom(Vec<ZoomCue>),
 }

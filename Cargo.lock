@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "lahza"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "ashpd 0.12.3",
  "async-io",
@@ -3109,6 +3109,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "unicode-segmentation",
  "uuid",
 ]
 
