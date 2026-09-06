@@ -20,8 +20,10 @@ mkdir -p dist
 cp "$build_dir"/lahza_*.snap dist/
 ```
 
-The recipe pins Rust 1.96.0. Snapcraft's managed build environment installs the
-compiler and the GNOME SDK automatically.
+The recipe pins Rust 1.96.0. A build-only `rust-deps` part installs upstream
+rustup directly in the managed environment, avoiding nested rustup Snap
+execution failures in CI. Snapcraft installs the compiler and GNOME SDK
+automatically; the toolchain is not included in the final package.
 
 Docker builds need extra preparation: Canonical's `8_core24` image currently
 lacks the desktop command-chain files, Rust, and the GNOME SDK. Those resources,
