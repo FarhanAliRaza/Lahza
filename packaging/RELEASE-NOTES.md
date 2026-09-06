@@ -1,4 +1,4 @@
-## Lahza v0.4.4
+## Lahza v0.4.5
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
@@ -31,19 +31,19 @@ sudo snap install lahza
 
 The stable channel receives this version after the release workflow and Store review succeed. Microphone capture and webcam access require `sudo snap connect lahza:audio-record` and `sudo snap connect lahza:camera` respectively.
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.4_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.5_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_0.4.4_amd64.deb
+sudo apt install ./lahza_0.4.5_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
 
-**Binary bundle:** download `lahza-0.4.4-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.4.5-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.4.4-linux-x86_64.tar.gz
-cd lahza-0.4.4-linux-x86_64
+tar -xzf lahza-0.4.5-linux-x86_64.tar.gz
+cd lahza-0.4.5-linux-x86_64
 ./install.sh
 ```
 

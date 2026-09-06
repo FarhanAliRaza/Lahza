@@ -111,7 +111,7 @@ Use `snap info lahza` to compare the installed version with the Store channels. 
 Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
 
 ```bash
-sudo apt install ./lahza_0.4.4_amd64.deb
+sudo apt install ./lahza_0.4.5_amd64.deb
 ```
 
 Launch **Lahza** from your application menu, or run `lahza`.
@@ -152,11 +152,11 @@ the Store credential using the [Snap release setup](packaging/SNAP.md#github-act
 
 ### Binary bundle — alternative
 
-Each release also includes `lahza-0.4.4-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
+Each release also includes `lahza-0.4.5-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
 
 ```bash
-tar -xzf lahza-0.4.4-linux-x86_64.tar.gz
-cd lahza-0.4.4-linux-x86_64
+tar -xzf lahza-0.4.5-linux-x86_64.tar.gz
+cd lahza-0.4.5-linux-x86_64
 ./install.sh
 ```
 
