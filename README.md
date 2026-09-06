@@ -1,12 +1,13 @@
 <div align="center">
   <img src="Lahza.png" alt="Lahza" width="128">
-  <h1>Lahza · لمحہ</h1>
+  <h1>Lahza · لحظہ</h1>
+  <p><em>Lahza</em> is Urdu for "a brief moment".</p>
   <p>A native Linux studio for screenshots, screen recordings, and motion.</p>
   <p>Capture a moment. Annotate it, style it, and turn it into something worth sharing.</p>
   <p><a href="https://snapcraft.io/lahza">Install from Snap Store</a> · <a href="https://github.com/FarhanAliRaza/lahza/releases">Other downloads</a> · <a href="https://github.com/FarhanAliRaza/lahza/issues">Report a bug</a> · <a href="#build-from-source">Build from source</a></p>
 </div>
 
-Lahza means **moment** in Urdu. Built with Rust and GPUI, it brings screenshot annotation, native screen recording, timeline editing, and animated presentations into one Linux desktop application.
+Built with Rust and GPUI, Lahza brings screenshot annotation, native screen recording, timeline editing, and animated presentations into one Linux desktop application.
 
 ## Features
 
