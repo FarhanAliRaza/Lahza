@@ -3,7 +3,7 @@
   <h1>Lahza · لمحہ</h1>
   <p>A native Linux studio for screenshots, screen recordings, and motion.</p>
   <p>Capture a moment. Annotate it, style it, and turn it into something worth sharing.</p>
-  <p><a href="https://github.com/FarhanAliRaza/lahza/releases">Downloads</a> · <a href="https://github.com/FarhanAliRaza/lahza/issues">Report a bug</a> · <a href="#build-from-source">Build from source</a></p>
+  <p><a href="https://snapcraft.io/lahza">Install from Snap Store</a> · <a href="https://github.com/FarhanAliRaza/lahza/releases">Other downloads</a> · <a href="https://github.com/FarhanAliRaza/lahza/issues">Report a bug</a> · <a href="#build-from-source">Build from source</a></p>
 </div>
 
 Lahza means **moment** in Urdu. Built with Rust and GPUI, it brings screenshot annotation, native screen recording, timeline editing, and animated presentations into one Linux desktop application.
@@ -70,7 +70,43 @@ Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social s
 
 ## Install
 
-### Debian / Ubuntu package
+### Snap — recommended
+
+Install [Lahza from the Snap Store](https://snapcraft.io/lahza) on amd64 Linux with [snapd installed](https://snapcraft.io/docs/installing-snapd):
+
+```bash
+sudo snap install lahza
+```
+
+Launch **Lahza** from your application menu, or run:
+
+```bash
+snap run lahza
+```
+
+The Snap bundles its desktop and media dependencies and receives automatic updates through snapd. To check for an update manually, close Lahza and run:
+
+```bash
+sudo snap refresh lahza
+```
+
+For microphone and system-audio capture, connect the recording permission:
+
+```bash
+sudo snap connect lahza:audio-record
+```
+
+To save files on removable drives, also run `sudo snap connect lahza:removable-media`.
+
+**Previously installed a local test `.snap`?** Switch it to the Store version once to enable normal updates:
+
+```bash
+sudo snap refresh lahza --amend --channel=stable
+```
+
+Use `snap info lahza` to compare the installed version with the Store channels. If you also have a Debian or source installation, `snap run lahza` explicitly launches the Snap.
+
+### Debian / Ubuntu package — alternative
 
 Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
 
@@ -107,14 +143,14 @@ The `_apt` “unsandboxed as root” notice for an unreadable Downloads director
 
 For maintainers: update and commit the release notes on `master`, then run `just release` to bump the patch version and push a release tag. Pass a version such as `0.5.0` to choose it explicitly, or use `just release-check` to preview. See [release instructions](packaging/SNAP.md#cut-a-release). The release workflow validates the tag and publishes the `.deb` and `SHA256SUMS` consumed by the updater. Do not replace old release assets with changed builds under the same version.
 
-Release packages are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; build from source if the package's dependencies are unavailable. Before the first release is published, development packages are available as artifacts in successful [build workflow runs](https://github.com/FarhanAliRaza/lahza/actions/workflows/linux-deb.yml).
+Debian packages and binary bundles are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; use the Snap or build from source if the package's dependencies are unavailable.
 
 The release workflow also builds and tests a `core24` Snap. Matching version
 tags publish it to the Snap Store after both package jobs pass (stable versions
 to `stable`, prerelease versions to `beta`). Maintainers must first configure
 the Store credential using the [Snap release setup](packaging/SNAP.md#github-actions-releases).
 
-### Binary bundle
+### Binary bundle — alternative
 
 Each release also includes `lahza-0.4.4-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
 
@@ -130,7 +166,7 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 
 - A Linux desktop with Vulkan support. Wayland and X11 backends are compiled in.
 - `xdg-desktop-portal` and the appropriate portal backend for your desktop.
-- PipeWire and GStreamer for recording; FFmpeg/FFprobe for preview and video export.
+- PipeWire for desktop capture. The Snap bundles GStreamer, FFmpeg, and FFprobe; Debian and source installations use system media libraries and tools.
 - Desktop support for the screenshot and screencast portals. Picker options depend on your desktop.
 
 
