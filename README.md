@@ -109,6 +109,11 @@ For maintainers: increment the version in `Cargo.toml` and regenerate `Cargo.loc
 
 Release packages are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; build from source if the package's dependencies are unavailable. Before the first release is published, development packages are available as artifacts in successful [build workflow runs](https://github.com/FarhanAliRaza/lahza/actions/workflows/linux-deb.yml).
 
+The release workflow also builds and tests a `core24` Snap. Matching version
+tags publish it to the Snap Store after both package jobs pass (stable versions
+to `stable`, prerelease versions to `beta`). Maintainers must first configure
+the Store credential using the [Snap release setup](packaging/SNAP.md#github-actions-releases).
+
 ### Binary bundle
 
 Each release also includes `lahza-0.4.2-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:

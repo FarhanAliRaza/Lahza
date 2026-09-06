@@ -148,3 +148,124 @@ jobs:
           fail_on_unmatched_files: true
           body_path: packaging/RELEASE-NOTES.md
           generate_release_notes: true
+
+  build-snap:
+    name: Build and test Snap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      file: ${{ steps.metadata.outputs.file }}
+      channel: ${{ steps.metadata.outputs.channel }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Validate release version
+        id: metadata
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as source:
+              version = tomllib.load(source)["package"]["version"]
+          ref = os.environ["GITHUB_REF"]
+          if ref.startswith("refs/tags/") and ref != f"refs/tags/v{version}":
+              raise SystemExit(f"Release tag must match Cargo.toml version {version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"version={version}", file=output)
+              print(f"file=lahza_{version}_amd64.snap", file=output)
+              print(f"channel={'beta' if '-' in version else 'stable'}", file=output)
+          PY
+
+      - name: Build Snap in managed Ubuntu 24.04 environment
+        id: snapcraft
+        uses: canonical/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1
+        with:
+          snapcraft-channel: 8.x/stable
+
+      - name: Collect Snap and checksum
+        id: package
+        env:
+          BUILT_SNAP: ${{ steps.snapcraft.outputs.snap }}
+          SNAP_FILE: ${{ steps.metadata.outputs.file }}
+        run: |
+          test "$(basename "$BUILT_SNAP")" = "$SNAP_FILE"
+          mkdir -p dist
+          cp "$BUILT_SNAP" "dist/$SNAP_FILE"
+          cd dist
+          sha256sum "$SNAP_FILE" > SNAP-SHA256SUMS
+
+      - name: Install and test confined Snap
+        env:
+          SNAP_FILE: ${{ steps.metadata.outputs.file }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          sudo snap install --dangerous "dist/$SNAP_FILE"
+          snap connections lahza
+          test "$(snap run lahza --version)" = "Lahza $VERSION"
+          snap run --shell lahza -c 'exec "$SNAP/snap/command-chain/gpu-2404-wrapper" "$SNAP/snap/command-chain/desktop-launch" bash -s' \
+            < packaging/snap-smoke-test.sh | tee dist/snap-smoke-test.log
+
+      - name: Upload Snap and test log
+        if: always() && steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lahza-snap-amd64
+          path: |
+            dist/*.snap
+            dist/SNAP-SHA256SUMS
+            dist/snap-smoke-test.log
+          if-no-files-found: error
+
+  publish-snap:
+    name: Publish tested Snap
+    needs: [build-deb, build-snap]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: snap-publish-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Download tested Snap
+        uses: actions/download-artifact@v4
+        with:
+          name: lahza-snap-amd64
+          path: dist
+
+      - name: Verify artifact checksum
+        working-directory: dist
+        run: sha256sum -c SNAP-SHA256SUMS
+
+      - name: Attach Snap to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" dist/*.snap dist/SNAP-SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Check Snap Store credential
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [[ -z "$SNAPCRAFT_STORE_CREDENTIALS" ]]; then
+            echo "::error::Set the SNAPCRAFT_STORE_CREDENTIALS repository secret. See packaging/SNAP.md."
+            exit 1
+          fi
+
+      - name: Install Snapcraft
+        run: sudo snap install snapcraft --classic --channel=8.x/stable
+
+      - name: Publish to Snap Store
+        uses: canonical/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: dist/${{ needs.build-snap.outputs.file }}
+          release: ${{ needs.build-snap.outputs.channel }}

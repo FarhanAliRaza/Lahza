@@ -1,4 +1,9 @@
 /target/
+/parts/
+/stage/
+/prime/
+/dist/
+/*.snap
 *.log
 
 # Local clone of the macOS reference app (github.com/fayazara/Screendrop)
