@@ -864,7 +864,7 @@ impl Studio {
             .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
             .child(self.segmented(
                 "aspect-ratio",
-                &["Auto", "1:1", "4:3", "3:2", "16:9"],
+                &["Auto", "1:1", "4:3", "3:2", "16:9", "9:16"],
                 self.aspect_ratio,
                 |this, value| this.aspect_ratio = value,
                 cx,

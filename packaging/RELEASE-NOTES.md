@@ -1,12 +1,12 @@
-## Lahza v0.4.5
+## Lahza v0.4.6
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
 ### Changed in this release
 
-- Added eight shadow colors across Soft, Long, Glow, and Crisp styles, with matching preview and export rendering.
-- Saved presets and projects now retain the shadow color; older projects keep their original black shadows.
-- Fixed dragging the Shadow Amount control after its label changed. Sliders now use stable targets independent of their display labels.
+- Fixed recording startup with the Snap's older PipeWire plugin by using GStreamer's pipeline clock API instead of the unsupported `provide-clock` property.
+- Fixed thin dark edges in composed previews caused by rounding the canvas image dimensions, including the 4:3 layout.
+- Added a 9:16 canvas preset for Shorts and other portrait layouts, with portrait export support.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
@@ -31,19 +31,19 @@ sudo snap install lahza
 
 The stable channel receives this version after the release workflow and Store review succeed. Microphone capture and webcam access require `sudo snap connect lahza:audio-record` and `sudo snap connect lahza:camera` respectively.
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.5_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.6_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_0.4.5_amd64.deb
+sudo apt install ./lahza_0.4.6_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
 
-**Binary bundle:** download `lahza-0.4.5-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.4.6-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.4.5-linux-x86_64.tar.gz
-cd lahza-0.4.5-linux-x86_64
+tar -xzf lahza-0.4.6-linux-x86_64.tar.gz
+cd lahza-0.4.6-linux-x86_64
 ./install.sh
 ```
 

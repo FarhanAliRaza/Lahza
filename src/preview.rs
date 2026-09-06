@@ -429,7 +429,14 @@ impl Studio {
                 },
             )
             .when_some(composited, |this, image| {
-                this.child(img(image).absolute().inset_0().size_full())
+                // Match the canvas exactly even when the raster size was rounded.
+                this.child(
+                    img(image)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Fill),
+                )
             })
             .child(
                 canvas(

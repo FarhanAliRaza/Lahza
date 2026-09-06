@@ -725,7 +725,7 @@ impl SegmentPipeline {
     }
 }
 
-fn spawn_segment(
+fn build_segment_pipeline(
     output: &Path,
     index: usize,
     portal_fd: i32,
@@ -733,14 +733,14 @@ fn spawn_segment(
     options: &RecordingOptions,
     camera_device: Option<&str>,
     camera_frames: Option<&Arc<CameraFrames>>,
-) -> Result<SegmentPipeline, String> {
+) -> Result<gst::Pipeline, String> {
     let path = segment_path(output, index);
     let _ = fs::remove_file(&path);
     gst::init().map_err(|error| format!("could not initialize GStreamer: {error}"))?;
     let mut description = format!(
         "matroskamux name=mux ! filesink location=\"{}\" \
          pipewiresrc name=screen_source fd={} path={} always-copy=true \
-         provide-clock=false keepalive-time=1000 ! videoconvert ! \
+         keepalive-time=1000 ! videoconvert ! \
          queue max-size-buffers=4 leaky=downstream ! \
          vp8enc deadline=1 cpu-used=8 threads=4 target-bitrate=12000000 \
          keyframe-max-dist=60 ! queue ! mux. ",
@@ -808,6 +808,24 @@ fn spawn_segment(
         .map_err(|error| format!("could not build GStreamer pipeline: {error}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "GStreamer did not create a pipeline".to_string())?;
+    // Keep capture timestamps on a steady clock without relying on the
+    // pipewiresrc `provide-clock` property, absent in the core24 Snap runtime.
+    pipeline.use_clock(Some(&gst::SystemClock::obtain()));
+    Ok(pipeline)
+}
+
+fn spawn_segment(
+    output: &Path,
+    index: usize,
+    portal_fd: i32,
+    node: u32,
+    options: &RecordingOptions,
+    camera_device: Option<&str>,
+    camera_frames: Option<&Arc<CameraFrames>>,
+) -> Result<SegmentPipeline, String> {
+    let pipeline = build_segment_pipeline(
+        output, index, portal_fd, node, options, camera_device, camera_frames,
+    )?;
     if let Some(frames) = camera_frames.filter(|_| camera_device.is_some()) {
         attach_preview(&pipeline, "recording_camera_preview", frames.clone())?;
     }
@@ -940,6 +958,29 @@ fn finalize_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_pipeline_builds_with_installed_pipewire_plugin() {
+        let root = std::env::temp_dir().join(format!("lahza-pipeline-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("screen.mkv");
+        for (microphone, system_audio) in [(false, false), (true, false), (false, true), (true, true)] {
+            let options = RecordingOptions {
+                microphone,
+                system_audio,
+                microphone_device: None,
+                camera: false,
+                camera_device: None,
+            };
+            // Build the real recording pipeline without opening the portal or
+            // starting capture. Also run against the Snap's older plugin.
+            let pipeline = build_segment_pipeline(&output, 0, -1, 0, &options, None, None)
+                .expect("recording pipeline must support the installed PipeWire plugin");
+            assert_eq!(pipeline.pipeline_clock(), gst::SystemClock::obtain());
+            assert!(pipeline.by_name("screen_source").is_some());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn segment_names_are_stable_and_stay_in_the_project() {

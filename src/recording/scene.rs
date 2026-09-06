@@ -2554,6 +2554,12 @@ mod tests {
             ..SceneStyle::default()
         };
         assert_eq!(style.export_canvas_size(1000, 1000, 1080), (1920, 1080));
+        let portrait = SceneStyle {
+            aspect: Some(9.0 / 16.0),
+            ..SceneStyle::default()
+        };
+        assert_eq!(portrait.export_canvas_size(1920, 1080, 1920), (1080, 1920));
+        assert_eq!(portrait.export_canvas_size(1920, 1080, 1080), (608, 1080));
         let auto = SceneStyle {
             aspect: None,
             ..SceneStyle::default()

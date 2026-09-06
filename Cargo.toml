@@ -1,6 +1,6 @@
 [package]
 name = "lahza"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 license = "MIT"
 description = "Lahza: a Linux-first screenshot and recording studio built with Rust and GPUI"

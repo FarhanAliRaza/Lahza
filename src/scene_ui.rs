@@ -6,7 +6,7 @@
 use gpui::{
     canvas, div, hsla, img, point, prelude::*, px, quad, rgb, size, AnyElement, Bounds,
     ContentMask, Context, CursorStyle, FontWeight, Hsla, KeyDownEvent, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage,
     ScrollDelta, ScrollWheelEvent, Window,
 };
 use image::RgbaImage;
@@ -1429,7 +1429,15 @@ impl Studio {
             .shadow_lg()
             .bg(rgb(0x111214))
             .when_some(image, |this, image| {
-                this.child(img(image).absolute().inset_0().size_full())
+                // The compositor already fits the scene. Fill the fractional
+                // layout bounds so integer raster rounding cannot add bars.
+                this.child(
+                    img(image)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Fill),
+                )
             })
             .child(
                 canvas(
