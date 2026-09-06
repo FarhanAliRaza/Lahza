@@ -105,7 +105,7 @@ A source or bundle install in `~/.local/bin/lahza` can take precedence over `/us
 
 The `_apt` “unsandboxed as root” notice for an unreadable Downloads directory does not mean installation failed. The updater uses an APT-readable temporary download directory. Installing a package system-wide requires `sudo`; repeating the same version does not fetch a newer GitHub release.
 
-For maintainers: increment the version in `Cargo.toml` and regenerate `Cargo.lock` for each release, then publish a matching `vX.Y.Z` tag. The release workflow validates the tag and publishes the `.deb` and `SHA256SUMS` consumed by the updater. Do not replace old release assets with changed builds under the same version.
+For maintainers: update and commit the release notes on `master`, then run `python3 packaging/release.py` to bump the patch version and push a release tag. Pass a version such as `0.5.0` to choose it explicitly, or use `--dry-run` to preview. See [release instructions](packaging/SNAP.md#cut-a-release). The release workflow validates the tag and publishes the `.deb` and `SHA256SUMS` consumed by the updater. Do not replace old release assets with changed builds under the same version.
 
 Release packages are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; build from source if the package's dependencies are unavailable. Before the first release is published, development packages are available as artifacts in successful [build workflow runs](https://github.com/FarhanAliRaza/lahza/actions/workflows/linux-deb.yml).
 

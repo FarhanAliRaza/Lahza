@@ -114,15 +114,33 @@ the upload action reports that result in the job log.
 
 ### Cut a release
 
-After merging the workflow and completing authorization, update `Cargo.toml`
-and `Cargo.lock`, commit the release changes, and push a matching tag:
+On `master`, update `packaging/RELEASE-NOTES.md` for the upcoming release and
+commit your changes. Then run from the repository root (Python 3.11+ and Git):
 
 ```bash
-# Example for the next stable release, after updating both version files:
-git push origin master
-git tag v0.4.3
-git push origin v0.4.3
+# Preview the next patch release without changing files or pushing:
+python3 packaging/release.py --dry-run
+
+# Bump the patch version, commit, and push master plus the new tag:
+python3 packaging/release.py
+
+# Or choose an explicit version (prereleases publish to beta):
+python3 packaging/release.py 0.5.0-rc.1
 ```
+
+The script updates the Lahza version in `Cargo.toml` and `Cargo.lock`, plus
+versioned download examples and the release-notes heading. It preserves your
+hand-written release notes. It requires a clean working tree on `master`,
+fetches remote history and tags, and rejects downgrades, duplicate tags, and a
+branch that is behind or diverged from `origin/master`. Local commits ahead
+of the remote are included in the push.
+
+The release commit and annotated tag are pushed atomically, so a rejected
+push cannot publish only one of them. If pushing fails, the local commit and
+tag remain available; the script prints the command to retry. `--dry-run`
+fetches remote refs for validation but does not change files, create commits
+or tags, or push. GitHub Actions runs the package builds and tests before
+Snap publication.
 
 No manual Snap build or Store upload is needed for subsequent releases.
 CI checks use synthetic media; real source-picker and device capture checks
