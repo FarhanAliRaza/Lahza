@@ -42,13 +42,13 @@ parts:
       craftctl default
       curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
         https://sh.rustup.rs --output rustup-init.sh
-      sh rustup-init.sh -y --profile minimal --default-toolchain none --no-modify-path
+      sh rustup-init.sh -y --profile minimal --default-toolchain 1.96.0 --no-modify-path
 
   lahza:
     plugin: rust
     after: [rust-deps]
     source: .
-    rust-channel: "1.96.0"
+    rust-channel: "none"
     build-packages:
       - pkg-config
       - libclang-dev

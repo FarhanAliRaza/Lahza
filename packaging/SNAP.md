@@ -22,8 +22,8 @@ cp "$build_dir"/lahza_*.snap dist/
 
 The recipe pins Rust 1.96.0. A build-only `rust-deps` part installs upstream
 rustup directly in the managed environment, avoiding nested rustup Snap
-execution failures in CI. Snapcraft installs the compiler and GNOME SDK
-automatically; the toolchain is not included in the final package.
+execution failures in CI. The setup part installs the pinned compiler, and Snapcraft supplies the GNOME
+SDK automatically; the toolchain is not included in the final package.
 
 Docker builds need extra preparation: Canonical's `8_core24` image currently
 lacks the desktop command-chain files, Rust, and the GNOME SDK. Those resources,
