@@ -56,7 +56,17 @@ snap run --shell lahza -c 'exec "$SNAP/snap/command-chain/gpu-2404-wrapper" "$SN
 This checks the bundled tools, plugins, PipeWire modules, VP8/Opus recording,
 H.264/AAC export, and frame decoding without recording any real devices.
 
-Microphone/system-audio capture and webcam access need their interfaces connected:
+Lahza checks camera and audio-record access when a device toggle or picker is
+used, and before recording. If access is missing it shows **Allow device access**
+with **Open permissions**, which opens the Lahza page in the desktop software
+app (`snap://lahza`). Enable access in **Permissions**, return to Lahza, and click
+**Try again**. It rechecks access and refreshes devices without restarting. A
+missing permission is not reported as missing hardware. Cancel stops the
+pending action; screen-only recording needs neither permission.
+
+On desktops without a handler for Snap links, the dialog explains how to find
+Lahza in the system software app. For headless setup or troubleshooting only,
+the equivalent commands are:
 
 ```bash
 sudo snap connect lahza:audio-record
@@ -72,6 +82,10 @@ Check these operations on a real desktop before releasing:
 3. Import an image, apply Tutorial steps, and export PNG and MP4.
 4. Record the screen, pause/resume, and stop; verify the resulting video.
 5. Record microphone/system audio and a webcam; verify playback and export.
+   On a fresh install with those interfaces disconnected, verify that toggles
+   and device pickers show the permission dialog, Cancel keeps capture off,
+   and granting access followed by Try again discovers devices. Also check
+   that screen-only recording works with both interfaces disconnected.
 6. Save and reopen a project under the user's home directory.
 
 Run the checks on Wayland and X11. Optional GNOME Shell input tracking needs

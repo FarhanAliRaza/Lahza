@@ -187,6 +187,9 @@ impl Render for Studio {
             .when_some(toast, |element, toast| {
                 element.child(self.notification_card(toast, cx))
             })
+            .when(self.capture_access_prompt.is_some(), |element| {
+                element.child(self.capture_access_dialog(cx))
+            })
     }
 }
 

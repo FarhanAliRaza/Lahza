@@ -808,6 +808,10 @@ impl Studio {
             .flex_col()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.capture_access_prompt.is_some() {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.handle_video_key(event, cx) {
                     cx.notify();
                 }

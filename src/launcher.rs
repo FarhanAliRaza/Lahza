@@ -1,9 +1,10 @@
 //! Capture launcher layout, source selectors, and recorder window lifecycle.
 
 use super::{
-    blue, brand_wordmark, camera_devices, ink, library, line, microphone_devices, muted,
+    blue, brand_wordmark, ink, library, line, muted,
     open_studio_window, panel, recording, RecordingOptions, RecordingState, Studio,
 };
+use crate::capture_access::CaptureAccess;
 use gpui::{
     div, hsla, img, point, prelude::*, px, rgb, svg, AnyElement, App, ClickEvent, Context,
     FontWeight, IntoElement, ObjectFit, Window,
@@ -76,8 +77,8 @@ impl Studio {
         devices: &[(String, String)],
         selected: &Option<String>,
         open: bool,
-        set_open: impl Fn(&mut Self, bool) + 'static,
-        pick: impl Fn(&mut Self, Option<String>) + 'static,
+        set_open: impl Fn(&mut Self, bool, &mut Context<Self>) + 'static,
+        pick: impl Fn(&mut Self, Option<String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let label = selected
@@ -110,7 +111,7 @@ impl Studio {
             .hover(|s| s.text_color(ink()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                toggle(this, !open);
+                toggle(this, !open, cx);
                 cx.notify();
             }))
             .child(
@@ -150,7 +151,7 @@ impl Studio {
                                     .flex_col()
                                     .text_color(ink())
                                     .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-                                        close(this, false);
+                                        close(this, false, cx);
                                         cx.notify();
                                     }))
                                     .children(entries.into_iter().enumerate().map(
@@ -196,7 +197,7 @@ impl Studio {
                                                 )
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     cx.stop_propagation();
-                                                    pick(this, name.clone());
+                                                    pick(this, name.clone(), cx);
                                                     cx.notify();
                                                 }))
                                         },
@@ -415,23 +416,30 @@ impl Studio {
                             &self.camera_devices,
                             &self.camera_device,
                             self.launcher_camera_menu_open,
-                            |this, open| this.launcher_camera_menu_open = open,
-                            |this, device| {
+                            |this, open, cx| {
+                                if open {
+                                    this.request_capture_access(CaptureAccess::CameraPicker, cx);
+                                } else {
+                                    this.launcher_camera_menu_open = false;
+                                }
+                            },
+                            |this, device, cx| {
                                 if this.camera_device != device {
                                     this.camera_device = device;
                                     // Restart the preview on the new device.
                                     this.camera_preview = None;
                                 }
-                                this.record_camera = true;
+                                this.request_capture_access(CaptureAccess::Camera, cx);
                                 this.launcher_camera_menu_open = false;
                             },
                             cx,
                         ),
                         self.record_camera,
                         cx.listener(|this, _, _, cx| {
-                            this.record_camera = !this.record_camera;
                             if this.record_camera {
-                                this.camera_devices = camera_devices();
+                                this.record_camera = false;
+                            } else {
+                                this.request_capture_access(CaptureAccess::Camera, cx);
                             }
                             cx.notify();
                         }),
@@ -467,19 +475,26 @@ impl Studio {
                             &self.microphone_devices,
                             &self.microphone_device,
                             self.launcher_mic_menu_open,
-                            |this, open| this.launcher_mic_menu_open = open,
-                            |this, device| {
+                            |this, open, cx| {
+                                if open {
+                                    this.request_capture_access(CaptureAccess::MicrophonePicker, cx);
+                                } else {
+                                    this.launcher_mic_menu_open = false;
+                                }
+                            },
+                            |this, device, cx| {
                                 this.microphone_device = device;
-                                this.record_microphone = true;
+                                this.request_capture_access(CaptureAccess::Microphone, cx);
                                 this.launcher_mic_menu_open = false;
                             },
                             cx,
                         ),
                         self.record_microphone,
                         cx.listener(|this, _, _, cx| {
-                            this.record_microphone = !this.record_microphone;
                             if this.record_microphone {
-                                this.microphone_devices = microphone_devices();
+                                this.record_microphone = false;
+                            } else {
+                                this.request_capture_access(CaptureAccess::Microphone, cx);
                             }
                             cx.notify();
                         }),
@@ -491,7 +506,11 @@ impl Studio {
                         "Sound playing on this computer",
                         self.record_system_audio,
                         cx.listener(|this, _, _, cx| {
-                            this.record_system_audio = !this.record_system_audio;
+                            if this.record_system_audio {
+                                this.record_system_audio = false;
+                            } else {
+                                this.request_capture_access(CaptureAccess::SystemAudio, cx);
+                            }
                             cx.notify();
                         }),
                     ))

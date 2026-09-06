@@ -71,43 +71,9 @@ Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social s
 
 ## Install
 
-### Snap — recommended
+### Debian / Ubuntu package — recommended
 
-Install [Lahza from the Snap Store](https://snapcraft.io/lahza) on amd64 Linux with [snapd installed](https://snapcraft.io/docs/installing-snapd):
-
-```bash
-sudo snap install lahza
-```
-
-Launch **Lahza** from your application menu, or run:
-
-```bash
-snap run lahza
-```
-
-The Snap bundles its desktop and media dependencies and receives automatic updates through snapd. To check for an update manually, close Lahza and run:
-
-```bash
-sudo snap refresh lahza
-```
-
-For microphone and system-audio capture, connect the recording permission:
-
-```bash
-sudo snap connect lahza:audio-record
-```
-
-To save files on removable drives, also run `sudo snap connect lahza:removable-media`.
-
-**Previously installed a local test `.snap`?** Switch it to the Store version once to enable normal updates:
-
-```bash
-sudo snap refresh lahza --amend --channel=stable
-```
-
-Use `snap info lahza` to compare the installed version with the Store channels. If you also have a Debian or source installation, `snap run lahza` explicitly launches the Snap.
-
-### Debian / Ubuntu package — alternative
+Recommended for **Ubuntu 24.04 amd64** and compatible distributions. It uses the normal desktop device access without Snap’s additional camera and audio-recording permission connections.
 
 Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
 
@@ -150,6 +116,43 @@ The release workflow also builds and tests a `core24` Snap. Matching version
 tags publish it to the Snap Store after both package jobs pass (stable versions
 to `stable`, prerelease versions to `beta`). Maintainers must first configure
 the Store credential using the [Snap release setup](packaging/SNAP.md#github-actions-releases).
+
+### Snap — alternative
+
+The Snap requires extra camera and audio-recording permission setup. For the simplest recording setup on Ubuntu 24.04 amd64, use the Debian package above.
+
+Install [Lahza from the Snap Store](https://snapcraft.io/lahza) on amd64 Linux with [snapd installed](https://snapcraft.io/docs/installing-snapd):
+
+```bash
+sudo snap install lahza
+```
+
+Launch **Lahza** from your application menu, or run:
+
+```bash
+snap run lahza
+```
+
+The Snap bundles its desktop and media dependencies and receives automatic updates through snapd. To check for an update manually, close Lahza and run:
+
+```bash
+sudo snap refresh lahza
+```
+
+When camera or audio recording access is missing, Lahza shows an **Allow device
+access** prompt. Choose **Open permissions**, allow access on Lahza’s page in
+your software app, then return and choose **Try again**. Device lists refresh
+without restarting. See [Snap setup](packaging/SNAP.md) for troubleshooting.
+
+To save files on removable drives, also run `sudo snap connect lahza:removable-media`.
+
+**Previously installed a local test `.snap`?** Switch it to the Store version once to enable normal updates:
+
+```bash
+sudo snap refresh lahza --amend --channel=stable
+```
+
+Use `snap info lahza` to compare the installed version with the Store channels. If you also have a Debian or source installation, `snap run lahza` explicitly launches the Snap.
 
 ### Binary bundle — alternative
 

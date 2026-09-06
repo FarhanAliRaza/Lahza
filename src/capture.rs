@@ -57,6 +57,13 @@ impl Studio {
         if self.recording_state != RecordingState::Idle || self.recording_busy {
             return;
         }
+        self.request_capture_access(crate::capture_access::CaptureAccess::Recording, cx);
+    }
+
+    pub(super) fn start_recording_with_access(&mut self, cx: &mut Context<Self>) {
+        if self.recording_state != RecordingState::Idle || self.recording_busy {
+            return;
+        }
         // Starting a new capture from an open video project must stop its
         // synchronized playback before capture becomes the active media clock.
         self.pause_video_playback();

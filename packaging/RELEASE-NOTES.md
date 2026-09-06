@@ -4,9 +4,11 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Fixed recording startup with the Snap's older PipeWire plugin by using GStreamer's pipeline clock API instead of the unsupported `provide-clock` property.
-- Fixed thin dark edges in composed previews caused by rounding the canvas image dimensions, including the 4:3 layout.
-- Added a 9:16 canvas preset for Shorts and other portrait layouts, with portrait export support.
+- Added in-app permission checks for camera, microphone, and system audio in the Snap, with an Open permissions action and retry without restarting.
+- Device selectors now check access before discovery, and recording checks the selected sources before opening the screen picker.
+- Made the Debian package the recommended installation; the Snap remains an alternative with additional permission setup.
+- Corrected the Urdu spelling in the Lahza wordmark and documented the name.
+- Updated Snap packaging to reuse the Ubuntu-built release binary and fixed its CI artifact path.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
@@ -23,14 +25,6 @@ For Debian updates, run `lahza-update --install`. Snap updates are managed by sn
 
 ### Download and install
 
-**Snap (amd64 Linux with snapd):**
-
-```bash
-sudo snap install lahza
-```
-
-The stable channel receives this version after the release workflow and Store review succeed. Microphone capture and webcam access require `sudo snap connect lahza:audio-record` and `sudo snap connect lahza:camera` respectively.
-
 **Ubuntu 24.04 amd64 — recommended:** download `lahza_0.4.6_amd64.deb`, then run:
 
 ```bash
@@ -38,6 +32,14 @@ sudo apt install ./lahza_0.4.6_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
+
+**Snap (alternative, amd64 Linux with snapd):**
+
+```bash
+sudo snap install lahza
+```
+
+The stable channel receives this version after the release workflow and Store review succeed. Camera and audio recording require additional permission setup. Lahza now prompts when access is missing: choose Open permissions, allow access in the software app, then return and choose Try again.
 
 **Binary bundle:** download `lahza-0.4.6-linux-x86_64.tar.gz`, then run:
 

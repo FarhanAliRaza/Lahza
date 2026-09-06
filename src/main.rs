@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod annotations;
 mod capture;
+mod capture_access;
 mod controls;
 mod crop;
 mod launcher;
@@ -248,6 +249,9 @@ struct Studio {
     recording_started_at: Option<Instant>,
     recording_session_path: Option<PathBuf>,
     record_system_audio: bool,
+    capture_access_prompt: Option<capture_access::AccessPrompt>,
+    capture_access_busy: bool,
+    camera_access_checked: bool,
     record_microphone: bool,
     /// Selected microphone source name; `None` follows the system default.
     microphone_device: Option<String>,
@@ -544,6 +548,9 @@ impl Studio {
             recording_started_at: None,
             recording_session_path: None,
             record_system_audio: false,
+            capture_access_prompt: None,
+            capture_access_busy: false,
+            camera_access_checked: false,
             record_microphone: false,
             microphone_device: None,
             microphone_devices: microphone_devices(),
@@ -749,6 +756,13 @@ impl Studio {
         if self.recording_state != RecordingState::Idle {
             self.camera_preview = None;
         } else if self.camera_preview.is_none() {
+            // A new recorder window can inherit an enabled camera. Check
+            // access before trying the device, just as an explicit toggle does.
+            if !self.camera_access_checked {
+                self.record_camera = false;
+                self.request_capture_access(capture_access::CaptureAccess::Camera, cx);
+                return;
+            }
             let device = match self.camera_device.clone() {
                 Some(device) => Ok(device),
                 None => recording::native::default_camera_device(),
@@ -1261,6 +1275,10 @@ impl Studio {
             .flex_col()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.capture_access_prompt.is_some() {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.handle_animation_key(event, cx) {
                     cx.notify();
                     return;
