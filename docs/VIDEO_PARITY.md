@@ -1,10 +1,5 @@
 # Video parity contract
 
-The macOS Swift implementation is the behavioral specification for the Rust
-video workflow. A control appearing in the Rust UI is not evidence of parity;
-the underlying state transition, saved project data, recovery behavior,
-preview, and exported output must agree.
-
 ## Recording lifecycle
 
 - [ ] Full-screen and window source selection; area selection where supported.
