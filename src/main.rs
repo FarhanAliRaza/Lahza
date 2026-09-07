@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod annotations;
 mod capture;
+mod capture_area;
 mod capture_access;
 mod controls;
 mod crop;
@@ -252,6 +253,7 @@ struct Studio {
     recording_started_at: Option<Instant>,
     recording_session_path: Option<PathBuf>,
     record_system_audio: bool,
+    record_area: bool,
     capture_access_prompt: Option<capture_access::AccessPrompt>,
     capture_access_busy: bool,
     camera_access_checked: bool,
@@ -563,6 +565,7 @@ impl Studio {
             recording_started_at: None,
             recording_session_path: None,
             record_system_audio: false,
+            record_area: false,
             capture_access_prompt: None,
             capture_access_busy: false,
             camera_access_checked: false,

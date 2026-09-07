@@ -4,15 +4,13 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- MP4 exports automatically detect working NVIDIA NVENC or Intel/AMD VAAPI encoders, with a faster CPU fallback when hardware encoding is unavailable.
-- Edited recordings and webcam clips stream directly into export, removing the full intermediate-video preparation pass. Audio edits are applied during final encoding.
-- Export runs in the background with a collapsible progress panel, filename, encoder status, estimated time remaining, and cancellation. Continue editing and previewing while the original project snapshot renders.
-- Cached webcam shadows avoid repeating a full-canvas blur on every frame.
-- Webcam playback reuses a decoder, pairs camera frames with screen timestamps, and waits for camera readiness before starting audio. A regular playback cadence keeps webcams and motion smooth when the screen recording has sparse frames.
-- Timeline playback applies cuts and speed changes without rebuilding preview videos, preserves audio pitch, and reuses playback across unchanged splits.
-- Clip edits keep media annotations aligned with retained footage and preserve annotation state for undo. Deleted motion regions no longer leave a held transform on later clips.
+- Record a selected rectangle of a screen using an app-owned preview picker after choosing a monitor in the system picker.
+- Choose exact 720p, 1080p, 1440p, or 4K capture sizes, or draw in 16:9, 9:16, 1:1, and 4:3. Move selections, use Shift-drag to redraw, and switch shapes without progressively shrinking the capture area.
+- Crop the stream before encoding, preserving the selected area through pause and resume. Area recordings include the system cursor; editable cursor effects and automatic click zooms are unavailable in this mode.
+- Show a click-through desktop border outside the captured area: red while recording and amber while paused. The indicator uses X11/XWayland; edges at monitor boundaries may be off-screen.
+- Document the area-recording workflow and add launch-post drafts.
 
-Validation: 160 automated Rust tests and 15 packaging tests passed locally; five manual/device-dependent Rust tests remain excluded from the default suite. Added regression tests for sparse screen recordings, repeated playback starts, webcam synchronization, export streaming, and time estimates.
+Validation: 166 automated Rust tests and 15 packaging tests passed locally; seven interactive/device-dependent Rust tests are excluded from the default suite. Tests cover selection geometry, exact dimensions, repeated shape changes, scaled border placement, and a real crop encode/decode roundtrip. Cross-desktop source-picker and recording validation remains outstanding.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

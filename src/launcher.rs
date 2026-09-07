@@ -1,8 +1,8 @@
 //! Capture launcher layout, source selectors, and recorder window lifecycle.
 
 use super::{
-    blue, brand_wordmark, ink, library, line, muted,
-    open_studio_window, panel, recording, RecordingOptions, RecordingState, Studio,
+    blue, brand_wordmark, ink, library, line, muted, open_studio_window, panel, recording,
+    RecordingOptions, RecordingState, Studio,
 };
 use crate::capture_access::CaptureAccess;
 use gpui::{
@@ -228,7 +228,9 @@ impl Studio {
         }
         self.pause_video_playback();
         self.finish_annotation_interaction();
+        let record_area = self.record_area;
         let options = RecordingOptions {
+            area: None,
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
             microphone_device: self.microphone_device.clone(),
@@ -238,6 +240,7 @@ impl Studio {
         match open_studio_window(cx, false, move |window_handle, cx| {
             cx.new(|cx| {
                 let mut studio = Studio::new(window_handle, None, None, cx);
+                studio.record_area = record_area;
                 studio.record_system_audio = options.system_audio;
                 studio.record_microphone = options.microphone;
                 studio.microphone_device = options.microphone_device;
@@ -395,6 +398,8 @@ impl Studio {
                                         .child(div().text_sm().font_weight(FontWeight::BOLD).child(
                                             if recording {
                                                 "Recording…"
+                                            } else if self.record_area {
+                                                "Record area"
                                             } else {
                                                 "Record screen"
                                             },
@@ -405,6 +410,41 @@ impl Studio {
                                             }
                                         })),
                                 ),
+                        )
+                    })
+                    .when(!recording, |this| {
+                        this.child(
+                            div().flex_none().flex().gap_2().children(
+                                [("Screen / window", false), ("Selected area", true)]
+                                    .into_iter()
+                                    .map(|(label, area)| {
+                                        div()
+                                            .id(("recording-source-mode", usize::from(area)))
+                                            .flex_1()
+                                            .py_2()
+                                            .rounded_lg()
+                                            .border_1()
+                                            .text_sm()
+                                            .text_center()
+                                            .cursor_pointer()
+                                            .border_color(if self.record_area == area {
+                                                blue()
+                                            } else {
+                                                line()
+                                            })
+                                            .bg(gpui::white())
+                                            .text_color(if self.record_area == area {
+                                                blue()
+                                            } else {
+                                                ink()
+                                            })
+                                            .child(label)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.record_area = area;
+                                                cx.notify();
+                                            }))
+                                    }),
+                            ),
                         )
                     })
                     .child(self.launcher_source_row(
@@ -477,7 +517,10 @@ impl Studio {
                             self.launcher_mic_menu_open,
                             |this, open, cx| {
                                 if open {
-                                    this.request_capture_access(CaptureAccess::MicrophonePicker, cx);
+                                    this.request_capture_access(
+                                        CaptureAccess::MicrophonePicker,
+                                        cx,
+                                    );
                                 } else {
                                     this.launcher_mic_menu_open = false;
                                 }

@@ -76,6 +76,25 @@ Save screenshots as **PNG** and videos or animations as **MP4**, **WebM**, or **
 3. Select **Motion** for zooms, pans, transforms, or screenshot animation. Add a motion region at the playhead or double-click the orange lane, then select it to edit its focus and timing.
 4. Use **Export** to choose an output format and save the result.
 
+To record part of a screen, choose **Selected area** in the capture launcher,
+then **Record area**. Choose the screen in the system picker, drag a rectangle
+on its preview, and click **Start recording** (or press Enter). Use **Size** for
+an exact 720p, 1080p, 1440p, or 4K capture, or **Shape** to draw in 16:9, 9:16,
+1:1, or 4:3. Each shape starts at the largest size that fits the screen, so
+switching shapes does not progressively shrink the selection. Sizes larger
+than the selected screen are disabled. Drag inside
+the selection to move it; in Free or a shape mode, Shift-drag draws a new area.
+The displayed dimensions are capture pixels, independent of desktop scaling.
+Escape or **Cancel** exits without starting a recording. Only the selected rectangle is
+encoded, including when you pause and resume. Area recordings include the
+system cursor; editable cursor effects and automatic click zooms are unavailable
+in this mode.
+
+While an area recording is active, a click-through red border marks its desktop
+bounds. The border turns amber when paused and disappears when recording ends.
+It uses X11/XWayland and is drawn outside the capture so it does not appear in
+the saved video. Edges flush with a monitor boundary may be off-screen.
+
 With the media selected, drag to move, **Shift-drag** to tilt, **Ctrl-drag** to spin, scroll to scale, and double-click to reset.
 
 ## Build from source

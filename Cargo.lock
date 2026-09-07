@@ -3111,6 +3111,7 @@ dependencies = [
  "serde_json",
  "unicode-segmentation",
  "uuid",
+ "x11rb",
 ]
 
 [[package]]

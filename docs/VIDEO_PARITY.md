@@ -3,6 +3,9 @@
 ## Recording lifecycle
 
 - [ ] Full-screen and window source selection; area selection where supported.
+- Area recording has an app-owned rectangle picker after portal monitor
+  selection. It crops the stream before encoding and uses the embedded system
+  cursor. Cross-desktop validation remains outstanding.
 - [x] Starting, recording, paused, finishing, and idle states.
 - [x] Fixed-width elapsed clock with visible recording/paused status.
 - [x] Pause/resume, restart, stop-and-save, and discard controls backed by the

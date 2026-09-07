@@ -1,4 +1,6 @@
-use super::camera_preview::{CameraFrames, attach_preview, preview_branch};
+use super::area::{preview_frame, AreaRequest, RecordingArea};
+use super::area_indicator::AreaIndicator;
+use super::camera_preview::{attach_preview, preview_branch, CameraFrames};
 use super::input::{monotonic_ns, ActiveRange, InputCapture, InputMapping};
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SourceType},
@@ -78,6 +80,7 @@ pub trait RecorderBackend {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecordingOptions {
+    pub area: Option<RecordingArea>,
     pub system_audio: bool,
     pub microphone: bool,
     /// PulseAudio/PipeWire source name to record from; `None` uses the default.
@@ -122,6 +125,7 @@ enum WorkerCommand {
 }
 
 pub struct NativeRecorder {
+    area_requests: Option<mpsc::Sender<AreaRequest>>,
     camera_frames: Option<Arc<CameraFrames>>,
     options: RecordingOptions,
     state: Arc<Mutex<SharedState>>,
@@ -142,12 +146,18 @@ impl NativeRecorder {
 
     pub fn with_options(options: RecordingOptions) -> Self {
         Self {
+            area_requests: None,
             camera_frames: None,
             options,
             state: Arc::new(Mutex::new(SharedState::default())),
             commands: None,
             worker: None,
         }
+    }
+
+    pub fn with_area_selection(mut self, requests: mpsc::Sender<AreaRequest>) -> Self {
+        self.area_requests = Some(requests);
+        self
     }
 
     pub fn with_camera_preview(mut self, frames: Arc<CameraFrames>) -> Self {
@@ -217,13 +227,24 @@ impl RecorderBackend for NativeRecorder {
         ensure_runtime()?;
         let output = output.to_path_buf();
         let options = self.options.clone();
+        let area_requests = self.area_requests.clone();
         let camera_frames = self.camera_frames.clone();
         let state = self.state.clone();
         let (commands_tx, commands_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("lahza-native-recorder".into())
-            .spawn(move || run_worker(output, options, state, commands_rx, ready_tx, camera_frames))?;
+            .spawn(move || {
+                run_worker(
+                    output,
+                    options,
+                    state,
+                    commands_rx,
+                    ready_tx,
+                    camera_frames,
+                    area_requests,
+                )
+            })?;
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.commands = Some(commands_tx);
@@ -324,16 +345,19 @@ fn ensure_runtime() -> Result<(), RecorderError> {
 
 fn run_worker(
     output: PathBuf,
-    options: RecordingOptions,
+    mut options: RecordingOptions,
     state: Arc<Mutex<SharedState>>,
     commands: mpsc::Receiver<WorkerCommand>,
     ready: mpsc::Sender<Result<(), String>>,
     camera_frames: Option<Arc<CameraFrames>>,
+    area_requests: Option<mpsc::Sender<AreaRequest>>,
 ) {
     let result = async_io::block_on(async {
         let input_destination = output.with_file_name("input.json");
-        let mut input_capture =
-            InputCapture::start(output.parent().unwrap_or_else(|| Path::new(".")));
+        // Area capture embeds the compositor cursor. Do not collect unused
+        // full-monitor input metadata or leave raw events in the project.
+        let mut input_capture = (area_requests.is_none() && options.area.is_none())
+            .then(|| InputCapture::start(output.parent().unwrap_or_else(|| Path::new("."))));
         let proxy = Screencast::new().await.map_err(|error| error.to_string())?;
         let session = proxy
             .create_session()
@@ -342,14 +366,25 @@ fn run_worker(
         proxy
             .select_sources(
                 &session,
-                if input_capture.uses_pipewire_metadata() {
+                if area_requests.is_some() || options.area.is_some() {
+                    // Crop the real cursor along with the screen. Synthesizing
+                    // it from full-monitor metadata would misplace it.
+                    CursorMode::Embedded
+                } else if input_capture
+                    .as_ref()
+                    .is_some_and(InputCapture::uses_pipewire_metadata)
+                {
                     CursorMode::Metadata
-                } else if input_capture.is_active() {
+                } else if input_capture.as_ref().is_some_and(InputCapture::is_active) {
                     CursorMode::Hidden
                 } else {
                     CursorMode::Embedded
                 },
-                SourceType::Monitor | SourceType::Window,
+                if area_requests.is_some() {
+                    SourceType::Monitor.into()
+                } else {
+                    SourceType::Monitor | SourceType::Window
+                },
                 false,
                 None,
                 PersistMode::ExplicitlyRevoked,
@@ -374,7 +409,12 @@ fn run_worker(
                 .map(|(width, height)| (f64::from(width), f64::from(height)))
                 .unwrap_or((1.0, 1.0)),
         };
-        let pointer_remote = if input_capture.uses_pipewire_metadata() {
+        let pointer_remote = if area_requests.is_none()
+            && options.area.is_none()
+            && input_capture
+                .as_ref()
+                .is_some_and(InputCapture::uses_pipewire_metadata)
+        {
             Some(
                 proxy
                     .open_pipe_wire_remote(&session)
@@ -388,8 +428,41 @@ fn run_worker(
             .open_pipe_wire_remote(&session)
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(pointer_remote) = pointer_remote.as_ref() {
+        if let (Some(pointer_remote), Some(input_capture)) =
+            (pointer_remote.as_ref(), input_capture.as_mut())
+        {
             input_capture.attach_pipewire(pointer_remote.as_raw_fd(), node, input_mapping)?;
+        }
+
+        if let Some(requests) = area_requests.as_ref() {
+            let frame = match preview_frame(remote.as_raw_fd(), node) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    let _ = session.close().await;
+                    return Err(error);
+                }
+            };
+            let (reply, response) = mpsc::channel();
+            let selection = requests
+                .send(AreaRequest { frame, reply })
+                .map_err(|_| "area selection was cancelled".to_string())
+                .and_then(|_| {
+                    response
+                        .recv()
+                        .ok()
+                        .flatten()
+                        .ok_or_else(|| "area selection was cancelled".to_string())
+                });
+            match selection {
+                Ok(area) => options.area = Some(area),
+                Err(error) => {
+                    let _ = session.close().await;
+                    return Err(error);
+                }
+            }
+            // Give the compositor time to remove the selection window before
+            // the first encoded frame. Preview pixels never reach a file.
+            thread::sleep(Duration::from_millis(250));
         }
 
         let camera = if options.camera {
@@ -410,6 +483,16 @@ fn run_worker(
             camera.as_deref(),
             camera_frames.as_ref(),
         )?);
+        let mut indicator =
+            options
+                .area
+                .and_then(|area| match AreaIndicator::start(area, input_mapping) {
+                    Ok(indicator) => Some(indicator),
+                    Err(error) => {
+                        eprintln!("Recording area indicator unavailable: {error}");
+                        None
+                    }
+                });
         segments.push(0);
         let mut active_ranges = Vec::new();
         let mut active_range_start = Some(monotonic_ns());
@@ -425,6 +508,9 @@ fn run_worker(
         let _ = ready.send(Ok(()));
 
         loop {
+            if let Some(indicator) = indicator.as_mut() {
+                indicator.tick();
+            }
             if let Some(error) = child.as_mut().and_then(SegmentPipeline::take_failure) {
                 return Err(error);
             }
@@ -453,6 +539,9 @@ fn run_worker(
                                 shared.elapsed += started.elapsed();
                             }
                             shared.paused = true;
+                            if let Some(indicator) = indicator.as_mut() {
+                                indicator.set_paused(true);
+                            }
                         })
                     } else {
                         Err("recording is already paused".into())
@@ -471,7 +560,7 @@ fn run_worker(
                             node,
                             &options,
                             camera.as_deref(),
-            camera_frames.as_ref(),
+                            camera_frames.as_ref(),
                         ) {
                             Ok(next) => {
                                 let path = segment_path(&output, index);
@@ -483,6 +572,9 @@ fn run_worker(
                                 shared.paused = false;
                                 shared.started_at = Some(Instant::now());
                                 shared.output = Some(path);
+                                if let Some(indicator) = indicator.as_mut() {
+                                    indicator.set_paused(false);
+                                }
                                 Ok(())
                             }
                             Err(error) => Err(error),
@@ -491,6 +583,7 @@ fn run_worker(
                     let _ = reply.send(result);
                 }
                 WorkerCommand::Stop(reply) => {
+                    drop(indicator.take());
                     let result = (|| {
                         if let Some(start_ns) = active_range_start.take() {
                             active_ranges.push(ActiveRange {
@@ -524,9 +617,12 @@ fn run_worker(
                         } else {
                             false
                         };
-                        let pointer_synthesized = input_capture
-                            .finish(&active_ranges, input_mapping, &input_destination)
-                            .unwrap_or(false);
+                        let pointer_synthesized =
+                            input_capture.take().is_some_and(|input_capture| {
+                                input_capture
+                                    .finish(&active_ranges, input_mapping, &input_destination)
+                                    .unwrap_or(false)
+                            });
                         let mut shared = state.lock().expect("native recorder state poisoned");
                         if let Some(started) = shared.started_at.take() {
                             shared.elapsed += started.elapsed();
@@ -737,10 +833,14 @@ fn build_segment_pipeline(
     let path = segment_path(output, index);
     let _ = fs::remove_file(&path);
     gst::init().map_err(|error| format!("could not initialize GStreamer: {error}"))?;
+    let crop_filter = options
+        .area
+        .map(RecordingArea::pipeline_filter)
+        .unwrap_or_default();
     let mut description = format!(
         "matroskamux name=mux ! filesink location=\"{}\" \
          pipewiresrc name=screen_source fd={} path={} always-copy=true \
-         keepalive-time=1000 ! videoconvert ! \
+         keepalive-time=1000 ! videoconvert ! {crop_filter}\
          queue max-size-buffers=4 leaky=downstream ! \
          vp8enc deadline=1 cpu-used=8 threads=4 target-bitrate=12000000 \
          keyframe-max-dist=60 ! queue ! mux. ",
@@ -801,7 +901,10 @@ fn build_segment_pipeline(
     }
 
     if camera_device.is_some() && camera_frames.is_some() {
-        description.push_str(&format!("camera_tee. ! {}", preview_branch("recording_camera_preview")));
+        description.push_str(&format!(
+            "camera_tee. ! {}",
+            preview_branch("recording_camera_preview")
+        ));
     }
 
     let pipeline = gst::parse::launch(&description)
@@ -824,7 +927,13 @@ fn spawn_segment(
     camera_frames: Option<&Arc<CameraFrames>>,
 ) -> Result<SegmentPipeline, String> {
     let pipeline = build_segment_pipeline(
-        output, index, portal_fd, node, options, camera_device, camera_frames,
+        output,
+        index,
+        portal_fd,
+        node,
+        options,
+        camera_device,
+        camera_frames,
     )?;
     if let Some(frames) = camera_frames.filter(|_| camera_device.is_some()) {
         attach_preview(&pipeline, "recording_camera_preview", frames.clone())?;
@@ -964,8 +1073,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("lahza-pipeline-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let output = root.join("screen.mkv");
-        for (microphone, system_audio) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (microphone, system_audio) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let options = RecordingOptions {
+                area: None,
                 microphone,
                 system_audio,
                 microphone_device: None,
@@ -978,6 +1090,16 @@ mod tests {
                 .expect("recording pipeline must support the installed PipeWire plugin");
             assert_eq!(pipeline.pipeline_clock(), gst::SystemClock::obtain());
             assert!(pipeline.by_name("screen_source").is_some());
+            let cropped = RecordingOptions {
+                area: RecordingArea::from_drag((0.25, 0.25), (0.75, 0.75), (1920, 1080)),
+                ..options
+            };
+            for index in [0, 1] {
+                // The same crop must build for both the initial segment and a
+                // resumed segment, with every supported audio combination.
+                build_segment_pipeline(&output, index, -1, 0, &cropped, None, None)
+                    .expect("area recording pipeline must support pause/resume and audio");
+            }
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -999,6 +1121,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let output = root.join("screen.mkv");
         let mut recorder = NativeRecorder::with_options(RecordingOptions {
+            area: None,
             system_audio: true,
             microphone: true,
             microphone_device: None,

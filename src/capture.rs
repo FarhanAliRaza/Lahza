@@ -71,8 +71,16 @@ impl Studio {
         self.recording_state = RecordingState::Starting;
         self.recording_elapsed = Duration::ZERO;
         self.recording_started_at = None;
-        self.toast = Some("Choose a screen or window to record…".into());
+        self.toast = Some(
+            if self.record_area {
+                "Choose a screen, then select the area to record…"
+            } else {
+                "Choose a screen or window to record…"
+            }
+            .into(),
+        );
         let options = RecordingOptions {
+            area: None,
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
             microphone_device: self.microphone_device.clone(),
@@ -82,11 +90,15 @@ impl Studio {
         // The recorder opens the webcam itself; release the preview's handle.
         self.camera_preview = None;
         self.recording_camera_enabled = options.camera;
+        let area_requests = self.record_area.then(|| self.area_selection_requests(cx));
         let camera_frames = self.camera_frames.clone();
         let task = cx.background_executor().spawn(async move {
-            let mut controller = RecordingController::new(
-                NativeRecorder::with_options(options).with_camera_preview(camera_frames),
-            );
+            let mut recorder =
+                NativeRecorder::with_options(options).with_camera_preview(camera_frames);
+            if let Some(requests) = area_requests {
+                recorder = recorder.with_area_selection(requests);
+            }
+            let mut controller = RecordingController::new(recorder);
             let result = controller
                 .start()
                 .map(|session| session.directory.clone())
