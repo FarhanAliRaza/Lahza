@@ -4,9 +4,12 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Fixed template captions disappearing outside the screenshot. Captions now use the full scene canvas in preview and export, including captions in older saved projects.
-- Selecting existing text no longer focuses the text field automatically. Single-click to select and move; double-click or click the inspector text field to edit.
-- Removed white preview borders around transparent window captures by removing the placeholder backing behind loaded screenshots.
+- Added real screenshots alongside the README's feature descriptions, including annotation and animated scene templates.
+- Simplified installation and feature descriptions, placed Debian installation first, and moved setup details to the bottom.
+- Expanded the Snap Store feature description to match the README showcase.
+- Moved the application icon into assets and updated packaging and installer references.
+
+This is a documentation and packaging update; application behavior is unchanged from v0.5.1.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

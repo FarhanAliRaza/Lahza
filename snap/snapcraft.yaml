@@ -8,6 +8,21 @@ description: |
   Capture screenshots and screen recordings, then turn them into polished
   visuals with backgrounds, annotations, motion presets, and scene templates.
   Edit locally and export images or videos.
+
+  - Capture screens, windows, or areas. Record with system and microphone
+    audio, pause and resume, and save editable projects with autosave.
+  - Style captures with backgrounds, rounded corners, shadows, window
+    frames, watermarks, and 3D perspective. Save reusable presets.
+  - Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive
+    details and animate annotations with custom timing.
+  - Trim, split, and change clip speed. Add zooms, pans, 3D motion, and camera
+    overlays. Cursor effects and click-based zooms require input metadata.
+  - Animate screenshots with motion presets, timed captions, and cursor
+    walkthroughs. Start with templates for launches, tutorials, and more.
+  - Export PNG, MP4, WebM, or GIF, with video output up to 4K at 30 or 60 fps.
+
+  Camera and audio recording may require Snap interface connections.
+  Follow the app's Allow device access prompt when needed.
 license: MIT
 grade: stable
 confinement: strict
