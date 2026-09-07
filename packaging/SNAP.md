@@ -167,6 +167,10 @@ still need a desktop when changing those integrations.
 
 ## Manual publishing
 
+Store screenshots and their upload order are documented in
+[store/README.md](store/README.md). Update the listing media separately from
+the package release; a new Snap revision is not needed for screenshot changes.
+
 ```bash
 snapcraft upload --release=beta ./dist/lahza_*.snap
 snapcraft revisions lahza

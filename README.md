@@ -135,6 +135,8 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 
 ### Design the scene
 
+[![Lahza screenshot editor showing wallpaper choices and image appearance controls](docs/screenshots/01-screenshot-styling.png)](packaging/store/screenshots/01-screenshot-styling.png)
+
 - Frame your media with solid colors, gradients, or wallpaper backgrounds.
 - Adjust padding, rounded corners, borders, shadows, and window frames.
 - Add background blur, grain, vignette, and a corner text watermark.
@@ -145,6 +147,8 @@ Perspective changes become visible when the media is tilted with Rotate X or Y. 
 
 ### Edit recordings
 
+[![Lahza video editor showing a camera overlay, pointer controls, and a multitrack timeline](docs/screenshots/03-video-and-camera.png)](packaging/store/screenshots/03-video-and-camera.png)
+
 - Preview recordings with synchronized audio and a seekable clip timeline.
 - Trim, split, delete, and change clip speed, with undo/redo.
 - Edit motion regions on the orange lane: timing, magnification, easing, focus, and pan destination.
@@ -154,6 +158,8 @@ Perspective changes become visible when the media is tilted with Rotate X or Y. 
 - Composite an added camera clip as picture-in-picture, with shape, corner, size, mirroring, margin, and shadow controls.
 
 ### Animate still images
+
+[![Lahza Motion editor with a floating card preset and timed captions](docs/screenshots/02-motion-and-captions.png)](packaging/store/screenshots/02-motion-and-captions.png)
 
 - Select **Motion** to turn a screenshot into an animated scene.
 - Trim the image independently of the scene. Use **+ 5s** on the timeline to leave room for later content; the background remains after the image ends.
@@ -170,6 +176,8 @@ For a loaded video, **Motion** opens the recording's motion controls directly.
 Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social square**, **Changelog**, **Cinematic**, **Minimal dark**, or **Store listing**. Templates combine scene styling, motion, and editable captions. On recordings, they add an intro while retaining later motion regions.
 
 ### Export
+
+[![Lahza export panel showing MP4, WebM, GIF, resolution, and frame rate options](docs/screenshots/04-export-formats.png)](packaging/store/screenshots/04-export-formats.png)
 
 - Save styled screenshots as **PNG**.
 - Export recordings and animated screenshots as **MP4 (H.264/AAC)**, **WebM (VP9/Opus)**, or **looping GIF**.
