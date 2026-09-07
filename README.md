@@ -11,18 +11,18 @@ Built with Rust and GPUI, Lahza brings screenshot annotation, native screen reco
 
 ## Install
 
-### Snap
-
-```bash
-sudo snap install lahza
-```
-
 ### Debian / Ubuntu
 
 Download the `.deb` for Ubuntu 24.04 amd64 from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then run:
 
 ```bash
 sudo apt install ./lahza_0.5.1_amd64.deb
+```
+
+### Snap
+
+```bash
+sudo snap install lahza
 ```
 
 [Permissions, updates, and troubleshooting](#installation-details)
