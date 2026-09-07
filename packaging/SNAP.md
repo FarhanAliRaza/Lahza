@@ -58,15 +58,14 @@ H.264/AAC export, and frame decoding without recording any real devices.
 
 Lahza checks camera and audio-record access when a device toggle or picker is
 used, and before recording. If access is missing it shows **Allow device access**
-with **Open permissions**, which opens the Lahza page in the desktop software
-app (`snap://lahza`). Enable access in **Permissions**, return to Lahza, and click
-**Try again**. It rechecks access and refreshes devices without restarting. A
-missing permission is not reported as missing hardware. Cancel stops the
-pending action; screen-only recording needs neither permission.
+with commands for only the missing permissions. Choose **Copy commands**, paste
+and run them in Terminal, then return to Lahza and click **Try again**. It
+rechecks access and refreshes devices without restarting. A missing permission
+is not reported as missing hardware. Cancel stops the pending action;
+screen-only recording needs neither permission.
 
-On desktops without a handler for Snap links, the dialog explains how to find
-Lahza in the system software app. For headless setup or troubleshooting only,
-the equivalent commands are:
+The store listing may only show “Sandboxed” without permission controls, so the
+dialog does not rely on a `snap://` link. The manual setup commands are:
 
 ```bash
 sudo snap connect lahza:audio-record

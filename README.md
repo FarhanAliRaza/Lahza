@@ -80,8 +80,8 @@ sudo snap refresh lahza
 ```
 
 When camera or audio recording access is missing, Lahza shows an **Allow device
-access** prompt. Choose **Open permissions**, allow access on Lahza’s page in
-your software app, then return and choose **Try again**. Device lists refresh
+access** prompt with the commands needed to enable access. Choose **Copy commands**,
+paste and run them in Terminal, then return and choose **Try again**. Device lists refresh
 without restarting. See [Snap setup](packaging/SNAP.md) for troubleshooting.
 
 To save files on removable drives, also run `sudo snap connect lahza:removable-media`.

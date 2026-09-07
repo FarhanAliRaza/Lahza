@@ -16,6 +16,7 @@ pub(crate) enum CaptureAccess {
 pub(crate) struct AccessPrompt {
     action: CaptureAccess,
     message: String,
+    commands: String,
 }
 
 fn required_interfaces(action: CaptureAccess, camera: bool, audio: bool) -> Vec<&'static str> {
@@ -61,7 +62,7 @@ fn interface_connected(interface: &str) -> Result<bool, String> {
     match status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => Err("Could not check device access. Open Lahza’s permissions and try again.".into()),
+        _ => Err("Could not check device access. Run `snap connections lahza` in Terminal to inspect access, then choose Try again.".into()),
     }
 }
 
@@ -71,7 +72,15 @@ fn permission_message(missing: &[&str]) -> String {
         ["audio-record"] => "audio recording access (microphone and system sound)",
         _ => "camera and audio recording access",
     };
-    format!("Lahza needs {access}. Open Permissions in Lahza’s app settings and allow access, then return here and choose Try again.")
+    format!("Lahza needs {access}. Copy the command(s) below and run them in Terminal. Enter your password if asked, then return here and choose Try again.")
+}
+
+fn permission_commands(missing: &[&str]) -> String {
+    missing
+        .iter()
+        .map(|interface| format!("sudo snap connect lahza:{interface}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl Studio {
@@ -88,12 +97,13 @@ impl Studio {
         self.capture_access_busy = true;
         let task = cx.background_executor().spawn(async move {
             let missing = if confined {
-                missing_interfaces(&interfaces, interface_connected)?
+                missing_interfaces(&interfaces, interface_connected)
+                    .map_err(|message| (message, String::new()))?
             } else {
                 Vec::new()
             };
             if !missing.is_empty() {
-                return Err(permission_message(&missing));
+                return Err((permission_message(&missing), permission_commands(&missing)));
             }
             let cameras = if matches!(action, CaptureAccess::Camera | CaptureAccess::CameraPicker) {
                 Some(camera_devices())
@@ -115,10 +125,14 @@ impl Studio {
             let _ = weak.update(cx, |this, cx| {
                 this.capture_access_busy = false;
                 match result {
-                    Err(message) => {
+                    Err((message, commands)) => {
                         this.launcher_camera_menu_open = false;
                         this.launcher_mic_menu_open = false;
-                        this.capture_access_prompt = Some(AccessPrompt { action, message });
+                        this.capture_access_prompt = Some(AccessPrompt {
+                            action,
+                            message,
+                            commands,
+                        });
                     }
                     Ok((cameras, microphones)) => {
                         this.capture_access_prompt = None;
@@ -146,26 +160,6 @@ impl Studio {
         })
         .detach();
         cx.notify();
-    }
-
-    fn open_capture_permissions(&mut self, cx: &mut Context<Self>) {
-        let task = cx.background_executor().spawn(async move {
-            Command::new("xdg-open")
-                .arg("snap://lahza")
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        });
-        cx.spawn(async move |weak, cx| {
-            if !task.await {
-                let _ = weak.update(cx, |this, cx| {
-                    if let Some(prompt) = &mut this.capture_access_prompt {
-                        prompt.message = "Could not open app settings. Open your system’s software app, find Lahza, and enable camera or audio recording in Permissions. Then choose Try again.".into();
-                    }
-                    cx.notify();
-                });
-            }
-        }).detach();
     }
 
     pub(crate) fn capture_access_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -204,20 +198,27 @@ impl Studio {
                             .child("Allow device access"),
                     )
                     .child(div().whitespace_normal().child(prompt.message.clone()))
-                    .child(
-                        div()
-                            .id("open-capture-permissions")
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(0x18181b))
-                            .text_color(gpui::white())
-                            .cursor_pointer()
-                            .child("Open permissions")
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.open_capture_permissions(cx)),
-                            ),
-                    )
+                    .when(!prompt.commands.is_empty(), |element| {
+                        let commands = prompt.commands.clone();
+                        element
+                            .child(div().whitespace_normal().child(commands.clone()))
+                            .child(
+                                div()
+                                    .id("copy-capture-permissions")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x18181b))
+                                    .text_color(gpui::white())
+                                    .cursor_pointer()
+                                    .child("Copy commands")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            commands.clone(),
+                                        ));
+                                    })),
+                            )
+                    })
                     .child(
                         div()
                             .flex()

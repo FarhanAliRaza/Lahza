@@ -4,11 +4,9 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Unified annotation, clip, timing, and zoom undo history in video and motion scenes, and added Ctrl/Cmd+Y for redo.
-- Improved Delete and Escape behavior for annotations, motion regions, and image clips, with more consistent timeline keyboard focus.
-- Fixed images disappearing before longer templates finish. Applying a template now resets the image to cover the full scene, including after trimming or deleting it.
-- Made expanded template galleries scroll with the sidebar and added editor overflow scrolling for smaller windows.
-- Fixed action icons and removed automatic scaling when initializing manual transforms.
+- Replaced the Snap permission dialog’s store link with copyable Terminal commands for the missing camera or audio recording permissions.
+- Updated setup instructions for desktops whose store listing shows only “Sandboxed” without permission controls.
+- Kept permission retries and device refresh available without restarting Lahza.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
@@ -39,7 +37,7 @@ Launch **Lahza** from your app menu, or run `lahza`.
 sudo snap install lahza
 ```
 
-The stable channel receives this version after the release workflow and Store review succeed. Camera and audio recording require additional permission setup. Lahza now prompts when access is missing: choose Open permissions, allow access in the software app, then return and choose Try again.
+The stable channel receives this version after the release workflow and Store review succeed. Camera and audio recording require additional permission setup. Lahza now prompts when access is missing: choose Copy commands, paste and run them in Terminal, then return and choose Try again.
 
 **Binary bundle:** download `lahza-0.4.9-linux-x86_64.tar.gz`, then run:
 
