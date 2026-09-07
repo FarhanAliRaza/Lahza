@@ -4,186 +4,70 @@
   <p><em>Lahza</em> is Urdu for "a brief moment".</p>
   <p>A native Linux studio for screenshots, screen recordings, and motion.</p>
   <p>Capture a moment. Annotate it, style it, and turn it into something worth sharing.</p>
-  <p><a href="#install">Install Debian / Ubuntu package</a> · <a href="https://github.com/FarhanAliRaza/lahza/releases">All downloads</a> · <a href="https://github.com/FarhanAliRaza/lahza/issues">Report a bug</a> · <a href="#build-from-source">Build from source</a></p>
+  <p><a href="#install">Install</a> · <a href="https://github.com/FarhanAliRaza/lahza/releases">All downloads</a> · <a href="https://github.com/FarhanAliRaza/lahza/issues">Report a bug</a> · <a href="#build-from-source">Build from source</a></p>
 </div>
 
 Built with Rust and GPUI, Lahza brings screenshot annotation, native screen recording, timeline editing, and animated presentations into one Linux desktop application.
 
 ## Install
 
-### Debian / Ubuntu package — recommended
-
-Recommended for **Ubuntu 24.04 amd64** and compatible distributions. It uses the normal desktop device access without Snap’s additional camera and audio-recording permission connections.
-
-Download the `.deb` from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then install the downloaded file:
-
-```bash
-sudo apt install ./lahza_0.5.1_amd64.deb
-```
-
-Launch **Lahza** from your application menu, or run `lahza`.
-
-#### Updates and older local installations
-
-Debian packages built from this source include a terminal updater:
-
-```bash
-lahza-update --check
-lahza-update --install
-```
-
-It checks the latest stable GitHub Release, downloads a newer package for your architecture, verifies its release SHA256 checksum and package metadata, and runs `sudo apt install`. APT asks for confirmation. Save your work and fully quit and reopen Lahza after installation. Checksums verify download integrity against the release; they are not independent signatures. The updater requires internet access and manages Debian installations only.
-
-Existing 0.4.1 packages do not contain this command. Until you install a release containing it, you can run `python3 packaging/lahza-update --install` from this source checkout, or download a newer `.deb` and use `sudo apt install ./<downloaded-file>.deb`. Installing a local `.deb` does not subscribe APT to GitHub Releases; automatic updates through `apt upgrade` would require a separately hosted APT repository.
-
-If the old app still opens, check for multiple installations:
-
-```bash
-type -a lahza
-dpkg-query -W lahza
-/usr/bin/lahza
-```
-
-A source or bundle install in `~/.local/bin/lahza` can take precedence over `/usr/bin/lahza`. A user launcher at `~/.local/share/applications/com.lahza.Lahza.desktop` also overrides the system launcher. Back up or remove those old local installation files if you want to use only the Debian package. New Debian package launchers explicitly select `/usr/bin/lahza`; an existing user launcher still takes precedence. New builds support `lahza --version` to identify the executable's version.
-
-The `_apt` “unsandboxed as root” notice for an unreadable Downloads directory does not mean installation failed. The updater uses an APT-readable temporary download directory. Installing a package system-wide requires `sudo`; repeating the same version does not fetch a newer GitHub release.
-
-For maintainers: update and commit the release notes on `master`, then run `just release` to bump the patch version and push a release tag. Pass a version such as `0.5.0` to choose it explicitly, or use `just release-check` to preview. See [release instructions](packaging/SNAP.md#cut-a-release). The release workflow validates the tag and publishes the `.deb` and `SHA256SUMS` consumed by the updater. Do not replace old release assets with changed builds under the same version.
-
-Debian packages and binary bundles are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; use the Snap or build from source if the package's dependencies are unavailable.
-
-The release workflow also builds and tests a `core24` Snap. Matching version
-tags publish it to the Snap Store after both package jobs pass (stable versions
-to `stable`, prerelease versions to `beta`). Maintainers must first configure
-the Store credential using the [Snap release setup](packaging/SNAP.md#github-actions-releases).
-
-### Snap — alternative
-
-The Snap requires extra camera and audio-recording permission setup. For the simplest recording setup on Ubuntu 24.04 amd64, use the Debian package above.
-
-Install [Lahza from the Snap Store](https://snapcraft.io/lahza) on amd64 Linux with [snapd installed](https://snapcraft.io/docs/installing-snapd):
+### Snap
 
 ```bash
 sudo snap install lahza
 ```
 
-Launch **Lahza** from your application menu, or run:
+### Debian / Ubuntu
+
+Download the `.deb` for Ubuntu 24.04 amd64 from [GitHub Releases](https://github.com/FarhanAliRaza/lahza/releases), then run:
 
 ```bash
-snap run lahza
+sudo apt install ./lahza_0.5.1_amd64.deb
 ```
 
-The Snap bundles its desktop and media dependencies and receives automatic updates through snapd. To check for an update manually, close Lahza and run:
-
-```bash
-sudo snap refresh lahza
-```
-
-When camera or audio recording access is missing, Lahza shows an **Allow device
-access** prompt with the commands needed to enable access. Choose **Copy commands**,
-paste and run them in Terminal, then return and choose **Try again**. Device lists refresh
-without restarting. See [Snap setup](packaging/SNAP.md) for troubleshooting.
-
-To save files on removable drives, also run `sudo snap connect lahza:removable-media`.
-
-**Previously installed a local test `.snap`?** Switch it to the Store version once to enable normal updates:
-
-```bash
-sudo snap refresh lahza --amend --channel=stable
-```
-
-Use `snap info lahza` to compare the installed version with the Store channels. If you also have a Debian or source installation, `snap run lahza` explicitly launches the Snap.
-
-### Binary bundle — alternative
-
-Each release also includes `lahza-0.5.1-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
-
-```bash
-tar -xzf lahza-0.5.1-linux-x86_64.tar.gz
-cd lahza-0.5.1-linux-x86_64
-./install.sh
-```
-
-The installer adds the binary, assets, desktop entry, and icon under `~/.local`. Ensure `~/.local/bin` is on `PATH`. Run `./install.sh --help` for details. The bundle requires system libraries and is built on Ubuntu 24.04; it is not a static build. The release notes list runtime dependencies. `SHA256SUMS` accompanies both downloads for integrity verification.
-
-### Desktop requirements
-
-- A Linux desktop with Vulkan support. Wayland and X11 backends are compiled in.
-- `xdg-desktop-portal` and the appropriate portal backend for your desktop.
-- PipeWire for desktop capture. The Snap bundles GStreamer, FFmpeg, and FFprobe; Debian and source installations use system media libraries and tools.
-- Desktop support for the screenshot and screencast portals. Picker options depend on your desktop.
-
+[Permissions, updates, and troubleshooting](#installation-details)
 
 ## Features
 
 ### Capture and record
 
-- Capture a screen, window, or area through your desktop's screenshot picker.
-- Use the **Screenshot** button in the launcher to capture a screen, window, or area.
-- Record a monitor or window through the ScreenCast portal and PipeWire.
-- Use a separate recorder window with pause, resume, restart, stop, and discard controls.
-- Include system audio, microphone audio, or both.
-- Keep recordings in editable `.lahzarec` project folders, with draft autosave and recovery of usable unfinished recordings.
+Capture screens, windows, or areas. Record with system and microphone audio, pause and resume, and save editable projects with autosave.
 
 ### Annotate screenshots and videos
 
-- Draw arrows, lines, freehand strokes, rectangles, filled rectangles, and ellipses.
-- Add text, numbered steps, and highlights; obscure details with blur or pixelation.
-- Crop screenshots and undo or redo edits.
-- Give video and animated-image annotations start and end times on their own timeline lane.
-- Animate annotations with effects such as draw-on, type-on, pop, and slide.
+![Lahza annotation tools with text styling and timed captions on the video timeline](docs/screenshots/05-annotations.png)
+
+Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive details, crop screenshots, and animate annotations with custom timing.
 
 ### Design the scene
 
 [![Lahza screenshot editor showing wallpaper choices and image appearance controls](docs/screenshots/01-screenshot-styling.png)](packaging/store/screenshots/01-screenshot-styling.png)
 
-- Frame your media with solid colors, gradients, or wallpaper backgrounds.
-- Adjust padding, rounded corners, borders, shadows, and window frames.
-- Add background blur, grain, vignette, and a corner text watermark.
-- Position, scale, and rotate the media in 3D, with perspective and adjustable anchor points.
-- Use **Fit**, **Fill**, and **Actual size**, or save a look to your personal preset library.
-
-Perspective changes become visible when the media is tilted with Rotate X or Y. Anchor controls set the pivot for scaling and rotation.
+Style your captures with backgrounds, rounded corners, shadows, and window frames. Add effects and watermarks, adjust 3D perspective, and save reusable presets.
 
 ### Edit recordings
 
 [![Lahza video editor showing a camera overlay, pointer controls, and a multitrack timeline](docs/screenshots/03-video-and-camera.png)](packaging/store/screenshots/03-video-and-camera.png)
 
-- Preview recordings with synchronized audio and a seekable clip timeline.
-- Trim, split, delete, and change clip speed, with undo/redo.
-- Edit motion regions on the orange lane: timing, magnification, easing, focus, and pan destination.
-- Choose **Transform** in a motion region to animate card scale, X/Y position, and X/Y/Z rotation with separate start/end values. Choose **Both** to combine those transforms with zoom/pan. Values are relative to the scene layout. New manual transforms default to **Keep end state**; choose **Reset to layout** under **After motion** for an immediate reset. Existing regions and presets retain their previous reset behavior. A new transform starts from the pose at its start time.
-- Generate zoom regions from captured clicks, then adjust them manually.
-- Customize the reconstructed pointer, idle hiding, shadows, and click effects when input metadata is available.
-- Composite an added camera clip as picture-in-picture, with shape, corner, size, mirroring, margin, and shadow controls.
+Trim, split, and change clip speed. Add zooms, pans, 3D motion, and camera overlays. Customize cursor effects and generate click-based zooms when input metadata is available.
 
 ### Animate still images
 
 [![Lahza Motion editor with a floating card preset and timed captions](docs/screenshots/02-motion-and-captions.png)](packaging/store/screenshots/02-motion-and-captions.png)
 
-- Select **Motion** to turn a screenshot into an animated scene.
-- Trim the image independently of the scene. Use **+ 5s** on the timeline to leave room for later content; the background remains after the image ends.
-- Add text anywhere on the canvas in Motion mode. Text has its own timing and entrance/exit animation, independent of image movement and duration.
-- Start with slow zooms, pans, center focus, sweep, 3D tilt, floating card, corner reveal, or tilted scroll presets.
-- Edit the resulting motion regions using the same controls as recordings.
-- Build a sequence of images, each with its own duration, motion, and captions.
-- Create a synthetic cursor walkthrough by choosing points on the image.
-
-For a loaded video, **Motion** opens the recording's motion controls directly.
+Turn screenshots into animated scenes with zoom, pan, and 3D presets. Combine images, timed captions, and cursor walkthroughs.
 
 ### Start from a template
 
-Choose **Product launch**, **Feature spotlight**, **Tutorial steps**, **Social square**, **Changelog**, **Cinematic**, **Minimal dark**, or **Store listing**. Templates combine scene styling, motion, and editable captions. On recordings, they add an intro while retaining later motion regions.
+![Lahza template browser showing product launch, feature spotlight, tutorial, and other animated scene presets](docs/screenshots/06-scene-templates.png)
+
+Start with ready-made layouts for product launches, tutorials, social posts, changelogs, and more. Customize their styling, motion, and captions.
 
 ### Export
 
 [![Lahza export panel showing MP4, WebM, GIF, resolution, and frame rate options](docs/screenshots/04-export-formats.png)](packaging/store/screenshots/04-export-formats.png)
 
-- Save styled screenshots as **PNG**.
-- Export recordings and animated screenshots as **MP4 (H.264/AAC)**, **WebM (VP9/Opus)**, or **looping GIF**.
-- Choose original resolution, 720p, 1080p, 1440p, or 4K, at 30 or 60 fps.
-- See a size estimate, track progress, and cancel an export.
-- Render backgrounds, media transforms, motion, pointers, and annotations through the scene compositor used by the preview.
+Save screenshots as **PNG** and videos or animations as **MP4**, **WebM**, or **GIF**. Export up to **4K** at **30 or 60 fps**, with size estimates and progress tracking.
 
 ## Quick start
 
@@ -273,3 +157,91 @@ See [the engineering parity checklist](docs/VIDEO_PARITY.md) for deeper implemen
 Bug reports and focused pull requests are welcome. Include your distribution, desktop environment, Wayland/X11 session, Lahza version, steps to reproduce, and relevant terminal output. Review screenshots, recordings, and logs for private information before attaching them.
 
 The application declares the **MIT** license in `Cargo.toml`.
+
+## Installation details
+
+Launch **Lahza** from your application menu. For the Debian package, you can also run `lahza`.
+
+### Debian updates and troubleshooting
+
+Debian packages built from this source include a terminal updater:
+
+```bash
+lahza-update --check
+lahza-update --install
+```
+
+It checks the latest stable GitHub Release, downloads a newer package for your architecture, verifies its release SHA256 checksum and package metadata, and runs `sudo apt install`. APT asks for confirmation. Save your work and fully quit and reopen Lahza after installation. Checksums verify download integrity against the release; they are not independent signatures. The updater requires internet access and manages Debian installations only.
+
+Existing 0.4.1 packages do not contain this command. Until you install a release containing it, you can run `python3 packaging/lahza-update --install` from this source checkout, or download a newer `.deb` and use `sudo apt install ./<downloaded-file>.deb`. Installing a local `.deb` does not subscribe APT to GitHub Releases; automatic updates through `apt upgrade` would require a separately hosted APT repository.
+
+If the old app still opens, check for multiple installations:
+
+```bash
+type -a lahza
+dpkg-query -W lahza
+/usr/bin/lahza
+```
+
+A source or bundle install in `~/.local/bin/lahza` can take precedence over `/usr/bin/lahza`. A user launcher at `~/.local/share/applications/com.lahza.Lahza.desktop` also overrides the system launcher. Back up or remove those old local installation files if you want to use only the Debian package. New Debian package launchers explicitly select `/usr/bin/lahza`; an existing user launcher still takes precedence. New builds support `lahza --version` to identify the executable's version.
+
+The `_apt` “unsandboxed as root” notice for an unreadable Downloads directory does not mean installation failed. The updater uses an APT-readable temporary download directory. Installing a package system-wide requires `sudo`; repeating the same version does not fetch a newer GitHub release.
+
+For maintainers: update and commit the release notes on `master`, then run `just release` to bump the patch version and push a release tag. Pass a version such as `0.5.0` to choose it explicitly, or use `just release-check` to preview. See [release instructions](packaging/SNAP.md#cut-a-release). The release workflow validates the tag and publishes the `.deb` and `SHA256SUMS` consumed by the updater. Do not replace old release assets with changed builds under the same version.
+
+Debian packages and binary bundles are built on **Ubuntu 24.04, amd64**. Compatibility with older distributions is not guaranteed; use the Snap or build from source if the package's dependencies are unavailable.
+
+The release workflow also builds and tests a `core24` Snap. Matching version
+tags publish it to the Snap Store after both package jobs pass (stable versions
+to `stable`, prerelease versions to `beta`). Maintainers must first configure
+the Store credential using the [Snap release setup](packaging/SNAP.md#github-actions-releases).
+
+### Snap permissions and updates
+
+The Snap requires [snapd](https://snapcraft.io/docs/installing-snapd) and extra camera and audio-recording permission setup. The Debian package uses normal desktop device access without these additional Snap connections.
+
+Launch **Lahza** from your application menu, or run:
+
+```bash
+snap run lahza
+```
+
+The Snap bundles its desktop and media dependencies and receives automatic updates through snapd. To check for an update manually, close Lahza and run:
+
+```bash
+sudo snap refresh lahza
+```
+
+When camera or audio recording access is missing, Lahza shows an **Allow device
+access** prompt with the commands needed to enable access. Choose **Copy commands**,
+paste and run them in Terminal, then return and choose **Try again**. Device lists refresh
+without restarting. See [Snap setup](packaging/SNAP.md) for troubleshooting.
+
+To save files on removable drives, also run `sudo snap connect lahza:removable-media`.
+
+**Previously installed a local test `.snap`?** Switch it to the Store version once to enable normal updates:
+
+```bash
+sudo snap refresh lahza --amend --channel=stable
+```
+
+Use `snap info lahza` to compare the installed version with the Store channels. If you also have a Debian or source installation, `snap run lahza` explicitly launches the Snap.
+
+### Binary bundle — alternative
+
+Each release also includes `lahza-0.5.1-linux-x86_64.tar.gz`, containing the executable, assets, and a user-local installer:
+
+```bash
+tar -xzf lahza-0.5.1-linux-x86_64.tar.gz
+cd lahza-0.5.1-linux-x86_64
+./install.sh
+```
+
+The installer adds the binary, assets, desktop entry, and icon under `~/.local`. Ensure `~/.local/bin` is on `PATH`. Run `./install.sh --help` for details. The bundle requires system libraries and is built on Ubuntu 24.04; it is not a static build. The release notes list runtime dependencies. `SHA256SUMS` accompanies both downloads for integrity verification.
+
+### Desktop requirements
+
+- A Linux desktop with Vulkan support. Wayland and X11 backends are compiled in.
+- `xdg-desktop-portal` and the appropriate portal backend for your desktop.
+- PipeWire for desktop capture. The Snap bundles GStreamer, FFmpeg, and FFprobe; Debian and source installations use system media libraries and tools.
+- Desktop support for the screenshot and screencast portals. Picker options depend on your desktop.
