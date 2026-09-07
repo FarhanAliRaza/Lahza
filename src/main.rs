@@ -1123,7 +1123,7 @@ impl Studio {
 impl Studio {
     fn render_export(&mut self, destination: &std::path::Path) -> Result<(), String> {
         self.rebuild_redactions()?;
-        if self.scene_style().needs_composited_preview() || self.annotations.iter().any(|mark| mark.canvas) {
+        if self.scene_style().needs_composited_preview() || self.annotations.iter().any(|mark| mark.is_canvas()) {
             return self.render_composited_export(destination);
         }
         let capture_path = self

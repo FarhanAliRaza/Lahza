@@ -114,6 +114,14 @@ pub(crate) struct AnnotationMark {
     pub(crate) canvas: bool,
 }
 
+impl AnnotationMark {
+    /// Template captions belong to the full scene, including in projects saved
+    /// before templates explicitly set `canvas`. Media callouts stay attached.
+    pub(crate) fn is_canvas(&self) -> bool {
+        self.canvas || (self.from_template && self.tool == Tool::Text)
+    }
+}
+
 impl Default for AnnotationMark {
     fn default() -> Self {
         Self {

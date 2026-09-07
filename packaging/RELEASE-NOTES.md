@@ -4,9 +4,9 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Replaced the Snap permission dialog’s store link with copyable Terminal commands for the missing camera or audio recording permissions.
-- Updated setup instructions for desktops whose store listing shows only “Sandboxed” without permission controls.
-- Kept permission retries and device refresh available without restarting Lahza.
+- Fixed template captions disappearing outside the screenshot. Captions now use the full scene canvas in preview and export, including captions in older saved projects.
+- Selecting existing text no longer focuses the text field automatically. Single-click to select and move; double-click or click the inspector text field to edit.
+- Removed white preview borders around transparent window captures by removing the placeholder backing behind loaded screenshots.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

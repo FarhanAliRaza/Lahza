@@ -409,7 +409,7 @@ impl Studio {
     }
 
     pub(super) fn fit_text_box_to_content(&mut self, index: usize) {
-        let canvas_text = self.annotations.get(index).is_some_and(|mark| mark.canvas);
+        let canvas_text = self.annotations.get(index).is_some_and(|mark| mark.is_canvas());
         let aspect = self
             .media_dimensions()
             .map(|(width, height)| width as f32 / height.max(1) as f32)
@@ -440,6 +440,7 @@ impl Studio {
         position: Point<Pixels>,
         image: Bounds<Pixels>,
         rendered_bounds: &[Bounds<Pixels>],
+        click_count: usize,
     ) {
         // GPUI can retain more than one paint-scoped mouse listener across a
         // redraw. Treat a physical press as one editing transaction so a
@@ -474,7 +475,7 @@ impl Studio {
                     .iter()
                     .enumerate()
                     .rposition(|(index, mark)| {
-                        if mark.canvas != self.canvas_annotation_drag { return false; }
+                        if mark.is_canvas() != self.canvas_annotation_drag { return false; }
                         rendered_bounds
                             .get(index)
                             .copied()
@@ -493,10 +494,14 @@ impl Studio {
             if self.selected_annotation.is_some() {
                 self.record_annotation_undo();
             }
+            // Selection keeps keyboard focus on the canvas for moving. Only
+            // an explicit double-click requests focus in the text inspector.
             self.editing_text = self.selected_annotation.filter(|index| {
-                self.annotations
-                    .get(*index)
-                    .is_some_and(|mark| mark.tool == Tool::Text)
+                click_count >= 2
+                    && !self.selection_resizing
+                    && self.annotations
+                        .get(*index)
+                        .is_some_and(|mark| mark.tool == Tool::Text)
             });
             if self.editing_text.is_some() {
                 self.caret_visible = true;
@@ -599,7 +604,7 @@ impl Studio {
             {
                 let frame = self.pinned_bounds(image);
                 if let Some(mark) = self.annotations.get_mut(index) {
-                    let image = if mark.pinned { frame } else { image };
+                    let image = if mark.pinned && !mark.is_canvas() { frame } else { image };
                     let dx = (position.x - last.x) / image.size.width;
                     let dy = (position.y - last.y) / image.size.height;
                     if self.selection_resizing && mark.tool != Tool::Pen {

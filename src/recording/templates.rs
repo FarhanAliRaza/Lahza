@@ -49,8 +49,8 @@ impl TemplateMotion {
     }
 }
 
-/// A caption or callout a template places on the media, in normalized
-/// media coordinates, with its entrance and exit already timed.
+/// A caption on the scene canvas or a callout on the media, in normalized
+/// coordinates, with its entrance and exit already timed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TemplateMark {
     pub tool: Tool,
@@ -153,6 +153,7 @@ impl TemplateMark {
             from_template: true,
             // Captions overlay the frame; the camera moves beneath them.
             pinned: true,
+            canvas: self.tool == Tool::Text,
             ..AnnotationMark::default()
         }
     }
@@ -584,6 +585,7 @@ mod tests {
                 assert!(mark.start.y >= 0.0 && mark.end.y <= 1.0);
                 if mark.tool == Tool::Text {
                     assert!(!mark.text.is_empty());
+                    assert!(mark.canvas, "template captions must use the full canvas");
                 }
             }
             for cue in template.cues(template.duration) {

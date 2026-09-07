@@ -715,7 +715,7 @@ impl Studio {
             let viewport = self.video_viewport_timeline.frame_at(time);
             timed::active_marks(&self.annotations, time, viewport)
         } else {
-            self.annotations.iter().filter(|mark| !mark.canvas).cloned().collect()
+            self.annotations.iter().filter(|mark| !mark.is_canvas()).cloned().collect()
         };
         let signature = timed::marks_signature(&marks) ^ ((width as u64) << 32 | height as u64);
         if let Some((cached, layer)) = self.preview_cache.overlay.as_ref() {
@@ -1168,7 +1168,7 @@ impl Studio {
         self.annotations
             .iter()
             .enumerate()
-            .filter(|(_, mark)| mark.canvas)
+            .filter(|(_, mark)| mark.is_canvas())
             .filter_map(|(index, mark)| {
                 let mark = if self.scene_is_timed() {
                     timed::editor_mark(
@@ -1189,6 +1189,7 @@ impl Studio {
         position: Point<Pixels>,
         canvas: Bounds<Pixels>,
         hits: &[(usize, Bounds<Pixels>)],
+        click_count: usize,
     ) -> bool {
         // Retained paint listeners must not reclassify an active gesture.
         if self.pointer_is_down {
@@ -1221,7 +1222,7 @@ impl Studio {
                 *value = *hit;
             }
         }
-        self.pointer_down(position, canvas, &bounds);
+        self.pointer_down(position, canvas, &bounds, click_count);
         self.video_selected_zoom_cue = None;
         self.video_selected_clip = None;
         self.scene_selection = SceneSelection::Scene;
@@ -1564,7 +1565,7 @@ impl Studio {
         let mut painted = Vec::with_capacity(marks.len());
         let mut painted_indices = Vec::with_capacity(marks.len());
         for (index, mark) in marks.iter().enumerate() {
-            if mark.canvas || !media_visible { continue; }
+            if mark.is_canvas() || !media_visible { continue; }
             if let Some(animated) = timed::editor_mark(
                 mark,
                 time,
@@ -1708,7 +1709,7 @@ impl Studio {
                                 }
                                 entity.update(cx, |this, cx| {
                                     this.focus_handle.focus(window);
-                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits) {
+                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, event.click_count) {
                                         cx.notify();
                                         return;
                                     }
@@ -1734,6 +1735,7 @@ impl Studio {
                                                 flat,
                                                 interaction_bounds,
                                                 &annotation_bounds,
+                                                event.click_count,
                                             );
                                         }
                                     } else {
@@ -1744,6 +1746,7 @@ impl Studio {
                                                 flat,
                                                 interaction_bounds,
                                                 &annotation_bounds,
+                                                event.click_count,
                                             );
                                         }
                                         if this.selected_annotation.is_some() {
@@ -3082,9 +3085,9 @@ impl Studio {
                         }
                     },
                 ))
-                .when(mark.canvas, |panel| panel.child(div().text_xs().text_color(muted())
+                .when(mark.is_canvas(), |panel| panel.child(div().text_xs().text_color(muted())
                     .child("Independent text: stays on the canvas when the image moves or ends.")))
-                .when(!mark.canvas, |panel| panel.child(self.scene_toggle_row(
+                .when(!mark.is_canvas(), |panel| panel.child(self.scene_toggle_row(
                     "annotation-pinned",
                     "Ignore camera zoom",
                     mark.pinned,
@@ -3278,7 +3281,7 @@ pub(crate) fn canvas_overlay_source_for(
     marks: Vec<AnnotationMark>,
     aspect: f64,
 ) -> Option<crate::recording::export::OverlaySource> {
-    let marks: Vec<_> = marks.into_iter().filter(|mark| mark.canvas).collect();
+    let marks: Vec<_> = marks.into_iter().filter(|mark| mark.is_canvas()).collect();
     if marks.is_empty() {
         return None;
     }
@@ -3522,5 +3525,61 @@ impl Studio {
         frame
             .save(destination)
             .map_err(|error| format!("Could not save PNG: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod canvas_caption_tests {
+    use super::*;
+    use crate::recording::scene::{FrameInput, SceneBackground, SceneCompositor, SceneTransform};
+
+    #[test]
+    fn saved_template_caption_renders_beyond_transformed_screenshot() {
+        let template = crate::recording::templates::find("product-launch").unwrap();
+        let mut caption = template.marks(template.duration).into_iter()
+            .find(|mark| mark.tool == Tool::Text).unwrap();
+        // Simulate an older saved template caption dragged onto the background.
+        caption.canvas = false;
+        caption.start = crate::NormPoint { x: 0.05, y: 0.85 };
+        caption.end = crate::NormPoint { x: 0.95, y: 0.99 };
+        caption.color = 0xff0000;
+        caption.font_size = 60.0;
+        caption.timing = None;
+        let caption: AnnotationMark = serde_json::from_str(
+            &serde_json::to_string(&caption).unwrap()).unwrap();
+        assert!(caption.is_canvas());
+        assert!(timed::active_marks(&[caption.clone()], 2.0, Default::default()).is_empty());
+        let mut overlay = canvas_overlay_source_for(vec![caption], 16.0 / 9.0).unwrap();
+        let layer = overlay(2.0).unwrap();
+        let style = SceneStyle {
+            background: SceneBackground::Solid(0),
+            padding: 0, shadow: 0, corners: 0, border: false,
+            transform: SceneTransform {
+                scale: 0.5, rotation_y: 15.0, ..Default::default()
+            },
+            ..Default::default()
+        };
+        let compositor = SceneCompositor::new(&style, 480, 270, 160, 90).unwrap();
+        let source = RgbaImage::from_pixel(160, 90, image::Rgba([0, 255, 0, 255]));
+        let output = compositor.compose_layers(FrameInput {
+            source: &source, overlay: None, viewport: Default::default(),
+            pointer: None, camera: None,
+        }, true, Some(&layer));
+        assert!(output.enumerate_pixels().any(|(_, y, p)|
+            y > 220 && p[0] > 150 && p[1] < 80),
+            "caption must remain visible below the screenshot");
+    }
+
+    #[test]
+    fn template_callouts_and_manual_media_text_stay_on_media() {
+        let mut mark = AnnotationMark {
+            tool: Tool::Number, from_template: true, ..Default::default()
+        };
+        assert!(!mark.is_canvas());
+        mark.tool = Tool::Text;
+        mark.from_template = false;
+        assert!(!mark.is_canvas());
+        mark.canvas = true;
+        assert!(mark.is_canvas());
     }
 }

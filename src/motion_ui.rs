@@ -1988,7 +1988,7 @@ impl Studio {
         let mut svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><image href="{href}" x="0" y="0" width="{width}" height="{height}" preserveAspectRatio="none"/><g>"#
         );
-        let marks: Vec<_> = self.annotations.iter().filter(|mark| !mark.canvas).cloned().collect();
+        let marks: Vec<_> = self.annotations.iter().filter(|mark| !mark.is_canvas()).cloned().collect();
         svg.push_str(&crate::annotations_svg(&marks, 0.0, 0.0, width, height, stroke_scale));
         svg.push_str("</g></svg>");
         let mut options = resvg::usvg::Options::default();

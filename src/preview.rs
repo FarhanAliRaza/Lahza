@@ -119,7 +119,7 @@ impl Studio {
                 let mut marks = Vec::new();
                 let mut indices = Vec::new();
                 for (index, mark) in annotations.iter().enumerate() {
-                    if mark.canvas || !media_visible { continue; }
+                    if mark.is_canvas() || !media_visible { continue; }
                     if let Some(animated) = timed::editor_mark(
                         mark,
                         time,
@@ -131,7 +131,7 @@ impl Studio {
                 }
                 (marks, indices)
             } else {
-                annotations.into_iter().enumerate().filter(|(_, mark)| !mark.canvas)
+                annotations.into_iter().enumerate().filter(|(_, mark)| !mark.is_canvas())
                     .map(|(index, mark)| (mark, index)).unzip()
             };
         let caret_visible = self.caret_visible;
@@ -258,19 +258,16 @@ impl Studio {
                     .top(image_y)
                     .w(image_width)
                     .h(image_height)
-                    .bg(rgb(0xfafafa))
-                    .border_1()
-                    .border_color(rgb(0xd6dde6))
+                    // Window captures can include transparent shadow margins.
+                    // Keep the empty-state backing out of loaded screenshots so
+                    // those margins reveal the scene background, as in export.
+                    .when(!has_capture, |this| {
+                        this.bg(rgb(0xfafafa))
+                            .border_1()
+                            .border_color(rgb(0xd6dde6))
+                    })
                     .overflow_hidden()
                     .rounded(corner_radius)
-                    .when(has_capture, |this| {
-                        this.child(
-                            img("mock-capture.svg")
-                                .size_full()
-                                .object_fit(ObjectFit::Contain)
-                                .rounded(corner_radius),
-                        )
-                    })
                     .when(!has_capture, |this| {
                         this.flex()
                             .flex_col()
@@ -594,7 +591,7 @@ impl Studio {
                                 }
                                 entity.update(cx, |this, cx| {
                                     this.focus_handle.focus(window);
-                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits) {
+                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, event.click_count) {
                                         cx.notify();
                                         return;
                                     }
@@ -630,6 +627,7 @@ impl Studio {
                                                 flat,
                                                 interaction_bounds,
                                                 &annotation_bounds,
+                                                event.click_count,
                                             );
                                         }
                                         if this.selected_annotation.is_some() {
@@ -653,6 +651,7 @@ impl Studio {
                                                 flat,
                                                 interaction_bounds,
                                                 &annotation_bounds,
+                                                event.click_count,
                                             );
                                         }
                                     } else if this.crop_active {
@@ -672,6 +671,7 @@ impl Studio {
                                                 event.position,
                                                 image_bounds,
                                                 &annotation_bounds,
+                                                event.click_count,
                                             );
                                         }
                                         if this.selected_annotation.is_none() {
@@ -688,6 +688,7 @@ impl Studio {
                                             flat,
                                             interaction_bounds,
                                             &annotation_bounds,
+                                            event.click_count,
                                         );
                                     }
                                     cx.notify();
