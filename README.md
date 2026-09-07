@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="Lahza.png" alt="Lahza" width="128">
+  <img src="assets/Lahza.png" alt="Lahza" width="128">
   <h1>Lahza · لحظہ</h1>
   <p><em>Lahza</em> is Urdu for "a brief moment".</p>
   <p>A native Linux studio for screenshots, screen recordings, and motion.</p>
@@ -33,17 +33,17 @@ sudo apt install ./lahza_0.5.1_amd64.deb
 
 Capture screens, windows, or areas. Record with system and microphone audio, pause and resume, and save editable projects with autosave.
 
-### Annotate screenshots and videos
-
-![Lahza annotation tools with text styling and timed captions on the video timeline](docs/screenshots/05-annotations.png)
-
-Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive details, crop screenshots, and animate annotations with custom timing.
-
 ### Design the scene
 
 [![Lahza screenshot editor showing wallpaper choices and image appearance controls](docs/screenshots/01-screenshot-styling.png)](packaging/store/screenshots/01-screenshot-styling.png)
 
 Style your captures with backgrounds, rounded corners, shadows, and window frames. Add effects and watermarks, adjust 3D perspective, and save reusable presets.
+
+### Annotate screenshots and videos
+
+![Lahza annotation tools with text styling and timed captions on the video timeline](docs/screenshots/05-annotations.png)
+
+Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive details, crop screenshots, and animate annotations with custom timing.
 
 ### Edit recordings
 
@@ -103,7 +103,7 @@ For a desktop install, use `just install-desktop` if you have [just](https://git
 install -Dm755 target/release/lahza ~/.local/bin/lahza
 install -Dm644 packaging/com.lahza.Lahza.desktop \
   ~/.local/share/applications/com.lahza.Lahza.desktop
-install -Dm644 Lahza.png \
+install -Dm644 assets/Lahza.png \
   ~/.local/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png
 update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor

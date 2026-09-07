@@ -30,7 +30,7 @@ install: build
 install-desktop: install
     install -Dm644 packaging/com.lahza.Lahza.desktop \
       {{apps}}/com.lahza.Lahza.desktop
-    install -Dm644 Lahza.png \
+    install -Dm644 assets/Lahza.png \
       {{icons}}/512x512/apps/com.lahza.Lahza.png
     update-desktop-database {{apps}}
     gtk-update-icon-cache -t {{icons}}

@@ -7,7 +7,7 @@ defined here in unit coordinates so the SVG and the PNGs cannot drift apart.
 
     python3 packaging/icons/generate-icons.py
 
-Writes packaging/icons/lahza.svg and Lahza.png, the 512x512 icon used by the
+Writes packaging/icons/lahza.svg and assets/Lahza.png, the 512x512 icon used by the
 Snap Store, the desktop entry, and the README.
 """
 
@@ -113,7 +113,7 @@ def main() -> None:
     ICONS.mkdir(parents=True, exist_ok=True)
     (ICONS / "lahza.svg").write_text(render_svg())
 
-    render_png(SIZE).save(ROOT / "Lahza.png", optimize=True)
+    render_png(SIZE).save(ROOT / "assets" / "Lahza.png", optimize=True)
 
 
 if __name__ == "__main__":

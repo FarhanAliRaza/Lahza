@@ -77,7 +77,7 @@ jobs:
             "${package_root}/usr/share/applications/com.lahza.Lahza.desktop"
           sed -i 's|^Exec=lahza$|Exec=/usr/bin/lahza|' \
             "${package_root}/usr/share/applications/com.lahza.Lahza.desktop"
-          install -Dm644 Lahza.png \
+          install -Dm644 assets/Lahza.png \
             "${package_root}/usr/share/pixmaps/com.lahza.Lahza.png"
           install -d "${package_root}/usr/share/lahza/assets"
           cp -a assets/. "${package_root}/usr/share/lahza/assets/"
@@ -114,7 +114,7 @@ jobs:
           install -Dm644 README.md "${bundle_root}/README.md"
           install -Dm644 packaging/com.lahza.Lahza.desktop \
             "${bundle_root}/share/applications/com.lahza.Lahza.desktop"
-          install -Dm644 Lahza.png \
+          install -Dm644 assets/Lahza.png \
             "${bundle_root}/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"
           install -d "${bundle_root}/share/lahza/assets"
           cp -a assets/. "${bundle_root}/share/lahza/assets/"

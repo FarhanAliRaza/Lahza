@@ -36,7 +36,7 @@ User-local install:
 install -Dm755 target/release/lahza ~/.local/bin/lahza
 install -Dm644 packaging/com.lahza.Lahza.desktop \
   ~/.local/share/applications/com.lahza.Lahza.desktop
-install -Dm644 Lahza.png \
+install -Dm644 assets/Lahza.png \
   ~/.local/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png
 update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor

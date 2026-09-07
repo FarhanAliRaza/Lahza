@@ -1,6 +1,6 @@
 name: lahza
 title: Lahza
-icon: Lahza.png
+icon: assets/Lahza.png
 base: core24
 adopt-info: lahza
 summary: Screenshot and recording studio for Linux
@@ -57,7 +57,7 @@ parts:
       install -Dm755 prebuilt/lahza "$CRAFT_PART_INSTALL/bin/lahza"
       craftctl set version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
       install -Dm644 packaging/com.lahza.Lahza.desktop "$CRAFT_PART_INSTALL/share/applications/com.lahza.Lahza.desktop"
-      install -Dm644 Lahza.png "$CRAFT_PART_INSTALL/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"
+      install -Dm644 assets/Lahza.png "$CRAFT_PART_INSTALL/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"
       # A themed icon name is not resolvable from the host, so point the
       # launcher at the icon inside the snap.
       sed -i 's|^Icon=.*|Icon=${SNAP}/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png|' \
