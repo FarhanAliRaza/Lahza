@@ -668,6 +668,7 @@ impl Studio {
                     .cursor(CursorStyle::PointingHand)
                     .when(width >= 44.0, |this| this.child(label))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.finish_annotation_interaction();
                         this.video_selected_zoom_cue = Some(cue_id);
                         this.video_selected_clip = None;
                         this.motion_pick = MotionPick::Focus;
@@ -1915,13 +1916,18 @@ impl Studio {
             return false;
         }
         let keystroke = &event.keystroke;
-        if (keystroke.modifiers.control || keystroke.modifiers.platform) && keystroke.key == "z" {
-            if keystroke.modifiers.shift {
-                self.redo_video_edit(cx);
-            } else {
-                self.undo_video_edit(cx);
+        if keystroke.modifiers.control || keystroke.modifiers.platform {
+            match keystroke.key.as_str() {
+                "z" if !keystroke.modifiers.shift => self.undo_current(cx),
+                "z" | "y" => self.redo_current(cx),
+                _ => return false,
             }
             return true;
+        }
+        if matches!(keystroke.key.as_str(), "delete" | "backspace")
+            && self.selected_annotation.is_some()
+        {
+            return self.handle_key(event);
         }
         if self.walkthrough_mode && matches!(keystroke.key.as_str(), "enter" | "escape") {
             self.walkthrough_mode = false;
@@ -1947,12 +1953,15 @@ impl Studio {
                 self.video_position = (self.video_position + 0.5).min(self.video_duration);
                 true
             }
-            "delete" | "backspace" if self.video_selected_zoom_cue.is_some() => {
-                self.delete_selected_video_zoom(cx);
+            "delete" | "backspace" => {
+                self.delete_selected_video_edit(cx);
                 true
             }
-            "escape" if self.video_selected_zoom_cue.is_some() => {
+            "escape" => {
+                self.finish_annotation_interaction();
                 self.video_selected_zoom_cue = None;
+                self.video_selected_clip = None;
+                self.tool = crate::Tool::Select;
                 true
             }
             _ => false,

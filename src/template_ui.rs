@@ -39,7 +39,21 @@ impl Studio {
             if !self.animation_active {
                 return;
             }
-            self.set_animation_duration(template.duration);
+            // A template owns the whole still scene, including the image span.
+            // Changing only the scene duration leaves longer templates blank
+            // after the previous image out-point (or preserves a deleted image).
+            if self.animation_duration != template.duration
+                || self.animation_image_start != 0.0
+                || self.animation_image_end != template.duration
+            {
+                self.video_undo_stack.push(VideoEditSnapshot::ImageTiming {
+                    scene: self.animation_duration,
+                    start: self.animation_image_start,
+                    end: self.animation_image_end,
+                });
+                self.video_redo_stack.clear();
+                self.restore_image_timing(template.duration, 0.0, template.duration);
+            }
         }
         let scene_duration = self.video_duration;
         let intro = template.duration.min(scene_duration);

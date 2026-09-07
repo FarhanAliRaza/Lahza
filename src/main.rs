@@ -1042,13 +1042,11 @@ impl Studio {
             return true;
         }
         let keystroke = &event.keystroke;
-        if (keystroke.modifiers.control || keystroke.modifiers.platform) && keystroke.key == "z" {
-            if keystroke.modifiers.shift {
-                if !self.redo_annotations() {
-                    self.redo_video_edit(cx);
-                }
-            } else if !self.undo_annotations() {
-                self.undo_video_edit(cx);
+        if keystroke.modifiers.control || keystroke.modifiers.platform {
+            match keystroke.key.as_str() {
+                "z" if !keystroke.modifiers.shift => self.undo_current(cx),
+                "z" | "y" => self.redo_current(cx),
+                _ => return false,
             }
             return true;
         }
@@ -1282,10 +1280,10 @@ impl Studio {
         let timeline = self.animation_active.then(|| self.timeline_bar(cx));
         let sidebar = self.inspector_visible.then(|| self.sidebar(cx));
 
-        div()
+        let editor = div()
             .size_full()
-            .min_w(px(980.0))
-            .min_h(px(680.0))
+            .min_w(px(shell_ui::EDITOR_MIN_WIDTH))
+            .min_h(px(shell_ui::EDITOR_MIN_HEIGHT))
             .bg(rgb(0xf3f3f4))
             .text_color(ink())
             .font_family("Inter")
@@ -1390,7 +1388,8 @@ impl Studio {
                     )
                     .when_some(sidebar, |this, sidebar| this.child(sidebar)),
             )
-            .into_any_element()
+            .into_any_element();
+        shell_ui::editor_viewport(editor)
     }
 }
 

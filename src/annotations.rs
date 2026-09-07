@@ -344,6 +344,11 @@ pub(crate) fn paint_highlights(
 
 impl Studio {
     pub(super) fn record_annotation_undo(&mut self) {
+        if self.scene_is_timed() {
+            self.video_undo_stack.push(crate::VideoEditSnapshot::Annotations(self.annotations.clone()));
+            self.video_redo_stack.clear();
+            return;
+        }
         self.undo_stack.push(self.annotations.clone());
         if self.undo_stack.len() > 100 {
             self.undo_stack.remove(0);
@@ -692,9 +697,9 @@ impl Studio {
             return true;
         }
         if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
-            && event.keystroke.key == "z"
+            && matches!(event.keystroke.key.as_str(), "z" | "y")
         {
-            return if event.keystroke.modifiers.shift {
+            return if event.keystroke.modifiers.shift || event.keystroke.key == "y" {
                 self.redo_annotations() || self.redo_crop()
             } else {
                 self.undo_annotations() || self.undo_crop()

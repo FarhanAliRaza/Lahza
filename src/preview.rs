@@ -812,10 +812,10 @@ impl Studio {
         let sidebar = self.inspector_visible.then(|| self.sidebar(cx));
         let speed_dialog = self.video_speed_dialog(cx);
 
-        div()
+        let editor = div()
             .size_full()
-            .min_w(px(980.0))
-            .min_h(px(680.0))
+            .min_w(px(crate::shell_ui::EDITOR_MIN_WIDTH))
+            .min_h(px(crate::shell_ui::EDITOR_MIN_HEIGHT))
             .bg(rgb(0xf3f3f4))
             .text_color(ink())
             .font_family("Inter")
@@ -942,6 +942,7 @@ impl Studio {
             .when_some(speed_dialog, |this, dialog| {
                 this.child(gpui::deferred(dialog).with_priority(1))
             })
-            .into_any_element()
+            .into_any_element();
+        crate::shell_ui::editor_viewport(editor)
     }
 }

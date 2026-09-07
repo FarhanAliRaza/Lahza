@@ -4,13 +4,11 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Added card motion with animated scale, position, and 3D rotation, draggable Start/End values, and a choice to keep the final pose or reset to layout. New manual transforms keep their final pose; existing regions and presets preserve their behavior.
-- Fixed stale motion previews, focus pin dragging, endpoint editing at image boundaries, and transform flashes near motion boundaries.
-- Separated image timing from scene duration. Move image clips, trim either edge, and extend scenes to leave room for other content.
-- Placed overlapping motion regions on separate timeline rows and made image clicks select and seek.
-- Added independent canvas text that can animate before or after the image, with matching preview and export behavior.
-- Added native text fields for annotations, watermarks, and annotation timing, including selection, clipboard editing, undo, and Unicode-aware cursor movement.
-- Removed the automatic slow zoom when entering Motion and the automatic 1.2× scale change when creating a transform. Expanded offscreen movement and moved Delete and Deselect actions to the top of the editors with visible icons.
+- Unified annotation, clip, timing, and zoom undo history in video and motion scenes, and added Ctrl/Cmd+Y for redo.
+- Improved Delete and Escape behavior for annotations, motion regions, and image clips, with more consistent timeline keyboard focus.
+- Fixed images disappearing before longer templates finish. Applying a template now resets the image to cover the full scene, including after trimming or deleting it.
+- Made expanded template galleries scroll with the sidebar and added editor overflow scrolling for smaller windows.
+- Fixed action icons and removed automatic scaling when initializing manual transforms.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

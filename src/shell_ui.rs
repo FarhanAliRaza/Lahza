@@ -28,6 +28,20 @@ const TIMELINE_CONTROLS_HEIGHT: f32 = 46.0;
 const SCENE_STRIP_HEIGHT: f32 = 42.0;
 const TIMELINE_LANES_HEIGHT: f32 = 148.0;
 
+pub(crate) const EDITOR_MIN_WIDTH: f32 = 980.0;
+pub(crate) const EDITOR_MIN_HEIGHT: f32 = 680.0;
+
+/// Keep the complete editor reachable when the compositor gives us less space
+/// than the layout's minimum size (for example, a small or tiled window).
+pub(crate) fn editor_viewport(content: AnyElement) -> AnyElement {
+    div()
+        .id("editor-viewport")
+        .size_full()
+        .overflow_scroll()
+        .child(content)
+        .into_any_element()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EditorMode {
     Static,
@@ -207,7 +221,7 @@ impl Studio {
         }
     }
 
-    fn undo_current(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn undo_current(&mut self, cx: &mut Context<Self>) {
         match self.editor_mode() {
             EditorMode::Video => self.undo_video_edit(cx),
             EditorMode::Motion => {
@@ -227,7 +241,7 @@ impl Studio {
         }
     }
 
-    fn redo_current(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn redo_current(&mut self, cx: &mut Context<Self>) {
         match self.editor_mode() {
             EditorMode::Video => self.redo_video_edit(cx),
             EditorMode::Motion => {
@@ -336,8 +350,9 @@ impl Studio {
         } else {
             0.0
         };
-        let width = (viewport.width - px(CANVAS_PADDING * 2.0 + inspector)).max(px(1.0));
-        let height = (viewport.height
+        let width = (viewport.width.max(px(EDITOR_MIN_WIDTH))
+            - px(CANVAS_PADDING * 2.0 + inspector)).max(px(1.0));
+        let height = (viewport.height.max(px(EDITOR_MIN_HEIGHT))
             - px(TOP_BAR_HEIGHT + CANVAS_PADDING * 2.0 + self.timeline_bar_height()))
         .max(px(1.0));
         self.preview_canvas_size(width, height)
@@ -1348,13 +1363,7 @@ impl Studio {
             )
             .child(self.section_header("templates", "Browse templates", None, cx))
             .when(self.section_open("templates"), |this| {
-                this.child(
-                    div()
-                        .id("template-browser")
-                        .max_h(px(340.0))
-                        .overflow_y_scroll()
-                        .child(self.template_gallery_section(cx)),
-                )
+                this.child(self.template_gallery_section(cx))
             })
             .into_any_element()
     }
@@ -1755,7 +1764,7 @@ impl Studio {
             } else {
                 format!("Image · {:.2}s", image_duration)
             };
-            vec![div()
+            if image_duration <= 0.0 { Vec::new() } else { vec![div()
                 .id("image-timeline-clip")
                 .cursor(CursorStyle::ClosedHand)
                 .absolute()
@@ -1818,7 +1827,7 @@ impl Studio {
                         cx.stop_propagation();
                         cx.notify();
                     })))
-                .into_any_element()]
+                .into_any_element()] }
         };
         let motion_track = self.motion_track(timeline_scroll, timeline_content_width, progress, cx);
         let annotation_track =
@@ -1830,6 +1839,10 @@ impl Studio {
         };
 
         div()
+            .capture_any_mouse_down(cx.listener(|this, _, window, _| {
+                this.stop_editing_text();
+                this.focus_handle.focus(window);
+            }))
             .flex_none()
             .px_6()
             .flex()

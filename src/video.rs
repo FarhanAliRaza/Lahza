@@ -326,6 +326,13 @@ impl Studio {
             return;
         };
         match previous {
+            VideoEditSnapshot::Annotations(marks) => {
+                self.video_redo_stack.push(VideoEditSnapshot::Annotations(
+                    std::mem::replace(&mut self.annotations, marks)));
+                self.finish_annotation_interaction();
+                let _ = self.rebuild_redactions();
+                cx.notify();
+            }
             VideoEditSnapshot::ImageTiming { scene, start, end } => {
                 self.video_redo_stack.push(VideoEditSnapshot::ImageTiming { scene: self.animation_duration, start: self.animation_image_start, end: self.animation_image_end });
                 self.restore_image_timing(scene, start, end);
@@ -353,6 +360,13 @@ impl Studio {
             return;
         };
         match next {
+            VideoEditSnapshot::Annotations(marks) => {
+                self.video_undo_stack.push(VideoEditSnapshot::Annotations(
+                    std::mem::replace(&mut self.annotations, marks)));
+                self.finish_annotation_interaction();
+                let _ = self.rebuild_redactions();
+                cx.notify();
+            }
             VideoEditSnapshot::ImageTiming { scene, start, end } => {
                 self.video_undo_stack.push(VideoEditSnapshot::ImageTiming { scene: self.animation_duration, start: self.animation_image_start, end: self.animation_image_end });
                 self.restore_image_timing(scene, start, end);
@@ -376,7 +390,20 @@ impl Studio {
     }
 
     pub(super) fn delete_selected_video_edit(&mut self, cx: &mut Context<Self>) {
-        if !self.delete_selected_video_zoom(cx) {
+        if self.delete_selected_video_zoom(cx) { return; }
+        if self.animation_active && self.video_project.is_none() {
+            if self.video_selected_clip.is_some() && self.animation_image_end > self.animation_image_start {
+                self.video_undo_stack.push(VideoEditSnapshot::ImageTiming {
+                    scene: self.animation_duration,
+                    start: self.animation_image_start,
+                    end: self.animation_image_end,
+                });
+                self.video_redo_stack.clear();
+                self.restore_image_timing(self.animation_duration, 0.0, 0.0);
+                self.video_selected_clip = None;
+                cx.notify();
+            }
+        } else {
             self.delete_selected_video_clip(cx);
         }
     }
