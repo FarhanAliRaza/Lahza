@@ -1540,7 +1540,7 @@ impl Studio {
 
     /// Editing controls for an animated screenshot's timeline.
     fn motion_edit_controls(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.export_progress.is_some();
+        let busy = self.video_edit_busy;
         let has_selection = self.video_selected_zoom_cue.is_some();
         div()
             .flex()

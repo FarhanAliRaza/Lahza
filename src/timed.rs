@@ -577,3 +577,70 @@ mod tests {
         assert_ne!(a, marks_signature(&[changed]));
     }
 }
+
+/// Media-attached overlays follow retained source ranges just like camera and
+/// audio. Canvas overlays deliberately have an independent lifetime.
+pub(crate) fn remap_clip_annotations(
+    marks: &[crate::AnnotationMark],
+    old: &crate::recording::clips::RecordingClipTimeline,
+    new: &crate::recording::clips::RecordingClipTimeline,
+) -> Vec<crate::AnnotationMark> {
+    let mut result = Vec::new();
+    let starts = old.clip_starts();
+    for mark in marks {
+        let Some(timing) = mark.timing.filter(|_| !mark.canvas) else {
+            result.push(mark.clone());
+            continue;
+        };
+        let mut intervals = Vec::new();
+        for (clip, start) in old.segments.iter().zip(&starts) {
+            let a = timing.start.max(*start);
+            let b = timing.end.min(start + clip.editor_duration());
+            if b <= a { continue; }
+            let source_a = clip.source_start + (a - start) * clip.speed;
+            let source_b = clip.source_start + (b - start) * clip.speed;
+            intervals.extend(new.slices_overlapping(source_a, source_b).into_iter()
+                .map(|slice| (slice.editor_start, slice.editor_end)));
+        }
+        intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for (start, end) in intervals {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 + 1e-6 { last.1 = last.1.max(end); continue; }
+            }
+            merged.push((start, end));
+        }
+        for (start, end) in merged {
+            let mut mark = mark.clone();
+            mark.timing = Some(AnnotationTiming { start, end, ..timing });
+            result.push(mark);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod clip_edit_tests {
+    use super::*;
+    use crate::recording::clips::RecordingClipTimeline;
+
+    #[test]
+    fn deleting_a_clip_removes_its_overlays_and_ripples_retained_timing() {
+        let (old, _) = RecordingClipTimeline::full(9.0).split_at(3.0).unwrap();
+        let (old, _) = old.split_at(6.0).unwrap();
+        let new = old.deleting(old.segments[1].id).unwrap();
+        let mark = |start, end| crate::AnnotationMark {
+            timing: Some(AnnotationTiming { start, end, ..Default::default() }),
+            ..Default::default()
+        };
+        let mut canvas = mark(4.0, 5.0);
+        canvas.canvas = true;
+        let marks = vec![mark(4.0, 5.0), mark(7.0, 8.0), mark(2.0, 7.0), canvas.clone()];
+        let remapped = remap_clip_annotations(&marks, &old, &new);
+        assert_eq!(remapped.len(), 3);
+        assert_eq!((remapped[0].timing.unwrap().start, remapped[0].timing.unwrap().end), (4.0, 5.0));
+        assert_eq!((remapped[1].timing.unwrap().start, remapped[1].timing.unwrap().end), (2.0, 4.0));
+        assert_eq!(remapped[2], canvas);
+        assert_eq!(marks[0].timing.unwrap().start, 4.0, "undo snapshot remains intact");
+    }
+}

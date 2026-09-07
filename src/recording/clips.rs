@@ -127,6 +127,36 @@ impl RecordingClipTimeline {
             .sum()
     }
 
+    /// Playback can cross a plain split without restarting a decoder. IDs
+    /// remain in the edit model; this view only merges identical source maps.
+    pub fn playback_ranges(&self) -> Vec<RecordingClipSegment> {
+        let mut ranges: Vec<RecordingClipSegment> = Vec::new();
+        for clip in &self.segments {
+            if let Some(previous) = ranges.last_mut() {
+                if clip.gap_before == 0.0
+                    && (previous.source_end - clip.source_start).abs() < EPSILON
+                    && (previous.speed - clip.speed).abs() < EPSILON
+                {
+                    previous.source_end = clip.source_end;
+                    continue;
+                }
+            }
+            ranges.push(clip.clone());
+        }
+        ranges
+    }
+
+    pub fn same_source_mapping(&self, other: &Self) -> bool {
+        let left = self.playback_ranges();
+        let right = other.playback_ranges();
+        left.len() == right.len() && left.iter().zip(&right).all(|(a, b)| {
+            (a.source_start - b.source_start).abs() < EPSILON
+                && (a.source_end - b.source_end).abs() < EPSILON
+                && (a.speed - b.speed).abs() < EPSILON
+                && (a.gap_before - b.gap_before).abs() < EPSILON
+        })
+    }
+
     /// Repairs invalid data (non-finite values, overlaps, duplicate ids)
     /// while preserving the user's playback order, so reordered clips
     /// survive normalization.
@@ -287,6 +317,13 @@ impl RecordingClipTimeline {
             slot_start += segment.slot_duration();
         }
         None
+    }
+
+    /// Source time for linked media; gaps contain no video, camera, or audio.
+    pub fn content_source_time_at(&self, editor_time: f64) -> Option<f64> {
+        let location = self.location_at(editor_time)?;
+        (editor_time >= location.editor_start && editor_time < self.duration())
+            .then_some(location.source_time)
     }
 
     pub fn source_time_at(&self, editor_time: f64) -> f64 {

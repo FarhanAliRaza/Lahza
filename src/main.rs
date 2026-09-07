@@ -292,12 +292,10 @@ struct Studio {
     video_speed_draft: Option<f64>,
     /// Counts preview renders so a superseded render's result is dropped
     /// while playback and seeks stay independent of in-flight renders.
-    video_preview_render_generation: u64,
     video_clip_timeline: RecordingClipTimeline,
     video_selected_clip: Option<Uuid>,
     video_undo_stack: Vec<VideoEditSnapshot>,
     video_redo_stack: Vec<VideoEditSnapshot>,
-    video_preview_path: Option<PathBuf>,
     video_playback_generation: Arc<AtomicU64>,
     video_seek_drag: Option<(Pixels, f64)>,
     video_trim_drag: Option<VideoTrimDrag>,
@@ -314,6 +312,8 @@ struct Studio {
     export_format: ExportFormat,
     export_progress: Option<Arc<ExportProgress>>,
     export_label: SharedString,
+    export_filename: SharedString,
+    export_panel_collapsed: bool,
     /// Screenshot motion mode: the video motion state drives a still image.
     animation_active: bool,
     animation_duration: f64,
@@ -462,6 +462,7 @@ enum RecordingAction {
 #[derive(Default)]
 struct PlaybackUpdates {
     frame: Option<DecodedFrame>,
+    camera: Option<(f64, Arc<image::RgbaImage>)>,
     terminal: Option<Result<(), String>>,
 }
 
@@ -470,14 +471,17 @@ struct PlaybackMailbox(Arc<Mutex<PlaybackUpdates>>);
 
 impl PlaybackMailbox {
     fn publish(&self, frame: DecodedFrame) {
-        let previous = self
-            .0
-            .lock()
-            .expect("playback mailbox poisoned")
-            .frame
-            .replace(frame);
-        // Release the potentially large previous image outside the lock.
-        drop(previous);
+        self.publish_with_camera(frame, None);
+    }
+
+    fn publish_with_camera(&self, frame: DecodedFrame, camera: Option<(f64, Arc<image::RgbaImage>)>) {
+        let mut mailbox = self.0.lock().expect("playback mailbox poisoned");
+        let previous = mailbox.frame.replace(frame);
+        let previous_camera = std::mem::replace(&mut mailbox.camera, camera);
+        drop(mailbox);
+        // Screen and camera are replaced atomically, including when dropping
+        // frames to catch up after the UI stalls.
+        drop((previous, previous_camera));
     }
 
     fn finish(&self, result: Result<(), String>) {
@@ -588,12 +592,10 @@ impl Studio {
             video_playing: false,
             video_edit_busy: false,
             video_speed_draft: None,
-            video_preview_render_generation: 0,
             video_clip_timeline: RecordingClipTimeline::default(),
             video_selected_clip: None,
             video_undo_stack: Vec::new(),
             video_redo_stack: Vec::new(),
-            video_preview_path: None,
             video_playback_generation: Arc::new(AtomicU64::new(0)),
             video_seek_drag: None,
             video_trim_drag: None,
@@ -609,6 +611,8 @@ impl Studio {
             export_format: ExportFormat::Mp4,
             export_progress: None,
             export_label: SharedString::default(),
+            export_filename: SharedString::default(),
+            export_panel_collapsed: false,
             animation_active: false,
             animation_duration: 5.0,
             animation_image_start: 0.0,
@@ -1495,6 +1499,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_drops_screen_and_camera_frames_as_one_pair() {
+        let mailbox = PlaybackMailbox::default();
+        for index in 0..100 {
+            let frame = DecodedFrame { time: index as f64, width: 1, height: 1, rgba: vec![index, 0, 0, 255] };
+            let camera = Arc::new(image::RgbaImage::from_pixel(1, 1, image::Rgba([index, 0, 0, 255])));
+            mailbox.publish_with_camera(frame, Some((index as f64, camera)));
+        }
+        let update = mailbox.take();
+        let frame = update.frame.unwrap();
+        let (time, camera) = update.camera.unwrap();
+        assert_eq!(frame.time, 99.0);
+        assert_eq!(frame.time, time);
+        assert_eq!(frame.rgba, camera.as_raw().clone());
+        assert!(mailbox.take().camera.is_none());
+        mailbox.publish(DecodedFrame { time: 100.0, width: 1, height: 1, rgba: vec![0; 4] });
+        assert!(mailbox.take().camera.is_none(), "a gap must not retain the old camera");
+    }
 
     #[test]
     fn playback_keeps_draining_while_the_preview_is_stalled() {

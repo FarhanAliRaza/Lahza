@@ -13,8 +13,9 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -22,7 +23,7 @@ use super::{
     pointer_timeline::PointerTimeline,
     scene::{FrameInput, PointerOverlay, SceneCompositor, SceneStyle},
     video::{
-        probe_media, render_clip_preview, VideoError, VideoFrameStream, NOISE_REDUCTION_FILTER,
+        clip_filter, probe_media, VideoError, VideoFrameStream, NOISE_REDUCTION_FILTER,
     },
     viewport::ViewportTimeline,
 };
@@ -165,9 +166,28 @@ pub struct ExportProgress {
     completed: AtomicU64,
     total: AtomicU64,
     cancelled: AtomicBool,
+    encoder: Mutex<Option<String>>,
+    encoding_started: Mutex<Option<Instant>>,
 }
 
 impl ExportProgress {
+    pub fn remaining_label(&self) -> String {
+        let elapsed = self.encoding_started.lock().unwrap().map(|start| start.elapsed());
+        remaining_label(
+            self.completed.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+            elapsed,
+        )
+    }
+
+    pub fn encoder_label(&self) -> Option<String> {
+        self.encoder.lock().ok().and_then(|label| label.clone())
+    }
+
+    fn set_encoder_label(&self, label: &str) {
+        *self.encoder.lock().unwrap() = Some(label.to_owned());
+    }
+
     pub fn fraction(&self) -> f64 {
         let total = self.total.load(Ordering::Relaxed);
         if total == 0 {
@@ -185,9 +205,36 @@ impl ExportProgress {
     }
 
     fn reset(&self, total: u64) {
+        *self.encoder.lock().unwrap() = None;
+        *self.encoding_started.lock().unwrap() = None;
         self.total.store(total, Ordering::Relaxed);
         self.completed.store(0, Ordering::Relaxed);
     }
+}
+
+/// Measure only frame production: preparing edited sources and probing the
+/// GPU should not inflate the estimated time for every remaining frame.
+fn remaining_label(completed: u64, total: u64, elapsed: Option<Duration>) -> String {
+    let Some(elapsed) = elapsed.filter(|_| total > 0) else {
+        return "Preparing export…".into();
+    };
+    if completed >= total {
+        // FFmpeg still has buffered frames and container metadata to write.
+        return "Finalizing file…".into();
+    }
+    if completed < 2 || elapsed < Duration::from_secs(2) {
+        return "Estimating time remaining…".into();
+    }
+    let seconds = (elapsed.as_secs_f64() * (total - completed) as f64 / completed as f64)
+        .ceil().max(1.0) as u64;
+    let time = if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    };
+    format!("About {time} remaining")
 }
 
 /// Where the media frames come from.
@@ -281,11 +328,9 @@ fn frames_for(duration: f64, frame_rate: f64) -> u64 {
 enum PreparedSource {
     Video {
         stream: VideoFrameStream,
-        audio: Option<PathBuf>,
+        audio: Option<(PathBuf, String)>,
         pointer: Option<PointerTimeline>,
-        temporary: Option<PathBuf>,
         camera: Option<VideoFrameStream>,
-        camera_temporary: Option<PathBuf>,
     },
     Image {
         image: RgbaImage,
@@ -304,9 +349,7 @@ impl PreparedSource {
     fn cleanup(&mut self) {
         if let PreparedSource::Video {
             stream,
-            temporary,
             camera,
-            camera_temporary,
             ..
         } = self
         {
@@ -314,40 +357,6 @@ impl PreparedSource {
             if let Some(camera) = camera.as_mut() {
                 camera.stop();
             }
-            if let Some(path) = temporary.take() {
-                let _ = fs::remove_file(path);
-            }
-            if let Some(path) = camera_temporary.take() {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-}
-
-/// Opens the camera clip cut with the same clip timeline as the master so
-/// both streams advance in lockstep in editor time.
-fn prepare_camera(
-    camera: &Path,
-    clips: &RecordingClipTimeline,
-    destination: &Path,
-    frame_rate: f64,
-) -> Result<(VideoFrameStream, Option<PathBuf>), VideoError> {
-    let info = probe_media(camera)?;
-    let clips = clips.normalized(info.duration);
-    let (playback, temporary) = if clips.is_unedited(info.duration) {
-        (camera.to_path_buf(), None)
-    } else {
-        let temporary = temporary_sibling(destination, "camera.mkv");
-        render_clip_preview(camera, &temporary, &clips)?;
-        (temporary.clone(), Some(temporary))
-    };
-    match VideoFrameStream::open_with_frame_rate(&playback, 0.0, 1280, 1280, Some(frame_rate)) {
-        Ok(stream) => Ok((stream, temporary)),
-        Err(error) => {
-            if let Some(path) = temporary {
-                let _ = fs::remove_file(path);
-            }
-            Err(error)
         }
     }
 }
@@ -407,53 +416,19 @@ fn prepare_source(
         } => {
             let info = probe_media(&media)?;
             let clips = clips.normalized(info.duration);
-            let (playback, temporary) = if clips.is_unedited(info.duration) {
-                (media.clone(), None)
-            } else {
-                let temporary = temporary_sibling(&request.destination, "edit.mkv");
-                render_clip_preview(&media, &temporary, &clips)?;
-                (temporary.clone(), Some(temporary))
-            };
-            // Decode close to native resolution so zoomed regions stay sharp,
-            // but cap very large masters to keep the CPU compositor responsive.
-            let stream = match VideoFrameStream::open_with_frame_rate(
-                &playback,
-                0.0,
-                info.width.min(2560),
-                info.height.min(1600),
-                Some(frame_rate),
-            ) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    if let Some(path) = temporary {
-                        let _ = fs::remove_file(path);
-                    }
-                    return Err(error);
-                }
-            };
-            let audio =
-                (info.has_audio && request.include_audio && request.format.supports_audio())
-                    .then(|| playback);
-            let (camera, camera_temporary) = match camera
-                .filter(|_| request.style.camera.enabled)
-                .map(|path| prepare_camera(&path, &clips, &request.destination, frame_rate))
-            {
-                Some(Ok((stream, temporary))) => (Some(stream), temporary),
-                Some(Err(error)) => {
-                    if let Some(path) = temporary {
-                        let _ = fs::remove_file(path);
-                    }
-                    return Err(error);
-                }
-                None => (None, None),
-            };
+            let stream = VideoFrameStream::open_timeline(
+                &media, &clips, info.width.min(2560), info.height.min(1600), frame_rate,
+            )?;
+            let audio = (info.has_audio && request.include_audio && request.format.supports_audio())
+                .then(|| (media, clip_filter(&info, &clips, 1, false, true)));
+            let camera = camera.filter(|_| request.style.camera.enabled)
+                .map(|path| VideoFrameStream::open_timeline(&path, &clips, 1280, 1280, frame_rate))
+                .transpose()?;
             Ok(PreparedSource::Video {
                 stream,
                 audio,
                 pointer,
-                temporary,
                 camera,
-                camera_temporary,
             })
         }
     }
@@ -485,7 +460,23 @@ fn encode(
         PreparedSource::Image { .. } => None,
     };
     let temporary = temporary_sibling(&request.destination, request.format.extension());
+    let encoder = if request.format == ExportFormat::Mp4 {
+        progress.set_encoder_label("Checking GPU");
+        let encoder = super::export_encoder::select_mp4_encoder(
+            canvas_width, canvas_height, frame_rate, progress,
+        );
+        progress.set_encoder_label(encoder.label());
+        Some(encoder)
+    } else {
+        None
+    };
+    if progress.is_cancelled() {
+        return Err(VideoError::Cancelled);
+    }
     let mut command = Command::new("ffmpeg");
+    if let Some(encoder) = &encoder {
+        encoder.configure_input(&mut command);
+    }
     command
         .args([
             "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s",
@@ -494,27 +485,23 @@ fn encode(
         .arg("-framerate")
         .arg(format!("{frame_rate:.3}"))
         .args(["-i", "pipe:0"]);
-    if let Some(audio) = audio.as_ref() {
-        command.arg("-i").arg(audio);
-        if request.noise_reduction {
-            command.args(["-af", NOISE_REDUCTION_FILTER]);
-        }
+    if let Some((path, filter)) = audio.as_ref() {
+        command.arg("-i").arg(path);
+        let filter = if request.noise_reduction {
+            format!("{filter};[audio]{NOISE_REDUCTION_FILTER}[export_audio]")
+        } else {
+            format!("{filter};[audio]anull[export_audio]")
+        };
+        command.arg("-filter_complex").arg(filter);
     }
     match request.format {
         ExportFormat::Mp4 => {
             command.args(["-map", "0:v"]);
             if audio.is_some() {
-                command.args(["-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
+                command.args(["-map", "[export_audio]", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
             }
+            encoder.as_ref().unwrap().configure_output(&mut command);
             command.args([
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
                 "-movflags",
                 "+faststart",
                 "-f",
@@ -526,7 +513,7 @@ fn encode(
             if audio.is_some() {
                 command.args([
                     "-map",
-                    "1:a:0",
+                    "[export_audio]",
                     "-c:a",
                     "libopus",
                     "-b:a",
@@ -576,6 +563,7 @@ fn encode(
         .take()
         .ok_or_else(|| VideoError::Decode("FFmpeg encoder did not accept frame input".into()))?;
 
+    *progress.encoding_started.lock().unwrap() = Some(Instant::now());
     let mut last_video_frame: Option<RgbaImage> = None;
     let mut last_camera_frame: Option<RgbaImage> = None;
     let mut write_error: Option<VideoError> = None;
@@ -750,6 +738,31 @@ mod tests {
     };
     use image::Rgba;
 
+    #[test]
+    fn remaining_time_handles_preparation_sampling_and_finalization() {
+        assert_eq!(remaining_label(0, 9000, None), "Preparing export…");
+        assert_eq!(remaining_label(0, 0, Some(Duration::ZERO)), "Preparing export…");
+        assert_eq!(remaining_label(0, 9000, Some(Duration::from_secs(10))), "Estimating time remaining…");
+        assert_eq!(remaining_label(30, 9000, Some(Duration::from_secs(1))), "Estimating time remaining…");
+        assert_eq!(remaining_label(100, 1000, Some(Duration::from_secs(10))), "About 1m 30s remaining");
+        assert_eq!(remaining_label(500, 1000, Some(Duration::from_secs(10))), "About 10s remaining");
+        assert_eq!(remaining_label(100, 1000, Some(Duration::from_secs(400))), "About 1h 0m remaining");
+        assert_eq!(remaining_label(999, 1000, Some(Duration::from_secs(10))), "About 1s remaining");
+        assert_eq!(remaining_label(1000, 1000, Some(Duration::from_secs(10))), "Finalizing file…");
+    }
+
+    #[test]
+    fn resetting_progress_clears_the_previous_export_estimate() {
+        let progress = ExportProgress::default();
+        progress.reset(100);
+        *progress.encoding_started.lock().unwrap() = Some(Instant::now() - Duration::from_secs(10));
+        progress.completed.store(50, Ordering::Relaxed);
+        assert!(progress.remaining_label().starts_with("About "));
+        progress.reset(200);
+        assert_eq!(progress.remaining_label(), "Preparing export…");
+        assert_eq!(progress.fraction(), 0.0);
+    }
+
     fn ffmpeg_available() -> bool {
         Command::new("ffmpeg")
             .arg("-version")
@@ -814,6 +827,59 @@ mod tests {
             aspect: Some(16.0 / 9.0),
             ..SceneStyle::default()
         }
+    }
+
+    #[test]
+    fn streamed_export_preserves_reordering_speed_gaps_and_audio_without_intermediates() {
+        if !ffmpeg_available() { return; }
+        use crate::recording::clips::RecordingClipSegment;
+        let root = test_root("streamed-edits");
+        let media = root.join("colors.mkv");
+        let output = Command::new("ffmpeg").args([
+            "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=red:s=160x90:r=20:d=1",
+            "-f", "lavfi", "-i", "color=green:s=160x90:r=20:d=1",
+            "-f", "lavfi", "-i", "color=blue:s=160x90:r=20:d=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+            "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+            "-map", "[v]", "-map", "3:a", "-c:v", "ffv1", "-c:a", "pcm_s16le",
+        ]).arg(&media).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let mut blue = RecordingClipSegment::new(2.0, 3.0);
+        blue.speed = 2.0;
+        let mut red = RecordingClipSegment::new(0.0, 1.0);
+        red.speed = 0.5;
+        red.gap_before = 0.25;
+        let clips = RecordingClipTimeline::new(vec![blue, red]);
+        for format in [ExportFormat::Mp4, ExportFormat::WebM] {
+            let destination = root.join(format!("streamed.{}", format.extension()));
+            let mut style = SceneStyle {
+                background: SceneBackground::Solid(0), padding: 0, corners: 0,
+                shadow: 0, border: false, aspect: Some(16.0 / 9.0), ..Default::default()
+            };
+            style.camera.enabled = false;
+            let mut request = SceneExportRequest::new(destination.clone(), format, 90,
+                style, ViewportTimeline::default(), clips.duration());
+            request.frame_rate = 20.0;
+            let source = || SceneSource::Video {
+                media: media.clone(), clips: clips.clone(), pointer: None, camera: Some(media.clone()),
+            };
+            let before = fs::read_dir(&root).unwrap().count();
+            let mut prepared = prepare_source(source(), &request, 20.0).unwrap();
+            assert_eq!(fs::read_dir(&root).unwrap().count(), before, "preparation created intermediate media");
+            prepared.cleanup();
+            export_scene(source(), &mut request, &ExportProgress::default()).unwrap();
+            let info = probe_media(&destination).unwrap();
+            assert!(info.has_audio);
+            assert!((info.duration - 2.75).abs() < 0.15, "{}", info.duration);
+            for (time, expected) in [(0.2, [0, 0, 255]), (0.6, [0, 0, 0]), (1.5, [255, 0, 0])] {
+                let frame = super::super::video::decode_frame(&destination, time, 160, 90).unwrap();
+                for (value, expected) in frame.rgba[..3].iter().zip(expected) {
+                    assert!((i32::from(*value) - expected).abs() < 25, "{time}: {:?}", &frame.rgba[..3]);
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::{
         pointer_timeline::PointerTimeline,
         scene::SceneStyle,
         session::{RecordingController, RecordingState},
-        video::{load_or_rebuild_poster, probe_media, render_clip_preview},
+        video::{load_or_rebuild_poster, probe_media},
         viewport::{synthesize_zoom_cues, ViewportTimeline},
     },
     scene_ui::SceneSelection,
@@ -293,14 +293,12 @@ impl Studio {
         self.pause_video_playback();
         self.autosave_scene_style();
         self.leave_video_annotations();
-        self.video_preview_render_generation += 1;
         self.video_edit_busy = false;
         self.video_speed_draft = None;
         self.last_video_project = self.video_project.take().map(|session| session.directory);
         self.sync_camera_preview(cx);
         let frame = self.video_frame.take();
         self.retire_image(frame);
-        self.video_preview_path = None;
         self.video_undo_stack.clear();
         self.video_redo_stack.clear();
         self.video_selected_clip = None;
@@ -374,8 +372,6 @@ impl Studio {
                 .map_err(|error| format!("Could not decode recording preview: {error}"))?;
         self.video_playback_generation
             .fetch_add(1, Ordering::SeqCst);
-        // Drop any preview render still running for the previous project.
-        self.video_preview_render_generation += 1;
         let source_duration = media
             .as_ref()
             .map(|media| media.duration)
@@ -416,18 +412,6 @@ impl Studio {
             .read_edit_field::<RecordingExtras>("lahzaExtras")
             .ok()
             .flatten();
-        let preview_path = session.directory.join(".edit-preview.mkv");
-        let edited_preview = if clip_timeline.is_unedited(source_duration) {
-            None
-        } else {
-            let noise_reduction = saved_extras
-                .as_ref()
-                .is_some_and(|extras| extras.noise_reduction);
-            let source = Self::media_source_for(&session, noise_reduction);
-            render_clip_preview(&source, &preview_path, &clip_timeline)
-                .map_err(|error| format!("Could not build edited preview: {error}"))?;
-            Some(preview_path)
-        };
         if self.animation_active {
             self.exit_animation();
         }
@@ -454,7 +438,6 @@ impl Studio {
         self.video_clip_timeline = clip_timeline;
         self.video_undo_stack.clear();
         self.video_redo_stack.clear();
-        self.video_preview_path = edited_preview;
         self.video_seek_drag = None;
         self.video_trim_drag = None;
         self.video_move_drag = None;

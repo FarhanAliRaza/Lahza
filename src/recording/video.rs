@@ -252,6 +252,89 @@ pub fn export_clip_timeline(
     render_clip_timeline(source, destination, timeline, "mp4")
 }
 
+/// Shared edit graph for direct export streams and materialized previews.
+/// Audio and video can be requested separately without decoding the other.
+pub(super) fn clip_filter(
+    info: &MediaInfo,
+    timeline: &RecordingClipTimeline,
+    input: usize,
+    video: bool,
+    audio: bool,
+) -> String {
+    // Gaps between clips render as black video with silent audio. Every
+    // chain is normalized to one pixel/sample format so concat accepts the
+    // generated fillers alongside the source segments.
+    use std::fmt::Write as _;
+    let frame_rate = if info.frame_rate.is_finite() && info.frame_rate > 0.0 {
+        info.frame_rate
+    } else {
+        30.0
+    };
+    let mut filter = String::new();
+    let mut chains: Vec<usize> = Vec::new();
+    let mut label = 0usize;
+    for clip in timeline.playback_ranges().iter() {
+        if clip.gap_before > 0.0 {
+            if video {
+                write!(
+                    filter,
+                    "color=c=black:s={}x{}:r={:.6}:d={:.9},format=yuv420p,setsar=1[v{label}];",
+                    info.width, info.height, frame_rate, clip.gap_before
+                )
+                .expect("writing to String cannot fail");
+            }
+            if audio {
+                write!(
+                    filter,
+                    "anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{:.9}[a{label}];",
+                    clip.gap_before
+                )
+                .expect("writing to String cannot fail");
+            }
+            chains.push(label);
+            label += 1;
+        }
+        if video {
+            write!(
+            filter,
+            "[{input}:v]trim=start={:.9}:end={:.9},setpts=(PTS-STARTPTS)/{:.9},format=yuv420p,setsar=1[v{label}];",
+            clip.source_start, clip.source_end, clip.speed
+        )
+        .expect("writing to String cannot fail");
+        }
+        if audio {
+            write!(
+                filter,
+                "[{input}:a]atrim=start={:.9}:end={:.9},asetpts=PTS-STARTPTS,atempo={:.9},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{label}];",
+                clip.source_start, clip.source_end, clip.speed
+            )
+            .expect("writing to String cannot fail");
+        }
+        chains.push(label);
+        label += 1;
+    }
+    for index in &chains {
+        if video {
+            write!(filter, "[v{index}]").expect("writing to String cannot fail");
+        }
+        if audio {
+            write!(filter, "[a{index}]").expect("writing to String cannot fail");
+        }
+    }
+    write!(
+        filter,
+        "concat=n={}:v={}:a={}{}{}",
+        chains.len(),
+        u8::from(video),
+        u8::from(audio),
+        if video { "[video]" } else { "" },
+        if audio { "[audio]" } else { "" }
+    )
+    .expect("writing to String cannot fail");
+
+    filter
+}
+
 fn render_clip_timeline(
     source: &Path,
     destination: &Path,
@@ -266,68 +349,7 @@ fn render_clip_timeline(
         ));
     }
 
-    // Gaps between clips render as black video with silent audio. Every
-    // chain is normalized to one pixel/sample format so concat accepts the
-    // generated fillers alongside the source segments.
-    use std::fmt::Write as _;
-    let frame_rate = if info.frame_rate.is_finite() && info.frame_rate > 0.0 {
-        info.frame_rate
-    } else {
-        30.0
-    };
-    let mut filter = String::new();
-    let mut chains: Vec<usize> = Vec::new();
-    let mut label = 0usize;
-    for clip in timeline.segments.iter() {
-        if clip.gap_before > 0.0 {
-            write!(
-                filter,
-                "color=c=black:s={}x{}:r={:.6}:d={:.9},format=yuv420p,setsar=1[v{label}];",
-                info.width, info.height, frame_rate, clip.gap_before
-            )
-            .expect("writing to String cannot fail");
-            if info.has_audio {
-                write!(
-                    filter,
-                    "anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{:.9}[a{label}];",
-                    clip.gap_before
-                )
-                .expect("writing to String cannot fail");
-            }
-            chains.push(label);
-            label += 1;
-        }
-        write!(
-            filter,
-            "[0:v]trim=start={:.9}:end={:.9},setpts=(PTS-STARTPTS)/{:.9},format=yuv420p,setsar=1[v{label}];",
-            clip.source_start, clip.source_end, clip.speed
-        )
-        .expect("writing to String cannot fail");
-        if info.has_audio {
-            write!(
-                filter,
-                "[0:a]atrim=start={:.9}:end={:.9},asetpts=PTS-STARTPTS,atempo={:.9},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{label}];",
-                clip.source_start, clip.source_end, clip.speed
-            )
-            .expect("writing to String cannot fail");
-        }
-        chains.push(label);
-        label += 1;
-    }
-    for index in &chains {
-        write!(filter, "[v{index}]").expect("writing to String cannot fail");
-        if info.has_audio {
-            write!(filter, "[a{index}]").expect("writing to String cannot fail");
-        }
-    }
-    write!(
-        filter,
-        "concat=n={}:v=1:a={}[video]{}",
-        chains.len(),
-        u8::from(info.has_audio),
-        if info.has_audio { "[audio]" } else { "" }
-    )
-    .expect("writing to String cannot fail");
+    let filter = clip_filter(&info, &timeline, 0, true, info.has_audio);
 
     let temporary = temporary_video_sibling(destination);
     let mut command = Command::new("ffmpeg");
@@ -636,12 +658,74 @@ impl VideoFrameStream {
         })
     }
 
+    /// Apply the edit directly to decoded frames, without an intermediate
+    /// video encode or a second decode of that temporary file.
+    pub fn open_timeline(
+        path: &Path,
+        timeline: &RecordingClipTimeline,
+        maximum_width: u32,
+        maximum_height: u32,
+        frame_rate: f64,
+    ) -> Result<Self, VideoError> {
+        let info = probe_media(path)?;
+        let timeline = timeline.normalized(info.duration);
+        if timeline.is_unedited(info.duration) {
+            return Self::open_with_frame_rate(
+                path,
+                0.0,
+                maximum_width,
+                maximum_height,
+                Some(frame_rate),
+            );
+        }
+        let (width, height) =
+            fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
+        let mut filter = clip_filter(&info, &timeline, 0, true, false);
+        filter.push_str(&format!(
+            ";[video]fps={frame_rate:.6},scale={width}:{height}:flags=lanczos,format=rgba[frames]"
+        ));
+        let mut child = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args([
+                "-filter_complex",
+                &filter,
+                "-map",
+                "[frames]",
+                "-an",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| VideoError::Decode("FFmpeg did not provide frame output".into()))?;
+        Ok(Self {
+            child,
+            stdout,
+            width,
+            height,
+            frame_rate,
+            next_frame_index: 0,
+            start_time: 0.0,
+        })
+    }
+
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
     pub fn frame_rate(&self) -> f64 {
         self.frame_rate
+    }
+
+    pub fn next_time(&self) -> f64 {
+        self.start_time + self.next_frame_index as f64 / self.frame_rate
     }
 
     pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>, VideoError> {
@@ -682,7 +766,7 @@ impl Drop for VideoFrameStream {
     }
 }
 
-fn fitted_dimensions(
+pub(super) fn fitted_dimensions(
     source_width: u32,
     source_height: u32,
     maximum_width: u32,
@@ -746,8 +830,7 @@ mod tests {
     use super::*;
 
     fn test_video() -> Option<(PathBuf, PathBuf)> {
-        let root =
-            std::env::temp_dir().join(format!("lahza-video-test-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("lahza-video-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).ok()?;
         let path = root.join("test.mkv");
         let status = Command::new("ffmpeg")
@@ -769,10 +852,8 @@ mod tests {
     }
 
     fn test_video_with_audio() -> Option<(PathBuf, PathBuf)> {
-        let root = std::env::temp_dir().join(format!(
-            "lahza-video-audio-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("lahza-video-audio-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).ok()?;
         let path = root.join("test.mkv");
         let status = Command::new("ffmpeg")

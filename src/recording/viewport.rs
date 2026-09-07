@@ -95,6 +95,12 @@ impl ViewportTimeline {
         if !duration.is_finite() || duration <= 0.0 {
             return Self::default();
         }
+        // A removed animation cannot leave a held end pose on later footage.
+        // Keep authored cues untouched so undo restores them with the clip.
+        let retained_cues: Vec<_> = cues.iter()
+            .filter(|cue| !clips.slices_overlapping(cue.start, cue.end).is_empty())
+            .cloned().collect();
+        let cues = retained_cues.as_slice();
         let frame_count = ((duration * STEP_RATE).ceil() as usize + 1).max(2);
         let dt = 1.0 / STEP_RATE;
         let mut amount = DampedSpring::new(1.0);
@@ -1438,5 +1444,21 @@ mod tests {
         assert_eq!(visible, 0.5);
         assert_eq!(left, 0.0);
         assert_eq!(top, 0.5);
+    }
+}
+
+#[cfg(test)]
+mod deleted_motion_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_motion_cannot_hold_its_end_pose_on_retained_video() {
+        let mut cue = ZoomCue::pinned(1.0, 2.0, 1.0, NormalizedPoint { x: 0.5, y: 0.5 });
+        let mut pose = SceneTransform::default();
+        pose.scale = 1.5;
+        cue.transform = Some(TransformMotion { end: pose, keep_end_state: true, ..Default::default() });
+        let clips = RecordingClipTimeline::new(vec![super::super::clips::RecordingClipSegment::new(3.0, 5.0)]);
+        let viewport = ViewportTimeline::build(&[cue], &PointerTimeline::default(), &clips, &PointerCaptureFile::default());
+        assert_eq!(viewport.frame_at(1.0).transform, SceneTransform::default());
     }
 }

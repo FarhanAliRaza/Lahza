@@ -5,10 +5,12 @@ use super::{
     VideoTrimDrag, VideoZoomDrag, VideoZoomDragKind,
 };
 use crate::recording::{
+    camera_playback::CameraPlaybackDecoder,
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
     model::RecordingSession,
+    playback::TimelinePlaybackStream,
     pointer_timeline::PointerTimeline,
-    video::{decode_frame, render_clip_preview, render_denoised_copy, SynchronizedPlaybackStream},
+    video::{decode_frame, render_denoised_copy},
     viewport::{ViewportTimeline, ZoomCue},
 };
 use gpui::{
@@ -16,7 +18,6 @@ use gpui::{
     Pixels, Timer,
 };
 use std::{
-    fs,
     path::PathBuf,
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -338,11 +339,15 @@ impl Studio {
                 self.restore_image_timing(scene, start, end);
                 cx.notify();
             }
-            VideoEditSnapshot::Clips(timeline) => {
+            VideoEditSnapshot::Clips { timeline, annotations } => {
                 self.video_redo_stack
-                    .push(VideoEditSnapshot::Clips(self.video_clip_timeline.clone()));
+                    .push(VideoEditSnapshot::Clips { timeline: self.video_clip_timeline.clone(), annotations: self.annotations.clone() });
                 let selected = timeline.segments.first().map(|clip| clip.id);
                 self.apply_video_clip_timeline(timeline, selected, false, cx);
+                self.annotations = annotations;
+                self.finish_annotation_interaction();
+                let _ = self.rebuild_redactions();
+                cx.notify();
             }
             VideoEditSnapshot::Zoom(cues) => {
                 self.video_redo_stack
@@ -372,11 +377,15 @@ impl Studio {
                 self.restore_image_timing(scene, start, end);
                 cx.notify();
             }
-            VideoEditSnapshot::Clips(timeline) => {
+            VideoEditSnapshot::Clips { timeline, annotations } => {
                 self.video_undo_stack
-                    .push(VideoEditSnapshot::Clips(self.video_clip_timeline.clone()));
+                    .push(VideoEditSnapshot::Clips { timeline: self.video_clip_timeline.clone(), annotations: self.annotations.clone() });
                 let selected = timeline.segments.first().map(|clip| clip.id);
                 self.apply_video_clip_timeline(timeline, selected, false, cx);
+                self.annotations = annotations;
+                self.finish_annotation_interaction();
+                let _ = self.rebuild_redactions();
+                cx.notify();
             }
             VideoEditSnapshot::Zoom(cues) => {
                 self.video_undo_stack
@@ -409,9 +418,7 @@ impl Studio {
     }
 
     pub(super) fn video_playback_path(&self) -> Option<PathBuf> {
-        self.video_preview_path
-            .clone()
-            .or_else(|| self.video_media_source())
+        self.video_media_source()
     }
 
     /// The recording the editor plays and cuts: the noise-reduced copy when
@@ -473,15 +480,9 @@ impl Studio {
         cx.notify();
     }
 
-    /// Re-renders the edited preview from the current media source, or just
-    /// re-seeks when the recording plays uncut.
+    /// Source changes only require a seek; cuts stay virtual until export.
     pub(super) fn refresh_video_media_source(&mut self, cx: &mut Context<Self>) {
-        if self.video_preview_path.is_some() {
-            let timeline = self.video_clip_timeline.clone();
-            self.apply_video_clip_timeline(timeline, self.video_selected_clip, false, cx);
-        } else {
-            self.seek_video(self.video_position, cx);
-        }
+        self.seek_video(self.video_position, cx);
     }
 
     pub(super) fn rebuild_video_motion_timelines(&mut self) {
@@ -544,17 +545,36 @@ impl Studio {
         }
         if push_undo {
             self.video_undo_stack
-                .push(VideoEditSnapshot::Clips(self.video_clip_timeline.clone()));
+                .push(VideoEditSnapshot::Clips { timeline: self.video_clip_timeline.clone(), annotations: self.annotations.clone() });
             self.video_redo_stack.clear();
         }
-        self.pause_video_playback();
+        let mapping_changed = !timeline.same_source_mapping(&self.video_clip_timeline);
+        if mapping_changed {
+            self.pause_video_playback();
+            self.annotations = crate::timed::remap_clip_annotations(
+                &self.annotations, &self.video_clip_timeline, &timeline);
+            self.finish_annotation_interaction();
+            let _ = self.rebuild_redactions();
+        }
         self.video_position = self.video_position.min(timeline.duration());
         self.video_duration = timeline.duration();
         self.video_selected_clip = selected
             .filter(|id| timeline.segments.iter().any(|clip| clip.id == *id))
             .or_else(|| timeline.segments.first().map(|clip| clip.id));
         self.video_clip_timeline = timeline.clone();
-        self.rebuild_video_motion_timelines();
+        if mapping_changed {
+            self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
+            self.camera_decode_in_flight = false;
+            self.camera_frame_rgba = None;
+            self.camera_decoded_time = -1.0;
+            if self.video_selected_zoom_cue.is_some_and(|id| {
+                self.video_zoom_cues.iter().find(|cue| cue.id == id).is_none_or(|cue|
+                    timeline.slices_overlapping(cue.start, cue.end).is_empty())
+            }) {
+                self.video_selected_zoom_cue = None;
+            }
+            self.rebuild_video_motion_timelines();
+        }
 
         let Some(session) = self.video_project.clone() else {
             return;
@@ -564,53 +584,9 @@ impl Studio {
             cx.notify();
             return;
         }
-        if timeline.is_unedited(self.video_source_duration) {
-            self.video_preview_path = None;
-            self.video_edit_busy = false;
+        if mapping_changed {
             self.seek_video(self.video_position, cx);
-            return;
         }
-
-        self.video_edit_busy = true;
-        let previous_preview = self.video_preview_path.take();
-        self.toast = Some("Updating video and audio preview…".into());
-        let source = Self::media_source_for(&session, self.video_noise_reduction);
-        self.video_preview_render_generation += 1;
-        let token = self.video_preview_render_generation;
-        let destination = session.directory.join(format!(".edit-preview-{token}.mkv"));
-        let task = cx.background_executor().spawn(async move {
-            render_clip_preview(&source, &destination, &timeline)
-                .map(|_| destination)
-                .map_err(|error| error.to_string())
-        });
-        cx.spawn(async move |weak, cx| {
-            let result = task.await;
-            let _ = weak.update(cx, |this, cx| {
-                if this.video_preview_render_generation != token {
-                    if let Ok(path) = result {
-                        let _ = fs::remove_file(path);
-                    }
-                    return;
-                }
-                this.video_edit_busy = false;
-                match result {
-                    Ok(path) => {
-                        this.video_preview_path = Some(path);
-                        if let Some(previous) = previous_preview {
-                            let _ = fs::remove_file(previous);
-                        }
-                        this.toast = None;
-                        this.seek_video(this.video_position, cx);
-                    }
-                    Err(error) => {
-                        this.toast =
-                            Some(format!("Could not update edited preview: {error}").into());
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
         cx.notify();
     }
 
@@ -698,17 +674,83 @@ impl Studio {
             self.video_position = 0.0;
         }
         let start_time = self.video_position;
+        let timeline = self.video_clip_timeline.clone();
+        let muted = self.video_audio_muted;
         let generation = self.video_playback_generation.clone();
         let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
         let receiver = PlaybackMailbox::default();
-        let sender = receiver.clone();
+        let mut camera_ready = None;
+        let sender = if let Some(path) = self.video_camera_path.clone() {
+            let pending = PlaybackMailbox::default();
+            let raw_sender = pending.clone();
+            let paired_sender = receiver.clone();
+            let camera_generation = generation.clone();
+            let camera_timeline = timeline.clone();
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+            camera_ready = Some(ready_receiver);
+            // Blocking pipe reads use a dedicated worker so they cannot
+            // occupy the executor thread needed by the screen/audio transport.
+            std::thread::spawn(move || {
+                let mut decoder = Some(CameraPlaybackDecoder::new(path));
+                let cancelled = || camera_generation.load(Ordering::SeqCst) != token
+                    || Arc::strong_count(&paired_sender.0) <= 1;
+                // Open FFmpeg and decode its first frame before allowing the
+                // master transport to start its screen/audio clock.
+                // Starting in a gap warms the upcoming clip, without showing
+                // its camera until actual content begins.
+                let source_time = camera_timeline.location_at(start_time).map(|location| location.source_time);
+                if let Some(Err(error)) = decoder.as_mut().map(|decoder| decoder.frame_at(source_time, &cancelled)) {
+                    eprintln!("Webcam playback failed: {error}");
+                    decoder = None;
+                }
+                if cancelled() || ready_sender.send(()).is_err() { return; }
+                while !cancelled() {
+                    let update = pending.take();
+                    let had_frame = update.frame.is_some();
+                    if let Some(frame) = update.frame {
+                        let source_time = camera_timeline.content_source_time_at(frame.time);
+                        let camera = match decoder.as_mut().filter(|_| source_time.is_some())
+                            .map(|decoder| decoder.frame_at(source_time, &cancelled)) {
+                            Some(Ok(camera)) => camera,
+                            Some(Err(error)) => {
+                                eprintln!("Webcam playback failed: {error}");
+                                decoder = None;
+                                None
+                            }
+                            None => None,
+                        };
+                        if cancelled() { break; }
+                        paired_sender.publish_with_camera(frame, camera);
+                    }
+                    if let Some(terminal) = update.terminal {
+                        paired_sender.finish(terminal);
+                        break;
+                    }
+                    if !had_frame { std::thread::sleep(Duration::from_millis(2)); }
+                }
+            });
+            raw_sender
+        } else {
+            receiver.clone()
+        };
+        // Invalidate any still-frame seek that predates playback.
+        self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
+        self.camera_decode_in_flight = false;
         self.video_playing = true;
         self.toast = None;
 
         cx.background_executor()
             .spawn(async move {
+                if let Some(ready) = camera_ready {
+                    if !crate::recording::camera_playback::wait_until_ready(&ready, || {
+                        generation.load(Ordering::SeqCst) != token || Arc::strong_count(&sender.0) <= 1
+                    }) {
+                        sender.finish(Err("Webcam playback initialization stopped".into()));
+                        return;
+                    }
+                }
                 let mut stream =
-                    match SynchronizedPlaybackStream::open(&path, start_time, 1920, 1080) {
+                    match TimelinePlaybackStream::open(&path, timeline, start_time, 1920, 1080, muted) {
                         Ok(stream) => stream,
                         Err(error) => {
                             sender.finish(Err(error.to_string()));
@@ -717,7 +759,7 @@ impl Studio {
                     };
                 while generation.load(Ordering::SeqCst) == token && Arc::strong_count(&sender.0) > 1
                 {
-                    match stream.next_frame() {
+                    match stream.next_frame(|| generation.load(Ordering::SeqCst) != token || Arc::strong_count(&sender.0) <= 1) {
                         Ok(Some(frame)) => {
                             sender.publish(frame);
                         }
@@ -743,12 +785,15 @@ impl Studio {
             }
             let PlaybackUpdates {
                 frame: latest_frame,
+                camera,
                 terminal,
             } = receiver.take();
             let terminal_received = terminal.is_some();
             if weak
                 .update(cx, |this, cx| {
                     if let Some(frame) = latest_frame {
+                        this.camera_decoded_time = camera.as_ref().map_or(-1.0, |(time, _)| *time);
+                        this.camera_frame_rgba = camera.map(|(_, image)| image);
                         this.video_position = frame.time.min(this.video_duration);
                         if let Some(pixels) =
                             image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
@@ -776,6 +821,8 @@ impl Studio {
     }
 
     pub(super) fn pause_video_playback(&mut self) {
+        self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
+        self.camera_decode_in_flight = false;
         self.video_playback_generation
             .fetch_add(1, Ordering::SeqCst);
         self.video_playing = false;
@@ -787,6 +834,8 @@ impl Studio {
         self.pause_video_playback();
         let position = position.clamp(0.0, self.video_duration);
         self.video_position = position;
+        self.camera_frame_rgba = None;
+        self.camera_decoded_time = -1.0;
         if self.selected_annotation.is_some_and(|index| {
             self.annotations.get(index).is_none_or(|mark| {
                 mark.timing
@@ -801,8 +850,14 @@ impl Studio {
         };
         let generation = self.video_playback_generation.clone();
         let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.video_clip_timeline.location_at(position).is_some_and(|location| position < location.editor_start) {
+            self.set_video_frame(image::RgbaImage::from_pixel(16, 9, image::Rgba([0, 0, 0, 255])));
+            cx.notify();
+            return;
+        }
+        let source_time = self.video_clip_timeline.source_time_at(position);
         let task = cx.background_executor().spawn(async move {
-            decode_frame(&path, position, 2560, 1440).map_err(|error| error.to_string())
+            decode_frame(&path, source_time, 2560, 1440).map_err(|error| error.to_string())
         });
         cx.spawn(async move |weak, cx| {
             let result = task.await;
@@ -833,7 +888,7 @@ impl Studio {
         format!("{:02}:{:02}", seconds / 60, seconds % 60)
     }
 
-    /// Modal that previews a clip speed change before rendering it once.
+    /// Modal that previews a clip speed change before applying it.
     pub(super) fn video_speed_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let draft = self.video_speed_draft?;
         let selected = self.video_selected_clip?;

@@ -930,27 +930,39 @@ impl Studio {
         let Some(path) = self.video_camera_path.clone() else {
             return;
         };
-        if !self.camera_overlay.enabled || self.camera_decode_in_flight {
+        if self.video_playing || !self.camera_overlay.enabled || self.camera_decode_in_flight {
             return;
         }
-        let source_time = self.video_clip_timeline.source_time_at(self.video_position);
-        if self.camera_frame_rgba.is_some() && (self.camera_decoded_time - source_time).abs() < 0.12
+        let Some(source_time) = self.video_clip_timeline.content_source_time_at(self.video_position) else {
+            self.camera_frame_rgba = None;
+            return;
+        };
+        if self.camera_frame_rgba.is_some() && (self.camera_decoded_time - source_time).abs() < 1.0 / 30.0
         {
             return;
         }
         self.camera_decode_in_flight = true;
         self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
         let token = self.camera_decode_token;
+        let decode_path = path.clone();
         let task = cx.background_executor().spawn(async move {
-            crate::recording::video::decode_frame(&path, source_time, 640, 640)
+            crate::recording::video::decode_frame(&decode_path, source_time, 640, 640)
                 .ok()
                 .and_then(|frame| RgbaImage::from_raw(frame.width, frame.height, frame.rgba))
         });
         cx.spawn(async move |weak, cx| {
             let frame = task.await;
             let _ = weak.update(cx, |this, cx| {
-                this.camera_decode_in_flight = false;
                 if this.camera_decode_token != token {
+                    return;
+                }
+                this.camera_decode_in_flight = false;
+                // A seek may have moved again while FFmpeg was decoding.
+                let current = this.video_clip_timeline.content_source_time_at(this.video_position);
+                if this.video_playing || this.video_camera_path.as_ref() != Some(&path)
+                    || current.is_none_or(|time| (time - source_time).abs() >= 1.0 / 30.0)
+                {
+                    cx.notify();
                     return;
                 }
                 if let Some(frame) = frame {
@@ -964,6 +976,7 @@ impl Studio {
     }
 
     pub(crate) fn import_camera_clip(&mut self, cx: &mut Context<Self>) {
+        self.pause_video_playback();
         let Some(session) = self.video_project.clone() else {
             return;
         };
@@ -1013,6 +1026,7 @@ impl Studio {
     }
 
     pub(crate) fn remove_camera_clip(&mut self) {
+        self.pause_video_playback();
         if let Some(path) = self.video_camera_path.take() {
             let _ = std::fs::remove_file(path);
         }
@@ -1128,27 +1142,23 @@ impl Studio {
                 .overflow_hidden()
                 .rounded_lg()
                 .bg(rgb(0xECEDF1))
-                .child(
+                .children(self.video_clip_timeline.segments.iter().zip(self.video_clip_timeline.clip_starts()).map(|(clip, start)| {
                     div()
                         .absolute()
-                        .left(px(-(timeline_scroll as f32)))
+                        .left(px((start / self.video_duration.max(f64::EPSILON) * timeline_content_width - timeline_scroll) as f32))
                         .top(px(3.0))
-                        .w(px(timeline_content_width as f32))
+                        .w(px((clip.editor_duration() / self.video_duration.max(f64::EPSILON) * timeline_content_width) as f32))
                         .h(px(16.0))
                         .rounded_md()
-                        .bg(if enabled {
-                            hsla(271.0 / 360.0, 0.6, 0.55, 1.0)
-                        } else {
-                            hsla(271.0 / 360.0, 0.2, 0.7, 1.0)
-                        })
-                        .flex()
-                        .items_center()
-                        .px_2()
-                        .text_xs()
+                        .border_r_1()
+                        .border_color(rgb(0xECEDF1))
+                        .overflow_hidden()
+                        .bg(if enabled { hsla(271.0 / 360.0, 0.6, 0.55, 1.0) } else { hsla(271.0 / 360.0, 0.2, 0.7, 1.0) })
+                        .flex().items_center().px_2().text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(0xffffff))
-                        .child(format!("Camera · {name}")),
-                )
+                        .child(format!("Camera · {name}"))
+                }))
                 .child(
                     div()
                         .absolute()
@@ -2541,7 +2551,10 @@ impl Studio {
         let mut x = 0.0;
         while x < timeline_content_width {
             let editor_time = x / timeline_content_width * duration;
-            let source_time = self.video_clip_timeline.source_time_at(editor_time);
+            let Some(source_time) = self.video_clip_timeline.content_source_time_at(editor_time) else {
+                x += bar_width;
+                continue;
+            };
             let bucket = ((source_time / self.video_source_duration) * bucket_count as f64)
                 .floor()
                 .clamp(0.0, bucket_count as f64 - 1.0) as usize;
@@ -2581,6 +2594,10 @@ impl Studio {
                         .w(px(timeline_content_width as f32))
                         .h_full()
                         .children(bars)
+                        .children(self.video_clip_timeline.clip_starts().into_iter().skip(1).map(|start| {
+                            div().absolute().left(px((start / duration * timeline_content_width) as f32))
+                                .top_0().w(px(1.0)).h_full().bg(rgb(0xECEDF1))
+                        }))
                         .child(
                             div()
                                 .absolute()

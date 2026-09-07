@@ -1727,7 +1727,7 @@ impl Studio {
     }
 
     fn begin_image_timing_drag(&mut self, x: Pixels, edge: Option<ClipEdge>) {
-        if !self.animation_active || self.video_project.is_some() || self.export_progress.is_some()
+        if !self.animation_active || self.video_project.is_some()
         {
             return;
         }
@@ -2401,15 +2401,27 @@ impl Studio {
         request: SceneExportRequest,
         cx: &mut Context<Self>,
     ) {
-        self.pause_video_playback();
+        // The file picker is asynchronous; another export may have started
+        // since this request was captured. Keep ownership of the active job.
+        if self.export_progress.is_some() {
+            self.toast = Some("An export is already running".into());
+            cx.notify();
+            return;
+        }
+        // Source and request own a snapshot of the edit. Preview playback and
+        // later edits can continue independently on the UI's project state.
         let progress = Arc::new(ExportProgress::default());
         self.export_progress = Some(progress.clone());
         self.export_label = format!("Exporting {}…", request.format.label()).into();
-        self.video_edit_busy = true;
+        self.export_panel_collapsed = false;
+        self.export_filename = request.destination.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Export".into()).into();
         self.toast = None;
         let format_label = request.format.label();
         let destination = request.destination.clone();
         let mut request = request;
+        let job_progress = progress.clone();
         let task = cx.background_executor().spawn(async move {
             export_scene(source, &mut request, &progress).map_err(|error| error.to_string())
         });
@@ -2419,7 +2431,8 @@ impl Studio {
             let active = weak
                 .update(cx, |this, cx| {
                     cx.notify();
-                    this.export_progress.is_some()
+                    this.export_progress.as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &job_progress))
                 })
                 .unwrap_or(false);
             if !active {
@@ -2431,7 +2444,6 @@ impl Studio {
             let result = task.await;
             let _ = weak.update(cx, |this, cx| {
                 this.export_progress = None;
-                this.video_edit_busy = false;
                 this.toast = Some(match result {
                     Ok(()) => {
                         crate::notifications::Notification::exported(
@@ -2455,11 +2467,13 @@ impl Studio {
         }
     }
 
-    /// Floating progress card with a cancel button while an export runs.
+    /// A nonmodal job panel. Only the panel itself occupies pointer space,
+    /// leaving the canvas and timeline available while the snapshot renders.
     pub(crate) fn export_status_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let progress = self.export_progress.as_ref()?;
         let fraction = progress.fraction();
         let cancelling = progress.is_cancelled();
+        let collapsed = self.export_panel_collapsed;
         let label = if cancelling {
             "Cancelling…".to_string()
         } else {
@@ -2468,67 +2482,78 @@ impl Studio {
         Some(
             div()
                 .absolute()
-                .bottom(px(20.0))
-                .left_0()
-                .right_0()
+                .bottom(px(16.0))
+                .right(px(16.0))
+                .w(px(320.0))
+                .p_4()
+                .rounded_xl()
+                .border_1()
+                .border_color(line())
+                .bg(rgb(0xffffff))
+                .text_color(crate::ink())
+                .shadow_lg()
                 .flex()
-                .justify_center()
+                .flex_col()
+                .gap_3()
                 .child(
                     div()
-                        .w(px(320.0))
-                        .p_3()
-                        .rounded_lg()
-                        .bg(hsla(220.0 / 360.0, 0.2, 0.12, 0.94))
-                        .text_color(rgb(0xffffff))
                         .flex()
-                        .flex_col()
+                        .items_center()
+                        .justify_between()
                         .gap_2()
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(label))
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(label),
-                                )
-                                .child(
-                                    div()
-                                        .id("export-cancel")
-                                        .px_2()
-                                        .h(px(24.0))
-                                        .flex()
-                                        .items_center()
-                                        .rounded_md()
-                                        .bg(hsla(0.0, 0.0, 1.0, 0.12))
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.22)))
-                                        .child("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_export();
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(6.0))
-                                .rounded_full()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.15))
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .h_full()
-                                        .w(gpui::relative(fraction as f32))
-                                        .rounded_full()
-                                        .bg(orange(false)),
-                                ),
+                                .id("export-collapse")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(muted())
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0xf1f2f4)))
+                                .child(if collapsed { "Expand" } else { "Minimize" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_panel_collapsed = !this.export_panel_collapsed;
+                                    cx.notify();
+                                })),
                         ),
                 )
+                .when(!collapsed, |panel| {
+                    panel
+                        .child(div().text_xs().text_color(muted()).text_ellipsis().child(self.export_filename.clone()))
+                        .child(div().text_xs().text_color(muted())
+                            .child("Keep editing. This export uses the version you started with."))
+                        .children(progress.encoder_label().map(|label| div().text_xs().text_color(muted()).child(label)))
+                })
+                .child(
+                    div().w_full().h(px(5.0)).rounded_full().bg(rgb(0xe9ebef)).overflow_hidden()
+                        .child(div().h_full().w(gpui::relative(fraction as f32)).rounded_full().bg(orange(false))),
+                )
+                .when(!collapsed, |panel| {
+                    panel.child(
+                        div().flex().items_center().justify_between().gap_2()
+                            .child(div().text_xs().child(if cancelling {
+                                "Stopping export…".into()
+                            } else {
+                                progress.remaining_label()
+                            }))
+                            .child(
+                                div().id("export-cancel").px_2().py_1().rounded_md()
+                                    .border_1().border_color(line()).text_xs()
+                                    .opacity(if cancelling { 0.5 } else { 1.0 })
+                                    .child("Cancel")
+                                    .when(!cancelling, |button| {
+                                        button.cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0xf1f2f4)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_export();
+                                                cx.notify();
+                                            }))
+                                    }),
+                            ),
+                    )
+                })
                 .into_any_element(),
         )
     }

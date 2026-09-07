@@ -4,12 +4,15 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Added real screenshots alongside the README's feature descriptions, including annotation and animated scene templates.
-- Simplified installation and feature descriptions, placed Debian installation first, and moved setup details to the bottom.
-- Expanded the Snap Store feature description to match the README showcase.
-- Moved the application icon into assets and updated packaging and installer references.
+- MP4 exports automatically detect working NVIDIA NVENC or Intel/AMD VAAPI encoders, with a faster CPU fallback when hardware encoding is unavailable.
+- Edited recordings and webcam clips stream directly into export, removing the full intermediate-video preparation pass. Audio edits are applied during final encoding.
+- Export runs in the background with a collapsible progress panel, filename, encoder status, estimated time remaining, and cancellation. Continue editing and previewing while the original project snapshot renders.
+- Cached webcam shadows avoid repeating a full-canvas blur on every frame.
+- Webcam playback reuses a decoder, pairs camera frames with screen timestamps, and waits for camera readiness before starting audio. A regular playback cadence keeps webcams and motion smooth when the screen recording has sparse frames.
+- Timeline playback applies cuts and speed changes without rebuilding preview videos, preserves audio pitch, and reuses playback across unchanged splits.
+- Clip edits keep media annotations aligned with retained footage and preserve annotation state for undo. Deleted motion regions no longer leave a held transform on later clips.
 
-This is a documentation and packaging update; application behavior is unchanged from v0.5.1.
+Validation: 160 automated Rust tests and 15 packaging tests passed locally; five manual/device-dependent Rust tests remain excluded from the default suite. Added regression tests for sparse screen recordings, repeated playback starts, webcam synchronization, export streaming, and time estimates.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
@@ -66,6 +69,6 @@ To verify downloaded files, download `SHA256SUMS` into the same directory and ru
 
 ### Early-release limitations
 
-Desktop capture support depends on your compositor and portals. Editable cursor effects and automatic click zooms depend on input metadata; the optional bundled GNOME helper supplies additional input information. Live webcam capture/device selection is unfinished; camera-file overlays are supported. Recovery cannot guarantee that every interrupted recording is salvageable. Automated checks do not replace hands-on testing across Linux desktops.
+Desktop capture support depends on your compositor and portals. Editable cursor effects and automatic click zooms depend on input metadata; the optional bundled GNOME helper supplies additional input information. Webcam availability and GPU encoding depend on device permissions and installed drivers. Recovery cannot guarantee that every interrupted recording is salvageable. Automated checks do not replace hands-on testing across Linux desktops.
 
 See the [README](https://github.com/FarhanAliRaza/lahza#readme) for features, source installation, and GNOME helper setup. Please report issues with your distribution, desktop, session type, and reproduction steps.

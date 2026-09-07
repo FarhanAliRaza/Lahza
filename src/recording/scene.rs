@@ -890,6 +890,7 @@ pub struct SceneCompositor {
     source_height: u32,
     background: RgbaImage,
     card: std::cell::RefCell<Option<CardLayer>>,
+    camera_shadow: std::cell::RefCell<Option<CameraShadow>>,
     vignette: Option<Vec<f32>>,
     watermark: Option<RgbaImage>,
 }
@@ -998,6 +999,7 @@ impl SceneCompositor {
             source_height,
             background,
             card: std::cell::RefCell::new(None),
+            camera_shadow: std::cell::RefCell::new(None),
             vignette,
             watermark,
         })
@@ -1248,8 +1250,20 @@ impl SceneCompositor {
     }
 
     fn paint_camera(&self, output: &mut RgbaImage, camera: &RgbaImage) {
-        let overlay = self.style.camera;
-        paint_camera_overlay(output, camera, overlay, overlay.rect(self.width as f64, self.height as f64));
+        if camera.width() == 0 || camera.height() == 0 {
+            return;
+        }
+        let mut overlay = self.style.camera;
+        let rect = overlay.rect(self.width as f64, self.height as f64);
+        if overlay.shadow {
+            let mut cache = self.camera_shadow.borrow_mut();
+            let shadow = cache.get_or_insert_with(|| {
+                CameraShadow::new(self.width, self.height, overlay, rect)
+            });
+            shadow.paint(output);
+            overlay.shadow = false;
+        }
+        paint_camera_overlay(output, camera, overlay, rect);
     }
 
     fn paint_pointer(
@@ -1639,15 +1653,17 @@ pub fn camera_framing_preview(camera: &RgbaImage, overlay: CameraOverlay) -> Rgb
     output
 }
 
-/// Shared cover-fit camera renderer for the launcher, editor, and export.
-fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: CameraOverlay, rect: Rect) {
-    if camera.width() == 0 || camera.height() == 0 {
-        return;
-    }
-    let radius = overlay.radius(rect);
-    if overlay.shadow {
-        let width = output.width() as usize;
-        let height = output.height() as usize;
+/// Only nonzero shadow pixels are retained. Geometry stays fixed for the
+/// lifetime of a compositor; changing webcam frames must not repeat the blur.
+struct CameraShadow {
+    pixels: Vec<(usize, f64)>,
+}
+
+impl CameraShadow {
+    fn new(width: u32, height: u32, overlay: CameraOverlay, rect: Rect) -> Self {
+        let radius = overlay.radius(rect);
+        let width = width as usize;
+        let height = height as usize;
         let mut mask = vec![0.0f32; width * height];
         let offset = rect.height * 0.06;
         let x0 = (rect.x - 2.0).floor().max(0.0) as usize;
@@ -1663,14 +1679,29 @@ fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: Cam
             }
         }
         blur_plane(&mut mask, width, height, rect.height * 0.05 * 0.5 + 1.0);
-        for y in 0..height {
-            for x in 0..width {
-                let alpha = mask[y * width + x] as f64 * 0.35;
-                if alpha > 0.001 {
-                    blend_pixel(output, x as u32, y as u32, [0, 0, 0], alpha);
-                }
-            }
+        let pixels = mask.into_iter().enumerate().filter_map(|(index, value)| {
+            let alpha = f64::from(value) * 0.35;
+            (alpha > 0.001).then_some((index * 4, alpha))
+        }).collect();
+        Self { pixels }
+    }
+
+    fn paint(&self, output: &mut RgbaImage) {
+        let raw: &mut [u8] = output.as_mut();
+        for &(offset, alpha) in &self.pixels {
+            blend_slice(&mut raw[offset..offset + 4], [0, 0, 0], alpha);
         }
+    }
+}
+
+/// Shared cover-fit camera renderer for the launcher, editor, and export.
+fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: CameraOverlay, rect: Rect) {
+    if camera.width() == 0 || camera.height() == 0 {
+        return;
+    }
+    let radius = overlay.radius(rect);
+    if overlay.shadow {
+        CameraShadow::new(output.width(), output.height(), overlay, rect).paint(output);
     }
     // Cover-fit: scale the frame so the square is filled, crop the rest.
     let frame_width = camera.width() as f64;
@@ -2451,6 +2482,61 @@ fn paint_cursor_bitmap(
 mod tests {
     use super::*;
     use crate::recording::pointer_timeline::PointerPressFrame;
+
+    #[test]
+    #[ignore = "manual export compositor benchmark"]
+    fn benchmark_export_camera() {
+        let source = checker(1920, 1080);
+        let camera = checker(640, 480);
+        let style = SceneStyle::default();
+        let compositor = SceneCompositor::new(&style, 1920, 1080, 1920, 1080).unwrap();
+        let mut output = source.clone();
+        compositor.paint_camera(&mut output, &camera);
+        let start = std::time::Instant::now();
+        for _ in 0..60 {
+            let pixels: &mut [u8] = output.as_mut();
+            pixels.copy_from_slice(source.as_raw());
+            compositor.paint_camera(&mut output, &camera);
+            std::hint::black_box(&output);
+        }
+        eprintln!("1080p camera: {:.2} ms/frame", start.elapsed().as_secs_f64() * 1000.0 / 60.0);
+        let start = std::time::Instant::now();
+        for _ in 0..60 {
+            std::hint::black_box(compositor.compose(FrameInput {
+                source: &source, overlay: None, viewport: ViewportFrame::default(),
+                pointer: None, camera: Some(&camera),
+            }));
+        }
+        eprintln!("1080p composition: {:.2} ms/frame", start.elapsed().as_secs_f64() * 1000.0 / 60.0);
+    }
+
+    #[test]
+    fn cached_camera_shadow_matches_uncached_and_rebuilds_for_new_geometry() {
+        let camera = checker(96, 72);
+        for shape in [CameraShape::Circle, CameraShape::Squircle, CameraShape::Square] {
+            let mut style = SceneStyle::default();
+            style.camera.shape = shape;
+            let compositor = SceneCompositor::new(&style, 320, 180, 320, 180).unwrap();
+            assert!(compositor.camera_shadow.borrow().is_none());
+            for background in [Rgba([90, 160, 230, 255]), Rgba([230, 50, 100, 100])] {
+                let mut cached = RgbaImage::from_pixel(320, 180, background);
+                let mut reference = cached.clone();
+                compositor.paint_camera(&mut cached, &camera);
+                paint_camera_overlay(&mut reference, &camera, style.camera, style.camera.rect(320.0, 180.0));
+                assert_eq!(cached, reference);
+            }
+            assert!(compositor.camera_shadow.borrow().is_some());
+            style.camera.position = WatermarkPosition::TopLeft;
+            style.camera.size = 40;
+            let rebuilt = compositor.rebuild(&style, 400, 300, 320, 180).unwrap();
+            assert!(rebuilt.camera_shadow.borrow().is_none());
+            let mut cached = RgbaImage::from_pixel(400, 300, Rgba([200, 200, 200, 255]));
+            let mut reference = cached.clone();
+            rebuilt.paint_camera(&mut cached, &camera);
+            paint_camera_overlay(&mut reference, &camera, style.camera, style.camera.rect(400.0, 300.0));
+            assert_eq!(cached, reference);
+        }
+    }
 
     fn checker(width: u32, height: u32) -> RgbaImage {
         let mut image = RgbaImage::new(width, height);

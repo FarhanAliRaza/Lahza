@@ -291,7 +291,7 @@ pub(crate) struct VideoZoomDrag {
 pub(crate) enum VideoEditSnapshot {
     Annotations(Vec<AnnotationMark>),
     ImageTiming { scene: f64, start: f64, end: f64 },
-    Clips(RecordingClipTimeline),
+    Clips { timeline: RecordingClipTimeline, annotations: Vec<AnnotationMark> },
     Zoom(Vec<ZoomCue>),
 }
 

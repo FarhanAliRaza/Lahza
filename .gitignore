@@ -10,3 +10,11 @@
 # Local clone of the macOS reference app (github.com/fayazara/Screendrop)
 /Screendrop/
 __pycache__/
+
+# Recording exports written into the repository by the file picker.
+/.*.tmp.mp4
+/.*.tmp.webm
+/.*.tmp.gif
+/Lahza-*.mp4
+/Lahza-*.webm
+/Lahza-*.gif
