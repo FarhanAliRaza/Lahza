@@ -13,12 +13,22 @@ command -v ffprobe
 command -v gst-play-1.0
 
 for element in pipewiresrc pulsesrc v4l2src vp8enc opusenc matroskamux \
+  avenc_ffv1 avdec_ffv1 capssetter videocrop videoscale videobox \
   videoconvert audioconvert audioresample appsink tee; do
   gst-inspect-1.0 "$element" >/dev/null
 done
 
 smoke_dir="$(mktemp -d)"
 trap 'rm -rf "$smoke_dir"' EXIT
+
+# Window recordings require FFV1 and must retain transparent pixels.
+gst-launch-1.0 -q -e videotestsrc num-buffers=3 pattern=ball background-color=0x00000000 \
+  ! video/x-raw,format=BGRA,width=64,height=64,framerate=30/1 \
+  ! avenc_ffv1 ! matroskamux ! filesink location="$smoke_dir/window.mkv"
+ffmpeg -nostdin -v error -i "$smoke_dir/window.mkv" -frames:v 1 \
+  -pix_fmt rgba -f rawvideo "$smoke_dir/window.rgba"
+test "$(wc -c < "$smoke_dir/window.rgba")" -eq 16384
+test "$(od -An -tu1 -j3 -N1 "$smoke_dir/window.rgba" | tr -d ' ')" = 0
 
 # Exercise the recording codecs using synthetic sources, without capturing
 # the desktop, microphone, or camera.

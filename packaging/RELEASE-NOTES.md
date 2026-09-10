@@ -4,15 +4,15 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Record a selected rectangle of a screen using an app-owned preview picker after choosing a monitor in the system picker.
-- Choose exact 720p, 1080p, 1440p, or 4K capture sizes, or draw in 16:9, 9:16, 1:1, and 4:3. Move selections, use Shift-drag to redraw, and switch shapes without progressively shrinking the capture area.
-- Crop the stream before encoding, preserving the selected area through pause and resume. Area recordings include the system cursor; editable cursor effects and automatic click zooms are unavailable in this mode.
-- Show a click-through desktop border outside the captured area: red while recording and amber while paused. The indicator uses X11/XWayland; edges at monitor boundaries may be off-screen.
-- Document the area-recording workflow and add launch-post drafts.
+- Crop videos using draggable handles and aspect presets. Apply, cancel, reset, and undo/redo crops; saved crops survive reopening and apply consistently to playback and export without changing the original recording.
+- Preserve native window pixels when resizing during recording, including changes between portrait and landscape shapes. Selection geometry and scene effects follow the window's current dimensions.
+- Preserve window transparency and remove identified desktop shadow margins from presentation bounds, fixing black borders, hidden padding, and misplaced corners or shadows.
+- Improve recording startup and finalization, and retain cursor events across pause/resume.
+- Add a handwritten annotation font and fix text formatting.
 
-Validation: 166 automated Rust tests and 15 packaging tests passed locally; seven interactive/device-dependent Rust tests are excluded from the default suite. Tests cover selection geometry, exact dimensions, repeated shape changes, scaled border placement, and a real crop encode/decode roundtrip. Cross-desktop source-picker and recording validation remains outstanding.
+Validation: 187 automated Rust tests and 15 packaging tests passed locally; ten interactive/device-dependent Rust tests are excluded from the default suite. The graphical crop workflow was also checked against a disposable recording. Regression coverage includes native window pixels, transparency, changing geometry, crop persistence, motion coordinates, and a real trimmed MP4 crop export with audio and an unchanged source file. Cross-desktop capture validation remains outstanding.
 
-Snap builds are installed and tested under strict confinement in CI, including synthetic recording, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
+Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
 For Debian updates, run `lahza-update --install`. Snap updates are managed by snapd.
 
@@ -20,7 +20,7 @@ For Debian updates, run `lahza-update --install`. Snap updates are managed by sn
 
 - Screenshot capture and annotation: shapes, arrows, text, numbered steps, highlights, blur, and pixelation.
 - Screen recording with pause/resume, microphone and system audio, editable projects, and draft recovery.
-- Clip trimming, splitting, speed changes, motion regions, and timed annotations.
+- Video cropping, clip trimming, splitting, speed changes, motion regions, and timed annotations.
 - Styled backgrounds, window frames, shadows, borders, watermarks, and 3D media transforms.
 - Animated screenshots, image sequences, cursor walkthroughs, and eight scene templates.
 - PNG, MP4, WebM, and GIF exports.
@@ -66,6 +66,8 @@ A Vulkan-capable desktop, PipeWire, and the portal backend for your desktop are 
 To verify downloaded files, download `SHA256SUMS` into the same directory and run `sha256sum --ignore-missing -c SHA256SUMS`.
 
 ### Early-release limitations
+
+Window recordings use lossless FFV1 to preserve pixels and transparency, so their project files can be larger. A window that grows beyond the recording's initial capture surface stops recording rather than being silently reduced or clipped. Shadow-margin detection relies on alpha edges; ambiguous shapes retain their visible bounds. Layout fixes also apply to existing alpha-capable window recordings, but detail lost through older capture-time downscaling cannot be restored.
 
 Desktop capture support depends on your compositor and portals. Editable cursor effects and automatic click zooms depend on input metadata; the optional bundled GNOME helper supplies additional input information. Webcam availability and GPU encoding depend on device permissions and installed drivers. Recovery cannot guarantee that every interrupted recording is salvageable. Automated checks do not replace hands-on testing across Linux desktops.
 
