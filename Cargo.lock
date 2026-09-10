@@ -3156,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "lahza"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "ashpd 0.12.3",
  "async-io",
