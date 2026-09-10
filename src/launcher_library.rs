@@ -198,7 +198,12 @@ impl Studio {
 /// Decode off the UI thread and retain only a display-sized image.
 fn load_thumbnail(path: &std::path::Path, projects: bool) -> Option<image::RgbaImage> {
     let source = if projects {
-        path.join("poster.jpg")
+        let poster = path.join(recording::model::RecordingSession::POSTER_FILE);
+        if poster.exists() {
+            poster
+        } else {
+            path.join("poster.jpg")
+        }
     } else {
         path.to_path_buf()
     };
@@ -240,6 +245,11 @@ mod tests {
             load_thumbnail(&root, true).unwrap().dimensions(),
             (192, 108)
         );
+        image::RgbaImage::new(1280, 720)
+            .save(root.join(recording::model::RecordingSession::POSTER_FILE))
+            .unwrap();
+        let thumbnail = load_thumbnail(&root, true).unwrap();
+        assert!(thumbnail.pixels().all(|pixel| pixel[3] == 0));
         std::fs::remove_dir_all(root).unwrap();
     }
 

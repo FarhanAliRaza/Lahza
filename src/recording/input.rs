@@ -156,6 +156,12 @@ impl InputCapture {
         self.active
     }
 
+    pub fn detach_pipewire(&mut self) {
+        if let Some(poller) = self.pipewire_poller.take() {
+            poller.stop();
+        }
+    }
+
     pub fn finish(
         mut self,
         ranges: &[ActiveRange],
@@ -610,7 +616,11 @@ fn poll_pipewire_cursor(
 ) {
     let result = (|| -> Result<(), String> {
         pipewire::init();
-        let file = fs::File::create(&event_path)
+        // Reconnecting after a pause must retain the earlier cursor events.
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&event_path)
             .map_err(|error| format!("could not create pointer event stream: {error}"))?;
         let state = Arc::new(std::sync::Mutex::new(PipeWireEventWriter {
             writer: BufWriter::new(file),

@@ -397,11 +397,14 @@ impl Studio {
             .read_edit_field::<SceneStyle>("scene")
             .ok()
             .flatten();
+        let source_size = if media.as_ref().is_some_and(|media| media.window_capture) {
+            poster.dimensions()
+        } else { (manifest.pixel_width.max(1), manifest.pixel_height.max(1)) };
         let pointer_timeline = PointerTimeline::build_with_clip_timeline(
             pointer_capture.clone(),
             source_duration,
-            manifest.pixel_width as f64,
-            manifest.pixel_height as f64,
+            source_size.0 as f64,
+            source_size.1 as f64,
             saved_style
                 .as_ref()
                 .map(|style| style.pointer)
@@ -427,7 +430,8 @@ impl Studio {
         if self.animation_active {
             self.exit_animation();
         }
-        self.video_source_size = (manifest.pixel_width.max(1), manifest.pixel_height.max(1));
+        self.video_window_capture = media.as_ref().is_some_and(|media| media.window_capture);
+        self.video_source_size = source_size;
         self.motion_pick = MotionPick::Focus;
         if self.video_project.is_none() {
             self.screenshot_annotations = AnnotationWorkspace {
@@ -471,7 +475,11 @@ impl Studio {
             .filter(|press| press.phase == recording::model::PressPhase::Down)
             .map(|press| press.time)
             .collect();
+        self.video_crop = CropRect::UNIT;
+        self.crop_active = false;
+        self.crop_drag = None;
         if let Some(style) = saved_style.as_ref() {
+            self.video_crop = style.source_crop.validated();
             self.apply_scene_style(style);
         }
         self.persisted_scene_style = saved_style;

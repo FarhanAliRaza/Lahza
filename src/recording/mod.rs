@@ -20,6 +20,7 @@ pub mod pointer_timeline;
 pub mod presets;
 pub mod scene;
 pub mod session;
+mod stream_geometry;
 pub mod templates;
 pub mod video;
 pub mod viewport;

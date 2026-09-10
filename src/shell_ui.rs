@@ -452,7 +452,7 @@ impl Studio {
     }
 
     fn crop_controls(&self, cx: &mut Context<Self>) -> AnyElement {
-        let crop_pixel_size = self.captured_dimensions.map(|(width, height)| {
+        let crop_pixel_size = self.media_dimensions().map(|(width, height)| {
             format!(
                 "{} × {}",
                 (self.crop_rect.width * width as f32).round() as u32,
@@ -609,16 +609,19 @@ impl Studio {
                     |this, _, cx| this.redo_current(cx),
                 ))
                 .child(divider())
-                .when(mode == EditorMode::Static, |this| {
+                .when(mode == EditorMode::Static || mode == EditorMode::Video, |this| {
                     this.child(self.bar_button(
                         "bar-crop",
                         "icons/crop.svg",
                         Some("Crop"),
-                        self.captured_path.is_some(),
+                        if mode == EditorMode::Video { self.video_frame.is_some() && !self.video_edit_busy } else { self.captured_path.is_some() },
                         cx,
-                        |this, _, _| {
+                        |this, _, cx| {
                             this.stop_editing_text();
                             this.begin_crop();
+                            if this.video_project.is_some() && this.crop_active {
+                                this.seek_video(this.video_position, cx);
+                            }
                         },
                     ))
                 })

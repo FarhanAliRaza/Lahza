@@ -15,6 +15,7 @@ pub struct MediaInfo {
     pub height: u32,
     pub frame_rate: f64,
     pub has_audio: bool,
+    pub window_capture: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +64,8 @@ struct ProbeOutput {
 #[derive(Deserialize)]
 struct ProbeStream {
     codec_type: String,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     avg_frame_rate: Option<String>,
@@ -79,7 +82,7 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, VideoError> {
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,width,height,avg_frame_rate",
+            "format=duration:stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate",
             "-of",
             "json",
         ])
@@ -120,6 +123,13 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, VideoError> {
             .and_then(parse_frame_rate)
             .filter(|value| value.is_finite() && *value > 0.0)
             .unwrap_or(30.0),
+        window_capture: path.with_extension("window.json").is_file()
+            || (path
+                .parent()
+                .and_then(Path::extension)
+                .is_some_and(|ext| ext == "lahzarec")
+                && video.codec_name.as_deref() == Some("ffv1")
+                && video.pix_fmt.as_deref() == Some("bgra")),
         has_audio: probe
             .streams
             .iter()
@@ -134,7 +144,7 @@ pub fn decode_frame(
     maximum_height: u32,
 ) -> Result<DecodedFrame, VideoError> {
     let info = probe_media(path)?;
-    let (width, height) = fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
+    let (width, height) = decode_dimensions(&info, maximum_width, maximum_height);
     let selected_time = time.clamp(0.0, info.duration);
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-ss"])
@@ -151,12 +161,15 @@ pub fn decode_frame(
         ));
     }
     validate_frame_bytes(&output.stdout, width, height)?;
-    Ok(DecodedFrame {
-        time: selected_time,
-        width,
-        height,
-        rgba: output.stdout,
-    })
+    Ok(present_frame(
+        DecodedFrame {
+            time: selected_time,
+            width,
+            height,
+            rgba: output.stdout,
+        },
+        info.window_capture,
+    ))
 }
 
 pub fn write_poster(
@@ -174,10 +187,18 @@ pub fn write_poster(
     )?;
     let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
         .ok_or_else(|| VideoError::Decode("decoded poster had an invalid byte count".into()))?;
-    let image = image::DynamicImage::ImageRgba8(image).to_rgb8();
+    let image = image::DynamicImage::ImageRgba8(image).thumbnail(maximum_width, maximum_height);
+    let (image, format) = if destination.extension().is_some_and(|ext| ext == "png") {
+        (image, image::ImageFormat::Png)
+    } else {
+        (
+            image::DynamicImage::ImageRgb8(image.to_rgb8()),
+            image::ImageFormat::Jpeg,
+        )
+    };
     let temporary = temporary_sibling(destination);
     image
-        .save_with_format(&temporary, image::ImageFormat::Jpeg)
+        .save_with_format(&temporary, format)
         .map_err(|error| VideoError::Decode(error.to_string()))?;
     fs::rename(&temporary, destination)?;
     Ok(())
@@ -189,6 +210,11 @@ pub fn load_or_rebuild_poster(
     maximum_width: u32,
     maximum_height: u32,
 ) -> Result<image::RgbaImage, VideoError> {
+    if probe_media(video_path)?.window_capture {
+        let frame = decode_frame(video_path, 0.1, maximum_width, maximum_height)?;
+        return image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+            .ok_or_else(|| VideoError::Decode("invalid window preview pixels".into()));
+    }
     if let Ok(poster) = image::open(poster_path) {
         return Ok(poster.to_rgba8());
     }
@@ -278,7 +304,7 @@ pub(super) fn clip_filter(
             if video {
                 write!(
                     filter,
-                    "color=c=black:s={}x{}:r={:.6}:d={:.9},format=yuv420p,setsar=1[v{label}];",
+                    "color=c=black:s={}x{}:r={:.6}:d={:.9},format=rgba,setsar=1[v{label}];",
                     info.width, info.height, frame_rate, clip.gap_before
                 )
                 .expect("writing to String cannot fail");
@@ -297,7 +323,7 @@ pub(super) fn clip_filter(
         if video {
             write!(
             filter,
-            "[{input}:v]trim=start={:.9}:end={:.9},setpts=(PTS-STARTPTS)/{:.9},format=yuv420p,setsar=1[v{label}];",
+            "[{input}:v]trim=start={:.9}:end={:.9},setpts=(PTS-STARTPTS)/{:.9},format=rgba,setsar=1[v{label}];",
             clip.source_start, clip.source_end, clip.speed
         )
         .expect("writing to String cannot fail");
@@ -362,16 +388,20 @@ fn render_clip_timeline(
     if info.has_audio {
         command.args(["-map", "[audio]"]);
     }
-    command.args([
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "18",
-        "-pix_fmt",
-        "yuv420p",
-    ]);
+    if container == "matroska" {
+        command.args(["-c:v", "ffv1", "-pix_fmt", "bgra"]);
+    } else {
+        command.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
+    }
     if info.has_audio {
         command.args(["-c:a", "aac", "-b:a", "192k"]);
     }
@@ -447,6 +477,27 @@ pub fn decode_thumbnails(
     if count == 0 || info.duration <= 0.0 {
         return Ok(Vec::new());
     }
+    if info.window_capture {
+        return (0..count)
+            .map(|index| {
+                let frame = decode_frame(
+                    path,
+                    info.duration * index as f64 / count as f64,
+                    info.width,
+                    info.height,
+                )?;
+                let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+                    .ok_or_else(|| VideoError::Decode("invalid window thumbnail".into()))?;
+                Ok(image::DynamicImage::ImageRgba8(image)
+                    .resize(
+                        u32::MAX,
+                        height.max(8),
+                        image::imageops::FilterType::Triangle,
+                    )
+                    .to_rgba8())
+            })
+            .collect();
+    }
     let height = (height.max(8) / 2) * 2;
     let width = ((height as f64 * info.width as f64 / info.height as f64).round() as u32).max(2);
     let width = (width / 2) * 2;
@@ -483,7 +534,13 @@ pub struct VideoFrameStream {
     frame_rate: f64,
     next_frame_index: u64,
     start_time: f64,
+    window_capture: bool,
 }
+
+// Our sink handles conversion and fitting. Native video prevents playbin
+// from inserting its own scaler with opaque aspect-ratio padding first.
+pub(super) const PLAYBACK_FLAGS: &str =
+    "video+audio+text+soft-volume+native-video+deinterlace+soft-colorbalance";
 
 /// Runtime-only GStreamer transport. `fdsink sync=true` and playbin's audio
 /// sink share one pipeline clock, so the bytes handed to GPUI are scheduled
@@ -498,6 +555,7 @@ pub struct SynchronizedPlaybackStream {
     frame_rate: f64,
     next_frame_index: u64,
     start_time: f64,
+    window_capture: bool,
 }
 
 impl SynchronizedPlaybackStream {
@@ -508,14 +566,13 @@ impl SynchronizedPlaybackStream {
         maximum_height: u32,
     ) -> Result<Self, VideoError> {
         let info = probe_media(path)?;
-        let (width, height) =
-            fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
+        let (width, height) = decode_dimensions(&info, maximum_width, maximum_height);
         let start_time = start_time.clamp(0.0, info.duration);
         // Variable-rate screen captures report absurd nominal rates; the
         // preview never needs more than 60 frames a second.
         let frame_rate = info.frame_rate.round().clamp(1.0, 60.0);
         let sink = format!(
-            "videoconvert ! videoscale method=lanczos ! videorate ! video/x-raw,format=RGBA,width={width},height={height},framerate={frame_rate:.0}/1,pixel-aspect-ratio=1/1 ! fdsink fd=1 sync=true async=false"
+            "videoconvert ! videoscale method=lanczos add-borders=false ! videorate ! video/x-raw,format=RGBA,width={width},height={height},framerate={frame_rate:.0}/1,pixel-aspect-ratio=1/1 ! fdsink fd=1 sync=true async=false"
         );
         let mut child = Command::new("gst-play-1.0")
             .args([
@@ -523,6 +580,8 @@ impl SynchronizedPlaybackStream {
                 "--no-position",
                 "--no-interactive",
                 "--accurate-seeks",
+                "--flags",
+                PLAYBACK_FLAGS,
                 "--start-position",
             ])
             .arg(format!("{start_time:.6}"))
@@ -549,6 +608,7 @@ impl SynchronizedPlaybackStream {
             frame_rate,
             next_frame_index: 0,
             start_time,
+            window_capture: info.window_capture,
         })
     }
 
@@ -578,12 +638,15 @@ impl SynchronizedPlaybackStream {
         }
         let time = self.start_time + self.next_frame_index as f64 / self.frame_rate;
         self.next_frame_index += 1;
-        Ok(Some(DecodedFrame {
-            time,
-            width: self.width,
-            height: self.height,
-            rgba,
-        }))
+        Ok(Some(present_frame(
+            DecodedFrame {
+                time,
+                width: self.width,
+                height: self.height,
+                rgba,
+            },
+            self.window_capture,
+        )))
     }
 
     pub fn position(&self) -> f64 {
@@ -622,8 +685,7 @@ impl VideoFrameStream {
         frame_rate: Option<f64>,
     ) -> Result<Self, VideoError> {
         let info = probe_media(path)?;
-        let (width, height) =
-            fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
+        let (width, height) = decode_dimensions(&info, maximum_width, maximum_height);
         let start_time = start_time.clamp(0.0, info.duration);
         let frame_rate = frame_rate
             .filter(|rate| rate.is_finite() && *rate > 0.0)
@@ -655,6 +717,7 @@ impl VideoFrameStream {
             frame_rate,
             next_frame_index: 0,
             start_time,
+            window_capture: info.window_capture,
         })
     }
 
@@ -678,8 +741,7 @@ impl VideoFrameStream {
                 Some(frame_rate),
             );
         }
-        let (width, height) =
-            fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
+        let (width, height) = decode_dimensions(&info, maximum_width, maximum_height);
         let mut filter = clip_filter(&info, &timeline, 0, true, false);
         filter.push_str(&format!(
             ";[video]fps={frame_rate:.6},scale={width}:{height}:flags=lanczos,format=rgba[frames]"
@@ -713,6 +775,7 @@ impl VideoFrameStream {
             frame_rate,
             next_frame_index: 0,
             start_time: 0.0,
+            window_capture: info.window_capture,
         })
     }
 
@@ -746,12 +809,15 @@ impl VideoFrameStream {
         }
         let time = self.start_time + self.next_frame_index as f64 / self.frame_rate;
         self.next_frame_index += 1;
-        Ok(Some(DecodedFrame {
-            time,
-            width: self.width,
-            height: self.height,
-            rgba,
-        }))
+        Ok(Some(present_frame(
+            DecodedFrame {
+                time,
+                width: self.width,
+                height: self.height,
+                rgba,
+            },
+            self.window_capture,
+        )))
     }
 
     pub fn stop(&mut self) {
@@ -763,6 +829,99 @@ impl VideoFrameStream {
 impl Drop for VideoFrameStream {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+pub(super) fn decode_dimensions(
+    info: &MediaInfo,
+    maximum_width: u32,
+    maximum_height: u32,
+) -> (u32, u32) {
+    if info.window_capture {
+        (info.width, info.height)
+    } else {
+        fitted_dimensions(info.width, info.height, maximum_width, maximum_height)
+    }
+}
+
+/// Find a sharp body edge in each half of an alpha profile. Desktop shadows
+/// fade gradually; window edges introduce a much larger opacity change.
+/// Separate halves also handle a translucent body with an opaque title bar.
+fn window_body_edges(profile: &[u8], start: u32, end: u32) -> Option<(u32, u32)> {
+    let middle = start + (end - start) / 2;
+    let edge = |reverse: bool| {
+        let mut best = None;
+        let mut largest = 0;
+        let range = if reverse { middle..end } else { start..middle };
+        for index in range {
+            let outside = if reverse {
+                profile.get(index as usize + 1).copied().unwrap_or(0)
+            } else {
+                index
+                    .checked_sub(1)
+                    .map(|i| profile[i as usize])
+                    .unwrap_or(0)
+            };
+            let inside = profile[index as usize];
+            let jump = inside.saturating_sub(outside) as u16;
+            if jump >= 8 && jump * 5 >= inside as u16 * 2 && jump > largest {
+                largest = jump;
+                best = Some(index);
+            }
+        }
+        best
+    };
+    Some((edge(false)?, edge(true)? + 1))
+}
+
+/// Presentation geometry follows the window body, not its storage or OS shadow.
+/// Crop before any scaling so resizing never throws away captured detail.
+pub(super) fn present_frame(frame: DecodedFrame, window_capture: bool) -> DecodedFrame {
+    if !window_capture || frame.width == 0 || frame.height == 0 {
+        return frame;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (frame.width, frame.height, 0, 0);
+    let mut columns = vec![0; frame.width as usize];
+    let mut rows = vec![0; frame.height as usize];
+    for (index, pixel) in frame.rgba.chunks_exact(4).enumerate() {
+        if pixel[3] != 0 {
+            let x = index as u32 % frame.width;
+            let y = index as u32 / frame.width;
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + 1);
+            bottom = bottom.max(y + 1);
+            columns[x as usize] = columns[x as usize].max(pixel[3]);
+            rows[y as usize] = rows[y as usize].max(pixel[3]);
+        }
+    }
+    // Only remove a soft margin when all four body edges are identifiable.
+    // Keep unusual/translucent shapes intact when the alpha signal is ambiguous.
+    if right > left && bottom > top {
+        if let (Some((body_left, body_right)), Some((body_top, body_bottom))) = (
+            window_body_edges(&columns, left, right),
+            window_body_edges(&rows, top, bottom),
+        ) {
+            (left, top, right, bottom) = (body_left, body_top, body_right, body_bottom);
+        }
+    }
+    if right <= left
+        || bottom <= top
+        || (left == 0 && top == 0 && right == frame.width && bottom == frame.height)
+    {
+        return frame;
+    }
+    let (width, height) = (right - left, bottom - top);
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in top..bottom {
+        let start = ((y * frame.width + left) * 4) as usize;
+        rgba.extend_from_slice(&frame.rgba[start..start + width as usize * 4]);
+    }
+    DecodedFrame {
+        time: frame.time,
+        width,
+        height,
+        rgba,
     }
 }
 
@@ -828,6 +987,336 @@ fn temporary_video_sibling(destination: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shadowed_window(width: u32, height: u32, body: &image::RgbaImage) -> image::RgbaImage {
+        let (left, top) = ((width - body.width()) / 2, (height - body.height()) / 2);
+        let mut frame = image::RgbaImage::new(width, height);
+        for (x, y, pixel) in frame.enumerate_pixels_mut() {
+            let dx = left
+                .saturating_sub(x)
+                .max((x + 1).saturating_sub(left + body.width()));
+            let dy = top
+                .saturating_sub(y)
+                .max((y + 1).saturating_sub(top + body.height()));
+            let distance = dx.max(dy);
+            if distance == 0 {
+                *pixel = *body.get_pixel(x - left, y - top);
+            } else {
+                *pixel = image::Rgba([
+                    0,
+                    0,
+                    0,
+                    [55, 39, 28, 16, 8, 4, 2, 1]
+                        .get(distance as usize - 1)
+                        .copied()
+                        .unwrap_or(0),
+                ]);
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn window_presentation_removes_soft_shadow_without_changing_body_pixels() {
+        for opacity in [100, 180, 255] {
+            let mut body = image::RgbaImage::from_pixel(40, 30, image::Rgba([0, 0, 0, opacity]));
+            // Opaque title bar, translucent content, and antialiased native corners.
+            for y in 0..5 {
+                for x in 0..40 {
+                    body.put_pixel(x, y, image::Rgba([20, 40, 60, 255]));
+                }
+            }
+            body.put_pixel(0, 0, image::Rgba([0, 0, 0, 0]));
+            body.put_pixel(1, 0, image::Rgba([20, 40, 60, 128]));
+            let storage = shadowed_window(80, 70, &body);
+            let frame = DecodedFrame {
+                time: 3.0,
+                width: 80,
+                height: 70,
+                rgba: storage.into_raw(),
+            };
+            let presented = present_frame(frame, true);
+            assert_eq!(
+                (presented.width, presented.height, presented.time),
+                (40, 30, 3.0)
+            );
+            assert_eq!(presented.rgba, body.into_raw());
+        }
+    }
+
+    #[test]
+    fn ambiguous_window_alpha_and_non_window_media_keep_their_bounds() {
+        for window_capture in [true, false] {
+            let source = image::RgbaImage::from_pixel(40, 30, image::Rgba([10, 20, 30, 4]));
+            let frame = DecodedFrame {
+                time: 0.0,
+                width: 40,
+                height: 30,
+                rgba: source.clone().into_raw(),
+            };
+            let presented = present_frame(frame, window_capture);
+            assert_eq!((presented.width, presented.height), (40, 30));
+            assert_eq!(presented.rgba, source.into_raw());
+        }
+        let blank = present_frame(
+            DecodedFrame {
+                time: 0.0,
+                width: 40,
+                height: 30,
+                rgba: vec![0; 40 * 30 * 4],
+            },
+            true,
+        );
+        assert_eq!((blank.width, blank.height), (40, 30));
+    }
+
+    #[test]
+    fn window_alpha_survives_recording_posters_playback_and_edited_export() {
+        use crate::recording::{clips::RecordingClipSegment, playback::TimelinePlaybackStream};
+        use gst::prelude::*;
+        use gstreamer as gst;
+
+        gst::init().unwrap();
+        let root = std::env::temp_dir().join(format!("lahza-alpha-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("screen.mkv");
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=20 pattern=ball foreground-color=4278190080 background-color=0 ! \
+             video/x-raw,format=BGRA,width=64,height=48,framerate=10/1 ! identity ! {} ! \
+             matroskamux ! filesink location=\"{}\"",
+            crate::recording::native::WINDOW_ENCODER, path.display()
+        )).unwrap().downcast::<gst::Pipeline>().unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let message = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(5),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(matches!(message.unwrap().view(), gst::MessageView::Eos(_)));
+        let assert_alpha = |rgba: &[u8]| {
+            assert!(
+                rgba.chunks_exact(4).any(|p| p[3] == 0),
+                "transparent margins became opaque"
+            );
+            assert!(
+                rgba.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255),
+                "shadow alpha was lost"
+            );
+            assert!(
+                rgba.chunks_exact(4).any(|p| p == [0, 0, 0, 255]),
+                "opaque black content must remain opaque"
+            );
+        };
+        assert_alpha(&decode_frame(&path, 0.2, 64, 48).unwrap().rgba);
+        let poster = root.join("poster.png");
+        write_poster(&path, &poster, 64, 48).unwrap();
+        assert_alpha(image::open(&poster).unwrap().to_rgba8().as_raw());
+        let timeline = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.2, 1.2)]);
+        let mut playback =
+            TimelinePlaybackStream::open(&path, timeline.clone(), 0.0, 64, 48, true).unwrap();
+        assert_alpha(&playback.next_frame(|| false).unwrap().unwrap().rgba);
+        playback.stop();
+        let mut export = VideoFrameStream::open_timeline(&path, &timeline, 64, 48, 10.0).unwrap();
+        assert_alpha(&export.next_frame().unwrap().unwrap().rgba);
+        export.stop();
+        let edited = root.join("edited.mkv");
+        render_clip_preview(&path, &edited, &timeline).unwrap();
+        assert_alpha(&decode_frame(&edited, 0.2, 64, 48).unwrap().rgba);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_window_presentation_and_export_follow_each_frames_shape() {
+        use crate::recording::{
+            clips::RecordingClipSegment,
+            export::{export_scene, ExportFormat, ExportProgress, SceneExportRequest, SceneSource},
+            playback::TimelinePlaybackStream,
+            scene::{SceneBackground, SceneStyle},
+            viewport::ViewportTimeline,
+        };
+        use std::io::Write;
+        let root =
+            std::env::temp_dir().join(format!("lahza-native-window-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("screen.mkv");
+        let mut encoder = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgba",
+                "-video_size",
+                "64x48",
+                "-framerate",
+                "10",
+                "-i",
+                "pipe:0",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "bgra",
+            ])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = encoder.stdin.take().unwrap();
+        for index in 0..20 {
+            let (width, height) = if index < 10 { (20, 32) } else { (48, 27) };
+            let mut body = image::RgbaImage::new(width, height);
+            for y in 0..height {
+                for x in 0..width {
+                    body.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([0, if (x + y) % 2 == 0 { 255 } else { 180 }, 0, 255]),
+                    );
+                }
+            }
+            let frame = shadowed_window(64, 48, &body);
+            stdin.write_all(frame.as_raw()).unwrap();
+        }
+        drop(stdin);
+        assert!(encoder.wait().unwrap().success());
+        fs::write(path.with_extension("window.json"), r#"{"version":1}"#).unwrap();
+        let first = decode_frame(&path, 0.2, 8, 8).unwrap();
+        assert_eq!((first.width, first.height), (20, 32));
+        let wide = decode_frame(&path, 1.2, 8, 8).unwrap();
+        assert_eq!((wide.width, wide.height), (48, 27));
+        for (i, pixel) in wide.rgba.chunks_exact(4).enumerate() {
+            assert_eq!(
+                pixel,
+                [
+                    0,
+                    if (i % 48 + i / 48) % 2 == 0 { 255 } else { 180 },
+                    0,
+                    255
+                ]
+            );
+        }
+        let clips = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.0, 2.0)]);
+        let mut playback =
+            TimelinePlaybackStream::open(&path, clips.clone(), 1.2, 8, 8, true).unwrap();
+        let frame = playback.next_frame(|| false).unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), (48, 27));
+        playback.stop();
+        let reordered = RecordingClipTimeline::new(vec![
+            RecordingClipSegment::new(1.0, 2.0),
+            RecordingClipSegment::new(0.0, 1.0),
+        ]);
+        let mut stream = VideoFrameStream::open_timeline(&path, &reordered, 8, 8, 10.0).unwrap();
+        assert_eq!(stream.next_frame().unwrap().unwrap().width, 48);
+        for _ in 0..10 {
+            stream.next_frame().unwrap().unwrap();
+        }
+        assert_eq!(stream.next_frame().unwrap().unwrap().width, 20);
+        stream.stop();
+        let destination = root.join("export.mp4");
+        let style = SceneStyle {
+            background: SceneBackground::Solid(0x202080),
+            padding: 0,
+            corners: 0,
+            shadow: 0,
+            border: false,
+            aspect: Some(16.0 / 9.0),
+            ..Default::default()
+        };
+        let mut request = SceneExportRequest::new(
+            destination.clone(),
+            ExportFormat::Mp4,
+            180,
+            style,
+            ViewportTimeline::default(),
+            2.0,
+        );
+        request.frame_rate = 10.0;
+        export_scene(
+            SceneSource::Video {
+                media: path,
+                clips,
+                pointer: None,
+                camera: None,
+            },
+            &mut request,
+            &ExportProgress::default(),
+        )
+        .unwrap();
+        let extent = |time| {
+            let frame = decode_frame(&destination, time, 320, 180).unwrap();
+            let mut left = 320;
+            let mut right = 0;
+            for (i, p) in frame.rgba.chunks_exact(4).enumerate() {
+                if p[1] > p[0].saturating_add(50) && p[1] > p[2].saturating_add(50) {
+                    left = left.min(i as u32 % frame.width);
+                    right = right.max(i as u32 % frame.width);
+                }
+            }
+            right - left + 1
+        };
+        assert!(extent(0.2) < 130);
+        assert!(
+            extent(1.2) > 300,
+            "wide frames must fill the 16:9 canvas at export, not the original portrait box"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn odd_window_dimensions_do_not_add_opaque_playback_edges() {
+        use crate::recording::{clips::RecordingClipSegment, playback::TimelinePlaybackStream};
+        let root = std::env::temp_dir().join(format!("lahza-odd-window-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        for (width, height) in [(65, 64), (64, 65)] {
+            let mut source = image::RgbaImage::new(width, height);
+            for y in 16..48 {
+                for x in 16..48 {
+                    source.put_pixel(x, y, image::Rgba([20, 60, 100, 255]));
+                }
+            }
+            let still = root.join("window.png");
+            source.save(&still).unwrap();
+            let path = root.join("screen.mkv");
+            let output = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-loop", "1", "-i"])
+                .arg(&still)
+                .args(["-t", "1", "-r", "10", "-c:v", "ffv1", "-pix_fmt", "bgra"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let assert_edges = |frame: DecodedFrame| {
+                assert_eq!((frame.width, frame.height), (64, 64));
+                for (i, pixel) in frame.rgba.chunks_exact(4).enumerate() {
+                    let (x, y) = (i % 64, i / 64);
+                    if x == 0 || x == 63 || y == 0 || y == 63 {
+                        assert_eq!(
+                            pixel[3], 0,
+                            "opaque edge at ({x}, {y}) for {width}x{height} window"
+                        );
+                    }
+                }
+                assert_eq!(
+                    &frame.rgba[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
+                    &[20, 60, 100, 255]
+                );
+            };
+            let timeline = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.0, 0.8)]);
+            let mut playback =
+                TimelinePlaybackStream::open(&path, timeline, 0.0, 128, 128, true).unwrap();
+            assert_edges(playback.next_frame(|| false).unwrap().unwrap());
+            playback.stop();
+            let mut transport = SynchronizedPlaybackStream::open(&path, 0.0, 128, 128).unwrap();
+            assert_edges(transport.next_frame().unwrap().unwrap());
+            transport.stop();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn test_video() -> Option<(PathBuf, PathBuf)> {
         let root = std::env::temp_dir().join(format!("lahza-video-test-{}", uuid::Uuid::new_v4()));

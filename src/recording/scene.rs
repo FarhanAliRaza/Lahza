@@ -17,7 +17,7 @@ use super::{
     model::NormalizedPoint,
     overlays::pointer_press_effect_geometry,
     pointer_timeline::{PointerBitmap, PointerFrame, PointerTimelineOptions},
-    viewport::{visible_rect, Tilt, ViewportFrame},
+    viewport::{Tilt, ViewportFrame},
 };
 
 /// The preview canvas height every scene dimension is expressed against.
@@ -364,6 +364,8 @@ impl WindowFrame {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SceneStyle {
+    #[serde(default)]
+    pub(crate) source_crop: crate::CropRect,
     pub background: SceneBackground,
     /// Window chrome (title bar) above the media.
     pub window_frame: WindowFrame,
@@ -400,6 +402,7 @@ impl Default for SceneStyle {
     fn default() -> Self {
         Self {
             background: SceneBackground::default(),
+            source_crop: crate::CropRect::UNIT,
             window_frame: WindowFrame::Off,
             padding: 20,
             corners: 12,
@@ -439,7 +442,8 @@ impl SceneStyle {
                 if source_height == 0 {
                     16.0 / 9.0
                 } else {
-                    source_width as f64 / source_height as f64
+                    let crop = self.source_crop.validated();
+                    source_width as f64 * crop.width as f64 / (source_height as f64 * crop.height as f64)
                 }
             });
         let height = (canvas_height.max(2) / 2) * 2;
@@ -528,6 +532,9 @@ impl SceneGeometry {
         style: &SceneStyle,
     ) -> Self {
         let ui_scale = (canvas_height / REFERENCE_CANVAS_HEIGHT).max(0.05);
+        let crop = style.source_crop.validated();
+        let source_width = source_width * crop.width as f64;
+        let source_height = source_height * crop.height as f64;
         let border_width = if style.border {
             style.border_thickness as f64 * 0.48 * ui_scale
         } else {
@@ -874,13 +881,60 @@ pub struct FrameInput<'a> {
     pub camera: Option<&'a RgbaImage>,
 }
 
+#[derive(PartialEq)]
+struct MediaShadow {
+    alpha: image::GrayImage,
+    viewport: (f64, f64, f64, f64),
+    sample_bounds: (f64, f64, f64, f64),
+}
+
+impl MediaShadow {
+    fn from_source(source: &RgbaImage, viewport: (f64, f64, f64, f64), crop: crate::CropRect) -> Option<Self> {
+        if source.pixels().all(|pixel| pixel[3] == 255) {
+            return None;
+        }
+        Some(Self {
+            alpha: image::GrayImage::from_raw(
+                source.width(),
+                source.height(),
+                source.pixels().map(|pixel| pixel[3]).collect(),
+            )
+            .expect("one alpha value per source pixel"),
+            viewport,
+            sample_bounds: crop.sample_bounds(source.width(), source.height()),
+        })
+    }
+
+    fn sample(&self, u: f64, v: f64) -> f64 {
+        let (left, top, visible_x, visible_y) = self.viewport;
+        let x = tap(
+            (left + u.clamp(0.0, 1.0) * visible_x).clamp(self.sample_bounds.0, self.sample_bounds.2) * f64::from(self.alpha.width()) - 0.5,
+            self.alpha.width(),
+        );
+        let y = tap(
+            (top + v.clamp(0.0, 1.0) * visible_y).clamp(self.sample_bounds.1, self.sample_bounds.3) * f64::from(self.alpha.height()) - 0.5,
+            self.alpha.height(),
+        );
+        let x1 = (x.index + 1).min(self.alpha.width() as usize - 1);
+        let y1 = (y.index + 1).min(self.alpha.height() as usize - 1);
+        let pixels = self.alpha.as_raw();
+        let width = self.alpha.width() as usize;
+        let row = |y: usize| {
+            u32::from(pixels[y * width + x.index]) * (256 - x.weight)
+                + u32::from(pixels[y * width + x1]) * x.weight
+        };
+        f64::from(row(y.index) * (256 - y.weight) + row(y1) * y.weight) / (255.0 * 65_536.0)
+    }
+}
+
 struct CardLayer {
     transform: SceneTransform,
+    shadow_source: Option<MediaShadow>,
     pixels: RgbaImage,
 }
 
 /// CPU compositor with the static layers (background, effects, watermark)
-/// precomputed once; the shadow/border card layer is cached per transform.
+/// precomputed once; the card is cached per transform and alpha silhouette.
 pub struct SceneCompositor {
     style: SceneStyle,
     geometry: SceneGeometry,
@@ -1041,7 +1095,7 @@ impl SceneCompositor {
     ) -> RgbaImage {
         let transform = self.style.transform.with_motion(input.viewport);
         let mut output = if media_visible {
-            self.card_layer(transform)
+            self.card_layer(transform, input.source, input.viewport)
         } else {
             self.background.clone()
         };
@@ -1090,19 +1144,35 @@ impl SceneCompositor {
         output
     }
 
-    /// Background plus shadow and border for `transform`, cached while the
-    /// transform stays the same (animated tilts re-render it per frame).
-    fn card_layer(&self, transform: SceneTransform) -> RgbaImage {
+    /// Cache the card while its transform and visible alpha silhouette match.
+    /// Window resizes and viewport crops can change the shadow inside a fixed
+    /// recording canvas, even when the card transform stays the same.
+    fn card_layer(
+        &self,
+        transform: SceneTransform,
+        source: &RgbaImage,
+        viewport: ViewportFrame,
+    ) -> RgbaImage {
+        let shadow_source = self
+            .geometry
+            .shadow
+            .and_then(|_| MediaShadow::from_source(source, self.style.source_crop.visible_rect(viewport), self.style.source_crop));
         let mut cache = self.card.borrow_mut();
         if let Some(layer) = cache.as_ref() {
-            if layer.transform == transform {
+            if layer.transform == transform && layer.shadow_source == shadow_source {
                 return layer.pixels.clone();
             }
         }
         let mut pixels = self.background.clone();
         let projection = self.geometry.projection(transform);
         if let Some(shadow) = self.geometry.shadow {
-            paint_shadow(&mut pixels, &projection, self.geometry, shadow);
+            paint_shadow(
+                &mut pixels,
+                &projection,
+                self.geometry,
+                shadow,
+                shadow_source.as_ref(),
+            );
         }
         if let Some(bar) = self.style.window_frame.bar_color() {
             if self.geometry.title_height > 0.0 {
@@ -1114,6 +1184,7 @@ impl SceneCompositor {
         }
         *cache = Some(CardLayer {
             transform,
+            shadow_source,
             pixels: pixels.clone(),
         });
         pixels
@@ -1215,7 +1286,7 @@ impl SceneCompositor {
             return;
         }
         let overlay = overlay.filter(|layer| layer.width() > 0 && layer.height() > 0);
-        let (left, top, visible) = visible_rect(viewport);
+        let (left, top, visible_x, visible_y) = self.style.source_crop.visible_rect(viewport);
         let (x0, y0, x1, y1) = self.pixel_range(projection, 2.0);
         if x0 >= x1 || y0 >= y1 {
             return;
@@ -1227,7 +1298,9 @@ impl SceneCompositor {
             overlay,
             left,
             top,
-            visible,
+            visible_x,
+            visible_y,
+            sample_bounds: self.style.source_crop.sample_bounds(source.width(), source.height()),
             x0,
             x1,
         };
@@ -1278,10 +1351,10 @@ impl SceneCompositor {
             return;
         }
         let frame = &pointer.frame;
-        let (left, top, visible) = visible_rect(viewport);
+        let (left, top, visible_x, visible_y) = self.style.source_crop.visible_rect(viewport);
         let to_canvas = |point: NormalizedPoint| {
-            let u = (point.x - left) / visible;
-            let v = (point.y - top) / visible;
+            let u = (point.x - left) / visible_x;
+            let v = (point.y - top) / visible_y;
             (projection.project(u, v), u, v)
         };
         let clip = Rect {
@@ -1339,8 +1412,8 @@ impl SceneCompositor {
         let local_scale = projection.screen_scale_at(u, v);
         // Canvas pixels per normalized media unit at this point.
         let unit_scale = (
-            self.geometry.media.width * local_scale / visible,
-            self.geometry.media.height * local_scale / visible,
+            self.geometry.media.width * local_scale / visible_x,
+            self.geometry.media.height * local_scale / visible_y,
         );
         let bitmap = frame
             .bitmap
@@ -1350,9 +1423,9 @@ impl SceneCompositor {
             // Captured cursors keep their on-screen proportion to the
             // recording, boosted so 100% reads like the vector arrow.
             let media_scale =
-                local_scale * pointer_scale * frame.magnification / visible * CAPTURED_CURSOR_BOOST;
-            let width = bitmap.reference_width * self.geometry.media.width * media_scale;
-            let height = bitmap.reference_height * self.geometry.media.height * media_scale;
+                local_scale * pointer_scale * frame.magnification * CAPTURED_CURSOR_BOOST;
+            let width = bitmap.reference_width * self.geometry.media.width * media_scale / visible_x;
+            let height = bitmap.reference_height * self.geometry.media.height * media_scale / visible_y;
             if width < 1.0 || height < 1.0 {
                 return;
             }
@@ -1387,7 +1460,7 @@ impl SceneCompositor {
             .as_deref()
             .and_then(|bitmap| bitmap.shape)
             .unwrap_or_default();
-        let height = ASSET_CURSOR_HEIGHT * self.geometry.media.height * local_scale / visible
+        let height = ASSET_CURSOR_HEIGHT * self.geometry.media.height * local_scale / visible_y
             * pointer_scale
             * frame.magnification;
         if height < 1.0 {
@@ -1419,7 +1492,9 @@ struct MediaPainter<'a> {
     overlay: Option<&'a RgbaImage>,
     left: f64,
     top: f64,
-    visible: f64,
+    visible_x: f64,
+    visible_y: f64,
+    sample_bounds: (f64, f64, f64, f64),
     x0: u32,
     x1: u32,
 }
@@ -1482,7 +1557,7 @@ impl MediaPainter<'_> {
                 (self.x0..self.x1)
                     .map(|x| {
                         let u = a * (f64::from(x) + 0.5) + b;
-                        let media_u = self.left + u.clamp(0.0, 1.0) * self.visible;
+                        let media_u = (self.left + u.clamp(0.0, 1.0) * self.visible_x).clamp(self.sample_bounds.0, self.sample_bounds.2);
                         (
                             u,
                             tap(media_u * source_width - 0.5, self.source.width()),
@@ -1506,7 +1581,7 @@ impl MediaPainter<'_> {
             let py = f64::from(y) + 0.5;
             let row_taps = axis_aligned.map(|(_, _, c, d)| {
                 let v = c * py + d;
-                let media_v = self.top + v.clamp(0.0, 1.0) * self.visible;
+                let media_v = (self.top + v.clamp(0.0, 1.0) * self.visible_y).clamp(self.sample_bounds.1, self.sample_bounds.3);
                 let surface_y = v * media.height + self.geometry.title_height;
                 let interior_row =
                     v * media.height > pixel_size + 1.0 && surface_y < surface_height - band;
@@ -1558,8 +1633,8 @@ impl MediaPainter<'_> {
         if coverage <= 0.0 {
             return;
         }
-        let media_u = self.left + u.clamp(0.0, 1.0) * self.visible;
-        let media_v = self.top + v.clamp(0.0, 1.0) * self.visible;
+        let media_u = (self.left + u.clamp(0.0, 1.0) * self.visible_x).clamp(self.sample_bounds.0, self.sample_bounds.2);
+        let media_v = (self.top + v.clamp(0.0, 1.0) * self.visible_y).clamp(self.sample_bounds.1, self.sample_bounds.3);
         let mut sample = sample_bilinear(
             self.source,
             media_u * f64::from(self.source.width()) - 0.5,
@@ -2084,6 +2159,7 @@ fn paint_shadow(
     projection: &MediaProjection,
     geometry: SceneGeometry,
     shadow: ShadowSpec,
+    source: Option<&MediaShadow>,
 ) {
     let width = image.width() as usize;
     let height = image.height() as usize;
@@ -2106,7 +2182,21 @@ fn paint_shadow(
             }
             let pixel_size = projection.pixel_size_at(px, py);
             let distance = geometry.surface_distance(u, v);
-            mask[y * width + x] = (0.5 - (distance - border) / pixel_size).clamp(0.0, 1.0) as f32;
+            let outer = (0.5 - (distance - border) / pixel_size).clamp(0.0, 1.0);
+            let coverage = if let Some(source) = source {
+                let inner = (0.5 - distance / pixel_size).clamp(0.0, 1.0);
+                let alpha = if v < 0.0 && geometry.title_height > 0.0 {
+                    1.0
+                } else {
+                    source.sample(u, v)
+                };
+                // Keep the optional frame/border's own shadow, but let the
+                // media cast a shadow only where this frame has visible pixels.
+                (outer - inner).max(0.0) + inner * alpha
+            } else {
+                outer
+            };
+            mask[y * width + x] = coverage as f32;
         }
     }
     // A CSS blur radius corresponds to a Gaussian with sigma = radius / 2.
@@ -2744,6 +2834,144 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set LAHZA_SHADOW_RECORDING to a resized window recording for visual verification"]
+    fn render_resized_window_shadow_preview() {
+        let root = std::path::PathBuf::from(std::env::var_os("LAHZA_SHADOW_RECORDING").unwrap());
+        let edit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("edit.draft.json")).unwrap()).unwrap();
+        let style: SceneStyle = serde_json::from_value(edit["scene"].clone()).unwrap();
+        let path = root.join("screen.mkv");
+        let frame = super::super::video::decode_frame(&path, 0.2, 1920, 1080).unwrap();
+        let compositor =
+            SceneCompositor::new(&style, 1000, 700, frame.width, frame.height).unwrap();
+        let source = RgbaImage::from_raw(frame.width, frame.height, frame.rgba).unwrap();
+        compose(&compositor, &source);
+        let time = std::env::var("LAHZA_SHADOW_TIME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(12.0);
+        let frame = super::super::video::decode_frame(&path, time, 1920, 1080).unwrap();
+        eprintln!("presented window at {time}s: {}x{}", frame.width, frame.height);
+        let source = RgbaImage::from_raw(frame.width, frame.height, frame.rgba).unwrap();
+        let compositor = compositor.rebuild(&style, 1000, 700, source.width(), source.height()).unwrap();
+        let output = compose(&compositor, &source);
+        let media = compositor.geometry.media;
+        assert!((media.width / media.height - source.width() as f64 / source.height() as f64).abs() < 1e-6);
+        let destination = std::env::var_os("LAHZA_SHADOW_PREVIEW").unwrap();
+        output.save(destination).unwrap();
+    }
+
+    #[test]
+    fn window_shadow_follows_resizes_and_invalidates_the_cached_silhouette() {
+        let style = SceneStyle {
+            shadow: 40,
+            ..flat_style(0xffffff)
+        };
+        let compositor = SceneCompositor::new(&style, 400, 300, 400, 300).unwrap();
+        let window = |left, right| {
+            let mut image = RgbaImage::new(400, 300);
+            for y in 40..260 {
+                for x in left..right {
+                    image.put_pixel(x, y, Rgba([20, 60, 100, 255]));
+                }
+            }
+            image
+        };
+        let wide = window(40, 360);
+        let narrow = window(160, 240);
+        compose(&compositor, &wide);
+        let resized = compose(&compositor, &narrow);
+        let fresh = SceneCompositor::new(&style, 400, 300, 400, 300).unwrap();
+        assert_eq!(
+            resized,
+            compose(&fresh, &narrow),
+            "resizing must refresh the cached shadow"
+        );
+        assert_eq!(
+            resized.get_pixel(80, 150).0,
+            [255; 4],
+            "old window footprint must reveal the background"
+        );
+        assert!(
+            resized.get_pixel(155, 150)[0] < 255,
+            "the resized window must still cast a shadow"
+        );
+        let blank = compose(&compositor, &RgbaImage::new(400, 300));
+        assert!(
+            blank.pixels().all(|pixel| pixel.0 == [255; 4]),
+            "invisible media must not cast a rectangular shadow"
+        );
+        assert_eq!(
+            compose(&compositor, &wide),
+            compose(&fresh, &wide),
+            "growing the window must also refresh its shadow"
+        );
+    }
+
+    #[test]
+    fn window_shadow_tracks_viewport_crops_and_preserves_opaque_card_shadows() {
+        let style = SceneStyle {
+            shadow: 40,
+            ..flat_style(0xffffff)
+        };
+        let compositor = SceneCompositor::new(&style, 200, 200, 200, 200).unwrap();
+        let mut source = RgbaImage::new(200, 200);
+        for y in 50..150 {
+            for x in 80..120 {
+                source.put_pixel(x, y, Rgba([20, 60, 100, 255]));
+            }
+        }
+        compose(&compositor, &source);
+        let viewport = ViewportFrame {
+            magnification: 2.0,
+            ..ViewportFrame::default()
+        };
+        let render = |compositor: &SceneCompositor| {
+            compositor.compose(FrameInput {
+                source: &source,
+                overlay: None,
+                viewport,
+                pointer: None,
+                camera: None,
+            })
+        };
+        let zoomed = render(&compositor);
+        let fresh = SceneCompositor::new(&style, 200, 200, 200, 200).unwrap();
+        assert_eq!(
+            zoomed,
+            render(&fresh),
+            "zoom must refresh the alpha shadow in canvas space"
+        );
+        let opaque = RgbaImage::from_pixel(200, 200, Rgba([20, 60, 100, 255]));
+        compose(&compositor, &opaque);
+        assert!(compositor
+            .card
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .shadow_source
+            .is_none());
+        assert_eq!(compose(&compositor, &opaque), compose(&fresh, &opaque));
+    }
+
+    #[test]
+    fn transparent_window_margins_reveal_the_scene_background() {
+        let compositor = SceneCompositor::new(&flat_style(0x4080c0), 100, 100, 100, 100).unwrap();
+        let mut source = RgbaImage::new(100, 100);
+        for y in 20..80 {
+            for x in 20..80 {
+                source.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+        source.put_pixel(10, 50, Rgba([0, 0, 0, 128]));
+        let output = compose(&compositor, &source);
+        assert_eq!(output.get_pixel(5, 50).0, [64, 128, 192, 255]);
+        assert_eq!(output.get_pixel(50, 50).0, [0, 0, 0, 255]);
+        let shadow = output.get_pixel(10, 50);
+        assert!(shadow[0] > 0 && shadow[0] < 64);
+    }
+
+    #[test]
     fn viewport_zoom_crops_the_media() {
         let compositor = SceneCompositor::new(&flat_style(0), 100, 100, 100, 100).unwrap();
         let viewport = ViewportFrame {
@@ -2773,6 +3001,76 @@ mod tests {
         let output = compose(&compositor, &checker(200, 200));
         assert_eq!(output.get_pixel(0, 0).0, [255, 255, 255, 255]);
         assert_eq!(output.get_pixel(100, 5).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn video_crop_matches_physical_crop_for_pixels_layout_and_decoration() {
+        let mut source = RgbaImage::from_pixel(128, 128, Rgba([255, 0, 0, 255]));
+        let crop = crate::CropRect { x: 0.25, y: 0.125, width: 0.5, height: 0.75 };
+        let body = RgbaImage::from_pixel(64, 96, Rgba([0, 100, 240, 255]));
+        image::imageops::overlay(&mut source, &body, 32, 16);
+        for decorated in [false, true] {
+            let style = SceneStyle {
+                source_crop: crop,
+                aspect: None,
+                padding: if decorated { 20 } else { 0 },
+                corners: if decorated { 80 } else { 0 },
+                border: decorated,
+                shadow: if decorated { 40 } else { 0 },
+                ..flat_style(0xffffff)
+            };
+            assert_eq!(style.export_canvas_size(128, 128, 192), (128, 192));
+            let cropped = SceneCompositor::new(&style, 128, 192, 128, 128).unwrap();
+            let reference = SceneCompositor::new(&SceneStyle { source_crop: crate::CropRect::UNIT, ..style }, 128, 192, 64, 96).unwrap();
+            assert_eq!(cropped.geometry(), reference.geometry());
+            let actual = compose(&cropped, &source);
+            let expected = compose(&reference, &body);
+            let largest = actual.as_raw().iter().zip(expected.as_raw()).map(|(a,b)| a.abs_diff(*b)).max().unwrap();
+            assert!(largest <= 1, "outside-crop pixels leaked into the frame: {largest}");
+        }
+    }
+
+    #[test]
+    fn video_crop_persists_and_old_scene_settings_keep_the_full_frame() {
+        let style = SceneStyle { source_crop: crate::CropRect { x: 0.25, y: 0.0, width: 0.5, height: 1.0 }, ..Default::default() };
+        let decoded: SceneStyle = serde_json::from_str(&serde_json::to_string(&style).unwrap()).unwrap();
+        assert_eq!(decoded.source_crop, style.source_crop);
+        assert_eq!(serde_json::from_str::<SceneStyle>("{}").unwrap().source_crop, crate::CropRect::UNIT);
+    }
+
+    #[test]
+    fn window_corners_border_and_shadow_use_body_bounds() {
+        let body = checker(200, 200);
+        let mut storage = RgbaImage::new(240, 240);
+        for y in 10..230 {
+            for x in 10..230 {
+                storage.put_pixel(x, y, Rgba([0, 0, 0, 28]));
+            }
+        }
+        image::imageops::overlay(&mut storage, &body, 20, 20);
+        let presented = super::super::video::present_frame(
+            super::super::video::DecodedFrame {
+                time: 0.0,
+                width: 240,
+                height: 240,
+                rgba: storage.into_raw(),
+            },
+            true,
+        );
+        let source = RgbaImage::from_raw(presented.width, presented.height, presented.rgba).unwrap();
+        for shadow in [0, 40] {
+            let style = SceneStyle {
+                padding: 20,
+                corners: 100,
+                border: true,
+                border_thickness: 20,
+                shadow,
+                ..flat_style(0xffffff)
+            };
+            let actual = SceneCompositor::new(&style, 300, 300, source.width(), source.height()).unwrap();
+            let expected = SceneCompositor::new(&style, 300, 300, body.width(), body.height()).unwrap();
+            assert_eq!(compose(&actual, &source), compose(&expected, &body));
+        }
     }
 
     #[test]

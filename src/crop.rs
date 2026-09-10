@@ -2,7 +2,10 @@
 
 use super::annotations::{norm_to_screen, screen_to_norm};
 use super::{CropDrag, CropHandle, CropRect, CropSnapshot, NormPoint, Studio, CROP_HANDLES};
-use gpui::{hsla, point, px, quad, rgb, size, Bounds, Pixels, Point, Window};
+use gpui::{
+    canvas, div, hsla, img, point, prelude::*, px, quad, rgb, size, AnyElement, Bounds, Context,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Window,
+};
 
 fn normalized_aspect(aspect: usize, (width, height): (u32, u32)) -> Option<f32> {
     let pixel_ratio = match aspect {
@@ -136,11 +139,13 @@ fn resize_crop_rect(
             bottom = point.y.max(top + min_height);
         }
     }
+    let left = left.clamp(0.0, 1.0 - min_width);
+    let top = top.clamp(0.0, 1.0 - min_height);
     CropRect {
-        x: left.clamp(0.0, 1.0),
-        y: top.clamp(0.0, 1.0),
-        width: (right - left).clamp(min_width, 1.0),
-        height: (bottom - top).clamp(min_height, 1.0),
+        x: left,
+        y: top,
+        width: right.clamp(left + min_width, 1.0) - left,
+        height: bottom.clamp(top + min_height, 1.0) - top,
     }
 }
 
@@ -266,10 +271,24 @@ pub(super) fn paint_crop_overlay(
 
 impl Studio {
     pub(super) fn crop_normalized_aspect(&self) -> Option<f32> {
-        normalized_aspect(self.crop_aspect, self.captured_dimensions?)
+        normalized_aspect(self.crop_aspect, self.media_dimensions()?)
     }
 
     pub(super) fn begin_crop(&mut self) {
+        if self.video_project.is_some() {
+            if self.video_frame.is_none() || self.video_edit_busy || self.crop_active {
+                return;
+            }
+            self.pause_video_playback();
+            self.stop_editing_text();
+            self.reset_annotation_interaction();
+            self.crop_rect = self.video_crop;
+            self.crop_aspect = 0;
+            self.crop_drag = None;
+            self.crop_session = None;
+            self.crop_active = true;
+            return;
+        }
         if self.captured_path.is_none() {
             self.toast = Some("Capture an image first".into());
             return;
@@ -382,7 +401,7 @@ impl Studio {
                 );
             }
             CropDrag::Resize(handle) => {
-                let (width, height) = self.captured_dimensions.unwrap_or((1200, 720));
+                let (width, height) = self.media_dimensions().unwrap_or((1200, 720));
                 self.crop_rect = resize_crop_rect(
                     self.crop_rect,
                     handle,
@@ -406,6 +425,21 @@ impl Studio {
     }
 
     pub(super) fn apply_crop(&mut self) -> Result<(), String> {
+        if self.video_project.is_some() {
+            let crop = self
+                .crop_rect
+                .snapped(self.video_source_size.0, self.video_source_size.1);
+            if crop != self.video_crop {
+                self.video_undo_stack
+                    .push(super::VideoEditSnapshot::Crop(self.video_crop));
+                self.video_redo_stack.clear();
+                self.video_crop = crop;
+            }
+            self.crop_active = false;
+            self.reset_crop();
+            self.autosave_scene_style();
+            return Ok(());
+        }
         let source = self
             .captured_path
             .as_ref()
@@ -534,6 +568,101 @@ impl Studio {
         };
         self.crop_undo_stack.push(current);
         self.restore_crop_snapshot(next)
+    }
+
+    pub(super) fn video_crop_canvas(
+        &self,
+        width: Pixels,
+        height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (source_width, source_height) = self.video_source_size;
+        let scale = ((f32::from(width) - 32.0).max(1.0) / source_width.max(1) as f32)
+            .min((f32::from(height) - 32.0).max(1.0) / source_height.max(1) as f32);
+        let image_width = px(source_width as f32 * scale);
+        let image_height = px(source_height as f32 * scale);
+        let x = (width - image_width) * 0.5;
+        let y = (height - image_height) * 0.5;
+        let rect = self.crop_rect;
+        let locked = self.crop_aspect != 0;
+        let entity = cx.entity();
+        div()
+            .id("video-crop-canvas")
+            .w(width)
+            .h(height)
+            .relative()
+            .bg(rgb(0x202124))
+            .when_some(self.video_frame.clone(), |this, image| {
+                this.child(
+                    img(image)
+                        .absolute()
+                        .left(x)
+                        .top(y)
+                        .w(image_width)
+                        .h(image_height)
+                        .object_fit(ObjectFit::Fill),
+                )
+            })
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        let image = Bounds {
+                            origin: point(bounds.origin.x + x, bounds.origin.y + y),
+                            size: size(image_width, image_height),
+                        };
+                        let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
+                        (image, hitbox)
+                    },
+                    move |_, (image, hitbox), window, _cx| {
+                        paint_crop_overlay(rect, image, locked, window);
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |event: &MouseDownEvent, _, window, cx| {
+                                if event.button == MouseButton::Left && hitbox.is_hovered(window) {
+                                    entity.update(cx, |this, cx| {
+                                        if !this.crop_active {
+                                            return;
+                                        }
+                                        this.focus_handle.focus(window);
+                                        this.crop_pointer_down(event.position, image);
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        });
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |event: &MouseMoveEvent, _, _, cx| {
+                                if event.dragging() {
+                                    entity.update(cx, |this, cx| {
+                                        if !this.crop_active {
+                                            return;
+                                        }
+                                        this.crop_pointer_move(event.position, image);
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        });
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |event: &MouseUpEvent, _, _, cx| {
+                                if event.button == MouseButton::Left {
+                                    entity.update(cx, |this, cx| {
+                                        this.crop_drag = None;
+                                        this.pointer_is_down = false;
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0()
+                .size_full(),
+            )
+            .into_any_element()
     }
 }
 

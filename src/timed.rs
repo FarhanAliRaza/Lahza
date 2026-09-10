@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
-use crate::recording::viewport::{visible_rect, ViewportFrame};
+use crate::recording::viewport::ViewportFrame;
 use crate::{AnnotationMark, NormPoint, Tool};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -318,22 +318,26 @@ pub fn animated_mark(mark: &AnnotationMark, time: f64) -> Option<AnnotationMark>
 /// it through the viewport crop leaves it fixed on the frame. Unpinned marks
 /// pass through unchanged.
 pub fn in_media_space(mark: AnnotationMark, viewport: ViewportFrame) -> AnnotationMark {
+    in_cropped_media_space(mark, viewport, crate::CropRect::UNIT)
+}
+
+fn in_cropped_media_space(mark: AnnotationMark, viewport: ViewportFrame, crop: crate::CropRect) -> AnnotationMark {
     if !mark.pinned {
         return mark;
     }
-    let (left, top, visible) = visible_rect(viewport);
+    let (left, top, visible_x, visible_y) = crop.visible_rect(viewport);
     let mut mapped = mark;
     let map = |point: NormPoint| NormPoint {
-        x: left as f32 + point.x * visible as f32,
-        y: top as f32 + point.y * visible as f32,
+        x: left as f32 + point.x * visible_x as f32,
+        y: top as f32 + point.y * visible_y as f32,
     };
     mapped.start = map(mapped.start);
     mapped.end = map(mapped.end);
     for point in &mut mapped.points {
         *point = map(*point);
     }
-    mapped.font_size *= visible as f32;
-    mapped.stroke_width *= visible as f32;
+    mapped.font_size *= visible_y as f32;
+    mapped.stroke_width *= visible_y as f32;
     mapped
 }
 
@@ -344,11 +348,20 @@ pub fn active_marks(
     time: f64,
     viewport: ViewportFrame,
 ) -> Vec<AnnotationMark> {
+    marks.iter().filter(|mark| !mark.is_canvas())
+        .filter_map(|mark| animated_mark(mark, time))
+        .map(|mark| in_media_space(mark, viewport)).collect()
+}
+
+pub(crate) fn active_marks_in_crop(
+    marks: &[AnnotationMark], time: f64, viewport: ViewportFrame, crop: crate::CropRect,
+) -> Vec<AnnotationMark> {
+    if crop == crate::CropRect::UNIT { return active_marks(marks, time, viewport); }
     marks
         .iter()
         .filter(|mark| !mark.is_canvas())
         .filter_map(|mark| animated_mark(mark, time))
-        .map(|mark| in_media_space(mark, viewport))
+        .map(|mark| in_cropped_media_space(mark, viewport, crop))
         .collect()
 }
 

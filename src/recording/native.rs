@@ -2,6 +2,7 @@ use super::area::{preview_frame, AreaRequest, RecordingArea};
 use super::area_indicator::AreaIndicator;
 use super::camera_preview::{attach_preview, preview_branch, CameraFrames};
 use super::input::{monotonic_ns, ActiveRange, InputCapture, InputMapping};
+use super::stream_geometry::{self, RecordingSize};
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SourceType},
     PersistMode,
@@ -10,10 +11,13 @@ use gst::prelude::*;
 use gstreamer as gst;
 use std::{
     fmt, fs, io,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -402,6 +406,7 @@ fn run_worker(
             .first()
             .ok_or_else(|| "no screen or window was selected".to_string())?;
         let node = stream.pipe_wire_node_id();
+        let preserve_alpha = stream.source_type() == Some(SourceType::Window);
         let input_mapping = InputMapping {
             origin: stream.position().map(|(x, y)| (f64::from(x), f64::from(y))),
             size: stream
@@ -409,32 +414,12 @@ fn run_worker(
                 .map(|(width, height)| (f64::from(width), f64::from(height)))
                 .unwrap_or((1.0, 1.0)),
         };
-        let pointer_remote = if area_requests.is_none()
-            && options.area.is_none()
-            && input_capture
-                .as_ref()
-                .is_some_and(InputCapture::uses_pipewire_metadata)
-        {
-            Some(
-                proxy
-                    .open_pipe_wire_remote(&session)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
-        let remote = proxy
-            .open_pipe_wire_remote(&session)
-            .await
-            .map_err(|error| error.to_string())?;
-        if let (Some(pointer_remote), Some(input_capture)) =
-            (pointer_remote.as_ref(), input_capture.as_mut())
-        {
-            input_capture.attach_pipewire(pointer_remote.as_raw_fd(), node, input_mapping)?;
-        }
-
         if let Some(requests) = area_requests.as_ref() {
+            let remote = proxy
+                .open_pipe_wire_remote(&session)
+                .await
+                .map_err(|error| error.to_string())?;
+
             let frame = match preview_frame(remote.as_raw_fd(), node) {
                 Ok(frame) => frame,
                 Err(error) => {
@@ -473,16 +458,38 @@ fn run_worker(
         } else {
             None
         };
+        // Each GStreamer pipeline needs a fresh portal connection, including
+        // after the area-selection preview has released its own pipeline.
+        let remote = proxy
+            .open_pipe_wire_remote(&session)
+            .await
+            .map_err(|error| error.to_string())?;
+        let recording_size = RecordingSize::default();
         let mut segments = Vec::new();
         let mut child = Some(spawn_segment(
             &output,
             segments.len(),
-            remote.as_raw_fd(),
+            remote,
             node,
             &options,
             camera.as_deref(),
             camera_frames.as_ref(),
+            recording_size.clone(),
+            preserve_alpha,
         )?);
+        // Negotiate and receive video before adding the cursor consumer.
+        // Starting the metadata-only stream first can leave a window's video
+        // consumer without any frames, even though caps and EOS succeed.
+        if let Some(input_capture) = input_capture
+            .as_mut()
+            .filter(|input| input.uses_pipewire_metadata())
+        {
+            let pointer_remote = proxy
+                .open_pipe_wire_remote(&session)
+                .await
+                .map_err(|error| error.to_string())?;
+            input_capture.attach_pipewire(pointer_remote.as_raw_fd(), node, input_mapping)?;
+        }
         let mut indicator =
             options
                 .area
@@ -527,6 +534,9 @@ fn run_worker(
             match command {
                 WorkerCommand::Pause(reply) => {
                     let result = if let Some(mut running) = child.take() {
+                        if let Some(input_capture) = input_capture.as_mut() {
+                            input_capture.detach_pipewire();
+                        }
                         if let Some(start_ns) = active_range_start.take() {
                             active_ranges.push(ActiveRange {
                                 start_ns,
@@ -553,16 +563,47 @@ fn run_worker(
                         Err("recording is not paused".into())
                     } else {
                         let index = segments.len();
-                        match spawn_segment(
-                            &output,
-                            index,
-                            remote.as_raw_fd(),
-                            node,
-                            &options,
-                            camera.as_deref(),
-                            camera_frames.as_ref(),
-                        ) {
+                        // The previous segment has consumed its connection.
+                        let next = proxy
+                            .open_pipe_wire_remote(&session)
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|next_remote| {
+                                spawn_segment(
+                                    &output,
+                                    index,
+                                    next_remote,
+                                    node,
+                                    &options,
+                                    camera.as_deref(),
+                                    camera_frames.as_ref(),
+                                    recording_size.clone(),
+                                    preserve_alpha,
+                                )
+                            });
+                        match next {
                             Ok(next) => {
+                                if let Some(input_capture) = input_capture
+                                    .as_mut()
+                                    .filter(|input| input.uses_pipewire_metadata())
+                                {
+                                    let pointer_result = async {
+                                        let pointer_remote = proxy
+                                            .open_pipe_wire_remote(&session)
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                        input_capture.attach_pipewire(
+                                            pointer_remote.as_raw_fd(),
+                                            node,
+                                            input_mapping,
+                                        )
+                                    }
+                                    .await;
+                                    if let Err(error) = pointer_result {
+                                        let _ = reply.send(Err(error));
+                                        continue;
+                                    }
+                                }
                                 let path = segment_path(&output, index);
                                 segments.push(index);
                                 child = Some(next);
@@ -793,9 +834,47 @@ pub fn microphone_devices() -> Vec<(String, String)> {
 struct SegmentPipeline {
     pipeline: gst::Pipeline,
     failure: Option<String>,
+    has_video: Arc<AtomicBool>,
+    // Keep the fd identity alive until GStreamer releases its cached core.
+    _portal_remote: Option<OwnedFd>,
 }
 
 impl SegmentPipeline {
+    fn new(pipeline: gst::Pipeline) -> Result<Self, String> {
+        let pad = pipeline
+            .by_name("screen_encoder")
+            .and_then(|encoder| encoder.static_pad("src"))
+            .ok_or_else(|| "GStreamer pipeline has no screen encoder output".to_string())?;
+        let has_video = Arc::new(AtomicBool::new(false));
+        let received = has_video.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            received.store(true, Ordering::Release);
+            gst::PadProbeReturn::Remove
+        });
+        Ok(Self {
+            pipeline,
+            failure: None,
+            has_video,
+            _portal_remote: None,
+        })
+    }
+
+    fn wait_for_video(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(error) = self.take_failure() {
+                return Err(error);
+            }
+            if self.has_video.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("No video frames arrived from the selected screen or window. Keep it visible and try recording again.".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn take_failure(&mut self) -> Option<String> {
         if self.failure.is_none() {
             let bus = self.pipeline.bus()?;
@@ -821,6 +900,15 @@ impl SegmentPipeline {
     }
 }
 
+impl Drop for SegmentPipeline {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+pub(super) const WINDOW_ENCODER: &str =
+    "video/x-raw,format=BGRA ! avenc_ffv1 name=screen_encoder threads=0";
+
 fn build_segment_pipeline(
     output: &Path,
     index: usize,
@@ -829,6 +917,7 @@ fn build_segment_pipeline(
     options: &RecordingOptions,
     camera_device: Option<&str>,
     camera_frames: Option<&Arc<CameraFrames>>,
+    preserve_alpha: bool,
 ) -> Result<gst::Pipeline, String> {
     let path = segment_path(output, index);
     let _ = fs::remove_file(&path);
@@ -837,16 +926,27 @@ fn build_segment_pipeline(
         .area
         .map(RecordingArea::pipeline_filter)
         .unwrap_or_default();
+    // Window buffers include transparent shadows and rounded corners. Keep
+    // their alpha in the source recording so Studio can composite them.
+    let encoder = if preserve_alpha {
+        WINDOW_ENCODER
+    } else {
+        "vp8enc name=screen_encoder deadline=1 cpu-used=8 threads=4 target-bitrate=12000000 keyframe-max-dist=60"
+    };
     let mut description = format!(
         "matroskamux name=mux ! filesink location=\"{}\" \
          pipewiresrc name=screen_source fd={} path={} always-copy=true \
-         keepalive-time=1000 ! videoconvert ! {crop_filter}\
+         keepalive-time=1000 ! {} ! {crop_filter}\
          queue max-size-buffers=4 leaky=downstream ! \
-         vp8enc deadline=1 cpu-used=8 threads=4 target-bitrate=12000000 \
-         keyframe-max-dist=60 ! queue ! mux. ",
+         {encoder} ! queue ! mux. ",
         path.display(),
         portal_fd,
-        node
+        node,
+        if preserve_alpha {
+            stream_geometry::NATIVE_WINDOW_FILTER
+        } else {
+            stream_geometry::FILTER
+        },
     );
     // Sources capture at the device's native 48 kHz so PipeWire does not
     // resample for the client. A lone source feeds the encoder directly:
@@ -920,21 +1020,32 @@ fn build_segment_pipeline(
 fn spawn_segment(
     output: &Path,
     index: usize,
-    portal_fd: i32,
+    portal_remote: OwnedFd,
     node: u32,
     options: &RecordingOptions,
     camera_device: Option<&str>,
     camera_frames: Option<&Arc<CameraFrames>>,
+    recording_size: RecordingSize,
+    preserve_alpha: bool,
 ) -> Result<SegmentPipeline, String> {
     let pipeline = build_segment_pipeline(
         output,
         index,
-        portal_fd,
+        portal_remote.as_raw_fd(),
         node,
         options,
         camera_device,
         camera_frames,
+        preserve_alpha,
     )?;
+    stream_geometry::attach(&pipeline, recording_size, preserve_alpha)?;
+    if preserve_alpha {
+        fs::write(
+            output.with_extension("window.json"),
+            r#"{"version":1,"pixels":"native"}"#,
+        )
+        .map_err(|error| format!("could not save window capture metadata: {error}"))?;
+    }
     if let Some(frames) = camera_frames.filter(|_| camera_device.is_some()) {
         attach_preview(&pipeline, "recording_camera_preview", frames.clone())?;
     }
@@ -963,18 +1074,13 @@ fn spawn_segment(
         }
         gst::PadProbeReturn::Ok
     });
-    pipeline
+    let mut segment = SegmentPipeline::new(pipeline)?;
+    segment._portal_remote = Some(portal_remote);
+    segment
+        .pipeline
         .set_state(gst::State::Playing)
         .map_err(|error| format!("could not start GStreamer pipeline: {error}"))?;
-    thread::sleep(Duration::from_millis(120));
-    let mut segment = SegmentPipeline {
-        pipeline,
-        failure: None,
-    };
-    if let Some(error) = segment.take_failure() {
-        let _ = segment.pipeline.set_state(gst::State::Null);
-        return Err(error);
-    }
+    segment.wait_for_video(Duration::from_secs(5))?;
     Ok(segment)
 }
 
@@ -1005,7 +1111,11 @@ fn finalize_child(child: &mut SegmentPipeline) -> Result<(), String> {
         }
     };
     let _ = child.pipeline.set_state(gst::State::Null);
-    result
+    result?;
+    if !child.has_video.load(Ordering::Acquire) {
+        return Err("No video frames were recorded from the selected screen or window. Keep it visible and try recording again.".into());
+    }
+    Ok(())
 }
 
 fn finalize_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> {
@@ -1069,6 +1179,206 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recording_requires_video_before_reporting_ready() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "appsrc is-live=true format=time caps=video/x-raw,format=I420,width=64,height=64,framerate=30/1 ! \
+             vp8enc name=screen_encoder deadline=1 ! matroskamux ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let mut segment = SegmentPipeline::new(pipeline.clone()).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let error = segment
+            .wait_for_video(Duration::from_millis(80))
+            .unwrap_err();
+        assert!(error.contains("No video frames arrived"), "{error}");
+        drop(segment);
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+    }
+
+    #[test]
+    fn eos_without_video_is_not_a_successful_recording() {
+        gst::init().unwrap();
+        let root = std::env::temp_dir().join(format!("lahza-empty-video-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("empty.mkv");
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=0 ! video/x-raw,width=64,height=64 ! \
+             vp8enc name=screen_encoder deadline=1 ! matroskamux ! filesink location=\"{}\"",
+            path.display()
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let mut segment = SegmentPipeline::new(pipeline.clone()).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let error = finalize_child(&mut segment).unwrap_err();
+        assert!(error.contains("No video frames were recorded"), "{error}");
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a live window node in LAHZA_TEST_PIPEWIRE_NODE"]
+    fn live_window_cursor_capture_records_across_pause() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let node: u32 = std::env::var("LAHZA_TEST_PIPEWIRE_NODE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let root = std::env::temp_dir().join(format!("lahza-window-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let socket = std::env::var("XDG_RUNTIME_DIR").unwrap() + "/pipewire-0";
+        let pointer_remote = UnixStream::connect(&socket).unwrap();
+        let remote = UnixStream::connect(&socket).unwrap();
+        let mut input = InputCapture::start(&root);
+        let output = root.join("screen.mkv");
+        let recording_size = RecordingSize::default();
+        let mut segment = spawn_segment(
+            &output,
+            0,
+            remote.into(),
+            node,
+            &RecordingOptions::default(),
+            None,
+            None,
+            recording_size.clone(),
+            true,
+        )
+        .unwrap();
+        input
+            .attach_pipewire(
+                pointer_remote.as_raw_fd(),
+                node,
+                InputMapping {
+                    origin: Some((0.0, 0.0)),
+                    size: (640.0, 360.0),
+                },
+            )
+            .unwrap();
+        drop(pointer_remote);
+        thread::sleep(Duration::from_secs(2));
+        input.detach_pipewire();
+        let cursor_before_pause = fs::read(root.join("input.cursor.jsonl")).unwrap();
+        assert!(!cursor_before_pause.is_empty());
+        finalize_child(&mut segment).unwrap();
+        drop(segment);
+        thread::sleep(Duration::from_millis(300));
+        let resumed_remote = UnixStream::connect(&socket).unwrap();
+        let mut resumed = spawn_segment(
+            &output,
+            1,
+            resumed_remote.into(),
+            node,
+            &RecordingOptions::default(),
+            None,
+            None,
+            recording_size.clone(),
+            true,
+        )
+        .unwrap();
+        let pointer_remote = UnixStream::connect(&socket).unwrap();
+        input
+            .attach_pipewire(
+                pointer_remote.as_raw_fd(),
+                node,
+                InputMapping {
+                    origin: Some((0.0, 0.0)),
+                    size: (640.0, 360.0),
+                },
+            )
+            .unwrap();
+        drop(pointer_remote);
+        thread::sleep(Duration::from_secs(2));
+        finalize_child(&mut resumed).unwrap();
+        for index in [0, 1] {
+            let path = segment_path(&output, index);
+            println!(
+                "test recording: {} ({} bytes)",
+                path.display(),
+                path.metadata().unwrap().len()
+            );
+            let info = super::super::video::probe_media(&path).unwrap();
+            assert!(info.duration > 1.0);
+            assert_eq!((info.width, info.height), *recording_size.get().unwrap());
+        }
+        drop(input);
+        let cursor_after_resume = fs::read(root.join("input.cursor.jsonl")).unwrap();
+        assert!(cursor_after_resume.starts_with(&cursor_before_pause));
+        assert!(cursor_after_resume.len() > cursor_before_pause.len());
+        finalize_segments(
+            &[segment_path(&output, 0), segment_path(&output, 1)],
+            &output,
+        )
+        .unwrap();
+        let info = super::super::video::probe_media(&output).unwrap();
+        assert!(info.duration > 2.0);
+        assert_eq!((info.width, info.height), *recording_size.get().unwrap());
+        println!(
+            "window recording dimensions: {}x{}",
+            info.width, info.height
+        );
+        if let Some(destination) = std::env::var_os("LAHZA_TEST_RECORDING_COPY") {
+            let destination = PathBuf::from(destination);
+            fs::copy(&output, &destination).unwrap();
+            fs::copy(
+                output.with_extension("window.json"),
+                destination.with_extension("window.json"),
+            )
+            .unwrap();
+            let frame =
+                super::super::video::decode_frame(&output, 0.2, info.width, info.height).unwrap();
+            assert!(
+                frame.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0),
+                "window margins must stay transparent"
+            );
+            let source = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba).unwrap();
+            let compositor = super::super::scene::SceneCompositor::new(
+                &super::super::scene::SceneStyle {
+                    background: super::super::scene::SceneBackground::Solid(0x7bcbe8),
+                    ..Default::default()
+                },
+                1000,
+                700,
+                frame.width,
+                frame.height,
+            )
+            .unwrap();
+            compositor
+                .compose(super::super::scene::FrameInput {
+                    source: &source,
+                    overlay: None,
+                    viewport: super::super::viewport::ViewportFrame::default(),
+                    pointer: None,
+                    camera: None,
+                })
+                .save(destination.with_extension("png"))
+                .unwrap();
+        }
+        if std::env::var_os("LAHZA_TEST_RESIZE").is_some() {
+            let first = super::super::video::decode_frame(&output, 0.2, 320, 180).unwrap();
+            let wide = super::super::video::decode_frame(&output, 1.6, 320, 180).unwrap();
+            println!(
+                "native window sizes: {}x{} -> {}x{}",
+                first.width, first.height, wide.width, wide.height
+            );
+            assert!(
+                wide.width > 800 && wide.width > first.width,
+                "growing the window must preserve its new physical resolution"
+            );
+            assert!(
+                wide.width as f64 / wide.height as f64 > 1.4,
+                "presentation must follow the wider aspect ratio"
+            );
+        }
+        super::super::video::decode_frame(&output, info.duration * 0.75, 320, 180).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn recording_pipeline_builds_with_installed_pipewire_plugin() {
         let root = std::env::temp_dir().join(format!("lahza-pipeline-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -1086,7 +1396,7 @@ mod tests {
             };
             // Build the real recording pipeline without opening the portal or
             // starting capture. Also run against the Snap's older plugin.
-            let pipeline = build_segment_pipeline(&output, 0, -1, 0, &options, None, None)
+            let pipeline = build_segment_pipeline(&output, 0, -1, 0, &options, None, None, true)
                 .expect("recording pipeline must support the installed PipeWire plugin");
             assert_eq!(pipeline.pipeline_clock(), gst::SystemClock::obtain());
             assert!(pipeline.by_name("screen_source").is_some());
@@ -1097,7 +1407,7 @@ mod tests {
             for index in [0, 1] {
                 // The same crop must build for both the initial segment and a
                 // resumed segment, with every supported audio combination.
-                build_segment_pipeline(&output, index, -1, 0, &cropped, None, None)
+                build_segment_pipeline(&output, index, -1, 0, &cropped, None, None, false)
                     .expect("area recording pipeline must support pause/resume and audio");
             }
         }

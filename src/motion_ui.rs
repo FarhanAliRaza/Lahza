@@ -411,6 +411,7 @@ impl Studio {
         };
         SceneStyle {
             background,
+            source_crop: if self.video_project.is_some() { self.video_crop } else { crate::CropRect::UNIT },
             window_frame: self.window_frame,
             padding: self.padding,
             corners: self.corners,

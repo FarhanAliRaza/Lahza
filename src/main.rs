@@ -283,6 +283,7 @@ struct Studio {
     /// so the Video tab returns to it instead of asking again.
     last_video_project: Option<PathBuf>,
     video_frame: Option<Arc<RenderImage>>,
+    video_crop: CropRect,
     video_pointer_timeline: PointerTimeline,
     video_viewport_timeline: ViewportTimeline,
     video_pointer_synthesized: bool,
@@ -312,6 +313,7 @@ struct Studio {
     video_media_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     /// Pixel size of the open recording's master, for scene layout.
     video_source_size: (u32, u32),
+    video_window_capture: bool,
     export_format: ExportFormat,
     export_progress: Option<Arc<ExportProgress>>,
     export_label: SharedString,
@@ -587,6 +589,7 @@ impl Studio {
             video_project: None,
             last_video_project: None,
             video_frame: None,
+            video_crop: CropRect::UNIT,
             video_pointer_timeline: PointerTimeline::default(),
             video_viewport_timeline: ViewportTimeline::default(),
             video_pointer_synthesized: false,
@@ -612,6 +615,7 @@ impl Studio {
             video_timeline_bounds: Arc::new(Mutex::new(None)),
             video_media_bounds: Arc::new(Mutex::new(None)),
             video_source_size: (1280, 720),
+            video_window_capture: false,
             export_format: ExportFormat::Mp4,
             export_progress: None,
             export_label: SharedString::default(),
@@ -752,6 +756,9 @@ impl Studio {
 
     /// Keeps an RGBA copy of the shown video frame for the compositor.
     fn set_video_frame(&mut self, pixels: image::RgbaImage) {
+        if self.video_window_capture {
+            self.video_source_size = pixels.dimensions();
+        }
         self.video_frame_rgba = Some(Arc::new(pixels.clone()));
         let previous = self.video_frame.replace(cached_render_image(pixels));
         self.retire_image(previous);
@@ -936,7 +943,11 @@ impl Studio {
             _ => self
                 .video_project
                 .as_ref()
-                .map(|_| self.video_source_size)
+                .map(|_| {
+                    let crop = self.video_crop.validated();
+                    ((self.video_source_size.0 as f32 * crop.width).round().max(1.0) as u32,
+                     (self.video_source_size.1 as f32 * crop.height).round().max(1.0) as u32)
+                })
                 .or(self.captured_dimensions)
                 .filter(|(_, height)| *height > 0)
                 .map(|(width, height)| width as f32 / height as f32)
@@ -969,7 +980,9 @@ impl Studio {
         available_width: Pixels,
         available_height: Pixels,
     ) -> (Pixels, Pixels) {
-        let ratio = self.selected_canvas_ratio();
+        let ratio = if self.crop_active && self.video_project.is_some() {
+            self.video_source_size.0 as f32 / self.video_source_size.1.max(1) as f32
+        } else { self.selected_canvas_ratio() };
         if available_width / available_height > ratio {
             (available_height * ratio, available_height)
         } else {
@@ -1037,6 +1050,14 @@ impl Studio {
     }
 
     fn handle_video_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.crop_active {
+            match event.keystroke.key.as_str() {
+                "escape" => self.cancel_crop(),
+                "enter" => { if let Err(error) = self.apply_crop() { self.toast = Some(error.into()); } }
+                _ => {}
+            }
+            return true;
+        }
         // The speed dialog owns the keyboard: Escape cancels, Enter applies.
         if let Some(draft) = self.video_speed_draft {
             match event.keystroke.key.as_str() {
@@ -1506,6 +1527,60 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a display and LAHZA_CROP_TEST_RECORDING pointing to a disposable project"]
+    fn video_crop_editor_apply_cancel_reset_undo_and_reopen() {
+        let path = PathBuf::from(std::env::var_os("LAHZA_CROP_TEST_RECORDING").unwrap());
+        Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+            let handle = open_studio_window(cx, true, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, Some(path.clone()), None, cx))
+            }).unwrap();
+            handle.update(cx, |studio, _, cx| {
+                assert!(studio.video_project.is_some());
+                studio.video_crop = CropRect::UNIT;
+                studio.begin_crop();
+                assert!(studio.crop_active);
+                assert!(!studio.video_playing);
+                let bounds = Bounds { origin: point(px(0.0), px(0.0)), size: size(px(1000.0), px(600.0)) };
+                studio.crop_pointer_down(point(px(1000.0), px(600.0)), bounds);
+                studio.crop_pointer_move(point(px(700.0), px(450.0)), bounds);
+                assert!(studio.crop_rect.width < 0.71 && studio.crop_rect.height < 0.76);
+                studio.apply_crop().unwrap();
+                let applied = studio.video_crop;
+                assert_ne!(applied, CropRect::UNIT);
+                assert!(!studio.crop_active);
+                studio.undo_video_edit(cx);
+                assert_eq!(studio.video_crop, CropRect::UNIT);
+                studio.redo_video_edit(cx);
+                assert_eq!(studio.video_crop, applied);
+                studio.begin_crop();
+                studio.reset_crop();
+                studio.cancel_crop();
+                assert_eq!(studio.video_crop, applied);
+                studio.begin_crop();
+                studio.reset_crop();
+                studio.apply_crop().unwrap();
+                assert_eq!(studio.video_crop, CropRect::UNIT);
+                studio.begin_crop();
+                studio.set_crop_aspect(2);
+                studio.apply_crop().unwrap();
+                let square = studio.video_crop;
+                let ratio = studio.video_source_size.0 as f32 * square.width
+                    / (studio.video_source_size.1 as f32 * square.height);
+                assert!((ratio - 1.0).abs() < 0.005);
+                studio.open_video_project(path).unwrap();
+                assert_eq!(studio.video_crop, square);
+                studio.begin_crop();
+                assert_eq!(studio.crop_rect, square);
+                studio.cancel_crop();
+            }).unwrap();
+            cx.spawn(async |cx| {
+                Timer::after(Duration::from_millis(200)).await;
+                cx.update(|cx| cx.quit()).unwrap();
+            }).detach();
+        });
+    }
 
     #[test]
     fn playback_drops_screen_and_camera_frames_as_one_pair() {

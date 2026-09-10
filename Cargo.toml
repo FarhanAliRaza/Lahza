@@ -13,6 +13,7 @@ chrono = { version = "=0.4.43", default-features = false, features = ["clock", "
 gpui = { version = "=0.2.2", default-features = false, features = ["wayland", "x11"] }
 futures-util = "=0.3.34"
 gstreamer = "=0.25.3"
+gstreamer-video = "=0.25.3"
 image = "=0.25.10"
 libc = "0.2"
 pipewire = "=0.9.2"

@@ -2,7 +2,7 @@
 //! audio, to each retained range. Only export materializes the composition.
 use super::{
     clips::RecordingClipTimeline,
-    video::{fitted_dimensions, probe_media, DecodedFrame, VideoError},
+    video::{decode_dimensions, present_frame, probe_media, DecodedFrame, VideoError, PLAYBACK_FLAGS},
 };
 use gstreamer::{self as gst, prelude::*};
 use std::{
@@ -17,6 +17,7 @@ pub struct TimelinePlaybackStream {
     width: u32,
     height: u32,
     muted: bool,
+    window_capture: bool,
     pipeline: Option<gst::Element>,
     sink: Option<gst::Element>,
     active: Option<usize>,
@@ -37,7 +38,7 @@ impl TimelinePlaybackStream {
         gst::init().map_err(|e| VideoError::Decode(e.to_string()))?;
         let info = probe_media(path)?;
         let (width, height) =
-            fitted_dimensions(info.width, info.height, maximum_width, maximum_height);
+            decode_dimensions(&info, maximum_width, maximum_height);
         timeline.segments = timeline.playback_ranges();
         Ok(Self {
             path: path.to_owned(),
@@ -46,6 +47,7 @@ impl TimelinePlaybackStream {
             width,
             height,
             muted,
+            window_capture: info.window_capture,
             pipeline: None,
             sink: None,
             active: None,
@@ -62,8 +64,10 @@ impl TimelinePlaybackStream {
         // one frame per second. Repeat its last picture at a regular cadence
         // so the playhead and linked webcam keep following the audio clock.
         // Scale before videorate so repeated frames reuse the resized buffer.
+        // Dimensions are already fitted. Padding for subpixel aspect-ratio
+        // rounding would add opaque black edges to transparent windows.
         let sink = gst::parse::bin_from_description(&format!(
-            "videoconvert ! videoscale ! video/x-raw,format=RGBA,width={},height={},pixel-aspect-ratio=1/1 ! videorate ! video/x-raw,framerate=30/1 ! appsink name=frames sync=true max-buffers=2 drop=false wait-on-eos=false", self.width, self.height
+            "videoconvert ! videoscale add-borders=false ! video/x-raw,format=RGBA,width={},height={},pixel-aspect-ratio=1/1 ! videorate ! video/x-raw,framerate=30/1 ! appsink name=frames sync=true max-buffers=2 drop=false wait-on-eos=false", self.width, self.height
         ), true).map_err(|e| VideoError::Decode(e.to_string()))?;
         let frames = sink.by_name("frames").unwrap();
         let uri = gst::glib::filename_to_uri(&self.path, None)
@@ -75,6 +79,7 @@ impl TimelinePlaybackStream {
             .build()
             .map_err(|e| VideoError::Decode(format!("could not preserve audio pitch: {e}")))?;
         let pipeline = gst::ElementFactory::make("playbin")
+            .property_from_str("flags", PLAYBACK_FLAGS)
             .property("uri", uri.as_str())
             .property("video-sink", &sink)
             .property("audio-filter", &tempo)
@@ -179,12 +184,9 @@ impl TimelinePlaybackStream {
                 if map.len() != expected {
                     return Err(VideoError::Decode("invalid preview frame size".into()));
                 }
-                return Ok(Some(DecodedFrame {
-                    time: self.position,
-                    width: self.width,
-                    height: self.height,
-                    rgba: map.to_vec(),
-                }));
+                return Ok(Some(present_frame(DecodedFrame {
+                    time: self.position, width: self.width, height: self.height, rgba: map.to_vec(),
+                }, self.window_capture)));
             }
             if let Some(message) = self
                 .pipeline

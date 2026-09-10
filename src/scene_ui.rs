@@ -69,15 +69,16 @@ pub(crate) struct FocusDrag {
     pick: crate::motion_ui::MotionPick,
     projection: MediaProjection,
     viewport: ViewportFrame,
+    crop: crate::CropRect,
 }
 
 impl FocusDrag {
     fn target_at(&self, x: f64, y: f64) -> NormalizedPoint {
         let (u, v) = self.projection.unproject(x, y);
-        let (left, top, visible) = crate::recording::viewport::visible_rect(self.viewport);
+        let (left, top, visible_x, visible_y) = self.crop.visible_rect(self.viewport);
         NormalizedPoint {
-            x: left + u.clamp(0.0, 1.0) * visible,
-            y: top + v.clamp(0.0, 1.0) * visible,
+            x: left + u.clamp(0.0, 1.0) * visible_x,
+            y: top + v.clamp(0.0, 1.0) * visible_y,
         }
         .clamped()
     }
@@ -382,19 +383,22 @@ mod motion_picking_tests {
         transform.rotation_z = 8.0;
         let projection = geometry.projection(transform);
         let source = NormalizedPoint { x: 0.4, y: 0.6 };
-        for magnification in [1.0, 1.4, 2.0, 3.0] {
+        for (magnification, crop) in [1.0, 1.4, 2.0, 3.0].into_iter().flat_map(|zoom| {
+            [crate::CropRect::UNIT, crate::CropRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 }]
+                .map(move |crop| (zoom, crop))
+        }) {
             let viewport = ViewportFrame {
                 magnification,
                 anchor: NormalizedPoint { x: 0.45, y: 0.55 },
                 ..ViewportFrame::default()
             };
-            let (left, top, visible) = crate::recording::viewport::visible_rect(viewport);
+            let (left, top, visible_x, visible_y) = crop.visible_rect(viewport);
             let (x, y) = projection.project(
-                (source.x - left) / visible,
-                (source.y - top) / visible,
+                (source.x - left) / visible_x,
+                (source.y - top) / visible_y,
             );
             for pick in [crate::motion_ui::MotionPick::Focus, crate::motion_ui::MotionPick::PanEnd] {
-                let drag = FocusDrag { pick, projection, viewport };
+                let drag = FocusDrag { pick, projection, viewport, crop };
                 let target = drag.target_at(x, y);
                 assert!((target.x - source.x).abs() < 1e-9);
                 assert!((target.y - source.y).abs() < 1e-9);
@@ -713,7 +717,7 @@ impl Studio {
         let (width, height) = self.media_dimensions()?;
         let marks = if self.scene_is_timed() {
             let viewport = self.video_viewport_timeline.frame_at(time);
-            timed::active_marks(&self.annotations, time, viewport)
+            timed::active_marks_in_crop(&self.annotations, time, viewport, self.scene_style().source_crop)
         } else {
             self.annotations.iter().filter(|mark| !mark.is_canvas()).cloned().collect()
         };
@@ -737,10 +741,12 @@ impl Studio {
         let source = self.preview_source()?;
         // While a slider or the media is being dragged, compose a half-size
         // proxy that the canvas scales up; the full-size frame is rendered
-        // once the drag ends. Interactive edits stay smooth this way.
-        let proxy = if self.slider_drag.is_some()
-            || self.media_drag.is_some()
-            || self.motion_transform_drag.is_some()
+        // once the drag ends. Native window recordings retain a full-size
+        // preview during scaling so text detail does not appear to disappear.
+        let proxy = if !(self.video_project.is_some() && self.video_window_capture)
+            && (self.slider_drag.is_some()
+                || self.media_drag.is_some()
+                || self.motion_transform_drag.is_some())
         {
             0.5
         } else {
@@ -875,11 +881,11 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        let (left, top, visible) = crate::recording::viewport::visible_rect(viewport);
+        let (left, top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(viewport);
         Some(
             NormalizedPoint {
-                x: left + u * visible,
-                y: top + v * visible,
+                x: left + u * visible_x,
+                y: top + v * visible_y,
             }
             .clamped(),
         )
@@ -1269,9 +1275,9 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        let (left, top, visible) = crate::recording::viewport::visible_rect(viewport);
-        let media_x = left + u * visible;
-        let media_y = top + v * visible;
+        let (left, top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(viewport);
+        let media_x = left + u * visible_x;
+        let media_y = top + v * visible_y;
         point(
             flat.origin.x + flat.size.width * media_x as f32,
             flat.origin.y + flat.size.height * media_y as f32,
@@ -1344,6 +1350,7 @@ impl Studio {
                 pick,
                 projection,
                 viewport: self.video_viewport_timeline.frame_at(self.video_position),
+                crop: self.scene_style().source_crop,
             };
             self.focus_drag = Some(drag);
             self.pin_focus_at_media(drag.target_at(local_x as f64, local_y as f64), pick, cx);
@@ -1460,8 +1467,8 @@ impl Studio {
         };
         if !cue.has_camera_motion() { return Vec::new(); }
         let frame = self.video_viewport_timeline.frame_at(self.video_position);
-        let (left, top, visible) = crate::recording::viewport::visible_rect(frame);
-        let to_visible = |p: NormalizedPoint| ((p.x - left) / visible, (p.y - top) / visible);
+        let (left, top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(frame);
+        let to_visible = |p: NormalizedPoint| ((p.x - left) / visible_x, (p.y - top) / visible_y);
         let focus = match cue.anchor_mode {
             crate::recording::viewport::ZoomAnchorMode::PinnedAnchor => cue.pinned_point,
             _ => frame.anchor,
@@ -1587,8 +1594,9 @@ impl Studio {
         }
         let caret_visible = self.caret_visible;
         let frame = self.video_viewport_timeline.frame_at(time);
-        let (view_left, view_top, _) = crate::recording::viewport::visible_rect(frame);
-        let view_zoom = frame.magnification.max(1.0) as f32;
+        let (view_left, view_top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(frame);
+        let view_zoom_x = (1.0 / visible_x) as f32;
+        let view_zoom_y = (1.0 / visible_y) as f32;
         let media_rect = geometry.media;
         div()
             .id("scene-canvas")
@@ -1636,10 +1644,10 @@ impl Studio {
                         // The full media through the current viewport crop.
                         let interaction_bounds = Bounds {
                             origin: point(
-                                media.origin.x - media.size.width * view_zoom * view_left as f32,
-                                media.origin.y - media.size.height * view_zoom * view_top as f32,
+                                media.origin.x - media.size.width * view_zoom_x * view_left as f32,
+                                media.origin.y - media.size.height * view_zoom_y * view_top as f32,
                             ),
-                            size: size(media.size.width * view_zoom, media.size.height * view_zoom),
+                            size: size(media.size.width * view_zoom_x, media.size.height * view_zoom_y),
                         };
                         let annotation_bounds = window.with_content_mask(
                             Some(ContentMask { bounds: media }),
@@ -3252,11 +3260,12 @@ impl Studio {
         &self,
     ) -> Option<crate::recording::export::OverlaySource> {
         let (width, height) = self.media_dimensions()?;
-        overlay_source_for(
+        cropped_overlay_source_for(
             self.annotations.clone(),
             self.video_viewport_timeline.clone(),
             width,
             height,
+            self.scene_style().source_crop,
         )
     }
 }
@@ -3269,13 +3278,20 @@ pub(crate) fn overlay_source_for(
     width: u32,
     height: u32,
 ) -> Option<crate::recording::export::OverlaySource> {
+    cropped_overlay_source_for(marks, viewport, width, height, crate::CropRect::UNIT)
+}
+
+fn cropped_overlay_source_for(
+    marks: Vec<AnnotationMark>, viewport: ViewportTimeline,
+    width: u32, height: u32, crop: crate::CropRect,
+) -> Option<crate::recording::export::OverlaySource> {
     {
         if marks.is_empty() {
             return None;
         }
         let mut cache: Option<(u64, Arc<RgbaImage>)> = None;
         Some(Box::new(move |time: f64| {
-            let active = timed::active_marks(&marks, time, viewport.frame_at(time));
+            let active = timed::active_marks_in_crop(&marks, time, viewport.frame_at(time), crop);
             if active.is_empty() {
                 return None;
             }

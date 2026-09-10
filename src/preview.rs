@@ -806,11 +806,15 @@ impl Studio {
         }
         self.ensure_camera_frame(cx);
         let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
-        let video_canvas = self.scene_canvas(canvas_width, canvas_height, cx);
+        let video_canvas = if self.crop_active {
+            self.video_crop_canvas(canvas_width, canvas_height, cx)
+        } else {
+            self.scene_canvas(canvas_width, canvas_height, cx)
+        };
         let top_bar = self.top_bar(cx);
         let canvas_area = self.canvas_area(video_canvas, cx);
-        let timeline = self.timeline_bar(cx);
-        let sidebar = self.inspector_visible.then(|| self.sidebar(cx));
+        let timeline = if self.crop_active { div().into_any_element() } else { self.timeline_bar(cx) };
+        let sidebar = (self.inspector_visible && !self.crop_active).then(|| self.sidebar(cx));
         let speed_dialog = self.video_speed_dialog(cx);
 
         let editor = div()

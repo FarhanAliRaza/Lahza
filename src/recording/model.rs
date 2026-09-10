@@ -26,7 +26,7 @@ impl RecordingSession {
     pub const DRAFT_FILE: &'static str = "edit.draft.json";
     pub const PROJECT_FILE: &'static str = "project.json";
     pub const RENDER_STAMP_FILE: &'static str = "render.json";
-    pub const POSTER_FILE: &'static str = "poster.jpg";
+    pub const POSTER_FILE: &'static str = "poster.png";
     pub const REPLACEMENT_AUDIO_STEM: &'static str = "audio-replacement";
     /// Derived copy of the screen recording with noise-reduced audio.
     pub const DENOISED_FILE: &'static str = ".audio-denoised.mkv";

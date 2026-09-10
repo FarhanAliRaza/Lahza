@@ -328,6 +328,7 @@ fn frames_for(duration: f64, frame_rate: f64) -> u64 {
 enum PreparedSource {
     Video {
         stream: VideoFrameStream,
+        initial_size: (u32, u32),
         audio: Option<(PathBuf, String)>,
         pointer: Option<PointerTimeline>,
         camera: Option<VideoFrameStream>,
@@ -341,7 +342,7 @@ enum PreparedSource {
 impl PreparedSource {
     fn dimensions(&self) -> (u32, u32) {
         match self {
-            PreparedSource::Video { stream, .. } => stream.dimensions(),
+            PreparedSource::Video { initial_size, .. } => *initial_size,
             PreparedSource::Image { image, .. } => (image.width(), image.height()),
         }
     }
@@ -416,9 +417,14 @@ fn prepare_source(
         } => {
             let info = probe_media(&media)?;
             let clips = clips.normalized(info.duration);
-            let stream = VideoFrameStream::open_timeline(
-                &media, &clips, info.width.min(2560), info.height.min(1600), frame_rate,
-            )?;
+            let (width, height) = if request.style.source_crop != crate::CropRect::UNIT {
+                (info.width, info.height)
+            } else { (info.width.min(2560), info.height.min(1600)) };
+            let stream = VideoFrameStream::open_timeline(&media, &clips, width, height, frame_rate)?;
+            let initial_size = if info.window_capture {
+                let frame = super::video::decode_frame(&media, clips.segments.first().map_or(0.0, |clip| clip.source_start), info.width, info.height)?;
+                (frame.width, frame.height)
+            } else { stream.dimensions() };
             let audio = (info.has_audio && request.include_audio && request.format.supports_audio())
                 .then(|| (media, clip_filter(&info, &clips, 1, false, true)));
             let camera = camera.filter(|_| request.style.camera.enabled)
@@ -426,6 +432,7 @@ fn prepare_source(
                 .transpose()?;
             Ok(PreparedSource::Video {
                 stream,
+                initial_size,
                 audio,
                 pointer,
                 camera,
@@ -446,7 +453,7 @@ fn encode(
         request
             .style
             .export_canvas_size(source_width, source_height, request.canvas_height);
-    let compositor = SceneCompositor::new(
+    let mut compositor = SceneCompositor::new(
         &request.style,
         canvas_width,
         canvas_height,
@@ -564,6 +571,7 @@ fn encode(
         .ok_or_else(|| VideoError::Decode("FFmpeg encoder did not accept frame input".into()))?;
 
     *progress.encoding_started.lock().unwrap() = Some(Instant::now());
+    let mut compositor_source_size = (source_width, source_height);
     let mut last_video_frame: Option<RgbaImage> = None;
     let mut last_camera_frame: Option<RgbaImage> = None;
     let mut write_error: Option<VideoError> = None;
@@ -626,6 +634,14 @@ fn encode(
                 (frame, overlay)
             }
         };
+        if source_frame.dimensions() != compositor_source_size {
+            compositor_source_size = source_frame.dimensions();
+            match compositor.rebuild(&request.style, canvas_width, canvas_height,
+                compositor_source_size.0, compositor_source_size.1) {
+                Ok(next) => compositor = next,
+                Err(error) => { write_error = Some(VideoError::InvalidMedia(error)); break; }
+            }
+        }
         let viewport = request.viewport.frame_at(time);
         let overlay = request.overlay.as_mut().and_then(|source| source(time));
         let canvas_overlay = request.canvas_overlay.as_mut().and_then(|source| source(time));
@@ -1095,6 +1111,42 @@ mod tests {
         let info = probe_media(&destination).unwrap();
         assert_eq!((info.width, info.height), (320, 180));
         assert!((info.duration - 2.5).abs() < 0.25, "{}", info.duration);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn video_crop_export_keeps_only_selected_pixels_and_preserves_audio_and_source() {
+        if !ffmpeg_available() { return; }
+        let root = test_root("crop");
+        let media = root.join("source.mkv");
+        let result = Command::new("ffmpeg").args([
+            "-v", "error", "-f", "lavfi", "-i",
+            "color=red:s=160x96:r=10:d=1,drawbox=x=80:y=0:w=80:h=96:color=lime:t=fill",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "ffv1", "-c:a", "pcm_s16le", "-y",
+        ]).arg(&media).status().unwrap();
+        assert!(result.success());
+        let original = fs::read(&media).unwrap();
+        let destination = root.join("cropped.mp4");
+        let style = SceneStyle {
+            source_crop: crate::CropRect { x: 0.5, y: 0.0, width: 0.5, height: 1.0 },
+            padding: 0, corners: 0, shadow: 0, border: false,
+            ..SceneStyle::default()
+        };
+        let mut request = SceneExportRequest::new(destination.clone(), ExportFormat::Mp4, 96, style, ViewportTimeline::default(), 0.6);
+        request.frame_rate = 10.0;
+        export_scene(SceneSource::Video {
+            media: media.clone(),
+            clips: RecordingClipTimeline::new(vec![crate::recording::clips::RecordingClipSegment::new(0.2, 0.8)]),
+            pointer: None, camera: None,
+        }, &mut request, &ExportProgress::default()).unwrap();
+        let info = probe_media(&destination).unwrap();
+        assert_eq!((info.width, info.height), (80, 96));
+        assert!(info.has_audio);
+        assert!((info.duration - 0.6).abs() < 0.15);
+        let frame = crate::recording::video::decode_frame(&destination, 0.3, 80, 96).unwrap();
+        assert!(frame.rgba.chunks_exact(4).all(|p| p[1] > 200 && p[0] < 30 && p[2] < 30));
+        assert_eq!(fs::read(&media).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
     }
 

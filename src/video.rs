@@ -327,6 +327,11 @@ impl Studio {
             return;
         };
         match previous {
+            VideoEditSnapshot::Crop(crop) => {
+                self.video_redo_stack.push(VideoEditSnapshot::Crop(std::mem::replace(&mut self.video_crop, crop)));
+                self.autosave_scene_style();
+                cx.notify();
+            }
             VideoEditSnapshot::Annotations(marks) => {
                 self.video_redo_stack.push(VideoEditSnapshot::Annotations(
                     std::mem::replace(&mut self.annotations, marks)));
@@ -365,6 +370,11 @@ impl Studio {
             return;
         };
         match next {
+            VideoEditSnapshot::Crop(crop) => {
+                self.video_undo_stack.push(VideoEditSnapshot::Crop(std::mem::replace(&mut self.video_crop, crop)));
+                self.autosave_scene_style();
+                cx.notify();
+            }
             VideoEditSnapshot::Annotations(marks) => {
                 self.video_undo_stack.push(VideoEditSnapshot::Annotations(
                     std::mem::replace(&mut self.annotations, marks)));
@@ -663,7 +673,7 @@ impl Studio {
     }
 
     pub(super) fn start_video_playback(&mut self, cx: &mut Context<Self>) {
-        if self.video_playing || self.video_duration <= 0.0 || self.video_edit_busy {
+        if self.crop_active || self.video_playing || self.video_duration <= 0.0 || self.video_edit_busy {
             return;
         }
         let Some(path) = self.video_playback_path() else {
@@ -674,6 +684,7 @@ impl Studio {
             self.video_position = 0.0;
         }
         let start_time = self.video_position;
+        let decode_size = if self.video_crop != crate::CropRect::UNIT { self.video_source_size } else { (1920, 1080) };
         let timeline = self.video_clip_timeline.clone();
         let muted = self.video_audio_muted;
         let generation = self.video_playback_generation.clone();
@@ -750,7 +761,7 @@ impl Studio {
                     }
                 }
                 let mut stream =
-                    match TimelinePlaybackStream::open(&path, timeline, start_time, 1920, 1080, muted) {
+                    match TimelinePlaybackStream::open(&path, timeline, start_time, decode_size.0, decode_size.1, muted) {
                         Ok(stream) => stream,
                         Err(error) => {
                             sender.finish(Err(error.to_string()));
@@ -856,8 +867,9 @@ impl Studio {
             return;
         }
         let source_time = self.video_clip_timeline.source_time_at(position);
+        let decode_size = if self.crop_active || self.video_crop != crate::CropRect::UNIT { self.video_source_size } else { (2560, 1440) };
         let task = cx.background_executor().spawn(async move {
-            decode_frame(&path, source_time, 2560, 1440).map_err(|error| error.to_string())
+            decode_frame(&path, source_time, decode_size.0, decode_size.1).map_err(|error| error.to_string())
         });
         cx.spawn(async move |weak, cx| {
             let result = task.await;
