@@ -2026,7 +2026,7 @@ fn render_watermark(watermark: &Watermark, width: u32, height: u32) -> Result<Rg
     render_svg_layer(&svg, width, height)
 }
 
-/// System fonts loaded once and shared by every SVG render (loading them
+/// Bundled and system fonts loaded once and shared by every SVG render (loading them
 /// per frame would dominate watermark and annotation rendering).
 pub fn shared_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
@@ -2035,6 +2035,9 @@ pub fn shared_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
         .get_or_init(|| {
             let mut database = resvg::usvg::fontdb::Database::new();
             database.load_system_fonts();
+            for bytes in crate::fonts::HANDWRITTEN_FONTS {
+                database.load_font_data(bytes.to_vec());
+            }
             std::sync::Arc::new(database)
         })
         .clone()

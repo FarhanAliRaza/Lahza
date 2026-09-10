@@ -24,6 +24,7 @@ mod capture_area;
 mod capture_access;
 mod controls;
 mod crop;
+mod fonts;
 mod launcher;
 mod launcher_library;
 mod launcher_recording;
@@ -1483,6 +1484,9 @@ fn main() {
             base: asset_directory(),
         })
         .run(move |cx: &mut App| {
+            cx.text_system()
+                .add_fonts(fonts::HANDWRITTEN_FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect())
+                .expect("failed to load bundled handwritten font");
             let starts_in_editor = initial_recording.is_some() || initial_image.is_some();
             open_studio_window(cx, starts_in_editor, move |window_handle, cx| {
                 cx.new(|cx| {

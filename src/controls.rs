@@ -530,7 +530,7 @@ impl Studio {
                         |this, index| this.child(self.annotation_text_field(index, cx)),
                     )
                     .child(div().flex().gap_1().children(
-                        ["Pro", "Compact", "Rounded"].into_iter().enumerate().map(
+                        ["Pro", "Compact", "Rounded", "Hand"].into_iter().enumerate().map(
                             |(index, label)| {
                                 div()
                                     .id(("text-family", index))
@@ -546,6 +546,10 @@ impl Studio {
                                     .items_center()
                                     .justify_center()
                                     .text_xs()
+                                    .when(index == 3, |this| {
+                                        this.font_family(crate::fonts::HANDWRITTEN_FAMILY)
+                                            .text_base()
+                                    })
                                     .cursor_pointer()
                                     .child(label)
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -612,18 +616,18 @@ impl Studio {
                                                 this.record_annotation_undo();
                                             }
                                             match style {
-                                                0 => this.text_bold = !this.text_bold,
-                                                1 => this.text_italic = !this.text_italic,
-                                                _ => this.text_underline = !this.text_underline,
+                                                0 => this.text_bold = !enabled,
+                                                1 => this.text_italic = !enabled,
+                                                _ => this.text_underline = !enabled,
                                             }
                                             if let Some(mark) = this
                                                 .selected_annotation
                                                 .and_then(|index| this.annotations.get_mut(index))
                                             {
                                                 match style {
-                                                    0 => mark.bold = !mark.bold,
-                                                    1 => mark.italic = !mark.italic,
-                                                    _ => mark.underline = !mark.underline,
+                                                    0 => mark.bold = !enabled,
+                                                    1 => mark.italic = !enabled,
+                                                    _ => mark.underline = !enabled,
                                                 }
                                             }
                                             cx.notify();

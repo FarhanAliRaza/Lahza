@@ -6,7 +6,7 @@ use super::{
 use crate::recording::viewport::visible_rect;
 use gpui::{
     font, hsla, point, px, quad, rgb, size, App, Bounds, FontWeight, Hsla, KeyDownEvent,
-    PathBuilder, Pixels, Point, TextRun, UnderlineStyle, Window,
+    PathBuilder, Pixels, Point, TextRun, Window,
 };
 use std::{fmt::Write as _, fs};
 
@@ -213,6 +213,7 @@ pub(crate) fn paint_annotation(
                 let family = match mark.font_family {
                     1 => "DejaVu Sans Condensed",
                     2 => "Ubuntu",
+                    3 => crate::fonts::HANDWRITTEN_FAMILY,
                     _ => "Noto Sans",
                 };
                 let mut text_font = font(family);
@@ -229,11 +230,8 @@ pub(crate) fn paint_annotation(
                     font: text_font,
                     color,
                     background_color: None,
-                    underline: mark.underline.then_some(UnderlineStyle {
-                        color: Some(color),
-                        thickness: px((mark.font_size / 18.0).max(1.0)),
-                        wavy: false,
-                    }),
+                    // Paint the annotation underline explicitly below the baseline.
+                    underline: None,
                     strikethrough: None,
                 };
                 let line = window.text_system().shape_line(
@@ -258,6 +256,26 @@ pub(crate) fn paint_annotation(
                     window,
                     cx,
                 );
+                if mark.underline {
+                    let thickness = px((mark.font_size / 18.0).max(1.0));
+                    let baseline = (font_size * 1.25 - line.ascent - line.descent) * 0.5
+                        + line.ascent;
+                    let underline_y = baseline + font_size * 0.1;
+                    window.paint_quad(quad(
+                        Bounds {
+                            origin: point(origin_x, bounds.origin.y + underline_y),
+                            size: size(line.width, thickness),
+                        },
+                        px(0.0),
+                        color,
+                        px(0.0),
+                        clear,
+                        Default::default(),
+                    ));
+                    // Keep the selection border below the underline.
+                    rendered_bounds.size.height = rendered_bounds.size.height
+                        .max(underline_y + thickness + inset);
+                }
             }
             if display.is_empty() {
                 rendered_bounds = Bounds {
@@ -917,6 +935,7 @@ pub(super) fn annotations_svg(
                             "DejaVu Sans Condensed, DejaVu Sans, Liberation Sans Narrow, sans-serif"
                         }
                         2 => "Ubuntu, Cantarell, Noto Sans, DejaVu Sans, sans-serif",
+                        3 => crate::fonts::HANDWRITTEN_FAMILY,
                         _ => {
                             "Noto Sans, Inter, DejaVu Sans, Liberation Sans, Cantarell, sans-serif"
                         }
@@ -944,6 +963,68 @@ mod tests {
     use super::{annotations_svg, xml_escape, AnnotationMark, NormPoint, Tool};
     use crate::scene_ui;
     use std::fs;
+
+    #[test]
+    fn handwritten_styles_render_distinctly_without_system_fonts() {
+        use resvg::usvg::fontdb::{Database, Family, Query, Style, Weight};
+
+        let mut fonts = Database::new();
+        for bytes in crate::fonts::HANDWRITTEN_FONTS {
+            fonts.load_font_data(bytes.to_vec());
+        }
+        let shared = crate::recording::scene::shared_fontdb();
+        let mut options = resvg::usvg::Options::default();
+        options.fontdb = std::sync::Arc::new(fonts);
+        let mut rendered = Vec::new();
+        for (bold, italic, face_name) in [
+            (false, false, "ComicNeue-Regular"),
+            (true, false, "ComicNeue-Bold"),
+            (false, true, "ComicNeue-Italic"),
+            (true, true, "ComicNeue-BoldItalic"),
+        ] {
+            let query = Query {
+                families: &[Family::Name(crate::fonts::HANDWRITTEN_FAMILY)],
+                weight: if bold { Weight::BOLD } else { Weight::NORMAL },
+                style: if italic { Style::Italic } else { Style::Normal },
+                ..Query::default()
+            };
+            for database in [shared.as_ref(), options.fontdb.as_ref()] {
+                let face = database.query(&query).expect("bundled annotation font style");
+                assert_eq!(database.face(face).unwrap().post_script_name, face_name);
+            }
+            for underline in [false, true] {
+                let mark = AnnotationMark {
+                    tool: Tool::Text,
+                    text: "Handwritten notes".into(),
+                    font_family: 3,
+                    font_size: 32.0,
+                    bold,
+                    italic,
+                    underline,
+                    start: NormPoint { x: 0.05, y: 0.1 },
+                    end: NormPoint { x: 0.95, y: 0.9 },
+                    ..AnnotationMark::default()
+                };
+                let fragment = annotations_svg(&[mark], 0.0, 0.0, 400, 80, 1.0);
+                assert!(fragment.contains("font-family=\"Comic Neue\""));
+                let svg = format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="80">{fragment}</svg>"#
+                );
+                let tree = resvg::usvg::Tree::from_str(&svg, &options).unwrap();
+                let mut output = resvg::tiny_skia::Pixmap::new(400, 80).unwrap();
+                resvg::render(
+                    &tree,
+                    resvg::tiny_skia::Transform::identity(),
+                    &mut output.as_mut(),
+                );
+                assert!(output.pixels().iter().any(|pixel| pixel.alpha() > 0));
+                for previous in &rendered {
+                    assert_ne!(output.data(), previous, "styles must change rendered pixels");
+                }
+                rendered.push(output.data().to_vec());
+            }
+        }
+    }
 
     #[test]
     fn export_annotations_render_in_a_caller_owned_group() {
