@@ -840,7 +840,16 @@ impl Studio {
     }
 
     pub(super) fn seek_video(&mut self, position: f64, cx: &mut Context<Self>) {
+        self.annotation_edit_preview_pending = false;
+        self.annotation_editing_time = None;
         self.stop_editing_text();
+        self.seek_video_frame(position, cx);
+    }
+
+    /// Decode an explicitly requested video frame without entering annotation editing.
+    pub(crate) fn seek_video_frame(&mut self, position: f64, cx: &mut Context<Self>) {
+        self.annotation_edit_preview_pending = false;
+        self.annotation_editing_time = None;
         let playback_path = self.video_playback_path();
         self.pause_video_playback();
         let position = position.clamp(0.0, self.video_duration);

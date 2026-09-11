@@ -6,6 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Annotation(usize),
+    CanvasAnnotation(usize),
     Watermark,
     Time(usize, bool),
     None,
@@ -35,6 +36,7 @@ struct Buffer {
     state: Snapshot,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    multiline: bool,
 }
 impl Buffer {
     fn range(&self) -> Range<usize> {
@@ -57,7 +59,11 @@ impl Buffer {
     fn replace(&mut self, range: Range<usize>, text: &str) {
         let start = self.boundary(range.start);
         let end = self.boundary(range.end).max(start);
-        let text = text.replace(['\r', '\n'], " ");
+        let text = if self.multiline {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.replace(['\r', '\n'], " ")
+        };
         if self.state.text[start..end] == text {
             self.select(start + text.len(), false);
             return;
@@ -162,6 +168,9 @@ pub(crate) struct TextField {
     placeholder: SharedString,
     marked: Option<Range<usize>>,
     layout: Option<ShapedLine>,
+    canvas_lines: Vec<(Range<usize>, ShapedLine, Point<Pixels>)>,
+    canvas_line_height: Pixels,
+    pending_caret: Option<Point<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
     scroll: Pixels,
     selecting: bool,
@@ -197,6 +206,9 @@ impl TextField {
             placeholder: placeholder.to_owned().into(),
             marked: None,
             layout: None,
+            canvas_lines: Vec::new(),
+            canvas_line_height: px(24.),
+            pending_caret: None,
             bounds: None,
             scroll: px(0.),
             selecting: false,
@@ -229,7 +241,10 @@ impl TextField {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.update_focus(self.focus.is_focused(window), cx);
+        // Canvas editing survives focus moving to style controls; explicit canvas actions finish it.
+        if !matches!(self.target, Target::CanvasAnnotation(_)) {
+            self.update_focus(self.focus.is_focused(window), cx);
+        }
         let changed_target = self.target != target;
         if changed_target || (!self.focus.is_focused(window) && self.buffer.state.text != value) {
             if changed_target && self.focus.is_focused(window) {
@@ -238,6 +253,7 @@ impl TextField {
             }
             self.target = target;
             self.buffer = Buffer::default();
+            self.buffer.multiline = matches!(target, Target::CanvasAnnotation(_));
             self.buffer.state.text = value.into();
             self.buffer.select(value.len(), false);
             self.initial = value.into();
@@ -259,6 +275,18 @@ impl TextField {
         cx.notify();
     }
     fn index(&self, pos: Point<Pixels>) -> usize {
+        if self.buffer.multiline {
+            if let Some((range, line, origin)) = self
+                .canvas_lines
+                .iter()
+                .find(|(_, _, p)| pos.y < p.y + self.canvas_line_height)
+                .or_else(|| self.canvas_lines.last())
+            {
+                return self.buffer.boundary(
+                    range.start + line.closest_index_for_x(pos.x - origin.x).min(range.len()),
+                );
+            }
+        }
         match (&self.layout, self.bounds) {
             (Some(line), Some(bounds)) => self
                 .buffer
@@ -266,7 +294,12 @@ impl TextField {
             _ => 0,
         }
     }
-    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.focus.focus(window);
         self.selecting = true;
         self.marked = None;
@@ -301,6 +334,33 @@ impl TextField {
             "left" | "right" => {
                 self.buffer.move_cursor(key == "right", command, mods.shift);
                 self.marked = None;
+            }
+            "up" | "down" if self.buffer.multiline => {
+                if let Some(p) = self.canvas_cursor(self.buffer.state.cursor) {
+                    let next = point(
+                        p.x,
+                        p.y + if key == "up" {
+                            -self.canvas_line_height
+                        } else {
+                            self.canvas_line_height
+                        } + px(1.),
+                    );
+                    self.buffer.select(self.index(next), mods.shift);
+                }
+            }
+            "home" | "end" if self.buffer.multiline && !command => {
+                if let Some((range, _, _)) = self.canvas_lines.iter().find(|(r, _, _)| {
+                    r.contains(&self.buffer.state.cursor) || r.end == self.buffer.state.cursor
+                }) {
+                    self.buffer.select(
+                        if key == "home" {
+                            range.start
+                        } else {
+                            range.end
+                        },
+                        mods.shift,
+                    );
+                }
             }
             "home" | "end" => {
                 self.buffer.select(
@@ -346,8 +406,25 @@ impl TextField {
                 self.marked = None;
                 changed = true;
             }
+            "enter" if self.buffer.multiline && !command => {
+                if self.marked.is_none() {
+                    self.buffer.replace(self.buffer.range(), "\n");
+                    changed = true;
+                }
+            }
+            "escape" if self.buffer.multiline => {
+                if self.marked.take().is_some() {
+                    cx.notify();
+                } else {
+                    self.emit(EventKind::Commit, cx);
+                    self.parent_focus.focus(window);
+                }
+            }
             "enter" => {
                 self.marked = None;
+                if self.buffer.multiline {
+                    self.emit(EventKind::Commit, cx);
+                }
                 self.parent_focus.focus(window);
             }
             "escape" => {
@@ -356,6 +433,10 @@ impl TextField {
                 self.marked = None;
                 self.emit(EventKind::Cancel, cx);
                 self.parent_focus.focus(window);
+            }
+            "tab" if self.buffer.multiline => {
+                self.buffer.replace(self.buffer.range(), "    ");
+                changed = true;
             }
             "tab" => {
                 if mods.shift {
@@ -373,6 +454,153 @@ impl TextField {
             cx.notify();
         }
         cx.stop_propagation();
+    }
+}
+
+impl TextField {
+    pub(crate) fn canvas_hit(&self, p: Point<Pixels>) -> bool {
+        self.bounds.is_some_and(|b| b.contains(&p))
+    }
+    pub(crate) fn canvas_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        if self.selecting && event.dragging() {
+            self.buffer.select(self.index(event.position), true);
+            self.blink = true;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+    pub(crate) fn canvas_release(&mut self) {
+        self.selecting = false;
+    }
+    fn canvas_cursor(&self, index: usize) -> Option<Point<Pixels>> {
+        let (r, line, p) = self
+            .canvas_lines
+            .iter()
+            .find(|(r, _, _)| index >= r.start && index <= r.end)
+            .or_else(|| self.canvas_lines.last())?;
+        Some(point(
+            p.x + line.x_for_index(index.saturating_sub(r.start).min(r.len())),
+            p.y,
+        ))
+    }
+    pub(crate) fn begin_canvas(
+        &mut self,
+        point: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_caret = point;
+        self.focus.focus(window);
+        self.update_focus(true, cx);
+    }
+    pub(crate) fn paint_canvas(
+        entity: &Entity<Self>,
+        mark: &crate::AnnotationMark,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let layout = crate::annotation_text::layout(mark, f32::from(bounds.size.width));
+        let origin = bounds.origin;
+        let actual = Bounds::new(origin, size(px(layout.width), px(layout.height)));
+        let focus = entity.read(cx).focus.clone();
+        let focused = focus.is_focused(window);
+        let mut lines = Vec::new();
+        for (row, l) in layout.lines.iter().enumerate() {
+            let text = &mark.text[l.range.clone()];
+            let run = TextRun {
+                len: text.len(),
+                font: crate::annotation_text::font(mark),
+                color: rgb(mark.color).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let line = window.text_system().shape_line(
+                text.to_owned().into(),
+                px(mark.font_size),
+                &[run],
+                None,
+            );
+            lines.push((
+                l.range.clone(),
+                line,
+                point(
+                    origin.x + px(layout.x(l, mark.text_alignment)),
+                    origin.y + px(row as f32 * layout.line_height),
+                ),
+            ));
+        }
+        entity.update(cx, |input, _| {
+            input.canvas_lines = lines;
+            input.canvas_line_height = px(layout.line_height);
+            input.bounds = Some(actual);
+            if let Some(p) = input.pending_caret.take() {
+                input.buffer.select(input.index(p), false);
+            }
+        });
+        let input = entity.read(cx);
+        let selection = input.buffer.range();
+        let lines = input.canvas_lines.clone();
+        let marked = input.marked.clone();
+        let blink = input.blink;
+        let caret = input.canvas_cursor(selection.start);
+        for (range, line, p) in &lines {
+            let start = selection.start.max(range.start);
+            let end = selection.end.min(range.end);
+            if start < end || (selection.start <= range.end && selection.end > range.end) {
+                let x0 = line.x_for_index(start.saturating_sub(range.start).min(range.len()));
+                let x1 = if selection.end > range.end {
+                    line.width + px(mark.font_size * 0.3)
+                } else {
+                    line.x_for_index(end.saturating_sub(range.start))
+                };
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(p.x + x0, p.y),
+                        size((x1 - x0).abs().max(px(2.)), px(layout.line_height)),
+                    ),
+                    rgba(0x2997ff55),
+                ));
+                let _ = line.paint(*p, px(layout.line_height), window, cx);
+            }
+            if let Some(marked) = &marked {
+                let a = marked.start.max(range.start);
+                let b = marked.end.min(range.end);
+                if a < b {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                p.x + line.x_for_index(a - range.start),
+                                p.y + px(layout.baseline + 2.),
+                            ),
+                            size(
+                                line.x_for_index(b - range.start)
+                                    - line.x_for_index(a - range.start),
+                                px(1.),
+                            ),
+                        ),
+                        rgb(0x2997ff),
+                    ));
+                }
+            }
+        }
+        if focused && blink && selection.is_empty() {
+            if let Some(p) = caret {
+                window.paint_quad(fill(
+                    Bounds::new(p, size(px(1.5), px(layout.line_height))),
+                    rgb(mark.color),
+                ));
+            }
+        }
+        window.handle_input(&focus, ElementInputHandler::new(actual, entity.clone()), cx);
+        let entity = entity.clone();
+        window.on_key_event(move |event: &KeyDownEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && entity.read(cx).focus.is_focused(window) {
+                entity.update(cx, |input, cx| input.key(event, window, cx));
+            }
+        });
     }
 }
 
@@ -454,8 +682,23 @@ impl EntityInputHandler for TextField {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let bounds = self.bounds?;
-        let line = self.layout.as_ref()?;
         let range = self.buffer.from_utf16(range);
+        if self.buffer.multiline {
+            let start = self.canvas_cursor(range.start)?;
+            let end = self.canvas_cursor(range.end).unwrap_or(start);
+            return Some(Bounds::new(
+                start,
+                size(
+                    if end.y == start.y {
+                        (end.x - start.x).abs().max(px(1.))
+                    } else {
+                        bounds.size.width
+                    },
+                    self.canvas_line_height,
+                ),
+            ));
+        }
+        let line = self.layout.as_ref()?;
         Some(Bounds::from_corners(
             point(
                 bounds.left() + line.x_for_index(range.start) - self.scroll,
@@ -538,7 +781,7 @@ impl Render for TextField {
                         let text: SharedString = if empty {
                             input.placeholder.clone()
                         } else {
-                            input.buffer.state.text.clone().into()
+                            input.buffer.state.text.replace(['\r', '\n'], " ").into()
                         };
                         let color = if empty {
                             rgb(0x85858c).into()
@@ -643,6 +886,22 @@ impl Render for TextField {
 #[cfg(test)]
 mod tests {
     use super::Buffer;
+    #[test]
+    fn canvas_buffer_preserves_paragraphs_and_undoes_selected_unicode_replacement() {
+        let mut b = Buffer::default();
+        b.multiline = true;
+        b.replace(0..0, "one\r\ntwo 👩‍💻");
+        assert_eq!(b.state.text, "one\ntwo 👩‍💻");
+        b.select(4, false);
+        b.select(7, true);
+        b.replace(b.range(), "three");
+        assert_eq!(b.state.text, "one\nthree 👩‍💻");
+        b.undo(false);
+        assert_eq!(b.state.text, "one\ntwo 👩‍💻");
+        b.select(b.state.text.len(), false);
+        b.delete(false, false);
+        assert_eq!(b.state.text, "one\ntwo ");
+    }
     #[test]
     fn editing_selection_clipboard_replacement_and_history() {
         let mut b = Buffer::default();

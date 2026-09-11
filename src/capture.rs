@@ -26,6 +26,110 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Disk access, probing, decoding, and timeline construction happen off the UI thread.
+pub(crate) struct PreparedVideoProject {
+    session: RecordingSession,
+    poster: image::RgbaImage,
+    source_duration: f64,
+    clip_timeline: RecordingClipTimeline,
+    pointer_capture: PointerCaptureFile,
+    saved_style: Option<SceneStyle>,
+    source_size: (u32, u32),
+    pointer_timeline: PointerTimeline,
+    zoom_cues: Vec<recording::viewport::ZoomCue>,
+    viewport_timeline: ViewportTimeline,
+    saved_extras: Option<RecordingExtras>,
+    saved_annotations: Vec<AnnotationMark>,
+    window_capture: bool,
+    pointer_synthesized: bool,
+    camera_path: Option<PathBuf>,
+}
+
+impl PreparedVideoProject {
+    pub(crate) fn load(directory: PathBuf) -> Result<Self, String> {
+        let session = RecordingSession { directory };
+        let mut manifest = session
+            .read_manifest()
+            .map_err(|error| format!("Could not open recording manifest: {error}"))?;
+        let media = probe_media(&session.screen_path()).ok();
+        if let Some(media) = media.as_ref() {
+            if manifest.pixel_width != media.width
+                || manifest.pixel_height != media.height
+                || (manifest.duration - media.duration).abs() > 0.001
+            {
+                manifest.pixel_width = media.width;
+                manifest.pixel_height = media.height;
+                manifest.duration = media.duration;
+                session
+                    .write_manifest(&manifest)
+                    .map_err(|error| format!("Could not repair recording manifest: {error}"))?;
+            }
+        }
+        // A poster is a disposable cache, never a project validity
+        // requirement. Repair it or decode directly from the master.
+        let poster =
+            load_or_rebuild_poster(&session.screen_path(), &session.poster_path(), 1280, 720)
+                .map_err(|error| format!("Could not decode recording preview: {error}"))?;
+        let source_duration = media
+            .as_ref()
+            .map(|media| media.duration)
+            .unwrap_or(manifest.duration)
+            .max(0.0);
+        let clip_timeline = session
+            .effective_clip_timeline(source_duration)
+            .map_err(|error| format!("Could not load recording edits: {error}"))?;
+        let pointer_capture = session.read_pointer_capture().unwrap_or_default();
+        let saved_style = session
+            .read_edit_field::<SceneStyle>("scene")
+            .ok()
+            .flatten();
+        let source_size = if media.as_ref().is_some_and(|media| media.window_capture) {
+            poster.dimensions()
+        } else { (manifest.pixel_width.max(1), manifest.pixel_height.max(1)) };
+        let pointer_timeline = PointerTimeline::build_with_clip_timeline(
+            pointer_capture.clone(),
+            source_duration,
+            source_size.0 as f64,
+            source_size.1 as f64,
+            saved_style
+                .as_ref()
+                .map(|style| style.pointer)
+                .unwrap_or_default()
+                .timeline_options(),
+            Some(&clip_timeline),
+        );
+        let generated_zoom_cues = synthesize_zoom_cues(&pointer_capture, source_duration);
+        let zoom_cues = session
+            .effective_zoom_cues()
+            .map_err(|error| format!("Could not load zoom edits: {error}"))?
+            .unwrap_or(generated_zoom_cues);
+        let viewport_timeline = ViewportTimeline::build(
+            &zoom_cues,
+            &pointer_timeline,
+            &clip_timeline,
+            &pointer_capture,
+        );
+        let saved_extras = session
+            .read_edit_field::<RecordingExtras>("lahzaExtras")
+            .ok()
+            .flatten();
+        let saved_annotations = session
+            .read_edit_field::<Vec<AnnotationMark>>("annotations")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let camera_path = session.camera_path();
+        let camera_path = camera_path.is_file().then_some(camera_path);
+        Ok(Self {
+            window_capture: media.as_ref().is_some_and(|media| media.window_capture),
+            pointer_synthesized: manifest.pointer_synthesized,
+            session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
+            source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
+            saved_annotations, camera_path,
+        })
+    }
+}
+
 impl Studio {
     pub(super) fn displayed_recording_elapsed(&self) -> Duration {
         self.recording_elapsed
@@ -190,25 +294,12 @@ impl Studio {
                             this.recording_started_at = None;
                             this.recording_session_path = path.clone();
                             this.launcher_active = false;
-                            this.toast = path.and_then(|path| {
-                                match this.open_video_project(path.clone()) {
-                                    Ok(()) => {
-                                        let mut message =
-                                            format!("Recording saved to {}", path.display());
-                                        if !warnings.is_empty() {
-                                            message.push_str(&format!(" — {}", warnings.join(" ")));
-                                        }
-                                        Some(message.into())
-                                    }
-                                    Err(error) => Some(
-                                        format!(
-                                            "Recording saved to {}, but Studio could not open it: {error}",
-                                            path.display()
-                                        )
-                                        .into(),
-                                    ),
-                                }
-                            });
+                            if let Some(path) = path {
+                                this.start_loading(crate::loading::LoadRequest::Recording(path.clone()), false, cx);
+                                let mut message = format!("Recording saved to {}", path.display());
+                                if !warnings.is_empty() { message.push_str(&format!(" — {}", warnings.join(" "))); }
+                                this.toast = Some(message.into());
+                            }
                         }
                         RecordingAction::Discard => {
                             this.recording_elapsed = Duration::ZERO;
@@ -345,92 +436,30 @@ impl Studio {
             };
             let _ = weak.update(cx, |this, cx| {
                 this.pause_video_playback();
-                match this.open_video_project(path.clone()) {
-                    Ok(()) => this.toast = None,
-                    Err(error) => {
-                        this.toast =
-                            Some(format!("Could not open {}: {error}", path.display()).into());
-                    }
-                }
+                this.start_loading(crate::loading::LoadRequest::Recording(path), false, cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    #[cfg(test)]
     pub(super) fn open_video_project(&mut self, directory: PathBuf) -> Result<(), String> {
-        let session = RecordingSession { directory };
-        let mut manifest = session
-            .read_manifest()
-            .map_err(|error| format!("Could not open recording manifest: {error}"))?;
-        let media = probe_media(&session.screen_path()).ok();
-        if let Some(media) = media.as_ref() {
-            if manifest.pixel_width != media.width
-                || manifest.pixel_height != media.height
-                || (manifest.duration - media.duration).abs() > 0.001
-            {
-                manifest.pixel_width = media.width;
-                manifest.pixel_height = media.height;
-                manifest.duration = media.duration;
-                session
-                    .write_manifest(&manifest)
-                    .map_err(|error| format!("Could not repair recording manifest: {error}"))?;
-            }
-        }
-        // A poster is a disposable cache, never a project validity
-        // requirement. Repair it or decode directly from the master.
-        let poster =
-            load_or_rebuild_poster(&session.screen_path(), &session.poster_path(), 1280, 720)
-                .map_err(|error| format!("Could not decode recording preview: {error}"))?;
-        self.video_playback_generation
-            .fetch_add(1, Ordering::SeqCst);
-        let source_duration = media
-            .as_ref()
-            .map(|media| media.duration)
-            .unwrap_or(manifest.duration)
-            .max(0.0);
-        let clip_timeline = session
-            .effective_clip_timeline(source_duration)
-            .map_err(|error| format!("Could not load recording edits: {error}"))?;
-        let pointer_capture = session.read_pointer_capture().unwrap_or_default();
-        let saved_style = session
-            .read_edit_field::<SceneStyle>("scene")
-            .ok()
-            .flatten();
-        let source_size = if media.as_ref().is_some_and(|media| media.window_capture) {
-            poster.dimensions()
-        } else { (manifest.pixel_width.max(1), manifest.pixel_height.max(1)) };
-        let pointer_timeline = PointerTimeline::build_with_clip_timeline(
-            pointer_capture.clone(),
-            source_duration,
-            source_size.0 as f64,
-            source_size.1 as f64,
-            saved_style
-                .as_ref()
-                .map(|style| style.pointer)
-                .unwrap_or_default()
-                .timeline_options(),
-            Some(&clip_timeline),
-        );
-        let generated_zoom_cues = synthesize_zoom_cues(&pointer_capture, source_duration);
-        let zoom_cues = session
-            .effective_zoom_cues()
-            .map_err(|error| format!("Could not load zoom edits: {error}"))?
-            .unwrap_or(generated_zoom_cues);
-        let viewport_timeline = ViewportTimeline::build(
-            &zoom_cues,
-            &pointer_timeline,
-            &clip_timeline,
-            &pointer_capture,
-        );
-        let saved_extras = session
-            .read_edit_field::<RecordingExtras>("lahzaExtras")
-            .ok()
-            .flatten();
+        self.apply_video_project(PreparedVideoProject::load(directory)?);
+        Ok(())
+    }
+
+    pub(crate) fn apply_video_project(&mut self, prepared: PreparedVideoProject) {
+        let PreparedVideoProject {
+            session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
+            source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
+            saved_annotations, window_capture, pointer_synthesized, camera_path,
+        } = prepared;
+        self.video_playback_generation.fetch_add(1, Ordering::SeqCst);
         if self.animation_active {
             self.exit_animation();
         }
-        self.video_window_capture = media.as_ref().is_some_and(|media| media.window_capture);
+        self.video_window_capture = window_capture;
         self.video_source_size = source_size;
         self.motion_pick = MotionPick::Focus;
         if self.video_project.is_none() {
@@ -444,7 +473,7 @@ impl Studio {
         self.set_video_frame(poster);
         self.video_pointer_timeline = pointer_timeline;
         self.video_viewport_timeline = viewport_timeline;
-        self.video_pointer_synthesized = manifest.pointer_synthesized;
+        self.video_pointer_synthesized = pointer_synthesized;
         self.video_source_duration = source_duration;
         self.video_duration = clip_timeline.duration();
         self.video_position = 0.0;
@@ -463,12 +492,6 @@ impl Studio {
         self.video_timeline_zoom = 1.0;
         self.video_timeline_scroll = 0.0;
         // Scene settings and Lahza extras saved with this project.
-        let session = self.video_project.clone().expect("project was just opened");
-        let saved_annotations = session
-            .read_edit_field::<Vec<AnnotationMark>>("annotations")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
         self.video_press_times = pointer_capture
             .presses
             .iter()
@@ -494,8 +517,7 @@ impl Studio {
         let thumbnails = self.video_thumbnails.drain(..).collect::<Vec<_>>();
         self.retired_images.extend(thumbnails);
         self.video_extras_pending = true;
-        let camera_path = session.camera_path();
-        self.video_camera_path = camera_path.is_file().then_some(camera_path);
+        self.video_camera_path = camera_path;
         self.camera_frame_rgba = None;
         self.camera_decoded_time = -1.0;
         self.scene_selection = SceneSelection::Scene;
@@ -505,58 +527,58 @@ impl Studio {
         if !self.video_removed_presses.is_empty() {
             self.rebuild_video_motion_timelines();
         }
-        Ok(())
     }
 
     pub(super) fn finish_capture_request(&mut self, result: Result<PathBuf, String>) {
         self.capturing = false;
-        match result {
-            Ok(path) => {
-                self.launcher_active = false;
-                self.captured_dimensions = image::image_dimensions(&path).ok();
-                let image = self.displayed_capture_image.take();
-                self.retired_images.extend(image);
-                self.capture_rgba = None;
-                if let Ok(image) = image::open(&path) {
-                    self.set_capture_image(image.to_rgba8());
-                }
-                self.scene_selection = SceneSelection::Scene;
-                self.media_drag = None;
-                self.captured_path = Some(path);
-                self.processed_capture_path = None;
-                self.annotations.clear();
-                self.undo_stack.clear();
-                self.redo_stack.clear();
-                self.original_capture = None;
-                self.source_crop = CropRect::UNIT;
-                self.crop_session = None;
-                self.crop_undo_stack.clear();
-                self.crop_redo_stack.clear();
-                self.crop_active = false;
-                self.crop_rect = CropRect::UNIT;
-                self.annotation_draft = None;
-                self.selected_annotation = None;
-                // A new capture starts static; its motion regions start fresh.
-                if self.animation_active {
-                    self.exit_animation();
-                }
-                self.video_zoom_cues.clear();
-                self.animation_preset = None;
-                self.animation_image_start = 0.0;
-                self.animation_image_end = self.animation_duration;
-                let scenes = self.image_scenes.drain(..).map(|scene| scene.render);
-                self.retired_images.extend(scenes);
-                self.image_scene_index = 0;
-                self.walkthrough_stops.clear();
-                self.walkthrough_mode = false;
-                self.animation_pointer_capture = PointerCaptureFile::default();
-                self.video_pointer_timeline = PointerTimeline::default();
-                self.toast = Some("Screenshot captured — editing controls are active".into());
-            }
-            Err(error) => {
-                self.toast = Some(format!("Capture failed or was cancelled: {error}").into());
-            }
+        match result.and_then(|path| {
+            image::open(&path).map(|image| (path, image.to_rgba8()))
+                .map_err(|error| format!("Could not decode screenshot: {error}"))
+        }) {
+            Ok((path, image)) => self.apply_capture_image(path, image),
+            Err(error) => self.toast = Some(format!("Capture failed or was cancelled: {error}").into()),
         }
+    }
+
+    pub(crate) fn apply_capture_image(&mut self, path: PathBuf, pixels: image::RgbaImage) {
+        self.capturing = false;
+        self.launcher_active = false;
+        self.captured_dimensions = Some(pixels.dimensions());
+        let image = self.displayed_capture_image.take();
+        self.retired_images.extend(image);
+        self.set_capture_image(pixels);
+        self.scene_selection = SceneSelection::Scene;
+        self.media_drag = None;
+        self.captured_path = Some(path);
+        self.processed_capture_path = None;
+        self.annotations.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.original_capture = None;
+        self.source_crop = CropRect::UNIT;
+        self.crop_session = None;
+        self.crop_undo_stack.clear();
+        self.crop_redo_stack.clear();
+        self.crop_active = false;
+        self.crop_rect = CropRect::UNIT;
+        self.annotation_draft = None;
+        self.selected_annotation = None;
+        // A new capture starts static; its motion regions start fresh.
+        if self.animation_active {
+            self.exit_animation();
+        }
+        self.video_zoom_cues.clear();
+        self.animation_preset = None;
+        self.animation_image_start = 0.0;
+        self.animation_image_end = self.animation_duration;
+        let scenes = self.image_scenes.drain(..).map(|scene| scene.render);
+        self.retired_images.extend(scenes);
+        self.image_scene_index = 0;
+        self.walkthrough_stops.clear();
+        self.walkthrough_mode = false;
+        self.animation_pointer_capture = PointerCaptureFile::default();
+        self.video_pointer_timeline = PointerTimeline::default();
+        self.toast = Some("Screenshot captured — editing controls are active".into());
     }
 
     pub(super) fn begin_screen_capture(&mut self, cx: &mut Context<Self>) {

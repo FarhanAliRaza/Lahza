@@ -1,0 +1,18 @@
+[package]
+name = "lahza-annotations"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Annotation models, drawing, text, snapping, animation, and rendering for Lahza"
+
+[dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["wayland", "x11"] }
+image = "=0.25.10"
+lyon = "=1.0.19"
+resvg = { version = "=0.45.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+rustybuzz = "=0.20.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+unicode-segmentation = "=1.13.3"
+
+[dev-dependencies]
+serde_json = "=1.0.151"

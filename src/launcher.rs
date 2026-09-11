@@ -557,6 +557,7 @@ impl Studio {
                             cx.notify();
                         }),
                     ))
+                    .child(crate::theme::credit_footer())
                     .into_any_element()
             } else {
                 div()

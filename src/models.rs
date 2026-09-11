@@ -1,4 +1,6 @@
-//! Shared annotation, image-scene, crop, and video-editing data models.
+//! Image-scene, crop, and video-editing data models.
+
+pub(crate) use lahza_annotations::{AnnotationMark, AnnotationWorkspace, NormPoint, Tool, ANNOTATION_COLORS};
 
 use crate::{
     recording::{
@@ -8,146 +10,11 @@ use crate::{
         pointer_timeline::PointerTimeline,
         viewport::{MotionPreset, ViewportTimeline, ZoomCue},
     },
-    timed::AnnotationTiming,
 };
 use gpui::{Pixels, RenderImage};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 use uuid::Uuid;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum Tool {
-    Select,
-    Rectangle,
-    FilledRectangle,
-    Ellipse,
-    Line,
-    Arrow,
-    Pen,
-    Number,
-    Text,
-    Pixelate,
-    Blur,
-    Highlight,
-}
-
-impl Tool {
-    pub(crate) const ALL: [(Tool, &'static str); 12] = [
-        (Tool::Select, "icons/select.svg"),
-        (Tool::Rectangle, "icons/rectangle.svg"),
-        (Tool::FilledRectangle, "icons/filled-rectangle.svg"),
-        (Tool::Ellipse, "icons/ellipse.svg"),
-        (Tool::Line, "icons/line.svg"),
-        (Tool::Arrow, "icons/arrow.svg"),
-        (Tool::Pen, "icons/pen.svg"),
-        (Tool::Number, "icons/number.svg"),
-        (Tool::Text, "icons/text.svg"),
-        (Tool::Pixelate, "icons/pixelate.svg"),
-        (Tool::Blur, "icons/blur.svg"),
-        (Tool::Highlight, "icons/highlight.svg"),
-    ];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Tool::Select => "Select",
-            Tool::Rectangle => "Rectangle",
-            Tool::FilledRectangle => "Filled rectangle",
-            Tool::Ellipse => "Ellipse",
-            Tool::Line => "Line",
-            Tool::Arrow => "Arrow",
-            Tool::Pen => "Pen",
-            Tool::Number => "Number",
-            Tool::Text => "Text",
-            Tool::Pixelate => "Pixelate",
-            Tool::Blur => "Blur",
-            Tool::Highlight => "Highlight",
-        }
-    }
-
-    pub(crate) fn help_text(self) -> &'static str {
-        match self {
-            Tool::Select => "Select and move an existing annotation",
-            Tool::Rectangle => "Drag to draw an outlined rectangle",
-            Tool::FilledRectangle => "Drag to draw a solid rectangle",
-            Tool::Ellipse => "Drag to draw a circle or ellipse",
-            Tool::Line => "Drag between two endpoints for a straight line",
-            Tool::Arrow => "Drag from the tail toward the arrow point",
-            Tool::Pen => "Hold and drag to draw a freehand stroke",
-            Tool::Number => "Click to place the next numbered circle",
-            Tool::Text => "Click to place a text annotation",
-            Tool::Pixelate => "Drag over an area to hide it with pixels",
-            Tool::Blur => "Drag over an area to obscure it with blur",
-            Tool::Highlight => "Drag an area to keep visible; everything outside is dimmed",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub(crate) struct AnnotationMark {
-    pub(crate) tool: Tool,
-    pub(crate) start: NormPoint,
-    pub(crate) end: NormPoint,
-    pub(crate) points: Vec<NormPoint>,
-    pub(crate) number: usize,
-    pub(crate) color: u32,
-    pub(crate) stroke_width: f32,
-    pub(crate) density: f32,
-    pub(crate) text: String,
-    pub(crate) font_size: f32,
-    pub(crate) font_family: u8,
-    pub(crate) text_alignment: u8,
-    pub(crate) bold: bool,
-    pub(crate) italic: bool,
-    pub(crate) underline: bool,
-    /// When the scene is animated: when and how the mark appears.
-    pub(crate) timing: Option<AnnotationTiming>,
-    /// Painted opacity (animation applies its fade here).
-    pub(crate) opacity: f32,
-    /// Placed by a template; replaced when another template is applied.
-    pub(crate) from_template: bool,
-    /// Anchored to the visible frame instead of the media, so camera motion
-    /// pans beneath it (captions, step numbers).
-    pub(crate) pinned: bool,
-    /// Positioned on the scene canvas, independent of media placement and lifetime.
-    pub(crate) canvas: bool,
-}
-
-impl AnnotationMark {
-    /// Template captions belong to the full scene, including in projects saved
-    /// before templates explicitly set `canvas`. Media callouts stay attached.
-    pub(crate) fn is_canvas(&self) -> bool {
-        self.canvas || (self.from_template && self.tool == Tool::Text)
-    }
-}
-
-impl Default for AnnotationMark {
-    fn default() -> Self {
-        Self {
-            tool: Tool::Rectangle,
-            start: NormPoint::default(),
-            end: NormPoint::default(),
-            points: Vec::new(),
-            number: 1,
-            color: ANNOTATION_COLORS[1].1,
-            stroke_width: 4.0,
-            density: 0.5,
-            text: String::new(),
-            font_size: 24.0,
-            font_family: 0,
-            text_alignment: 0,
-            bold: false,
-            italic: false,
-            underline: false,
-            timing: None,
-            opacity: 1.0,
-            from_template: false,
-            pinned: false,
-            canvas: false,
-        }
-    }
-}
 
 /// One image of an animated scene sequence: everything the editor needs to
 /// bring it back, stored while another image is being edited.
@@ -170,21 +37,6 @@ pub(crate) struct ImageScene {
     pub(crate) walkthrough_stops: Vec<recording::model::NormalizedPoint>,
     pub(crate) viewport: ViewportTimeline,
     pub(crate) pointer: Option<PointerTimeline>,
-}
-
-/// Annotations plus their undo history, so the screenshot editor's marks
-/// survive a detour through the recording editor (which has its own set).
-#[derive(Clone, Debug, Default)]
-pub(crate) struct AnnotationWorkspace {
-    pub(crate) marks: Vec<AnnotationMark>,
-    pub(crate) undo: Vec<Vec<AnnotationMark>>,
-    pub(crate) redo: Vec<Vec<AnnotationMark>>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct NormPoint {
-    pub(crate) x: f32,
-    pub(crate) y: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -340,16 +192,3 @@ pub(crate) enum VideoEditSnapshot {
     Clips { timeline: RecordingClipTimeline, annotations: Vec<AnnotationMark> },
     Zoom(Vec<ZoomCue>),
 }
-
-pub(crate) const ANNOTATION_COLORS: [(&str, u32); 10] = [
-    ("Black", 0x050506),
-    ("Red", 0xf73833),
-    ("Orange", 0xff8714),
-    ("Yellow", 0xffd12e),
-    ("Green", 0x2eb85c),
-    ("Turquoise", 0x33c4b8),
-    ("Blue", 0x2e7aff),
-    ("Purple", 0x8c4cf2),
-    ("Pink", 0xff2e6e),
-    ("White", 0xf5f5f5),
-];

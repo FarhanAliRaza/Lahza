@@ -3167,6 +3167,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-video",
  "image",
+ "lahza-annotations",
  "libc",
  "libspa-sys",
  "pipewire",
@@ -3176,6 +3177,20 @@ dependencies = [
  "unicode-segmentation",
  "uuid",
  "x11rb",
+]
+
+[[package]]
+name = "lahza-annotations"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "image",
+ "lyon",
+ "resvg",
+ "rustybuzz 0.20.1",
+ "serde",
+ "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]

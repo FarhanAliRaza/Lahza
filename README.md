@@ -41,6 +41,9 @@ Style your captures with backgrounds, rounded corners, shadows, and window frame
 
 ### Annotate screenshots and videos
 
+Annotations move and resize freely by default. Hold **Ctrl** to align with
+image/canvas guides while moving or resizing.
+
 ![Lahza annotation tools with text styling and timed captions on the video timeline](docs/screenshots/05-annotations.png)
 
 Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive details, crop screenshots, and animate annotations with custom timing.
@@ -147,8 +150,10 @@ Log out and back in so GNOME Shell discovers the extension. It remains idle unle
 
 `src/main.rs` owns application startup, shared Studio state, and editor coordination. Editor behavior is split by responsibility:
 
-- `models.rs`: annotation, crop, and timeline editing data types.
-- `annotations.rs` and `crop.rs`: editing operations, geometry, painting, and related tests.
+- [`crates/annotations`](crates/annotations): shared annotation models, geometry, snapping, text layout, painting, export, and animation, with its own fonts and fixtures.
+- `models.rs`: crop, scene, and timeline editing data types.
+- `annotations.rs` and `timed.rs`: connect the annotation crate to Studio input, selection, undo, and video timing.
+- `crop.rs`: crop editing operations and painting.
 - `capture.rs`: recording lifecycle, project loading, and screenshot capture.
 - `video.rs`: timeline editing and playback.
 - `controls.rs`, `preview.rs`, and `launcher.rs`: editor controls, canvas layout, and launcher UI.
@@ -159,8 +164,10 @@ The existing `recording/` modules own media processing and persistence. Keep new
 ### Development checks
 
 ```bash
-cargo check --locked
-cargo test --release --locked
+cargo check --locked --workspace
+cargo test --release --locked --workspace
+# Annotation engine only:
+cargo test --locked -p lahza-annotations
 ```
 
 Export integration tests require FFmpeg/FFprobe. Desktop capture and playback also need manual testing in a real Linux desktop session.

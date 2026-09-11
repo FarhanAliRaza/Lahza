@@ -187,11 +187,7 @@ impl Studio {
             }
             EditorMode::Video => match self.last_video_project.clone() {
                 Some(directory) => {
-                    if let Err(error) = self.open_video_project(directory.clone()) {
-                        self.last_video_project = None;
-                        self.toast =
-                            Some(format!("Could not open {}: {error}", directory.display()).into());
-                    }
+                    self.start_loading(crate::loading::LoadRequest::Recording(directory), false, cx);
                 }
                 None => self.open_video_project_dialog(cx),
             },
@@ -754,6 +750,8 @@ impl Studio {
     }
 
     fn select_inspector_tab(&mut self, tab: InspectorTab) {
+        self.annotation_editing_time = None;
+        self.annotation_edit_preview_pending = false;
         self.stop_editing_text();
         self.selected_annotation = None;
         self.annotation_draft = None;
@@ -1037,83 +1035,169 @@ impl Studio {
         let selected = self
             .selected_annotation
             .filter(|index| *index < self.annotations.len());
-        let timing = self.annotation_timing_inspector(cx);
+        let selected_indices = self.annotation_selected_indices();
+        let selection_count = selected_indices.len();
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .when(selected.is_some() || self.tool != Tool::Select, |this| {
+            .child(self.video_annotate_section(cx))
+            .when(selection_count > 1, |this| {
                 this.child(
                     div()
                         .flex()
+                        .flex_none()
                         .items_center()
+                        .justify_between()
                         .gap_2()
-                        .when(selected.is_some(), |this| {
-                            this.child(self.selection_action_button(
-                                "annotation-delete",
-                                true,
-                                true,
-                                cx,
-                                |this, _| {
-                                    if let Some(index) = this.selected_annotation.take() {
-                                        if index < this.annotations.len() {
-                                            this.record_annotation_undo();
-                                            this.annotations.remove(index);
-                                        }
-                                    }
-                                },
-                            ))
-                        })
-                        .child(self.selection_action_button(
-                            "annotation-done",
-                            false,
+                        .child(div().text_xs().text_color(muted()).child(format!("{selection_count} selected")))
+                        .child(self.small_button(
+                            "annotation-delete-selection",
+                            if selection_count == self.annotations.len() { "Delete all" } else { "Delete selected" },
                             true,
                             cx,
                             |this, _| {
-                                this.stop_editing_text();
-                                this.selected_annotation = None;
-                                this.tool = Tool::Select;
+                                if this.delete_selected_annotations() && this.processed_capture_path.is_some() {
+                                    if let Err(error) = this.rebuild_redactions() {
+                                        this.toast = Some(error.into());
+                                    }
+                                }
                             },
                         )),
                 )
             })
-            .child(self.video_annotate_section(cx))
-            .when(selected.is_none() && self.tool == Tool::Select, |this| {
-                this.when(!self.annotations.is_empty(), |this| {
-                    this.child(div().text_sm().text_color(muted()).child(
-                        "Select an annotation on the canvas or below to edit its properties.",
-                    ))
-                })
-                .children(self.annotations.iter().enumerate().map(|(index, mark)| {
-                    div()
-                        .id(("annotation-list", index))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0xf0f1f3))
-                        .text_sm()
-                        .cursor_pointer()
-                        .child(format!("{} · {}", index + 1, mark.tool.label()))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.stop_editing_text();
-                            this.selected_annotation = Some(index);
-                            this.tool = Tool::Select;
-                            cx.notify();
-                        }))
-                }))
-            })
-            .when(selected.is_some() || self.tool != Tool::Select, |this| {
+            .when(selected.is_none() && self.tool != Tool::Select, |this| {
                 this.child(
-                    div().text_sm().font_weight(FontWeight::SEMIBOLD).child(
-                        selected
-                            .map(|index| self.annotations[index].tool.label())
-                            .unwrap_or(self.tool.label()),
-                    ),
+                    div()
+                        .flex()
+                        .flex_none()
+                        .flex_col()
+                        .gap_2()
+                        .child(Self::tab_label(self.tool.label()))
+                        .child(self.annotation_style_controls(cx)),
                 )
-                .child(Self::tab_label("Appearance"))
-                .child(self.annotation_style_controls(cx))
             })
-            .when_some(timing, |this, panel| this.child(panel))
+            .children(self.annotations.iter().enumerate().map(|(index, mark)| {
+                let open = selected == Some(index);
+                let title = if mark.tool == Tool::Text && !mark.text.trim().is_empty() {
+                    mark.text.split_whitespace().collect::<Vec<_>>().join(" ")
+                } else {
+                    format!("{} {}", mark.tool.label(), index + 1)
+                };
+                div()
+                    .id(("annotation-card", index))
+                    .flex()
+                    .flex_none()
+                    .flex_col()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .rounded_md()
+                            .bg(if selected_indices.contains(&index) { rgb(0xe7f1ff) } else { rgb(0xf0f1f3) })
+                            .child(
+                                div()
+                                    .id(("annotation-list", index))
+                                    .anchor_scroll(
+                                        open.then(|| self.annotation_inspector_anchor.clone()),
+                                    )
+                                    .flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .h(px(40.0))
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .child(
+                                        svg()
+                                            .path(if open {
+                                                "icons/chevron-down.svg"
+                                            } else {
+                                                "icons/chevron-right.svg"
+                                            })
+                                            .size(px(14.0))
+                                            .flex_none()
+                                            .text_color(muted()),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path(
+                                                Tool::ALL
+                                                    .iter()
+                                                    .find(|(tool, _)| *tool == mark.tool)
+                                                    .unwrap()
+                                                    .1,
+                                            )
+                                            .size(px(16.0))
+                                            .flex_none()
+                                            .text_color(ink()),
+                                    )
+                                    .child(
+                                        div().flex_1().min_w_0().text_sm().truncate().child(title),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if this.selected_annotation == Some(index) {
+                                            this.finish_annotation_interaction();
+                                        } else {
+                                            this.select_annotation_for_timing(index);
+                                            this.annotation_inspector_anchor.scroll_to(window, cx);
+                                        }
+                                        this.tool = Tool::Select;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("annotation-row-delete", index))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(32.0))
+                                    .mr_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0xfee2e2)))
+                                    .child(
+                                        svg()
+                                            .path("icons/trash.svg")
+                                            .size(px(14.0))
+                                            .text_color(muted()),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_annotation_for_timing(index);
+                                        if this.delete_selected_annotations()
+                                            && this.processed_capture_path.is_some()
+                                        {
+                                            if let Err(error) = this.rebuild_redactions() {
+                                                this.toast = Some(error.into());
+                                            }
+                                        }
+                                        this.tool = Tool::Select;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .when(open, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .flex_col()
+                                .gap_3()
+                                .py_3()
+                                .child(self.annotation_style_controls(cx))
+                                .when_some(self.annotation_timing_inspector(cx), |this, panel| {
+                                    this.child(panel)
+                                }),
+                        )
+                    })
+            }))
             .into_any_element()
     }
 
@@ -1504,13 +1588,15 @@ impl Studio {
             .child(
                 div()
                     .id("inspector-scroll")
+                    .track_scroll(&self.inspector_scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_5()
                     .flex()
                     .flex_col()
-                    .child(div().flex_none().w_full().child(body)),
+                    .child(div().flex_none().w_full().child(body))
+                    .child(div().flex_none().mt_5().child(crate::theme::credit_footer())),
             )
             .when(self.crop_active, |this| {
                 this.opacity(0.52).child(

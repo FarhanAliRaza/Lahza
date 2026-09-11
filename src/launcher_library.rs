@@ -179,15 +179,9 @@ impl Studio {
                             .text_color(blue()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if projects {
-                            if let Err(error) = this.open_video_project(path.clone()) {
-                                this.toast = Some(error.into());
-                            } else {
-                                this.launcher_active = false;
-                            }
-                        } else {
-                            this.finish_capture_request(Ok(path.clone()));
-                        }
+                        let request = if projects { crate::loading::LoadRequest::Recording(path.clone()) }
+                            else { crate::loading::LoadRequest::Image(path.clone()) };
+                        this.start_loading(request, false, cx);
                         cx.notify();
                     })),
             )

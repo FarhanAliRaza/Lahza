@@ -2101,58 +2101,8 @@ fn render_watermark(watermark: &Watermark, width: u32, height: u32) -> Result<Rg
     render_svg_layer(&svg, width, height)
 }
 
-/// Bundled and system fonts loaded once and shared by every SVG render (loading them
-/// per frame would dominate watermark and annotation rendering).
-pub fn shared_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
-    static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
-        std::sync::OnceLock::new();
-    FONTS
-        .get_or_init(|| {
-            let mut database = resvg::usvg::fontdb::Database::new();
-            database.load_system_fonts();
-            for bytes in crate::fonts::HANDWRITTEN_FONTS {
-                database.load_font_data(bytes.to_vec());
-            }
-            std::sync::Arc::new(database)
-        })
-        .clone()
-}
-
-/// Renders SVG markup to a straight-alpha RGBA layer.
-pub fn render_svg_layer(svg: &str, width: u32, height: u32) -> Result<RgbaImage, String> {
-    let mut options = resvg::usvg::Options::default();
-    options.fontdb = shared_fontdb();
-    let tree = resvg::usvg::Tree::from_str(svg, &options)
-        .map_err(|error| format!("could not parse overlay: {error}"))?;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
-        .ok_or_else(|| "overlay dimensions are too large".to_string())?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::identity(),
-        &mut pixmap.as_mut(),
-    );
-    let mut data = pixmap.take();
-    // tiny-skia stores premultiplied alpha; the compositor expects straight.
-    for pixel in data.chunks_exact_mut(4) {
-        let alpha = pixel[3] as u32;
-        if alpha > 0 && alpha < 255 {
-            for channel in pixel.iter_mut().take(3) {
-                *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
-            }
-        }
-    }
-    RgbaImage::from_raw(width, height, data)
-        .ok_or_else(|| "overlay had an invalid byte count".to_string())
-}
-
-pub fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
+pub use lahza_annotations::fonts::shared_fontdb;
+pub use lahza_annotations::svg::{render_svg_layer, xml_escape};
 
 fn paint_shadow(
     image: &mut RgbaImage,

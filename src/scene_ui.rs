@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    annotations_svg, blue, cached_render_image, ink, line, muted, paint_annotation,
+    blue, cached_render_image, ink, line, muted, paint_annotation,
     paint_highlights,
     recording::{
         cursor_assets::CursorFamily,
@@ -24,7 +24,7 @@ use crate::{
         model::NormalizedPoint,
         presets::ScenePreset,
         scene::{
-            render_svg_layer, MediaProjection, PointerMotion, PointerOverlay, SceneCompositor,
+            MediaProjection, PointerMotion, PointerOverlay, SceneCompositor,
             SceneGeometry, SceneStyle, SceneTransform, WatermarkPosition,
         },
         viewport::{MotionEasing, ViewportFrame, ViewportTimeline},
@@ -32,6 +32,28 @@ use crate::{
     timed::{self, AnnotationTiming, EntranceEffect, ExitEffect},
     AnnotationMark, SliderDrag, Studio, Tool, BACKGROUND_PRESETS,
 };
+
+/// Pack non-overlapping intervals together without ever stacking busy rows.
+fn annotation_lane_rows(marks: &[AnnotationMark], duration: f64) -> Vec<usize> {
+    let span = |mark: &AnnotationMark| mark.timing
+        .map(|timing| (timing.start, timing.end))
+        .unwrap_or((0.0, duration.max(f64::EPSILON)));
+    let mut order: Vec<_> = (0..marks.len()).collect();
+    order.sort_by(|a, b| span(&marks[*a]).0.total_cmp(&span(&marks[*b]).0));
+    let mut row_ends = Vec::new();
+    let mut rows = vec![0; marks.len()];
+    for index in order {
+        let (start, end) = span(&marks[index]);
+        let row = row_ends.iter().position(|row_end| *row_end <= start)
+            .unwrap_or_else(|| {
+                row_ends.push(f64::NEG_INFINITY);
+                row_ends.len() - 1
+            });
+        row_ends[row] = end;
+        rows[index] = row;
+    }
+    rows
+}
 
 /// Which part of the scene the inspector is editing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -303,6 +325,7 @@ impl SceneSlider {
                     if let Some(timing) = mark.timing.as_mut() {
                         timing.transition = value;
                         *timing = timing.clamped(duration);
+                        studio.annotation_edit_preview_pending = true;
                     }
                 }
             }
@@ -345,6 +368,138 @@ pub(crate) const CLICK_COLORS: [u32; 6] =
 #[cfg(test)]
 mod motion_picking_tests {
     use super::*;
+
+    #[test]
+    fn annotation_preview_texture_is_bounded_without_upscaling() {
+        assert_eq!(annotation_preview_size((3840, 2160), (960, 540)), (1440, 810));
+        assert_eq!(annotation_preview_size((3840, 2160), (480, 270)), (720, 405));
+        assert_eq!(annotation_preview_size((800, 600), (960, 540)), (800, 600));
+        assert_eq!(annotation_preview_size((2160, 3840), (540, 960)), (810, 1440));
+    }
+
+    #[test]
+    #[ignore = "requires a display (Xvfb) and FFmpeg"]
+    fn video_annotations_edit_at_the_chosen_frame_and_animate_when_scrubbing() {
+        use crate::*;
+        let directory = std::env::temp_dir().join(format!("lahza-annotation-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let session = RecordingSession { directory: directory.clone() };
+        assert!(std::process::Command::new("ffmpeg").args([
+            "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=800x450:rate=10",
+            "-t", "5", "-c:v", "libx264", "-preset", "ultrafast", "-y",
+        ]).arg(session.screen_path()).status().unwrap().success());
+        session.write_manifest(&crate::recording::model::CaptureManifest::default()).unwrap();
+        let project = directory.clone();
+        Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+            let handle = open_studio_window(cx, true, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            handle.update(cx, |studio, _, cx| {
+                studio.open_video_project(project).unwrap();
+                let bounds = Bounds::new(point(px(0.), px(0.)), size(px(800.), px(450.)));
+                studio.video_position = 1.0;
+                studio.video_playing = true;
+                studio.tool = Tool::Pen;
+                studio.pointer_down(point(px(100.), px(100.)), bounds, &[], 1);
+                studio.pointer_move(point(px(200.), px(150.)), bounds);
+                assert!(!studio.video_playing, "drawing pauses the transport");
+                let draft = studio.annotation_draft.clone().unwrap();
+                assert_eq!(timed::editor_mark(&draft, 1.0, studio.annotation_is_live(0)), Some(draft));
+                let frame = studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                let tick = std::time::Instant::now();
+                for n in 0..30 {
+                    studio.pointer_move(point(px(210. + n as f32), px(160.)), bounds);
+                    let next = studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                    assert!(Arc::ptr_eq(&frame, &next), "flat pen samples must not recompose the video");
+                }
+                eprintln!("30 video pen samples with cached preview: {:?}", tick.elapsed());
+                let (_, layer) = studio.preview_overlay(1.0, (480, 270)).unwrap();
+                assert!(layer.pixels().any(|p| p[3] > 0), "the projected path must include live drafts too");
+                studio.pointer_up(point(px(240.), px(160.)), bounds);
+                assert_eq!(studio.video_undo_stack.len(), 1);
+                studio.update_annotation_edit_preview();
+                assert_eq!(studio.video_position, 1.0, "finishing a stroke must not seek");
+                assert!(studio.annotation_is_live(0), "the completed stroke stays visible for editing");
+                let generation = studio.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst);
+                studio.update_annotation_edit_preview();
+                assert_eq!(studio.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst), generation);
+                let first_timing = studio.annotations[0].timing;
+                studio.pointer_down(point(px(300.), px(100.)), bounds, &[], 1);
+                studio.pointer_move(point(px(400.), px(160.)), bounds);
+                studio.pointer_up(point(px(400.), px(160.)), bounds);
+                studio.update_annotation_edit_preview();
+                assert_eq!(studio.annotations[1].timing, first_timing, "successive strokes stay together in time");
+                assert_eq!(studio.video_position, 1.0);
+                assert_eq!(studio.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst), generation,
+                    "the next stroke must not cancel the pending frame decode");
+                assert!(studio.annotation_is_live(0) && studio.annotation_is_live(1),
+                    "all annotations under the playhead stay complete while authoring");
+                let mut future = studio.annotations[0].clone();
+                future.timing = Some(AnnotationTiming { start: 3., end: 4., ..Default::default() });
+                studio.annotations.push(future);
+                assert!(!studio.annotation_is_live(2), "editing must not reveal future annotations");
+                studio.annotations.pop();
+                studio.video_playing = true;
+                assert!(!studio.annotation_is_live(0), "playback always uses real animation");
+                studio.video_playing = false;
+                studio.seek_video(1.1, cx);
+                assert!(!studio.annotation_is_live(0) && !studio.annotation_is_live(1));
+                assert_eq!(timed::editor_mark(&studio.annotations[0], 1.1, studio.annotation_is_live(0)),
+                    timed::animated_mark(&studio.annotations[0], 1.1));
+                let generation = studio.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst);
+                studio.select_annotation_for_timing(0);
+                studio.update_annotation_edit_preview();
+                assert_eq!(studio.video_position, 1.1, "selecting for editing must not seek");
+                assert!(studio.annotation_is_live(0) && studio.annotation_is_live(1));
+                assert_eq!(studio.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst), generation);
+
+                studio.seek_video(studio.video_duration, cx);
+                studio.tool = Tool::Text;
+                studio.canvas_annotation_drag = true;
+                studio.pointer_down(point(px(300.), px(220.)), bounds, &[], 1);
+                studio.pointer_up(point(px(300.), px(220.)), bounds);
+                studio.canvas_annotation_drag = false;
+                studio.update_annotation_edit_preview();
+                assert_eq!(studio.editing_text, Some(2), "editing preview preserves the empty text editor");
+                let timing = studio.annotations[2].timing.unwrap();
+                assert!(timing.end <= studio.video_duration);
+                assert_eq!(studio.video_position, studio.video_duration);
+                assert!(studio.annotation_is_live(2), "last-frame text stays editable without rewinding");
+                studio.annotations[2].text = "Video caption".into();
+                studio.seek_video(timing.start, cx);
+                studio.selected_annotation = Some(2);
+                studio.annotation_selection = vec![2];
+                assert!(!studio.annotation_is_live(2));
+                assert!(studio.canvas_annotation_marks().iter().all(|(_, mark)| mark.text.is_empty()),
+                    "selected text must still type in at the actual scrubbed playhead");
+                studio.select_annotation_for_timing(2);
+                studio.update_annotation_edit_preview();
+                assert_eq!(studio.canvas_annotation_marks()[0].1.text, "Video caption");
+
+                studio.finish_annotation_interaction();
+                studio.video_position = 2.0;
+                studio.scene_transform.rotation_y = 10.0;
+                studio.video_source_size = (3840, 2160);
+                studio.tool = Tool::Arrow;
+                studio.pointer_down(point(px(100.), px(100.)), bounds, &[], 1);
+                studio.pointer_move(point(px(300.), px(180.)), bounds);
+                assert_eq!(studio.video_position, 2.0, "drawing an arrow holds the target frame");
+                studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                assert_eq!(studio.preview_cache.frame.as_ref().unwrap().0.canvas, (240, 135));
+                assert_eq!(studio.preview_cache.overlay.as_ref().unwrap().1.dimensions(), (360, 203));
+                studio.pointer_up(point(px(300.), px(180.)), bounds);
+                studio.update_annotation_edit_preview();
+                assert_eq!(studio.video_position, 2.0, "finishing an arrow holds the target frame");
+                studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                assert_eq!(studio.preview_cache.frame.as_ref().unwrap().0.canvas, (480, 270));
+            }).unwrap();
+            cx.spawn(async |cx| {
+                Timer::after(Duration::from_millis(500)).await;
+                cx.update(|cx| cx.quit()).unwrap();
+            }).detach();
+        });
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn paused_preview_cache_tracks_motion_edits() {
@@ -710,17 +865,24 @@ impl Studio {
 
     /// Flattened annotation layer for the current time when the media is
     /// transformed (GPUI cannot paint annotations through a 3D projection).
-    fn preview_overlay(&mut self, time: f64) -> Option<(u64, Arc<RgbaImage>)> {
-        if self.annotations.is_empty() {
+    fn preview_overlay(&mut self, time: f64, canvas: (u32, u32)) -> Option<(u64, Arc<RgbaImage>)> {
+        if self.annotations.is_empty() && self.annotation_draft.is_none() {
             return None;
         }
         let (width, height) = self.media_dimensions()?;
-        let marks = if self.scene_is_timed() {
-            let viewport = self.video_viewport_timeline.frame_at(time);
-            timed::active_marks_in_crop(&self.annotations, time, viewport, self.scene_style().source_crop)
-        } else {
-            self.annotations.iter().filter(|mark| !mark.is_canvas()).cloned().collect()
-        };
+        // This is a preview texture, not an export. Rasterizing a 4K layer
+        // for every pointer sample needlessly stalls the UI thread.
+        let (width, height) = annotation_preview_size((width, height), canvas);
+        let viewport = self.video_viewport_timeline.frame_at(time);
+        let crop = self.scene_style().source_crop;
+        let marks: Vec<_> = self.annotations.iter().chain(self.annotation_draft.iter())
+            .enumerate().filter(|(_, mark)| !mark.is_canvas())
+            .filter_map(|(index, mark)| {
+                let mark = if self.scene_is_timed() {
+                    timed::editor_mark(mark, time, self.annotation_is_live(index))?
+                } else { mark.clone() };
+                Some(timed::in_cropped_media_space(mark, viewport, crop))
+            }).collect();
         let signature = timed::marks_signature(&marks) ^ ((width as u64) << 32 | height as u64);
         if let Some((cached, layer)) = self.preview_cache.overlay.as_ref() {
             if *cached == signature {
@@ -743,10 +905,12 @@ impl Studio {
         // proxy that the canvas scales up; the full-size frame is rendered
         // once the drag ends. Native window recordings retain a full-size
         // preview during scaling so text detail does not appear to disappear.
-        let proxy = if !(self.video_project.is_some() && self.video_window_capture)
+        let annotation_proxy = self.pointer_is_down && !self.annotations_paint_flat()
+            && !self.canvas_annotation_drag;
+        let proxy = if annotation_proxy || (!(self.video_project.is_some() && self.video_window_capture)
             && (self.slider_drag.is_some()
                 || self.media_drag.is_some()
-                || self.motion_transform_drag.is_some())
+                || self.motion_transform_drag.is_some()))
         {
             0.5
         } else {
@@ -769,7 +933,7 @@ impl Studio {
             ViewportFrame::default()
         };
         let overlay = if !style.transform.with_motion(viewport).is_identity() {
-            self.preview_overlay(time)
+            self.preview_overlay(time, canvas)
         } else {
             None
         };
@@ -1180,6 +1344,30 @@ impl Studio {
         )
     }
 
+    /// Author at a fixed frame with complete marks. Timing and animation are
+    /// restored immediately when the user scrubs or plays, even with a selection.
+    pub(crate) fn annotation_is_live(&self, index: usize) -> bool {
+        if self.video_playing || self.video_seek_drag.is_some() { return false; }
+        let editing = self.pointer_is_down || self.editing_text == Some(index)
+            || self.annotation_editing_time.is_some_and(|time| (time - self.video_position).abs() < 1e-6);
+        if !editing { return false; }
+        self.annotations.get(index).map_or(self.pointer_is_down, |mark| {
+            mark.timing.is_none_or(|timing| (timing.start..=timing.end).contains(&self.video_position))
+        })
+    }
+
+    pub(crate) fn update_annotation_edit_preview(&mut self) {
+        if self.pointer_is_down || self.annotation_drag.is_some() || self.slider_drag.is_some() {
+            return;
+        }
+        if !std::mem::take(&mut self.annotation_edit_preview_pending) || !self.scene_is_timed() {
+            return;
+        }
+        // Editing changes only the annotation preview, never the video frame.
+        self.annotation_editing_time = (!self.video_playing && self.video_seek_drag.is_none()
+            && self.selected_annotation.is_some()).then_some(self.video_position);
+    }
+
     pub(crate) fn canvas_annotation_marks(&self) -> Vec<(usize, AnnotationMark)> {
         self.annotations
             .iter()
@@ -1190,7 +1378,7 @@ impl Studio {
                     timed::editor_mark(
                         mark,
                         self.video_position,
-                        self.selected_annotation == Some(index),
+                        self.annotation_is_live(index),
                     )?
                 } else {
                     mark.clone()
@@ -1205,20 +1393,24 @@ impl Studio {
         position: Point<Pixels>,
         canvas: Bounds<Pixels>,
         hits: &[(usize, Bounds<Pixels>)],
+        media: Bounds<Pixels>,
+        rendered: &[Bounds<Pixels>],
         click_count: usize,
     ) -> bool {
         // Retained paint listeners must not reclassify an active gesture.
         if self.pointer_is_down {
             return self.canvas_annotation_drag;
         }
+        if self.scene_annotation_select(position, canvas, media, rendered, hits, click_count) {
+            return true;
+        }
         let create = self.scene_is_timed() && self.tool == Tool::Text;
         let hit =
-            self.tool == Tool::Select && hits.iter().any(|(_, bounds)| bounds.contains(&position));
+            self.tool == Tool::Select && hits.iter().any(|(_, bounds)| Bounds::from_corners(point(bounds.left()-px(10.),bounds.top()-px(10.)),point(bounds.right()+px(10.),bounds.bottom()+px(10.))).contains(&position));
         if !canvas.contains(&position) || (!create && !hit) {
             self.canvas_annotation_drag = false;
             return false;
         }
-        self.pause_video_playback();
         if create
             && self.animation_active
             && self.video_position + AnnotationTiming::DEFAULT_DURATION > self.video_duration
@@ -1577,7 +1769,8 @@ impl Studio {
         if let Some(draft) = self.annotation_draft.clone() {
             marks.push(draft);
         }
-        let selected_annotation = self.selected_annotation;
+        let selected_annotations = self.annotation_selected_indices();
+        let canvas_focus = self.editing_text.map(|_| self.text_fields.canvas.read(cx).focus.clone());
         let editing_text = self.editing_text;
         let mut painted = Vec::with_capacity(marks.len());
         let mut painted_indices = Vec::with_capacity(marks.len());
@@ -1586,7 +1779,7 @@ impl Studio {
             if let Some(animated) = timed::editor_mark(
                 mark,
                 time,
-                selected_annotation == Some(index) || editing_text == Some(index),
+                self.annotation_is_live(index),
             ) {
                 painted.push(animated);
                 painted_indices.push(index);
@@ -1623,7 +1816,10 @@ impl Studio {
                 canvas(
                     // The hitbox lets occluding overlays (dialogs) shadow the
                     // raw mouse listeners registered in paint.
-                    move |bounds, window, _| {
+                    move |bounds, window, cx| {
+                        if let Some(focus) = &canvas_focus {
+                            window.set_focus_handle(focus, cx);
+                        }
                         if let Ok(mut stored) = bounds_store.lock() {
                             *stored = Some(bounds);
                         }
@@ -1649,6 +1845,7 @@ impl Studio {
                             ),
                             size: size(media.size.width * view_zoom_x, media.size.height * view_zoom_y),
                         };
+                        let mut selection_outline = None;
                         let annotation_bounds = window.with_content_mask(
                             Some(ContentMask { bounds: media }),
                             |window| {
@@ -1656,7 +1853,7 @@ impl Studio {
                                     return Vec::new();
                                 }
                                 paint_highlights(&painted, interaction_bounds, window);
-                                let mut rendered = Vec::with_capacity(painted.len());
+                                let mut rendered = vec![Bounds::new(point(px(-100000.),px(-100000.)),size(px(0.),px(0.))); committed_count+1];
                                 for (slot, mark) in painted.iter().enumerate() {
                                     let index = painted_indices[slot];
                                     let rendered_bounds = paint_annotation(
@@ -1671,40 +1868,37 @@ impl Studio {
                                         window,
                                         cx,
                                     );
-                                    rendered.push(rendered_bounds);
-                                    if selected_annotation == Some(index) {
-                                        window.paint_quad(quad(
-                                            rendered_bounds,
-                                            px(3.0),
-                                            hsla(0.0, 0.0, 0.0, 0.0),
-                                            px(2.0),
-                                            rgb(0x2997ff),
-                                            Default::default(),
-                                        ));
-                                        window.paint_quad(quad(
-                                            Bounds {
-                                                origin: point(
-                                                    rendered_bounds.origin.x
-                                                        + rendered_bounds.size.width
-                                                        - px(5.0),
-                                                    rendered_bounds.origin.y
-                                                        + rendered_bounds.size.height
-                                                        - px(5.0),
-                                                ),
-                                                size: size(px(10.0), px(10.0)),
-                                            },
-                                            px(5.0),
-                                            rgb(0xffffff),
-                                            px(2.0),
-                                            rgb(0x2997ff),
-                                            Default::default(),
-                                        ));
+                                    rendered[index] = rendered_bounds;
+                                    if selected_annotations.len() == 1 && selected_annotations.contains(&index) && editing_text != Some(index) {
+                                        selection_outline = Some((slot, rendered_bounds));
                                     }
                                 }
                                 rendered
                             },
                         );
-                        let canvas_hits = paint_canvas_annotations(&canvas_annotations, selected_annotation, bounds, window, cx);
+                        let canvas_hits = paint_canvas_annotations(&canvas_annotations, &selected_annotations, editing_text, bounds, window, cx);
+                        crate::text_fields_ui::paint_canvas_text(&entity, bounds, interaction_bounds, media, window, cx);
+                        if let Some((slot, selected_bounds)) = selection_outline {
+                            let mark = &painted[slot];
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                crate::annotations::paint_selection(mark, if mark.pinned { media } else { interaction_bounds }, selected_bounds, window);
+                            });
+                        }
+                        let group_bounds = entity.read(cx).annotation_group_bounds(bounds, interaction_bounds, &annotation_bounds, &canvas_hits);
+                        if let Some(group) = group_bounds {
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                crate::annotations::paint_selection_box(group, window);
+                            });
+                        }
+                        entity.update(cx, |this, cx| this.paint_annotation_brush(window, cx));
+                        let mut cursor_bounds = annotation_bounds.clone();
+                        cursor_bounds.resize(committed_count + 1, Bounds::new(point(px(-100000.), px(-100000.)), size(px(0.), px(0.))));
+                        for (index, hit) in &canvas_hits { cursor_bounds[*index] = *hit; }
+                        let studio = entity.read(cx);
+                        let cursor = if studio.tool == Tool::Select && group_bounds.is_some_and(|group| group.contains(&window.mouse_position())) {
+                            if studio.pointer_is_down { gpui::CursorStyle::ClosedHand } else { gpui::CursorStyle::OpenHand }
+                        } else { studio.annotation_cursor(window.mouse_position(), interaction_bounds, &cursor_bounds) };
+                        window.set_cursor_style(cursor, &hitbox);
                         if show_handles {
                             paint_selection_handles(&projection, bounds, window);
                         }
@@ -1726,8 +1920,12 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if this.canvas_text_mouse_down(event, window, cx) {
+                                        cx.notify();
+                                        return;
+                                    }
                                     this.focus_handle.focus(window);
-                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, event.click_count) {
+                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, interaction_bounds, &annotation_bounds, event.click_count) {
                                         cx.notify();
                                         return;
                                     }
@@ -1747,7 +1945,6 @@ impl Studio {
                                             cx,
                                         );
                                     } else if !select_tool {
-                                        this.pause_video_playback();
                                         if interaction_bounds.contains(&flat) {
                                             this.pointer_down(
                                                 flat,
@@ -1771,7 +1968,7 @@ impl Studio {
                                             this.video_selected_zoom_cue = None;
                                             this.video_selected_press = None;
                                             this.scene_selection = SceneSelection::Scene;
-                                        } else {
+                                        } else if !this.annotation_brushing() {
                                             this.toast = None;
                                             this.scene_pointer_down(
                                                 event.position,
@@ -1793,6 +1990,9 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if this.canvas_text_mouse_move(event, cx) {
+                                        return;
+                                    }
                                     if this.canvas_annotation_drag {
                                         this.pointer_move(event.position, bounds);
                                         cx.notify();
@@ -1820,6 +2020,7 @@ impl Studio {
                                 return;
                             }
                             entity.update(cx, |this, cx| {
+                                this.text_fields.canvas.update(cx, |field, _| field.canvas_release());
                                 if this.canvas_annotation_drag {
                                     this.pointer_up(event.position, bounds);
                                     this.canvas_annotation_drag = false;
@@ -2687,12 +2888,28 @@ impl Studio {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if self.annotations.is_empty() {
+            self.annotation_timeline_selection.set(None);
+            self.annotation_timeline_scroll.set_offset(point(px(0.), px(0.)));
             return None;
         }
         let duration = self.video_duration.max(f64::EPSILON);
         let selected = self.selected_annotation;
         let rows = self.annotation_lane_rows();
         let lane_height = self.annotation_lane_height();
+        let content_height = 6.0 + (rows.iter().max().copied().unwrap_or(0) + 1) as f32 * Self::ANNOTATION_ROW_HEIGHT;
+        let selected_row = selected.and_then(|index| rows.get(index).map(|row| (index, *row)));
+        // Reveal a newly selected/created row once; manual scrolling must remain free.
+        if self.annotation_timeline_selection.replace(selected_row) != selected_row {
+            if let Some((_, row)) = selected_row {
+                let top = 3.0 + row as f32 * Self::ANNOTATION_ROW_HEIGHT;
+                let current = -f32::from(self.annotation_timeline_scroll.offset().y);
+                let scroll = if top < current { top - 3.0 }
+                    else if top + Self::ANNOTATION_ROW_HEIGHT > current + lane_height {
+                        top + Self::ANNOTATION_ROW_HEIGHT - lane_height + 3.0
+                    } else { current };
+                self.annotation_timeline_scroll.set_offset(point(px(0.), px(-scroll.clamp(0.0, content_height - lane_height))));
+            }
+        }
         let mut regions: Vec<AnyElement> = Vec::new();
         for (index, mark) in self.annotations.iter().enumerate() {
             let timing = mark.timing.unwrap_or(AnnotationTiming {
@@ -2752,10 +2969,8 @@ impl Studio {
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
                             this.select_annotation_for_timing(index);
-                            // Clicking a region also moves the playhead there.
-                            if let Some(target) = this.motion_timeline_time_at(event.position.x) {
-                                this.seek_video(target, cx);
-                            }
+                            // Resolve a visible frame once the click/trim
+                            // settles, not a new FFmpeg seek per drag sample.
                             this.begin_annotation_drag(
                                 index,
                                 AnnotationDragKind::Move,
@@ -2825,20 +3040,26 @@ impl Studio {
                 .h(px(lane_height))
                 .flex_none()
                 .overflow_hidden()
+                .overflow_y_scroll()
+                .track_scroll(&self.annotation_timeline_scroll)
                 .rounded_lg()
                 .bg(rgb(0xECEDF1))
                 .child(
                     div()
-                        .absolute()
-                        .left(px(-(timeline_scroll as f32)))
-                        .top_0()
-                        .w(px(timeline_content_width as f32))
-                        .h_full()
-                        .children(regions)
+                        .relative()
+                        .w_full()
+                        .h(px(content_height))
+                        .child(div()
+                            .absolute()
+                            .left(px(-(timeline_scroll as f32)))
+                            .top_0()
+                            .w(px(timeline_content_width as f32))
+                            .h_full()
+                            .children(regions))
                         .child(
                             div()
                                 .absolute()
-                                .left(px((timeline_content_width * progress) as f32 - 1.0))
+                                .left(px((timeline_content_width * progress - timeline_scroll) as f32 - 1.0))
                                 .top_0()
                                 .w(px(2.0))
                                 .h_full()
@@ -2862,50 +3083,11 @@ impl Studio {
     }
 
     const ANNOTATION_ROW_HEIGHT: f32 = 24.0;
-    const ANNOTATION_MAX_ROWS: usize = 3;
+    const ANNOTATION_VISIBLE_ROWS: usize = 3;
 
-    /// Row each annotation occupies on the lane so overlapping marks stack
-    /// instead of hiding each other (greedy, capped at a few rows).
+    /// Reuse a row only after its previous annotation ends.
     pub(crate) fn annotation_lane_rows(&self) -> Vec<usize> {
-        let duration = self.video_duration.max(f64::EPSILON);
-        let mut row_ends: Vec<f64> = Vec::new();
-        let mut rows = Vec::with_capacity(self.annotations.len());
-        let mut order: Vec<usize> = (0..self.annotations.len()).collect();
-        let span = |mark: &AnnotationMark| {
-            mark.timing
-                .map(|timing| (timing.start, timing.end))
-                .unwrap_or((0.0, duration))
-        };
-        order.sort_by(|a, b| {
-            span(&self.annotations[*a])
-                .0
-                .total_cmp(&span(&self.annotations[*b]).0)
-        });
-        let mut assigned = vec![0usize; self.annotations.len()];
-        for index in order {
-            let (start, end) = span(&self.annotations[index]);
-            let row = row_ends
-                .iter()
-                .position(|row_end| *row_end <= start + 1e-6)
-                .unwrap_or_else(|| {
-                    if row_ends.len() < Self::ANNOTATION_MAX_ROWS {
-                        row_ends.push(f64::NEG_INFINITY);
-                        row_ends.len() - 1
-                    } else {
-                        // Every row is busy: share the one that frees up first.
-                        row_ends
-                            .iter()
-                            .enumerate()
-                            .min_by(|a, b| a.1.total_cmp(b.1))
-                            .map(|(row, _)| row)
-                            .unwrap_or(0)
-                    }
-                });
-            row_ends[row] = row_ends[row].max(end);
-            assigned[index] = row;
-        }
-        rows.extend(assigned);
-        rows
+        annotation_lane_rows(&self.annotations, self.video_duration)
     }
 
     /// Height of the annotation lane for the current stacking.
@@ -2916,12 +3098,27 @@ impl Studio {
             .max()
             .map(|row| row + 1)
             .unwrap_or(1);
-        6.0 + rows as f32 * Self::ANNOTATION_ROW_HEIGHT
+        6.0 + rows.min(Self::ANNOTATION_VISIBLE_ROWS) as f32 * Self::ANNOTATION_ROW_HEIGHT
     }
 
-    fn select_annotation_for_timing(&mut self, index: usize) {
+    pub(crate) fn select_annotation_for_timing(&mut self, index: usize) {
+        if self.video_playing { self.pause_video_playback(); }
+        self.annotation_editing_time = None;
+        // Finishing an empty caption removes it, shifting subsequent row indices.
+        let removed = self.editing_text.filter(|editing| {
+            self.annotations.get(*editing).is_some_and(|mark| mark.text.trim().is_empty())
+        });
         self.stop_editing_text();
+        if removed == Some(index) {
+            return;
+        }
+        let index = index - usize::from(removed.is_some_and(|removed| removed < index));
+        if index >= self.annotations.len() {
+            return;
+        }
         self.selected_annotation = Some(index);
+        self.annotation_selection = vec![index];
+        self.annotation_edit_preview_pending = true;
         self.video_selected_zoom_cue = None;
         self.scene_selection = SceneSelection::Scene;
     }
@@ -2939,7 +3136,9 @@ impl Studio {
         if mark.timing.is_none() && kind != AnnotationDragKind::Move {
             return;
         }
-        self.pause_video_playback();
+        if self.video_playing {
+            self.pause_video_playback();
+        }
         self.record_annotation_undo();
         self.annotation_drag = Some(AnnotationDrag {
             index,
@@ -2984,7 +3183,9 @@ impl Studio {
     }
 
     pub(crate) fn end_annotation_drag(&mut self) -> bool {
-        self.annotation_drag.take().is_some()
+        let ended = self.annotation_drag.take().is_some();
+        self.annotation_edit_preview_pending |= ended;
+        ended
     }
 
     fn edit_selected_timing(&mut self, edit: impl FnOnce(&mut AnnotationTiming, f64)) {
@@ -3000,6 +3201,7 @@ impl Studio {
             .unwrap_or_else(|| AnnotationTiming::for_tool(mark.tool, 0.0, duration));
         edit(&mut timing, duration);
         mark.timing = Some(timing.clamped(duration));
+        self.annotation_edit_preview_pending = true;
     }
 
     pub(crate) fn commit_annotation_time(&mut self) {
@@ -3021,6 +3223,7 @@ impl Studio {
         let timing = mark.timing.unwrap_or_else(|| AnnotationTiming::for_tool(mark.tool, 0.0, duration));
         if let Some(updated) = timing.with_boundary(start, value, duration) {
             mark.timing = Some(updated.clamped(duration));
+            self.annotation_edit_preview_pending = true;
         }
     }
 
@@ -3341,54 +3544,36 @@ pub(crate) fn canvas_overlay_source_for(
     }))
 }
 
-/// Renders annotation marks (no capture) to a transparent layer.
-pub(crate) fn render_annotation_layer(
-    marks: &[AnnotationMark],
-    width: u32,
-    height: u32,
-) -> Option<RgbaImage> {
-    let stroke_scale = width.min(height) as f32 / 800.0;
-    let mut svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><g>"#
-    );
-    svg.push_str(&annotations_svg(
-        marks,
-        0.0,
-        0.0,
-        width,
-        height,
-        stroke_scale,
-    ));
-    svg.push_str("</g></svg>");
-    render_svg_layer(&svg, width, height).ok()
+/// Cap preview texture work to the display size; exports retain source resolution.
+fn annotation_preview_size(source: (u32, u32), canvas: (u32, u32)) -> (u32, u32) {
+    let scale = ((canvas.0.max(canvas.1) as f64 * 1.5)
+        / source.0.max(source.1).max(1) as f64).min(1.0);
+    ((source.0 as f64 * scale).round().max(1.0) as u32,
+     (source.1 as f64 * scale).round().max(1.0) as u32)
 }
+
+pub(crate) use lahza_annotations::svg::render_annotations as render_annotation_layer;
 
 /// Paint independent text above the entire scene, including its background.
 pub(crate) fn paint_canvas_annotations(
     marks: &[(usize, AnnotationMark)],
-    selected: Option<usize>,
+    selected: &[usize],
+    editing: Option<usize>,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) -> Vec<(usize, Bounds<Pixels>)> {
     let mut hits = Vec::new();
-    let scale = f32::from(bounds.size.width.min(bounds.size.height)) / 800.0;
+    let scale = lahza_annotations::canvas::canvas_scale(bounds);
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for (index, mark) in marks {
             let mut mark = mark.clone();
             mark.font_size *= scale;
-            mark.stroke_width *= scale;
+            mark.scale_stroke_width(scale);
             let hit = paint_annotation(&mark, bounds, false, false, window, cx);
             hits.push((*index, hit));
-            if selected == Some(*index) {
-                window.paint_quad(quad(
-                    hit,
-                    px(3.0),
-                    hsla(0.0, 0.0, 0.0, 0.0),
-                    px(2.0),
-                    rgb(0x2997ff),
-                    Default::default(),
-                ));
+            if selected.len() == 1 && selected.contains(index) && editing!=Some(*index) {
+                crate::annotations::paint_selection(&mark,bounds,hit,window);
             }
         }
     });
@@ -3565,6 +3750,36 @@ impl Studio {
 mod canvas_caption_tests {
     use super::*;
     use crate::recording::scene::{FrameInput, SceneBackground, SceneCompositor, SceneTransform};
+
+    #[test]
+    fn annotation_rows_keep_every_overlapping_mark_accessible() {
+        let marks = vec![AnnotationMark::default(); 12];
+        assert_eq!(annotation_lane_rows(&marks, 8.0), (0..12).collect::<Vec<_>>());
+        let mut marks = marks;
+        marks.remove(4);
+        assert_eq!(annotation_lane_rows(&marks, 8.0), (0..11).collect::<Vec<_>>());
+        assert!(annotation_lane_rows(&[], 8.0).is_empty());
+    }
+
+    #[test]
+    fn annotation_rows_reuse_only_finished_intervals() {
+        let spans = [(4., 6.), (0., 2.), (1., 5.), (2., 4.), (0., 8.), (0.5, 7.)];
+        let marks: Vec<_> = spans.iter().map(|&(start, end)| AnnotationMark {
+            timing: Some(AnnotationTiming { start, end, ..Default::default() }),
+            ..Default::default()
+        }).collect();
+        let rows = annotation_lane_rows(&marks, 8.0);
+        assert_eq!(rows[0], rows[1]);
+        assert_eq!(rows[1], rows[3]);
+        assert_eq!(rows.iter().max(), Some(&3));
+        for i in 0..spans.len() {
+            for j in i + 1..spans.len() {
+                if spans[i].0 < spans[j].1 && spans[j].0 < spans[i].1 {
+                    assert_ne!(rows[i], rows[j], "overlapping marks {i} and {j}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn saved_template_caption_renders_beyond_transformed_screenshot() {

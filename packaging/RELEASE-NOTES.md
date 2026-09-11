@@ -4,13 +4,17 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Crop videos using draggable handles and aspect presets. Apply, cancel, reset, and undo/redo crops; saved crops survive reopening and apply consistently to playback and export without changing the original recording.
-- Preserve native window pixels when resizing during recording, including changes between portrait and landscape shapes. Selection geometry and scene effects follow the window's current dimensions.
-- Preserve window transparency and remove identified desktop shadow margins from presentation bounds, fixing black borders, hidden padding, and misplaced corners or shadows.
-- Improve recording startup and finalization, and retain cursor events across pause/resume.
-- Add a handwritten annotation font and fix text formatting.
+- Improve annotation selection: select outlined shapes from their interiors, drag from anywhere inside a selection, move multiple marks as one group, and delete the complete selection. Selection outlines and handles stay consistent at different display scales.
+- Add smoother pressure-sensitive ink with speed-based mouse strokes, more natural hand-drawn shapes and curved arrows, and Shantell Sans Informal as the default font for new text annotations.
+- Improve text creation, editing, resizing, formatting, and selection, including readable initial text sizes on video.
+- Make alignment snapping optional with Ctrl, with guides for other annotations and canvas edges, centers, and thirds.
+- Keep the video playhead where you are drawing. Annotations at that frame appear fully while editing; scrubbing and playback show their actual entrance and exit animations.
+- Keep annotation settings in expandable list rows, add group actions, and give overlapping video annotations separate scrollable timeline rows.
+- Add a responsive loading screen for startup and opening images or recordings, with cancellation and retry after errors.
+- Add creator and issue-report links at the end of the editor sidebar and capture controls.
+- Extract the annotation engine into a reusable workspace crate, with rendering fixtures and public API regression coverage.
 
-Validation: 187 automated Rust tests and 15 packaging tests passed locally; ten interactive/device-dependent Rust tests are excluded from the default suite. The graphical crop workflow was also checked against a disposable recording. Regression coverage includes native window pixels, transparency, changing geometry, crop persistence, motion coordinates, and a real trimmed MP4 crop export with audio and an unchanged source file. Cross-desktop capture validation remains outstanding.
+Validation: the workspace Rust suite and packaging tests pass locally. Native display tests also cover loading, cancellation, retry, and video annotation editing at a fixed playhead. Loading, error states, selection outlines at different display scales, handwritten font styles, and annotation timeline scrolling were checked on disposable projects. Interactive/device-dependent tests remain excluded from the default suite; cross-desktop capture validation remains outstanding.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

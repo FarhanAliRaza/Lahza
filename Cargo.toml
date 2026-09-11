@@ -5,7 +5,13 @@ edition = "2021"
 license = "MIT"
 description = "Lahza: a Linux-first screenshot and recording studio built with Rust and GPUI"
 
+[workspace]
+members = ["crates/annotations"]
+default-members = [".", "crates/annotations"]
+resolver = "2"
+
 [dependencies]
+lahza-annotations = { path = "crates/annotations" }
 ashpd = { version = "=0.12.3", default-features = false, features = ["async-std"] }
 async-io = "=2.6.0"
 base64 = "=0.22.1"

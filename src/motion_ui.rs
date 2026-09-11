@@ -1946,11 +1946,13 @@ impl Studio {
             }
             "left" => {
                 self.pause_video_playback();
+                self.finish_annotation_interaction();
                 self.video_position = (self.video_position - 0.5).max(0.0);
                 true
             }
             "right" => {
                 self.pause_video_playback();
+                self.finish_annotation_interaction();
                 self.video_position = (self.video_position + 0.5).min(self.video_duration);
                 true
             }

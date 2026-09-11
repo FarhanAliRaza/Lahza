@@ -153,6 +153,7 @@ impl Studio {
                                 ink()
                             }))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cancel_annotation_gesture();
                                 this.stop_editing_text();
                                 this.tool = tool;
                                 if tool != Tool::Select {
@@ -167,11 +168,6 @@ impl Studio {
 
     /// Annotation tools shared by still and timed scenes.
     pub(crate) fn video_annotate_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let hint = if self.annotations.is_empty() {
-            "Pick a tool and draw on the canvas.".to_string()
-        } else {
-            format!("{} — {}", self.tool.label(), self.tool.help_text())
-        };
         div()
             .flex()
             .flex_col()
@@ -196,7 +192,6 @@ impl Studio {
                     }),
             )
             .child(self.tool_grid(cx))
-            .child(div().text_xs().text_color(muted()).child(hint))
             .into_any_element()
     }
 
@@ -382,6 +377,12 @@ impl Studio {
             target_tool,
             Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Arrow | Tool::Pen
         );
+        let supports_drawn = crate::annotation_geometry::supports_drawn(target_tool);
+        let hand_drawn = self
+            .selected_annotation
+            .and_then(|i| self.annotations.get(i))
+            .map(|mark| mark.hand_drawn)
+            .unwrap_or(self.annotation_hand_drawn);
         let is_redaction = matches!(target_tool, Tool::Pixelate | Tool::Blur);
         let is_text = target_tool == Tool::Text;
         let selected_color = self
@@ -455,6 +456,61 @@ impl Studio {
                         ),
                     )
             })
+            .when(supports_drawn, |this| {
+                this.child(div().text_xs().text_color(muted()).child("Style"))
+                    .child(
+                        div().flex().gap_1().children(
+                            [(true, "Drawn"), (false, "Clean")]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (drawn, label))| {
+                                    div()
+                                        .id(("annotation-drawn-style", index))
+                                        .flex_1()
+                                        .h(px(32.0))
+                                        .rounded_md()
+                                        .bg(if hand_drawn == drawn {
+                                            rgb(0xffffff)
+                                        } else {
+                                            rgb(0xf0f0f1)
+                                        })
+                                        .when(hand_drawn == drawn, |this| {
+                                            this.shadow_sm().border_1().border_color(line())
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let selected: Vec<_> = this
+                                                .annotation_selected_indices()
+                                                .into_iter()
+                                                .filter(|i| {
+                                                    crate::annotation_geometry::supports_drawn(
+                                                        this.annotations[*i].tool,
+                                                    ) && this.annotations[*i].hand_drawn != drawn
+                                                })
+                                                .collect();
+                                            if !selected.is_empty() {
+                                                this.record_annotation_undo();
+                                            }
+                                            for i in selected {
+                                                let mark = &mut this.annotations[i];
+                                                mark.hand_drawn = drawn;
+                                                if mark.draw_seed == 0 {
+                                                    mark.draw_seed =
+                                                        crate::annotation_geometry::new_draw_seed();
+                                                }
+                                            }
+                                            this.annotation_hand_drawn = drawn;
+                                            cx.notify();
+                                        }))
+                                }),
+                        ),
+                    )
+            })
             .when(supports_stroke, |this| {
                 this.child(div().text_xs().text_color(muted()).child("Stroke width"))
                     .child(div().flex().gap_1().children(
@@ -522,7 +578,7 @@ impl Studio {
                 let size_value = self
                     .selected_annotation
                     .and_then(|index| self.annotations.get(index))
-                    .map(|mark| mark.font_size)
+                    .map(|mark| self.annotation_text_preview_size(mark))
                     .unwrap_or(self.text_font_size);
                 this.child(div().text_xs().text_color(muted()).child("Text"))
                     .when_some(
@@ -572,7 +628,7 @@ impl Studio {
                         SliderTarget::FontSize,
                         "Font size",
                         size_value.round().clamp(10.0, 96.0) as u8,
-                        " pt",
+                        " px",
                         |studio, value| {
                             if studio.selected_annotation.is_some() {
                                 studio.record_annotation_undo();

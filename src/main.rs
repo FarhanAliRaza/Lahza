@@ -19,14 +19,15 @@ use std::{
 use uuid::Uuid;
 
 mod annotations;
+use lahza_annotations::{geometry as annotation_geometry, snapping as annotation_snapping, text as annotation_text, fonts};
 mod capture;
 mod capture_area;
 mod capture_access;
 mod controls;
 mod crop;
-mod fonts;
 mod launcher;
 mod launcher_library;
+mod loading;
 mod launcher_recording;
 mod library;
 mod models;
@@ -223,6 +224,8 @@ struct Studio {
     /// launcher hands off to the full-size editor window.
     window_handle: AnyWindowHandle,
     launcher_active: bool,
+    loading: Option<loading::LoadingState>,
+    load_generation: u64,
     /// The studio is still in the launcher's compact window and must move to
     /// an editor-sized one when the editor first renders.
     launcher_window: bool,
@@ -234,6 +237,7 @@ struct Studio {
     tool: Tool,
     annotation_color_index: usize,
     annotation_stroke_width: f32,
+    annotation_hand_drawn: bool,
     redaction_strength: u8,
     text_font_size: f32,
     text_font_family: u8,
@@ -407,6 +411,10 @@ struct Studio {
     inspector_visible: bool,
     background_preset: Option<usize>,
     inspector_tab: InspectorTab,
+    inspector_scroll: gpui::ScrollHandle,
+    annotation_timeline_scroll: gpui::ScrollHandle,
+    annotation_timeline_selection: std::cell::Cell<Option<(usize, usize)>>,
+    annotation_inspector_anchor: gpui::ScrollAnchor,
     /// Collapsible inspector sections currently open.
     open_sections: HashSet<&'static str>,
     capturing: bool,
@@ -422,9 +430,16 @@ struct Studio {
     undo_stack: Vec<Vec<AnnotationMark>>,
     redo_stack: Vec<Vec<AnnotationMark>>,
     annotation_draft: Option<AnnotationMark>,
+    annotation_edit_preview_pending: bool,
+    /// Frame held while authoring; scrubbing and playback clear this preview override.
+    annotation_editing_time: Option<f64>,
     selected_annotation: Option<usize>,
     selection_last_point: Option<Point<Pixels>>,
-    selection_resizing: bool,
+    annotation_gesture: Option<annotations::Gesture>,
+    annotation_selection: Vec<usize>,
+    annotation_view_bounds: Option<Bounds<Pixels>>,
+    annotation_modifiers: gpui::Modifiers,
+    canvas_caret_point: Option<Point<Pixels>>,
     pointer_is_down: bool,
     toast: Option<notifications::Notification>,
     toast_timer: Option<Task<()>>,
@@ -536,9 +551,12 @@ impl Studio {
         });
         let focus_handle = cx.focus_handle();
         let text_fields = text_fields_ui::TextFields::new(focus_handle.clone(), cx);
+        let inspector_scroll = gpui::ScrollHandle::new();
         let mut studio = Self {
             window_handle,
             launcher_active: initial_recording.is_none() && initial_image.is_none(),
+            loading: None,
+            load_generation: 0,
             launcher_window: initial_recording.is_none() && initial_image.is_none(),
             recorder_window: None,
             launcher_tab: 0,
@@ -548,11 +566,12 @@ impl Studio {
             tool: Tool::Select,
             annotation_color_index: 1,
             annotation_stroke_width: 4.0,
+            annotation_hand_drawn: true,
             redaction_strength: 55,
-            text_font_size: 32.0,
-            text_font_family: 0,
+            text_font_size: 24.0,
+            text_font_family: 3,
             text_alignment: 0,
-            text_bold: true,
+            text_bold: false,
             text_italic: false,
             text_underline: false,
             editing_text: None,
@@ -574,11 +593,11 @@ impl Studio {
             camera_access_checked: false,
             record_microphone: false,
             microphone_device: None,
-            microphone_devices: microphone_devices(),
+            microphone_devices: Vec::new(),
             launcher_mic_menu_open: false,
             record_camera: false,
             camera_device: None,
-            camera_devices: camera_devices(),
+            camera_devices: Vec::new(),
             launcher_camera_menu_open: false,
             camera_frames: Arc::new(CameraFrames::default()),
             camera_preview: None,
@@ -701,6 +720,10 @@ impl Studio {
             inspector_visible: true,
             background_preset: Some(0),
             inspector_tab: InspectorTab::Design,
+            annotation_inspector_anchor: gpui::ScrollAnchor::for_handle(inspector_scroll.clone()),
+            inspector_scroll,
+            annotation_timeline_scroll: gpui::ScrollHandle::new(),
+            annotation_timeline_selection: std::cell::Cell::new(None),
             open_sections: HashSet::from(["pointer", "camera", "audio"]),
             capturing: false,
             captured_path: None,
@@ -713,9 +736,15 @@ impl Studio {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             annotation_draft: None,
+            annotation_edit_preview_pending: false,
+            annotation_editing_time: None,
             selected_annotation: None,
             selection_last_point: None,
-            selection_resizing: false,
+            annotation_gesture: None,
+            annotation_selection: Vec::new(),
+            annotation_view_bounds: None,
+            annotation_modifiers: Default::default(),
+            canvas_caret_point: None,
             pointer_is_down: false,
             toast: None,
             toast_timer: None,
@@ -725,18 +754,14 @@ impl Studio {
             image_trim_drag: None,
             canvas_annotation_drag: false,
         };
-        if let Some(path) = initial_image {
-            if path.is_file() {
-                studio.finish_capture_request(Ok(path));
-            } else {
-                studio.toast = Some(format!("Could not open {}", path.display()).into());
-            }
-        }
-        if let Some(directory) = initial_recording {
-            if let Err(error) = studio.open_video_project(directory) {
-                studio.toast = Some(error.into());
-            }
-        }
+        let request = if let Some(path) = initial_recording {
+            loading::LoadRequest::Recording(path)
+        } else if let Some(path) = initial_image {
+            loading::LoadRequest::Image(path)
+        } else {
+            loading::LoadRequest::Launch
+        };
+        studio.start_loading(request, true, cx);
         studio
     }
 
@@ -917,7 +942,8 @@ impl Studio {
         self.annotation_draft = None;
         self.annotation_drag = None;
         self.selection_last_point = None;
-        self.selection_resizing = false;
+        self.annotation_gesture = None;
+        self.annotation_selection.clear();
         self.pointer_is_down = false;
         self.tool = Tool::Select;
     }
@@ -1014,11 +1040,13 @@ impl Studio {
             6 => {
                 self.text_font_size = value.clamp(10, 96) as f32;
                 let selected = self.selected_annotation;
+                let scale = selected.and_then(|index| self.annotations.get(index))
+                    .map(|mark| self.annotation_text_scale(mark)).unwrap_or(1.0);
                 if let Some(mark) = selected
                     .and_then(|index| self.annotations.get_mut(index))
                     .filter(|mark| mark.tool == Tool::Text)
                 {
-                    mark.font_size = self.text_font_size;
+                    mark.font_size = self.text_font_size / scale;
                 }
                 if let Some(index) = selected {
                     self.fit_text_box_to_content(index);
@@ -1071,6 +1099,16 @@ impl Studio {
             return true;
         }
         let keystroke = &event.keystroke;
+        let command = keystroke.modifiers.control || keystroke.modifiers.platform;
+        if (self.selected_annotation.is_some() || self.annotation_gesture.is_some())
+            && (matches!(keystroke.key.as_str(), "escape" | "enter" | "left" | "right" | "up" | "down")
+                || (command && matches!(keystroke.key.as_str(), "a" | "d")))
+            && self.handle_key(event)
+        {
+            if self.video_playing { self.pause_video_playback(); }
+            self.annotation_edit_preview_pending = self.selected_annotation.is_some();
+            return true;
+        }
         if keystroke.modifiers.control || keystroke.modifiers.platform {
             match keystroke.key.as_str() {
                 "z" if !keystroke.modifiers.shift => self.undo_current(cx),
@@ -1079,14 +1117,10 @@ impl Studio {
             }
             return true;
         }
-        if matches!(keystroke.key.as_str(), "delete" | "backspace") {
-            if let Some(index) = self.selected_annotation.take() {
-                if index < self.annotations.len() {
-                    self.record_annotation_undo();
-                    self.annotations.remove(index);
-                }
-                return true;
-            }
+        if matches!(keystroke.key.as_str(), "delete" | "backspace")
+            && self.delete_selected_annotations()
+        {
+            return true;
         }
         if keystroke.key == "escape"
             && (self.selected_annotation.is_some() || self.tool != Tool::Select)
@@ -1265,6 +1299,7 @@ impl Studio {
 impl Studio {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.drop_retired_images(window);
+        if self.loading.is_some() { return self.render_loading(window, cx); }
         self.sync_camera_preview(cx);
         if self.launcher_active {
             return self.render_launcher(cx);
@@ -1286,6 +1321,7 @@ impl Studio {
                 cx.activate(true);
             });
         }
+        self.update_annotation_edit_preview();
         self.sync_text_fields(window, cx);
         // Both video and animated-still transport need an initial keyboard
         // target, even before the user clicks the canvas.
@@ -1319,12 +1355,24 @@ impl Studio {
             .flex()
             .flex_col()
             .track_focus(&self.focus_handle)
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                this.update_annotation_modifiers(event.modifiers);
+                cx.notify();
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.capture_access_prompt.is_some() {
                     cx.stop_propagation();
                     return;
                 }
                 if this.native_text_focused(window, cx) { return; }
+                if this.selected_annotation.is_some() && this.handle_key(event) {
+                    if this.processed_capture_path.is_some() {
+                        let _ = this.rebuild_redactions();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if this.handle_animation_key(event, cx) {
                     cx.stop_propagation();
                     cx.notify();
@@ -1529,14 +1577,118 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a display (can run under Xvfb)"]
+    fn annotation_delete_removes_full_selection_and_undo_restores_it() {
+        Application::new().with_assets(Assets { base: asset_directory() }).run(|cx| {
+            let handle = open_studio_window(cx, true, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            handle.update(cx, |studio, _, cx| {
+                let original: Vec<_> = [Tool::Arrow, Tool::Text, Tool::Pen, Tool::Ellipse, Tool::Rectangle]
+                    .into_iter().enumerate().map(|(i, tool)| AnnotationMark {
+                        tool,
+                        text: format!("Annotation {i}"),
+                        ..Default::default()
+                    }).collect();
+                // Exercise the sidebar's shared action and both keyboard routes.
+                for route in 0..3 {
+                    for selection in [vec![4, 0, 2], vec![0, 1, 2, 3, 4], vec![2]] {
+                        studio.annotations = original.clone();
+                        studio.annotation_selection = selection.clone();
+                        studio.selected_annotation = selection.last().copied();
+                        studio.undo_stack.clear();
+                        studio.redo_stack.clear();
+                        studio.video_undo_stack.clear();
+                        studio.video_redo_stack.clear();
+                        studio.animation_active = route == 2;
+                        let event = KeyDownEvent {
+                            keystroke: gpui::Keystroke::parse(if route == 2 { "backspace" } else { "delete" }).unwrap(),
+                            is_held: false,
+                        };
+                        assert!(match route {
+                            0 => studio.delete_selected_annotations(),
+                            1 => studio.handle_key(&event),
+                            _ => studio.handle_video_key(&event, cx),
+                        });
+                        let remaining: Vec<_> = original.iter().enumerate()
+                            .filter(|(i, _)| !selection.contains(i))
+                            .map(|(_, mark)| mark.clone()).collect();
+                        assert_eq!(studio.annotations, remaining);
+                        assert!(studio.annotation_selected_indices().is_empty());
+                        assert!(studio.editing_text.is_none());
+                        assert!(!studio.delete_selected_annotations());
+                        if route == 2 {
+                            assert_eq!(studio.video_undo_stack.len(), 1);
+                            studio.undo_video_edit(cx);
+                            assert_eq!(studio.annotations, original);
+                            studio.redo_video_edit(cx);
+                        } else {
+                            assert_eq!(studio.undo_stack.len(), 1);
+                            assert!(studio.undo_annotations());
+                            assert_eq!(studio.annotations, original);
+                            assert!(studio.redo_annotations());
+                        }
+                        assert_eq!(studio.annotations, remaining);
+                    }
+                }
+            }).unwrap();
+            cx.spawn(async |cx| {
+                Timer::after(Duration::from_millis(200)).await;
+                cx.update(|cx| cx.quit()).unwrap();
+            }).detach();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a display (can run under Xvfb)"]
+    fn annotation_rows_select_and_delete_after_empty_text_is_discarded() {
+        Application::new().with_assets(Assets { base: asset_directory() }).run(|cx| {
+            let handle = open_studio_window(cx, true, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            handle.update(cx, |studio, _, _| {
+                for timed in [false, true] {
+                    studio.animation_active = timed;
+                    studio.annotations = vec![
+                        AnnotationMark { tool: Tool::Text, text: String::new(), ..Default::default() },
+                        AnnotationMark { tool: Tool::Text, text: "Keep me".into(), ..Default::default() },
+                        AnnotationMark { tool: Tool::Text, text: "Selected row".into(), ..Default::default() },
+                    ];
+                    studio.editing_text = Some(0);
+                    studio.selected_annotation = Some(0);
+                    studio.annotation_selection = vec![0, 1, 2];
+                    studio.select_annotation_for_timing(2);
+                    assert_eq!(studio.annotations.len(), 2);
+                    assert_eq!(studio.selected_annotation, Some(1));
+                    assert_eq!(studio.annotation_selection, vec![1]);
+                    assert_eq!(studio.annotations[1].text, "Selected row");
+                    studio.finish_annotation_interaction();
+                    assert!(studio.selected_annotation.is_none());
+                    assert!(studio.annotation_selection.is_empty());
+                    assert_eq!(studio.annotations.len(), 2);
+                    studio.select_annotation_for_timing(1);
+                    assert!(studio.delete_selected_annotations());
+                    assert_eq!(studio.annotations.len(), 1);
+                    assert_eq!(studio.annotations[0].text, "Keep me");
+                }
+            }).unwrap();
+            cx.spawn(async |cx| {
+                Timer::after(Duration::from_millis(200)).await;
+                cx.update(|cx| cx.quit()).unwrap();
+            }).detach();
+        });
+    }
+
+    #[test]
     #[ignore = "requires a display and LAHZA_CROP_TEST_RECORDING pointing to a disposable project"]
     fn video_crop_editor_apply_cancel_reset_undo_and_reopen() {
         let path = PathBuf::from(std::env::var_os("LAHZA_CROP_TEST_RECORDING").unwrap());
         Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
             let handle = open_studio_window(cx, true, |handle, cx| {
-                cx.new(|cx| Studio::new(handle, Some(path.clone()), None, cx))
+                cx.new(|cx| Studio::new(handle, None, None, cx))
             }).unwrap();
             handle.update(cx, |studio, _, cx| {
+                studio.open_video_project(path.clone()).unwrap();
                 assert!(studio.video_project.is_some());
                 studio.video_crop = CropRect::UNIT;
                 studio.begin_crop();

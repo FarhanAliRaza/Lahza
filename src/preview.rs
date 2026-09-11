@@ -6,7 +6,7 @@ use super::{
     SceneSelection, Studio, Tool, GRADIENT_BACKGROUNDS, MOTION_ZOOM_SLIDER, SOLID_BACKGROUNDS,
 };
 use gpui::{
-    canvas, div, hsla, img, point, prelude::*, px, quad, rgb, size, svg, AnyElement, Background,
+    canvas, div, hsla, img, point, prelude::*, px, rgb, size, svg, AnyElement, Background,
     Bounds, BoxShadow, ContentMask, Context, CursorStyle, FontWeight, Hsla, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
     RenderImage, ScrollWheelEvent, Window,
@@ -111,7 +111,8 @@ impl Studio {
         let media_visible = self.image_visible_at(self.video_position);
         let committed_count = self.annotations.len();
         // Animated scenes paint each mark at its state for the playhead time.
-        let selected_annotation = self.selected_annotation;
+        let selected_annotations = self.annotation_selected_indices();
+        let canvas_focus = self.editing_text.map(|_| self.text_fields.canvas.read(cx).focus.clone());
         let editing_text = self.editing_text;
         let (annotations, painted_indices): (Vec<AnnotationMark>, Vec<usize>) =
             if self.animation_active {
@@ -123,7 +124,7 @@ impl Studio {
                     if let Some(animated) = timed::editor_mark(
                         mark,
                         time,
-                        selected_annotation == Some(index) || editing_text == Some(index),
+                        self.annotation_is_live(index),
                     ) {
                         marks.push(animated);
                         indices.push(index);
@@ -442,7 +443,10 @@ impl Studio {
                 canvas(
                     // The hitbox lets occluding overlays (dialogs) shadow the
                     // raw mouse listeners registered below.
-                    move |bounds, window, _| {
+                    move |bounds, window, cx| {
+                        if let Some(focus) = &canvas_focus {
+                            window.set_focus_handle(focus, cx);
+                        }
                         (
                             annotations,
                             window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
@@ -492,6 +496,7 @@ impl Studio {
                             image_bounds
                         };
                         let painted_indices = painted_indices.clone();
+                        let mut selection_outline = None;
                         let annotation_bounds = window.with_content_mask(
                             Some(ContentMask {
                                 bounds: image_bounds,
@@ -501,7 +506,7 @@ impl Studio {
                                     return Vec::new();
                                 }
                                 paint_highlights(&annotations, paint_bounds, window);
-                                let mut annotation_bounds = Vec::with_capacity(annotations.len());
+                                let mut annotation_bounds = vec![Bounds::new(point(px(-100000.),px(-100000.)),size(px(0.),px(0.))); committed_count+1];
                                 for (painted, mark) in annotations.iter().enumerate() {
                                     let index = painted_indices[painted];
                                     let rendered_bounds = paint_annotation(
@@ -516,41 +521,37 @@ impl Studio {
                                         window,
                                         cx,
                                     );
-                                    annotation_bounds.push(rendered_bounds);
-                                    if selected_annotation == Some(index) {
-                                        let selected_bounds = rendered_bounds;
-                                        window.paint_quad(quad(
-                                            selected_bounds,
-                                            px(3.0),
-                                            hsla(0.0, 0.0, 0.0, 0.0),
-                                            px(2.0),
-                                            rgb(0x2997ff),
-                                            Default::default(),
-                                        ));
-                                        window.paint_quad(quad(
-                                            Bounds {
-                                                origin: point(
-                                                    selected_bounds.origin.x
-                                                        + selected_bounds.size.width
-                                                        - px(5.0),
-                                                    selected_bounds.origin.y
-                                                        + selected_bounds.size.height
-                                                        - px(5.0),
-                                                ),
-                                                size: size(px(10.0), px(10.0)),
-                                            },
-                                            px(5.0),
-                                            rgb(0xffffff),
-                                            px(2.0),
-                                            rgb(0x2997ff),
-                                            Default::default(),
-                                        ));
+                                    annotation_bounds[index] = rendered_bounds;
+                                    if selected_annotations.len() == 1 && selected_annotations.contains(&index) && editing_text != Some(index) {
+                                        selection_outline = Some((painted, rendered_bounds));
                                     }
                                 }
                                 annotation_bounds
                             },
                         );
-                        let canvas_hits = scene_ui::paint_canvas_annotations(&canvas_annotations, selected_annotation, bounds, window, cx);
+                        let canvas_hits = scene_ui::paint_canvas_annotations(&canvas_annotations, &selected_annotations, editing_text, bounds, window, cx);
+                        crate::text_fields_ui::paint_canvas_text(&entity, bounds, interaction_bounds, image_bounds, window, cx);
+                        if let Some((slot, selected_bounds)) = selection_outline {
+                            let mark = &annotations[slot];
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                crate::annotations::paint_selection(mark, if mark.pinned { image_bounds } else { paint_bounds }, selected_bounds, window);
+                            });
+                        }
+                        let group_bounds = entity.read(cx).annotation_group_bounds(bounds, interaction_bounds, &annotation_bounds, &canvas_hits);
+                        if let Some(group) = group_bounds {
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                crate::annotations::paint_selection_box(group, window);
+                            });
+                        }
+                        entity.update(cx, |this, cx| this.paint_annotation_brush(window, cx));
+                        let mut cursor_bounds = annotation_bounds.clone();
+                        cursor_bounds.resize(committed_count + 1, Bounds::new(point(px(-100000.), px(-100000.)), size(px(0.), px(0.))));
+                        for (index, hit) in &canvas_hits { cursor_bounds[*index] = *hit; }
+                        let studio = entity.read(cx);
+                        let cursor = if studio.tool == Tool::Select && group_bounds.is_some_and(|group| group.contains(&window.mouse_position())) {
+                            if studio.pointer_is_down { gpui::CursorStyle::ClosedHand } else { gpui::CursorStyle::OpenHand }
+                        } else { studio.annotation_cursor(window.mouse_position(), interaction_bounds, &cursor_bounds) };
+                        window.set_cursor_style(cursor, &hitbox);
                         if !motion_markers.is_empty() {
                             window.with_content_mask(
                                 Some(ContentMask {
@@ -590,8 +591,12 @@ impl Studio {
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if this.canvas_text_mouse_down(event, window, cx) {
+                                        cx.notify();
+                                        return;
+                                    }
                                     this.focus_handle.focus(window);
-                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, event.click_count) {
+                                    if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, interaction_bounds, &annotation_bounds, event.click_count) {
                                         cx.notify();
                                         return;
                                     }
@@ -633,7 +638,7 @@ impl Studio {
                                         if this.selected_annotation.is_some() {
                                             this.video_selected_press = None;
                                             this.scene_selection = SceneSelection::Scene;
-                                        } else {
+                                        } else if !this.annotation_brushing() {
                                             this.toast = None;
                                             this.scene_pointer_down(
                                                 event.position,
@@ -645,7 +650,6 @@ impl Studio {
                                         }
                                     } else if animation_active {
                                         // Drawing tools place timed marks at the playhead.
-                                        this.pause_video_playback();
                                         if interaction_bounds.contains(&flat) {
                                             this.pointer_down(
                                                 flat,
@@ -674,7 +678,7 @@ impl Studio {
                                                 event.click_count,
                                             );
                                         }
-                                        if this.selected_annotation.is_none() {
+                                        if this.selected_annotation.is_none() && !this.annotation_brushing() {
                                             this.scene_pointer_down(
                                                 event.position,
                                                 bounds,
@@ -699,9 +703,13 @@ impl Studio {
                             let entity = entity.clone();
                             move |event: &MouseMoveEvent, _, _, cx| {
                                 if !event.dragging() {
+                                    entity.update(cx, |_, cx| cx.notify());
                                     return;
                                 }
                                 entity.update(cx, |this, cx| {
+                                    if this.canvas_text_mouse_move(event, cx) {
+                                        return;
+                                    }
                                     if this.canvas_annotation_drag {
                                         this.pointer_move(event.position, bounds);
                                         cx.notify();
@@ -740,6 +748,7 @@ impl Studio {
                                 return;
                             }
                             entity.update(cx, |this, cx| {
+                                this.text_fields.canvas.update(cx, |field, _| field.canvas_release());
                                 if this.canvas_annotation_drag {
                                     this.pointer_up(event.position, bounds);
                                     this.canvas_annotation_drag = false;
@@ -827,6 +836,10 @@ impl Studio {
             .flex()
             .flex_col()
             .track_focus(&self.focus_handle)
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                this.update_annotation_modifiers(event.modifiers);
+                cx.notify();
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.native_text_focused(window, cx) { return; }
                 if this.capture_access_prompt.is_some() {

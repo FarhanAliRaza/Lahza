@@ -40,6 +40,50 @@ pub(super) fn brand_wordmark_latin(width: f32, height: f32) -> AnyElement {
         .into_any_element()
 }
 
+/// Shared credit and support links for the capture window and editor sidebar.
+pub(super) fn credit_footer() -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_between()
+        .py_3()
+        .border_t_1()
+        .border_color(line())
+        .text_xs()
+        .text_color(muted())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child("Created with")
+                .child(svg().path("icons/heart.svg").size(px(12.0)).flex_none().text_color(rgb(0xe5484d)))
+                .child("by")
+                .child(
+                    div()
+                        .id("credit-linkedin")
+                        .py_1()
+                        .cursor_pointer()
+                        .text_color(blue())
+                        .underline()
+                        .hover(|style| style.text_color(rgb(0x1265c7)))
+                        .child("Farhan")
+                        .on_click(|_, _, cx| cx.open_url("https://www.linkedin.com/in/farhanaliraza/")),
+                ),
+        )
+        .child(
+            div()
+                .id("credit-issues")
+                .py_1()
+                .cursor_pointer()
+                .hover(|style| style.text_color(blue()))
+                .child("Report an issue ↗")
+                .on_click(|_, _, cx| cx.open_url("https://github.com/FarhanAliRaza/Lahza/issues")),
+        )
+        .into_any_element()
+}
+
 pub(super) fn ink() -> Hsla {
     hsla(220.0 / 360.0, 0.13, 0.12, 1.0)
 }
