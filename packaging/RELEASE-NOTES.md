@@ -4,13 +4,17 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Keep zoom framing steady during zoom-in and zoom-out, including authored zoom ramps and timeline seeking. Zoom-out preserves the outgoing focus and settles at the full frame without an extra pan or rebound.
-- Smooth small, rapid cursor shakes while preserving deliberate movements, dragging, and clicks.
-- Let the cursor glide toward an upcoming click throughout the anticipation window, avoiding a late correction.
-- Scale cursor artwork smoothly during zoom and click animations instead of stepping between whole-pixel sizes.
-- Advance cursor and camera animation between decoded video frames for smoother editor playback.
+- Compose exported video frames on a hardware Vulkan GPU when available, preferring discrete GPUs. NVIDIA and AMD share the composition path for media transforms, cropping, rounded masks, webcam layers, cursor effects, captions, and watermarks.
+- Fall back to CPU composition when GPU initialization or rendering fails. Launch with `LAHZA_COMPOSITOR=cpu` to force CPU composition for troubleshooting.
+- Show Composition and Encoding separately in export progress, so hardware encoding no longer implies that frame composition also uses the GPU.
+- Skip inactive captions and reuse unchanged resized caption layers, avoiding expensive full-frame resampling on every frame.
+- Reuse GPU buffers and cached layers throughout an export, with optimized frame readback for FFmpeg.
 
-Validation: the workspace Rust suite, packaging tests, and confined Snap smoke test passed in CI for the application changes. Regression tests cover fixed zoom pivots, zoom-out framing, random seeking, cursor shake filtering, drag preservation, and click anticipation. The release workflow reruns these checks for the versioned packages. Interactive/device-dependent tests remain excluded from the default suite; cross-desktop capture validation remains outstanding.
+On an RTX 3060, a 20-second 1080p/30fps sample from a real recording exported in 14.0 seconds with GPU composition versus 22.8 seconds with CPU composition, using NVIDIA encoding in both cases. This sample is not a full-length export benchmark; results depend on the project and hardware.
+
+Validation: 230 automated tests and 114 GPU-versus-CPU frame comparisons passed locally. GPU comparisons cover transparency, cropping, zoom, perspective, off-screen placement, camera shapes and mirroring, cursor effects, changing captions, and resized frames. NVIDIA hardware was tested; AMD hardware, full-length and 4K/60fps exports, forced GPU failure, and cancellation during GPU work remain untested. The release workflow reruns the Rust and packaging suites and confined Snap smoke checks for the versioned packages.
+
+Decoding, text/vector rasterization, and preparation of cached backgrounds and shadows still run on the CPU. Composed frames are read back for FFmpeg; this is not a zero-copy decoding-to-encoding pipeline.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 

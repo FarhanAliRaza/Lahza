@@ -2527,7 +2527,8 @@ impl Studio {
                         .child(div().text_xs().text_color(muted()).text_ellipsis().child(self.export_filename.clone()))
                         .child(div().text_xs().text_color(muted())
                             .child("Keep editing. This export uses the version you started with."))
-                        .children(progress.encoder_label().map(|label| div().text_xs().text_color(muted()).child(label)))
+                        .children(progress.compositor_label().map(|label| div().text_xs().text_color(muted()).child(format!("Composition: {label}"))))
+                        .children(progress.encoder_label().map(|label| div().text_xs().text_color(muted()).child(format!("Encoding: {label}"))))
                 })
                 .child(
                     div().w_full().h(px(5.0)).rounded_full().bg(rgb(0xe9ebef)).overflow_hidden()

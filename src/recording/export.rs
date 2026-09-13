@@ -167,6 +167,7 @@ pub struct ExportProgress {
     total: AtomicU64,
     cancelled: AtomicBool,
     encoder: Mutex<Option<String>>,
+    compositor: Mutex<Option<String>>,
     encoding_started: Mutex<Option<Instant>>,
 }
 
@@ -182,6 +183,15 @@ impl ExportProgress {
 
     pub fn encoder_label(&self) -> Option<String> {
         self.encoder.lock().ok().and_then(|label| label.clone())
+    }
+
+    pub fn compositor_label(&self) -> Option<String> {
+        self.compositor.lock().ok().and_then(|label| label.clone())
+    }
+
+    fn set_compositor_label(&self, label: &str) {
+        let mut current = self.compositor.lock().unwrap();
+        if current.as_deref() != Some(label) { *current = Some(label.to_owned()); }
     }
 
     fn set_encoder_label(&self, label: &str) {
@@ -206,6 +216,7 @@ impl ExportProgress {
 
     fn reset(&self, total: u64) {
         *self.encoder.lock().unwrap() = None;
+        *self.compositor.lock().unwrap() = None;
         *self.encoding_started.lock().unwrap() = None;
         self.total.store(total, Ordering::Relaxed);
         self.completed.store(0, Ordering::Relaxed);
@@ -462,6 +473,9 @@ fn encode(
     )
     .map_err(VideoError::InvalidMedia)?;
 
+    let mut renderer = super::scene::gpu::Renderer::new();
+    progress.set_compositor_label(renderer.label());
+
     let audio = match prepared {
         PreparedSource::Video { audio, .. } => audio.clone(),
         PreparedSource::Image { .. } => None,
@@ -645,13 +659,14 @@ fn encode(
         let viewport = request.viewport.frame_at(time);
         let overlay = request.overlay.as_mut().and_then(|source| source(time));
         let canvas_overlay = request.canvas_overlay.as_mut().and_then(|source| source(time));
-        let output = compositor.compose_layers(FrameInput {
+        let output = renderer.compose(&compositor, FrameInput {
             source: source_frame,
             overlay: overlay.as_deref(),
             viewport,
             pointer: pointer_overlay.as_ref(),
             camera: last_camera_frame.as_ref(),
         }, time >= request.media_start && request.media_end.is_none_or(|end| time < end), canvas_overlay.as_deref());
+        progress.set_compositor_label(renderer.label());
         if let Err(error) = stdin.write_all(output.as_raw()) {
             write_error = Some(VideoError::Decode(format!(
                 "FFmpeg stopped accepting frames: {error}"
@@ -696,13 +711,14 @@ fn encode(
                 .map(|frame| PointerOverlay { frame });
             let overlay = segment.overlay.as_mut().and_then(|source| source(time));
             let canvas_overlay = segment.canvas_overlay.as_mut().and_then(|source| source(time));
-            let output = compositor.compose_layers(FrameInput {
+            let output = renderer.compose(&compositor, FrameInput {
                 source: &segment.image,
                 overlay: overlay.as_deref(),
                 viewport: segment.viewport.frame_at(time),
                 pointer: pointer_overlay.as_ref(),
                 camera: None,
             }, time >= segment.media_start && segment.media_end.is_none_or(|end| time < end), canvas_overlay.as_deref());
+            progress.set_compositor_label(renderer.label());
             if let Err(error) = stdin.write_all(output.as_raw()) {
                 write_error = Some(VideoError::Decode(format!(
                     "FFmpeg stopped accepting frames: {error}"
@@ -773,10 +789,14 @@ mod tests {
         progress.reset(100);
         *progress.encoding_started.lock().unwrap() = Some(Instant::now() - Duration::from_secs(10));
         progress.completed.store(50, Ordering::Relaxed);
+        progress.set_compositor_label("Vulkan · test GPU");
+        progress.set_encoder_label("GPU · NVIDIA");
         assert!(progress.remaining_label().starts_with("About "));
         progress.reset(200);
         assert_eq!(progress.remaining_label(), "Preparing export…");
         assert_eq!(progress.fraction(), 0.0);
+        assert!(progress.compositor_label().is_none());
+        assert!(progress.encoder_label().is_none());
     }
 
     fn ffmpeg_available() -> bool {
@@ -796,6 +816,52 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    #[ignore = "set LAHZA_EXPORT_PROJECT to benchmark 20 seconds of a saved recording"]
+    fn benchmark_saved_recording_export() {
+        use crate::recording::model::RecordingSession;
+        let session = RecordingSession {
+            directory: std::env::var_os("LAHZA_EXPORT_PROJECT").expect("recording directory").into(),
+        };
+        let document = session.effective_edit_document().unwrap().unwrap();
+        let style: SceneStyle = serde_json::from_value(document["scene"].clone()).unwrap();
+        let info = probe_media(&session.screen_path()).unwrap();
+        let clips = session.effective_clip_timeline(info.duration).unwrap();
+        let capture = session.read_pointer_capture().unwrap();
+        let pointer = PointerTimeline::build_with_clip_timeline(
+            capture.clone(), info.duration, info.width as f64, info.height as f64,
+            style.pointer.timeline_options(), Some(&clips),
+        );
+        let cues: Vec<super::super::viewport::ZoomCue> = document.get("zoomCues").cloned()
+            .map(|value| serde_json::from_value(value).unwrap()).unwrap_or_default();
+        let viewport = ViewportTimeline::build(&cues, &pointer, &clips, &capture);
+        let marks: Vec<crate::AnnotationMark> = document.get("annotations").cloned()
+            .map(|value| serde_json::from_value(value).unwrap()).unwrap_or_default();
+        let root = test_root("benchmark");
+        let destination = root.join("sample.mp4");
+        let duration = clips.duration().min(20.0);
+        let mut request = SceneExportRequest::new(destination.clone(), ExportFormat::Mp4,
+            1080, style.clone(), viewport.clone(), duration);
+        request.frame_rate = 30.0;
+        request.noise_reduction = document["lahzaExtras"]["noiseReduction"].as_bool().unwrap_or(false);
+        request.include_audio = !document["lahzaExtras"]["audioMuted"].as_bool().unwrap_or(false);
+        let (width, height) = style.export_canvas_size(info.width, info.height, 1080);
+        request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(marks.clone(), width as f64 / height as f64);
+        request.overlay = crate::scene_ui::overlay_source_for(marks, viewport, info.width, info.height);
+        let progress = ExportProgress::default();
+        let start = Instant::now();
+        export_scene(SceneSource::Video {
+            media: session.screen_path(), clips, pointer: Some(pointer),
+            camera: session.camera_path().exists().then(|| session.camera_path()),
+        }, &mut request, &progress).unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!("Saved project: {duration:.1}s at {width}x{height}/30fps exported in {elapsed:.2}s ({:.2}x realtime), compositor={:?}, encoder={:?}, output={}",
+            duration / elapsed, progress.compositor_label(), progress.encoder_label(), destination.display());
+        let output = probe_media(&destination).unwrap();
+        assert_eq!((output.width, output.height), (width, height));
+        assert!((output.duration - duration).abs() < 0.15);
     }
 
     fn test_video(root: &Path) -> PathBuf {

@@ -2,13 +2,16 @@
 //!
 //! A scene is a canvas (background + effects) with one media surface (the
 //! screenshot or a decoded video frame) placed on it through a 2D/3D
-//! transform. The same geometry and the same CPU compositor are used for the
-//! editor preview, animated-screenshot export, and recording export, so what
-//! the user sees is what the file contains.
+//! transform. Preview and export share geometry and asset preparation. Export
+//! uses the offscreen Vulkan compositor when available, with this CPU renderer
+//! as its reference and fallback.
 
 use image::{Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+#[path = "scene_gpu.rs"]
+pub mod gpu;
 
 pub use super::pointer_timeline::PointerMotion;
 
@@ -869,6 +872,7 @@ pub struct PointerOverlay {
 }
 
 /// Per-frame inputs to [`SceneCompositor::compose`].
+#[derive(Clone, Copy)]
 pub struct FrameInput<'a> {
     /// Full media (screenshot or decoded video frame).
     pub source: &'a RgbaImage,
@@ -945,6 +949,7 @@ pub struct SceneCompositor {
     background: RgbaImage,
     card: std::cell::RefCell<Option<CardLayer>>,
     camera_shadow: std::cell::RefCell<Option<CameraShadow>>,
+    canvas_overlay: std::cell::RefCell<Option<(RgbaImage, RgbaImage)>>,
     vignette: Option<Vec<f32>>,
     watermark: Option<RgbaImage>,
 }
@@ -1054,6 +1059,7 @@ impl SceneCompositor {
             background,
             card: std::cell::RefCell::new(None),
             camera_shadow: std::cell::RefCell::new(None),
+            canvas_overlay: std::cell::RefCell::new(None),
             vignette,
             watermark,
         })
@@ -1132,13 +1138,18 @@ impl SceneCompositor {
             if layer.dimensions() == output.dimensions() {
                 blend_layer(&mut output, layer);
             } else {
-                let layer = image::imageops::resize(
-                    layer,
-                    self.width,
-                    self.height,
-                    image::imageops::FilterType::Lanczos3,
-                );
-                blend_layer(&mut output, &layer);
+                // Timed annotation sources reuse unchanged pixels. Resample
+                // those pixels once, rather than once per video frame. Own
+                // the key so mutating/reusing an input allocation is safe.
+                let mut cache = self.canvas_overlay.borrow_mut();
+                if !cache.as_ref().is_some_and(|(source, _)| source == layer) {
+                    let resized = image::imageops::resize(
+                        layer, self.width, self.height,
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                    *cache = Some((layer.clone(), resized));
+                }
+                blend_layer(&mut output, &cache.as_ref().unwrap().1);
             }
         }
         output
@@ -1339,16 +1350,35 @@ impl SceneCompositor {
         paint_camera_overlay(output, camera, overlay, rect);
     }
 
-    fn paint_pointer(
+    fn paint_pointer(&self, output: &mut RgbaImage, projection: &MediaProjection,
+        pointer: &PointerOverlay, viewport: ViewportFrame) {
+        let clip = Rect { x: 0.0, y: 0.0, width: self.width as f64, height: self.height as f64 };
+        for command in self.pointer_commands(projection, pointer, viewport) {
+            match command {
+                PointerCommand::Disc { x, y, radius, line_width, color, opacity } => {
+                    if let Some(line_width) = line_width {
+                        paint_ring(output, clip, x, y, radius, line_width, color, opacity);
+                    } else {
+                        paint_disc(output, clip, x, y, radius, color, opacity);
+                    }
+                }
+                PointerCommand::Bitmap { bitmap, placement, opacity, shadow_only } => {
+                    paint_cursor_bitmap(output, clip, &bitmap, placement, opacity, shadow_only);
+                }
+            }
+        }
+    }
+
+    fn pointer_commands(
         &self,
-        output: &mut RgbaImage,
         projection: &MediaProjection,
         pointer: &PointerOverlay,
         viewport: ViewportFrame,
-    ) {
+    ) -> Vec<PointerCommand> {
+        let mut commands = Vec::with_capacity(4);
         let style = self.style.pointer;
         if !style.visible {
-            return;
+            return commands;
         }
         let frame = &pointer.frame;
         let (left, top, visible_x, visible_y) = self.style.source_crop.visible_rect(viewport);
@@ -1356,12 +1386,6 @@ impl SceneCompositor {
             let u = (point.x - left) / visible_x;
             let v = (point.y - top) / visible_y;
             (projection.project(u, v), u, v)
-        };
-        let clip = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: self.width as f64,
-            height: self.height as f64,
         };
         let pointer_scale = style.scale as f64 / 100.0;
         if style.click_effects {
@@ -1375,25 +1399,10 @@ impl SceneCompositor {
                         viewport.magnification.max(1.0) * pointer_scale,
                     );
                     let color = unpack(style.click_color);
-                    paint_disc(
-                        output,
-                        clip,
-                        x,
-                        y,
-                        geometry.impact_radius,
-                        color,
-                        geometry.impact_opacity,
-                    );
-                    paint_ring(
-                        output,
-                        clip,
-                        x,
-                        y,
-                        geometry.ripple_radius,
-                        geometry.ripple_line_width,
-                        color,
-                        geometry.ripple_opacity,
-                    );
+                    commands.push(PointerCommand::Disc { x, y, radius: geometry.impact_radius,
+                        line_width: None, color, opacity: geometry.impact_opacity });
+                    commands.push(PointerCommand::Disc { x, y, radius: geometry.ripple_radius,
+                        line_width: Some(geometry.ripple_line_width), color, opacity: geometry.ripple_opacity });
                 }
             }
         }
@@ -1403,11 +1412,11 @@ impl SceneCompositor {
             1.0
         };
         if opacity <= 0.0 {
-            return;
+            return commands;
         }
         let ((x, y), u, v) = to_canvas(frame.location);
         if !(-0.02..=1.02).contains(&u) || !(-0.02..=1.02).contains(&v) {
-            return;
+            return commands;
         }
         let local_scale = projection.screen_scale_at(u, v);
         // Canvas pixels per normalized media unit at this point.
@@ -1417,7 +1426,7 @@ impl SceneCompositor {
         );
         let bitmap = frame
             .bitmap
-            .as_deref()
+            .as_ref()
             .filter(|_| style.family == CursorFamily::Recorded);
         if let Some(bitmap) = bitmap {
             // Captured cursors keep their on-screen proportion to the
@@ -1427,7 +1436,7 @@ impl SceneCompositor {
             let width = bitmap.reference_width * self.geometry.media.width * media_scale / visible_x;
             let height = bitmap.reference_height * self.geometry.media.height * media_scale / visible_y;
             if width < 1.0 || height < 1.0 {
-                return;
+                return commands;
             }
             let placement = BitmapPlacement {
                 hotspot_x: x,
@@ -1443,10 +1452,10 @@ impl SceneCompositor {
                     hotspot_y: y + height * 0.07,
                     ..placement
                 };
-                paint_cursor_bitmap(output, clip, bitmap, shadow, opacity * 0.35, true);
+                commands.push(PointerCommand::Bitmap { bitmap: bitmap.clone(), placement: shadow, opacity: opacity * 0.35, shadow_only: true });
             }
-            paint_cursor_bitmap(output, clip, bitmap, placement, opacity, false);
-            return;
+            commands.push(PointerCommand::Bitmap { bitmap: bitmap.clone(), placement, opacity, shadow_only: false });
+            return commands;
         }
         // Styled cursors follow Cap: a fixed height relative to the media,
         // in the chosen family's rendition of the recorded shape.  The
@@ -1464,7 +1473,7 @@ impl SceneCompositor {
             * pointer_scale
             * frame.magnification;
         if height < 1.0 {
-            return;
+            return commands;
         }
         // Rasterize at the next coarse step above the drawn size and let
         // the painter resample to the exact fractional height: zoom and
@@ -1473,7 +1482,7 @@ impl SceneCompositor {
         // integer height.
         let raster_height = (height / CURSOR_RASTER_STEP).ceil() * CURSOR_RASTER_STEP;
         let Some(asset) = cursor_assets::rasterize(family, shape, raster_height as u32) else {
-            return;
+            return commands;
         };
         let width = height * f64::from(asset.image.width()) / f64::from(asset.image.height());
         let placement = BitmapPlacement {
@@ -1484,8 +1493,14 @@ impl SceneCompositor {
             tilt_degrees: frame.tilt_degrees,
             smear: cursor_smear(frame.velocity, unit_scale, width),
         };
-        paint_cursor_bitmap(output, clip, &asset, placement, opacity, false);
+        commands.push(PointerCommand::Bitmap { bitmap: asset, placement, opacity, shadow_only: false });
+        commands
     }
+}
+
+enum PointerCommand {
+    Disc { x: f64, y: f64, radius: f64, line_width: Option<f64>, color: [u8; 3], opacity: f64 },
+    Bitmap { bitmap: std::sync::Arc<PointerBitmap>, placement: BitmapPlacement, opacity: f64, shadow_only: bool },
 }
 
 /// Paints the media surface into a band of output rows.  Untransformed
@@ -2560,6 +2575,58 @@ mod tests {
             }));
         }
         eprintln!("1080p composition: {:.2} ms/frame", start.elapsed().as_secs_f64() * 1000.0 / 60.0);
+        // Canvas captions are rendered at an 800px reference height. Include
+        // the layer even when transparent to catch work outside its timing.
+        let mut caption = RgbaImage::new(1422, 800);
+        for visible in [false, true] {
+            if visible {
+                for y in 600..640 {
+                    for x in 400..900 {
+                        caption.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+                    }
+                }
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..60 {
+                std::hint::black_box(compositor.compose_layers(FrameInput {
+                    source: &source, overlay: None, viewport: ViewportFrame::default(),
+                    pointer: None, camera: Some(&camera),
+                }, true, Some(&caption)));
+            }
+            eprintln!("1080p composition + canvas caption (visible={visible}): {:.2} ms/frame",
+                start.elapsed().as_secs_f64() * 1000.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn cached_canvas_overlay_matches_resampling_after_changes_and_rebuilds() {
+        let style = flat_style(0x345678);
+        let compositor = SceneCompositor::new(&style, 96, 64, 48, 32).unwrap();
+        let source = checker(48, 32);
+        let mut caption = RgbaImage::new(48, 32);
+        let check = |compositor: &SceneCompositor, caption: &RgbaImage| {
+            let mut expected = compose(compositor, &source);
+            let resized = image::imageops::resize(caption, expected.width(), expected.height(),
+                image::imageops::FilterType::Lanczos3);
+            blend_layer(&mut expected, &resized);
+            let actual = compositor.compose_layers(FrameInput {
+                source: &source, overlay: None, viewport: Default::default(),
+                pointer: None, camera: None,
+            }, true, Some(caption));
+            assert_eq!(actual, expected);
+        };
+        check(&compositor, &caption);
+        caption.put_pixel(12, 20, Rgba([255, 0, 0, 180]));
+        check(&compositor, &caption);
+        check(&compositor, &caption);
+        // Mutate the same allocation, then change its dimensions, then seek
+        // back to blank. None of these may reuse stale caption pixels.
+        caption.put_pixel(12, 20, Rgba([0, 255, 0, 90]));
+        check(&compositor, &caption);
+        check(&compositor, &checker(32, 48));
+        check(&compositor, &RgbaImage::new(48, 32));
+        let rebuilt = compositor.rebuild(&style, 128, 96, 48, 32).unwrap();
+        check(&rebuilt, &caption);
     }
 
     #[test]

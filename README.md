@@ -172,6 +172,30 @@ cargo test --locked -p lahza-annotations
 
 Export integration tests require FFmpeg/FFprobe. Desktop capture and playback also need manual testing in a real Linux desktop session.
 
+### GPU export composition
+
+Exports automatically select a hardware Vulkan GPU, preferring a discrete GPU.
+NVIDIA and AMD use the same compositor for media transforms and cropping,
+rounded masks, webcam layers, cursor effects, captions, and watermark blending.
+The export panel reports **Composition** and **Encoding** separately: hardware
+composition can also run with a software video encoder. If Vulkan is unavailable
+or fails, the current frame and remaining export use the CPU compositor.
+
+Decoding, text/vector rasterization, and preparation of cached backgrounds and
+shadows still run on the CPU. Composed frames are read back for the existing
+FFmpeg encoder; this is not a zero-copy decoding-to-encoding pipeline.
+
+For troubleshooting or comparison, launch with `LAHZA_COMPOSITOR=cpu` to force
+CPU composition. The shader validation and CPU fallback tests run in the normal
+suite. On a machine with a working NVIDIA/AMD Vulkan driver, run:
+
+```bash
+cargo test --release --locked hardware_composition_matches_cpu -- --ignored --nocapture
+cargo test --release --locked benchmark_hardware_composition -- --ignored --nocapture
+# Export a 20-second sample to a temporary directory without editing the project:
+LAHZA_EXPORT_PROJECT=/path/to/project.lahzarec cargo test --release --locked benchmark_saved_recording_export -- --ignored --nocapture
+```
+
 ## First-release scope
 
 Lahza is an early Linux release. Desktop portal behavior varies by compositor, and the presence of both display backends does not imply every capture feature has been validated on every desktop. Camera-file overlays are supported; live webcam capture and device selection remain unfinished. Recovery can salvage usable recordings, but cannot guarantee recovery after every encoder or system failure.

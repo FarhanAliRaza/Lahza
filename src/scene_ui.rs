@@ -3532,6 +3532,11 @@ pub(crate) fn canvas_overlay_source_for(
             .iter()
             .filter_map(|mark| timed::animated_mark(mark, time))
             .collect();
+        // An inactive caption must not send a full transparent canvas through
+        // the compositor (including its export-resolution resampling).
+        if active.is_empty() {
+            return None;
+        }
         let signature = timed::marks_signature(&active);
         if let Some((cached, layer)) = &cache {
             if *cached == signature {
@@ -3779,6 +3784,23 @@ mod canvas_caption_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn canvas_caption_is_absent_outside_its_timing_and_survives_seeking() {
+        let caption = AnnotationMark {
+            tool: Tool::Text, canvas: true, text: "Caption".into(),
+            timing: Some(AnnotationTiming { start: 12.5, end: 15.0, ..Default::default() }),
+            ..Default::default()
+        };
+        let mut overlay = canvas_overlay_source_for(vec![caption], 16.0 / 9.0).unwrap();
+        assert!(overlay(0.0).is_none());
+        let visible = overlay(13.5).unwrap();
+        assert!(visible.pixels().any(|pixel| pixel[3] > 0));
+        assert!(Arc::ptr_eq(&visible, &overlay(13.6).unwrap()));
+        assert!(overlay(16.0).is_none());
+        assert!(overlay(12.0).is_none());
+        assert_eq!(visible.as_ref(), overlay(13.5).unwrap().as_ref());
     }
 
     #[test]
