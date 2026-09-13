@@ -317,6 +317,7 @@ impl PointerTimeline {
                 &first
             };
             let mut target = (latest.x, latest.y);
+            let mut anticipating_press = false;
             let mut approaching_press = false;
             let returning = return_target
                 .filter(|_| timeline_duration - time <= LOOP_RETURN_WINDOW)
@@ -328,6 +329,7 @@ impl PointerTimeline {
                 let remaining = press.time - time;
                 if (0.0..=ANTICIPATION_WINDOW).contains(&remaining) {
                     target = (press.x, press.y);
+                    anticipating_press = true;
                     approaching_press = remaining <= INTERCEPT_WINDOW;
                 }
             }
@@ -342,7 +344,11 @@ impl PointerTimeline {
             };
             let desired_lead = motion.friction / motion.tension.max(0.000_001);
             phase_lead += (desired_lead - phase_lead) * LEAD_SMOOTHING;
-            if !approaching_press && !returning {
+            // The press target must survive the whole anticipation window,
+            // as in Cap: replacing it with the lead-compensated travel path
+            // until the intercept spring kicks in turns the early glide into
+            // a late correction.
+            if !anticipating_press && !returning {
                 if let Some(interpolated) =
                     interpolated_travel_position(&travel_samples, time + phase_lead)
                 {
@@ -684,6 +690,32 @@ mod tests {
         assert!((effect.location.x - 0.9).abs() < 1e-12);
         assert!(frame.location.x < effect.location.x);
         assert_eq!(effect.progress, 0.0);
+    }
+
+    #[test]
+    fn press_target_holds_through_the_anticipation_window() {
+        // Mirrors Cap's `click_target_snap_glides_ahead_of_click`: the
+        // pointer sits still until it jumps to the click at 0.6s.
+        let mut travel: Vec<_> = (0..=5)
+            .map(|i| travel(f64::from(i) * 0.1, 0.1, 0.1, PointerTravelKind::Move))
+            .collect();
+        travel.push(self::travel(0.6, 0.9, 0.9, PointerTravelKind::Move));
+        let capture = PointerCaptureFile {
+            travel,
+            presses: vec![press(0.6, 0.9, PressPhase::Down)],
+            ..Default::default()
+        };
+        let timeline = PointerTimeline::build(
+            capture,
+            1.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions::default(),
+        );
+        let x_at = |time: f64| timeline.frame_at(time).unwrap().location.x;
+        assert!(x_at(0.08) < 0.12, "moved before the window opened: {}", x_at(0.08));
+        assert!(x_at(0.3) > 0.4, "no early glide toward the click: {}", x_at(0.3));
+        assert!(x_at(0.59) > 0.8, "not at the click just before it: {}", x_at(0.59));
     }
 
     #[test]

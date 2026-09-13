@@ -64,10 +64,35 @@ impl Default for ViewportFrame {
 
 #[derive(Clone, Debug, Default)]
 pub struct ViewportTimeline {
-    frames: Vec<ViewportFrame>,
+    frames: Vec<ViewportSample>,
     duration: f64,
     cues: Vec<ZoomCue>,
     clips: RecordingClipTimeline,
+}
+
+/// Framing is a proportion of the available crop travel, not a source-space
+/// crop center. Its valid range stays 0..1 at every magnification.
+#[derive(Clone, Copy, Debug)]
+struct ViewportSample {
+    magnification: f64,
+    framing: NormalizedPoint,
+    tilt: Tilt,
+}
+
+impl ViewportSample {
+    fn frame(self, transform: SceneTransform) -> ViewportFrame {
+        let half = 0.5 / self.magnification.max(1.0);
+        let travel = 1.0 - 2.0 * half;
+        ViewportFrame {
+            magnification: self.magnification,
+            anchor: NormalizedPoint {
+                x: half + self.framing.x.clamp(0.0, 1.0) * travel,
+                y: half + self.framing.y.clamp(0.0, 1.0) * travel,
+            },
+            tilt: self.tilt,
+            transform,
+        }
+    }
 }
 
 impl ViewportTimeline {
@@ -104,8 +129,9 @@ impl ViewportTimeline {
         let frame_count = ((duration * STEP_RATE).ceil() as usize + 1).max(2);
         let dt = 1.0 / STEP_RATE;
         let mut amount = DampedSpring::new(1.0);
-        let mut anchor_x = DampedSpring::new(0.5);
-        let mut anchor_y = DampedSpring::new(0.5);
+        let mut framing_x = DampedSpring::new(0.5);
+        let mut framing_y = DampedSpring::new(0.5);
+        let mut held_framing = NormalizedPoint { x: 0.5, y: 0.5 };
         let mut tilt_x = DampedSpring::new(0.0);
         let mut tilt_y = DampedSpring::new(0.0);
         let mut tilt_z = DampedSpring::new(0.0);
@@ -140,14 +166,19 @@ impl ViewportTimeline {
                     Some(cue.anchor_at(base, progress))
                 })
                 .unwrap_or(NormalizedPoint { x: 0.5, y: 0.5 });
-            let target_anchor = bounded_anchor(
-                raw_target,
-                target_magnification,
-                active
-                    .map(|cue| cue.anchor_mode)
-                    .unwrap_or(ZoomAnchorMode::PinnedAnchor),
-                active.map(|cue| cue.bounds_bias).unwrap_or(0.0),
-            );
+            if let Some(cue) = active {
+                // Preserve the authored framing at the cue's full zoom. Using
+                // the changing ramp amount here would move the pivot itself.
+                held_framing = framing_for_focus(
+                    raw_target,
+                    cue.zoom,
+                    cue.anchor_mode,
+                    cue.bounds_bias,
+                );
+            }
+            // Zoom-out keeps the outgoing focus; scale alone reveals the
+            // full frame, without a second pan toward the middle.
+            let target_framing = held_framing;
             let target_tilt = active.map(|cue| cue.tilt_at(progress)).unwrap_or_default();
             let cue_id = active.map(|cue| cue.id);
             let changed = cue_id != previous_cue;
@@ -159,41 +190,40 @@ impl ViewportTimeline {
 
             if should_snap {
                 amount.snap(target_magnification);
-                anchor_x.snap(target_anchor.x);
-                anchor_y.snap(target_anchor.y);
+                framing_x.snap(target_framing.x);
+                framing_y.snap(target_framing.y);
                 tilt_x.snap(target_tilt.x);
                 tilt_y.snap(target_tilt.y);
                 tilt_z.snap(target_tilt.z);
-            } else if frame_index > 0 {
-                tilt_x.step(target_tilt.x, MOTION_PROFILE, dt);
-                tilt_y.step(target_tilt.y, MOTION_PROFILE, dt);
-                tilt_z.step(target_tilt.z, MOTION_PROFILE, dt);
-                // Cap's renderer pre-aims while scale is visually identity.
-                // This prevents a late diagonal pan as an incoming zoom ramps.
-                if amount.position <= 1.000_5 && target_magnification > 1.0 {
-                    anchor_x.snap(target_anchor.x);
-                    anchor_y.snap(target_anchor.y);
-                } else {
-                    anchor_x.step(target_anchor.x, MOTION_PROFILE, dt);
-                    anchor_y.step(target_anchor.y, MOTION_PROFILE, dt);
+            } else {
+                // At identity all framing coordinates show the full image,
+                // so pre-aim without producing any visible movement.
+                if amount.position <= 1.000_5 {
+                    framing_x.snap(target_framing.x);
+                    framing_y.snap(target_framing.y);
+                } else if frame_index > 0 {
+                    framing_x.step(target_framing.x, MOTION_PROFILE, dt);
+                    framing_y.step(target_framing.y, MOTION_PROFILE, dt);
                 }
-                amount.step(target_magnification, MOTION_PROFILE, dt);
+                if frame_index > 0 {
+                    tilt_x.step(target_tilt.x, MOTION_PROFILE, dt);
+                    tilt_y.step(target_tilt.y, MOTION_PROFILE, dt);
+                    tilt_z.step(target_tilt.z, MOTION_PROFILE, dt);
+                    amount.step(target_magnification, MOTION_PROFILE, dt);
+                }
             }
 
-            let transform = active
-                .and_then(|cue| cue.transform.map(|motion| motion.at(cue.easing.apply(progress))))
-                .unwrap_or(SceneTransform::IDENTITY);
-            let magnification = amount.position.max(1.0);
-            frames.push(ViewportFrame {
-                magnification,
-                transform,
-                anchor: clamp_to_frame(
-                    NormalizedPoint {
-                        x: anchor_x.position,
-                        y: anchor_y.position,
-                    },
-                    magnification,
-                ),
+            if amount.position < 1.0 {
+                // Stop at the full frame, including velocity, so spring
+                // undershoot cannot cause a small second zoom after release.
+                amount.snap(1.0);
+            }
+            frames.push(ViewportSample {
+                magnification: amount.position,
+                framing: NormalizedPoint {
+                    x: framing_x.position.clamp(0.0, 1.0),
+                    y: framing_y.position.clamp(0.0, 1.0),
+                },
                 tilt: Tilt {
                     x: tilt_x.position,
                     y: tilt_y.position,
@@ -216,22 +246,33 @@ impl ViewportTimeline {
             return ViewportFrame::default();
         };
         if self.frames.len() == 1 || self.duration <= 0.0 {
-            return ViewportFrame { transform, ..first };
+            return first.frame(transform);
         }
         let position = time.clamp(0.0, self.duration) * STEP_RATE;
         let index = position as usize;
         if index >= self.frames.len() - 1 {
-            return ViewportFrame { transform, ..*self.frames.last().unwrap_or(&first) };
+            return self.frames.last().unwrap_or(&first).frame(transform);
         }
         let fraction = position - index as f64;
         let left = self.frames[index];
         let right = self.frames[index + 1];
-        ViewportFrame {
+        // Interpolate in framing space, then derive the source crop. Lerp of
+        // crop centers would reintroduce pivot drift between cached samples.
+        let left_framing = if left.magnification == 1.0 {
+            right.framing
+        } else {
+            left.framing
+        };
+        let right_framing = if right.magnification == 1.0 {
+            left_framing
+        } else {
+            right.framing
+        };
+        ViewportSample {
             magnification: lerp(left.magnification, right.magnification, fraction),
-            transform,
-            anchor: NormalizedPoint {
-                x: lerp(left.anchor.x, right.anchor.x, fraction),
-                y: lerp(left.anchor.y, right.anchor.y, fraction),
+            framing: NormalizedPoint {
+                x: lerp(left_framing.x, right_framing.x, fraction),
+                y: lerp(left_framing.y, right_framing.y, fraction),
             },
             tilt: Tilt {
                 x: lerp(left.tilt.x, right.tilt.x, fraction),
@@ -239,6 +280,7 @@ impl ViewportTimeline {
                 z: lerp(left.tilt.z, right.tilt.z, fraction),
             },
         }
+        .frame(transform)
     }
 }
 
@@ -389,6 +431,24 @@ fn cue_priority(cue: &ZoomCue) -> u8 {
         ZoomAnchorMode::PointerAnchor => 1,
         ZoomAnchorMode::SmartAnchor => 2,
         ZoomAnchorMode::PinnedAnchor => 3,
+    }
+}
+
+fn framing_for_focus(
+    point: NormalizedPoint,
+    magnification: f64,
+    mode: ZoomAnchorMode,
+    bounds_bias: f64,
+) -> NormalizedPoint {
+    let half = 0.5 / magnification.max(1.0);
+    let travel = 1.0 - 2.0 * half;
+    if travel <= f64::EPSILON {
+        return point.clamped();
+    }
+    let anchor = bounded_anchor(point, magnification, mode, bounds_bias);
+    NormalizedPoint {
+        x: ((anchor.x - half) / travel).clamp(0.0, 1.0),
+        y: ((anchor.y - half) / travel).clamp(0.0, 1.0),
     }
 }
 
@@ -1141,6 +1201,51 @@ mod tests {
         assert!(walkthrough_capture(&[], 6.0).travel.is_empty());
     }
 
+    #[test]
+    #[ignore = "set LAHZA_ZOOM_RECORDING to a recording package to print its automatic zoom camera"]
+    fn real_recording_auto_zoom_camera_report() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("LAHZA_ZOOM_RECORDING").expect("recording package"),
+        );
+        let capture: PointerCaptureFile =
+            serde_json::from_slice(&std::fs::read(root.join("input.json")).unwrap()).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("capture.json")).unwrap()).unwrap();
+        let duration = meta["duration"].as_f64().unwrap();
+        let width = meta["pixelWidth"].as_f64().unwrap();
+        let height = meta["pixelHeight"].as_f64().unwrap();
+        let cues = synthesize_zoom_cues(&capture, duration);
+        let clips = RecordingClipTimeline::new(vec![
+            crate::recording::clips::RecordingClipSegment::new(0.0, duration),
+        ]);
+        let pointer = PointerTimeline::build(
+            capture.clone(),
+            duration,
+            width,
+            height,
+            PointerTimelineOptions::default(),
+        );
+        for (index, cue) in cues.iter().enumerate() {
+            let clusters = build_focus_clusters(cue, &capture, &clips, &pointer);
+            eprintln!("cue {index}: {:.2}s..{:.2}s zoom {:.2}", cue.start, cue.end, cue.zoom);
+            for cluster in &clusters {
+                eprintln!(
+                    "  cluster from {:.2}s x {:.3}..{:.3} y {:.3}..{:.3} center ({:.3},{:.3})",
+                    cluster.editor_start, cluster.min_x, cluster.max_x, cluster.min_y,
+                    cluster.max_y, cluster.center().x, cluster.center().y
+                );
+            }
+        }
+        let viewport = ViewportTimeline::build(&cues, &pointer, &clips, &capture);
+        for press in capture.presses.iter().filter(|press| press.phase == PressPhase::Down) {
+            let frame = viewport.frame_at(press.time);
+            eprintln!(
+                "click {:.2}s at ({:.3},{:.3}): magnification {:.2} anchor ({:.3},{:.3})",
+                press.time, press.x, press.y, frame.magnification, frame.anchor.x, frame.anchor.y
+            );
+        }
+    }
+
     fn down(time: f64, x: f64, y: f64) -> PointerPressEvent {
         PointerPressEvent {
             time,
@@ -1243,6 +1348,72 @@ mod tests {
             ..Default::default()
         };
         assert!(synthesize_zoom_cues(&capture, 10.0).is_empty());
+    }
+
+    #[test]
+    fn zoom_in_keeps_its_pivot_fixed_between_simulation_samples() {
+        for mode in [ZoomAnchorMode::PinnedAnchor, ZoomAnchorMode::PointerAnchor] {
+            let mut cue = ZoomCue::pinned(
+                0.5, 2.0, 1.5, NormalizedPoint { x: 0.65, y: 0.35 },
+            );
+            cue.anchor_mode = mode;
+            cue.bounds_bias = 0.25;
+            let viewport = ViewportTimeline::build_static(&[cue], 4.0);
+            // These pivots produce the existing settled framing at 1.5x.
+            let pivot = match mode {
+                ZoomAnchorMode::PinnedAnchor => NormalizedPoint { x: 0.95, y: 0.05 },
+                _ => NormalizedPoint { x: 0.875, y: 0.125 },
+            };
+            for time in [0.501, 0.537, 0.613, 0.729, 0.947, 1.313] {
+                assert_pivot_stationary(viewport.frame_at(time), pivot);
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_out_preserves_the_outgoing_framing() {
+        let cue = ZoomCue::pinned(
+            0.5, 2.0, 1.5, NormalizedPoint { x: 0.625, y: 0.375 },
+        );
+        let viewport = ViewportTimeline::build_static(&[cue], 4.0);
+        let pivot = NormalizedPoint { x: 0.875, y: 0.125 };
+        for time in [2.017, 2.113, 2.229, 2.347, 2.513, 3.173] {
+            assert_pivot_stationary(viewport.frame_at(time), pivot);
+        }
+        assert_eq!(viewport.frame_at(4.0).magnification, 1.0);
+    }
+
+    #[test]
+    fn authored_zoom_ramps_keep_a_fixed_pivot_and_support_random_seeks() {
+        for motion in [MotionStyle::ZoomIn, MotionStyle::ZoomOut] {
+            let mut cue = ZoomCue::pinned(
+                0.0, 2.5, 1.5, NormalizedPoint { x: 0.6, y: 0.4 },
+            );
+            cue.motion = motion;
+            cue.skips_easing = motion == MotionStyle::ZoomOut;
+            let viewport = ViewportTimeline::build_static(&[cue], 4.0);
+            let pivot = NormalizedPoint { x: 0.8, y: 0.2 };
+            let times = [0.003, 0.113, 0.729, 1.347, 2.113, 2.497, 2.613, 3.719];
+            let sequential: Vec<_> = times.iter().map(|&t| viewport.frame_at(t)).collect();
+            for index in [7, 0, 4, 2, 6, 1, 5, 3] {
+                let frame = viewport.frame_at(times[index]);
+                assert_eq!(frame, sequential[index]);
+                assert_pivot_stationary(frame, pivot);
+            }
+        }
+    }
+
+    fn assert_pivot_stationary(frame: ViewportFrame, pivot: NormalizedPoint) {
+        let (left, top, visible) = visible_rect(frame);
+        let projected = NormalizedPoint {
+            x: (pivot.x - left) / visible,
+            y: (pivot.y - top) / visible,
+        };
+        assert!(
+            (projected.x - pivot.x).abs() < 1e-9
+                && (projected.y - pivot.y).abs() < 1e-9,
+            "zoom pivot drifted: {pivot:?} -> {projected:?} at {frame:?}"
+        );
     }
 
     #[test]

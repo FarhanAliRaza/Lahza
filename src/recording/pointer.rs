@@ -89,6 +89,7 @@ pub fn sanitize_pointer_capture(
     travel.sort_by(|left, right| stable_time_order(left.1.time, left.0, right.1.time, right.0));
     let travel: Vec<_> = travel.into_iter().map(|(_, sample)| sample).collect();
     let travel = drop_isolated_spikes(travel, width, height);
+    let travel = drop_hand_shake(travel);
     let travel = thin_travel_samples(
         travel,
         width,
@@ -220,6 +221,46 @@ fn thin_travel_samples(
     if result.last() != Some(&last) {
         result.push(last);
     }
+    result
+}
+
+/// Largest normalized displacement that still counts as a shake.
+const SHAKE_THRESHOLD: f64 = 0.015;
+/// Three samples closer together than this can form a shake.
+const SHAKE_WINDOW: f64 = 0.1;
+
+/// Removes the middle sample of small, rapid direction reversals so a
+/// hesitant hand reads as one deliberate glide (Cap's shake filter).
+/// Only ordinary moves are filtered. Drag samples and transitions into or
+/// out of a drag stay intact; clicks are stored separately.
+fn drop_hand_shake(samples: Vec<PointerTravelSample>) -> Vec<PointerTravelSample> {
+    if samples.len() < 3 {
+        return samples;
+    }
+    let last = samples.last().cloned().expect("non-empty travel");
+    let mut result = Vec::with_capacity(samples.len());
+    result.push(samples[0].clone());
+    for (index, current) in samples.iter().enumerate().skip(1).take(samples.len() - 2) {
+        let previous = result.last().expect("first sample exists");
+        let next = &samples[index + 1];
+        let same_state = current.kind == PointerTravelKind::Move
+            && current.kind == previous.kind
+            && current.kind == next.kind
+            && current.artwork_id == previous.artwork_id
+            && current.artwork_id == next.artwork_id;
+        if same_state && next.time - previous.time <= SHAKE_WINDOW {
+            let to_current = (current.x - previous.x, current.y - previous.y);
+            let to_next = (next.x - current.x, next.y - current.y);
+            let reversal = to_current.0 * to_next.0 + to_current.1 * to_next.1 < 0.0;
+            let small = to_current.0.hypot(to_current.1) < SHAKE_THRESHOLD
+                && to_next.0.hypot(to_next.1) < SHAKE_THRESHOLD;
+            if reversal && small {
+                continue;
+            }
+        }
+        result.push(current.clone());
+    }
+    result.push(last);
     result
 }
 
@@ -392,6 +433,57 @@ mod tests {
         assert_eq!(stream.sanitized_capture.travel[0].x, 0.1);
         assert_eq!(stream.sanitized_capture.travel[1].x, 1.0);
         assert_eq!(stream.sanitized_capture.travel[1].y, 0.0);
+    }
+
+    #[test]
+    fn small_rapid_reversals_are_dropped_but_deliberate_ones_stay() {
+        let mut capture = PointerCaptureFile::default();
+        capture.travel = vec![
+            travel(0.0, 0.5, 0.5),
+            // A jitter step back and forth within 100ms.
+            travel(0.02, 0.505, 0.5),
+            travel(0.04, 0.5, 0.5),
+            // A deliberate reversal: too large to be a shake.
+            travel(0.06, 0.6, 0.5),
+            travel(0.08, 0.5, 0.5),
+            // A slow reversal outside the shake window.
+            travel(0.3, 0.505, 0.5),
+            travel(0.5, 0.5, 0.5),
+        ];
+        let stream = sanitize_pointer_capture(
+            capture,
+            PointerSanitizeOptions::for_recording(1920.0, 1080.0),
+        );
+        let times: Vec<_> = stream
+            .sanitized_capture
+            .travel
+            .iter()
+            .map(|sample| sample.time)
+            .collect();
+        assert!(!times.contains(&0.02), "{times:?}");
+        assert!(times.contains(&0.06), "{times:?}");
+        assert!(times.contains(&0.3), "{times:?}");
+    }
+
+    #[test]
+    fn sanitizer_preserves_small_rapid_drag_reversals() {
+        let samples: Vec<_> = [(0.0, 0.5), (0.02, 0.505), (0.04, 0.5)]
+            .into_iter()
+            .map(|(time, x)| PointerTravelSample {
+                kind: PointerTravelKind::Drag,
+                ..travel(time, x, 0.5)
+            })
+            .collect();
+        let capture = PointerCaptureFile {
+            travel: samples.clone(),
+            ..Default::default()
+        };
+        let stream = sanitize_pointer_capture(
+            capture,
+            PointerSanitizeOptions::for_recording(1920.0, 1080.0),
+        );
+        assert_eq!(stream.sanitized_capture.travel, samples);
+        assert!(stream.samples.iter().all(|sample| sample.kind == PointerStreamKind::Drag));
     }
 
     #[test]

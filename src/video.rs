@@ -20,7 +20,7 @@ use gpui::{
 use std::{
     path::PathBuf,
     sync::{atomic::Ordering, Arc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -789,6 +789,13 @@ impl Studio {
             .detach();
 
         let active_generation = self.video_playback_generation.clone();
+        // Screen frames arrive at 30 fps, but the cursor and camera are
+        // animated at 120 Hz. Between frames the playhead advances on the
+        // wall clock, capped at the last observed frame interval so it never
+        // runs ahead of the next frame, and the scene re-renders at 60 Hz.
+        let mut clock: Option<(Instant, f64)> = None;
+        let mut frame_interval = 1.0 / 30.0;
+        let mut last_advance = Instant::now();
         cx.spawn(async move |weak, cx| loop {
             Timer::after(Duration::from_millis(8)).await;
             if active_generation.load(Ordering::SeqCst) != token {
@@ -800,17 +807,42 @@ impl Studio {
                 terminal,
             } = receiver.take();
             let terminal_received = terminal.is_some();
+            let now = Instant::now();
+            let predicted = match (&latest_frame, clock) {
+                (Some(frame), _) => {
+                    if let Some((_, previous)) = clock {
+                        let interval = frame.time - previous;
+                        if interval > 0.0 && interval < 0.5 {
+                            frame_interval = interval;
+                        }
+                    }
+                    clock = Some((now, frame.time));
+                    Some(frame.time)
+                }
+                (None, Some((since, time)))
+                    if now.duration_since(last_advance) >= Duration::from_millis(15) =>
+                {
+                    Some(time + since.elapsed().as_secs_f64().min(frame_interval))
+                }
+                _ => None,
+            };
+            if predicted.is_none() && !terminal_received {
+                continue;
+            }
+            last_advance = now;
             if weak
                 .update(cx, |this, cx| {
                     if let Some(frame) = latest_frame {
                         this.camera_decoded_time = camera.as_ref().map_or(-1.0, |(time, _)| *time);
                         this.camera_frame_rgba = camera.map(|(_, image)| image);
-                        this.video_position = frame.time.min(this.video_duration);
                         if let Some(pixels) =
                             image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
                         {
                             this.set_video_frame(pixels);
                         }
+                    }
+                    if let Some(time) = predicted {
+                        this.video_position = time.min(this.video_duration).max(this.video_position);
                     }
                     if let Some(result) = terminal {
                         this.video_playing = false;

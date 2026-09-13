@@ -1466,15 +1466,21 @@ impl SceneCompositor {
         if height < 1.0 {
             return;
         }
-        let Some(asset) = cursor_assets::rasterize(family, shape, height.round() as u32) else {
+        // Rasterize at the next coarse step above the drawn size and let
+        // the painter resample to the exact fractional height: zoom and
+        // click animations scale smoothly instead of stepping a pixel at a
+        // time, and a zoom no longer fills the cache with one sprite per
+        // integer height.
+        let raster_height = (height / CURSOR_RASTER_STEP).ceil() * CURSOR_RASTER_STEP;
+        let Some(asset) = cursor_assets::rasterize(family, shape, raster_height as u32) else {
             return;
         };
-        let width = f64::from(asset.image.width());
+        let width = height * f64::from(asset.image.width()) / f64::from(asset.image.height());
         let placement = BitmapPlacement {
             hotspot_x: x,
             hotspot_y: y,
             width,
-            height: f64::from(asset.image.height()),
+            height,
             tilt_degrees: frame.tilt_degrees,
             smear: cursor_smear(frame.velocity, unit_scale, width),
         };
@@ -2351,6 +2357,9 @@ const CURSOR_SMEAR_AMOUNT: f64 = 1.0;
 /// Longest smear, in cursor widths; only pathological jumps hit it.
 const CURSOR_SMEAR_MAX_WIDTHS: f64 = 4.0;
 const CURSOR_SMEAR_TAPS: usize = 21;
+/// Styled cursor artwork is rasterized in steps of this many pixels and
+/// drawn downscaled to the exact size.
+const CURSOR_RASTER_STEP: f64 = 16.0;
 
 /// Canvas-space trail for a cursor moving at `velocity` (normalized media
 /// units per second) drawn `width` pixels wide.
