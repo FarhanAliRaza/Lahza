@@ -4,17 +4,13 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Improve annotation selection: select outlined shapes from their interiors, drag from anywhere inside a selection, move multiple marks as one group, and delete the complete selection. Selection outlines and handles stay consistent at different display scales.
-- Add smoother pressure-sensitive ink with speed-based mouse strokes, more natural hand-drawn shapes and curved arrows, and Shantell Sans Informal as the default font for new text annotations.
-- Improve text creation, editing, resizing, formatting, and selection, including readable initial text sizes on video.
-- Make alignment snapping optional with Ctrl, with guides for other annotations and canvas edges, centers, and thirds.
-- Keep the video playhead where you are drawing. Annotations at that frame appear fully while editing; scrubbing and playback show their actual entrance and exit animations.
-- Keep annotation settings in expandable list rows, add group actions, and give overlapping video annotations separate scrollable timeline rows.
-- Add a responsive loading screen for startup and opening images or recordings, with cancellation and retry after errors.
-- Add creator and issue-report links at the end of the editor sidebar and capture controls.
-- Extract the annotation engine into a reusable workspace crate, with rendering fixtures and public API regression coverage.
+- Keep zoom framing steady during zoom-in and zoom-out, including authored zoom ramps and timeline seeking. Zoom-out preserves the outgoing focus and settles at the full frame without an extra pan or rebound.
+- Smooth small, rapid cursor shakes while preserving deliberate movements, dragging, and clicks.
+- Let the cursor glide toward an upcoming click throughout the anticipation window, avoiding a late correction.
+- Scale cursor artwork smoothly during zoom and click animations instead of stepping between whole-pixel sizes.
+- Advance cursor and camera animation between decoded video frames for smoother editor playback.
 
-Validation: the workspace Rust suite and packaging tests pass locally. Native display tests also cover loading, cancellation, retry, and video annotation editing at a fixed playhead. Loading, error states, selection outlines at different display scales, handwritten font styles, and annotation timeline scrolling were checked on disposable projects. Interactive/device-dependent tests remain excluded from the default suite; cross-desktop capture validation remains outstanding.
+Validation: the workspace Rust suite, packaging tests, and confined Snap smoke test passed in CI for the application changes. Regression tests cover fixed zoom pivots, zoom-out framing, random seeking, cursor shake filtering, drag preservation, and click anticipation. The release workflow reruns these checks for the versioned packages. Interactive/device-dependent tests remain excluded from the default suite; cross-desktop capture validation remains outstanding.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
