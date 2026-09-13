@@ -3156,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "lahza"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "ash",
  "ashpd 0.12.3",
