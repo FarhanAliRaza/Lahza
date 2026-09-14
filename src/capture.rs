@@ -489,6 +489,8 @@ impl Studio {
         self.video_zoom_cues = zoom_cues;
         self.video_selected_zoom_cue = None;
         self.video_zoom_drag = None;
+        self.video_timeline_span = self.video_duration.max(0.001);
+        self.video_timeline_extent = self.video_timeline_span;
         self.video_timeline_zoom = 1.0;
         self.video_timeline_scroll = 0.0;
         // Scene settings and Lahza extras saved with this project.

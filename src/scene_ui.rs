@@ -1315,9 +1315,9 @@ impl Studio {
                 .children(self.video_clip_timeline.segments.iter().zip(self.video_clip_timeline.clip_starts()).map(|(clip, start)| {
                     div()
                         .absolute()
-                        .left(px((start / self.video_duration.max(f64::EPSILON) * timeline_content_width - timeline_scroll) as f32))
+                        .left(px((start / self.video_timeline_duration() * timeline_content_width - timeline_scroll) as f32))
                         .top(px(3.0))
-                        .w(px((clip.editor_duration() / self.video_duration.max(f64::EPSILON) * timeline_content_width) as f32))
+                        .w(px((clip.editor_duration() / self.video_timeline_duration() * timeline_content_width) as f32))
                         .h(px(16.0))
                         .rounded_md()
                         .border_r_1()
@@ -2752,7 +2752,7 @@ impl Studio {
         if self.video_audio_levels.is_empty() || self.video_source_duration <= 0.0 {
             return None;
         }
-        let duration = self.video_duration.max(f64::EPSILON);
+        let duration = self.video_timeline_duration();
         let muted_lane = self.video_audio_muted;
         let bucket_count = self.video_audio_levels.len();
         let mut bars: Vec<AnyElement> = Vec::new();
@@ -2892,7 +2892,7 @@ impl Studio {
             self.annotation_timeline_scroll.set_offset(point(px(0.), px(0.)));
             return None;
         }
-        let duration = self.video_duration.max(f64::EPSILON);
+        let duration = self.video_timeline_duration();
         let selected = self.selected_annotation;
         let rows = self.annotation_lane_rows();
         let lane_height = self.annotation_lane_height();
@@ -2914,7 +2914,7 @@ impl Studio {
         for (index, mark) in self.annotations.iter().enumerate() {
             let timing = mark.timing.unwrap_or(AnnotationTiming {
                 start: 0.0,
-                end: duration,
+                end: self.video_duration,
                 ..AnnotationTiming::default()
             });
             let left = timing.start / duration * timeline_content_width;
@@ -3145,8 +3145,7 @@ impl Studio {
             kind,
             start_x,
             original,
-            seconds_per_pixel: duration
-                / (self.video_timeline_viewport_width() * self.video_timeline_zoom).max(1.0),
+            seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
         });
     }
 

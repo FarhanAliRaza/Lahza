@@ -146,20 +146,23 @@ pub(crate) struct CropSnapshot {
     pub(crate) annotations: Vec<AnnotationMark>,
 }
 
-/// Drag-to-reorder for a timeline clip. Armed on clip mouse-down, it only
-/// becomes `active` (and suppresses playhead scrubbing) after the pointer
-/// travels past a small threshold, so plain clicks keep seeking.
+/// A clip press selects; release seeks unless movement crossed the drag
+/// threshold. Moving a clip never doubles as playhead scrubbing.
 #[derive(Clone, Copy)]
 pub(crate) struct VideoMoveDrag {
     pub(crate) clip_id: Uuid,
     pub(crate) start_x: Pixels,
     pub(crate) current_x: Pixels,
+    pub(crate) start_scroll: f64,
+    pub(crate) editor_seconds_per_pixel: f64,
     pub(crate) active: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct VideoTrimDrag {
     pub(crate) start_x: Pixels,
+    pub(crate) start_scroll: f64,
+    pub(crate) original_position: f64,
     pub(crate) original_timeline: RecordingClipTimeline,
     pub(crate) original_clip: RecordingClipSegment,
     pub(crate) edge: ClipEdge,

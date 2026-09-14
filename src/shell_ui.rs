@@ -1708,18 +1708,7 @@ impl Studio {
         self.pause_video_playback();
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
-        let target = self
-            .video_timeline_bounds
-            .lock()
-            .ok()
-            .and_then(|bounds| *bounds)
-            .map(|bounds| {
-                let local = ((event.position.x - bounds.origin.x) / px(1.0)) as f64;
-                ((self.video_timeline_scroll + local)
-                    / (self.video_timeline_viewport_width() * self.video_timeline_zoom))
-                    .clamp(0.0, 1.0)
-                    * self.video_duration
-            })
+        let target = self.motion_timeline_time_at(event.position.x)
             .unwrap_or(self.video_position);
         self.video_position = target;
         self.video_seek_drag = Some((event.position.x, target));
@@ -1745,17 +1734,16 @@ impl Studio {
         let is_video = self.video_project.is_some();
         let playing = self.video_playing;
         let progress = if self.video_duration > 0.0 {
-            (self.video_position / self.video_duration).clamp(0.0, 1.0)
+            (self.video_position / self.video_timeline_duration()).clamp(0.0, 1.0)
         } else {
             0.0
         };
         let current_time = Self::video_timecode(self.video_position);
         let duration = Self::video_timecode(self.video_duration);
-        let timeline_duration = self.video_duration.max(f64::EPSILON);
+        let timeline_duration = self.video_timeline_duration();
         let timeline_zoom = self.video_timeline_zoom;
         let timeline_scroll = self.video_timeline_scroll;
-        let timeline_viewport_width = self.video_timeline_viewport_width();
-        let timeline_content_width = timeline_viewport_width * timeline_zoom;
+        let timeline_content_width = self.video_timeline_content_width();
         let timeline_bounds = self.video_timeline_bounds.clone();
         let lane_extra = self.timeline_lane_extra();
         let selected_clip = self.video_selected_clip;
@@ -2036,6 +2024,8 @@ impl Studio {
                                         .cursor_pointer()
                                         .child(format!("{timeline_zoom:.1}×"))
                                         .on_click(cx.listener(|this, _, _, cx| {
+                                            this.video_timeline_span = this.video_duration.max(0.001);
+                                            this.video_timeline_extent = this.video_duration.max(this.video_position);
                                             this.video_timeline_zoom = 1.0;
                                             this.video_timeline_scroll = 0.0;
                                             cx.notify();
@@ -2118,6 +2108,35 @@ impl Studio {
                                     .gap_1()
                                     .overflow_hidden()
                                     .cursor(CursorStyle::ResizeLeftRight)
+                                    .on_scroll_wheel(cx.listener(
+                                        |this, event: &ScrollWheelEvent, _, cx| {
+                                            let delta = match event.delta {
+                                                ScrollDelta::Pixels(delta) => (
+                                                    (delta.x / px(1.0)) as f64,
+                                                    (delta.y / px(1.0)) as f64,
+                                                ),
+                                                ScrollDelta::Lines(delta) => {
+                                                    (delta.x as f64 * 16.0, delta.y as f64 * 16.0)
+                                                }
+                                            };
+                                            if event.modifiers.control || event.modifiers.platform {
+                                                let factor = 2_f64.powf(delta.1 / 220.0);
+                                                this.zoom_video_timeline(
+                                                    factor,
+                                                    this.video_position,
+                                                );
+                                            } else {
+                                                let pan = if delta.0.abs() > delta.1.abs() {
+                                                    -delta.0
+                                                } else {
+                                                    -delta.1
+                                                };
+                                                this.pan_video_timeline(pan);
+                                            }
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        },
+                                    ))
                             .child(
                                 div()
                                     .id("timeline-ruler")
@@ -2237,36 +2256,7 @@ impl Studio {
                                             this.timeline_seek_down(event);
                                             cx.notify();
                                         }),
-                                    )
-                                    .on_scroll_wheel(cx.listener(
-                                        |this, event: &ScrollWheelEvent, _, cx| {
-                                            let delta = match event.delta {
-                                                ScrollDelta::Pixels(delta) => (
-                                                    (delta.x / px(1.0)) as f64,
-                                                    (delta.y / px(1.0)) as f64,
-                                                ),
-                                                ScrollDelta::Lines(delta) => {
-                                                    (delta.x as f64 * 16.0, delta.y as f64 * 16.0)
-                                                }
-                                            };
-                                            if event.modifiers.control || event.modifiers.platform {
-                                                let factor = 2_f64.powf(delta.1 / 220.0);
-                                                this.zoom_video_timeline(
-                                                    factor,
-                                                    this.video_position,
-                                                );
-                                            } else {
-                                                let pan = if delta.0.abs() > delta.1.abs() {
-                                                    -delta.0
-                                                } else {
-                                                    -delta.1
-                                                };
-                                                this.pan_video_timeline(pan);
-                                            }
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        },
-                                    )),
+                                    ),
                             )
                             .child(motion_track)
                             .when_some(annotation_track, |this, lane| this.child(lane))
@@ -2288,7 +2278,7 @@ impl Studio {
             .into_any_element()
     }
 
-    /// The recording's clips on the seek bar: draggable to reorder, with
+    /// The recording's clips on the track: draggable to reposition, with
     /// trim handles on the selected clip.
     fn video_clip_lane(
         &self,
@@ -2324,18 +2314,12 @@ impl Studio {
                     .when(dragging, |this| this.opacity(0.4))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            // Arm a potential reorder drag; the seek-bar's own
-                            // mouse-down still runs (no stop_propagation) so a
-                            // plain click keeps moving the playhead.
-                            this.video_move_drag = Some(VideoMoveDrag {
-                                clip_id,
-                                start_x: event.position.x,
-                                current_x: event.position.x,
-                                active: false,
-                            });
-                            this.video_selected_clip = Some(clip_id);
-                            this.video_selected_zoom_cue = None;
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            // Keep the parent scrub handler out of clip
+                            // gestures. A click seeks on release; a drag moves.
+                            cx.stop_propagation();
+                            this.focus_handle.focus(window);
+                            this.begin_video_move_drag(clip_id, event.position.x);
                             cx.notify();
                         }),
                     )
@@ -2379,15 +2363,7 @@ impl Studio {
                                 .child(label),
                         )
                     })
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        // Selection only: the seek bar's mouse-down already
-                        // moved the playhead to the clicked spot; seeking to
-                        // the clip head here would yank the playhead back.
-                        this.video_selected_clip = Some(clip_id);
-                        this.video_selected_zoom_cue = None;
-                        cx.notify();
-                    }))
+                    .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
                     .when(selected_clip == Some(clip_id), |this| {
                         this.child(
                             div()
@@ -2395,14 +2371,15 @@ impl Studio {
                                 .absolute()
                                 .left_0()
                                 .top_0()
-                                .w(px(10.0))
+                                .w(px((width * 0.25).min(10.0)))
                                 .h_full()
                                 .bg(hsla(0.0, 0.0, 1.0, 0.5))
                                 .cursor(CursorStyle::ResizeLeftRight)
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                         cx.stop_propagation();
+                                        this.focus_handle.focus(window);
                                         this.begin_video_trim(
                                             clip_id,
                                             ClipEdge::Leading,
@@ -2418,14 +2395,15 @@ impl Studio {
                                 .absolute()
                                 .right_0()
                                 .top_0()
-                                .w(px(10.0))
+                                .w(px((width * 0.25).min(10.0)))
                                 .h_full()
                                 .bg(hsla(0.0, 0.0, 1.0, 0.5))
                                 .cursor(CursorStyle::ResizeLeftRight)
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                         cx.stop_propagation();
+                                        this.focus_handle.focus(window);
                                         this.begin_video_trim(
                                             clip_id,
                                             ClipEdge::Trailing,

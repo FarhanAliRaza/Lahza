@@ -862,19 +862,7 @@ impl Studio {
                         changed = true;
                     }
                 } else if event.dragging() {
-                    if let Some(drag) = this.video_move_drag.as_mut() {
-                        drag.current_x = event.position.x;
-                        // Reordering while a preview render is in flight is
-                        // safe: the next apply supersedes it via the
-                        // generation token, so don't gate on video_edit_busy.
-                        if !drag.active && (drag.current_x - drag.start_x).abs() > px(6.0) {
-                            drag.active = true;
-                            this.video_seek_drag = None;
-                        }
-                        if drag.active {
-                            changed = true;
-                        }
-                    }
+                    changed |= this.update_video_move_drag(event.position.x);
                     if this.video_zoom_drag.is_some() {
                         this.update_video_zoom_drag(event.position.x);
                         changed = true;
@@ -883,11 +871,9 @@ impl Studio {
                         changed = true;
                     } else if let Some((start_x, start_position)) = this.video_seek_drag {
                         let delta = (event.position.x - start_x) / px(1.0);
-                        let content_width =
-                            this.video_timeline_viewport_width() * this.video_timeline_zoom;
                         this.video_position = (start_position
-                            + delta as f64 / content_width * this.video_duration)
-                            .clamp(0.0, this.video_duration);
+                            + delta as f64 * this.video_timeline_seconds_per_pixel())
+                            .clamp(0.0, this.video_timeline_duration());
                         changed = true;
                     }
                 }
@@ -897,7 +883,7 @@ impl Studio {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
                     if this.end_motion_transform_drag() {
                         cx.notify();
                     }
@@ -907,13 +893,9 @@ impl Studio {
                     if this.end_annotation_drag() {
                         cx.notify();
                     }
-                    if let Some(drag) = this.video_move_drag.take() {
-                        if drag.active {
-                            this.commit_video_move_drag(drag, cx);
-                            this.slider_drag = None;
-                            cx.notify();
-                            return;
-                        }
+                    if this.finish_video_move_drag(event.position.x, cx) {
+                        this.slider_drag = None;
+                        return;
                     }
                     if this.video_zoom_drag.is_some() {
                         this.commit_video_zoom_drag(cx);
@@ -933,7 +915,13 @@ impl Studio {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    this.finish_video_move_drag(event.position.x, cx);
+                    if this.video_trim_drag.is_some() {
+                        this.commit_video_trim(cx);
+                    } else if this.video_zoom_drag.is_some() {
+                        this.commit_video_zoom_drag(cx);
+                    }
                     if this.end_motion_transform_drag() {
                         cx.notify();
                     }

@@ -461,8 +461,8 @@ impl Studio {
     pub(crate) fn motion_timeline_time_at(&self, x: Pixels) -> Option<f64> {
         let bounds = (*self.video_timeline_bounds.lock().ok()?)?;
         let local = f64::from((x - bounds.origin.x) / px(1.0));
-        let content = (self.video_timeline_viewport_width() * self.video_timeline_zoom).max(1.0);
-        Some(((self.video_timeline_scroll + local) / content).clamp(0.0, 1.0) * self.video_duration)
+        Some(((self.video_timeline_scroll + local) * self.video_timeline_seconds_per_pixel())
+            .clamp(0.0, self.video_timeline_duration()))
     }
 
     /// Adds a default motion region around `editor_time` and selects it.
@@ -760,11 +760,11 @@ impl Studio {
     }
 
     pub(crate) fn motion_lane_height(&self) -> f32 {
-        let width = self.video_timeline_viewport_width() * self.video_timeline_zoom;
+        let width = self.video_timeline_content_width();
         let rows = motion_lane_layout(
             &self.video_zoom_cues,
             &self.video_clip_timeline,
-            self.video_duration,
+            self.video_timeline_duration(),
             width,
         )
         .iter()
@@ -783,7 +783,7 @@ impl Studio {
         progress: f64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let timeline_duration = self.video_duration.max(f64::EPSILON);
+        let timeline_duration = self.video_timeline_duration();
         let lane = self.motion_lane_elements(timeline_duration, timeline_content_width, cx);
         let empty = self.video_zoom_cues.is_empty();
         div()
