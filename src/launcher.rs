@@ -557,6 +557,7 @@ impl Studio {
                             cx.notify();
                         }),
                     ))
+                    .child(self.launcher_teleprompter(recording, cx))
                     .child(crate::theme::credit_footer())
                     .into_any_element()
             } else {

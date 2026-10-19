@@ -91,7 +91,7 @@ impl PresetLibrary {
     }
 }
 
-fn config_root() -> PathBuf {
+pub(crate) fn config_root() -> PathBuf {
     if let Some(root) = std::env::var_os("LAHZA_CONFIG_DIR") {
         return PathBuf::from(root);
     }

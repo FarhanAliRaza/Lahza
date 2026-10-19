@@ -16,6 +16,7 @@ pub mod media_bank;
 pub mod studio_overlays;
 pub mod transcript;
 pub mod transcription;
+pub mod teleprompter;
 pub mod motion;
 pub mod native;
 pub mod overlays;

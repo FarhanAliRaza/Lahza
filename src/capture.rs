@@ -239,6 +239,7 @@ impl Studio {
                         this.recording_state = RecordingState::Recording;
                         this.recording_started_at = Some(Instant::now());
                         this.recording_session_path = Some(path);
+                        this.open_prompter(cx);
                         this.toast = Some(
                             format!("Recording with {}", NativeRecorder::description()).into(),
                         );
@@ -293,17 +294,27 @@ impl Studio {
             let (controller, result, warnings) = task.await;
             let _ = weak.update(cx, |this, cx| {
                 this.recording_busy = false;
+                // The prompter belongs to a live recording only.
+                if matches!(action, RecordingAction::Stop | RecordingAction::Discard)
+                    || controller.state() == RecordingState::Idle
+                {
+                    this.close_prompter(cx);
+                }
                 this.recording_state = controller.state();
                 match result {
                     Ok(path) => match action {
                         RecordingAction::Pause => {
+                            this.pause_prompter(true, cx);
                             this.toast = Some("Recording paused".into());
                         }
                         RecordingAction::Resume => {
+                            this.pause_prompter(false, cx);
                             this.recording_started_at = Some(Instant::now());
                             this.toast = Some("Recording resumed".into());
                         }
                         RecordingAction::Restart => {
+                            // A new take reads the script from the top.
+                            this.open_prompter(cx);
                             this.recording_elapsed = Duration::ZERO;
                             this.recording_started_at = Some(Instant::now());
                             this.recording_session_path = path;
