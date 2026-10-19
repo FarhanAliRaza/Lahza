@@ -54,6 +54,8 @@ Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive details
 
 Trim, split, and change clip speed. Add zooms, pans, 3D motion, and camera overlays. Customize cursor effects and generate click-based zooms when input metadata is available.
 
+Transcribe the narration on this computer into subtitles with an optional spoken-word highlight, then cut footage by transcript: select words, remove filler words, or trim long pauses. Show typed keystrokes and a speed badge on sped-up clips, and drag the camera bubble anywhere with snap guides.
+
 ### Animate still images
 
 [![Lahza Motion editor with a floating card preset and timed captions](docs/screenshots/02-motion-and-captions.png)](packaging/store/screenshots/02-motion-and-captions.png)
@@ -70,7 +72,7 @@ Start with ready-made layouts for product launches, tutorials, social posts, cha
 
 [![Lahza export panel showing MP4, WebM, GIF, resolution, and frame rate options](docs/screenshots/04-export-formats.png)](packaging/store/screenshots/04-export-formats.png)
 
-Save screenshots as **PNG** and videos or animations as **MP4**, **WebM**, or **GIF**. Export up to **4K** at **30 or 60 fps**, with size estimates and progress tracking.
+Save screenshots as **PNG** and videos or animations as **MP4** (H.264 or HEVC), **WebM**, or **GIF**. Export up to **4K** at **30 or 60 fps**, with optional motion blur, size estimates and progress tracking. Fixed-aspect canvases such as 9:16 or 4:5 can **Fill** the frame with a camera that follows the cursor. Export the mixed audio alone as **M4A** or **WAV**, subtitles as **SRT**, or upload to your own share server and copy the link.
 
 ## Quick start
 
@@ -295,6 +297,39 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 - `xdg-desktop-portal` and the appropriate portal backend for your desktop.
 - PipeWire for desktop capture. The Snap bundles GStreamer, FFmpeg, and FFprobe; Debian and source installations use system media libraries and tools.
 - Desktop support for the screenshot and screencast portals. Picker options depend on your desktop.
+
+### Optional tools
+
+- `whisper.cpp` (`sudo apt install whisper.cpp`) enables on-device subtitle
+  transcription and the teleprompter's voice following. The speech model
+  (148 MB, or 488 MB for the accurate one) downloads on first use into
+  `~/.local/share/lahza/models`.
+- `curl` is used to download speech models and to upload to a share server.
+
+### Subtitles and transcript editing
+
+Open **Record → Subtitles** and choose **Transcribe narration**. Captions follow
+every clip edit. **Edit transcript** opens a panel where clicking a word seeks to
+it, Shift-click selects a range, and **Cut word**, **Remove fillers** and **Trim
+pauses** remove footage. A cut also removes the cut words from captions you have
+not edited, and both undo together. Click a caption's time to edit its text.
+**Export .srt…** saves subtitles for the edited timeline.
+
+### Teleprompter
+
+Turn on **Teleprompter** in the recorder, then open or paste a script. While
+recording, the prompter floats at the top of the main screen. With whisper.cpp,
+the voice model and the microphone on, it scrolls as you read; otherwise scroll
+it with the mouse wheel or click a word. Desktop capture cannot exclude a window,
+so record a window or an area, or move the prompter to another display, to keep
+it out of the video.
+
+### Sharing
+
+**Export → Share** uploads the current edit to a Screendrop-compatible upload
+worker and copies the share link. Enter the server address and upload token
+once; they are stored in `~/.config/lahza/cloud.json`, readable only by you. The
+share page receives a poster, a storyboard and the transcript.
 
 ### Imported timeline media
 
