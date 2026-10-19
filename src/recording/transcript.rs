@@ -195,6 +195,122 @@ impl Transcript {
     }
 }
 
+/// Transcript-driven cuts: word selections, filler words and long pauses
+/// become source-time ranges for `RecordingClipTimeline::removing_source_ranges`.
+pub mod planner {
+    use super::TranscriptWord;
+
+    /// Hesitation sounds safe to cut. Discourse words like "like" stay.
+    const FILLERS: [&str; 15] = [
+        "um", "umm", "ummm", "uh", "uhh", "uhhh", "uhm", "uhmm", "er", "erm", "hmm", "hm", "hmmm",
+        "mhm", "mmm",
+    ];
+    /// A word cut bites this far into surrounding silence, never into a word.
+    const MAXIMUM_WORD_PADDING: f64 = 0.12;
+    /// Pauses longer than this are dead air.
+    pub const SILENCE_THRESHOLD: f64 = 1.1;
+    const SILENCE_PADDING: f64 = 0.35;
+    const MINIMUM_SILENCE_CUT: f64 = 0.3;
+
+    pub fn is_filler(word: &TranscriptWord) -> bool {
+        let letters: String = word
+            .display()
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .flat_map(char::to_lowercase)
+            .collect();
+        FILLERS.contains(&letters.as_str())
+    }
+
+    pub fn filler_indices(words: &[TranscriptWord]) -> Vec<usize> {
+        (0..words.len()).filter(|&index| is_filler(&words[index])).collect()
+    }
+
+    /// Source range removing words `first..=last`.
+    pub fn cut_range(words: &[TranscriptWord], first: usize, last: usize, source_duration: f64) -> Option<(f64, f64)> {
+        if first > last || last >= words.len() {
+            return None;
+        }
+        let previous_end = first.checked_sub(1).map_or(0.0, |index| words[index].end);
+        let next_start = words.get(last + 1).map_or(source_duration, |word| word.start);
+        let gap_before = (words[first].start - previous_end).max(0.0);
+        let gap_after = (next_start - words[last].end).max(0.0);
+        let start = (words[first].start - MAXIMUM_WORD_PADDING.min(gap_before / 2.0)).max(0.0);
+        let end = (words[last].end + MAXIMUM_WORD_PADDING.min(gap_after / 2.0)).min(source_duration);
+        (end > start).then_some((start, end))
+    }
+
+    pub fn filler_cut_ranges(words: &[TranscriptWord], source_duration: f64) -> Vec<(f64, f64)> {
+        filler_indices(words)
+            .into_iter()
+            .filter_map(|index| cut_range(words, index, index, source_duration))
+            .collect()
+    }
+
+    /// Every pause longer than the threshold, including dead air before the
+    /// first word and after the last, keeping a beat on each side.
+    pub fn silence_cut_ranges(words: &[TranscriptWord], source_duration: f64) -> Vec<(f64, f64)> {
+        if words.is_empty() || source_duration <= 0.0 {
+            return Vec::new();
+        }
+        let mut sorted: Vec<&TranscriptWord> = words.iter().collect();
+        sorted.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let mut gaps = Vec::new();
+        let mut spoken_end: f64 = 0.0;
+        for word in sorted {
+            if word.start > spoken_end {
+                gaps.push((spoken_end, word.start));
+            }
+            spoken_end = spoken_end.max(word.end);
+        }
+        if source_duration > spoken_end {
+            gaps.push((spoken_end, source_duration));
+        }
+        gaps.into_iter()
+            .filter(|(start, end)| end - start > SILENCE_THRESHOLD)
+            .map(|(start, end)| (start + SILENCE_PADDING, end - SILENCE_PADDING))
+            .filter(|(start, end)| end - start >= MINIMUM_SILENCE_CUT)
+            .collect()
+    }
+}
+
+impl Transcript {
+    /// Drop words whose midpoint falls in `ranges` from cues whose text was
+    /// never hand-edited, so captions stop quoting footage that was cut.
+    pub fn removing_cut_words(&self, ranges: &[(f64, f64)]) -> Transcript {
+        let cut = |word: &TranscriptWord| {
+            let middle = (word.start + word.end) * 0.5;
+            ranges.iter().any(|(start, end)| middle >= *start && middle < *end)
+        };
+        let mut next = self.clone();
+        for cue in &mut next.cues {
+            let words: Vec<&TranscriptWord> = self
+                .words
+                .iter()
+                .filter(|word| word.start >= cue.start - 0.001 && word.start < cue.end)
+                .collect();
+            let original = join_words(words.iter().copied());
+            if original != cue.text || !words.iter().any(|word| cut(word)) {
+                continue;
+            }
+            cue.text = join_words(words.into_iter().filter(|word| !cut(word)));
+        }
+        next.cues.retain(|cue| !cue.text.trim().is_empty());
+        next
+    }
+}
+
+fn join_words<'a>(words: impl Iterator<Item = &'a TranscriptWord>) -> String {
+    let mut text = String::new();
+    for word in words {
+        if !text.is_empty() && !word.text.starts_with(char::is_whitespace) {
+            text.push(' ');
+        }
+        text.push_str(&word.text);
+    }
+    text.trim().to_string()
+}
+
 /// The cue covering a time, if any.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SubtitleTimeline {

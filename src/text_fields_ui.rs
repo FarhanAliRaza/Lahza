@@ -8,6 +8,7 @@ pub(crate) struct TextFields {
     pub watermark: gpui::Entity<TextField>,
     pub start: gpui::Entity<TextField>,
     pub end: gpui::Entity<TextField>,
+    pub cue: gpui::Entity<TextField>,
 }
 impl TextFields {
     pub fn new(parent: FocusHandle, cx: &mut Context<Studio>) -> Self {
@@ -25,6 +26,7 @@ impl TextFields {
             watermark: create("Type a watermark…"),
             start: create("Seconds"),
             end: create("Seconds"),
+            cue: create("Caption text"),
         }
     }
 }
@@ -36,6 +38,7 @@ impl Studio {
             &self.text_fields.watermark,
             &self.text_fields.start,
             &self.text_fields.end,
+            &self.text_fields.cue,
         ]
         .iter()
         .any(|field| field.read(cx).focus.is_focused(window))
@@ -130,6 +133,15 @@ impl Studio {
                 cx,
             )
         });
+        let cue = self
+            .selected_cue_text()
+            .filter(|_| self.inspector_visible && self.transcript_open && self.effective_tab() == InspectorTab::Record);
+        let (cue_target, cue_text) = cue
+            .map(|(id, text)| (Target::Cue(id), text))
+            .unwrap_or((Target::None, String::new()));
+        self.text_fields
+            .cue
+            .update(cx, |field, cx| field.sync(cue_target, &cue_text, window, cx));
         if projected_edit.is_some_and(|i| target == Target::Annotation(i)) {
             self.text_fields.annotation.read(cx).focus.focus(window);
         }
@@ -192,6 +204,11 @@ impl Studio {
                     self.watermark.text = event.text.clone();
                 }
             }
+            Target::Cue(id) if self.transcript_selected_cue == Some(id) => match event.kind {
+                EventKind::Focus => self.begin_cue_text_edit(),
+                EventKind::Change => self.set_cue_text(id, &event.text, false, cx),
+                EventKind::Commit | EventKind::Cancel => self.set_cue_text(id, &event.text, true, cx),
+            },
             Target::Time(index, start) => {
                 if event.kind == EventKind::Focus {
                     self.stop_editing_text();

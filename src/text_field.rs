@@ -9,6 +9,8 @@ pub(crate) enum Target {
     CanvasAnnotation(usize),
     Watermark,
     Time(usize, bool),
+    /// A subtitle cue's text, by cue id.
+    Cue(uuid::Uuid),
     None,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

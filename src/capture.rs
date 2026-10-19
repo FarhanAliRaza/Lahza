@@ -522,6 +522,9 @@ impl Studio {
         self.video_keystrokes = pointer_capture.keystrokes.clone();
         self.video_transcript = transcript;
         self.video_transcript_revision += 1;
+        self.transcript_open = false;
+        self.transcript_selected_cue = None;
+        self.transcript_selection = None;
         self.video_overlay_cache = None;
         self.video_press_times = pointer_capture
             .presses

@@ -1455,6 +1455,9 @@ impl Studio {
     }
 
     fn record_tab(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.transcript_open && self.video_transcript.is_some() {
+            return self.transcript_panel(cx);
+        }
         div()
             .flex()
             .flex_col()
@@ -1470,6 +1473,10 @@ impl Studio {
             .child(self.section_header("audio", "Audio", None, cx))
             .when(self.section_open("audio"), |this| {
                 this.child(self.audio_section(cx))
+            })
+            .child(self.section_header("subtitles", "Subtitles", None, cx))
+            .when(self.section_open("subtitles"), |this| {
+                this.child(self.subtitle_section(cx))
             })
             .child(self.section_header("keystrokes", "Keystrokes", None, cx))
             .when(self.section_open("keystrokes"), |this| {

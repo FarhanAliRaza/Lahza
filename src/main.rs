@@ -46,6 +46,7 @@ mod timed;
 mod video;
 mod media_ui;
 mod overlays_ui;
+mod transcript_ui;
 
 use annotations::{annotations_svg, paint_annotation, paint_highlights};
 use crop::paint_crop_overlay;
@@ -387,6 +388,13 @@ struct Studio {
     /// Bumped on every transcript edit so derived overlays rebuild.
     video_transcript_revision: u64,
     video_overlay_cache: Option<(overlays_ui::OverlayKey, Arc<recording::studio_overlays::StudioOverlays>)>,
+    speech_model: recording::transcription::SpeechModel,
+    transcription_job: Option<transcript_ui::TranscriptionJob>,
+    /// The transcript editor replaces the Record tab while open.
+    transcript_open: bool,
+    transcript_selected_cue: Option<Uuid>,
+    /// Selected word range (anchor, head) in transcript word indices.
+    transcript_selection: Option<(usize, usize)>,
     video_camera_path: Option<PathBuf>,
     camera_frame_rgba: Option<Arc<image::RgbaImage>>,
     camera_decoded_time: f64,
@@ -711,6 +719,11 @@ impl Studio {
             video_transcript: None,
             video_transcript_revision: 0,
             video_overlay_cache: None,
+            speech_model: Default::default(),
+            transcription_job: None,
+            transcript_open: false,
+            transcript_selected_cue: None,
+            transcript_selection: None,
             video_camera_path: None,
             camera_frame_rgba: None,
             camera_decoded_time: -1.0,

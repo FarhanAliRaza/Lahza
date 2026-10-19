@@ -471,6 +471,10 @@ impl Studio {
                 self.rebuild_video_motion_timelines();
                 self.persist_video_zoom_cues(cx);
             }
+            snapshot @ (VideoEditSnapshot::Transcript(_) | VideoEditSnapshot::TranscriptCut { .. }) => {
+                let inverse = self.restore_transcript_snapshot(snapshot, cx);
+                self.video_redo_stack.push(inverse);
+            }
         }
     }
 
@@ -517,6 +521,10 @@ impl Studio {
                 self.video_selected_zoom_cue = None;
                 self.rebuild_video_motion_timelines();
                 self.persist_video_zoom_cues(cx);
+            }
+            snapshot @ (VideoEditSnapshot::Transcript(_) | VideoEditSnapshot::TranscriptCut { .. }) => {
+                let inverse = self.restore_transcript_snapshot(snapshot, cx);
+                self.video_undo_stack.push(inverse);
             }
         }
     }

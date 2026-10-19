@@ -195,4 +195,11 @@ pub(crate) enum VideoEditSnapshot {
     ImageTiming { scene: f64, start: f64, end: f64 },
     Clips { timeline: RecordingClipTimeline, annotations: Vec<AnnotationMark> },
     Zoom(Vec<ZoomCue>),
+    Transcript(Option<recording::transcript::Transcript>),
+    /// A transcript-driven cut: footage, annotations and caption text together.
+    TranscriptCut {
+        timeline: RecordingClipTimeline,
+        annotations: Vec<AnnotationMark>,
+        transcript: Option<recording::transcript::Transcript>,
+    },
 }
