@@ -73,6 +73,16 @@ pub(crate) enum MediaDragKind {
     Scale,
 }
 
+/// Dragging the camera bubble; positions are canvas pixels of the preview.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CameraDrag {
+    start: Point<Pixels>,
+    start_center: (f64, f64),
+    canvas_size: (f64, f64),
+    /// Snap guide per axis, while snapped.
+    guides: (Option<f64>, Option<f64>),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MediaDrag {
     pub kind: MediaDragKind,
@@ -670,7 +680,7 @@ impl Studio {
     /// Autosaves scene settings into the recording's edit draft when they
     /// changed since the last save (called from render, skipped mid-drag).
     pub(crate) fn autosave_scene_style(&mut self) {
-        if self.slider_drag.is_some() || self.media_drag.is_some() {
+        if self.slider_drag.is_some() || self.media_drag.is_some() || self.camera_drag.is_some() {
             return;
         }
         let Some(session) = self.video_project.as_ref() else {
@@ -933,6 +943,7 @@ impl Studio {
         let proxy = if annotation_proxy || (!(self.video_project.is_some() && self.video_window_capture)
             && (self.slider_drag.is_some()
                 || self.media_drag.is_some()
+                || self.camera_drag.is_some()
                 || self.motion_transform_drag.is_some()))
         {
             0.5
@@ -1239,10 +1250,14 @@ impl Studio {
     pub(crate) fn camera_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_camera = self.video_camera_path.is_some();
         let overlay = self.camera_overlay;
-        let position_index = WatermarkPosition::ALL
-            .iter()
-            .position(|position| *position == overlay.position)
-            .unwrap_or(3);
+        let position_index = if overlay.center.is_some() {
+            usize::MAX
+        } else {
+            WatermarkPosition::ALL
+                .iter()
+                .position(|position| *position == overlay.position)
+                .unwrap_or(3)
+        };
         let shape_index = crate::recording::scene::CameraShape::ALL
             .iter()
             .position(|shape| *shape == overlay.shape)
@@ -1278,8 +1293,14 @@ impl Studio {
                     "camera-position",
                     &["Top left", "Top right", "Bottom left", "Bottom right"],
                     position_index,
-                    |this, index| this.camera_overlay.position = WatermarkPosition::ALL[index],
+                    |this, index| {
+                        this.camera_overlay.position = WatermarkPosition::ALL[index];
+                        this.camera_overlay.center = None;
+                    },
                     cx,
+                ))
+                .child(div().text_xs().text_color(muted()).child(
+                    "Or drag the bubble on the canvas; it snaps to the edges and center.",
                 ))
                 .child(self.segmented(
                     "camera-shape",
@@ -1663,6 +1684,59 @@ impl Studio {
         self.media_drag.take().is_some()
     }
 
+    /// Whether the camera bubble is drawn at the playhead.
+    pub(crate) fn camera_bubble_visible(&self) -> bool {
+        self.video_project.is_some()
+            && self.video_camera_path.is_some()
+            && self.camera_overlay.enabled
+            && self.video_clip_timeline
+                .content_source_time_at(self.video_position)
+                .is_some_and(|time| time < self.video_recording_duration)
+    }
+
+    /// Starts dragging the camera bubble when the press lands on it.
+    pub(crate) fn camera_pointer_down(&mut self, position: Point<Pixels>, canvas: Bounds<Pixels>) -> bool {
+        if !self.camera_bubble_visible() {
+            return false;
+        }
+        let (width, height) = (f32::from(canvas.size.width) as f64, f32::from(canvas.size.height) as f64);
+        let rect = self.camera_overlay.rect(width, height);
+        let local = (
+            f32::from(position.x - canvas.origin.x) as f64,
+            f32::from(position.y - canvas.origin.y) as f64,
+        );
+        if !rect.contains(local.0, local.1) {
+            return false;
+        }
+        self.pause_video_playback();
+        self.camera_drag = Some(CameraDrag {
+            start: position,
+            start_center: (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5),
+            canvas_size: (width, height),
+            guides: (None, None),
+        });
+        true
+    }
+
+    pub(crate) fn update_camera_drag(&mut self, position: Point<Pixels>) -> bool {
+        let Some(drag) = self.camera_drag.as_mut() else {
+            return false;
+        };
+        let proposed = (
+            drag.start_center.0 + f32::from(position.x - drag.start.x) as f64,
+            drag.start_center.1 + f32::from(position.y - drag.start.y) as f64,
+        );
+        let (center, guides) =
+            self.camera_overlay.snapped_center(proposed, drag.canvas_size.0, drag.canvas_size.1);
+        drag.guides = guides;
+        self.camera_overlay.center = Some(center);
+        true
+    }
+
+    pub(crate) fn end_camera_drag(&mut self) -> bool {
+        self.camera_drag.take().is_some()
+    }
+
     pub(crate) fn scene_scroll(&mut self, event: &ScrollWheelEvent) -> bool {
         if self.scene_selection != SceneSelection::Media {
             return false;
@@ -1795,6 +1869,9 @@ impl Studio {
         let paint_flat = self.annotations_paint_flat();
         let composite_flat = paint_flat && self.has_media_image_overlays();
         let select_tool = self.tool == Tool::Select;
+        let camera_guides = self.camera_drag.map(|drag| drag.guides);
+        let camera_grab = (select_tool && self.camera_bubble_visible()).then_some(self.camera_overlay);
+        let camera_dragging = self.camera_drag.is_some();
         let text_cursor = self.tool == Tool::Text || self.editing_text.is_some();
         let committed_count = self.annotations.len();
         let mut marks = self.annotations.clone();
@@ -1940,9 +2017,36 @@ impl Studio {
                         cursor_bounds.resize(committed_count + 1, Bounds::new(point(px(-100000.), px(-100000.)), size(px(0.), px(0.))));
                         for (index, hit) in &canvas_hits { cursor_bounds[*index] = *hit; }
                         let studio = entity.read(cx);
-                        let cursor = if studio.tool == Tool::Select && group_bounds.is_some_and(|group| group.contains(&window.mouse_position())) {
+                        let mouse = window.mouse_position();
+                        let over_camera = camera_grab.is_some_and(|camera| {
+                            camera
+                                .rect(f32::from(bounds.size.width) as f64, f32::from(bounds.size.height) as f64)
+                                .contains(f32::from(mouse.x - bounds.origin.x) as f64, f32::from(mouse.y - bounds.origin.y) as f64)
+                        });
+                        let cursor = if camera_dragging {
+                            gpui::CursorStyle::ClosedHand
+                        } else if studio.tool == Tool::Select && group_bounds.is_some_and(|group| group.contains(&mouse)) {
                             if studio.pointer_is_down { gpui::CursorStyle::ClosedHand } else { gpui::CursorStyle::OpenHand }
-                        } else { studio.annotation_cursor(window.mouse_position(), interaction_bounds, &cursor_bounds) };
+                        } else if over_camera {
+                            gpui::CursorStyle::OpenHand
+                        } else { studio.annotation_cursor(mouse, interaction_bounds, &cursor_bounds) };
+                        if let Some((guide_x, guide_y)) = camera_guides {
+                            let guide = hsla(212.0 / 360.0, 1.0, 0.56, 1.0);
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                if let Some(x) = guide_x {
+                                    window.paint_quad(gpui::fill(
+                                        Bounds::new(point(bounds.origin.x + px(x as f32 - 0.5), bounds.origin.y), size(px(1.0), bounds.size.height)),
+                                        guide,
+                                    ));
+                                }
+                                if let Some(y) = guide_y {
+                                    window.paint_quad(gpui::fill(
+                                        Bounds::new(point(bounds.origin.x, bounds.origin.y + px(y as f32 - 0.5)), size(bounds.size.width, px(1.0))),
+                                        guide,
+                                    ));
+                                }
+                            });
+                        }
                         window.set_cursor_style(cursor, &hitbox);
                         if show_handles {
                             paint_selection_handles(&projection, bounds, window);
@@ -1971,6 +2075,10 @@ impl Studio {
                                     }
                                     this.focus_handle.focus(window);
                                     if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, interaction_bounds, &annotation_bounds, event.click_count) {
+                                        cx.notify();
+                                        return;
+                                    }
+                                    if select_tool && this.camera_pointer_down(event.position, bounds) {
                                         cx.notify();
                                         return;
                                     }

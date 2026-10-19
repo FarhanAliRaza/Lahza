@@ -230,6 +230,10 @@ pub struct CameraOverlay {
     /// Distance from the canvas edge as a percent of the canvas height.
     pub margin: u8,
     pub shadow: bool,
+    /// Free placement: the bubble's center as a fraction of the canvas.
+    /// `None` pins it to `position`'s corner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub center: Option<(f64, f64)>,
 }
 
 impl Default for CameraOverlay {
@@ -242,15 +246,36 @@ impl Default for CameraOverlay {
             mirror: false,
             margin: 4,
             shadow: true,
+            center: None,
         }
     }
 }
 
 impl CameraOverlay {
+    /// Snap distance for dragging, in canvas pixels at 1080p.
+    const SNAP_DISTANCE: f64 = 8.0 / 1080.0;
+
+    fn side_and_margin(&self, canvas_width: f64, canvas_height: f64) -> (f64, f64) {
+        let side = (canvas_height * (self.size.clamp(10, 60) as f64 / 100.0)).min(canvas_width);
+        let margin = canvas_height * (self.margin.min(20) as f64 / 100.0);
+        (side, margin)
+    }
+
     /// The overlay rect on a canvas of this size.
     pub fn rect(&self, canvas_width: f64, canvas_height: f64) -> Rect {
-        let side = canvas_height * (self.size.clamp(10, 60) as f64 / 100.0);
-        let margin = canvas_height * (self.margin.min(20) as f64 / 100.0);
+        let (side, margin) = self.side_and_margin(canvas_width, canvas_height);
+        if let Some((cx, cy)) = self.center.filter(|(x, y)| x.is_finite() && y.is_finite()) {
+            let place = |center: f64, length: f64| {
+                let low = margin.min((length - side) * 0.5).max(0.0);
+                (center * length - side * 0.5).clamp(low, (length - low - side).max(low))
+            };
+            return Rect {
+                x: place(cx, canvas_width),
+                y: place(cy, canvas_height),
+                width: side,
+                height: side,
+            };
+        }
         let x = match self.position {
             WatermarkPosition::TopLeft | WatermarkPosition::BottomLeft => margin,
             WatermarkPosition::TopRight | WatermarkPosition::BottomRight => {
@@ -269,6 +294,42 @@ impl CameraOverlay {
             width: side,
             height: side,
         }
+    }
+
+    /// Place the bubble's center at `proposed` (canvas pixels), snapping each
+    /// axis to the near margin, the middle, or the far margin. Returns the
+    /// normalized center and, per axis, the guide line to draw.
+    pub fn snapped_center(
+        &self,
+        proposed: (f64, f64),
+        canvas_width: f64,
+        canvas_height: f64,
+    ) -> ((f64, f64), (Option<f64>, Option<f64>)) {
+        let (side, margin) = self.side_and_margin(canvas_width, canvas_height);
+        let snap = Self::SNAP_DISTANCE * canvas_height;
+        let axis = |center: f64, length: f64| -> (f64, Option<f64>) {
+            let radius = side * 0.5;
+            let targets = [
+                (margin + radius, margin),
+                (length * 0.5, length * 0.5),
+                (length - margin - radius, length - margin),
+            ];
+            let nearest = targets
+                .iter()
+                .min_by(|a, b| (a.0 - center).abs().total_cmp(&(b.0 - center).abs()))
+                .copied()
+                .filter(|(target, _)| (target - center).abs() <= snap);
+            match nearest {
+                Some((target, guide)) => (target, Some(guide)),
+                None => (center.clamp(radius, (length - radius).max(radius)), None),
+            }
+        };
+        let (x, guide_x) = axis(proposed.0, canvas_width);
+        let (y, guide_y) = axis(proposed.1, canvas_height);
+        (
+            ((x / canvas_width).clamp(0.0, 1.0), (y / canvas_height).clamp(0.0, 1.0)),
+            (guide_x, guide_y),
+        )
     }
 
     pub fn radius(&self, rect: Rect) -> f64 {

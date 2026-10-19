@@ -349,6 +349,7 @@ struct Studio {
     pointer_style: PointerStyle,
     scene_selection: SceneSelection,
     media_drag: Option<MediaDrag>,
+    camera_drag: Option<scene_ui::CameraDrag>,
     /// Which motion marker (focus or pan end) the pointer is dragging.
     focus_drag: Option<scene_ui::FocusDrag>,
     scene_canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -689,6 +690,7 @@ impl Studio {
             pointer_style: PointerStyle::default(),
             scene_selection: SceneSelection::Scene,
             media_drag: None,
+            camera_drag: None,
             focus_drag: None,
             scene_canvas_bounds: scene_ui::scene_canvas_bounds_store(),
             preview_cache: PreviewCache::default(),

@@ -862,6 +862,8 @@ impl Studio {
                     if this.update_media_drag(event.position) {
                         changed = true;
                     }
+                } else if event.dragging() && this.camera_drag.is_some() {
+                    changed |= this.update_camera_drag(event.position);
                 } else if event.dragging() && this.video_audio_drag.is_some() {
                     changed |= this.update_audio_drag(event.position.x);
                 } else if event.dragging() {
@@ -893,6 +895,9 @@ impl Studio {
                     if this.end_media_drag() {
                         cx.notify();
                     }
+                    if this.end_camera_drag() {
+                        cx.notify();
+                    }
                     if this.end_annotation_drag() {
                         cx.notify();
                     }
@@ -921,6 +926,7 @@ impl Studio {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    this.end_camera_drag();
                     this.finish_audio_drag(event.position.x, cx);
                     this.finish_video_move_drag(event.position.x, cx);
                     if this.video_trim_drag.is_some() {
