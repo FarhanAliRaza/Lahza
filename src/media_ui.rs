@@ -7,7 +7,7 @@ use crate::{
     AnnotationMark, NormPoint, Studio, Tool, VideoEditSnapshot,
 };
 use base64::Engine;
-use gpui::{div, prelude::*, px, AnyElement, Context};
+use gpui::{div, prelude::*, px, AnyElement, Context, CursorStyle, MouseButton, MouseDownEvent, Pixels};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ImportKind {
@@ -20,6 +20,139 @@ enum Imported {
     Clip(std::path::PathBuf, f64, f64),
     Image(String, u32, u32),
     Audio(AudioClip),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum AudioDragKind {
+    Move,
+    Leading,
+    Trailing,
+}
+
+/// A press on the Music / SFX lane. A click selects and seeks on release; a
+/// drag past a small threshold moves the layer or trims one edge.
+pub(crate) struct AudioDrag {
+    id: uuid::Uuid,
+    kind: AudioDragKind,
+    start_x: Pixels,
+    start_scroll: f64,
+    seconds_per_pixel: f64,
+    original: AudioClip,
+    original_clips: Vec<AudioClip>,
+    active: bool,
+}
+
+impl AudioClip {
+    const MINIMUM_DURATION: f64 = 0.12;
+}
+
+impl Studio {
+    pub(crate) fn begin_audio_drag(&mut self, id: uuid::Uuid, kind: AudioDragKind, start_x: Pixels) {
+        if self.video_edit_busy {
+            return;
+        }
+        let Some(original) = self.video_audio_clips.iter().find(|clip| clip.id == id).cloned() else {
+            return;
+        };
+        self.finish_annotation_interaction();
+        self.pause_video_playback();
+        self.video_seek_drag = None;
+        self.video_move_drag = None;
+        self.video_trim_drag = None;
+        self.video_zoom_drag = None;
+        self.video_audio_drag = Some(AudioDrag {
+            id,
+            kind,
+            start_x,
+            start_scroll: self.video_timeline_scroll,
+            seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
+            original,
+            original_clips: self.video_audio_clips.clone(),
+            active: false,
+        });
+    }
+
+    /// Previews the gesture directly on the layer list; the original list is
+    /// restored into the undo stack on commit.
+    pub(crate) fn update_audio_drag(&mut self, pointer_x: Pixels) -> bool {
+        let Some(drag) = self.video_audio_drag.as_mut() else {
+            return false;
+        };
+        drag.active |= (pointer_x - drag.start_x).abs() > px(6.0);
+        if !drag.active {
+            return false;
+        }
+        let delta = (f64::from((pointer_x - drag.start_x) / px(1.0))
+            + self.video_timeline_scroll
+            - drag.start_scroll)
+            * drag.seconds_per_pixel;
+        let original = drag.original.clone();
+        let kind = drag.kind;
+        let id = drag.id;
+        let snap = 8.0 * drag.seconds_per_pixel;
+        let workspace = self.video_timeline_duration();
+        let mut candidates = vec![0.0, self.video_position];
+        let starts = self.video_clip_timeline.clip_starts();
+        for (index, segment) in self.video_clip_timeline.segments.iter().enumerate() {
+            candidates.push(starts[index]);
+            candidates.push(starts[index] + segment.editor_duration());
+        }
+        let snapped = |value: f64| {
+            candidates
+                .iter()
+                .copied()
+                .filter(|candidate| (value - candidate).abs() < snap)
+                .min_by(|a, b| (value - a).abs().total_cmp(&(value - b).abs()))
+                .unwrap_or(value)
+        };
+        let Some(clip) = self.video_audio_clips.iter_mut().find(|clip| clip.id == id) else {
+            return false;
+        };
+        match kind {
+            AudioDragKind::Move => {
+                let max_start = (workspace - original.duration).max(0.0);
+                clip.start = snapped(original.start + delta).clamp(0.0, max_start);
+            }
+            AudioDragKind::Leading => {
+                let new_start = snapped(original.start + delta);
+                let shift = (new_start - original.start).clamp(
+                    -original.source_start.min(original.start),
+                    original.duration - AudioClip::MINIMUM_DURATION,
+                );
+                clip.start = original.start + shift;
+                clip.source_start = original.source_start + shift;
+                clip.duration = original.duration - shift;
+            }
+            AudioDragKind::Trailing => {
+                let new_end = snapped(original.start + original.duration + delta);
+                let mut longest = (workspace - original.start).max(AudioClip::MINIMUM_DURATION);
+                if original.source_duration > 0.0 {
+                    longest = longest.min(original.source_duration - original.source_start);
+                }
+                clip.duration = (new_end - original.start)
+                    .clamp(AudioClip::MINIMUM_DURATION.min(longest), longest);
+            }
+        }
+        true
+    }
+
+    pub(crate) fn finish_audio_drag(&mut self, pointer_x: Pixels, cx: &mut Context<Self>) -> bool {
+        self.update_audio_drag(pointer_x);
+        let Some(drag) = self.video_audio_drag.take() else {
+            return false;
+        };
+        if drag.active {
+            self.video_undo_stack.push(VideoEditSnapshot::Audio(drag.original_clips));
+            self.video_redo_stack.clear();
+            self.save_audio_clips(cx);
+        } else if let Some(position) = self.motion_timeline_time_at(pointer_x) {
+            self.seek_video(position, cx);
+        }
+        self.select_inspector_tab(crate::shell_ui::InspectorTab::Record);
+        self.open_sections.insert("audio");
+        cx.notify();
+        true
+    }
 }
 
 impl Studio {
@@ -207,7 +340,7 @@ impl Studio {
     pub(crate) fn imported_audio_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_2()
             .child(self.small_button("add-background-audio", "Add music / sound effect", !self.video_edit_busy, cx, |this, cx| this.import_timeline_media(ImportKind::Audio, cx)))
-            .child(div().text_xs().text_color(crate::muted()).child("Audio starts at the playhead and mixes with the recording. Ends at the video’s end."));
+            .child(div().text_xs().text_color(crate::muted()).child("Audio starts at the playhead and mixes with the recording. Drag a layer on the Music / SFX lane to move it, or drag its edges to trim."));
         for clip in &self.video_audio_clips {
             let id = clip.id;
             let name = clip.name.clone();
@@ -364,48 +497,73 @@ impl Studio {
 
     pub(crate) fn imported_audio_lane(
         &self,
-        width: f64,
+        _width: f64,
         scroll: f64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        const ROW: f32 = 24.0;
+        let seconds_per_pixel = self.video_timeline_seconds_per_pixel();
+        let dragging = self.video_audio_drag.as_ref().filter(|drag| drag.active).map(|drag| drag.id);
         let mut lane = div()
             .relative()
-            .h(px(self.video_audio_clips.len() as f32 * 24.0))
+            .h(px(self.video_audio_clips.len() as f32 * ROW))
             .overflow_hidden();
         for (index, clip) in self.video_audio_clips.iter().enumerate() {
-            let end = (clip.start + clip.duration).min(self.video_duration);
-            if end <= clip.start {
-                continue;
-            }
-            lane = lane.child(
+            let id = clip.id;
+            let left = (clip.start / seconds_per_pixel - scroll) as f32;
+            let width = ((clip.duration / seconds_per_pixel) as f32).max(3.0);
+            let handle = |kind: AudioDragKind, cx: &mut Context<Self>| {
                 div()
+                    .id((if kind == AudioDragKind::Leading { "audio-trim-leading" } else { "audio-trim-trailing" }, id.as_u128() as u64))
                     .absolute()
-                    .top(px(index as f32 * 24.0))
-                    .left(px(
-                        (clip.start / self.video_duration * width - scroll) as f32
-                    ))
-                    .w(px(((end - clip.start) / self.video_duration * width) as f32))
-                    .h(px(22.0))
-                    .rounded_sm()
-                    .bg(gpui::rgb(0xccebe5))
-                    .px_2()
-                    .text_xs()
-                    .overflow_hidden()
-                    .child(format!(
-                        "{} · {}%",
-                        clip.name,
-                        (clip.volume * 100.0).round()
-                    ))
+                    .top_0()
+                    .h_full()
+                    .w(px((width * 0.25).min(8.0)))
+                    .when(kind == AudioDragKind::Leading, |this| this.left_0())
+                    .when(kind == AudioDragKind::Trailing, |this| this.right_0())
+                    .bg(gpui::rgba(0x1f6f5f80))
+                    .cursor(CursorStyle::ResizeLeftRight)
                     .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, event, _, cx| {
-                            this.timeline_seek_down(event);
-                            this.select_inspector_tab(crate::shell_ui::InspectorTab::Record);
-                            this.open_sections.insert("audio");
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
+                            this.focus_handle.focus(window);
+                            this.begin_audio_drag(id, kind, event.position.x);
                             cx.notify();
                         }),
-                    ),
+                    )
+            };
+            lane = lane.child(
+                div()
+                    .id(("audio-layer", id.as_u128() as u64))
+                    .absolute()
+                    .top(px(index as f32 * ROW))
+                    .left(px(left))
+                    .w(px(width))
+                    .h(px(ROW - 2.0))
+                    .rounded_sm()
+                    .bg(gpui::rgb(0xccebe5))
+                    .when(dragging == Some(id), |this| this.opacity(0.6))
+                    .cursor(if dragging == Some(id) { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px_2()
+                            .text_xs()
+                            .whitespace_nowrap()
+                            .child(format!("{} · {}%", clip.name, (clip.volume * 100.0).round())),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.focus_handle.focus(window);
+                            this.begin_audio_drag(id, AudioDragKind::Move, event.position.x);
+                            cx.notify();
+                        }),
+                    )
+                    .child(handle(AudioDragKind::Leading, cx))
+                    .child(handle(AudioDragKind::Trailing, cx)),
             );
         }
         lane.into_any_element()
@@ -505,6 +663,7 @@ mod tests {
                             volume: 0.5,
                             fade_in: 0.2,
                             fade_out: 0.2,
+                            source_duration: 0.0,
                         };
                         studio.video_audio_clips.push(clip.clone());
                         studio.edit_audio(clip.id, |clip| clip.volume = 0.2, cx);

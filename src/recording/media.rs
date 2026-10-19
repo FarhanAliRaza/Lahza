@@ -23,6 +23,9 @@ pub struct AudioClip {
     pub volume: f64,
     pub fade_in: f64,
     pub fade_out: f64,
+    /// Length of the imported asset; 0 when unknown (older projects).
+    #[serde(default)]
+    pub source_duration: f64,
 }
 
 impl AudioClip {
@@ -174,6 +177,7 @@ pub fn import_audio(
         volume: 0.5,
         fade_in: 0.0,
         fade_out: 0.0,
+        source_duration: duration,
     };
     clip.validate()?;
     Ok(clip)
@@ -253,6 +257,12 @@ pub fn append_media(
     if let Err(error) = bank.save(&asset_path(session, &file)?) {
         let _ = fs::remove_file(destination);
         return Err(error);
+    }
+    // The new index supersedes the previous one (and its denoised twin);
+    // the assets they list are all still referenced by the new index.
+    if MediaBank::load(&original)?.is_some() {
+        let _ = fs::remove_file(&original);
+        let _ = fs::remove_file(original.with_extension("denoised.media.json"));
     }
     Ok((file, start, end))
 }
