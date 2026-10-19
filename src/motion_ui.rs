@@ -2044,6 +2044,17 @@ impl Studio {
         let suggested_name = chrono::Local::now()
             .format(&format!("Lahza-%Y-%m-%d_%H-%M-%S.{}", format.extension()))
             .to_string();
+        let (source, request) = self.video_export_request(&session, format);
+        self.prompt_and_run_scene_export(source, request, suggested_name, cx);
+    }
+
+    /// The current recording edit as an export job in `format`, with the
+    /// export settings from the inspector. The destination is left empty.
+    pub(crate) fn video_export_request(
+        &mut self,
+        session: &crate::RecordingSession,
+        format: ExportFormat,
+    ) -> (SceneSource, SceneExportRequest) {
         self.sync_reframe();
         let mut request = SceneExportRequest::new(
             Default::default(),
@@ -2073,7 +2084,7 @@ impl Studio {
                 .then(|| self.video_pointer_timeline.clone()),
             camera: self.video_camera_path.clone(),
         };
-        self.prompt_and_run_scene_export(source, request, suggested_name, cx);
+        (source, request)
     }
 
     /// Animated screenshot export through the same scene pipeline.

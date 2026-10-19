@@ -1547,6 +1547,10 @@ impl Studio {
                                 }))
                         }),
                 )
+                .when(self.video_project.is_some(), |this| {
+                    this.child(Self::tab_label("Share"))
+                        .child(self.share_section(cx))
+                })
                 .into_any_element(),
         };
         let tabs = div()

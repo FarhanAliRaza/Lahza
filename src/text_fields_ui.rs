@@ -9,6 +9,9 @@ pub(crate) struct TextFields {
     pub start: gpui::Entity<TextField>,
     pub end: gpui::Entity<TextField>,
     pub cue: gpui::Entity<TextField>,
+    pub cloud_url: gpui::Entity<TextField>,
+    pub cloud_token: gpui::Entity<TextField>,
+    pub share_title: gpui::Entity<TextField>,
 }
 impl TextFields {
     pub fn new(parent: FocusHandle, cx: &mut Context<Studio>) -> Self {
@@ -27,6 +30,9 @@ impl TextFields {
             start: create("Seconds"),
             end: create("Seconds"),
             cue: create("Caption text"),
+            cloud_url: create("share.example.com"),
+            cloud_token: create("Paste the upload token"),
+            share_title: create("Untitled"),
         }
     }
 }
@@ -39,6 +45,9 @@ impl Studio {
             &self.text_fields.start,
             &self.text_fields.end,
             &self.text_fields.cue,
+            &self.text_fields.cloud_url,
+            &self.text_fields.cloud_token,
+            &self.text_fields.share_title,
         ]
         .iter()
         .any(|field| field.read(cx).focus.is_focused(window))
@@ -142,6 +151,23 @@ impl Studio {
         self.text_fields
             .cue
             .update(cx, |field, cx| field.sync(cue_target, &cue_text, window, cx));
+        let export_visible = self.inspector_visible
+            && self.effective_tab() == InspectorTab::Export
+            && self.video_project.is_some();
+        let editing_server = export_visible && (self.cloud_editing || !self.cloud.is_configured());
+        let share_ready = export_visible && !editing_server;
+        for (field, target, value) in [
+            (&self.text_fields.cloud_url, Target::CloudUrl, self.cloud.worker_url.clone()),
+            (&self.text_fields.cloud_token, Target::CloudToken, self.cloud.upload_token.clone()),
+        ] {
+            let target = if editing_server { target } else { Target::None };
+            field.update(cx, |field, cx| field.sync(target, &value, window, cx));
+        }
+        let title_target = if share_ready { Target::ShareTitle } else { Target::None };
+        let title = self.share_title.clone();
+        self.text_fields
+            .share_title
+            .update(cx, |field, cx| field.sync(title_target, &title, window, cx));
         if projected_edit.is_some_and(|i| target == Target::Annotation(i)) {
             self.text_fields.annotation.read(cx).focus.focus(window);
         }
@@ -209,6 +235,15 @@ impl Studio {
                 EventKind::Change => self.set_cue_text(id, &event.text, false, cx),
                 EventKind::Commit | EventKind::Cancel => self.set_cue_text(id, &event.text, true, cx),
             },
+            Target::CloudUrl if matches!(event.kind, EventKind::Change | EventKind::Cancel) => {
+                self.cloud.worker_url = event.text.clone();
+            }
+            Target::CloudToken if matches!(event.kind, EventKind::Change | EventKind::Cancel) => {
+                self.cloud.upload_token = event.text.clone();
+            }
+            Target::ShareTitle if matches!(event.kind, EventKind::Change | EventKind::Cancel) => {
+                self.share_title = event.text.clone();
+            }
             Target::Time(index, start) => {
                 if event.kind == EventKind::Focus {
                     self.stop_editing_text();

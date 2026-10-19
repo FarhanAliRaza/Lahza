@@ -11,6 +11,9 @@ pub(crate) enum Target {
     Time(usize, bool),
     /// A subtitle cue's text, by cue id.
     Cue(uuid::Uuid),
+    CloudUrl,
+    CloudToken,
+    ShareTitle,
     None,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

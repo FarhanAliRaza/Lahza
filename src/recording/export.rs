@@ -218,6 +218,16 @@ impl ExportProgress {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// Restart the bar for a follow-up stage such as uploading.
+    pub fn begin_stage(&self, total: u64) {
+        self.reset(total);
+        *self.encoding_started.lock().unwrap() = Some(Instant::now());
+    }
+
+    pub fn set_completed(&self, completed: u64) {
+        self.completed.store(completed, Ordering::Relaxed);
+    }
+
     fn reset(&self, total: u64) {
         *self.encoder.lock().unwrap() = None;
         *self.compositor.lock().unwrap() = None;

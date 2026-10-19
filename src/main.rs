@@ -48,6 +48,7 @@ mod media_ui;
 mod overlays_ui;
 mod transcript_ui;
 mod teleprompter_ui;
+mod cloud_ui;
 
 use annotations::{annotations_svg, paint_annotation, paint_highlights};
 use crop::paint_crop_overlay;
@@ -404,6 +405,11 @@ struct Studio {
     teleprompter: recording::teleprompter::TeleprompterSettings,
     prompter_window: Option<teleprompter_ui::PrompterHandle>,
     voice_model_download: Option<recording::transcription::JobProgress>,
+    cloud: recording::cloud::CloudSettings,
+    /// The sharing server form is open.
+    cloud_editing: bool,
+    share_title: String,
+    last_share_url: Option<SharedString>,
     video_camera_path: Option<PathBuf>,
     camera_frame_rgba: Option<Arc<image::RgbaImage>>,
     camera_decoded_time: f64,
@@ -740,6 +746,10 @@ impl Studio {
             teleprompter: recording::teleprompter::TeleprompterSettings::load(),
             prompter_window: None,
             voice_model_download: None,
+            cloud: recording::cloud::CloudSettings::load(),
+            cloud_editing: false,
+            share_title: String::new(),
+            last_share_url: None,
             video_camera_path: None,
             camera_frame_rgba: None,
             camera_decoded_time: -1.0,
