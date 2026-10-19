@@ -24,6 +24,43 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Geometry for a recording's independent, scrollable time ruler.
+struct RecordingTimelineGeometry {
+    duration: f64,
+    seconds_per_pixel: f64,
+}
+
+impl RecordingTimelineGeometry {
+    fn new(span: f64, extent: f64, media_duration: f64, viewport_width: f64, zoom: f64) -> Self {
+        let span = span.max(0.001);
+        Self {
+            duration: extent.max(media_duration).max(span) + span,
+            seconds_per_pixel: span / (viewport_width * zoom).max(1.0),
+        }
+    }
+}
+
+impl VideoTrimDrag {
+    fn preview(&self, pointer_x: Pixels, scroll: f64, source_duration: f64) -> Option<RecordingClipTimeline> {
+        let range = self.original_timeline.editor_range(self.original_clip.id)?;
+        let edge_time = match self.edge {
+            ClipEdge::Leading => range.start,
+            ClipEdge::Trailing => range.end,
+        };
+        let pixels = f64::from((pointer_x - self.start_x) / px(1.0)) + scroll - self.start_scroll;
+        let mut delta = pixels * self.editor_seconds_per_pixel;
+        // The parked playhead is the trim target. Snap the edge to it without
+        // ever seeking or changing the source frame under retained content.
+        if pixels.abs() > f64::EPSILON
+            && (edge_time + delta - self.original_position).abs() <= 8.0 * self.editor_seconds_per_pixel
+        {
+            delta = self.original_position - edge_time;
+        }
+        self.original_timeline.trimming(self.original_clip.id, self.edge, delta, source_duration)
+            .map(|(timeline, _)| timeline)
+    }
+}
+
 impl Studio {
     /// Width of the visible timeline strip, measured on the last paint. The
     /// strip stretches with the window, so seek and drag math must use the
@@ -38,6 +75,37 @@ impl Studio {
             .unwrap_or(600.0)
     }
 
+    /// The ruler has its own extent and scale. Editing clips must never fit
+    /// the remaining media back into the viewport. Leave room to place clips
+    /// beyond the current end; this empty workspace is not exported.
+    pub(crate) fn video_timeline_duration(&self) -> f64 {
+        if self.video_project.is_some() {
+            self.recording_timeline_geometry().duration
+        } else {
+            self.video_duration.max(f64::EPSILON)
+        }
+    }
+
+    pub(crate) fn video_timeline_seconds_per_pixel(&self) -> f64 {
+        if self.video_project.is_some() {
+            self.recording_timeline_geometry().seconds_per_pixel
+        } else {
+            self.video_duration.max(f64::EPSILON)
+                / (self.video_timeline_viewport_width() * self.video_timeline_zoom).max(1.0)
+        }
+    }
+
+    fn recording_timeline_geometry(&self) -> RecordingTimelineGeometry {
+        RecordingTimelineGeometry::new(
+            self.video_timeline_span, self.video_timeline_extent, self.video_duration,
+            self.video_timeline_viewport_width(), self.video_timeline_zoom,
+        )
+    }
+
+    pub(crate) fn video_timeline_content_width(&self) -> f64 {
+        self.video_timeline_duration() / self.video_timeline_seconds_per_pixel()
+    }
+
     pub(super) fn zoom_video_timeline(&mut self, factor: f64, anchor_time: f64) {
         const MAX_POINTS_PER_SECOND: f64 = 240.0;
         const MAX_CONTENT_WIDTH: f64 = 100_000.0;
@@ -45,25 +113,26 @@ impl Studio {
             return;
         }
         let viewport_width = self.video_timeline_viewport_width();
-        let maximum_width = MAX_CONTENT_WIDTH.min(MAX_POINTS_PER_SECOND * self.video_duration);
-        let maximum_zoom = (maximum_width / viewport_width).max(1.0);
+        let duration = self.video_timeline_duration();
+        let maximum_width = MAX_CONTENT_WIDTH.min(MAX_POINTS_PER_SECOND * duration);
         let previous_zoom = self.video_timeline_zoom;
+        let maximum_zoom = (maximum_width / self.video_timeline_content_width() * previous_zoom).max(1.0);
         let next_zoom = (previous_zoom * factor).clamp(1.0, maximum_zoom);
         if (next_zoom - previous_zoom).abs() < 0.000_1 {
             return;
         }
-        let anchor_fraction = (anchor_time / self.video_duration).clamp(0.0, 1.0);
-        let previous_anchor_x = anchor_fraction * viewport_width * previous_zoom;
-        let anchor_viewport_x = previous_anchor_x - self.video_timeline_scroll;
+        let anchor_time = anchor_time.clamp(0.0, duration);
+        let anchor_viewport_x = anchor_time / self.video_timeline_seconds_per_pixel()
+            - self.video_timeline_scroll;
         self.video_timeline_zoom = next_zoom;
-        let next_anchor_x = anchor_fraction * viewport_width * next_zoom;
-        let maximum_scroll = viewport_width * next_zoom - viewport_width;
+        let next_anchor_x = anchor_time / self.video_timeline_seconds_per_pixel();
+        let maximum_scroll = (self.video_timeline_content_width() - viewport_width).max(0.0);
         self.video_timeline_scroll = (next_anchor_x - anchor_viewport_x).clamp(0.0, maximum_scroll);
     }
 
     pub(super) fn pan_video_timeline(&mut self, delta: f64) {
-        let viewport_width = self.video_timeline_viewport_width();
-        let maximum_scroll = (viewport_width * self.video_timeline_zoom - viewport_width).max(0.0);
+        let maximum_scroll =
+            (self.video_timeline_content_width() - self.video_timeline_viewport_width()).max(0.0);
         self.video_timeline_scroll =
             (self.video_timeline_scroll + delta).clamp(0.0, maximum_scroll);
     }
@@ -83,13 +152,16 @@ impl Studio {
         };
         self.pause_video_playback();
         self.video_selected_clip = Some(clip_id);
+        self.video_seek_drag = None;
+        self.video_move_drag = None;
         self.video_trim_drag = Some(VideoTrimDrag {
             start_x,
+            start_scroll: self.video_timeline_scroll,
+            original_position: self.video_position,
             original_timeline: self.video_clip_timeline.clone(),
             original_clip,
             edge,
-            editor_seconds_per_pixel: self.video_duration
-                / (self.video_timeline_viewport_width() * self.video_timeline_zoom).max(1.0),
+            editor_seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
         });
     }
 
@@ -97,19 +169,11 @@ impl Studio {
         let Some(drag) = self.video_trim_drag.as_ref() else {
             return;
         };
-        let editor_delta =
-            ((pointer_x - drag.start_x) / px(1.0)) as f64 * drag.editor_seconds_per_pixel;
-        let Some((timeline, _)) = drag.original_timeline.trimming(
-            drag.original_clip.id,
-            drag.edge,
-            editor_delta,
-            self.video_source_duration,
-        ) else {
+        let Some(timeline) = drag.preview(pointer_x, self.video_timeline_scroll, self.video_source_duration) else {
             return;
         };
         self.video_clip_timeline = timeline;
         self.video_duration = self.video_clip_timeline.duration();
-        self.video_position = self.video_position.min(self.video_duration);
     }
 
     pub(super) fn commit_video_trim(&mut self, cx: &mut Context<Self>) {
@@ -118,25 +182,67 @@ impl Studio {
         };
         let requested = self.video_clip_timeline.clone();
         let selected = Some(drag.original_clip.id);
+        self.video_position = drag.original_position;
         self.video_clip_timeline = drag.original_timeline;
         self.video_duration = self.video_clip_timeline.duration();
         self.apply_video_clip_timeline(requested, selected, true, cx);
     }
 
+    pub(super) fn begin_video_move_drag(&mut self, clip_id: Uuid, start_x: Pixels) {
+        self.finish_annotation_interaction();
+        self.pause_video_playback();
+        self.video_selected_clip = Some(clip_id);
+        self.video_selected_zoom_cue = None;
+        self.video_seek_drag = None;
+        self.video_trim_drag = None;
+        self.video_zoom_drag = None;
+        self.video_move_drag = Some(VideoMoveDrag {
+            clip_id,
+            start_x,
+            current_x: start_x,
+            start_scroll: self.video_timeline_scroll,
+            editor_seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
+            active: false,
+        });
+    }
+
+    /// A press selects immediately; a small motion threshold prevents a
+    /// normal click from accidentally repositioning the clip.
+    pub(super) fn update_video_move_drag(&mut self, pointer_x: Pixels) -> bool {
+        let Some(drag) = self.video_move_drag.as_mut() else { return false; };
+        drag.current_x = pointer_x;
+        drag.active |= (pointer_x - drag.start_x).abs() > px(6.0);
+        drag.active
+    }
+
+    pub(super) fn finish_video_move_drag(&mut self, pointer_x: Pixels, cx: &mut Context<Self>) -> bool {
+        self.update_video_move_drag(pointer_x);
+        let Some(drag) = self.video_move_drag.take() else { return false; };
+        if drag.active {
+            self.commit_video_move_drag(drag, cx);
+        } else if let Some(position) = self.motion_timeline_time_at(pointer_x) {
+            // Like Cap, a clip click selects and seeks on release. Waiting
+            // until release lets a drag move the clip without scrubbing.
+            self.seek_video(position, cx);
+        }
+        cx.notify();
+        true
+    }
+
     /// Where the dragged clip's content would start in editor time, given
-    /// the drag's pixel displacement. The scale is frozen at the drag's
-    /// current duration so the conversion is stable throughout the gesture.
+    /// the drag's pixel displacement, including any scrolling during the
+    /// gesture. The time scale is captured when the drag begins.
     pub(super) fn video_move_new_start(&self, drag: &VideoMoveDrag) -> Option<f64> {
         let range = self.video_clip_timeline.editor_range(drag.clip_id)?;
-        let content_width = self.video_timeline_viewport_width() * self.video_timeline_zoom;
+        let content_width = self.video_timeline_content_width();
         if content_width <= 0.0 || self.video_duration <= 0.0 {
             return None;
         }
-        let seconds_per_pixel = self.video_duration / content_width;
-        let delta = ((drag.current_x - drag.start_x) / px(1.0)) as f64 * seconds_per_pixel;
-        // Allow extending past the end by up to the current duration, and
-        // snap to clip boundaries so gaps close seamlessly.
-        let mut new_start = (range.start + delta).clamp(0.0, self.video_duration);
+        let seconds_per_pixel = drag.editor_seconds_per_pixel;
+        let delta = (f64::from((drag.current_x - drag.start_x) / px(1.0))
+            + self.video_timeline_scroll - drag.start_scroll) * seconds_per_pixel;
+        // Place clips anywhere in the scrollable workspace.
+        let mut new_start = (range.start + delta).clamp(0.0, self.video_timeline_duration());
         let clip_length = range.end - range.start;
         let snap = 8.0 * seconds_per_pixel;
         let starts = self.video_clip_timeline.clip_starts();
@@ -206,8 +312,7 @@ impl Studio {
             kind,
             editor_start,
             editor_end,
-            editor_seconds_per_pixel: self.video_duration
-                / (self.video_timeline_viewport_width() * self.video_timeline_zoom).max(1.0),
+            editor_seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
         });
     }
 
@@ -575,7 +680,10 @@ impl Studio {
             self.finish_annotation_interaction();
             let _ = self.rebuild_redactions();
         }
-        self.video_position = self.video_position.min(timeline.duration());
+        // Keep the workspace (and the parked playhead) even after deleting or
+        // trimming content at its end. Only explicit Fit changes the scale.
+        self.video_timeline_extent = self.video_timeline_extent
+            .max(self.video_duration).max(timeline.duration()).max(self.video_position);
         self.video_duration = timeline.duration();
         self.video_selected_clip = selected
             .filter(|id| timeline.segments.iter().any(|clip| clip.id == *id))
@@ -904,7 +1012,7 @@ impl Studio {
         self.annotation_editing_time = None;
         let playback_path = self.video_playback_path();
         self.pause_video_playback();
-        let position = position.clamp(0.0, self.video_duration);
+        let position = position.clamp(0.0, self.video_timeline_duration());
         self.video_position = position;
         self.camera_frame_rgba = None;
         self.camera_decoded_time = -1.0;
@@ -922,7 +1030,9 @@ impl Studio {
         };
         let generation = self.video_playback_generation.clone();
         let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.video_clip_timeline.location_at(position).is_some_and(|location| position < location.editor_start) {
+        if position > self.video_duration
+            || self.video_clip_timeline.location_at(position).is_some_and(|location| position < location.editor_start)
+        {
             self.set_video_frame(image::RgbaImage::from_pixel(16, 9, image::Rgba([0, 0, 0, 255])));
             cx.notify();
             return;
@@ -1240,4 +1350,190 @@ impl Studio {
                     ),
             )
     }
+}
+
+
+#[cfg(test)]
+mod timeline_interaction_tests {
+    use super::*;
+
+    fn trim_drag(edge: ClipEdge, position: f64) -> VideoTrimDrag {
+        let timeline = RecordingClipTimeline::full(10.0);
+        VideoTrimDrag {
+            start_x: px(100.0),
+            start_scroll: 200.0,
+            original_position: position,
+            original_clip: timeline.segments[0].clone(),
+            original_timeline: timeline,
+            edge,
+            editor_seconds_per_pixel: 0.01,
+        }
+    }
+
+    #[test]
+    fn leading_handle_snaps_to_parked_frame_at_a_scrolled_zoom() {
+        let drag = trim_drag(ClipEdge::Leading, 4.0);
+        let trimmed = drag.preview(px(497.0), 200.0, 10.0).unwrap();
+        assert_eq!(trimmed.editor_range(drag.original_clip.id).unwrap().start, 4.0);
+        assert_eq!(trimmed.source_time_at(drag.original_position), 4.0);
+        assert_eq!(drag.original_position, 4.0);
+        // Scrolling by 100 pixels during the drag has the same effect as
+        // moving the pointer by that amount in the content.
+        assert_eq!(drag.preview(px(397.0), 300.0, 10.0).unwrap(), trimmed);
+    }
+
+    #[test]
+    fn trailing_handle_can_cross_target_and_return_without_losing_it() {
+        let drag = trim_drag(ClipEdge::Trailing, 6.0);
+        let shortened = drag.preview(px(-600.0), 200.0, 10.0).unwrap();
+        assert_eq!(shortened.duration(), 3.0);
+        let at_target = drag.preview(px(-297.0), 200.0, 10.0).unwrap();
+        assert_eq!(at_target.duration(), 6.0);
+        assert_eq!(at_target.source_time_at(drag.original_position), 6.0);
+        assert_eq!(drag.preview(drag.start_x, drag.start_scroll, 10.0).unwrap(), drag.original_timeline);
+    }
+
+    #[test]
+    fn trim_and_move_do_not_change_ruler_scale_or_playhead_coordinates() {
+        let drag = trim_drag(ClipEdge::Trailing, 6.0);
+        let before = RecordingTimelineGeometry::new(10.0, 10.0, 10.0, 600.0, 2.0);
+        let trimmed = drag.preview(px(-600.0), 200.0, 10.0).unwrap();
+        let after = RecordingTimelineGeometry::new(10.0, 10.0, trimmed.duration(), 600.0, 2.0);
+        let playhead_x = |geometry: &RecordingTimelineGeometry| {
+            drag.original_position / geometry.duration
+                * (geometry.duration / geometry.seconds_per_pixel) - 200.0
+        };
+        assert_eq!(before.seconds_per_pixel, after.seconds_per_pixel);
+        assert_eq!(before.duration, after.duration);
+        assert_eq!(playhead_x(&before), playhead_x(&after));
+        let moved = trimmed.repositioning(drag.original_clip.id, 15.0).unwrap();
+        let extended = RecordingTimelineGeometry::new(10.0, moved.duration(), moved.duration(), 600.0, 2.0);
+        assert!(extended.duration > before.duration);
+        assert_eq!(playhead_x(&before), playhead_x(&extended));
+        // Undoing a move preserves the scrollable extent as well as scale.
+        let undone = RecordingTimelineGeometry::new(10.0, moved.duration(), 10.0, 600.0, 2.0);
+        assert_eq!(undone.duration, extended.duration);
+    }
+
+    #[test]
+    #[ignore = "requires X11, python3 and libXtst (run under Xvfb)"]
+    fn rendered_clip_click_seeks_and_drag_moves_without_scrubbing() {
+        use crate::{asset_directory, open_studio_window, Assets};
+        use gpui::{point, Application};
+        // XTest produces the native XI2 events GPUI uses on Linux.
+        fn pointer(x: i32, y: i32, button: &str) {
+            let status = std::process::Command::new("python3").arg("-c").arg(r#"
+import ctypes, sys
+x11 = ctypes.CDLL('libX11.so.6')
+xtst = ctypes.CDLL('libXtst.so.6')
+x11.XOpenDisplay.restype = ctypes.c_void_p
+display = ctypes.c_void_p(x11.XOpenDisplay(None))
+assert display.value
+xtst.XTestFakeMotionEvent(display, -1, int(sys.argv[1]), int(sys.argv[2]), 0)
+if sys.argv[3] != 'move':
+    xtst.XTestFakeButtonEvent(display, 1, sys.argv[3] == 'down', 0)
+x11.XSync(display, False)
+x11.XCloseDisplay(display)
+"#).arg(x.to_string()).arg(y.to_string()).arg(button).status().unwrap();
+            assert!(status.success());
+        }
+        let root = std::env::temp_dir().join(format!("lahza-timeline-input-{}", Uuid::new_v4()));
+        let session = RecordingSession::create_in(&root).unwrap();
+        Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+            let handle = open_studio_window(cx, true, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            let clip_id = handle.update(cx, |studio, _, cx| {
+                studio.load_generation = studio.load_generation.wrapping_add(1);
+                studio.loading = None;
+                studio.launcher_active = false;
+                studio.launcher_window = false;
+                studio.video_project = Some(session);
+                studio.video_clip_timeline = RecordingClipTimeline::full(10.0);
+                studio.video_duration = 10.0;
+                studio.video_source_duration = 10.0;
+                studio.video_timeline_span = 20.0;
+                studio.video_timeline_extent = 20.0;
+                studio.video_position = 4.0;
+                studio.video_selected_clip = None;
+                studio.set_video_frame(image::RgbaImage::from_pixel(160, 90, image::Rgba([50, 70, 100, 255])));
+                cx.notify();
+                studio.video_clip_timeline.segments[0].id
+            }).unwrap();
+            cx.spawn(async move |cx| {
+                Timer::after(Duration::from_millis(200)).await;
+                let window_handle: gpui::AnyWindowHandle = handle.into();
+                window_handle.update(cx, |_, window, cx| {
+                    window.draw(cx).clear();
+                    window.draw(cx).clear();
+                }).unwrap();
+                let (start, drag_pixels, expected_start) = handle.update(cx, |studio, window, _| {
+                    let bounds = studio.video_timeline_bounds.lock().unwrap()
+                        .expect("rendered video timeline bounds");
+                    let origin = window.bounds().origin;
+                    // Release beyond the original clip's right edge.
+                    let drag_pixels = (studio.video_timeline_viewport_width() * 0.55).round() as i32;
+                    (point(origin.x + bounds.origin.x + px(40.0), origin.y + bounds.origin.y + px(17.0)),
+                        drag_pixels, f64::from(drag_pixels) * studio.video_timeline_seconds_per_pixel())
+                }).unwrap();
+                let x = f32::from(start.x) as i32;
+                let y = f32::from(start.y) as i32;
+                pointer(x, y, "down");
+                Timer::after(Duration::from_millis(100)).await;
+                let expected_click_time = handle.update(cx, |studio, _, _| {
+                    assert_eq!(studio.video_selected_clip, Some(clip_id), "clip press must select the video");
+                    assert!(studio.video_move_drag.is_some(), "clip press must arm dragging");
+                    assert!(studio.video_seek_drag.is_none(), "clip selection must not arm scrubbing");
+                    assert_eq!(studio.video_position, 4.0, "mouse-down must wait to distinguish a click from a drag");
+                    // Use window-local native coordinates, excluding any
+                    // X11 window decoration offset from the global pointer.
+                    let bounds = studio.video_timeline_bounds.lock().unwrap().unwrap();
+                    let local_x = studio.video_move_drag.unwrap().start_x - bounds.origin.x;
+                    f64::from(local_x / px(1.0)) * studio.video_timeline_seconds_per_pixel()
+                }).unwrap();
+                pointer(x, y, "up");
+                Timer::after(Duration::from_millis(100)).await;
+                let clicked_position = handle.update(cx, |studio, _, _| {
+                    assert!(studio.video_move_drag.is_none());
+                    assert_eq!(studio.video_clip_timeline.editor_range(clip_id).unwrap().start, 0.0,
+                        "a plain click must not reposition the clip");
+                    let expected = expected_click_time;
+                    assert!((studio.video_position - expected).abs() < studio.video_timeline_seconds_per_pixel(),
+                        "a clip click must seek: actual {}, expected {expected}, seconds/pixel {}",
+                        studio.video_position, studio.video_timeline_seconds_per_pixel());
+                    assert!(studio.video_seek_drag.is_none());
+                    studio.video_position
+                }).unwrap();
+                pointer(x, y, "down");
+                Timer::after(Duration::from_millis(100)).await;
+                pointer(x + drag_pixels, y, "move");
+                Timer::after(Duration::from_millis(100)).await;
+                handle.update(cx, |studio, _, _| {
+                    let drag = studio.video_move_drag.unwrap();
+                    assert!(drag.active, "dragging the clip must activate the move");
+                    assert_eq!(studio.video_position, clicked_position, "clip dragging must not scrub");
+                }).unwrap();
+                pointer(x + drag_pixels, y, "up");
+                Timer::after(Duration::from_millis(100)).await;
+                handle.update(cx, |studio, _, cx| {
+                    assert!(studio.video_move_drag.is_none());
+                    let actual_start = studio.video_clip_timeline.editor_range(clip_id).unwrap().start;
+                    // XI2 fixed-point coordinates round slightly; require
+                    // placement within one physical pixel of the drop.
+                    assert!((actual_start - expected_start).abs() < studio.video_timeline_seconds_per_pixel(),
+                        "drop placed clip at {actual_start}, expected {expected_start}");
+                    assert_eq!(studio.video_position, clicked_position);
+                    let moved = studio.video_clip_timeline.clone();
+                    studio.undo_video_edit(cx);
+                    assert_eq!(studio.video_clip_timeline.editor_range(clip_id).unwrap().start, 0.0);
+                    studio.redo_video_edit(cx);
+                    assert_eq!(studio.video_clip_timeline, moved);
+                    assert_eq!(studio.video_project.as_ref().unwrap().effective_clip_timeline(10.0).unwrap(), moved);
+                }).unwrap();
+                cx.update(|cx| cx.quit()).unwrap();
+                std::fs::remove_dir_all(&root).unwrap();
+            }).detach();
+        });
+    }
+
 }

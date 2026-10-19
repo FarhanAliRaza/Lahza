@@ -314,6 +314,9 @@ struct Studio {
     video_zoom_cues: Vec<ZoomCue>,
     video_selected_zoom_cue: Option<Uuid>,
     video_zoom_drag: Option<VideoZoomDrag>,
+    /// Seconds visible at 1×; changed only by opening a recording or explicit fit.
+    video_timeline_span: f64,
+    video_timeline_extent: f64,
     video_timeline_zoom: f64,
     video_timeline_scroll: f64,
     video_timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -635,6 +638,8 @@ impl Studio {
             video_zoom_cues: Vec::new(),
             video_selected_zoom_cue: None,
             video_zoom_drag: None,
+            video_timeline_span: 1.0,
+            video_timeline_extent: 1.0,
             video_timeline_zoom: 1.0,
             video_timeline_scroll: 0.0,
             video_timeline_bounds: Arc::new(Mutex::new(None)),
@@ -1404,11 +1409,9 @@ impl Studio {
                         changed |= this.update_annotation_drag(event.position.x);
                     } else if let Some((start_x, start_position)) = this.video_seek_drag {
                         let delta = (event.position.x - start_x) / px(1.0);
-                        let content_width =
-                            this.video_timeline_viewport_width() * this.video_timeline_zoom;
                         this.video_position = (start_position
-                            + delta as f64 / content_width * this.video_duration)
-                            .clamp(0.0, this.video_duration);
+                            + delta as f64 * this.video_timeline_seconds_per_pixel())
+                            .clamp(0.0, this.video_timeline_duration());
                         changed = true;
                     }
                 }

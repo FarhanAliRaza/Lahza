@@ -1,20 +1,16 @@
-## Lahza v0.5.6
+## Lahza v0.5.9
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
 ### Changed in this release
 
-- Improve annotation selection: select outlined shapes from their interiors, drag from anywhere inside a selection, move multiple marks as one group, and delete the complete selection. Selection outlines and handles stay consistent at different display scales.
-- Add smoother pressure-sensitive ink with speed-based mouse strokes, more natural hand-drawn shapes and curved arrows, and Shantell Sans Informal as the default font for new text annotations.
-- Improve text creation, editing, resizing, formatting, and selection, including readable initial text sizes on video.
-- Make alignment snapping optional with Ctrl, with guides for other annotations and canvas edges, centers, and thirds.
-- Keep the video playhead where you are drawing. Annotations at that frame appear fully while editing; scrubbing and playback show their actual entrance and exit animations.
-- Keep annotation settings in expandable list rows, add group actions, and give overlapping video annotations separate scrollable timeline rows.
-- Add a responsive loading screen for startup and opening images or recordings, with cancellation and retry after errors.
-- Add creator and issue-report links at the end of the editor sidebar and capture controls.
-- Extract the annotation engine into a reusable workspace crate, with rendering fixtures and public API regression coverage.
+- Keep the timeline scale and parked playhead stable while trimming. Retained frames and neighboring clips stay at their existing times; trimmed space becomes a gap instead of shifting the video.
+- Snap trim handles to the playhead so the chosen frame remains an exact trim target. Short clips retain a draggable center between their trim handles.
+- Scroll beyond the recording and place clips elsewhere on the timeline without automatically fitting the video to the viewport. Audio, camera, motion, and annotation lanes use the same time scale.
+- Click a clip to select it and move the playhead on release, matching Cap's click behavior. Drag the clip body to reposition it without scrubbing, or drag the ruler to scrub.
+- Finish clip moves when released outside the clip, preserve undo/redo and saved placement, and keep minimum-length trims intact when saving.
 
-Validation: the workspace Rust suite and packaging tests pass locally. Native display tests also cover loading, cancellation, retry, and video annotation editing at a fixed playhead. Loading, error states, selection outlines at different display scales, handwritten font styles, and annotation timeline scrolling were checked on disposable projects. Interactive/device-dependent tests remain excluded from the default suite; cross-desktop capture validation remains outstanding.
+Validation includes automated clip and timeline regression tests plus native X11 mouse interaction under Xvfb, covering click-to-seek, clip dragging, undo/redo, and persisted placement. The release workflow runs the Rust and packaging suites and confined Snap smoke checks for the versioned packages.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
@@ -31,10 +27,10 @@ For Debian updates, run `lahza-update --install`. Snap updates are managed by sn
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.5.6_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_0.5.9_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_0.5.6_amd64.deb
+sudo apt install ./lahza_0.5.9_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
@@ -47,11 +43,11 @@ sudo snap install lahza
 
 The stable channel receives this version after the release workflow and Store review succeed. Camera and audio recording require additional permission setup. Lahza now prompts when access is missing: choose Copy commands, paste and run them in Terminal, then return and choose Try again.
 
-**Binary bundle:** download `lahza-0.5.6-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-0.5.9-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-0.5.6-linux-x86_64.tar.gz
-cd lahza-0.5.6-linux-x86_64
+tar -xzf lahza-0.5.9-linux-x86_64.tar.gz
+cd lahza-0.5.9-linux-x86_64
 ./install.sh
 ```
 

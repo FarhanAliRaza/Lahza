@@ -177,7 +177,7 @@ impl RecordingClipTimeline {
                 let [lower, upper] = source_bounds.unwrap_or([0.0, safe_duration]);
                 let start = finite_or(segment.source_start, lower).clamp(lower, upper);
                 let end = finite_or(segment.source_end, start).clamp(start, upper);
-                if end - start < RecordingClipSegment::MINIMUM_DURATION {
+                if end - start + EPSILON < RecordingClipSegment::MINIMUM_DURATION {
                     return None;
                 }
                 let id = if seen_ids.insert(segment.id) {
@@ -198,7 +198,7 @@ impl RecordingClipTimeline {
                         let gap = finite_nonnegative(segment.gap_before);
                         // Snap float dust to zero so adjacent clips stay
                         // seamless instead of flashing a one-frame gap.
-                        if gap < 0.01 {
+                        if gap < EPSILON {
                             0.0
                         } else {
                             gap
@@ -226,7 +226,7 @@ impl RecordingClipTimeline {
         for &index in &order {
             let segment = &mut segments[index];
             segment.source_start = segment.source_start.max(previous_end);
-            if segment.duration() < RecordingClipSegment::MINIMUM_DURATION {
+            if segment.duration() + EPSILON < RecordingClipSegment::MINIMUM_DURATION {
                 dropped[index] = true;
             } else {
                 previous_end = segment.source_end;
@@ -446,6 +446,8 @@ impl RecordingClipTimeline {
         Self::new(segments)
     }
 
+    /// Move only the requested edge. Retained frames and other clips keep
+    /// their editor times; removed content becomes a gap rather than rippling.
     pub fn trimming(
         &self,
         segment_id: Uuid,
@@ -480,15 +482,34 @@ impl RecordingClipTimeline {
             ClipEdge::Leading => {
                 replacement.source_start = (original.source_start + source_delta)
                     .max(previous_end)
+                    .max(original.source_start - original.gap_before * original.speed)
                     .min(original.source_end - RecordingClipSegment::MINIMUM_DURATION);
             }
             ClipEdge::Trailing => {
+                let timeline_limit = self.segments.get(index + 1)
+                    .map(|next| original.source_end + next.gap_before * original.speed)
+                    .unwrap_or(source_duration);
                 replacement.source_end = (original.source_end + source_delta)
                     .min(next_start)
+                    .min(timeline_limit)
                     .max(original.source_start + RecordingClipSegment::MINIMUM_DURATION);
             }
         }
-        Some((self.replacing(replacement.clone()), replacement))
+        let mut timeline = self.clone();
+        match edge {
+            ClipEdge::Leading => {
+                let delta = (replacement.source_start - original.source_start) / original.speed;
+                replacement.gap_before = (original.gap_before + delta).max(0.0);
+            }
+            ClipEdge::Trailing => {
+                if let Some(next) = timeline.segments.get_mut(index + 1) {
+                    next.gap_before = (next.gap_before + original.editor_duration()
+                        - replacement.editor_duration()).max(0.0);
+                }
+            }
+        }
+        timeline.segments[index] = replacement.clone();
+        Some((timeline, replacement))
     }
 
     pub fn removing_source_ranges(&self, ranges: &[(f64, f64)]) -> Option<Self> {
@@ -619,7 +640,10 @@ mod tests {
         let (split, right) = RecordingClipTimeline::new(vec![clip]).split_at(2.0).unwrap();
         let left = split.segments[0].id;
         assert_eq!(split.segments[1].source_bounds, Some([10.0, 15.0]));
-        let remaining = split.deleting(left).unwrap();
+        // Deleting the leading half leaves the trailing half at [12, 15]. Trims
+        // only extend into editor-time room, so grant the clip a gap first.
+        let mut remaining = split.deleting(left).unwrap();
+        remaining.segments[0].gap_before = 30.0;
         let (trimmed, _) = remaining.trimming(right, ClipEdge::Leading, -30.0, 50.0).unwrap();
         assert_eq!(trimmed.segments[0].source_start, 10.0);
         let (trimmed, _) = trimmed.trimming(right, ClipEdge::Trailing, 30.0, 50.0).unwrap();
@@ -763,9 +787,11 @@ mod tests {
     #[test]
     fn trim_drag_uses_editor_delta_times_speed_and_neighbor_limits() {
         let leading = segment(0.0, 2.0, 1.0);
-        let selected = segment(4.0, 8.0, 2.0);
+        let mut selected = segment(4.0, 8.0, 2.0);
+        selected.gap_before = 2.0;
         let selected_id = selected.id;
-        let trailing = segment(10.0, 12.0, 1.0);
+        let mut trailing = segment(10.0, 12.0, 1.0);
+        trailing.gap_before = 2.0;
         let timeline = RecordingClipTimeline::new(vec![leading, selected, trailing]);
 
         let (_, replacement) = timeline
@@ -781,4 +807,71 @@ mod tests {
             .unwrap();
         assert!((replacement.duration() - RecordingClipSegment::MINIMUM_DURATION).abs() < 1e-12);
     }
+
+    #[test]
+    fn leading_trim_keeps_the_target_frame_and_neighbors_at_the_same_time() {
+        let clip = segment(0.0, 10.0, 2.0);
+        let id = clip.id;
+        let timeline = RecordingClipTimeline::new(vec![clip, segment(10.0, 14.0, 1.0)]);
+        let (trimmed, _) = timeline.trimming(id, ClipEdge::Leading, 2.0, 14.0).unwrap();
+        assert_eq!(trimmed.editor_range(id).unwrap(), 2.0..5.0);
+        assert_eq!(trimmed.source_time_at(3.0), timeline.source_time_at(3.0));
+        assert_eq!(trimmed.clip_starts()[1], timeline.clip_starts()[1]);
+        assert_eq!(trimmed.duration(), timeline.duration());
+        assert_eq!(trimmed.content_source_time_at(1.0), None);
+        assert_eq!(trimmed.normalized(14.0), trimmed);
+        let (restored, _) = trimmed.trimming(id, ClipEdge::Leading, -2.0, 14.0).unwrap();
+        assert_eq!(restored, timeline);
+    }
+
+    #[test]
+    fn trailing_trim_leaves_a_gap_and_can_be_restored_without_moving_neighbors() {
+        let clip = segment(0.0, 10.0, 2.0);
+        let id = clip.id;
+        let timeline = RecordingClipTimeline::new(vec![clip, segment(10.0, 14.0, 1.0)]);
+        let (trimmed, _) = timeline.trimming(id, ClipEdge::Trailing, -2.0, 14.0).unwrap();
+        assert_eq!(trimmed.editor_range(id).unwrap(), 0.0..3.0);
+        assert_eq!(trimmed.source_time_at(2.0), timeline.source_time_at(2.0));
+        assert_eq!(trimmed.clip_starts()[1], 5.0);
+        assert_eq!(trimmed.content_source_time_at(4.0), None);
+        let (restored, _) = trimmed.trimming(id, ClipEdge::Trailing, 2.0, 14.0).unwrap();
+        assert_eq!(restored, timeline);
+    }
+
+    #[test]
+    fn trim_extension_cannot_overlap_adjacent_clips_in_editor_time() {
+        // Source room alone is insufficient: these reordered clips touch on the timeline.
+        let timeline = RecordingClipTimeline::new(vec![
+            segment(10.0, 12.0, 1.0), segment(4.0, 8.0, 2.0), segment(0.0, 2.0, 1.0),
+        ]);
+        let id = timeline.segments[1].id;
+        for edge in [ClipEdge::Leading, ClipEdge::Trailing] {
+            let delta = if edge == ClipEdge::Leading { -99.0 } else { 99.0 };
+            let (trimmed, _) = timeline.trimming(id, edge, delta, 14.0).unwrap();
+            assert_eq!(trimmed, timeline);
+        }
+    }
+
+    #[test]
+    fn tiny_leading_trim_survives_normalization_without_shifting_source_time() {
+        let timeline = RecordingClipTimeline::full(10.0);
+        let id = timeline.segments[0].id;
+        let (trimmed, _) = timeline.trimming(id, ClipEdge::Leading, 0.005, 10.0).unwrap();
+        let saved = trimmed.normalized(10.0);
+        assert_eq!(saved, trimmed);
+        assert!((saved.source_time_at(5.0) - 5.0).abs() < 1e-12);
+    }
+
+
+    #[test]
+    fn trimming_to_minimum_length_does_not_drop_the_clip_when_saved() {
+        let timeline = RecordingClipTimeline::full(10.0);
+        let id = timeline.segments[0].id;
+        for edge in [ClipEdge::Leading, ClipEdge::Trailing] {
+            let delta = if edge == ClipEdge::Leading { 99.0 } else { -99.0 };
+            let (trimmed, _) = timeline.trimming(id, edge, delta, 10.0).unwrap();
+            assert_eq!(trimmed.normalized(10.0), trimmed);
+        }
+    }
+
 }

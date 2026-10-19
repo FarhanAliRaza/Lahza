@@ -3156,11 +3156,15 @@ dependencies = [
 
 [[package]]
 name = "lahza"
-version = "0.5.6"
+version = "0.5.9"
 dependencies = [
+ "ash",
  "ashpd 0.12.3",
  "async-io",
  "base64",
+ "blade-graphics",
+ "blade-macros",
+ "bytemuck",
  "chrono",
  "futures-util",
  "gpui",
@@ -3170,6 +3174,7 @@ dependencies = [
  "lahza-annotations",
  "libc",
  "libspa-sys",
+ "naga",
  "pipewire",
  "resvg",
  "serde",
