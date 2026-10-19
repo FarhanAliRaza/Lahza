@@ -10,6 +10,27 @@ use std::{
 
 use super::export::ExportProgress;
 
+/// The video codec inside an MP4.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoCodec {
+    /// Plays everywhere.
+    #[default]
+    H264,
+    /// About 40% smaller at the same quality; newer players only.
+    Hevc,
+}
+
+impl VideoCodec {
+    pub const ALL: [VideoCodec; 2] = [VideoCodec::H264, VideoCodec::Hevc];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Hevc => "HEVC",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mp4Encoder {
     Nvenc,
@@ -32,18 +53,21 @@ impl Mp4Encoder {
         }
     }
 
-    pub fn configure_output(&self, command: &mut Command) {
+    pub fn configure_output(&self, command: &mut Command, codec: VideoCodec) {
+        let hevc = codec == VideoCodec::Hevc;
+        // HEVC holds the same visual quality at a higher quantizer.
+        let quality = if hevc { "22" } else { "18" };
         match self {
             Self::Nvenc => {
                 command.args([
                     "-c:v",
-                    "h264_nvenc",
+                    if hevc { "hevc_nvenc" } else { "h264_nvenc" },
                     "-preset",
                     "p4",
                     "-rc",
                     "vbr",
                     "-cq",
-                    "18",
+                    quality,
                     "-b:v",
                     "0",
                     "-pix_fmt",
@@ -55,18 +79,28 @@ impl Mp4Encoder {
                     "-vf",
                     "format=nv12,hwupload",
                     "-c:v",
-                    "h264_vaapi",
+                    if hevc { "hevc_vaapi" } else { "h264_vaapi" },
                     "-rc_mode",
                     "CQP",
                     "-qp",
-                    "18",
+                    quality,
+                ]);
+            }
+            Self::Software if hevc => {
+                command.args([
+                    "-c:v", "libx265", "-preset", "fast", "-crf", quality, "-pix_fmt", "yuv420p",
+                    "-x265-params", "log-level=error",
                 ]);
             }
             Self::Software => {
                 command.args([
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", quality, "-pix_fmt", "yuv420p",
                 ]);
             }
+        }
+        if hevc {
+            // The hvc1 tag lets QuickTime and Safari play the file.
+            command.args(["-tag:v", "hvc1"]);
         }
     }
 }
@@ -75,6 +109,7 @@ pub fn select_mp4_encoder(
     width: u32,
     height: u32,
     frame_rate: f64,
+    codec: VideoCodec,
     progress: &ExportProgress,
 ) -> Mp4Encoder {
     let mut candidates = vec![Mp4Encoder::Nvenc];
@@ -89,7 +124,7 @@ pub fn select_mp4_encoder(
     devices.sort();
     candidates.extend(devices.into_iter().map(Mp4Encoder::Vaapi));
     select_from(candidates, |candidate| {
-        !progress.is_cancelled() && probe(candidate, width, height, frame_rate, progress)
+        !progress.is_cancelled() && probe(candidate, width, height, frame_rate, codec, progress)
     })
 }
 
@@ -108,6 +143,7 @@ fn probe(
     width: u32,
     height: u32,
     frame_rate: f64,
+    codec: VideoCodec,
     progress: &ExportProgress,
 ) -> bool {
     let mut command = Command::new("ffmpeg");
@@ -116,7 +152,7 @@ fn probe(
     command.args(["-f", "lavfi", "-i"]).arg(format!(
         "color=c=black:s={width}x{height}:r={frame_rate:.3},format=rgba"
     ));
-    encoder.configure_output(&mut command);
+    encoder.configure_output(&mut command, codec);
     command.args(["-frames:v", "3", "-an", "-f", "null", "-"]);
     probe_command(command, Duration::from_secs(5), || progress.is_cancelled())
 }
@@ -192,7 +228,7 @@ mod tests {
         let mut command = Command::new("ffmpeg");
         encoder.configure_input(&mut command);
         command.args(["-i", "pipe:0"]);
-        encoder.configure_output(&mut command);
+        encoder.configure_output(&mut command, VideoCodec::H264);
         let args: Vec<_> = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

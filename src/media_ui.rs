@@ -495,6 +495,109 @@ impl Studio {
         list.into_any_element()
     }
 
+    /// The edit's mixed audio (recording plus music layers) as M4A or WAV.
+    pub(crate) fn export_audio_only(
+        &mut self,
+        format: crate::recording::export::AudioFormat,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::recording::export::{export_audio, AudioExportRequest, ExportProgress};
+        if self.export_progress.is_some() || self.video_edit_busy {
+            return;
+        }
+        let Some(session) = self.video_project.clone() else {
+            return;
+        };
+        let mut request = AudioExportRequest {
+            destination: Default::default(),
+            format,
+            media: Self::media_source_for(&session, false),
+            clips: self.video_clip_timeline.clone(),
+            include_recording: !self.video_audio_muted,
+            noise_reduction: self.video_noise_reduction,
+            audio_clips: self
+                .video_audio_clips
+                .iter()
+                .cloned()
+                .map(|clip| (session.directory.join(&clip.file), clip))
+                .collect(),
+        };
+        let directory = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let name = chrono::Local::now()
+            .format(&format!("Lahza-%Y-%m-%d_%H-%M-%S.{}", format.extension()))
+            .to_string();
+        let prompt = cx.prompt_for_new_path(&directory, Some(&name));
+        cx.spawn(async move |weak, cx| {
+            let Some(destination) = prompt.await.ok().and_then(Result::ok).flatten() else {
+                let _ = weak.update(cx, |this, cx| {
+                    this.toast = Some("Export cancelled".into());
+                    cx.notify();
+                });
+                return;
+            };
+            request.destination = if destination.extension().is_some() {
+                destination
+            } else {
+                destination.with_extension(format.extension())
+            };
+            let Ok(Some(progress)) = weak.update(cx, |this, cx| {
+                if this.export_progress.is_some() {
+                    this.toast = Some("An export is already running".into());
+                    cx.notify();
+                    return None;
+                }
+                let progress = std::sync::Arc::new(ExportProgress::default());
+                this.export_progress = Some(progress.clone());
+                this.export_label = format!("Exporting {}…", format.label()).into();
+                this.export_panel_collapsed = false;
+                this.export_filename = request
+                    .destination
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Audio".into())
+                    .into();
+                cx.notify();
+                Some(progress)
+            }) else {
+                return;
+            };
+            let destination = request.destination.clone();
+            let job = progress.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { export_audio(request, &job).map_err(|error| error.to_string()) });
+            let ticker = progress.clone();
+            let weak_ticker = weak.clone();
+            cx.spawn(async move |cx| loop {
+                gpui::Timer::after(std::time::Duration::from_millis(120)).await;
+                let active = weak_ticker
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.export_progress.as_ref().is_some_and(|active| std::sync::Arc::ptr_eq(active, &ticker))
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            })
+            .detach();
+            let result = task.await;
+            let _ = weak.update(cx, |this, cx| {
+                this.export_progress = None;
+                this.toast = Some(match result {
+                    Ok(()) => crate::notifications::Notification::exported(
+                        format!("Exported {} to {}", format.label(), destination.display()),
+                        destination,
+                    ),
+                    Err(error) if error == "export cancelled" => "Export cancelled".into(),
+                    Err(error) => format!("Export failed: {error}").into(),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn imported_audio_lane(
         &self,
         _width: f64,

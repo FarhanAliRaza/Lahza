@@ -28,6 +28,8 @@ use super::{
     viewport::ViewportTimeline,
 };
 
+pub use super::export_encoder::VideoCodec;
+
 /// Output height presets.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ExportResolution {
@@ -75,6 +77,7 @@ impl ExportResolution {
 /// each encoder at the settings used here.
 pub fn estimate_size_bytes(
     format: ExportFormat,
+    codec: VideoCodec,
     width: u32,
     height: u32,
     frame_rate: f64,
@@ -82,6 +85,7 @@ pub fn estimate_size_bytes(
 ) -> u64 {
     let pixels_per_second = width as f64 * height as f64 * frame_rate.max(1.0);
     let bits_per_pixel = match format {
+        ExportFormat::Mp4 if codec == VideoCodec::Hevc => 0.055,
         ExportFormat::Mp4 => 0.09,
         ExportFormat::WebM => 0.06,
         ExportFormat::Gif => 0.45,
@@ -290,6 +294,10 @@ pub struct SceneExportRequest {
     pub duration: f64,
     /// GIF only: loop forever instead of playing once.
     pub loop_forever: bool,
+    /// MP4 only: H.264 or HEVC.
+    pub video_codec: VideoCodec,
+    /// Average sub-frame camera states while the camera moves.
+    pub motion_blur: bool,
     /// Keep the recording's audio track (when the format supports it).
     pub include_audio: bool,
     pub audio_clips: Vec<(PathBuf, super::media::AudioClip)>,
@@ -325,6 +333,8 @@ impl SceneExportRequest {
             viewport,
             duration,
             loop_forever: true,
+            video_codec: VideoCodec::H264,
+            motion_blur: false,
             include_audio: true,
             audio_clips: Vec::new(),
             recording_duration: None,
@@ -461,6 +471,165 @@ fn prepare_source(
     }
 }
 
+/// Add the recording audio and music layers as FFmpeg inputs starting at
+/// input `first_input`, returning a filter graph that ends in
+/// `[export_audio]`, or `None` when there is nothing to hear.
+fn add_audio_graph(
+    command: &mut Command,
+    first_input: usize,
+    recording: Option<&(Vec<super::media_bank::MediaInput>, String)>,
+    noise_reduction: bool,
+    audio_clips: &[(PathBuf, super::media::AudioClip)],
+    editor_duration: f64,
+    output_duration: f64,
+) -> Result<Option<String>, VideoError> {
+    let mut filters = Vec::new();
+    let mut labels = Vec::new();
+    let mut next_input = first_input;
+    if let Some((inputs, filter)) = recording {
+        super::media_bank::add_inputs(command, inputs);
+        filters.push(if noise_reduction {
+            format!("{filter};[audio]{NOISE_REDUCTION_FILTER}[recording_audio]")
+        } else {
+            format!("{filter};[audio]anull[recording_audio]")
+        });
+        labels.push("[recording_audio]".to_string());
+        next_input += inputs.len();
+    }
+    for (index, (path, clip)) in audio_clips.iter().enumerate() {
+        clip.validate()?;
+        if clip.start >= editor_duration {
+            continue;
+        }
+        command.arg("-i").arg(path);
+        let label = format!("music{index}");
+        filters.push(clip.filter(next_input, &label));
+        labels.push(format!("[{label}]"));
+        next_input += 1;
+    }
+    if labels.is_empty() {
+        return Ok(None);
+    }
+    filters.push(format!(
+        "{}amix=inputs={}:normalize=0:duration=longest,alimiter=limit=0.95:level=0:latency=1,apad,atrim=duration={output_duration:.9}[export_audio]",
+        labels.join(""),
+        labels.len()
+    ));
+    Ok(Some(filters.join(";")))
+}
+
+/// Audio-only deliverables.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AudioFormat {
+    #[default]
+    M4a,
+    Wav,
+}
+
+impl AudioFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            AudioFormat::M4a => "m4a",
+            AudioFormat::Wav => "wav",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioFormat::M4a => "M4A",
+            AudioFormat::Wav => "WAV",
+        }
+    }
+}
+
+/// Everything an audio-only export needs: the edited recording audio and
+/// the music layers, mixed exactly as the video export mixes them.
+pub struct AudioExportRequest {
+    pub destination: PathBuf,
+    pub format: AudioFormat,
+    pub media: PathBuf,
+    pub clips: RecordingClipTimeline,
+    pub include_recording: bool,
+    pub noise_reduction: bool,
+    pub audio_clips: Vec<(PathBuf, super::media::AudioClip)>,
+}
+
+pub fn export_audio(request: AudioExportRequest, progress: &ExportProgress) -> Result<(), VideoError> {
+    let info = probe_media(&request.media)?;
+    let clips = request.clips.normalized(info.duration);
+    let duration = clips.duration();
+    if duration <= 0.0 {
+        return Err(VideoError::InvalidMedia("the edit is empty".into()));
+    }
+    let recording = (info.has_audio && request.include_recording)
+        .then(|| super::media_bank::source_filter(&request.media, &clips, 0, false, true))
+        .transpose()?;
+    let mut command = Command::new("ffmpeg");
+    command.args(["-v", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]);
+    let Some(graph) = add_audio_graph(
+        &mut command,
+        0,
+        recording.as_ref(),
+        request.noise_reduction,
+        &request.audio_clips,
+        duration,
+        duration,
+    )?
+    else {
+        return Err(VideoError::InvalidMedia("this edit has no audio to export".into()));
+    };
+    command.arg("-filter_complex").arg(graph).args(["-map", "[export_audio]"]);
+    match request.format {
+        AudioFormat::M4a => command.args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "ipod"]),
+        AudioFormat::Wav => command.args(["-c:a", "pcm_s16le", "-f", "wav"]),
+    };
+    let temporary = temporary_sibling(&request.destination, request.format.extension());
+    progress.reset(1000);
+    *progress.encoding_started.lock().unwrap() = Some(Instant::now());
+    let mut child = command
+        .arg(&temporary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| VideoError::Decode(format!("could not start FFmpeg: {error}")))?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let total_micros = duration * 1_000_000.0;
+    let per_mille = Arc::new(AtomicU64::new(0));
+    let reader_per_mille = per_mille.clone();
+    // FFmpeg reports `out_time_us=` lines on stdout with -progress.
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(value) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<f64>().ok()) {
+                reader_per_mille.store(((value / total_micros).clamp(0.0, 1.0) * 1000.0) as u64, Ordering::Relaxed);
+            }
+        }
+    });
+    loop {
+        progress.completed.store(per_mille.load(Ordering::Relaxed), Ordering::Relaxed);
+        if progress.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&temporary);
+            return Err(VideoError::Cancelled);
+        }
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = reader.join();
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary);
+        return Err(VideoError::Decode(String::from_utf8_lossy(&output.stderr).trim().into()));
+    }
+    progress.completed.store(1000, Ordering::Relaxed);
+    fs::rename(&temporary, &request.destination)?;
+    Ok(())
+}
+
 fn encode(
     prepared: &mut PreparedSource,
     request: &mut SceneExportRequest,
@@ -505,7 +674,7 @@ fn encode(
     let encoder = if request.format == ExportFormat::Mp4 {
         progress.set_encoder_label("Checking GPU");
         let encoder = super::export_encoder::select_mp4_encoder(
-            canvas_width, canvas_height, frame_rate, progress,
+            canvas_width, canvas_height, frame_rate, request.video_codec, progress,
         );
         progress.set_encoder_label(encoder.label());
         Some(encoder)
@@ -527,44 +696,29 @@ fn encode(
         .arg("-framerate")
         .arg(format!("{frame_rate:.3}"))
         .args(["-i", "pipe:0"]);
-    let mut audio_filters = Vec::new();
-    let mut audio_labels = Vec::new();
-    let mut next_input = 1;
-    if let Some((inputs, filter)) = audio.as_ref() {
-        super::media_bank::add_inputs(&mut command, inputs);
-        let filter = if request.noise_reduction {
-            format!("{filter};[audio]{NOISE_REDUCTION_FILTER}[recording_audio]")
-        } else {
-            format!("{filter};[audio]anull[recording_audio]")
-        };
-        audio_filters.push(filter);
-        audio_labels.push("[recording_audio]".to_string());
-        next_input += inputs.len();
-    }
-    if request.format.supports_audio() {
-        for (index, (path, clip)) in request.audio_clips.iter().enumerate() {
-            clip.validate()?;
-            if clip.start >= request.duration { continue; }
-            command.arg("-i").arg(path);
-            let label = format!("music{index}");
-            audio_filters.push(clip.filter(next_input, &label));
-            audio_labels.push(format!("[{label}]"));
-            next_input += 1;
+    let audio_duration = (main_frames + request.followers.iter().map(|s| frames_for(s.duration, frame_rate)).sum::<u64>()) as f64 / frame_rate;
+    let has_audio = match add_audio_graph(
+        &mut command,
+        1,
+        audio.as_ref(),
+        request.noise_reduction,
+        if request.format.supports_audio() { &request.audio_clips } else { &[] },
+        request.duration,
+        audio_duration,
+    )? {
+        Some(graph) => {
+            command.arg("-filter_complex").arg(graph);
+            true
         }
-    }
-    let has_audio = !audio_labels.is_empty();
-    if has_audio {
-        let audio_duration = (main_frames + request.followers.iter().map(|s| frames_for(s.duration, frame_rate)).sum::<u64>()) as f64 / frame_rate;
-        audio_filters.push(format!("{}amix=inputs={}:normalize=0:duration=longest,alimiter=limit=0.95:level=0:latency=1,apad,atrim=duration={audio_duration:.9}[export_audio]", audio_labels.join(""), audio_labels.len()));
-        command.arg("-filter_complex").arg(audio_filters.join(";"));
-    }
+        None => false,
+    };
     match request.format {
         ExportFormat::Mp4 => {
             command.args(["-map", "0:v"]);
             if has_audio {
                 command.args(["-map", "[export_audio]", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
             }
-            encoder.as_ref().unwrap().configure_output(&mut command);
+            encoder.as_ref().unwrap().configure_output(&mut command, request.video_codec);
             command.args([
                 "-movflags",
                 "+faststart",
@@ -705,13 +859,44 @@ fn encode(
             Some(layers) => layers.layer(time, canvas_overlay),
             None => canvas_overlay,
         };
-        let output = renderer.compose(&compositor, FrameInput {
+        let media_visible = time >= request.media_start && request.media_end.is_none_or(|end| time < end);
+        let mut output = renderer.compose(&compositor, FrameInput {
             source: source_frame,
             overlay: overlay.as_deref(),
             viewport,
             pointer: pointer_overlay.as_ref(),
             camera: last_camera_frame.as_ref(),
-        }, time >= request.media_start && request.media_end.is_none_or(|end| time < end), canvas_overlay.as_deref());
+        }, media_visible, canvas_overlay.as_deref());
+        // Motion blur by temporal supersampling: while the camera moves,
+        // average several camera states across the frame's shutter. Settled
+        // frames pay for a single composition.
+        let shutter = 1.0 / frame_rate;
+        if request.motion_blur
+            && camera_moved(request.viewport.frame_at(time - shutter * 0.5), request.viewport.frame_at(time + shutter * 0.5))
+        {
+            let mut sum: Vec<u32> = output.as_raw().iter().map(|&value| value as u32).collect();
+            for sample in 0..MOTION_BLUR_SAMPLES - 1 {
+                let offset = ((sample as f64 + 0.5) / (MOTION_BLUR_SAMPLES - 1) as f64 - 0.5) * shutter;
+                let frame = renderer.compose(&compositor, FrameInput {
+                    source: source_frame,
+                    overlay: overlay.as_deref(),
+                    viewport: request.viewport.frame_at(time + offset),
+                    pointer: pointer_overlay.as_ref(),
+                    camera: last_camera_frame.as_ref(),
+                }, media_visible, canvas_overlay.as_deref());
+                for (total, value) in sum.iter_mut().zip(frame.as_raw()) {
+                    *total += *value as u32;
+                }
+            }
+            let count = MOTION_BLUR_SAMPLES as u32;
+            if let Some(blurred) = RgbaImage::from_raw(
+                output.width(),
+                output.height(),
+                sum.into_iter().map(|total| ((total + count / 2) / count) as u8).collect(),
+            ) {
+                output = blurred;
+            }
+        }
         progress.set_compositor_label(renderer.label());
         if let Err(error) = stdin.write_all(output.as_raw()) {
             write_error = Some(VideoError::Decode(format!(
@@ -796,6 +981,20 @@ fn encode(
     }
     fs::rename(&temporary, &request.destination)?;
     Ok(())
+}
+
+/// Camera states averaged per moving frame when motion blur is on.
+const MOTION_BLUR_SAMPLES: usize = 6;
+
+/// Whether the virtual camera moves noticeably across a shutter interval.
+fn camera_moved(early: super::viewport::ViewportFrame, late: super::viewport::ViewportFrame) -> bool {
+    (early.magnification - late.magnification).abs() > 1e-4
+        || (early.anchor.x - late.anchor.x).abs() > 2e-5
+        || (early.anchor.y - late.anchor.y).abs() > 2e-5
+        || (early.tilt.x - late.tilt.x).abs() > 0.01
+        || (early.tilt.y - late.tilt.y).abs() > 0.01
+        || (early.tilt.z - late.tilt.z).abs() > 0.01
+        || early.transform != late.transform
 }
 
 fn temporary_sibling(destination: &Path, extension: &str) -> PathBuf {

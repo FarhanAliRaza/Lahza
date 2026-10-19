@@ -2579,7 +2579,7 @@ impl Studio {
         let format = self.export_format;
         let frame_rate = self.export_frame_rate;
         let duration = self.video_duration.max(0.0);
-        let estimate = estimate_size_bytes(format, width, height, frame_rate, duration);
+        let estimate = estimate_size_bytes(format, self.export_codec, width, height, frame_rate, duration);
         let resolution_index = ExportResolution::ALL
             .iter()
             .position(|resolution| *resolution == self.export_resolution)
@@ -2653,11 +2653,72 @@ impl Studio {
                     |this| this.export_loop = !this.export_loop,
                 ))
             })
+            .when(format == ExportFormat::Mp4, |this| {
+                let codec_index = crate::recording::export::VideoCodec::ALL
+                    .iter()
+                    .position(|codec| *codec == self.export_codec)
+                    .unwrap_or(0);
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_xs().text_color(muted()).w(px(72.0)).child("Codec"))
+                        .child(div().flex_1().child(self.segmented(
+                            "export-codec",
+                            &["H.264", "HEVC"],
+                            codec_index,
+                            |this, index| this.export_codec = crate::recording::export::VideoCodec::ALL[index],
+                            cx,
+                        ))),
+                )
+                .when(self.export_codec == crate::recording::export::VideoCodec::Hevc, |this| {
+                    this.child(div().text_xs().text_color(muted()).child(
+                        "Smaller files; some older players and browsers cannot play HEVC.",
+                    ))
+                })
+            })
+            .when(self.video_project.is_some() || self.animation_active, |this| {
+                this.child(self.scene_toggle_row(
+                    "export-motion-blur",
+                    "Motion blur",
+                    self.export_motion_blur,
+                    cx,
+                    |this| this.export_motion_blur = !this.export_motion_blur,
+                ))
+                .when(self.export_motion_blur, |this| {
+                    this.child(div().text_xs().text_color(muted()).child(
+                        "Smooths zooms and pans like a real camera shutter. Moving frames take longer to render.",
+                    ))
+                })
+            })
             .child(div().text_xs().text_color(muted()).child(format!(
                 "{width} × {height} · {frame_rate:.0} fps · {:.1}s · about {}",
                 duration,
                 format_size(estimate)
             )))
+            .when(self.video_project.is_some(), |this| {
+                this.child(div().mt_2().text_xs().text_color(muted()).child("Audio only"))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(self.small_button(
+                                "export-audio-m4a",
+                                "Export M4A…",
+                                self.export_progress.is_none(),
+                                cx,
+                                |this, cx| this.export_audio_only(crate::recording::export::AudioFormat::M4a, cx),
+                            ))
+                            .child(self.small_button(
+                                "export-audio-wav",
+                                "Export WAV…",
+                                self.export_progress.is_none(),
+                                cx,
+                                |this, cx| this.export_audio_only(crate::recording::export::AudioFormat::Wav, cx),
+                            )),
+                    )
+            })
             .into_any_element()
     }
 

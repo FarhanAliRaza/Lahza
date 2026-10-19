@@ -2055,6 +2055,8 @@ impl Studio {
         );
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
+        request.video_codec = self.export_codec;
+        request.motion_blur = self.export_motion_blur;
         request.include_audio = !self.video_audio_muted;
         request.noise_reduction = self.video_noise_reduction;
         request.audio_clips = self.video_audio_clips.iter().cloned().map(|clip| (session.directory.join(&clip.file), clip)).collect();
@@ -2115,6 +2117,8 @@ impl Studio {
         request.media_end = Some(self.animation_image_end);
         request.frame_rate = self.export_frame_rate;
         request.loop_forever = self.export_loop;
+        request.video_codec = self.export_codec;
+        request.motion_blur = self.export_motion_blur;
         request.overlay = self.annotation_overlay_source();
         request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(
             self.annotations.clone(), self.selected_canvas_ratio() as f64);
