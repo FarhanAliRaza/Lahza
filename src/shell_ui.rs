@@ -1471,6 +1471,14 @@ impl Studio {
             .when(self.section_open("audio"), |this| {
                 this.child(self.audio_section(cx))
             })
+            .child(self.section_header("keystrokes", "Keystrokes", None, cx))
+            .when(self.section_open("keystrokes"), |this| {
+                this.child(self.keystroke_section(cx))
+            })
+            .child(self.section_header("speed-badge", "Speed badge", None, cx))
+            .when(self.section_open("speed-badge"), |this| {
+                this.child(self.speed_badge_section(cx))
+            })
             .into_any_element()
     }
 

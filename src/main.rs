@@ -45,6 +45,7 @@ mod theme;
 mod timed;
 mod video;
 mod media_ui;
+mod overlays_ui;
 
 use annotations::{annotations_svg, paint_annotation, paint_highlights};
 use crop::paint_crop_overlay;
@@ -377,6 +378,15 @@ struct Studio {
     video_selected_press: Option<f64>,
     annotation_drag: Option<AnnotationDrag>,
     camera_overlay: CameraOverlay,
+    input_overlays: recording::studio_overlays::InputOverlayStyle,
+    subtitle_style: recording::studio_overlays::SubtitleStyle,
+    /// Recorded keystrokes on the source timeline.
+    video_keystrokes: Vec<recording::model::KeystrokeEvent>,
+    /// Narration transcript on the source timeline, when transcribed.
+    video_transcript: Option<recording::transcript::Transcript>,
+    /// Bumped on every transcript edit so derived overlays rebuild.
+    video_transcript_revision: u64,
+    video_overlay_cache: Option<(overlays_ui::OverlayKey, Arc<recording::studio_overlays::StudioOverlays>)>,
     video_camera_path: Option<PathBuf>,
     camera_frame_rgba: Option<Arc<image::RgbaImage>>,
     camera_decoded_time: f64,
@@ -695,6 +705,12 @@ impl Studio {
             video_selected_press: None,
             annotation_drag: None,
             camera_overlay: CameraOverlay::default(),
+            input_overlays: Default::default(),
+            subtitle_style: Default::default(),
+            video_keystrokes: Vec::new(),
+            video_transcript: None,
+            video_transcript_revision: 0,
+            video_overlay_cache: None,
             video_camera_path: None,
             camera_frame_rgba: None,
             camera_decoded_time: -1.0,

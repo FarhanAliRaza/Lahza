@@ -13,6 +13,8 @@ pub mod input;
 pub mod model;
 pub mod media;
 pub mod media_bank;
+pub mod studio_overlays;
+pub mod transcript;
 pub mod motion;
 pub mod native;
 pub mod overlays;

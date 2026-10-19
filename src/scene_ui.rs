@@ -144,11 +144,13 @@ pub(crate) enum SceneSlider {
     AnnotationTransition,
     CameraSize,
     CameraMargin,
+    SubtitlePosition,
+    SubtitleSize,
 }
 
 impl SceneSlider {
     const BASE: usize = 100;
-    const ALL: [SceneSlider; 19] = [
+    const ALL: [SceneSlider; 21] = [
         SceneSlider::Scale,
         SceneSlider::PositionX,
         SceneSlider::PositionY,
@@ -168,6 +170,8 @@ impl SceneSlider {
         SceneSlider::AnnotationTransition,
         SceneSlider::CameraSize,
         SceneSlider::CameraMargin,
+        SceneSlider::SubtitlePosition,
+        SceneSlider::SubtitleSize,
     ];
 
     pub(crate) fn id(self) -> usize {
@@ -200,6 +204,8 @@ impl SceneSlider {
             SceneSlider::AnnotationTransition => "Transition",
             SceneSlider::CameraSize => "Size",
             SceneSlider::CameraMargin => "Margin",
+            SceneSlider::SubtitlePosition => "Height",
+            SceneSlider::SubtitleSize => "Text size",
         }
     }
 
@@ -218,6 +224,14 @@ impl SceneSlider {
             SceneSlider::AnnotationTransition => (0.0, 2.0),
             SceneSlider::CameraSize => (10.0, 60.0),
             SceneSlider::CameraMargin => (0.0, 20.0),
+            SceneSlider::SubtitlePosition => {
+                let (low, high) = crate::recording::studio_overlays::SubtitleStyle::VERTICAL_RANGE;
+                (low * 100.0, high * 100.0)
+            }
+            SceneSlider::SubtitleSize => {
+                let (low, high) = crate::recording::studio_overlays::SubtitleStyle::FONT_SCALE_RANGE;
+                (low * 100.0, high * 100.0)
+            }
         }
     }
 
@@ -233,6 +247,8 @@ impl SceneSlider {
             SceneSlider::AnnotationTransition => 0.35,
             SceneSlider::CameraSize => 24.0,
             SceneSlider::CameraMargin => 4.0,
+            SceneSlider::SubtitlePosition => 92.0,
+            SceneSlider::SubtitleSize => 100.0,
             _ => 0.0,
         }
     }
@@ -291,6 +307,8 @@ impl SceneSlider {
                 .unwrap_or(0.35),
             SceneSlider::CameraSize => studio.camera_overlay.size as f64,
             SceneSlider::CameraMargin => studio.camera_overlay.margin as f64,
+            SceneSlider::SubtitlePosition => studio.subtitle_style.vertical_position * 100.0,
+            SceneSlider::SubtitleSize => studio.subtitle_style.font_scale * 100.0,
         }
     }
 
@@ -316,6 +334,8 @@ impl SceneSlider {
             SceneSlider::DefaultZoom => studio.default_motion_zoom = value,
             SceneSlider::CameraSize => studio.camera_overlay.size = value.round() as u8,
             SceneSlider::CameraMargin => studio.camera_overlay.margin = value.round() as u8,
+            SceneSlider::SubtitlePosition => studio.subtitle_style.vertical_position = value / 100.0,
+            SceneSlider::SubtitleSize => studio.subtitle_style.font_scale = value / 100.0,
             SceneSlider::AnnotationTransition => {
                 let duration = studio.video_duration;
                 if let Some(mark) = studio
@@ -642,6 +662,8 @@ impl Studio {
         }
         self.pointer_style = style.pointer;
         self.camera_overlay = style.camera;
+        self.input_overlays = style.input_overlays;
+        self.subtitle_style = style.subtitles;
     }
 
     /// Autosaves scene settings into the recording's edit draft when they
@@ -1800,6 +1822,10 @@ impl Studio {
         let view_zoom_x = (1.0 / visible_x) as f32;
         let view_zoom_y = (1.0 / visible_y) as f32;
         let media_rect = geometry.media;
+        let overlay_shapes = self.preview_overlay_shapes(
+            (f32::from(canvas_width) as f64, f32::from(canvas_height) as f64),
+            geometry.card(),
+        );
         div()
             .id("scene-canvas")
             .w(canvas_width)
@@ -1890,6 +1916,11 @@ impl Studio {
                             },
                         );
                         let canvas_hits = paint_canvas_annotations(&canvas_annotations, &selected_annotations, editing_text, bounds, window, cx);
+                        if !overlay_shapes.is_empty() {
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                crate::overlays_ui::paint_overlay_shapes(&overlay_shapes, bounds.origin, window, cx);
+                            });
+                        }
                         crate::text_fields_ui::paint_canvas_text(&entity, bounds, interaction_bounds, media, window, cx);
                         if let Some((slot, selected_bounds)) = selection_outline {
                             let mark = &painted[slot];

@@ -431,6 +431,8 @@ impl Studio {
                 .then(|| self.watermark.clone()),
             pointer: self.pointer_style,
             camera: self.camera_overlay,
+            input_overlays: self.input_overlays,
+            subtitles: self.subtitle_style,
         }
     }
 
@@ -2057,6 +2059,7 @@ impl Studio {
         request.overlay = self.annotation_overlay_source();
         request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(
             self.annotations.clone(), self.selected_canvas_ratio() as f64);
+        request.studio_overlays = Some((*self.studio_overlays()).clone());
         let source = SceneSource::Video {
             media: Self::media_source_for(&session, false),
             clips: self.video_clip_timeline.clone(),

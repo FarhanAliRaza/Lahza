@@ -399,6 +399,10 @@ pub struct SceneStyle {
     pub pointer: PointerStyle,
     /// How a camera clip is placed; the clip itself lives in the project.
     pub camera: CameraOverlay,
+    /// Keystroke captions and the speed badge.
+    pub input_overlays: super::studio_overlays::InputOverlayStyle,
+    /// Narration subtitle bar.
+    pub subtitles: super::studio_overlays::SubtitleStyle,
 }
 
 impl Default for SceneStyle {
@@ -424,6 +428,8 @@ impl Default for SceneStyle {
             watermark: None,
             pointer: PointerStyle::default(),
             camera: CameraOverlay::default(),
+            input_overlays: Default::default(),
+            subtitles: Default::default(),
         }
     }
 }

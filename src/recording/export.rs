@@ -294,6 +294,8 @@ pub struct SceneExportRequest {
     pub include_audio: bool,
     pub audio_clips: Vec<(PathBuf, super::media::AudioClip)>,
     pub recording_duration: Option<f64>,
+    /// Keystroke captions, speed badge and subtitles above the main scene.
+    pub studio_overlays: Option<super::studio_overlays::StudioOverlays>,
     /// Suppress steady background noise in the exported audio.
     pub noise_reduction: bool,
     /// Per-frame media-space overlay, such as timed annotations.
@@ -326,6 +328,7 @@ impl SceneExportRequest {
             include_audio: true,
             audio_clips: Vec::new(),
             recording_duration: None,
+            studio_overlays: None,
             noise_reduction: false,
             overlay: None,
             canvas_overlay: None,
@@ -478,6 +481,18 @@ fn encode(
         source_height,
     )
     .map_err(VideoError::InvalidMedia)?;
+    // Drawn at the export resolution, so caption text stays sharp at 4K.
+    let mut overlay_layers = request
+        .studio_overlays
+        .take()
+        .filter(|overlays| !overlays.is_empty())
+        .map(|overlays| {
+            super::studio_overlays::OverlayLayerCache::new(
+                overlays,
+                (canvas_width, canvas_height),
+                compositor.geometry().card(),
+            )
+        });
 
     let mut renderer = super::scene::gpu::Renderer::new();
     progress.set_compositor_label(renderer.label());
@@ -686,6 +701,10 @@ fn encode(
         let viewport = request.viewport.frame_at(time);
         let overlay = request.overlay.as_mut().and_then(|source| source(time));
         let canvas_overlay = request.canvas_overlay.as_mut().and_then(|source| source(time));
+        let canvas_overlay = match overlay_layers.as_mut() {
+            Some(layers) => layers.layer(time, canvas_overlay),
+            None => canvas_overlay,
+        };
         let output = renderer.compose(&compositor, FrameInput {
             source: source_frame,
             overlay: overlay.as_deref(),

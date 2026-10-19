@@ -42,6 +42,7 @@ pub(crate) struct PreparedVideoProject {
     saved_extras: Option<RecordingExtras>,
     saved_annotations: Vec<AnnotationMark>,
     audio_clips: Vec<recording::media::AudioClip>,
+    transcript: Option<recording::transcript::Transcript>,
     window_capture: bool,
     pointer_synthesized: bool,
     camera_path: Option<PathBuf>,
@@ -132,13 +133,19 @@ impl PreparedVideoProject {
             .unwrap_or_default();
         let camera_path = session.camera_path();
         let camera_path = camera_path.is_file().then_some(camera_path);
+        // A damaged transcript must not block opening the recording.
+        let transcript = session
+            .read_edit_field::<recording::transcript::Transcript>("transcript")
+            .ok()
+            .flatten()
+            .filter(|transcript| !transcript.words.is_empty() || !transcript.cues.is_empty());
         Ok(Self {
             window_capture: source_info.window_capture,
             recording_duration: manifest.duration,
             pointer_synthesized: manifest.pointer_synthesized,
             session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
             source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
-            saved_annotations, camera_path, audio_clips,
+            saved_annotations, camera_path, audio_clips, transcript,
         })
     }
 }
@@ -469,6 +476,7 @@ impl Studio {
             session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
             source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
             saved_annotations, window_capture, pointer_synthesized, camera_path, audio_clips, recording_duration,
+            transcript,
         } = prepared;
         self.video_playback_generation.fetch_add(1, Ordering::SeqCst);
         if self.animation_active {
@@ -511,6 +519,10 @@ impl Studio {
         self.video_timeline_zoom = 1.0;
         self.video_timeline_scroll = 0.0;
         // Scene settings and Lahza extras saved with this project.
+        self.video_keystrokes = pointer_capture.keystrokes.clone();
+        self.video_transcript = transcript;
+        self.video_transcript_revision += 1;
+        self.video_overlay_cache = None;
         self.video_press_times = pointer_capture
             .presses
             .iter()
