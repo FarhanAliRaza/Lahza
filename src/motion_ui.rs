@@ -423,6 +423,8 @@ impl Studio {
             border_color: BORDER_COLORS[self.border_color.min(BORDER_COLORS.len() - 1)],
             border_opacity: self.border_opacity,
             aspect: (self.aspect_ratio != 0).then(|| self.selected_canvas_ratio() as f64),
+            // Fill needs the follow camera, which only recordings build.
+            fill: self.content_fill && self.aspect_ratio != 0 && self.video_project.is_some(),
             background_blur: self.background_blur,
             background_noise: self.background_noise,
             vignette: self.vignette,
@@ -2042,6 +2044,7 @@ impl Studio {
         let suggested_name = chrono::Local::now()
             .format(&format!("Lahza-%Y-%m-%d_%H-%M-%S.{}", format.extension()))
             .to_string();
+        self.sync_reframe();
         let mut request = SceneExportRequest::new(
             Default::default(),
             format,

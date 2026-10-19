@@ -380,6 +380,8 @@ struct Studio {
     annotation_drag: Option<AnnotationDrag>,
     camera_overlay: CameraOverlay,
     input_overlays: recording::studio_overlays::InputOverlayStyle,
+    /// Fill the fixed-aspect canvas with the recording instead of fitting it.
+    content_fill: bool,
     subtitle_style: recording::studio_overlays::SubtitleStyle,
     /// Recorded keystrokes on the source timeline.
     video_keystrokes: Vec<recording::model::KeystrokeEvent>,
@@ -714,6 +716,7 @@ impl Studio {
             annotation_drag: None,
             camera_overlay: CameraOverlay::default(),
             input_overlays: Default::default(),
+            content_fill: false,
             subtitle_style: Default::default(),
             video_keystrokes: Vec::new(),
             video_transcript: None,
@@ -1009,6 +1012,7 @@ impl Studio {
             3 => 3.0 / 2.0,
             4 => 16.0 / 9.0,
             5 => 9.0 / 16.0,
+            6 => 4.0 / 5.0,
             _ => self
                 .video_project
                 .as_ref()

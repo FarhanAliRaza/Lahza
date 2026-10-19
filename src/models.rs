@@ -100,8 +100,8 @@ impl CropRect {
         let (x, y, width, height) = (crop.x as f64, crop.y as f64, crop.width as f64, crop.height as f64);
         frame.anchor.x = (frame.anchor.x - x) / width;
         frame.anchor.y = (frame.anchor.y - y) / height;
-        let (left, top, visible) = recording::viewport::visible_rect(frame);
-        (x + left * width, y + top * height, visible * width, visible * height)
+        let (left, top, visible_x, visible_y) = recording::viewport::visible_rect(frame);
+        (x + left * width, y + top * height, visible_x * width, visible_y * height)
     }
 }
 

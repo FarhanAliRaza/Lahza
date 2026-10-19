@@ -388,6 +388,9 @@ pub struct SceneStyle {
     pub border_opacity: u8,
     /// Canvas aspect ratio (width / height). `None` follows the media.
     pub aspect: Option<f64>,
+    /// With a fixed aspect: crop the media to fill the card (a follow camera
+    /// keeps the action in frame) instead of fitting it whole.
+    pub fill: bool,
     /// 0-100 blur of the background layer.
     pub background_blur: u8,
     /// 0-100 film grain on the background layer.
@@ -421,6 +424,7 @@ impl Default for SceneStyle {
             border_color: 0x3678ef,
             border_opacity: 100,
             aspect: None,
+            fill: false,
             background_blur: 0,
             background_noise: 0,
             vignette: 0,
@@ -458,6 +462,30 @@ impl SceneStyle {
         let height = (canvas_height.max(2) / 2) * 2;
         let width = ((height as f64 * ratio).round() as u32).max(2);
         (width / 2 * 2, height)
+    }
+
+    /// Fill crops the media to the card; it needs a fixed canvas aspect.
+    pub fn fills_card(&self) -> bool {
+        self.fill && self.aspect.is_some_and(|ratio| ratio.is_finite() && ratio > 0.0)
+    }
+
+    /// Visible fraction of the cropped media per axis when Fill crops it to
+    /// the card. Proportional layout makes it independent of resolution.
+    pub fn fill_fraction(&self, source_width: u32, source_height: u32) -> Option<(f64, f64)> {
+        if !self.fills_card() || source_width == 0 || source_height == 0 {
+            return None;
+        }
+        let height = REFERENCE_CANVAS_HEIGHT;
+        let width = height * self.aspect?;
+        let card = SceneGeometry::layout(width, height, source_width as f64, source_height as f64, self).media;
+        let crop = self.source_crop.validated();
+        let media_aspect = source_width as f64 * crop.width as f64 / (source_height as f64 * crop.height as f64);
+        let card_aspect = card.width / card.height.max(1e-6);
+        Some(if media_aspect > card_aspect {
+            ((card_aspect / media_aspect).clamp(0.01, 1.0), 1.0)
+        } else {
+            (1.0, (media_aspect / card_aspect).clamp(0.01, 1.0))
+        })
     }
 
     /// True when the GPUI preview cannot reproduce the style with plain
@@ -569,14 +597,18 @@ impl SceneGeometry {
         } else {
             720.0
         };
-        let scale = (available_width / source_width).min(available_height / source_height);
-        let width = source_width * scale;
-        let height = source_height * scale;
-        let media = Rect {
-            x: inset + (available_width - width) * 0.5,
-            y: inset + title_height + (available_height - height) * 0.5,
-            width,
-            height,
+        let media = if style.fills_card() {
+            Rect { x: inset, y: inset + title_height, width: available_width, height: available_height }
+        } else {
+            let scale = (available_width / source_width).min(available_height / source_height);
+            let width = source_width * scale;
+            let height = source_height * scale;
+            Rect {
+                x: inset + (available_width - width) * 0.5,
+                y: inset + title_height + (available_height - height) * 0.5,
+                width,
+                height,
+            }
         };
         let strength = style.shadow as f64 / 100.0;
         let (radius_scale, offset_scale, opacity_scale) = match style.shadow_style {

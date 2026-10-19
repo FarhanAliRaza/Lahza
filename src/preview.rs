@@ -155,7 +155,7 @@ impl Studio {
         // the exporter uses; annotations move with it.
         let (view_zoom, view_left, view_top) = if animation_active {
             let frame = self.video_viewport_timeline.frame_at(self.video_position);
-            let (left, top, _) = visible_rect(frame);
+            let (left, top, _, _) = visible_rect(frame);
             (frame.magnification.max(1.0) as f32, left as f32, top as f32)
         } else {
             (1.0, 0.0, 0.0)
@@ -809,6 +809,7 @@ impl Studio {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.autosave_scene_style();
+        self.sync_reframe();
         if self.video_extras_pending {
             self.video_extras_pending = false;
             self.spawn_video_extras(cx);

@@ -880,11 +880,25 @@ impl Studio {
             .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
             .child(self.segmented(
                 "aspect-ratio",
-                &["Auto", "1:1", "4:3", "3:2", "16:9", "9:16"],
+                &["Auto", "1:1", "4:3", "3:2", "16:9", "9:16", "4:5"],
                 self.aspect_ratio,
                 |this, value| this.aspect_ratio = value,
                 cx,
             ))
+            .when(self.video_project.is_some() && self.aspect_ratio != 0, |this| {
+                this.child(self.segmented(
+                    "content-fill",
+                    &["Fit", "Fill"],
+                    usize::from(self.content_fill),
+                    |this, value| this.content_fill = value == 1,
+                    cx,
+                ))
+                .child(div().text_xs().text_color(muted()).child(if self.content_fill {
+                    "Crops the recording to the canvas; the camera follows your cursor."
+                } else {
+                    "Shows the whole recording on the background."
+                }))
+            })
             .child(self.slider_row(
                 SliderTarget::Padding,
                 "Padding",

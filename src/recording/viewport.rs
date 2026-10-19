@@ -12,11 +12,15 @@ use super::{
 /// Normalized rectangle of the media a viewport frame shows:
 /// `(left, top, visible_fraction)`. Preview, focus picking, and export all
 /// derive the crop from this single definition.
-pub fn visible_rect(frame: ViewportFrame) -> (f64, f64, f64) {
-    let visible = 1.0 / frame.magnification.max(1.0);
-    let left = (frame.anchor.x - visible * 0.5).clamp(0.0, 1.0 - visible);
-    let top = (frame.anchor.y - visible * 0.5).clamp(0.0, 1.0 - visible);
-    (left, top, visible)
+/// The media window `(left, top, width, height)` a frame shows, as fractions
+/// of the (cropped) media. Fill mode narrows one axis to the card's aspect.
+pub fn visible_rect(frame: ViewportFrame) -> (f64, f64, f64, f64) {
+    let magnification = frame.magnification.max(1.0);
+    let visible_x = (frame.fill.0.clamp(0.01, 1.0) / magnification).min(1.0);
+    let visible_y = (frame.fill.1.clamp(0.01, 1.0) / magnification).min(1.0);
+    let left = (frame.anchor.x - visible_x * 0.5).clamp(0.0, 1.0 - visible_x);
+    let top = (frame.anchor.y - visible_y * 0.5).clamp(0.0, 1.0 - visible_y);
+    (left, top, visible_x, visible_y)
 }
 
 const STEP_RATE: f64 = 120.0;
@@ -49,6 +53,9 @@ pub struct ViewportFrame {
     pub anchor: NormalizedPoint,
     pub tilt: Tilt,
     pub transform: SceneTransform,
+    /// Fraction of the media visible on each axis at magnification 1. Below
+    /// 1 when Fill crops the media to the card's aspect ratio.
+    pub fill: (f64, f64),
 }
 
 impl Default for ViewportFrame {
@@ -58,6 +65,7 @@ impl Default for ViewportFrame {
             anchor: NormalizedPoint { x: 0.5, y: 0.5 },
             tilt: Tilt::default(),
             transform: SceneTransform::IDENTITY,
+            fill: (1.0, 1.0),
         }
     }
 }
@@ -68,6 +76,50 @@ pub struct ViewportTimeline {
     duration: f64,
     cues: Vec<ZoomCue>,
     clips: RecordingClipTimeline,
+    reframe: Option<std::sync::Arc<Reframe>>,
+}
+
+/// Fill mode's follow camera: the media is cropped to the card's aspect and
+/// the crop drifts calmly after the pointer. Zoom cues bring their own
+/// camera, so the crop hands over to them as they ramp in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reframe {
+    /// Visible media fraction per axis at magnification 1.
+    pub fill: (f64, f64),
+    /// What the track was built for, so callers can tell when it is stale.
+    pub key: ReframeKey,
+    /// Crop center per step, in source-normalized coordinates.
+    anchors: Vec<NormalizedPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReframeKey {
+    pub fill: (f64, f64),
+    pub crop: crate::CropRect,
+}
+
+impl Reframe {
+    /// Share of the visible crop the pointer roams before the camera moves.
+    const DEAD_ZONE: f64 = 0.28;
+    /// Low-pass time constant for camera moves, in seconds.
+    const SMOOTHING_TAU: f64 = 0.45;
+    /// Magnification over which the crop hands over to a zoom cue's anchor.
+    const ZOOM_HANDOFF: f64 = 0.2;
+
+    fn anchor_at(&self, time: f64) -> Option<NormalizedPoint> {
+        let first = *self.anchors.first()?;
+        let position = time.max(0.0) * STEP_RATE;
+        let index = position as usize;
+        if index + 1 >= self.anchors.len() {
+            return Some(*self.anchors.last().unwrap_or(&first));
+        }
+        let fraction = position - index as f64;
+        let (a, b) = (self.anchors[index], self.anchors[index + 1]);
+        Some(NormalizedPoint {
+            x: lerp(a.x, b.x, fraction),
+            y: lerp(a.y, b.y, fraction),
+        })
+    }
 }
 
 /// Framing is a proportion of the available crop travel, not a source-space
@@ -91,6 +143,7 @@ impl ViewportSample {
             },
             tilt: self.tilt,
             transform,
+            fill: (1.0, 1.0),
         }
     }
 }
@@ -233,10 +286,95 @@ impl ViewportTimeline {
             previous_cue = cue_id;
         }
 
-        Self { frames, duration, cues: cues.to_vec(), clips: clips.clone() }
+        Self { frames, duration, cues: cues.to_vec(), clips: clips.clone(), reframe: None }
+    }
+
+    pub fn reframe(&self) -> Option<&Reframe> {
+        self.reframe.as_deref()
+    }
+
+    /// Change only the fill window of an existing camera (cheap, for live
+    /// slider drags); the key stays stale so the next sync rebuilds it.
+    pub fn reshape_reframe(&mut self, fill: (f64, f64)) -> bool {
+        let Some(reframe) = self.reframe.as_mut() else {
+            return false;
+        };
+        std::sync::Arc::make_mut(reframe).fill = fill;
+        true
+    }
+
+    /// Drop Fill's follow camera (Fit, or an unconstrained canvas).
+    pub fn clear_reframe(&mut self) {
+        self.reframe = None;
+    }
+
+    /// Build Fill's follow camera for a `fill` window inside `crop`, chasing
+    /// `focus` (source-normalized, usually the smoothed pointer).
+    pub fn set_reframe(
+        &mut self,
+        fill: (f64, f64),
+        crop: crate::CropRect,
+        focus: impl Fn(f64) -> Option<NormalizedPoint>,
+    ) {
+        let crop = crop.validated();
+        let (cx, cy, cw, ch) = (crop.x as f64, crop.y as f64, crop.width as f64, crop.height as f64);
+        let to_crop = |p: NormalizedPoint| NormalizedPoint { x: (p.x - cx) / cw, y: (p.y - cy) / ch };
+        let steps = ((self.duration.max(0.0) * STEP_RATE).round() as usize + 1).max(2);
+        let smoothing = 1.0 - (-(1.0 / STEP_RATE) / Reframe::SMOOTHING_TAU).exp();
+        let mut center = focus(0.0).map(to_crop).unwrap_or(NormalizedPoint { x: 0.5, y: 0.5 });
+        let mut anchors = Vec::with_capacity(steps);
+        for step in 0..steps {
+            let time = step as f64 / STEP_RATE;
+            let base = self.base_frame_at(time);
+            let magnification = base.magnification.max(1.0);
+            let visible_x = (fill.0 / magnification).min(1.0);
+            let visible_y = (fill.1 / magnification).min(1.0);
+            let zoom_anchor = to_crop(base.anchor);
+            let point = focus(time).map(to_crop).unwrap_or(zoom_anchor);
+            let (window_x, window_y) = (visible_x * Reframe::DEAD_ZONE, visible_y * Reframe::DEAD_ZONE);
+            let mut target = center;
+            if point.x > center.x + window_x {
+                target.x = point.x - window_x;
+            } else if point.x < center.x - window_x {
+                target.x = point.x + window_x;
+            }
+            if point.y > center.y + window_y {
+                target.y = point.y - window_y;
+            } else if point.y < center.y - window_y {
+                target.y = point.y + window_y;
+            }
+            center.x += (target.x - center.x) * smoothing;
+            center.y += (target.y - center.y) * smoothing;
+            let handoff = ((magnification - 1.0) / Reframe::ZOOM_HANDOFF).clamp(0.0, 1.0);
+            let mut anchor = NormalizedPoint {
+                x: center.x + (zoom_anchor.x - center.x) * handoff,
+                y: center.y + (zoom_anchor.y - center.y) * handoff,
+            };
+            anchor.x = if visible_x >= 1.0 { 0.5 } else { anchor.x.clamp(visible_x * 0.5, 1.0 - visible_x * 0.5) };
+            anchor.y = if visible_y >= 1.0 { 0.5 } else { anchor.y.clamp(visible_y * 0.5, 1.0 - visible_y * 0.5) };
+            // Stay continuous through zoom handoffs.
+            center = anchor;
+            anchors.push(NormalizedPoint { x: cx + anchor.x * cw, y: cy + anchor.y * ch });
+        }
+        self.reframe = Some(std::sync::Arc::new(Reframe {
+            fill,
+            key: ReframeKey { fill, crop },
+            anchors,
+        }));
     }
 
     pub fn frame_at(&self, time: f64) -> ViewportFrame {
+        let mut frame = self.base_frame_at(time);
+        if let Some(reframe) = self.reframe.as_deref() {
+            frame.fill = reframe.fill;
+            if let Some(anchor) = reframe.anchor_at(time.clamp(0.0, self.duration.max(0.0))) {
+                frame.anchor = anchor;
+            }
+        }
+        frame
+    }
+
+    fn base_frame_at(&self, time: f64) -> ViewportFrame {
         // Evaluate authored transforms at the requested time. Interpolating
         // cached frames across a cue boundary blends with the reset pose and
         // makes the image flash back before the animation has actually ended.
@@ -1282,7 +1420,7 @@ mod tests {
         let timeline = ViewportTimeline::build_static(&cues, 5.0);
         let opening = timeline.frame_at(0.0);
         assert!((opening.magnification - 2.2).abs() < 1e-6);
-        let (left, top, _) = visible_rect(opening);
+        let (left, top, _, _) = visible_rect(opening);
         assert!(
             left < 1e-6 && top < 1e-6,
             "should open on the top-left corner"
@@ -1404,7 +1542,7 @@ mod tests {
     }
 
     fn assert_pivot_stationary(frame: ViewportFrame, pivot: NormalizedPoint) {
-        let (left, top, visible) = visible_rect(frame);
+        let (left, top, visible, _) = visible_rect(frame);
         let projected = NormalizedPoint {
             x: (pivot.x - left) / visible,
             y: (pivot.y - top) / visible,
@@ -1606,11 +1744,10 @@ mod tests {
 
     #[test]
     fn visible_rect_is_clamped_inside_the_media() {
-        let (left, top, visible) = visible_rect(ViewportFrame {
+        let (left, top, visible, _) = visible_rect(ViewportFrame {
             magnification: 2.0,
             anchor: NormalizedPoint { x: 0.0, y: 1.0 },
-            tilt: Tilt::default(),
-            transform: SceneTransform::IDENTITY,
+            ..ViewportFrame::default()
         });
         assert_eq!(visible, 0.5);
         assert_eq!(left, 0.0);

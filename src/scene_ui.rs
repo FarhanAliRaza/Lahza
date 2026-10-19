@@ -663,6 +663,7 @@ impl Studio {
         self.pointer_style = style.pointer;
         self.camera_overlay = style.camera;
         self.input_overlays = style.input_overlays;
+        self.content_fill = style.fill;
         self.subtitle_style = style.subtitles;
     }
 

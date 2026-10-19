@@ -616,6 +616,33 @@ impl Studio {
         self.seek_video(self.video_position, cx);
     }
 
+    /// Keep Fill's follow camera in step with the style and motion edits.
+    /// A rebuilt motion timeline carries no reframe, so it is rebuilt here.
+    pub(super) fn sync_reframe(&mut self) {
+        if self.video_project.is_none() {
+            return;
+        }
+        let style = self.scene_style();
+        let Some(fill) = style.fill_fraction(self.video_source_size.0, self.video_source_size.1) else {
+            self.video_viewport_timeline.clear_reframe();
+            return;
+        };
+        let key = crate::recording::viewport::ReframeKey { fill, crop: style.source_crop.validated() };
+        if self.video_viewport_timeline.reframe().map(|reframe| reframe.key) == Some(key) {
+            return;
+        }
+        // Mid-drag, reshape the existing camera; rebuild it once the drag ends.
+        if (self.slider_drag.is_some() || self.media_drag.is_some())
+            && self.video_viewport_timeline.reshape_reframe(fill)
+        {
+            return;
+        }
+        let pointer = &self.video_pointer_timeline;
+        self.video_viewport_timeline.set_reframe(fill, style.source_crop, |time| {
+            pointer.frame_at(time).map(|frame| frame.location)
+        });
+    }
+
     pub(super) fn rebuild_video_motion_timelines(&mut self) {
         let Some(session) = self.video_project.as_ref() else {
             if self.animation_active {

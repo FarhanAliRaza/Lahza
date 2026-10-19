@@ -62,9 +62,9 @@ fn frame_now(preset: MotionPreset) -> ViewportFrame {
 fn project(u: f64, v: f64, frame: ViewportFrame, bounds: Bounds<Pixels>) -> gpui::Point<Pixels> {
     let width = f64::from(f32::from(bounds.size.width));
     let height = f64::from(f32::from(bounds.size.height));
-    let (left, top, visible) = visible_rect(frame);
-    let x = (u - left - visible * 0.5) / visible * width;
-    let y = (v - top - visible * 0.5) / visible * height;
+    let (left, top, visible_x, visible_y) = visible_rect(frame);
+    let x = (u - left - visible_x * 0.5) / visible_x * width;
+    let y = (v - top - visible_y * 0.5) / visible_y * height;
     let camera = (width * width + height * height).sqrt() * 2.0;
     let (sx, cx) = frame.tilt.x.to_radians().sin_cos();
     let (sy, cy) = frame.tilt.y.to_radians().sin_cos();
