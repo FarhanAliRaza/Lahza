@@ -426,6 +426,18 @@ impl PointerTimeline {
         self.frames.is_empty()
     }
 
+    /// Imported media has no captured pointer, even when it is moved between
+    /// recording clips. Clear the cursor and click pulse over those intervals.
+    pub fn restrict_to_recording(&mut self, clips: &RecordingClipTimeline, duration: f64) {
+        for (index, frame) in self.frames.iter_mut().enumerate() {
+            let time = index as f64 / STEP_RATE;
+            if clips.content_source_time_at(time).is_none_or(|source| source >= duration) {
+                frame.opacity = 0.0;
+                frame.press = None;
+            }
+        }
+    }
+
     pub fn frame_at(&self, time: f64) -> Option<PointerFrame> {
         let mut frame = self.interpolated_frame(time)?;
         frame.bitmap = self.artwork(frame.artwork_id.as_deref()).cloned();

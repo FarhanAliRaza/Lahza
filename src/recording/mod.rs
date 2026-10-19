@@ -11,6 +11,8 @@ pub mod export;
 mod export_encoder;
 pub mod input;
 pub mod model;
+pub mod media;
+pub mod media_bank;
 pub mod motion;
 pub mod native;
 pub mod overlays;

@@ -23,7 +23,7 @@ use super::{
     pointer_timeline::PointerTimeline,
     scene::{FrameInput, PointerOverlay, SceneCompositor, SceneStyle},
     video::{
-        clip_filter, probe_media, VideoError, VideoFrameStream, NOISE_REDUCTION_FILTER,
+        probe_media, VideoError, VideoFrameStream, NOISE_REDUCTION_FILTER,
     },
     viewport::ViewportTimeline,
 };
@@ -281,6 +281,8 @@ pub struct SceneExportRequest {
     pub loop_forever: bool,
     /// Keep the recording's audio track (when the format supports it).
     pub include_audio: bool,
+    pub audio_clips: Vec<(PathBuf, super::media::AudioClip)>,
+    pub recording_duration: Option<f64>,
     /// Suppress steady background noise in the exported audio.
     pub noise_reduction: bool,
     /// Per-frame media-space overlay, such as timed annotations.
@@ -311,6 +313,8 @@ impl SceneExportRequest {
             duration,
             loop_forever: true,
             include_audio: true,
+            audio_clips: Vec::new(),
+            recording_duration: None,
             noise_reduction: false,
             overlay: None,
             canvas_overlay: None,
@@ -329,9 +333,10 @@ enum PreparedSource {
     Video {
         stream: VideoFrameStream,
         initial_size: (u32, u32),
-        audio: Option<(PathBuf, String)>,
+        audio: Option<(Vec<super::media_bank::MediaInput>, String)>,
         pointer: Option<PointerTimeline>,
-        camera: Option<VideoFrameStream>,
+        camera: Option<(super::camera_playback::CameraPlaybackDecoder, f64)>,
+        clips: RecordingClipTimeline,
     },
     Image {
         image: RgbaImage,
@@ -355,9 +360,7 @@ impl PreparedSource {
         } = self
         {
             stream.stop();
-            if let Some(camera) = camera.as_mut() {
-                camera.stop();
-            }
+            *camera = None;
         }
     }
 }
@@ -426,16 +429,19 @@ fn prepare_source(
                 (frame.width, frame.height)
             } else { stream.dimensions() };
             let audio = (info.has_audio && request.include_audio && request.format.supports_audio())
-                .then(|| (media, clip_filter(&info, &clips, 1, false, true)));
+                .then(|| super::media_bank::source_filter(&media, &clips, 1, false, true)).transpose()?;
             let camera = camera.filter(|_| request.style.camera.enabled)
-                .map(|path| VideoFrameStream::open_timeline(&path, &clips, 1280, 1280, frame_rate))
-                .transpose()?;
+                .map(|path| {
+                    let duration = probe_media(&path)?.duration.min(request.recording_duration.unwrap_or(f64::INFINITY));
+                    Ok::<_, VideoError>((super::camera_playback::CameraPlaybackDecoder::new(path), duration))
+                }).transpose()?;
             Ok(PreparedSource::Video {
                 stream,
                 initial_size,
                 audio,
                 pointer,
                 camera,
+                clips,
             })
         }
     }
@@ -492,19 +498,41 @@ fn encode(
         .arg("-framerate")
         .arg(format!("{frame_rate:.3}"))
         .args(["-i", "pipe:0"]);
-    if let Some((path, filter)) = audio.as_ref() {
-        command.arg("-i").arg(path);
+    let mut audio_filters = Vec::new();
+    let mut audio_labels = Vec::new();
+    let mut next_input = 1;
+    if let Some((inputs, filter)) = audio.as_ref() {
+        super::media_bank::add_inputs(&mut command, inputs);
         let filter = if request.noise_reduction {
-            format!("{filter};[audio]{NOISE_REDUCTION_FILTER}[export_audio]")
+            format!("{filter};[audio]{NOISE_REDUCTION_FILTER}[recording_audio]")
         } else {
-            format!("{filter};[audio]anull[export_audio]")
+            format!("{filter};[audio]anull[recording_audio]")
         };
-        command.arg("-filter_complex").arg(filter);
+        audio_filters.push(filter);
+        audio_labels.push("[recording_audio]".to_string());
+        next_input += inputs.len();
+    }
+    if request.format.supports_audio() {
+        for (index, (path, clip)) in request.audio_clips.iter().enumerate() {
+            clip.validate()?;
+            if clip.start >= request.duration { continue; }
+            command.arg("-i").arg(path);
+            let label = format!("music{index}");
+            audio_filters.push(clip.filter(next_input, &label));
+            audio_labels.push(format!("[{label}]"));
+            next_input += 1;
+        }
+    }
+    let has_audio = !audio_labels.is_empty();
+    if has_audio {
+        let audio_duration = (main_frames + request.followers.iter().map(|s| frames_for(s.duration, frame_rate)).sum::<u64>()) as f64 / frame_rate;
+        audio_filters.push(format!("{}amix=inputs={}:normalize=0:duration=longest,alimiter=limit=0.95:level=0:latency=1,apad,atrim=duration={audio_duration:.9}[export_audio]", audio_labels.join(""), audio_labels.len()));
+        command.arg("-filter_complex").arg(audio_filters.join(";"));
     }
     match request.format {
         ExportFormat::Mp4 => {
             command.args(["-map", "0:v"]);
-            if audio.is_some() {
+            if has_audio {
                 command.args(["-map", "[export_audio]", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
             }
             encoder.as_ref().unwrap().configure_output(&mut command);
@@ -517,7 +545,7 @@ fn encode(
         }
         ExportFormat::WebM => {
             command.args(["-map", "0:v"]);
-            if audio.is_some() {
+            if has_audio {
                 command.args([
                     "-map",
                     "[export_audio]",
@@ -596,15 +624,14 @@ fn encode(
                 stream,
                 pointer,
                 camera,
+                clips,
                 ..
             } => {
-                if let Some(camera) = camera.as_mut() {
-                    if let Ok(Some(frame)) = camera.next_frame() {
-                        if let Some(image) =
-                            RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
-                        {
-                            last_camera_frame = Some(image);
-                        }
+                if let Some((camera, duration)) = camera.as_mut() {
+                    let source_time = clips.content_source_time_at(time).filter(|time| *time < *duration);
+                    match camera.frame_at(source_time, || progress.is_cancelled()) {
+                        Ok(frame) => last_camera_frame = frame.map(|(_, image)| (*image).clone()),
+                        Err(error) => { write_error = Some(error); break; }
                     }
                 }
                 match stream.next_frame() {

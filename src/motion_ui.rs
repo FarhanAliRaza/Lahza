@@ -2052,11 +2052,13 @@ impl Studio {
         request.loop_forever = self.export_loop;
         request.include_audio = !self.video_audio_muted;
         request.noise_reduction = self.video_noise_reduction;
+        request.audio_clips = self.video_audio_clips.iter().cloned().map(|clip| (session.directory.join(&clip.file), clip)).collect();
+        request.recording_duration = Some(self.video_recording_duration);
         request.overlay = self.annotation_overlay_source();
         request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(
             self.annotations.clone(), self.selected_canvas_ratio() as f64);
         let source = SceneSource::Video {
-            media: session.screen_path(),
+            media: Self::media_source_for(&session, false),
             clips: self.video_clip_timeline.clone(),
             pointer: self
                 .video_pointer_synthesized

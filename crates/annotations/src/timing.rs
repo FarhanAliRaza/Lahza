@@ -339,7 +339,14 @@ pub fn animated_mark(mark: &AnnotationMark, time: f64) -> Option<AnnotationMark>
 /// are only re-rendered when something changed.
 pub fn marks_signature(marks: &[AnnotationMark]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{marks:?}").hash(&mut hasher);
+    for mark in marks {
+        let mut geometry = mark.clone();
+        // Formatting embedded PNG data used to allocate megabytes on every
+        // animation tick. Hash the bytes directly and format only geometry.
+        let image = geometry.image_png.take();
+        image.hash(&mut hasher);
+        format!("{geometry:?}").hash(&mut hasher);
+    }
     hasher.finish()
 }
 

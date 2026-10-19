@@ -31,6 +31,7 @@ pub(crate) struct PreparedVideoProject {
     session: RecordingSession,
     poster: image::RgbaImage,
     source_duration: f64,
+    recording_duration: f64,
     clip_timeline: RecordingClipTimeline,
     pointer_capture: PointerCaptureFile,
     saved_style: Option<SceneStyle>,
@@ -40,6 +41,7 @@ pub(crate) struct PreparedVideoProject {
     viewport_timeline: ViewportTimeline,
     saved_extras: Option<RecordingExtras>,
     saved_annotations: Vec<AnnotationMark>,
+    audio_clips: Vec<recording::media::AudioClip>,
     window_capture: bool,
     pointer_synthesized: bool,
     camera_path: Option<PathBuf>,
@@ -70,14 +72,23 @@ impl PreparedVideoProject {
         let poster =
             load_or_rebuild_poster(&session.screen_path(), &session.poster_path(), 1280, 720)
                 .map_err(|error| format!("Could not decode recording preview: {error}"))?;
-        let source_duration = media
-            .as_ref()
-            .map(|media| media.duration)
-            .unwrap_or(manifest.duration)
-            .max(0.0);
-        let clip_timeline = session
+        let source = recording::media::source_path(&session).map_err(|error| error.to_string())?;
+        let source_info = probe_media(&source).map_err(|error| error.to_string())?;
+        let audio_clips = session.read_edit_field::<Vec<recording::media::AudioClip>>("audioClips")
+            .map_err(|error| error.to_string())?.unwrap_or_default();
+        for clip in &audio_clips {
+            clip.validate().map_err(|error| error.to_string())?;
+            recording::media::asset_path(&session, &clip.file).map_err(|error| error.to_string())?;
+        }
+        let source_duration = source_info.duration.max(0.0);
+        let mut clip_timeline = session
             .effective_clip_timeline(source_duration)
             .map_err(|error| format!("Could not load recording edits: {error}"))?;
+        for clip in &mut clip_timeline.segments {
+            if clip.source_bounds.is_none() && clip.source_end <= manifest.duration {
+                clip.source_bounds = Some([0.0, manifest.duration]);
+            }
+        }
         let pointer_capture = session.read_pointer_capture().unwrap_or_default();
         let saved_style = session
             .read_edit_field::<SceneStyle>("scene")
@@ -86,7 +97,7 @@ impl PreparedVideoProject {
         let source_size = if media.as_ref().is_some_and(|media| media.window_capture) {
             poster.dimensions()
         } else { (manifest.pixel_width.max(1), manifest.pixel_height.max(1)) };
-        let pointer_timeline = PointerTimeline::build_with_clip_timeline(
+        let mut pointer_timeline = PointerTimeline::build_with_clip_timeline(
             pointer_capture.clone(),
             source_duration,
             source_size.0 as f64,
@@ -98,7 +109,8 @@ impl PreparedVideoProject {
                 .timeline_options(),
             Some(&clip_timeline),
         );
-        let generated_zoom_cues = synthesize_zoom_cues(&pointer_capture, source_duration);
+        pointer_timeline.restrict_to_recording(&clip_timeline, manifest.duration);
+        let generated_zoom_cues = synthesize_zoom_cues(&pointer_capture, manifest.duration);
         let zoom_cues = session
             .effective_zoom_cues()
             .map_err(|error| format!("Could not load zoom edits: {error}"))?
@@ -121,11 +133,12 @@ impl PreparedVideoProject {
         let camera_path = session.camera_path();
         let camera_path = camera_path.is_file().then_some(camera_path);
         Ok(Self {
-            window_capture: media.as_ref().is_some_and(|media| media.window_capture),
+            window_capture: source_info.window_capture,
+            recording_duration: manifest.duration,
             pointer_synthesized: manifest.pointer_synthesized,
             session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
             source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
-            saved_annotations, camera_path,
+            saved_annotations, camera_path, audio_clips,
         })
     }
 }
@@ -399,6 +412,7 @@ impl Studio {
         self.video_edit_busy = false;
         self.video_speed_draft = None;
         self.last_video_project = self.video_project.take().map(|session| session.directory);
+        self.video_import_token = None;
         self.sync_camera_preview(cx);
         let frame = self.video_frame.take();
         self.retire_image(frame);
@@ -407,6 +421,7 @@ impl Studio {
         self.video_selected_clip = None;
         self.video_selected_zoom_cue = None;
         self.video_camera_path = None;
+        self.video_audio_clips.clear();
         self.camera_frame_rgba = None;
         // Recording motion must not leak into a later screenshot animation.
         self.video_zoom_cues.clear();
@@ -453,7 +468,7 @@ impl Studio {
         let PreparedVideoProject {
             session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
             source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
-            saved_annotations, window_capture, pointer_synthesized, camera_path,
+            saved_annotations, window_capture, pointer_synthesized, camera_path, audio_clips, recording_duration,
         } = prepared;
         self.video_playback_generation.fetch_add(1, Ordering::SeqCst);
         if self.animation_active {
@@ -470,11 +485,13 @@ impl Studio {
             };
         }
         self.video_project = Some(session);
+        self.video_import_token = None;
         self.set_video_frame(poster);
         self.video_pointer_timeline = pointer_timeline;
         self.video_viewport_timeline = viewport_timeline;
         self.video_pointer_synthesized = pointer_synthesized;
         self.video_source_duration = source_duration;
+        self.video_recording_duration = recording_duration;
         self.video_duration = clip_timeline.duration();
         self.video_position = 0.0;
         self.video_playing = false;
@@ -508,6 +525,7 @@ impl Studio {
         self.persisted_scene_style = saved_style;
         let extras = saved_extras.clone().unwrap_or_default();
         self.video_audio_muted = extras.audio_muted;
+        self.video_audio_clips = audio_clips;
         self.video_noise_reduction = extras.noise_reduction;
         self.video_removed_presses = extras.removed_press_times;
         self.persisted_extras = saved_extras;

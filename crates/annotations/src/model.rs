@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Tool {
+    Image,
     Select,
     Rectangle,
     FilledRectangle,
@@ -37,6 +38,7 @@ impl Tool {
 
     pub fn label(self) -> &'static str {
         match self {
+            Tool::Image => "Image",
             Tool::Select => "Select",
             Tool::Rectangle => "Rectangle",
             Tool::FilledRectangle => "Filled rectangle",
@@ -54,6 +56,7 @@ impl Tool {
 
     pub fn help_text(self) -> &'static str {
         match self {
+            Tool::Image => "Move or resize the imported image",
             Tool::Select => {
                 "Click to select, Shift-click to add; drag empty space to select several"
             }
@@ -75,6 +78,9 @@ impl Tool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AnnotationMark {
+    /// Embedded PNG, so overlays survive moving projects and deleting imports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_png: Option<std::sync::Arc<str>>,
     pub tool: Tool,
     pub start: NormPoint,
     pub end: NormPoint,
@@ -137,6 +143,7 @@ impl AnnotationMark {
 impl Default for AnnotationMark {
     fn default() -> Self {
         Self {
+            image_png: None,
             tool: Tool::Rectangle,
             start: NormPoint::default(),
             end: NormPoint::default(),

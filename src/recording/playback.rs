@@ -12,6 +12,9 @@ use std::{
 
 pub struct TimelinePlaybackStream {
     path: PathBuf,
+    bank: Option<super::media_bank::MediaBank>,
+    source_offset: f64,
+    still_frame: Option<(DecodedFrame, Instant, f64)>,
     timeline: RecordingClipTimeline,
     position: f64,
     width: u32,
@@ -23,7 +26,7 @@ pub struct TimelinePlaybackStream {
     active: Option<usize>,
     gap_clock: Option<(Instant, f64)>,
     #[cfg(test)]
-    audio_samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    pub(super) audio_samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
 }
 
 impl TimelinePlaybackStream {
@@ -39,9 +42,14 @@ impl TimelinePlaybackStream {
         let info = probe_media(path)?;
         let (width, height) =
             decode_dimensions(&info, maximum_width, maximum_height);
+        let bank = super::media_bank::MediaBank::load(path)?;
         timeline.segments = timeline.playback_ranges();
+        if let Some(bank) = &bank { timeline = bank.ranges(&timeline); }
         Ok(Self {
             path: path.to_owned(),
+            bank,
+            source_offset: 0.0,
+            still_frame: None,
             position: start.clamp(0.0, timeline.duration()),
             timeline,
             width,
@@ -60,6 +68,17 @@ impl TimelinePlaybackStream {
     fn start_clip(&mut self, index: usize, source_time: f64) -> Result<(), VideoError> {
         self.stop();
         let clip = &self.timeline.segments[index];
+        let (path, offset, borders) = if let Some(bank) = &self.bank {
+            let (entry, offset) = bank.locate(source_time);
+            if bank.entries[entry].still {
+                let frame = bank.decode_frame(&self.path, source_time, self.width, self.height)?;
+                self.still_frame = Some((frame, Instant::now(), self.position));
+                self.active = Some(index);
+                return Ok(());
+            }
+            (bank.entry_path(&self.path, entry), offset, entry != 0)
+        } else { (self.path.clone(), 0.0, false) };
+        self.source_offset = offset;
         // Screen captures are variable-rate: a static desktop can have only
         // one frame per second. Repeat its last picture at a regular cadence
         // so the playhead and linked webcam keep following the audio clock.
@@ -67,44 +86,30 @@ impl TimelinePlaybackStream {
         // Dimensions are already fitted. Padding for subpixel aspect-ratio
         // rounding would add opaque black edges to transparent windows.
         let sink = gst::parse::bin_from_description(&format!(
-            "videoconvert ! videoscale add-borders=false ! video/x-raw,format=RGBA,width={},height={},pixel-aspect-ratio=1/1 ! videorate ! video/x-raw,framerate=30/1 ! appsink name=frames sync=true max-buffers=2 drop=false wait-on-eos=false", self.width, self.height
+            "videoconvert ! videoscale add-borders={borders} ! video/x-raw,format=RGBA,width={},height={},pixel-aspect-ratio=1/1 ! videorate ! video/x-raw,framerate=30/1 ! appsink name=frames sync=true max-buffers=2 drop=false wait-on-eos=false", self.width, self.height
         ), true).map_err(|e| VideoError::Decode(e.to_string()))?;
         let frames = sink.by_name("frames").unwrap();
-        let uri = gst::glib::filename_to_uri(&self.path, None)
+        let uri = gst::glib::filename_to_uri(&path, None)
             .map_err(|e| VideoError::Decode(e.to_string()))?;
         // Rate seeks alone resample audio and shift the speaker's pitch.
         // Scaletempo time-stretches samples to the segment rate while keeping
         // their pitch, matching the atempo filter used for export.
-        let tempo = gst::ElementFactory::make("scaletempo")
-            .build()
-            .map_err(|e| VideoError::Decode(format!("could not preserve audio pitch: {e}")))?;
+        let audio_filter = gst::parse::bin_from_description("scaletempo ! volume name=recording_gain", true)
+            .map_err(|e| VideoError::Decode(format!("could not prepare recording audio: {e}")))?;
+        audio_filter.by_name("recording_gain").unwrap().set_property("mute", self.muted);
         let pipeline = gst::ElementFactory::make("playbin")
-            .property_from_str("flags", PLAYBACK_FLAGS)
+            .property_from_str("flags", &format!("{PLAYBACK_FLAGS}+force-filters"))
             .property("uri", uri.as_str())
             .property("video-sink", &sink)
-            .property("audio-filter", &tempo)
-            .property("mute", self.muted)
+            .property("audio-filter", &audio_filter)
+            // Reset the stream gain left by older builds; recording mute lives
+            // in the filter, so it cannot mute music through a shared sink.
+            .property("volume", 1.0_f64)
+            .property("mute", false)
             .build()
             .map_err(|e| VideoError::Decode(e.to_string()))?;
         #[cfg(test)]
-        {
-            let audio_sink = gst::parse::bin_from_description(
-                "audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=1 ! fakesink name=audio sync=true signal-handoffs=true", true).unwrap();
-            let samples = self.audio_samples.clone();
-            audio_sink
-                .by_name("audio")
-                .unwrap()
-                .connect("handoff", false, move |values| {
-                    let buffer = values[1].get::<gst::Buffer>().unwrap();
-                    let map = buffer.map_readable().unwrap();
-                    samples.lock().unwrap().extend(
-                        map.chunks_exact(4)
-                            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())),
-                    );
-                    None
-                });
-            pipeline.set_property("audio-sink", audio_sink);
-        }
+        pipeline.set_property("audio-sink", test_audio_sink(self.audio_samples.clone()));
         // Store before changing state so every failure is cleaned up by Drop.
         self.pipeline = Some(pipeline.clone());
         self.sink = Some(frames);
@@ -121,9 +126,9 @@ impl TimelinePlaybackStream {
                 clip.speed,
                 gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
-                gst::ClockTime::from_nseconds((source_time * 1e9) as u64),
+                gst::ClockTime::from_nseconds(((source_time - offset) * 1e9) as u64),
                 gst::SeekType::Set,
-                gst::ClockTime::from_nseconds((clip.source_end * 1e9) as u64),
+                gst::ClockTime::from_nseconds(((clip.source_end - offset) * 1e9) as u64),
             )
             .map_err(|e| VideoError::Decode(e.to_string()))?;
         pipeline
@@ -160,6 +165,14 @@ impl TimelinePlaybackStream {
             if self.active != Some(location.segment_index) {
                 self.start_clip(location.segment_index, location.source_time)?;
             }
+            if let Some((frame, clock, start)) = &self.still_frame {
+                std::thread::sleep(Duration::from_millis(16));
+                let end = location.editor_start + self.timeline.segments[location.segment_index].editor_duration();
+                self.position = (start + clock.elapsed().as_secs_f64()).min(end);
+                let mut frame = frame.clone();
+                frame.time = self.position.min(end - 1e-9);
+                return Ok(Some(frame));
+            }
             let sink = self.sink.as_ref().unwrap();
             let sample =
                 sink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
@@ -169,7 +182,7 @@ impl TimelinePlaybackStream {
                     .ok_or_else(|| VideoError::Decode("preview sample has no buffer".into()))?;
                 let pts = buffer
                     .pts()
-                    .map(|t| t.nseconds() as f64 / 1e9)
+                    .map(|t| t.nseconds() as f64 / 1e9 + self.source_offset)
                     .ok_or_else(|| VideoError::Decode("preview frame has no timestamp".into()))?;
                 let clip = &self.timeline.segments[location.segment_index];
                 if pts < clip.source_start || pts >= clip.source_end {
@@ -212,6 +225,7 @@ impl TimelinePlaybackStream {
         if let Some(pipeline) = self.pipeline.take() {
             let _ = pipeline.set_state(gst::State::Null);
         }
+        self.still_frame = None;
         self.sink = None;
         self.active = None;
     }
@@ -220,6 +234,21 @@ impl Drop for TimelinePlaybackStream {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Capture the samples after production audio filters without a sound device.
+#[cfg(test)]
+pub(super) fn test_audio_sink(samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>>) -> gst::Bin {
+    let sink = gst::parse::bin_from_description(
+        "audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=1 ! fakesink name=audio sync=true signal-handoffs=true", true).unwrap();
+    sink.by_name("audio").unwrap().connect("handoff", false, move |values| {
+        let buffer = values[1].get::<gst::Buffer>().unwrap();
+        let map = buffer.map_readable().unwrap();
+        samples.lock().unwrap().extend(map.chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())));
+        None
+    });
+    sink
 }
 
 #[cfg(test)]

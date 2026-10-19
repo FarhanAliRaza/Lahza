@@ -28,6 +28,9 @@ pub struct RecordingClipSegment {
     /// video with silent audio, and let clips sit anywhere on the timeline.
     #[serde(default)]
     pub gap_before: f64,
+    /// The imported asset's immutable range within the project media source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bounds: Option<[f64; 2]>,
 }
 
 impl RecordingClipSegment {
@@ -44,6 +47,7 @@ impl RecordingClipSegment {
             source_end,
             speed: 1.0,
             gap_before: 0.0,
+            source_bounds: None,
         }
     }
 
@@ -134,6 +138,7 @@ impl RecordingClipTimeline {
         for clip in &self.segments {
             if let Some(previous) = ranges.last_mut() {
                 if clip.gap_before == 0.0
+                    && previous.source_bounds == clip.source_bounds
                     && (previous.source_end - clip.source_start).abs() < EPSILON
                     && (previous.speed - clip.speed).abs() < EPSILON
                 {
@@ -167,8 +172,11 @@ impl RecordingClipTimeline {
             .segments
             .iter()
             .filter_map(|segment| {
-                let start = finite_or(segment.source_start, 0.0).clamp(0.0, safe_duration);
-                let end = finite_or(segment.source_end, start).clamp(start, safe_duration);
+                let source_bounds = segment.source_bounds.filter(|bounds| bounds[0].is_finite() && bounds[1].is_finite() && bounds[0] >= 0.0 && bounds[0] < bounds[1])
+                    .map(|bounds| [bounds[0].min(safe_duration), bounds[1].min(safe_duration)]);
+                let [lower, upper] = source_bounds.unwrap_or([0.0, safe_duration]);
+                let start = finite_or(segment.source_start, lower).clamp(lower, upper);
+                let end = finite_or(segment.source_end, start).clamp(start, upper);
                 if end - start < RecordingClipSegment::MINIMUM_DURATION {
                     return None;
                 }
@@ -179,6 +187,7 @@ impl RecordingClipTimeline {
                 };
                 Some(RecordingClipSegment {
                     id,
+                    source_bounds,
                     source_start: start,
                     source_end: end,
                     speed: finite_or(segment.speed, 1.0).clamp(
@@ -389,6 +398,7 @@ impl RecordingClipTimeline {
         let trailing_id = Uuid::new_v4();
         let leading = RecordingClipSegment {
             id: segment.id,
+            source_bounds: segment.source_bounds,
             source_start: segment.source_start,
             source_end: source_time,
             speed: segment.speed,
@@ -396,6 +406,7 @@ impl RecordingClipTimeline {
         };
         let trailing = RecordingClipSegment {
             id: trailing_id,
+            source_bounds: segment.source_bounds,
             source_start: source_time,
             source_end: segment.source_end,
             speed: segment.speed,
@@ -456,14 +467,14 @@ impl RecordingClipTimeline {
             .filter(|clip| clip.id != segment_id)
             .map(|clip| clip.source_end)
             .filter(|&end| end <= original.source_start + EPSILON)
-            .fold(0.0, f64::max);
+            .fold(original.source_bounds.map_or(0.0, |bounds| bounds[0]), f64::max);
         let next_start = self
             .segments
             .iter()
             .filter(|clip| clip.id != segment_id)
             .map(|clip| clip.source_start)
             .filter(|&start| start >= original.source_end - EPSILON)
-            .fold(finite_nonnegative(source_duration), f64::min);
+            .fold(original.source_bounds.map_or(finite_nonnegative(source_duration), |bounds| bounds[1].min(finite_nonnegative(source_duration))), f64::min);
         let mut replacement = original.clone();
         match edge {
             ClipEdge::Leading => {
@@ -509,6 +520,7 @@ impl RecordingClipTimeline {
             {
                 next.push(RecordingClipSegment {
                     id: if kept_id { Uuid::new_v4() } else { segment.id },
+                    source_bounds: segment.source_bounds,
                     source_start: start,
                     source_end: end,
                     speed: segment.speed,
@@ -601,6 +613,22 @@ mod tests {
     }
 
     #[test]
+    fn imported_clip_trims_stay_inside_its_asset_after_splits_and_deletion() {
+        let mut clip = RecordingClipSegment::new(10.0, 15.0);
+        clip.source_bounds = Some([10.0, 15.0]);
+        let (split, right) = RecordingClipTimeline::new(vec![clip]).split_at(2.0).unwrap();
+        let left = split.segments[0].id;
+        assert_eq!(split.segments[1].source_bounds, Some([10.0, 15.0]));
+        let remaining = split.deleting(left).unwrap();
+        let (trimmed, _) = remaining.trimming(right, ClipEdge::Leading, -30.0, 50.0).unwrap();
+        assert_eq!(trimmed.segments[0].source_start, 10.0);
+        let (trimmed, _) = trimmed.trimming(right, ClipEdge::Trailing, 30.0, 50.0).unwrap();
+        assert_eq!(trimmed.segments[0].source_end, 15.0);
+        let restored: RecordingClipTimeline = serde_json::from_str(&serde_json::to_string(&trimmed).unwrap()).unwrap();
+        assert_eq!(restored.normalized(50.0), trimmed);
+    }
+
+    #[test]
     fn speed_changes_editor_mapping_without_changing_source_ranges() {
         let timeline =
             RecordingClipTimeline::new(vec![segment(1.0, 5.0, 2.0), segment(7.0, 11.0, 4.0)]);
@@ -630,6 +658,7 @@ mod tests {
         let timeline = RecordingClipTimeline::new(vec![
             RecordingClipSegment {
                 id: shared,
+                source_bounds: None,
                 source_start: 4.0,
                 source_end: 8.0,
                 speed: 99.0,
@@ -637,6 +666,7 @@ mod tests {
             },
             RecordingClipSegment {
                 id: shared,
+                source_bounds: None,
                 source_start: 1.0,
                 source_end: 5.0,
                 speed: f64::NAN,

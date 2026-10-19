@@ -186,6 +186,7 @@ pub(crate) struct VideoZoomDrag {
 
 #[derive(Clone, Debug)]
 pub(crate) enum VideoEditSnapshot {
+    Audio(Vec<recording::media::AudioClip>),
     Crop(CropRect),
     Annotations(Vec<AnnotationMark>),
     ImageTiming { scene: f64, start: f64, end: f64 },

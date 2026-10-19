@@ -271,3 +271,24 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 - `xdg-desktop-portal` and the appropriate portal backend for your desktop.
 - PipeWire for desktop capture. The Snap bundles GStreamer, FFmpeg, and FFprobe; Debian and source installations use system media libraries and tools.
 - Desktop support for the screenshot and screencast portals. Picker options depend on your desktop.
+
+### Imported timeline media
+
+In the recording editor, use **+ Image / video** to append a video or a five-second
+still-image clip. Imported clips use the existing trim, split, speed, move, and
+motion controls. Imports are stored inside the project; the original screen
+recording is preserved. Import copies only the new asset and updates a small
+media index; existing footage is never re-encoded during import. Images remain
+still files. Playback and export combine the separate assets on demand.
+
+Use **+ Image overlay** for an image that appears over the recording. Select it to
+move or resize it, then use the annotation timing controls for its start/end and
+entrance/exit animation. Transparent PNGs are supported, and overlay pixels are
+embedded in the saved annotation.
+
+Use **+ Audio** to add music or a sound effect at the playhead. The **Record → Audio**
+panel controls each layer's volume, placement, trimming, and fades. Multiple layers
+mix with the recording in preview and MP4/WebM export. The recording can be muted
+independently. Audio layers retain their editor-time positions when video clips
+are edited; audio beyond the end of the video is clipped. Audio edits support
+undo/redo and are saved with the project.

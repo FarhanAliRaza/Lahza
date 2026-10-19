@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     io::Read,
@@ -8,7 +8,7 @@ use std::{
 
 use super::clips::RecordingClipTimeline;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub duration: f64,
     pub width: u32,
@@ -77,6 +77,7 @@ struct ProbeFormat {
 }
 
 pub fn probe_media(path: &Path) -> Result<MediaInfo, VideoError> {
+    if let Some(bank) = super::media_bank::MediaBank::load(path)? { return Ok(bank.info()); }
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -143,6 +144,9 @@ pub fn decode_frame(
     maximum_width: u32,
     maximum_height: u32,
 ) -> Result<DecodedFrame, VideoError> {
+    if let Some(bank) = super::media_bank::MediaBank::load(path)? {
+        return bank.decode_frame(path, time, maximum_width, maximum_height);
+    }
     let info = probe_media(path)?;
     let (width, height) = decode_dimensions(&info, maximum_width, maximum_height);
     let selected_time = time.clamp(0.0, info.duration);
@@ -240,6 +244,20 @@ pub const NOISE_REDUCTION_FILTER: &str = "afftdn=nr=20:tn=1";
 /// run through [`NOISE_REDUCTION_FILTER`], so the editor can play what the
 /// export will sound like. The file only appears once it is complete.
 pub fn render_denoised_copy(source: &Path, destination: &Path) -> Result<(), VideoError> {
+    if let Some(mut bank) = super::media_bank::MediaBank::load(source)? {
+        for (index, entry) in bank.entries.iter_mut().enumerate() {
+            if !entry.info.has_audio { continue; }
+            let original = source.parent().unwrap().join(&entry.file);
+            let legacy_cache = source.parent().unwrap().join(super::model::RecordingSession::DENOISED_FILE);
+            let cache = if index == 0 && legacy_cache.exists() {
+                legacy_cache
+            } else { original.with_extension("denoised.mkv") };
+            if !cache.exists() { render_denoised_copy(&original, &cache)?; }
+            if entry.info.window_capture { fs::write(cache.with_extension("window.json"), b"{}")?; }
+            entry.file = cache.strip_prefix(source.parent().unwrap()).unwrap().into();
+        }
+        return bank.save(destination);
+    }
     let temporary = temporary_video_sibling(destination);
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-i"])
@@ -375,11 +393,13 @@ fn render_clip_timeline(
         ));
     }
 
-    let filter = clip_filter(&info, &timeline, 0, true, info.has_audio);
+    let (inputs, filter) = super::media_bank::source_filter(source, &timeline, 0, true, info.has_audio)?;
 
     let temporary = temporary_video_sibling(destination);
     let mut command = Command::new("ffmpeg");
-    command.args(["-v", "error", "-i"]).arg(source).args([
+    command.args(["-v", "error"]);
+    super::media_bank::add_inputs(&mut command, &inputs);
+    command.args([
         "-filter_complex",
         &filter,
         "-map",
@@ -426,6 +446,21 @@ fn render_clip_timeline(
 /// Root-mean-square loudness per bucket across the whole file (0..1), for
 /// the timeline's audio lane. Files without audio produce an empty list.
 pub fn audio_levels(path: &Path, buckets: usize) -> Result<Vec<f32>, VideoError> {
+    if let Some(bank) = super::media_bank::MediaBank::load(path)? {
+        let mut levels = vec![0.0; buckets];
+        let duration = bank.info().duration;
+        let mut offset = 0.0;
+        for (index, entry) in bank.entries.iter().enumerate() {
+            let start = (offset / duration * buckets as f64).round() as usize;
+            offset += entry.info.duration;
+            let end = ((offset / duration * buckets as f64).round() as usize).min(buckets);
+            if entry.info.has_audio && end > start {
+                let values = audio_levels(&bank.entry_path(path, index), end - start)?;
+                if values.len() == end - start { levels[start..end].copy_from_slice(&values); }
+            }
+        }
+        return Ok(levels);
+    }
     let info = probe_media(path)?;
     if !info.has_audio || buckets == 0 || info.duration <= 0.0 {
         return Ok(Vec::new());
@@ -477,7 +512,7 @@ pub fn decode_thumbnails(
     if count == 0 || info.duration <= 0.0 {
         return Ok(Vec::new());
     }
-    if info.window_capture {
+    if info.window_capture || super::media_bank::MediaBank::load(path)?.is_some() {
         return (0..count)
             .map(|index| {
                 let frame = decode_frame(
@@ -685,6 +720,12 @@ impl VideoFrameStream {
         frame_rate: Option<f64>,
     ) -> Result<Self, VideoError> {
         let info = probe_media(path)?;
+        if super::media_bank::MediaBank::load(path)?.is_some() {
+            let timeline = RecordingClipTimeline::new(vec![super::clips::RecordingClipSegment::new(start_time.max(0.0), info.duration)]);
+            let mut stream = Self::open_timeline(path, &timeline, maximum_width, maximum_height, frame_rate.unwrap_or(info.frame_rate))?;
+            stream.start_time = start_time;
+            return Ok(stream);
+        }
         let (width, height) = decode_dimensions(&info, maximum_width, maximum_height);
         let start_time = start_time.clamp(0.0, info.duration);
         let frame_rate = frame_rate
@@ -732,7 +773,7 @@ impl VideoFrameStream {
     ) -> Result<Self, VideoError> {
         let info = probe_media(path)?;
         let timeline = timeline.normalized(info.duration);
-        if timeline.is_unedited(info.duration) {
+        if timeline.is_unedited(info.duration) && super::media_bank::MediaBank::load(path)?.is_none() {
             return Self::open_with_frame_rate(
                 path,
                 0.0,
@@ -742,14 +783,14 @@ impl VideoFrameStream {
             );
         }
         let (width, height) = decode_dimensions(&info, maximum_width, maximum_height);
-        let mut filter = clip_filter(&info, &timeline, 0, true, false);
+        let (inputs, mut filter) = super::media_bank::source_filter(path, &timeline, 0, true, false)?;
         filter.push_str(&format!(
             ";[video]fps={frame_rate:.6},scale={width}:{height}:flags=lanczos,format=rgba[frames]"
         ));
-        let mut child = Command::new("ffmpeg")
-            .args(["-v", "error", "-i"])
-            .arg(path)
-            .args([
+        let mut command = Command::new("ffmpeg");
+        command.args(["-v", "error"]);
+        super::media_bank::add_inputs(&mut command, &inputs);
+        let mut child = command.args([
                 "-filter_complex",
                 &filter,
                 "-map",

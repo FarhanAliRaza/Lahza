@@ -327,6 +327,10 @@ impl Studio {
             return;
         };
         match previous {
+            VideoEditSnapshot::Audio(clips) => {
+                self.video_redo_stack.push(VideoEditSnapshot::Audio(std::mem::replace(&mut self.video_audio_clips, clips)));
+                self.save_audio_clips(cx);
+            }
             VideoEditSnapshot::Crop(crop) => {
                 self.video_redo_stack.push(VideoEditSnapshot::Crop(std::mem::replace(&mut self.video_crop, crop)));
                 self.autosave_scene_style();
@@ -370,6 +374,10 @@ impl Studio {
             return;
         };
         match next {
+            VideoEditSnapshot::Audio(clips) => {
+                self.video_undo_stack.push(VideoEditSnapshot::Audio(std::mem::replace(&mut self.video_audio_clips, clips)));
+                self.save_audio_clips(cx);
+            }
             VideoEditSnapshot::Crop(crop) => {
                 self.video_undo_stack.push(VideoEditSnapshot::Crop(std::mem::replace(&mut self.video_crop, crop)));
                 self.autosave_scene_style();
@@ -444,7 +452,7 @@ impl Studio {
         if noise_reduction && denoised.exists() {
             denoised
         } else {
-            session.screen_path()
+            crate::recording::media::source_path(session).unwrap_or_else(|_| session.screen_path())
         }
     }
 
@@ -462,7 +470,7 @@ impl Studio {
         }
         self.video_edit_busy = true;
         self.toast = Some("Preparing noise-reduced audio…".into());
-        let source = session.screen_path();
+        let source = Self::media_source_for(&session, false);
         let destination = session.denoised_path();
         let task = cx.background_executor().spawn(async move {
             render_denoised_copy(&source, &destination).map_err(|error| error.to_string())
@@ -525,7 +533,7 @@ impl Studio {
         };
         let manifest = session.read_manifest().unwrap_or_default();
         let capture = self.filtered_pointer_capture();
-        let pointer = PointerTimeline::build_with_clip_timeline(
+        let mut pointer = PointerTimeline::build_with_clip_timeline(
             capture.clone(),
             self.video_source_duration,
             manifest.pixel_width as f64,
@@ -533,6 +541,7 @@ impl Studio {
             self.pointer_style.timeline_options(),
             Some(&self.video_clip_timeline),
         );
+        pointer.restrict_to_recording(&self.video_clip_timeline, manifest.duration);
         self.video_viewport_timeline = ViewportTimeline::build(
             &self.video_zoom_cues,
             &pointer,
@@ -687,10 +696,13 @@ impl Studio {
         let decode_size = if self.video_crop != crate::CropRect::UNIT { self.video_source_size } else { (1920, 1080) };
         let timeline = self.video_clip_timeline.clone();
         let muted = self.video_audio_muted;
+        let audio_clips = self.video_project.as_ref().map(|session| self.video_audio_clips.iter().cloned()
+            .map(|clip| (session.directory.join(&clip.file), clip)).collect()).unwrap_or_default();
         let generation = self.video_playback_generation.clone();
         let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
         let receiver = PlaybackMailbox::default();
         let mut camera_ready = None;
+        let recording_duration = self.video_recording_duration;
         let sender = if let Some(path) = self.video_camera_path.clone() {
             let pending = PlaybackMailbox::default();
             let raw_sender = pending.clone();
@@ -709,7 +721,7 @@ impl Studio {
                 // master transport to start its screen/audio clock.
                 // Starting in a gap warms the upcoming clip, without showing
                 // its camera until actual content begins.
-                let source_time = camera_timeline.location_at(start_time).map(|location| location.source_time);
+                let source_time = camera_timeline.location_at(start_time).map(|location| location.source_time).filter(|time| *time < recording_duration);
                 if let Some(Err(error)) = decoder.as_mut().map(|decoder| decoder.frame_at(source_time, &cancelled)) {
                     eprintln!("Webcam playback failed: {error}");
                     decoder = None;
@@ -719,7 +731,7 @@ impl Studio {
                     let update = pending.take();
                     let had_frame = update.frame.is_some();
                     if let Some(frame) = update.frame {
-                        let source_time = camera_timeline.content_source_time_at(frame.time);
+                        let source_time = camera_timeline.content_source_time_at(frame.time).filter(|time| *time < recording_duration);
                         let camera = match decoder.as_mut().filter(|_| source_time.is_some())
                             .map(|decoder| decoder.frame_at(source_time, &cancelled)) {
                             Some(Ok(camera)) => camera,
@@ -768,10 +780,18 @@ impl Studio {
                             return;
                         }
                     };
+                let mut audio = match crate::recording::media::AudioPlayback::open(audio_clips) {
+                    Ok(audio) => audio,
+                    Err(error) => { sender.finish(Err(error.to_string())); return; }
+                };
                 while generation.load(Ordering::SeqCst) == token && Arc::strong_count(&sender.0) > 1
                 {
                     match stream.next_frame(|| generation.load(Ordering::SeqCst) != token || Arc::strong_count(&sender.0) <= 1) {
                         Ok(Some(frame)) => {
+                            if let Err(error) = audio.sync(frame.time) {
+                                sender.finish(Err(error.to_string()));
+                                break;
+                            }
                             sender.publish(frame);
                         }
                         Ok(None) => {
@@ -1129,6 +1149,9 @@ impl Studio {
             .flex()
             .items_center()
             .gap_1()
+            .child(self.small_button("import-timeline-clip", "+ Image / video", !edit_busy, cx, |this, cx| this.import_timeline_media(crate::media_ui::ImportKind::Clip, cx)))
+            .child(self.small_button("import-image-overlay", "+ Image overlay", !edit_busy, cx, |this, cx| this.import_timeline_media(crate::media_ui::ImportKind::Image, cx)))
+            .child(self.small_button("import-audio", "+ Audio", !edit_busy, cx, |this, cx| this.import_timeline_media(crate::media_ui::ImportKind::Audio, cx)))
             .child(
                 div()
                     .id("video-split")

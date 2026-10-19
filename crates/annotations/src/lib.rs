@@ -10,6 +10,7 @@ pub mod fonts;
 pub mod geometry;
 mod ink;
 mod model;
+mod raster;
 pub mod redaction;
 pub mod snapping;
 pub mod svg;

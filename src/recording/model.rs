@@ -51,6 +51,13 @@ impl RecordingSession {
     }
 
     pub fn denoised_path(&self) -> PathBuf {
+        if let Ok(Some(source)) = self.read_edit_field::<PathBuf>("mediaSource") {
+            if source.to_string_lossy().ends_with(".media.json") {
+                if let Ok(path) = super::media::asset_path(self, &source) {
+                    return path.with_extension("denoised.media.json");
+                }
+            }
+        }
         self.directory.join(Self::DENOISED_FILE)
     }
 

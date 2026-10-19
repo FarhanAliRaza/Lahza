@@ -319,7 +319,7 @@ impl Studio {
         } else {
             self.annotation_lane_height() + 4.0
         };
-        camera + annotations + (self.motion_lane_height() - 30.0)
+        camera + annotations + (self.motion_lane_height() - 30.0) + self.video_audio_clips.len() as f32 * 24.0
     }
 
     fn timeline_bar_height(&self) -> f32 {
@@ -749,7 +749,7 @@ impl Studio {
         }
     }
 
-    fn select_inspector_tab(&mut self, tab: InspectorTab) {
+    pub(crate) fn select_inspector_tab(&mut self, tab: InspectorTab) {
         self.annotation_editing_time = None;
         self.annotation_edit_preview_pending = false;
         self.stop_editing_text();
@@ -1130,8 +1130,7 @@ impl Studio {
                                                 Tool::ALL
                                                     .iter()
                                                     .find(|(tool, _)| *tool == mark.tool)
-                                                    .unwrap()
-                                                    .1,
+                                                    .map_or("icons/image.svg", |(_, icon)| *icon),
                                             )
                                             .size(px(16.0))
                                             .flex_none()
@@ -1703,7 +1702,7 @@ impl Studio {
 
     /// Seeks to the pointer's position on the ruler or the clip lane and
     /// arms a scrub drag.
-    fn timeline_seek_down(&mut self, event: &MouseDownEvent) {
+    pub(crate) fn timeline_seek_down(&mut self, event: &MouseDownEvent) {
         self.finish_annotation_interaction();
         self.pause_video_playback();
         self.video_trim_drag = None;
@@ -1962,7 +1961,7 @@ impl Studio {
                     .gap_3()
                     .border_b_1()
                     .border_color(line())
-                    .child(div().flex_1().flex().items_center().child(edit_controls))
+                    .child(div().id("timeline-edit-actions").flex_1().min_w_0().overflow_x_scroll().flex().items_center().child(edit_controls))
                     .child(
                         div()
                             .flex_none()
@@ -2098,6 +2097,9 @@ impl Studio {
                                     })
                                     .when(audio_lane.is_some(), |this| {
                                         this.child(Self::track_label("Audio", 22.0))
+                                    })
+                                    .when(!self.video_audio_clips.is_empty(), |this| {
+                                        this.child(Self::track_label("Music / SFX", self.video_audio_clips.len() as f32 * 24.0))
                                     }),
                             ),
                     )
@@ -2272,6 +2274,7 @@ impl Studio {
                             .when_some(annotation_track, |this, lane| this.child(lane))
                             .when_some(camera_lane, |this, lane| this.child(lane))
                             .when_some(audio_lane, |this, lane| this.child(lane))
+                            .when(!self.video_audio_clips.is_empty(), |this| this.child(self.imported_audio_lane(timeline_content_width, timeline_scroll, cx)))
                             // Paint one continuous playhead above every lane and gap.
                             .child(
                                 div()

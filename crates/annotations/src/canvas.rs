@@ -4,6 +4,38 @@ use gpui::{
     font, hsla, point, px, quad, rgb, size, App, Bounds, Hsla, Pixels, Point, TextRun, Window,
 };
 
+fn image_render(data: &str, opacity: f32, window: &Window) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    use base64::Engine;
+    use std::{cell::RefCell, collections::HashMap, hash::{Hash, Hasher}, sync::Arc};
+    thread_local! {
+        static CACHE: RefCell<HashMap<(u64, u8), Arc<gpui::RenderImage>>> = RefCell::new(HashMap::new());
+    }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hash);
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let key = (hash.finish(), alpha);
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(image) = cache.get(&key) { return Some(image.clone()); }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+        let mut pixels = image::load_from_memory(&bytes).ok()?.thumbnail(1280, 1280).to_rgba8();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+            pixel[3] = ((pixel[3] as u16 * alpha as u16) / 255) as u8;
+        }
+        let image = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(pixels)]));
+        if cache.len() >= 16 {
+            let retired: Vec<_> = cache.drain().map(|(_, image)| image).collect();
+            // Keep atlas entries used by this paint alive until the next frame.
+            window.on_next_frame(move |window, _| {
+                for image in retired { let _ = window.drop_image(image); }
+            });
+        }
+        cache.insert(key, image.clone());
+        Some(image)
+    })
+}
+
 /// Scale from the document's 800-unit canvas to the current preview.
 pub fn canvas_scale(bounds: Bounds<Pixels>) -> f32 {
     f32::from(bounds.size.width.min(bounds.size.height)).max(1.0) / 800.0
@@ -166,6 +198,13 @@ pub fn paint_annotation(
         };
     }
     match mark.tool {
+        Tool::Image => {
+            if let Some(data) = &mark.image_png {
+                if let Some(pixels) = image_render(data, mark.opacity, window) {
+                    let _ = window.paint_image(bounds, Default::default(), pixels, 0, false);
+                }
+            }
+        }
         Tool::Rectangle => window.paint_quad(quad(
             bounds,
             px(2.0),

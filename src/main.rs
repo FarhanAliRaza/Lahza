@@ -44,6 +44,7 @@ mod template_ui;
 mod theme;
 mod timed;
 mod video;
+mod media_ui;
 
 use annotations::{annotations_svg, paint_annotation, paint_highlights};
 use crop::paint_crop_overlay;
@@ -293,9 +294,11 @@ struct Studio {
     video_pointer_synthesized: bool,
     video_duration: f64,
     video_source_duration: f64,
+    video_recording_duration: f64,
     video_position: f64,
     video_playing: bool,
     video_edit_busy: bool,
+    video_import_token: Option<Uuid>,
     /// Pending clip speed while the speed dialog is open; applied only on OK.
     video_speed_draft: Option<f64>,
     /// Counts preview renders so a superseded render's result is dropped
@@ -359,6 +362,7 @@ struct Studio {
     preset_library: PresetLibrary,
     default_motion_zoom: f64,
     video_audio_levels: Vec<f32>,
+    video_audio_clips: Vec<recording::media::AudioClip>,
     video_audio_muted: bool,
     video_noise_reduction: bool,
     video_thumbnails: Vec<Arc<RenderImage>>,
@@ -614,9 +618,11 @@ impl Studio {
             video_pointer_synthesized: false,
             video_duration: 0.0,
             video_source_duration: 0.0,
+            video_recording_duration: 0.0,
             video_position: 0.0,
             video_playing: false,
             video_edit_busy: false,
+            video_import_token: None,
             video_speed_draft: None,
             video_clip_timeline: RecordingClipTimeline::default(),
             video_selected_clip: None,
@@ -671,6 +677,7 @@ impl Studio {
             preset_library: PresetLibrary::load(),
             default_motion_zoom: 2.0,
             video_audio_levels: Vec::new(),
+            video_audio_clips: Vec::new(),
             video_audio_muted: false,
             video_noise_reduction: false,
             video_thumbnails: Vec::new(),

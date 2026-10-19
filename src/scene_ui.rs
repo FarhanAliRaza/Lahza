@@ -932,7 +932,7 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        let overlay = if !style.transform.with_motion(viewport).is_identity() {
+        let overlay = if !style.transform.with_motion(viewport).is_identity() || self.has_media_image_overlays() {
             self.preview_overlay(time, canvas)
         } else {
             None
@@ -1107,6 +1107,10 @@ impl Studio {
             self.camera_frame_rgba = None;
             return;
         };
+        if source_time >= self.video_recording_duration {
+            self.camera_frame_rgba = None;
+            return;
+        }
         if self.camera_frame_rgba.is_some() && (self.camera_decoded_time - source_time).abs() < 1.0 / 30.0
         {
             return;
@@ -1448,6 +1452,10 @@ impl Studio {
         self.scene_transform.with_motion(viewport).is_identity()
     }
 
+    fn has_media_image_overlays(&self) -> bool {
+        self.annotations.iter().any(|mark| mark.tool == Tool::Image && !mark.is_canvas())
+    }
+
     /// Maps a pointer position on a composited preview back to the position
     /// it would have on the flat, zoomed media rect `flat`, so annotation
     /// tools work through a 3D projection.
@@ -1762,6 +1770,7 @@ impl Studio {
         // Annotations paint flat over the media rect; a transformed card
         // hands them to the compositor instead (see `scene_preview_image`).
         let paint_flat = self.annotations_paint_flat();
+        let composite_flat = paint_flat && self.has_media_image_overlays();
         let select_tool = self.tool == Tool::Select;
         let text_cursor = self.tool == Tool::Text || self.editing_text.is_some();
         let committed_count = self.annotations.len();
@@ -1852,11 +1861,15 @@ impl Studio {
                                 if !paint_flat {
                                     return Vec::new();
                                 }
-                                paint_highlights(&painted, interaction_bounds, window);
+                                if !composite_flat { paint_highlights(&painted, interaction_bounds, window); }
                                 let mut rendered = vec![Bounds::new(point(px(-100000.),px(-100000.)),size(px(0.),px(0.))); committed_count+1];
                                 for (slot, mark) in painted.iter().enumerate() {
                                     let index = painted_indices[slot];
-                                    let rendered_bounds = paint_annotation(
+                                    let space = if mark.pinned { media } else { interaction_bounds };
+                                    let rendered_bounds = if composite_flat {
+                                        let bounds = lahza_annotations::canvas::annotation_snap_bounds(mark, space);
+                                        Bounds::from_corners(bounds.min.screen(), bounds.max.screen())
+                                    } else { paint_annotation(
                                         mark,
                                         if mark.pinned {
                                             media
@@ -1867,7 +1880,7 @@ impl Studio {
                                         editing_text == Some(index) && caret_visible,
                                         window,
                                         cx,
-                                    );
+                                    ) };
                                     rendered[index] = rendered_bounds;
                                     if selected_annotations.len() == 1 && selected_annotations.contains(&index) && editing_text != Some(index) {
                                         selection_outline = Some((slot, rendered_bounds));
@@ -2376,10 +2389,13 @@ impl Studio {
             .when(has_audio, |this| {
                 this.child(self.scene_toggle_row(
                     "audio-mute",
-                    "Include audio in export",
+                    "Recording audio",
                     !self.video_audio_muted,
                     cx,
-                    |this| this.video_audio_muted = !this.video_audio_muted,
+                    |this| {
+                        this.pause_video_playback();
+                        this.video_audio_muted = !this.video_audio_muted;
+                    },
                 ))
             })
             .when(has_audio && !self.video_audio_muted, |this| {
@@ -2407,6 +2423,7 @@ impl Studio {
                         .child("Removes steady background hiss from the preview and the export."),
                 )
             })
+            .child(self.imported_audio_controls(cx))
             .into_any_element()
     }
 
@@ -3692,7 +3709,7 @@ impl Studio {
         let Some(session) = self.video_project.as_ref() else {
             return;
         };
-        let path = session.screen_path();
+        let path = Self::media_source_for(session, false);
         self.video_extras_token = self.video_extras_token.wrapping_add(1);
         let token = self.video_extras_token;
         let task = cx.background_executor().spawn(async move {
