@@ -847,10 +847,51 @@ impl SegmentPipeline {
             .ok_or_else(|| "GStreamer pipeline has no screen encoder output".to_string())?;
         let has_video = Arc::new(AtomicBool::new(false));
         let received = has_video.clone();
-        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            received.store(true, Ordering::Release);
-            gst::PadProbeReturn::Remove
-        });
+        // videobox initially negotiates 1x1 before the first PipeWire buffer
+        // supplies its content rectangle. Audio can make matroskamux write
+        // that provisional size into its permanent header before video arrives.
+        // Keep only the latest caps, and deliver them with the first encoded
+        // frame, after stream_geometry has established the recording size.
+        let headers = Mutex::new(Some((None::<gst::Event>, Vec::<gst::Event>::new())));
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |pad, info| {
+                let mut headers = headers.lock().expect("screen headers poisoned");
+                let Some((caps, events)) = headers.as_mut() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                if let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() {
+                    match event.type_() {
+                        gst::EventType::Caps => {
+                            *caps = Some(event.clone());
+                            return gst::PadProbeReturn::Drop;
+                        }
+                        gst::EventType::Segment | gst::EventType::Tag => {
+                            // Sticky events can be retried while caps are held.
+                            events.retain(|previous| previous.type_() != event.type_());
+                            events.push(event.clone());
+                            return gst::PadProbeReturn::Drop;
+                        }
+                        gst::EventType::Eos => {}
+                        _ => return gst::PadProbeReturn::Ok,
+                    }
+                }
+                let (caps, events) = headers.take().unwrap();
+                drop(headers);
+                // Pushing reenters this probe; the drained state passes these
+                // events through. EOS also flushes headers for empty captures.
+                if let Some(caps) = caps {
+                    pad.push_event(caps);
+                }
+                for event in events {
+                    pad.push_event(event);
+                }
+                if matches!(info.data, Some(gst::PadProbeData::Buffer(_))) {
+                    received.store(true, Ordering::Release);
+                }
+                gst::PadProbeReturn::Remove
+            },
+        );
         Ok(Self {
             pipeline,
             failure: None,
@@ -1177,6 +1218,71 @@ fn finalize_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_cannot_commit_provisional_video_dimensions_to_the_recording_header() {
+        gst::init().unwrap();
+        let root = std::env::temp_dir().join(format!("lahza-recording-header-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        for rect in [None, Some((7, 9, 32, 20))] {
+            let path = root.join("screen.mkv");
+            let pipeline = gst::parse::launch(&format!(
+                "matroskamux name=mux ! filesink location=\"{}\" \
+                 appsrc name=screen_source is-live=true format=time \
+                 caps=video/x-raw,format=RGBA,width=64,height=48,framerate=30/1 ! \
+                 {} ! queue ! vp8enc name=screen_encoder deadline=1 cpu-used=8 \
+                 threads=4 target-bitrate=12000000 keyframe-max-dist=60 ! queue ! mux. \
+                 audiotestsrc is-live=true samplesperbuffer=480 ! audioconvert ! \
+                 audioresample ! opusenc name=audio_encoder ! queue ! mux.",
+                path.display(), stream_geometry::FILTER,
+            ))
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+            stream_geometry::attach(&pipeline, RecordingSize::default(), false).unwrap();
+            let audio_frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = audio_frames.clone();
+            pipeline.by_name("audio_encoder").unwrap().static_pad("src").unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    received.fetch_add(1, Ordering::Release);
+                    gst::PadProbeReturn::Ok
+                });
+            let video_pad = pipeline.by_name("screen_encoder").unwrap().static_pad("src").unwrap();
+            let mut segment = SegmentPipeline::new(pipeline.clone()).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            // Let audio reach the mux while video has negotiated caps but has
+            // not received the first buffer (and its possible crop metadata).
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while audio_frames.load(Ordering::Acquire) < 6 || video_pad.current_caps().is_none() {
+                assert!(Instant::now() < deadline, "initial negotiation must finish");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let source = pipeline.by_name("screen_source").unwrap();
+            for frame in 0..3 {
+                let mut buffer = gst::Buffer::from_mut_slice([20u8, 60, 100, 255].repeat(64 * 48));
+                let buffer_ref = buffer.get_mut().unwrap();
+                buffer_ref.set_pts(gst::ClockTime::from_mseconds(200 + frame * 34));
+                buffer_ref.set_duration(gst::ClockTime::from_nseconds(33_333_333));
+                if let Some(rect) = rect {
+                    gstreamer_video::VideoCropMeta::add(buffer_ref, rect);
+                }
+                assert_eq!(source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&buffer]), gst::FlowReturn::Ok);
+                thread::sleep(Duration::from_millis(34));
+            }
+            segment.wait_for_video(Duration::from_secs(2)).unwrap();
+            finalize_child(&mut segment).unwrap();
+            // Inspect the stored header directly: video::probe's recovery for
+            // old damaged recordings must not conceal a new capture regression.
+            let output = Command::new("ffprobe").args([
+                "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+            ]).arg(&path).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let expected = if rect.is_some() { "32x20" } else { "64x48" };
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recording_requires_video_before_reporting_ready() {

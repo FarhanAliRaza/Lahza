@@ -3556,6 +3556,7 @@ mod tests {
                 mirror: true,
                 margin: 5,
                 shadow: true,
+                center: None,
             },
             ..flat_style(0x000000)
         };

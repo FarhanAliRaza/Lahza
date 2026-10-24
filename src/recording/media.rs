@@ -204,7 +204,25 @@ pub fn append_media(
         },
     };
     let start = bank.info().duration;
-    let dimensions = image::image_dimensions(source).ok();
+    // Detect images from their contents, including AVIF and downloaded files
+    // with missing/misleading extensions. An unsupported image decoder must
+    // not send a still to the video probe, which requires a duration.
+    let reader = image::ImageReader::open(source)?.with_guessed_format()?;
+    let image_format = reader.format();
+    let mut decoded_still = None;
+    let dimensions = if image_format.is_some() {
+        Some(match reader.into_dimensions() {
+            Ok(dimensions) => dimensions,
+            Err(_) => {
+                let image = super::import_image::decode(source)?;
+                let dimensions = (image.width(), image.height());
+                decoded_still = Some(image);
+                dimensions
+            }
+        })
+    } else {
+        None
+    };
     let info = if let Some((width, height)) = dimensions {
         super::video::MediaInfo {
             width,
@@ -226,19 +244,19 @@ pub fn append_media(
     let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("bin");
     // Some image formats (notably GIF/AVIF) use video demuxers in FFmpeg,
     // which cannot loop a still. Normalize those once to a single PNG frame.
-    let normalize_still = dimensions.is_some()
-        && !matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff"
-        );
+    let normalize_still = image_format.is_some_and(|format| {
+        image::ImageFormat::from_extension(extension) != Some(format)
+            || !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg
+                | image::ImageFormat::WebP | image::ImageFormat::Bmp | image::ImageFormat::Tiff)
+    });
     let extension = if normalize_still { "png" } else { extension };
     let asset = PathBuf::from(format!("media/{id}.{extension}"));
     let destination = asset_path(session, &asset)?;
     // Keep a project-owned copy so moving/deleting the original cannot break edits.
     let copied = if normalize_still {
-        image::open(source)
-            .and_then(|image| image.save_with_format(&destination, image::ImageFormat::Png))
-            .map_err(|e| VideoError::Decode(e.to_string()))
+        decoded_still.map(Ok).unwrap_or_else(|| super::import_image::decode(source))
+            .and_then(|image| image.save_with_format(&destination, image::ImageFormat::Png)
+                .map_err(|e| VideoError::Decode(e.to_string())))
     } else {
         fs::copy(source, &destination)
             .map(|_| ())
@@ -557,6 +575,56 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn avif_and_misnamed_images_import_as_stills_and_export() {
+        use super::super::{media_bank::MediaBank, video::VideoFrameStream};
+        let project = Project::new();
+        let screen = project.video("screen.mkv", "red");
+        let original = fs::read(&screen).unwrap();
+        let png = project.0.directory.join("photo.png");
+        image::RgbaImage::from_pixel(40, 40, image::Rgba([0, 255, 0, 255]))
+            .save(&png).unwrap();
+        let avif = project.0.directory.join("photo.avif");
+        let output = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"]).arg(&png)
+            .args(["-frames:v", "1", "-c:v", "libaom-av1", "-cpu-used", "8", "-still-picture", "1"])
+            .arg(&avif).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let misnamed = project.0.directory.join("download.jpg");
+        fs::rename(&png, &misnamed).unwrap();
+        let extensionless = project.0.directory.join("download");
+        fs::copy(&misnamed, &extensionless).unwrap();
+        for source in [avif, misnamed, extensionless] {
+            let bytes = fs::read(&source).unwrap();
+            let (file, start, end) = append_media(&project.0, &source).unwrap();
+            assert!((end - start - 5.0).abs() < 1e-9);
+            let path = asset_path(&project.0, &file).unwrap();
+            let bank = MediaBank::load(&path).unwrap().unwrap();
+            let entry = bank.entries.last().unwrap();
+            assert!(entry.still);
+            assert!(!entry.info.has_audio);
+            assert_eq!((entry.info.width, entry.info.height), (40, 40));
+            assert_eq!(entry.file.extension().unwrap(), "png");
+            assert_eq!(fs::read(&source).unwrap(), bytes);
+            fs::remove_file(&source).unwrap();
+            let preview = decode_frame(&path, start + 0.2, 64, 36).unwrap();
+            let center = (18 * 64 + 32) * 4;
+            assert!(preview.rgba[center + 1] > 200 && preview.rgba[center] < 30);
+            let timeline = RecordingClipTimeline::new(vec![
+                RecordingClipSegment::new(start, start + 0.2),
+            ]);
+            let mut stream = VideoFrameStream::open_timeline(&path, &timeline, 64, 36, 30.0).unwrap();
+            let mut count = 0;
+            while let Some(frame) = stream.next_frame().unwrap() {
+                assert!(frame.rgba[center + 1] > 200);
+                count += 1;
+            }
+            assert_eq!(count, 6);
+            project.0.write_edit_field("mediaSource", &file).unwrap();
+        }
+        assert_eq!(fs::read(screen).unwrap(), original);
     }
 
     #[test]

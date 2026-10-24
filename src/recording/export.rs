@@ -1241,8 +1241,8 @@ mod tests {
         assert_eq!(ExportResolution::Original.canvas_height(900), 900);
         assert_eq!(ExportResolution::Original.canvas_height(300), 720);
         assert_eq!(ExportResolution::Uhd2160.canvas_height(300), 2160);
-        let small = estimate_size_bytes(ExportFormat::Mp4, 1280, 720, 30.0, 10.0);
-        let large = estimate_size_bytes(ExportFormat::Mp4, 1920, 1080, 60.0, 10.0);
+        let small = estimate_size_bytes(ExportFormat::Mp4, VideoCodec::H264, 1280, 720, 30.0, 10.0);
+        let large = estimate_size_bytes(ExportFormat::Mp4, VideoCodec::H264, 1920, 1080, 60.0, 10.0);
         assert!(small > 0 && large > small);
         assert_eq!(format_size(2 * 1_048_576), "2 MB");
         assert_eq!(format_size(512), "1 KB");

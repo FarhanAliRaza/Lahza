@@ -28,7 +28,7 @@ impl MediaBank {
         if !path.to_string_lossy().ends_with(".media.json") {
             return Ok(None);
         }
-        let bank: Self = serde_json::from_slice(&fs::read(path)?)
+        let mut bank: Self = serde_json::from_slice(&fs::read(path)?)
             .map_err(|e| VideoError::InvalidMedia(format!("invalid media index: {e}")))?;
         if bank.entries.is_empty()
             || bank.entries.iter().any(|entry| {
@@ -48,6 +48,29 @@ impl MediaBank {
             return Err(VideoError::InvalidMedia(
                 "invalid media index entries".into(),
             ));
+        }
+        // Old recording headers could report 1x1, and imported-media indexes
+        // cached that geometry. Repair only those placeholders in memory so
+        // existing projects benefit from the decoded-frame probe too.
+        for entry in &mut bank.entries {
+            if entry.info.width > 1 && entry.info.height > 1 {
+                continue;
+            }
+            let source = path.parent().unwrap_or_else(|| Path::new("")).join(&entry.file);
+            if source.to_string_lossy().ends_with(".media.json") {
+                return Err(VideoError::InvalidMedia(
+                    "media index entries must reference media files".into(),
+                ));
+            }
+            let (width, height) = if entry.still {
+                image::image_dimensions(&source)
+                    .map_err(|error| VideoError::Probe(error.to_string()))?
+            } else {
+                let info = video::probe_media(&source)?;
+                (info.width, info.height)
+            };
+            entry.info.width = width;
+            entry.info.height = height;
         }
         Ok(Some(bank))
     }
@@ -283,4 +306,61 @@ pub fn source_filter(
         if audio { "[audio]" } else { "" }
     ));
     Ok((inputs, filter))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placeholder_entry(file: &str, still: bool) -> MediaEntry {
+        MediaEntry {
+            file: file.into(),
+            still,
+            info: MediaInfo {
+                duration: 5.0,
+                width: 1,
+                height: 1,
+                frame_rate: 30.0,
+                has_audio: false,
+                window_capture: false,
+            },
+        }
+    }
+
+    #[test]
+    fn placeholder_dimensions_are_recovered_without_rewriting_the_index() {
+        let root = std::env::temp_dir().join(format!("lahza-bank-size-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.media.json");
+        image::RgbaImage::new(64, 48).save(root.join("still.png")).unwrap();
+        let mut healthy = placeholder_entry("unopened.mkv", false);
+        healthy.info.width = 160;
+        healthy.info.height = 90;
+        let bank = MediaBank {
+            entries: vec![placeholder_entry("still.png", true), healthy],
+        };
+        bank.save(&path).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let restored = MediaBank::load(&path).unwrap().unwrap();
+        let mut expected = bank.entries[0].info.clone();
+        expected.width = 64;
+        expected.height = 48;
+        assert_eq!(restored.entries[0].info, expected);
+        // Valid dimensions do not require opening the referenced asset.
+        assert_eq!(restored.entries[1].info, bank.entries[1].info);
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dimension_recovery_rejects_unsafe_paths_and_recursive_indexes() {
+        let root = std::env::temp_dir().join(format!("lahza-bank-path-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.media.json");
+        for file in ["../outside.mkv", "/outside.mkv", "source.media.json"] {
+            MediaBank { entries: vec![placeholder_entry(file, false)] }.save(&path).unwrap();
+            assert!(matches!(MediaBank::load(&path), Err(VideoError::InvalidMedia(_))));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

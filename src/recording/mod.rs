@@ -10,6 +10,7 @@ pub mod cursor_theme;
 pub mod export;
 mod export_encoder;
 pub mod input;
+pub(crate) mod import_image;
 pub mod model;
 pub mod media;
 pub mod media_bank;

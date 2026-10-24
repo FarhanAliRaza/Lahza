@@ -207,7 +207,8 @@ impl Studio {
                             .map(Imported::Audio)
                             .map_err(|e| e.to_string()),
                         ImportKind::Image => {
-                            let image = image::open(&source).map_err(|e| e.to_string())?;
+                            let image = crate::recording::import_image::decode(&source)
+                                .map_err(|e| e.to_string())?;
                             // Bound embedded overlay size while retaining transparent pixels.
                             let image = image.thumbnail(2560, 2560);
                             let mut bytes = std::io::Cursor::new(Vec::new());

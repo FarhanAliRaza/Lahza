@@ -77,7 +77,12 @@ struct ProbeFormat {
 }
 
 pub fn probe_media(path: &Path) -> Result<MediaInfo, VideoError> {
-    if let Some(bank) = super::media_bank::MediaBank::load(path)? { return Ok(bank.info()); }
+    probe_media_with_recovery(path).map(|(info, _)| info)
+}
+
+/// Also reports whether an old placeholder header required decoded dimensions.
+fn probe_media_with_recovery(path: &Path) -> Result<(MediaInfo, bool), VideoError> {
+    if let Some(bank) = super::media_bank::MediaBank::load(path)? { return Ok((bank.info(), false)); }
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -106,15 +111,17 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, VideoError> {
         .duration
         .parse::<f64>()
         .map_err(|_| VideoError::InvalidMedia("recording has no valid duration".into()))?;
-    let width = video
-        .width
-        .filter(|value| *value > 0)
-        .ok_or_else(|| VideoError::InvalidMedia("recording has no valid width".into()))?;
-    let height = video
-        .height
-        .filter(|value| *value > 0)
-        .ok_or_else(|| VideoError::InvalidMedia("recording has no valid height".into()))?;
-    Ok(MediaInfo {
+    // Older PipeWire recordings could mux an initial 1x1 negotiation into
+    // the container header while encoding full-size frames. Scaling from
+    // that header reduces otherwise intact recordings to a blurry 2x2 image.
+    let (width, height, recovered) = match (video.width, video.height) {
+        (Some(width), Some(height)) if width > 1 && height > 1 => (width, height, false),
+        _ => {
+            let (width, height) = probe_frame_dimensions(path)?;
+            (width, height, true)
+        }
+    };
+    Ok((MediaInfo {
         duration,
         width,
         height,
@@ -135,7 +142,39 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, VideoError> {
             .streams
             .iter()
             .any(|stream| stream.codec_type == "audio"),
-    })
+    }, recovered))
+}
+
+fn probe_frame_dimensions(path: &Path) -> Result<(u32, u32), VideoError> {
+    #[derive(Deserialize)]
+    struct FrameDimensions {
+        width: u32,
+        height: u32,
+    }
+    #[derive(Deserialize)]
+    struct Frames {
+        frames: Vec<FrameDimensions>,
+    }
+    // Decode only the first video packet, not the whole recording. Stream
+    // metadata alone can keep reporting the muxer's placeholder dimensions.
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+            "-show_entries", "frame=width,height", "-of", "json",
+        ])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(VideoError::Probe(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let probe: Frames = serde_json::from_slice(&output.stdout)
+        .map_err(|error| VideoError::Probe(error.to_string()))?;
+    probe.frames.into_iter()
+        .find(|frame| frame.width > 0 && frame.height > 0)
+        .map(|frame| (frame.width, frame.height))
+        .ok_or_else(|| VideoError::InvalidMedia("recording has no valid frame dimensions".into()))
 }
 
 pub fn decode_frame(
@@ -191,7 +230,14 @@ pub fn write_poster(
     )?;
     let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
         .ok_or_else(|| VideoError::Decode("decoded poster had an invalid byte count".into()))?;
-    let image = image::DynamicImage::ImageRgba8(image).thumbnail(maximum_width, maximum_height);
+    let image = image::DynamicImage::ImageRgba8(image);
+    // Ordinary frames are already fitted by decode_frame. Only native
+    // window frames bypass that scaling to preserve their alpha crop.
+    let image = if info.window_capture {
+        image.thumbnail(maximum_width, maximum_height)
+    } else {
+        image
+    };
     let (image, format) = if destination.extension().is_some_and(|ext| ext == "png") {
         (image, image::ImageFormat::Png)
     } else {
@@ -214,13 +260,19 @@ pub fn load_or_rebuild_poster(
     maximum_width: u32,
     maximum_height: u32,
 ) -> Result<image::RgbaImage, VideoError> {
-    if probe_media(video_path)?.window_capture {
+    let (info, recovered_dimensions) = probe_media_with_recovery(video_path)?;
+    if info.window_capture {
         let frame = decode_frame(video_path, 0.1, maximum_width, maximum_height)?;
         return image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
             .ok_or_else(|| VideoError::Decode("invalid window preview pixels".into()));
     }
+    let expected_size = decode_dimensions(&info, maximum_width, maximum_height);
     if let Ok(poster) = image::open(poster_path) {
-        return Ok(poster.to_rgba8());
+        // A tiny decoded frame may have been enlarged before caching. For
+        // square recordings even its poster dimensions can look correct.
+        if !recovered_dimensions && (poster.width(), poster.height()) == expected_size {
+            return Ok(poster.to_rgba8());
+        }
     }
     if write_poster(video_path, poster_path, maximum_width, maximum_height).is_ok() {
         if let Ok(poster) = image::open(poster_path) {
@@ -1424,6 +1476,71 @@ mod tests {
         assert_eq!((frame.width, frame.height), (160, 90));
         assert_eq!(frame.rgba.len(), 160 * 90 * 4);
         assert!(frame.rgba.iter().any(|value| *value != 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn placeholder_container_dimensions_recover_frames_and_cached_posters() {
+        use crate::recording::{clips::RecordingClipSegment, playback::TimelinePlaybackStream};
+        let root = std::env::temp_dir().join(format!("lahza-placeholder-size-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("screen.mkv");
+        let output = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10:duration=1",
+                "-c:v", "libvpx", "-deadline", "realtime",
+            ])
+            .arg(&path)
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        // Reproduce an old recording: Matroska PixelWidth/PixelHeight say
+        // 1x1, but the VP8 keyframes contain the complete 64x48 picture.
+        let mut bytes = fs::read(&path).unwrap();
+        let dimensions = [0xb0, 0x81, 64, 0xba, 0x81, 48];
+        let offsets: Vec<_> = bytes.windows(dimensions.len()).enumerate()
+            .filter_map(|(i, window)| (window == dimensions).then_some(i)).collect();
+        assert_eq!(offsets.len(), 1);
+        bytes[offsets[0] + 2] = 1;
+        bytes[offsets[0] + 5] = 1;
+        fs::write(&path, bytes).unwrap();
+
+        let info = probe_media(&path).unwrap();
+        assert_eq!((info.width, info.height), (64, 48));
+        let bank_path = root.join("source.media.json");
+        let mut cached_info = info.clone();
+        cached_info.width = 1;
+        cached_info.height = 1;
+        super::super::media_bank::MediaBank {
+            entries: vec![super::super::media_bank::MediaEntry {
+                file: "screen.mkv".into(), info: cached_info, still: false,
+            }],
+        }.save(&bank_path).unwrap();
+        let bank_info = probe_media(&bank_path).unwrap();
+        assert_eq!((bank_info.width, bank_info.height), (64, 48));
+        let frame = decode_frame(&path, 0.2, 32, 24).unwrap();
+        assert_eq!((frame.width, frame.height), (32, 24));
+        assert!(frame.rgba.chunks_exact(4).any(|pixel| pixel != &frame.rgba[..4]));
+        let bank_frame = decode_frame(&bank_path, 0.2, 32, 24).unwrap();
+        assert_eq!(bank_frame, frame);
+        let timeline = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.0, 0.8)]);
+        let mut playback = TimelinePlaybackStream::open(&path, timeline, 0.0, 32, 24, true).unwrap();
+        let frame = playback.next_frame(|| false).unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), (32, 24));
+        playback.stop();
+
+        let poster = root.join("poster.png");
+        // The old writer could also upscale its broken square thumbnail.
+        for (width, height) in [(2, 2), (24, 24), (32, 24)] {
+            image::RgbaImage::from_pixel(width, height, image::Rgba([9, 9, 9, 255]))
+                .save(&poster).unwrap();
+            let recovered = load_or_rebuild_poster(&path, &poster, 32, 24).unwrap();
+            assert_eq!(recovered.dimensions(), (32, 24));
+            assert!(recovered.pixels().any(|pixel| pixel.0 != [9, 9, 9, 255]));
+            assert_eq!(image::image_dimensions(&poster).unwrap(), (32, 24));
+        }
+        // A valid small source should not be enlarged just to fill the budget.
+        write_poster(&path, &poster, 1280, 720).unwrap();
+        assert_eq!(image::image_dimensions(&poster).unwrap(), (64, 48));
         fs::remove_dir_all(root).unwrap();
     }
 
