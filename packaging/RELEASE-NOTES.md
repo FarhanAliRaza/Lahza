@@ -4,13 +4,17 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Keep the timeline scale and parked playhead stable while trimming. Retained frames and neighboring clips stay at their existing times; trimmed space becomes a gap instead of shifting the video.
-- Snap trim handles to the playhead so the chosen frame remains an exact trim target. Short clips retain a draggable center between their trim handles.
-- Scroll beyond the recording and place clips elsewhere on the timeline without automatically fitting the video to the viewport. Audio, camera, motion, and annotation lanes use the same time scale.
-- Click a clip to select it and move the playhead on release, matching Cap's click behavior. Drag the clip body to reposition it without scrubbing, or drag the ruler to scrub.
-- Finish clip moves when released outside the clip, preserve undo/redo and saved placement, and keep minimum-length trims intact when saving.
+- Add a draggable teleprompter that follows your voice, with improved word highlighting and recovery after misheard speech. Speech setup includes Auto, GPU, and CPU processing, a bundled Whisper runtime, and persistent diagnostic logs.
+- Transcribe narration locally into subtitles with spoken-word highlighting, then edit footage by transcript, remove filler words, or trim pauses.
+- Add Classic zoom and Glass loupe motion, camera response presets, improved cursor movement, and editable automatic click zooms.
+- Preserve native recording detail in playback, settled previews, zooms, and glass lenses. Compatible Vulkan GPUs can enhance enlarged regions in paused previews and exports; original-source rendering remains available as a fallback.
+- Add webcam Overlay, Fullscreen, and Split layouts, source cropping and focus, and freely draggable camera placement with snap guides. Expand canvas presets and support custom proportions.
+- Add display, window, and area recording modes with a cancellable countdown. Floating recording controls and the camera monitor follow the selected display; GNOME capture protection keeps them and the prompter out of screen recordings when the helper is available.
+- Import video, images, and audio into editable timeline layers. Drag Music / SFX, clips, and motion regions, and zoom the timeline out to 0.1× while preserving playhead placement.
+- Add keystroke captions, speed badges, HEVC, motion blur, audio-only exports, and sharing through a self-hosted upload worker.
+- Reorganize editing controls into dedicated panels and move playback composition off the UI thread. Fix recording dimensions, AVIF imports, camera device selection, and recording-overlay placement.
 
-Validation includes automated clip and timeline regression tests plus native X11 mouse interaction under Xvfb, covering click-to-seek, clip dragging, undo/redo, and persisted placement. The release workflow runs the Rust and packaging suites and confined Snap smoke checks for the versioned packages.
+Validation includes Rust and packaging regressions, native editor workflows covering save/reopen and encoded exports, GPU/CPU rendering comparisons, and replayed Whisper output. The release workflow runs the Rust and packaging suites and confined Snap smoke checks for the versioned packages.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
@@ -51,14 +55,15 @@ cd lahza-0.5.9-linux-x86_64
 ./install.sh
 ```
 
-This installs the binary, assets, desktop entry, and icon into `~/.local`. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/lahza` from the extracted bundle. The bundle uses system libraries; it is not a statically linked or universally portable build.
+This installs the binary, bundled Whisper runtime, assets, desktop entry, and icon into `~/.local`. Speech models download during setup. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/lahza` from the extracted bundle. The bundle uses system libraries; it is not a statically linked or universally portable build.
 
 On Ubuntu, install the bundle's runtime dependencies with:
 
 ```bash
 sudo apt install ffmpeg gstreamer1.0-pipewire gstreamer1.0-plugins-good \
   gstreamer1.0-tools gstreamer1.0-libav gstreamer1.0-plugins-base-apps libgstreamer1.0-0 \
-  libpipewire-0.3-0 libx11-6 libxkbcommon-x11-0 libxkbcommon0 xdg-desktop-portal
+  libpipewire-0.3-0 libx11-6 libxkbcommon-x11-0 libxkbcommon0 \
+  libsdl2-2.0-0 libvulkan1 libgomp1 xdg-desktop-portal
 ```
 
 A Vulkan-capable desktop, PipeWire, and the portal backend for your desktop are required. Packages are built on Ubuntu 24.04 for x86_64; older distributions may need a source build.
