@@ -47,6 +47,7 @@ mod video;
 mod media_ui;
 mod overlays_ui;
 mod transcript_ui;
+mod speech_ui;
 mod teleprompter_ui;
 mod recording_overlay_ui;
 mod recording_overlay_drag;
@@ -410,6 +411,12 @@ struct Studio {
     video_transcript_revision: u64,
     video_overlay_cache: Option<(overlays_ui::OverlayKey, Arc<recording::studio_overlays::StudioOverlays>)>,
     speech_model: recording::transcription::SpeechModel,
+    speech_processing: recording::speech_runtime::ProcessingMode,
+    speech_runtime_status: recording::speech_runtime::RuntimeStatus,
+    speech_setup_job: Option<recording::transcription::JobProgress>,
+    speech_setup_installing: bool,
+    speech_processing_status: Option<String>,
+    subtitle_speech_advanced_open: bool,
     transcription_job: Option<transcript_ui::TranscriptionJob>,
     /// The transcript editor replaces the Record tab while open.
     transcript_open: bool,
@@ -417,8 +424,8 @@ struct Studio {
     /// Selected word range (anchor, head) in transcript word indices.
     transcript_selection: Option<(usize, usize)>,
     teleprompter: recording::teleprompter::TeleprompterSettings,
+    teleprompter_advanced_open: bool,
     prompter_window: Option<teleprompter_ui::PrompterHandle>,
-    voice_model_download: Option<recording::transcription::JobProgress>,
     cloud: recording::cloud::CloudSettings,
     /// The sharing server form is open.
     cloud_editing: bool,
@@ -596,6 +603,7 @@ impl Studio {
             if weak
                 .update(cx, |this, cx| {
                     this.reconcile_recording_lifecycle(cx);
+                    this.refresh_speech_processing(cx);
                     if this.recording_state == RecordingState::Recording
                         && !this.recording_window_minimized
                     {
@@ -763,13 +771,19 @@ impl Studio {
             video_transcript_revision: 0,
             video_overlay_cache: None,
             speech_model: Default::default(),
+            speech_processing: recording::speech_runtime::load_processing_mode(),
+            speech_runtime_status: recording::speech_runtime::current_status(),
+            speech_setup_job: None,
+            speech_setup_installing: false,
+            speech_processing_status: None,
+            subtitle_speech_advanced_open: false,
             transcription_job: None,
             transcript_open: false,
             transcript_selected_cue: None,
             transcript_selection: None,
             teleprompter: recording::teleprompter::TeleprompterSettings::load(),
+            teleprompter_advanced_open: false,
             prompter_window: None,
-            voice_model_download: None,
             cloud: recording::cloud::CloudSettings::load(),
             cloud_editing: false,
             share_title: String::new(),
@@ -854,6 +868,7 @@ impl Studio {
         } else {
             loading::LoadRequest::Launch
         };
+        studio.initialize_speech_processing(cx);
         studio.start_loading(request, true, cx);
         studio
     }

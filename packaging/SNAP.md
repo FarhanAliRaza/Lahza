@@ -3,7 +3,8 @@
 The Snap configuration is `snap/snapcraft.yaml`. It builds an amd64, strictly
 confined package on Ubuntu 24.04 (`core24`), taking its version from `Cargo.toml`.
 The GNOME extension supplies desktop integration and the graphics runtime.
-FFmpeg, GStreamer tools/plugins, PipeWire modules, and Lahza assets are bundled.
+FFmpeg, GStreamer tools/plugins, PipeWire modules, the matched Whisper CPU/Vulkan
+runtime, and Lahza assets are bundled. Speech models download on first setup.
 
 ## Build
 
@@ -16,6 +17,8 @@ source copy to avoid copying Cargo's large local target directory:
 ```bash
 cargo build --release --locked
 install -Dm755 target/release/lahza prebuilt/lahza
+# Build dependencies: cmake, g++, make, curl, libsdl2-dev, libvulkan-dev, glslc.
+packaging/build-whisper-runtime.sh prebuilt/whisper
 build_dir="$(mktemp -d /tmp/lahza-snap.XXXXXX)"
 rsync -a --exclude=/.git --exclude=/.agents --exclude=/.codex \
   --exclude=/target --exclude=/parts --exclude=/stage --exclude=/prime \
@@ -53,7 +56,7 @@ snap run --shell lahza -c 'exec "$SNAP/snap/command-chain/gpu-2404-wrapper" "$SN
   < packaging/snap-smoke-test.sh
 ```
 
-This checks the bundled tools, plugins, PipeWire modules, VP8/Opus recording,
+This checks Whisper CLI/stream startup, bundled tools, plugins, PipeWire modules, VP8/Opus recording,
 H.264/AAC export, and frame decoding without recording any real devices.
 
 Lahza checks camera and audio-record access when a device toggle or picker is

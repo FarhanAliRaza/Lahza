@@ -31,14 +31,14 @@ impl Studio {
     // ------------------------------------------------------------------
 
     pub(crate) fn start_transcription(&mut self, cx: &mut Context<Self>) {
-        if self.transcription_job.is_some() || self.video_edit_busy {
+        if self.transcription_job.is_some() || self.video_edit_busy || self.speech_setup_job.is_some() {
             return;
         }
         let Some(session) = self.video_project.clone() else {
             return;
         };
         if transcription::whisper_executable().is_none() {
-            self.toast = Some("Install whisper.cpp to transcribe: sudo apt install whisper.cpp".into());
+            self.toast = Some("Set up voice recognition in Processing before transcribing.".into());
             cx.notify();
             return;
         }
@@ -390,7 +390,29 @@ impl Studio {
 
     /// Record → Subtitles.
     pub(crate) fn subtitle_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut section = div().flex().flex_col().gap_2();
+        let mut section = div().flex().flex_col().gap_2()
+            .child(
+                div().id("subtitle-speech-advanced")
+                    .flex().items_center().gap_1().py_1()
+                    .text_xs().text_color(muted()).cursor_pointer()
+                    .hover(|style| style.text_color(blue()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.subtitle_speech_advanced_open = !this.subtitle_speech_advanced_open;
+                        cx.notify();
+                    }))
+                    .child(gpui::svg().path(if self.subtitle_speech_advanced_open {
+                        "icons/chevron-down.svg"
+                    } else {
+                        "icons/chevron-right.svg"
+                    }).size(px(12.0)).text_color(muted()))
+                    .child("Advanced"),
+            )
+            .when(self.subtitle_speech_advanced_open, |section| {
+                section.child(self.speech_processing_controls("subtitle-processing", cx))
+            })
+            .when(!self.subtitle_speech_advanced_open, |section| {
+                section.children(self.speech_setup_notice("subtitle-setup-notice", cx))
+            });
         if let Some(job) = self.transcription_job.as_ref() {
             let percent = (job.progress.get() * 100.0).round();
             let label = if job.downloading.load(Ordering::Relaxed) {
@@ -428,19 +450,8 @@ impl Studio {
             if !installed {
                 return section
                     .child(div().text_xs().text_color(muted()).child(
-                        "Transcription uses whisper.cpp. Install it, then come back:",
+                        "Set up voice recognition above to transcribe this recording.",
                     ))
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(0xf4f4f5))
-                            .font_family("monospace")
-                            .text_xs()
-                            .child("sudo apt install whisper.cpp"),
-                    )
-                    .child(self.text_button("transcribe-recheck", "Check again", true, false, cx, |_, _| {}))
                     .into_any_element();
             }
             let selected = SpeechModel::ALL.iter().position(|m| *m == model).unwrap_or(0);
@@ -464,7 +475,7 @@ impl Studio {
                 .child(self.text_button(
                     "transcribe-start",
                     label,
-                    !self.video_edit_busy,
+                    !self.video_edit_busy && self.speech_setup_job.is_none(),
                     true,
                     cx,
                     |this, cx| this.start_transcription(cx),

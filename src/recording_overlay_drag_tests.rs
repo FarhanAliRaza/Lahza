@@ -595,3 +595,70 @@ fn native_pointer_drag_moves_recording_overlays_and_preserves_recording_state() 
             .detach();
         });
 }
+
+#[test]
+#[ignore = "requires X11/XWayland and XTEST; run with WAYLAND_DISPLAY unset (Xvfb supported)"]
+fn native_pointer_drag_moves_teleprompter_header_without_moving_script_clicks() {
+    let pointer = NativePointer::new();
+    Application::new()
+        .with_assets(Assets { base: asset_directory() })
+        .run(move |cx| {
+            let launcher = open_studio_window(cx, false, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            let owner = launcher.entity(cx).unwrap();
+            let (prompter, exclusion) = owner.update(cx, |studio, cx| {
+                studio.load_generation = studio.load_generation.wrapping_add(1);
+                studio.loading = None;
+                studio.record_microphone = false;
+                studio.teleprompter = crate::recording::teleprompter::TeleprompterSettings {
+                    enabled: true,
+                    follow_voice: false,
+                    script: "Alpha beta gamma delta epsilon\nZeta eta theta iota kappa\nLambda mu nu xi omicron".into(),
+                    ..Default::default()
+                };
+                studio.recording_state = RecordingState::Recording;
+                let exclusion = studio.open_prompter(cx).unwrap().unwrap();
+                (studio.prompter_window.unwrap(), exclusion)
+            });
+            cx.spawn(async move |cx| {
+                settle().await;
+                let title = exclusion.title().to_owned();
+                let id = pointer.find_window(&title)
+                    .expect("native teleprompter window with exact request title+PID");
+                pointer.force_configure(id);
+                settle().await;
+                draw_overlay(prompter.into(), cx).await;
+
+                drag(&pointer, id, (0.08, 0.08), "teleprompter header label").await;
+                drag(&pointer, id, (0.88, 0.08), "teleprompter header status").await;
+
+                // Script words remain click targets; pressing and moving on
+                // the script must not turn a seek into a native window drag.
+                let before = pointer.origin(id);
+                let word = pointer.point(id, (0.10, 0.28));
+                pointer.motion_wait(word.0, word.1).await;
+                settle().await;
+                pointer.button_wait(true).await;
+                pointer.motion_wait(word.0 + 30, word.1 + 20).await;
+                pointer.button_wait(false).await;
+                settle().await;
+                assert_eq!(pointer.origin(id), before, "script press incorrectly moved the teleprompter");
+
+                assert_eq!(pointer.find_window(&title), Some(id), "drag replaced the protected window");
+                assert_eq!(exclusion.title(), title);
+                owner.update(cx, |studio, cx| {
+                    assert_eq!(studio.recording_state, RecordingState::Recording);
+                    assert_eq!(studio.prompter_window, Some(prompter));
+                    assert!(!studio.record_microphone);
+                    studio.close_prompter(cx);
+                    studio.recording_state = RecordingState::Idle;
+                }).unwrap();
+                settle().await;
+                assert_eq!(pointer.find_window(&title), None);
+                drop(exclusion);
+                drop(pointer);
+                cx.update(|cx| cx.quit()).unwrap();
+            }).detach();
+        });
+}

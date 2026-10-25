@@ -11,6 +11,9 @@ test -d "$SPA_PLUGIN_DIR/support"
 command -v ffmpeg
 command -v ffprobe
 command -v gst-play-1.0
+env -u GGML_BACKEND_PATH "$SNAP/lib/lahza/whisper/bin/whisper-cli" --help >/dev/null 2>&1
+env -u GGML_BACKEND_PATH "$SNAP/lib/lahza/whisper/bin/whisper-stream" --help >/dev/null 2>&1
+test -f "$SNAP/lib/lahza/whisper/lib/libggml-vulkan.so"
 
 for element in pipewiresrc pulsesrc v4l2src vp8enc opusenc matroskamux \
   avenc_ffv1 avdec_ffv1 capssetter videocrop videoscale videobox \

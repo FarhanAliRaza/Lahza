@@ -56,6 +56,10 @@ parts:
     plugin: nil
     source: .
     stage-packages:
+      - curl
+      - libsdl2-2.0-0
+      - libvulkan1
+      - libgomp1
       - ffmpeg
       - gstreamer1.0-tools
       - gstreamer1.0-plugins-base-apps
@@ -69,7 +73,10 @@ parts:
     override-build: |
       craftctl default
       test -f prebuilt/lahza || { echo "prebuilt/lahza is missing; see packaging/SNAP.md" >&2; exit 1; }
+      test -x prebuilt/whisper/bin/whisper-stream || { echo "Run packaging/build-whisper-runtime.sh prebuilt/whisper first; see packaging/SNAP.md" >&2; exit 1; }
       install -Dm755 prebuilt/lahza "$CRAFT_PART_INSTALL/bin/lahza"
+      install -d "$CRAFT_PART_INSTALL/lib/lahza/whisper"
+      cp -a prebuilt/whisper/. "$CRAFT_PART_INSTALL/lib/lahza/whisper/"
       craftctl set version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
       install -Dm644 packaging/com.lahza.Lahza.desktop "$CRAFT_PART_INSTALL/share/applications/com.lahza.Lahza.desktop"
       install -Dm644 assets/Lahza.png "$CRAFT_PART_INSTALL/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"

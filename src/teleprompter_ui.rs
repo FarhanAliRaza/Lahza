@@ -2,9 +2,11 @@
 //! shown while recording. The prompter scrolls with the speaker's voice
 //! when whisper.cpp is available, and by hand (mouse wheel, clicking a
 //! word) always.
-use crate::recording::teleprompter::{ScriptLayout, SpeechFollower, TeleprompterSettings};
+use crate::recording::teleprompter::{
+    ScriptLayout, SpeechFollower, SpeechStatus, TeleprompterSettings,
+};
 use crate::recording::capture_exclusion::CaptureExclusion;
-use crate::recording::transcription::{self, JobProgress, SpeechModel};
+use crate::recording_overlay_drag::OverlayDrag;
 use crate::{blue, line, muted, Studio};
 use gpui::{
     div, point, prelude::*, px, rgb, size, AnyElement, Bounds, Context, FontWeight,
@@ -20,9 +22,53 @@ const PROMPTER_WIDTH: f32 = 760.0;
 const HEADER_HEIGHT: f32 = 28.0;
 const PADDING: f32 = 14.0;
 
+fn voice_status_text(status: SpeechStatus) -> SharedString {
+    match status {
+        SpeechStatus::Starting => "Starting voice follow…".into(),
+        SpeechStatus::Listening(device) => format!("Following your voice · {device}").into(),
+        SpeechStatus::Paused(device) => format!("Voice follow paused · {device}").into(),
+        SpeechStatus::Failed(reason) => format!("Voice follow stopped: {reason} · scroll to advance").into(),
+    }
+}
+
+/// Recognition publishes a count, so the active word is the last one
+/// matched. Before speech starts, cue the first word of a nonempty script.
+fn highlighted_word(layout: &ScriptLayout, spoken: usize) -> Option<usize> {
+    let last = layout.word_count().checked_sub(1)?;
+    Some(spoken.saturating_sub(1).min(last))
+}
+
+fn highlighted_line(layout: &ScriptLayout, spoken: usize) -> usize {
+    highlighted_word(layout, spoken).map_or(0, |word| layout.line_of(word))
+}
+
+/// Speech updates arrive outside GPUI. Invalidate the view for each new
+/// word, including words that do not move the current line.
+fn update_reading_position(
+    layout: &ScriptLayout,
+    position: usize,
+    previous_position: &mut usize,
+    shown_line: &mut f32,
+) -> bool {
+    let mut changed = position != *previous_position;
+    *previous_position = position;
+    let target = highlighted_line(layout, position) as f32;
+    let delta = target - *shown_line;
+    if delta.abs() > 0.002 {
+        // Ease toward the reading line rather than jumping.
+        *shown_line += delta * 0.22;
+        if (target - *shown_line).abs() < 0.002 {
+            *shown_line = target;
+        }
+        changed = true;
+    }
+    changed
+}
+
 /// The prompter window's view.
 pub(crate) struct Prompter {
     exclusion: CaptureExclusion,
+    drag: OverlayDrag,
     layout: ScriptLayout,
     font_size: f32,
     /// Script words read so far; written by the follower and by hand.
@@ -39,7 +85,14 @@ impl Prompter {
         (self.font_size * 1.45).round()
     }
 
-    fn new(settings: &TeleprompterSettings, microphone: bool, exclusion: CaptureExclusion, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        settings: &TeleprompterSettings,
+        microphone: bool,
+        microphone_device: Option<&str>,
+        exclusion: CaptureExclusion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let font_size = settings.font_size.clamp(16.0, 48.0);
         let text_width = PROMPTER_WIDTH - PADDING * 2.0;
         let font = gpui::font("Inter");
@@ -60,13 +113,16 @@ impl Prompter {
         } else if !microphone {
             (None, "Microphone is off · scroll to advance".into())
         } else {
-            match SpeechFollower::start(&settings.script, position.clone()) {
-                Ok(follower) => (Some(follower), "Following your voice".into()),
+            match SpeechFollower::start(
+                &settings.script, position.clone(), microphone_device, &settings.voice_language,
+            ) {
+                Ok(follower) => (Some(follower), voice_status_text(SpeechStatus::Starting)),
                 Err(reason) => (None, format!("Voice follow unavailable: {reason} · scroll to advance").into()),
             }
         };
         let window_handle = window.window_handle();
         let mut checked_protection = Instant::now();
+        let mut previous_position = 0;
         let ticker = cx.spawn(async move |weak, cx| loop {
             Timer::after(Duration::from_millis(33)).await;
             let keep_open = weak
@@ -80,15 +136,20 @@ impl Prompter {
                             // exposed frames while we notice its disappearance.
                             return false;
                         }
-                    }
-                    let target = this.layout.reading_line(this.position.load(Ordering::Relaxed)) as f32;
-                    let delta = target - this.shown_line;
-                    if delta.abs() > 0.002 {
-                        // Ease toward the reading line rather than jumping.
-                        this.shown_line += delta * 0.22;
-                        if (target - this.shown_line).abs() < 0.002 {
-                            this.shown_line = target;
+                        if let Some(follower) = this.follower.as_mut() {
+                            let status = voice_status_text(follower.status());
+                            if status != this.status {
+                                this.status = status;
+                                cx.notify();
+                            }
                         }
+                    }
+                    if update_reading_position(
+                        &this.layout,
+                        this.position.load(Ordering::Relaxed),
+                        &mut previous_position,
+                        &mut this.shown_line,
+                    ) {
                         cx.notify();
                     }
                     true
@@ -101,6 +162,7 @@ impl Prompter {
         });
         Self {
             exclusion,
+            drag: OverlayDrag::default(),
             layout,
             font_size,
             position,
@@ -129,15 +191,15 @@ impl Prompter {
         if lines.abs() < 0.3 || self.layout.is_empty() {
             return;
         }
-        let current = self.layout.reading_line(self.position.load(Ordering::Relaxed));
+        let current = highlighted_line(&self.layout, self.position.load(Ordering::Relaxed));
         let target = if lines > 0.0 {
             (current + 1).min(self.layout.lines.len() - 1)
         } else {
             current.saturating_sub(1)
         };
-        // Position at the start of the target line.
+        // Store a spoken-word count so the target line's first word is active.
         let first_word = self.layout.lines[target].first().map_or(0, |word| word.index);
-        self.position.store(first_word, Ordering::Relaxed);
+        self.position.store(first_word + 1, Ordering::Relaxed);
         cx.notify();
     }
 }
@@ -146,6 +208,7 @@ impl Render for Prompter {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let line_height = self.line_height();
         let position = self.position.load(Ordering::Relaxed);
+        let active_word = highlighted_word(&self.layout, position);
         let offset = self.shown_line * line_height;
         let accent = rgb(0xffd60a);
         let mut column = div().absolute().left_0().right_0().top(px(-offset)).flex().flex_col();
@@ -158,17 +221,17 @@ impl Render for Prompter {
                         .id(("prompter-word", index))
                         .text_size(px(self.font_size))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(if index < position {
-                            gpui::hsla(0.0, 0.0, 1.0, 0.38)
-                        } else if index == position {
+                        .text_color(if Some(index) == active_word {
                             accent.into()
+                        } else if index < position {
+                            gpui::hsla(0.0, 0.0, 1.0, 0.38)
                         } else {
                             gpui::white()
                         })
                         .cursor_pointer()
                         .child(word.text.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.position.store(index, Ordering::Relaxed);
+                            this.position.store(index + 1, Ordering::Relaxed);
                             cx.notify();
                         })),
                 );
@@ -182,6 +245,8 @@ impl Render for Prompter {
             .font_family("Inter")
             .bg(rgb(0x111214))
             .text_color(gpui::white())
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag.end()))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.drag.end()))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.scroll(event, cx)))
             .child(
                 div()
@@ -195,9 +260,18 @@ impl Render for Prompter {
                     .text_xs()
                     .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.55))
                     .cursor(gpui::CursorStyle::OpenHand)
-                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-                    .child("Teleprompter")
-                    .child(self.status.clone()),
+                    .tooltip(crate::timeline_ui::tooltip("Drag to move teleprompter"))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event, window, cx| {
+                        this.drag.begin(this.exclusion.title(), event, window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div().flex().items_center().gap_2()
+                            .child(div().text_size(px(16.0)).child("⠿"))
+                            .child("Teleprompter"),
+                    )
+                    .child(div().id("teleprompter-runtime-status").min_w_0().ml_3().truncate().child(self.status.clone())
+                        .tooltip(crate::timeline_ui::tooltip(self.status.clone()))),
             )
             .child(
                 div()
@@ -223,6 +297,7 @@ impl Studio {
         let exclusion = CaptureExclusion::new()?;
         let window_exclusion = exclusion.clone();
         let microphone = self.record_microphone;
+        let microphone_device = self.microphone_device.clone();
         let width = px(PROMPTER_WIDTH);
         let height = px(Prompter::window_height(settings.lines, settings.font_size));
         // Top center of the main screen, close to where a webcam sits.
@@ -252,7 +327,9 @@ impl Studio {
             },
             move |window, cx| {
                 window.set_window_title(window_exclusion.title());
-                cx.new(|cx| Prompter::new(&settings, microphone, window_exclusion, window, cx))
+                cx.new(|cx| Prompter::new(
+                    &settings, microphone, microphone_device.as_deref(), window_exclusion, window, cx,
+                ))
             },
         );
         match result {
@@ -270,10 +347,13 @@ impl Studio {
         if let Some(handle) = self.prompter_window {
             let settings = self.teleprompter.clone();
             let microphone = self.record_microphone;
+            let microphone_device = self.microphone_device.clone();
             let _ = handle.update(cx, |prompter, window, cx| {
                 let exclusion = prompter.exclusion.clone();
                 drop(prompter.follower.take());
-                *prompter = Prompter::new(&settings, microphone, exclusion, window, cx);
+                *prompter = Prompter::new(
+                    &settings, microphone, microphone_device.as_deref(), exclusion, window, cx,
+                );
             });
         }
     }
@@ -343,46 +423,6 @@ impl Studio {
         }
     }
 
-    fn download_voice_model(&mut self, cx: &mut Context<Self>) {
-        if self.voice_model_download.is_some() {
-            return;
-        }
-        let progress = JobProgress::default();
-        self.voice_model_download = Some(progress.clone());
-        let job = progress.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { transcription::download_model(SpeechModel::Base, &job).map(|_| ()) });
-        let ticker = progress.clone();
-        cx.spawn(async move |weak, cx| loop {
-            Timer::after(Duration::from_millis(200)).await;
-            let active = weak
-                .update(cx, |this, cx| {
-                    cx.notify();
-                    this.voice_model_download
-                        .as_ref()
-                        .is_some_and(|active| Arc::ptr_eq(&active.fraction, &ticker.fraction))
-                })
-                .unwrap_or(false);
-            if !active {
-                break;
-            }
-        })
-        .detach();
-        cx.spawn(async move |weak, cx| {
-            let result = task.await;
-            let _ = weak.update(cx, |this, cx| {
-                this.voice_model_download = None;
-                this.toast = Some(match result {
-                    Ok(()) => "Voice model ready".into(),
-                    Err(error) => format!("Could not download the voice model: {error}").into(),
-                });
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn launcher_button(
         &self,
         id: &'static str,
@@ -447,19 +487,8 @@ impl Studio {
         if !settings.enabled || recording {
             return row;
         }
-        let voice = if !settings.follow_voice {
-            None
-        } else if transcription::whisper_executable().is_none() {
-            Some("Install whisper.cpp to scroll with your voice: sudo apt install whisper.cpp".to_string())
-        } else if let Some(download) = self.voice_model_download.as_ref() {
-            Some(format!("Downloading voice model… {:.0}%", download.get() * 100.0))
-        } else if !SpeechModel::Base.is_installed() {
-            Some(format!("Scrolling with your voice needs a {} MB model.", SpeechModel::Base.megabytes()))
-        } else if !self.record_microphone {
-            Some("Turn on the microphone to scroll with your voice.".into())
-        } else {
-            None
-        };
+        let voice = (settings.follow_voice && !self.record_microphone)
+            .then_some("Microphone off");
         let preview: String = settings
             .script
             .split_whitespace()
@@ -535,24 +564,44 @@ impl Studio {
                         },
                     ))
                     .when_some(voice, |this, message| {
-                        let needs_model = transcription::whisper_executable().is_some()
-                            && !SpeechModel::Base.is_installed()
-                            && self.voice_model_download.is_none();
-                        this.child(div().text_xs().text_color(muted()).child(message)).when(needs_model, |this| {
-                            this.child(self.launcher_button(
-                                "teleprompter-model",
-                                format!("Download voice model ({} MB)", SpeechModel::Base.megabytes()),
-                                true,
-                                cx,
-                                |this, cx| this.download_voice_model(cx),
-                            ))
-                        })
+                        this.child(div().text_xs().text_color(muted()).child(message))
                     })
-                    .child(div().text_xs().text_color(muted()).child(
-                        "The prompter stays visible to you and out of the recording. Screen and area capture need the Lahza GNOME helper; window capture works without it.",
-                    ))
-                    .child(div().h(px(1.0)).bg(line()))
-                    .child(div().text_xs().text_color(blue()).child("Scroll the prompter or click a word to jump.")),
+                    .when(settings.follow_voice, |this| {
+                        this.child(
+                            div()
+                                .id("teleprompter-advanced")
+                                .flex().items_center().gap_1().py_1()
+                                .text_xs().text_color(muted()).cursor_pointer()
+                                .hover(|style| style.text_color(blue()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.teleprompter_advanced_open = !this.teleprompter_advanced_open;
+                                    cx.notify();
+                                }))
+                                .child(gpui::svg().path(if self.teleprompter_advanced_open {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                }).size(px(12.0)).text_color(muted()))
+                                .child("Advanced"),
+                        )
+                        .when(self.teleprompter_advanced_open, |this| {
+                            this.child(div().text_xs().text_color(muted()).child("Language"))
+                                .child(self.segmented(
+                                    "teleprompter-language",
+                                    &["Auto", "English"],
+                                    if settings.voice_language == "en" { 1 } else { 0 },
+                                    |this, index| {
+                                        this.teleprompter.voice_language = if index == 1 { "en" } else { "auto" }.into();
+                                        this.save_teleprompter();
+                                    },
+                                    cx,
+                                ))
+                                .child(self.speech_processing_controls("teleprompter-processing", cx))
+                        })
+                        .when(!self.teleprompter_advanced_open, |this| {
+                            this.children(self.speech_setup_notice("teleprompter-setup-notice", cx))
+                        })
+                    }),
             )
             .into_any_element()
     }
@@ -560,3 +609,64 @@ impl Studio {
 
 /// The prompter window handle type, stored on the studio.
 pub(crate) type PrompterHandle = WindowHandle<Prompter>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlight_stays_on_the_matched_word_and_its_line_at_boundaries() {
+        let layout = ScriptLayout::new("one two three\nfour five six", 100.0, |word| word.len() as f32);
+        for (spoken, word, line) in [
+            (0, 0, 0), // First-word cue before recognition starts.
+            (1, 0, 0),
+            (2, 1, 0),
+            (3, 2, 0), // Keep the last matched word visible at the line end.
+            (4, 3, 1),
+            (6, 5, 1), // The final spoken word stays highlighted.
+            (usize::MAX, 5, 1),
+        ] {
+            assert_eq!(highlighted_word(&layout, spoken), Some(word));
+            assert_eq!(highlighted_line(&layout, spoken), line);
+        }
+        assert_eq!(highlighted_word(&ScriptLayout::default(), 0), None);
+        assert_eq!(highlighted_line(&ScriptLayout::default(), 0), 0);
+
+        // A clicked word or a scroll target uses the same count convention.
+        for selected in [0, 2, 3, 5] {
+            let position = selected + 1;
+            assert_eq!(highlighted_word(&layout, position), Some(selected));
+            assert_eq!(highlighted_line(&layout, position), layout.line_of(selected));
+        }
+    }
+
+    #[test]
+    fn speech_redraws_each_word_before_scrolling_and_manual_rewind_still_works() {
+        let layout = ScriptLayout::new("one two three\nfour five six", 100.0, |word| word.len() as f32);
+        let mut previous_position = 0;
+        let mut shown_line = 0.0;
+        assert!(!update_reading_position(&layout, 0, &mut previous_position, &mut shown_line));
+
+        // Speech advances the highlight even while all words share a line.
+        for position in [1, 2, 3] {
+            assert!(update_reading_position(&layout, position, &mut previous_position, &mut shown_line));
+            assert_eq!(shown_line, 0.0);
+            assert!(!update_reading_position(&layout, position, &mut previous_position, &mut shown_line));
+        }
+
+        // Speaking the next line's first word starts smooth scrolling, which
+        // keeps repainting without requiring another recognized word.
+        assert!(update_reading_position(&layout, 4, &mut previous_position, &mut shown_line));
+        assert!(shown_line > 0.0 && shown_line < 1.0);
+        assert!(update_reading_position(&layout, 4, &mut previous_position, &mut shown_line));
+        for _ in 0..40 {
+            update_reading_position(&layout, 4, &mut previous_position, &mut shown_line);
+        }
+        assert_eq!(shown_line, 1.0);
+        assert!(!update_reading_position(&layout, 4, &mut previous_position, &mut shown_line));
+
+        // Clicking or scrolling back uses the same invalidation path.
+        assert!(update_reading_position(&layout, 1, &mut previous_position, &mut shown_line));
+        assert!(shown_line < 1.0);
+    }
+}

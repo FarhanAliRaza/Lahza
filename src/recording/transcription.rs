@@ -4,6 +4,7 @@
 //! the user's data directory.
 
 use super::clips::RecordingClipTimeline;
+use super::speech_runtime::{self, ProcessingMode, RuntimeDiagnostics, RuntimeStatus};
 use super::transcript::{Transcript, TranscriptWord};
 use super::video::VideoError;
 use std::io::{BufRead, BufReader};
@@ -82,6 +83,9 @@ fn models_directory() -> PathBuf {
 pub fn whisper_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("LAHZA_WHISPER_CLI").map(PathBuf::from) {
         return path.is_file().then_some(path);
+    }
+    if let Some(path) = super::speech_setup::bundled_executable("whisper-cli") {
+        return Some(path);
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -204,7 +208,7 @@ pub fn transcribe(
     progress: &JobProgress,
 ) -> Result<Transcript, VideoError> {
     let whisper = whisper_executable().ok_or_else(|| {
-        VideoError::InvalidMedia("whisper.cpp is not installed (sudo apt install whisper.cpp)".into())
+        VideoError::InvalidMedia("Set up speech processing before transcribing".into())
     })?;
     let info = super::video::probe_media(source)?;
     if !info.has_audio {
@@ -222,13 +226,45 @@ pub fn transcribe(
         .map(|count| count.get().saturating_sub(1).clamp(1, 16))
         .unwrap_or(4);
     let output_base = work.0.join("words");
+    let mode = speech_runtime::load_processing_mode();
+    let checked = speech_runtime::probe(&whisper, model, mode, progress).map_err(|error| {
+        if progress.is_cancelled() { VideoError::Cancelled } else { VideoError::InvalidMedia(error) }
+    })?;
+    speech_runtime::set_status(checked.clone());
+    let actual_mode = if matches!(checked, RuntimeStatus::Cpu { .. }) { ProcessingMode::Cpu } else { mode };
+    let first = transcribe_audio(&whisper, model, &audio, &output_base, threads, actual_mode, &checked, progress);
+    let transcript = match first {
+        Err(error) if mode == ProcessingMode::Auto && actual_mode != ProcessingMode::Cpu && !progress.is_cancelled() => {
+            let fallback = RuntimeStatus::Cpu { reason: format!("GPU transcription failed: {}", error.to_string().chars().take(240).collect::<String>()) };
+            eprintln!("[transcription] retrying on CPU: {error}");
+            transcribe_audio(&whisper, model, &audio, &output_base, threads, ProcessingMode::Cpu, &fallback, progress)?
+        }
+        result => result?,
+    };
+    progress.set(1.0);
+    Ok(transcript)
+}
+
+fn transcribe_audio(
+    whisper: &Path,
+    model: &Path,
+    audio: &Path,
+    output_base: &Path,
+    threads: usize,
+    mode: ProcessingMode,
+    checked: &RuntimeStatus,
+    progress: &JobProgress,
+) -> Result<Transcript, VideoError> {
+    if progress.is_cancelled() { return Err(VideoError::Cancelled); }
     // One segment per word gives word-level timing for karaoke and cutting.
-    let mut child = Command::new(&whisper)
+    let mut child = speech_runtime::command_with_mode(whisper, mode)
         .arg("-m")
         .arg(model)
         .arg("-f")
         .arg(&audio)
-        .args(["-l", "auto", "-ml", "1", "-sow", "-oj", "-np", "-pp", "-t"])
+        // Keep diagnostics enabled so the actual backend can be verified;
+        // stdout is already discarded, so `-np` is unnecessary here.
+        .args(["-l", "auto", "-ml", "1", "-sow", "-oj", "-pp", "-t"])
         .arg(threads.to_string())
         .arg("-of")
         .arg(&output_base)
@@ -239,9 +275,17 @@ pub fn transcribe(
         .map_err(|error| VideoError::InvalidMedia(format!("could not start whisper.cpp: {error}")))?;
     let stderr = child.stderr.take().expect("stderr was piped");
     let reader_progress = progress.clone();
+    let checked = checked.clone();
     let reader = std::thread::spawn(move || {
         let mut tail = Vec::new();
+        let mut diagnostics = RuntimeDiagnostics::new(mode);
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            diagnostics.observe(&line);
+            let mut runtime = diagnostics.status();
+            if let (RuntimeStatus::Cpu { reason }, RuntimeStatus::Cpu { reason: checked_reason }) = (&mut runtime, &checked) {
+                *reason = checked_reason.clone();
+            }
+            if !matches!(runtime, RuntimeStatus::Checking) { speech_runtime::set_status(runtime); }
             if let Some(percent) = line
                 .split("progress =")
                 .nth(1)
@@ -255,26 +299,34 @@ pub fn transcribe(
                 }
             }
         }
-        tail.join("\n")
+        (diagnostics, tail.join("\n"))
     });
     let status = loop {
         if progress.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = reader.join();
             return Err(VideoError::Cancelled);
         }
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {},
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(error.into());
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    let messages = reader.join().unwrap_or_default();
+    let (diagnostics, messages) = reader.join().map_err(|_| VideoError::InvalidMedia("Whisper's output reader stopped".into()))?;
     if !status.success() {
         return Err(VideoError::InvalidMedia(format!("whisper.cpp failed: {}", messages.trim())));
     }
+    diagnostics.validate().map_err(VideoError::InvalidMedia)?;
     let json = std::fs::read_to_string(output_base.with_extension("json"))?;
     let transcript = parse_whisper_json(&json)?;
-    progress.set(1.0);
     Ok(transcript)
 }
 
@@ -376,6 +428,31 @@ fn parse_whisper_json(json: &str) -> Result<Transcript, VideoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_gpu_request_rejects_cpu_output_and_cpu_choice_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = WorkDirectory::new().unwrap();
+        let executable = work.0.join("whisper-cli");
+        std::fs::write(&executable, r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-np" ]; then echo 'backend diagnostics were disabled' >&2; exit 9; fi
+    if [ "$1" = "-of" ]; then shift; output="$1"; fi
+    shift
+done
+printf 'whisper_model_load: CPU total size = 147.37 MB\nwhisper_backend_init_gpu: no GPU found\n' >&2
+printf '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":500},"text":" Hello"}]}' > "${output}.json"
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = work.0.join("words");
+        let progress = JobProgress::default();
+        let error = transcribe_audio(&executable, Path::new("model.bin"), Path::new("audio.wav"), &output, 1,
+            ProcessingMode::Gpu, &RuntimeStatus::Checking, &progress).unwrap_err();
+        assert!(error.to_string().contains("GPU processing is unavailable"));
+        let transcript = transcribe_audio(&executable, Path::new("model.bin"), Path::new("audio.wav"), &output, 1,
+            ProcessingMode::Cpu, &RuntimeStatus::Cpu { reason: "selected in Processing".into() }, &progress).unwrap();
+        assert_eq!(transcript.words.len(), 1);
+    }
 
     #[test]
     fn whisper_words_merge_punctuation_and_cap_long_timestamps() {

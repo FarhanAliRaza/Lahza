@@ -32,6 +32,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             binutils \
+            cmake \
+            curl \
+            glslc \
             jq \
             ffmpeg \
             gstreamer1.0-tools \
@@ -44,15 +47,31 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
+            libsdl2-dev \
+            libvulkan-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev
 
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Build bundled speech runtime
+        run: packaging/build-whisper-runtime.sh prebuilt/whisper
+
+      - name: Test bundled speech runtime
+        run: |
+          curl --fail --location --silent --show-error --retry 3 \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin \
+            --output /tmp/lahza-whisper-test-model.bin
+          curl --fail --location --silent --show-error --retry 3 \
+            https://raw.githubusercontent.com/ggml-org/whisper.cpp/2eeeba56e9edd762b4b38467bab96c2517163158/samples/jfk.wav \
+            --output /tmp/lahza-whisper-test.wav
+          packaging/smoke-whisper-runtime.sh prebuilt/whisper \
+            /tmp/lahza-whisper-test-model.bin /tmp/lahza-whisper-test.wav
+
       - name: Run tests
         run: |
-          cargo test --release --locked
+          cargo test --release --locked -- --test-threads=1
           python3 -m unittest discover -s packaging/tests
 
       - name: Create DEB package
@@ -81,6 +100,8 @@ jobs:
             "${package_root}/usr/share/pixmaps/com.lahza.Lahza.png"
           install -d "${package_root}/usr/share/lahza/assets"
           cp -a assets/. "${package_root}/usr/share/lahza/assets/"
+          install -d "${package_root}/usr/lib/lahza/whisper"
+          cp -a prebuilt/whisper/. "${package_root}/usr/lib/lahza/whisper/"
           chmod -R go-w "${package_root}/usr/share/lahza/assets"
           install -d "${package_root}/DEBIAN"
 
@@ -92,7 +113,7 @@ jobs:
           Homepage: https://github.com/FarhanAliRaza/lahza
           Section: graphics
           Priority: optional
-          Depends: python3, ca-certificates, ffmpeg, gstreamer1.0-libav, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-tools, gstreamer1.0-plugins-base-apps, libgstreamer1.0-0, libpipewire-0.3-0, libx11-6, libxkbcommon-x11-0, libxkbcommon0, xdg-desktop-portal
+          Depends: python3, ca-certificates, curl, ffmpeg, gstreamer1.0-libav, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-tools, gstreamer1.0-plugins-base-apps, libgstreamer1.0-0, libpipewire-0.3-0, libx11-6, libxkbcommon-x11-0, libxkbcommon0, libsdl2-2.0-0, libvulkan1, libgomp1, xdg-desktop-portal
           Description: Lahza screenshot and recording studio for Linux
            Capture, annotate, and export screenshots and screen recordings.
           EOF
@@ -118,7 +139,11 @@ jobs:
             "${bundle_root}/share/icons/hicolor/512x512/apps/com.lahza.Lahza.png"
           install -d "${bundle_root}/share/lahza/assets"
           cp -a assets/. "${bundle_root}/share/lahza/assets/"
+          install -d "${bundle_root}/lib/lahza/whisper"
+          cp -a prebuilt/whisper/. "${bundle_root}/lib/lahza/whisper/"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          tar -C prebuilt -czf "dist/lahza-whisper-${version}-linux-x86_64.tar.gz" whisper
+          cp "dist/lahza-whisper-${version}-linux-x86_64.tar.gz" prebuilt/whisper-runtime.tar.gz
           install -Dm755 "${bundle_root}/bin/lahza" prebuilt/lahza
           cd dist
           sha256sum *.deb *.tar.gz > SHA256SUMS
@@ -132,9 +157,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lahza-binary-amd64
-          # A bare file keeps no directory structure, so the Snap job's
-          # download lands exactly at prebuilt/lahza.
-          path: prebuilt/lahza
+          # Archive the runtime so executable bits and relative symlinks are
+          # preserved when the Snap job downloads the artifact.
+          path: |
+            prebuilt/lahza
+            prebuilt/whisper-runtime.tar.gz
           if-no-files-found: error
 
       - name: Upload workflow artifact
@@ -195,6 +222,10 @@ jobs:
         with:
           name: lahza-binary-amd64
           path: prebuilt
+
+      - name: Prepare downloaded runtime for Snapcraft
+        run: |
+          tar -xzf prebuilt/whisper-runtime.tar.gz -C prebuilt
 
       - name: Build Snap in managed Ubuntu 24.04 environment
         id: snapcraft

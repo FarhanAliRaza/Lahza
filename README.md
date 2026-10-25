@@ -305,7 +305,7 @@ cd lahza-0.5.9-linux-x86_64
 ./install.sh
 ```
 
-The installer adds the binary, assets, desktop entry, and icon under `~/.local`. Ensure `~/.local/bin` is on `PATH`. Run `./install.sh --help` for details. The bundle requires system libraries and is built on Ubuntu 24.04; it is not a static build. The release notes list runtime dependencies. `SHA256SUMS` accompanies both downloads for integrity verification.
+The installer adds the binary, Whisper runtime, assets, desktop entry, and icon under `~/.local`. Ensure `~/.local/bin` is on `PATH`. Run `./install.sh --help` for details. The bundle requires system libraries and is built on Ubuntu 24.04; it is not a static build. The release notes list runtime dependencies. `SHA256SUMS` accompanies the downloads for integrity verification.
 
 ### Desktop requirements
 
@@ -316,10 +316,12 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
 
 ### Optional tools
 
-- `whisper.cpp` (`sudo apt install whisper.cpp`) enables on-device subtitle
-  transcription and the teleprompter's voice following. The speech model
-  (148 MB, or 488 MB for the accurate one) downloads on first use into
-  `~/.local/share/lahza/models`.
+- Release packages include a matched Whisper CPU/Vulkan runtime for subtitles
+  and voice following. Choose **Set up voice recognition** in Teleprompter or
+  Subtitles to download the model (148 MB; the accurate subtitle model is
+  488 MB). Models stay in `~/.local/share/lahza/models`. Source installations
+  can download the matching release's runtime through the same setup button,
+  or use an installed `whisper-cli` and `whisper-stream`.
 - `curl` is used to download speech models and to upload to a share server.
 
 ### Timeline editing
@@ -372,9 +374,34 @@ during a take, the floating windows close and the launcher returns.
 ### Teleprompter
 
 Turn on **Teleprompter** in the recorder, then open or paste a script. While
-recording, the prompter floats at the top of the main screen. With whisper.cpp,
-the voice model and the microphone on, it scrolls as you read; otherwise scroll
-it with the mouse wheel or click a word.
+recording, the prompter floats at the top of the main screen. With whisper.cpp's
+`whisper-stream`, the voice model and the microphone on, it highlights words and
+scrolls as you read using the microphone selected in the recorder. Its header
+shows when voice following is starting, active, paused, or has failed. You can
+always scroll with the mouse wheel or click a word.
+Drag the teleprompter's header to place it anywhere on your desktop; moving it
+keeps your reading position and capture protection intact.
+
+Expand **Advanced** to change language and processing. Choose **Language → English**
+for an English script to avoid repeated language guesses on short phrases.
+**Processing → Auto** is the default: it
+uses a compatible GPU and falls back to CPU with a reason. **GPU** requires
+GPU processing and reports an error if unavailable; **CPU** disables GPU use.
+This preference applies to both voice following and subtitles and survives
+restarts. Setup runs a short local inference, then displays the actual device
+and backend, such as “Using NVIDIA GeForce RTX 3060 — Vulkan”. The prompter
+also reports the backend used by its running recognizer. **Check**
+rechecks after a driver or hardware change. Drivers must be installed on the
+host; Lahza includes the inference backend, not graphics drivers.
+
+The live recognizer prints its hypotheses,
+matched script word, microphone and compute backend to the launch log
+(`~/.local/state/lahza/launch.log` when started with `just run`). Advanced users
+can override the binaries with `LAHZA_WHISPER_CLI` / `LAHZA_WHISPER_STREAM`.
+An explicit `GGML_BACKEND_PATH` takes precedence in Auto/GPU modes; its plugin
+must match the selected runtime. CPU mode ignores that override. The legacy
+`~/.local/share/lahza/backends/libggml-vulkan.so` path is used only with external
+Whisper installations, never mixed into the bundled runtime.
 
 With the [GNOME capture helper](#gnome-capture-helper), the prompter is omitted
 from screen and selected-area recordings while remaining visible on your

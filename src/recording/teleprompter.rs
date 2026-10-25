@@ -7,12 +7,13 @@
 //! interferes with the recording.
 
 use super::transcription::{whisper_executable, SpeechModel};
+use super::speech_runtime::{self, ProcessingMode, RuntimeDiagnostics, RuntimeStatus};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Saved prompter settings and script.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -26,6 +27,8 @@ pub struct TeleprompterSettings {
     pub font_size: f32,
     /// Advance with the speaker's voice when whisper.cpp is available.
     pub follow_voice: bool,
+    /// Pin a known language instead of guessing again on each short chunk.
+    pub voice_language: String,
 }
 
 impl Default for TeleprompterSettings {
@@ -36,6 +39,7 @@ impl Default for TeleprompterSettings {
             lines: 3,
             font_size: 26.0,
             follow_voice: true,
+            voice_language: "auto".into(),
         }
     }
 }
@@ -96,19 +100,22 @@ pub fn normalized_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// How many script display words have been spoken, given everything the
-/// recognizer has heard. Greedy with a short lookahead, so a misheard or
-/// skipped word never stalls the prompter.
+/// Align a recognition hypothesis near the current script position.
+/// Skipped or misheard words cost evidence, so a repeated common word
+/// cannot pull the reader into a later clause on its own.
 #[derive(Clone, Debug, Default)]
 pub struct ScriptMatcher {
     entries: Vec<(String, usize)>,
+    script_words: Vec<String>,
 }
 
 impl ScriptMatcher {
     const LOOKAHEAD: usize = 8;
+    const MAX_HYPOTHESIS_WORDS: usize = 128;
 
     pub fn new(script: &str) -> Self {
         Self {
+            script_words: display_words(script).into_iter().map(str::to_owned).collect(),
             entries: display_words(script)
                 .into_iter()
                 .enumerate()
@@ -124,18 +131,61 @@ impl ScriptMatcher {
         self.entries.is_empty()
     }
 
+    #[cfg(test)]
     pub fn spoken_count(&self, spoken: &[String]) -> usize {
-        let mut position = 0;
-        for word in spoken {
-            if position >= self.entries.len() {
-                break;
+        self.spoken_count_from(spoken, 0)
+    }
+
+    fn spoken_count_from(&self, spoken: &[String], start: usize) -> usize {
+        let first = self.entries.partition_point(|(_, index)| *index < start);
+        let spoken = &spoken[..spoken.len().min(Self::MAX_HYPOTHESIS_WORDS)];
+        let end = (first + spoken.len() + Self::LOOKAHEAD).min(self.entries.len());
+        let script = &self.entries[first..end];
+        // Anchor the alignment to the current chunk: skipping script words
+        // costs more than an extra recognition word. Only an endpoint that
+        // actually matches can advance the reader; trailing guesses cannot.
+        let mut previous: Vec<i32> = (0..=script.len()).map(|index| -2 * index as i32).collect();
+        let mut best_score = 0;
+        let mut best_end = 0;
+        for (heard_index, word) in spoken.iter().enumerate() {
+            let mut current = vec![0; script.len() + 1];
+            current[0] = -(heard_index as i32 + 1);
+            for (script_index, (reference, _)) in script.iter().enumerate() {
+                let column = script_index + 1;
+                let matches = comparable_number(word) == comparable_number(reference);
+                let diagonal = previous[column - 1] + if matches { 3 } else { -2 };
+                current[column] = diagonal.max(previous[column] - 1).max(current[column - 1] - 2);
+                if matches && (diagonal > best_score
+                    || (diagonal == best_score && column < best_end))
+                {
+                    best_score = diagonal;
+                    best_end = column;
+                }
             }
-            let end = (position + Self::LOOKAHEAD).min(self.entries.len());
-            if let Some(found) = (position..end).find(|&index| self.entries[index].0 == *word) {
-                position = found + 1;
-            }
+            previous = current;
         }
-        position.checked_sub(1).map_or(0, |last| self.entries[last].1 + 1)
+        // One exact word at the anchor is enough; an isolated common word
+        // farther ahead is not. Equal evidence prefers the nearer endpoint.
+        if best_score >= 3 {
+            (script[best_end - 1].1 + 1).max(start)
+        } else {
+            start
+        }
+    }
+}
+
+/// Whisper commonly writes spoken numbers as digits even when the script
+/// spells them out (or vice versa). Keep other words distinct: "to" is not 2.
+fn comparable_number(word: &str) -> &str {
+    match word {
+        "zero" => "0", "one" => "1", "two" => "2", "three" => "3",
+        "four" => "4", "five" => "5", "six" => "6", "seven" => "7",
+        "eight" => "8", "nine" => "9", "ten" => "10", "eleven" => "11",
+        "twelve" => "12", "thirteen" => "13", "fourteen" => "14", "fifteen" => "15",
+        "sixteen" => "16", "seventeen" => "17", "eighteen" => "18", "nineteen" => "19",
+        "twenty" => "20", "thirty" => "30", "forty" => "40", "fifty" => "50",
+        "sixty" => "60", "seventy" => "70", "eighty" => "80", "ninety" => "90",
+        _ => word,
     }
 }
 
@@ -217,68 +267,310 @@ impl ScriptLayout {
     }
 }
 
-/// Live speech following: runs `whisper-stream` on the default microphone
+/// Find the streaming executable independently of the batch transcription CLI.
+pub fn whisper_stream_executable() -> Option<PathBuf> {
+    find_stream_executable(
+        std::env::var_os("LAHZA_WHISPER_STREAM").map(PathBuf::from),
+        whisper_executable(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+fn find_stream_executable(
+    override_path: Option<PathBuf>,
+    cli: Option<PathBuf>,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(path) = override_path {
+        return path.is_file().then_some(path);
+    }
+    cli.map(|path| path.with_file_name("whisper-stream"))
+        .into_iter()
+        .chain(search_path.into_iter().flat_map(std::env::split_paths)
+            .map(|directory| directory.join("whisper-stream")))
+        .find(|path| path.is_file())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SpeechStatus {
+    Starting,
+    Listening(String),
+    Paused(String),
+    Failed(String),
+}
+
+fn stream_command(stream: &Path, model: &Path, microphone_device: Option<&str>, language: &str, mode: ProcessingMode) -> Command {
+    let threads = std::thread::available_parallelism()
+        .map(|count| (count.get() / 2).clamp(2, 8))
+        .unwrap_or(4);
+    let mut command = speech_runtime::command_with_mode(stream, mode);
+    command.arg("-m").arg(model)
+        // Temperature fallback can spend seconds retrying silence or a bad
+        // partial guess, during which whisper-stream discards incoming audio.
+        .args(["--step", "800", "--length", "5000", "--keep", "200", "-nf", "-l", language, "-t"])
+        .arg(threads.to_string());
+    if let Some(device) = microphone_device.filter(|device| !device.is_empty()) {
+        // Recorder device IDs are Pulse/PipeWire source names, not SDL's
+        // numeric capture indices. Route the child through the same source.
+        command.env("SDL_AUDIODRIVER", "pulseaudio").env("PULSE_SOURCE", device);
+    }
+    command
+}
+
+/// Live speech following: runs `whisper-stream` on the selected microphone
 /// and publishes the (monotonic) number of script words spoken.
 pub struct SpeechFollower {
     child: Child,
     paused: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+    diagnostics: Arc<Mutex<Vec<u8>>>,
+    stderr_reader: std::thread::JoinHandle<()>,
+    failure: Option<String>,
+    runtime: Arc<Mutex<RuntimeDiagnostics>>,
+    mode: ProcessingMode,
+    started: std::time::Instant,
+    cpu_retry: Option<CpuRetry>,
+    fallback_reason: Option<String>,
+}
+
+struct CpuRetry {
+    command: Command,
+    matcher: ScriptMatcher,
+    spoken: Arc<AtomicUsize>,
 }
 
 impl SpeechFollower {
     /// Start following when whisper.cpp and the speech model are present.
-    pub fn start(script: &str, spoken: Arc<AtomicUsize>) -> Result<Self, String> {
+    pub fn start(script: &str, spoken: Arc<AtomicUsize>, microphone_device: Option<&str>, language: &str) -> Result<Self, String> {
         let matcher = ScriptMatcher::new(script);
         if matcher.is_empty() {
             return Err("the script has no words".into());
         }
-        let whisper = whisper_executable().ok_or("whisper.cpp is not installed")?;
-        let stream = whisper.with_file_name("whisper-stream");
-        if !stream.is_file() {
-            return Err("whisper-stream is not installed".into());
-        }
+        let stream = whisper_stream_executable().ok_or("whisper-stream is not installed")?;
         let model = SpeechModel::Base;
         if !model.is_installed() {
             return Err("the speech model is not downloaded".into());
         }
-        let threads = std::thread::available_parallelism()
-            .map(|count| (count.get() / 2).clamp(2, 8))
-            .unwrap_or(4);
-        let mut child = Command::new(stream)
-            .arg("-m")
-            .arg(model.path())
-            .args(["--step", "800", "--length", "5000", "--keep", "200", "-l", "auto", "-t"])
-            .arg(threads.to_string())
-            .stdin(Stdio::null())
+        let mode = speech_runtime::load_processing_mode();
+        let cpu_retry = (mode == ProcessingMode::Auto).then(|| CpuRetry {
+            command: stream_command(&stream, &model.path(), microphone_device, language, ProcessingMode::Cpu),
+            matcher: matcher.clone(),
+            spoken: spoken.clone(),
+        });
+        let mut follower = Self::spawn(
+            stream_command(&stream, &model.path(), microphone_device, language, mode), matcher, spoken, mode,
+        )?;
+        follower.cpu_retry = cpu_retry;
+        Ok(follower)
+    }
+
+    fn spawn(command: Command, matcher: ScriptMatcher, spoken: Arc<AtomicUsize>, mode: ProcessingMode) -> Result<Self, String> {
+        Self::spawn_with_pause(command, matcher, spoken, mode, false)
+    }
+
+    fn spawn_with_pause(mut command: Command, matcher: ScriptMatcher, spoken: Arc<AtomicUsize>, mode: ProcessingMode, initially_paused: bool) -> Result<Self, String> {
+        let child_setting = |key: &str| {
+            command.get_envs().find(|(name, _)| *name == key)
+                .map(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+                .unwrap_or_else(|| std::env::var_os(key))
+        };
+        eprintln!(
+            "[voice-follow] starting executable={:?} args={:?} audio_driver={:?} microphone={:?} backend={:?}",
+            command.get_program(), command.get_args().collect::<Vec<_>>(),
+            child_setting("SDL_AUDIODRIVER"), child_setting("PULSE_SOURCE"),
+            child_setting("GGML_BACKEND_PATH"),
+        );
+        let mut child = command.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not start whisper-stream: {error}"))?;
         let mut stdout = child.stdout.take().ok_or("whisper-stream has no output")?;
-        let paused = Arc::new(AtomicBool::new(false));
+        let stderr = child.stderr.take().ok_or("whisper-stream has no diagnostics")?;
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let reader_diagnostics = diagnostics.clone();
+        let runtime = Arc::new(Mutex::new(RuntimeDiagnostics::new(mode)));
+        let reader_runtime = runtime.clone();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut stderr = BufReader::new(stderr);
+            let mut buffer = Vec::new();
+            let mut previous_line = String::new();
+            while let Ok(count) = stderr.read_until(b'\n', &mut buffer) {
+                if count == 0 { break; }
+                {
+                    let mut tail = reader_diagnostics.lock().unwrap();
+                    tail.extend_from_slice(&buffer);
+                    let excess = tail.len().saturating_sub(8192);
+                    tail.drain(..excess);
+                }
+                for line in String::from_utf8_lossy(&buffer).lines() {
+                    let line = line.trim_end();
+                    reader_runtime.lock().unwrap().observe(line);
+                    if !line.is_empty() && line != previous_line {
+                        eprintln!("[voice-follow] whisper: {line}");
+                        previous_line = line.to_owned();
+                    }
+                }
+                buffer.clear();
+            }
+        });
+        let paused = Arc::new(AtomicBool::new(initially_paused));
         let reader_paused = paused.clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let reader_ready = ready.clone();
+        let stdout_runtime = runtime.clone();
         std::thread::spawn(move || {
             let mut parser = StreamParser::default();
             let mut buffer = [0u8; 4096];
-            let mut reported = 0;
+            let mut progress = SpeechProgress::new(matcher);
+            let mut log = SpeechLog::default();
             while let Ok(count) = stdout.read(&mut buffer) {
                 if count == 0 {
                     break;
                 }
+                // A manual click/scroll establishes a new matching anchor.
+                let position = spoken.load(Ordering::Relaxed);
+                if position != progress.reported {
+                    progress.seek(position);
+                    parser.discard_speech();
+                }
                 parser.push(&buffer[..count]);
-                if reader_paused.load(Ordering::Relaxed) {
+                let hypotheses = std::mem::take(&mut parser.hypotheses);
+                if parser.ready {
+                    reader_ready.store(true, Ordering::Relaxed);
+                }
+                // An explicit GPU request cannot silently advance the script
+                // with CPU results while the status poll notices the failure.
+                if mode == ProcessingMode::Gpu && !stdout_runtime.lock().unwrap().status().is_gpu() {
+                    parser.discard_speech();
+                    progress.seek(position);
                     continue;
                 }
-                let heard = parser.heard_words();
-                let count = matcher.spoken_count(&heard);
-                // Progress only moves forward: a revised guess must never
-                // scroll back while someone is mid-sentence.
-                if count > reported {
-                    reported = count;
-                    spoken.fetch_max(count, Ordering::Relaxed);
+                if reader_paused.load(Ordering::Relaxed) {
+                    for hypothesis in &hypotheses {
+                        log.print(hypothesis, &progress.matcher, position, true);
+                    }
+                    parser.discard_speech();
+                    progress.seek(position);
+                    continue;
+                }
+                let next = progress.update(&mut parser);
+                // Do not overwrite a manual jump made while this chunk was
+                // being matched. The next update will adopt its position.
+                if let Err(manual_position) = spoken.compare_exchange(
+                    position, next, Ordering::Relaxed, Ordering::Relaxed,
+                ) {
+                    progress.seek(manual_position);
+                    parser.discard_speech();
+                }
+                for hypothesis in &hypotheses {
+                    log.print(hypothesis, &progress.matcher, spoken.load(Ordering::Relaxed), false);
                 }
             }
         });
-        Ok(Self { child, paused })
+        Ok(Self {
+            child, paused, ready, diagnostics, stderr_reader, failure: None,
+            runtime, mode, started: std::time::Instant::now(), cpu_retry: None, fallback_reason: None,
+        })
+    }
+
+    /// Spawning succeeds before SDL opens the microphone or Whisper loads
+    /// the model. Only announce listening after its ready marker, and keep
+    /// checking for failures throughout the take.
+    pub fn status(&mut self) -> SpeechStatus {
+        if let Some(reason) = &self.failure {
+            return SpeechStatus::Failed(reason.clone());
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) if self.stderr_reader.is_finished() => {
+                let diagnostics = self.diagnostics.lock().unwrap().clone();
+                let text = String::from_utf8_lossy(&diagnostics);
+                let detail = text.lines().rev().find(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    ["error", "failed", "cannot", "couldn't", "could not"]
+                        .iter().any(|word| lower.contains(word))
+                }).or_else(|| text.lines().rev().find(|line| !line.trim().is_empty()));
+                let mut reason = format!("whisper-stream stopped ({status})");
+                if let Some(detail) = detail {
+                    reason.push_str(": ");
+                    reason.extend(detail.trim().chars().take(240));
+                }
+                return self.startup_failed(reason);
+            }
+            Err(error) => {
+                let reason = format!("could not check whisper-stream: {error}");
+                self.failure = Some(reason.clone());
+                return SpeechStatus::Failed(reason);
+            }
+            _ => {}
+        }
+        if !self.ready.load(Ordering::Relaxed) && self.started.elapsed() > std::time::Duration::from_secs(60) {
+            return self.startup_failed("Whisper did not become ready within 60 seconds".into());
+        }
+        let mut runtime = self.runtime.lock().unwrap().status();
+        if self.mode == ProcessingMode::Auto && self.cpu_retry.is_some() {
+            if let RuntimeStatus::Cpu { reason } = &runtime {
+                if reason.contains("software renderer") {
+                    return self.startup_failed(reason.clone());
+                }
+            }
+        }
+        if self.mode == ProcessingMode::Gpu && self.ready.load(Ordering::Relaxed) {
+            if runtime == RuntimeStatus::Checking {
+                if self.started.elapsed() > std::time::Duration::from_secs(60) {
+                    return self.startup_failed("Whisper did not confirm GPU processing".into());
+                }
+                return SpeechStatus::Starting;
+            }
+            if let RuntimeStatus::Cpu { .. } = &runtime {
+                speech_runtime::set_status(runtime.clone());
+                let reason = runtime.validate(self.mode).unwrap_err();
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.failure = Some(reason.clone());
+                return SpeechStatus::Failed(reason);
+            }
+        }
+        if let (RuntimeStatus::Cpu { reason }, Some(fallback)) = (&mut runtime, &self.fallback_reason) {
+            *reason = format!("automatic startup failed: {fallback}");
+        }
+        speech_runtime::set_status(runtime.clone());
+        if self.paused.load(Ordering::Relaxed) {
+            SpeechStatus::Paused(runtime.label())
+        } else if self.ready.load(Ordering::Relaxed) {
+            SpeechStatus::Listening(runtime.label())
+        } else {
+            SpeechStatus::Starting
+        }
+    }
+
+    fn startup_failed(&mut self, reason: String) -> SpeechStatus {
+        let software_renderer = matches!(self.runtime.lock().unwrap().status(), RuntimeStatus::Cpu { reason } if reason.contains("software renderer"));
+        if !self.ready.load(Ordering::Relaxed) || software_renderer {
+            if let Some(retry) = self.cpu_retry.take() {
+                let paused = self.paused.load(Ordering::Relaxed);
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                eprintln!("[voice-follow] automatic startup failed; retrying CPU: {reason}");
+                match Self::spawn_with_pause(retry.command, retry.matcher, retry.spoken, ProcessingMode::Cpu, paused) {
+                    Ok(mut follower) => {
+                        follower.fallback_reason = Some(reason);
+                        follower.set_paused(paused);
+                        *self = follower;
+                        return SpeechStatus::Starting;
+                    }
+                    Err(cpu_error) => {
+                        let reason = format!("{reason}; CPU fallback failed: {cpu_error}");
+                        self.failure = Some(reason.clone());
+                        return SpeechStatus::Failed(reason);
+                    }
+                }
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.failure = Some(reason.clone());
+        SpeechStatus::Failed(reason)
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -293,16 +585,97 @@ impl Drop for SpeechFollower {
     }
 }
 
+/// Keep the model's actual hypotheses visible alongside the position sent
+/// to the UI. Repeated repaint text and blank terminal clears are omitted.
+#[derive(Default)]
+struct SpeechLog {
+    previous_hypothesis: String,
+}
+
+impl SpeechLog {
+    fn message(&mut self, hypothesis: &str, matcher: &ScriptMatcher, spoken: usize, paused: bool) -> Option<String> {
+        let hypothesis = hypothesis.trim();
+        if hypothesis.is_empty() || hypothesis == self.previous_hypothesis {
+            return None;
+        }
+        self.previous_hypothesis = hypothesis.to_owned();
+        let matched_word = spoken.checked_sub(1)
+            .and_then(|index| matcher.script_words.get(index))
+            .map_or("<none>", String::as_str);
+        Some(format!(
+            "[voice-follow] hypothesis={hypothesis:?} matched={spoken}/{} matched_word={matched_word:?} paused={paused}",
+            matcher.script_words.len(),
+        ))
+    }
+
+    fn print(&mut self, hypothesis: &str, matcher: &ScriptMatcher, spoken: usize, paused: bool) {
+        if let Some(message) = self.message(hypothesis, matcher, spoken, paused) {
+            eprintln!("{message}");
+        }
+    }
+}
+
+struct SpeechProgress {
+    matcher: ScriptMatcher,
+    reported: usize,
+    chunk_start: usize,
+}
+
+impl SpeechProgress {
+    fn new(matcher: ScriptMatcher) -> Self {
+        Self { matcher, reported: 0, chunk_start: 0 }
+    }
+
+    fn update(&mut self, parser: &mut StreamParser) -> usize {
+        for line in std::mem::take(&mut parser.committed) {
+            self.follow(&line);
+            // Whisper may revise away words we already followed. Preserve
+            // that progress when a new audio chunk begins instead of matching
+            // all subsequent speech against the script's first eight words.
+            self.chunk_start = self.reported;
+        }
+        self.follow(&parser.current);
+        self.reported
+    }
+
+    fn follow(&mut self, text: &str) {
+        let heard = normalized_words(&strip_annotations(text));
+        self.reported = self.reported.max(self.matcher.spoken_count_from(&heard, self.chunk_start));
+    }
+
+    fn seek(&mut self, position: usize) {
+        self.reported = position;
+        // A manual jump highlights this word so it can be read again. The
+        // published count includes it, but matching must still start on it.
+        self.chunk_start = position.saturating_sub(1);
+    }
+}
+
 /// Splits whisper-stream's terminal output into committed lines (ended by a
 /// newline) and the volatile line it keeps rewriting after carriage returns.
 #[derive(Default)]
 struct StreamParser {
     committed: Vec<String>,
     current: String,
+    hypotheses: Vec<String>,
     escape: bool,
+    ready: bool,
 }
 
 impl StreamParser {
+    fn remember_hypothesis(&mut self) {
+        let text = self.current.trim();
+        if !text.is_empty() && self.hypotheses.last().is_none_or(|last| last != text) {
+            self.hypotheses.push(text.to_owned());
+        }
+    }
+
+    fn discard_speech(&mut self) {
+        self.committed.clear();
+        self.current.clear();
+        self.hypotheses.clear();
+    }
+
     fn push(&mut self, bytes: &[u8]) {
         for character in String::from_utf8_lossy(bytes).chars() {
             if self.escape {
@@ -314,9 +687,16 @@ impl StreamParser {
             }
             match character {
                 '\x1b' => self.escape = true,
-                '\r' => self.current.clear(),
+                '\r' => {
+                    self.remember_hypothesis();
+                    self.current.clear();
+                }
                 '\n' => {
+                    self.remember_hypothesis();
                     let line = std::mem::take(&mut self.current);
+                    if line.trim() == "[Start speaking]" {
+                        self.ready = true;
+                    }
                     if !line.trim().is_empty() {
                         self.committed.push(line);
                     }
@@ -324,10 +704,12 @@ impl StreamParser {
                 _ => self.current.push(character),
             }
         }
+        self.remember_hypothesis();
     }
 
     /// Everything heard so far, without non-speech annotations such as
     /// "[Start speaking]" or "(music)".
+    #[cfg(test)]
     fn heard_words(&self) -> Vec<String> {
         self.committed
             .iter()
@@ -381,11 +763,198 @@ mod tests {
     }
 
     #[test]
+    fn matcher_keeps_repeated_phrases_near_the_anchor_and_matches_spoken_numbers() {
+        let matcher = ScriptMatcher::new(
+            "1. The hook (5 to 30 seconds) The hook has twenty seconds to do three things",
+        );
+        assert_eq!(matcher.spoken_count(&normalized_words("one")), 1);
+        assert_eq!(matcher.spoken_count(&normalized_words("one the hook from the hook")), 3);
+        assert_eq!(matcher.spoken_count(&normalized_words("one the hook five to thirty")), 6);
+        assert_eq!(matcher.spoken_count(&normalized_words("one the hook 5 to 30 seconds")), 7);
+        assert_eq!(matcher.spoken_count_from(&normalized_words("the hook has 20 seconds to do 3 things"), 7), 16);
+    }
+
+    #[test]
+    fn matcher_uses_phrase_evidence_instead_of_jumping_to_a_later_common_word() {
+        let matcher = ScriptMatcher::new("the viewer is in the right place raise the stakes right now");
+        assert_eq!(matcher.spoken_count(&normalized_words("you are in the right place")), 7);
+        assert_eq!(matcher.spoken_count(&normalized_words("you are in the right place raise")), 8);
+        let matcher = ScriptMatcher::new("First explain a surprising result before showing the next step");
+        assert_eq!(matcher.spoken_count(&normalized_words("the")), 0);
+        assert_eq!(matcher.spoken_count(&normalized_words("unrelated noise the")), 0);
+        assert_eq!(matcher.spoken_count(&normalized_words("first explain the result")), 2);
+    }
+
+    #[test]
     fn stream_parser_commits_lines_and_drops_annotations() {
         let mut parser = StreamParser::default();
         parser.push(b"[Start speaking]\n\x1b[2K\r          \x1b[2K\r Hello wor");
         parser.push(b"\x1b[2K\r Hello world\n\x1b[2K\r today");
         assert_eq!(parser.heard_words(), ["hello", "world", "today"]);
+    }
+
+    #[test]
+    fn voice_logs_keep_revised_hypotheses_and_show_the_published_word() {
+        let mut parser = StreamParser::default();
+        parser.push(b"\x1b[2K\r Hello wor\x1b[2K\r Hello, world!\n\x1b[2K\r [BLANK_AUDIO]");
+        assert_eq!(parser.hypotheses, ["Hello wor", "Hello, world!", "[BLANK_AUDIO]"]);
+
+        let matcher = ScriptMatcher::new("Hello, world! Again —");
+        let mut log = SpeechLog::default();
+        assert_eq!(log.message(" Hello, world! ", &matcher, 2, false).unwrap(),
+            "[voice-follow] hypothesis=\"Hello, world!\" matched=2/4 matched_word=\"world!\" paused=false");
+        assert!(log.message("Hello, world!", &matcher, 2, false).is_none());
+        assert!(log.message("   ", &matcher, 2, false).is_none());
+        let paused = log.message("[BLANK_AUDIO]", &matcher, 0, true).unwrap();
+        assert!(paused.contains("hypothesis=\"[BLANK_AUDIO]\""));
+        assert!(paused.contains("matched=0/4 matched_word=\"<none>\" paused=true"));
+    }
+
+    #[test]
+    fn voice_progress_continues_after_whisper_revises_a_completed_chunk() {
+        let mut progress = SpeechProgress::new(ScriptMatcher::new(
+            "one two three four five six seven eight nine ten eleven twelve",
+        ));
+        let mut parser = StreamParser::default();
+        parser.push(b"\x1b[2K\r one two three four five six seven eight nine");
+        assert_eq!(progress.update(&mut parser), 9);
+        // whisper-stream rewrites its current hypothesis before committing it.
+        // The words already followed must still anchor the next audio chunk.
+        parser.push(b"\x1b[2K\r [BLANK_AUDIO]\n");
+        assert_eq!(progress.update(&mut parser), 9);
+        parser.push(b"\x1b[2K\r ten eleven twelve");
+        assert_eq!(progress.update(&mut parser), 12);
+    }
+
+    #[test]
+    fn revised_hypotheses_do_not_replay_repeated_words_or_undo_manual_jumps() {
+        let mut progress = SpeechProgress::new(ScriptMatcher::new(
+            "hello world hello world this is the second sentence",
+        ));
+        let mut parser = StreamParser::default();
+        for _ in 0..3 {
+            parser.push(b"\r hello world");
+            assert_eq!(progress.update(&mut parser), 2);
+        }
+        parser.push(b"\n\r hello world");
+        assert_eq!(progress.update(&mut parser), 4);
+        progress.seek(7);
+        parser.discard_speech();
+        parser.push(b"\r second sentence");
+        assert_eq!(progress.update(&mut parser), 9);
+        progress.seek(0);
+        parser.discard_speech();
+        parser.push(b"\r hello world");
+        assert_eq!(progress.update(&mut parser), 2);
+    }
+
+    #[test]
+    fn clicking_a_repeated_word_reanchors_on_that_occurrence() {
+        let mut progress = SpeechProgress::new(ScriptMatcher::new("hello world hello world"));
+        let mut parser = StreamParser::default();
+        // The highlighted first word is represented by a spoken count of 1.
+        progress.seek(1);
+        parser.push(b"\r hello");
+        assert_eq!(progress.update(&mut parser), 1);
+        parser.push(b"\r hello world");
+        assert_eq!(progress.update(&mut parser), 2);
+        parser.push(b"\n\r hello world");
+        assert_eq!(progress.update(&mut parser), 4);
+    }
+
+    fn await_status(follower: &mut SpeechFollower, accept: impl Fn(&SpeechStatus) -> bool) -> SpeechStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let status = follower.status();
+            if accept(&status) { return status; }
+            assert!(std::time::Instant::now() < deadline, "unexpected voice status: {status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn voice_status_waits_for_readiness_and_reports_microphone_failure() {
+        let spoken = Arc::new(AtomicUsize::new(0));
+        let mut loading = Command::new("sh");
+        loading.args(["-c", "exec sleep 10"]);
+        let mut follower = SpeechFollower::spawn(loading, ScriptMatcher::new("hello"), spoken.clone(), ProcessingMode::Auto).unwrap();
+        assert_eq!(follower.status(), SpeechStatus::Starting);
+        drop(follower);
+
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "printf 'audio.init() failed: microphone unavailable\\n' >&2; exit 7"]);
+        let mut follower = SpeechFollower::spawn(failing, ScriptMatcher::new("hello"), spoken, ProcessingMode::Auto).unwrap();
+        let status = await_status(&mut follower, |status| matches!(status, SpeechStatus::Failed(_)));
+        let SpeechStatus::Failed(reason) = &status else { unreachable!() };
+        assert!(reason.contains("microphone unavailable"), "{reason}");
+        assert!(reason.contains('7'), "{reason}");
+        assert_eq!(follower.status(), status, "failure remains visible after the child exits");
+    }
+
+    #[test]
+    fn selected_microphone_reaches_the_stream_and_live_words_reach_the_ui_position() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lahza-voice-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let stream = root.join("whisper-stream");
+        std::fs::write(&stream, "#!/bin/sh\n\
+            test \"$SDL_AUDIODRIVER\" = pulseaudio || exit 11\n\
+            test \"$PULSE_SOURCE\" = selected-microphone || exit 12\n\
+            printf '[Start speaking]\\n\\033[2K\\r hello world'\n\
+            exec sleep 10\n").unwrap();
+        std::fs::set_permissions(&stream, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A standalone streaming installation needs no batch CLI beside it.
+        let path = std::env::join_paths([&root]).unwrap();
+        assert_eq!(find_stream_executable(None, Some(root.join("elsewhere/whisper-cli")), Some(&path)), Some(stream.clone()));
+        assert_eq!(find_stream_executable(Some(root.join("missing")), None, Some(&path)), None);
+        let spoken = Arc::new(AtomicUsize::new(0));
+        let mut follower = SpeechFollower::spawn(
+            stream_command(&stream, &root.join("model.bin"), Some("selected-microphone"), "en", ProcessingMode::Auto),
+            ScriptMatcher::new("hello world"), spoken.clone(), ProcessingMode::Auto,
+        ).unwrap();
+        await_status(&mut follower, |status| matches!(status, SpeechStatus::Listening(_)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while spoken.load(Ordering::Relaxed) != 2 {
+            assert!(std::time::Instant::now() < deadline, "stream did not publish recognized words");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        follower.set_paused(true);
+        assert!(matches!(follower.status(), SpeechStatus::Paused(_)));
+        follower.set_paused(false);
+        assert!(matches!(follower.status(), SpeechStatus::Listening(_)));
+        drop(follower);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_gpu_rejects_cpu_stream_without_publishing_words() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'whisper_backend_init_gpu: no GPU found\\n' >&2; printf '[Start speaking]\\n\\r hello world'; exec sleep 10"]);
+        let spoken = Arc::new(AtomicUsize::new(0));
+        let mut follower = SpeechFollower::spawn(command, ScriptMatcher::new("hello world"), spoken.clone(), ProcessingMode::Gpu).unwrap();
+        let status = await_status(&mut follower, |status| matches!(status, SpeechStatus::Failed(_)));
+        let SpeechStatus::Failed(reason) = status else { unreachable!() };
+        assert!(reason.contains("GPU processing is unavailable"), "{reason}");
+        assert_eq!(spoken.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_auto_start_retries_cpu_once_and_keeps_pause_and_reason() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'Vulkan initialization failed\\n' >&2; exit 2"]);
+        let mut retry = Command::new("sh");
+        retry.args(["-c", "printf 'whisper_model_load: CPU total size = 147.37 MB\\n' >&2; printf '[Start speaking]\\n\\r hello world'; exec sleep 10"]);
+        let spoken = Arc::new(AtomicUsize::new(0));
+        let matcher = ScriptMatcher::new("hello world");
+        let mut follower = SpeechFollower::spawn(command, matcher.clone(), spoken.clone(), ProcessingMode::Auto).unwrap();
+        follower.cpu_retry = Some(CpuRetry { command: retry, matcher, spoken: spoken.clone() });
+        follower.set_paused(true);
+        let status = await_status(&mut follower, |status| matches!(status, SpeechStatus::Paused(label) if label.contains("Using CPU")));
+        let SpeechStatus::Paused(label) = status else { unreachable!() };
+        assert!(label.contains("Vulkan initialization failed"), "{label}");
+        assert_eq!(follower.mode, ProcessingMode::Cpu);
+        assert!(follower.cpu_retry.is_none());
+        assert_eq!(spoken.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -395,5 +964,29 @@ mod tests {
         assert_eq!(layout.reading_line(1), 0);
         assert_eq!(layout.reading_line(2), 1);
         assert_eq!(layout.reading_line(3), 2);
+    }
+
+    #[test]
+    #[ignore = "set LAHZA_VOICE_REPLAY_EVENTS and LAHZA_VOICE_REPLAY_CONFIG to replay saved local Whisper output"]
+    fn replay_saved_whisper_output_against_local_script() {
+        let events = std::env::var_os("LAHZA_VOICE_REPLAY_EVENTS").expect("set LAHZA_VOICE_REPLAY_EVENTS");
+        let config = std::env::var_os("LAHZA_VOICE_REPLAY_CONFIG").expect("set LAHZA_VOICE_REPLAY_CONFIG");
+        let settings: TeleprompterSettings = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+        let events: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(events).unwrap()).unwrap();
+        let mut progress = SpeechProgress::new(ScriptMatcher::new(&settings.script));
+        let mut parser = StreamParser::default();
+        let mut log = SpeechLog::default();
+        for event in events {
+            parser.push(event["text"].as_str().unwrap().as_bytes());
+            let position = progress.update(&mut parser);
+            for hypothesis in std::mem::take(&mut parser.hypotheses) {
+                if let Some(message) = log.message(&hypothesis, &progress.matcher, position, false) {
+                    eprintln!("{:.3}s {message}", event["seconds"].as_f64().unwrap_or_default());
+                }
+            }
+        }
+        if let Ok(expected) = std::env::var("LAHZA_VOICE_REPLAY_EXPECTED") {
+            assert_eq!(progress.reported, expected.parse::<usize>().unwrap());
+        }
     }
 }
