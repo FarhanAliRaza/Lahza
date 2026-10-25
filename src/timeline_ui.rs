@@ -616,7 +616,7 @@ impl Studio {
                 "timeline-zoom-out",
                 "−",
                 "Zoom out · Ctrl+−",
-                self.video_timeline_zoom > 1.0001,
+                self.video_timeline_zoom > crate::video::MIN_TIMELINE_ZOOM + 0.0001,
                 false,
                 cx,
                 |this, _| this.zoom_video_timeline(1.0 / 1.4, this.timeline_button_zoom_anchor()),
@@ -752,7 +752,11 @@ impl Studio {
                             .text_right()
                             .text_xs()
                             .text_color(muted())
-                            .child(format!("{:.1}×", self.video_timeline_zoom)),
+                            .child(if self.video_timeline_zoom < 1.0 {
+                                format!("{:.2}×", self.video_timeline_zoom)
+                            } else {
+                                format!("{:.1}×", self.video_timeline_zoom)
+                            }),
                     ),
             )
             .into_any_element()

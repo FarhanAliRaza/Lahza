@@ -8,11 +8,12 @@
 
 use super::transcription::{whisper_executable, SpeechModel};
 use super::speech_runtime::{self, ProcessingMode, RuntimeDiagnostics, RuntimeStatus};
+use super::speech_diagnostics::VoiceLog;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Saved prompter settings and script.
@@ -95,6 +96,7 @@ pub fn normalize(word: &str) -> String {
 pub fn normalized_words(text: &str) -> Vec<String> {
     display_words(text)
         .into_iter()
+        .flat_map(|word| word.split(['-', '‐', '‑', '–', '—']))
         .map(normalize)
         .filter(|word| !word.is_empty())
         .collect()
@@ -111,6 +113,7 @@ pub struct ScriptMatcher {
 
 impl ScriptMatcher {
     const LOOKAHEAD: usize = 8;
+    const RECOVERY_LOOKAHEAD: usize = 64;
     const MAX_HYPOTHESIS_WORDS: usize = 128;
 
     pub fn new(script: &str) -> Self {
@@ -119,10 +122,7 @@ impl ScriptMatcher {
             entries: display_words(script)
                 .into_iter()
                 .enumerate()
-                .filter_map(|(index, word)| {
-                    let normalized = normalize(word);
-                    (!normalized.is_empty()).then_some((normalized, index))
-                })
+                .flat_map(|(index, word)| normalized_words(word).into_iter().map(move |word| (word, index)))
                 .collect(),
         }
     }
@@ -139,6 +139,22 @@ impl ScriptMatcher {
     fn spoken_count_from(&self, spoken: &[String], start: usize) -> usize {
         let first = self.entries.partition_point(|(_, index)| *index < start);
         let spoken = &spoken[..spoken.len().min(Self::MAX_HYPOTHESIS_WORDS)];
+        // whisper-stream retains 200 ms across committed chunks. A repeated
+        // word from that overlap must not penalize the next real word: e.g.
+        // "it away" when "it" was already committed and the anchor is "away".
+        // Prefer the current anchor for repeated phrases such as "hello world
+        // hello world", where the same prefix is also valid new speech.
+        let overlap = if self.entries.get(first).zip(spoken.first())
+            .is_some_and(|((reference, _), word)| comparable_number(reference) == comparable_number(word))
+        {
+            0
+        } else {
+            (1..=first.min(spoken.len()).min(2)).rev().find(|&count| {
+                self.entries[first - count..first].iter().zip(&spoken[..count])
+                    .all(|((reference, _), word)| comparable_number(reference) == comparable_number(word))
+            }).unwrap_or(0)
+        };
+        let spoken = &spoken[overlap..];
         let end = (first + spoken.len() + Self::LOOKAHEAD).min(self.entries.len());
         let script = &self.entries[first..end];
         // Anchor the alignment to the current chunk: skipping script words
@@ -155,7 +171,7 @@ impl ScriptMatcher {
                 let matches = comparable_number(word) == comparable_number(reference);
                 let diagonal = previous[column - 1] + if matches { 3 } else { -2 };
                 current[column] = diagonal.max(previous[column] - 1).max(current[column - 1] - 2);
-                if matches && (diagonal > best_score
+                if matches && self.completes_word(first + script_index) && (diagonal > best_score
                     || (diagonal == best_score && column < best_end))
                 {
                     best_score = diagonal;
@@ -166,12 +182,105 @@ impl ScriptMatcher {
         }
         // One exact word at the anchor is enough; an isolated common word
         // farther ahead is not. Equal evidence prefers the nearer endpoint.
-        if best_score >= 3 {
+        let anchored = if best_score >= 3 {
             (script[best_end - 1].1 + 1).max(start)
         } else {
             start
-        }
+        };
+        // A small match at the old anchor must not hide stronger evidence
+        // that the speaker has continued after a misrecognized phrase.
+        anchored.max(self.recover_phrase(spoken, first).unwrap_or(start))
     }
+
+    fn completes_word(&self, entry: usize) -> bool {
+        self.entries.get(entry + 1).is_none_or(|next| next.1 != self.entries[entry].1)
+    }
+
+    /// Recover within the next 64 display words. A nearby exact phrase can
+    /// use two distinct substantive words; farther matches need three. One
+    /// recognition error is allowed only with four exact matches, including
+    /// three distinct substantive words. Common words alone cannot jump ahead.
+    fn recover_phrase(&self, spoken: &[String], first: usize) -> Option<usize> {
+        let start_word = self.entries.get(first)?.1;
+        let end = self.entries.partition_point(|(_, index)| *index < start_word + Self::RECOVERY_LOOKAHEAD);
+        // (heard end, heard start, script start, display-word end)
+        let mut best: Option<(usize, usize, usize, usize)> = None;
+        for script_start in first..end {
+            let nearby = self.entries[script_start].1 - start_word <= Self::LOOKAHEAD;
+            for heard_start in 0..spoken.len() {
+                if let Some((heard_end, word_end)) = self.recover_from(
+                    spoken, script_start, end, heard_start, 0, Vec::new(), false, nearby,
+                ) {
+                    // Follow the latest recognizable speech in this rolling
+                    // hypothesis, not a strong but stale prefix. For the same
+                    // heard span, keep the nearest script occurrence.
+                    if best.is_none_or(|previous| heard_end > previous.0
+                        || (heard_end == previous.0 && heard_start < previous.1)
+                        || (heard_end == previous.0 && heard_start == previous.1
+                            && script_start < previous.2))
+                    {
+                        best = Some((heard_end, heard_start, script_start, word_end));
+                    }
+                }
+            }
+        }
+        best.map(|(_, _, _, word_end)| word_end)
+    }
+
+    fn recover_from<'a>(
+        &'a self, spoken: &[String], mut script: usize, end: usize, mut heard: usize,
+        mut matches: usize, mut substantive: Vec<&'a str>, edited: bool, nearby: bool,
+    ) -> Option<(usize, usize)> {
+        let mut best_end: Option<(usize, usize)> = None;
+        while script < end && heard < spoken.len() {
+            let reference = &self.entries[script].0;
+            if comparable_number(reference) != comparable_number(&spoken[heard]) {
+                // Start and end on recognized words. Try only one changed,
+                // omitted, or extra word inside an otherwise matching phrase.
+                if !edited && matches > 0 {
+                    for (skip_script, skip_heard) in [(1, 1), (1, 0), (0, 1)] {
+                        if let Some(matched) = self.recover_from(
+                            spoken, script + skip_script, end, heard + skip_heard,
+                            matches, substantive.clone(), true, nearby,
+                        ) {
+                            if best_end.is_none_or(|previous| matched.0 > previous.0
+                                || (matched.0 == previous.0 && matched.1 < previous.1))
+                            {
+                                best_end = Some(matched);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            matches += 1;
+            let word = comparable_number(reference);
+            if substantive_word(reference) && !substantive.contains(&word) {
+                substantive.push(word);
+            }
+            let enough = if edited {
+                matches >= 4 && substantive.len() >= 3
+            } else {
+                matches >= 3 && (substantive.len() >= 3 || (nearby && substantive.len() >= 2))
+            };
+            if enough && self.completes_word(script) {
+                best_end = Some((heard + 1, self.entries[script].1 + 1));
+            }
+            script += 1;
+            heard += 1;
+        }
+        best_end
+    }
+
+}
+
+fn substantive_word(word: &str) -> bool {
+    word.len() >= 3 && !matches!(word,
+        "the" | "and" | "are" | "was" | "were" | "for" | "from" | "with" |
+        "this" | "that" | "these" | "those" | "you" | "your" | "they" | "their" |
+        "them" | "his" | "her" | "our" | "its" | "has" | "had" | "have" |
+        "will" | "would" | "could" | "should" | "can" | "but" | "not" |
+        "what" | "which" | "when" | "where" | "who" | "how" | "there" | "here")
 }
 
 /// Whisper commonly writes spoken numbers as digits even when the script
@@ -331,6 +440,12 @@ pub struct SpeechFollower {
     started: std::time::Instant,
     cpu_retry: Option<CpuRetry>,
     fallback_reason: Option<String>,
+    trace: Arc<VoiceLog>,
+    spoken: Arc<AtomicUsize>,
+    last_output_ms: Arc<AtomicU64>,
+    last_progress: (usize, std::time::Instant),
+    last_status: Option<SpeechStatus>,
+    last_log: std::time::Instant,
 }
 
 struct CpuRetry {
@@ -357,40 +472,54 @@ impl SpeechFollower {
             matcher: matcher.clone(),
             spoken: spoken.clone(),
         });
-        let mut follower = Self::spawn(
+        let mut follower = Self::spawn_with_log(
             stream_command(&stream, &model.path(), microphone_device, language, mode), matcher, spoken, mode,
+            false, VoiceLog::new(),
         )?;
         follower.cpu_retry = cpu_retry;
         Ok(follower)
     }
 
+    #[cfg(test)]
     fn spawn(command: Command, matcher: ScriptMatcher, spoken: Arc<AtomicUsize>, mode: ProcessingMode) -> Result<Self, String> {
-        Self::spawn_with_pause(command, matcher, spoken, mode, false)
+        Self::spawn_with_log(command, matcher, spoken, mode, false, VoiceLog::disabled())
     }
 
-    fn spawn_with_pause(mut command: Command, matcher: ScriptMatcher, spoken: Arc<AtomicUsize>, mode: ProcessingMode, initially_paused: bool) -> Result<Self, String> {
+    fn spawn_with_log(mut command: Command, matcher: ScriptMatcher, spoken: Arc<AtomicUsize>, mode: ProcessingMode, initially_paused: bool, trace: Arc<VoiceLog>) -> Result<Self, String> {
         let child_setting = |key: &str| {
             command.get_envs().find(|(name, _)| *name == key)
                 .map(|(_, value)| value.map(std::ffi::OsStr::to_owned))
                 .unwrap_or_else(|| std::env::var_os(key))
         };
-        eprintln!(
+        let startup = format!(
             "[voice-follow] starting executable={:?} args={:?} audio_driver={:?} microphone={:?} backend={:?}",
             command.get_program(), command.get_args().collect::<Vec<_>>(),
             child_setting("SDL_AUDIODRIVER"), child_setting("PULSE_SOURCE"),
             child_setting("GGML_BACKEND_PATH"),
         );
+        eprintln!("{startup}");
+        trace.write(&startup);
+        trace.write(&format!("script_words={} processing={mode:?}", matcher.script_words.len()));
+        if let Some(path) = trace.path() {
+            eprintln!("[voice-follow] saved diagnostics: {}", path.display());
+        }
         let mut child = command.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("could not start whisper-stream: {error}"))?;
+            .map_err(|error| {
+                let error = format!("could not start whisper-stream: {error}");
+                trace.write(&error);
+                error
+            })?;
+        let started = std::time::Instant::now();
         let mut stdout = child.stdout.take().ok_or("whisper-stream has no output")?;
         let stderr = child.stderr.take().ok_or("whisper-stream has no diagnostics")?;
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
         let reader_diagnostics = diagnostics.clone();
         let runtime = Arc::new(Mutex::new(RuntimeDiagnostics::new(mode)));
         let reader_runtime = runtime.clone();
+        let stderr_trace = trace.clone();
         let stderr_reader = std::thread::spawn(move || {
             let mut stderr = BufReader::new(stderr);
             let mut buffer = Vec::new();
@@ -408,17 +537,23 @@ impl SpeechFollower {
                     reader_runtime.lock().unwrap().observe(line);
                     if !line.is_empty() && line != previous_line {
                         eprintln!("[voice-follow] whisper: {line}");
+                        stderr_trace.write(&format!("whisper: {line}"));
                         previous_line = line.to_owned();
                     }
                 }
                 buffer.clear();
             }
+            stderr_trace.write("Whisper diagnostics stream closed");
         });
         let paused = Arc::new(AtomicBool::new(initially_paused));
         let reader_paused = paused.clone();
         let ready = Arc::new(AtomicBool::new(false));
         let reader_ready = ready.clone();
         let stdout_runtime = runtime.clone();
+        let stdout_trace = trace.clone();
+        let follower_spoken = spoken.clone();
+        let last_output_ms = Arc::new(AtomicU64::new(0));
+        let reader_last_output_ms = last_output_ms.clone();
         std::thread::spawn(move || {
             let mut parser = StreamParser::default();
             let mut buffer = [0u8; 4096];
@@ -428,9 +563,11 @@ impl SpeechFollower {
                 if count == 0 {
                     break;
                 }
+                reader_last_output_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                 // A manual click/scroll establishes a new matching anchor.
                 let position = spoken.load(Ordering::Relaxed);
                 if position != progress.reported {
+                    stdout_trace.write(&format!("manual_jump matched={position}"));
                     progress.seek(position);
                     parser.discard_speech();
                 }
@@ -448,7 +585,7 @@ impl SpeechFollower {
                 }
                 if reader_paused.load(Ordering::Relaxed) {
                     for hypothesis in &hypotheses {
-                        log.print(hypothesis, &progress.matcher, position, true);
+                        log.print_to(&stdout_trace, hypothesis, &progress.matcher, position, true);
                     }
                     parser.discard_speech();
                     progress.seek(position);
@@ -464,13 +601,17 @@ impl SpeechFollower {
                     parser.discard_speech();
                 }
                 for hypothesis in &hypotheses {
-                    log.print(hypothesis, &progress.matcher, spoken.load(Ordering::Relaxed), false);
+                    log.print_to(&stdout_trace, hypothesis, &progress.matcher, spoken.load(Ordering::Relaxed), false);
                 }
             }
+            stdout_trace.write("Whisper recognition stream closed");
         });
+        let initial_position = follower_spoken.load(Ordering::Relaxed);
         Ok(Self {
             child, paused, ready, diagnostics, stderr_reader, failure: None,
-            runtime, mode, started: std::time::Instant::now(), cpu_retry: None, fallback_reason: None,
+            runtime, mode, started, cpu_retry: None, fallback_reason: None,
+            trace, spoken: follower_spoken, last_output_ms,
+            last_progress: (initial_position, started), last_status: None, last_log: started,
         })
     }
 
@@ -478,6 +619,28 @@ impl SpeechFollower {
     /// the model. Only announce listening after its ready marker, and keep
     /// checking for failures throughout the take.
     pub fn status(&mut self) -> SpeechStatus {
+        let status = self.check_status();
+        let now = std::time::Instant::now();
+        let position = self.spoken.load(Ordering::Relaxed);
+        if position != self.last_progress.0 {
+            self.last_progress = (position, now);
+        }
+        if self.last_status.as_ref() != Some(&status)
+            || now.duration_since(self.last_log).as_secs() >= 5
+        {
+            let output_age = self.started.elapsed().as_secs_f64()
+                - self.last_output_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+            self.trace.write(&format!(
+                "status={status:?} matched={position} output_age={output_age:.2}s progress_age={:.2}s",
+                now.duration_since(self.last_progress.1).as_secs_f64(),
+            ));
+            self.last_status = Some(status.clone());
+            self.last_log = now;
+        }
+        status
+    }
+
+    fn check_status(&mut self) -> SpeechStatus {
         if let Some(reason) = &self.failure {
             return SpeechStatus::Failed(reason.clone());
         }
@@ -552,7 +715,8 @@ impl SpeechFollower {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 eprintln!("[voice-follow] automatic startup failed; retrying CPU: {reason}");
-                match Self::spawn_with_pause(retry.command, retry.matcher, retry.spoken, ProcessingMode::Cpu, paused) {
+                self.trace.write(&format!("automatic startup failed; retrying CPU: {reason}"));
+                match Self::spawn_with_log(retry.command, retry.matcher, retry.spoken, ProcessingMode::Cpu, paused, self.trace.clone()) {
                     Ok(mut follower) => {
                         follower.fallback_reason = Some(reason);
                         follower.set_paused(paused);
@@ -574,12 +738,14 @@ impl SpeechFollower {
     }
 
     pub fn set_paused(&self, paused: bool) {
+        self.trace.write(if paused { "paused" } else { "resumed" });
         self.paused.store(paused, Ordering::Relaxed);
     }
 }
 
 impl Drop for SpeechFollower {
     fn drop(&mut self) {
+        self.trace.write(&format!("stopping process pid={} matched={}", self.child.id(), self.spoken.load(Ordering::Relaxed)));
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -611,6 +777,13 @@ impl SpeechLog {
     fn print(&mut self, hypothesis: &str, matcher: &ScriptMatcher, spoken: usize, paused: bool) {
         if let Some(message) = self.message(hypothesis, matcher, spoken, paused) {
             eprintln!("{message}");
+        }
+    }
+
+    fn print_to(&mut self, trace: &VoiceLog, hypothesis: &str, matcher: &ScriptMatcher, spoken: usize, paused: bool) {
+        if let Some(message) = self.message(hypothesis, matcher, spoken, paused) {
+            eprintln!("{message}");
+            trace.write(&message);
         }
     }
 }
@@ -786,6 +959,137 @@ mod tests {
     }
 
     #[test]
+    fn chunk_overlap_does_not_stall_on_the_next_word() {
+        let mut progress = SpeechProgress::new(ScriptMatcher::new(
+            "hint at the grand payoff without giving it away use this three-part formula",
+        ));
+        let mut parser = StreamParser::default();
+        parser.push(b"hint at the grand payoff without giving it\n");
+        assert_eq!(progress.update(&mut parser), 8);
+        // Actual stream shape: the retained audio repeats "it", then the
+        // rest is misheard. The correctly recognized "away" must still win.
+        parser.push(b"\r it away. You will have three portfolio.");
+        assert_eq!(progress.update(&mut parser), 9);
+        parser.push(b"\n\r use this 3 part formula");
+        assert_eq!(progress.update(&mut parser), 13);
+    }
+
+    #[test]
+    fn compound_alignment_keeps_display_word_indices_and_waits_for_whole_word() {
+        let matcher = ScriptMatcher::new("use this three-part formula then lean-in");
+        assert_eq!(matcher.spoken_count(&normalized_words("use this three")), 2);
+        assert_eq!(matcher.spoken_count(&normalized_words("use this 3 part formula")), 4);
+        assert_eq!(matcher.spoken_count_from(&normalized_words("then lean in"), 4), 6);
+    }
+
+    #[test]
+    fn strong_later_phrase_recovers_after_skipped_words_but_common_words_do_not() {
+        let script = "confirm the viewer is in the right place raise the stakes why this matters right now \
+            and open the first curiosity loop hint at the grand payoff without giving it away \
+            use this three-part formula";
+        let matcher = ScriptMatcher::new(script);
+        let start = 8; // "place" was the last word recognized.
+        let away = script.split_whitespace().position(|word| word == "away").unwrap() + 1;
+        assert_eq!(matcher.spoken_count_from(&normalized_words("without giving it away"), start), away);
+        assert_eq!(matcher.spoken_count_from(&normalized_words("the first"), start), start);
+        assert_eq!(matcher.spoken_count_from(&normalized_words("and the"), start), start);
+
+        let repeated = ScriptMatcher::new("missed intro and some other words bright green apples \
+            extra words bright green apples");
+        assert_eq!(repeated.spoken_count_from(&normalized_words("bright green apples"), 0), 9);
+        let far = format!("{} bright green apples", "unheard ".repeat(65));
+        assert_eq!(ScriptMatcher::new(&far).spoken_count(&normalized_words("bright green apples")), 0);
+    }
+
+    #[test]
+    fn continuation_recovers_after_misheard_formula_without_manual_seek() {
+        let mut progress = SpeechProgress::new(ScriptMatcher::new(
+            "it away. Use this three-part formula. Context lean-in. Establish what the video is about",
+        ));
+        let mut parser = StreamParser::default();
+        parser.push(b"it\n\r it away. You will have three portfolio.\n");
+        assert_eq!(progress.update(&mut parser), 2);
+        parser.push(b"\r Context lean in");
+        assert_eq!(progress.update(&mut parser), 8);
+        parser.push(b"\n\r Establish what this video is about");
+        assert_eq!(progress.update(&mut parser), 14);
+        parser.push(b"\n\r [BLANK_AUDIO]\n");
+        assert_eq!(progress.update(&mut parser), 14, "silence must not advance the script");
+    }
+
+    #[test]
+    fn recovery_tolerates_one_wrong_missing_or_extra_word() {
+        let matcher = ScriptMatcher::new(
+            "Use this three-part formula. Context lean-in. Establish what the video is about",
+        );
+        for heard in [
+            "Establish what this video is about",
+            "Establish what video is about",
+            "Establish really what the video is about",
+        ] {
+            assert_eq!(matcher.spoken_count(&normalized_words(heard)), 12, "{heard}");
+        }
+        assert_eq!(matcher.spoken_count(&normalized_words("Establish really what this radio is about")), 0);
+    }
+
+    #[test]
+    fn small_anchor_match_does_not_hide_a_strong_later_phrase() {
+        let matcher = ScriptMatcher::new(
+            "Use this three-part formula. Context lean-in. Establish what the video is about \
+            and connect it to something the viewer already cares about. \
+            The right viewers will recognise themselves in it.",
+        );
+        assert_eq!(matcher.spoken_count(&normalized_words(
+            "Use this. Something the viewer already cares about."
+        )), 22);
+        assert_eq!(matcher.spoken_count(&normalized_words(
+            "Use this. The right viewers will recognise themselves in it."
+        )), 30);
+    }
+
+    #[test]
+    fn strong_earlier_phrase_does_not_hide_later_speech_in_the_same_chunk() {
+        let script = format!("{}without giving it away. Use this three-part formula. Context lean-in. \
+            Establish what the video is about and connect it to something the viewer already cares about. \
+            Extra words. Something the viewer already cares about.", "unheard ".repeat(47));
+        let mut progress = SpeechProgress {
+            matcher: ScriptMatcher::new(&script), reported: 47, chunk_start: 47,
+        };
+        let mut parser = StreamParser::default();
+        parser.push(b"\r without giving it away");
+        assert_eq!(progress.update(&mut parser), 51);
+        for _ in 0..3 {
+            parser.push(b"\r without giving it away. You will have three portfolio. \
+                Something the viewer already cares about.");
+            assert_eq!(progress.update(&mut parser), 73,
+                "later speech should win without a newline or skipping to the repeated occurrence");
+        }
+    }
+
+    #[test]
+    fn weak_recovery_cannot_jump_far_or_count_repeated_words_as_more_evidence() {
+        let far_pair = format!("{} the right place", "missed ".repeat(12));
+        assert_eq!(ScriptMatcher::new(&far_pair).spoken_count(&normalized_words("the right place")), 0);
+        let repeated = format!("{} bright bright bright", "missed ".repeat(12));
+        assert_eq!(ScriptMatcher::new(&repeated).spoken_count(&normalized_words("bright bright bright")), 0);
+        let matcher = ScriptMatcher::new("Use this three-part formula. Context lean-in.");
+        assert_eq!(matcher.spoken_count(&normalized_words("unrelated chatter and the")), 0);
+        assert_eq!(matcher.spoken_count(&[]), 0);
+    }
+
+    #[test]
+    fn overlap_and_recovery_do_not_replay_a_repeated_phrase_in_the_same_chunk() {
+        let mut progress = SpeechProgress::new(ScriptMatcher::new("hello world again hello world again"));
+        let mut parser = StreamParser::default();
+        for _ in 0..3 {
+            parser.push(b"\r hello world again");
+            assert_eq!(progress.update(&mut parser), 3);
+        }
+        parser.push(b"\n\r hello world again");
+        assert_eq!(progress.update(&mut parser), 6);
+    }
+
+    #[test]
     fn stream_parser_commits_lines_and_drops_annotations() {
         let mut parser = StreamParser::default();
         parser.push(b"[Start speaking]\n\x1b[2K\r          \x1b[2K\r Hello wor");
@@ -908,9 +1212,12 @@ mod tests {
         assert_eq!(find_stream_executable(None, Some(root.join("elsewhere/whisper-cli")), Some(&path)), Some(stream.clone()));
         assert_eq!(find_stream_executable(Some(root.join("missing")), None, Some(&path)), None);
         let spoken = Arc::new(AtomicUsize::new(0));
-        let mut follower = SpeechFollower::spawn(
+        let trace = VoiceLog::in_directory(&root.join("logs")).unwrap();
+        let trace_path = trace.path().unwrap().to_owned();
+        let mut follower = SpeechFollower::spawn_with_log(
             stream_command(&stream, &root.join("model.bin"), Some("selected-microphone"), "en", ProcessingMode::Auto),
             ScriptMatcher::new("hello world"), spoken.clone(), ProcessingMode::Auto,
+            false, trace,
         ).unwrap();
         await_status(&mut follower, |status| matches!(status, SpeechStatus::Listening(_)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -923,6 +1230,19 @@ mod tests {
         follower.set_paused(false);
         assert!(matches!(follower.status(), SpeechStatus::Listening(_)));
         drop(follower);
+        let saved = loop {
+            let saved = std::fs::read_to_string(&trace_path).unwrap();
+            if saved.contains("hypothesis=\"hello world\"") { break saved; }
+            assert!(std::time::Instant::now() < deadline, "recognized words were not saved to diagnostics");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(saved.contains("selected-microphone"));
+        assert!(saved.contains("matched=2/2"));
+        assert!(saved.contains("output_age="));
+        assert!(saved.contains("progress_age="));
+        assert!(saved.contains("paused"));
+        assert!(saved.contains("resumed"));
+        assert!(saved.contains("stopping process"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

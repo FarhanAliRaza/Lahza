@@ -394,9 +394,11 @@ also reports the backend used by its running recognizer. **Check**
 rechecks after a driver or hardware change. Drivers must be installed on the
 host; Lahza includes the inference backend, not graphics drivers.
 
-The live recognizer prints its hypotheses,
-matched script word, microphone and compute backend to the launch log
-(`~/.local/state/lahza/launch.log` when started with `just run`). Advanced users
+The live recognizer saves its hypotheses, matched script word, microphone,
+backend and progress timing to `~/.local/state/lahza/voice-follow/` (the latest
+20 sessions). These logs survive restarts and also work for desktop launches.
+`just run` additionally writes `~/.local/state/lahza/launch.log` and preserves
+the previous nonempty run as `launch.previous.log`. Advanced users
 can override the binaries with `LAHZA_WHISPER_CLI` / `LAHZA_WHISPER_STREAM`.
 An explicit `GGML_BACKEND_PATH` takes precedence in Auto/GPU modes; its plugin
 must match the selected runtime. CPU mode ignores that override. The legacy

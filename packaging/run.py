@@ -9,6 +9,10 @@ import sys
 
 def launch(binary, log_path, startup_timeout=1.5):
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the last useful session after a restart, including its Whisper
+    # output. An empty launch must not replace an existing diagnostic backup.
+    if log_path.exists() and log_path.stat().st_size:
+        log_path.replace(log_path.with_name(f"{log_path.stem}.previous{log_path.suffix}"))
     with log_path.open("wb") as log:
         try:
             process = subprocess.Popen(

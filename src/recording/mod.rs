@@ -19,6 +19,7 @@ pub mod studio_overlays;
 pub mod transcript;
 pub mod transcription;
 pub mod speech_runtime;
+pub mod speech_diagnostics;
 pub mod speech_setup;
 pub mod teleprompter;
 pub mod cloud;

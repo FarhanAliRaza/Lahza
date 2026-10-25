@@ -25,6 +25,8 @@ use std::{
 use uuid::Uuid;
 use crate::timeline_edit::{snap_guide_at_edges, snap_timeline_edges};
 
+pub(crate) const MIN_TIMELINE_ZOOM: f64 = 0.1;
+
 /// Geometry for a recording's independent, scrollable time ruler.
 struct RecordingTimelineGeometry {
     duration: f64,
@@ -35,7 +37,10 @@ impl RecordingTimelineGeometry {
     fn new(span: f64, extent: f64, media_duration: f64, viewport_width: f64, zoom: f64) -> Self {
         let span = span.max(0.001);
         Self {
-            duration: extent.max(media_duration).max(span) + span,
+            // Zooming out exposes more editable space, without stretching
+            // the clips back to fit the viewport.
+            duration: (extent.max(media_duration).max(span) + span)
+                .max(span / zoom.max(MIN_TIMELINE_ZOOM)),
             seconds_per_pixel: span / (viewport_width * zoom).max(1.0),
         }
     }
@@ -115,12 +120,17 @@ impl Studio {
         if self.video_duration <= 0.0 || !factor.is_finite() || factor <= 0.0 {
             return;
         }
+        if self.video_project.is_some() {
+            // A playhead parked in empty space exposed by zooming out must
+            // remain on the ruler when zooming back in.
+            self.video_timeline_extent = self.video_timeline_extent.max(self.video_position);
+        }
         let viewport_width = self.video_timeline_viewport_width();
         let duration = self.video_timeline_duration();
         let maximum_width = MAX_CONTENT_WIDTH.min(MAX_POINTS_PER_SECOND * duration);
         let previous_zoom = self.video_timeline_zoom;
         let maximum_zoom = (maximum_width / self.video_timeline_content_width() * previous_zoom).max(1.0);
-        let next_zoom = (previous_zoom * factor).clamp(1.0, maximum_zoom);
+        let next_zoom = (previous_zoom * factor).clamp(MIN_TIMELINE_ZOOM, maximum_zoom);
         if (next_zoom - previous_zoom).abs() < 0.000_1 {
             return;
         }
@@ -1362,6 +1372,15 @@ mod timeline_interaction_tests {
     }
 
     #[test]
+    fn zoomed_out_ruler_fills_viewport_without_stretching_media() {
+        for zoom in [0.1, 0.25, 0.5, 1.0, 2.0] {
+            let geometry = RecordingTimelineGeometry::new(10.0, 10.0, 10.0, 600.0, zoom);
+            assert!(geometry.duration / geometry.seconds_per_pixel >= 600.0 - 1e-9);
+            assert!((10.0 / geometry.seconds_per_pixel - 600.0 * zoom).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn trim_and_move_do_not_change_ruler_scale_or_playhead_coordinates() {
         let drag = trim_drag(ClipEdge::Trailing, 6.0);
         let before = RecordingTimelineGeometry::new(10.0, 10.0, 10.0, 600.0, 2.0);
@@ -1420,8 +1439,10 @@ x11.XCloseDisplay(display)
                 studio.video_clip_timeline = RecordingClipTimeline::full(10.0);
                 studio.video_duration = 10.0;
                 studio.video_source_duration = 10.0;
-                studio.video_timeline_span = 20.0;
+                studio.video_timeline_span = 10.0;
                 studio.video_timeline_extent = 20.0;
+                studio.zoom_video_timeline(0.5, 0.0);
+                assert_eq!(studio.video_timeline_zoom, 0.5);
                 studio.video_position = 4.0;
                 studio.video_selected_clip = None;
                 studio.set_video_frame(image::RgbaImage::from_pixel(160, 90, image::Rgba([50, 70, 100, 255])));
@@ -1559,6 +1580,29 @@ x11.XCloseDisplay(display)
                     pointer(tiny_x, tiny_y + offset_y, "up");
                     Timer::after(Duration::from_millis(60)).await;
                 }
+                handle.update(cx, |studio, _, _| {
+                    studio.video_duration = 10.0;
+                    studio.video_clip_timeline = RecordingClipTimeline::full(10.0);
+                    studio.fit_timeline();
+                    studio.zoom_video_timeline(0.01, 0.0);
+                    assert_eq!(studio.video_timeline_zoom, MIN_TIMELINE_ZOOM);
+                    studio.pan_video_timeline(1000.0);
+                    assert!(studio.video_timeline_scroll.abs() < 1e-6);
+
+                    // Park in the empty space exposed at 0.1×, then zoom in:
+                    // the same time must remain under the same screen point.
+                    studio.video_position = 90.0;
+                    let before_x = studio.video_position / studio.video_timeline_seconds_per_pixel();
+                    studio.zoom_video_timeline(10.0, studio.video_position);
+                    assert!(studio.video_timeline_duration() >= studio.video_position);
+                    let bounds = studio.video_timeline_bounds.lock().unwrap().unwrap();
+                    let time = studio.motion_timeline_time_at(bounds.origin.x + px(before_x as f32)).unwrap();
+                    assert!((time - 90.0).abs() < 1e-4);
+                    studio.fit_timeline();
+                    assert_eq!(studio.video_timeline_zoom, 1.0);
+                    assert_eq!(studio.video_timeline_scroll, 0.0);
+                    assert_eq!(studio.video_duration, 10.0);
+                }).unwrap();
                 cx.update(|cx| cx.quit()).unwrap();
                 std::fs::remove_dir_all(&root).unwrap();
             }).detach();
