@@ -136,11 +136,11 @@ impl Studio {
         cx.spawn(async move |weak, cx| {
             let (devices, result) = task.await;
             let _ = weak.update(cx, |this, cx| {
+                if this.load_generation != generation { return; }
                 if let Some((microphones, cameras)) = devices {
                     this.microphone_devices = microphones;
                     this.camera_devices = cameras;
                 }
-                if this.load_generation != generation { return; }
                 match result {
                     Ok(prepared) => {
                         match prepared {

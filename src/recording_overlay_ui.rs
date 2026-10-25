@@ -3,7 +3,7 @@
 use crate::recording::camera_preview::{CameraFrame, CameraFrames};
 use crate::recording::capture_exclusion::CaptureExclusion;
 use crate::recording::native::CaptureSourceGeometry;
-use crate::recording::scene::{CameraOverlay, CameraShape};
+use crate::recording::scene::{CameraOverlay, Rect};
 use crate::recording_overlay_drag::OverlayDrag;
 use crate::{cached_render_image, RecordingAction, RecordingState, Studio};
 use gpui::{
@@ -24,30 +24,23 @@ const STALE_CAMERA: Duration = Duration::from_secs(1);
 #[path = "recording_overlay_drag_tests.rs"]
 mod drag_tests;
 
-fn monitor_pixels(frame: CameraFrame, mirror: bool) -> Option<image::RgbaImage> {
+#[cfg(test)]
+#[path = "recording_overlay_probe_tests.rs"]
+mod visibility_probe_tests;
+
+fn monitor_pixels(frame: CameraFrame, overlay: CameraOverlay, canvas_aspect: f64) -> Option<image::RgbaImage> {
     let pixels = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)?;
-    let side = frame.width.min(frame.height);
-    if side == 0 {
-        return None;
-    }
-    // Match the saved compositor's center cover-crop. GPUI rounds the full
-    // image bounds before clipping a Cover-fit landscape image, which would
-    // leave square corners inside our circular viewport without this crop.
-    let mut pixels = if frame.width == frame.height {
-        pixels
-    } else {
-        image::imageops::crop_imm(
-            &pixels,
-            (frame.width - side) / 2,
-            (frame.height - side) / 2,
-            side,
-            side,
-        )
-        .to_image()
-    };
-    if mirror {
-        image::imageops::flip_horizontal_in_place(&mut pixels);
-    }
+    if frame.width == 0 || frame.height == 0 { return None; }
+    let source_aspect = frame.width as f64 / frame.height as f64;
+    let composed = overlay.rect_for_frame(canvas_aspect, 1.0, source_aspect, 1.0);
+    let crop = crate::recording::camera_layout::source_crop(overlay, source_aspect, composed);
+    let width = (crop.width * frame.width as f64).round().max(1.0) as u32;
+    let height = (crop.height * frame.height as f64).round().max(1.0) as u32;
+    let x = (crop.x * frame.width as f64).round() as u32;
+    let y = (crop.y * frame.height as f64).round() as u32;
+    let mut pixels = image::imageops::crop_imm(&pixels,
+        x.min(frame.width - width), y.min(frame.height - height), width, height).to_image();
+    if overlay.mirror { image::imageops::flip_horizontal_in_place(&mut pixels); }
     Some(pixels)
 }
 
@@ -57,6 +50,7 @@ struct RecordingSnapshot {
     busy: bool,
     has_controller: bool,
     timecode: String,
+    start_label: String,
 }
 
 impl RecordingSnapshot {
@@ -65,7 +59,12 @@ impl RecordingSnapshot {
             state: studio.recording_state,
             busy: studio.recording_busy,
             has_controller: studio.recording_controller.is_some(),
-            timecode: studio.recording_timecode(),
+            timecode: studio.recording_startup.as_ref()
+                .and_then(|startup| startup.countdown_remaining())
+                .filter(|_| studio.recording_state == RecordingState::Starting)
+                .map(|remaining| remaining.to_string())
+                .unwrap_or_else(|| studio.recording_timecode()),
+            start_label: studio.recording_start_label(),
         }
     }
 
@@ -78,9 +77,10 @@ impl RecordingSnapshot {
             )
     }
 
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self.state {
-            RecordingState::Idle | RecordingState::Starting => "Starting…",
+            RecordingState::Idle => "Starting…",
+            RecordingState::Starting => &self.start_label,
             RecordingState::Finishing => "Saving…",
             RecordingState::Paused if self.busy => "Resuming…",
             RecordingState::Recording if self.busy => "Updating…",
@@ -162,7 +162,9 @@ impl RecordingPill {
             let owner = owner.clone();
             cx.defer(move |cx| {
                 let _ = owner.update(cx, |studio, cx| {
-                    if RecordingSnapshot::from_studio(studio).can_control() {
+                    if studio.recording_state == RecordingState::Starting {
+                        studio.cancel_recording_start(cx);
+                    } else if RecordingSnapshot::from_studio(studio).can_control() {
                         studio.run_recording_action(RecordingAction::Stop, cx);
                         cx.notify();
                     }
@@ -184,7 +186,9 @@ impl RecordingPill {
         // The displayed snapshot can be up to 100 ms old: check the live
         // state again so double clicks cannot race an in-flight operation.
         let _ = self.studio.update(cx, |studio, cx| {
-            if RecordingSnapshot::from_studio(studio).can_control() {
+            if matches!(action, RecordingAction::Stop) && studio.recording_state == RecordingState::Starting {
+                studio.cancel_recording_start(cx);
+            } else if RecordingSnapshot::from_studio(studio).can_control() {
                 studio.run_recording_action(action, cx);
                 cx.notify();
             }
@@ -199,7 +203,7 @@ impl RecordingPill {
         stop: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let enabled = self.snapshot.can_control();
+        let enabled = self.snapshot.can_control() || (stop && self.snapshot.state == RecordingState::Starting);
         div()
             .id(id)
             .size(px(36.0))
@@ -331,7 +335,7 @@ impl Render for RecordingPill {
                                             .text_size(px(10.0))
                                             .line_height(px(12.0))
                                             .text_color(rgb(0xb5b8c3))
-                                            .child(self.snapshot.label()),
+                                            .child(self.snapshot.label().to_owned()),
                                     ),
                             ),
                     )
@@ -352,7 +356,7 @@ impl Render for RecordingPill {
                     ))
                     .child(self.button(
                         "recording-pill-stop",
-                        "Stop and save recording",
+                        if self.snapshot.state == RecordingState::Starting { "Cancel recording" } else { "Stop and save recording" },
                         RecordingAction::Stop,
                         true,
                         cx,
@@ -368,6 +372,7 @@ pub(crate) struct RecordingCamera {
     overlay: CameraOverlay,
     generation: u64,
     image: Option<Arc<RenderImage>>,
+    image_aspect: f64,
     last_frame: Option<Instant>,
     waiting: bool,
     positioned_source: Option<CaptureSourceGeometry>,
@@ -396,10 +401,17 @@ impl RecordingCamera {
         let mut checked = Instant::now();
         let ticker = cx.spawn(async move |weak, cx| loop {
             Timer::after(Duration::from_millis(67)).await;
-            let Ok((snapshot, overlay)) = studio.read_with(cx, |studio, _| {
+            let Ok((snapshot, overlay, canvas_aspect)) = studio.read_with(cx, |studio, _| {
+                let source_aspect = studio.recording_controller.as_ref()
+                    .and_then(|controller| controller.source_geometry())
+                    .map(|geometry| geometry.size.0 as f64 / geometry.size.1.max(1) as f64);
+                let canvas_aspect = if studio.aspect_ratio == 0 {
+                    source_aspect.unwrap_or(studio.selected_canvas_ratio() as f64)
+                } else { studio.selected_canvas_ratio() as f64 };
                 (
                     RecordingSnapshot::from_studio(studio),
                     studio.camera_overlay,
+                    canvas_aspect,
                 )
             }) else {
                 let _ = handle.update(cx, |root, window, cx| {
@@ -447,7 +459,7 @@ impl RecordingCamera {
             // simply replaces the shared slot instead of queueing frames.
             let pixels = cx
                 .background_executor()
-                .spawn(async move { monitor_pixels(frame, overlay.mirror) })
+                .spawn(async move { monitor_pixels(frame, overlay, canvas_aspect) })
                 .await;
             let Some(pixels) = pixels else { continue };
             if handle
@@ -457,6 +469,7 @@ impl RecordingCamera {
                     };
                     view.update(cx, |this, cx| {
                         this.generation = generation;
+                        this.image_aspect = pixels.width() as f64 / pixels.height().max(1) as f64;
                         let previous = this.image.replace(cached_render_image(pixels));
                         if let Some(previous) = previous {
                             let _ = window.drop_image(previous);
@@ -486,6 +499,7 @@ impl RecordingCamera {
             overlay,
             generation,
             image: None,
+            image_aspect: overlay.aspect_ratio(1.0),
             last_frame: None,
             waiting: true,
             positioned_source: None,
@@ -494,10 +508,11 @@ impl RecordingCamera {
         }
     }
 
-    fn badge(&self) -> Option<&'static str> {
+    fn badge(&self) -> Option<&str> {
         match self.snapshot.state {
             RecordingState::Paused => Some("Camera paused"),
             RecordingState::Finishing => Some("Saving recording…"),
+            RecordingState::Starting if self.snapshot.start_label != "Starting…" => Some(&self.snapshot.start_label),
             RecordingState::Idle | RecordingState::Starting => Some("Starting camera…"),
             RecordingState::Recording if self.waiting => Some("Waiting for camera…"),
             RecordingState::Recording if self.snapshot.busy => Some("Updating…"),
@@ -508,14 +523,17 @@ impl RecordingCamera {
 
 impl Render for RecordingCamera {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let radius = match self.overlay.shape {
-            CameraShape::Circle => CAMERA_SIZE / 2.0,
-            CameraShape::Squircle => CAMERA_SIZE * 0.18,
-            CameraShape::Square => CAMERA_SIZE * 0.03,
-        };
-        let badge = self.badge();
+        let rect = crate::recording::camera_layout::fit_rect(
+            Rect { x: 0.0, y: 0.0, width: (CAMERA_SIZE - 6.0) as f64, height: (CAMERA_SIZE - 6.0) as f64 },
+            self.image_aspect,
+        );
+        let radius = self.overlay.radius(rect) as f32;
+        let badge = self.badge().map(str::to_owned);
         div()
             .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
             .p(px(3.0))
             .on_mouse_up(
                 MouseButton::Left,
@@ -529,7 +547,8 @@ impl Render for RecordingCamera {
                 div()
                     .id("recording-camera-monitor")
                     .relative()
-                    .size_full()
+                    .w(px(rect.width as f32))
+                    .h(px(rect.height as f32))
                     .rounded(px(radius))
                     .overflow_hidden()
                     .border_2()
@@ -635,6 +654,66 @@ struct DesktopRect {
     height: u32,
 }
 
+fn monitor_containing_window(window: DesktopRect, monitors: &[DesktopRect]) -> Option<DesktopRect> {
+    monitors.iter().copied().filter_map(|monitor| {
+        let width = ((window.x as i64 + window.width as i64)
+            .min(monitor.x as i64 + monitor.width as i64)
+            - (window.x as i64).max(monitor.x as i64)).max(0);
+        let height = ((window.y as i64 + window.height as i64)
+            .min(monitor.y as i64 + monitor.height as i64)
+            - (window.y as i64).max(monitor.y as i64)).max(0);
+        let area = width * height;
+        (area > 0).then_some((area, monitor))
+    }).max_by_key(|(area, _)| *area).map(|(_, monitor)| monitor)
+}
+
+fn desktop_rect(bounds: Bounds<Pixels>, scale: f32) -> DesktopRect {
+    DesktopRect {
+        x: (f32::from(bounds.origin.x) * scale).round() as i32,
+        y: (f32::from(bounds.origin.y) * scale).round() as i32,
+        width: (f32::from(bounds.size.width) * scale).round().max(0.0) as u32,
+        height: (f32::from(bounds.size.height) * scale).round().max(0.0) as u32,
+    }
+}
+
+fn monitor_bounds(monitor: DesktopRect, scale: f32) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(px(monitor.x as f32 / scale), px(monitor.y as f32 / scale)),
+        size: size(px(monitor.width as f32 / scale), px(monitor.height as f32 / scale)),
+    }
+}
+
+/// GPUI's X11 display covers the entire desktop, including gaps between
+/// unequal monitors. Anchor both windows to one real monitor before mapping
+/// them, including while the portal is open and when recording a window.
+fn initial_overlay_monitor(launcher: Option<DesktopRect>) -> PlacementResult<DesktopRect> {
+    use x11rb::{connection::Connection, protocol::{randr::ConnectionExt, xproto::ConnectionExt as _}};
+    let (connection, index) = x11rb::connect(None)?;
+    let root = connection.setup().roots[index].root;
+    let info = connection.randr_get_monitors(root, true)?.reply()?;
+    let monitors: Vec<_> = info.monitors.iter().filter(|monitor| monitor.width > 0 && monitor.height > 0)
+        .map(|monitor| DesktopRect {
+            x: monitor.x.into(), y: monitor.y.into(),
+            width: monitor.width.into(), height: monitor.height.into(),
+        }).collect();
+    if let Some(monitor) = launcher.and_then(|launcher| monitor_containing_window(launcher, &monitors)) {
+        return Ok(monitor);
+    }
+    if let Ok(pointer) = connection.query_pointer(root)?.reply() {
+        let pointer = DesktopRect { x: pointer.root_x.into(), y: pointer.root_y.into(), width: 1, height: 1 };
+        if let Some(monitor) = monitor_containing_window(pointer, &monitors) {
+            return Ok(monitor);
+        }
+    }
+    info.monitors.iter().find(|monitor| monitor.primary && monitor.width > 0 && monitor.height > 0)
+        .map(|monitor| DesktopRect {
+            x: monitor.x.into(), y: monitor.y.into(),
+            width: monitor.width.into(), height: monitor.height.into(),
+        })
+        .or_else(|| monitors.first().copied())
+        .ok_or_else(|| "no active recording overlay display".into())
+}
+
 /// Portal positions are compositor coordinates, whereas RandR reports the
 /// X11/XWayland desktop. Accept only an unambiguous position/scale match.
 fn capture_monitor(source: CaptureSourceGeometry, monitors: &[DesktopRect]) -> Option<DesktopRect> {
@@ -648,6 +727,12 @@ fn capture_monitor(source: CaptureSourceGeometry, monitors: &[DesktopRect]) -> O
         .collect();
     if valid.len() == 1 {
         return Some(valid[0]);
+    }
+    if let Some(exact) = valid.iter().find(|monitor| {
+        (monitor.x, monitor.y) == source.position
+            && (monitor.width as i32, monitor.height as i32) == source.size
+    }) {
+        return Some(*exact);
     }
     let matches: Vec<_> = valid
         .into_iter()
@@ -892,19 +977,27 @@ impl Studio {
         cx: &mut Context<Self>,
     ) -> Result<Vec<CaptureExclusion>, String> {
         self.close_recording_overlays(cx);
-        let display = self
+        let launcher = self
             .window_handle
-            .update(cx, |_, window, cx| window.display(cx))
-            .ok()
-            .flatten()
+            .update(cx, |_, window, cx| (window.bounds(), window.scale_factor(), window.display(cx)))
+            .ok();
+        let scale = launcher.as_ref().map(|(_, scale, _)| *scale).unwrap_or(1.0);
+        let display = launcher.as_ref().and_then(|(_, _, display)| display.clone())
             .or_else(|| cx.primary_display());
-        let bounds = display
+        let fallback_bounds = display
             .as_ref()
             .map(|display| display.bounds())
             .unwrap_or_else(|| Bounds {
                 origin: point(px(0.0), px(0.0)),
                 size: size(px(1280.0), px(720.0)),
             });
+        let bounds = match initial_overlay_monitor(launcher.map(|(bounds, scale, _)| desktop_rect(bounds, scale))) {
+            Ok(monitor) => monitor_bounds(monitor, scale),
+            Err(error) => {
+                eprintln!("Could not locate recording overlay monitor: {error}");
+                fallback_bounds
+            }
+        };
         let display_id = display.as_ref().map(|display| display.id());
         let owner = cx.entity().downgrade();
         let snapshot = RecordingSnapshot::from_studio(self);
@@ -978,6 +1071,54 @@ impl Studio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_overlays_share_the_launcher_monitor_in_an_uneven_desktop() {
+        let wide = DesktopRect { x: 0, y: 0, width: 3440, height: 1440 };
+        let portrait = DesktopRect { x: 3440, y: 0, width: 1080, height: 1920 };
+        let monitors = [wide, portrait];
+        for (launcher, expected) in [
+            (DesktopRect { x: 1500, y: 500, width: 430, height: 610 }, wide),
+            (DesktopRect { x: 3700, y: 500, width: 430, height: 610 }, portrait),
+            (DesktopRect { x: 3300, y: 500, width: 430, height: 610 }, portrait),
+        ] {
+            let monitor = monitor_containing_window(launcher, &monitors).unwrap();
+            assert_eq!(monitor, expected);
+            let bounds = monitor_bounds(monitor, 1.0);
+            for camera in [false, true] {
+                let overlay = desktop_rect(overlay_bounds(bounds, camera), 1.0);
+                assert!(overlay.x >= monitor.x && overlay.y >= monitor.y);
+                assert!(overlay.x as i64 + overlay.width as i64 <= monitor.x as i64 + monitor.width as i64);
+                assert!(overlay.y as i64 + overlay.height as i64 <= monitor.y as i64 + monitor.height as i64);
+            }
+        }
+        // The old whole-desktop placement put the pill in this gap.
+        let gap = DesktopRect { x: 2116, y: 1832, width: 292, height: 56 };
+        assert_eq!(monitor_containing_window(gap, &monitors), None);
+    }
+
+    #[test]
+    fn initial_overlay_monitor_conversion_preserves_negative_and_scaled_bounds() {
+        let left = DesktopRect { x: -2560, y: -120, width: 2560, height: 1440 };
+        for scale in [1.0, 1.25, 2.0] {
+            let logical = monitor_bounds(left, scale);
+            assert_eq!(desktop_rect(logical, scale), left);
+            let launcher = Bounds {
+                origin: point(px(-900.0 / scale), px(200.0 / scale)),
+                size: size(px(430.0 / scale), px(610.0 / scale)),
+            };
+            assert_eq!(monitor_containing_window(desktop_rect(launcher, scale), &[left]), Some(left));
+        }
+    }
+
+    #[test]
+    fn exact_capture_monitor_wins_over_an_ambiguous_scaled_match() {
+        let primary = DesktopRect { x: 0, y: 0, width: 1920, height: 1080 };
+        let next = DesktopRect { x: 1920, ..primary };
+        let scaled = DesktopRect { x: 3840, y: 0, width: 3840, height: 2160 };
+        let source = CaptureSourceGeometry { position: (1920, 0), size: (1920, 1080), is_monitor: true };
+        assert_eq!(capture_monitor(source, &[primary, next, scaled]), Some(next));
+    }
 
     #[test]
     fn selected_ultrawide_or_portrait_monitor_controls_overlay_placement() {
@@ -1198,13 +1339,25 @@ mod tests {
             height: 2,
             rgba: pixels.into_raw(),
         };
-        let normal = monitor_pixels(frame.clone(), false).unwrap();
-        let mirrored = monitor_pixels(frame, true).unwrap();
+        let normal = monitor_pixels(frame.clone(), CameraOverlay::default(), 16.0 / 9.0).unwrap();
+        let mirrored = monitor_pixels(frame, CameraOverlay { mirror: true, ..Default::default() }, 16.0 / 9.0).unwrap();
         assert_eq!(normal.dimensions(), (2, 2));
         assert_eq!(normal.get_pixel(0, 0).0, [1, 0, 0, 255]);
         assert_eq!(normal.get_pixel(1, 1).0, [2, 1, 0, 255]);
         assert_eq!(mirrored.get_pixel(0, 0), normal.get_pixel(1, 0));
         assert_eq!(mirrored.get_pixel(1, 1), normal.get_pixel(0, 1));
+    }
+
+    #[test]
+    fn camera_only_monitor_uses_the_selected_canvas_crop() {
+        let pixels = image::RgbaImage::from_fn(160, 90, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
+        let frame = CameraFrame { width: 160, height: 90, rgba: pixels.into_raw() };
+        let overlay = CameraOverlay { layout: crate::recording::camera_layout::CameraLayout::Fullscreen, ..Default::default() };
+        let wide = monitor_pixels(frame.clone(), overlay, 16.0 / 9.0).unwrap();
+        let portrait = monitor_pixels(frame, overlay, 9.0 / 16.0).unwrap();
+        assert_eq!(wide.dimensions(), (160, 90));
+        assert_eq!(portrait.dimensions(), (51, 90));
+        assert_eq!(portrait.get_pixel(0, 0).0[0], 55);
     }
 
     #[test]
@@ -1351,6 +1504,7 @@ mod tests {
             busy: false,
             has_controller: true,
             timecode: "00:00".into(),
+            start_label: "Starting…".into(),
         };
         for state in [
             RecordingState::Idle,

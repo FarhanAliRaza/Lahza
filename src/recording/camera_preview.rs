@@ -7,6 +7,8 @@
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_video::prelude::*;
+use std::time::{Duration, Instant};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -32,6 +34,11 @@ pub struct CameraFrames {
 }
 
 impl CameraFrames {
+    pub fn clear(&self) {
+        *self.frame.lock().expect("camera frame slot poisoned") = None;
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     pub fn publish(&self, frame: CameraFrame) {
         *self.frame.lock().expect("camera frame slot poisoned") = Some(frame);
         self.generation.fetch_add(1, Ordering::Release);
@@ -79,26 +86,22 @@ pub fn attach_preview(
         let Some(caps) = pad.current_caps() else {
             return gst::PadProbeReturn::Ok;
         };
-        let Some(structure) = caps.structure(0) else {
+        let Ok(video_info) = gstreamer_video::VideoInfo::from_caps(&caps) else {
             return gst::PadProbeReturn::Ok;
         };
-        let (Ok(width), Ok(height)) = (
-            structure.get::<i32>("width"),
-            structure.get::<i32>("height"),
-        ) else {
+        let Ok(frame) = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &video_info) else {
             return gst::PadProbeReturn::Ok;
         };
-        let (width, height) = (width as u32, height as u32);
-        let Ok(map) = buffer.map_readable() else {
-            return gst::PadProbeReturn::Ok;
-        };
-        let expected = width as usize * height as usize * 4;
-        if map.len() >= expected {
-            frames.publish(CameraFrame {
-                width,
-                height,
-                rgba: map.as_slice()[..expected].to_vec(),
-            });
+        let (width, height) = (frame.width(), frame.height());
+        let stride = frame.plane_stride()[0];
+        let Ok(pixels) = frame.plane_data(0) else { return gst::PadProbeReturn::Ok; };
+        let row_bytes = width as usize * 4;
+        if stride > 0 && stride as usize >= row_bytes && pixels.len() >= stride as usize * height as usize {
+            let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+            for row in pixels.chunks_exact(stride as usize).take(height as usize) {
+                rgba.extend_from_slice(&row[..row_bytes]);
+            }
+            frames.publish(CameraFrame { width, height, rgba });
         }
         gst::PadProbeReturn::Ok
     });
@@ -108,24 +111,53 @@ pub fn attach_preview(
 /// A standalone webcam pipeline that only feeds the preview.
 pub struct CameraPreview {
     pipeline: gst::Pipeline,
+    frames: Arc<CameraFrames>,
+    initial_generation: u64,
+    started_at: Instant,
 }
 
 impl CameraPreview {
     pub fn start(device: &str, frames: Arc<CameraFrames>) -> Result<Self, String> {
         gst::init().map_err(|error| format!("could not initialize GStreamer: {error}"))?;
+        frames.clear();
+        let initial_generation = frames.generation.load(Ordering::Acquire);
+        // decodebin accepts raw and MJPEG-only webcam modes alike. Device
+        // properties are set directly rather than parsed as pipeline syntax.
         let description = format!(
-            "v4l2src device=\"{device}\" ! {}",
+            "v4l2src name=camera_source do-timestamp=true ! decodebin ! {}",
             preview_branch("camera_preview")
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| format!("could not build webcam preview: {error}"))?
             .downcast::<gst::Pipeline>()
             .map_err(|_| "GStreamer did not create a preview pipeline".to_string())?;
-        attach_preview(&pipeline, "camera_preview", frames)?;
-        pipeline
-            .set_state(gst::State::Playing)
+        pipeline.by_name("camera_source").ok_or_else(|| "webcam source is unavailable".to_string())?
+            .set_property("device", device);
+        attach_preview(&pipeline, "camera_preview", frames.clone())?;
+        let preview = Self { pipeline, frames, initial_generation, started_at: Instant::now() };
+        preview.pipeline.set_state(gst::State::Playing)
             .map_err(|error| format!("could not start webcam preview: {error}"))?;
-        Ok(Self { pipeline })
+        Ok(preview)
+    }
+
+    /// Poll with the launcher frames so unplugged/busy cameras cannot leave
+    /// a frozen picture that appears to be live.
+    pub fn take_error(&self) -> Option<String> {
+        if let Some(bus) = self.pipeline.bus() {
+            while let Some(message) = bus.pop() {
+                match message.view() {
+                    gst::MessageView::Error(error) => return Some(format!("{}", error.error())),
+                    gst::MessageView::Eos(..) => return Some("The webcam stopped sending video.".into()),
+                    _ => {}
+                }
+            }
+        }
+        if self.started_at.elapsed() > Duration::from_secs(5)
+            && self.frames.generation.load(Ordering::Acquire) == self.initial_generation
+        {
+            return Some("No webcam frames arrived. Check that the camera is connected and not in use by another application.".into());
+        }
+        None
     }
 }
 
@@ -140,6 +172,47 @@ impl Drop for CameraPreview {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn missing_device_reports_an_error_and_discards_stale_frames() {
+        let frames = Arc::new(CameraFrames::default());
+        frames.publish(CameraFrame { width: 1, height: 1, rgba: vec![255; 4] });
+        let result = CameraPreview::start("/dev/lahza-missing-camera-test", frames.clone());
+        match result {
+            Err(error) => assert!(!error.is_empty()),
+            Ok(preview) => {
+                let deadline = Instant::now() + Duration::from_secs(6);
+                loop {
+                    if let Some(error) = preview.take_error() {
+                        assert!(!error.is_empty());
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "missing device appeared live");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        assert!(frames.newer_than(0).is_none());
+    }
+
+    #[test]
+    fn mjpeg_camera_frames_decode_into_the_same_preview_branch() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=4 ! video/x-raw,width=640,height=480 ! jpegenc ! decodebin ! {}",
+            preview_branch("preview")
+        )).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let frames = Arc::new(CameraFrames::default());
+        attach_preview(&pipeline, "preview", frames.clone()).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let message = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(5), &[gst::MessageType::Eos, gst::MessageType::Error]);
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(matches!(message.unwrap().view(), gst::MessageView::Eos(_)));
+        let (_, frame) = frames.newer_than(0).unwrap();
+        assert_eq!((frame.width, frame.height), (320, 240));
+        assert_eq!(frame.rgba.len(), 320 * 240 * 4);
+    }
 
     #[test]
     fn recording_tee_encodes_while_publishing_bounded_preview_frames() {

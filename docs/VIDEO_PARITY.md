@@ -2,17 +2,24 @@
 
 ## Recording lifecycle
 
-- [ ] Full-screen and window source selection; area selection where supported.
-- Area recording has an app-owned rectangle picker after portal monitor
-  selection. It crops the stream before encoding and uses the embedded system
-  cursor. Cross-desktop validation remains outstanding.
+- [x] Explicit Display / Window / Area recording modes, portal source selection,
+  countdown, cancel, and close-on-start controls. Area recording has an
+  app-owned rectangle picker after portal monitor selection; it crops the
+  stream before encoding and uses the embedded system cursor. Cross-desktop
+  portal and live-device validation remains outstanding.
 - [x] Starting, recording, paused, finishing, and idle states.
 - [x] Fixed-width elapsed clock with visible recording/paused status.
 - [x] Pause/resume, restart, stop-and-save, and discard controls backed by the
   same recording controller rather than UI-only placeholders.
+- [x] Protected recording pill and camera monitor start together on the
+  launcher's physical monitor, including unequal-height and portrait layouts.
+  A selected display moves both overlays together; window capture and missing
+  portal geometry retain their initial visible placement. Helper failures
+  preserve launcher controls and report the failure reason.
 - [ ] A recording that started is never silently lost after an encoder,
   compositor, display, sleep, or disk error.
-- [ ] Stop opens a persistent project without forcing a flattened export.
+- [x] Stop opens the persistent project without forcing a flattened export,
+  retaining the chosen scene style.
 
 ## Project package
 
@@ -21,7 +28,8 @@
 - [x] Atomic JSON sidecar writes.
 - [ ] Camera master, replacement audio, poster, render stamp, and metadata.
   Real decoded poster generation, lossless JSON render stamps, and project
-  metadata are implemented; camera and replacement-audio persistence remain.
+  metadata and the optional camera master are implemented; replacement-audio
+  persistence remains.
 - [x] Draft autosave remains separate from explicit save, reopens first after
   recovery, and preserves unknown fields written by newer project versions.
 - [x] Recovery scans unfinished packages after restart and adopts usable raw
@@ -38,9 +46,14 @@
 - [x] Swift-equivalent deterministic pointer sanitizer: stable ordering,
   tolerance clamping, isolated-spike removal, travel thinning, input cleanup,
   artwork validation, and travel/press/release stream priority.
-- [x] Deterministic 120 Hz reconstructed cursor timeline with Swift's glide,
-  intercept, drag-track, press-settle, inactivity reveal, tilt, interpolation,
-  and exact press-target behavior.
+- [x] Deterministic cursor path planner with 1 ms integration, cut-bounded
+  anticipation, grouped input accuracy constraints, bounded speed search,
+  compressed idle spans, and deterministic arbitrary seeking. Smooth /
+  Medium / Rapid / None are selectable; old motion values still deserialize.
+- [x] Spring click scale (90% while pressed), idle blur/fade, typing hide,
+  velocity tilt, directional steering, and a configurable loop return.
+  Available capture metadata supplies button, drag, release, and artwork
+  constraints; dedicated hover-change metadata is not currently recorded.
 - [x] Deterministic click-pulse geometry and keystroke caption timeline shared
   as renderer-ready data.
 - [x] Clip-aware pointer remapping before spring integration, including
@@ -49,9 +62,15 @@
 
 ## Automatic zoom
 
-- [x] Swift cue synthesis constants: 0.3 s pre-roll, 2.5 s post-roll,
-  2.5 s transitive join tolerance, 1 s tail exclusion, 0.8 s trailing guard,
-  and 1.5× default magnification.
+- [x] Compact click zoom: 0.6 s pre-roll, 1.6 s post-roll, 0.6 s join
+  tolerance, 1 s tail exclusion, 0.8 s trailing guard, and 1.5× default
+  magnification. Cinematic is an explicit alternative with 0.3 s pre-roll,
+  2.5 s post-roll/join tolerance, 2× zoom, and Focused camera response.
+  New captures seed Cinematic when no authored cues exist; existing/imported
+  projects keep the Compact fallback. New manual cues use Focused, while
+  missing response fields in older saved cues continue to load as Standard.
+  See [the Screen Studio study](SCREEN_STUDIO_ANIMATION_STUDY.md) for evidence
+  and remaining differences; these options do not establish full parity.
 - [x] Pointer, smart, and pinned anchor modes represented as project data.
 - [x] Editable add/remove/move/resize/enable controls with undo/redo. Motion
   regions live on an orange timeline lane: double-click adds one at that
@@ -61,8 +80,34 @@
 - [x] Deterministic 120 Hz viewport spring used by both preview and export.
   `ViewportTimeline` is the single camera source; the GPUI preview and the
   CPU `SceneCompositor` read the same `visible_rect` per frame.
-- [ ] Bounds-aware framing and long-travel comfort widening.
-- [ ] Clip cuts and speed changes preserve continuous camera motion.
+- [x] Per-region Standard, Smooth, and Focused camera response, persisted with
+  the cue and retained during release. Older projects retain Standard.
+- [x] Duration-weighted activity clusters after 10 px travel thinning, with
+  button events retained and bounds scaled by zoom, crop, and Fill on both axes.
+- [x] Classic and Glass Loupe are separate animated tracks. The lens includes
+  source-anchored focus, size, magnification, spring appearance/disappearance,
+  bevel refraction, RGB dispersion, reflected rim, directional highlights,
+  colored shine, shadow, and camera fading. CPU preview and GPU/CPU export
+  use the same geometry and optical equations; canvas overlays stay above it.
+- [x] Motion overview exposes illustrated **Classic zoom** and **Glass loupe**
+  creation cards at the playhead, plus a selectable list of regions. Creation
+  takes one undo step. Selected zooms follow the recovered inspector order:
+  style, Instant animation or lens size, Auto/Manual position, and zoom level.
+  Manual positioning has a clickable source preview; the zoom track supports
+  click and drag. Advanced optics/animation/timing and Pan & transform are
+  separate disclosures. Automatic generation and new-region defaults are
+  grouped in the overview; image-scene presets have their own section.
+- [x] Playback composition runs outside the UI thread with a single replaceable
+  waiting frame, preventing a backlog. Exact paused frames and export retain
+  the same optics; large CPU lens passes use at most four parallel workers.
+  Playback preview size is bounded to 1.44 million pixels while preserving
+  aspect ratio; paused preview and export use their requested full resolution.
+- [x] Per-region early animation (350 ms) and exact instant boundaries. The
+  instant spring window extends 50 ms beyond the authored end to snap release;
+  the visible zoom itself does not extend past the region.
+- [x] Clip cuts and speed changes remap camera and lens regions deterministically;
+  removed regions cannot leave a held pose on retained footage.
+- [ ] Long-travel comfort widening beyond the bounded camera target.
 
 ## Native Linux backend
 
@@ -77,11 +122,14 @@
   the cursor when it is unavailable.
 - [x] Optional system-audio and microphone sources share the native media clock,
   mix into an Opus track, survive pause/resume, and are recorded in the manifest.
-- [ ] Optional camera master and device selection. A camera clip can be
-  added to a project from a file (`camera.mkv`), is cut with the same clip
-  timeline as the master, and is composited as a picture-in-picture bubble
-  (corner, size, circle/rounded/square, mirror, margin, shadow) in preview
-  and export; live camera capture and device selection remain.
+- [x] Optional native camera capture and device selection, persisted as a
+  camera master and mapped through the same clip timeline as the screen.
+  Live physical-device validation remains outstanding in this implementation
+  session; synthetic media tests do not establish desktop hardware reliability.
+- [x] Overlay / Fullscreen / Split camera layouts, native/square/wide/tall
+  aspect choices, source crop and focus, mirror, corner radius, shadow, and
+  separate normal/zoomed size. Shared layout math drives CPU preview, GPU
+  export, focus picking, drag limits, and the framing preview.
 
 ## Studio and export
 
@@ -100,7 +148,7 @@
 - [x] Timeline zoom and horizontal navigation with Swift's playhead-anchored
   scaling, 240-points/second and 100,000-pixel caps, Ctrl/Super-wheel zoom,
   wheel panning, visible zoom controls, and fit reset.
-- [ ] Camera/background/aspect controls. The video canvas now lives in the
+- [x] Camera/background/aspect controls. The video canvas now lives in the
   standard Lahza shell and uses the shared color/gradient/wallpaper
   library, padding, corners, four shadow styles, aspect presets, border, and
   collapsible inspector. The preview is the compositor's own output, so
@@ -108,12 +156,12 @@
   (scale, position, X/Y/Z rotation, perspective, anchor, with drag, tilt,
   spin, scroll-to-scale, corner handles, and double-click reset) look the
   same in the editor and in the file. Scene settings autosave into the
-  project's edit document under `scene`. Camera composition remains (no
-  camera master is recorded yet).
+  project's edit document under `scene`; recorded or imported camera media
+  uses the shared camera compositor and layout controls.
 - [x] Preview and export share the same immutable pointer and viewport timelines.
   `recording::export::export_scene` renders the full scene (background,
-  padding, corners, border, shadow, camera motion, reconstructed cursor and
-  click pulses) through `recording::scene::SceneCompositor`, then encodes
+  padding, corners, border, shadow, camera motion, glass loupe, camera media,
+  reconstructed cursor and click pulses) through `recording::scene::SceneCompositor`, then encodes
   MP4 (H.264/AAC), WebM (VP9/Opus), or GIF with FFmpeg. Layout is derived
   from `SceneGeometry`, which the preview canvas also uses.
 - [ ] Timestamped export with progress, cancellation, and stale-render detection.
@@ -121,7 +169,8 @@
   1080p, 1440p, 4K), 30/60 fps, GIF looping, audio include/mute, and a size
   estimate are implemented; stale-render detection remains.
 - [x] Pointer inspector: show/hide cursor, cursor size, cursor shadow, hide
-  when idle, click effects and colour; click markers on the ruler select
+  when idle, spring response, typing hide, steering, loop return, click effects
+  and colour; click markers on the ruler select
   individual presses, which can be removed (persisted as
   `lahzaExtras.removedPressTimes`).
 - [x] Audio lane with an RMS waveform mapped through the clip timeline and a
@@ -181,3 +230,9 @@ implemented and a manual Swift-versus-Rust behavior pass has been recorded.
   draft persistence. An FFmpeg integration test cut a synthetic A/V source,
   accelerated one retained clip to 2x, concatenated both streams, and decoded
   the resulting preview successfully with audio present.
+
+- 2026-10-25: Screen Studio static study and independent Rust reconstruction
+  added constrained cursor planning, duration-weighted camera focus, lens optics,
+  camera layouts, and recording controls. Synthetic render/animation tests and
+  a glass-lens gallery exercise the implementation; no macOS reference runtime
+  or pixel-equivalence claim is made. See [the study](SCREEN_STUDIO_ANIMATION_STUDY.md).

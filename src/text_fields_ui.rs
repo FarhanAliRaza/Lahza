@@ -12,6 +12,8 @@ pub(crate) struct TextFields {
     pub cloud_url: gpui::Entity<TextField>,
     pub cloud_token: gpui::Entity<TextField>,
     pub share_title: gpui::Entity<TextField>,
+    pub aspect_width: gpui::Entity<TextField>,
+    pub aspect_height: gpui::Entity<TextField>,
 }
 impl TextFields {
     pub fn new(parent: FocusHandle, cx: &mut Context<Studio>) -> Self {
@@ -33,6 +35,8 @@ impl TextFields {
             cloud_url: create("share.example.com"),
             cloud_token: create("Paste the upload token"),
             share_title: create("Untitled"),
+            aspect_width: create("Width"),
+            aspect_height: create("Height"),
         }
     }
 }
@@ -48,6 +52,8 @@ impl Studio {
             &self.text_fields.cloud_url,
             &self.text_fields.cloud_token,
             &self.text_fields.share_title,
+            &self.text_fields.aspect_width,
+            &self.text_fields.aspect_height,
         ]
         .iter()
         .any(|field| field.read(cx).focus.is_focused(window))
@@ -154,6 +160,15 @@ impl Studio {
         let export_visible = self.inspector_visible
             && self.effective_tab() == InspectorTab::Export
             && self.video_project.is_some();
+        let custom_aspect_visible = !self.launcher_active && self.aspect_ratio == 10
+            && self.inspector_visible && self.effective_tab() == InspectorTab::Design;
+        for (field, width, value) in [
+            (&self.text_fields.aspect_width, true, self.custom_canvas_draft.0),
+            (&self.text_fields.aspect_height, false, self.custom_canvas_draft.1),
+        ] {
+            let target = if custom_aspect_visible { Target::CanvasAspect(width) } else { Target::None };
+            field.update(cx, |field, cx| field.sync(target, &value.to_string(), window, cx));
+        }
         let editing_server = export_visible && (self.cloud_editing || !self.cloud.is_configured());
         let share_ready = export_visible && !editing_server;
         for (field, target, value) in [
@@ -177,6 +192,24 @@ impl Studio {
     }
     fn on_text_field_event(&mut self, event: &FieldEvent, cx: &mut Context<Self>) {
         match event.target {
+            Target::CanvasAspect(width) if event.kind == EventKind::Commit => {
+                if let Ok(value) = event.text.trim().parse::<u32>() {
+                    let value = value.clamp(1, 10000);
+                    let mut dimensions = self.custom_canvas_draft;
+                    if width { dimensions.0 = value; } else { dimensions.1 = value; }
+                    self.custom_canvas_draft = dimensions;
+                    let ratio = dimensions.0 as f64 / dimensions.1 as f64;
+                    if (0.05..=20.0).contains(&ratio) {
+                        self.custom_canvas_dimensions = dimensions;
+                        self.aspect_ratio = 10;
+                        self.toast = None;
+                    } else {
+                        self.toast = Some("Edit the other dimension to use a ratio between 1:20 and 20:1".into());
+                    }
+                } else {
+                    self.toast = Some("Enter a whole number from 1 to 10000".into());
+                }
+            }
             Target::CanvasAnnotation(index)
                 if self.editing_text == Some(index)
                     && self

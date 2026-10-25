@@ -106,7 +106,7 @@ impl Studio {
                 return Err((permission_message(&missing), permission_commands(&missing)));
             }
             let cameras = if matches!(action, CaptureAccess::Camera | CaptureAccess::CameraPicker) {
-                Some(camera_devices())
+                Some(recording::native::camera_devices_result().map_err(|message| (message, String::new()))?)
             } else {
                 None
             };
@@ -146,11 +146,13 @@ impl Studio {
                             CaptureAccess::Camera => {
                                 this.camera_access_checked = true;
                                 this.record_camera = true;
+                                this.camera_overlay.enabled = true;
                             }
                             CaptureAccess::Microphone => this.record_microphone = true,
                             CaptureAccess::SystemAudio => this.record_system_audio = true,
-                            CaptureAccess::CameraPicker => this.launcher_camera_menu_open = true,
-                            CaptureAccess::MicrophonePicker => this.launcher_mic_menu_open = true,
+                            // Opening/closing belongs to the trigger. A delayed discovery
+                            // result must not reopen a chooser dismissed by the user.
+                            CaptureAccess::CameraPicker | CaptureAccess::MicrophonePicker => {},
                             CaptureAccess::Recording => this.start_recording_with_access(cx),
                         }
                     }

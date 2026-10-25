@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub mod gpu;
 
 pub use super::pointer_timeline::PointerMotion;
+pub use super::camera_layout::{CameraAspect, CameraLayout, CameraSplitDirection};
 
 use super::{
     cursor_assets::{self, CursorFamily},
@@ -223,11 +224,26 @@ impl CameraShape {
 pub struct CameraOverlay {
     pub enabled: bool,
     pub position: WatermarkPosition,
-    /// Diameter as a percent of the canvas height (10-60).
+    /// Longest side as a percent of the canvas short side (10-60).
     pub size: u8,
     pub shape: CameraShape,
+    pub aspect: CameraAspect,
+    pub layout: CameraLayout,
+    /// Optional size during screen zooms; None preserves the normal size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zoomed_size: Option<u8>,
+    /// Corner radius as a percent of the short side; None uses the shape preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corner_radius: Option<u8>,
+    /// Center in unmirrored webcam coordinates.
+    pub crop_center: (f64, f64),
+    pub crop_zoom: u16,
+    pub split_direction: CameraSplitDirection,
+    pub split_flip: bool,
+    /// Screen share of a split layout (25-75 percent).
+    pub split_ratio: u8,
     pub mirror: bool,
-    /// Distance from the canvas edge as a percent of the canvas height.
+    /// Distance from the canvas edge as a percent of its short side.
     pub margin: u8,
     pub shadow: bool,
     /// Free placement: the bubble's center as a fraction of the canvas.
@@ -243,6 +259,15 @@ impl Default for CameraOverlay {
             position: WatermarkPosition::BottomRight,
             size: 24,
             shape: CameraShape::Circle,
+            aspect: CameraAspect::Square,
+            layout: CameraLayout::Overlay,
+            zoomed_size: None,
+            corner_radius: None,
+            crop_center: (0.5, 0.5),
+            crop_zoom: 100,
+            split_direction: CameraSplitDirection::Auto,
+            split_flip: false,
+            split_ratio: 60,
             mirror: false,
             margin: 4,
             shadow: true,
@@ -255,90 +280,75 @@ impl CameraOverlay {
     /// Snap distance for dragging, in canvas pixels at 1080p.
     const SNAP_DISTANCE: f64 = 8.0 / 1080.0;
 
-    fn side_and_margin(&self, canvas_width: f64, canvas_height: f64) -> (f64, f64) {
-        let side = (canvas_height * (self.size.clamp(10, 60) as f64 / 100.0)).min(canvas_width);
-        let margin = canvas_height * (self.margin.min(20) as f64 / 100.0);
-        (side, margin)
+    pub fn aspect_ratio(&self, source_aspect: f64) -> f64 {
+        if self.shape == CameraShape::Circle { 1.0 } else { self.aspect.ratio(source_aspect) }
     }
 
-    /// The overlay rect on a canvas of this size.
+    /// The unzoomed overlay, retained for callers without a source frame.
     pub fn rect(&self, canvas_width: f64, canvas_height: f64) -> Rect {
-        let (side, margin) = self.side_and_margin(canvas_width, canvas_height);
-        if let Some((cx, cy)) = self.center.filter(|(x, y)| x.is_finite() && y.is_finite()) {
-            let place = |center: f64, length: f64| {
-                let low = margin.min((length - side) * 0.5).max(0.0);
-                (center * length - side * 0.5).clamp(low, (length - low - side).max(low))
-            };
-            return Rect {
-                x: place(cx, canvas_width),
-                y: place(cy, canvas_height),
-                width: side,
-                height: side,
-            };
-        }
-        let x = match self.position {
-            WatermarkPosition::TopLeft | WatermarkPosition::BottomLeft => margin,
-            WatermarkPosition::TopRight | WatermarkPosition::BottomRight => {
-                canvas_width - margin - side
-            }
-        };
-        let y = match self.position {
-            WatermarkPosition::TopLeft | WatermarkPosition::TopRight => margin,
-            WatermarkPosition::BottomLeft | WatermarkPosition::BottomRight => {
-                canvas_height - margin - side
-            }
-        };
-        Rect {
-            x,
-            y,
-            width: side,
-            height: side,
-        }
+        self.rect_for_frame(canvas_width, canvas_height, 1.0, 1.0)
     }
 
-    /// Place the bubble's center at `proposed` (canvas pixels), snapping each
-    /// axis to the near margin, the middle, or the far margin. Returns the
-    /// normalized center and, per axis, the guide line to draw.
+    pub fn rect_for_frame(&self, width: f64, height: f64, source_aspect: f64, zoom: f64) -> Rect {
+        super::camera_layout::layout(*self, width, height, source_aspect, zoom).camera
+    }
+
+    pub fn screen_area(&self, width: f64, height: f64) -> Rect {
+        super::camera_layout::layout(*self, width, height, 1.0, 1.0).screen
+    }
+
     pub fn snapped_center(
-        &self,
-        proposed: (f64, f64),
-        canvas_width: f64,
-        canvas_height: f64,
+        &self, proposed: (f64, f64), width: f64, height: f64,
     ) -> ((f64, f64), (Option<f64>, Option<f64>)) {
-        let (side, margin) = self.side_and_margin(canvas_width, canvas_height);
-        let snap = Self::SNAP_DISTANCE * canvas_height;
-        let axis = |center: f64, length: f64| -> (f64, Option<f64>) {
-            let radius = side * 0.5;
-            let targets = [
-                (margin + radius, margin),
-                (length * 0.5, length * 0.5),
-                (length - margin - radius, length - margin),
-            ];
-            let nearest = targets
-                .iter()
+        self.snapped_center_for_frame(proposed, width, height, 1.0, 1.0)
+    }
+
+    /// Drag handles use the same dimensions and padding as the composed frame.
+    pub fn snapped_center_for_frame(
+        &self, proposed: (f64, f64), width: f64, height: f64, source_aspect: f64, zoom: f64,
+    ) -> ((f64, f64), (Option<f64>, Option<f64>)) {
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return ((0.5, 0.5), (None, None));
+        }
+        let rect = self.rect_for_frame(width, height, source_aspect, zoom);
+        let mut corner = *self;
+        corner.center = None;
+        corner.position = WatermarkPosition::TopLeft;
+        let inset = corner.rect_for_frame(width, height, source_aspect, zoom);
+        let snap = Self::SNAP_DISTANCE * width.min(height);
+        let axis = |center: f64, length: f64, size: f64, margin: f64| {
+            let radius = size * 0.5;
+            let low = margin + radius;
+            let high = (length - margin - radius).max(low);
+            let targets = [(low, margin), (length * 0.5, length * 0.5), (high, length - margin)];
+            let center = if center.is_finite() { center } else { length * 0.5 };
+            let nearest = targets.into_iter()
                 .min_by(|a, b| (a.0 - center).abs().total_cmp(&(b.0 - center).abs()))
-                .copied()
                 .filter(|(target, _)| (target - center).abs() <= snap);
             match nearest {
                 Some((target, guide)) => (target, Some(guide)),
-                None => (center.clamp(radius, (length - radius).max(radius)), None),
+                None => (center.clamp(low, high), None),
             }
         };
-        let (x, guide_x) = axis(proposed.0, canvas_width);
-        let (y, guide_y) = axis(proposed.1, canvas_height);
-        (
-            ((x / canvas_width).clamp(0.0, 1.0), (y / canvas_height).clamp(0.0, 1.0)),
-            (guide_x, guide_y),
-        )
+        let (x, guide_x) = axis(proposed.0, width, rect.width, inset.x);
+        let (y, guide_y) = axis(proposed.1, height, rect.height, inset.y);
+        (((x / width).clamp(0.0, 1.0), (y / height).clamp(0.0, 1.0)), (guide_x, guide_y))
     }
 
     pub fn radius(&self, rect: Rect) -> f64 {
-        match self.shape {
-            CameraShape::Circle => rect.width * 0.5,
-            CameraShape::Squircle => rect.width * 0.18,
-            CameraShape::Square => rect.width * 0.03,
+        if self.layout == CameraLayout::Fullscreen { return 0.0; }
+        let side = rect.width.min(rect.height);
+        if self.shape == CameraShape::Circle { return side * 0.5; }
+        if self.shape == CameraShape::Squircle {
+            if let Some(radius) = self.corner_radius { return side * f64::from(radius.min(50)) / 100.0; }
+        }
+        side * match self.shape {
+            CameraShape::Circle => 0.5,
+            CameraShape::Squircle => 0.18,
+            CameraShape::Square => 0.03,
         }
     }
+
 }
 
 /// How the reconstructed cursor is drawn.
@@ -360,6 +370,11 @@ pub struct PointerStyle {
     /// Glide back to the starting position before the end so the video
     /// loops cleanly.
     pub loop_to_start: bool,
+    pub rotation: super::pointer_timeline::PointerRotation,
+    pub rotation_strength: f64,
+    pub hide_when_typing: bool,
+    pub idle_hide_delay: f64,
+    pub loop_return_duration: f64,
 }
 
 impl PointerStyle {
@@ -370,9 +385,13 @@ impl PointerStyle {
     pub fn timeline_options(self) -> PointerTimelineOptions {
         PointerTimelineOptions {
             fallback_artwork: None,
-            hide_after_inactivity: Some(Self::IDLE_HIDE_DELAY),
+            hide_after_inactivity: self.hide_when_idle.then_some(self.idle_hide_delay.clamp(0.5, 5.0)),
             motion: self.motion,
             loop_to_start: self.loop_to_start,
+            rotation: self.rotation,
+            rotation_strength: self.rotation_strength,
+            hide_when_typing: self.hide_when_typing,
+            loop_return_duration: self.loop_return_duration,
         }
     }
 }
@@ -389,6 +408,11 @@ impl Default for PointerStyle {
             motion: PointerMotion::Default,
             family: CursorFamily::Recorded,
             loop_to_start: false,
+            rotation: super::pointer_timeline::PointerRotation::Velocity,
+            rotation_strength: 0.5,
+            hide_when_typing: true,
+            idle_hide_delay: Self::IDLE_HIDE_DELAY,
+            loop_return_duration: 1.0,
         }
     }
 }
@@ -449,6 +473,9 @@ pub struct SceneStyle {
     pub border_opacity: u8,
     /// Canvas aspect ratio (width / height). `None` follows the media.
     pub aspect: Option<f64>,
+    /// Preserve the proportions typed into the custom canvas fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_dimensions: Option<(u32, u32)>,
     /// With a fixed aspect: crop the media to fill the card (a follow camera
     /// keeps the action in frame) instead of fitting it whole.
     pub fill: bool,
@@ -485,6 +512,7 @@ impl Default for SceneStyle {
             border_color: 0x3678ef,
             border_opacity: 100,
             aspect: None,
+            aspect_dimensions: None,
             fill: false,
             background_blur: 0,
             background_noise: 0,
@@ -547,6 +575,14 @@ impl SceneStyle {
         } else {
             (1.0, (media_aspect / card_aspect).clamp(0.01, 1.0))
         })
+    }
+
+    /// Source-space viewport available to focus clustering before magnification.
+    pub fn focus_bounds(&self, source_width: u32, source_height: u32) -> (f64, f64) {
+        let crop = self.source_crop.validated();
+        let fill = self.fill_fraction(source_width, source_height).unwrap_or((1.0, 1.0));
+        ((f64::from(crop.width) * fill.0).clamp(0.001, 1.0),
+            (f64::from(crop.height) * fill.1).clamp(0.001, 1.0))
     }
 
     /// True when the GPUI preview cannot reproduce the style with plain
@@ -646,8 +682,9 @@ impl SceneGeometry {
         } else {
             TITLE_BAR_HEIGHT * ui_scale
         };
-        let available_width = (canvas_width - inset * 2.0).max(1.0);
-        let available_height = (canvas_height - inset * 2.0 - title_height).max(1.0);
+        let screen_area = style.camera.screen_area(canvas_width, canvas_height);
+        let available_width = (screen_area.width - inset * 2.0).max(1.0);
+        let available_height = (screen_area.height - inset * 2.0 - title_height).max(1.0);
         let source_width = if source_width > 0.0 {
             source_width
         } else {
@@ -659,14 +696,14 @@ impl SceneGeometry {
             720.0
         };
         let media = if style.fills_card() {
-            Rect { x: inset, y: inset + title_height, width: available_width, height: available_height }
+            Rect { x: screen_area.x + inset, y: screen_area.y + inset + title_height, width: available_width, height: available_height }
         } else {
             let scale = (available_width / source_width).min(available_height / source_height);
             let width = source_width * scale;
             let height = source_height * scale;
             Rect {
-                x: inset + (available_width - width) * 0.5,
-                y: inset + title_height + (available_height - height) * 0.5,
+                x: screen_area.x + inset + (available_width - width) * 0.5,
+                y: screen_area.y + inset + title_height + (available_height - height) * 0.5,
                 width,
                 height,
             }
@@ -1186,6 +1223,31 @@ impl SceneCompositor {
             .projection(self.style.transform.with_motion(viewport))
     }
 
+    pub(crate) fn loupe_geometry(
+        &self,
+        viewport: ViewportFrame,
+    ) -> Option<super::loupe::LoupeGeometry> {
+        let lens = viewport.loupe?;
+        let projection = self.projection(viewport);
+        let (left, top, width, height) = self.style.source_crop.visible_rect(viewport);
+        let u = (lens.center.x - left) / width;
+        let v = (lens.center.y - top) / height;
+        let center = projection.project(u, v);
+        // Exact homography derivative keeps lens size proportional across
+        // preview/export resolutions, even when the media is tilted.
+        let m = projection.forward;
+        let denominator = m[2][0] * u + m[2][1] * v + m[2][2];
+        let dxdu = (m[0][0] - center.0 * m[2][0]) / denominator;
+        let dxdv = (m[0][1] - center.0 * m[2][1]) / denominator;
+        let dydu = (m[1][0] - center.1 * m[2][0]) / denominator;
+        let dydv = (m[1][1] - center.1 * m[2][1]) / denominator;
+        let scale = ((dxdu * dydv - dxdv * dydu).abs()
+            / (self.geometry.media.width * self.geometry.media.height)).sqrt();
+        let radius = lens.radius * self.geometry.media.width.max(self.geometry.media.height)
+            * scale;
+        super::loupe::LoupeGeometry::new(lens, center, radius)
+    }
+
     /// Composes one output frame.
     pub fn compose(&self, input: FrameInput<'_>) -> RgbaImage {
         self.compose_layers(input, true, None)
@@ -1216,10 +1278,27 @@ impl SceneCompositor {
             if let Some(pointer) = input.pointer {
                 self.paint_pointer(&mut output, &projection, pointer, input.viewport);
             }
+            if let Some(lens) = self.loupe_geometry(input.viewport) {
+                super::loupe::paint(&mut output, lens);
+            }
         }
         if let Some(camera) = input.camera {
             if self.style.camera.enabled {
-                self.paint_camera(&mut output, camera);
+                let presence = if media_visible {
+                    input.viewport.loupe.map_or(0.0, |lens| lens.presence.clamp(0.0, 1.0))
+                } else { 0.0 };
+                if presence <= 0.0 {
+                    self.paint_camera(&mut output, camera, input.viewport.magnification);
+                } else if presence < 1.0 {
+                    let mut with_camera = output.clone();
+                    self.paint_camera(&mut with_camera, camera, input.viewport.magnification);
+                    for (base, painted) in output.pixels_mut().zip(with_camera.pixels()) {
+                        for channel in 0..4 {
+                            base[channel] = (base[channel] as f64 * presence
+                                + painted[channel] as f64 * (1.0 - presence)).round() as u8;
+                        }
+                    }
+                }
             }
         }
         if let Some(watermark) = self.watermark.as_ref() {
@@ -1432,17 +1511,19 @@ impl SceneCompositor {
         });
     }
 
-    fn paint_camera(&self, output: &mut RgbaImage, camera: &RgbaImage) {
+    fn paint_camera(&self, output: &mut RgbaImage, camera: &RgbaImage, zoom: f64) {
         if camera.width() == 0 || camera.height() == 0 {
             return;
         }
         let mut overlay = self.style.camera;
-        let rect = overlay.rect(self.width as f64, self.height as f64);
+        let rect = overlay.rect_for_frame(self.width as f64, self.height as f64, camera.width() as f64 / camera.height() as f64, zoom);
+        overlay.shadow &= overlay.layout != CameraLayout::Fullscreen;
         if overlay.shadow {
             let mut cache = self.camera_shadow.borrow_mut();
-            let shadow = cache.get_or_insert_with(|| {
-                CameraShadow::new(self.width, self.height, overlay, rect)
-            });
+            if cache.as_ref().is_none_or(|shadow| shadow.rect != rect) {
+                *cache = Some(CameraShadow::new(self.width, self.height, overlay, rect));
+            }
+            let shadow = cache.as_ref().expect("camera shadow just prepared");
             shadow.paint(output);
             overlay.shadow = false;
         }
@@ -1841,16 +1922,25 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// Enlarged framing preview using the exact crop, mask, mirror, and shadow
 /// painter used for the recording. Placement and size remain editor settings.
 pub fn camera_framing_preview(camera: &RgbaImage, overlay: CameraOverlay) -> RgbaImage {
+    camera_framing_preview_in_canvas(camera, overlay, 1.0)
+}
+
+pub fn camera_framing_preview_in_canvas(camera: &RgbaImage, overlay: CameraOverlay, canvas_aspect: f64) -> RgbaImage {
     let mut output = RgbaImage::from_pixel(200, 200, Rgba([251, 251, 251, 255]));
-    paint_camera_overlay(&mut output, camera, overlay, Rect {
-        x: 12.0, y: 12.0, width: 176.0, height: 176.0,
-    });
+    let composed = overlay.rect_for_frame(canvas_aspect, 1.0,
+        camera.width() as f64 / camera.height().max(1) as f64, 1.0);
+    let rect = super::camera_layout::fit_rect(
+        Rect { x: 12.0, y: 12.0, width: 176.0, height: 176.0 },
+        composed.width / composed.height,
+    );
+    paint_camera_overlay(&mut output, camera, overlay, rect);
     output
 }
 
 /// Only nonzero shadow pixels are retained. Geometry stays fixed for the
 /// lifetime of a compositor; changing webcam frames must not repeat the blur.
 struct CameraShadow {
+    rect: Rect,
     pixels: Vec<(usize, f64)>,
 }
 
@@ -1878,7 +1968,7 @@ impl CameraShadow {
             let alpha = f64::from(value) * 0.35;
             (alpha > 0.001).then_some((index * 4, alpha))
         }).collect();
-        Self { pixels }
+        Self { rect, pixels }
     }
 
     fn paint(&self, output: &mut RgbaImage) {
@@ -1898,14 +1988,9 @@ fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: Cam
     if overlay.shadow {
         CameraShadow::new(output.width(), output.height(), overlay, rect).paint(output);
     }
-    // Cover-fit: scale the frame so the square is filled, crop the rest.
     let frame_width = camera.width() as f64;
     let frame_height = camera.height() as f64;
-    let scale = (rect.width / frame_width).max(rect.height / frame_height);
-    let scaled_width = frame_width * scale;
-    let scaled_height = frame_height * scale;
-    let offset_x = (rect.width - scaled_width) * 0.5;
-    let offset_y = (rect.height - scaled_height) * 0.5;
+    let crop = super::camera_layout::source_crop(overlay, frame_width / frame_height, rect);
     let x0 = rect.x.floor().max(0.0) as u32;
     let y0 = rect.y.floor().max(0.0) as u32;
     let x1 = (rect.right().ceil().max(0.0) as u32).min(output.width());
@@ -1921,11 +2006,9 @@ fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: Cam
             if coverage <= 0.0 {
                 continue;
             }
-            let mut sx = (local_x - offset_x) / scale - 0.5;
-            if overlay.mirror {
-                sx = frame_width - 1.0 - sx;
-            }
-            let sy = (local_y - offset_y) / scale - 0.5;
+            let source_u = if overlay.mirror { 1.0 - u } else { u };
+            let sx = (crop.x + source_u * crop.width) * frame_width - 0.5;
+            let sy = (crop.y + v * crop.height) * frame_height - 0.5;
             let sample = sample_bilinear(camera, sx, sy);
             blend_pixel(
                 output,
@@ -2657,12 +2740,12 @@ mod tests {
         let style = SceneStyle::default();
         let compositor = SceneCompositor::new(&style, 1920, 1080, 1920, 1080).unwrap();
         let mut output = source.clone();
-        compositor.paint_camera(&mut output, &camera);
+        compositor.paint_camera(&mut output, &camera, 1.0);
         let start = std::time::Instant::now();
         for _ in 0..60 {
             let pixels: &mut [u8] = output.as_mut();
             pixels.copy_from_slice(source.as_raw());
-            compositor.paint_camera(&mut output, &camera);
+            compositor.paint_camera(&mut output, &camera, 1.0);
             std::hint::black_box(&output);
         }
         eprintln!("1080p camera: {:.2} ms/frame", start.elapsed().as_secs_f64() * 1000.0 / 60.0);
@@ -2739,7 +2822,7 @@ mod tests {
             for background in [Rgba([90, 160, 230, 255]), Rgba([230, 50, 100, 100])] {
                 let mut cached = RgbaImage::from_pixel(320, 180, background);
                 let mut reference = cached.clone();
-                compositor.paint_camera(&mut cached, &camera);
+                compositor.paint_camera(&mut cached, &camera, 1.0);
                 paint_camera_overlay(&mut reference, &camera, style.camera, style.camera.rect(320.0, 180.0));
                 assert_eq!(cached, reference);
             }
@@ -2750,9 +2833,47 @@ mod tests {
             assert!(rebuilt.camera_shadow.borrow().is_none());
             let mut cached = RgbaImage::from_pixel(400, 300, Rgba([200, 200, 200, 255]));
             let mut reference = cached.clone();
-            rebuilt.paint_camera(&mut cached, &camera);
+            rebuilt.paint_camera(&mut cached, &camera, 1.0);
             paint_camera_overlay(&mut reference, &camera, style.camera, style.camera.rect(400.0, 300.0));
             assert_eq!(cached, reference);
+        }
+    }
+
+    #[test]
+    fn responsive_webcam_shadow_and_crop_match_uncached_composition() {
+        let camera = checker(96, 72);
+        for (width, height) in [(320, 180), (180, 320), (240, 240)] {
+            let mut style = SceneStyle::default();
+            style.camera.shape = CameraShape::Squircle;
+            style.camera.aspect = CameraAspect::Wide;
+            style.camera.zoomed_size = Some(12);
+            style.camera.crop_center = (0.2, 0.8);
+            style.camera.crop_zoom = 150;
+            let compositor = SceneCompositor::new(&style, width, height, 320, 180).unwrap();
+            for zoom in [1.0, 1.25, 1.5, 1.0] {
+                let mut cached = RgbaImage::from_pixel(width, height, Rgba([90, 160, 230, 255]));
+                let mut reference = cached.clone();
+                let rect = style.camera.rect_for_frame(width as f64, height as f64, 96.0 / 72.0, zoom);
+                compositor.paint_camera(&mut cached, &camera, zoom);
+                paint_camera_overlay(&mut reference, &camera, style.camera, rect);
+                assert_eq!(cached, reference, "{width}x{height}, zoom={zoom}");
+            }
+        }
+    }
+
+    #[test]
+    fn split_camera_layout_places_the_screen_inside_its_reserved_area() {
+        for (width, height) in [(320.0, 180.0), (180.0, 320.0), (240.0, 240.0)] {
+            for flip in [false, true] {
+                let mut style = SceneStyle::default();
+                style.camera.layout = CameraLayout::Split;
+                style.camera.split_flip = flip;
+                let geometry = SceneGeometry::layout(width, height, 1920.0, 1080.0, &style);
+                let area = style.camera.screen_area(width, height);
+                assert!(geometry.media.x >= area.x && geometry.media.y >= area.y);
+                assert!(geometry.media.right() <= area.right() + 1e-9);
+                assert!(geometry.media.bottom() <= area.bottom() + 1e-9);
+            }
         }
     }
 
@@ -3557,6 +3678,7 @@ mod tests {
                 margin: 5,
                 shadow: true,
                 center: None,
+                ..Default::default()
             },
             ..flat_style(0x000000)
         };
@@ -3774,5 +3896,84 @@ mod box_blur_edge_tests {
         for v in out {
             assert!((v - 200.0).abs() < 0.01, "edge darkened: {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod loupe_composition_tests {
+    use super::*;
+    use crate::recording::viewport::LoupeFrame;
+
+    fn lens() -> LoupeFrame {
+        LoupeFrame { center: NormalizedPoint { x:0.5,y:0.5 }, radius:0.35,
+            magnification:2.0, bevel:0.2, chromatic_aberration:0.5, presence:1.0 }
+    }
+
+    #[test]
+    fn lens_tracks_source_crop_projection_and_output_resolution() {
+        let mut style = SceneStyle::default();
+        style.source_crop = crate::CropRect { x:0.2,y:0.1,width:0.6,height:0.8 };
+        style.transform.rotation_y = 18.0;
+        let viewport = ViewportFrame { loupe:Some(lens()), ..Default::default() };
+        let small = SceneCompositor::new(&style,320,240,160,100).unwrap();
+        let large = SceneCompositor::new(&style,640,480,160,100).unwrap();
+        let a = small.loupe_geometry(viewport).unwrap();
+        let b = large.loupe_geometry(viewport).unwrap();
+        assert!((b.radius - a.radius * 2.0).abs() < 1e-3);
+        assert!((b.center[0] - a.center[0] * 2.0).abs() < 1e-3);
+        assert!((b.center[1] - a.center[1] * 2.0).abs() < 1e-3);
+        let expected = small.projection(viewport).project(0.5,0.5);
+        assert!((a.center[0] as f64 - expected.0).abs() < 1e-3);
+        assert!((a.center[1] as f64 - expected.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn lens_hides_camera_and_keeps_canvas_overlays_above_glass() {
+        let style = SceneStyle::default();
+        let scene = SceneCompositor::new(&style,240,160,120,80).unwrap();
+        let source = RgbaImage::from_pixel(120,80,Rgba([30,60,90,255]));
+        let camera = RgbaImage::from_pixel(60,60,Rgba([240,30,10,255]));
+        let input = FrameInput {source:&source,overlay:None,
+            viewport:ViewportFrame {loupe:Some(lens()),..Default::default()}, pointer:None,camera:None};
+        let expected = scene.compose(input);
+        assert_eq!(scene.compose(FrameInput {camera:Some(&camera),..input}),expected);
+        let caption = RgbaImage::from_pixel(240,160,Rgba([20,230,40,255]));
+        let composited = scene.compose_layers(input,true,Some(&caption));
+        assert!(composited.pixels().all(|p| p.0 == [20,230,40,255]));
+        assert_eq!(scene.compose_layers(input,false,None),
+            scene.compose_layers(FrameInput {viewport:ViewportFrame::default(),..input},false,None));
+    }
+
+    #[test]
+    #[ignore = "writes /tmp/lahza-loupe-gallery.png for visual inspection"]
+    fn render_loupe_gallery() {
+        let source = RgbaImage::from_fn(640,400,|x,y| {
+            let color = if y < 32 { [35,43,62,255] }
+                else if x < 124 { if y % 42 < 4 { [58,69,92,255] } else { [27,34,51,255] } }
+                else if x > 144 && x < 616 && y > 60 && y < 116 { [41,165,157,255] }
+                else if x > 144 && x < 616 && y > 140 && y < 360 {
+                    if (x-144) % 80 < 2 || (y-140) % 40 < 2 { [169,183,205,255] }
+                    else if (x/20+y/18)%5 == 0 { [104,124,156,255] } else { [222,230,240,255] }
+                } else { [243,246,251,255] };
+            Rgba(color)
+        });
+        let style = SceneStyle { background:SceneBackground::Solid(0x151b2d),
+            padding:22,corners:12,shadow:25,..Default::default() };
+        let scene = SceneCompositor::new(&style,640,440,640,400).unwrap();
+        let mut gallery = RgbaImage::new(1920,1760);
+        for (row,presence) in [0.2,0.6,1.0,0.35].into_iter().enumerate() {
+            for column in 0..3 {
+                let lens = (column > 0).then_some(LoupeFrame {
+                    center:NormalizedPoint {x:0.62,y:0.54}, radius:0.3,
+                    magnification:1.0 + presence, presence,
+                    bevel:if column == 2 {0.2*presence} else {0.0},
+                    chromatic_aberration:if column == 2 {0.7*presence} else {0.0},
+                });
+                let image = scene.compose(FrameInput {source:&source,overlay:None,
+                    viewport:ViewportFrame {loupe:lens,..Default::default()},pointer:None,camera:None});
+                image::imageops::replace(&mut gallery,&image,column*640,row as i64*440);
+            }
+        }
+        gallery.save("/tmp/lahza-loupe-gallery.png").unwrap();
     }
 }

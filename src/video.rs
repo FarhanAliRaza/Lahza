@@ -325,8 +325,7 @@ impl Studio {
         let original_selection = self.video_selected_clip;
         let original_zoom_selection = self.video_selected_zoom_cue;
         self.pause_video_playback();
-        self.video_selected_zoom_cue = Some(cue_id);
-        self.video_selected_clip = None;
+        self.select_motion_region(cue_id);
         self.video_seek_drag = None;
         self.video_move_drag = None;
         self.video_trim_drag = None;
@@ -674,10 +673,19 @@ impl Studio {
     /// Keep Fill's follow camera in step with the style and motion edits.
     /// A rebuilt motion timeline carries no reframe, so it is rebuilt here.
     pub(super) fn sync_reframe(&mut self) {
-        if self.video_project.is_none() {
+        if self.video_project.is_none() || self.video_clip_timeline.duration() <= 0.0 {
             return;
         }
         let style = self.scene_style();
+        let focus_bounds = style.focus_bounds(self.video_source_size.0, self.video_source_size.1);
+        if self.slider_drag.is_none() && self.media_drag.is_none()
+            && self.video_viewport_timeline.focus_bounds() != focus_bounds {
+            let capture = self.filtered_pointer_capture();
+            self.video_viewport_timeline = ViewportTimeline::build_for_viewport(
+                &self.video_zoom_cues, &self.video_pointer_timeline,
+                &self.video_clip_timeline, &capture, focus_bounds,
+            );
+        }
         let Some(fill) = style.fill_fraction(self.video_source_size.0, self.video_source_size.1) else {
             self.video_viewport_timeline.clear_reframe();
             return;
@@ -737,11 +745,12 @@ impl Studio {
             Some(&self.video_clip_timeline),
         );
         pointer.restrict_to_recording(&self.video_clip_timeline, manifest.duration);
-        self.video_viewport_timeline = ViewportTimeline::build(
+        self.video_viewport_timeline = ViewportTimeline::build_for_viewport(
             &self.video_zoom_cues,
             &pointer,
             &self.video_clip_timeline,
             &capture,
+            self.scene_style().focus_bounds(self.video_source_size.0, self.video_source_size.1),
         );
         self.video_pointer_timeline = pointer;
     }

@@ -22,7 +22,7 @@ use crate::{
 use gpui::{AnyWindowHandle, Context, PathPromptOptions};
 use std::{
     path::PathBuf,
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -189,11 +189,12 @@ impl PreparedVideoProject {
             .effective_zoom_cues()
             .map_err(|error| format!("Could not load zoom edits: {error}"))?
             .unwrap_or(generated_zoom_cues);
-        let viewport_timeline = ViewportTimeline::build(
+        let viewport_timeline = ViewportTimeline::build_for_viewport(
             &zoom_cues,
             &pointer_timeline,
             &clip_timeline,
             &pointer_capture,
+            saved_style.as_ref().cloned().unwrap_or_default().focus_bounds(source_size.0, source_size.1),
         );
         let saved_extras = session
             .read_edit_field::<RecordingExtras>("lahzaExtras")
@@ -305,7 +306,11 @@ impl Studio {
             }
             .into(),
         );
+        let startup = Arc::new(recording::native::RecordingStartup::default());
+        self.recording_startup = Some(startup.clone());
         let mut options = RecordingOptions {
+            source: if self.record_area { recording::native::RecordingSource::Screen } else { self.recording_source },
+            countdown_seconds: self.recording_countdown,
             area: None,
             capture_exclusions: prompter_exclusion.into_iter().collect(),
             system_audio: self.record_system_audio,
@@ -325,48 +330,86 @@ impl Studio {
         cx.spawn(async move |weak, cx| {
             // Open after the initiating event releases its window borrow,
             // so overlay placement can query the launcher's actual display.
-            let Ok(overlay_exclusions) = weak.update(cx, |this, cx| {
+            let Ok((overlay_exclusions, opening_error)) = weak.update(cx, |this, cx| {
                 match this.open_recording_overlays(cx) {
-                    Ok(exclusions) => exclusions,
+                    Ok(exclusions) => (exclusions, None),
                     Err(error) => {
                         this.close_recording_overlays(cx);
-                        eprintln!("Floating recording controls unavailable: {error}");
-                        Vec::new()
+                        (Vec::new(), Some(error))
                     }
                 }
             }) else { return };
             let protection = cx.background_executor().spawn(async move {
-                let ready = !overlay_exclusions.is_empty()
-                    && recording::capture_exclusion::CaptureExclusion::wait_until_all_protected(
+                let readiness = if let Some(error) = opening_error {
+                    Err((error, "Floating windows could not open"))
+                } else if overlay_exclusions.is_empty() {
+                    Err((
+                        "No recording overlay protection requests were created".into(),
+                        "Floating windows could not open",
+                    ))
+                } else {
+                    recording::capture_exclusion::CaptureExclusion::wait_until_all_protected(
                         &overlay_exclusions,
                         Duration::from_secs(3),
-                    ).is_ok();
-                (overlay_exclusions, ready)
+                    )
+                    .map_err(|error| (error, "Capture Helper did not confirm protection"))
+                };
+                (overlay_exclusions, readiness)
             });
-            let (overlay_exclusions, protected) = protection.await;
-            let Ok(protected) = weak.update(cx, |this, cx| {
+            let (overlay_exclusions, readiness) = protection.await;
+            let Ok(overlay_failure) = weak.update(cx, |this, cx| {
                 // A protection watchdog may have closed the windows while
                 // the background wait completed. Only a visible, protected
                 // pill can replace the launcher's recording controls.
-                let protected = protected
-                    && this.recording_pill.is_some()
-                    && (!this.record_camera || this.recording_camera_window.is_some())
-                    && overlay_exclusions.iter().all(|request| request.is_protected());
-                if protected {
+                let pill_open = this.recording_pill.is_some();
+                let camera_open = this.recording_camera_window.is_some();
+                let protection_states: Vec<_> = overlay_exclusions
+                    .iter()
+                    .map(|request| (request, request.is_protected()))
+                    .collect();
+                let readiness = readiness.and_then(|()| {
+                    if !pill_open || (this.record_camera && !camera_open) {
+                        Err((
+                            "A recording overlay closed while waiting for protection".into(),
+                            "Floating windows closed during setup",
+                        ))
+                    } else if protection_states.iter().any(|(_, protected)| !protected) {
+                        Err((
+                            "Recording overlay protection was lost before capture setup".into(),
+                            "Capture Helper lost protection",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let failure = if let Err((error, summary)) = readiness {
+                    eprintln!(
+                        "Floating recording controls unavailable: {error}; controls_open={pill_open}, camera_requested={}, camera_open={camera_open}",
+                        this.record_camera,
+                    );
+                    for (request, protected) in protection_states {
+                        eprintln!(
+                            "Recording overlay {:?}: protected={protected}, previously_protected={}",
+                            request.title(),
+                            request.has_been_protected(),
+                        );
+                    }
+                    this.close_recording_overlays(cx);
+                    Some(summary)
+                } else {
                     this.recording_window_minimized = true;
                     let handle = this.window_handle;
                     cx.defer(move |cx| {
                         let _ = handle.update(cx, |_, window, _| window.minimize_window());
                     });
-                } else {
-                    this.close_recording_overlays(cx);
-                }
+                    None
+                };
                 cx.notify();
-                protected
+                failure
             }) else {
                 return;
             };
-            if protected {
+            if overlay_failure.is_none() {
                 options.capture_exclusions.extend(overlay_exclusions);
             }
             // Let the compositor finish hiding the launcher or removing
@@ -374,7 +417,7 @@ impl Studio {
             gpui::Timer::after(Duration::from_millis(400)).await;
             let task = cx.background_executor().spawn(async move {
                 let mut recorder =
-                    NativeRecorder::with_options(options).with_camera_preview(camera_frames);
+                    NativeRecorder::with_options(options).with_camera_preview(camera_frames).with_startup(startup);
                 if let Some(requests) = area_requests {
                     recorder = recorder.with_area_selection(requests);
                 }
@@ -388,7 +431,14 @@ impl Studio {
             let outcome = task.await;
             let _ = weak.update(cx, |this, cx| {
                 this.recording_busy = false;
+                let cancelled = this.recording_startup.take().is_some_and(|startup| startup.is_cancelled());
                 match outcome {
+                    Ok((controller, Ok(_))) if cancelled => {
+                        this.recording_controller = Some(controller);
+                        this.run_recording_action(RecordingAction::Discard, cx);
+                        cx.notify();
+                        return;
+                    }
                     Ok((controller, Ok(path))) => {
                         this.position_recording_overlays(controller.source_geometry(), cx);
                         this.recording_controller = Some(controller);
@@ -396,8 +446,8 @@ impl Studio {
                         this.recording_started_at = Some(Instant::now());
                         this.recording_session_path = Some(path);
                         let mut message = format!("Recording with {}", NativeRecorder::description());
-                        if !protected {
-                            message.push_str(" · Floating controls unavailable; use the controls here");
+                        if let Some(reason) = overlay_failure {
+                            message.push_str(&format!(" · Floating controls unavailable: {reason}; use the controls here"));
                         }
                         this.toast = Some(message.into());
                         // Discard speech heard during source selection while
@@ -410,7 +460,7 @@ impl Studio {
                         this.restore_recording_window(cx);
                         this.recording_state = controller.state();
                         this.recording_controller = None;
-                        this.toast = Some(format!("Recording could not start: {error}").into());
+                        this.toast = Some(if cancelled { "Recording cancelled".into() } else { format!("Recording could not start: {error}").into() });
                     }
                     Err(error) => {
                         this.close_prompter(cx);
@@ -420,11 +470,55 @@ impl Studio {
                         this.toast = Some(error.into());
                     }
                 }
-                this.sync_camera_preview(cx);
+                if this.recording_close_requested && this.recording_state == RecordingState::Idle {
+                    this.recording_close_requested = false;
+                    let handle = this.window_handle;
+                    cx.defer(move |cx| { let _ = handle.update(cx, |_, window, _| window.remove_window()); });
+                } else {
+                    this.sync_camera_preview(cx);
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// New captures use cinematic motion; existing projects keep their authored cues.
+    fn save_recording_appearance(&self, directory: &std::path::Path) {
+        let session = RecordingSession { directory: directory.to_owned() };
+        let mut style = self.scene_style();
+        style.camera.enabled &= self.recording_camera_enabled
+            && session.read_manifest().is_ok_and(|manifest| manifest.includes_camera);
+        let save = || -> std::io::Result<()> {
+            session.write_edit_field("scene", &style)?;
+            if session.effective_zoom_cues()?.is_none() {
+                let capture = session.read_pointer_capture()?;
+                let duration = session.read_manifest()?.duration;
+                let cues = recording::viewport::synthesize_zoom_cues_with_style(
+                    &capture, duration, recording::viewport::AutoZoomStyle::Cinematic,
+                );
+                session.write_edit_field("zoomCues", &cues)?;
+            }
+            Ok(())
+        };
+        if let Err(error) = save() { eprintln!("Could not save recording appearance: {error}"); }
+    }
+
+    pub(crate) fn recording_start_label(&self) -> String {
+        match self.recording_startup.as_ref() {
+            Some(startup) if startup.is_cancelled() => "Cancelling…".into(),
+            Some(startup) => startup.countdown_remaining().map(|seconds| format!("Recording in {seconds}…"))
+                .unwrap_or_else(|| "Choose your recording source…".into()),
+            None => "Starting…".into(),
+        }
+    }
+
+    pub(crate) fn cancel_recording_start(&mut self, cx: &mut Context<Self>) {
+        if let Some(startup) = self.recording_startup.as_ref() {
+            startup.cancel();
+            self.toast = Some("Cancelling recording setup…".into());
+            cx.notify();
+        }
     }
 
     pub(super) fn run_recording_action(&mut self, action: RecordingAction, cx: &mut Context<Self>) {
@@ -500,6 +594,7 @@ impl Studio {
                             this.recording_session_path = path.clone();
                             this.launcher_active = false;
                             if let Some(path) = path {
+                                this.save_recording_appearance(&path);
                                 this.start_loading(crate::loading::LoadRequest::Recording(path.clone()), false, cx);
                                 let mut message = format!("Recording saved to {}", path.display());
                                 if !warnings.is_empty() { message.push_str(&format!(" — {}", warnings.join(" "))); }
@@ -541,7 +636,13 @@ impl Studio {
                 } else {
                     this.recording_controller = Some(controller);
                 }
-                this.sync_camera_preview(cx);
+                if this.recording_close_requested && this.recording_state == RecordingState::Idle {
+                    this.recording_close_requested = false;
+                    let handle = this.window_handle;
+                    cx.defer(move |cx| { let _ = handle.update(cx, |_, window, _| window.remove_window()); });
+                } else {
+                    this.sync_camera_preview(cx);
+                }
                 cx.notify();
             });
         })
@@ -555,6 +656,11 @@ impl Studio {
     ) {
         if self.recording_state == RecordingState::Idle {
             let _ = window_handle.update(cx, |_, window, _| window.remove_window());
+            return;
+        }
+        if self.recording_state == RecordingState::Starting {
+            self.recording_close_requested = true;
+            self.cancel_recording_start(cx);
             return;
         }
         if self.recording_busy {
@@ -590,6 +696,7 @@ impl Studio {
                     Ok(path) => {
                         this.close_prompter(cx);
                         this.close_recording_overlays(cx);
+                        this.save_recording_appearance(&path);
                         this.recording_session_path = Some(path);
                         this.recording_controller = None;
                         for warning in warnings {
@@ -779,6 +886,7 @@ impl Studio {
         self.retired_images.extend(thumbnails);
         self.video_extras_pending = true;
         self.video_camera_path = camera_path;
+        if self.video_camera_path.is_none() { self.camera_overlay.enabled = false; }
         self.camera_frame_rgba = None;
         self.camera_decoded_time = -1.0;
         self.scene_selection = SceneSelection::Scene;

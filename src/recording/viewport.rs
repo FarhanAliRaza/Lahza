@@ -25,12 +25,115 @@ pub fn visible_rect(frame: ViewportFrame) -> (f64, f64, f64, f64) {
 
 const STEP_RATE: f64 = 120.0;
 const CLUSTER_WIDTH_RATIO: f64 = 0.5;
-const CLUSTER_HEIGHT_RATIO: f64 = 0.7;
+const CLUSTER_HEIGHT_RATIO: f64 = 0.5;
 const MOTION_PROFILE: SpringConstant = SpringConstant {
     tension: 200.0,
     friction: 40.0,
     inertia: 2.25,
 };
+
+/// Camera response, independent of the authored ramp's easing curve.
+/// Standard preserves the response of projects saved before this control.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CameraMotion {
+    #[default]
+    Standard,
+    Smooth,
+    Focused,
+}
+
+impl CameraMotion {
+    pub const ALL: [Self; 3] = [Self::Standard, Self::Smooth, Self::Focused];
+
+    fn spring(self) -> SpringConstant {
+        match self {
+            Self::Standard => MOTION_PROFILE,
+            Self::Smooth => SpringConstant { tension: 170.0, friction: 50.0, inertia: 3.0 },
+            Self::Focused => SpringConstant { tension: 250.0, friction: 40.0, inertia: 2.25 },
+        }
+    }
+
+    fn step(self, spring: &mut DampedSpring, target: f64, dt: f64) {
+        let mut constant = self.spring();
+        if self != Self::Standard {
+            // Brake fast approaches using critical damping. This retains
+            // velocity through target changes while reducing overshoot.
+            let displacement = target - spring.position;
+            let natural_frequency = (constant.tension / constant.inertia).sqrt();
+            if spring.velocity * displacement > 0.0
+                && spring.velocity.abs() > displacement.abs() * natural_frequency
+            {
+                constant.friction = constant.friction.max(
+                    2.0 * (constant.inertia * constant.tension).sqrt(),
+                );
+            }
+        }
+        spring.step(target, constant, dt);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ZoomPresentation {
+    #[default]
+    Classic,
+    GlassLoupe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LoupeOptions {
+    /// Radius as a fraction of the media's longer edge.
+    pub radius: f64,
+    pub bevel: f64,
+    pub chromatic_aberration: f64,
+    pub glass: bool,
+}
+
+impl Default for LoupeOptions {
+    fn default() -> Self {
+        Self { radius: 0.35, bevel: 0.2, chromatic_aberration: 0.5, glass: true }
+    }
+}
+
+impl LoupeOptions {
+    pub fn clamped(self) -> Self {
+        let finite = |value: f64, fallback: f64| if value.is_finite() { value } else { fallback };
+        Self {
+            radius: finite(self.radius, 0.35).clamp(0.25, 0.75),
+            bevel: finite(self.bevel, 0.2).clamp(0.0, 0.5),
+            chromatic_aberration: finite(self.chromatic_aberration, 0.5).clamp(0.0, 1.0),
+            glass: self.glass,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoupeFrame {
+    pub center: NormalizedPoint,
+    pub radius: f64,
+    pub magnification: f64,
+    pub bevel: f64,
+    pub chromatic_aberration: f64,
+    pub presence: f64,
+}
+
+impl LoupeFrame {
+    fn interpolate(self, other: Self, fraction: f64) -> Self {
+        Self {
+            center: NormalizedPoint {
+                x: lerp(self.center.x, other.center.x, fraction),
+                y: lerp(self.center.y, other.center.y, fraction),
+            },
+            radius: lerp(self.radius, other.radius, fraction),
+            magnification: lerp(self.magnification, other.magnification, fraction),
+            bevel: lerp(self.bevel, other.bevel, fraction),
+            chromatic_aberration: lerp(self.chromatic_aberration, other.chromatic_aberration, fraction),
+            presence: lerp(self.presence, other.presence, fraction),
+        }
+    }
+}
 
 /// Animated 3D rotation (degrees) added to the authored scene transform.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -56,6 +159,8 @@ pub struct ViewportFrame {
     /// Fraction of the media visible on each axis at magnification 1. Below
     /// 1 when Fill crops the media to the card's aspect ratio.
     pub fill: (f64, f64),
+    /// Local magnification over the screen; independent of the classic camera.
+    pub loupe: Option<LoupeFrame>,
 }
 
 impl Default for ViewportFrame {
@@ -66,6 +171,7 @@ impl Default for ViewportFrame {
             tilt: Tilt::default(),
             transform: SceneTransform::IDENTITY,
             fill: (1.0, 1.0),
+            loupe: None,
         }
     }
 }
@@ -75,6 +181,8 @@ pub struct ViewportTimeline {
     frames: Vec<ViewportSample>,
     duration: f64,
     cues: Vec<ZoomCue>,
+    cue_clusters: Vec<Vec<FocusCluster>>,
+    focus_bounds: (f64, f64),
     clips: RecordingClipTimeline,
     reframe: Option<std::sync::Arc<Reframe>>,
 }
@@ -129,6 +237,7 @@ struct ViewportSample {
     magnification: f64,
     framing: NormalizedPoint,
     tilt: Tilt,
+    loupe: Option<LoupeFrame>,
 }
 
 impl ViewportSample {
@@ -144,6 +253,7 @@ impl ViewportSample {
             tilt: self.tilt,
             transform,
             fill: (1.0, 1.0),
+            loupe: self.loupe.filter(|frame| frame.presence > 0.0001),
         }
     }
 }
@@ -169,6 +279,20 @@ impl ViewportTimeline {
         clips: &RecordingClipTimeline,
         capture: &PointerCaptureFile,
     ) -> Self {
+        Self::build_for_viewport(cues, pointer, clips, capture, (1.0, 1.0))
+    }
+
+    /// Visible source fraction before zoom (crop multiplied by Fill). Camera
+    /// activity groups must fit the actual viewport, including portrait crops.
+    pub fn build_for_viewport(
+        cues: &[ZoomCue],
+        pointer: &PointerTimeline,
+        clips: &RecordingClipTimeline,
+        capture: &PointerCaptureFile,
+        visible_source: (f64, f64),
+    ) -> Self {
+        let sanitize = |value: f64| if value.is_finite() { value.clamp(0.001, 1.0) } else { 1.0 };
+        let focus_bounds = (sanitize(visible_source.0), sanitize(visible_source.1));
         let duration = clips.duration();
         if !duration.is_finite() || duration <= 0.0 {
             return Self::default();
@@ -189,16 +313,18 @@ impl ViewportTimeline {
         let mut tilt_y = DampedSpring::new(0.0);
         let mut tilt_z = DampedSpring::new(0.0);
         let mut previous_cue = None;
+        let mut camera_motion = CameraMotion::default();
+        let mut loupe_motion = LoupeMotion::default();
         let mut frames = Vec::with_capacity(frame_count);
         let cue_clusters: Vec<Vec<FocusCluster>> = cues
             .iter()
-            .map(|cue| build_focus_clusters(cue, capture, clips, pointer))
+            .map(|cue| build_focus_clusters_for_viewport(cue, capture, clips, pointer, focus_bounds))
             .collect();
 
         for frame_index in 0..frame_count {
             let editor_time = (frame_index as f64 * dt).min(duration);
             let source_time = clips.source_time_at(editor_time);
-            let active = active_cue(source_time, cues);
+            let active = active_zoom_cue(source_time, cues, ZoomPresentation::Classic);
             let progress = active
                 .map(|cue| cue.progress_at(source_time))
                 .unwrap_or(0.0);
@@ -207,19 +333,13 @@ impl ViewportTimeline {
                 .unwrap_or(1.0);
             let raw_target = active
                 .and_then(|cue| {
-                    let base = match cue.anchor_mode {
-                        ZoomAnchorMode::PinnedAnchor => Some(cue.pinned_point),
-                        ZoomAnchorMode::PointerAnchor | ZoomAnchorMode::SmartAnchor => {
-                            let cue_index =
-                                cues.iter().position(|candidate| candidate.id == cue.id)?;
-                            cluster_center_at(&cue_clusters[cue_index], editor_time)
-                                .or(Some(cue.pinned_point))
-                        }
-                    }?;
+                    let base = cue_focus(cue, cues, &cue_clusters, editor_time);
                     Some(cue.anchor_at(base, progress))
                 })
                 .unwrap_or(NormalizedPoint { x: 0.5, y: 0.5 });
             if let Some(cue) = active {
+                // Keep the outgoing response during release as well.
+                camera_motion = cue.camera_motion;
                 // Preserve the authored framing at the cue's full zoom. Using
                 // the changing ramp amount here would move the pivot itself.
                 held_framing = framing_for_focus(
@@ -235,9 +355,9 @@ impl ViewportTimeline {
             let target_tilt = active.map(|cue| cue.tilt_at(progress)).unwrap_or_default();
             let cue_id = active.map(|cue| cue.id);
             let changed = cue_id != previous_cue;
-            let should_snap = changed
-                && (active.is_some_and(|cue| cue.skips_easing)
-                    || previous_cue
+            let instant_window = in_instant_window(source_time, cues);
+            let should_snap = instant_window
+                || (changed && previous_cue
                         .and_then(|id| cues.iter().find(|cue| cue.id == id))
                         .is_some_and(|cue| cue.skips_easing));
 
@@ -255,14 +375,14 @@ impl ViewportTimeline {
                     framing_x.snap(target_framing.x);
                     framing_y.snap(target_framing.y);
                 } else if frame_index > 0 {
-                    framing_x.step(target_framing.x, MOTION_PROFILE, dt);
-                    framing_y.step(target_framing.y, MOTION_PROFILE, dt);
+                    camera_motion.step(&mut framing_x, target_framing.x, dt);
+                    camera_motion.step(&mut framing_y, target_framing.y, dt);
                 }
                 if frame_index > 0 {
-                    tilt_x.step(target_tilt.x, MOTION_PROFILE, dt);
-                    tilt_y.step(target_tilt.y, MOTION_PROFILE, dt);
-                    tilt_z.step(target_tilt.z, MOTION_PROFILE, dt);
-                    amount.step(target_magnification, MOTION_PROFILE, dt);
+                    camera_motion.step(&mut tilt_x, target_tilt.x, dt);
+                    camera_motion.step(&mut tilt_y, target_tilt.y, dt);
+                    camera_motion.step(&mut tilt_z, target_tilt.z, dt);
+                    camera_motion.step(&mut amount, target_magnification, dt);
                 }
             }
 
@@ -271,6 +391,14 @@ impl ViewportTimeline {
                 // undershoot cannot cause a small second zoom after release.
                 amount.snap(1.0);
             }
+            let loupe_cue = active_zoom_cue(source_time, cues, ZoomPresentation::GlassLoupe);
+            let loupe_target = loupe_cue.map(|cue| {
+                let base = cue_focus(cue, cues, &cue_clusters, editor_time);
+                cue.anchor_at(base, cue.progress_at(source_time))
+            });
+            let loupe = loupe_motion.advance(
+                loupe_cue, loupe_target, source_time, if frame_index == 0 { 0.0 } else { dt }, instant_window,
+            );
             frames.push(ViewportSample {
                 magnification: amount.position,
                 framing: NormalizedPoint {
@@ -282,12 +410,15 @@ impl ViewportTimeline {
                     y: tilt_y.position,
                     z: tilt_z.position,
                 },
+                loupe,
             });
             previous_cue = cue_id;
         }
 
-        Self { frames, duration, cues: cues.to_vec(), clips: clips.clone(), reframe: None }
+        Self { frames, duration, cues: cues.to_vec(), cue_clusters, focus_bounds, clips: clips.clone(), reframe: None }
     }
+
+    pub fn focus_bounds(&self) -> (f64, f64) { self.focus_bounds }
 
     pub fn reframe(&self) -> Option<&Reframe> {
         self.reframe.as_deref()
@@ -365,6 +496,34 @@ impl ViewportTimeline {
 
     pub fn frame_at(&self, time: f64) -> ViewportFrame {
         let mut frame = self.base_frame_at(time);
+        // Instant regions are evaluated at the requested source timestamp,
+        // not interpolated across a baked sample's entry/exit boundary.
+        let source_time = self.clips.source_time_at(time.clamp(0.0, self.duration.max(0.0)));
+        for presentation in [ZoomPresentation::Classic, ZoomPresentation::GlassLoupe] {
+            let Some(cue) = active_zoom_cue(source_time, &self.cues, presentation)
+                .filter(|cue| cue.skips_easing || in_instant_window(source_time, &self.cues)) else { continue; };
+            let progress = cue.progress_at(source_time);
+            let base = cue_focus(cue, &self.cues, &self.cue_clusters, time);
+            let center = cue.anchor_at(base, progress);
+            if presentation == ZoomPresentation::Classic {
+                let sample = ViewportSample {
+                    magnification: cue.magnification_at(progress),
+                    framing: framing_for_focus(center, cue.zoom, cue.anchor_mode, cue.bounds_bias),
+                    tilt: cue.tilt_at(progress), loupe: frame.loupe,
+                }.frame(frame.transform);
+                frame.magnification = sample.magnification;
+                frame.anchor = sample.anchor;
+                frame.tilt = sample.tilt;
+            } else {
+                let options = cue.loupe.clamped();
+                frame.loupe = Some(LoupeFrame {
+                    center: loupe_drift(center, source_time), radius: options.radius,
+                    magnification: cue.magnification_at(progress), presence: 1.0,
+                    bevel: if options.glass { options.bevel } else { 0.0 },
+                    chromatic_aberration: if options.glass { options.chromatic_aberration } else { 0.0 },
+                });
+            }
+        }
         if let Some(reframe) = self.reframe.as_deref() {
             frame.fill = reframe.fill;
             if let Some(anchor) = reframe.anchor_at(time.clamp(0.0, self.duration.max(0.0))) {
@@ -394,6 +553,19 @@ impl ViewportTimeline {
         let fraction = position - index as f64;
         let left = self.frames[index];
         let right = self.frames[index + 1];
+        let left_time = self.clips.source_time_at(index as f64 / STEP_RATE);
+        let right_time = self.clips.source_time_at(((index + 1) as f64 / STEP_RATE).min(self.duration));
+        let boundary_fraction = |presentation| {
+            let a = active_zoom_cue(left_time, &self.cues, presentation);
+            let b = active_zoom_cue(right_time, &self.cues, presentation);
+            if a.map(|c| c.id) != b.map(|c| c.id)
+                && (a.is_some_and(|c| c.skips_easing) || b.is_some_and(|c| c.skips_easing)) {
+                let current = active_zoom_cue(source_time, &self.cues, presentation).map(|c| c.id);
+                if current == b.map(|c| c.id) { 1.0 } else { 0.0 }
+            } else { fraction }
+        };
+        let classic_fraction = boundary_fraction(ZoomPresentation::Classic);
+        let loupe_fraction = boundary_fraction(ZoomPresentation::GlassLoupe);
         // Interpolate in framing space, then derive the source crop. Lerp of
         // crop centers would reintroduce pivot drift between cached samples.
         let left_framing = if left.magnification == 1.0 {
@@ -407,16 +579,17 @@ impl ViewportTimeline {
             right.framing
         };
         ViewportSample {
-            magnification: lerp(left.magnification, right.magnification, fraction),
+            magnification: lerp(left.magnification, right.magnification, classic_fraction),
             framing: NormalizedPoint {
-                x: lerp(left_framing.x, right_framing.x, fraction),
-                y: lerp(left_framing.y, right_framing.y, fraction),
+                x: lerp(left_framing.x, right_framing.x, classic_fraction),
+                y: lerp(left_framing.y, right_framing.y, classic_fraction),
             },
             tilt: Tilt {
-                x: lerp(left.tilt.x, right.tilt.x, fraction),
-                y: lerp(left.tilt.y, right.tilt.y, fraction),
-                z: lerp(left.tilt.z, right.tilt.z, fraction),
+                x: lerp(left.tilt.x, right.tilt.x, classic_fraction),
+                y: lerp(left.tilt.y, right.tilt.y, classic_fraction),
+                z: lerp(left.tilt.z, right.tilt.z, classic_fraction),
             },
+            loupe: interpolate_loupe(left.loupe, right.loupe, loupe_fraction),
         }
         .frame(transform)
     }
@@ -429,6 +602,11 @@ struct FocusCluster {
     min_y: f64,
     max_y: f64,
     editor_start: f64,
+    weighted_x: f64,
+    weighted_y: f64,
+    weight: f64,
+    last_point: NormalizedPoint,
+    last_time: f64,
 }
 
 impl FocusCluster {
@@ -439,6 +617,11 @@ impl FocusCluster {
             min_y: point.y,
             max_y: point.y,
             editor_start,
+            weighted_x: 0.0,
+            weighted_y: 0.0,
+            weight: 0.0,
+            last_point: point,
+            last_time: editor_start,
         }
     }
 
@@ -447,7 +630,17 @@ impl FocusCluster {
             && self.max_y.max(point.y) - self.min_y.min(point.y) <= max_height
     }
 
-    fn add(&mut self, point: NormalizedPoint) {
+    fn finish(&mut self, editor_end: f64) {
+        let weight = (editor_end - self.last_time).max(0.0);
+        self.weighted_x += self.last_point.x * weight;
+        self.weighted_y += self.last_point.y * weight;
+        self.weight += weight;
+        self.last_time = editor_end;
+    }
+
+    fn add(&mut self, point: NormalizedPoint, editor_time: f64) {
+        self.finish(editor_time);
+        self.last_point = point;
         self.min_x = self.min_x.min(point.x);
         self.max_x = self.max_x.max(point.x);
         self.min_y = self.min_y.min(point.y);
@@ -455,47 +648,66 @@ impl FocusCluster {
     }
 
     fn center(self) -> NormalizedPoint {
-        NormalizedPoint {
-            x: (self.min_x + self.max_x) * 0.5,
-            y: (self.min_y + self.max_y) * 0.5,
-        }
+        if self.weight <= f64::EPSILON { return self.last_point; }
+        NormalizedPoint { x: self.weighted_x / self.weight, y: self.weighted_y / self.weight }
     }
 }
 
+#[cfg(test)]
 fn build_focus_clusters(
     cue: &ZoomCue,
     capture: &PointerCaptureFile,
     clips: &RecordingClipTimeline,
     pointer: &PointerTimeline,
 ) -> Vec<FocusCluster> {
+    build_focus_clusters_for_viewport(cue, capture, clips, pointer, (1.0, 1.0))
+}
+
+fn build_focus_clusters_for_viewport(
+    cue: &ZoomCue,
+    capture: &PointerCaptureFile,
+    clips: &RecordingClipTimeline,
+    pointer: &PointerTimeline,
+    visible_source: (f64, f64),
+) -> Vec<FocusCluster> {
     if cue.anchor_mode == ZoomAnchorMode::PinnedAnchor {
         return Vec::new();
     }
-    let max_width = CLUSTER_WIDTH_RATIO / cue.zoom.max(1.0);
-    let max_height = CLUSTER_HEIGHT_RATIO / cue.zoom.max(1.0);
-    let mut samples: Vec<_> = capture
-        .travel
-        .iter()
-        .filter(|sample| {
-            sample.time.is_finite()
-                && sample.x.is_finite()
-                && sample.y.is_finite()
-                && sample.time >= cue.start
-                && sample.time <= cue.end
-        })
-        .filter_map(|sample| {
-            clips.editor_time_for_event(sample.time).map(|editor_time| {
-                (
-                    editor_time,
-                    NormalizedPoint {
-                        x: sample.x,
-                        y: sample.y,
-                    }
-                    .clamped(),
-                )
-            })
-        })
+    let max_width = CLUSTER_WIDTH_RATIO * visible_source.0 / cue.zoom.max(1.0);
+    let max_height = CLUSTER_HEIGHT_RATIO * visible_source.1 / cue.zoom.max(1.0);
+    // Keep click/drag events and remove sub-pixel travel noise before grouping.
+    // Centres are weighted by time spent at each position, so brief excursions
+    // do not outweigh the place where the cursor rests.
+    let mut source: Vec<_> = capture.travel.iter().map(|sample| {
+        (sample.time, NormalizedPoint { x: sample.x, y: sample.y },
+            sample.kind == super::model::PointerTravelKind::Drag)
+    }).chain(capture.presses.iter().map(|press| {
+        (press.time, NormalizedPoint { x: press.x, y: press.y }, true)
+    })).filter(|(time, point, _)| time.is_finite() && point.x.is_finite() && point.y.is_finite())
         .collect();
+    source.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (width, height) = pointer.recording_size();
+    let mut previous = None;
+    source.retain(|(_, point, important)| {
+        let retain = *important || width <= 0.0 || height <= 0.0 || previous.is_none_or(|last: NormalizedPoint| {
+            ((point.x - last.x) * width).hypot((point.y - last.y) * height) >= 10.0
+        });
+        if retain { previous = Some(*point); }
+        retain
+    });
+    let mut samples = Vec::new();
+    let slices = clips.slices_overlapping(cue.start, cue.end);
+    for slice in &slices {
+        if let Some((_, point, _)) = source.iter().rev().find(|(time, _, _)| *time <= slice.source_start) {
+            samples.push((slice.editor_start, point.clamped()));
+        }
+        for (time, point, _) in &source {
+            if *time > slice.source_start && *time <= slice.source_end {
+                let t = (*time - slice.source_start) / (slice.source_end - slice.source_start).max(1e-9);
+                samples.push((lerp(slice.editor_start, slice.editor_end, t), point.clamped()));
+            }
+        }
+    }
     samples.sort_by(|left, right| left.0.total_cmp(&right.0));
 
     if samples.is_empty() {
@@ -511,12 +723,14 @@ fn build_focus_clusters(
     let mut current = FocusCluster::new(samples[0].1, samples[0].0);
     for (editor_time, point) in samples.into_iter().skip(1) {
         if current.can_add(point, max_width, max_height) {
-            current.add(point);
+            current.add(point, editor_time);
         } else {
+            current.finish(editor_time);
             clusters.push(current);
             current = FocusCluster::new(point, editor_time);
         }
     }
+    current.finish(slices.last().map(|slice| slice.editor_end).unwrap_or(current.last_time + 0.1));
     clusters.push(current);
     clusters
 }
@@ -559,6 +773,142 @@ fn active_cue(time: f64, cues: &[ZoomCue]) -> Option<&ZoomCue> {
                 .cmp(&cue_priority(right))
                 .then_with(|| left.start.total_cmp(&right.start))
         })
+}
+
+fn active_zoom_cue(
+    time: f64,
+    cues: &[ZoomCue],
+    presentation: ZoomPresentation,
+) -> Option<&ZoomCue> {
+    let eligible = |cue: &&ZoomCue| cue.is_enabled && cue.presentation == presentation;
+    let active = cues.iter().filter(eligible)
+        .filter(|cue| time >= cue.start && time <= cue.end)
+        .max_by(|a, b| cue_priority(a).cmp(&cue_priority(b))
+            .then_with(|| a.start.total_cmp(&b.start)));
+    if active.is_some() || active_cue(time, cues).is_some() {
+        return active;
+    }
+    cues.iter().filter(eligible)
+        .filter(|cue| cue.start_animation_early && !cue.skips_easing
+            && time >= (cue.start - 0.35).max(0.0) && time < cue.start)
+        .min_by(|a, b| a.start.total_cmp(&b.start))
+}
+
+fn cue_focus(
+    cue: &ZoomCue,
+    cues: &[ZoomCue],
+    clusters: &[Vec<FocusCluster>],
+    editor_time: f64,
+) -> NormalizedPoint {
+    if cue.anchor_mode == ZoomAnchorMode::PinnedAnchor {
+        return cue.pinned_point;
+    }
+    cues.iter().position(|candidate| candidate.id == cue.id)
+        .and_then(|index| cluster_center_at(&clusters[index], editor_time))
+        .unwrap_or(cue.pinned_point)
+}
+
+fn interpolate_loupe(a: Option<LoupeFrame>, b: Option<LoupeFrame>, t: f64) -> Option<LoupeFrame> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.interpolate(b, t)),
+        (Some(a), None) => Some(a.interpolate(LoupeFrame { presence: 0.0, magnification: 1.0, ..a }, t)),
+        (None, Some(b)) => Some(LoupeFrame { presence: 0.0, magnification: 1.0, ..b }.interpolate(b, t)),
+        (None, None) => None,
+    }
+}
+
+fn loupe_drift(mut center: NormalizedPoint, time: f64) -> NormalizedPoint {
+    center.x += (time * std::f64::consts::TAU / 12.0).sin() * 0.0125;
+    center.y += ((time + 7.5) * std::f64::consts::TAU / 18.0).cos() * 0.0125;
+    center
+}
+
+fn in_instant_window(time: f64, cues: &[ZoomCue]) -> bool {
+    cues.iter().any(|cue| cue.is_enabled && cue.skips_easing
+        && time >= cue.start && time <= cue.end + 0.05)
+}
+
+struct LoupeMotion {
+    x: DampedSpring,
+    y: DampedSpring,
+    radius: DampedSpring,
+    amount: DampedSpring,
+    presence: DampedSpring,
+    bevel: DampedSpring,
+    chroma: DampedSpring,
+    response: CameraMotion,
+    previous: Option<(Uuid, bool)>,
+}
+
+impl Default for LoupeMotion {
+    fn default() -> Self {
+        Self {
+            x: DampedSpring::new(0.5), y: DampedSpring::new(0.5),
+            radius: DampedSpring::new(0.35), amount: DampedSpring::new(1.0),
+            presence: DampedSpring::new(0.0), bevel: DampedSpring::new(0.0),
+            chroma: DampedSpring::new(0.0), response: CameraMotion::default(), previous: None,
+        }
+    }
+}
+
+impl LoupeMotion {
+    fn advance(
+        &mut self,
+        cue: Option<&ZoomCue>,
+        center: Option<NormalizedPoint>,
+        time: f64,
+        dt: f64,
+        instant_window: bool,
+    ) -> Option<LoupeFrame> {
+        let mut target_radius = self.radius.position;
+        let mut target_center = NormalizedPoint { x: self.x.position, y: self.y.position };
+        let (mut amount, mut presence, mut bevel, mut chroma) = (1.0, 0.0, 0.0, 0.0);
+        if let Some(cue) = cue {
+            let options = cue.loupe.clamped();
+            self.response = cue.camera_motion;
+            target_radius = options.radius;
+            target_center = center.unwrap_or(cue.pinned_point).clamped();
+            // A slow, small drift makes the glass feel suspended over the
+            // source. It is based on source time, so seeking is deterministic.
+            target_center = loupe_drift(target_center, time);
+            amount = cue.magnification_at(cue.progress_at(time));
+            presence = 1.0;
+            if options.glass {
+                bevel = options.bevel;
+                chroma = options.chromatic_aberration;
+            }
+            if self.presence.position <= 0.0001 && self.previous.is_none() {
+                self.x.snap(target_center.x);
+                self.y.snap(target_center.y);
+                self.radius.snap(target_radius);
+            }
+        }
+        let identity = cue.map(|cue| (cue.id, cue.skips_easing));
+        let instant = instant_window || identity.is_some_and(|(_, instant)| instant)
+            || (identity != self.previous && self.previous.is_some_and(|(_, instant)| instant));
+        let mut spring = self.response.spring();
+        spring.tension *= 1.5;
+        for (state, target) in [
+            (&mut self.x, target_center.x), (&mut self.y, target_center.y),
+            (&mut self.radius, target_radius), (&mut self.amount, amount),
+            (&mut self.presence, presence), (&mut self.bevel, bevel), (&mut self.chroma, chroma),
+        ] {
+            if instant { state.snap(target); } else if dt > 0.0 { state.step(target, spring, dt); }
+        }
+        self.previous = identity;
+        if self.presence.position < 0.0 {
+            self.presence.snap(0.0);
+            self.amount.snap(1.0);
+        }
+        (self.presence.position > 0.0001).then_some(LoupeFrame {
+            center: NormalizedPoint { x: self.x.position, y: self.y.position },
+            radius: self.radius.position.clamp(0.01, 0.75),
+            magnification: self.amount.position.max(1.0),
+            bevel: self.bevel.position.clamp(0.0, 0.5),
+            chromatic_aberration: self.chroma.position.clamp(0.0, 1.0),
+            presence: self.presence.position.clamp(0.0, 1.0),
+        })
+    }
 }
 
 fn cue_priority(cue: &ZoomCue) -> u8 {
@@ -749,6 +1099,13 @@ pub struct ZoomCue {
     pub is_enabled: bool,
     pub is_implicit: bool,
     pub skips_easing: bool,
+    #[serde(default)]
+    pub presentation: ZoomPresentation,
+    #[serde(default)]
+    pub loupe: LoupeOptions,
+    /// Anticipate this region by 350ms, without changing its timeline bounds.
+    #[serde(default)]
+    pub start_animation_early: bool,
     /// Magnification envelope. Older projects omit it and behave as `Hold`.
     #[serde(default)]
     pub motion: MotionStyle,
@@ -759,6 +1116,9 @@ pub struct ZoomCue {
     /// Ramp shape for zoom in/out and pan.
     #[serde(default)]
     pub easing: MotionEasing,
+    /// Response for entry, following, and release; absent in older projects.
+    #[serde(default)]
+    pub camera_motion: CameraMotion,
     /// Optional 3D tilt of the media surface while the region is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tilt: Option<Tilt>,
@@ -784,9 +1144,13 @@ impl ZoomCue {
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            presentation: ZoomPresentation::Classic,
+            loupe: LoupeOptions::default(),
+            start_animation_early: false,
             motion: MotionStyle::Hold,
             pan_to: None,
             easing: MotionEasing::Smooth,
+            camera_motion: CameraMotion::default(),
             tilt: None,
             transform: None,
         }
@@ -849,7 +1213,8 @@ impl ZoomCue {
     }
 
     pub fn has_camera_motion(&self) -> bool {
-        self.transform.is_none() || self.zoom > 1.0 || self.pan_to.is_some() || self.tilt.is_some()
+        self.presentation == ZoomPresentation::GlassLoupe || self.transform.is_none()
+            || self.zoom > 1.0 || self.pan_to.is_some() || self.tilt.is_some()
     }
 
     pub fn summary(&self) -> String {
@@ -864,7 +1229,8 @@ impl ZoomCue {
         } else {
             ""
         };
-        let mut label = format!("{motion}{:.1}×{pan}{tilt}", self.zoom);
+        let presentation = if self.presentation == ZoomPresentation::GlassLoupe { "Loupe " } else { "" };
+        let mut label = format!("{presentation}{motion}{:.1}×{pan}{tilt}", self.zoom);
         if let Some(transform) = self.transform {
             let a = transform.start;
             let b = transform.end;
@@ -882,32 +1248,39 @@ impl ZoomCue {
         label
     }
 
-    fn around_press(time: f64, point: NormalizedPoint, duration: f64) -> Option<Self> {
-        // Keep automatic click zooms deliberately short. The cue's `end` is
-        // the start of the camera's spring-driven release back to 1x; making
-        // the post-roll too long leaves the recording looking permanently
-        // zoomed after ordinary clicks.
-        const PRE_ROLL: f64 = 0.6;
-        const POST_ROLL: f64 = 1.6;
+    fn around_press(
+        time: f64,
+        point: NormalizedPoint,
+        duration: f64,
+        style: AutoZoomStyle,
+    ) -> Option<Self> {
         const TRAILING_GUARD: f64 = 0.8;
         const EARLIEST_START: f64 = 0.001;
 
-        let start = (time - PRE_ROLL).max(EARLIEST_START);
-        let end = (time + POST_ROLL).min(duration - TRAILING_GUARD);
+        let (lead, hold, zoom, camera_motion) = match style {
+            AutoZoomStyle::Compact => (0.6, 1.6, 1.5, CameraMotion::Standard),
+            AutoZoomStyle::Cinematic => (0.3, 2.5, 2.0, CameraMotion::Focused),
+        };
+        let start = (time - lead).max(EARLIEST_START);
+        let end = (time + hold).min(duration - TRAILING_GUARD);
         (end > start).then(|| Self {
             id: Uuid::new_v4(),
             start,
             end,
-            zoom: 1.5,
+            zoom,
             anchor_mode: ZoomAnchorMode::PointerAnchor,
             pinned_point: point.clamped(),
             bounds_bias: 0.25,
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            presentation: ZoomPresentation::Classic,
+            loupe: LoupeOptions::default(),
+            start_animation_early: false,
             motion: MotionStyle::Hold,
             pan_to: None,
             easing: MotionEasing::Smooth,
+            camera_motion,
             tilt: None,
             transform: None,
         })
@@ -1082,12 +1455,32 @@ impl MotionPreset {
     }
 }
 
-/// Down-clicks create editable cues using Cap's activity timing. Only
-/// overlapping or genuinely adjacent click windows merge, leaving enough
-/// identity time for the camera to visibly zoom back out between interactions.
+/// Down-clicks create editable cues using the compact activity recipe.
+/// Short gaps merge while separated interactions let the camera zoom out.
 pub fn synthesize_zoom_cues(capture: &PointerCaptureFile, duration: f64) -> Vec<ZoomCue> {
-    const JOIN_TOLERANCE: f64 = 0.6;
+    synthesize_zoom_cues_with_style(capture, duration, AutoZoomStyle::Compact)
+}
+
+/// Generation recipes expand into ordinary editable cues. They do not change
+/// saved regions or the default behavior of existing capture callers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoZoomStyle {
+    /// Short holds and the existing default response.
+    Compact,
+    /// Longer activity groups with closer framing and a focused response.
+    Cinematic,
+}
+
+pub fn synthesize_zoom_cues_with_style(
+    capture: &PointerCaptureFile,
+    duration: f64,
+    style: AutoZoomStyle,
+) -> Vec<ZoomCue> {
     const TAIL_EXCLUSION: f64 = 1.0;
+    let join_tolerance = match style {
+        AutoZoomStyle::Compact => 0.6,
+        AutoZoomStyle::Cinematic => 2.5,
+    };
 
     if !duration.is_finite() || duration <= 0.0 {
         return Vec::new();
@@ -1111,6 +1504,7 @@ pub fn synthesize_zoom_cues(capture: &PointerCaptureFile, duration: f64) -> Vec<
                     y: press.y,
                 },
                 duration,
+                style,
             )
         })
         .collect();
@@ -1119,7 +1513,7 @@ pub fn synthesize_zoom_cues(capture: &PointerCaptureFile, duration: f64) -> Vec<
     let mut merged: Vec<ZoomCue> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         if let Some(previous) = merged.last_mut() {
-            if candidate.start <= previous.end + JOIN_TOLERANCE {
+            if candidate.start <= previous.end + join_tolerance {
                 previous.end = previous.end.max(candidate.end);
                 continue;
             }
@@ -1415,6 +1809,67 @@ mod tests {
     }
 
     #[test]
+    fn cinematic_clicks_hold_related_activity_and_release_between_groups() {
+        let capture = PointerCaptureFile {
+            presses: vec![
+                down(14.0, 0.8, 0.8),
+                down(2.0, 0.2, 0.2),
+                down(7.2, 0.5, 0.5),
+            ],
+            ..Default::default()
+        };
+        let cinematic =
+            synthesize_zoom_cues_with_style(&capture, 20.0, AutoZoomStyle::Cinematic);
+        assert_eq!(cinematic.len(), 2);
+        assert!((cinematic[0].start - 1.7).abs() < 1e-9);
+        assert!((cinematic[0].end - 9.7).abs() < 1e-9);
+        assert!((cinematic[1].start - 13.7).abs() < 1e-9);
+        assert!((cinematic[1].end - 16.5).abs() < 1e-9);
+        for cue in &cinematic {
+            assert_eq!(cue.zoom, 2.0);
+            assert_eq!(cue.camera_motion, CameraMotion::Focused);
+            assert!(!cue.skips_easing);
+        }
+        // The existing recipe still lets the camera pull back between these
+        // clicks; selecting the new recipe is the only behavior change.
+        let compact = synthesize_zoom_cues(&capture, 20.0);
+        assert_eq!(compact.len(), 3);
+        assert!(compact.iter().all(|cue| cue.zoom == 1.5
+            && cue.camera_motion == CameraMotion::Standard));
+    }
+
+    #[test]
+    fn cinematic_clicks_respect_recording_edges_and_tail_exclusion() {
+        let capture = PointerCaptureFile {
+            presses: vec![
+                down(0.0, 0.2, 0.2),
+                down(8.9, 0.8, 0.8),
+                down(9.0, 0.5, 0.5),
+            ],
+            ..Default::default()
+        };
+        let cues = synthesize_zoom_cues_with_style(&capture, 10.0, AutoZoomStyle::Cinematic);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].start, 0.001);
+        assert_eq!(cues[0].end, 2.5);
+        assert!((cues[1].start - 8.6).abs() < 1e-9);
+        assert_eq!(cues[1].end, 9.2);
+        assert_eq!(cues[1].pinned_point, NormalizedPoint { x: 0.8, y: 0.8 });
+        let final_click = PointerCaptureFile {
+            presses: vec![down(9.0, 0.5, 0.5)],
+            ..Default::default()
+        };
+        assert!(synthesize_zoom_cues_with_style(
+            &final_click, 10.0, AutoZoomStyle::Cinematic,
+        ).is_empty());
+        for duration in [0.5, 0.0, f64::NAN, f64::INFINITY] {
+            assert!(synthesize_zoom_cues_with_style(
+                &capture, duration, AutoZoomStyle::Cinematic,
+            ).is_empty());
+        }
+    }
+
+    #[test]
     fn corner_reveal_opens_zoomed_on_the_corner_and_ends_on_the_full_frame() {
         let cues = MotionPreset::CornerReveal.cues(5.0);
         let timeline = ViewportTimeline::build_static(&cues, 5.0);
@@ -1648,9 +2103,13 @@ mod tests {
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            presentation: ZoomPresentation::Classic,
+            loupe: LoupeOptions::default(),
+            start_animation_early: false,
             motion: MotionStyle::Hold,
             pan_to: None,
             easing: MotionEasing::Smooth,
+            camera_motion: CameraMotion::default(),
             tilt: None,
             transform: None,
         };
@@ -1668,11 +2127,62 @@ mod tests {
             "isEnabled":true,"isImplicit":false,"skipsEasing":false}"#;
         let cue: ZoomCue = serde_json::from_str(json).unwrap();
         assert_eq!(cue.motion, MotionStyle::Hold);
+        assert_eq!(cue.camera_motion, CameraMotion::Standard);
+        assert_eq!(cue.presentation, ZoomPresentation::Classic);
+        assert_eq!(cue.loupe, LoupeOptions::default());
+        assert_eq!(cue.loupe.radius, 0.35);
+        assert_eq!(cue.loupe.clamped().radius, 0.35);
+        assert!(!cue.start_animation_early);
         assert_eq!(cue.pan_to, None);
         assert_eq!(cue.transform, None);
         let round_trip = serde_json::to_string(&cue).unwrap();
         assert!(!round_trip.contains("panTo"));
         assert!(round_trip.contains("\"motion\":\"hold\""));
+    }
+
+    #[test]
+    fn focused_camera_settles_faster_than_smooth_on_entry_and_release() {
+        let mut cue = ZoomCue::pinned(0.5, 2.5, 2.0, NormalizedPoint { x: 0.7, y: 0.3 });
+        cue.camera_motion = CameraMotion::Smooth;
+        let smooth = ViewportTimeline::build_static(&[cue.clone()], 5.0);
+        cue.camera_motion = CameraMotion::Focused;
+        let focused = ViewportTimeline::build_static(&[cue], 5.0);
+        assert!(focused.frame_at(0.85).magnification > smooth.frame_at(0.85).magnification + 0.1);
+        assert!(focused.frame_at(2.85).magnification < smooth.frame_at(2.85).magnification - 0.1);
+        for timeline in [&smooth, &focused] {
+            // A hold should settle without a second zoom pulse; releasing
+            // must return to the full image and stay there.
+            let mut previous = 1.0;
+            for index in 60..=299 {
+                let zoom = timeline.frame_at(index as f64 / STEP_RATE).magnification;
+                assert!(zoom >= previous - 1e-5 && zoom <= 2.000_01, "{zoom} after {previous}");
+                previous = zoom;
+            }
+            previous = timeline.frame_at(2.51).magnification;
+            for index in 302..=600 {
+                let zoom = timeline.frame_at(index as f64 / STEP_RATE).magnification;
+                assert!(zoom >= 1.0 && zoom <= previous + 1e-5, "{zoom} after {previous}");
+                previous = zoom;
+            }
+            assert!((timeline.frame_at(5.0).magnification - 1.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn changing_camera_response_preserves_continuity_and_seek_determinism() {
+        let mut first = ZoomCue::pinned(0.5, 1.5, 2.0, NormalizedPoint { x: 0.2, y: 0.5 });
+        first.camera_motion = CameraMotion::Smooth;
+        let mut second = ZoomCue::pinned(1.5, 3.0, 3.0, NormalizedPoint { x: 0.8, y: 0.5 });
+        second.camera_motion = CameraMotion::Focused;
+        let viewport = ViewportTimeline::build_static(&[first, second], 5.0);
+        let before = viewport.frame_at(1.5 - 1.0 / STEP_RATE);
+        let at = viewport.frame_at(1.5);
+        assert!((at.magnification - before.magnification).abs() < 0.02);
+        assert!((at.anchor.x - before.anchor.x).abs() < 0.02);
+        let expected = viewport.frame_at(2.25);
+        let _ = viewport.frame_at(4.5);
+        let _ = viewport.frame_at(0.75);
+        assert_eq!(expected, viewport.frame_at(2.25));
     }
 
     #[test]
@@ -1768,5 +2278,141 @@ mod deleted_motion_tests {
         let clips = RecordingClipTimeline::new(vec![super::super::clips::RecordingClipSegment::new(3.0, 5.0)]);
         let viewport = ViewportTimeline::build(&[cue], &PointerTimeline::default(), &clips, &PointerCaptureFile::default());
         assert_eq!(viewport.frame_at(1.0).transform, SceneTransform::default());
+    }
+}
+
+#[cfg(test)]
+mod loupe_tests {
+    use super::*;
+    use crate::recording::{clips::RecordingClipSegment, model::{PointerTravelKind, PointerTravelSample}};
+
+    fn cue() -> ZoomCue {
+        let mut cue = ZoomCue::pinned(1.0, 2.5, 2.0, NormalizedPoint { x: 0.3, y: 0.6 });
+        cue.presentation = ZoomPresentation::GlassLoupe;
+        cue.camera_motion = CameraMotion::Focused;
+        cue
+    }
+
+    #[test]
+    fn lens_fades_in_and_out_without_scaling_the_screen_or_shrinking_radius() {
+        let timeline = ViewportTimeline::build_static(&[cue()], 5.0);
+        assert!(timeline.frame_at(0.8).loupe.is_none());
+        let entering = timeline.frame_at(1.1).loupe.unwrap();
+        let settled = timeline.frame_at(2.0).loupe.unwrap();
+        let leaving = timeline.frame_at(2.6).loupe.unwrap();
+        assert!(entering.presence > 0.0 && entering.presence < 0.8, "{entering:?}");
+        assert!(settled.presence > 0.99 && settled.magnification > 1.99, "{settled:?}");
+        assert!(leaving.presence > 0.0 && leaving.presence < settled.presence);
+        assert!((entering.radius - 0.35).abs() < 1e-9);
+        assert!((leaving.radius - 0.35).abs() < 1e-9);
+        assert!((settled.center.x - 0.3).abs() < 0.02);
+        assert!((settled.center.y - 0.6).abs() < 0.02);
+        assert!(timeline.frame_at(4.9).loupe.is_none());
+        for time in [0.0, 0.9, 1.1, 2.0, 2.6, 4.9] {
+            assert_eq!(timeline.frame_at(time).magnification, 1.0);
+        }
+    }
+
+    #[test]
+    fn early_onset_respects_active_regions_and_instant_intervals_snap() {
+        for presentation in [ZoomPresentation::Classic, ZoomPresentation::GlassLoupe] {
+            let mut cue = cue();
+            cue.presentation = presentation;
+            cue.start_animation_early = true;
+            let timeline = ViewportTimeline::build_static(&[cue.clone()], 4.0);
+            let visible = |frame: ViewportFrame| frame.magnification > 1.001 || frame.loupe.is_some();
+            assert!(!visible(timeline.frame_at(0.6)));
+            assert!(visible(timeline.frame_at(0.85)));
+            let prior = ZoomCue::pinned(0.1, 0.95, 1.0, NormalizedPoint { x: 0.5, y: 0.5 });
+            assert_ne!(active_zoom_cue(0.8, &[prior, cue.clone()], presentation).map(|c| c.id), Some(cue.id));
+            cue.skips_easing = true;
+            let timeline = ViewportTimeline::build_static(&[cue], 4.0);
+            assert!(!visible(timeline.frame_at(0.85)));
+            let frame = timeline.frame_at(1.0);
+            let zoom = frame.loupe.map_or(frame.magnification, |lens| lens.magnification);
+            assert_eq!(zoom, 2.0);
+            assert!(visible(timeline.frame_at(2.49)));
+            assert!(!visible(timeline.frame_at(2.51)));
+        }
+    }
+
+    #[test]
+    fn loupe_and_classic_camera_have_independent_tracks_and_seek_deterministically() {
+        let classic = ZoomCue::pinned(0.2, 3.0, 1.5, NormalizedPoint { x: 0.5, y: 0.5 });
+        let mut glass = cue();
+        glass.loupe.radius = 0.75;
+        let cues = [classic, glass];
+        let timeline = ViewportTimeline::build_static(&cues, 5.0);
+        let sample = timeline.frame_at(2.1);
+        assert!((sample.magnification - 1.5).abs() < 0.01);
+        assert!((sample.loupe.unwrap().magnification - 2.0).abs() < 0.01);
+        assert_eq!(sample.loupe.unwrap().radius, 0.75);
+        let times = [0.01, 0.85, 1.001, 1.125, 2.1, 2.555, 3.45, 4.99];
+        let sequential: Vec<_> = times.map(|time| timeline.frame_at(time)).into();
+        for i in [7, 1, 4, 0, 5, 2, 6, 3] { assert_eq!(timeline.frame_at(times[i]), sequential[i]); }
+        let json = serde_json::to_string(&cues).unwrap();
+        let restored = serde_json::from_str::<Vec<ZoomCue>>(&json).unwrap();
+        assert_eq!(restored, cues);
+        assert_eq!(restored[1].loupe.radius, 0.75);
+        assert_eq!(restored[1].loupe.clamped().radius, 0.75);
+        let mut oversized = restored[1].clone();
+        oversized.loupe.radius = 1.2;
+        oversized.skips_easing = true;
+        assert_eq!(oversized.loupe.clamped().radius, 0.75);
+        assert_eq!(ViewportTimeline::build_static(&[oversized], 5.0)
+            .frame_at(1.5).loupe.unwrap().radius, 0.75);
+    }
+
+    #[test]
+    fn instant_lens_boundaries_do_not_crossfade_between_baked_samples() {
+        let mut cue = cue();
+        cue.start = 1.003;
+        cue.end = 2.473;
+        cue.skips_easing = true;
+        let timeline = ViewportTimeline::build_static(&[cue], 4.0);
+        assert!(timeline.frame_at(1.002999).loupe.is_none());
+        assert_eq!(timeline.frame_at(1.003).loupe.unwrap().presence, 1.0);
+        assert_eq!(timeline.frame_at(2.472999).loupe.unwrap().presence, 1.0);
+        assert!(timeline.frame_at(2.473001).loupe.is_none());
+    }
+
+    #[test]
+    fn lens_uses_clip_time_and_removed_regions_cannot_appear() {
+        let mut segment = RecordingClipSegment::new(0.5, 3.5);
+        segment.speed = 2.0;
+        let clips = RecordingClipTimeline::new(vec![segment]);
+        let mut cue = cue();
+        cue.skips_easing = true;
+        let timeline = ViewportTimeline::build(&[cue.clone()], &PointerTimeline::default(), &clips,
+            &PointerCaptureFile::default());
+        assert!(timeline.frame_at(0.1).loupe.is_none());
+        assert_eq!(timeline.frame_at(0.3).loupe.unwrap().magnification, 2.0);
+        assert!(timeline.frame_at(1.1).loupe.is_none());
+        let removed = RecordingClipTimeline::new(vec![RecordingClipSegment::new(3.0, 5.0)]);
+        let timeline = ViewportTimeline::build(&[cue], &PointerTimeline::default(), &removed,
+            &PointerCaptureFile::default());
+        assert!(timeline.frame_at(0.5).loupe.is_none());
+    }
+
+    #[test]
+    fn cluster_focus_is_weighted_by_dwell_and_not_sample_count() {
+        let sample = |time, x, y| PointerTravelSample { time, x, y,
+            kind: PointerTravelKind::Move, artwork_id: None };
+        let capture = PointerCaptureFile { travel: vec![sample(0.0, 0.4, 0.5),
+            sample(1.8, 0.5, 0.5), sample(1.9, 0.6, 0.5)], ..Default::default() };
+        let mut cue = ZoomCue::pinned(0.0, 2.0, 2.0, NormalizedPoint { x:0.5,y:0.5 });
+        cue.anchor_mode = ZoomAnchorMode::SmartAnchor;
+        let clusters = build_focus_clusters(&cue, &capture, &RecordingClipTimeline::full(2.0),
+            &PointerTimeline::default());
+        assert_eq!(clusters.len(), 1);
+        assert!((clusters[0].center().x - 0.415).abs() < 1e-9);
+        let cropped = build_focus_clusters_for_viewport(&cue, &capture,
+            &RecordingClipTimeline::full(2.0), &PointerTimeline::default(), (0.3, 1.0));
+        assert_eq!(cropped.len(), 3, "narrow crops need smaller activity groups");
+        // The same limit applies on both axes, so a vertical excursion forms
+        // a new viewing region just like horizontal travel.
+        let capture = PointerCaptureFile { travel: vec![sample(0.0,0.4,0.2), sample(1.0,0.4,0.5)], ..Default::default() };
+        assert_eq!(build_focus_clusters(&cue, &capture, &RecordingClipTimeline::full(2.0),
+            &PointerTimeline::default()).len(), 2);
     }
 }

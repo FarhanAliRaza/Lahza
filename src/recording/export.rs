@@ -1005,6 +1005,7 @@ fn camera_moved(early: super::viewport::ViewportFrame, late: super::viewport::Vi
         || (early.tilt.y - late.tilt.y).abs() > 0.01
         || (early.tilt.z - late.tilt.z).abs() > 0.01
         || early.transform != late.transform
+        || early.loupe != late.loupe
 }
 
 fn temporary_sibling(destination: &Path, extension: &str) -> PathBuf {

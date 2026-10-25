@@ -17,11 +17,11 @@ use crate::{
     recording::{
         clips::ClipEdge, scene::WindowFrame, viewport::MotionPreset,
     },
-    scene_ui::{SceneSelection, SceneSlider},
+    scene_ui::SceneSelection,
     timestamped_export_name, Studio, Tool, VideoMoveDrag,
 };
 
-pub(crate) const INSPECTOR_WIDTH: f32 = 360.0;
+pub(crate) const INSPECTOR_WIDTH: f32 = 404.0;
 pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
 const CANVAS_PADDING: f32 = 40.0;
 const TIMELINE_CONTROLS_HEIGHT: f32 = 78.0;
@@ -67,24 +67,34 @@ pub(crate) enum InspectorTab {
     Design,
     Annotate,
     Motion,
+    Camera,
+    Cursor,
+    Audio,
     Record,
     Export,
 }
 
 impl InspectorTab {
-    const ALL: [InspectorTab; 4] = [
+    const ALL: [InspectorTab; 8] = [
         InspectorTab::Design,
-        InspectorTab::Annotate,
+        InspectorTab::Camera,
+        InspectorTab::Cursor,
         InspectorTab::Motion,
+        InspectorTab::Audio,
         InspectorTab::Record,
+        InspectorTab::Annotate,
+        InspectorTab::Export,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            InspectorTab::Design => "Design",
+            InspectorTab::Design => "General",
             InspectorTab::Annotate => "Annotate",
             InspectorTab::Motion => "Motion",
-            InspectorTab::Record => "Record",
+            InspectorTab::Camera => "Camera",
+            InspectorTab::Cursor => "Cursor",
+            InspectorTab::Audio => "Audio",
+            InspectorTab::Record => "Captions",
             InspectorTab::Export => "Export",
         }
     }
@@ -94,7 +104,10 @@ impl InspectorTab {
             InspectorTab::Design => "icons/palette.svg",
             InspectorTab::Annotate => "icons/pen.svg",
             InspectorTab::Motion => "icons/film.svg",
-            InspectorTab::Record => "icons/video.svg",
+            InspectorTab::Camera => "icons/video.svg",
+            InspectorTab::Cursor => "icons/mouse-pointer.svg",
+            InspectorTab::Audio => "icons/volume.svg",
+            InspectorTab::Record => "icons/text.svg",
             InspectorTab::Export => "icons/upload.svg",
         }
     }
@@ -103,7 +116,8 @@ impl InspectorTab {
         match self {
             InspectorTab::Design | InspectorTab::Annotate => true,
             InspectorTab::Motion | InspectorTab::Export => mode != EditorMode::Static,
-            InspectorTab::Record => mode == EditorMode::Video,
+            InspectorTab::Cursor => mode != EditorMode::Static,
+            InspectorTab::Record | InspectorTab::Camera | InspectorTab::Audio => mode == EditorMode::Video,
         }
     }
 }
@@ -748,6 +762,7 @@ impl Studio {
             self.tool = Tool::Select;
         }
         self.inspector_tab = tab;
+        self.inspector_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
     }
 
     pub(crate) fn section_open(&self, id: &'static str) -> bool {
@@ -864,13 +879,7 @@ impl Studio {
             .gap_2()
             .child(Self::tab_label("Canvas"))
             .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
-            .child(self.segmented(
-                "aspect-ratio",
-                &["Auto", "1:1", "4:3", "3:2", "16:9", "9:16", "4:5"],
-                self.aspect_ratio,
-                |this, value| this.aspect_ratio = value,
-                cx,
-            ))
+            .child(self.canvas_aspect_picker(cx))
             .when(self.video_project.is_some() && self.aspect_ratio != 0, |this| {
                 this.child(self.segmented(
                     "content-fill",
@@ -1027,6 +1036,42 @@ impl Studio {
             .child(self.section_header("saved-presets", "Saved presets", None, cx))
             .when(self.section_open("saved-presets"), |this| {
                 this.child(self.preset_library_section(cx))
+            })
+            .into_any_element()
+    }
+
+    pub(crate) fn canvas_aspect_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let presets = [
+            ("Auto", 0, 1.6), ("16:9", 4, 16.0 / 9.0), ("9:16", 5, 9.0 / 16.0),
+            ("1:1", 1, 1.0), ("4:5", 6, 4.0 / 5.0), ("4:3", 2, 4.0 / 3.0),
+            ("3:2", 3, 1.5), ("3:4", 7, 0.75), ("2:3", 8, 2.0 / 3.0),
+            ("21:9", 9, 21.0 / 9.0), ("Custom", 10, 1.4),
+        ];
+        div().flex().flex_col().gap_2()
+            .child(div().grid().grid_cols(3).gap_2().children(presets.into_iter().map(|(label, index, ratio)| {
+                let active = self.aspect_ratio == index;
+                let width = 32.0_f32.min(22.0 * ratio);
+                let height = width / ratio;
+                div().id(("canvas-aspect", index)).h(px(64.0)).rounded_lg()
+                    .border_1().border_color(if active { blue() } else { line() })
+                    .bg(if active { rgb(0xe7f1ff) } else { rgb(0xffffff) })
+                    .flex().flex_col().items_center().justify_center().gap_1()
+                    .cursor_pointer().hover(|style| style.bg(rgb(0xeef4fb)))
+                    .child(div().w(px(width)).h(px(height)).rounded(px(3.0))
+                        .border_1().border_color(if active { blue() } else { muted() }))
+                    .child(div().text_xs().text_color(if active { blue() } else { ink() }).child(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.aspect_ratio = index;
+                        if index == 10 { this.custom_canvas_draft = this.custom_canvas_dimensions; }
+                        cx.notify();
+                    }))
+            })))
+            .when(self.aspect_ratio == 10, |this| {
+                this.child(div().flex().items_center().gap_2()
+                    .child(div().flex_1().min_w_0().child(self.text_fields.aspect_width.clone()))
+                    .child(div().text_sm().text_color(muted()).child(":"))
+                    .child(div().flex_1().min_w_0().child(self.text_fields.aspect_height.clone())))
+                    .child(div().text_xs().text_color(muted()).child("Enter width and height proportions, then press Enter."))
             })
             .into_any_element()
     }
@@ -1425,28 +1470,20 @@ impl Studio {
     }
 
     fn motion_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(transform) = self.transform_inspector(cx) {
-            return transform;
-        }
         if let Some(region) = self.motion_inspector(cx) {
             return region;
+        }
+        if let Some(transform) = self.transform_inspector(cx) {
+            return transform;
         }
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(Self::tab_label("Scene motion"))
-            .when(self.editor_mode() == EditorMode::Motion, |this| {
-                this.child(self.animation_settings(cx))
-            })
             .child(self.motion_overview_section(cx))
-            .child(self.scene_slider_row(SceneSlider::DefaultZoom, cx))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("Starting zoom for new motion regions."),
-            )
+            .when(self.editor_mode() == EditorMode::Motion, |this| this
+                .child(self.section_header("scene-animation", "Scene animation", None, cx))
+                .when(self.section_open("scene-animation"), |this| this.child(self.animation_settings(cx))))
             .child(self.section_header("templates", "Browse templates", None, cx))
             .when(self.section_open("templates"), |this| {
                 this.child(self.template_gallery_section(cx))
@@ -1462,22 +1499,8 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.section_header("pointer", "Pointer", None, cx))
-            .when(self.section_open("pointer"), |this| {
-                this.child(self.pointer_section(cx))
-            })
-            .child(self.section_header("camera", "Camera", None, cx))
-            .when(self.section_open("camera"), |this| {
-                this.child(self.camera_section(cx))
-            })
-            .child(self.section_header("audio", "Audio", None, cx))
-            .when(self.section_open("audio"), |this| {
-                this.child(self.audio_section(cx))
-            })
-            .child(self.section_header("subtitles", "Subtitles", None, cx))
-            .when(self.section_open("subtitles"), |this| {
-                this.child(self.subtitle_section(cx))
-            })
+            .child(Self::tab_label("Subtitles & transcript"))
+            .child(self.subtitle_section(cx))
             .child(self.section_header("keystrokes", "Keystrokes", None, cx))
             .when(self.section_open("keystrokes"), |this| {
                 this.child(self.keystroke_section(cx))
@@ -1496,6 +1519,9 @@ impl Studio {
             InspectorTab::Design => self.design_tab(cx),
             InspectorTab::Annotate => self.annotate_tab(cx),
             InspectorTab::Motion => self.motion_tab(cx),
+            InspectorTab::Camera => self.camera_section(cx),
+            InspectorTab::Cursor => self.pointer_section(cx),
+            InspectorTab::Audio => self.audio_section(cx),
             InspectorTab::Record => self.record_tab(cx),
             InspectorTab::Export => div()
                 .flex()
@@ -1540,13 +1566,17 @@ impl Studio {
                 .into_any_element(),
         };
         let tabs = div()
-            .h(px(64.0))
+            .id("inspector-navigation")
+            .w(px(64.0))
+            .h_full()
             .flex_none()
             .flex()
-            .px_2()
+            .flex_col()
+            .overflow_y_scroll()
+            .px_1()
             .py_2()
             .gap_1()
-            .border_b_1()
+            .border_r_1()
             .border_color(line())
             .children(
                 InspectorTab::ALL
@@ -1557,7 +1587,8 @@ impl Studio {
                         let selected = candidate == tab;
                         div()
                             .id(("inspector-tab", index))
-                            .flex_1()
+                            .flex_none()
+                            .h(px(58.0))
                             .flex()
                             .flex_col()
                             .items_center()
@@ -1581,7 +1612,7 @@ impl Studio {
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.0))
+                                    .text_size(px(10.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(if selected { ink() } else { muted() })
                                     .child(candidate.label()),
@@ -1598,23 +1629,27 @@ impl Studio {
             .h_full()
             .relative()
             .flex()
-            .flex_col()
             .bg(panel())
             .border_l_1()
             .border_color(line())
             .child(tabs)
             .child(
                 div()
+                    .flex_1().min_w_0().h_full().flex().flex_col()
+                    .child(div().h(px(52.0)).flex_none().px_4().flex().items_center()
+                        .border_b_1().border_color(line()).text_sm().font_weight(FontWeight::SEMIBOLD)
+                        .child(tab.label()))
+                    .child(div()
                     .id("inspector-scroll")
                     .track_scroll(&self.inspector_scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .p_5()
+                    .p_4()
                     .flex()
                     .flex_col()
                     .child(div().flex_none().w_full().child(body))
-                    .child(div().flex_none().mt_5().child(crate::theme::credit_footer())),
+                    .child(div().flex_none().mt_5().child(crate::theme::credit_footer()))),
             )
             .when(self.crop_active, |this| {
                 this.opacity(0.52).child(

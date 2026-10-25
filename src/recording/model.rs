@@ -762,9 +762,13 @@ mod tests {
             is_enabled: true,
             is_implicit: false,
             skips_easing: false,
+            presentation: Default::default(),
+            loupe: Default::default(),
+            start_animation_early: false,
             motion: Default::default(),
             pan_to: None,
             easing: Default::default(),
+            camera_motion: super::super::viewport::CameraMotion::Focused,
             tilt: None,
             transform: Some(super::super::viewport::TransformMotion {
                 end: super::super::scene::SceneTransform {

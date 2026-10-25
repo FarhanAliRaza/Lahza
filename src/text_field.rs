@@ -5,6 +5,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
+    CanvasAspect(bool),
     Annotation(usize),
     CanvasAnnotation(usize),
     Watermark,

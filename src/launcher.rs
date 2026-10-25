@@ -6,206 +6,159 @@ use super::{
 };
 use crate::capture_access::CaptureAccess;
 use gpui::{
-    div, hsla, img, point, prelude::*, px, rgb, svg, AnyElement, App, ClickEvent, Context,
+    div, img, point, prelude::*, px, rgb, svg, AnyElement, App, ClickEvent, Context,
     FontWeight, IntoElement, ObjectFit, Window,
 };
 
 impl Studio {
+    /// Device choice and capture state are separate controls, as in the editor.
     pub(super) fn launcher_source_row(
         &self,
         id: &'static str,
         icon: &'static str,
         title: &'static str,
-        subtitle: impl IntoElement,
+        content: impl IntoElement,
         enabled: bool,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
-        div()
-            .id(id)
-            .h(px(52.0))
-            .flex_none()
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(if enabled { blue() } else { line() })
-            .bg(if enabled {
-                hsla(211.0 / 360.0, 0.9, 0.96, 1.0)
-            } else {
-                gpui::white()
-            })
-            .cursor_pointer()
-            .on_click(on_click)
-            .child(svg().path(icon).size(px(17.0)).text_color(if enabled {
-                blue()
-            } else {
-                muted()
-            }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(div().text_xs().text_color(muted()).child(subtitle)),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_full()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .bg(if enabled { blue() } else { line() })
-                    .text_color(if enabled { gpui::white() } else { ink() })
-                    .child(if enabled { "On" } else { "Off" }),
-            )
+        let editable = self.recording_state == RecordingState::Idle && !self.capture_access_busy;
+        div().id(id).flex_none().p_3().flex().flex_col().gap_2()
+            .rounded_lg().border_1().border_color(line()).bg(gpui::white())
+            .child(div().h(px(24.0)).flex().items_center().gap_2()
+                .child(svg().path(icon).size(px(17.0)).flex_none()
+                    .text_color(if enabled { blue() } else { muted() }))
+                .child(div().flex_1().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().id((id, 0usize)).h(px(28.0)).flex().items_center().gap_2()
+                    .when(editable, |button| button.cursor_pointer().on_click(on_toggle))
+                    .when(!editable, |button| button.opacity(0.5).cursor(gpui::CursorStyle::OperationNotAllowed))
+                    .child(div().text_xs().text_color(muted()).child(if enabled { "On" } else { "Off" }))
+                    .child(self.toggle(enabled))))
+            .child(content)
             .into_any_element()
     }
 
-    /// A web-style device select for a launcher row: shows the chosen entry,
-    /// opens a popup on click, and closes on a pick or a click outside.
+    /// An outlined device field with a full-width, independently dismissible menu.
     pub(super) fn launcher_device_select(
         &self,
         id: &'static str,
+        title: &'static str,
+        icon: &'static str,
+        window: &Window,
         devices: &[(String, String)],
         selected: &Option<String>,
         open: bool,
         set_open: impl Fn(&mut Self, bool, &mut Context<Self>) + 'static,
         pick: impl Fn(&mut Self, Option<String>, &mut Context<Self>) + 'static,
+        refresh: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let label = selected
-            .as_ref()
-            .and_then(|selected| {
-                devices
-                    .iter()
-                    .find(|(name, _)| name == selected)
-                    .map(|(_, label)| label.clone())
-            })
-            .unwrap_or_else(|| "System default".to_string());
+        let editable = self.recording_state == RecordingState::Idle;
+        let width = (window.viewport_size().width - px(58.0)).max(px(200.0));
+        let loading = self.capture_access_busy;
+        let label = match selected {
+            Some(selected) => devices.iter().find(|(name, _)| name == selected)
+                .map(|(_, label)| label.clone()).unwrap_or_else(|| "Device unavailable · choose another".into()),
+            None => "System default".into(),
+        };
+        let empty = devices.is_empty();
         let entries = std::iter::once((None, "System default".to_string()))
-            .chain(
-                devices
-                    .iter()
-                    .map(|(name, label)| (Some(name.clone()), label.clone())),
-            )
+            .chain(devices.iter().map(|(name, label)| (Some(name.clone()), label.clone())))
             .collect::<Vec<_>>();
         let pick = std::rc::Rc::new(pick);
         let set_open = std::rc::Rc::new(set_open);
         let toggle = set_open.clone();
-        div()
-            .id(id)
-            .relative()
-            .flex()
-            .items_center()
-            .gap_1()
-            .cursor_pointer()
-            .text_color(if open { blue() } else { muted() })
-            .hover(|s| s.text_color(ink()))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                toggle(this, !open, cx);
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .max_w(px(220.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(label),
-            )
-            .child(svg().path("icons/chevron-down.svg").size(px(12.0)))
-            .when(open, |this| {
+        let trigger_bounds = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
+        let measure = trigger_bounds.clone();
+        let clicked_bounds = trigger_bounds.clone();
+        let anchor = self.launcher_device_anchor.unwrap_or(gpui::Bounds {
+            origin: point(px(29.0), px(0.0)), size: gpui::size(width, px(38.0)),
+        });
+        let below = (window.viewport_size().height - anchor.bottom() - px(14.0)).max(px(0.0));
+        let above = (anchor.top() - px(14.0)).max(px(0.0));
+        let desired_height = px(76.0) + px(entries.len() as f32 * 42.0 + if empty { 36.0 } else { 0.0 }).min(px(220.0));
+        let opens_below = below >= desired_height || below >= above;
+        let list_height = ((if opens_below { below } else { above }) - px(76.0)).clamp(px(38.0), px(220.0));
+        let menu_position = if opens_below {
+            point(anchor.left(), anchor.bottom() + px(6.0))
+        } else { point(anchor.left(), anchor.top() - px(6.0)) };
+        div().id(id).relative().w_full().h(px(38.0)).flex_none()
+            .flex().items_center().gap_2().pl_3().pr_2()
+            .rounded_md().border_1().text_sm()
+            .border_color(if open { blue() } else { rgb(0xc8cdd5).into() })
+            .bg(if open { rgb(0xf0f6ff) } else { rgb(0xf8f9fb) })
+            .text_color(ink())
+            .when(editable, |field| field.cursor_pointer()
+                .hover(|field| field.border_color(blue()).bg(rgb(0xf0f6ff)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.focus_handle.focus(window);
+                    this.launcher_device_anchor = clicked_bounds.get();
+                    toggle(this, !open, cx);
+                    cx.notify();
+                })))
+            .when(!editable, |field| field.opacity(0.5).cursor(gpui::CursorStyle::OperationNotAllowed))
+            .tooltip(crate::timeline_ui::tooltip(format!("Choose {title}: {label}")))
+            .child(gpui::canvas(move |bounds, _, _| measure.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(div().w(px(24.0)).h(px(24.0)).flex_none().flex().items_center().justify_center()
+                .child(svg().path("icons/chevron-down.svg").size(px(16.0)).text_color(if open { blue() } else { muted() })))
+            .when(open && editable, |field| {
                 let close = set_open.clone();
-                this.child(
-                    gpui::deferred(
-                        gpui::anchored()
-                            .position_mode(gpui::AnchoredPositionMode::Local)
-                            .position(point(px(0.0), px(22.0)))
-                            .snap_to_window_with_margin(gpui::Edges {
-                                top: px(8.0),
-                                right: px(8.0),
-                                bottom: px(8.0),
-                                left: px(8.0),
-                            })
-                            .child(
-                                div()
-                                    .id((id, 1usize))
-                                    .w(px(280.0))
-                                    .max_h(px(240.0))
-                                    .overflow_y_scroll()
-                                    .py_1()
-                                    .rounded_lg()
-                                    .bg(gpui::white())
-                                    .border_1()
-                                    .border_color(line())
-                                    .shadow_md()
-                                    .flex()
-                                    .flex_col()
-                                    .text_color(ink())
-                                    .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-                                        close(this, false, cx);
-                                        cx.notify();
-                                    }))
-                                    .children(entries.into_iter().enumerate().map(
-                                        |(index, (name, entry))| {
-                                            let is_selected = *selected == name;
-                                            let pick = pick.clone();
-                                            div()
-                                                .id((id, index + 2))
-                                                .h(px(30.0))
-                                                .flex_none()
-                                                .px_2()
-                                                .mx_1()
-                                                .rounded_md()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .cursor_pointer()
-                                                .hover(|s| {
-                                                    s.bg(hsla(220.0 / 360.0, 0.08, 0.95, 1.0))
-                                                })
-                                                .child(
-                                                    svg()
-                                                        .path("icons/check.svg")
-                                                        .size(px(13.0))
-                                                        .text_color(if is_selected {
-                                                            blue()
-                                                        } else {
-                                                            gpui::transparent_black()
-                                                        }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .font_weight(if is_selected {
-                                                            FontWeight::SEMIBOLD
-                                                        } else {
-                                                            FontWeight::NORMAL
-                                                        })
-                                                        .child(entry),
-                                                )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    pick(this, name.clone(), cx);
-                                                    cx.notify();
-                                                }))
-                                        },
-                                    )),
-                            ),
-                    )
-                    .with_priority(1),
-                )
+                field.child(gpui::deferred(
+                    gpui::anchored()
+                        .position_mode(gpui::AnchoredPositionMode::Window)
+                        .anchor(if opens_below { gpui::Corner::TopLeft } else { gpui::Corner::BottomLeft })
+                        .position(menu_position)
+                        .snap_to_window_with_margin(gpui::Edges { top: px(8.0), right: px(8.0), bottom: px(8.0), left: px(8.0) })
+                        .child(div().id((id, 1usize)).w(width).rounded_lg()
+                            .border_1().border_color(line()).bg(gpui::white()).shadow_lg()
+                            .flex().flex_col().text_color(ink()).text_sm()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                // Let the trigger's click close it; closing on mouse-down
+                                // would otherwise reopen it on the subsequent mouse-up.
+                                if trigger_bounds.get().is_some_and(|bounds| bounds.contains(&event.position)) { return; }
+                                close(this, false, cx);
+                                cx.notify();
+                            }))
+                            .child(div().px_3().pt_3().pb_2().text_xs().font_weight(FontWeight::SEMIBOLD)
+                                .text_color(muted()).child(format!("Choose {title}")))
+                            .child(div().id((id, 10000usize)).max_h(list_height).overflow_y_scroll().p_1()
+                                .flex().flex_col().gap_1()
+                                .children(entries.into_iter().enumerate().map(|(index, (name, entry))| {
+                                    let is_selected = *selected == name;
+                                    let pick = pick.clone();
+                                    div().id((id, index + 2)).min_h(px(38.0)).flex_none().px_2().py_2()
+                                        .rounded_md().flex().items_center().gap_2()
+                                        .when(!loading, |row| row.cursor_pointer())
+                                        .when(loading, |row| row.opacity(0.5).cursor(gpui::CursorStyle::OperationNotAllowed))
+                                        .bg(if is_selected { rgb(0xe7f1ff) } else { rgb(0xffffff) })
+                                        .hover(|row| row.bg(rgb(0xf0f4f9)))
+                                        .child(svg().path(icon).size(px(16.0)).flex_none()
+                                            .text_color(if is_selected { blue() } else { muted() }))
+                                        .child(div().flex_1().min_w_0().text_size(px(13.0)).line_height(px(18.0))
+                                            .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                            .child(entry))
+                                        .child(svg().path("icons/check.svg").size(px(16.0)).flex_none()
+                                            .text_color(if is_selected { blue() } else { gpui::transparent_black() }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if loading { return; }
+                                            pick(this, name.clone(), cx);
+                                            cx.notify();
+                                        }))
+                                }))
+                                .when(empty, |list| list.child(div().px_3().py_2().text_xs().text_color(muted())
+                                    .child(if loading { "Looking for connected devices…" } else { "No devices found. Connect one, then refresh." }))))
+                            .child(div().border_t_1().border_color(line()).p_1()
+                                .child(div().id((id, 10001usize)).h(px(34.0)).px_2().rounded_md().flex().items_center()
+                                    .text_xs().text_color(if loading { muted() } else { blue() })
+                                    .when(!loading, |button| button.cursor_pointer().hover(|button| button.bg(rgb(0xf0f4f9)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation(); refresh(this, cx); cx.notify();
+                                        })))
+                                    .child(if loading { "Refreshing devices…" } else { "Refresh devices" }))))
+                ).with_priority(1))
             })
             .into_any_element()
     }
@@ -229,7 +182,12 @@ impl Studio {
         self.pause_video_playback();
         self.finish_annotation_interaction();
         let record_area = self.record_area;
+        let camera_overlay = self.camera_overlay;
+        let aspect_ratio = self.aspect_ratio;
+        let custom_canvas_dimensions = self.custom_canvas_dimensions;
         let options = RecordingOptions {
+            source: self.recording_source,
+            countdown_seconds: self.recording_countdown,
             area: None,
             capture_exclusions: Vec::new(),
             system_audio: self.record_system_audio,
@@ -242,6 +200,13 @@ impl Studio {
             cx.new(|cx| {
                 let mut studio = Studio::new(window_handle, None, None, cx);
                 studio.record_area = record_area;
+                studio.recording_source = options.source;
+                studio.recording_countdown = options.countdown_seconds;
+                studio.camera_overlay = camera_overlay;
+                studio.camera_overlay.enabled = true;
+                studio.aspect_ratio = aspect_ratio;
+                studio.custom_canvas_dimensions = custom_canvas_dimensions;
+                studio.custom_canvas_draft = custom_canvas_dimensions;
                 studio.record_system_audio = options.system_audio;
                 studio.record_microphone = options.microphone;
                 studio.microphone_device = options.microphone_device;
@@ -259,7 +224,7 @@ impl Studio {
         cx.notify();
     }
 
-    pub(super) fn render_launcher(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_launcher(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let items = if self.launcher_tab == 1 {
             &self.recent_projects
         } else {
@@ -273,6 +238,14 @@ impl Studio {
             .font_family("Inter")
             .flex()
             .flex_col()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && (this.launcher_camera_menu_open || this.launcher_mic_menu_open) {
+                    this.launcher_camera_menu_open = false;
+                    this.launcher_mic_menu_open = false;
+                    cx.stop_propagation(); cx.notify();
+                }
+            }))
             .child(
                 div()
                     .h(px(54.0))
@@ -401,6 +374,8 @@ impl Studio {
                                                 "Recording…"
                                             } else if self.record_area {
                                                 "Record area"
+                                            } else if self.recording_source == recording::native::RecordingSource::Window {
+                                                "Record window"
                                             } else {
                                                 "Record screen"
                                             },
@@ -413,70 +388,46 @@ impl Studio {
                                 ),
                         )
                     })
-                    .when(!recording, |this| {
-                        this.child(
-                            div().flex_none().flex().gap_2().children(
-                                [("Screen / window", false), ("Selected area", true)]
-                                    .into_iter()
-                                    .map(|(label, area)| {
-                                        div()
-                                            .id(("recording-source-mode", usize::from(area)))
-                                            .flex_1()
-                                            .py_2()
-                                            .rounded_lg()
-                                            .border_1()
-                                            .text_sm()
-                                            .text_center()
-                                            .cursor_pointer()
-                                            .border_color(if self.record_area == area {
-                                                blue()
-                                            } else {
-                                                line()
-                                            })
-                                            .bg(gpui::white())
-                                            .text_color(if self.record_area == area {
-                                                blue()
-                                            } else {
-                                                ink()
-                                            })
-                                            .child(label)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.record_area = area;
-                                                cx.notify();
-                                            }))
-                                    }),
-                            ),
-                        )
-                    })
+                    .when(!recording, |panel| panel
+                        .child(self.segmented("recording-source-mode", &["Screen", "Window", "Area"],
+                            if self.record_area { 2 } else if self.recording_source == recording::native::RecordingSource::Window { 1 } else { 0 },
+                            |this, i| { this.record_area = i == 2; this.recording_source = if i == 1 { recording::native::RecordingSource::Window } else { recording::native::RecordingSource::Screen }; }, cx))
+                        .child(div().text_xs().text_color(muted()).child("Countdown"))
+                        .child(self.segmented("recording-countdown", &["Off", "3 sec", "5 sec", "10 sec"], [0, 3, 5, 10].iter().position(|v| *v == self.recording_countdown).unwrap_or(1),
+                            |this, i| this.recording_countdown = [0, 3, 5, 10][i], cx)))
                     .child(self.launcher_source_row(
                         "launcher-camera",
                         "icons/video.svg",
                         "Camera",
                         self.launcher_device_select(
-                            "launcher-camera-select",
+                            "launcher-camera-select", "camera", "icons/video.svg", window,
                             &self.camera_devices,
                             &self.camera_device,
                             self.launcher_camera_menu_open,
                             |this, open, cx| {
+                                if this.recording_state != RecordingState::Idle { return; }
+                                this.launcher_camera_menu_open = open;
                                 if open {
-                                    this.request_capture_access(CaptureAccess::CameraPicker, cx);
-                                } else {
-                                    this.launcher_camera_menu_open = false;
+                                    this.launcher_mic_menu_open = false;
+                                    if this.camera_devices.is_empty() { this.request_capture_access(CaptureAccess::CameraPicker, cx); }
                                 }
                             },
                             |this, device, cx| {
+                                if this.recording_state != RecordingState::Idle || this.capture_access_busy { return; }
                                 if this.camera_device != device {
                                     this.camera_device = device;
                                     // Restart the preview on the new device.
                                     this.camera_preview = None;
                                 }
-                                this.request_capture_access(CaptureAccess::Camera, cx);
                                 this.launcher_camera_menu_open = false;
+                                this.request_capture_access(CaptureAccess::Camera, cx);
                             },
+                            |this, cx| this.request_capture_access(CaptureAccess::CameraPicker, cx),
                             cx,
                         ),
                         self.record_camera,
                         cx.listener(|this, _, _, cx| {
+                            if this.recording_state != RecordingState::Idle { return; }
                             if this.record_camera {
                                 this.record_camera = false;
                             } else {
@@ -502,7 +453,7 @@ impl Studio {
                                         div()
                                             .text_xs()
                                             .text_color(muted())
-                                            .child("Camera crop · enlarged preview"),
+                                            .child("Camera preview"),
                                     ),
                             )
                         },
@@ -512,29 +463,30 @@ impl Studio {
                         "icons/microphone.svg",
                         "Microphone",
                         self.launcher_device_select(
-                            "launcher-mic-select",
+                            "launcher-mic-select", "microphone", "icons/microphone.svg", window,
                             &self.microphone_devices,
                             &self.microphone_device,
                             self.launcher_mic_menu_open,
                             |this, open, cx| {
+                                if this.recording_state != RecordingState::Idle { return; }
+                                this.launcher_mic_menu_open = open;
                                 if open {
-                                    this.request_capture_access(
-                                        CaptureAccess::MicrophonePicker,
-                                        cx,
-                                    );
-                                } else {
-                                    this.launcher_mic_menu_open = false;
+                                    this.launcher_camera_menu_open = false;
+                                    if this.microphone_devices.is_empty() { this.request_capture_access(CaptureAccess::MicrophonePicker, cx); }
                                 }
                             },
                             |this, device, cx| {
+                                if this.recording_state != RecordingState::Idle || this.capture_access_busy { return; }
                                 this.microphone_device = device;
-                                this.request_capture_access(CaptureAccess::Microphone, cx);
                                 this.launcher_mic_menu_open = false;
+                                this.request_capture_access(CaptureAccess::Microphone, cx);
                             },
+                            |this, cx| this.request_capture_access(CaptureAccess::MicrophonePicker, cx),
                             cx,
                         ),
                         self.record_microphone,
                         cx.listener(|this, _, _, cx| {
+                            if this.recording_state != RecordingState::Idle { return; }
                             if this.record_microphone {
                                 this.record_microphone = false;
                             } else {
@@ -547,9 +499,10 @@ impl Studio {
                         "launcher-system-audio",
                         "icons/volume.svg",
                         "System audio",
-                        "Sound playing on this computer",
+                        div().text_xs().text_color(muted()).child("Sound playing on this computer"),
                         self.record_system_audio,
                         cx.listener(|this, _, _, cx| {
+                            if this.recording_state != RecordingState::Idle { return; }
                             if this.record_system_audio {
                                 this.record_system_audio = false;
                             } else {

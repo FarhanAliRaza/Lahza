@@ -10,11 +10,13 @@ impl Studio {
                 RecordingState::Starting | RecordingState::Finishing
             );
         let status = match self.recording_state {
-            RecordingState::Starting => "Starting recording…",
-            RecordingState::Finishing => "Saving recording…",
-            RecordingState::Paused => "Recording paused",
-            _ => "Recording in progress",
+            RecordingState::Starting => self.recording_start_label(),
+            RecordingState::Finishing => "Saving recording…".into(),
+            RecordingState::Paused => "Recording paused".into(),
+            _ => "Recording in progress".into(),
         };
+        let cancel_start = (self.recording_state == RecordingState::Starting).then(||
+            self.small_button("launcher-cancel-start", "Cancel recording", true, cx, |this, cx| this.cancel_recording_start(cx)));
         let action_button =
             |id: &'static str, label: &'static str, icon: &'static str, action, primary: bool| {
                 div()
@@ -119,6 +121,7 @@ impl Studio {
                         )
                     }),
             )
+            .when_some(cancel_start, |panel, cancel| panel.child(cancel))
             .child(
                 div()
                     .flex()

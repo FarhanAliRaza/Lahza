@@ -1,6 +1,7 @@
 use super::{
     clips::RecordingClipTimeline,
     cursor_assets::CursorShape,
+    cursor_planner::{advance_scalar, CursorEventKind, CursorPath, CursorSample},
     model::{NormalizedPoint, PointerArtwork, PointerCaptureFile},
     motion::{DampedSpring, SpringConstant},
     pointer::{
@@ -10,105 +11,132 @@ use super::{
 use base64::Engine;
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 const STEP_RATE: f64 = 120.0;
-/// How long before the end the cursor starts gliding back to where it
-/// began when loop-friendly playback is requested.
-const LOOP_RETURN_WINDOW: f64 = 0.75;
-const ANTICIPATION_WINDOW: f64 = 0.5;
-const INTERCEPT_WINDOW: f64 = 0.175;
 const PULSE_DURATION: f64 = 0.4;
-const TILT_SAMPLE_WINDOW: f64 = 0.4;
-const TILT_GAIN: f64 = 0.03;
-/// Cap's default rotation amount.
-const TILT_WEIGHT: f64 = 0.15;
 const REVEAL_LEAD_WINDOW: f64 = 0.25;
-const IDLE_GAP_THRESHOLD: f64 = 4.0 / 60.0;
-const LEAD_SMOOTHING: f64 = 0.12;
-
 const GLIDE: SpringConstant = SpringConstant {
     tension: 470.0,
     friction: 70.0,
     inertia: 3.0,
 };
-const INTERCEPT: SpringConstant = SpringConstant {
-    tension: 538.0,
+const MEDIUM: SpringConstant = SpringConstant {
+    tension: 340.0,
+    friction: 60.0,
+    inertia: 3.0,
+};
+const RAPID: SpringConstant = SpringConstant {
+    tension: 530.0,
     friction: 40.0,
     inertia: 1.0,
 };
-const TRACK: SpringConstant = SpringConstant {
-    tension: 1000.0,
-    friction: 40.0,
+const TYPING_FADE: SpringConstant = SpringConstant {
+    tension: 600.0,
+    friction: 50.0,
     inertia: 1.0,
-};
-const SETTLE: SpringConstant = SpringConstant {
-    tension: 300.0,
-    friction: 30.0,
-    inertia: 0.3,
 };
 
-/// Movement style of the reconstructed cursor: how quickly the glide
-/// spring follows the recorded pointer.
+/// Old serialized choices remain readable; the picker exposes the four current
+/// styles. Existing Quick/Default/Slow projects retain their spring constants.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PointerMotion {
+    None,
+    #[default]
+    Smooth,
+    Medium,
     Rapid,
     Quick,
-    #[default]
     Default,
     Slow,
 }
-
 impl PointerMotion {
-    pub const ALL: [PointerMotion; 4] = [
-        PointerMotion::Rapid,
-        PointerMotion::Quick,
-        PointerMotion::Default,
-        PointerMotion::Slow,
-    ];
-
+    pub const ALL: [Self; 4] = [Self::None, Self::Smooth, Self::Medium, Self::Rapid];
     pub fn label(self) -> &'static str {
         match self {
-            PointerMotion::Rapid => "Rapid",
-            PointerMotion::Quick => "Quick",
-            PointerMotion::Default => "Default",
-            PointerMotion::Slow => "Slow",
+            Self::None => "None",
+            Self::Smooth | Self::Default => "Smooth",
+            Self::Medium => "Medium",
+            Self::Rapid => "Rapid",
+            Self::Quick => "Quick",
+            Self::Slow => "Slow",
         }
     }
-
-    fn glide(self) -> SpringConstant {
+    pub fn current_index(self) -> usize {
         match self {
-            PointerMotion::Rapid => SpringConstant {
-                tension: 1100.0,
-                friction: 85.0,
-                inertia: 3.0,
-            },
-            PointerMotion::Quick => SpringConstant {
+            Self::None => 0,
+            Self::Smooth | Self::Default | Self::Slow => 1,
+            Self::Medium | Self::Quick => 2,
+            Self::Rapid => 3,
+        }
+    }
+    fn glide(self) -> Option<SpringConstant> {
+        Some(match self {
+            Self::None => return None,
+            Self::Smooth | Self::Default => GLIDE,
+            Self::Medium => MEDIUM,
+            Self::Rapid => RAPID,
+            Self::Quick => SpringConstant {
                 tension: 720.0,
                 friction: 78.0,
                 inertia: 3.0,
             },
-            PointerMotion::Default => GLIDE,
-            PointerMotion::Slow => SpringConstant {
+            Self::Slow => SpringConstant {
                 tension: 260.0,
                 friction: 54.0,
                 inertia: 3.0,
             },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PointerRotation {
+    Off,
+    #[default]
+    Velocity,
+    Directional,
+}
+impl PointerRotation {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Velocity, Self::Directional];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Velocity => "Tilt",
+            Self::Directional => "Direction",
         }
     }
 }
 
-/// Knobs that change how the baked cursor track is produced.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PointerTimelineOptions {
-    /// Artwork used for samples without a captured cursor image.
     pub fallback_artwork: Option<PointerArtwork>,
-    /// Seconds of stillness after which the cursor fades out.
     pub hide_after_inactivity: Option<f64>,
     pub motion: PointerMotion,
-    /// Glide back to the first recorded position before the end.
     pub loop_to_start: bool,
+    pub loop_return_duration: f64,
+    pub rotation: PointerRotation,
+    pub rotation_strength: f64,
+    pub hide_when_typing: bool,
+}
+impl Default for PointerTimelineOptions {
+    fn default() -> Self {
+        Self {
+            fallback_artwork: None,
+            hide_after_inactivity: None,
+            motion: PointerMotion::Smooth,
+            loop_to_start: false,
+            loop_return_duration: 1.0,
+            rotation: PointerRotation::Velocity,
+            rotation_strength: 0.5,
+            hide_when_typing: true,
+        }
+    }
 }
 
 /// Decoded, premultiplied cursor image ready to paint.
@@ -186,6 +214,10 @@ pub struct PointerTimeline {
     duration: f64,
     artwork_by_id: HashMap<String, Arc<PointerBitmap>>,
     fallback_artwork: Option<Arc<PointerBitmap>>,
+    path: CursorPath,
+    recording_size: (f64, f64),
+    artwork_changes: Vec<(f64, Option<String>)>,
+    instant_clicks: Option<Vec<(f64, bool)>>,
 }
 
 impl PointerTimeline {
@@ -221,8 +253,11 @@ impl PointerTimeline {
             hide_after_inactivity,
             motion,
             loop_to_start,
+            loop_return_duration,
+            rotation,
+            rotation_strength,
+            hide_when_typing,
         } = options;
-        let glide = motion.glide();
         if !duration.is_finite() || duration <= 0.0 {
             return Self::default();
         }
@@ -238,6 +273,13 @@ impl PointerTimeline {
             capture,
             PointerSanitizeOptions::for_recording(width, height),
         );
+        let mut typing_times: Vec<_> = stream
+            .sanitized_capture
+            .keystrokes
+            .iter()
+            .flat_map(|key| timeline_event_times(key.time, clip_timeline))
+            .collect();
+        typing_times.sort_by(f64::total_cmp);
         let source_samples: Vec<_> = stream
             .samples
             .into_iter()
@@ -249,22 +291,7 @@ impl PointerTimeline {
         let Some(first) = samples.first().cloned() else {
             return Self::default();
         };
-        let press_samples: Vec<_> = samples
-            .iter()
-            .filter(|sample| sample.kind == PointerStreamKind::Press)
-            .cloned()
-            .collect();
-        let travel_samples: Vec<_> = samples
-            .iter()
-            .filter(|sample| {
-                matches!(
-                    sample.kind,
-                    PointerStreamKind::Travel | PointerStreamKind::Drag
-                )
-            })
-            .cloned()
-            .collect();
-        let artwork_by_id: HashMap<_, _> = stream
+        let artwork_by_id = stream
             .artwork
             .iter()
             .filter_map(|artwork| {
@@ -276,150 +303,254 @@ impl PointerTimeline {
             .as_ref()
             .and_then(PointerBitmap::decode)
             .map(Arc::new);
-        let return_target = loop_to_start
-            .then(|| travel_samples.first().map(|sample| (sample.x, sample.y)))
-            .flatten();
-
+        let cuts = cut_times(clip_timeline);
+        let mut points: Vec<_> = samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| CursorSample {
+                time: sample.time,
+                x: sample.x * width,
+                y: sample.y * height,
+                kind: match sample.kind {
+                    PointerStreamKind::Travel => CursorEventKind::Travel,
+                    PointerStreamKind::Drag => CursorEventKind::Drag,
+                    PointerStreamKind::Press => CursorEventKind::Press,
+                    PointerStreamKind::Release => CursorEventKind::Release,
+                },
+                artwork_change: index > 0 && sample.artwork_id != samples[index - 1].artwork_id,
+            })
+            .collect();
+        let return_duration = if loop_return_duration.is_finite() {
+            loop_return_duration.clamp(0.1, 4.0)
+        } else {
+            1.0
+        };
+        let loop_start = loop_to_start.then_some((timeline_duration - return_duration).max(0.0));
+        if let Some(start) = loop_start {
+            let source = source_sample_at(start, &samples).unwrap_or(first.clone());
+            points.retain(|p| p.time < start);
+            let steps = ((timeline_duration - start) * STEP_RATE).ceil().max(1.0) as usize;
+            for index in 0..=steps {
+                let fraction = index as f64 / steps as f64;
+                let eased = smoothstep(0.0, 1.0, fraction);
+                points.push(CursorSample {
+                    time: start + (timeline_duration - start) * fraction,
+                    x: lerp(source.x, first.x, eased) * width,
+                    y: lerp(source.y, first.y, eased) * height,
+                    kind: CursorEventKind::Travel,
+                    artwork_change: false,
+                });
+            }
+            // The last sample is a precision target so the loop closes even
+            // with the slowest spring, without resetting position at playback.
+            if let Some(last) = points.last_mut() {
+                last.artwork_change = true;
+            }
+        }
+        let mut artwork_changes = Vec::new();
+        let mut click_states = Vec::new();
+        let mut buttons = HashSet::new();
+        for sample in &samples {
+            if artwork_changes
+                .last()
+                .is_none_or(|(_, id)| *id != sample.artwork_id)
+            {
+                artwork_changes.push((sample.time, sample.artwork_id.clone()));
+            }
+            match sample.kind {
+                PointerStreamKind::Press => {
+                    buttons.insert(sample.button.unwrap_or(0));
+                }
+                PointerStreamKind::Release => {
+                    buttons.remove(&sample.button.unwrap_or(0));
+                }
+                PointerStreamKind::Travel => buttons.clear(),
+                PointerStreamKind::Drag => {}
+            }
+            let pressed = !buttons.is_empty() || sample.kind == PointerStreamKind::Drag;
+            if click_states
+                .last()
+                .is_none_or(|(_, previous)| *previous != pressed)
+            {
+                click_states.push((sample.time, pressed));
+            }
+        }
+        let instant_clicks = (motion == PointerMotion::None).then_some(click_states);
+        let path = CursorPath::build(&points, timeline_duration, motion.glide(), &cuts);
         let frame_count = ((timeline_duration * STEP_RATE).ceil() as usize + 1).max(2);
         let dt = 1.0 / STEP_RATE;
-        let mut x_spring = DampedSpring::new(first.x);
-        let mut y_spring = DampedSpring::new(first.y);
-        let mut opacity_spring = DampedSpring::new(1.0);
-        let mut blur_spring = DampedSpring::new(0.0);
-        let mut sample_index: isize = -1;
-        let mut travel_index: isize = -1;
-        let mut latest_press_index: isize = -1;
+        let mut opacity = DampedSpring::new(if first.time <= 0.0 { 1.0 } else { 0.0 });
+        let mut blur = DampedSpring::new(0.0);
+        let mut click = DampedSpring::new(1.0);
+        let mut angle = DampedSpring::new(0.0);
+        let mut velocity_ema = 0.0;
+        let mut angular_velocity: f64 = 0.0;
+        let mut directional: f64 = 0.0;
+        let mut sample_index = 0;
+        let mut pressed_buttons = HashSet::new();
         let mut current_artwork_id = first.artwork_id.clone();
-        let mut phase_lead = glide.friction / glide.tension;
+        let mut cut_index = 0;
+        let mut latest_press = None;
         let mut frames = Vec::with_capacity(frame_count);
-
-        for frame_index in 0..frame_count {
-            let time = (frame_index as f64 * dt).min(timeline_duration);
-            while (sample_index + 1) < samples.len() as isize
-                && samples[(sample_index + 1) as usize].time <= time
-            {
-                sample_index += 1;
-                current_artwork_id = samples[sample_index as usize].artwork_id.clone();
-            }
-            while (travel_index + 1) < travel_samples.len() as isize
-                && travel_samples[(travel_index + 1) as usize].time <= time
-            {
-                travel_index += 1;
-            }
-            while (latest_press_index + 1) < press_samples.len() as isize
-                && press_samples[(latest_press_index + 1) as usize].time <= time
-            {
-                latest_press_index += 1;
-            }
-            let latest = if sample_index >= 0 {
-                &samples[sample_index as usize]
-            } else {
-                &first
-            };
-            let mut target = (latest.x, latest.y);
-            let mut anticipating_press = false;
-            let mut approaching_press = false;
-            let returning = return_target
-                .filter(|_| timeline_duration - time <= LOOP_RETURN_WINDOW)
-                .map(|start| target = start)
-                .is_some();
-            let upcoming_press_index = latest_press_index + 1;
-            if !returning && upcoming_press_index < press_samples.len() as isize {
-                let press = &press_samples[upcoming_press_index as usize];
-                let remaining = press.time - time;
-                if (0.0..=ANTICIPATION_WINDOW).contains(&remaining) {
-                    target = (press.x, press.y);
-                    anticipating_press = true;
-                    approaching_press = remaining <= INTERCEPT_WINDOW;
+        let strength = if rotation_strength.is_finite() {
+            rotation_strength.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        for index in 0..frame_count {
+            let time = (index as f64 * dt).min(timeline_duration);
+            if cuts.get(cut_index).is_some_and(|v| *v <= time) {
+                while cuts.get(cut_index).is_some_and(|v| *v <= time) {
+                    cut_index += 1;
                 }
+                pressed_buttons.clear();
+                click.snap(1.0);
+                angle.snap(0.0);
+                velocity_ema = 0.0;
+                directional = 0.0;
+                angular_velocity = 0.0;
+                latest_press = None;
             }
-            let motion = if returning {
-                GLIDE
-            } else if latest.kind == PointerStreamKind::Drag {
-                TRACK
-            } else if approaching_press {
-                INTERCEPT
-            } else {
-                glide
-            };
-            let desired_lead = motion.friction / motion.tension.max(0.000_001);
-            phase_lead += (desired_lead - phase_lead) * LEAD_SMOOTHING;
-            // The press target must survive the whole anticipation window,
-            // as in Cap: replacing it with the lead-compensated travel path
-            // until the intercept spring kicks in turns the early glide into
-            // a late correction.
-            if !anticipating_press && !returning {
-                if let Some(interpolated) =
-                    interpolated_travel_position(&travel_samples, time + phase_lead)
-                {
-                    target = interpolated;
-                }
-            }
-            x_spring.step(target.0, motion, dt);
-            y_spring.step(target.1, motion, dt);
-
-            let hidden = hide_after_inactivity
-                .filter(|value| *value > 0.0)
-                .is_some_and(|threshold| {
-                    if travel_index < 0 || returning {
-                        return false;
+            while sample_index < samples.len() && samples[sample_index].time <= time {
+                let sample = &samples[sample_index];
+                current_artwork_id = sample.artwork_id.clone();
+                match sample.kind {
+                    PointerStreamKind::Press => {
+                        pressed_buttons.insert(sample.button.unwrap_or(0));
+                        latest_press = Some(sample);
                     }
-                    let previous = &travel_samples[travel_index as usize];
-                    let next = travel_samples.get(travel_index as usize + 1);
-                    let will_move_soon = next
-                        .map(|sample| sample.time - time <= REVEAL_LEAD_WINDOW)
-                        .unwrap_or(false);
-                    time - previous.time > threshold && !will_move_soon
+                    PointerStreamKind::Release => {
+                        pressed_buttons.remove(&sample.button.unwrap_or(0));
+                    }
+                    PointerStreamKind::Travel => {
+                        pressed_buttons.clear();
+                    }
+                    PointerStreamKind::Drag => {}
+                }
+                sample_index += 1;
+            }
+            let latest = &samples[sample_index.saturating_sub(1)];
+            let state = path.at(time);
+            let returning = loop_start.is_some_and(|start| time >= start);
+            let hidden = hide_after_inactivity
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .is_some_and(|threshold| {
+                    !returning
+                        && time - latest.time > threshold
+                        && !samples
+                            .get(sample_index)
+                            .is_some_and(|s| s.time - time <= REVEAL_LEAD_WINDOW)
                 });
-            opacity_spring.step(if hidden { 0.0 } else { 1.0 }, SETTLE, dt);
-            blur_spring.step(if hidden { 5.0 } else { 0.0 }, SETTLE, dt);
-
-            let press = if latest_press_index >= 0 {
-                let event = &press_samples[latest_press_index as usize];
+            let upper = typing_times.partition_point(|v| *v <= time);
+            let lower = typing_times.partition_point(|v| *v < time - 1.8);
+            let typing = hide_when_typing
+                && upper.saturating_sub(lower) >= 3
+                && typing_times
+                    .get(upper.saturating_sub(1))
+                    .is_some_and(|key| *key > latest.time)
+                && !returning;
+            advance_scalar(
+                &mut opacity,
+                if hidden || typing || time < first.time {
+                    0.0
+                } else {
+                    1.0
+                },
+                if typing { TYPING_FADE } else { MEDIUM },
+                dt,
+            );
+            advance_scalar(
+                &mut blur,
+                if hidden || typing { 10.0 } else { 0.0 },
+                MEDIUM,
+                dt,
+            );
+            let pressed = !pressed_buttons.is_empty() || latest.kind == PointerStreamKind::Drag;
+            let click_target = if pressed { 0.9 } else { 1.0 };
+            if let Some(spring) = motion.glide() {
+                advance_scalar(&mut click, click_target, spring, dt);
+            } else {
+                click.snap(click_target);
+            }
+            velocity_ema += (state.velocity_x / 1000.0 - velocity_ema) * (1.0 - (-dt / 0.12).exp());
+            let target_angle = match rotation {
+                PointerRotation::Off => 0.0,
+                PointerRotation::Velocity => (velocity_ema * 12.0 * strength).clamp(-20.0, 20.0),
+                PointerRotation::Directional => {
+                    let speed = state.velocity_x.hypot(state.velocity_y) / 1000.0;
+                    if speed > 0.025 {
+                        let heading = state.velocity_y.atan2(state.velocity_x).to_degrees() + 112.5;
+                        let difference = (heading - directional + 180.0).rem_euclid(360.0) - 180.0;
+                        angular_velocity += 0.00005
+                            * speed.min(3.0)
+                            * difference.to_radians().sin()
+                            * (dt * 1000.0);
+                    }
+                    angular_velocity *= (-dt / 0.1).exp();
+                    angular_velocity =
+                        angular_velocity.clamp(-0.4_f64.to_radians(), 0.4_f64.to_radians());
+                    directional = (directional + angular_velocity.to_degrees() * dt * 1000.0)
+                        .clamp(-135.0, 135.0);
+                    directional * strength
+                }
+            };
+            let rotation_spring = if rotation == PointerRotation::Directional {
+                SpringConstant {
+                    tension: 320.0,
+                    friction: 28.0,
+                    inertia: 1.0,
+                }
+            } else {
+                SpringConstant {
+                    tension: 120.0,
+                    friction: 8.0,
+                    inertia: 1.0,
+                }
+            };
+            if motion == PointerMotion::None || rotation == PointerRotation::Off {
+                angle.snap(0.0);
+            } else {
+                advance_scalar(&mut angle, target_angle, rotation_spring, dt);
+            }
+            let press = latest_press.and_then(|event| {
                 let elapsed = time - event.time;
-                (elapsed <= PULSE_DURATION).then(|| PointerPressFrame {
+                (elapsed <= PULSE_DURATION).then_some(PointerPressFrame {
                     location: NormalizedPoint {
                         x: event.x,
                         y: event.y,
                     },
                     progress: (elapsed / PULSE_DURATION).clamp(0.0, 1.0),
                 })
-            } else {
-                None
-            };
+            });
             frames.push(PointerFrame {
                 location: NormalizedPoint {
-                    x: x_spring.position,
-                    y: y_spring.position,
+                    x: state.x / width,
+                    y: state.y / height,
                 },
                 artwork_id: current_artwork_id.clone(),
                 bitmap: None,
-                // Cap treats click feedback as an independent 130ms curve,
-                // not another target on the cursor movement spring.
-                magnification: click_scale_at(&samples, time),
-                tilt_degrees: 0.0,
-                opacity: opacity_spring.position.clamp(0.0, 1.0),
-                blur_radius: blur_spring.position.max(0.0),
-                velocity: (x_spring.velocity, y_spring.velocity),
+                magnification: click.position.clamp(0.85, 1.05),
+                tilt_degrees: angle.position,
+                opacity: opacity.position.clamp(0.0, 1.0),
+                blur_radius: blur.position.max(0.0),
+                velocity: (state.velocity_x / width, state.velocity_y / height),
                 press,
             });
         }
-
-        let tilt_offset = ((TILT_SAMPLE_WINDOW * STEP_RATE).round() as usize).max(1);
-        for index in 0..frames.len() {
-            let previous = frames[index.saturating_sub(tilt_offset)].location;
-            let current = frames[index].location;
-            let delta_points = (current.x - previous.x) * width;
-            frames[index].tilt_degrees =
-                (delta_points * TILT_GAIN * TILT_WEIGHT).clamp(-20.0, 20.0);
-        }
-
         Self {
             frames,
             duration: timeline_duration,
             artwork_by_id,
             fallback_artwork,
+            path,
+            recording_size: (width, height),
+            artwork_changes,
+            instant_clicks,
         }
+    }
+
+    pub fn recording_size(&self) -> (f64, f64) {
+        self.recording_size
     }
 
     pub fn is_empty(&self) -> bool {
@@ -431,7 +562,10 @@ impl PointerTimeline {
     pub fn restrict_to_recording(&mut self, clips: &RecordingClipTimeline, duration: f64) {
         for (index, frame) in self.frames.iter_mut().enumerate() {
             let time = index as f64 / STEP_RATE;
-            if clips.content_source_time_at(time).is_none_or(|source| source >= duration) {
+            if clips
+                .content_source_time_at(time)
+                .is_none_or(|source| source >= duration)
+            {
                 frame.opacity = 0.0;
                 frame.press = None;
             }
@@ -439,7 +573,33 @@ impl PointerTimeline {
     }
 
     pub fn frame_at(&self, time: f64) -> Option<PointerFrame> {
+        let time = if time.is_finite() {
+            time.clamp(0.0, self.duration)
+        } else {
+            0.0
+        };
         let mut frame = self.interpolated_frame(time)?;
+        let state = self.path.at(time);
+        frame.location = NormalizedPoint {
+            x: state.x / self.recording_size.0,
+            y: state.y / self.recording_size.1,
+        };
+        frame.velocity = (
+            state.velocity_x / self.recording_size.0,
+            state.velocity_y / self.recording_size.1,
+        );
+        let artwork_index = self.artwork_changes.partition_point(|(at, _)| *at <= time);
+        if artwork_index > 0 {
+            frame.artwork_id = self.artwork_changes[artwork_index - 1].1.clone();
+        }
+        if let Some(clicks) = &self.instant_clicks {
+            let index = clicks.partition_point(|(at, _)| *at <= time);
+            frame.magnification = if index > 0 && clicks[index - 1].1 {
+                0.9
+            } else {
+                1.0
+            };
+        }
         frame.bitmap = self.artwork(frame.artwork_id.as_deref()).cloned();
         Some(frame)
     }
@@ -494,67 +654,6 @@ impl PointerTimeline {
     }
 }
 
-fn interpolated_travel_position(samples: &[PointerStreamEvent], time: f64) -> Option<(f64, f64)> {
-    let first = samples.first()?;
-    let index = samples.partition_point(|sample| sample.time <= time);
-    if index == 0 {
-        return Some((first.x, first.y));
-    }
-    let previous = &samples[index - 1];
-    let Some(next) = samples.get(index) else {
-        return Some((previous.x, previous.y));
-    };
-    let elapsed = next.time - previous.time;
-    if !elapsed.is_finite() || elapsed <= 0.0 || elapsed > IDLE_GAP_THRESHOLD {
-        return Some((previous.x, previous.y));
-    }
-    let fraction = ((time - previous.time) / elapsed).clamp(0.0, 1.0);
-    Some((
-        lerp(previous.x, next.x, fraction),
-        lerp(previous.y, next.y, fraction),
-    ))
-}
-
-fn click_scale_at(samples: &[PointerStreamEvent], time: f64) -> f64 {
-    const CLICK_DURATION: f64 = 0.13;
-    const SHRINK_SIZE: f64 = 0.8;
-    let is_click = |sample: &&PointerStreamEvent| {
-        matches!(
-            sample.kind,
-            PointerStreamKind::Press | PointerStreamKind::Release
-        )
-    };
-    let next = samples
-        .iter()
-        .filter(is_click)
-        .find(|sample| sample.time > time);
-    let click_t = if let Some(next) = next {
-        if next.kind == PointerStreamKind::Press && next.time - time <= CLICK_DURATION {
-            smoothstep(0.0, CLICK_DURATION, next.time - time)
-        } else if next.kind == PointerStreamKind::Release {
-            0.0
-        } else {
-            1.0
-        }
-    } else if let Some(previous) = samples
-        .iter()
-        .rev()
-        .filter(is_click)
-        .find(|sample| sample.time <= time)
-    {
-        if previous.kind == PointerStreamKind::Press {
-            0.0
-        } else if time - previous.time <= CLICK_DURATION {
-            smoothstep(0.0, CLICK_DURATION, time - previous.time)
-        } else {
-            1.0
-        }
-    } else {
-        1.0
-    };
-    click_t + (1.0 - click_t) * SHRINK_SIZE
-}
-
 fn smoothstep(low: f64, high: f64, value: f64) -> f64 {
     let t = ((value - low) / (high - low)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -583,16 +682,15 @@ fn timeline_samples(
 
     let mut ranked = Vec::with_capacity(source_samples.len() + clip_timeline.segments.len());
     for (index, sample) in source_samples.iter().enumerate() {
-        let Some(editor_time) = clip_timeline.editor_time_for_event(sample.time) else {
-            continue;
-        };
-        let mut mapped = sample.clone();
-        mapped.time = editor_time;
-        ranked.push(EditedPointerEvent {
-            event: mapped,
-            boundary_seed: false,
-            order: index,
-        });
+        for editor_time in timeline_event_times(sample.time, Some(clip_timeline)) {
+            let mut mapped = sample.clone();
+            mapped.time = editor_time;
+            ranked.push(EditedPointerEvent {
+                event: mapped,
+                boundary_seed: false,
+                order: index,
+            });
+        }
     }
 
     let mut slot_start = 0.0;
@@ -618,6 +716,46 @@ fn timeline_samples(
             .then_with(|| left.order.cmp(&right.order))
     });
     ranked.into_iter().map(|item| item.event).collect()
+}
+
+fn timeline_event_times(time: f64, clips: Option<&RecordingClipTimeline>) -> Vec<f64> {
+    let Some(clips) = clips else {
+        return vec![time];
+    };
+    let mut result = Vec::new();
+    let mut start = 0.0;
+    for segment in &clips.segments {
+        if time >= segment.source_start && time < segment.source_end {
+            result.push(
+                start + segment.gap_before + (time - segment.source_start) / segment.speed.max(0.5),
+            );
+        }
+        start += segment.slot_duration();
+    }
+    result
+}
+
+fn cut_times(clips: Option<&RecordingClipTimeline>) -> Vec<f64> {
+    let Some(clips) = clips else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    let mut time = 0.0;
+    for (index, segment) in clips.segments.iter().enumerate() {
+        let previous = index.checked_sub(1).map(|i| &clips.segments[i]);
+        if segment.gap_before > 0.0 {
+            result.push(time);
+            result.push(time + segment.gap_before);
+        } else if previous.is_some_and(|previous| {
+            (previous.source_end - segment.source_start).abs() > 1e-6
+                || (previous.speed - segment.speed).abs() > 1e-6
+                || previous.source_bounds != segment.source_bounds
+        }) {
+            result.push(time);
+        }
+        time += segment.slot_duration();
+    }
+    result
 }
 
 fn source_sample_at(time: f64, samples: &[PointerStreamEvent]) -> Option<PointerStreamEvent> {
@@ -700,14 +838,12 @@ mod tests {
         let frame = timeline.frame_at(0.5).expect("frame");
         let effect = frame.press.expect("press effect");
         assert!((effect.location.x - 0.9).abs() < 1e-12);
-        assert!(frame.location.x < effect.location.x);
+        assert!((frame.location.x - effect.location.x).abs() * 1920.0 < 2.0);
         assert_eq!(effect.progress, 0.0);
     }
 
     #[test]
-    fn press_target_holds_through_the_anticipation_window() {
-        // Mirrors Cap's `click_target_snap_glides_ahead_of_click`: the
-        // pointer sits still until it jumps to the click at 0.6s.
+    fn press_planner_arrives_at_recorded_target_with_bounded_anticipation() {
         let mut travel: Vec<_> = (0..=5)
             .map(|i| travel(f64::from(i) * 0.1, 0.1, 0.1, PointerTravelKind::Move))
             .collect();
@@ -725,13 +861,21 @@ mod tests {
             PointerTimelineOptions::default(),
         );
         let x_at = |time: f64| timeline.frame_at(time).unwrap().location.x;
-        assert!(x_at(0.08) < 0.12, "moved before the window opened: {}", x_at(0.08));
-        assert!(x_at(0.3) > 0.4, "no early glide toward the click: {}", x_at(0.3));
-        assert!(x_at(0.59) > 0.8, "not at the click just before it: {}", x_at(0.59));
+        assert!(
+            x_at(0.08) < 0.12,
+            "moved before the window opened: {}",
+            x_at(0.08)
+        );
+        assert!(x_at(0.59) > 0.8, "not approaching click: {}", x_at(0.59));
+        assert!(
+            (x_at(0.6) - 0.9).abs() * 1000.0 < 2.0,
+            "missed recorded click: {}",
+            x_at(0.6)
+        );
     }
 
     #[test]
-    fn press_anticipation_shrinks_cursor_before_down_event() {
+    fn spring_click_feedback_follows_press_and_recovers() {
         let capture = PointerCaptureFile {
             travel: vec![travel(0.0, 0.5, 0.5, PointerTravelKind::Move)],
             presses: vec![
@@ -747,8 +891,166 @@ mod tests {
             1000.0,
             PointerTimelineOptions::default(),
         );
-        assert!(timeline.frame_at(0.45).unwrap().magnification < 1.0);
+        assert_eq!(timeline.frame_at(0.45).unwrap().magnification, 1.0);
+        assert!(timeline.frame_at(0.65).unwrap().magnification < 0.95);
         assert!(timeline.frame_at(1.2).unwrap().magnification > 0.99);
+    }
+
+    fn click_timeline(events: Vec<PointerPressEvent>) -> PointerTimeline {
+        PointerTimeline::build(
+            PointerCaptureFile {
+                travel: vec![travel(0.0, 0.5, 0.5, PointerTravelKind::Move)],
+                presses: events,
+                ..Default::default()
+            },
+            3.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions::default(),
+        )
+    }
+
+    #[test]
+    fn every_click_release_recovers_even_with_later_clicks() {
+        let first = vec![
+            press(0.5, 0.5, PressPhase::Down),
+            press(0.7, 0.5, PressPhase::Up),
+        ];
+        let mut repeated = first.clone();
+        repeated.extend([
+            press(2.0, 0.5, PressPhase::Down),
+            press(2.2, 0.5, PressPhase::Up),
+        ]);
+        let baseline = click_timeline(first);
+        let actual = click_timeline(repeated);
+        for step in 70..120 {
+            let time = step as f64 / 100.0;
+            assert_eq!(
+                actual.frame_at(time).unwrap().magnification,
+                baseline.frame_at(time).unwrap().magnification
+            );
+        }
+        assert!(
+            actual.frame_at(0.8).unwrap().magnification
+                > actual.frame_at(0.7).unwrap().magnification
+        );
+        assert!(actual.frame_at(1.4).unwrap().magnification > 0.999);
+    }
+
+    #[test]
+    fn rapid_clicks_preserve_continuous_size_and_recover() {
+        let timeline = click_timeline(vec![
+            press(0.5, 0.5, PressPhase::Down),
+            press(0.6, 0.5, PressPhase::Up),
+            press(0.66, 0.5, PressPhase::Down),
+            press(0.8, 0.5, PressPhase::Up),
+        ]);
+        for boundary in [0.5, 0.6, 0.66, 0.8] {
+            let before = timeline.frame_at(boundary - 1e-6).unwrap().magnification;
+            let after = timeline.frame_at(boundary + 1e-6).unwrap().magnification;
+            assert!((before - after).abs() < 1e-4);
+        }
+        assert!(timeline.frame_at(0.75).unwrap().magnification < 0.99);
+        assert!(timeline.frame_at(1.5).unwrap().magnification > 0.999);
+    }
+
+    #[test]
+    fn held_drag_stays_pressed_until_release_then_recovers() {
+        let timeline = click_timeline(vec![
+            press(0.2, 0.5, PressPhase::Down),
+            press(1.2, 0.5, PressPhase::Up),
+            press(2.0, 0.5, PressPhase::Down),
+        ]);
+        assert!((timeline.frame_at(1.1).unwrap().magnification - 0.9).abs() < 0.001);
+        assert!(timeline.frame_at(1.5).unwrap().magnification > 0.99);
+    }
+
+    #[test]
+    fn future_click_does_not_pull_cursor_away_from_a_held_drag() {
+        let capture = PointerCaptureFile {
+            travel: (0..=100)
+                .map(|step| {
+                    travel(
+                        step as f64 / 100.0,
+                        0.2,
+                        0.5,
+                        if step >= 10 {
+                            PointerTravelKind::Drag
+                        } else {
+                            PointerTravelKind::Move
+                        },
+                    )
+                })
+                .collect(),
+            presses: vec![
+                press(0.1, 0.2, PressPhase::Down),
+                press(1.0, 0.2, PressPhase::Up),
+            ],
+            ..Default::default()
+        };
+        let mut with_future_click = capture.clone();
+        with_future_click
+            .presses
+            .push(press(1.1, 0.9, PressPhase::Down));
+        let build = |capture| {
+            PointerTimeline::build(
+                capture,
+                1.5,
+                1000.0,
+                1000.0,
+                PointerTimelineOptions::default(),
+            )
+        };
+        let baseline = build(capture);
+        let actual = build(with_future_click);
+        for step in 12..120 {
+            let time = step as f64 / STEP_RATE;
+            assert_eq!(
+                actual.frame_at(time).unwrap().location,
+                baseline.frame_at(time).unwrap().location,
+                "drag changed at {time}"
+            );
+        }
+        assert!(
+            actual.frame_at(1.1).unwrap().location.x > 0.5,
+            "the next click should still be anticipated after release"
+        );
+    }
+
+    #[test]
+    fn cutting_out_a_release_does_not_leave_the_next_clip_dragging() {
+        let capture = PointerCaptureFile {
+            travel: vec![
+                travel(0.0, 0.2, 0.5, PointerTravelKind::Move),
+                travel(0.1, 0.2, 0.5, PointerTravelKind::Drag),
+                travel(0.7, 0.2, 0.5, PointerTravelKind::Move),
+                travel(0.9, 0.2, 0.5, PointerTravelKind::Move),
+                travel(1.4, 0.9, 0.5, PointerTravelKind::Move),
+            ],
+            presses: vec![
+                press(0.1, 0.2, PressPhase::Down),
+                press(0.7, 0.2, PressPhase::Up),
+                press(1.4, 0.9, PressPhase::Down),
+                press(1.5, 0.9, PressPhase::Up),
+            ],
+            ..Default::default()
+        };
+        let clips = RecordingClipTimeline::new(vec![
+            RecordingClipSegment::new(0.0, 0.5),
+            RecordingClipSegment::new(0.9, 2.0),
+        ]);
+        let timeline = PointerTimeline::build_with_clip_timeline(
+            capture,
+            2.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions::default(),
+            Some(&clips),
+        );
+        // The second clip starts at 0.5s; its cursor should recover after
+        // the removed mouse-up and anticipate its click at editor time 1s.
+        assert!(timeline.frame_at(0.65).unwrap().magnification > 0.99);
+        assert!((timeline.frame_at(1.0).unwrap().location.x - 0.9).abs() * 1000.0 < 2.0);
     }
 
     #[test]
@@ -905,5 +1207,148 @@ mod tests {
         assert!(mapped
             .iter()
             .any(|event| event.time == 2.0 && event.x == 0.8));
+    }
+    #[test]
+    fn new_and_legacy_motion_values_round_trip() {
+        for value in [
+            "none", "smooth", "medium", "rapid", "quick", "default", "slow",
+        ] {
+            let json = format!("\"{value}\"");
+            let motion: PointerMotion = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&motion).unwrap(), json);
+            assert!(motion.current_index() < PointerMotion::ALL.len());
+        }
+    }
+
+    #[test]
+    fn none_has_exact_event_timing_and_no_rotation() {
+        let capture = PointerCaptureFile {
+            travel: vec![
+                travel(0.0, 0.2, 0.5, PointerTravelKind::Move),
+                travel(0.02, 0.8, 0.5, PointerTravelKind::Move),
+            ],
+            presses: vec![
+                press(0.5037, 0.8, PressPhase::Down),
+                press(0.7, 0.8, PressPhase::Up),
+            ],
+            ..Default::default()
+        };
+        let timeline = PointerTimeline::build(
+            capture,
+            1.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions {
+                motion: PointerMotion::None,
+                ..Default::default()
+            },
+        );
+        assert!((timeline.frame_at(0.01).unwrap().location.x - 0.5).abs() < 1e-5);
+        assert_eq!(timeline.frame_at(0.50369).unwrap().magnification, 1.0);
+        assert_eq!(timeline.frame_at(0.5037).unwrap().magnification, 0.9);
+        assert_eq!(timeline.frame_at(0.2).unwrap().tilt_degrees, 0.0);
+    }
+
+    #[test]
+    fn typing_fades_cursor_until_pointer_activity_and_can_be_disabled() {
+        let capture = PointerCaptureFile {
+            travel: vec![
+                travel(0.0, 0.2, 0.5, PointerTravelKind::Move),
+                travel(1.2, 0.3, 0.5, PointerTravelKind::Move),
+            ],
+            keystrokes: [0.1, 0.2, 0.3]
+                .into_iter()
+                .map(|time| super::super::model::KeystrokeEvent {
+                    time,
+                    key: "Space".into(),
+                    modifiers: vec![],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let hidden = PointerTimeline::build(
+            capture.clone(),
+            2.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions::default(),
+        );
+        let visible = PointerTimeline::build(
+            capture,
+            2.0,
+            1000.0,
+            1000.0,
+            PointerTimelineOptions {
+                hide_when_typing: false,
+                ..Default::default()
+            },
+        );
+        assert!(hidden.frame_at(0.8).unwrap().opacity < 0.05);
+        assert!(hidden.frame_at(1.8).unwrap().opacity > 0.95);
+        assert_eq!(visible.frame_at(0.8).unwrap().opacity, 1.0);
+    }
+
+    #[test]
+    fn rotation_modes_are_distinct_finite_and_seek_stable() {
+        let capture = PointerCaptureFile {
+            travel: (0..=100)
+                .map(|i| {
+                    travel(
+                        i as f64 / 100.0,
+                        0.1 + i as f64 * 0.007,
+                        0.5,
+                        PointerTravelKind::Move,
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let build = |rotation| {
+            PointerTimeline::build(
+                capture.clone(),
+                2.0,
+                1920.0,
+                1080.0,
+                PointerTimelineOptions {
+                    rotation,
+                    ..Default::default()
+                },
+            )
+        };
+        let off = build(PointerRotation::Off);
+        let tilt = build(PointerRotation::Velocity);
+        let direction = build(PointerRotation::Directional);
+        assert_eq!(off.frame_at(0.8).unwrap().tilt_degrees, 0.0);
+        assert!(tilt.frame_at(0.8).unwrap().tilt_degrees > 1.0);
+        assert!(
+            direction.frame_at(0.8).unwrap().tilt_degrees
+                > tilt.frame_at(0.8).unwrap().tilt_degrees
+        );
+        let expected = direction.frame_at(0.6).unwrap();
+        direction.frame_at(1.9);
+        direction.frame_at(0.0);
+        assert_eq!(direction.frame_at(0.6).unwrap(), expected);
+        assert_eq!(tilt.recording_size(), (1920.0, 1080.0));
+    }
+
+    #[test]
+    fn repeated_source_segments_repeat_pointer_and_key_events() {
+        let clips = RecordingClipTimeline::new(vec![
+            RecordingClipSegment::new(1.0, 2.0),
+            RecordingClipSegment::new(1.0, 2.0),
+        ]);
+        assert_eq!(timeline_event_times(1.25, Some(&clips)), vec![0.25, 1.25]);
+        let mapped = timeline_samples(
+            vec![stream_event(1.25, 0.5, PointerStreamKind::Press)],
+            Some(&clips),
+        );
+        assert_eq!(
+            mapped
+                .iter()
+                .filter(|e| e.kind == PointerStreamKind::Press)
+                .map(|e| e.time)
+                .collect::<Vec<_>>(),
+            vec![0.25, 1.25]
+        );
     }
 }

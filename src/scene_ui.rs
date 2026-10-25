@@ -1,5 +1,5 @@
-//! Scene-level editing shared by both editors: the composited preview that
-//! matches export pixel-for-pixel, 3D transform editing (inspector and
+//! Scene-level editing shared by both editors: exact paused previews and
+//! responsive playback proxies, 3D transform editing (inspector and
 //! direct manipulation), background effects, watermark, pointer styling,
 //! export options, the preset library, and timed annotations.
 
@@ -10,6 +10,7 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, Window,
 };
 use image::RgbaImage;
+use crate::scene_preview::{playback_canvas_size, PreviewJob, PreviewKey, PreviewMedia, PreviewWorker};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -24,7 +25,7 @@ use crate::{
         model::NormalizedPoint,
         presets::ScenePreset,
         scene::{
-            MediaProjection, PointerMotion, PointerOverlay, SceneCompositor,
+            CameraLayout, MediaProjection, PointerMotion, PointerOverlay, SceneCompositor,
             SceneGeometry, SceneStyle, SceneTransform, WatermarkPosition,
         },
         viewport::{MotionEasing, ViewportFrame, ViewportTimeline},
@@ -79,6 +80,8 @@ pub(crate) struct CameraDrag {
     start: Point<Pixels>,
     start_center: (f64, f64),
     canvas_size: (f64, f64),
+    source_aspect: f64,
+    zoom: f64,
     /// Snap guide per axis, while snapped.
     guides: (Option<f64>, Option<f64>),
 }
@@ -233,11 +236,20 @@ pub(crate) enum SceneSlider {
     CameraMargin,
     SubtitlePosition,
     SubtitleSize,
+    CursorIdleDelay,
+    CursorRotation,
+    CursorLoopDuration,
+    CameraZoomedSize,
+    CameraCornerRadius,
+    CameraCropZoom,
+    CameraCropX,
+    CameraCropY,
+    CameraSplitRatio,
 }
 
 impl SceneSlider {
     const BASE: usize = 100;
-    const ALL: [SceneSlider; 21] = [
+    const ALL: [SceneSlider; 30] = [
         SceneSlider::Scale,
         SceneSlider::PositionX,
         SceneSlider::PositionY,
@@ -259,6 +271,15 @@ impl SceneSlider {
         SceneSlider::CameraMargin,
         SceneSlider::SubtitlePosition,
         SceneSlider::SubtitleSize,
+        SceneSlider::CursorIdleDelay,
+        SceneSlider::CursorRotation,
+        SceneSlider::CursorLoopDuration,
+        SceneSlider::CameraZoomedSize,
+        SceneSlider::CameraCornerRadius,
+        SceneSlider::CameraCropZoom,
+        SceneSlider::CameraCropX,
+        SceneSlider::CameraCropY,
+        SceneSlider::CameraSplitRatio,
     ];
 
     pub(crate) fn id(self) -> usize {
@@ -293,11 +314,30 @@ impl SceneSlider {
             SceneSlider::CameraMargin => "Margin",
             SceneSlider::SubtitlePosition => "Height",
             SceneSlider::SubtitleSize => "Text size",
+            SceneSlider::CursorIdleDelay => "Hide after",
+            SceneSlider::CursorRotation => "Rotation strength",
+            SceneSlider::CursorLoopDuration => "Return duration",
+            SceneSlider::CameraZoomedSize => "Size when zoomed",
+            SceneSlider::CameraCornerRadius => "Roundness",
+            SceneSlider::CameraCropZoom => "Crop zoom",
+            SceneSlider::CameraCropX => "Crop horizontal",
+            SceneSlider::CameraCropY => "Crop vertical",
+            SceneSlider::CameraSplitRatio => "Screen share",
+
         }
     }
 
     fn range(self) -> (f64, f64) {
         match self {
+            SceneSlider::CursorIdleDelay => (0.5, 5.0),
+            SceneSlider::CursorRotation => (0.0, 100.0),
+            SceneSlider::CursorLoopDuration => (0.2, 3.0),
+            SceneSlider::CameraZoomedSize => (10.0, 60.0),
+            SceneSlider::CameraCornerRadius => (0.0, 50.0),
+            SceneSlider::CameraCropZoom => (100.0, 300.0),
+            SceneSlider::CameraCropX => (0.0, 100.0),
+            SceneSlider::CameraCropY => (0.0, 100.0),
+            SceneSlider::CameraSplitRatio => (25.0, 75.0),
             SceneSlider::Scale => (SceneTransform::MIN_SCALE, SceneTransform::MAX_SCALE),
             SceneSlider::PositionX | SceneSlider::PositionY =>
                 (-SceneTransform::MAX_POSITION, SceneTransform::MAX_POSITION),
@@ -324,6 +364,15 @@ impl SceneSlider {
 
     fn default_value(self) -> f64 {
         match self {
+            SceneSlider::CursorIdleDelay => 1.5,
+            SceneSlider::CursorRotation => 50.0,
+            SceneSlider::CursorLoopDuration => 1.0,
+            SceneSlider::CameraZoomedSize => 18.0,
+            SceneSlider::CameraCornerRadius => 18.0,
+            SceneSlider::CameraCropZoom => 100.0,
+            SceneSlider::CameraCropX => 50.0,
+            SceneSlider::CameraCropY => 50.0,
+            SceneSlider::CameraSplitRatio => 60.0,
             SceneSlider::Scale => 1.0,
             SceneSlider::Perspective => SceneTransform::IDENTITY.perspective,
             SceneSlider::AnchorX | SceneSlider::AnchorY => 0.5,
@@ -350,7 +399,7 @@ impl SceneSlider {
             SceneSlider::Perspective | SceneSlider::AnchorX | SceneSlider::AnchorY => {
                 format!("{:.0}%", value * 100.0)
             }
-            SceneSlider::AnnotationTransition => format!("{value:.2}s"),
+            SceneSlider::CursorIdleDelay | SceneSlider::CursorLoopDuration | SceneSlider::AnnotationTransition => format!("{value:.2}s"),
             _ => format!("{value:.0}%"),
         }
     }
@@ -361,7 +410,7 @@ impl SceneSlider {
             SceneSlider::PositionX | SceneSlider::PositionY => 0.02,
             SceneSlider::RotationX | SceneSlider::RotationY | SceneSlider::RotationZ => 1.0,
             SceneSlider::Perspective | SceneSlider::AnchorX | SceneSlider::AnchorY => 0.05,
-            SceneSlider::AnnotationTransition => 0.05,
+            SceneSlider::CursorIdleDelay | SceneSlider::CursorLoopDuration | SceneSlider::AnnotationTransition => 0.05,
             SceneSlider::CameraMargin => 1.0,
             _ => 2.0,
         }
@@ -370,6 +419,15 @@ impl SceneSlider {
     fn get(self, studio: &Studio) -> f64 {
         let transform = studio.scene_transform;
         match self {
+            SceneSlider::CursorIdleDelay => studio.pointer_style.idle_hide_delay,
+            SceneSlider::CursorRotation => studio.pointer_style.rotation_strength * 100.0,
+            SceneSlider::CursorLoopDuration => studio.pointer_style.loop_return_duration,
+            SceneSlider::CameraZoomedSize => studio.camera_overlay.zoomed_size.unwrap_or(studio.camera_overlay.size) as f64,
+            SceneSlider::CameraCornerRadius => studio.camera_overlay.corner_radius.unwrap_or(18) as f64,
+            SceneSlider::CameraCropZoom => studio.camera_overlay.crop_zoom as f64,
+            SceneSlider::CameraCropX => studio.camera_overlay.crop_center.0 * 100.0,
+            SceneSlider::CameraCropY => studio.camera_overlay.crop_center.1 * 100.0,
+            SceneSlider::CameraSplitRatio => studio.camera_overlay.split_ratio as f64,
             SceneSlider::Scale => transform.scale,
             SceneSlider::PositionX => transform.position_x,
             SceneSlider::PositionY => transform.position_y,
@@ -403,6 +461,15 @@ impl SceneSlider {
         let (min, max) = self.range();
         let value = value.clamp(min, max);
         match self {
+            SceneSlider::CursorIdleDelay => studio.pointer_style.idle_hide_delay = value,
+            SceneSlider::CursorRotation => studio.pointer_style.rotation_strength = value / 100.0,
+            SceneSlider::CursorLoopDuration => studio.pointer_style.loop_return_duration = value,
+            SceneSlider::CameraZoomedSize => studio.camera_overlay.zoomed_size = Some(value.round() as u8),
+            SceneSlider::CameraCornerRadius => studio.camera_overlay.corner_radius = Some(value.round() as u8),
+            SceneSlider::CameraCropZoom => studio.camera_overlay.crop_zoom = value.round() as u16,
+            SceneSlider::CameraCropX => studio.camera_overlay.crop_center.0 = value / 100.0,
+            SceneSlider::CameraCropY => studio.camera_overlay.crop_center.1 = value / 100.0,
+            SceneSlider::CameraSplitRatio => studio.camera_overlay.split_ratio = value.round() as u8,
             SceneSlider::Scale => studio.scene_transform.scale = value,
             SceneSlider::PositionX => studio.scene_transform.position_x = value,
             SceneSlider::PositionY => studio.scene_transform.position_y = value,
@@ -437,6 +504,9 @@ impl SceneSlider {
                 }
             }
         }
+        if matches!(self, Self::CursorIdleDelay | Self::CursorRotation | Self::CursorLoopDuration) {
+            studio.rebuild_video_motion_timelines();
+        }
     }
 }
 
@@ -445,6 +515,7 @@ pub(crate) struct PreviewCache {
     pub compositor: Option<(SceneStyle, (u32, u32), (u32, u32), SceneCompositor)>,
     pub frame: Option<(PreviewKey, Arc<RenderImage>)>,
     pub overlay: Option<(u64, Arc<RgbaImage>)>,
+    worker: Option<PreviewWorker>,
 }
 
 impl Default for PreviewCache {
@@ -453,20 +524,9 @@ impl Default for PreviewCache {
             compositor: None,
             frame: None,
             overlay: None,
+            worker: None,
         }
     }
-}
-
-#[derive(Clone, PartialEq)]
-pub(crate) struct PreviewKey {
-    style: SceneStyle,
-    canvas: (u32, u32),
-    source: usize,
-    time_bits: u64,
-    viewport: ViewportFrame,
-    overlay: u64,
-    pointer: bool,
-    media_visible: bool,
 }
 
 pub(crate) const CLICK_COLORS: [u32; 6] =
@@ -613,12 +673,15 @@ mod motion_picking_tests {
         let key = PreviewKey {
             style: SceneStyle::default(),
             canvas: (960, 540),
+            source_size: (1920, 1080),
             source: 1,
             time_bits: 5.0_f64.to_bits(),
             viewport: ViewportFrame::default(),
             overlay: 0,
             pointer: false,
             media_visible: true,
+            generation: 0,
+            media: PreviewMedia::Image(1),
         };
         let mut edited = key.clone();
         edited.viewport.magnification = 2.0;
@@ -751,7 +814,34 @@ impl Studio {
         self.camera_overlay = style.camera;
         self.input_overlays = style.input_overlays;
         self.content_fill = style.fill;
+        self.restore_canvas_ratio(style.aspect);
+        if let Some((width, height)) = style.aspect_dimensions.filter(|(w, h)|
+            (1..=10000).contains(w) && (1..=10000).contains(h)
+            && style.aspect.is_some_and(|ratio| (ratio - *w as f64 / *h as f64).abs() < 0.0001)) {
+            self.aspect_ratio = 10;
+            self.custom_canvas_dimensions = (width, height);
+        }
+        self.custom_canvas_draft = self.custom_canvas_dimensions;
         self.subtitle_style = style.subtitles;
+    }
+
+    pub(crate) fn restore_canvas_ratio(&mut self, aspect: Option<f64>) {
+        const RATIOS: [f64; 9] = [1.0, 4.0 / 3.0, 3.0 / 2.0, 16.0 / 9.0,
+            9.0 / 16.0, 4.0 / 5.0, 3.0 / 4.0, 2.0 / 3.0, 21.0 / 9.0];
+        let Some(ratio) = aspect.filter(|r| r.is_finite() && *r > 0.0) else {
+            self.aspect_ratio = 0;
+            return;
+        };
+        if let Some(index) = RATIOS.iter().position(|r| (r - ratio).abs() < 0.00001) {
+            self.aspect_ratio = index + 1;
+        } else {
+            self.aspect_ratio = 10;
+            self.custom_canvas_dimensions = if ratio >= 1.0 {
+                (10000, (10000.0 / ratio.clamp(0.05, 20.0)).round() as u32)
+            } else {
+                ((10000.0 * ratio.clamp(0.05, 20.0)).round() as u32, 10000)
+            };
+        }
     }
 
     /// Autosaves scene settings into the recording's edit draft when they
@@ -1004,12 +1094,15 @@ impl Studio {
         Some((signature, layer))
     }
 
-    /// Composited frame for the preview canvas, cached until an input changes.
+    /// Exact paused frame, or the latest completed background playback frame.
     pub(crate) fn scene_preview_image(
         &mut self,
         canvas_width: Pixels,
         canvas_height: Pixels,
     ) -> Option<Arc<RenderImage>> {
+        if !self.video_playing {
+            if let Some(worker) = &self.preview_cache.worker { worker.invalidate(); }
+        }
         let source = self.preview_source()?;
         // While a slider or the media is being dragged, compose a half-size
         // proxy that the canvas scales up; the full-size frame is rendered
@@ -1027,10 +1120,10 @@ impl Studio {
         } else {
             1.0
         };
-        let canvas = (
+        let canvas = playback_canvas_size((
             (f32::from(canvas_width) * proxy).round().max(2.0) as u32,
             (f32::from(canvas_height) * proxy).round().max(2.0) as u32,
-        );
+        ), self.video_playing);
         let style = self.scene_style();
         let source_size = (source.width(), source.height());
         let time = if self.video_project.is_some() || self.animation_active {
@@ -1043,7 +1136,7 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        let overlay = if !style.transform.with_motion(viewport).is_identity() || self.has_media_image_overlays() {
+        let overlay = if viewport.loupe.is_some() || !style.transform.with_motion(viewport).is_identity() || self.has_media_image_overlays() {
             self.preview_overlay(time, canvas)
         } else {
             None
@@ -1058,6 +1151,7 @@ impl Studio {
         let key = PreviewKey {
             style: style.clone(),
             canvas,
+            source_size,
             source: Arc::as_ptr(&source) as usize
                 ^ camera
                     .as_ref()
@@ -1071,11 +1165,41 @@ impl Studio {
                 .unwrap_or(0),
             pointer: has_pointer,
             media_visible: self.image_visible_at(time),
+            generation: self.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst),
+            media: self.video_project.as_ref().map(|session| PreviewMedia::Video(session.directory.clone()))
+                .unwrap_or_else(|| PreviewMedia::Image(Arc::as_ptr(&source) as usize)),
         };
         if let Some((cached, image)) = self.preview_cache.frame.as_ref() {
             if *cached == key {
                 return Some(image.clone());
             }
+        }
+        let pointer = has_pointer
+            .then(|| self.video_pointer_timeline.frame_at(time))
+            .flatten()
+            .map(|frame| PointerOverlay { frame });
+        if self.video_playing {
+            if self.preview_cache.worker.is_none() {
+                match PreviewWorker::new() {
+                    Ok(worker) => self.preview_cache.worker = Some(worker),
+                    Err(error) => {
+                        self.toast = Some(format!("Preview worker could not start: {error}").into());
+                        return self.preview_cache.frame.as_ref().map(|(_, image)| image.clone());
+                    }
+                }
+            }
+            let worker = self.preview_cache.worker.as_ref().unwrap();
+            worker.request(PreviewJob {
+                key: key.clone(), source,
+                overlay: overlay.map(|(_, layer)| layer), pointer, camera,
+            });
+            if let Some(completed) = worker.take_completed(&key) {
+                let previous = self.preview_cache.frame.replace((completed.key, completed.image));
+                self.retire_image(previous.map(|(_, image)| image));
+            }
+            return self.preview_cache.frame.as_ref()
+                .filter(|(shown, _)| shown.same_media(&key))
+                .map(|(_, image)| image.clone());
         }
         let rebuild = match self.preview_cache.compositor.as_ref() {
             Some((cached_style, cached_canvas, cached_source, _)) => {
@@ -1095,10 +1219,6 @@ impl Studio {
             .ok()?;
             self.preview_cache.compositor = Some((style.clone(), canvas, source_size, compositor));
         }
-        let pointer = has_pointer
-            .then(|| self.video_pointer_timeline.frame_at(time))
-            .flatten()
-            .map(|frame| PointerOverlay { frame });
         let compositor = &self.preview_cache.compositor.as_ref()?.3;
         let frame = compositor.compose_layers(crate::recording::scene::FrameInput {
             source: &source,
@@ -1316,6 +1436,9 @@ impl Studio {
             let _ = std::fs::remove_file(path);
         }
         self.camera_frame_rgba = None;
+        self.camera_overlay.enabled = false;
+        self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
+        self.camera_decode_in_flight = false;
         if let Some(session) = self.video_project.as_ref() {
             if let Ok(mut manifest) = session.read_manifest() {
                 manifest.includes_camera = false;
@@ -1324,94 +1447,60 @@ impl Studio {
         }
     }
 
+    pub(crate) fn camera_style_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::recording::camera_layout::{CameraAspect, CameraLayout, CameraSplitDirection};
+        let overlay = self.camera_overlay;
+        div().flex().flex_col().gap_2()
+            .child(Self::inspector_label("Layout"))
+            .child(self.segmented("camera-layout", &["Overlay", "Split", "Camera only"], CameraLayout::ALL.iter().position(|v| *v == overlay.layout).unwrap_or(0),
+                |this, i| this.camera_overlay.layout = CameraLayout::ALL[i], cx))
+            .when(overlay.layout == CameraLayout::Split, |panel| panel
+                .child(self.segmented("camera-split-direction", &["Auto", "Horizontal", "Vertical"], CameraSplitDirection::ALL.iter().position(|v| *v == overlay.split_direction).unwrap_or(0),
+                    |this, i| this.camera_overlay.split_direction = CameraSplitDirection::ALL[i], cx))
+                .child(div().text_xs().text_color(muted()).child("Auto places the camera beside landscape video and below portrait video."))
+                .child(self.scene_slider_row(SceneSlider::CameraSplitRatio, cx))
+                .child(self.scene_toggle_row("camera-split-flip", "Swap sides", overlay.split_flip, cx, |this| this.camera_overlay.split_flip = !this.camera_overlay.split_flip)))
+            .when(overlay.layout == CameraLayout::Overlay, |panel| panel
+                .child(self.segmented("camera-position", &["Top left", "Top right", "Bottom left", "Bottom right"],
+                    if overlay.center.is_some() { usize::MAX } else { WatermarkPosition::ALL.iter().position(|v| *v == overlay.position).unwrap_or(3) },
+                    |this, i| { this.camera_overlay.position = WatermarkPosition::ALL[i]; this.camera_overlay.center = None; }, cx))
+                .child(div().text_xs().text_color(muted()).child("Drag on the canvas to snap to an edge or the center."))
+                .child(self.scene_slider_row(SceneSlider::CameraSize, cx))
+                .child(self.scene_toggle_row("camera-zoom-resize", "Resize during zoom", overlay.zoomed_size.is_some(), cx, |this| {
+                    this.camera_overlay.zoomed_size = if this.camera_overlay.zoomed_size.is_some() { None } else { Some((this.camera_overlay.size * 3 / 4).max(10)) };
+                }))
+                .when(overlay.zoomed_size.is_some(), |panel| panel.child(self.scene_slider_row(SceneSlider::CameraZoomedSize, cx))))
+            .when(overlay.layout != CameraLayout::Fullscreen, |panel| panel
+                .child(Self::inspector_label("Shape & frame"))
+                .child(self.segmented("camera-shape", &["Circle", "Rounded", "Rectangle"], crate::recording::scene::CameraShape::ALL.iter().position(|v| *v == overlay.shape).unwrap_or(0),
+                    |this, i| this.camera_overlay.shape = crate::recording::scene::CameraShape::ALL[i], cx))
+                .when(overlay.shape != crate::recording::scene::CameraShape::Circle, |panel| panel
+                    .child(self.segmented("camera-aspect", &["Square", "Original", "16:9", "9:16"], CameraAspect::ALL.iter().position(|v| *v == overlay.aspect).unwrap_or(0),
+                        |this, i| this.camera_overlay.aspect = CameraAspect::ALL[i], cx))
+                    .when(overlay.shape == crate::recording::scene::CameraShape::Squircle, |panel| panel.child(self.scene_slider_row(SceneSlider::CameraCornerRadius, cx))))
+                .child(self.scene_slider_row(SceneSlider::CameraMargin, cx))
+                .child(self.scene_toggle_row("camera-shadow", "Shadow", overlay.shadow, cx, |this| this.camera_overlay.shadow = !this.camera_overlay.shadow)))
+            .child(Self::inspector_label("Framing"))
+            .child(self.scene_slider_row(SceneSlider::CameraCropZoom, cx))
+            .child(self.scene_slider_row(SceneSlider::CameraCropX, cx))
+            .child(self.scene_slider_row(SceneSlider::CameraCropY, cx))
+            .child(self.scene_toggle_row("camera-mirror", "Mirror", overlay.mirror, cx, |this| this.camera_overlay.mirror = !this.camera_overlay.mirror))
+            .child(self.small_button("camera-reset-crop", "Reset framing", true, cx, |this, _| {
+                this.camera_overlay.crop_center = (0.5, 0.5); this.camera_overlay.crop_zoom = 100;
+            }))
+            .into_any_element()
+    }
+
     pub(crate) fn camera_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_camera = self.video_camera_path.is_some();
-        let overlay = self.camera_overlay;
-        let position_index = if overlay.center.is_some() {
-            usize::MAX
-        } else {
-            WatermarkPosition::ALL
-                .iter()
-                .position(|position| *position == overlay.position)
-                .unwrap_or(3)
-        };
-        let shape_index = crate::recording::scene::CameraShape::ALL
-            .iter()
-            .position(|shape| *shape == overlay.shape)
-            .unwrap_or(0);
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .when(!has_camera, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted())
-                        .child("Add a webcam clip recorded alongside this screen capture to show it as a picture-in-picture bubble."),
-                )
-                .child(self.small_button(
-                    "camera-add",
-                    "Add camera clip…",
-                    self.export_progress.is_none(),
-                    cx,
-                    |this, cx| this.import_camera_clip(cx),
-                ))
-            })
-            .when(has_camera, |this| {
-                this.child(self.scene_toggle_row(
-                    "camera-enabled",
-                    "Show camera",
-                    overlay.enabled,
-                    cx,
-                    |this| this.camera_overlay.enabled = !this.camera_overlay.enabled,
-                ))
-                .child(self.segmented(
-                    "camera-position",
-                    &["Top left", "Top right", "Bottom left", "Bottom right"],
-                    position_index,
-                    |this, index| {
-                        this.camera_overlay.position = WatermarkPosition::ALL[index];
-                        this.camera_overlay.center = None;
-                    },
-                    cx,
-                ))
-                .child(div().text_xs().text_color(muted()).child(
-                    "Or drag the bubble on the canvas; it snaps to the edges and center.",
-                ))
-                .child(self.segmented(
-                    "camera-shape",
-                    &["Circle", "Squircle", "Square"],
-                    shape_index,
-                    |this, index| {
-                        this.camera_overlay.shape = crate::recording::scene::CameraShape::ALL[index]
-                    },
-                    cx,
-                ))
-                .child(self.scene_slider_row(SceneSlider::CameraSize, cx))
-                .child(self.scene_slider_row(SceneSlider::CameraMargin, cx))
-                .child(self.scene_toggle_row(
-                    "camera-mirror",
-                    "Mirror",
-                    overlay.mirror,
-                    cx,
-                    |this| this.camera_overlay.mirror = !this.camera_overlay.mirror,
-                ))
-                .child(self.scene_toggle_row(
-                    "camera-shadow",
-                    "Shadow",
-                    overlay.shadow,
-                    cx,
-                    |this| this.camera_overlay.shadow = !this.camera_overlay.shadow,
-                ))
-                .child(self.small_button(
-                    "camera-remove",
-                    "Remove camera clip",
-                    self.export_progress.is_none(),
-                    cx,
-                    |this, _| this.remove_camera_clip(),
-                ))
-            })
+        div().flex().flex_col().gap_3()
+            .when(!has_camera, |panel| panel
+                .child(div().text_sm().text_color(muted()).child("Add a webcam clip to frame your camera alongside the recording."))
+                .child(self.small_button("camera-add", "Add camera clip…", self.export_progress.is_none(), cx, |this, cx| this.import_camera_clip(cx))))
+            .when(has_camera, |panel| panel
+                .child(self.scene_toggle_row("camera-enabled", "Show camera", self.camera_overlay.enabled, cx, |this| this.camera_overlay.enabled = !this.camera_overlay.enabled))
+                .child(self.camera_style_controls(cx))
+                .child(self.small_button("camera-remove", "Remove camera clip", self.export_progress.is_none(), cx, |this, _| this.remove_camera_clip())))
             .into_any_element()
     }
 
@@ -1571,7 +1660,7 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        self.scene_transform.with_motion(viewport).is_identity()
+        viewport.loupe.is_none() && self.scene_transform.with_motion(viewport).is_identity()
     }
 
     fn has_media_image_overlays(&self) -> bool {
@@ -1767,9 +1856,17 @@ impl Studio {
         self.video_project.is_some()
             && self.video_camera_path.is_some()
             && self.camera_overlay.enabled
+            && self.video_viewport_timeline.frame_at(self.timeline_display_time()).loupe.is_none_or(|lens| lens.presence < 0.95)
             && self.video_clip_timeline
                 .content_source_time_at(self.video_position)
                 .is_some_and(|time| time < self.video_recording_duration)
+    }
+
+    pub(crate) fn camera_source_aspect(&self) -> f64 {
+        self.camera_frame_rgba.as_ref()
+            .filter(|frame| frame.height() > 0)
+            .map(|frame| frame.width() as f64 / frame.height() as f64)
+            .unwrap_or(1.0)
     }
 
     /// Starts dragging the camera bubble when the press lands on it.
@@ -1778,7 +1875,9 @@ impl Studio {
             return false;
         }
         let (width, height) = (f32::from(canvas.size.width) as f64, f32::from(canvas.size.height) as f64);
-        let rect = self.camera_overlay.rect(width, height);
+        let source_aspect = self.camera_source_aspect();
+        let zoom = self.video_viewport_timeline.frame_at(self.timeline_display_time()).magnification;
+        let rect = self.camera_overlay.rect_for_frame(width, height, source_aspect, zoom);
         let local = (
             f32::from(position.x - canvas.origin.x) as f64,
             f32::from(position.y - canvas.origin.y) as f64,
@@ -1787,10 +1886,14 @@ impl Studio {
             return false;
         }
         self.pause_video_playback();
+        self.select_inspector_tab(crate::shell_ui::InspectorTab::Camera);
+        if self.camera_overlay.layout != CameraLayout::Overlay { return true; }
         self.camera_drag = Some(CameraDrag {
             start: position,
             start_center: (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5),
             canvas_size: (width, height),
+            source_aspect,
+            zoom,
             guides: (None, None),
         });
         true
@@ -1805,7 +1908,7 @@ impl Studio {
             drag.start_center.1 + f32::from(position.y - drag.start.y) as f64,
         );
         let (center, guides) =
-            self.camera_overlay.snapped_center(proposed, drag.canvas_size.0, drag.canvas_size.1);
+            self.camera_overlay.snapped_center_for_frame(proposed, drag.canvas_size.0, drag.canvas_size.1, drag.source_aspect, drag.zoom);
         drag.guides = guides;
         self.camera_overlay.center = Some(center);
         true
@@ -1846,7 +1949,9 @@ impl Studio {
         let to_visible = |p: NormalizedPoint| ((p.x - left) / visible_x, (p.y - top) / visible_y);
         let focus = match cue.anchor_mode {
             crate::recording::viewport::ZoomAnchorMode::PinnedAnchor => cue.pinned_point,
-            _ => frame.anchor,
+            _ => if cue.presentation == crate::recording::viewport::ZoomPresentation::GlassLoupe {
+                frame.loupe.map_or(frame.anchor, |lens| lens.center)
+            } else { frame.anchor },
         };
         let (u, v) = to_visible(focus);
         let mut markers = vec![(crate::motion_ui::MotionPick::Focus, u, v)];
@@ -1948,7 +2053,8 @@ impl Studio {
         let composite_flat = paint_flat && self.has_media_image_overlays();
         let select_tool = self.tool == Tool::Select;
         let camera_guides = self.camera_drag.map(|drag| drag.guides);
-        let camera_grab = (select_tool && self.camera_bubble_visible()).then_some(self.camera_overlay);
+        let camera_grab = (select_tool && self.camera_bubble_visible() && self.camera_overlay.layout == CameraLayout::Overlay)
+            .then(|| (self.camera_overlay, self.camera_source_aspect(), self.video_viewport_timeline.frame_at(self.timeline_display_time()).magnification));
         let camera_dragging = self.camera_drag.is_some();
         let text_cursor = self.tool == Tool::Text || self.editing_text.is_some();
         let committed_count = self.annotations.len();
@@ -2096,9 +2202,9 @@ impl Studio {
                         for (index, hit) in &canvas_hits { cursor_bounds[*index] = *hit; }
                         let studio = entity.read(cx);
                         let mouse = window.mouse_position();
-                        let over_camera = camera_grab.is_some_and(|camera| {
+                        let over_camera = camera_grab.is_some_and(|(camera, source_aspect, zoom)| {
                             camera
-                                .rect(f32::from(bounds.size.width) as f64, f32::from(bounds.size.height) as f64)
+                                .rect_for_frame(f32::from(bounds.size.width) as f64, f32::from(bounds.size.height) as f64, source_aspect, zoom)
                                 .contains(f32::from(mouse.x - bounds.origin.x) as f64, f32::from(mouse.y - bounds.origin.y) as f64)
                         });
                         let cursor = if camera_dragging {
@@ -2500,18 +2606,26 @@ impl Studio {
                         style.hide_when_idle,
                         cx,
                         |this| {
-                            this.pointer_style.hide_when_idle = !this.pointer_style.hide_when_idle
+                            this.pointer_style.hide_when_idle = !this.pointer_style.hide_when_idle;
+                            this.rebuild_video_motion_timelines();
                         },
                     ))
+                    .when(style.hide_when_idle, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorIdleDelay, cx)))
+                    .child(self.scene_toggle_row("pointer-hide-typing", "Hide while typing", style.hide_when_typing, cx, |this| {
+                        this.pointer_style.hide_when_typing = !this.pointer_style.hide_when_typing;
+                        this.rebuild_video_motion_timelines();
+                    }))
+                    .child(div().text_xs().text_color(muted()).child("Rotation"))
+                    .child(self.segmented("pointer-rotation", &["Off", "Tilt", "Direction"],
+                        crate::recording::pointer_timeline::PointerRotation::ALL.iter().position(|v| *v == style.rotation).unwrap_or(1),
+                        |this, i| { this.pointer_style.rotation = crate::recording::pointer_timeline::PointerRotation::ALL[i]; this.rebuild_video_motion_timelines(); }, cx))
+                    .when(style.rotation != crate::recording::pointer_timeline::PointerRotation::Off, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorRotation, cx)))
                     .child(div().text_xs().text_color(muted()).child("Movement"))
                     .child(
                         self.segmented(
                             "pointer-motion",
-                            &["Rapid", "Quick", "Default", "Slow"],
-                            PointerMotion::ALL
-                                .iter()
-                                .position(|motion| *motion == style.motion)
-                                .unwrap_or(2),
+                            &["None", "Smooth", "Medium", "Rapid"],
+                            style.motion.current_index(),
                             |this, value| {
                                 this.pointer_style.motion = PointerMotion::ALL[value.min(3)];
                                 this.rebuild_video_motion_timelines();
@@ -2529,6 +2643,7 @@ impl Studio {
                             this.rebuild_video_motion_timelines();
                         },
                     ))
+                    .when(style.loop_to_start, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorLoopDuration, cx)))
             })
             .child(self.scene_toggle_row(
                 "pointer-clicks",

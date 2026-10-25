@@ -266,6 +266,7 @@ impl<B: RecorderBackend> RecordingController<B> {
         // The backend has delivered its finalized output. Every subsequent
         // error is an import/recovery problem, never an ongoing recording.
         self.state = RecordingState::Idle;
+        self.warnings.extend(self.backend.capture_warnings());
         match self.wait_for_status(Duration::from_secs(5), |status| !status.active) {
             Ok(true) => {}
             Ok(false) => self.warnings.push(
@@ -461,6 +462,7 @@ mod tests {
         stop_error: bool,
         stop_calls: usize,
         stop_during_start: bool,
+        capture_warnings: Vec<String>,
     }
 
     impl RecorderBackend for FakeBackend {
@@ -503,6 +505,10 @@ mod tests {
         fn has_stopped(&self) -> bool {
             self.stopped
         }
+
+        fn capture_warnings(&self) -> Vec<String> {
+            self.capture_warnings.clone()
+        }
     }
 
     #[test]
@@ -537,6 +543,31 @@ mod tests {
             session.read_pointer_capture().unwrap(),
             PointerCaptureFile::default()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recoverable_webcam_warning_survives_stop_without_losing_the_screen() {
+        let (root, session) = recovery_session();
+        fs::write(session.screen_path(), b"saved screen").unwrap();
+        let camera_segment = session.directory.join("camera-segment-0000.mkv");
+        fs::write(&camera_segment, b"recoverable webcam").unwrap();
+        let warning = "The screen was saved, but the webcam could not be finalized.".to_string();
+        let backend = FakeBackend {
+            output: session.screen_path(),
+            stopped: true,
+            capture_warnings: vec![warning.clone()],
+            ..Default::default()
+        };
+        let mut controller = RecordingController::from_started_backend_for_test(backend, session);
+
+        let saved = controller.stop_and_save().unwrap();
+
+        assert_eq!(controller.state(), RecordingState::Idle);
+        assert!(controller.warnings.contains(&warning));
+        assert!(!saved.read_manifest().unwrap().includes_camera);
+        assert_eq!(fs::read(saved.screen_path()).unwrap(), b"saved screen");
+        assert_eq!(fs::read(camera_segment).unwrap(), b"recoverable webcam");
         fs::remove_dir_all(root).unwrap();
     }
 

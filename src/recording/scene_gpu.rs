@@ -5,8 +5,28 @@ use blade_graphics as gpu;
 use bytemuck::{Pod, Zeroable};
 use gpu::ShaderData as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_BUFFER: usize = 128 * 1024 * 1024;
+static GPU_EXPORT_IN_USE: AtomicBool = AtomicBool::new(false);
+
+/// Vulkan loader/driver initialization can race another context's resource
+/// calls. One export owns GPU access through teardown; competing exports use
+/// the existing CPU renderer immediately, keeping cancellation responsive.
+struct GpuExportLease<'a>(&'a AtomicBool);
+
+impl<'a> GpuExportLease<'a> {
+    fn try_acquire(in_use: &'a AtomicBool) -> Option<Self> {
+        in_use.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok().map(|_| Self(in_use))
+    }
+}
+
+impl Drop for GpuExportLease<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -26,12 +46,15 @@ struct Params {
     images: [[u32; 4]; 8],
     inverse: [[f32; 4]; 3],
     viewport: [f32; 4],
+    loupe_shape: [f32; 4],
+    loupe_optics: [f32; 4],
     sample_bounds: [f32; 4],
     geometry: [f32; 4],
     projection: [f32; 4],
     media_bounds: [u32; 4],
     camera_rect: [f32; 4],
     camera_info: [f32; 4],
+    camera_crop: [f32; 4],
     draws: [Draw; 4],
 }
 
@@ -219,8 +242,11 @@ struct Compositor {
     caption_temp: Buffer,
     caption_scaled: Buffer,
     caption_size: (u32, u32, u32, u32),
-    shadow_key: Option<(u32, u32, CameraOverlay)>,
+    shadow_key: Option<(u32, u32, CameraOverlay, Rect)>,
     pending: Option<gpu::SyncPoint>,
+    // Last field: Rust drops the context and resources before releasing the
+    // lease. Quarantining a lost device also retains its lease until exit.
+    _lease: GpuExportLease<'static>,
 }
 
 /// Prefer a discrete GPU and reject software Vulkan implementations. Try the
@@ -266,6 +292,8 @@ fn hardware_device_ids() -> Result<Vec<u32>, String> {
 
 impl Compositor {
     fn new() -> Result<Self, String> {
+        let lease = GpuExportLease::try_acquire(&GPU_EXPORT_IN_USE)
+            .ok_or("another export is using the GPU")?;
         let mut context = None;
         for device_id in hardware_device_ids()? {
             // SAFETY: headless context, no external handles or shared ownership.
@@ -318,6 +346,7 @@ impl Compositor {
             resize_horizontal,
             context,
             pending: None,
+            _lease: lease,
         })
     }
 
@@ -350,6 +379,12 @@ impl Compositor {
             .map(|row| [row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
         let (l, t, w, h) = scene.style.source_crop.visible_rect(input.viewport);
         params.viewport = [l as f32, t as f32, w as f32, h as f32];
+        if visible {
+            if let Some(lens) = scene.loupe_geometry(input.viewport) {
+                params.loupe_shape = lens.shape();
+                params.loupe_optics = lens.optics();
+            }
+        }
         let (l, t, r, b) = scene
             .style
             .source_crop
@@ -389,11 +424,14 @@ impl Compositor {
         let camera = input
             .camera
             .filter(|image| scene.style.camera.enabled && image.width() > 0 && image.height() > 0);
-        if camera.is_some() {
-            let rect = scene
-                .style
-                .camera
-                .rect(scene.width as f64, scene.height as f64);
+        if let Some(camera) = camera {
+            let overlay = scene.style.camera;
+            let rect = overlay.rect_for_frame(scene.width as f64, scene.height as f64,
+                camera.width() as f64 / camera.height() as f64, input.viewport.magnification);
+            let crop = super::super::camera_layout::source_crop(overlay,
+                camera.width() as f64 / camera.height() as f64, rect);
+            params.camera_crop = [crop.x as f32, crop.y as f32, crop.width as f32, crop.height as f32];
+            let shadow_enabled = overlay.shadow && overlay.layout != CameraLayout::Fullscreen;
             params.camera_rect = [
                 rect.x as f32,
                 rect.y as f32,
@@ -403,11 +441,11 @@ impl Compositor {
             params.camera_info = [
                 scene.style.camera.radius(rect) as f32,
                 f32::from(scene.style.camera.mirror),
-                f32::from(scene.style.camera.shadow),
+                f32::from(shadow_enabled),
                 0.0,
             ];
-            if scene.style.camera.shadow {
-                let key = (scene.width, scene.height, scene.style.camera);
+            if shadow_enabled {
+                let key = (scene.width, scene.height, scene.style.camera, rect);
                 if self.shadow_key != Some(key) {
                     let shadow =
                         CameraShadow::new(scene.width, scene.height, scene.style.camera, rect);
@@ -727,6 +765,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gpu_export_lease_is_nonblocking_and_released_after_drop_or_unwind() {
+        let in_use = AtomicBool::new(false);
+        let lease = GpuExportLease::try_acquire(&in_use).unwrap();
+        std::thread::scope(|scope| {
+            let contenders: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+                assert!(GpuExportLease::try_acquire(&in_use).is_none());
+            })).collect();
+            for contender in contenders { contender.join().unwrap(); }
+        });
+        drop(lease);
+        let result = catch_unwind(|| {
+            let _lease = GpuExportLease::try_acquire(&in_use).unwrap();
+            panic!("GPU initialization failed");
+        });
+        assert!(result.is_err());
+        assert!(GpuExportLease::try_acquire(&in_use).is_some());
+    }
+
+    #[test]
+    fn concurrent_renderer_uses_cpu_without_waiting_for_the_gpu_owner() {
+        // This test never opens a GPU. Wait only for other parallel tests to
+        // finish their current export, then model an owner holding the lease.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let lease = loop {
+            if let Some(lease) = GpuExportLease::try_acquire(&GPU_EXPORT_IN_USE) { break lease; }
+            assert!(std::time::Instant::now() < deadline, "previous GPU export did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut renderer = Renderer::new();
+            assert!(renderer.gpu.is_none());
+            assert_eq!(renderer.label(), "CPU");
+            let scene = SceneCompositor::new(&SceneStyle::default(), 64, 48, 32, 24).unwrap();
+            let source = RgbaImage::from_pixel(32, 24, Rgba([50, 100, 150, 255]));
+            let input = FrameInput {
+                source: &source, overlay: None, viewport: ViewportFrame::default(),
+                pointer: None, camera: None,
+            };
+            assert_eq!(renderer.compose(&scene, input, true, None), scene.compose_layers(input, true, None));
+            finished.send(()).unwrap();
+        });
+        let completed = result.recv_timeout(std::time::Duration::from_secs(2));
+        drop(lease);
+        worker.join().unwrap();
+        completed.expect("CPU fallback waited for the GPU owner");
+    }
+
+    #[test]
     fn readback_copy_preserves_aligned_unaligned_and_partial_cache_lines() {
         #[repr(align(64))]
         struct Aligned([u8; 1024]);
@@ -860,6 +947,11 @@ mod tests {
                 ..Default::default()
             });
             style.camera.shape = CameraShape::ALL[variant % 3];
+            style.camera.aspect = CameraAspect::ALL[variant % CameraAspect::ALL.len()];
+            style.camera.layout = CameraLayout::ALL[variant % CameraLayout::ALL.len()];
+            style.camera.zoomed_size = Some(16);
+            style.camera.crop_zoom = 150;
+            style.camera.crop_center = (0.35, 0.65);
             style.camera.mirror = variant % 2 == 0;
             style.camera.enabled = variant != 9;
             style.camera.shadow = variant != 10;
@@ -952,6 +1044,37 @@ mod tests {
             camera: Some(&camera),
         };
         compare(&mut gpu, &scene, input, true, Some(&reshaped));
+    }
+
+    #[test]
+    #[ignore = "requires a hardware Vulkan GPU; compares animated glass optics with the CPU"]
+    fn hardware_loupe_composition_matches_cpu() {
+        let mut gpu = Compositor::new().expect("hardware Vulkan compositor");
+        let source = pattern(160, 100, false);
+        let overlay = pattern(160, 100, true);
+        let camera = pattern(80, 48, false);
+        let caption = pattern(256, 192, true);
+        for variant in 0..4 {
+            let mut style = SceneStyle::default();
+            style.padding = 8;
+            style.transform.rotation_y = if variant == 1 { 22.0 } else { 0.0 };
+            style.source_crop = if variant == 2 {
+                crate::CropRect { x: 0.15, y: 0.1, width: 0.75, height: 0.8 }
+            } else { crate::CropRect::UNIT };
+            let scene = SceneCompositor::new(&style, 256, 192, 160, 100).unwrap();
+            for presence in [0.15, 0.6, 1.0] {
+                let frame = super::super::super::viewport::LoupeFrame {
+                    center: NormalizedPoint { x: if variant == 3 { 0.05 } else { 0.55 }, y: 0.45 },
+                    radius: 0.35, magnification: 1.0 + presence,
+                    bevel: 0.2 * presence, chromatic_aberration: 0.5 * presence, presence,
+                };
+                let input = FrameInput { source: &source, overlay: Some(&overlay),
+                    viewport: ViewportFrame { loupe: Some(frame), ..Default::default() },
+                    pointer: None, camera: Some(&camera) };
+                compare(&mut gpu, &scene, input, true, Some(&caption));
+                compare(&mut gpu, &scene, input, false, None);
+            }
+        }
     }
 
     #[test]

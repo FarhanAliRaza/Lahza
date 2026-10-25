@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -111,13 +111,93 @@ pub trait RecorderBackend {
         false
     }
 
+    /// Recoverable capture failures reported after the screen was saved.
+    fn capture_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn pointer_synthesized(&self) -> bool {
         false
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecordingSource {
+    #[default]
+    Any,
+    Screen,
+    Window,
+}
+
+/// Shared with the launcher before the background recorder has started.
+#[derive(Default)]
+pub struct RecordingStartup {
+    remaining: AtomicU8,
+    cancelled: AtomicBool,
+    started: AtomicBool,
+}
+
+impl RecordingStartup {
+    pub fn countdown_remaining(&self) -> Option<u8> {
+        let remaining = self.remaining.load(Ordering::Acquire);
+        (remaining > 0).then_some(remaining)
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// Dropping the pending portal operation lets the caller close its session
+/// promptly when the launcher cancels an open source picker.
+async fn during_startup<T>(
+    startup: &RecordingStartup,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    if startup.is_cancelled() {
+        return Err("Recording was cancelled before capture started.".into());
+    }
+    let cancelled = async {
+        loop {
+            if startup.is_cancelled() {
+                return Err("Recording was cancelled before capture started.".into());
+            }
+            async_io::Timer::after(Duration::from_millis(50)).await;
+        }
+    };
+    futures_util::pin_mut!(operation, cancelled);
+    match futures_util::future::select(operation, cancelled).await {
+        futures_util::future::Either::Left((result, _)) => result,
+        futures_util::future::Either::Right((result, _)) => result,
+    }
+}
+
+fn wait_for_countdown(startup: &RecordingStartup, seconds: u8, mut closed: impl FnMut() -> bool) -> Result<(), String> {
+    // Restart reuses this recorder after its launcher has gone away. Only the
+    // initial capture has a visible countdown and a startup cancellation UI.
+    let seconds = if startup.started.load(Ordering::Acquire) { 0 } else { seconds };
+    let deadline = Instant::now() + Duration::from_secs(u64::from(seconds.min(10)));
+    let result = loop {
+        if startup.is_cancelled() || closed() {
+            break Err("Recording was cancelled before capture started.".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { break Ok(()); }
+        startup.remaining.store(remaining.as_secs_f64().ceil() as u8, Ordering::Release);
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    };
+    startup.remaining.store(0, Ordering::Release);
+    result
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecordingOptions {
+    pub source: RecordingSource,
+    pub countdown_seconds: u8,
     pub area: Option<RecordingArea>,
     /// Keeps every floating window's helper request alive and requires
     /// protected offscreen compositing before desktop/area recording.
@@ -175,6 +255,7 @@ pub struct NativeRecorder {
     area_requests: Option<mpsc::Sender<AreaRequest>>,
     camera_frames: Option<Arc<CameraFrames>>,
     options: RecordingOptions,
+    startup: Arc<RecordingStartup>,
     state: Arc<Mutex<SharedState>>,
     commands: Option<mpsc::Sender<WorkerCommand>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -209,6 +290,7 @@ impl NativeRecorder {
             area_requests: None,
             camera_frames: None,
             options,
+            startup: Arc::new(RecordingStartup::default()),
             state: Arc::new(Mutex::new(SharedState::default())),
             commands: None,
             worker: None,
@@ -223,6 +305,15 @@ impl NativeRecorder {
     pub fn with_camera_preview(mut self, frames: Arc<CameraFrames>) -> Self {
         self.camera_frames = Some(frames);
         self
+    }
+
+    pub fn with_startup(mut self, startup: Arc<RecordingStartup>) -> Self {
+        self.startup = startup;
+        self
+    }
+
+    pub fn countdown_remaining(&self) -> Option<u8> {
+        self.startup.countdown_remaining()
     }
 
     pub fn description() -> &'static str {
@@ -288,6 +379,7 @@ impl RecorderBackend for NativeRecorder {
         *self.state.lock().expect("native recorder state poisoned") = SharedState::default();
         let output = output.to_path_buf();
         let options = self.options.clone();
+        let startup = self.startup.clone();
         let area_requests = self.area_requests.clone();
         let camera_frames = self.camera_frames.clone();
         let state = self.state.clone();
@@ -299,6 +391,7 @@ impl RecorderBackend for NativeRecorder {
                 run_worker(
                     output,
                     options,
+                    startup,
                     state,
                     commands_rx,
                     ready_tx,
@@ -308,6 +401,7 @@ impl RecorderBackend for NativeRecorder {
             })?;
         match ready_rx.recv() {
             Ok(Ok(())) => {
+                self.startup.started.store(true, Ordering::Release);
                 self.commands = Some(commands_tx);
                 self.worker = Some(worker);
                 Ok(())
@@ -380,6 +474,17 @@ impl RecorderBackend for NativeRecorder {
                 .unwrap_or(false)
     }
 
+    fn capture_warnings(&self) -> Vec<String> {
+        let camera_was_lost = self.options.camera && self.state.lock().is_ok_and(|state| {
+            matches!(state.completion, Some(Ok(_))) && !state.camera_recorded
+        });
+        if camera_was_lost {
+            vec!["The screen recording was saved, but the webcam recording could not be finalized. Any recoverable camera segments remain in the project folder.".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn pointer_synthesized(&self) -> bool {
         self.state
             .lock()
@@ -428,6 +533,7 @@ fn ensure_runtime() -> Result<(), RecorderError> {
 fn run_worker(
     output: PathBuf,
     mut options: RecordingOptions,
+    startup: Arc<RecordingStartup>,
     state: Arc<Mutex<SharedState>>,
     commands: mpsc::Receiver<WorkerCommand>,
     ready: mpsc::Sender<Result<(), String>>,
@@ -435,6 +541,7 @@ fn run_worker(
     area_requests: Option<mpsc::Sender<AreaRequest>>,
 ) {
     let result = async_io::block_on(async {
+        if startup.is_cancelled() { return Err("Recording was cancelled before capture started.".into()); }
         let input_destination = output.with_file_name("input.json");
         // Area capture embeds the compositor cursor. Do not collect unused
         // full-monitor input metadata or leave raw events in the project.
@@ -448,7 +555,7 @@ fn run_worker(
         // Subscribe before showing the picker so a fast external close cannot
         // be lost between receiving the stream and starting the worker loop.
         let mut closed = Box::pin(session.receive_closed().await.map_err(|error| error.to_string())?);
-        proxy
+        let selection = during_startup(&startup, async { proxy
             .select_sources(
                 &session,
                 if area_requests.is_some() || options.area.is_some() {
@@ -465,23 +572,38 @@ fn run_worker(
                 } else {
                     CursorMode::Embedded
                 },
-                if area_requests.is_some() {
+                if area_requests.is_some() || options.area.is_some() {
                     SourceType::Monitor.into()
                 } else {
-                    SourceType::Monitor | SourceType::Window
+                    match options.source {
+                        RecordingSource::Any => SourceType::Monitor | SourceType::Window,
+                        RecordingSource::Screen => SourceType::Monitor.into(),
+                        RecordingSource::Window => SourceType::Window.into(),
+                    }
                 },
                 false,
                 None,
                 PersistMode::ExplicitlyRevoked,
             )
             .await
-            .map_err(|error| error.to_string())?;
-        let response = proxy
+            .map_err(|error| error.to_string()) }).await;
+        if let Err(error) = selection {
+            let _ = session.close().await;
+            return Err(error);
+        }
+        let response = during_startup(&startup, async { proxy
             .start(&session, None)
             .await
             .map_err(|error| error.to_string())?
             .response()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string()) }).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = session.close().await;
+                return Err(error);
+            }
+        };
         let stream = response
             .streams()
             .first()
@@ -530,12 +652,15 @@ fn run_worker(
             let selection = requests
                 .send(AreaRequest { frame, reply })
                 .map_err(|_| "area selection was cancelled".to_string())
-                .and_then(|_| {
-                    response
-                        .recv()
-                        .ok()
-                        .flatten()
-                        .ok_or_else(|| "area selection was cancelled".to_string())
+                .and_then(|_| loop {
+                    if startup.is_cancelled() || closed.next().now_or_never().is_some() {
+                        break Err("area selection was cancelled".to_string());
+                    }
+                    match response.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Some(area)) => break Ok(area),
+                        Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break Err("area selection was cancelled".into()),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
                 });
             match selection {
                 Ok(area) => options.area = Some(area),
@@ -549,6 +674,12 @@ fn run_worker(
             thread::sleep(Duration::from_millis(250));
         }
 
+        if let Err(error) = wait_for_countdown(&startup, options.countdown_seconds, || {
+            closed.next().now_or_never().is_some()
+        }) {
+            let _ = session.close().await;
+            return Err(error);
+        }
         let camera = if options.camera {
             Some(match options.camera_device.clone() {
                 Some(device) => device,
@@ -574,6 +705,10 @@ fn run_worker(
         }
         let recording_size = RecordingSize::default();
         let mut segments = Vec::new();
+        if startup.is_cancelled() {
+            let _ = session.close().await;
+            return Err("Recording was cancelled before capture started.".into());
+        }
         let mut child = Some(spawn_segment(
             &output,
             segments.len(),
@@ -585,6 +720,11 @@ fn run_worker(
             recording_size.clone(),
             preserve_alpha,
         )?);
+        if startup.is_cancelled() {
+            drop(child.take());
+            let _ = session.close().await;
+            return Err("Recording was cancelled before capture started.".into());
+        }
         // Negotiate and receive video before adding the cursor consumer.
         // Starting the metadata-only stream first can leave a window's video
         // consumer without any frames, even though caps and EOS succeed.
@@ -631,6 +771,11 @@ fn run_worker(
             shared.elapsed = Duration::ZERO;
             shared.output = Some(segment_path(&output, 0));
             shared.failure = None;
+        }
+        if startup.is_cancelled() {
+            drop(child.take());
+            let _ = session.close().await;
+            return Err("Recording was cancelled before capture started.".into());
         }
         let _ = ready.send(Ok(()));
 
@@ -955,7 +1100,7 @@ pub fn audio_sources() -> Vec<AudioSource> {
 
 /// The V4L2 device node of the first webcam GStreamer can capture from.
 pub fn default_camera_device() -> Result<String, String> {
-    camera_devices()
+    camera_devices_result()?
         .into_iter()
         .next()
         .map(|(path, _)| path)
@@ -964,16 +1109,16 @@ pub fn default_camera_device() -> Result<String, String> {
 
 /// Webcams GStreamer can capture from, as `(V4L2 device node, display name)`.
 pub fn camera_devices() -> Vec<(String, String)> {
-    if gst::init().is_err() {
-        return Vec::new();
-    }
+    camera_devices_result().unwrap_or_default()
+}
+
+pub fn camera_devices_result() -> Result<Vec<(String, String)>, String> {
+    gst::init().map_err(|error| format!("could not initialize camera discovery: {error}"))?;
     let monitor = gst::DeviceMonitor::new();
     monitor.add_filter(Some("Video/Source"), None);
-    if monitor.start().is_err() {
-        return Vec::new();
-    }
+    monitor.start().map_err(|error| format!("could not discover webcams: {error}"))?;
     let mut seen = std::collections::HashSet::new();
-    let devices = monitor
+    let mut devices: Vec<_> = monitor
         .devices()
         .iter()
         .filter_map(|device| {
@@ -986,7 +1131,8 @@ pub fn camera_devices() -> Vec<(String, String)> {
         })
         .collect();
     monitor.stop();
-    devices
+    devices.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(devices)
 }
 
 /// Microphones GStreamer can capture from, as `(source name, display name)`.
@@ -1264,18 +1410,17 @@ fn build_segment_pipeline(
             }
         }
     }
-    if let Some(device) = camera_device {
+    if camera_device.is_some() {
         // The webcam shares the screen pipeline's clock, so both files carry
         // the same running-time stamps and stay aligned in the editor.
         let camera_segment = camera_segment_path(output, index);
         let _ = fs::remove_file(&camera_segment);
         description.push_str(&format!(
-            "v4l2src device=\"{}\" do-timestamp=true ! videoconvert ! tee name=camera_tee \
+            "v4l2src name=camera_source do-timestamp=true ! decodebin ! videoconvert ! tee name=camera_tee \
              camera_tee. ! queue max-size-buffers=4 leaky=downstream ! \
              vp8enc deadline=1 cpu-used=8 threads=2 target-bitrate=4000000 \
              keyframe-max-dist=60 ! queue ! matroskamux ! \
              filesink location=\"{}\" ",
-            device,
             camera_segment.display()
         ));
     }
@@ -1291,6 +1436,10 @@ fn build_segment_pipeline(
         .map_err(|error| format!("could not build GStreamer pipeline: {error}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "GStreamer did not create a pipeline".to_string())?;
+    if let Some(device) = camera_device {
+        pipeline.by_name("camera_source").ok_or_else(|| "GStreamer pipeline has no webcam source".to_string())?
+            .set_property("device", device);
+    }
     // Keep capture timestamps on a steady clock without relying on the
     // pipewiresrc `provide-clock` property, absent in the core24 Snap runtime.
     pipeline.use_clock(Some(&gst::SystemClock::obtain()));
@@ -1470,6 +1619,73 @@ fn finalize_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn countdown_publishes_remaining_time_and_cancels_before_capture() {
+        let startup = Arc::new(RecordingStartup::default());
+        let worker_startup = startup.clone();
+        let worker = thread::spawn(move || wait_for_countdown(&worker_startup, 3, || false));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while startup.countdown_remaining().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(startup.countdown_remaining(), Some(3));
+        let cancelled_at = Instant::now();
+        startup.cancel();
+        assert!(worker.join().unwrap().unwrap_err().contains("cancelled"));
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+        assert_eq!(startup.countdown_remaining(), None);
+        assert!(wait_for_countdown(&RecordingStartup::default(), 0, || false).is_ok());
+        assert!(wait_for_countdown(&RecordingStartup::default(), 3, || true).is_err());
+    }
+
+    #[test]
+    fn source_picker_future_is_cancelled_without_waiting_for_its_response() {
+        let startup = Arc::new(RecordingStartup::default());
+        let worker_startup = startup.clone();
+        let (result, response) = mpsc::channel();
+        let (started, waiting) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let outcome = async_io::block_on(during_startup(&worker_startup, async move {
+                started.send(()).unwrap();
+                futures_util::future::pending::<Result<(), String>>().await
+            }));
+            result.send(outcome).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+        startup.cancel();
+        assert!(response.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().contains("cancelled"));
+        worker.join().unwrap();
+        let startup = RecordingStartup::default();
+        assert_eq!(async_io::block_on(during_startup(&startup, async { Ok(42) })), Ok(42));
+    }
+
+    #[test]
+    fn restart_skips_the_initial_countdown_but_still_honors_cancellation() {
+        let startup = RecordingStartup::default();
+        startup.started.store(true, Ordering::Release);
+        let started = Instant::now();
+        assert!(wait_for_countdown(&startup, 10, || false).is_ok());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(startup.countdown_remaining(), None);
+        startup.cancel();
+        assert!(wait_for_countdown(&startup, 10, || false).is_err());
+    }
+
+    #[test]
+    fn missing_webcam_warning_requires_a_successfully_saved_screen() {
+        let recorder = NativeRecorder::with_options(RecordingOptions {
+            camera: true,
+            ..RecordingOptions::default()
+        });
+        assert!(recorder.capture_warnings().is_empty());
+        recorder.state.lock().unwrap().completion = Some(Err("failed screen".into()));
+        assert!(recorder.capture_warnings().is_empty());
+        recorder.state.lock().unwrap().completion = Some(Ok(PathBuf::from("screen.mkv")));
+        assert_eq!(recorder.capture_warnings().len(), 1);
+        recorder.state.lock().unwrap().camera_recorded = true;
+        assert!(recorder.capture_warnings().is_empty());
+    }
 
     #[test]
     fn terminal_result_survives_a_closed_command_channel_and_repeated_stop() {
@@ -1873,6 +2089,7 @@ mod tests {
                 microphone_device: None,
                 camera: false,
                 camera_device: None,
+                ..Default::default()
             };
             // Build the real recording pipeline without opening the portal or
             // starting capture. Also run against the Snap's older plugin.
@@ -1919,6 +2136,7 @@ mod tests {
             microphone_device: None,
             camera: false,
             camera_device: None,
+            ..Default::default()
         });
         recorder.start_recording(&output).unwrap();
         thread::sleep(Duration::from_secs(1));

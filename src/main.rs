@@ -32,6 +32,7 @@ mod launcher_recording;
 mod library;
 mod models;
 mod motion_ui;
+mod motion_overview_ui;
 mod notifications;
 mod text_field;
 mod text_fields_ui;
@@ -39,6 +40,7 @@ mod preset_cards;
 mod preview;
 mod recording;
 mod scene_ui;
+mod scene_preview;
 mod shell_ui;
 mod template_ui;
 mod theme;
@@ -275,6 +277,10 @@ struct Studio {
     recording_session_path: Option<PathBuf>,
     record_system_audio: bool,
     record_area: bool,
+    recording_source: recording::native::RecordingSource,
+    recording_countdown: u8,
+    recording_startup: Option<Arc<recording::native::RecordingStartup>>,
+    recording_close_requested: bool,
     capture_access_prompt: Option<capture_access::AccessPrompt>,
     capture_access_busy: bool,
     camera_access_checked: bool,
@@ -290,6 +296,7 @@ struct Studio {
     /// `(device node, display name)` of every webcam, refreshed with the launcher.
     camera_devices: Vec<(String, String)>,
     launcher_camera_menu_open: bool,
+    launcher_device_anchor: Option<Bounds<Pixels>>,
     /// Latest webcam frame from the launcher preview pipeline.
     camera_frames: Arc<CameraFrames>,
     /// Webcam pipeline while the launcher shows the camera and nothing records.
@@ -330,6 +337,7 @@ struct Studio {
     video_zoom_cues: Vec<ZoomCue>,
     video_selected_zoom_cue: Option<Uuid>,
     video_zoom_drag: Option<VideoZoomDrag>,
+    motion_zoom_track: Option<(Pixels, Pixels)>,
     /// Seconds visible at 1×; changed only by opening a recording or explicit fit.
     video_timeline_span: f64,
     video_timeline_extent: f64,
@@ -453,6 +461,8 @@ struct Studio {
     shadow_style: usize,
     shadow_color: u32,
     aspect_ratio: usize,
+    custom_canvas_dimensions: (u32, u32),
+    custom_canvas_draft: (u32, u32),
     border_color: usize,
     padding: u8,
     shadow: u8,
@@ -604,7 +614,7 @@ impl Studio {
                 .update(cx, |this, cx| {
                     this.reconcile_recording_lifecycle(cx);
                     this.refresh_speech_processing(cx);
-                    if this.recording_state == RecordingState::Recording
+                    if matches!(this.recording_state, RecordingState::Recording | RecordingState::Starting)
                         && !this.recording_window_minimized
                     {
                         cx.notify();
@@ -657,6 +667,10 @@ impl Studio {
             recording_session_path: None,
             record_system_audio: false,
             record_area: false,
+            recording_source: recording::native::RecordingSource::Screen,
+            recording_countdown: 3,
+            recording_startup: None,
+            recording_close_requested: false,
             capture_access_prompt: None,
             capture_access_busy: false,
             camera_access_checked: false,
@@ -668,6 +682,7 @@ impl Studio {
             camera_device: None,
             camera_devices: Vec::new(),
             launcher_camera_menu_open: false,
+            launcher_device_anchor: None,
             camera_frames: Arc::new(CameraFrames::default()),
             camera_preview: None,
             camera_frame: None,
@@ -701,6 +716,7 @@ impl Studio {
             video_zoom_cues: Vec::new(),
             video_selected_zoom_cue: None,
             video_zoom_drag: None,
+            motion_zoom_track: None,
             video_timeline_span: 1.0,
             video_timeline_extent: 1.0,
             video_timeline_zoom: 1.0,
@@ -807,6 +823,8 @@ impl Studio {
             shadow_style: 1,
             shadow_color: 0x000000,
             aspect_ratio: 0,
+            custom_canvas_dimensions: (16, 9),
+            custom_canvas_draft: (16, 9),
             border_color: 3,
             padding: 8,
             shadow: 14,
@@ -951,6 +969,12 @@ impl Studio {
         cx.spawn(async move |weak, cx| loop {
             Timer::after(Duration::from_millis(66)).await;
             let state = weak.update(cx, |this, cx| {
+                if let Some(error) = this.camera_preview.as_ref().and_then(|preview| preview.take_error()) {
+                    this.camera_preview = None;
+                    this.camera_frames.clear();
+                    this.record_camera = false;
+                    this.toast = Some(format!("Camera disconnected: {error}").into());
+                }
                 if !this.wants_camera_preview() {
                     this.camera_poll_running = false;
                     let frame = this.camera_frame.take();
@@ -958,9 +982,9 @@ impl Studio {
                     cx.notify();
                     return None;
                 }
-                Some((this.camera_frame_generation, this.camera_overlay))
+                Some((this.camera_frame_generation, this.camera_overlay, this.selected_canvas_ratio() as f64))
             });
-            let Ok(Some((seen, overlay))) = state else {
+            let Ok(Some((seen, overlay, canvas_aspect))) = state else {
                 break;
             };
             let Some((generation, frame)) = frames.newer_than(seen) else {
@@ -972,7 +996,7 @@ impl Studio {
                 .background_executor()
                 .spawn(async move {
                     let pixels = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)?;
-                    Some(recording::scene::camera_framing_preview(&pixels, overlay))
+                    Some(recording::scene::camera_framing_preview_in_canvas(&pixels, overlay, canvas_aspect))
                 })
                 .await;
             if weak
@@ -1076,6 +1100,11 @@ impl Studio {
             4 => 16.0 / 9.0,
             5 => 9.0 / 16.0,
             6 => 4.0 / 5.0,
+            7 => 3.0 / 4.0,
+            8 => 2.0 / 3.0,
+            9 => 21.0 / 9.0,
+            10 => self.custom_canvas_dimensions.0.max(1) as f32
+                / self.custom_canvas_dimensions.1.max(1) as f32,
             _ => self
                 .video_project
                 .as_ref()
@@ -1181,8 +1210,14 @@ impl Studio {
             return false;
         }
 
-        let delta = (event.position.x - drag.start_x) / px(1.0);
-        let value = (drag.start_value as f32 + delta).round().clamp(0.0, 100.0) as u8;
+        let value = if drag.slider_id == MOTION_ZOOM_SLIDER {
+            self.motion_zoom_track.map(|(left, width)| {
+                ((event.position.x - left) / width * 100.0).round().clamp(0.0, 100.0) as u8
+            })
+        } else { None }.unwrap_or_else(|| {
+            let delta = (event.position.x - drag.start_x) / px(1.0);
+            (drag.start_value as f32 + delta).round().clamp(0.0, 100.0) as u8
+        });
         self.set_slider_value(drag.slider_id, value);
         true
     }
@@ -1413,7 +1448,7 @@ impl Studio {
         if self.loading.is_some() { return self.render_loading(window, cx); }
         self.sync_camera_preview(cx);
         if self.launcher_active {
-            return self.render_launcher(cx);
+            return self.render_launcher(window, cx);
         }
         if std::mem::take(&mut self.launcher_window) {
             // GPUI cannot reliably resize a Wayland window in place, so the
@@ -1920,3 +1955,6 @@ mod tests {
         assert!(empty.frame.is_none() && empty.terminal.is_none());
     }
 }
+
+#[cfg(test)]
+mod studio_workflow_tests;
