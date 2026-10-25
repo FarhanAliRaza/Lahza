@@ -1,10 +1,10 @@
-//! Bounded CPU playback previews, independent of the UI clock. Oversized
-//! canvases use an aspect-preserving proxy; paused previews stay exact.
+//! Bounded background previews, independent of the UI clock. Playback uses an
+//! aspect-preserving proxy; settled frames use native pixels and GPU enhancement.
 use crate::recording::scene::{FrameInput, PointerOverlay, SceneCompositor, SceneStyle};
 use crate::recording::viewport::ViewportFrame;
 use gpui::RenderImage;
 use image::RgbaImage;
-use std::{path::PathBuf, sync::{Arc, Condvar, Mutex}};
+use std::{path::PathBuf, sync::{Arc, Condvar, Mutex}, thread::JoinHandle};
 
 /// Full-frame glass composition measured ~42 ms at 1080p in the development
 /// build. A 1600x900 pixel budget targets a 30 fps playback frame budget while
@@ -46,6 +46,7 @@ pub(crate) struct PreviewKey {
     pub media_visible: bool,
     pub generation: u64,
     pub media: PreviewMedia,
+    pub high_quality: bool,
 }
 
 impl PreviewKey {
@@ -54,18 +55,19 @@ impl PreviewKey {
     /// Older playback frames are usable, but frames from another edit,
     /// canvas, source, or playback session must never replace the preview.
     pub(crate) fn compatible(&self, other: &Self) -> bool {
+        if self.high_quality || other.high_quality { return self == other; }
         self.same_scene(other) && self.generation == other.generation
     }
 
     pub(crate) fn same_scene(&self, other: &Self) -> bool {
-        self.same_media(other) && self.canvas == other.canvas
+        self.same_media(other) && self.style == other.style
+            && self.canvas == other.canvas && self.source_size == other.source_size
     }
 
     /// A displayed frame may briefly scale across a playback proxy change;
     /// worker completions must still pass the stricter canvas/generation key.
     pub(crate) fn same_media(&self, other: &Self) -> bool {
-        self.style == other.style && self.source_size == other.source_size
-            && self.media == other.media
+        self.media == other.media
     }
 }
 
@@ -82,14 +84,67 @@ pub(crate) struct CompletedPreview {
     pub image: Arc<RenderImage>,
 }
 
+struct FailedPreview {
+    key: PreviewKey,
+    message: String,
+}
+
 #[derive(Default)]
 struct Mailbox {
     pending: Option<PreviewJob>,
     completed: Option<CompletedPreview>,
+    failure: Option<FailedPreview>,
     requested: Option<PreviewKey>,
     epoch: u64,
     stopped: bool,
+    active: bool,
 }
+
+struct WorkerThread {
+    mailbox: Arc<(Mutex<Mailbox>, Condvar)>,
+    handle: JoinHandle<()>,
+}
+
+/// Closing a project only signals its worker. Keep the thread until it has
+/// actually destroyed its renderer, so application shutdown can join even
+/// workers belonging to projects that were closed earlier.
+struct WorkerRegistry {
+    workers: Mutex<Vec<WorkerThread>>,
+}
+
+static WORKERS: WorkerRegistry = WorkerRegistry::new();
+
+impl WorkerRegistry {
+    const fn new() -> Self { Self { workers: Mutex::new(Vec::new()) } }
+
+    fn drain(&self) {
+        // Registration uses this same lock. No worker needs it to finish;
+        // holding it prevents a new thread from escaping the shutdown drain.
+        let mut workers = self.workers.lock().unwrap_or_else(|error| error.into_inner());
+        for worker in workers.iter() { stop_worker(&worker.mailbox); }
+        for worker in workers.drain(..) { join_worker(worker.handle); }
+    }
+}
+
+fn stop_worker(mailbox: &Arc<(Mutex<Mailbox>, Condvar)>) {
+    let mut state = mailbox.0.lock().unwrap_or_else(|error| error.into_inner());
+    state.stopped = true;
+    state.pending = None;
+    state.completed = None;
+    state.failure = None;
+    mailbox.1.notify_one();
+}
+
+fn join_worker(handle: JoinHandle<()>) {
+    if handle.join().is_err() {
+        eprintln!("Preview worker panicked while shutting down");
+    }
+}
+
+/// Must run synchronously before GPUI and the process begin GPU teardown.
+/// Waiting for mailbox.active is insufficient: renderer destruction happens
+/// after that flag is cleared, at the end of the worker closure.
+pub(crate) fn shutdown_workers() { WORKERS.drain(); }
 
 /// At most one frame computes, one waits, and one awaits presentation. New
 /// requests replace the waiting frame, so playback never builds up latency.
@@ -100,6 +155,7 @@ pub(crate) struct PreviewWorker {
 impl PreviewWorker {
     pub(crate) fn new() -> std::io::Result<Self> {
         let mut cache: Option<(SceneStyle, (u32, u32), (u32, u32), SceneCompositor)> = None;
+        let mut renderer = None;
         Self::spawn(move |job| {
             let key = &job.key;
             let rebuild = cache.as_ref().is_none_or(|(style, canvas, source, _)| {
@@ -114,18 +170,38 @@ impl PreviewWorker {
                 }.ok()?;
                 cache = Some((key.style.clone(), key.canvas, key.source_size, compositor));
             }
-            let frame = cache.as_ref()?.3.compose_layers(FrameInput {
+            let scene = &cache.as_ref()?.3;
+            let input = FrameInput {
                 source: &job.source, overlay: job.overlay.as_deref(), viewport: key.viewport,
                 pointer: job.pointer.as_ref(), camera: job.camera.as_deref(),
-            }, key.media_visible, None);
+            };
+            let renderer = renderer.get_or_insert_with(crate::recording::scene::gpu::Renderer::shared);
+            let frame = if key.high_quality {
+                renderer.compose(scene, input, key.media_visible, None)
+            } else {
+                renderer.compose_fast(scene, input, key.media_visible, None)
+            };
             Some(crate::cached_render_image(frame))
         })
     }
 
-    fn spawn(mut compose: impl FnMut(&PreviewJob) -> Option<Arc<RenderImage>> + Send + 'static) -> std::io::Result<Self> {
+    fn spawn(compose: impl FnMut(&PreviewJob) -> Option<Arc<RenderImage>> + Send + 'static) -> std::io::Result<Self> {
+        Self::spawn_in(compose, &WORKERS)
+    }
+
+    fn spawn_in(mut compose: impl FnMut(&PreviewJob) -> Option<Arc<RenderImage>> + Send + 'static,
+        registry: &WorkerRegistry) -> std::io::Result<Self> {
+        let mut workers = registry.workers.lock().unwrap_or_else(|error| error.into_inner());
+        // A finished thread has completed all captured resource destructors.
+        // Reap it without making project creation wait for an active worker.
+        for index in (0..workers.len()).rev() {
+            if workers[index].handle.is_finished() {
+                join_worker(workers.swap_remove(index).handle);
+            }
+        }
         let mailbox = Arc::new((Mutex::new(Mailbox::default()), Condvar::new()));
         let shared = mailbox.clone();
-        std::thread::Builder::new().name("lahza-scene-preview".into()).spawn(move || loop {
+        let handle = std::thread::Builder::new().name("lahza-scene-preview".into()).spawn(move || loop {
             let (job, epoch) = {
                 let (lock, wake) = &*shared;
                 let mut state = lock.lock().unwrap();
@@ -133,25 +209,42 @@ impl PreviewWorker {
                     state = wake.wait(state).unwrap();
                 }
                 if state.stopped { break; }
+                state.active = true;
                 (state.pending.take().unwrap(), state.epoch)
             };
             // Expensive composition and RGBA -> BGRA conversion never hold
             // the mailbox lock or execute on the application's UI thread.
-            let image = compose(&job);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compose(&job)));
             let mut state = shared.0.lock().unwrap();
+            state.active = false;
             if state.stopped { break; }
             if state.epoch == epoch {
-                if let Some(image) = image {
-                    state.completed = Some(CompletedPreview { key: job.key, image });
+                match result {
+                    Ok(Some(image)) => {
+                        state.failure = None;
+                        state.completed = Some(CompletedPreview { key: job.key, image });
+                    }
+                    failed => {
+                        state.completed = None;
+                        state.failure = Some(FailedPreview {
+                            key: job.key,
+                            message: match failed {
+                                Ok(None) => "Could not render the preview. Change the frame or scene to try again.",
+                                _ => "Preview rendering failed unexpectedly. Change the frame or scene to try again.",
+                            }.into(),
+                        });
+                    }
                 }
             }
         })?;
+        workers.push(WorkerThread { mailbox: mailbox.clone(), handle });
         Ok(Self { mailbox })
     }
 
     pub(crate) fn request(&self, job: PreviewJob) {
         let mut state = self.mailbox.0.lock().unwrap();
         if state.requested.as_ref() == Some(&job.key) { return; }
+        state.failure = None;
         if state.requested.as_ref().is_some_and(|old| !old.compatible(&job.key) || job.key.time() < old.time()) {
             state.epoch = state.epoch.wrapping_add(1);
             state.completed = None;
@@ -166,25 +259,45 @@ impl PreviewWorker {
             .filter(|frame| frame.key.compatible(current))
     }
 
+    /// A failed key stays deduplicated after its error is consumed. A later
+    /// frame or edit can recover without a busy retry loop on the same input.
+    pub(crate) fn take_failure(&self, current: &PreviewKey) -> Option<String> {
+        self.mailbox.0.lock().unwrap().failure.take()
+            .filter(|failure| failure.key.compatible(current))
+            .map(|failure| failure.message)
+    }
+
     pub(crate) fn invalidate(&self) {
         let mut state = self.mailbox.0.lock().unwrap();
         if state.requested.take().is_some() {
             state.epoch = state.epoch.wrapping_add(1);
             state.pending = None;
             state.completed = None;
+            state.failure = None;
         }
+    }
+
+    pub(crate) fn has_completed(&self) -> bool {
+        let state = self.mailbox.0.lock().unwrap();
+        state.completed.is_some() || state.failure.is_some()
+    }
+
+    pub(crate) fn has_work(&self) -> bool {
+        let state = self.mailbox.0.lock().unwrap();
+        state.active || state.pending.is_some() || state.completed.is_some() || state.failure.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_current(&self, key: &PreviewKey) -> bool {
+        self.mailbox.0.lock().unwrap().requested.as_ref() == Some(key)
     }
 }
 
 impl Drop for PreviewWorker {
     fn drop(&mut self) {
-        let mut state = self.mailbox.0.lock().unwrap();
-        state.stopped = true;
-        state.pending = None;
-        state.completed = None;
-        self.mailbox.1.notify_one();
+        stop_worker(&self.mailbox);
         // Do not join: closing a project must not wait for an in-flight frame.
-        // The worker owns its inputs and exits as soon as that frame finishes.
+        // The registry joins any remaining threads during application quit.
     }
 }
 
@@ -222,7 +335,7 @@ mod tests {
                 style: SceneStyle::default(), canvas: (64, 48), source_size: (32, 24),
                 source: 1, time_bits: time.to_bits(), viewport: ViewportFrame::default(),
                 overlay: 0, pointer: false, media_visible: true, generation: 1,
-                media: PreviewMedia::Image(1),
+                media: PreviewMedia::Image(1), high_quality: false,
             },
             source: Arc::new(RgbaImage::from_pixel(32, 24, image::Rgba([30, 60, 90, 255]))),
             overlay: None, pointer: None, camera: None,
@@ -291,6 +404,91 @@ mod tests {
     }
 
     #[test]
+    fn settled_previews_reject_stale_playback_seek_and_source_completions() {
+        // Production no longer explicitly invalidates the worker on pause.
+        // Quality transitions and settled-frame identity must do that work,
+        // even when media, style, canvas, and playback generation stay equal.
+        for change in 0..4 {
+            let (started, starts) = mpsc::channel();
+            let (permit, permits) = mpsc::channel();
+            let worker = PreviewWorker::spawn(move |job| {
+                started.send(()).unwrap();
+                permits.recv().unwrap();
+                Some(crate::cached_render_image((*job.source).clone()))
+            }).unwrap();
+            let mut old = job(1.0);
+            old.key.high_quality = change != 0;
+            worker.request(old);
+            starts.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            let mut next = job(1.0);
+            next.key.high_quality = change != 3;
+            match change {
+                0 => {} // Playback finishes; request an exact settled frame.
+                1 => next.key.time_bits = 2.0f64.to_bits(),
+                2 => next.key.source += 1, // Same time, freshly decoded pixels.
+                _ => {} // Playback resumes before settled rendering completes.
+            }
+            let key = next.key.clone();
+            worker.request(next);
+            permit.send(()).unwrap();
+            starts.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(worker.take_completed(&key).is_none(),
+                "stale completion survived quality/settled change {change}");
+            permit.send(()).unwrap();
+            assert!(ready(&worker, &key).key == key,
+                "the replacement must match the complete requested key");
+        }
+    }
+
+    #[test]
+    fn failed_and_panicked_previews_report_once_stop_polling_and_recover_on_new_input() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for panic_on_failure in [false, true] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let count = attempts.clone();
+            let worker = PreviewWorker::spawn(move |job| {
+                count.fetch_add(1, Ordering::SeqCst);
+                if job.key.time() == 1.0 {
+                    assert!(!panic_on_failure, "synthetic preview compositor failure");
+                    return None;
+                }
+                Some(crate::cached_render_image((*job.source).clone()))
+            }).unwrap();
+            let mut first = job(1.0);
+            first.key.high_quality = true;
+            let key = first.key.clone();
+            worker.request(first);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !worker.has_completed() {
+                assert!(Instant::now() < deadline, "a failed frame must wake the UI poller");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!worker.mailbox.0.lock().unwrap().active,
+                "a rendering error must release the active slot");
+            assert!(worker.take_completed(&key).is_none());
+            assert!(worker.take_failure(&key).is_some());
+            assert!(worker.take_failure(&key).is_none(), "report each error once");
+            assert!(!worker.has_work(), "the UI must stop polling after consuming the error");
+
+            let mut repeated = job(1.0);
+            repeated.key = key;
+            worker.request(repeated);
+            assert!(!worker.has_work(), "failed input must not cause a busy retry loop");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+            let mut next = job(2.0);
+            next.key.high_quality = true;
+            let next_key = next.key.clone();
+            worker.request(next);
+            assert_eq!(ready(&worker, &next_key).key.time(), 2.0);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert!(!worker.has_work());
+            assert!(worker.take_failure(&next_key).is_none());
+        }
+    }
+
+    #[test]
     fn dropping_preview_does_not_wait_for_a_busy_compositor() {
         let (started, starts) = mpsc::channel();
         let (permit, permits) = mpsc::channel();
@@ -312,7 +510,75 @@ mod tests {
     }
 
     #[test]
-    fn background_composition_matches_the_exact_paused_frame() {
+    fn shutdown_joins_closed_projects_through_renderer_destruction() {
+        struct RendererDrop {
+            started: mpsc::Sender<()>,
+            permit: mpsc::Receiver<()>,
+        }
+        impl Drop for RendererDrop {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.permit.recv().unwrap();
+            }
+        }
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let (started, starts) = mpsc::channel();
+        let (permit, permits) = mpsc::channel();
+        let (destroying, destroys) = mpsc::channel();
+        let (release_destructor, destructor_permit) = mpsc::channel();
+        let renderer = RendererDrop { started: destroying, permit: destructor_permit };
+        let worker = PreviewWorker::spawn_in(move |_| {
+            let _keep_renderer_alive = &renderer;
+            started.send(()).unwrap();
+            permits.recv().unwrap();
+            None
+        }, &registry).unwrap();
+        worker.request(job(1.0));
+        starts.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(worker); // This project has already closed when app quit begins.
+
+        let (drained, drains) = mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            registry.drain();
+            drained.send(()).unwrap();
+        });
+        permit.send(()).unwrap();
+        destroys.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(drains.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "shutdown returned while the renderer destructor was still running");
+        release_destructor.send(()).unwrap();
+        drains.recv_timeout(Duration::from_secs(2)).unwrap();
+        drain.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_stops_idle_workers_and_finishes_after_a_destructor_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct RendererDrop(Arc<AtomicUsize>, bool);
+        impl Drop for RendererDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert!(!self.1, "test renderer teardown panic");
+            }
+        }
+        let registry = WorkerRegistry::new();
+        let destroyed = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = [true, false].into_iter().map(|panic| {
+            let renderer = RendererDrop(destroyed.clone(), panic);
+            PreviewWorker::spawn_in(move |_| {
+                let _keep_renderer_alive = &renderer;
+                None
+            }, &registry).unwrap()
+        }).collect();
+        registry.drain();
+        assert_eq!(destroyed.load(Ordering::SeqCst), 2);
+        assert!(registry.workers.lock().unwrap().is_empty());
+        drop(workers);
+    }
+
+    #[test]
+    fn background_fast_composition_matches_cpu_with_rounding() {
         let worker = PreviewWorker::new().unwrap();
         let mut input = job(1.25);
         input.key.viewport.loupe = Some(crate::recording::viewport::LoupeFrame {
@@ -327,7 +593,12 @@ mod tests {
         worker.request(input);
         let actual = ready(&worker, &key);
         assert_eq!(actual.key.time(), 1.25);
-        assert_eq!(actual.image.as_bytes(0), expected.as_bytes(0));
+        let actual_bytes = actual.image.as_bytes(0).unwrap();
+        let expected_bytes = expected.as_bytes(0).unwrap();
+        let differences: Vec<_> = actual_bytes.iter().zip(expected_bytes)
+            .map(|(a,b)| a.abs_diff(*b)).collect();
+        assert_eq!(actual_bytes.len(), expected_bytes.len());
+        assert!(differences.iter().all(|difference| *difference <= 2), "GPU and CPU preview differ beyond rounding");
     }
 
     #[test]

@@ -808,7 +808,7 @@ mod tests {
                             let mut export = studio.annotation_overlay_source().unwrap();
                             for time in [0.1, 0.2, 0.3, 1.0, 1.8] {
                                 studio.video_position = time;
-                                studio.scene_preview_image(px(480.0), px(270.0)).unwrap();
+                                studio.scene_preview_image_ready(px(480.0), px(270.0)).unwrap();
                                 let (signature, preview) = studio.preview_cache.overlay.as_ref().expect("flat image overlays must be composited, not painted as snapping sprites");
                                 assert_ne!(*signature, 0);
                                 assert_eq!(preview.as_ref(), export(time).unwrap().as_ref(), "{effect:?} at {time}: preview and export must agree");

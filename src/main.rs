@@ -585,6 +585,9 @@ impl PlaybackMailbox {
     }
 }
 
+struct PreviewShutdownHook;
+impl gpui::Global for PreviewShutdownHook {}
+
 impl Studio {
     fn new(
         window_handle: AnyWindowHandle,
@@ -592,6 +595,19 @@ impl Studio {
         initial_image: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
+        if !cx.has_global::<PreviewShutdownHook>() {
+            cx.set_global(PreviewShutdownHook);
+            recording::scene::gpu::Renderer::begin_application();
+            // Use App's observer, not Context's weak-entity wrapper: this
+            // must also run after the last Studio/project has been closed.
+            App::on_app_quit(cx, |_| {
+                // Run before returning the future. GPUI clears its windows
+                // next and only gives asynchronous quit work 100 ms.
+                scene_preview::shutdown_workers();
+                recording::scene::gpu::Renderer::shutdown_shared();
+                async {}
+            }).detach();
+        }
         let caret_blink_task = cx.spawn(async move |weak, cx| loop {
             Timer::after(Duration::from_millis(530)).await;
             if weak
@@ -1446,6 +1462,7 @@ impl Studio {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.drop_retired_images(window);
         if self.loading.is_some() { return self.render_loading(window, cx); }
+        self.preview_cache.display_scale = window.scale_factor();
         self.sync_camera_preview(cx);
         if self.launcher_active {
             return self.render_launcher(window, cx);
@@ -1483,6 +1500,7 @@ impl Studio {
         } else {
             None
         };
+        self.watch_scene_preview(cx);
         let canvas = self
             .mock_capture(cx, canvas_width, canvas_height, composited)
             .into_any_element();

@@ -813,7 +813,13 @@ impl Studio {
         if self.video_extras_pending {
             self.video_extras_pending = false;
             self.spawn_video_extras(cx);
+            // The poster is only an opening placeholder. Promote it to the
+            // original source frame even when the user does not seek or play.
+            if !self.video_playing {
+                self.queue_timeline_frame(self.video_position, false, cx);
+            }
         }
+        self.promote_paused_video_frame(cx);
         self.refresh_timeline_thumbnails(cx);
         self.ensure_camera_frame(cx);
         let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());

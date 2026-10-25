@@ -913,7 +913,10 @@ impl Studio {
         }
         self.follow_timeline_playhead(true);
         let start_time = self.video_position;
-        let decode_size = if self.video_crop != crate::CropRect::UNIT { self.video_source_size } else { (1920, 1080) };
+        // Camera zoom and the loupe must sample the original recording pixels.
+        // The scene worker bounds output resolution separately; shrinking the
+        // decoded source here would permanently discard detail before zoom.
+        let decode_size = self.video_source_size;
         let timeline = self.video_clip_timeline.clone();
         let muted = self.video_audio_muted;
         let audio_clips = self.video_project.as_ref().map(|session| self.video_audio_clips.iter().cloned()

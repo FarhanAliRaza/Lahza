@@ -71,7 +71,7 @@ fn mix(a: f32, b: f32, t: f32) -> f32 {
 
 /// Pixel centers use canvas coordinates, shared with the GPU compositor.
 #[inline]
-fn sample(image: &RgbaImage, p: [f32; 2]) -> [f32; 4] {
+pub(crate) fn sample(image: &RgbaImage, p: [f32; 2]) -> [f32; 4] {
     let x = (p[0] - 0.5).clamp(0.0, image.width().saturating_sub(1) as f32);
     let y = (p[1] - 0.5).clamp(0.0, image.height().saturating_sub(1) as f32);
     let x0 = x.floor() as u32;
@@ -93,11 +93,22 @@ fn sample(image: &RgbaImage, p: [f32; 2]) -> [f32; 4] {
 
 /// Apply after the screen and pointer, before the camera and canvas overlays.
 /// Sampling an immutable screen makes the result independent of traversal.
+#[cfg(test)]
 pub(crate) fn paint(image: &mut RgbaImage, lens: LoupeGeometry) {
+    let screen = image.clone();
+    paint_with_sampler(image, lens, &|point| sample(&screen, point));
+}
+
+/// Shade the lens from continuous canvas coordinates. A scene can reproject
+/// these coordinates directly into its original media instead of magnifying
+/// pixels that were already reduced to preview resolution.
+pub(crate) fn paint_with_sampler<S>(image: &mut RgbaImage, lens: LoupeGeometry, sample: &S)
+where
+    S: Fn([f32; 2]) -> [f32; 4] + Sync,
+{
     if image.width() == 0 || image.height() == 0 || lens.presence <= 0.0 {
         return;
     }
-    let screen = image.clone();
     let prepared = PreparedLens::new(lens, image.width(), image.height());
     let reach = lens.radius * 1.4 + 2.0;
     let x0 = (lens.center[0] - reach).floor().max(0.0) as u32;
@@ -119,13 +130,12 @@ pub(crate) fn paint(image: &mut RgbaImage, lens: LoupeGeometry) {
     let raw: &mut [u8] = image.as_mut();
     let rows = &mut raw[y0 as usize * stride..y1 as usize * stride];
     if workers == 1 {
-        paint_rows(rows, stride, y0, x0, x1, &screen, &prepared);
+        paint_rows(rows, stride, y0, x0, x1, sample, &prepared);
     } else {
         let chunk_rows =
             (y1 - y0) as usize / workers + usize::from((y1 - y0) as usize % workers != 0);
         std::thread::scope(|scope| {
             for (chunk, rows) in rows.chunks_mut(chunk_rows * stride).enumerate() {
-                let screen = &screen;
                 let prepared = &prepared;
                 scope.spawn(move || {
                     paint_rows(
@@ -134,7 +144,7 @@ pub(crate) fn paint(image: &mut RgbaImage, lens: LoupeGeometry) {
                         y0 + (chunk * chunk_rows) as u32,
                         x0,
                         x1,
-                        screen,
+                        sample,
                         prepared,
                     )
                 });
@@ -152,13 +162,13 @@ fn worker_count(pixels: usize) -> usize {
     available.min((pixels / 60_000).max(1))
 }
 
-fn paint_rows(
+fn paint_rows<S: Fn([f32; 2]) -> [f32; 4] + Sync>(
     rows: &mut [u8],
     stride: usize,
     y0: u32,
     x0: u32,
     x1: u32,
-    screen: &RgbaImage,
+    sample: &S,
     prepared: &PreparedLens,
 ) {
     for (row_index, row) in rows.chunks_exact_mut(stride).enumerate() {
@@ -171,7 +181,7 @@ fn paint_rows(
                 row[offset + 2] as f32,
                 row[offset + 3] as f32,
             ];
-            let color = shade(screen, prepared, [x as f32 + 0.5, y as f32 + 0.5], base);
+            let color = shade(sample, prepared, [x as f32 + 0.5, y as f32 + 0.5], base);
             row[offset..offset + 4]
                 .copy_from_slice(&color.map(|c| c.clamp(0.0, 255.0).round() as u8));
         }
@@ -217,7 +227,12 @@ impl PreparedLens {
 }
 
 #[inline]
-fn shade(screen: &RgbaImage, prepared: &PreparedLens, p: [f32; 2], base: [f32; 4]) -> [f32; 4] {
+fn shade<S: Fn([f32; 2]) -> [f32; 4]>(
+    sample: &S,
+    prepared: &PreparedLens,
+    p: [f32; 2],
+    base: [f32; 4],
+) -> [f32; 4] {
     let lens = prepared.lens;
     let delta = [p[0] - lens.center[0], p[1] - lens.center[1]];
     let distance_squared = delta[0] * delta[0] + delta[1] * delta[1];
@@ -236,7 +251,7 @@ fn shade(screen: &RgbaImage, prepared: &PreparedLens, p: [f32; 2], base: [f32; 4
             lens.center[0] + delta[0] * prepared.inverse_zoom,
             lens.center[1] + delta[1] * prepared.inverse_zoom,
         ];
-        let glass = sample(screen, q);
+        let glass = sample(q);
         if lens.presence >= 1.0 {
             return glass;
         }
@@ -306,28 +321,19 @@ fn shade(screen: &RgbaImage, prepared: &PreparedLens, p: [f32; 2], base: [f32; 4
         lens.center[1] + delta[1] * scale,
     ];
     let dispersion = lens.chromatic_aberration * bevel * radius * 0.055 * shell;
-    let mut glass = sample(screen, q);
+    let mut glass = sample(q);
     if dispersion != 0.0 {
-        glass[0] = sample_channel::<0>(
-            screen,
-            [q[0] + normal[0] * dispersion, q[1] + normal[1] * dispersion],
-        );
-        glass[2] = sample_channel::<2>(
-            screen,
-            [q[0] - normal[0] * dispersion, q[1] - normal[1] * dispersion],
-        );
+        glass[0] = sample([q[0] + normal[0] * dispersion, q[1] + normal[1] * dispersion])[0];
+        glass[2] = sample([q[0] - normal[0] * dispersion, q[1] - normal[1] * dispersion])[2];
     }
     // The rim reflects a compressed annulus just outside the lens.
     let reflection_mix = shell * bevel * 0.8;
     if reflection_mix > 0.0 {
         let reflected_radius = radius * (1.0 + (1.0 - r) * 0.65);
-        let reflection = sample(
-            screen,
-            [
-                lens.center[0] + normal[0] * reflected_radius,
-                lens.center[1] + normal[1] * reflected_radius,
-            ],
-        );
+        let reflection = sample([
+            lens.center[0] + normal[0] * reflected_radius,
+            lens.center[1] + normal[1] * reflected_radius,
+        ]);
         for i in 0..3 {
             glass[i] = mix(glass[i], reflection[i], reflection_mix);
         }
@@ -341,29 +347,6 @@ fn shade(screen: &RgbaImage, prepared: &PreparedLens, p: [f32; 2], base: [f32; 4
         glass[i] = mix(glass[i], tint[i], highlight.clamp(0.0, 1.0));
     }
     std::array::from_fn(|i| mix(outside[i], glass[i], coverage * lens.presence))
-}
-
-#[inline]
-fn sample_channel<const CHANNEL: usize>(image: &RgbaImage, p: [f32; 2]) -> f32 {
-    let x = (p[0] - 0.5).clamp(0.0, image.width().saturating_sub(1) as f32);
-    let y = (p[1] - 0.5).clamp(0.0, image.height().saturating_sub(1) as f32);
-    let x0 = x.floor() as u32;
-    let y0 = y.floor() as u32;
-    let x1 = (x0 + 1).min(image.width() - 1);
-    let y1 = (y0 + 1).min(image.height() - 1);
-    mix(
-        mix(
-            image.get_pixel(x0, y0)[CHANNEL] as f32,
-            image.get_pixel(x1, y0)[CHANNEL] as f32,
-            x - x0 as f32,
-        ),
-        mix(
-            image.get_pixel(x0, y1)[CHANNEL] as f32,
-            image.get_pixel(x1, y1)[CHANNEL] as f32,
-            x - x0 as f32,
-        ),
-        y - y0 as f32,
-    )
 }
 
 #[cfg(test)]
@@ -528,7 +511,15 @@ mod tests {
             paint(&mut parallel, lens);
             let mut serial = source.clone();
             let prepared = PreparedLens::new(lens, 640, 360);
-            paint_rows(serial.as_mut(), 640 * 4, 0, 0, 640, &source, &prepared);
+            paint_rows(
+                serial.as_mut(),
+                640 * 4,
+                0,
+                0,
+                640,
+                &|point| sample(&source, point),
+                &prepared,
+            );
             assert_eq!(parallel, serial);
         }
     }

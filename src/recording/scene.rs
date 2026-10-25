@@ -1267,6 +1267,12 @@ impl SceneCompositor {
             self.background.clone()
         };
         let projection = self.geometry.projection(transform);
+        let lens = media_visible
+            .then(|| self.loupe_geometry(input.viewport))
+            .flatten();
+        // Keep only the card/background pass immutable. Lens pixels sample
+        // original media at fractional coordinates, before canvas reduction.
+        let lens_background = lens.map(|_| output.clone());
         if media_visible {
             self.paint_media(
                 &mut output,
@@ -1278,8 +1284,45 @@ impl SceneCompositor {
             if let Some(pointer) = input.pointer {
                 self.paint_pointer(&mut output, &projection, pointer, input.viewport);
             }
-            if let Some(lens) = self.loupe_geometry(input.viewport) {
-                super::loupe::paint(&mut output, lens);
+            if let (Some(lens), Some(background)) = (lens, lens_background.as_ref()) {
+                let (left, top, visible_x, visible_y) =
+                    self.style.source_crop.visible_rect(input.viewport);
+                let painter = MediaPainter {
+                    geometry: self.geometry,
+                    projection: &projection,
+                    source: input.source,
+                    overlay: input
+                        .overlay
+                        .filter(|image| image.width() > 0 && image.height() > 0),
+                    left,
+                    top,
+                    visible_x,
+                    visible_y,
+                    sample_bounds: self
+                        .style
+                        .source_crop
+                        .sample_bounds(input.source.width(), input.source.height()),
+                    x0: 0,
+                    x1: self.width,
+                };
+                let commands = input
+                    .pointer
+                    .map(|pointer| self.pointer_commands(&projection, pointer, input.viewport))
+                    .unwrap_or_default();
+                let pointers: Vec<_> = commands.iter().map(ContinuousPointer::new).collect();
+                let axis = projection.axis_aligned();
+                let (width, height) = (self.width, self.height);
+                super::loupe::paint_with_sampler(&mut output, lens, &|point| {
+                    let point = [
+                        point[0].clamp(0.5, width as f32 - 0.5),
+                        point[1].clamp(0.5, height as f32 - 0.5),
+                    ];
+                    let mut color = painter.sample_continuous(background, point, axis);
+                    for pointer in &pointers {
+                        color = pointer.sample(color, point);
+                    }
+                    color
+                });
             }
         }
         if let Some(camera) = input.camera {
@@ -1683,6 +1726,199 @@ enum PointerCommand {
     Bitmap { bitmap: std::sync::Arc<PointerBitmap>, placement: BitmapPlacement, opacity: f64, shadow_only: bool },
 }
 
+#[inline]
+fn continuous_over(base: [f32; 4], rgb: [f32; 3], alpha: f32) -> [f32; 4] {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let target = [rgb[0], rgb[1], rgb[2], 255.0];
+    std::array::from_fn(|i| {
+        (base[i] + (target[i] - base[i]) * alpha)
+            .clamp(0.0, 255.0)
+            .round()
+    })
+}
+
+/// Frame-constant pointer transforms, shared by every optical tap. Sampling
+/// the artwork directly preserves its hotspot, alpha, rotation and smear
+/// without first baking the cursor into a smaller preview bitmap.
+struct ContinuousPointer<'a> {
+    command: &'a PointerCommand,
+    bounds: [f64; 4],
+    sin: f64,
+    cos: f64,
+    anchor: (f64, f64),
+    smear: (f64, f64),
+    taps: usize,
+}
+
+impl<'a> ContinuousPointer<'a> {
+    fn new(command: &'a PointerCommand) -> Self {
+        let mut result = Self {
+            command,
+            bounds: [0.0; 4],
+            sin: 0.0,
+            cos: 1.0,
+            anchor: (0.0, 0.0),
+            smear: (0.0, 0.0),
+            taps: 1,
+        };
+        match command {
+            PointerCommand::Disc { x, y, radius, .. } => {
+                result.bounds = [
+                    (x - radius - 1.0).floor(),
+                    (y - radius - 1.0).floor(),
+                    (x + radius + 1.0).ceil(),
+                    (y + radius + 1.0).ceil(),
+                ];
+            }
+            PointerCommand::Bitmap {
+                bitmap,
+                placement: p,
+                ..
+            } => {
+                (result.sin, result.cos) = p.tilt_degrees.to_radians().sin_cos();
+                result.anchor = (bitmap.anchor.x * p.width, bitmap.anchor.y * p.height);
+                result.smear = (
+                    p.smear.0 * result.cos + p.smear.1 * result.sin,
+                    -p.smear.0 * result.sin + p.smear.1 * result.cos,
+                );
+                result.taps = if p.smear.0.hypot(p.smear.1) < 0.5 {
+                    1
+                } else {
+                    CURSOR_SMEAR_TAPS
+                };
+                let corners = [
+                    (0.0, 0.0),
+                    (p.width, 0.0),
+                    (0.0, p.height),
+                    (p.width, p.height),
+                ]
+                .map(|(x, y)| {
+                    let (x, y) = (x - result.anchor.0, y - result.anchor.1);
+                    (
+                        p.hotspot_x + x * result.cos - y * result.sin,
+                        p.hotspot_y + x * result.sin + y * result.cos,
+                    )
+                });
+                result.bounds = [
+                    (corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min)
+                        - 1.0
+                        - p.smear.0.max(0.0))
+                    .floor(),
+                    (corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min)
+                        - 1.0
+                        - p.smear.1.max(0.0))
+                    .floor(),
+                    (corners
+                        .iter()
+                        .map(|p| p.0)
+                        .fold(f64::NEG_INFINITY, f64::max)
+                        + 1.0
+                        - p.smear.0.min(0.0))
+                    .ceil(),
+                    (corners
+                        .iter()
+                        .map(|p| p.1)
+                        .fold(f64::NEG_INFINITY, f64::max)
+                        + 1.0
+                        - p.smear.1.min(0.0))
+                    .ceil(),
+                ];
+            }
+        }
+        result
+    }
+
+    #[inline]
+    fn sample(&self, base: [f32; 4], point: [f32; 2]) -> [f32; 4] {
+        let (px, py) = (f64::from(point[0]), f64::from(point[1]));
+        if px < self.bounds[0]
+            || py < self.bounds[1]
+            || px >= self.bounds[2]
+            || py >= self.bounds[3]
+        {
+            return base;
+        }
+        match self.command {
+            PointerCommand::Disc {
+                x,
+                y,
+                radius,
+                line_width,
+                color,
+                opacity,
+            } => {
+                if *opacity <= 0.0 || *radius <= 0.0 {
+                    return base;
+                }
+                let distance = (px - x).hypot(py - y);
+                let mut coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+                if let Some(width) = line_width {
+                    coverage *= (distance - (radius - width).max(0.0) + 0.5).clamp(0.0, 1.0);
+                }
+                continuous_over(base, color.map(f32::from), (coverage * opacity) as f32)
+            }
+            PointerCommand::Bitmap {
+                bitmap,
+                placement: p,
+                opacity,
+                shadow_only,
+            } => {
+                if *opacity <= 0.0 || p.width <= 0.0 || p.height <= 0.0 {
+                    return base;
+                }
+                let (dx, dy) = (px - p.hotspot_x, py - p.hotspot_y);
+                let (lx, ly) = (
+                    dx * self.cos + dy * self.sin + self.anchor.0,
+                    -dx * self.sin + dy * self.cos + self.anchor.1,
+                );
+                let source = &bitmap.image;
+                let mut sum = [0.0; 4];
+                for i in 0..self.taps {
+                    let t = i as f64 / self.taps.saturating_sub(1).max(1) as f64;
+                    let (tx, ty) = (lx + self.smear.0 * t, ly + self.smear.1 * t);
+                    if tx < -1.0 || ty < -1.0 || tx > p.width + 1.0 || ty > p.height + 1.0 {
+                        continue;
+                    }
+                    let sx = tx * f64::from(source.width()) / p.width - 0.5;
+                    let sy = ty * f64::from(source.height()) / p.height - 0.5;
+                    let (ix, iy) = (sx.floor(), sy.floor());
+                    let (fx, fy) = (sx - ix, sy - iy);
+                    for (x, y, weight) in [
+                        (ix, iy, (1.0 - fx) * (1.0 - fy)),
+                        (ix + 1.0, iy, fx * (1.0 - fy)),
+                        (ix, iy + 1.0, (1.0 - fx) * fy),
+                        (ix + 1.0, iy + 1.0, fx * fy),
+                    ] {
+                        if x < 0.0
+                            || y < 0.0
+                            || x >= f64::from(source.width())
+                            || y >= f64::from(source.height())
+                        {
+                            continue;
+                        }
+                        let pixel = source.get_pixel(x as u32, y as u32);
+                        for channel in 0..4 {
+                            sum[channel] += f64::from(pixel[channel]) * weight;
+                        }
+                    }
+                }
+                let sum = sum.map(|value| value / self.taps as f64);
+                let coverage = sum[3] / 255.0;
+                if coverage <= 0.002 {
+                    return base;
+                }
+                let color = if *shadow_only {
+                    [0.0; 3]
+                } else {
+                    [sum[0], sum[1], sum[2]]
+                        .map(|value| (value / coverage).round().clamp(0.0, 255.0) as f32)
+                };
+                continuous_over(base, color, (coverage * opacity) as f32)
+            }
+        }
+    }
+}
+
 /// Paints the media surface into a band of output rows.  Untransformed
 /// media takes an integer bilinear fast path away from the surface edge;
 /// the edge band and every projected pixel use the exact per-pixel path.
@@ -1742,6 +1978,74 @@ fn sample_fixed(image: &RgbaImage, x: Tap, y: Tap) -> [u8; 4] {
 }
 
 impl MediaPainter<'_> {
+    /// Reconstruct one continuous canvas position from the original source.
+    /// Unlike the raster pass, the lens never snaps its source weights to 8.8
+    /// or samples four already-reduced canvas pixels.
+    fn sample_continuous(
+        &self,
+        background: &RgbaImage,
+        p: [f32; 2],
+        axis: Option<(f64, f64, f64, f64)>,
+    ) -> [f32; 4] {
+        if self.source.width() == 0 || self.source.height() == 0 {
+            return super::loupe::sample(background, p);
+        }
+        let (px, py) = (f64::from(p[0]), f64::from(p[1]));
+        let (u, v) = axis.map_or_else(
+            || self.projection.unproject(px, py),
+            |(a, b, c, d)| (a * px + b, c * py + d),
+        );
+        if !(-0.05..=1.05).contains(&u) || !(-0.05..=1.05).contains(&v) {
+            return super::loupe::sample(background, p);
+        }
+        let ps = self.projection.pixel_size_at(px, py);
+        let media = self.geometry.media;
+        let band = self.geometry.radius + 2.0 * ps + 1.0;
+        let interior = axis.is_some()
+            && v * media.height > ps + 1.0
+            && v * media.height < media.height - band
+            && u * media.width > band
+            && u * media.width < media.width - band;
+        let coverage = if interior {
+            1.0
+        } else {
+            (0.5 - self.media_distance(u, v) / ps).clamp(0.0, 1.0)
+        };
+        if coverage <= 0.0 {
+            return super::loupe::sample(background, p);
+        }
+        let source_u = (self.left + u.clamp(0.0, 1.0) * self.visible_x)
+            .clamp(self.sample_bounds.0, self.sample_bounds.2);
+        let source_v = (self.top + v.clamp(0.0, 1.0) * self.visible_y)
+            .clamp(self.sample_bounds.1, self.sample_bounds.3);
+        let mut color = sample_bilinear(
+            self.source,
+            source_u * f64::from(self.source.width()) - 0.5,
+            source_v * f64::from(self.source.height()) - 0.5,
+        )
+        .map(f32::from);
+        if let Some(overlay) = self.overlay {
+            let annotation = sample_bilinear(
+                overlay,
+                source_u * f64::from(overlay.width()) - 0.5,
+                source_v * f64::from(overlay.height()) - 0.5,
+            );
+            color = continuous_over(
+                color,
+                [annotation[0], annotation[1], annotation[2]].map(f32::from),
+                f32::from(annotation[3]) / 255.0,
+            );
+        }
+        if coverage >= 1.0 && color[3] >= 255.0 {
+            return color;
+        }
+        continuous_over(
+            super::loupe::sample(background, p),
+            [color[0], color[1], color[2]],
+            coverage as f32 * color[3] / 255.0,
+        )
+    }
+
     fn media_distance(&self, u: f64, v: f64) -> f64 {
         self.geometry
             .surface_distance(u, v)
@@ -3907,6 +4211,234 @@ mod loupe_composition_tests {
     fn lens() -> LoupeFrame {
         LoupeFrame { center: NormalizedPoint { x:0.5,y:0.5 }, radius:0.35,
             magnification:2.0, bevel:0.2, chromatic_aberration:0.5, presence:1.0 }
+    }
+
+    #[test]
+    fn lens_preserves_native_one_pixel_strokes_and_glyphs_after_downscaling() {
+        let mut source = RgbaImage::from_pixel(1024, 512, Rgba([255, 255, 255, 255]));
+        // A one-pixel stripe chart beside tiny bitmap letters. A 4:1 canvas
+        // pass discards these strokes; a 4× lens must recover original pixels.
+        for y in 240..272 {
+            for x in 480..512 {
+                if x % 2 == 0 {
+                    source.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+                }
+            }
+        }
+        let glyphs = [
+            "1000101110",
+            "1000100100",
+            "1000100100",
+            "1111100100",
+            "1000100100",
+            "1000100100",
+            "1000101110",
+        ];
+        for (row, line) in glyphs.iter().enumerate() {
+            for (col, value) in line.bytes().enumerate() {
+                if value == b'1' {
+                    source.put_pixel(520 + col as u32, 248 + row as u32, Rgba([0, 0, 0, 255]));
+                }
+            }
+        }
+        for cropped in [false, true] {
+            let style = SceneStyle {
+                padding: 0,
+                corners: 0,
+                shadow: 0,
+                source_crop: if cropped {
+                    crate::CropRect {
+                        x: 0.25,
+                        y: 0.25,
+                        width: 0.5,
+                        height: 0.5,
+                    }
+                } else {
+                    crate::CropRect::UNIT
+                },
+                ..Default::default()
+            };
+            let scene = SceneCompositor::new(&style, 256, 128, 1024, 512).unwrap();
+            let frame = LoupeFrame {
+                magnification: if cropped { 2.0 } else { 4.0 },
+                bevel: 0.0,
+                chromatic_aberration: 0.0,
+                ..lens()
+            };
+            let input = FrameInput {
+                source: &source,
+                overlay: None,
+                viewport: ViewportFrame {
+                    loupe: Some(frame),
+                    ..Default::default()
+                },
+                pointer: None,
+                camera: None,
+            };
+            let sharp = scene.compose(input);
+            let mut reduced = scene.compose(FrameInput {
+                viewport: ViewportFrame::default(),
+                ..input
+            });
+            super::super::loupe::paint(&mut reduced, scene.loupe_geometry(input.viewport).unwrap());
+            let mut direct_error = 0u64;
+            let mut reduced_error = 0u64;
+            for y in 48..80 {
+                for x in 96..160 {
+                    let expected = source.get_pixel(384 + x, 192 + y)[0];
+                    direct_error += u64::from(sharp.get_pixel(x, y)[0].abs_diff(expected));
+                    reduced_error += u64::from(reduced.get_pixel(x, y)[0].abs_diff(expected));
+                }
+            }
+            assert!(
+                direct_error < 2048,
+                "native strokes softened with crop={cropped}: {direct_error}"
+            );
+            assert!(
+                reduced_error > 30 * 2048,
+                "fixture must detect the old reduced-canvas sampling"
+            );
+            eprintln!("native lens crop={cropped}: mean error {:.3}, reduced-canvas mean error {:.3}",
+                direct_error as f64 / 2048.0, reduced_error as f64 / 2048.0);
+            if let Some(directory) = std::env::var_os("LAHZA_SHARPNESS_ARTIFACTS") {
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&directory).unwrap();
+                source.save(directory.join("original-one-pixel-text.png")).unwrap();
+                sharp.save(directory.join(format!("native-loupe-crop-{cropped}.png"))).unwrap();
+                reduced.save(directory.join(format!("reduced-canvas-loupe-crop-{cropped}.png"))).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unit_lens_preserves_alpha_annotations_and_rotated_smeared_pointer() {
+        use crate::recording::pointer_timeline::PointerPressFrame;
+        let style = SceneStyle {
+            padding: 0,
+            corners: 0,
+            shadow: 0,
+            background: SceneBackground::Solid(0x204060),
+            pointer: PointerStyle {
+                family: CursorFamily::Recorded,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let scene = SceneCompositor::new(&style, 256, 160, 256, 160).unwrap();
+        let source = RgbaImage::from_fn(256, 160, |x, y| {
+            Rgba([x as u8, y as u8, 120, if x % 3 == 0 { 100 } else { 220 }])
+        });
+        let overlay = RgbaImage::from_fn(256, 160, |x, y| {
+            Rgba([230, 30, 120, if (x + y) % 3 == 0 { 150 } else { 0 }])
+        });
+        let bitmap = std::sync::Arc::new(PointerBitmap {
+            id: "lens-alpha-fixture".into(),
+            image: RgbaImage::from_pixel(12, 18, Rgba([100, 40, 20, 128])),
+            anchor: NormalizedPoint { x: 0.3, y: 0.2 },
+            reference_width: 0.08,
+            reference_height: 0.12,
+            shape: None,
+        });
+        let pointer = PointerOverlay {
+            frame: PointerFrame {
+                location: NormalizedPoint { x: 0.5, y: 0.5 },
+                artwork_id: None,
+                bitmap: Some(bitmap),
+                magnification: 1.0,
+                tilt_degrees: 23.0,
+                opacity: 0.7,
+                blur_radius: 0.0,
+                velocity: (0.9, 0.4),
+                press: Some(PointerPressFrame {
+                    location: NormalizedPoint { x: 0.5, y: 0.5 },
+                    progress: 0.3,
+                }),
+            },
+        };
+        let input = FrameInput {
+            source: &source,
+            overlay: Some(&overlay),
+            viewport: ViewportFrame::default(),
+            pointer: Some(&pointer),
+            camera: None,
+        };
+        let plain = scene.compose(input);
+        let optical = scene.compose(FrameInput {
+            viewport: ViewportFrame {
+                loupe: Some(LoupeFrame {
+                    magnification: 1.0,
+                    bevel: 0.0,
+                    chromatic_aberration: 0.0,
+                    ..lens()
+                }),
+                ..Default::default()
+            },
+            ..input
+        });
+        for y in 40..120 {
+            for x in 88..168 {
+                assert!(
+                    plain
+                        .get_pixel(x, y)
+                        .0
+                        .into_iter()
+                        .zip(optical.get_pixel(x, y).0)
+                        .all(|(a, b)| a.abs_diff(b) <= 1),
+                    "unit lens changed layered pixel({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual original-source lens performance regression; no capture devices"]
+    fn benchmark_original_source_lens() {
+        let source = RgbaImage::from_fn(3840, 2160, |x, y| {
+            Rgba([
+                ((x * 13 + y * 5) % 256) as u8,
+                ((x * 3 + y * 7) % 256) as u8,
+                ((x + y) % 256) as u8,
+                255,
+            ])
+        });
+        for (width, height) in [(1280, 720), (1600, 900)] {
+            let style = SceneStyle {
+                padding: 8,
+                shadow: 0,
+                background: SceneBackground::Solid(0x204060),
+                ..Default::default()
+            };
+            let scene = SceneCompositor::new(&style, width, height, 3840, 2160).unwrap();
+            let input = FrameInput {
+                source: &source,
+                overlay: None,
+                viewport: ViewportFrame {
+                    loupe: Some(LoupeFrame {
+                        magnification: 3.0,
+                        ..lens()
+                    }),
+                    ..Default::default()
+                },
+                pointer: None,
+                camera: None,
+            };
+            let _ = scene.compose(input);
+            let mut times = Vec::new();
+            for _ in 0..9 {
+                let start = std::time::Instant::now();
+                std::hint::black_box(scene.compose(input));
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "original source 3840×2160 lens to {width}×{height}: median={:.2}ms p95={:.2}ms",
+                times[4], times[8]
+            );
+            assert!(
+                times[4] < 250.0,
+                "lens composition must stay bounded for interactive previews"
+            );
+        }
     }
 
     #[test]

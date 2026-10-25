@@ -34,6 +34,7 @@ pub mod pointer_timeline;
 mod cursor_planner;
 pub mod presets;
 pub mod scene;
+pub(crate) mod screen_upscale;
 pub mod session;
 mod stream_geometry;
 pub mod templates;

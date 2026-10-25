@@ -36,6 +36,13 @@ struct Response {
     frame_rate: Option<f64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NativeRequestKey {
+    generation: u64,
+    source_revision: u64,
+    time_bits: u64,
+}
+
 #[derive(Default)]
 struct Worker {
     pending: Mutex<Option<Request>>,
@@ -137,6 +144,7 @@ pub(crate) struct TimelinePreviewState {
     last_request: Option<Instant>,
     deferred: Option<(f64, bool)>,
     defer_scheduled: bool,
+    native_request: Option<NativeRequestKey>,
     pub(crate) frame_rate: Option<f64>,
 }
 
@@ -171,6 +179,7 @@ impl Studio {
         self.timeline_preview.displayed_scrub = None;
         self.timeline_preview.deferred = None;
         self.timeline_preview.interactive_mode = None;
+        self.timeline_preview.native_request = None;
         self.timeline_preview.epoch = self.timeline_preview.epoch.wrapping_add(1);
         if let Some(worker) = &self.timeline_preview.worker {
             worker
@@ -221,6 +230,30 @@ impl Studio {
         self.seek_video_frame(self.video_position, cx);
     }
 
+    fn native_request_key(&self, time: f64) -> NativeRequestKey {
+        NativeRequestKey {
+            generation: self.video_playback_generation.load(Ordering::SeqCst),
+            source_revision: self.video_extras_token,
+            time_bits: time.to_bits(),
+        }
+    }
+
+    /// A quick play/pause can stop before the first native playback frame
+    /// replaces a scrub proxy. Promote once per source/time/generation. Keep
+    /// the attempted key after errors or gaps, so rendering cannot retry-loop.
+    pub(crate) fn promote_paused_video_frame(&mut self, cx: &mut Context<Self>) {
+        if self.video_project.is_none() || self.video_playing || self.video_window_capture
+            || self.video_seek_drag.is_some() || self.timeline_preview.requested_hover.is_some()
+            || self.video_frame_rgba.as_ref().is_none_or(|frame| frame.dimensions() == self.video_source_size)
+        {
+            return;
+        }
+        let key = self.native_request_key(self.video_position);
+        if self.timeline_preview.native_request != Some(key) {
+            self.queue_timeline_frame(self.video_position, false, cx);
+        }
+    }
+
     pub(crate) fn queue_timeline_frame(&mut self, time: f64, hover: bool, cx: &mut Context<Self>) {
         // Leave an in-flight seek enough time to display a frame while the
         // pointer keeps moving, and retain only the latest intermediate target.
@@ -252,6 +285,14 @@ impl Studio {
         let Some(path) = self.video_playback_path() else {
             return;
         };
+        // Opening a project or importing media defers thumbnail setup until
+        // render. That setup advances the shared source revision, so start it
+        // before capturing this seek's revision; otherwise the first native
+        // frame can be discarded and the low-resolution poster stays visible.
+        if self.video_extras_pending {
+            self.video_extras_pending = false;
+            self.spawn_video_extras(cx);
+        }
         // Pointer samples within one gesture may finish and display while a
         // newer target waits. A release, hover exit, or explicit seek starts
         // a new epoch, so none of the previous gesture's frames can land.
@@ -278,8 +319,11 @@ impl Studio {
         } else if hover || self.video_seek_drag.is_some() {
             (1280, 720)
         } else {
-            (2560, 1440)
+            // Explicit seeks and scrub release replace the interactive proxy
+            // with original pixels before evaluating any zoom or glass lens.
+            self.video_source_size
         };
+        self.timeline_preview.native_request = (!interactive).then(|| self.native_request_key(time));
         *worker.pending.lock().unwrap() = Some(Request {
             epoch: self.timeline_preview.epoch,
             generation: self.video_playback_generation.load(Ordering::SeqCst),

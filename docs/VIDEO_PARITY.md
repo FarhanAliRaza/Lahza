@@ -98,10 +98,29 @@
   separate disclosures. Automatic generation and new-region defaults are
   grouped in the overview; image-scene presets have their own section.
 - [x] Playback composition runs outside the UI thread with a single replaceable
-  waiting frame, preventing a backlog. Exact paused frames and export retain
-  the same optics; large CPU lens passes use at most four parallel workers.
+  waiting frame, preventing a backlog. Paused composition also runs off-thread
+  and rejects stale source, time, and scene results. Large CPU lens passes use
+  at most four parallel workers.
   Playback preview size is bounded to 1.44 million pixels while preserving
-  aspect ratio; paused preview and export use their requested full resolution.
+  aspect ratio; settled preview and export use their requested full resolution,
+  including the window's device scale for HiDPI previews.
+- [x] Native source detail survives playback, settled seeks, and export
+  preparation. Interactive scrubbing uses a temporary proxy. The lens
+  reprojects continuous samples into the original source, including bevel and
+  rim reflections, instead of enlarging a downsampled canvas. CPU/GPU raw-source
+  mapping preserves annotations, cursor artwork, alpha, and layer order.
+  Synthetic one-pixel text/stroke probes now have zero mean source error,
+  versus approximately 68.4/255 with the former reduced-canvas path.
+- [x] Bounded learned enhancement for enlarged source regions in settled
+  previews and export, with ordinary original-source fallback. It uses public
+  MIT Anime4K x2 S coefficients; 4× repeats the network with an attenuated
+  second pass. Final blending is capped at 85% for 2× and 65% for 4×.
+  Playback skips neural inference. GPU/independent CPU model
+  tests agree within 1/255 across full images, cropped regions, and tile seams.
+  This generic line-art model is not Screen Studio's UI-trained network;
+  exact visual parity and improved recognition of arbitrary text are unproven.
+  See [the clarity study](SCREEN_STUDIO_ANIMATION_STUDY.md#screen-super-resolution-and-source-clarity)
+  and [model provenance](../assets/upscaler/README.md).
 - [x] Per-region early animation (350 ms) and exact instant boundaries. The
   instant spring window extends 50 ms beyond the authored end to snap release;
   the visible zoom itself does not extend past the region.
@@ -236,3 +255,9 @@ implemented and a manual Swift-versus-Rust behavior pass has been recorded.
   camera layouts, and recording controls. Synthetic render/animation tests and
   a glass-lens gallery exercise the implementation; no macOS reference runtime
   or pixel-equivalence claim is made. See [the study](SCREEN_STUDIO_ANIMATION_STUDY.md).
+- 2026-10-25: the final default suite passed 421 tests, with 48 opt-in tests
+  ignored. Native UHD and camera/cursor/glass/export editor workflows separately
+  passed with process exit 0 after source-promotion and GPU-shutdown fixes. A 20-second
+  excerpt of the user's recording exported at 2580×1080/30 fps in 22.94 seconds
+  on RTX 3060 with NVENC. Its glass cue falls outside that excerpt, so this
+  does not measure real-recording glass-export performance.

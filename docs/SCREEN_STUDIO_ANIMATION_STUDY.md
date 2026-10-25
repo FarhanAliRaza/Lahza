@@ -227,6 +227,110 @@ layout/aspect/crop/focus controls and recording source/countdown/cancel flows.
 Linux portal and V4L2 capture are platform-native Lahza implementations; the
 macOS capture subsystem was not transplanted.
 
+## Screen super-resolution and source clarity
+
+The shipped renderer includes a screen-specific neural upscaler, beyond ordinary
+texture interpolation. This is a static observation of this exact version;
+we have not measured its runtime output on macOS. A focused REA analysis parsed
+both original modules without executing them: parent
+`ev_e059709b40e204865928acaf5247b8ac4eef4cefa3b003c8cc8936e0f68f8280`,
+summary `ev_70a28d683b7cc8303645095741d79d7e38aede49a672e26f635423cf417a5c9b`.
+The complete ledger is `ignore/screenstudio-4.1.0-upscaler-evidence.json`.
+Its semantic graph is partial; the following conclusions also use manual
+tracing of statically decoded string lookups and the original source bytes.
+
+- `B39sgn5K.js` `[641788,644569)` selects `screen-M` for 2× and
+  `screen-M-x4` for 4× under its default `quality` method. The alternate `fast`
+  method selects `screen-S` variants. Strength begins above 1.02 output pixels
+  per source pixel and reaches full magnification strength at 1.2. Motion
+  attenuates the effect between 4 and 28 device pixels; drawn blur trails
+  attenuate it between 4 and 8. Strength is quantized in sixteenths.
+- `[644569,650018)` plans only the visible source region, creates a WebGPU
+  compute pass and dispatches the selected network. It selects 4× when demand
+  is at least 2.5× and the result fits its limits; otherwise it tries 2×.
+  The limits are 24,000,000 output pixels and 8192 pixels per side. Insufficient
+  resources or a failed pass fall back to ordinary video.
+- This is connected to **screen video**, not merely small icons:
+  `superResolutionAt` `[721334,722705)` uses `screenVideoPixelSize`, screen
+  geometry and magnification. The footage reader `[650441,658080)` blends
+  the enhanced result with the normal sample when strength is at least 0.2
+  and the footprint is magnified (`videoLod < 0.05`). Classic-screen and
+  loupe presence supply separate strength gates.
+- Quality modes matter. `[351393,352109)` enables this feature for `export`
+  and `paused-high`, and disables it for `playing` and `paused-low`.
+  `[361011,361275)` resolves the current mode from export/playing state.
+  This version's inspected path therefore does **not** establish that neural
+  enhancement runs continuously during ordinary editor playback.
+- `vPAFtiYS.js` SHA-256
+  `49c7d884f9d823eee1f39da5a471d97fb92b08aaf5bc329e6cdebd826e5f084a`
+  contains the embedded screen network definition at `[608046,661681)` and
+  the network validator/registry at `[860411,863039)`. The latter describes
+  a convolution chain and luma-residual depth-to-space output; stock Anime4K
+  and custom screen networks are distinct entries. `[878242,882387)` implements
+  the compute backend and chooses `f16` when `shader-f16` is available, otherwise
+  `f32`. No Screen Studio weights or vendor implementation were copied into Lahza.
+- Ordinary sampling remains separate: the shared sampler near byte 216324
+  uses linear minification, magnification and mip filtering, with anisotropy 4.
+  A bicubic processor is registered near byte 431523, but that registration
+  alone does not show it is the active screen-zoom filter. This investigation
+  did not establish a Lanczos or MetalFX screen-zoom path. CoreML strings exist
+  in the native helper; their presence does not attribute the traced WebGPU
+  upscaler to CoreML, or establish the native helper's role in this feature.
+
+Lahza now preserves original recording pixels through playback decoding,
+settled seeks, and export preparation. Interactive timeline scrubbing can use
+a 1280×720 proxy; release requests native dimensions. Output preview budgets
+are independent of source decoding. HiDPI composition uses the window's device
+scale instead of treating logical UI points as output pixels.
+
+The glass lens now reprojects each continuous canvas sample into the original
+source, including the bevel and reflected rim. It no longer magnifies a
+previously downsampled scene raster. Source annotations and reconstructed
+cursor artwork use the same coordinates; camera, canvas annotations, and
+watermarks retain their compositing order. The CPU and Vulkan paths share this
+mapping without allocating a full-resolution enlarged canvas. This fixes an
+observed loss of native one-pixel text and strokes before any learned
+enhancement is involved.
+
+Settled previews and export additionally use a bounded Vulkan neural stage
+when the projected source is enlarged. Lahza bundles the public MIT-licensed
+**Anime4K v3.2 Upscale CNN x2 S** model; 4× output applies its 2× network twice,
+with the second pass's learned residual attenuated to 20% to reduce ringing
+on small text. This is a generic animation/line-art model, **not Screen
+Studio's UI-trained screen network**, and its weights are unchanged. Model
+provenance, the license, and the independent compute-port details are in
+[`assets/upscaler/README.md`](../assets/upscaler/README.md).
+
+Only the required source region is enhanced. Output is limited to 24 million
+pixels and 8192 pixels per side; 4× falls back to 2× when needed, then to
+ordinary original-source sampling if neither fits. Strength ramps between
+1.02× and 1.2× projected demand, capped at an 85% blend for 2× and 65% for 4×,
+with a separate local gate for ordinary media and glass samples. These blend
+caps also limit changes to small glyphs; the second 4× pass retains its separate
+20% residual attenuation. This independent policy does not reproduce the reference's
+motion attenuation or screen-specific quality models. Enhancement changes
+source RGB beneath annotations and preserves source alpha. Playback uses
+the shared GPU compositor with original-source sampling and no neural
+inference; paused rendering also runs asynchronously. Export shares this
+renderer and enables the high-quality neural path. Unsupported hardware,
+model failure, or GPU failure retains the original-source CPU path. A learned
+filter can change glyph shapes; it is not proof of recovered ground-truth
+detail or a measured match to Screen Studio output.
+
+Opening a recording now promotes its poster to a native frame automatically.
+Starting thumbnail work before capturing a seek's source revision prevents the
+first native seek from being silently discarded. A bounded promotion request
+also replaces a scrub proxy after a rapid play/pause; failed decodes and empty
+timeline regions cannot cause repeated requests. Hover and scrub proxies never
+trigger learned enhancement.
+
+The application retains one shared GPU renderer across projects. On quit, an
+unconditional application callback stops and joins preview workers, including
+workers from closed projects, then destroys the shared GPU synchronously.
+Ordinary project closure remains nonblocking. This fixes a reproduced NVIDIA
+shutdown crash where a detached preview worker destroyed its Vulkan device
+after process-level graphics finalization had begun.
+
 ## Changes implemented in Lahza
 
 - The cursor now uses an independent pixel-space path planner with 1 ms
@@ -274,10 +378,15 @@ macOS capture subsystem was not transplanted.
 - Playback composition uses a background worker with one active frame and one
   replaceable waiting frame. Newer requests replace waiting work; pause, seek,
   project changes, and incompatible scene changes invalidate old results.
-  Paused frames retain exact synchronous composition. Lens shading caches
+  Paused frames also compose off the UI thread and accept only the exact
+  requested frame, source, and scene key. Lens shading caches
   frame constants, skips inactive optical terms, and divides large CPU passes
   across at most four workers. Playback previews preserve aspect ratio within
-  a 1.44-million-pixel budget; paused editing and export retain full resolution.
+  a 1.44-million-pixel budget. Paused editing and export do not apply this
+  output-canvas budget. Playback, settled preview, and export retain native
+  decoded source dimensions; only interactive timeline scrubbing uses a
+  temporary source proxy. See the clarity section above for the separate
+  high-quality neural path and its limits.
 - Each region can start its animation 350 ms early, provided another active
   region does not take priority. This per-region scope is retained in Lahza;
   the reference inspector changes a project-wide option. Instant regions use exact source-time entry
@@ -322,7 +431,63 @@ Additional application workflow tests exercise editor controls, save/reopen,
 preview, and encoded exports. Test outcomes should be read alongside the final
 integration run; they do not establish behavior of every physical input device.
 
-Final integration validation on 2026-10-25:
+Source-clarity validation on 2026-10-25:
+
+- The final default workspace suite passed **421 tests**, with 48 opt-in
+  display/device/benchmark tests ignored. Both native editor workflows were
+  also run separately and exited 0 after the source-promotion and shutdown fixes.
+- The camera/cursor/glass/save/reopen/export workflow passed on RTX 3060.
+  Its 20 samples showed advancing preview timestamps, maximum lag was 133 ms,
+  and the encoded hold frame differed from the composed preview by mean RGB
+  channel error 4.013/255, including H.264 loss.
+- A 1024×512 one-pixel stripe and bitmap-glyph fixture rendered to a 256×128
+  canvas retains the exact source pixels inside the lens: mean channel error
+  **0.000/255**, both with a full source at 4× and a cropped source at 2×.
+  The previous reduced-canvas sampling path measured **68.400/255** and
+  **68.398/255** on the same probes. These compare known synthetic source
+  pixels, not the reference application's output. Inspected images are in
+  `/tmp/screenstudio-analysis/sharpness/`.
+- The lens test group passed 15 tests with four opt-in cases skipped. The
+  main WGSL validation and explicit hardware Vulkan/CPU lens comparison also
+  passed. A separate 1× lens test preserves transparency, media annotations,
+  rotated/smeared cursor artwork, and click effects within 1/255.
+- Native 3840×2160 video fixtures check decode, settled seek, playback, and
+  export preparation; odd-size sources keep their edge pixels. A nine-frame
+  FFV1 fixture decoded at 30 fps after 305 ms startup, taking 266 ms for
+  267 ms of media. This measures decoding, not complete glass playback.
+- The native UHD editor workflow passed on RTX 3060, including normal-open
+  promotion, an immediate seek before the first render, a hover-proxy →
+  play/pause transition, Classic/Glass playback, and settled Glass rendering.
+  All 20 UI samples advanced; 50 ms timer wakes measured 133.23 ms p95 and
+  139.54 ms maximum, with at most 300 ms preview lag. Settled Glass completed
+  in 137.45 ms. The process exited 0 after synchronous GPU cleanup; the same
+  regression previously exited 139 during detached-worker device destruction.
+  These synthetic FFV1 development-build measurements are not a universal
+  frame-rate guarantee. Artifacts: `/tmp/lahza-clarity-ui/artifacts/uhd-5dfb828a-b848-4a65-b9c2-b398670eccce/`.
+- Preview error injection verifies both an unsuccessful render and a compositor
+  panic report once, release the active slot, stop polling, and recover after
+  a new frame request. The regression passed; displayed frames are retained
+  across scene edits while stale worker completions remain rejected.
+- Full CPU scene composition with a 3840×2160 source and 3× lens measured
+  median/p95 **25.56/28.85 ms** at 1280×720 output and **39.66/47.48 ms** at
+  1600×900 output. These development-build timings exclude decoding, GPU
+  presentation, and neural inference; they are not a UHD playback guarantee.
+- The four neural unit tests and explicit hardware 2×/4× tests passed.
+  Full-frame and cropped output across tile seams match an independent
+  whole-frame CPU convolution oracle within 1/255, including the small-text
+  fixture. This establishes implementation agreement, not text-recognition
+  accuracy or superiority to the original source.
+- On the RTX 3060, neural command encoding plus GPU completion measured
+  median **0.62 ms** for a 480×270 region at 2×, **1.81 ms** for 960×540 at 2×,
+  **2.43 ms** for 480×270 at 4×, and **6.29 ms** for 1920×1080 at 2×.
+  These inference-only measurements exclude source upload, scene composition,
+  readback, and video encoding.
+- A 20-second excerpt of the user's recording exported at **2580×1080,
+  30 fps in 22.94 seconds** using the RTX 3060 compositor and NVENC. Its authored
+  glass cue begins after the tested excerpt, so this is a real-recording
+  decode/composition/encoding measurement, **not a real glass-export benchmark**.
+
+Earlier workflow validation on 2026-10-25, before the source-clarity changes:
 
 - `cargo test --workspace`: 405 tests passed, 42 opt-in display/device/benchmark
   tests ignored. The separate X11 editor workflow and hardware Vulkan glass
@@ -352,9 +517,11 @@ Final integration validation on 2026-10-25:
   not a frame-rate guarantee for every machine. Optimized optical output
   differs from the previous equations by at most 1/255 per color channel;
   the hardware Vulkan/CPU glass comparison also passes.
-- Concurrent exports exposed a Vulkan loader crash. GPU exports now acquire a
-  nonblocking lease through context teardown; another export uses the CPU
-  renderer immediately. The default parallel suite passed after this fix.
+- Concurrent exports exposed a Vulkan loader crash. A context-lifetime lease
+  guards hardware initialization. Preview workers and exports now share a
+  serialized renderer, avoiding an idle preview context forcing export onto
+  the CPU; independent context attempts still fall back without blocking.
+  A lost device is quarantined and its failed frame is rendered on the CPU.
 - Synthetic review artifacts are under `/tmp/screenstudio-analysis/workflow/`,
   including the editor panels, recorder, camera layout variants,
   `hold-preview.png`, `hold-export.png`, and `studio-workflow.mp4`.

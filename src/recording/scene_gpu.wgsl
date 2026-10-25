@@ -6,6 +6,7 @@ struct Draw {
 struct Params {
     canvas: vec4<u32>, images: array<vec4<u32>, 8>, inverse: array<vec4<f32>, 3>,
     viewport: vec4<f32>, loupe_shape: vec4<f32>, loupe_optics: vec4<f32>,
+    enhanced_rect: vec4<f32>, enhanced_info: vec4<f32>,
     sample_bounds: vec4<f32>, geometry: vec4<f32>,
     projection: vec4<f32>, media_bounds: vec4<u32>, camera_rect: vec4<f32>, camera_info: vec4<f32>, camera_crop: vec4<f32>,
     draws: array<Draw, 4>,
@@ -13,6 +14,7 @@ struct Params {
 var<storage, read> b_params: Params;
 var<storage, read> b_background: array<u32>;
 var<storage, read> b_source: array<u32>;
+var<storage, read> b_enhanced: array<u32>;
 var<storage, read> b_overlay: array<u32>;
 var<storage, read> b_camera: array<u32>;
 var<storage, read> b_cursor: array<u32>;
@@ -68,7 +70,32 @@ fn rounded_distance(local: vec2<f32>, size: vec2<f32>, radius: f32) -> f32 {
     let d = abs(local - size * 0.5) - (size * 0.5 - vec2<f32>(r));
     return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
 }
-fn media(dst: vec4<f32>, position: vec2<u32>, p: vec2<f32>) -> vec4<f32> {
+// Keep source reconstruction separate from layer composition so enhanced
+// source regions can use the same normalized coordinates later.
+fn media_source(source_uv: vec2<f32>, fixed: bool, demand: f32) -> vec4<f32> {
+    let source_point = source_uv * vec2<f32>(b_params.images[1].xy);
+    let base = sample_image(1u, source_point - vec2<f32>(0.5), fixed);
+    let info = b_params.enhanced_info;
+    if info.w <= 0.0 || demand <= 0.0 { return base; }
+    let region = b_params.enhanced_rect;
+    let local = source_point - region.xy;
+    if any(local < vec2<f32>(0.0)) || any(local >= region.zw) { return base; }
+    let size = vec2<u32>(info.xy);
+    let p = clamp(local * info.z - vec2<f32>(0.5), vec2<f32>(0.0), info.xy - vec2<f32>(1.0));
+    let lo = vec2<u32>(floor(p));
+    let hi = min(lo + vec2<u32>(1u), size - vec2<u32>(1u));
+    let f = p - vec2<f32>(lo);
+    let enhanced = mix(mix(unpack(b_enhanced[lo.y * size.x + lo.x]), unpack(b_enhanced[lo.y * size.x + hi.x]), f.x),
+        mix(unpack(b_enhanced[hi.y * size.x + lo.x]), unpack(b_enhanced[hi.y * size.x + hi.x]), f.x), f.y);
+    // Blend away from an interior ROI boundary; original image edges have
+    // the network's clamped context and need no artificial border fade.
+    let near = select(clamp(local / 4.0, vec2<f32>(0.0), vec2<f32>(1.0)), vec2<f32>(1.0), region.xy == vec2<f32>(0.0));
+    let far = select(clamp((region.zw - local) / 4.0, vec2<f32>(0.0), vec2<f32>(1.0)), vec2<f32>(1.0),
+        region.xy + region.zw >= vec2<f32>(b_params.images[1].xy));
+    let strength = min(info.w, demand) * min(min(near.x, near.y), min(far.x, far.y));
+    return vec4<f32>(mix(base.xyz, enhanced.xyz, strength), base.w);
+}
+fn media(dst: vec4<f32>, position: vec2<u32>, p: vec2<f32>, continuous: bool) -> vec4<f32> {
     if b_params.images[1].z == 0u { return dst; }
     if any(position < b_params.media_bounds.xy) || any(position >= b_params.media_bounds.zw) { return dst; }
     let uv = unproject(p);
@@ -81,11 +108,14 @@ fn media(dst: vec4<f32>, position: vec2<u32>, p: vec2<f32>) -> vec4<f32> {
     let coverage = clamp(0.5 - distance / ps, 0.0, 1.0);
     if coverage <= 0.0 { return dst; }
     let band = b_params.geometry.z + 2.0 * ps + 1.0;
-    let fixed = b_params.projection.z > 0.0 && uv.y * size.y > ps + 1.0
+    let fixed = !continuous && b_params.projection.z > 0.0 && uv.y * size.y > ps + 1.0
         && uv.y * size.y + title < surface_size.y - band && uv.x * size.x > band && uv.x * size.x < size.x - band;
     let source_uv = clamp(b_params.viewport.xy + clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * b_params.viewport.zw,
         b_params.sample_bounds.xy, b_params.sample_bounds.zw);
-    var s = sample_image(1u, source_uv * vec2<f32>(b_params.images[1].xy) - vec2<f32>(0.5), fixed);
+    let density = size / (vec2<f32>(b_params.images[1].xy) * b_params.viewport.zw * ps);
+    let magnification = select(1.0, b_params.loupe_shape.w, continuous);
+    let demand = clamp((max(density.x, density.y) * magnification - 1.02) / 0.18, 0.0, 1.0);
+    var s = media_source(source_uv, fixed, demand);
     if b_params.images[2].z != 0u {
         let annotation = sample_image(2u, source_uv * vec2<f32>(b_params.images[2].xy) - vec2<f32>(0.5), fixed);
         s = over(s, annotation.xyz, annotation.w / 255.0);
@@ -132,14 +162,13 @@ fn pointer(dst: vec4<f32>, d: Draw, p: vec2<f32>) -> vec4<f32> {
     let color = select(quantize(sum / coverage).xyz, vec3<f32>(0.0), d.kind.z != 0.0);
     return over(dst, color, coverage * d.kind.y);
 }
-// Recompose a screen pixel without overlays above the glass. Bilinear taps
-// below reproduce sampling the immutable CPU screen pass, including pointer.
+// Ordinary canvas pixels keep the original rasterization and rounding.
 fn screen_pixel(position: vec2<u32>) -> vec4<f32> {
     let index = position.y * b_params.canvas.x + position.x;
     let p = vec2<f32>(position) + vec2<f32>(0.5);
     var color = unpack(b_background[index]);
     if b_params.canvas.z != 0u {
-        color = media(color, position, p);
+        color = media(color, position, p, false);
         for (var i = 0u; i < b_params.canvas.w; i++) { color = pointer(color, b_params.draws[i], p); }
     }
     return color;
@@ -149,8 +178,21 @@ fn screen_sample(point: vec2<f32>) -> vec4<f32> {
     let lo = vec2<u32>(floor(p));
     let hi = min(lo + vec2<u32>(1u), b_params.canvas.xy - vec2<u32>(1u));
     let f = p - vec2<f32>(lo);
-    return mix(mix(screen_pixel(lo), screen_pixel(vec2<u32>(hi.x, lo.y)), f.x),
-        mix(screen_pixel(vec2<u32>(lo.x, hi.y)), screen_pixel(hi), f.x), f.y);
+    // Only the card/background is sampled from canvas pixels. Reproject the
+    // precise lens coordinate into original media and cursor artwork so a
+    // small preview cannot discard text detail before magnification.
+    var color = mix(mix(unpack(b_background[lo.y * b_params.canvas.x + lo.x]),
+        unpack(b_background[lo.y * b_params.canvas.x + hi.x]), f.x),
+        mix(unpack(b_background[hi.y * b_params.canvas.x + lo.x]),
+        unpack(b_background[hi.y * b_params.canvas.x + hi.x]), f.x), f.y);
+    let canvas_point = p + vec2<f32>(0.5);
+    if b_params.canvas.z != 0u {
+        color = media(color, vec2<u32>(floor(canvas_point)), canvas_point, true);
+        for (var i = 0u; i < b_params.canvas.w; i++) {
+            color = pointer(color, b_params.draws[i], canvas_point);
+        }
+    }
+    return color;
 }
 fn loupe(base: vec4<f32>, p: vec2<f32>) -> vec4<f32> {
     let shape = b_params.loupe_shape;
@@ -164,7 +206,7 @@ fn loupe(base: vec4<f32>, p: vec2<f32>) -> vec4<f32> {
     let inner_radius = min(min(1.0 - max(optics.x, 0.001), 0.965) * radius, radius - 0.5);
     let interior = inner_radius >= 0.0 && distance_squared <= inner_radius * inner_radius;
     // Most lens pixels have no bevel, reflection, dispersion, or rim light.
-    // Recompose four bilinear taps once, rather than four sets of four taps.
+    // One continuous scene query is enough for the unbent interior.
     if interior && optics.z >= 1.0 {
         return quantize(screen_sample(shape.xy + delta * (1.0 / shape.w)));
     }

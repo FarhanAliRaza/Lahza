@@ -454,10 +454,11 @@ fn prepare_source(
         } => {
             let info = probe_media(&media)?;
             let clips = clips.normalized(info.duration);
-            let (width, height) = if request.style.source_crop != crate::CropRect::UNIT {
-                (info.width, info.height)
-            } else { (info.width.min(2560), info.height.min(1600)) };
-            let stream = VideoFrameStream::open_timeline(&media, &clips, width, height, frame_rate)?;
+            // Output size belongs to the compositor. Decode the full source
+            // so zoomed regions can use its detail even in a smaller export.
+            let stream = VideoFrameStream::open_timeline(
+                &media, &clips, info.width, info.height, frame_rate,
+            )?;
             let initial_size = if info.window_capture {
                 let frame = super::video::decode_frame(&media, clips.segments.first().map_or(0.0, |clip| clip.source_start), info.width, info.height)?;
                 (frame.width, frame.height)
@@ -673,7 +674,7 @@ fn encode(
             )
         });
 
-    let mut renderer = super::scene::gpu::Renderer::new();
+    let mut renderer = super::scene::gpu::Renderer::shared();
     progress.set_compositor_label(renderer.label());
 
     let audio = match prepared {
@@ -1072,6 +1073,92 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn uhd_source_detail_survives_preview_and_export_preparation() {
+        use super::super::{clips::RecordingClipSegment, playback::TimelinePlaybackStream, video};
+        if !ffmpeg_available() { return; }
+        let root = test_root("native-detail");
+        let still = root.join("fine-lines.png");
+        let media = root.join("screen.mkv");
+        let (width, height) = (3840, 2160);
+        // Single-pixel stems disappear if the source is reduced before zoom.
+        // Keep the rest uniform so this fixture encodes quickly and losslessly.
+        let source = RgbaImage::from_fn(width, height, |x, y| {
+            if (1500..1756).contains(&x) && (900..1028).contains(&y) {
+                let level = if (x + y / 16) % 2 == 0 { 255 } else { 0 };
+                Rgba([level, level, level, 255])
+            } else {
+                Rgba([23, 47, 83, 255])
+            }
+        });
+        source.save(&still).unwrap();
+        let encoded = Command::new("ffmpeg")
+            .args(["-v", "error", "-loop", "1", "-framerate", "30", "-i"])
+            .arg(&still)
+            .args(["-frames:v", "9", "-c:v", "ffv1", "-level", "3", "-pix_fmt", "bgra", "-threads", "2", "-y"])
+            .arg(&media).output().unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+        let info = probe_media(&media).unwrap();
+        assert!(!info.window_capture, "exercise ordinary monitor/imported video, not the window exemption");
+        assert_eq!((info.width, info.height), (width, height));
+        let assert_detail = |frame: &video::DecodedFrame| {
+            assert_eq!((frame.width, frame.height), (width, height));
+            for y in 910..930 {
+                for x in 1510..1740 {
+                    let offset = ((y * width + x) * 4) as usize;
+                    assert_eq!(&frame.rgba[offset..offset + 4], &source.get_pixel(x, y).0,
+                        "source pixel {x},{y} changed before composition");
+                }
+            }
+        };
+        assert_detail(&video::decode_frame(&media, 0.1, width, height).unwrap());
+
+        // The paused decoder must replace a lightweight scrub frame with
+        // original detail when the settled request asks for native dimensions.
+        let mut proxy = crate::timeline_preview::PreviewDecoder::open(media.clone(), (1280, 720)).unwrap();
+        let frame = proxy.frame(0.1, &|| false).unwrap();
+        assert_eq!((frame.width, frame.height), (1280, 720));
+        drop(frame);
+        drop(proxy);
+        let mut paused = crate::timeline_preview::PreviewDecoder::open(media.clone(), (width, height)).unwrap();
+        assert_detail(&paused.frame(0.1, &|| false).unwrap());
+        drop(paused);
+
+        // Both direct and edited exports must keep UHD source detail even
+        // when the selected output canvas is only 1080p.
+        for clips in [
+            RecordingClipTimeline::full(info.duration),
+            RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.05, 0.25)]),
+        ] {
+            let request = SceneExportRequest::new(root.join("output.mp4"), ExportFormat::Mp4,
+                1080, SceneStyle::default(), ViewportTimeline::default(), clips.duration());
+            let mut prepared = prepare_source(SceneSource::Video {
+                media: media.clone(), clips, pointer: None, camera: None,
+            }, &request, 30.0).unwrap();
+            assert_eq!(prepared.dimensions(), (width, height));
+            let PreparedSource::Video { stream, .. } = &mut prepared else { unreachable!() };
+            assert_detail(&stream.next_frame().unwrap().unwrap());
+            prepared.cleanup();
+        }
+
+        // Exercise real-time native decoding without any camera or capture
+        // device. Timings are diagnostic; correctness is independent of load.
+        let mut playback = TimelinePlaybackStream::open(&media,
+            RecordingClipTimeline::full(info.duration), 0.0, width, height, true).unwrap();
+        let started = Instant::now();
+        let mut arrivals = Vec::new();
+        while let Some(frame) = playback.next_frame(|| started.elapsed() > Duration::from_secs(10)).unwrap() {
+            assert_detail(&frame);
+            arrivals.push(started.elapsed().as_secs_f64());
+        }
+        playback.stop();
+        assert!(arrivals.len() >= 8, "native playback must decode the complete fixture");
+        let steady = arrivals.last().unwrap() - arrivals.first().unwrap();
+        eprintln!("UHD native decode: {} frames, startup {:.3}s, steady {:.3}s for {:.3}s of media",
+            arrivals.len(), arrivals[0], steady, (arrivals.len() - 1) as f64 / 30.0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

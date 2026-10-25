@@ -206,6 +206,307 @@ fn save_display(path: &Path, compact: bool) {
     );
 }
 
+async fn uhd_wait_for_settled_preview(
+    handle: WindowHandle<Studio>,
+    time: f64,
+    glass: bool,
+    cx: &mut gpui::AsyncApp,
+) -> (Duration, Vec<Duration>) {
+    let started = std::time::Instant::now();
+    let mut wakes = Vec::new();
+    loop {
+        let scheduled = std::time::Instant::now();
+        Timer::after(Duration::from_millis(50)).await;
+        wakes.push(scheduled.elapsed());
+        let ready = handle
+            .update(cx, |studio, _, _| {
+                assert!(!studio.video_playing);
+                let generation = studio
+                    .video_playback_generation
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                studio.preview_cache.frame.as_ref().is_some_and(|(key, _)| {
+                    key.high_quality
+                        && key.generation == generation
+                        && key.time().to_bits() == time.to_bits()
+                        && key.source_size == (3840, 2160)
+                        && key.viewport.loupe.is_some() == glass
+                        && (glass || key.viewport.magnification > 1.1)
+                        && studio.video_frame_rgba.as_ref().is_some_and(|frame| {
+                            frame.dimensions() == (3840, 2160)
+                                && key.source == Arc::as_ptr(frame) as usize
+                        })
+                })
+            })
+            .unwrap();
+        if ready {
+            return (started.elapsed(), wakes);
+        }
+        if started.elapsed() >= Duration::from_secs(20) {
+            let status = handle.update(cx, |studio, window, _| {
+                format!("active={}, position={}, source={:?}, generation={}, presented={:?}, expected_viewport={:?}, toast_present={}",
+                    window.is_window_active(), studio.video_position,
+                    studio.video_frame_rgba.as_ref().map(|frame| frame.dimensions()),
+                    studio.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst),
+                    studio.preview_cache.frame.as_ref().map(|(key, _)| (
+                        key.time(), key.source_size, key.canvas, key.generation,
+                        key.high_quality, key.viewport.magnification, key.viewport.loupe.is_some(),
+                        studio.video_frame_rgba.as_ref().is_some_and(|source| key.source == Arc::as_ptr(source) as usize),
+                    )),
+                    studio.video_viewport_timeline.frame_at(time), studio.toast.is_some())
+            }).unwrap();
+            panic!("native settled preview at {time}s (glass={glass}) did not complete: {status}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an isolated X11 process, FFmpeg and graphics driver; synthetic UHD media only"]
+fn studio_uhd_zoom_playback_and_settled_preview_remain_responsive() {
+    let artifacts = artifact_directory().join(format!("uhd-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&artifacts).unwrap();
+    // This ignored workflow runs in its own process. Keep settings, recent
+    // projects and library discovery away from the user's configuration.
+    let environment = [
+        ("LAHZA_CONFIG_DIR", artifacts.join("settings")),
+        ("LAHZA_RECORDINGS_DIR", artifacts.join("recordings")),
+        ("XDG_CONFIG_HOME", artifacts.join("xdg-config")),
+    ];
+    let previous: Vec<_> = environment
+        .iter()
+        .map(|(name, _)| (*name, std::env::var_os(name)))
+        .collect();
+    for (name, directory) in &environment {
+        std::fs::create_dir_all(directory).unwrap();
+        std::env::set_var(name, directory);
+    }
+    std::fs::write(
+        artifacts.join("xdg-config/user-dirs.dirs"),
+        format!(
+            "XDG_PICTURES_DIR=\"{}\"\n",
+            artifacts.join("pictures").display()
+        ),
+    )
+    .unwrap();
+
+    let session = RecordingSession {
+        directory: artifacts.join("native-uhd.lahzarec"),
+    };
+    std::fs::create_dir_all(&session.directory).unwrap();
+    let still = artifacts.join("fine-detail.png");
+    image::RgbaImage::from_fn(3840, 2160, |x, y| {
+        let stripe = (x / 3 + y / 24) % 2 == 0;
+        if (900..2940).contains(&x) && (500..1660).contains(&y) {
+            image::Rgba(if stripe {
+                [238, 242, 250, 255]
+            } else {
+                [24, 39, 65, 255]
+            })
+        } else {
+            image::Rgba([32 + (x % 71) as u8, 80 + (y % 81) as u8, 180, 255])
+        }
+    })
+    .save(&still)
+    .unwrap();
+    let encoded = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-loop", "1", "-framerate", "30", "-i"])
+        .arg(&still)
+        // RGB FFV1 in a recording bundle marks a native window recording.
+        // YUV444 exercises the ordinary screen path and its former decode cap.
+        .args([
+            "-frames:v",
+            "90",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "yuv444p",
+            "-threads",
+            "2",
+            "-y",
+        ])
+        .arg(session.screen_path())
+        .output()
+        .unwrap();
+    assert!(
+        encoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encoded.stderr)
+    );
+    assert!(!probe_media(&session.screen_path()).unwrap().window_capture);
+    session
+        .write_manifest(&CaptureManifest {
+            duration: 3.0,
+            pixel_width: 3840,
+            pixel_height: 2160,
+            includes_camera: false,
+            pointer_synthesized: false,
+            ..Default::default()
+        })
+        .unwrap();
+    session
+        .write_pointer_capture(&PointerCaptureFile::default())
+        .unwrap();
+    let mut classic =
+        recording::viewport::ZoomCue::pinned(0.0, 1.35, 2.2, NormalizedPoint { x: 0.5, y: 0.5 });
+    classic.skips_easing = true;
+    let mut glass =
+        recording::viewport::ZoomCue::pinned(1.4, 3.0, 2.5, NormalizedPoint { x: 0.5, y: 0.5 });
+    glass.presentation = ZoomPresentation::GlassLoupe;
+    glass.skips_easing = true;
+    session
+        .write_edit_field("zoomCues", &vec![classic, glass])
+        .unwrap();
+    let project = session.directory.clone();
+    let screenshots = artifacts.clone();
+    Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+        let handle = open_studio_window(cx, true, |handle, cx| {
+            cx.new(|cx| Studio::new(handle, None, None, cx))
+        }).unwrap();
+        handle.update(cx, |studio, window, cx| {
+            studio.launcher_window = false;
+            studio.load_generation = studio.load_generation.wrapping_add(1);
+            studio.loading = None;
+            studio.open_video_project(project.clone()).unwrap();
+            studio.launcher_active = false;
+            studio.record_camera = false;
+            studio.record_microphone = false;
+            studio.record_system_audio = false;
+            studio.video_audio_muted = true;
+            studio.select_inspector_tab(shell_ui::InspectorTab::Motion);
+            window.activate_window();
+            window.refresh();
+            cx.notify();
+        }).unwrap();
+        cx.activate(true);
+        cx.spawn(async move |cx| {
+            // Normal opening must replace its poster without any seek action.
+            let (normal_open_hq, _) = uhd_wait_for_settled_preview(handle, 0.0, false, cx).await;
+            handle.update(cx, |studio, _, cx| {
+                studio.update_timeline_skim(Some(0.4), cx);
+                cx.notify();
+            }).unwrap();
+            let proxy_started = std::time::Instant::now();
+            loop {
+                Timer::after(Duration::from_millis(50)).await;
+                let proxy_ready = handle.update(cx, |studio, _, _| {
+                    studio.preview_cache.frame.as_ref().is_some_and(|(key, _)| {
+                        key.source_size == (1280, 720) && !key.high_quality
+                            && studio.video_frame_rgba.as_ref().is_some_and(|frame| frame.dimensions() == (1280, 720))
+                    })
+                }).unwrap();
+                if proxy_ready { break; }
+                assert!(proxy_started.elapsed() < Duration::from_secs(8), "interactive proxy did not display");
+            }
+            // Pause in the same UI update that starts playback: the decoder
+            // cannot publish a native frame in between these two actions.
+            handle.update(cx, |studio, _, cx| {
+                studio.start_video_playback(cx);
+                studio.pause_video_playback();
+                cx.notify();
+            }).unwrap();
+            let (quick_pause_hq, _) = uhd_wait_for_settled_preview(handle, 0.0, false, cx).await;
+            // Reopen and seek before the first render can start thumbnails.
+            // That setup must not invalidate this native-frame request.
+            handle.update(cx, |studio, window, cx| {
+                studio.open_video_project(project.clone()).unwrap();
+                studio.launcher_active = false;
+                studio.video_audio_muted = true;
+                studio.select_inspector_tab(shell_ui::InspectorTab::Motion);
+                studio.seek_video(0.5, cx);
+                window.refresh();
+                cx.notify();
+            }).unwrap();
+            let (initial_hq, _) = uhd_wait_for_settled_preview(handle, 0.5, false, cx).await;
+            Timer::after(Duration::from_millis(100)).await;
+            save_display(&screenshots.join("classic-native-paused.png"), false);
+            handle.update(cx, |studio, _, cx| {
+                studio.seek_video(0.0, cx);
+                studio.start_video_playback(cx);
+                cx.notify();
+            }).unwrap();
+            let warmup = std::time::Instant::now();
+            loop {
+                Timer::after(Duration::from_millis(25)).await;
+                let ready = handle.update(cx, |studio, _, _| {
+                    let generation = studio.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst);
+                    studio.preview_cache.frame.as_ref().is_some_and(|(key, _)| {
+                        key.generation == generation && !key.high_quality && key.time() > 0.05
+                            && key.source_size == (3840, 2160)
+                    })
+                }).unwrap();
+                if ready { break; }
+                assert!(warmup.elapsed() < Duration::from_secs(8), "UHD playback preview did not start");
+            }
+            let warmup_elapsed = warmup.elapsed();
+            let sampled = std::time::Instant::now();
+            let mut wakes = Vec::new();
+            let mut presented = Vec::new();
+            let mut max_lag = 0.0_f64;
+            let mut saw_classic = false;
+            let mut saw_glass = false;
+            while sampled.elapsed() < Duration::from_secs(2) {
+                let scheduled = std::time::Instant::now();
+                Timer::after(Duration::from_millis(50)).await;
+                wakes.push(scheduled.elapsed());
+                handle.update(cx, |studio, _, _| {
+                    assert_eq!(studio.video_frame_rgba.as_ref().unwrap().dimensions(), (3840, 2160));
+                    let (key, _) = studio.preview_cache.frame.as_ref().unwrap();
+                    assert_eq!(key.source_size, (3840, 2160));
+                    assert!(u64::from(key.canvas.0) * u64::from(key.canvas.1) <= 1600 * 900,
+                        "moving preview composition must remain bounded");
+                    presented.push(key.time());
+                    max_lag = max_lag.max(studio.video_position - key.time());
+                    saw_glass |= key.viewport.loupe.is_some();
+                    saw_classic |= key.viewport.loupe.is_none() && key.viewport.magnification > 1.1;
+                }).unwrap();
+            }
+            let mut distinct = presented.clone();
+            distinct.dedup_by(|a, b| a.to_bits() == b.to_bits());
+            wakes.sort();
+            let p95 = wakes[(wakes.len() - 1) * 95 / 100];
+            let maximum = *wakes.last().unwrap();
+            assert!(distinct.len() >= 3 && presented.last().unwrap() - presented[0] > 0.5,
+                "UHD preview must present advancing frames");
+            assert!(saw_classic && saw_glass, "both zoom styles must reach the displayed preview");
+            assert!(maximum < Duration::from_secs(1) && p95 < Duration::from_millis(500),
+                "UHD playback blocked UI timers: p95={p95:?}, maximum={maximum:?}");
+            assert!(max_lag < 1.0, "bounded preview accumulated {max_lag:.3}s of latency");
+            handle.update(cx, |studio, _, cx| {
+                studio.pause_video_playback();
+                studio.seek_video(1.8, cx);
+                cx.notify();
+            }).unwrap();
+            let (paused_hq, paused_wakes) = uhd_wait_for_settled_preview(handle, 1.8, true, cx).await;
+            let paused_max = *paused_wakes.iter().max().unwrap();
+            assert!(paused_max < Duration::from_secs(1), "settled enhancement blocked UI timers");
+            Timer::after(Duration::from_millis(100)).await;
+            save_display(&screenshots.join("glass-native-paused.png"), false);
+            eprintln!("UHD UI: {} advancing frames/{} samples, normal open HQ={normal_open_hq:?}, quick-pause HQ={quick_pause_hq:?}, immediate seek HQ={initial_hq:?}, playback warmup={warmup_elapsed:?}, 50ms wake p95={p95:?}, max={maximum:?}, max lag={max_lag:.3}s, paused HQ={paused_hq:?}, paused max wake={paused_max:?}", distinct.len(), presented.len());
+            std::fs::write(screenshots.join("metrics.json"), serde_json::to_vec_pretty(&serde_json::json!({
+                "source": [3840, 2160], "presented_frames": distinct.len(), "samples": presented.len(),
+                "normal_open_hq_ms": normal_open_hq.as_secs_f64() * 1000.0,
+                "quick_pause_hq_ms": quick_pause_hq.as_secs_f64() * 1000.0,
+                "initial_hq_ms": initial_hq.as_secs_f64() * 1000.0,
+                "playback_warmup_ms": warmup_elapsed.as_secs_f64() * 1000.0,
+                "timer_p95_ms": p95.as_secs_f64() * 1000.0, "timer_max_ms": maximum.as_secs_f64() * 1000.0,
+                "maximum_preview_lag_seconds": max_lag,
+                "paused_hq_ms": paused_hq.as_secs_f64() * 1000.0,
+                "paused_timer_max_ms": paused_max.as_secs_f64() * 1000.0,
+            })).unwrap()).unwrap();
+            cx.update(|cx| cx.quit()).unwrap();
+        }).detach();
+    });
+    for (name, value) in previous {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+    eprintln!("UHD UI artifacts: {}", artifacts.display());
+}
+
 #[test]
 #[ignore = "requires an X11 display, FFmpeg and graphics driver; Xvfb supported"]
 fn studio_camera_cursor_glass_save_reopen_and_export() {
@@ -426,7 +727,7 @@ fn studio_camera_cursor_glass_save_reopen_and_export() {
                         studio.video_position = 2.0;
                         assert!(studio.video_viewport_timeline.frame_at(2.0).loupe.is_some());
                         studio.video_selected_zoom_cue = Some(studio.video_zoom_cues[0].id);
-                        studio.scene_preview_image(px(700.0), px(500.0)).unwrap();
+                        studio.scene_preview_image_ready(px(700.0), px(500.0)).unwrap();
                         cx.notify();
                     })
                     .unwrap();

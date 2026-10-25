@@ -930,7 +930,12 @@ pub(crate) fn decode_dimensions(
     maximum_width: u32,
     maximum_height: u32,
 ) -> (u32, u32) {
-    if info.window_capture {
+    if info.window_capture
+        || (maximum_width >= info.width && maximum_height >= info.height)
+    {
+        // Native RGB frames can have odd dimensions. Do not resize them just
+        // to satisfy encoder alignment; the output encoder handles its own
+        // canvas and source sampling must retain every input pixel.
         (info.width, info.height)
     } else {
         fitted_dimensions(info.width, info.height, maximum_width, maximum_height)
@@ -1080,6 +1085,25 @@ fn temporary_video_sibling(destination: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_decode_keeps_odd_source_edges_instead_of_resizing() {
+        let info = MediaInfo {
+            duration: 1.0,
+            width: 3841,
+            height: 2161,
+            frame_rate: 30.0,
+            has_audio: false,
+            window_capture: false,
+        };
+        assert_eq!(decode_dimensions(&info, 3841, 2161), (3841, 2161));
+        assert_eq!(decode_dimensions(&info, 7680, 4320), (3841, 2161));
+        let proxy = decode_dimensions(&info, 1280, 720);
+        assert!(proxy.0 <= 1280 && proxy.1 <= 720);
+        assert!(proxy.0 < info.width && proxy.1 < info.height);
+        let window = MediaInfo { window_capture: true, ..info };
+        assert_eq!(decode_dimensions(&window, 1280, 720), (3841, 2161));
+    }
 
     fn shadowed_window(width: u32, height: u32, body: &image::RgbaImage) -> image::RgbaImage {
         let (left, top) = ((width - body.width()) / 2, (height - body.height()) / 2);
@@ -1383,30 +1407,40 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let assert_edges = |frame: DecodedFrame| {
-                assert_eq!((frame.width, frame.height), (64, 64));
+            let assert_edges = |frame: DecodedFrame, expected: (u32, u32)| {
+                assert_eq!((frame.width, frame.height), expected);
                 for (i, pixel) in frame.rgba.chunks_exact(4).enumerate() {
-                    let (x, y) = (i % 64, i / 64);
-                    if x == 0 || x == 63 || y == 0 || y == 63 {
+                    let (x, y) = (i % frame.width as usize, i / frame.width as usize);
+                    if x == 0 || x + 1 == frame.width as usize || y == 0 || y + 1 == frame.height as usize {
                         assert_eq!(
                             pixel[3], 0,
                             "opaque edge at ({x}, {y}) for {width}x{height} window"
                         );
                     }
                 }
+                let center = ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
                 assert_eq!(
-                    &frame.rgba[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
+                    &frame.rgba[center..center + 4],
                     &[20, 60, 100, 255]
                 );
+                if expected == (width, height) {
+                    assert_eq!(frame.rgba, *source.as_raw(),
+                        "native decoding must preserve every pixel, including odd edges");
+                }
             };
-            let timeline = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.0, 0.8)]);
-            let mut playback =
-                TimelinePlaybackStream::open(&path, timeline, 0.0, 128, 128, true).unwrap();
-            assert_edges(playback.next_frame(|| false).unwrap().unwrap());
-            playback.stop();
-            let mut transport = SynchronizedPlaybackStream::open(&path, 0.0, 128, 128).unwrap();
-            assert_edges(transport.next_frame().unwrap().unwrap());
-            transport.stop();
+            // Native requests retain the odd edge instead of shrinking it.
+            // Actual proxy downscales still must not introduce opaque borders.
+            let proxy = if width > height { (64, 62) } else { (62, 64) };
+            for (limit, expected) in [(128, (width, height)), (64, proxy)] {
+                let timeline = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.0, 0.8)]);
+                let mut playback =
+                    TimelinePlaybackStream::open(&path, timeline, 0.0, limit, limit, true).unwrap();
+                assert_edges(playback.next_frame(|| false).unwrap().unwrap(), expected);
+                playback.stop();
+                let mut transport = SynchronizedPlaybackStream::open(&path, 0.0, limit, limit).unwrap();
+                assert_edges(transport.next_frame().unwrap().unwrap(), expected);
+                transport.stop();
+            }
         }
         fs::remove_dir_all(root).unwrap();
     }

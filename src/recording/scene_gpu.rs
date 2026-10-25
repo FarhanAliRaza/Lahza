@@ -1,11 +1,13 @@
 //! Offscreen Vulkan composition. CPU code prepares geometry and cached assets;
 //! compute shaders resample and blend the moving layers. No window is required.
+use super::super::screen_upscale::{ScreenUpscaler, UpscalePlan};
 use super::*;
 use blade_graphics as gpu;
 use bytemuck::{Pod, Zeroable};
 use gpu::ShaderData as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 const MAX_BUFFER: usize = 128 * 1024 * 1024;
 static GPU_EXPORT_IN_USE: AtomicBool = AtomicBool::new(false);
@@ -17,8 +19,10 @@ struct GpuExportLease<'a>(&'a AtomicBool);
 
 impl<'a> GpuExportLease<'a> {
     fn try_acquire(in_use: &'a AtomicBool) -> Option<Self> {
-        in_use.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok().map(|_| Self(in_use))
+        in_use
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self(in_use))
     }
 }
 
@@ -48,6 +52,8 @@ struct Params {
     viewport: [f32; 4],
     loupe_shape: [f32; 4],
     loupe_optics: [f32; 4],
+    enhanced_rect: [f32; 4],
+    enhanced_info: [f32; 4],
     sample_bounds: [f32; 4],
     geometry: [f32; 4],
     projection: [f32; 4],
@@ -63,6 +69,7 @@ struct ComposeData {
     b_params: gpu::BufferPiece,
     b_background: gpu::BufferPiece,
     b_source: gpu::BufferPiece,
+    b_enhanced: gpu::BufferPiece,
     b_overlay: gpu::BufferPiece,
     b_camera: gpu::BufferPiece,
     b_cursor: gpu::BufferPiece,
@@ -87,7 +94,106 @@ pub struct Renderer {
     label: String,
 }
 
+/// Preview workers and exports reuse one hardware context. A preview cannot
+/// hold the export lease idle and force every later export onto the CPU.
+pub struct SharedRenderer {
+    backend: Arc<Mutex<Renderer>>,
+    label: String,
+}
+
+struct SharedRendererState {
+    backend: Weak<Mutex<Renderer>>,
+    // While GPUI is running, the app owns final GPU teardown. A weak cache
+    // alone can miss an export whose last Arc is already being destroyed.
+    application_owner: Option<Arc<Mutex<Renderer>>>,
+    application_running: bool,
+    shutting_down: bool,
+}
+
+static SHARED_RENDERER: Mutex<SharedRendererState> = Mutex::new(SharedRendererState {
+    backend: Weak::new(),
+    application_owner: None,
+    application_running: false,
+    shutting_down: false,
+});
+
+impl SharedRenderer {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn compose(
+        &mut self,
+        scene: &SceneCompositor,
+        input: FrameInput<'_>,
+        visible: bool,
+        caption: Option<&RgbaImage>,
+    ) -> RgbaImage {
+        let mut backend = self
+            .backend
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let image = backend.compose(scene, input, visible, caption);
+        self.label = backend.label().to_owned();
+        image
+    }
+
+    pub fn compose_fast(&mut self, scene: &SceneCompositor, input: FrameInput<'_>, visible: bool,
+        caption: Option<&RgbaImage>) -> RgbaImage {
+        let mut backend = self.backend.lock().unwrap_or_else(|error| error.into_inner());
+        let image = backend.compose_inner(scene, input, visible, caption, false);
+        self.label = backend.label().to_owned();
+        image
+    }
+}
+
 impl Renderer {
+    pub(crate) fn begin_application() {
+        let mut shared = SHARED_RENDERER.lock().unwrap_or_else(|error| error.into_inner());
+        // A new GPUI application (including another UI test) gets a fresh
+        // backend; handles surviving the previous app remain on the CPU.
+        if shared.shutting_down { shared.backend = Weak::new(); }
+        shared.application_running = true;
+        shared.shutting_down = false;
+        shared.application_owner = shared.backend.upgrade();
+    }
+
+    pub(crate) fn shutdown_shared() {
+        let backend = {
+            let mut shared = SHARED_RENDERER.lock().unwrap_or_else(|error| error.into_inner());
+            shared.shutting_down = true;
+            shared.application_running = false;
+            shared.application_owner.take().or_else(|| shared.backend.upgrade())
+        };
+        if let Some(backend) = backend {
+            // Finish the current frame, then destroy the GPU synchronously.
+            // Any export still holding this renderer continues using the CPU.
+            let mut renderer = backend.lock().unwrap_or_else(|error| error.into_inner());
+            drop(renderer.gpu.take());
+            renderer.label = "CPU (application shutdown)".into();
+        }
+    }
+
+    pub fn shared() -> SharedRenderer {
+        let mut shared = SHARED_RENDERER.lock().unwrap_or_else(|error| error.into_inner());
+        if shared.shutting_down {
+            let label = "CPU (application shutdown)".to_owned();
+            return SharedRenderer { backend: Arc::new(Mutex::new(Self { gpu: None, label: label.clone() })), label };
+        }
+        let backend = shared.backend.upgrade().unwrap_or_else(|| {
+            let backend = Arc::new(Mutex::new(Self::new()));
+            shared.backend = Arc::downgrade(&backend);
+            backend
+        });
+        if shared.application_running { shared.application_owner = Some(backend.clone()); }
+        let label = backend
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .label()
+            .to_owned();
+        SharedRenderer { backend, label }
+    }
+
     pub fn new() -> Self {
         if std::env::var("LAHZA_COMPOSITOR").as_deref() == Ok("cpu") {
             return Self {
@@ -129,9 +235,14 @@ impl Renderer {
         visible: bool,
         caption: Option<&RgbaImage>,
     ) -> RgbaImage {
+        self.compose_inner(scene, input, visible, caption, true)
+    }
+
+    fn compose_inner(&mut self, scene: &SceneCompositor, input: FrameInput<'_>, visible: bool,
+        caption: Option<&RgbaImage>, enhance: bool) -> RgbaImage {
         if let Some(gpu) = &mut self.gpu {
             match catch_unwind(AssertUnwindSafe(|| {
-                gpu.compose(scene, input, visible, caption)
+                gpu.compose_inner(scene, input, visible, caption, enhance)
             })) {
                 Ok(Ok(output)) => return output,
                 failure => {
@@ -230,6 +341,68 @@ impl Buffer {
     }
 }
 
+/// Enhance only source pixels that are actually enlarged. The ROI includes
+/// source context around the visible crop so the learned filter has no hard
+/// seam at a lens edge. Physical output dimensions naturally account for DPI.
+fn enhancement_plan(scene: &SceneCompositor, input: FrameInput<'_>) -> Option<(UpscalePlan, f32)> {
+    let (sw, sh) = input.source.dimensions();
+    if sw == 0 || sh == 0 { return None; }
+    let projection = scene.projection(input.viewport);
+    let (left, top, width, height) = scene.style.source_crop.visible_rect(input.viewport);
+    if width <= 0.0 || height <= 0.0 { return None; }
+    let ratio_at = |u: f64, v: f64| {
+        let p = projection.project(u, v);
+        let dx = projection.project(u + 0.001, v);
+        let dy = projection.project(u, v + 0.001);
+        ((dx.0 - p.0).hypot(dx.1 - p.1) / (0.001 * width * sw as f64))
+            .max((dy.0 - p.0).hypot(dy.1 - p.1) / (0.001 * height * sh as f64))
+    };
+    let base_ratio = [(0.5, 0.5), (0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        .into_iter().map(|(u, v)| ratio_at(u, v)).fold(0.0_f64, f64::max);
+    let lens = scene.loupe_geometry(input.viewport);
+    let lens_ratio = lens.map_or(0.0, |lens| {
+        let (u, v) = projection.unproject(lens.center[0] as f64, lens.center[1] as f64);
+        ratio_at(u, v) * lens.magnification as f64
+    });
+    let ratio = base_ratio.max(lens_ratio);
+    if !ratio.is_finite() || ratio <= 1.02 { return None; }
+    let mut region = [1.0_f64, 1.0, 0.0, 0.0];
+    let mut include = |x: f64, y: f64| {
+        let (u, v) = projection.unproject(x, y);
+        if u.is_finite() && v.is_finite() {
+            let x = left + u.clamp(0.0, 1.0) * width;
+            let y = top + v.clamp(0.0, 1.0) * height;
+            region[0] = region[0].min(x); region[1] = region[1].min(y);
+            region[2] = region[2].max(x); region[3] = region[3].max(y);
+        }
+    };
+    if base_ratio > 1.02 {
+        for x in [0.0, scene.width as f64 * 0.5, scene.width as f64] {
+            for y in [0.0, scene.height as f64 * 0.5, scene.height as f64] { include(x, y); }
+        }
+    }
+    if let Some(lens) = lens.filter(|_| lens_ratio > 1.02) {
+        let reach = lens.radius as f64 * (1.0 / lens.magnification as f64 + lens.bevel as f64);
+        for dx in [-reach, 0.0, reach] {
+            for dy in [-reach, 0.0, reach] {
+                include(lens.center[0] as f64 + dx, lens.center[1] as f64 + dy);
+            }
+        }
+    }
+    let x = ((region[0] * sw as f64).floor() as u32).saturating_sub(12).min(sw - 1);
+    let y = ((region[1] * sh as f64).floor() as u32).saturating_sub(12).min(sh - 1);
+    let right = ((region[2] * sw as f64).ceil() as u32).saturating_add(12).min(sw);
+    let bottom = ((region[3] * sh as f64).ceil() as u32).saturating_add(12).min(sh);
+    let mut plan = UpscalePlan { x, y, width: right.saturating_sub(x), height: bottom.saturating_sub(y),
+        scale: if ratio >= 2.5 { 4 } else { 2 } };
+    if plan.validate((sw, sh)).is_err() { plan.scale = 2; }
+    plan.validate((sw, sh)).ok()?;
+    // The public line-art network is deliberately blended with the original
+    // signal; a second inference pass must not punch holes into small glyphs.
+    let strength = if plan.scale == 4 { 0.65 } else { 0.85 };
+    Some((plan, ((ratio - 1.02) / 0.18).clamp(0.0, 1.0) as f32 * strength))
+}
+
 struct Compositor {
     context: gpu::Context,
     encoder: gpu::CommandEncoder,
@@ -244,6 +417,8 @@ struct Compositor {
     caption_size: (u32, u32, u32, u32),
     shadow_key: Option<(u32, u32, CameraOverlay, Rect)>,
     pending: Option<gpu::SyncPoint>,
+    upscaler: Option<ScreenUpscaler>,
+    enhancement_failed: bool,
     // Last field: Rust drops the context and resources before releasing the
     // lease. Quarantining a lost device also retains its lease until exit.
     _lease: GpuExportLease<'static>,
@@ -268,8 +443,8 @@ fn hardware_device_ids() -> Result<Vec<u32>, String> {
                 .into_iter()
                 .filter_map(|device| {
                     let p = instance.get_physical_device_properties(device);
-                    if p.limits.max_per_stage_descriptor_storage_buffers < 10
-                        || p.limits.max_descriptor_set_storage_buffers < 10
+                    if p.limits.max_per_stage_descriptor_storage_buffers < 12
+                        || p.limits.max_descriptor_set_storage_buffers < 12
                     {
                         return None;
                     }
@@ -346,6 +521,8 @@ impl Compositor {
             resize_horizontal,
             context,
             pending: None,
+            upscaler: None,
+            enhancement_failed: false,
             _lease: lease,
         })
     }
@@ -356,6 +533,27 @@ impl Compositor {
         input: FrameInput<'_>,
         visible: bool,
         caption: Option<&RgbaImage>,
+    ) -> Result<RgbaImage, String> {
+        self.compose_inner(scene, input, visible, caption, false)
+    }
+
+    fn compose_enhanced(
+        &mut self,
+        scene: &SceneCompositor,
+        input: FrameInput<'_>,
+        visible: bool,
+        caption: Option<&RgbaImage>,
+    ) -> Result<RgbaImage, String> {
+        self.compose_inner(scene, input, visible, caption, true)
+    }
+
+    fn compose_inner(
+        &mut self,
+        scene: &SceneCompositor,
+        input: FrameInput<'_>,
+        visible: bool,
+        caption: Option<&RgbaImage>,
+        enhance: bool,
     ) -> Result<RgbaImage, String> {
         let profile = std::env::var_os("LAHZA_GPU_PROFILE").is_some();
         let started = std::time::Instant::now();
@@ -426,11 +624,23 @@ impl Compositor {
             .filter(|image| scene.style.camera.enabled && image.width() > 0 && image.height() > 0);
         if let Some(camera) = camera {
             let overlay = scene.style.camera;
-            let rect = overlay.rect_for_frame(scene.width as f64, scene.height as f64,
-                camera.width() as f64 / camera.height() as f64, input.viewport.magnification);
-            let crop = super::super::camera_layout::source_crop(overlay,
-                camera.width() as f64 / camera.height() as f64, rect);
-            params.camera_crop = [crop.x as f32, crop.y as f32, crop.width as f32, crop.height as f32];
+            let rect = overlay.rect_for_frame(
+                scene.width as f64,
+                scene.height as f64,
+                camera.width() as f64 / camera.height() as f64,
+                input.viewport.magnification,
+            );
+            let crop = super::super::camera_layout::source_crop(
+                overlay,
+                camera.width() as f64 / camera.height() as f64,
+                rect,
+            );
+            params.camera_crop = [
+                crop.x as f32,
+                crop.y as f32,
+                crop.width as f32,
+                crop.height as f32,
+            ];
             let shadow_enabled = overlay.shadow && overlay.layout != CameraLayout::Fullscreen;
             params.camera_rect = [
                 rect.x as f32,
@@ -491,6 +701,49 @@ impl Compositor {
                 }
             }
         }
+        let mut enhanced_buffer = self.images[1].device.into();
+        if enhance && visible && !self.enhancement_failed {
+            if let Some((plan, strength)) = enhancement_plan(scene, input) {
+                if self.upscaler.is_none() {
+                    match ScreenUpscaler::new(&self.context) {
+                        Ok(upscaler) => self.upscaler = Some(upscaler),
+                        Err(error) => {
+                            eprintln!("Screen enhancement unavailable: {error}");
+                            self.enhancement_failed = true;
+                        }
+                    }
+                }
+                if let Some(upscaler) = self.upscaler.as_mut() {
+                    match upscaler.encode(
+                        &self.context,
+                        &mut self.encoder,
+                        self.images[1].device.into(),
+                        input.source.dimensions(),
+                        plan,
+                    ) {
+                        Ok(region) => {
+                            enhanced_buffer = region.buffer;
+                            params.enhanced_rect = [
+                                plan.x as f32,
+                                plan.y as f32,
+                                plan.width as f32,
+                                plan.height as f32,
+                            ];
+                            params.enhanced_info = [
+                                region.width as f32,
+                                region.height as f32,
+                                plan.scale as f32,
+                                strength,
+                            ];
+                        }
+                        Err(error) => {
+                            eprintln!("Screen enhancement skipped: {error}");
+                            self.enhancement_failed = true;
+                        }
+                    }
+                }
+            }
+        }
         self.params.upload(
             &self.context,
             &mut self.encoder,
@@ -540,6 +793,7 @@ impl Compositor {
                     b_params: self.params.device.into(),
                     b_background: self.images[0].device.into(),
                     b_source: self.images[1].device.into(),
+                    b_enhanced: enhanced_buffer,
                     b_overlay: self.images[2].device.into(),
                     b_camera: self.images[3].device.into(),
                     b_cursor: self.images[4].device.into(),
@@ -632,6 +886,9 @@ unsafe fn copy_readback_sse41(source: &[u8], output: &mut [u8]) {
 impl Drop for Compositor {
     fn drop(&mut self) {
         debug_assert!(self.pending.is_none());
+        if let Some(upscaler) = &mut self.upscaler {
+            upscaler.destroy(&self.context);
+        }
         for image in &mut self.images {
             image.destroy(&self.context);
         }
@@ -765,14 +1022,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn neural_plan_preserves_native_pixels_and_limits_work_to_enlarged_regions() {
+        let source = RgbaImage::new(1920, 1080);
+        let style = SceneStyle { padding: 0, corners: 0, shadow: 0, ..Default::default() };
+        let scene = SceneCompositor::new(&style, 960, 540, 1920, 1080).unwrap();
+        let mut input = FrameInput { source: &source, overlay: None, viewport: ViewportFrame::default(), pointer: None, camera: None };
+        assert!(enhancement_plan(&scene, input).is_none(), "downscaling must not run a neural pass");
+        input.viewport.magnification = 4.0;
+        let (plan, strength) = enhancement_plan(&scene, input).unwrap();
+        assert_eq!(plan.scale, 2);
+        assert_eq!(strength, 0.85);
+        assert!(plan.width < 600 && plan.height < 400, "enhance the visible zoom crop, not the whole frame: {plan:?}");
+        input.viewport.magnification = 8.0;
+        assert_eq!(enhancement_plan(&scene, input).unwrap().0.scale, 4);
+        input.viewport = ViewportFrame {
+            loupe: Some(super::super::super::viewport::LoupeFrame {
+                center: NormalizedPoint { x: 0.8, y: 0.4 }, radius: 0.2, magnification: 4.0,
+                bevel: 0.1, chromatic_aberration: 0.0, presence: 1.0,
+            }), ..Default::default()
+        };
+        let (plan, _) = enhancement_plan(&scene, input).unwrap();
+        assert_eq!(plan.scale, 2);
+        assert!(plan.x > 1000 && plan.width < 600 && plan.height < 600, "lens ROI follows its source position: {plan:?}");
+        assert!(plan.validate(source.dimensions()).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires a hardware Vulkan GPU; validates enhancement in final composition"]
+    fn hardware_neural_enhancement_is_composed_beneath_annotations_and_inside_lens() {
+        let mut gpu = Compositor::new().expect("hardware Vulkan compositor");
+        let source = RgbaImage::from_fn(128, 96, |x, y| {
+            let value = if (x / 3 + y / 5) % 2 == 0 { 25 } else { 220 };
+            Rgba([value, value, value, 255])
+        });
+        let mut overlay = RgbaImage::new(128, 96);
+        for y in 45..51 { for x in 60..68 { overlay.put_pixel(x, y, Rgba([20, 240, 90, 255])); } }
+        let style = SceneStyle { padding: 0, corners: 0, shadow: 0, ..Default::default() };
+        let scene = SceneCompositor::new(&style, 128, 96, 128, 96).unwrap();
+        let input = FrameInput {
+            source: &source, overlay: Some(&overlay),
+            viewport: ViewportFrame { loupe: Some(super::super::super::viewport::LoupeFrame {
+                center: NormalizedPoint { x: 0.5, y: 0.5 }, radius: 0.32, magnification: 3.0,
+                bevel: 0.12, chromatic_aberration: 0.0, presence: 1.0,
+            }), ..Default::default() }, pointer: None, camera: None,
+        };
+        let reference = gpu.compose(&scene, input, true, None).unwrap();
+        let enhanced = gpu.compose_enhanced(&scene, input, true, None).unwrap();
+        assert!(gpu.upscaler.is_some(), "the composed frame must actually dispatch the neural model");
+        assert_eq!(enhanced.get_pixel(64, 48), reference.get_pixel(64, 48), "opaque editor annotation stays above enhancement");
+        for y in 0..96 { for x in [0, 1, 126, 127] {
+            assert_eq!(enhanced.get_pixel(x, y), reference.get_pixel(x, y), "unmagnified source remains unchanged");
+        } }
+        let changed = enhanced.pixels().zip(reference.pixels()).filter(|(a,b)| a != b).count();
+        assert!(changed > 100, "neural output must reach the final lens ({changed} changed pixels)");
+        if let Some(path) = std::env::var_os("LAHZA_NEURAL_COMPOSITE_ARTIFACTS") {
+            let path = std::path::PathBuf::from(path); std::fs::create_dir_all(&path).unwrap();
+            reference.save(path.join("source-lens.png")).unwrap();
+            enhanced.save(path.join("enhanced-lens.png")).unwrap();
+        }
+    }
+
+    #[test]
     fn gpu_export_lease_is_nonblocking_and_released_after_drop_or_unwind() {
         let in_use = AtomicBool::new(false);
         let lease = GpuExportLease::try_acquire(&in_use).unwrap();
         std::thread::scope(|scope| {
-            let contenders: Vec<_> = (0..8).map(|_| scope.spawn(|| {
-                assert!(GpuExportLease::try_acquire(&in_use).is_none());
-            })).collect();
-            for contender in contenders { contender.join().unwrap(); }
+            let contenders: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        assert!(GpuExportLease::try_acquire(&in_use).is_none());
+                    })
+                })
+                .collect();
+            for contender in contenders {
+                contender.join().unwrap();
+            }
         });
         drop(lease);
         let result = catch_unwind(|| {
@@ -789,8 +1113,13 @@ mod tests {
         // finish their current export, then model an owner holding the lease.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let lease = loop {
-            if let Some(lease) = GpuExportLease::try_acquire(&GPU_EXPORT_IN_USE) { break lease; }
-            assert!(std::time::Instant::now() < deadline, "previous GPU export did not finish");
+            if let Some(lease) = GpuExportLease::try_acquire(&GPU_EXPORT_IN_USE) {
+                break lease;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "previous GPU export did not finish"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         let (finished, result) = std::sync::mpsc::channel();
@@ -801,10 +1130,16 @@ mod tests {
             let scene = SceneCompositor::new(&SceneStyle::default(), 64, 48, 32, 24).unwrap();
             let source = RgbaImage::from_pixel(32, 24, Rgba([50, 100, 150, 255]));
             let input = FrameInput {
-                source: &source, overlay: None, viewport: ViewportFrame::default(),
-                pointer: None, camera: None,
+                source: &source,
+                overlay: None,
+                viewport: ViewportFrame::default(),
+                pointer: None,
+                camera: None,
             };
-            assert_eq!(renderer.compose(&scene, input, true, None), scene.compose_layers(input, true, None));
+            assert_eq!(
+                renderer.compose(&scene, input, true, None),
+                scene.compose_layers(input, true, None)
+            );
             finished.send(()).unwrap();
         });
         let completed = result.recv_timeout(std::time::Duration::from_secs(2));
@@ -1054,24 +1389,56 @@ mod tests {
         let overlay = pattern(160, 100, true);
         let camera = pattern(80, 48, false);
         let caption = pattern(256, 192, true);
+        let pointer = PointerOverlay {
+            frame: PointerFrame {
+                location: NormalizedPoint { x: 0.55, y: 0.45 }, artwork_id: None,
+                bitmap: cursor_assets::rasterize(CursorFamily::MacOs, Default::default(), 64),
+                magnification: 1.2, tilt_degrees: 17.0, opacity: 0.8, blur_radius: 0.0,
+                velocity: (0.9, -0.6),
+                press: Some(super::super::super::pointer_timeline::PointerPressFrame {
+                    location: NormalizedPoint { x: 0.55, y: 0.45 }, progress: 0.4,
+                }),
+            },
+        };
         for variant in 0..4 {
             let mut style = SceneStyle::default();
             style.padding = 8;
             style.transform.rotation_y = if variant == 1 { 22.0 } else { 0.0 };
             style.source_crop = if variant == 2 {
-                crate::CropRect { x: 0.15, y: 0.1, width: 0.75, height: 0.8 }
-            } else { crate::CropRect::UNIT };
+                crate::CropRect {
+                    x: 0.15,
+                    y: 0.1,
+                    width: 0.75,
+                    height: 0.8,
+                }
+            } else {
+                crate::CropRect::UNIT
+            };
             let scene = SceneCompositor::new(&style, 256, 192, 160, 100).unwrap();
             for presence in [0.15, 0.6, 1.0] {
                 let frame = super::super::super::viewport::LoupeFrame {
-                    center: NormalizedPoint { x: if variant == 3 { 0.05 } else { 0.55 }, y: 0.45 },
-                    radius: 0.35, magnification: 1.0 + presence,
-                    bevel: 0.2 * presence, chromatic_aberration: 0.5 * presence, presence,
+                    center: NormalizedPoint {
+                        x: if variant == 3 { 0.05 } else { 0.55 },
+                        y: 0.45,
+                    },
+                    radius: 0.35,
+                    magnification: 1.0 + presence,
+                    bevel: 0.2 * presence,
+                    chromatic_aberration: 0.5 * presence,
+                    presence,
                 };
-                let input = FrameInput { source: &source, overlay: Some(&overlay),
-                    viewport: ViewportFrame { loupe: Some(frame), ..Default::default() },
-                    pointer: None, camera: Some(&camera) };
+                let input = FrameInput {
+                    source: &source,
+                    overlay: Some(&overlay),
+                    viewport: ViewportFrame {
+                        loupe: Some(frame),
+                        ..Default::default()
+                    },
+                    pointer: None,
+                    camera: Some(&camera),
+                };
                 compare(&mut gpu, &scene, input, true, Some(&caption));
+                compare(&mut gpu, &scene, FrameInput { pointer: Some(&pointer), ..input }, true, Some(&caption));
                 compare(&mut gpu, &scene, input, false, None);
             }
         }

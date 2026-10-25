@@ -512,19 +512,21 @@ impl SceneSlider {
 
 /// Composited preview state cached between renders.
 pub(crate) struct PreviewCache {
-    pub compositor: Option<(SceneStyle, (u32, u32), (u32, u32), SceneCompositor)>,
     pub frame: Option<(PreviewKey, Arc<RenderImage>)>,
     pub overlay: Option<(u64, Arc<RgbaImage>)>,
     worker: Option<PreviewWorker>,
+    pub(crate) display_scale: f32,
+    polling: bool,
 }
 
 impl Default for PreviewCache {
     fn default() -> Self {
         Self {
-            compositor: None,
             frame: None,
             overlay: None,
             worker: None,
+            display_scale: 1.0,
+            polling: false,
         }
     }
 }
@@ -572,11 +574,11 @@ mod motion_picking_tests {
                 assert!(!studio.video_playing, "drawing pauses the transport");
                 let draft = studio.annotation_draft.clone().unwrap();
                 assert_eq!(timed::editor_mark(&draft, 1.0, studio.annotation_is_live(0)), Some(draft));
-                let frame = studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                let frame = studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
                 let tick = std::time::Instant::now();
                 for n in 0..30 {
                     studio.pointer_move(point(px(210. + n as f32), px(160.)), bounds);
-                    let next = studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                    let next = studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
                     assert!(Arc::ptr_eq(&frame, &next), "flat pen samples must not recompose the video");
                 }
                 eprintln!("30 video pen samples with cached preview: {:?}", tick.elapsed());
@@ -651,13 +653,13 @@ mod motion_picking_tests {
                 studio.pointer_down(point(px(100.), px(100.)), bounds, &[], 1);
                 studio.pointer_move(point(px(300.), px(180.)), bounds);
                 assert_eq!(studio.video_position, 2.0, "drawing an arrow holds the target frame");
-                studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
                 assert_eq!(studio.preview_cache.frame.as_ref().unwrap().0.canvas, (240, 135));
                 assert_eq!(studio.preview_cache.overlay.as_ref().unwrap().1.dimensions(), (360, 203));
                 studio.pointer_up(point(px(300.), px(180.)), bounds);
                 studio.update_annotation_edit_preview();
                 assert_eq!(studio.video_position, 2.0, "finishing an arrow holds the target frame");
-                studio.scene_preview_image(px(480.), px(270.)).unwrap();
+                studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
                 assert_eq!(studio.preview_cache.frame.as_ref().unwrap().0.canvas, (480, 270));
             }).unwrap();
             cx.spawn(async |cx| {
@@ -682,6 +684,7 @@ mod motion_picking_tests {
             media_visible: true,
             generation: 0,
             media: PreviewMedia::Image(1),
+            high_quality: true,
         };
         let mut edited = key.clone();
         edited.viewport.magnification = 2.0;
@@ -1094,15 +1097,12 @@ impl Studio {
         Some((signature, layer))
     }
 
-    /// Exact paused frame, or the latest completed background playback frame.
+    /// Source-resolution composition runs off-thread, including paused enhancement.
     pub(crate) fn scene_preview_image(
         &mut self,
         canvas_width: Pixels,
         canvas_height: Pixels,
     ) -> Option<Arc<RenderImage>> {
-        if !self.video_playing {
-            if let Some(worker) = &self.preview_cache.worker { worker.invalidate(); }
-        }
         let source = self.preview_source()?;
         // While a slider or the media is being dragged, compose a half-size
         // proxy that the canvas scales up; the full-size frame is rendered
@@ -1121,8 +1121,8 @@ impl Studio {
             1.0
         };
         let canvas = playback_canvas_size((
-            (f32::from(canvas_width) * proxy).round().max(2.0) as u32,
-            (f32::from(canvas_height) * proxy).round().max(2.0) as u32,
+            (f32::from(canvas_width) * proxy * self.preview_cache.display_scale).round().max(2.0) as u32,
+            (f32::from(canvas_height) * proxy * self.preview_cache.display_scale).round().max(2.0) as u32,
         ), self.video_playing);
         let style = self.scene_style();
         let source_size = (source.width(), source.height());
@@ -1168,6 +1168,12 @@ impl Studio {
             generation: self.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst),
             media: self.video_project.as_ref().map(|session| PreviewMedia::Video(session.directory.clone()))
                 .unwrap_or_else(|| PreviewMedia::Image(Arc::as_ptr(&source) as usize)),
+            // Hover/scrub decodes are deliberately small. Never spend neural
+            // work enlarging those proxies; release supplies original pixels.
+            high_quality: !self.video_playing && proxy == 1.0
+                && self.timeline_skim_time().is_none() && self.video_seek_drag.is_none()
+                && (self.video_project.is_none() || self.video_window_capture
+                    || source_size == self.video_source_size),
         };
         if let Some((cached, image)) = self.preview_cache.frame.as_ref() {
             if *cached == key {
@@ -1178,59 +1184,65 @@ impl Studio {
             .then(|| self.video_pointer_timeline.frame_at(time))
             .flatten()
             .map(|frame| PointerOverlay { frame });
-        if self.video_playing {
-            if self.preview_cache.worker.is_none() {
-                match PreviewWorker::new() {
-                    Ok(worker) => self.preview_cache.worker = Some(worker),
-                    Err(error) => {
-                        self.toast = Some(format!("Preview worker could not start: {error}").into());
-                        return self.preview_cache.frame.as_ref().map(|(_, image)| image.clone());
-                    }
+        if self.preview_cache.worker.is_none() {
+            match PreviewWorker::new() {
+                Ok(worker) => self.preview_cache.worker = Some(worker),
+                Err(error) => {
+                    self.toast = Some(format!("Preview worker could not start: {error}").into());
+                    return self.preview_cache.frame.as_ref().map(|(_, image)| image.clone());
                 }
             }
-            let worker = self.preview_cache.worker.as_ref().unwrap();
-            worker.request(PreviewJob {
-                key: key.clone(), source,
-                overlay: overlay.map(|(_, layer)| layer), pointer, camera,
-            });
-            if let Some(completed) = worker.take_completed(&key) {
-                let previous = self.preview_cache.frame.replace((completed.key, completed.image));
-                self.retire_image(previous.map(|(_, image)| image));
-            }
-            return self.preview_cache.frame.as_ref()
-                .filter(|(shown, _)| shown.same_media(&key))
-                .map(|(_, image)| image.clone());
         }
-        let rebuild = match self.preview_cache.compositor.as_ref() {
-            Some((cached_style, cached_canvas, cached_source, _)) => {
-                *cached_style != style || *cached_canvas != canvas || *cached_source != source_size
-            }
-            None => true,
-        };
-        if rebuild {
-            let compositor = match self.preview_cache.compositor.as_ref() {
-                Some((_, _, _, previous)) => {
-                    previous.rebuild(&style, canvas.0, canvas.1, source_size.0, source_size.1)
-                }
-                None => {
-                    SceneCompositor::new(&style, canvas.0, canvas.1, source_size.0, source_size.1)
-                }
-            }
-            .ok()?;
-            self.preview_cache.compositor = Some((style.clone(), canvas, source_size, compositor));
+        let worker = self.preview_cache.worker.as_ref().unwrap();
+        worker.request(PreviewJob {
+            key: key.clone(), source,
+            overlay: overlay.map(|(_, layer)| layer), pointer, camera,
+        });
+        if let Some(completed) = worker.take_completed(&key) {
+            let previous = self.preview_cache.frame.replace((completed.key, completed.image));
+            self.retire_image(previous.map(|(_, image)| image));
         }
-        let compositor = &self.preview_cache.compositor.as_ref()?.3;
-        let frame = compositor.compose_layers(crate::recording::scene::FrameInput {
-            source: &source,
-            overlay: overlay.as_ref().map(|(_, layer)| layer.as_ref()),
-            viewport,
-            pointer: pointer.as_ref(),
-            camera: camera.as_deref(),
-        }, self.image_visible_at(time), None);
-        let image = cached_render_image(frame);
-        let previous = self.preview_cache.frame.replace((key, image.clone()));
-        self.retire_image(previous.map(|(_, image)| image));
-        Some(image)
+        if let Some(message) = self.preview_cache.worker.as_ref().unwrap().take_failure(&key) {
+            self.toast = Some(message.into());
+        }
+        self.preview_cache.frame.as_ref()
+            .filter(|(shown, _)| shown.same_media(&key))
+            .map(|(_, image)| image.clone())
+    }
+
+    /// Only poll while a bounded preview job is active; a paused frame gets
+    /// its own completion notification without rendering on the UI thread.
+    pub(crate) fn watch_scene_preview(&mut self, cx: &mut Context<Self>) {
+        if self.preview_cache.polling || !self.preview_cache.worker.as_ref().is_some_and(PreviewWorker::has_work) {
+            return;
+        }
+        self.preview_cache.polling = true;
+        cx.spawn(async move |weak, cx| loop {
+            gpui::Timer::after(std::time::Duration::from_millis(16)).await;
+            let keep = weak.update(cx, |this, cx| {
+                let ready = this.preview_cache.worker.as_ref().is_some_and(PreviewWorker::has_completed);
+                if ready { cx.notify(); }
+                let pending = this.preview_cache.worker.as_ref().is_some_and(PreviewWorker::has_work);
+                if !pending || ready {
+                    this.preview_cache.polling = false;
+                    false
+                } else { true }
+            }).unwrap_or(false);
+            if !keep { break; }
+        }).detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scene_preview_image_ready(&mut self, width: Pixels, height: Pixels) -> Option<Arc<RenderImage>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame = self.scene_preview_image(width, height);
+            if self.preview_cache.frame.as_ref().is_some_and(|(key, _)| {
+                self.preview_cache.worker.as_ref().is_some_and(|worker| worker.is_current(key))
+            }) { return frame; }
+            assert!(std::time::Instant::now() < deadline, "preview worker did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// Whether the screenshot preview must show the compositor's frame: the
@@ -2038,6 +2050,7 @@ impl Studio {
         let canvas_annotations = self.canvas_annotation_marks();
         let media_visible = self.image_visible_at(self.timeline_display_time());
         let image = self.scene_preview_image(canvas_width, canvas_height);
+        self.watch_scene_preview(cx);
         let bounds_store = self.scene_canvas_bounds.clone();
         let media_bounds_store = self.video_media_bounds.clone();
         let (geometry, projection) =
