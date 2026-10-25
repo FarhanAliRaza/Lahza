@@ -188,6 +188,14 @@ impl Studio {
         if self.recording_state != RecordingState::Idle || self.recording_busy {
             return;
         }
+        let prompter_exclusion = match self.open_prompter(cx) {
+            Ok(exclusion) => exclusion,
+            Err(error) => {
+                self.toast = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
         // Starting a new capture from an open video project must stop its
         // synchronized playback before capture becomes the active media clock.
         self.pause_video_playback();
@@ -205,6 +213,7 @@ impl Studio {
         );
         let options = RecordingOptions {
             area: None,
+            prompter_exclusion,
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
             microphone_device: self.microphone_device.clone(),
@@ -239,17 +248,21 @@ impl Studio {
                         this.recording_state = RecordingState::Recording;
                         this.recording_started_at = Some(Instant::now());
                         this.recording_session_path = Some(path);
-                        this.open_prompter(cx);
                         this.toast = Some(
                             format!("Recording with {}", NativeRecorder::description()).into(),
                         );
+                        // Discard speech heard during source selection while
+                        // retaining the already-protected native window.
+                        this.reset_prompter(cx);
                     }
                     Ok((controller, Err(error))) => {
+                        this.close_prompter(cx);
                         this.recording_state = controller.state();
                         this.recording_controller = None;
                         this.toast = Some(format!("Recording could not start: {error}").into());
                     }
                     Err(error) => {
+                        this.close_prompter(cx);
                         this.recording_state = RecordingState::Idle;
                         this.toast = Some(error.into());
                     }
@@ -271,6 +284,11 @@ impl Studio {
         };
         self.recording_busy = true;
         self.freeze_recording_clock();
+        if matches!(action, RecordingAction::Restart) {
+            // Preserve the protected window across takes. Replacing it would
+            // require another compositor acknowledgement before encoding.
+            self.pause_prompter(true, cx);
+        }
         if matches!(action, RecordingAction::Stop | RecordingAction::Discard) {
             self.recording_state = RecordingState::Finishing;
         }
@@ -313,12 +331,12 @@ impl Studio {
                             this.toast = Some("Recording resumed".into());
                         }
                         RecordingAction::Restart => {
-                            // A new take reads the script from the top.
-                            this.open_prompter(cx);
                             this.recording_elapsed = Duration::ZERO;
                             this.recording_started_at = Some(Instant::now());
                             this.recording_session_path = path;
                             this.toast = Some("Recording restarted".into());
+                            // A new take reads the script from the top.
+                            this.reset_prompter(cx);
                         }
                         RecordingAction::Stop => {
                             this.recording_elapsed = Duration::ZERO;
@@ -344,6 +362,14 @@ impl Studio {
                             this.recording_started_at = Some(Instant::now());
                         }
                         this.toast = Some(format!("Recording action failed: {error}").into());
+                        if matches!(action, RecordingAction::Restart)
+                            && matches!(
+                                controller.state(),
+                                RecordingState::Recording | RecordingState::Paused
+                            )
+                        {
+                            this.pause_prompter(controller.state() == RecordingState::Paused, cx);
+                        }
                     }
                 }
                 if controller.state() == RecordingState::Idle {
@@ -398,6 +424,7 @@ impl Studio {
                 this.recording_state = controller.state();
                 match result {
                     Ok(path) => {
+                        this.close_prompter(cx);
                         this.recording_session_path = Some(path);
                         this.recording_controller = None;
                         for warning in warnings {

@@ -2,12 +2,14 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {PrompterExclusion} from './prompter.js';
 
 const CONTROL_NAME = 'lahza-input-control.json';
 const SAMPLE_INTERVAL_MS = 16;
 
 export default class LahzaInputCapture extends Extension {
     enable() {
+        this._prompterExclusion = new PrompterExclusion();
         this._capture = null;
         this._controlPath = GLib.build_filenamev([
             GLib.get_user_runtime_dir(), CONTROL_NAME,
@@ -24,6 +26,8 @@ export default class LahzaInputCapture extends Extension {
     }
 
     disable() {
+        this._prompterExclusion?.destroy();
+        this._prompterExclusion = null;
         if (this._controlTimer) {
             GLib.source_remove(this._controlTimer);
             this._controlTimer = 0;

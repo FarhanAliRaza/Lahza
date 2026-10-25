@@ -67,6 +67,11 @@ impl TeleprompterSettings {
     pub fn has_script(&self) -> bool {
         !self.script.trim().is_empty()
     }
+
+    /// Whether an enabled script is ready to display for a recording.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.has_script()
+    }
 }
 
 /// Whitespace-separated display words, punctuation kept.
@@ -349,6 +354,23 @@ fn strip_annotations(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_enabled_nonempty_scripts_are_active() {
+        for (enabled, script, active) in [
+            (false, "Read this", false),
+            (true, "", false),
+            (true, " \n\t ", false),
+            (true, "Read this", true),
+        ] {
+            let settings = TeleprompterSettings {
+                enabled,
+                script: script.into(),
+                ..Default::default()
+            };
+            assert_eq!(settings.is_active(), active);
+        }
+    }
 
     #[test]
     fn matcher_skips_misheard_words_and_never_rewinds() {

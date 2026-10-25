@@ -3,6 +3,7 @@
 //! when whisper.cpp is available, and by hand (mouse wheel, clicking a
 //! word) always.
 use crate::recording::teleprompter::{ScriptLayout, SpeechFollower, TeleprompterSettings};
+use crate::recording::capture_exclusion::CaptureExclusion;
 use crate::recording::transcription::{self, JobProgress, SpeechModel};
 use crate::{blue, line, muted, Studio};
 use gpui::{
@@ -13,7 +14,7 @@ use gpui::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROMPTER_WIDTH: f32 = 760.0;
 const HEADER_HEIGHT: f32 = 28.0;
@@ -21,6 +22,7 @@ const PADDING: f32 = 14.0;
 
 /// The prompter window's view.
 pub(crate) struct Prompter {
+    exclusion: CaptureExclusion,
     layout: ScriptLayout,
     font_size: f32,
     /// Script words read so far; written by the follower and by hand.
@@ -37,7 +39,7 @@ impl Prompter {
         (self.font_size * 1.45).round()
     }
 
-    fn new(settings: &TeleprompterSettings, microphone: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(settings: &TeleprompterSettings, microphone: bool, exclusion: CaptureExclusion, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let font_size = settings.font_size.clamp(16.0, 48.0);
         let text_width = PROMPTER_WIDTH - PADDING * 2.0;
         let font = gpui::font("Inter");
@@ -63,10 +65,22 @@ impl Prompter {
                 Err(reason) => (None, format!("Voice follow unavailable: {reason} · scroll to advance").into()),
             }
         };
+        let window_handle = window.window_handle();
+        let mut checked_protection = Instant::now();
         let ticker = cx.spawn(async move |weak, cx| loop {
             Timer::after(Duration::from_millis(33)).await;
-            let alive = weak
+            let keep_open = weak
                 .update(cx, |this, cx| {
+                    if checked_protection.elapsed() >= Duration::from_millis(250) {
+                        checked_protection = Instant::now();
+                        let protected = this.exclusion.is_protected();
+                        if this.exclusion.has_been_protected() && !protected {
+                            // The helper keeps the exclusion effect attached
+                            // until this window is destroyed, preventing any
+                            // exposed frames while we notice its disappearance.
+                            return false;
+                        }
+                    }
                     let target = this.layout.reading_line(this.position.load(Ordering::Relaxed)) as f32;
                     let delta = target - this.shown_line;
                     if delta.abs() > 0.002 {
@@ -77,13 +91,16 @@ impl Prompter {
                         }
                         cx.notify();
                     }
+                    true
                 })
-                .is_ok();
-            if !alive {
+                .unwrap_or(false);
+            if !keep_open {
+                let _ = window_handle.update(cx, |_, window, _| window.remove_window());
                 break;
             }
         });
         Self {
+            exclusion,
             layout,
             font_size,
             position,
@@ -195,13 +212,16 @@ impl Render for Prompter {
 }
 
 impl Studio {
-    /// Show the prompter for a recording that just started.
-    pub(crate) fn open_prompter(&mut self, cx: &mut Context<Self>) {
+    /// Open before capture starts so the compositor can protect the exact
+    /// window before the first encoded frame. Window capture needs no helper.
+    pub(crate) fn open_prompter(&mut self, cx: &mut Context<Self>) -> Result<Option<CaptureExclusion>, String> {
         self.close_prompter(cx);
         let settings = self.teleprompter.clone();
-        if !settings.enabled || !settings.has_script() {
-            return;
+        if !settings.is_active() {
+            return Ok(None);
         }
+        let exclusion = CaptureExclusion::new()?;
+        let window_exclusion = exclusion.clone();
         let microphone = self.record_microphone;
         let width = px(PROMPTER_WIDTH);
         let height = px(Prompter::window_height(settings.lines, settings.font_size));
@@ -230,11 +250,31 @@ impl Studio {
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
-            move |window, cx| cx.new(|cx| Prompter::new(&settings, microphone, window, cx)),
+            move |window, cx| {
+                window.set_window_title(window_exclusion.title());
+                cx.new(|cx| Prompter::new(&settings, microphone, window_exclusion, window, cx))
+            },
         );
         match result {
-            Ok(handle) => self.prompter_window = Some(handle),
-            Err(error) => self.toast = Some(format!("Could not open the teleprompter: {error}").into()),
+            Ok(handle) => {
+                self.prompter_window = Some(handle);
+                self.pause_prompter(true, cx);
+                Ok(Some(exclusion))
+            }
+            Err(error) => Err(format!("Could not open the teleprompter: {error}")),
+        }
+    }
+
+    /// Reset the take without replacing the protected native window.
+    pub(crate) fn reset_prompter(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.prompter_window {
+            let settings = self.teleprompter.clone();
+            let microphone = self.record_microphone;
+            let _ = handle.update(cx, |prompter, window, cx| {
+                let exclusion = prompter.exclusion.clone();
+                drop(prompter.follower.take());
+                *prompter = Prompter::new(&settings, microphone, exclusion, window, cx);
+            });
         }
     }
 
@@ -257,6 +297,12 @@ impl Studio {
     }
 
     fn set_teleprompter_script(&mut self, script: String) {
+        // A file picker can finish after recording has started. Do not let
+        // its result enable the prompter on an existing monitor capture.
+        if self.recording_state != crate::RecordingState::Idle || self.recording_busy {
+            self.toast = Some("Finish recording before changing the script".into());
+            return;
+        }
         let script = script.replace("\r\n", "\n");
         if script.trim().is_empty() {
             self.toast = Some("That script is empty".into());
@@ -386,6 +432,13 @@ impl Studio {
             subtitle,
             settings.enabled,
             cx.listener(|this, _, _, cx| {
+                // The capture source is fixed for this take. Enabling a
+                // script after monitor capture starts would record it.
+                if this.recording_state != crate::RecordingState::Idle || this.recording_busy {
+                    this.toast = Some("Teleprompter settings can be changed after recording".into());
+                    cx.notify();
+                    return;
+                }
                 this.teleprompter.enabled = !this.teleprompter.enabled;
                 this.save_teleprompter();
                 cx.notify();
@@ -496,7 +549,7 @@ impl Studio {
                         })
                     })
                     .child(div().text_xs().text_color(muted()).child(
-                        "The prompter is a window on your screen: record a window or an area, or move it to another display, to keep it out of the video.",
+                        "The prompter stays visible to you and out of the recording. Screen and area capture need the Lahza GNOME helper; window capture works without it.",
                     ))
                     .child(div().h(px(1.0)).bg(line()))
                     .child(div().text_xs().text_color(blue()).child("Scroll the prompter or click a word to jump.")),

@@ -20,11 +20,16 @@ release *args:
 release-check *args:
     python3 packaging/release.py --dry-run "$@"
 
-# Build, stop the running app, and replace the installed binary
+# Install/enable the GNOME capture helper without rebuilding Lahza
+install-helper:
+    python3 packaging/install-gnome-helper.py
+
+# Build, replace the installed binary, and install the GNOME capture helper
 install: build
     pkill -x lahza || true
     install -Dm755 target/release/lahza {{bin}}
     @echo "Installed $(stat -c %y {{bin}} | cut -d. -f1) -> {{bin}}"
+    python3 packaging/install-gnome-helper.py
 
 # Full desktop install: binary, desktop entry, and icon
 install-desktop: install

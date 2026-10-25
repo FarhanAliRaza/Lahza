@@ -4,6 +4,7 @@ pub mod area;
 pub mod area_indicator;
 pub mod camera_preview;
 pub mod camera_playback;
+pub mod capture_exclusion;
 pub mod clips;
 pub mod cursor_assets;
 pub mod cursor_theme;

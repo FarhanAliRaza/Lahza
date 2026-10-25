@@ -1,6 +1,7 @@
 use super::area::{preview_frame, AreaRequest, RecordingArea};
 use super::area_indicator::AreaIndicator;
 use super::camera_preview::{attach_preview, preview_branch, CameraFrames};
+use super::capture_exclusion::{CaptureExclusion, CAPTURE_MEMORY_CAPS};
 use super::input::{monotonic_ns, ActiveRange, InputCapture, InputMapping};
 use super::stream_geometry::{self, RecordingSize};
 use ashpd::desktop::{
@@ -85,6 +86,9 @@ pub trait RecorderBackend {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecordingOptions {
     pub area: Option<RecordingArea>,
+    /// Keeps the helper request alive and requires protected offscreen
+    /// compositing before a desktop/area recording can start.
+    pub prompter_exclusion: Option<CaptureExclusion>,
     pub system_audio: bool,
     pub microphone: bool,
     /// PulseAudio/PipeWire source name to record from; `None` uses the default.
@@ -407,6 +411,13 @@ fn run_worker(
             .ok_or_else(|| "no screen or window was selected".to_string())?;
         let node = stream.pipe_wire_node_id();
         let preserve_alpha = stream.source_type() == Some(SourceType::Window);
+        let monitor_exclusion = options.prompter_exclusion.clone().filter(|_| !preserve_alpha);
+        if let Some(exclusion) = monitor_exclusion.as_ref() {
+            if let Err(error) = exclusion.wait_until_protected(Duration::from_secs(3)) {
+                let _ = session.close().await;
+                return Err(error);
+            }
+        }
         let input_mapping = InputMapping {
             origin: stream.position().map(|(x, y)| (f64::from(x), f64::from(y))),
             size: stream
@@ -420,7 +431,7 @@ fn run_worker(
                 .await
                 .map_err(|error| error.to_string())?;
 
-            let frame = match preview_frame(remote.as_raw_fd(), node) {
+            let frame = match preview_frame(remote.as_raw_fd(), node, options.prompter_exclusion.is_some()) {
                 Ok(frame) => frame,
                 Err(error) => {
                     let _ = session.close().await;
@@ -464,6 +475,14 @@ fn run_worker(
             .open_pipe_wire_remote(&session)
             .await
             .map_err(|error| error.to_string())?;
+        // Area selection may have been open for a long time. Verify the
+        // helper again immediately before the first frame can be encoded.
+        if let Some(exclusion) = monitor_exclusion.as_ref() {
+            if let Err(error) = exclusion.wait_until_protected(Duration::from_secs(3)) {
+                let _ = session.close().await;
+                return Err(error);
+            }
+        }
         let recording_size = RecordingSize::default();
         let mut segments = Vec::new();
         let mut child = Some(spawn_segment(
@@ -559,6 +578,12 @@ fn run_worker(
                     let _ = reply.send(result);
                 }
                 WorkerCommand::Resume(reply) => {
+                    if let Some(exclusion) = monitor_exclusion.as_ref() {
+                        if let Err(error) = exclusion.wait_until_protected(Duration::from_secs(3)) {
+                            let _ = reply.send(Err(error));
+                            continue;
+                        }
+                    }
                     let result = if child.is_some() {
                         Err("recording is not paused".into())
                     } else {
@@ -974,10 +999,16 @@ fn build_segment_pipeline(
     } else {
         "vp8enc name=screen_encoder deadline=1 cpu-used=8 threads=4 target-bitrate=12000000 keyframe-max-dist=60"
     };
+    // always-copy alone also accepts DMA-BUFs copied from the visible desktop.
+    let capture_filter = if options.prompter_exclusion.is_some() {
+        format!("capsfilter name=screen_capture_memory caps=\"{CAPTURE_MEMORY_CAPS}\" ! ")
+    } else {
+        String::new()
+    };
     let mut description = format!(
         "matroskamux name=mux ! filesink location=\"{}\" \
          pipewiresrc name=screen_source fd={} path={} always-copy=true \
-         keepalive-time=1000 ! {} ! {crop_filter}\
+         keepalive-time=1000 ! {capture_filter}{} ! {crop_filter}\
          queue max-size-buffers=4 leaky=downstream ! \
          {encoder} ! queue ! mux. ",
         path.display(),
@@ -1485,6 +1516,35 @@ mod tests {
     }
 
     #[test]
+    fn protected_capture_forces_shared_memory_before_any_video_processing() {
+        let root = std::env::temp_dir().join(format!("lahza-protected-pipeline-{}", uuid::Uuid::new_v4()));
+        let exclusion = CaptureExclusion::new_in(&root.join("requests")).unwrap();
+        let options = RecordingOptions {
+            prompter_exclusion: Some(exclusion),
+            ..Default::default()
+        };
+        let output = root.join("screen.mkv");
+        for preserve_alpha in [false, true] {
+            for index in [0, 1] {
+                let pipeline = build_segment_pipeline(
+                    &output, index, -1, 0, &options, None, None, preserve_alpha,
+                ).unwrap();
+                let source = pipeline.by_name("screen_source").unwrap();
+                let first_filter = source.static_pad("src").unwrap()
+                    .peer().unwrap().parent_element().unwrap();
+                assert_eq!(first_filter.name(), "screen_capture_memory");
+                let caps = first_filter.property::<gst::Caps>("caps");
+                let dmabuf: gst::Caps = "video/x-raw(memory:DMABuf),format=BGRA".parse().unwrap();
+                let shared: gst::Caps = "video/x-raw(memory:SystemMemory),format=BGRA".parse().unwrap();
+                assert!(!caps.can_intersect(&dmabuf), "DMA-BUF capture can include the desktop prompt");
+                assert!(caps.can_intersect(&shared));
+            }
+        }
+        drop(options);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn recording_pipeline_builds_with_installed_pipewire_plugin() {
         let root = std::env::temp_dir().join(format!("lahza-pipeline-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -1494,6 +1554,7 @@ mod tests {
         {
             let options = RecordingOptions {
                 area: None,
+                prompter_exclusion: None,
                 microphone,
                 system_audio,
                 microphone_device: None,
@@ -1538,6 +1599,7 @@ mod tests {
         let output = root.join("screen.mkv");
         let mut recorder = NativeRecorder::with_options(RecordingOptions {
             area: None,
+            prompter_exclusion: None,
             system_audio: true,
             microphone: true,
             microphone_device: None,

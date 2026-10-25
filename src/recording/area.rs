@@ -1,6 +1,7 @@
 //! Select a rectangle from the actual portal stream, before encoding starts.
 
 use super::camera_preview::{attach_preview, CameraFrame, CameraFrames};
+use super::capture_exclusion::CAPTURE_MEMORY_CAPS;
 use gstreamer::{self as gst, prelude::*};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -186,13 +187,18 @@ impl Drop for PreviewPipeline {
     }
 }
 
-pub fn preview_frame(fd: i32, node: u32) -> Result<CameraFrame, String> {
+pub fn preview_frame(fd: i32, node: u32, protected_capture: bool) -> Result<CameraFrame, String> {
     gst::init().map_err(|error| error.to_string())?;
     // Preserve the stream's pixel dimensions: portal sizes can be logical
     // coordinates on scaled displays. The RGBA rows have no alignment padding.
+    let capture_filter = if protected_capture {
+        format!("{CAPTURE_MEMORY_CAPS} ! ")
+    } else {
+        String::new()
+    };
     let pipeline = gst::parse::launch(&format!(
         "pipewiresrc fd={fd} path={node} always-copy=true keepalive-time=1000 ! \
-         videoconvert ! video/x-raw,format=RGBA ! \
+         {capture_filter}videoconvert ! video/x-raw,format=RGBA ! \
          fakesink name=area_preview sync=false async=false"
     ))
     .map_err(|error| format!("could not prepare area preview: {error}"))?

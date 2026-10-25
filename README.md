@@ -133,20 +133,36 @@ update-desktop-database ~/.local/share/applications
 gtk-update-icon-cache -t ~/.local/share/icons/hicolor
 ```
 
-Ensure `~/.local/bin` is on `PATH`. After later changes, `just install` rebuilds and replaces the installed executable, stopping any running instance; `just run` also launches it. For development without installing, use `cargo run`.
+Ensure `~/.local/bin` is on `PATH`. After later changes, `just install` rebuilds and replaces the installed executable, stopping any running instance; `just run` also launches it. On GNOME, these commands also install the capture helper and configure it to enable at login. A newly installed or updated helper needs a logout/login before use; restarting Lahza alone is not enough. For development without installing, use `cargo run`.
 
-### Optional GNOME input helper
+### GNOME capture helper
 
-The bundled GNOME Shell extension supplies additional pointer/click metadata and modifier/special-key captions. Install it with:
+The bundled GNOME Shell extension keeps the teleprompter visible on your desktop
+but out of screen and area recordings. It also supplies additional pointer/click
+metadata and modifier/special-key captions. It supports GNOME 48–50.
+
+For a source checkout, run `just install-helper` to install only the helper
+without rebuilding or stopping Lahza. `just install` and `just run` include this
+step automatically. The installer preserves your other extensions and reports
+when a logout/login is needed.
+
+To install the bundle manually:
 
 ```bash
-gnome-extensions pack --force --out-dir /tmp packaging/gnome-shell-extension
+gnome-extensions pack --force --extra-source=prompter.js --out-dir /tmp packaging/gnome-shell-extension
 gnome-extensions install --force \
   /tmp/lahza-input@com.lahza.shell-extension.zip
-gnome-extensions enable lahza-input@com.lahza
 ```
 
-Log out and back in so GNOME Shell discovers the extension. It remains idle unless Lahza activates it through its runtime control file. Plain typed text is not logged. Without a successful helper connection, recording can fall back to an embedded cursor; editable pointer effects and automatic click zooms depend on available input metadata.
+On a first installation, log out and back in so GNOME Shell discovers the
+extension, then run `gnome-extensions enable lahza-input@com.lahza`. After updating
+an already loaded version, log out and back in to load the new code.
+
+The helper acts only on Lahza's active capture requests. Plain typed text is not
+logged. Ordinary recordings and teleprompter window recordings work without the
+helper; screen/area recording with a teleprompter waits for confirmed exclusion
+before encoding. Editable pointer effects and automatic click zooms depend on
+available input metadata.
 
 ### Source layout
 
@@ -320,9 +336,19 @@ not edited, and both undo together. Click a caption's time to edit its text.
 Turn on **Teleprompter** in the recorder, then open or paste a script. While
 recording, the prompter floats at the top of the main screen. With whisper.cpp,
 the voice model and the microphone on, it scrolls as you read; otherwise scroll
-it with the mouse wheel or click a word. Desktop capture cannot exclude a window,
-so record a window or an area, or move the prompter to another display, to keep
-it out of the video.
+it with the mouse wheel or click a word.
+
+With the [GNOME capture helper](#gnome-capture-helper), the prompter is omitted
+from screen and selected-area recordings while remaining visible on your
+desktop. The content underneath stays live in the video. Lahza waits for the
+helper to protect the prompter before encoding; if protection is unavailable,
+it reports an error instead of recording the script. Window capture works
+without the helper.
+
+Teleprompter settings stay fixed during a take, including pause and resume;
+restarting resets the script inside the same protected window. Disabling the
+helper closes the prompter; its exclusion stays in place until the window is
+destroyed, so the script is not briefly exposed in the recording.
 
 ### Sharing
 
