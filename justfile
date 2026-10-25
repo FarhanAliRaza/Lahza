@@ -26,6 +26,7 @@ install-helper:
 
 # Build, replace the installed binary, and install the GNOME capture helper
 install: build
+    target/release/lahza --version
     pkill -x lahza || true
     install -Dm755 target/release/lahza {{bin}}
     @echo "Installed $(stat -c %y {{bin}} | cut -d. -f1) -> {{bin}}"
@@ -42,7 +43,7 @@ install-desktop: install
 
 # Build, replace the binary, and launch the app
 run: install
-    setsid {{bin}} >/dev/null 2>&1 &
+    python3 packaging/run.py '{{bin}}'
 
 # Remove the installed binary, desktop entry, and icon
 uninstall:

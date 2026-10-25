@@ -39,6 +39,7 @@ pub(crate) struct AudioDrag {
     seconds_per_pixel: f64,
     original: AudioClip,
     original_clips: Vec<AudioClip>,
+    snap_targets: Vec<f64>,
     active: bool,
 }
 
@@ -60,6 +61,7 @@ impl Studio {
         self.video_move_drag = None;
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
+        self.timeline_ui.snap_guide = None;
         self.video_audio_drag = Some(AudioDrag {
             id,
             kind,
@@ -68,6 +70,7 @@ impl Studio {
             seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
             original,
             original_clips: self.video_audio_clips.clone(),
+            snap_targets: self.timeline_snap_targets(None, None, Some(id)),
             active: false,
         });
     }
@@ -89,32 +92,27 @@ impl Studio {
         let original = drag.original.clone();
         let kind = drag.kind;
         let id = drag.id;
-        let snap = 8.0 * drag.seconds_per_pixel;
+        let seconds_per_pixel = drag.seconds_per_pixel;
+        let candidates = drag.snap_targets.clone();
         let workspace = self.video_timeline_duration();
-        let mut candidates = vec![0.0, self.video_position];
-        let starts = self.video_clip_timeline.clip_starts();
-        for (index, segment) in self.video_clip_timeline.segments.iter().enumerate() {
-            candidates.push(starts[index]);
-            candidates.push(starts[index] + segment.editor_duration());
-        }
-        let snapped = |value: f64| {
-            candidates
-                .iter()
-                .copied()
-                .filter(|candidate| (value - candidate).abs() < snap)
-                .min_by(|a, b| (value - a).abs().total_cmp(&(value - b).abs()))
-                .unwrap_or(value)
+        let enabled = self.timeline_ui.snap_enabled;
+        let snapped = |value: f64, duration: f64| {
+            crate::timeline_edit::snap_timeline_edges(value, duration, &candidates, seconds_per_pixel, enabled)
         };
         let Some(clip) = self.video_audio_clips.iter_mut().find(|clip| clip.id == id) else {
             return false;
         };
+        let guide;
         match kind {
             AudioDragKind::Move => {
                 let max_start = (workspace - original.duration).max(0.0);
-                clip.start = snapped(original.start + delta).clamp(0.0, max_start);
+                let (start, target) = snapped(original.start + delta, original.duration);
+                guide = target;
+                clip.start = start.clamp(0.0, max_start);
             }
             AudioDragKind::Leading => {
-                let new_start = snapped(original.start + delta);
+                let (new_start, target) = snapped(original.start + delta, 0.0);
+                guide = target;
                 let shift = (new_start - original.start).clamp(
                     -original.source_start.min(original.start),
                     original.duration - AudioClip::MINIMUM_DURATION,
@@ -124,7 +122,8 @@ impl Studio {
                 clip.duration = original.duration - shift;
             }
             AudioDragKind::Trailing => {
-                let new_end = snapped(original.start + original.duration + delta);
+                let (new_end, target) = snapped(original.start + original.duration + delta, 0.0);
+                guide = target;
                 let mut longest = (workspace - original.start).max(AudioClip::MINIMUM_DURATION);
                 if original.source_duration > 0.0 {
                     longest = longest.min(original.source_duration - original.source_start);
@@ -133,6 +132,12 @@ impl Studio {
                     .clamp(AudioClip::MINIMUM_DURATION.min(longest), longest);
             }
         }
+        let (start, end) = match kind {
+            AudioDragKind::Move => (clip.start, clip.start + clip.duration),
+            AudioDragKind::Leading => (clip.start, clip.start),
+            AudioDragKind::Trailing => (clip.start + clip.duration, clip.start + clip.duration),
+        };
+        self.timeline_ui.snap_guide = crate::timeline_edit::snap_guide_at_edges(guide, start, end);
         true
     }
 
@@ -141,17 +146,33 @@ impl Studio {
         let Some(drag) = self.video_audio_drag.take() else {
             return false;
         };
-        if drag.active {
+        self.timeline_ui.snap_guide = None;
+        if drag.active && self.video_audio_clips != drag.original_clips {
             self.video_undo_stack.push(VideoEditSnapshot::Audio(drag.original_clips));
             self.video_redo_stack.clear();
             self.save_audio_clips(cx);
-        } else if let Some(position) = self.motion_timeline_time_at(pointer_x) {
-            self.seek_video(position, cx);
+        } else if !drag.active {
+            if let Some(position) = self.motion_timeline_time_at(pointer_x) {
+                self.seek_video(position, cx);
+            }
         }
         self.select_inspector_tab(crate::shell_ui::InspectorTab::Record);
         self.open_sections.insert("audio");
         cx.notify();
         true
+    }
+
+    pub(crate) fn cancel_audio_drag(&mut self) -> bool {
+        let Some(drag) = self.video_audio_drag.take() else { return false; };
+        self.video_audio_clips = drag.original_clips;
+        self.timeline_ui.snap_guide = None;
+        true
+    }
+
+    pub(crate) fn audio_drag_range(&self) -> Option<(f64, f64)> {
+        let drag = self.video_audio_drag.as_ref().filter(|drag| drag.active)?;
+        let clip = self.video_audio_clips.iter().find(|clip| clip.id == drag.id)?;
+        Some((clip.start, clip.start + clip.duration))
     }
 }
 
@@ -610,6 +631,7 @@ impl Studio {
         let dragging = self.video_audio_drag.as_ref().filter(|drag| drag.active).map(|drag| drag.id);
         let mut lane = div()
             .relative()
+            .flex_none()
             .h(px(self.video_audio_clips.len() as f32 * ROW))
             .overflow_hidden();
         for (index, clip) in self.video_audio_clips.iter().enumerate() {

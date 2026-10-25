@@ -1,6 +1,6 @@
 use super::{
     model::{CaptureManifest, PointerCaptureFile, RecordingSession},
-    native::{RecordStatus, RecorderBackend, RecorderError},
+    native::{CaptureSourceGeometry, RecordStatus, RecorderBackend, RecorderError},
     video::{probe_media, write_poster},
 };
 use std::{
@@ -87,6 +87,34 @@ impl<B: RecorderBackend> RecordingController<B> {
 
     pub fn session(&self) -> Option<&RecordingSession> {
         self.session.as_ref()
+    }
+
+    pub fn has_stopped(&self) -> bool {
+        matches!(self.state, RecordingState::Recording | RecordingState::Paused)
+            && self.backend.has_stopped()
+    }
+
+    pub fn source_geometry(&self) -> Option<CaptureSourceGeometry> {
+        self.backend.source_geometry()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_started_backend_for_test(
+        mut backend: B,
+        session: RecordingSession,
+    ) -> Self {
+        let status = backend.record_status().ok();
+        Self {
+            backend,
+            state: RecordingState::Recording,
+            session: Some(session),
+            started_at: status
+                .as_ref()
+                .filter(|status| status.active && !status.paused)
+                .map(|_| Instant::now()),
+            elapsed_before_pause_ms: status.map(|status| status.duration_ms).unwrap_or(0),
+            warnings: Vec::new(),
+        }
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -213,7 +241,7 @@ impl<B: RecorderBackend> RecordingController<B> {
             .backend
             .record_status()
             .ok()
-            .filter(|status| status.active)
+            .filter(|status| status.active || self.backend.has_stopped())
             .map(|status| status.duration_ms)
             .unwrap_or_else(|| self.elapsed_ms());
         self.started_at = None;
@@ -222,18 +250,31 @@ impl<B: RecorderBackend> RecordingController<B> {
         let output = match self.backend.stop_recording() {
             Ok(output) => output,
             Err(error) => {
-                self.state = previous_state;
-                if previous_state == RecordingState::Recording {
+                // A stopped worker cannot be resumed by restoring the UI's
+                // old state. Keep its project for recovery, but end the clock.
+                self.state = if self.backend.has_stopped() {
+                    RecordingState::Idle
+                } else {
+                    previous_state
+                };
+                if self.state == RecordingState::Recording {
                     self.started_at = Some(Instant::now());
                 }
                 return Err(error.into());
             }
         };
-        if !self.wait_for_status(Duration::from_secs(5), |status| !status.active)? {
-            self.warnings.push(
+        // The backend has delivered its finalized output. Every subsequent
+        // error is an import/recovery problem, never an ongoing recording.
+        self.state = RecordingState::Idle;
+        match self.wait_for_status(Duration::from_secs(5), |status| !status.active) {
+            Ok(true) => {}
+            Ok(false) => self.warnings.push(
                 "The encoder returned the recording path but did not report a fully stopped output within 5 seconds."
                     .into(),
-            );
+            ),
+            Err(error) => self.warnings.push(format!(
+                "The recording was finalized, but its stopped status could not be checked: {error}"
+            )),
         }
         let source = output.as_path();
         let output_is_usable = wait_for_usable_output(source, Duration::from_secs(5));
@@ -316,7 +357,24 @@ impl<B: RecorderBackend> RecordingController<B> {
     }
 
     fn wait_until_active(&mut self, timeout: Duration) -> Result<bool, RecordingError> {
-        self.wait_for_status(timeout, |status| status.active)
+        let deadline = Instant::now() + timeout;
+        loop {
+            // start_recording already acknowledged its first video frame.
+            // The portal may close before this thread observes active=true;
+            // hand that completed take to normal finalization, not deletion.
+            if self.backend.has_stopped() {
+                return Ok(true);
+            }
+            match self.backend.record_status() {
+                Ok(status) if status.active => return Ok(true),
+                Err(error) if !self.backend.has_stopped() => return Err(error.into()),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Ok(self.backend.has_stopped());
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
     }
 
     fn wait_for_status(
@@ -394,10 +452,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[derive(Default)]
     struct FakeBackend {
         active: bool,
         paused: bool,
         output: PathBuf,
+        stopped: bool,
+        stop_error: bool,
+        stop_calls: usize,
+        stop_during_start: bool,
     }
 
     impl RecorderBackend for FakeBackend {
@@ -412,7 +475,8 @@ mod tests {
         }
 
         fn start_recording(&mut self, _output: &Path) -> Result<(), RecorderError> {
-            self.active = true;
+            self.active = !self.stop_during_start;
+            self.stopped = self.stop_during_start;
             Ok(())
         }
 
@@ -427,8 +491,17 @@ mod tests {
         }
 
         fn stop_recording(&mut self) -> Result<PathBuf, RecorderError> {
+            self.stop_calls += 1;
+            if self.stop_error {
+                return Err(RecorderError::Pipeline("finalization failed".into()));
+            }
             self.active = false;
+            self.stopped = true;
             Ok(self.output.clone())
+        }
+
+        fn has_stopped(&self) -> bool {
+            self.stopped
         }
     }
 
@@ -441,6 +514,7 @@ mod tests {
             active: false,
             paused: false,
             output,
+            ..Default::default()
         };
         let mut controller = RecordingController::new(backend);
         let root = std::env::temp_dir().join(format!(
@@ -472,6 +546,7 @@ mod tests {
             active: false,
             paused: false,
             output: PathBuf::new(),
+            ..Default::default()
         };
         let mut controller = RecordingController::new(backend);
         assert!(matches!(
@@ -490,6 +565,7 @@ mod tests {
             active: false,
             paused: false,
             output,
+            ..Default::default()
         };
         let mut controller = RecordingController::new(backend);
         let root =
@@ -503,5 +579,156 @@ mod tests {
         assert_eq!(controller.state(), RecordingState::Idle);
         assert!(!project.exists());
         fs::remove_dir(root).unwrap();
+    }
+
+    fn recovery_session() -> (PathBuf, RecordingSession) {
+        let root = std::env::temp_dir().join(format!(
+            "lahza-terminal-recording-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session = RecordingSession::create_in(&root).unwrap();
+        (root, session)
+    }
+
+    #[test]
+    fn terminal_stop_failure_ends_the_clock_and_keeps_the_project() {
+        let (root, session) = recovery_session();
+        let raw = session.directory.join("screen-segment-0000.mkv");
+        fs::write(&raw, b"recoverable footage").unwrap();
+        let backend = FakeBackend {
+            stopped: true,
+            stop_error: true,
+            ..Default::default()
+        };
+        let mut controller = RecordingController::from_started_backend_for_test(backend, session.clone());
+        // The backend's frozen duration must win over a stale UI clock.
+        controller.started_at = Some(Instant::now() - Duration::from_secs(30));
+        assert!(controller.has_stopped());
+
+        assert!(controller.stop_and_save().is_err());
+
+        assert_eq!(controller.state(), RecordingState::Idle);
+        assert_eq!(controller.elapsed_ms(), 1_250);
+        assert!(controller.started_at.is_none());
+        assert_eq!(controller.session(), Some(&session));
+        assert_eq!(fs::read(raw).unwrap(), b"recoverable footage");
+        assert!(!controller.has_stopped(), "the UI must consume a terminal event only once");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portal_close_before_start_status_poll_keeps_the_completed_take() {
+        let (root, session) = recovery_session();
+        fs::write(session.screen_path(), b"ready video").unwrap();
+        let backend = FakeBackend {
+            output: session.screen_path(),
+            stop_during_start: true,
+            ..Default::default()
+        };
+        let mut controller = RecordingController::new(backend);
+        let started = Instant::now();
+
+        assert_eq!(controller.start_with_session(session.clone()).unwrap(), &session);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(controller.state(), RecordingState::Recording);
+        assert!(controller.has_stopped(), "the UI must consume the completed take");
+        assert_eq!(controller.backend.stop_calls, 0);
+        assert_eq!(fs::read(session.screen_path()).unwrap(), b"ready video");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_live_backend_stop_failure_preserves_the_running_state() {
+        let (root, session) = recovery_session();
+        let backend = FakeBackend {
+            active: true,
+            stop_error: true,
+            ..Default::default()
+        };
+        let mut controller = RecordingController::from_started_backend_for_test(backend, session.clone());
+
+        assert!(controller.stop_and_save().is_err());
+
+        assert_eq!(controller.state(), RecordingState::Recording);
+        assert!(controller.started_at.is_some());
+        assert_eq!(controller.session(), Some(&session));
+        assert!(!controller.has_stopped());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn externally_completed_output_is_saved_once_with_its_frozen_duration() {
+        let (root, session) = recovery_session();
+        fs::write(session.screen_path(), b"video").unwrap();
+        let backend = FakeBackend {
+            output: session.screen_path(),
+            stopped: true,
+            ..Default::default()
+        };
+        let mut controller = RecordingController::from_started_backend_for_test(backend, session);
+        controller.started_at = Some(Instant::now() - Duration::from_secs(30));
+
+        let saved = controller.stop_and_save().unwrap();
+
+        assert_eq!(controller.state(), RecordingState::Idle);
+        assert_eq!(saved.read_manifest().unwrap().duration, 1.25);
+        assert_eq!(controller.backend.stop_calls, 1);
+        assert!(controller.stop_and_save().is_err());
+        assert_eq!(controller.backend.stop_calls, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn paused_recording_is_not_an_external_stop() {
+        let (root, session) = recovery_session();
+        let backend = FakeBackend {
+            active: true,
+            ..Default::default()
+        };
+        let mut controller = RecordingController::from_started_backend_for_test(backend, session);
+        controller.pause().unwrap();
+        assert_eq!(controller.state(), RecordingState::Paused);
+        assert!(!controller.has_stopped());
+
+        controller.backend.active = false;
+        controller.backend.stopped = true;
+        assert!(controller.has_stopped(), "portal closure must also be noticed while paused");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_import_failures_leave_idle_and_preserve_recoverable_files() {
+        for failure in ["missing output", "output install", "manifest"] {
+            let (root, session) = recovery_session();
+            let output = if failure == "output install" {
+                fs::create_dir(session.screen_path()).unwrap();
+                session.directory.join("screen-segment-0000.mkv")
+            } else {
+                session.screen_path()
+            };
+            if failure != "missing output" {
+                fs::write(&output, b"video").unwrap();
+            }
+            if failure == "manifest" {
+                fs::create_dir(session.capture_path()).unwrap();
+            }
+            let backend = FakeBackend {
+                output: output.clone(),
+                stopped: true,
+                ..Default::default()
+            };
+            let mut controller = RecordingController::from_started_backend_for_test(backend, session.clone());
+
+            assert!(controller.stop_and_save().is_err(), "{failure}");
+
+            assert_eq!(controller.state(), RecordingState::Idle, "{failure}");
+            assert_eq!(controller.session(), Some(&session), "{failure}");
+            assert!(controller.started_at.is_none(), "{failure}");
+            if failure != "missing output" {
+                assert_eq!(fs::read(&output).unwrap(), b"video", "{failure}");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

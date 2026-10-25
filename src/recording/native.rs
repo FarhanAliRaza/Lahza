@@ -10,6 +10,7 @@ use ashpd::desktop::{
 };
 use gst::prelude::*;
 use gstreamer as gst;
+use futures_util::{FutureExt, StreamExt};
 use std::{
     fmt, fs, io,
     os::fd::{AsRawFd, OwnedFd},
@@ -30,6 +31,29 @@ pub struct RecordStatus {
     pub timecode: String,
     pub duration_ms: u64,
     pub output_bytes: u64,
+}
+
+/// Selected source bounds in compositor logical coordinates, not encoded pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureSourceGeometry {
+    pub position: (i32, i32),
+    pub size: (i32, i32),
+    pub is_monitor: bool,
+}
+
+impl CaptureSourceGeometry {
+    fn from_portal(
+        position: Option<(i32, i32)>,
+        size: Option<(i32, i32)>,
+        source_type: Option<SourceType>,
+    ) -> Option<Self> {
+        let size = size.filter(|(width, height)| *width > 0 && *height > 0)?;
+        Some(Self {
+            position: position?,
+            size,
+            is_monitor: source_type == Some(SourceType::Monitor),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +90,15 @@ pub trait RecorderBackend {
     fn resume_recording(&mut self) -> Result<(), RecorderError>;
     fn stop_recording(&mut self) -> Result<PathBuf, RecorderError>;
 
+    /// Terminal shutdown has started; a paused recorder is not stopped.
+    fn has_stopped(&self) -> bool {
+        false
+    }
+
+    fn source_geometry(&self) -> Option<CaptureSourceGeometry> {
+        None
+    }
+
     fn includes_system_audio(&self) -> bool {
         false
     }
@@ -86,9 +119,9 @@ pub trait RecorderBackend {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecordingOptions {
     pub area: Option<RecordingArea>,
-    /// Keeps the helper request alive and requires protected offscreen
-    /// compositing before a desktop/area recording can start.
-    pub prompter_exclusion: Option<CaptureExclusion>,
+    /// Keeps every floating window's helper request alive and requires
+    /// protected offscreen compositing before desktop/area recording.
+    pub capture_exclusions: Vec<CaptureExclusion>,
     pub system_audio: bool,
     pub microphone: bool,
     /// PulseAudio/PipeWire source name to record from; `None` uses the default.
@@ -109,6 +142,9 @@ struct SharedState {
     failure: Option<String>,
     pointer_synthesized: bool,
     camera_recorded: bool,
+    stopped: bool,
+    completion: Option<Result<PathBuf, String>>,
+    source_geometry: Option<CaptureSourceGeometry>,
 }
 
 impl Default for SharedState {
@@ -122,6 +158,9 @@ impl Default for SharedState {
             failure: None,
             pointer_synthesized: false,
             camera_recorded: false,
+            stopped: false,
+            completion: None,
+            source_geometry: None,
         }
     }
 }
@@ -148,6 +187,19 @@ impl Default for NativeRecorder {
 }
 
 impl NativeRecorder {
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(output: PathBuf, elapsed: Duration) -> Self {
+        let recorder = Self::new();
+        {
+            let mut state = recorder.state.lock().unwrap();
+            state.elapsed = elapsed;
+            state.output = Some(output.clone());
+            state.stopped = true;
+            state.completion = Some(Ok(output));
+        }
+        recorder
+    }
+
     pub fn new() -> Self {
         Self::with_options(RecordingOptions::default())
     }
@@ -233,6 +285,7 @@ impl RecorderBackend for NativeRecorder {
             return Err(RecorderError::State("a recording is already active".into()));
         }
         ensure_runtime()?;
+        *self.state.lock().expect("native recorder state poisoned") = SharedState::default();
         let output = output.to_path_buf();
         let options = self.options.clone();
         let area_requests = self.area_requests.clone();
@@ -281,12 +334,33 @@ impl RecorderBackend for NativeRecorder {
     }
 
     fn stop_recording(&mut self) -> Result<PathBuf, RecorderError> {
-        let result = self.command(WorkerCommand::Stop);
+        // The portal can close before the UI sends Stop, or while it is being
+        // sent. Joining and reading the cached result handles both races.
+        let result = if self.has_stopped() {
+            None
+        } else {
+            Some(self.command(WorkerCommand::Stop))
+        };
         self.commands = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        result
+        self.state
+            .lock()
+            .expect("native recorder state poisoned")
+            .completion
+            .clone()
+            .map(|result| result.map_err(RecorderError::Pipeline))
+            .or(result)
+            .unwrap_or_else(|| Err(RecorderError::State("there is no active native recording".into())))
+    }
+
+    fn has_stopped(&self) -> bool {
+        self.state.lock().map(|state| state.stopped).unwrap_or(true)
+    }
+
+    fn source_geometry(&self) -> Option<CaptureSourceGeometry> {
+        self.state.lock().ok().and_then(|state| state.source_geometry)
     }
 
     fn includes_system_audio(&self) -> bool {
@@ -371,6 +445,9 @@ fn run_worker(
             .create_session()
             .await
             .map_err(|error| error.to_string())?;
+        // Subscribe before showing the picker so a fast external close cannot
+        // be lost between receiving the stream and starting the worker loop.
+        let mut closed = Box::pin(session.receive_closed().await.map_err(|error| error.to_string())?);
         proxy
             .select_sources(
                 &session,
@@ -410,13 +487,20 @@ fn run_worker(
             .first()
             .ok_or_else(|| "no screen or window was selected".to_string())?;
         let node = stream.pipe_wire_node_id();
+        state.lock().expect("native recorder state poisoned").source_geometry =
+            CaptureSourceGeometry::from_portal(stream.position(), stream.size(), stream.source_type());
         let preserve_alpha = stream.source_type() == Some(SourceType::Window);
-        let monitor_exclusion = options.prompter_exclusion.clone().filter(|_| !preserve_alpha);
-        if let Some(exclusion) = monitor_exclusion.as_ref() {
-            if let Err(error) = exclusion.wait_until_protected(Duration::from_secs(3)) {
-                let _ = session.close().await;
-                return Err(error);
-            }
+        let monitor_exclusions: &[CaptureExclusion] = if preserve_alpha {
+            &[]
+        } else {
+            &options.capture_exclusions
+        };
+        if let Err(error) = CaptureExclusion::wait_until_all_protected(
+            monitor_exclusions,
+            Duration::from_secs(3),
+        ) {
+            let _ = session.close().await;
+            return Err(error);
         }
         let input_mapping = InputMapping {
             origin: stream.position().map(|(x, y)| (f64::from(x), f64::from(y))),
@@ -431,7 +515,11 @@ fn run_worker(
                 .await
                 .map_err(|error| error.to_string())?;
 
-            let frame = match preview_frame(remote.as_raw_fd(), node, options.prompter_exclusion.is_some()) {
+            let frame = match preview_frame(
+                remote.as_raw_fd(),
+                node,
+                !options.capture_exclusions.is_empty(),
+            ) {
                 Ok(frame) => frame,
                 Err(error) => {
                     let _ = session.close().await;
@@ -477,11 +565,12 @@ fn run_worker(
             .map_err(|error| error.to_string())?;
         // Area selection may have been open for a long time. Verify the
         // helper again immediately before the first frame can be encoded.
-        if let Some(exclusion) = monitor_exclusion.as_ref() {
-            if let Err(error) = exclusion.wait_until_protected(Duration::from_secs(3)) {
-                let _ = session.close().await;
-                return Err(error);
-            }
+        if let Err(error) = CaptureExclusion::wait_until_all_protected(
+            monitor_exclusions,
+            Duration::from_secs(3),
+        ) {
+            let _ = session.close().await;
+            return Err(error);
         }
         let recording_size = RecordingSize::default();
         let mut segments = Vec::new();
@@ -499,15 +588,27 @@ fn run_worker(
         // Negotiate and receive video before adding the cursor consumer.
         // Starting the metadata-only stream first can leave a window's video
         // consumer without any frames, even though caps and EOS succeed.
-        if let Some(input_capture) = input_capture
+        let pointer_setup_error = if let Some(input_capture) = input_capture
             .as_mut()
             .filter(|input| input.uses_pipewire_metadata())
         {
-            let pointer_remote = proxy
-                .open_pipe_wire_remote(&session)
-                .await
-                .map_err(|error| error.to_string())?;
-            input_capture.attach_pipewire(pointer_remote.as_raw_fd(), node, input_mapping)?;
+            let attached = async {
+                let pointer_remote = proxy
+                    .open_pipe_wire_remote(&session)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                input_capture.attach_pipewire(pointer_remote.as_raw_fd(), node, input_mapping)
+            }.await;
+            attached.err()
+        } else {
+            None
+        };
+        if let Some(error) = pointer_setup_error {
+            // The screen already has frames. Metadata is optional; if the
+            // portal closed during setup the normal terminal loop below will
+            // finalize the take rather than report a failed/empty setup.
+            eprintln!("Recording pointer metadata unavailable: {error}");
+            input_capture.take();
         }
         let mut indicator =
             options
@@ -533,25 +634,31 @@ fn run_worker(
         }
         let _ = ready.send(Ok(()));
 
+        let mut stop_reply = None;
+        let mut terminal_error = None;
         loop {
             if let Some(indicator) = indicator.as_mut() {
                 indicator.tick();
             }
-            if let Some(error) = child.as_mut().and_then(SegmentPipeline::take_failure) {
-                return Err(error);
+            // Polling the D-Bus stream never blocks command handling. Its
+            // connection receives signals independently of the capture loop.
+            if closed.next().now_or_never().is_some() {
+                break;
+            }
+            if let Some(end) = child.as_mut().and_then(SegmentPipeline::take_end) {
+                if let PipelineEnd::Error(error) = end {
+                    terminal_error = Some(error);
+                }
+                break;
             }
             let command = match commands.recv_timeout(Duration::from_millis(50)) {
                 Ok(command) => command,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if let Some(mut running) = child.take() {
-                        let _ = finalize_child(&mut running);
-                    }
-                    break;
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match command {
                 WorkerCommand::Pause(reply) => {
+                    let finishing_segment = child.is_some();
                     let result = if let Some(mut running) = child.take() {
                         if let Some(input_capture) = input_capture.as_mut() {
                             input_capture.detach_pipewire();
@@ -575,15 +682,18 @@ fn run_worker(
                     } else {
                         Err("recording is already paused".into())
                     };
+                    let failed = finishing_segment && result.is_err();
+                    if failed {
+                        let error = result.as_ref().unwrap_err();
+                        terminal_error = Some(error.clone());
+                        mark_stopped(&state);
+                    }
                     let _ = reply.send(result);
+                    if failed {
+                        break;
+                    }
                 }
                 WorkerCommand::Resume(reply) => {
-                    if let Some(exclusion) = monitor_exclusion.as_ref() {
-                        if let Err(error) = exclusion.wait_until_protected(Duration::from_secs(3)) {
-                            let _ = reply.send(Err(error));
-                            continue;
-                        }
-                    }
                     let result = if child.is_some() {
                         Err("recording is not paused".into())
                     } else {
@@ -594,6 +704,12 @@ fn run_worker(
                             .await
                             .map_err(|error| error.to_string())
                             .and_then(|next_remote| {
+                                // Opening the portal remote may take time;
+                                // require fresh protection just before encode.
+                                CaptureExclusion::wait_until_all_protected(
+                                    monitor_exclusions,
+                                    Duration::from_secs(3),
+                                )?;
                                 spawn_segment(
                                     &output,
                                     index,
@@ -625,8 +741,16 @@ fn run_worker(
                                     }
                                     .await;
                                     if let Err(error) = pointer_result {
+                                        // The segment is already encoding.
+                                        // Keep it tracked and finalize instead
+                                        // of dropping it and reusing its path.
+                                        segments.push(index);
+                                        child = Some(next);
+                                        active_range_start = Some(monotonic_ns());
+                                        terminal_error = Some(error.clone());
+                                        mark_stopped(&state);
                                         let _ = reply.send(Err(error));
-                                        continue;
+                                        break;
                                     }
                                 }
                                 let path = segment_path(&output, index);
@@ -649,76 +773,126 @@ fn run_worker(
                     let _ = reply.send(result);
                 }
                 WorkerCommand::Stop(reply) => {
-                    drop(indicator.take());
-                    let result = (|| {
-                        if let Some(start_ns) = active_range_start.take() {
-                            active_ranges.push(ActiveRange {
-                                start_ns,
-                                end_ns: monotonic_ns(),
-                            });
-                        }
-                        if let Some(mut running) = child.take() {
-                            finalize_child(&mut running)?;
-                        }
-                        let screen_segments: Vec<_> = segments
-                            .iter()
-                            .map(|index| segment_path(&output, *index))
-                            .collect();
-                        finalize_segments(&screen_segments, &output)?;
-                        let camera_recorded = if camera.is_some() {
-                            let camera_output = camera_path(&output);
-                            let camera_segments: Vec<_> = segments
-                                .iter()
-                                .map(|index| camera_segment_path(&output, *index))
-                                .collect();
-                            // A webcam that produced no frames must not fail
-                            // the screen recording; the editor just omits it.
-                            match finalize_segments(&camera_segments, &camera_output) {
-                                Ok(()) => true,
-                                Err(error) => {
-                                    eprintln!("Webcam recording was dropped: {error}");
-                                    false
-                                }
-                            }
-                        } else {
-                            false
-                        };
-                        let pointer_synthesized =
-                            input_capture.take().is_some_and(|input_capture| {
-                                input_capture
-                                    .finish(&active_ranges, input_mapping, &input_destination)
-                                    .unwrap_or(false)
-                            });
-                        let mut shared = state.lock().expect("native recorder state poisoned");
-                        if let Some(started) = shared.started_at.take() {
-                            shared.elapsed += started.elapsed();
-                        }
-                        shared.active = false;
-                        shared.paused = false;
-                        shared.output = Some(output.clone());
-                        shared.pointer_synthesized = pointer_synthesized;
-                        shared.camera_recorded = camera_recorded;
-                        Ok(output.clone())
-                    })();
-                    let _ = reply.send(result);
+                    stop_reply = Some(reply);
                     break;
                 }
             }
+        }
+        mark_stopped(&state);
+        drop(indicator.take());
+        if let Some(start_ns) = active_range_start.take() {
+            active_ranges.push(ActiveRange { start_ns, end_ns: monotonic_ns() });
+        }
+        if let Some(input_capture) = input_capture.as_mut() {
+            input_capture.detach_pipewire();
+        }
+        let result = finalize_recording(
+            &output, child.take(), &segments, camera.is_some(), terminal_error,
+        );
+        let pointer_synthesized = input_capture.take().is_some_and(|input_capture| {
+            input_capture.finish(&active_ranges, input_mapping, &input_destination).unwrap_or(false)
+        });
+        {
+            let mut shared = state.lock().expect("native recorder state poisoned");
+            shared.pointer_synthesized = pointer_synthesized;
+            if let Ok(camera_recorded) = result.as_ref() {
+                shared.output = Some(output.clone());
+                shared.camera_recorded = *camera_recorded;
+            }
+        }
+        let completion = result.map(|_| output.clone());
+        store_completion(&state, completion.clone());
+        if let Some(reply) = stop_reply {
+            let _ = reply.send(completion);
         }
         let _ = session.close().await;
         Ok::<(), String>(())
     });
 
     if let Err(error) = result {
-        let mut shared = state.lock().expect("native recorder state poisoned");
-        shared.active = false;
-        shared.failure = Some(error.clone());
+        store_completion(&state, Err(error.clone()));
         let _ = ready.send(Err(error));
     }
 }
 
 fn segment_path(output: &Path, index: usize) -> PathBuf {
     output.with_file_name(format!("screen-segment-{index:04}.mkv"))
+}
+
+fn mark_stopped(state: &Arc<Mutex<SharedState>>) {
+    let mut state = state.lock().expect("native recorder state poisoned");
+    if let Some(started) = state.started_at.take() {
+        state.elapsed += started.elapsed();
+    }
+    state.active = false;
+    state.paused = false;
+    state.stopped = true;
+}
+
+fn store_completion(state: &Arc<Mutex<SharedState>>, result: Result<PathBuf, String>) {
+    mark_stopped(state);
+    let mut state = state.lock().expect("native recorder state poisoned");
+    state.failure = result.as_ref().err().cloned();
+    state.completion = Some(result);
+}
+
+/// Every terminal path installs the same screen/camera output, including a
+/// portal close while paused and a source that ends before Stop is clicked.
+fn finalize_recording(
+    output: &Path,
+    mut child: Option<SegmentPipeline>,
+    segments: &[usize],
+    camera: bool,
+    terminal_error: Option<String>,
+) -> Result<bool, String> {
+    let drain_error = child.as_mut().and_then(|child| finalize_child(child).err());
+    drop(child);
+    let screen_segments: Vec<_> = segments.iter().map(|index| segment_path(output, *index)).collect();
+    let recovery_error = drain_error.or(terminal_error);
+    if let Some(error) = recovery_error.as_ref() {
+        // A disconnected source may leave valid frames in a container whose
+        // final index was not written. Remux it before installing the project.
+        for path in &screen_segments {
+            recover_segment(path)?;
+        }
+        eprintln!("Recording source ended; preserving captured media: {error}");
+    }
+    finalize_segments(&screen_segments, output)?;
+    let camera_recorded = camera && {
+        let camera_segments: Vec<_> = segments.iter().map(|index| camera_segment_path(output, *index)).collect();
+        let repair = if recovery_error.is_some() {
+            camera_segments.iter().try_for_each(|path| recover_segment(path))
+        } else {
+            Ok(())
+        };
+        match repair.and_then(|_| finalize_segments(&camera_segments, &camera_path(output))) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("Webcam recording was dropped: {error}");
+                false
+            }
+        }
+    };
+    Ok(camera_recorded)
+}
+
+fn recover_segment(path: &Path) -> Result<(), String> {
+    let recovered = path.with_extension("recovered.mkv");
+    let result = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-copyts", "-copytb", "1", "-i"])
+        .arg(path)
+        .args(["-map", "0", "-c", "copy"])
+        .arg(&recovered)
+        .output()
+        .map_err(|error| format!("could not recover recording: {error}"))?;
+    if !result.status.success()
+        || !super::video::probe_media(&recovered).is_ok_and(|info| info.duration.is_finite() && info.duration > 0.0)
+    {
+        let _ = fs::remove_file(&recovered);
+        return Err(format!("could not finalize recording; captured segments remain at {}: {}",
+            path.display(), String::from_utf8_lossy(&result.stderr).trim()));
+    }
+    fs::rename(recovered, path).map_err(|error| format!("could not install recovered recording: {error}"))
 }
 
 fn camera_segment_path(output: &Path, index: usize) -> PathBuf {
@@ -860,8 +1034,15 @@ struct SegmentPipeline {
     pipeline: gst::Pipeline,
     failure: Option<String>,
     has_video: Arc<AtomicBool>,
+    source_ended: Arc<AtomicBool>,
+    pipeline_eos: bool,
     // Keep the fd identity alive until GStreamer releases its cached core.
     _portal_remote: Option<OwnedFd>,
+}
+
+enum PipelineEnd {
+    Eos,
+    Error(String),
 }
 
 impl SegmentPipeline {
@@ -871,6 +1052,16 @@ impl SegmentPipeline {
             .and_then(|encoder| encoder.static_pad("src"))
             .ok_or_else(|| "GStreamer pipeline has no screen encoder output".to_string())?;
         let has_video = Arc::new(AtomicBool::new(false));
+        let source_ended = Arc::new(AtomicBool::new(false));
+        if let Some(source_pad) = pipeline.by_name("screen_source").and_then(|source| source.static_pad("src")) {
+            let ended = source_ended.clone();
+            source_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if matches!(info.data.as_ref(), Some(gst::PadProbeData::Event(event)) if event.type_() == gst::EventType::Eos) {
+                    ended.store(true, Ordering::Release);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         let received = has_video.clone();
         // videobox initially negotiates 1x1 before the first PipeWire buffer
         // supplies its content rectangle. Audio can make matroskamux write
@@ -921,6 +1112,8 @@ impl SegmentPipeline {
             pipeline,
             failure: None,
             has_video,
+            source_ended,
+            pipeline_eos: false,
             _portal_remote: None,
         })
     }
@@ -928,11 +1121,17 @@ impl SegmentPipeline {
     fn wait_for_video(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(error) = self.take_failure() {
-                return Err(error);
-            }
             if self.has_video.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            if let Some(error) = self.take_failure() {
+                // The first frame and source EOS can arrive in the same
+                // poll. Preserve a real take for terminal finalization.
+                if self.has_video.load(Ordering::Acquire) {
+                    self.failure = Some(error);
+                    return Ok(());
+                }
+                return Err(error);
             }
             if Instant::now() >= deadline {
                 return Err("No video frames arrived from the selected screen or window. Keep it visible and try recording again.".into());
@@ -942,6 +1141,13 @@ impl SegmentPipeline {
     }
 
     fn take_failure(&mut self) -> Option<String> {
+        self.take_end().map(|end| match end {
+            PipelineEnd::Eos => "GStreamer stopped unexpectedly".into(),
+            PipelineEnd::Error(error) => error,
+        })
+    }
+
+    fn take_end(&mut self) -> Option<PipelineEnd> {
         if self.failure.is_none() {
             let bus = self.pipeline.bus()?;
             while let Some(message) = bus.pop() {
@@ -955,14 +1161,16 @@ impl SegmentPipeline {
                         break;
                     }
                     gst::MessageView::Eos(..) => {
-                        self.failure = Some("GStreamer stopped unexpectedly".into());
-                        break;
+                        self.pipeline_eos = true;
+                        return Some(PipelineEnd::Eos);
                     }
                     _ => {}
                 }
             }
         }
-        self.failure.take()
+        self.failure.take().map(PipelineEnd::Error).or_else(|| {
+            (self.pipeline_eos || self.source_ended.load(Ordering::Acquire)).then_some(PipelineEnd::Eos)
+        })
     }
 }
 
@@ -1000,7 +1208,7 @@ fn build_segment_pipeline(
         "vp8enc name=screen_encoder deadline=1 cpu-used=8 threads=4 target-bitrate=12000000 keyframe-max-dist=60"
     };
     // always-copy alone also accepts DMA-BUFs copied from the visible desktop.
-    let capture_filter = if options.prompter_exclusion.is_some() {
+    let capture_filter = if !options.capture_exclusions.is_empty() {
         format!("capsfilter name=screen_capture_memory caps=\"{CAPTURE_MEMORY_CAPS}\" ! ")
     } else {
         String::new()
@@ -1157,6 +1365,14 @@ fn spawn_segment(
 }
 
 fn finalize_child(child: &mut SegmentPipeline) -> Result<(), String> {
+    if child.pipeline_eos {
+        let _ = child.pipeline.set_state(gst::State::Null);
+        return if child.has_video.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err("No video frames were recorded from the selected screen or window.".into())
+        };
+    }
     child
         .pipeline
         .send_event(gst::event::Eos::new())
@@ -1166,12 +1382,17 @@ fn finalize_child(child: &mut SegmentPipeline) -> Result<(), String> {
         .pipeline
         .bus()
         .ok_or_else(|| "GStreamer pipeline has no message bus".to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(8);
     let result = loop {
-        let Some(message) = bus.timed_pop(gst::ClockTime::from_seconds(8)) else {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(message) = bus.timed_pop(gst::ClockTime::from_nseconds(remaining.as_nanos() as u64)) else {
             break Err("GStreamer did not finish the recording within 8 seconds".into());
         };
         match message.view() {
-            gst::MessageView::Eos(..) => break Ok(()),
+            gst::MessageView::Eos(..) => {
+                child.pipeline_eos = true;
+                break Ok(());
+            }
             gst::MessageView::Error(error) => {
                 break Err(format!(
                     "GStreamer pipeline failed: {} ({})",
@@ -1249,6 +1470,93 @@ fn finalize_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_result_survives_a_closed_command_channel_and_repeated_stop() {
+        let mut recorder = NativeRecorder::new();
+        {
+            let mut state = recorder.state.lock().unwrap();
+            state.active = true;
+            state.elapsed = Duration::from_millis(1200);
+        }
+        assert!(!recorder.has_stopped());
+        recorder.state.lock().unwrap().paused = true;
+        assert!(!recorder.has_stopped(), "pause must not trigger external-stop handling");
+        mark_stopped(&recorder.state);
+        assert!(recorder.has_stopped(), "UI can react before media finalization finishes");
+        let shared = recorder.state.clone();
+        let output = PathBuf::from("completed-screen.mkv");
+        let expected = output.clone();
+        recorder.worker = Some(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            store_completion(&shared, Ok(output));
+        }));
+        assert_eq!(recorder.stop_recording().unwrap(), expected);
+        assert_eq!(recorder.stop_recording().unwrap(), expected);
+        let status = recorder.record_status().unwrap();
+        assert!(!status.active && !status.paused);
+        assert_eq!(status.duration_ms, 1200);
+        store_completion(&recorder.state, Err("output could not be finalized".into()));
+        assert!(recorder.has_stopped());
+        assert!(recorder.stop_recording().unwrap_err().to_string().contains("output could not be finalized"));
+        assert!(recorder.stop_recording().unwrap_err().to_string().contains("output could not be finalized"));
+    }
+
+    #[test]
+    fn selected_source_geometry_preserves_logical_bounds_and_unknown_metadata() {
+        let geometry = CaptureSourceGeometry::from_portal(
+            Some((-1280, 120)), Some((1280, 720)), Some(SourceType::Monitor),
+        ).unwrap();
+        assert_eq!(geometry.position, (-1280, 120));
+        assert_eq!(geometry.size, (1280, 720));
+        assert!(geometry.is_monitor);
+        assert!(!CaptureSourceGeometry::from_portal(
+            Some((10, 20)), Some((640, 480)), Some(SourceType::Window),
+        ).unwrap().is_monitor);
+        assert!(CaptureSourceGeometry::from_portal(None, Some((1920, 1080)), Some(SourceType::Monitor)).is_none());
+        assert!(CaptureSourceGeometry::from_portal(Some((0, 0)), Some((0, 1080)), Some(SourceType::Monitor)).is_none());
+    }
+
+    #[test]
+    fn externally_ended_screen_drains_live_audio_and_installs_saved_output() {
+        gst::init().unwrap();
+        let root = std::env::temp_dir().join(format!("lahza-external-eos-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("screen.mkv");
+        let pipeline = gst::parse::launch(&format!(
+            "matroskamux name=mux ! filesink location=\"{}\" \
+             videotestsrc name=screen_source is-live=true num-buffers=12 ! video/x-raw,width=96,height=64,framerate=30/1 ! \
+             vp8enc name=screen_encoder deadline=1 ! queue ! mux. \
+             audiotestsrc is-live=true ! audioconvert ! opusenc ! queue ! mux.",
+            segment_path(&output, 0).display(),
+        )).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let mut segment = SegmentPipeline::new(pipeline).unwrap();
+        segment.pipeline.set_state(gst::State::Playing).unwrap();
+        segment.wait_for_video(Duration::from_secs(3)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(end) = segment.take_end() {
+                assert!(matches!(end, PipelineEnd::Eos));
+                break;
+            }
+            assert!(Instant::now() < deadline, "screen EOS must be detected while audio remains live");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!segment.pipeline_eos, "live audio has not ended with the screen source");
+        finalize_recording(&output, Some(segment), &[0], false, None).unwrap();
+        let info = super::super::video::probe_media(&output).unwrap();
+        assert!(info.duration > 0.2 && info.duration < 2.0, "{}", info.duration);
+        assert!(info.has_audio);
+        assert!(!segment_path(&output, 0).exists());
+
+        // A paused take has no running child. Source loss still installs its
+        // already-finalized screen and camera segments through the same path.
+        fs::copy(&output, segment_path(&output, 0)).unwrap();
+        fs::copy(&output, camera_segment_path(&output, 0)).unwrap();
+        assert!(finalize_recording(&output, None, &[0], true, Some("source disconnected".into())).unwrap());
+        assert!(super::super::video::probe_media(&camera_path(&output)).unwrap().duration > 0.2);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn audio_cannot_commit_provisional_video_dimensions_to_the_recording_header() {
@@ -1516,11 +1824,13 @@ mod tests {
     }
 
     #[test]
-    fn protected_capture_forces_shared_memory_before_any_video_processing() {
+    fn multiple_protected_windows_force_shared_memory_before_any_video_processing() {
         let root = std::env::temp_dir().join(format!("lahza-protected-pipeline-{}", uuid::Uuid::new_v4()));
-        let exclusion = CaptureExclusion::new_in(&root.join("requests")).unwrap();
+        let exclusions = (0..3)
+            .map(|_| CaptureExclusion::new_in(&root.join("requests")).unwrap())
+            .collect();
         let options = RecordingOptions {
-            prompter_exclusion: Some(exclusion),
+            capture_exclusions: exclusions,
             ..Default::default()
         };
         let output = root.join("screen.mkv");
@@ -1536,7 +1846,10 @@ mod tests {
                 let caps = first_filter.property::<gst::Caps>("caps");
                 let dmabuf: gst::Caps = "video/x-raw(memory:DMABuf),format=BGRA".parse().unwrap();
                 let shared: gst::Caps = "video/x-raw(memory:SystemMemory),format=BGRA".parse().unwrap();
-                assert!(!caps.can_intersect(&dmabuf), "DMA-BUF capture can include the desktop prompt");
+                assert!(
+                    !caps.can_intersect(&dmabuf),
+                    "DMA-BUF capture can include recording overlays",
+                );
                 assert!(caps.can_intersect(&shared));
             }
         }
@@ -1554,7 +1867,7 @@ mod tests {
         {
             let options = RecordingOptions {
                 area: None,
-                prompter_exclusion: None,
+                capture_exclusions: Vec::new(),
                 microphone,
                 system_audio,
                 microphone_device: None,
@@ -1567,6 +1880,7 @@ mod tests {
                 .expect("recording pipeline must support the installed PipeWire plugin");
             assert_eq!(pipeline.pipeline_clock(), gst::SystemClock::obtain());
             assert!(pipeline.by_name("screen_source").is_some());
+            assert!(pipeline.by_name("screen_capture_memory").is_none());
             let cropped = RecordingOptions {
                 area: RecordingArea::from_drag((0.25, 0.25), (0.75, 0.75), (1920, 1080)),
                 ..options
@@ -1599,7 +1913,7 @@ mod tests {
         let output = root.join("screen.mkv");
         let mut recorder = NativeRecorder::with_options(RecordingOptions {
             area: None,
-            prompter_exclusion: None,
+            capture_exclusions: Vec::new(),
             system_audio: true,
             microphone: true,
             microphone_device: None,

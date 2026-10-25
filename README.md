@@ -216,7 +216,7 @@ LAHZA_EXPORT_PROJECT=/path/to/project.lahzarec cargo test --release --locked ben
 
 ## First-release scope
 
-Lahza is an early Linux release. Desktop portal behavior varies by compositor, and the presence of both display backends does not imply every capture feature has been validated on every desktop. Camera-file overlays are supported; live webcam capture and device selection remain unfinished. Recovery can salvage usable recordings, but cannot guarantee recovery after every encoder or system failure.
+Lahza is an early Linux release. Desktop portal behavior varies by compositor, and the presence of both display backends does not imply every capture feature has been validated on every desktop. Live webcam capture depends on camera permissions and a supported V4L2 device. Recovery can salvage usable recordings, but cannot guarantee recovery after every encoder or system failure.
 
 See [the engineering parity checklist](docs/VIDEO_PARITY.md) for deeper implementation notes and outstanding work. Some checklist entries track broader parity requirements, rather than whether an individual control exists.
 
@@ -322,6 +322,25 @@ The installer adds the binary, assets, desktop entry, and icon under `~/.local`.
   `~/.local/share/lahza/models`.
 - `curl` is used to download speech models and to upload to a share server.
 
+### Timeline editing
+
+Drag the ruler to preview frames as you scrub. **Skim** previews a hovered moment
+without moving the playhead; leaving the timeline restores the parked frame.
+**Follow** keeps playback visible, and pauses following when you scroll manually.
+
+Use **Fit** (Ctrl+0) to show the full edit, or Ctrl+plus/minus to zoom around the
+visible playhead. Ctrl+wheel zooms around the pointer. The horizontal scrollbar
+pans the timeline. Drag the divider above the controls
+to resize the panel; stacked tracks scroll vertically, with Shift+wheel for
+horizontal movement. Arrow keys make fine seeks; Shift+arrows move one second,
+and Home/End jump to the beginning/end.
+
+Drag clip edges to trim, or a clip body to move it. **Snap** (N) aligns edits to
+the playhead and other boundaries and shows a guide. Esc cancels the active
+edit. Right-click a clip for split, speed, and deletion; right-click motion for
+its options. Drag across an empty motion lane to create a region of that length.
+Undo restores the selected clip and playhead as well as the edit.
+
 ### Subtitles and transcript editing
 
 Open **Record → Subtitles** and choose **Transcribe narration**. Captions follow
@@ -330,6 +349,25 @@ it, Shift-click selects a range, and **Cut word**, **Remove fillers** and **Trim
 pauses** remove footage. A cut also removes the cut words from captions you have
 not edited, and both undo together. Click a caption's time to edit its text.
 **Export .srt…** saves subtitles for the edited timeline.
+
+### Floating recording controls
+
+With **Lahza Capture Helper** active on GNOME, starting a recording shows a
+draggable pill with elapsed time, pause/resume, and stop/save controls. The
+launcher minimizes before capture starts. If the camera is enabled, a separate
+draggable webcam preview appears near the bottom-right. After selecting a monitor
+in the system picker, both overlays move onto that monitor; pausing and resuming
+preserve any placement you adjust during the take.
+
+Both floating windows are excluded from the screen recording. Webcam footage
+is recorded separately and remains editable; moving its preview does not change
+the camera's position in the finished video. The preview is marked paused while
+capture is paused. Stopping, including through GNOME's screen-sharing stop
+control, saves the take, closes both windows, and opens the editor.
+
+If the helper cannot protect these windows, they close before capture starts
+and the launcher keeps its existing recording controls. If protection is lost
+during a take, the floating windows close and the launcher returns.
 
 ### Teleprompter
 

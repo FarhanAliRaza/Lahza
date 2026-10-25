@@ -156,6 +156,8 @@ pub(crate) struct VideoMoveDrag {
     pub(crate) start_scroll: f64,
     pub(crate) editor_seconds_per_pixel: f64,
     pub(crate) active: bool,
+    pub(crate) original_selection: Option<Uuid>,
+    pub(crate) original_zoom_selection: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +169,9 @@ pub(crate) struct VideoTrimDrag {
     pub(crate) original_clip: RecordingClipSegment,
     pub(crate) edge: ClipEdge,
     pub(crate) editor_seconds_per_pixel: f64,
+    pub(crate) snap_targets: Vec<f64>,
+    pub(crate) original_selection: Option<Uuid>,
+    pub(crate) original_zoom_selection: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,12 +184,16 @@ pub(crate) enum VideoZoomDragKind {
 #[derive(Clone, Debug)]
 pub(crate) struct VideoZoomDrag {
     pub(crate) start_x: Pixels,
+    pub(crate) start_scroll: f64,
     pub(crate) original_cues: Vec<ZoomCue>,
     pub(crate) original_cue: ZoomCue,
     pub(crate) kind: VideoZoomDragKind,
     pub(crate) editor_start: f64,
     pub(crate) editor_end: f64,
     pub(crate) editor_seconds_per_pixel: f64,
+    pub(crate) snap_targets: Vec<f64>,
+    pub(crate) original_selection: Option<Uuid>,
+    pub(crate) original_zoom_selection: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,7 +202,12 @@ pub(crate) enum VideoEditSnapshot {
     Crop(CropRect),
     Annotations(Vec<AnnotationMark>),
     ImageTiming { scene: f64, start: f64, end: f64 },
-    Clips { timeline: RecordingClipTimeline, annotations: Vec<AnnotationMark> },
+    Clips {
+        timeline: RecordingClipTimeline,
+        annotations: Vec<AnnotationMark>,
+        selected: Option<Uuid>,
+        position: f64,
+    },
     Zoom(Vec<ZoomCue>),
     Transcript(Option<recording::transcript::Transcript>),
     /// A transcript-driven cut: footage, annotations and caption text together.

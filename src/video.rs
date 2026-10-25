@@ -1,7 +1,7 @@
 //! Video timeline editing, preview rendering, playback, and clip controls.
 
 use super::{
-    ink, muted, PlaybackMailbox, PlaybackUpdates, Studio, VideoEditSnapshot, VideoMoveDrag,
+    muted, PlaybackMailbox, PlaybackUpdates, Studio, VideoEditSnapshot, VideoMoveDrag,
     VideoTrimDrag, VideoZoomDrag, VideoZoomDragKind,
 };
 use crate::recording::{
@@ -10,11 +10,11 @@ use crate::recording::{
     model::RecordingSession,
     playback::TimelinePlaybackStream,
     pointer_timeline::PointerTimeline,
-    video::{decode_frame, render_denoised_copy},
+    video::render_denoised_copy,
     viewport::{ViewportTimeline, ZoomCue},
 };
 use gpui::{
-    div, hsla, prelude::*, px, rgb, svg, AnyElement, Context, FontWeight, IntoElement, MouseButton,
+    div, hsla, prelude::*, px, rgb, AnyElement, Context, FontWeight, IntoElement, MouseButton,
     Pixels, Timer,
 };
 use std::{
@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+use crate::timeline_edit::{snap_guide_at_edges, snap_timeline_edges};
 
 /// Geometry for a recording's independent, scrollable time ruler.
 struct RecordingTimelineGeometry {
@@ -41,23 +42,25 @@ impl RecordingTimelineGeometry {
 }
 
 impl VideoTrimDrag {
+    #[cfg(test)]
     fn preview(&self, pointer_x: Pixels, scroll: f64, source_duration: f64) -> Option<RecordingClipTimeline> {
+        self.preview_with_snapping(pointer_x, scroll, source_duration, true).map(|(timeline, _)| timeline)
+    }
+
+    fn preview_with_snapping(&self, pointer_x: Pixels, scroll: f64, source_duration: f64, snapping: bool) -> Option<(RecordingClipTimeline, Option<f64>)> {
         let range = self.original_timeline.editor_range(self.original_clip.id)?;
         let edge_time = match self.edge {
             ClipEdge::Leading => range.start,
             ClipEdge::Trailing => range.end,
         };
         let pixels = f64::from((pointer_x - self.start_x) / px(1.0)) + scroll - self.start_scroll;
-        let mut delta = pixels * self.editor_seconds_per_pixel;
-        // The parked playhead is the trim target. Snap the edge to it without
-        // ever seeking or changing the source frame under retained content.
-        if pixels.abs() > f64::EPSILON
-            && (edge_time + delta - self.original_position).abs() <= 8.0 * self.editor_seconds_per_pixel
-        {
-            delta = self.original_position - edge_time;
-        }
-        self.original_timeline.trimming(self.original_clip.id, self.edge, delta, source_duration)
-            .map(|(timeline, _)| timeline)
+        let requested = edge_time + pixels * self.editor_seconds_per_pixel;
+        let (snapped, guide) = snap_timeline_edges(requested, 0.0, &self.snap_targets,
+            self.editor_seconds_per_pixel, snapping && pixels.abs() > f64::EPSILON);
+        let (timeline, _) = self.original_timeline.trimming(self.original_clip.id, self.edge, snapped - edge_time, source_duration)?;
+        let range = timeline.editor_range(self.original_clip.id)?;
+        let actual = match self.edge { ClipEdge::Leading => range.start, ClipEdge::Trailing => range.end };
+        Some((timeline, snap_guide_at_edges(guide, actual, actual)))
     }
 }
 
@@ -150,10 +153,15 @@ impl Studio {
         else {
             return;
         };
+        let original_selection = self.video_selected_clip;
+        let original_zoom_selection = self.video_selected_zoom_cue;
         self.pause_video_playback();
         self.video_selected_clip = Some(clip_id);
+        self.video_selected_zoom_cue = None;
         self.video_seek_drag = None;
         self.video_move_drag = None;
+        self.video_zoom_drag = None;
+        self.timeline_ui.snap_guide = None;
         self.video_trim_drag = Some(VideoTrimDrag {
             start_x,
             start_scroll: self.video_timeline_scroll,
@@ -162,6 +170,9 @@ impl Studio {
             original_clip,
             edge,
             editor_seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
+            snap_targets: self.timeline_snap_targets(Some(clip_id), None, None),
+            original_selection,
+            original_zoom_selection,
         });
     }
 
@@ -169,26 +180,33 @@ impl Studio {
         let Some(drag) = self.video_trim_drag.as_ref() else {
             return;
         };
-        let Some(timeline) = drag.preview(pointer_x, self.video_timeline_scroll, self.video_source_duration) else {
+        let Some((timeline, guide)) = drag.preview_with_snapping(pointer_x, self.video_timeline_scroll, self.video_source_duration, self.timeline_ui.snap_enabled) else {
             return;
         };
         self.video_clip_timeline = timeline;
         self.video_duration = self.video_clip_timeline.duration();
+        self.timeline_ui.snap_guide = guide;
     }
 
     pub(super) fn commit_video_trim(&mut self, cx: &mut Context<Self>) {
         let Some(drag) = self.video_trim_drag.take() else {
             return;
         };
+        self.timeline_ui.snap_guide = None;
         let requested = self.video_clip_timeline.clone();
         let selected = Some(drag.original_clip.id);
         self.video_position = drag.original_position;
         self.video_clip_timeline = drag.original_timeline;
         self.video_duration = self.video_clip_timeline.duration();
+        self.video_selected_clip = drag.original_selection;
         self.apply_video_clip_timeline(requested, selected, true, cx);
+        self.video_selected_clip = selected;
     }
 
     pub(super) fn begin_video_move_drag(&mut self, clip_id: Uuid, start_x: Pixels) {
+        if self.video_edit_busy { return; }
+        let original_selection = self.video_selected_clip;
+        let original_zoom_selection = self.video_selected_zoom_cue;
         self.finish_annotation_interaction();
         self.pause_video_playback();
         self.video_selected_clip = Some(clip_id);
@@ -196,6 +214,7 @@ impl Studio {
         self.video_seek_drag = None;
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
+        self.timeline_ui.snap_guide = None;
         self.video_move_drag = Some(VideoMoveDrag {
             clip_id,
             start_x,
@@ -203,6 +222,8 @@ impl Studio {
             start_scroll: self.video_timeline_scroll,
             editor_seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
             active: false,
+            original_selection,
+            original_zoom_selection,
         });
     }
 
@@ -212,12 +233,21 @@ impl Studio {
         let Some(drag) = self.video_move_drag.as_mut() else { return false; };
         drag.current_x = pointer_x;
         drag.active |= (pointer_x - drag.start_x).abs() > px(6.0);
+        let drag = *drag;
+        self.timeline_ui.snap_guide = if drag.active {
+            self.video_move_target(&drag).and_then(|(_, guide)| {
+                let (timeline, _) = self.resolved_video_move_preview(&drag)?;
+                let range = timeline.editor_range(drag.clip_id)?;
+                snap_guide_at_edges(guide, range.start, range.end)
+            })
+        } else { None };
         drag.active
     }
 
     pub(super) fn finish_video_move_drag(&mut self, pointer_x: Pixels, cx: &mut Context<Self>) -> bool {
         self.update_video_move_drag(pointer_x);
         let Some(drag) = self.video_move_drag.take() else { return false; };
+        self.timeline_ui.snap_guide = None;
         if drag.active {
             self.commit_video_move_drag(drag, cx);
         } else if let Some(position) = self.motion_timeline_time_at(pointer_x) {
@@ -233,6 +263,10 @@ impl Studio {
     /// the drag's pixel displacement, including any scrolling during the
     /// gesture. The time scale is captured when the drag begins.
     pub(super) fn video_move_new_start(&self, drag: &VideoMoveDrag) -> Option<f64> {
+        self.video_move_target(drag).map(|(start, _)| start)
+    }
+
+    fn video_move_target(&self, drag: &VideoMoveDrag) -> Option<(f64, Option<f64>)> {
         let range = self.video_clip_timeline.editor_range(drag.clip_id)?;
         let content_width = self.video_timeline_content_width();
         if content_width <= 0.0 || self.video_duration <= 0.0 {
@@ -242,44 +276,21 @@ impl Studio {
         let delta = (f64::from((drag.current_x - drag.start_x) / px(1.0))
             + self.video_timeline_scroll - drag.start_scroll) * seconds_per_pixel;
         // Place clips anywhere in the scrollable workspace.
-        let mut new_start = (range.start + delta).clamp(0.0, self.video_timeline_duration());
+        let new_start = (range.start + delta).clamp(0.0, self.video_timeline_duration());
         let clip_length = range.end - range.start;
-        let snap = 8.0 * seconds_per_pixel;
-        let starts = self.video_clip_timeline.clip_starts();
-        let mut candidates = vec![0.0];
-        for (index, segment) in self.video_clip_timeline.segments.iter().enumerate() {
-            if segment.id == drag.clip_id {
-                continue;
-            }
-            // Snap this clip's head to a neighbor's tail, or its tail to a
-            // neighbor's head.
-            candidates.push(starts[index] + segment.editor_duration());
-            candidates.push(starts[index] - clip_length);
-        }
-        if let Some(best) = candidates
-            .into_iter()
-            .filter(|candidate| *candidate >= 0.0 && (new_start - candidate).abs() < snap)
-            .min_by(|left, right| {
-                (new_start - left)
-                    .abs()
-                    .total_cmp(&(new_start - right).abs())
-            })
-        {
-            new_start = best;
-        }
-        Some(new_start)
+        let (start, guide) = snap_timeline_edges(new_start, clip_length,
+            &self.timeline_snap_targets(Some(drag.clip_id), None, None), seconds_per_pixel,
+            self.timeline_ui.snap_enabled && drag.active);
+        Some((start.clamp(0.0, self.video_timeline_duration()), guide))
     }
 
     pub(super) fn commit_video_move_drag(&mut self, drag: VideoMoveDrag, cx: &mut Context<Self>) {
-        let Some(new_start) = self.video_move_new_start(&drag) else {
+        let Some((timeline, _)) = self.resolved_video_move_preview(&drag) else {
             return;
         };
-        if let Some(timeline) = self
-            .video_clip_timeline
-            .repositioning(drag.clip_id, new_start)
-        {
-            self.apply_video_clip_timeline(timeline, Some(drag.clip_id), true, cx);
-        }
+        self.video_selected_clip = drag.original_selection;
+        self.apply_video_clip_timeline(timeline, Some(drag.clip_id), true, cx);
+        self.video_selected_clip = Some(drag.clip_id);
     }
 
     pub(super) fn begin_video_zoom_drag(
@@ -301,18 +312,27 @@ impl Studio {
         else {
             return;
         };
+        let original_selection = self.video_selected_clip;
+        let original_zoom_selection = self.video_selected_zoom_cue;
         self.pause_video_playback();
         self.video_selected_zoom_cue = Some(cue_id);
         self.video_selected_clip = None;
         self.video_seek_drag = None;
+        self.video_move_drag = None;
+        self.video_trim_drag = None;
+        self.timeline_ui.snap_guide = None;
         self.video_zoom_drag = Some(VideoZoomDrag {
             start_x,
+            start_scroll: self.video_timeline_scroll,
             original_cues: self.video_zoom_cues.clone(),
             original_cue: cue,
             kind,
             editor_start,
             editor_end,
             editor_seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
+            snap_targets: self.timeline_snap_targets(None, Some(cue_id), None),
+            original_selection,
+            original_zoom_selection,
         });
     }
 
@@ -320,13 +340,19 @@ impl Studio {
         let Some(drag) = self.video_zoom_drag.as_ref().cloned() else {
             return;
         };
-        let editor_delta =
-            ((pointer_x - drag.start_x) / px(1.0)) as f64 * drag.editor_seconds_per_pixel;
+        let pixels = ((pointer_x - drag.start_x) / px(1.0)) as f64
+            + self.video_timeline_scroll - drag.start_scroll;
+        let editor_delta = pixels * drag.editor_seconds_per_pixel;
+        let snapping = self.timeline_ui.snap_enabled && pixels.abs() > f64::EPSILON;
         let mut cue = drag.original_cue.clone();
+        let guide;
         match drag.kind {
             VideoZoomDragKind::Move => {
                 let editor_duration = (drag.editor_end - drag.editor_start).max(0.0);
-                let new_editor_start = (drag.editor_start + editor_delta)
+                let (snapped, target) = snap_timeline_edges(drag.editor_start + editor_delta,
+                    editor_duration, &drag.snap_targets, drag.editor_seconds_per_pixel, snapping);
+                guide = target;
+                let new_editor_start = snapped
                     .clamp(0.0, (self.video_duration - editor_duration).max(0.0));
                 let source_start = self.video_clip_timeline.source_time_at(new_editor_start);
                 let source_duration = drag.original_cue.end - drag.original_cue.start;
@@ -337,15 +363,20 @@ impl Studio {
                 }
             }
             VideoZoomDragKind::Leading => {
-                let editor_time =
-                    (drag.editor_start + editor_delta).clamp(0.0, drag.editor_end - f64::EPSILON);
+                let (snapped, target) = snap_timeline_edges(drag.editor_start + editor_delta, 0.0,
+                    &drag.snap_targets, drag.editor_seconds_per_pixel, snapping);
+                guide = target;
+                let editor_time = snapped.clamp(0.0, drag.editor_end - f64::EPSILON);
                 cue.start = self
                     .video_clip_timeline
                     .source_time_at(editor_time)
                     .clamp(0.0, cue.end - ZoomCue::MINIMUM_DURATION);
             }
             VideoZoomDragKind::Trailing => {
-                let editor_time = (drag.editor_end + editor_delta)
+                let (snapped, target) = snap_timeline_edges(drag.editor_end + editor_delta, 0.0,
+                    &drag.snap_targets, drag.editor_seconds_per_pixel, snapping);
+                guide = target;
+                let editor_time = snapped
                     .clamp(drag.editor_start + f64::EPSILON, self.video_duration);
                 cue.end = self.video_clip_timeline.source_time_at(editor_time).clamp(
                     cue.start + ZoomCue::MINIMUM_DURATION,
@@ -353,6 +384,17 @@ impl Studio {
                 );
             }
         }
+        self.timeline_ui.snap_guide = guide.filter(|target| {
+            self.video_clip_timeline.slices_overlapping(cue.start, cue.end).iter()
+                .any(|slice| {
+                    let (start, end) = match drag.kind {
+                        VideoZoomDragKind::Move => (slice.editor_start, slice.editor_end),
+                        VideoZoomDragKind::Leading => (slice.editor_start, slice.editor_start),
+                        VideoZoomDragKind::Trailing => (slice.editor_end, slice.editor_end),
+                    };
+                    snap_guide_at_edges(Some(*target), start, end).is_some()
+                })
+        });
         self.video_zoom_cues = drag.original_cues;
         if let Some(current) = self
             .video_zoom_cues
@@ -370,6 +412,7 @@ impl Studio {
         let Some(drag) = self.video_zoom_drag.take() else {
             return;
         };
+        self.timeline_ui.snap_guide = None;
         if self.video_zoom_cues == drag.original_cues {
             return;
         }
@@ -428,6 +471,7 @@ impl Studio {
     }
 
     pub(super) fn undo_video_edit(&mut self, cx: &mut Context<Self>) {
+        if self.cancel_timeline_edit(cx) { return; }
         let Some(previous) = self.video_undo_stack.pop() else {
             return;
         };
@@ -453,11 +497,11 @@ impl Studio {
                 self.restore_image_timing(scene, start, end);
                 cx.notify();
             }
-            VideoEditSnapshot::Clips { timeline, annotations } => {
-                self.video_redo_stack
-                    .push(VideoEditSnapshot::Clips { timeline: self.video_clip_timeline.clone(), annotations: self.annotations.clone() });
-                let selected = timeline.segments.first().map(|clip| clip.id);
+            VideoEditSnapshot::Clips { timeline, annotations, selected, position } => {
+                self.video_redo_stack.push(self.clip_edit_snapshot());
+                self.video_position = position;
                 self.apply_video_clip_timeline(timeline, selected, false, cx);
+                self.video_selected_clip = selected;
                 self.annotations = annotations;
                 self.finish_annotation_interaction();
                 let _ = self.rebuild_redactions();
@@ -479,6 +523,7 @@ impl Studio {
     }
 
     pub(super) fn redo_video_edit(&mut self, cx: &mut Context<Self>) {
+        if self.cancel_timeline_edit(cx) { return; }
         let Some(next) = self.video_redo_stack.pop() else {
             return;
         };
@@ -504,11 +549,11 @@ impl Studio {
                 self.restore_image_timing(scene, start, end);
                 cx.notify();
             }
-            VideoEditSnapshot::Clips { timeline, annotations } => {
-                self.video_undo_stack
-                    .push(VideoEditSnapshot::Clips { timeline: self.video_clip_timeline.clone(), annotations: self.annotations.clone() });
-                let selected = timeline.segments.first().map(|clip| clip.id);
+            VideoEditSnapshot::Clips { timeline, annotations, selected, position } => {
+                self.video_undo_stack.push(self.clip_edit_snapshot());
+                self.video_position = position;
                 self.apply_video_clip_timeline(timeline, selected, false, cx);
+                self.video_selected_clip = selected;
                 self.annotations = annotations;
                 self.finish_annotation_interaction();
                 let _ = self.rebuild_redactions();
@@ -703,8 +748,7 @@ impl Studio {
             return;
         }
         if push_undo {
-            self.video_undo_stack
-                .push(VideoEditSnapshot::Clips { timeline: self.video_clip_timeline.clone(), annotations: self.annotations.clone() });
+            self.video_undo_stack.push(self.clip_edit_snapshot());
             self.video_redo_stack.clear();
         }
         let mapping_changed = !timeline.same_source_mapping(&self.video_clip_timeline);
@@ -753,7 +797,14 @@ impl Studio {
     }
 
     pub(super) fn split_video_clip(&mut self, cx: &mut Context<Self>) {
-        if let Some((timeline, selected)) = self.video_clip_timeline.split_at(self.video_position) {
+        self.split_video_clip_at(self.video_position, cx);
+    }
+
+    /// Contextual cutting uses pointer time without moving the parked
+    /// playhead, so the edit and its undo preserve the user's viewing point.
+    pub(crate) fn split_video_clip_at(&mut self, time: f64, cx: &mut Context<Self>) {
+        if self.video_edit_busy { return; }
+        if let Some((timeline, selected)) = self.video_clip_timeline.split_at(time) {
             self.apply_video_clip_timeline(timeline, Some(selected), true, cx);
         }
     }
@@ -768,12 +819,15 @@ impl Studio {
         let Some(timeline) = self.video_clip_timeline.deleting(selected) else {
             return;
         };
+        // Capture the parked playhead before deleting moves it to the cut.
+        self.video_undo_stack.push(self.clip_edit_snapshot());
+        self.video_redo_stack.clear();
         self.video_position = range.start.min(timeline.duration());
         let next_selected = timeline
             .location_at(self.video_position)
             .map(|location| location.segment_id)
             .or_else(|| timeline.segments.last().map(|clip| clip.id));
-        self.apply_video_clip_timeline(timeline, next_selected, true, cx);
+        self.apply_video_clip_timeline(timeline, next_selected, false, cx);
     }
 
     /// Preset playback-rate steps between the slow-motion floor and the
@@ -831,10 +885,14 @@ impl Studio {
         let Some(path) = self.video_playback_path() else {
             return;
         };
+        self.clear_timeline_preview();
+        self.cancel_timeline_edit(cx);
+        self.video_seek_drag = None;
         self.finish_annotation_interaction();
         if self.video_position >= self.video_duration - 0.01 {
             self.video_position = 0.0;
         }
+        self.follow_timeline_playhead(true);
         let start_time = self.video_position;
         let decode_size = if self.video_crop != crate::CropRect::UNIT { self.video_source_size } else { (1920, 1080) };
         let timeline = self.video_clip_timeline.clone();
@@ -1006,6 +1064,7 @@ impl Studio {
                     }
                     if let Some(time) = predicted {
                         this.video_position = time.min(this.video_duration).max(this.video_position);
+                        this.follow_timeline_playhead(false);
                     }
                     if let Some(result) = terminal {
                         this.video_playing = false;
@@ -1045,8 +1104,8 @@ impl Studio {
     pub(crate) fn seek_video_frame(&mut self, position: f64, cx: &mut Context<Self>) {
         self.annotation_edit_preview_pending = false;
         self.annotation_editing_time = None;
-        let playback_path = self.video_playback_path();
         self.pause_video_playback();
+        self.clear_timeline_preview();
         let position = position.clamp(0.0, self.video_timeline_duration());
         self.video_position = position;
         self.camera_frame_rgba = None;
@@ -1059,46 +1118,8 @@ impl Studio {
         }) {
             self.finish_annotation_interaction();
         }
-        let Some(path) = playback_path else {
-            cx.notify();
-            return;
-        };
-        let generation = self.video_playback_generation.clone();
-        let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        if position > self.video_duration
-            || self.video_clip_timeline.location_at(position).is_some_and(|location| position < location.editor_start)
-        {
-            self.set_video_frame(image::RgbaImage::from_pixel(16, 9, image::Rgba([0, 0, 0, 255])));
-            cx.notify();
-            return;
-        }
-        let source_time = self.video_clip_timeline.source_time_at(position);
-        let decode_size = if self.crop_active || self.video_crop != crate::CropRect::UNIT { self.video_source_size } else { (2560, 1440) };
-        let task = cx.background_executor().spawn(async move {
-            decode_frame(&path, source_time, decode_size.0, decode_size.1).map_err(|error| error.to_string())
-        });
-        cx.spawn(async move |weak, cx| {
-            let result = task.await;
-            if generation.load(Ordering::SeqCst) != token {
-                return;
-            }
-            let _ = weak.update(cx, |this, cx| {
-                match result {
-                    Ok(frame) => {
-                        if let Some(pixels) =
-                            image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
-                        {
-                            this.set_video_frame(pixels);
-                        }
-                    }
-                    Err(error) => {
-                        this.toast = Some(format!("Could not seek: {error}").into());
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.queue_timeline_frame(position, false, cx);
+        cx.notify();
     }
 
     pub(super) fn video_timecode(value: f64) -> String {
@@ -1275,116 +1296,7 @@ impl Studio {
         .map(IntoElement::into_any_element)
     }
 
-    pub(super) fn video_edit_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let edit_busy = self.video_edit_busy;
-        let can_delete = (self.video_selected_zoom_cue.is_some()
-            || self.video_clip_timeline.segments.len() > 1)
-            && !edit_busy;
-        let selected_speed = self
-            .video_selected_clip
-            .and_then(|id| {
-                self.video_clip_timeline
-                    .segments
-                    .iter()
-                    .find(|clip| clip.id == id)
-            })
-            .map(|clip| clip.speed)
-            .unwrap_or(1.0);
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(self.small_button("import-timeline-clip", "+ Image / video", !edit_busy, cx, |this, cx| this.import_timeline_media(crate::media_ui::ImportKind::Clip, cx)))
-            .child(self.small_button("import-image-overlay", "+ Image overlay", !edit_busy, cx, |this, cx| this.import_timeline_media(crate::media_ui::ImportKind::Image, cx)))
-            .child(self.small_button("import-audio", "+ Audio", !edit_busy, cx, |this, cx| this.import_timeline_media(crate::media_ui::ImportKind::Audio, cx)))
-            .child(
-                div()
-                    .id("video-split")
-                    .px_3()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .rounded_md()
-                    .text_sm()
-                    .when(!edit_busy, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                            .on_click(cx.listener(|this, _, _, cx| this.split_video_clip(cx)))
-                    })
-                    .opacity(if edit_busy { 0.35 } else { 1.0 })
-                    .child("Split"),
-            )
-            .child(
-                div()
-                    .id("video-add-zoom")
-                    .px_3()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .rounded_md()
-                    .text_sm()
-                    .when(!edit_busy, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xe7f1ff)))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.add_video_zoom_at_playhead(cx)),
-                            )
-                    })
-                    .opacity(if edit_busy { 0.35 } else { 1.0 })
-                    .child("+ Motion"),
-            )
-            .child(
-                div()
-                    .id("video-delete-clip")
-                    .size(px(32.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .when(can_delete, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xfee2e2)))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.delete_selected_video_edit(cx)),
-                            )
-                    })
-                    .opacity(if can_delete { 1.0 } else { 0.35 })
-                    .child(
-                        svg()
-                            .path("icons/trash.svg")
-                            .size(px(16.0))
-                            .text_color(ink()),
-                    ),
-            )
-            .child(
-                div()
-                    .id("video-speed")
-                    .ml_2()
-                    .px_3()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded_md()
-                    .text_sm()
-                    .when(self.video_selected_clip.is_some() && !edit_busy, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xeeeeef)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.video_speed_draft = Some(selected_speed);
-                                cx.notify();
-                            }))
-                    })
-                    .opacity(if edit_busy { 0.35 } else { 1.0 })
-                    .child("Speed")
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("{selected_speed}×")),
-                    ),
-            )
-    }
+
 }
 
 
@@ -1402,6 +1314,9 @@ mod timeline_interaction_tests {
             original_timeline: timeline,
             edge,
             editor_seconds_per_pixel: 0.01,
+            snap_targets: vec![0.0, position],
+            original_selection: None,
+            original_zoom_selection: None,
         }
     }
 
@@ -1426,6 +1341,24 @@ mod timeline_interaction_tests {
         assert_eq!(at_target.duration(), 6.0);
         assert_eq!(at_target.source_time_at(drag.original_position), 6.0);
         assert_eq!(drag.preview(drag.start_x, drag.start_scroll, 10.0).unwrap(), drag.original_timeline);
+    }
+
+    #[test]
+    fn trim_snapping_can_be_disabled_without_changing_the_parked_playhead() {
+        let drag = trim_drag(ClipEdge::Leading, 4.0);
+        let (trimmed, guide) = drag.preview_with_snapping(px(497.0), 200.0, 10.0, false).unwrap();
+        assert!((trimmed.editor_range(drag.original_clip.id).unwrap().start - 3.97).abs() < 1e-9);
+        assert_eq!(guide, None);
+        assert_eq!(drag.original_position, 4.0);
+    }
+
+    #[test]
+    fn trim_does_not_show_a_guide_when_source_limits_prevent_snapping() {
+        let mut drag = trim_drag(ClipEdge::Trailing, 6.0);
+        drag.snap_targets = vec![10.04];
+        let (trimmed, guide) = drag.preview_with_snapping(px(104.0), 200.0, 10.0, true).unwrap();
+        assert_eq!(trimmed.duration(), 10.0);
+        assert_eq!(guide, None);
     }
 
     #[test]
@@ -1564,7 +1497,68 @@ x11.XCloseDisplay(display)
                     studio.redo_video_edit(cx);
                     assert_eq!(studio.video_clip_timeline, moved);
                     assert_eq!(studio.video_project.as_ref().unwrap().effective_clip_timeline(10.0).unwrap(), moved);
+
+                    let undo_count = studio.video_undo_stack.len();
+                    studio.begin_video_trim(clip_id, ClipEdge::Leading, px(100.0));
+                    studio.update_video_trim(px(140.0));
+                    assert_ne!(studio.video_clip_timeline, moved);
+                    assert!(studio.cancel_timeline_edit(cx));
+                    assert_eq!(studio.video_clip_timeline, moved, "Escape restores the complete trim transaction");
+                    assert_eq!(studio.video_undo_stack.len(), undo_count, "cancel does not create an undo entry");
+                    assert!(studio.timeline_ui.snap_guide.is_none());
+
+                    let before_split_position = studio.video_clip_timeline.editor_range(clip_id).unwrap().start + 3.0;
+                    studio.video_selected_clip = Some(clip_id);
+                    studio.video_position = before_split_position;
+                    studio.split_video_clip(cx);
+                    let selected_after_split = studio.video_selected_clip;
+                    assert_ne!(selected_after_split, Some(clip_id));
+                    studio.video_position += 1.0;
+                    studio.undo_video_edit(cx);
+                    assert_eq!(studio.video_selected_clip, Some(clip_id), "undo restores clip selection");
+                    assert_eq!(studio.video_position, before_split_position, "undo restores parked playhead");
+                    studio.redo_video_edit(cx);
+                    assert_eq!(studio.video_selected_clip, selected_after_split);
+                    assert_eq!(studio.video_position, before_split_position + 1.0);
+
+                    let before_delete = studio.video_position;
+                    studio.delete_selected_video_clip(cx);
+                    studio.undo_video_edit(cx);
+                    assert_eq!(studio.video_selected_clip, selected_after_split, "deleted clip selection returns on undo");
+                    assert_eq!(studio.video_position, before_delete, "delete saves position before seeking to the cut");
+
+                    let parked = studio.video_position;
+                    let first_range = studio.video_clip_timeline.editor_range(clip_id).unwrap();
+                    studio.split_video_clip_at(first_range.start + 1.0, cx);
+                    assert_eq!(studio.video_position, parked, "contextual split preserves the parked playhead");
+                    studio.undo_video_edit(cx);
+                    assert_eq!(studio.video_position, parked);
+
+                    studio.video_clip_timeline = RecordingClipTimeline::full(0.12);
+                    studio.video_duration = 0.12;
+                    studio.video_position = 0.0;
+                    studio.video_selected_clip = Some(studio.video_clip_timeline.segments[0].id);
+                    cx.notify();
                 }).unwrap();
+                Timer::after(Duration::from_millis(100)).await;
+                let (tiny_x, tiny_y) = handle.update(cx, |studio, window, _| {
+                    let bounds = studio.video_timeline_bounds.lock().unwrap().unwrap();
+                    let origin = window.bounds().origin;
+                    assert!(0.12 / studio.video_timeline_seconds_per_pixel() < 16.0);
+                    (f32::from(origin.x + bounds.origin.x + px(8.0)) as i32,
+                        f32::from(origin.y + bounds.origin.y) as i32)
+                }).unwrap();
+                for (offset_y, edge) in [(12, ClipEdge::Leading), (36, ClipEdge::Trailing)] {
+                    pointer(tiny_x, tiny_y + offset_y, "down");
+                    Timer::after(Duration::from_millis(60)).await;
+                    handle.update(cx, |studio, _, _| {
+                        assert_eq!(studio.video_trim_drag.as_ref().map(|drag| drag.edge), Some(edge),
+                            "tiny clip keeps a usable target for both edges at time zero");
+                        assert!(studio.video_move_drag.is_none());
+                    }).unwrap();
+                    pointer(tiny_x, tiny_y + offset_y, "up");
+                    Timer::after(Duration::from_millis(60)).await;
+                }
                 cx.update(|cx| cx.quit()).unwrap();
                 std::fs::remove_dir_all(&root).unwrap();
             }).detach();

@@ -925,7 +925,7 @@ impl Drop for VideoFrameStream {
     }
 }
 
-pub(super) fn decode_dimensions(
+pub(crate) fn decode_dimensions(
     info: &MediaInfo,
     maximum_width: u32,
     maximum_height: u32,
@@ -969,7 +969,7 @@ fn window_body_edges(profile: &[u8], start: u32, end: u32) -> Option<(u32, u32)>
 
 /// Presentation geometry follows the window body, not its storage or OS shadow.
 /// Crop before any scaling so resizing never throws away captured detail.
-pub(super) fn present_frame(frame: DecodedFrame, window_capture: bool) -> DecodedFrame {
+pub(crate) fn present_frame(frame: DecodedFrame, window_capture: bool) -> DecodedFrame {
     if !window_capture || frame.width == 0 || frame.height == 0 {
         return frame;
     }

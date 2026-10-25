@@ -1,7 +1,7 @@
 {
   "uuid": "lahza-input@com.lahza",
   "name": "Lahza Capture Helper",
-  "description": "Captures pointer and shortcut events during recordings and keeps the teleprompter out of Lahza screen recordings.",
+  "description": "Captures pointer and shortcut events during recordings and keeps Lahza recording controls, camera preview, and teleprompter out of screen recordings.",
   "shell-version": ["48", "49", "50"],
   "version": 2
 }

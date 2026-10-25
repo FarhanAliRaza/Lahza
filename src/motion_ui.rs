@@ -64,6 +64,7 @@ fn visible_motion_endpoint(start: f64, end: f64, image_start: f64, image_end: f6
 #[derive(Clone, Copy)]
 pub(crate) struct ImageTrimDrag {
     start_x: Pixels,
+    start_scroll: f64,
     original_start: f64,
     original_end: f64,
     edge: Option<ClipEdge>,
@@ -73,6 +74,10 @@ pub(crate) struct ImageTrimDrag {
 }
 
 impl ImageTrimDrag {
+    fn range_at_scroll(self, x: Pixels, scroll: f64) -> (f64, f64) {
+        self.range_at(x + px((scroll - self.start_scroll) as f32))
+    }
+
     fn range_at(self, x: Pixels) -> (f64, f64) {
         if self.edge.is_none() {
             let pixels = f64::from((x - self.start_x) / px(1.0));
@@ -121,6 +126,7 @@ mod image_trim_tests {
     fn leading_trim_changes_only_start_and_keeps_a_nonempty_clip() {
         let drag = ImageTrimDrag {
             start_x: px(100.0),
+            start_scroll: 0.0,
             original_start: 1.0,
             original_end: 4.0,
             seconds_per_pixel: 0.01,
@@ -138,6 +144,7 @@ mod image_trim_tests {
     fn moving_image_preserves_duration_and_clamps_only_at_zero() {
         let drag = ImageTrimDrag {
             start_x: px(100.0),
+            start_scroll: 0.0,
             original_start: 1.0,
             original_end: 4.0,
             seconds_per_pixel: 0.01,
@@ -156,6 +163,7 @@ mod image_trim_tests {
     fn trailing_trim_respects_a_delayed_start() {
         let drag = ImageTrimDrag {
             start_x: px(100.0),
+            start_scroll: 0.0,
             original_start: 1.0,
             original_end: 4.0,
             seconds_per_pixel: 0.01,
@@ -166,6 +174,18 @@ mod image_trim_tests {
         assert_eq!(drag.range_at(px(200.0)), (1.0, 5.0));
         assert_eq!(drag.range_at(px(-500.0)), (1.0, 1.1));
         assert_eq!(drag.range_at(px(100.0)), (1.0, 4.0));
+    }
+
+    #[test]
+    fn image_trim_uses_the_scrolled_content_position() {
+        let drag = ImageTrimDrag {
+            start_x: px(100.0), start_scroll: 200.0,
+            original_start: 1.0, original_end: 4.0,
+            seconds_per_pixel: 0.01, edge: Some(ClipEdge::Trailing),
+            start: 1.0, end: 4.0,
+        };
+        assert_eq!(drag.range_at_scroll(px(150.0), 250.0), (1.0, 5.0));
+        assert_eq!(drag.range_at_scroll(px(100.0), 200.0), (1.0, 4.0));
     }
 }
 
@@ -452,7 +472,7 @@ impl Studio {
     }
 
     /// Whether the open scene has a reconstructed cursor to follow.
-    fn scene_has_pointer(&self) -> bool {
+    pub(crate) fn scene_has_pointer(&self) -> bool {
         (self.video_project.is_some() && !self.video_pointer_timeline.is_empty())
             || (self.animation_active && self.has_walkthrough())
     }
@@ -641,6 +661,7 @@ impl Studio {
             let left = region.left;
             let width = region.width;
             let selected = selected_zoom_cue == Some(cue_id);
+            let hovered = self.timeline_motion.hovered_region == Some(cue_id);
             let label = cue.summary();
             let enabled = cue.is_enabled;
             lane.push(
@@ -657,7 +678,7 @@ impl Studio {
                     .rounded_md()
                     .border_2()
                     .border_color(if selected {
-                        hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
+                        crate::blue()
                     } else {
                         hsla(0.0, 0.0, 0.0, 0.0)
                     })
@@ -671,7 +692,21 @@ impl Studio {
                     .justify_center()
                     .overflow_hidden()
                     .cursor(CursorStyle::PointingHand)
+                    .hover(|style| style.bg(orange(true)))
+                    .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                        let next = if *hovering { Some(cue_id) }
+                            else if this.timeline_motion.hovered_region == Some(cue_id) { None }
+                            else { this.timeline_motion.hovered_region };
+                        if next != this.timeline_motion.hovered_region {
+                            this.timeline_motion.hovered_region = next;
+                            cx.notify();
+                        }
+                    }))
                     .when(width >= 44.0, |this| this.child(label))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_timeline_context(crate::timeline_ui::TimelineContextTarget::Motion(cue_id), event.position, cx);
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.finish_annotation_interaction();
                         this.video_selected_zoom_cue = Some(cue_id);
@@ -697,7 +732,7 @@ impl Studio {
                             cx.notify();
                         }),
                     )
-                    .when(selected, |this| {
+                    .when(selected || hovered, |this| {
                         this.child(
                             div()
                                 .id((
@@ -778,8 +813,8 @@ impl Studio {
         rows as f32 * MOTION_ROW_HEIGHT
     }
 
-    /// The motion lane container. A single click on empty lane moves the
-    /// playhead; a double-click creates a region there.
+    /// Click empty space to seek, draw a range to create motion, or
+    /// double-click for a default region.
     pub(crate) fn motion_track(
         &self,
         timeline_scroll: f64,
@@ -817,7 +852,7 @@ impl Studio {
                             .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
                     ),
             )
-            .when(empty, |this| {
+            .when(empty && self.timeline_motion.creation.is_none(), |this| {
                 this.child(
                     div()
                         .absolute()
@@ -825,26 +860,30 @@ impl Studio {
                         .top(px(7.0))
                         .text_xs()
                         .text_color(muted())
-                        .child("Double-click to add a motion region"),
+                        .child("Drag to add motion · double-click for a quick region"),
                 )
             })
+            .when_some(self.motion_creation_preview(), |this, preview| this.child(preview))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                if let Some(time) = this.motion_timeline_time_at(event.position.x) {
+                    this.open_timeline_context(crate::timeline_ui::TimelineContextTarget::EmptyMotion(time), event.position, cx);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.pause_video_playback();
-                    this.video_trim_drag = None;
-                    this.video_zoom_drag = None;
+                    cx.stop_propagation();
                     let Some(target) = this.motion_timeline_time_at(event.position.x) else {
                         return;
                     };
                     if event.click_count >= 2 {
+                        this.cancel_motion_creation();
                         this.video_seek_drag = None;
                         this.seek_video(target, cx);
                         this.add_motion_region_at(target, cx);
                     } else {
-                        this.finish_annotation_interaction();
-                        this.video_position = target;
-                        this.video_seek_drag = Some((event.position.x, target));
+                        this.begin_motion_creation(event.position.x, cx);
                     }
                     cx.notify();
                 }),
@@ -1748,6 +1787,7 @@ impl Studio {
             .map(|clip| clip.id);
         self.image_trim_drag = Some(ImageTrimDrag {
             start_x: x,
+            start_scroll: self.video_timeline_scroll,
             original_start: self.animation_image_start,
             original_end: self.animation_image_end,
             edge,
@@ -1759,13 +1799,33 @@ impl Studio {
     }
 
     pub(crate) fn update_image_trim(&mut self, event: &MouseMoveEvent) -> bool {
-        let Some(drag) = self.image_trim_drag.as_mut() else {
-            return false;
-        };
+        if self.image_trim_drag.is_none() { return false; }
         if !event.dragging() {
             return self.end_image_trim();
         }
-        (drag.start, drag.end) = drag.range_at(event.position.x);
+        self.update_image_timeline_drag(event.position.x)
+    }
+
+    pub(crate) fn update_image_timeline_drag(&mut self, pointer_x: Pixels) -> bool {
+        let Some(mut drag) = self.image_trim_drag else { return false; };
+        let (start, end) = drag.range_at_scroll(pointer_x, self.video_timeline_scroll);
+        let moved = (f64::from(pointer_x - drag.start_x) + self.video_timeline_scroll - drag.start_scroll).abs() >= 3.0;
+        let (edge, length) = match drag.edge {
+            None => (start, end - start),
+            Some(ClipEdge::Leading) => (start, 0.0),
+            Some(ClipEdge::Trailing) => (end, 0.0),
+        };
+        let (snapped, guide) = crate::timeline_edit::snap_timeline_edges(
+            edge, length, &self.timeline_snap_targets(self.video_selected_clip, None, None),
+            drag.seconds_per_pixel, self.timeline_ui.snap_enabled && moved,
+        );
+        (drag.start, drag.end) = match drag.edge {
+            None => (snapped.max(0.0), snapped.max(0.0) + length),
+            Some(ClipEdge::Leading) => (snapped.clamp(0.0, (end - MINIMUM_IMAGE_DURATION).max(0.0)), end),
+            Some(ClipEdge::Trailing) => (start, snapped.max(start + MINIMUM_IMAGE_DURATION)),
+        };
+        self.timeline_ui.snap_guide = crate::timeline_edit::snap_guide_at_edges(guide, drag.start, drag.end);
+        self.image_trim_drag = Some(drag);
         true
     }
 
@@ -1773,6 +1833,7 @@ impl Studio {
         let Some(drag) = self.image_trim_drag.take() else {
             return false;
         };
+        self.timeline_ui.snap_guide = None;
         if (drag.start - drag.original_start).abs() > 1e-9
             || (drag.end - drag.original_end).abs() > 1e-9
         {
@@ -1785,6 +1846,14 @@ impl Studio {
             self.restore_image_timing(self.animation_duration.max(drag.end), drag.start, drag.end);
         }
         true
+    }
+
+    /// Image trim values remain a draft until release, so cancelling only
+    /// drops the draft and keeps both edit history stacks intact.
+    pub(crate) fn cancel_image_trim(&mut self) -> bool {
+        let cancelled = self.image_trim_drag.take().is_some();
+        if cancelled { self.timeline_ui.snap_guide = None; }
+        cancelled
     }
 
     /// Trim boundaries affect only the image layer, not other scene content.
@@ -1862,6 +1931,9 @@ impl Studio {
         if !self.animation_active || self.video_playing || self.video_duration <= 0.0 {
             return;
         }
+        self.cancel_timeline_edit(cx);
+        self.video_seek_drag = None;
+        self.follow_timeline_playhead(true);
         self.finish_annotation_interaction();
         if self.video_position >= self.video_duration - 0.01 {
             self.video_position = 0.0;
@@ -1893,6 +1965,7 @@ impl Studio {
                     } else {
                         next
                     };
+                    this.follow_timeline_playhead(false);
                     cx.notify();
                 })
                 .is_err()
@@ -1919,6 +1992,9 @@ impl Studio {
     ) -> bool {
         if !self.animation_active || self.editing_text.is_some() || self.crop_active {
             return false;
+        }
+        if self.handle_timeline_shortcut(event, cx) {
+            return true;
         }
         let keystroke = &event.keystroke;
         if keystroke.modifiers.control || keystroke.modifiers.platform {

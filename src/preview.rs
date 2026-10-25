@@ -108,7 +108,7 @@ impl Studio {
             annotations.push(draft);
         }
         let canvas_annotations = self.canvas_annotation_marks();
-        let media_visible = self.image_visible_at(self.video_position);
+        let media_visible = self.image_visible_at(self.timeline_display_time());
         let committed_count = self.annotations.len();
         // Animated scenes paint each mark at its state for the playhead time.
         let selected_annotations = self.annotation_selected_indices();
@@ -116,7 +116,7 @@ impl Studio {
         let editing_text = self.editing_text;
         let (annotations, painted_indices): (Vec<AnnotationMark>, Vec<usize>) =
             if self.animation_active {
-                let time = self.video_position;
+                let time = self.timeline_display_time();
                 let mut marks = Vec::new();
                 let mut indices = Vec::new();
                 for (index, mark) in annotations.iter().enumerate() {
@@ -154,7 +154,7 @@ impl Studio {
         // While animating, the still image is cropped by the same viewport
         // the exporter uses; annotations move with it.
         let (view_zoom, view_left, view_top) = if animation_active {
-            let frame = self.video_viewport_timeline.frame_at(self.video_position);
+            let frame = self.video_viewport_timeline.frame_at(self.timeline_display_time());
             let (left, top, _, _) = visible_rect(frame);
             (frame.magnification.max(1.0) as f32, left as f32, top as f32)
         } else {
@@ -814,6 +814,7 @@ impl Studio {
             self.video_extras_pending = false;
             self.spawn_video_extras(cx);
         }
+        self.refresh_timeline_thumbnails(cx);
         self.ensure_camera_frame(cx);
         let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
         let video_canvas = if self.crop_active {
@@ -853,6 +854,7 @@ impl Studio {
                 }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.timeline_pointer_move(event, cx) { cx.notify(); return; }
                 let mut changed = this.update_slider_drag(event);
                 if event.dragging() && this.annotation_drag.is_some() {
                     if this.update_annotation_drag(event.position.x) {
@@ -874,11 +876,10 @@ impl Studio {
                     } else if this.video_trim_drag.is_some() {
                         this.update_video_trim(event.position.x);
                         changed = true;
-                    } else if let Some((start_x, start_position)) = this.video_seek_drag {
-                        let delta = (event.position.x - start_x) / px(1.0);
-                        this.video_position = (start_position
-                            + delta as f64 * this.video_timeline_seconds_per_pixel())
-                            .clamp(0.0, this.video_timeline_duration());
+                    } else if this.video_seek_drag.is_some() {
+                        if let Some(time) = this.motion_timeline_time_at(event.position.x) {
+                            this.scrub_video_to(time, cx);
+                        }
                         changed = true;
                     }
                 }
@@ -889,6 +890,7 @@ impl Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     if this.end_motion_transform_drag() {
                         cx.notify();
                     }
@@ -911,8 +913,8 @@ impl Studio {
                         this.commit_video_zoom_drag(cx);
                     } else if this.video_trim_drag.is_some() {
                         this.commit_video_trim(cx);
-                    } else if this.video_seek_drag.take().is_some() {
-                        this.seek_video(this.video_position, cx);
+                    } else if this.video_seek_drag.is_some() {
+                        this.finish_timeline_scrub(cx);
                     }
                     if this
                         .slider_drag
@@ -926,17 +928,28 @@ impl Studio {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     this.end_camera_drag();
+                    this.end_media_drag();
+                    this.end_annotation_drag();
                     this.finish_audio_drag(event.position.x, cx);
                     this.finish_video_move_drag(event.position.x, cx);
                     if this.video_trim_drag.is_some() {
                         this.commit_video_trim(cx);
                     } else if this.video_zoom_drag.is_some() {
                         this.commit_video_zoom_drag(cx);
+                    } else if this.video_seek_drag.is_some() {
+                        this.finish_timeline_scrub(cx);
                     }
-                    if this.end_motion_transform_drag() {
-                        cx.notify();
+                    this.end_motion_transform_drag();
+                    if this
+                        .slider_drag
+                        .take()
+                        .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER)
+                    {
+                        this.persist_video_zoom_cues(cx);
                     }
+                    cx.notify();
                 }),
             )
             .child(top_bar)

@@ -24,9 +24,9 @@ use crate::{
 pub(crate) const INSPECTOR_WIDTH: f32 = 360.0;
 pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
 const CANVAS_PADDING: f32 = 40.0;
-const TIMELINE_CONTROLS_HEIGHT: f32 = 46.0;
+const TIMELINE_CONTROLS_HEIGHT: f32 = 78.0;
 const SCENE_STRIP_HEIGHT: f32 = 42.0;
-const TIMELINE_LANES_HEIGHT: f32 = 148.0;
+const TIMELINE_LANES_HEIGHT: f32 = 64.0;
 
 pub(crate) const EDITOR_MIN_WIDTH: f32 = 980.0;
 pub(crate) const EDITOR_MIN_HEIGHT: f32 = 680.0;
@@ -308,27 +308,13 @@ impl Studio {
     // Layout budget
     // ------------------------------------------------------------------
 
-    fn timeline_lane_extra(&self) -> f32 {
-        let camera = if self.video_camera_path.is_some() {
-            26.0
-        } else {
-            0.0
-        };
-        let annotations = if self.annotations.is_empty() {
-            0.0
-        } else {
-            self.annotation_lane_height() + 4.0
-        };
-        camera + annotations + (self.motion_lane_height() - 30.0) + self.video_audio_clips.len() as f32 * 24.0
-    }
-
     fn timeline_bar_height(&self) -> f32 {
         if self.editor_mode() == EditorMode::Static {
             0.0
         } else {
             TIMELINE_CONTROLS_HEIGHT
                 + TIMELINE_LANES_HEIGHT
-                + self.timeline_lane_extra()
+                + self.timeline_ui.lane_height
                 + 1.0
                 + if self.editor_mode() == EditorMode::Motion {
                     SCENE_STRIP_HEIGHT
@@ -1647,7 +1633,7 @@ impl Studio {
     // Timeline
     // ------------------------------------------------------------------
 
-    fn toggle_timeline_playback(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_timeline_playback(&mut self, cx: &mut Context<Self>) {
         if self.video_project.is_some() {
             if self.video_playing {
                 self.pause_video_playback();
@@ -1659,90 +1645,16 @@ impl Studio {
         }
     }
 
-    /// Editing controls for an animated screenshot's timeline.
-    fn motion_edit_controls(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.video_edit_busy;
-        let has_selection = self.video_selected_zoom_cue.is_some();
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .id("timeline-add-motion")
-                    .px_3()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .rounded_md()
-                    .text_sm()
-                    .opacity(if busy { 0.35 } else { 1.0 })
-                    .when(!busy, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xe7f1ff)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let position = this.video_position;
-                                this.add_motion_region_at(position, cx);
-                                cx.notify();
-                            }))
-                    })
-                    .child("+ Motion"),
-            )
-            .child(self.small_button("timeline-extend-scene", "+ 5s", !busy, cx, |this, _| {
-                this.set_animation_duration(this.animation_duration + 5.0);
-            }))
-            .child(
-                div()
-                    .id("timeline-delete-motion")
-                    .size(px(32.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .opacity(if has_selection { 1.0 } else { 0.35 })
-                    .when(has_selection, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xfee2e2)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.delete_selected_video_zoom(cx);
-                                cx.notify();
-                            }))
-                    })
-                    .child(
-                        svg()
-                            .path("icons/trash.svg")
-                            .size(px(16.0))
-                            .text_color(ink()),
-                    ),
-            )
-            .when(self.image_scenes.len() > 1, |this| {
-                this.child(
-                    div()
-                        .ml_2()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(muted())
-                        .child(format!(
-                            "Scene {} of {} · {:.1}s total",
-                            self.image_scene_index + 1,
-                            self.image_scenes.len(),
-                            self.sequence_duration()
-                        )),
-                )
-            })
-            .into_any_element()
-    }
-
     /// Seeks to the pointer's position on the ruler or the clip lane and
     /// arms a scrub drag.
-    pub(crate) fn timeline_seek_down(&mut self, event: &MouseDownEvent) {
+    pub(crate) fn timeline_seek_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.finish_annotation_interaction();
         self.pause_video_playback();
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
         let target = self.motion_timeline_time_at(event.position.x)
             .unwrap_or(self.video_position);
-        self.video_position = target;
+        self.scrub_video_to(target, cx);
         self.video_seek_drag = Some((event.position.x, target));
     }
 
@@ -1764,34 +1676,58 @@ impl Studio {
 
     pub(crate) fn timeline_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let is_video = self.video_project.is_some();
-        let playing = self.video_playing;
         let progress = if self.video_duration > 0.0 {
             (self.video_position / self.video_timeline_duration()).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        let current_time = Self::video_timecode(self.video_position);
-        let duration = Self::video_timecode(self.video_duration);
         let timeline_duration = self.video_timeline_duration();
-        let timeline_zoom = self.video_timeline_zoom;
         let timeline_scroll = self.video_timeline_scroll;
         let timeline_content_width = self.video_timeline_content_width();
         let timeline_bounds = self.video_timeline_bounds.clone();
-        let lane_extra = self.timeline_lane_extra();
         let selected_clip = self.video_selected_clip;
         let move_drag = self.video_move_drag.filter(|drag| drag.active);
         // While dragging, the clip's ghost follows the pointer (snapped the
         // same way the drop will land) so the destination — including a gap
         // past the end of the timeline — is always visible.
-        let move_ghost = move_drag.and_then(|drag| {
-            let range = self.video_clip_timeline.editor_range(drag.clip_id)?;
-            let new_start = self.video_move_new_start(&drag)?;
-            let scale = timeline_content_width / timeline_duration;
-            Some((
-                (new_start * scale) as f32,
-                (((range.end - range.start) * scale).max(3.0)) as f32,
-            ))
-        });
+        let move_ghosts: Vec<AnyElement> = move_drag
+            .into_iter()
+            .flat_map(|drag| {
+                let Some((resolved, _)) = self.resolved_video_move_preview(&drag) else {
+                    return Vec::new();
+                };
+                let scale = timeline_content_width / timeline_duration;
+                resolved
+                    .segments
+                    .iter()
+                    .filter_map(|clip| {
+                        let range = resolved.editor_range(clip.id)?;
+                        let old = self.video_clip_timeline.editor_range(clip.id)?;
+                        if clip.id != drag.clip_id && (range.start - old.start).abs() < 1e-6 {
+                            return None;
+                        }
+                        Some(
+                            div()
+                                .absolute()
+                                .left(px((range.start * scale) as f32))
+                                .top_0()
+                                .h_full()
+                                .w(px(((range.end - range.start) * scale).max(3.0) as f32))
+                                .rounded_md()
+                                .border_2()
+                                .border_color(blue())
+                                .bg(hsla(
+                                    217.0 / 360.0,
+                                    0.9,
+                                    0.6,
+                                    if clip.id == drag.clip_id { 0.35 } else { 0.16 },
+                                ))
+                                .into_any_element(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         // Time ruler: adaptive tick step targeting ~80px between labels.
         let ruler_step = {
             let raw = 80.0 * timeline_duration / timeline_content_width.max(1.0);
@@ -1803,8 +1739,11 @@ impl Studio {
             .unwrap_or(600.0)
         };
         let mut ruler_marks: Vec<AnyElement> = Vec::new();
-        let mut ruler_tick = 0.0;
-        while ruler_tick <= timeline_duration + 1e-6 {
+        let visible_start = timeline_scroll * self.video_timeline_seconds_per_pixel();
+        let visible_end = visible_start
+            + self.video_timeline_viewport_width() * self.video_timeline_seconds_per_pixel();
+        let mut ruler_tick = (visible_start / ruler_step).floor() * ruler_step;
+        while ruler_tick <= timeline_duration.min(visible_end + ruler_step) + 1e-6 {
             let x = (ruler_tick / timeline_duration * timeline_content_width) as f32;
             ruler_marks.push(
                 div()
@@ -1817,7 +1756,7 @@ impl Studio {
                     .into_any_element(),
             );
             let label = if ruler_step < 1.0 {
-                format!("{ruler_tick:.1}")
+                crate::timeline_edit::precise_timecode(ruler_tick)
             } else {
                 Self::video_timecode(ruler_tick)
             };
@@ -1825,7 +1764,7 @@ impl Studio {
                 div()
                     .absolute()
                     .left(px(x + 5.0))
-                    .top(px(1.0))
+                    .top(px(19.0))
                     .text_xs()
                     .text_color(muted())
                     .child(label)
@@ -1861,8 +1800,15 @@ impl Studio {
         } else {
             // An animated screenshot is one still per scene; the lane shows
             // the scene that is open.
-            let image_start = self.image_trim_drag.map(|drag| drag.start).unwrap_or(self.animation_image_start);
-            let image_end = self.image_trim_drag.map(|drag| drag.end).unwrap_or(self.animation_image_end).min(self.video_duration);
+            let image_start = self
+                .image_trim_drag
+                .map(|drag| drag.start)
+                .unwrap_or(self.animation_image_start);
+            let image_end = self
+                .image_trim_drag
+                .map(|drag| drag.end)
+                .unwrap_or(self.animation_image_end)
+                .min(self.video_duration);
             let image_duration = (image_end - image_start).max(0.0);
             let label = if self.image_scenes.len() > 1 {
                 format!(
@@ -1873,92 +1819,183 @@ impl Studio {
             } else {
                 format!("Image · {:.2}s", image_duration)
             };
-            if image_duration <= 0.0 { Vec::new() } else { vec![div()
-                .id("image-timeline-clip")
-                .cursor(CursorStyle::ClosedHand)
-                .absolute()
-                .left(px((timeline_content_width * image_start / timeline_duration) as f32))
-                .overflow_hidden()
-                .h_full()
-                .w(px((timeline_content_width * image_duration / timeline_duration).max(32.0) as f32))
-                .flex_none()
-                .rounded_md()
-                .border_2()
-                .border_color(if self.video_selected_clip.is_some() { ink() } else { hsla(0.0, 0.0, 0.0, 0.0) })
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.focus_handle.focus(window);
-                    this.timeline_seek_down(event);
-                    this.begin_image_move(event.position.x);
-                    this.video_selected_zoom_cue = None;
-                    this.selected_annotation = None;
-                    this.scene_selection = SceneSelection::Scene;
-                    this.video_selected_clip = this.video_clip_timeline.segments.first().map(|clip| clip.id);
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
-                .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(hsla(0.0, 0.0, 1.0, 0.92))
-                .child(
-                    div()
-                        .px_2()
-                        .rounded_md()
-                        .bg(hsla(0.0, 0.0, 0.0, 0.35))
-                        .child(label),
-                )
-                .child(div()
-                    .id("image-trim-start")
-                    .absolute().left_0().top_0().h_full().w(px(14.0))
-                    .flex().items_center().justify_center()
-                    .cursor(CursorStyle::ResizeLeftRight)
-                    .bg(hsla(0.0, 0.0, 0.0, 0.12))
-                    .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
-                    .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.begin_image_trim(event.position.x, ClipEdge::Leading);
-                        cx.stop_propagation();
-                        cx.notify();
-                    })))
-                .child(div()
-                    .id("image-trim-end")
-                    .absolute().right_0().top_0().h_full().w(px(14.0))
-                    .flex().items_center().justify_center()
-                    .cursor(CursorStyle::ResizeLeftRight)
-                    .bg(hsla(0.0, 0.0, 0.0, 0.12))
-                    .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
-                    .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.begin_image_trim(event.position.x, ClipEdge::Trailing);
-                        cx.stop_propagation();
-                        cx.notify();
-                    })))
-                .into_any_element()] }
+            if image_duration <= 0.0 {
+                Vec::new()
+            } else {
+                vec![div()
+                    .id("image-timeline-clip")
+                    .cursor(CursorStyle::ClosedHand)
+                    .absolute()
+                    .left(px(
+                        (timeline_content_width * image_start / timeline_duration) as f32,
+                    ))
+                    .overflow_hidden()
+                    .h_full()
+                    .w(px(
+                        (timeline_content_width * image_duration / timeline_duration).max(32.0)
+                            as f32,
+                    ))
+                    .flex_none()
+                    .rounded_md()
+                    .border_2()
+                    .border_color(if self.video_selected_clip.is_some() {
+                        ink()
+                    } else {
+                        hsla(0.0, 0.0, 0.0, 0.0)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.focus_handle.focus(window);
+                            this.timeline_seek_down(event, cx);
+                            this.begin_image_move(event.position.x);
+                            this.video_selected_zoom_cue = None;
+                            this.selected_annotation = None;
+                            this.scene_selection = SceneSelection::Scene;
+                            this.video_selected_clip = this
+                                .video_clip_timeline
+                                .segments
+                                .first()
+                                .map(|clip| clip.id);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(hsla(0.0, 0.0, 1.0, 0.92))
+                    .child(
+                        div()
+                            .px_2()
+                            .rounded_md()
+                            .bg(hsla(0.0, 0.0, 0.0, 0.35))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .id("image-trim-start")
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .h_full()
+                            .w(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::ResizeLeftRight)
+                            .bg(hsla(0.0, 0.0, 0.0, 0.12))
+                            .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
+                            .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_image_trim(event.position.x, ClipEdge::Leading);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("image-trim-end")
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .h_full()
+                            .w(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::ResizeLeftRight)
+                            .bg(hsla(0.0, 0.0, 0.0, 0.12))
+                            .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
+                            .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_image_trim(event.position.x, ClipEdge::Trailing);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .into_any_element()]
+            }
         };
         let motion_track = self.motion_track(timeline_scroll, timeline_content_width, progress, cx);
         let annotation_track =
             self.annotation_track(timeline_scroll, timeline_content_width, progress, cx);
-        let edit_controls = if is_video {
-            self.video_edit_controls(cx).into_any_element()
+        let audio_height = if audio_lane.is_some() { 26.0 } else { 0.0 };
+        let camera_height = if camera_lane.is_some() { 26.0 } else { 0.0 };
+        let annotation_height = if annotation_track.is_some() {
+            self.annotation_lane_height() + 4.0
         } else {
-            self.motion_edit_controls(cx)
+            0.0
         };
+        let tracks_height = 48.0
+            + 4.0
+            + self.motion_lane_height()
+            + audio_height
+            + camera_height
+            + annotation_height
+            + if self.video_audio_clips.is_empty() {
+                0.0
+            } else {
+                self.video_audio_clips.len() as f32 * 24.0 + 4.0
+            };
+        let vertical_overflow = tracks_height > self.timeline_ui.lane_height;
+        let playhead_x = (timeline_content_width * progress - timeline_scroll) as f32;
+        let expanded = self.timeline_ui.ruler_hover || self.video_seek_drag.is_some();
+        let head_width = if expanded { 76.0 } else { 18.0 };
+        let head_left = (playhead_x - head_width / 2.0).clamp(
+            0.0,
+            (self.video_timeline_viewport_width() as f32 - head_width).max(0.0),
+        );
+        let playhead_visible =
+            playhead_x >= 0.0 && playhead_x <= self.video_timeline_viewport_width() as f32;
+        let skim_x = self
+            .timeline_skim_time()
+            .map(|time| (time / self.video_timeline_seconds_per_pixel() - timeline_scroll) as f32);
+        let snap_x = self
+            .timeline_ui
+            .snap_guide
+            .map(|time| (time / self.video_timeline_seconds_per_pixel() - timeline_scroll) as f32);
+        let context = self.timeline_context_menu(cx);
+        let detail = self
+            .timeline_drag_readout()
+            .or_else(|| {
+                self.motion_creation_times().map(|(a, b)| {
+                    format!(
+                        "{} – {} · {}",
+                        crate::timeline_edit::precise_timecode(a),
+                        crate::timeline_edit::precise_timecode(b),
+                        crate::timeline_edit::precise_timecode(b - a)
+                    )
+                })
+            })
+            .or_else(|| {
+                self.timeline_skim_time()
+                    .map(|t| format!("Preview {}", crate::timeline_edit::precise_timecode(t)))
+            });
 
         div()
+            .relative()
             .capture_any_mouse_down(cx.listener(|this, _, window, _| {
                 this.stop_editing_text();
                 this.focus_handle.focus(window);
             }))
             .flex_none()
-            .px_6()
+            .px_4()
             .flex()
             .flex_col()
             .bg(rgb(0xffffff))
             .border_t_1()
             .border_color(line())
+            .child(self.timeline_resize_handle(cx))
             .when(!is_video, |this| {
                 this.child(
                     div()
@@ -1973,344 +2010,315 @@ impl Studio {
                         .child(self.scene_strip(cx)),
                 )
             })
+            .child(self.timeline_controls(cx))
             .child(
                 div()
-                    .h(px(TIMELINE_CONTROLS_HEIGHT))
-                    .flex_none()
                     .flex()
+                    .flex_none()
+                    .h(px(38.0))
                     .items_center()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(line())
-                    .child(div().id("timeline-edit-actions").flex_1().min_w_0().overflow_x_scroll().flex().items_center().child(edit_controls))
                     .child(
                         div()
+                            .w(px(104.0))
                             .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("timeline-play-pause")
-                                    .size(px(34.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .bg(ink())
-                                    .cursor_pointer()
-                                    .child(
-                                        svg()
-                                            .path(if playing {
-                                                "icons/pause.svg"
-                                            } else {
-                                                "icons/play.svg"
-                                            })
-                                            .size(px(15.0))
-                                            .text_color(rgb(0xffffff)),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_timeline_playback(cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(format!("{current_time} / {duration}")),
-                            ),
+                            .text_xs()
+                            .text_color(muted())
+                            .child("Time"),
                     )
                     .child(
-                        div().flex_1().flex().items_center().justify_end().child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_xs()
-                                .child(div().text_color(muted()).child("Timeline zoom"))
-                                .child(
+                        div()
+                            .id("timeline-ruler")
+                            .relative()
+                            .flex_1()
+                            .h_full()
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .on_hover(cx.listener(|this, hover, _, cx| {
+                                this.timeline_ui.ruler_hover = *hover;
+                                if !hover {
+                                    this.update_timeline_skim(None, cx);
+                                }
+                                cx.notify();
+                            }))
+                            .on_mouse_move(cx.listener(
+                                |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                    if !event.dragging() && this.timeline_ui.skim_enabled {
+                                        this.update_timeline_skim(
+                                            this.motion_timeline_time_at(event.position.x),
+                                            cx,
+                                        );
+                                    }
+                                },
+                            ))
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    let (dx, dy) = match event.delta {
+                                        ScrollDelta::Pixels(d) => (f64::from(d.x), f64::from(d.y)),
+                                        ScrollDelta::Lines(d) => {
+                                            (d.x as f64 * 16.0, d.y as f64 * 16.0)
+                                        }
+                                    };
+                                    if event.modifiers.control || event.modifiers.platform {
+                                        let anchor = this
+                                            .motion_timeline_time_at(event.position.x)
+                                            .unwrap_or(this.video_position);
+                                        this.zoom_video_timeline(2_f64.powf(dy / 220.0), anchor);
+                                    } else {
+                                        this.manually_pan_timeline(if dx.abs() > dy.abs() {
+                                            -dx
+                                        } else {
+                                            -dy
+                                        });
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(-(timeline_scroll as f32)))
+                                    .w(px(timeline_content_width as f32))
+                                    .h_full()
+                                    .children(ruler_marks),
+                            )
+                            .when(playhead_visible, |this| {
+                                this.child(
                                     div()
-                                        .id("timeline-zoom-out")
-                                        .size(px(28.0))
+                                        .absolute()
+                                        .left(px(head_left))
+                                        .top(px(1.0))
+                                        .w(px(head_width))
+                                        .h(px(18.0))
+                                        .rounded_sm()
+                                        .bg(blue())
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgb(0xeeeeef)))
-                                        .child("−")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.zoom_video_timeline(
-                                                1.0 / 1.25,
-                                                this.video_position,
-                                            );
-                                            cx.notify();
-                                        })),
+                                        .text_xs()
+                                        .text_color(rgb(0xffffff))
+                                        .child(if expanded {
+                                            crate::timeline_edit::precise_timecode(
+                                                self.video_position,
+                                            )
+                                        } else {
+                                            "▾".to_owned()
+                                        }),
                                 )
-                                .child(
-                                    div()
-                                        .id("timeline-fit")
-                                        .w(px(42.0))
-                                        .text_center()
-                                        .cursor_pointer()
-                                        .child(format!("{timeline_zoom:.1}×"))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.video_timeline_span = this.video_duration.max(0.001);
-                                            this.video_timeline_extent = this.video_duration.max(this.video_position);
-                                            this.video_timeline_zoom = 1.0;
-                                            this.video_timeline_scroll = 0.0;
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("timeline-zoom-in")
-                                        .size(px(28.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgb(0xeeeeef)))
-                                        .child("+")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.zoom_video_timeline(1.25, this.video_position);
-                                            cx.notify();
-                                        })),
-                                ),
-                        ),
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.timeline_seek_down(event, cx);
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             )
             .child(
                 div()
-                    .h(px(TIMELINE_LANES_HEIGHT + lane_extra))
+                    .id("timeline-tracks-scroll")
+                    .h(px(self.timeline_ui.lane_height))
                     .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.timeline_ui.vertical_scroll)
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        let (dx, dy) = match event.delta {
+                            ScrollDelta::Pixels(d) => (f64::from(d.x), f64::from(d.y)),
+                            ScrollDelta::Lines(d) => (d.x as f64 * 16.0, d.y as f64 * 16.0),
+                        };
+                        if event.modifiers.control || event.modifiers.platform {
+                            let anchor = this
+                                .motion_timeline_time_at(event.position.x)
+                                .unwrap_or(this.video_position);
+                            this.zoom_video_timeline(2_f64.powf(dy / 220.0), anchor);
+                        } else if event.modifiers.shift || dx.abs() > dy.abs() || !vertical_overflow
+                        {
+                            this.manually_pan_timeline(if dx.abs() > dy.abs() { -dx } else { -dy });
+                        } else {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
                     .child(
                         div()
-                            .w(px(104.0))
-                            .pr_3()
-                            .h(px(126.0 + lane_extra))
-                            .flex_none()
                             .flex()
-                            .flex_col()
-                            .justify_center()
+                            .h(px(tracks_height))
+                            .flex_none()
                             .child(
                                 div()
+                                    .w(px(104.0))
+                                    .pr_3()
+                                    .flex_none()
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(Self::track_label("Time", 16.0))
                                     .child(Self::track_label(
                                         if is_video { "Video" } else { "Image" },
-                                        34.0,
+                                        48.0,
                                     ))
                                     .child(Self::track_label("Motion", self.motion_lane_height()))
-                                    .when(annotation_track.is_some(), |this| {
-                                        this.child(Self::track_label(
+                                    .when(annotation_track.is_some(), |d| {
+                                        d.child(Self::track_label(
                                             "Annotations",
                                             self.annotation_lane_height(),
                                         ))
                                     })
-                                    .when(camera_lane.is_some(), |this| {
-                                        this.child(Self::track_label("Camera", 22.0))
+                                    .when(camera_lane.is_some(), |d| {
+                                        d.child(Self::track_label("Camera", 22.0))
                                     })
-                                    .when(audio_lane.is_some(), |this| {
-                                        this.child(Self::track_label("Audio", 22.0))
+                                    .when(audio_lane.is_some(), |d| {
+                                        d.child(Self::track_label("Audio", 22.0))
                                     })
-                                    .when(!self.video_audio_clips.is_empty(), |this| {
-                                        this.child(Self::track_label("Music / SFX", self.video_audio_clips.len() as f32 * 24.0))
+                                    .when(!self.video_audio_clips.is_empty(), |d| {
+                                        d.child(Self::track_label(
+                                            "Music / SFX",
+                                            self.video_audio_clips.len() as f32 * 24.0,
+                                        ))
                                     }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(320.0))
-                            .h(px(126.0 + lane_extra))
-                            .flex()
-                            .flex_col()
-                            .justify_center()
+                            )
                             .child(
                                 div()
+                                    .id("timeline-track-content")
                                     .relative()
-                                    .w_full()
+                                    .flex_1()
+                                    .min_w(px(280.0))
+                                    .h_full()
                                     .flex()
                                     .flex_col()
                                     .gap_1()
                                     .overflow_hidden()
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                                    .on_scroll_wheel(cx.listener(
-                                        |this, event: &ScrollWheelEvent, _, cx| {
-                                            let delta = match event.delta {
-                                                ScrollDelta::Pixels(delta) => (
-                                                    (delta.x / px(1.0)) as f64,
-                                                    (delta.y / px(1.0)) as f64,
-                                                ),
-                                                ScrollDelta::Lines(delta) => {
-                                                    (delta.x as f64 * 16.0, delta.y as f64 * 16.0)
+                                    .on_mouse_move(cx.listener(
+                                        |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                            if !event.dragging() {
+                                                let time =
+                                                    this.motion_timeline_time_at(event.position.x);
+                                                this.timeline_ui.hover_time = time;
+                                                if this.timeline_ui.skim_enabled {
+                                                    this.update_timeline_skim(time, cx);
                                                 }
-                                            };
-                                            if event.modifiers.control || event.modifiers.platform {
-                                                let factor = 2_f64.powf(delta.1 / 220.0);
-                                                this.zoom_video_timeline(
-                                                    factor,
-                                                    this.video_position,
-                                                );
-                                            } else {
-                                                let pan = if delta.0.abs() > delta.1.abs() {
-                                                    -delta.0
-                                                } else {
-                                                    -delta.1
-                                                };
-                                                this.pan_video_timeline(pan);
                                             }
-                                            cx.stop_propagation();
-                                            cx.notify();
                                         },
                                     ))
-                            .child(
-                                div()
-                                    .id("timeline-ruler")
-                                    .relative()
-                                    .w_full()
-                                    .h(px(16.0))
-                                    .flex_none()
-                                    .overflow_hidden()
+                                    .on_hover(cx.listener(|this, hover, _, cx| {
+                                        if !hover {
+                                            this.timeline_ui.hover_time = None;
+                                            this.update_timeline_skim(None, cx);
+                                        }
+                                    }))
                                     .child(
                                         div()
-                                            .absolute()
-                                            .left(px(-(timeline_scroll as f32)))
-                                            .top_0()
-                                            .w(px(timeline_content_width as f32))
-                                            .h_full()
-                                            .children(ruler_marks)
+                                            .id("timeline-seek-bar")
+                                            .relative()
+                                            .w_full()
+                                            .h(px(48.0))
+                                            .flex_none()
+                                            .overflow_hidden()
+                                            .rounded_lg()
+                                            .bg(rgb(0xECEDF1))
                                             .child(
                                                 div()
                                                     .absolute()
-                                                    .left(px((timeline_content_width * progress)
-                                                        as f32
-                                                        - 5.0))
-                                                    .top(px(2.0))
-                                                    .w(px(10.0))
-                                                    .h(px(13.0))
-                                                    .rounded_sm()
-                                                    .bg(ink()),
-                                            ),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                            this.timeline_seek_down(event);
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("timeline-seek-bar")
-                                    .relative()
-                                    .w_full()
-                                    .h(px(34.0))
-                                    .flex()
-                                    .overflow_hidden()
-                                    .rounded_lg()
-                                    .bg(rgb(0xECEDF1))
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left(px(-(timeline_scroll as f32)))
-                                            .top_0()
-                                            .w(px(timeline_content_width as f32))
-                                            .h_full()
-                                            .flex()
-                                            .children(clip_lane)
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .left(px((timeline_content_width * progress)
-                                                        as f32
-                                                        - 1.0))
+                                                    .left(px(-(timeline_scroll as f32)))
                                                     .top_0()
-                                                    .w(px(2.0))
+                                                    .w(px(timeline_content_width as f32))
                                                     .h_full()
-                                                    .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.85)),
+                                                    .flex()
+                                                    .children(clip_lane)
+                                                    .children(move_ghosts),
                                             )
-                                            .when_some(
-                                                move_ghost,
-                                                |this, (ghost_left, ghost_width)| {
-                                                    this.child(
-                                                        div()
-                                                            .absolute()
-                                                            .left(px(ghost_left))
-                                                            .top_0()
-                                                            .h_full()
-                                                            .w(px(ghost_width))
-                                                            .rounded_md()
-                                                            .border_2()
-                                                            .border_color(hsla(
-                                                                222.0 / 360.0,
-                                                                0.2,
-                                                                0.15,
-                                                                0.8,
-                                                            ))
-                                                            .bg(hsla(
-                                                                217.0 / 360.0,
-                                                                0.9,
-                                                                0.6,
-                                                                0.35,
-                                                            )),
-                                                    )
-                                                },
+                                            .child(
+                                                canvas(
+                                                    move |bounds, window, _| {
+                                                        if let Ok(mut stored) =
+                                                            timeline_bounds.lock()
+                                                        {
+                                                            if *stored != Some(bounds) {
+                                                                window.refresh();
+                                                            }
+                                                            *stored = Some(bounds);
+                                                        }
+                                                    },
+                                                    |_, _, _, _| {},
+                                                )
+                                                .absolute()
+                                                .size_full(),
+                                            )
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, event: &MouseDownEvent, _, cx| {
+                                                        this.timeline_seek_down(event, cx);
+                                                        cx.notify();
+                                                    },
+                                                ),
                                             ),
                                     )
-                                    .child(
-                                        canvas(
-                                            move |bounds, window, _| {
-                                                if let Ok(mut stored) = timeline_bounds.lock() {
-                                                    // Lanes are laid out with the
-                                                    // previous width; redraw once
-                                                    // the real width is known.
-                                                    if *stored != Some(bounds) {
-                                                        window.refresh();
-                                                    }
-                                                    *stored = Some(bounds);
-                                                }
-                                            },
-                                            |_, _, _, _| {},
+                                    .child(motion_track)
+                                    .when_some(annotation_track, |d, lane| d.child(lane))
+                                    .when_some(camera_lane, |d, lane| d.child(lane))
+                                    .when_some(audio_lane, |d, lane| d.child(lane))
+                                    .when(!self.video_audio_clips.is_empty(), |d| {
+                                        d.child(self.imported_audio_lane(
+                                            timeline_content_width,
+                                            timeline_scroll,
+                                            cx,
+                                        ))
+                                    })
+                                    .when_some(skim_x, |d, x| {
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(x))
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(px(1.0))
+                                                .bg(rgb(0x8b95a5)),
                                         )
-                                        .absolute()
-                                        .size_full(),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                            this.timeline_seek_down(event);
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(motion_track)
-                            .when_some(annotation_track, |this, lane| this.child(lane))
-                            .when_some(camera_lane, |this, lane| this.child(lane))
-                            .when_some(audio_lane, |this, lane| this.child(lane))
-                            .when(!self.video_audio_clips.is_empty(), |this| this.child(self.imported_audio_lane(timeline_content_width, timeline_scroll, cx)))
-                            // Paint one continuous playhead above every lane and gap.
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px((timeline_content_width * progress - timeline_scroll) as f32 - 1.0))
-                                    .top(px(15.0))
-                                    .bottom_0()
-                                    .w(px(2.0))
-                                    .bg(ink()),
-                            ),
+                                    })
+                                    .when_some(snap_x, |d, x| {
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(x))
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(px(1.0))
+                                                .bg(rgb(0xe08a26)),
+                                        )
+                                    })
+                                    .when(playhead_visible, |d| {
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(playhead_x - 1.0))
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(px(2.0))
+                                                .bg(blue()),
+                                        )
+                                    }),
                             ),
                     ),
             )
+            .child(self.timeline_scrollbar(cx))
+            .when_some(detail, |d, text| {
+                d.child(
+                    div()
+                        .absolute()
+                        .right(px(20.0))
+                        .bottom(px(22.0))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(ink())
+                        .text_color(rgb(0xffffff))
+                        .text_xs()
+                        .child(text),
+                )
+            })
+            .when_some(context, |d, menu| d.child(menu))
             .into_any_element()
     }
 
@@ -2324,135 +2332,88 @@ impl Studio {
         move_drag: Option<VideoMoveDrag>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        self.video_clip_timeline
-            .segments
-            .iter()
-            .flat_map(|clip| {
-                let clip_id = clip.id;
-                let dragging = move_drag.is_some_and(|drag| drag.clip_id == clip_id);
-                let width = (clip.editor_duration() / timeline_duration * timeline_content_width)
-                    .max(3.0) as f32;
-                // A clip's leading gap renders as an empty stretch of track.
-                let spacer = (clip.gap_before > 0.0).then(|| {
-                    div()
-                        .h_full()
-                        .w(px(
-                            (clip.gap_before / timeline_duration * timeline_content_width) as f32,
-                        ))
-                        .flex_none()
-                        .into_any_element()
-                });
-                let clip_element = div()
-                    .id(("video-clip", clip_id.as_u128() as u64))
-                    .h_full()
-                    .w(px(width))
-                    .flex_none()
-                    .when(dragging, |this| this.opacity(0.4))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            // Keep the parent scrub handler out of clip
-                            // gestures. A click seeks on release; a drag moves.
-                            cx.stop_propagation();
-                            this.focus_handle.focus(window);
-                            this.begin_video_move_drag(clip_id, event.position.x);
-                            cx.notify();
-                        }),
-                    )
-                    // All clips share one bright fill (they come from the
-                    // same source recording); a gap is just bare track.
-                    // Selection is shown by a light ring alone.
-                    .rounded_md()
-                    .border_2()
-                    .border_color(if selected_clip == Some(clip_id) {
-                        hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
-                    } else {
-                        hsla(0.0, 0.0, 0.0, 0.0)
-                    })
-                    .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(hsla(0.0, 0.0, 1.0, 0.92))
-                    .children(self.clip_thumbnails(
-                        clip.source_start,
-                        clip.source_end,
-                        clip.speed,
-                        width,
-                        34.0,
-                    ))
-                    .when(width >= 52.0, |this| {
-                        let label = if (clip.speed - 1.0).abs() > f64::EPSILON {
-                            format!("{:.1}s · {}×", clip.editor_duration(), clip.speed)
-                        } else {
-                            format!("{:.1}s", clip.editor_duration())
-                        };
-                        this.child(
-                            div()
-                                .px_2()
-                                .rounded_md()
-                                .bg(hsla(0.0, 0.0, 0.0, 0.35))
-                                .child(label),
-                        )
-                    })
-                    .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
-                    .when(selected_clip == Some(clip_id), |this| {
-                        this.child(
-                            div()
-                                .id(("video-trim-leading", clip_id.as_u128() as u64))
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .w(px((width * 0.25).min(10.0)))
-                                .h_full()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.5))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.focus_handle.focus(window);
-                                        this.begin_video_trim(
-                                            clip_id,
-                                            ClipEdge::Leading,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id(("video-trim-trailing", clip_id.as_u128() as u64))
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .w(px((width * 0.25).min(10.0)))
-                                .h_full()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.5))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.focus_handle.focus(window);
-                                        this.begin_video_trim(
-                                            clip_id,
-                                            ClipEdge::Trailing,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                    })
-                    .into_any_element();
-                spacer.into_iter().chain(std::iter::once(clip_element))
-            })
-            .collect()
+        let scale = timeline_content_width / timeline_duration.max(f64::EPSILON);
+        let mut elements = Vec::new();
+        let mut selected_handles = Vec::new();
+        for clip in &self.video_clip_timeline.segments {
+            let clip_id = clip.id;
+            let Some(range) = self.video_clip_timeline.editor_range(clip_id) else { continue; };
+            let left = (range.start * scale) as f32;
+            let true_width = ((range.end - range.start) * scale) as f32;
+            let width = true_width.max(1.0);
+            let selected = selected_clip == Some(clip_id);
+            let hovered = self.timeline_ui.hovered_clip == Some(clip_id);
+            let dragging = move_drag.is_some_and(|drag| drag.clip_id == clip_id);
+            // Absolute positions preserve real clip boundaries even when a
+            // subpixel clip needs a minimum visible mark. Gaps stay empty.
+            let body = div()
+                .id(("video-clip", clip_id.as_u128() as u64))
+                .absolute().left(px(left)).top_0().h_full().w(px(width))
+                .rounded_md().border_2()
+                .border_color(if selected { blue() } else if hovered { hsla(217.0 / 360.0, 0.8, 0.68, 0.75) } else { hsla(0.0, 0.0, 0.0, 0.0) })
+                .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
+                .flex().items_center().justify_center().overflow_hidden()
+                .text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xffffff))
+                .when(dragging, |d| d.opacity(0.4))
+                .children(self.clip_thumbnails(range.start, clip.source_start, clip.source_end, clip.speed, width, 48.0))
+                .when(!selected, |d| d.child(div().absolute().size_full().bg(hsla(0.0, 0.0, 0.0, if hovered { 0.06 } else { 0.16 }))))
+                .when(width >= 52.0, |d| {
+                    let label = if (clip.speed - 1.0).abs() > f64::EPSILON {
+                        format!("{:.1}s · {}×", clip.editor_duration(), clip.speed)
+                    } else { format!("{:.1}s", clip.editor_duration()) };
+                    d.child(div().relative().px_2().rounded_md().bg(hsla(0.0, 0.0, 0.0, 0.45)).child(label))
+                })
+                .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                .on_hover(cx.listener(move |this, hover, _, cx| {
+                    if *hover { this.timeline_ui.hovered_clip = Some(clip_id); }
+                    else if this.timeline_ui.hovered_clip == Some(clip_id) { this.timeline_ui.hovered_clip = None; }
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.focus_handle.focus(window);
+                    this.begin_video_move_drag(clip_id, event.position.x);
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let time = this.motion_timeline_time_at(event.position.x).unwrap_or(this.video_position);
+                    this.open_timeline_context(crate::timeline_ui::TimelineContextTarget::Clip(clip_id, time), event.position, cx);
+                }));
+            elements.push(body.into_any_element());
+
+            if !selected || dragging { continue; }
+            for edge in [ClipEdge::Leading, ClipEdge::Trailing] {
+                let leading = edge == ClipEdge::Leading;
+                let edge_x = if leading { left } else { left + true_width };
+                let narrow = true_width < 32.0;
+                // Keep 16px hit targets outside the clipped thumbnail body.
+                // Tiny clips use separate vertical halves, so neither edge
+                // steals the other's target (including a clip at time zero).
+                let hit_left = (edge_x - if leading { 5.0 } else { 11.0 }).max(0.0);
+                let grip_left = (edge_x - hit_left - 1.5).clamp(0.0, 13.0);
+                let height = if narrow { 24.0 } else { 48.0 };
+                let top = if narrow && !leading { 24.0 } else { 0.0 };
+                let handle = div()
+                    .id((if leading { "video-trim-leading" } else { "video-trim-trailing" }, clip_id.as_u128() as u64))
+                    .absolute().left(px(hit_left)).top(px(top)).w(px(16.0)).h(px(height))
+                    .occlude().cursor(CursorStyle::ResizeLeftRight)
+                    .tooltip(crate::timeline_ui::tooltip(if leading { "Drag to trim start · Escape cancels" } else { "Drag to trim end · Escape cancels" }))
+                    .child(div().absolute().left(px(grip_left)).top(px((height - 18.0) / 2.0)).w(px(3.0)).h(px(18.0))
+                        .rounded_sm().bg(rgb(0xffffff)).shadow_sm())
+                    .hover(|s| s.bg(hsla(217.0 / 360.0, 0.8, 0.55, 0.35)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.focus_handle.focus(window);
+                        this.begin_video_trim(clip_id, edge, event.position.x);
+                        cx.notify();
+                    }));
+                selected_handles.push(handle.into_any_element());
+            }
+        }
+        // Hitboxes are above all clip bodies; the selected clip wins a
+        // shared boundary over a neighboring clip's move target.
+        elements.extend(selected_handles);
+        elements
     }
 }

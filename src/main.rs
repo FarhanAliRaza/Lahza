@@ -48,7 +48,14 @@ mod media_ui;
 mod overlays_ui;
 mod transcript_ui;
 mod teleprompter_ui;
+mod recording_overlay_ui;
+mod recording_overlay_drag;
 mod cloud_ui;
+mod timeline_ui;
+mod timeline_edit;
+mod timeline_preview;
+mod timeline_thumbnails;
+mod timeline_motion;
 
 use annotations::{annotations_svg, paint_annotation, paint_highlights};
 use crop::paint_crop_overlay;
@@ -259,6 +266,9 @@ struct Studio {
     recording_controller: Option<RecordingController<NativeRecorder>>,
     recording_state: RecordingState,
     recording_busy: bool,
+    recording_window_minimized: bool,
+    recording_pill: Option<WindowHandle<recording_overlay_ui::RecordingPill>>,
+    recording_camera_window: Option<WindowHandle<recording_overlay_ui::RecordingCamera>>,
     recording_elapsed: Duration,
     recording_started_at: Option<Instant>,
     recording_session_path: Option<PathBuf>,
@@ -325,6 +335,10 @@ struct Studio {
     video_timeline_zoom: f64,
     video_timeline_scroll: f64,
     video_timeline_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    timeline_ui: timeline_ui::TimelineUiState,
+    timeline_preview: timeline_preview::TimelinePreviewState,
+    timeline_thumbnails: timeline_thumbnails::TimelineThumbnailState,
+    timeline_motion: timeline_motion::TimelineMotionState,
     video_media_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     /// Pixel size of the open recording's master, for scene layout.
     video_source_size: (u32, u32),
@@ -581,7 +595,10 @@ impl Studio {
             Timer::after(Duration::from_millis(250)).await;
             if weak
                 .update(cx, |this, cx| {
-                    if this.recording_state == RecordingState::Recording {
+                    this.reconcile_recording_lifecycle(cx);
+                    if this.recording_state == RecordingState::Recording
+                        && !this.recording_window_minimized
+                    {
                         cx.notify();
                     }
                 })
@@ -624,6 +641,9 @@ impl Studio {
             recording_controller: None,
             recording_state: RecordingState::Idle,
             recording_busy: false,
+            recording_window_minimized: false,
+            recording_pill: None,
+            recording_camera_window: None,
             recording_elapsed: Duration::ZERO,
             recording_started_at: None,
             recording_session_path: None,
@@ -678,6 +698,10 @@ impl Studio {
             video_timeline_zoom: 1.0,
             video_timeline_scroll: 0.0,
             video_timeline_bounds: Arc::new(Mutex::new(None)),
+            timeline_ui: timeline_ui::TimelineUiState::default(),
+            timeline_preview: timeline_preview::TimelinePreviewState::default(),
+            timeline_thumbnails: timeline_thumbnails::TimelineThumbnailState::default(),
+            timeline_motion: timeline_motion::TimelineMotionState::default(),
             video_media_bounds: Arc::new(Mutex::new(None)),
             video_source_size: (1280, 720),
             video_window_capture: false,
@@ -860,6 +884,7 @@ impl Studio {
 
     fn wants_camera_preview(&self) -> bool {
         self.launcher_active
+            && !self.recording_window_minimized
             && match self.recording_state {
                 RecordingState::Idle => self.record_camera,
                 RecordingState::Starting | RecordingState::Recording | RecordingState::Paused => {
@@ -1168,6 +1193,7 @@ impl Studio {
             }
             return true;
         }
+        if self.handle_timeline_shortcut(event, cx) { return true; }
         let keystroke = &event.keystroke;
         let command = keystroke.modifiers.control || keystroke.modifiers.platform;
         if (self.selected_annotation.is_some() || self.annotation_gesture.is_some())
@@ -1435,6 +1461,9 @@ impl Studio {
                     return;
                 }
                 if this.native_text_focused(window, cx) { return; }
+                if this.animation_active && event.keystroke.key == "escape" && this.handle_timeline_shortcut(event, cx) {
+                    cx.stop_propagation(); cx.notify(); return;
+                }
                 if this.selected_annotation.is_some() && this.handle_key(event) {
                     if this.processed_capture_path.is_some() {
                         let _ = this.rebuild_redactions();
@@ -1456,6 +1485,7 @@ impl Studio {
                 }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.timeline_pointer_move(event, cx) { cx.notify(); return; }
                 let mut changed = this.update_slider_drag(event);
                 if event.dragging() && this.media_drag.is_some() {
                     changed |= this.update_media_drag(event.position);
@@ -1465,11 +1495,10 @@ impl Studio {
                         changed = true;
                     } else if this.annotation_drag.is_some() {
                         changed |= this.update_annotation_drag(event.position.x);
-                    } else if let Some((start_x, start_position)) = this.video_seek_drag {
-                        let delta = (event.position.x - start_x) / px(1.0);
-                        this.video_position = (start_position
-                            + delta as f64 * this.video_timeline_seconds_per_pixel())
-                            .clamp(0.0, this.video_timeline_duration());
+                    } else if this.video_seek_drag.is_some() {
+                        if let Some(time) = this.motion_timeline_time_at(event.position.x) {
+                            this.scrub_video_to(time, cx);
+                        }
                         changed = true;
                     }
                 }
@@ -1479,7 +1508,8 @@ impl Studio {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     this.end_image_trim();
                     this.end_motion_transform_drag();
                     this.end_media_drag();
@@ -1487,7 +1517,9 @@ impl Studio {
                     if this.video_zoom_drag.is_some() {
                         this.commit_video_zoom_drag(cx);
                     }
-                    this.video_seek_drag = None;
+                    if this.video_seek_drag.is_some() {
+                        this.finish_timeline_scrub(cx);
+                    }
                     let rebuild = this.slider_drag.is_some_and(|drag| drag.slider_id == 5);
                     let motion_slider = this
                         .slider_drag
@@ -1504,13 +1536,28 @@ impl Studio {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     this.end_image_trim();
                     this.end_motion_transform_drag();
+                    this.end_media_drag();
+                    this.end_annotation_drag();
+                    if this.video_zoom_drag.is_some() {
+                        this.commit_video_zoom_drag(cx);
+                    }
+                    if this.video_seek_drag.is_some() {
+                        this.finish_timeline_scrub(cx);
+                    }
                     let rebuild = this.slider_drag.is_some_and(|drag| drag.slider_id == 5);
+                    let motion_slider = this
+                        .slider_drag
+                        .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER);
                     this.slider_drag = None;
                     if rebuild {
                         let _ = this.rebuild_redactions();
+                    }
+                    if motion_slider {
+                        this.persist_video_zoom_cues(cx);
                     }
                     cx.notify();
                 }),
@@ -1570,6 +1617,14 @@ fn open_studio_window(
         },
         move |window, cx| {
             let studio = build(window.window_handle(), cx);
+            studio.update(cx, |_, cx| {
+                cx.observe_window_activation(window, |studio, window, cx| {
+                    if window.is_window_active() && studio.recording_window_minimized {
+                        studio.recording_window_minimized = false;
+                        cx.notify();
+                    }
+                }).detach();
+            });
             let weak = studio.downgrade();
             window.on_window_should_close(cx, move |window, cx| {
                 weak.update(cx, |studio, cx| {

@@ -31,6 +31,7 @@ pub(crate) struct PreparedVideoProject {
     session: RecordingSession,
     poster: image::RgbaImage,
     source_duration: f64,
+    frame_rate: f64,
     recording_duration: f64,
     clip_timeline: RecordingClipTimeline,
     pointer_capture: PointerCaptureFile,
@@ -46,6 +47,78 @@ pub(crate) struct PreparedVideoProject {
     window_capture: bool,
     pointer_synthesized: bool,
     camera_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod recording_lifecycle_tests {
+    use super::*;
+    use crate::{asset_directory, open_studio_window, Assets};
+    use gpui::{AppContext, Application, Timer};
+
+    #[test]
+    #[ignore = "requires a native display (run under Xvfb)"]
+    fn external_stop_saves_recording_and_paused_takes_even_when_launcher_is_minimized() {
+        let root = std::env::temp_dir().join(format!("lahza-external-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let sample = root.join("sample.mkv");
+        assert!(std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=64x48:r=10", "-t", "0.3", "-c:v", "libx264"])
+            .arg(&sample).status().unwrap().success());
+        Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+            let handle = open_studio_window(cx, false, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            // The launcher is replaced by a larger editor window after save;
+            // the same Studio entity owns both windows and its clock task.
+            let owner = handle.entity(cx).unwrap();
+            cx.spawn(async move |cx| {
+                for state in [RecordingState::Recording, RecordingState::Paused] {
+                    let session = RecordingSession::create_in(&root).unwrap();
+                    std::fs::copy(&sample, session.screen_path()).unwrap();
+                    let project = session.directory.clone();
+                    owner.update(cx, |studio, _| {
+                        let backend = NativeRecorder::completed_for_test(session.screen_path(), Duration::from_millis(300));
+                        studio.recording_controller = Some(RecordingController::from_started_backend_for_test(backend, session));
+                        studio.recording_state = state;
+                        studio.recording_window_minimized = true;
+                        studio.recording_busy = false;
+                        studio.recording_elapsed = Duration::from_millis(300);
+                        studio.recording_started_at = (state == RecordingState::Recording).then(Instant::now);
+                        studio.recording_session_path = Some(project.clone());
+                        studio.launcher_active = true;
+                    }).unwrap();
+
+                    // Exercise the actual recurring clock task, without calling
+                    // Stop or the reconciliation method from the test.
+                    let mut finished = false;
+                    for _ in 0..120 {
+                        Timer::after(Duration::from_millis(50)).await;
+                        finished = owner.update(cx, |studio, _| {
+                            studio.recording_state == RecordingState::Idle
+                                && studio.video_project.as_ref().is_some_and(|session| session.directory == project)
+                        }).unwrap();
+                        if finished { break; }
+                    }
+                    assert!(finished, "the external stop must save and open the take from {state:?}");
+                    owner.update(cx, |studio, _| {
+                        assert!(!studio.recording_busy);
+                        assert!(studio.recording_controller.is_none());
+                        assert!(studio.recording_started_at.is_none());
+                        assert_eq!(studio.recording_elapsed, Duration::ZERO);
+                        assert!(!studio.recording_window_minimized);
+                        assert!(!studio.launcher_active);
+                        assert!(studio.recording_pill.is_none());
+                        assert!(studio.recording_camera_window.is_none());
+                    }).unwrap();
+                    assert!(project.join("capture.json").exists());
+                }
+                let current_window = owner.update(cx, |studio, _| studio.window_handle).unwrap();
+                let _ = current_window.update(cx, |_, window, _| window.remove_window());
+                std::fs::remove_dir_all(root).unwrap();
+                cx.update(|cx| cx.quit()).unwrap();
+            }).detach();
+        });
+    }
 }
 
 impl PreparedVideoProject {
@@ -140,6 +213,7 @@ impl PreparedVideoProject {
             .flatten()
             .filter(|transcript| !transcript.words.is_empty() || !transcript.cues.is_empty());
         Ok(Self {
+            frame_rate: source_info.frame_rate,
             window_capture: source_info.window_capture,
             recording_duration: manifest.duration,
             pointer_synthesized: manifest.pointer_synthesized,
@@ -177,6 +251,26 @@ impl Studio {
         }
     }
 
+    /// A portal session can end without any Lahza button being pressed. Keep
+    /// checking while minimized and paused, and use the same save path as Stop.
+    pub(super) fn reconcile_recording_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if !self.recording_busy
+            && matches!(self.recording_state, RecordingState::Recording | RecordingState::Paused)
+            && self.recording_controller.as_ref().is_some_and(|controller| controller.has_stopped())
+        {
+            self.run_recording_action(RecordingAction::Stop, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn restore_recording_window(&mut self, cx: &mut Context<Self>) {
+        self.recording_window_minimized = false;
+        let handle = self.window_handle;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        });
+    }
+
     pub(super) fn start_recording(&mut self, cx: &mut Context<Self>) {
         if self.recording_state != RecordingState::Idle || self.recording_busy {
             return;
@@ -211,9 +305,9 @@ impl Studio {
             }
             .into(),
         );
-        let options = RecordingOptions {
+        let mut options = RecordingOptions {
             area: None,
-            prompter_exclusion,
+            capture_exclusions: prompter_exclusion.into_iter().collect(),
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
             microphone_device: self.microphone_device.clone(),
@@ -225,44 +319,103 @@ impl Studio {
         self.recording_camera_enabled = options.camera;
         let area_requests = self.record_area.then(|| self.area_selection_requests(cx));
         let camera_frames = self.camera_frames.clone();
-        let task = cx.background_executor().spawn(async move {
-            let mut recorder =
-                NativeRecorder::with_options(options).with_camera_preview(camera_frames);
-            if let Some(requests) = area_requests {
-                recorder = recorder.with_area_selection(requests);
-            }
-            let mut controller = RecordingController::new(recorder);
-            let result = controller
-                .start()
-                .map(|session| session.directory.clone())
-                .map_err(|error| error.to_string());
-            Ok::<_, String>((controller, result))
-        });
+        // Optional recording chrome must not make the GNOME helper a new
+        // prerequisite for basic capture. Map and verify every overlay before
+        // opening the source picker; otherwise use the existing launcher.
         cx.spawn(async move |weak, cx| {
+            // Open after the initiating event releases its window borrow,
+            // so overlay placement can query the launcher's actual display.
+            let Ok(overlay_exclusions) = weak.update(cx, |this, cx| {
+                match this.open_recording_overlays(cx) {
+                    Ok(exclusions) => exclusions,
+                    Err(error) => {
+                        this.close_recording_overlays(cx);
+                        eprintln!("Floating recording controls unavailable: {error}");
+                        Vec::new()
+                    }
+                }
+            }) else { return };
+            let protection = cx.background_executor().spawn(async move {
+                let ready = !overlay_exclusions.is_empty()
+                    && recording::capture_exclusion::CaptureExclusion::wait_until_all_protected(
+                        &overlay_exclusions,
+                        Duration::from_secs(3),
+                    ).is_ok();
+                (overlay_exclusions, ready)
+            });
+            let (overlay_exclusions, protected) = protection.await;
+            let Ok(protected) = weak.update(cx, |this, cx| {
+                // A protection watchdog may have closed the windows while
+                // the background wait completed. Only a visible, protected
+                // pill can replace the launcher's recording controls.
+                let protected = protected
+                    && this.recording_pill.is_some()
+                    && (!this.record_camera || this.recording_camera_window.is_some())
+                    && overlay_exclusions.iter().all(|request| request.is_protected());
+                if protected {
+                    this.recording_window_minimized = true;
+                    let handle = this.window_handle;
+                    cx.defer(move |cx| {
+                        let _ = handle.update(cx, |_, window, _| window.minimize_window());
+                    });
+                } else {
+                    this.close_recording_overlays(cx);
+                }
+                cx.notify();
+                protected
+            }) else {
+                return;
+            };
+            if protected {
+                options.capture_exclusions.extend(overlay_exclusions);
+            }
+            // Let the compositor finish hiding the launcher or removing
+            // unprotected overlays before any screen frames can be recorded.
+            gpui::Timer::after(Duration::from_millis(400)).await;
+            let task = cx.background_executor().spawn(async move {
+                let mut recorder =
+                    NativeRecorder::with_options(options).with_camera_preview(camera_frames);
+                if let Some(requests) = area_requests {
+                    recorder = recorder.with_area_selection(requests);
+                }
+                let mut controller = RecordingController::new(recorder);
+                let result = controller
+                    .start()
+                    .map(|session| session.directory.clone())
+                    .map_err(|error| error.to_string());
+                Ok::<_, String>((controller, result))
+            });
             let outcome = task.await;
             let _ = weak.update(cx, |this, cx| {
                 this.recording_busy = false;
                 match outcome {
                     Ok((controller, Ok(path))) => {
+                        this.position_recording_overlays(controller.source_geometry(), cx);
                         this.recording_controller = Some(controller);
                         this.recording_state = RecordingState::Recording;
                         this.recording_started_at = Some(Instant::now());
                         this.recording_session_path = Some(path);
-                        this.toast = Some(
-                            format!("Recording with {}", NativeRecorder::description()).into(),
-                        );
+                        let mut message = format!("Recording with {}", NativeRecorder::description());
+                        if !protected {
+                            message.push_str(" · Floating controls unavailable; use the controls here");
+                        }
+                        this.toast = Some(message.into());
                         // Discard speech heard during source selection while
                         // retaining the already-protected native window.
                         this.reset_prompter(cx);
                     }
                     Ok((controller, Err(error))) => {
                         this.close_prompter(cx);
+                        this.close_recording_overlays(cx);
+                        this.restore_recording_window(cx);
                         this.recording_state = controller.state();
                         this.recording_controller = None;
                         this.toast = Some(format!("Recording could not start: {error}").into());
                     }
                     Err(error) => {
                         this.close_prompter(cx);
+                        this.close_recording_overlays(cx);
+                        this.restore_recording_window(cx);
                         this.recording_state = RecordingState::Idle;
                         this.toast = Some(error.into());
                     }
@@ -317,6 +470,8 @@ impl Studio {
                     || controller.state() == RecordingState::Idle
                 {
                     this.close_prompter(cx);
+                    this.close_recording_overlays(cx);
+                    this.restore_recording_window(cx);
                 }
                 this.recording_state = controller.state();
                 match result {
@@ -331,6 +486,7 @@ impl Studio {
                             this.toast = Some("Recording resumed".into());
                         }
                         RecordingAction::Restart => {
+                            this.position_recording_overlays(controller.source_geometry(), cx);
                             this.recording_elapsed = Duration::ZERO;
                             this.recording_started_at = Some(Instant::now());
                             this.recording_session_path = path;
@@ -358,10 +514,18 @@ impl Studio {
                         }
                     },
                     Err(error) => {
-                        if controller.state() == RecordingState::Recording {
+                        if controller.state() == RecordingState::Recording && !controller.has_stopped() {
                             this.recording_started_at = Some(Instant::now());
                         }
-                        this.toast = Some(format!("Recording action failed: {error}").into());
+                        this.toast = Some(if controller.state() == RecordingState::Idle {
+                            let recovery = controller.session().map(|session| {
+                                this.recording_session_path = Some(session.directory.clone());
+                                format!(" Files were preserved at {}.", session.directory.display())
+                            }).unwrap_or_default();
+                            format!("Recording ended, but could not be saved: {error}.{recovery}")
+                        } else {
+                            format!("Recording action failed: {error}")
+                        }.into());
                         if matches!(action, RecordingAction::Restart)
                             && matches!(
                                 controller.state(),
@@ -425,6 +589,7 @@ impl Studio {
                 match result {
                     Ok(path) => {
                         this.close_prompter(cx);
+                        this.close_recording_overlays(cx);
                         this.recording_session_path = Some(path);
                         this.recording_controller = None;
                         for warning in warnings {
@@ -432,11 +597,27 @@ impl Studio {
                         }
                     }
                     Err(error) => {
-                        this.toast = Some(
-                            format!("Could not safely close; recording was preserved: {error}")
-                                .into(),
-                        );
-                        this.recording_controller = Some(controller);
+                        if controller.state() == RecordingState::Idle {
+                            this.close_prompter(cx);
+                            this.close_recording_overlays(cx);
+                            this.restore_recording_window(cx);
+                            let recovery = controller.session().map(|session| {
+                                this.recording_session_path = Some(session.directory.clone());
+                                format!(" Files were preserved at {}.", session.directory.display())
+                            }).unwrap_or_default();
+                            this.toast = Some(format!("Recording ended, but could not be saved: {error}.{recovery}").into());
+                            this.recording_controller = None;
+                            this.sync_camera_preview(cx);
+                        } else {
+                            if controller.state() == RecordingState::Recording && !controller.has_stopped() {
+                                this.recording_started_at = Some(Instant::now());
+                            }
+                            this.toast = Some(
+                                format!("Could not safely close; recording was preserved: {error}")
+                                    .into(),
+                            );
+                            this.recording_controller = Some(controller);
+                        }
                     }
                 }
                 cx.notify();
@@ -452,6 +633,9 @@ impl Studio {
     /// project's draft file, so reopening the recording restores them.
     pub(super) fn close_video_editor(&mut self, cx: &mut Context<Self>) {
         self.pause_video_playback();
+        self.clear_timeline_preview();
+        self.reset_timeline_thumbnails();
+        self.reset_timeline_interactions();
         self.autosave_scene_style();
         self.leave_video_annotations();
         self.video_edit_busy = false;
@@ -510,8 +694,11 @@ impl Studio {
     }
 
     pub(crate) fn apply_video_project(&mut self, prepared: PreparedVideoProject) {
+        self.clear_timeline_preview();
+        self.reset_timeline_thumbnails();
+        self.reset_timeline_interactions();
         let PreparedVideoProject {
-            session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
+            session, poster, source_duration, frame_rate, clip_timeline, pointer_capture, saved_style,
             source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
             saved_annotations, window_capture, pointer_synthesized, camera_path, audio_clips, recording_duration,
             transcript,
@@ -520,6 +707,7 @@ impl Studio {
         if self.animation_active {
             self.exit_animation();
         }
+        self.timeline_preview.frame_rate = (frame_rate.is_finite() && frame_rate > 0.0).then_some(frame_rate);
         self.video_window_capture = window_capture;
         self.video_source_size = source_size;
         self.motion_pick = MotionPick::Focus;

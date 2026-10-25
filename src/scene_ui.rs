@@ -129,7 +129,84 @@ pub(crate) struct AnnotationDrag {
     pub kind: AnnotationDragKind,
     pub start_x: Pixels,
     pub original: AnnotationTiming,
+    pub original_timing: Option<AnnotationTiming>,
+    pub start_scroll: f64,
     pub seconds_per_pixel: f64,
+}
+
+impl AnnotationDrag {
+    fn preview(self, pointer_x: Pixels, scroll: f64, duration: f64, targets: &[f64], snapping: bool)
+        -> (Option<AnnotationTiming>, Option<f64>)
+    {
+        let delta = (f64::from((pointer_x - self.start_x) / px(1.0))
+            + scroll - self.start_scroll) * self.seconds_per_pixel;
+        if delta.abs() < 1e-9 { return (self.original_timing, None); }
+        let mut timing = self.original.clamped(duration);
+        let (edge, length) = match self.kind {
+            AnnotationDragKind::Move => (timing.start, timing.duration()),
+            AnnotationDragKind::Leading => (timing.start, 0.0),
+            AnnotationDragKind::Trailing => (timing.end, 0.0),
+        };
+        let (snapped, guide) = crate::timeline_edit::snap_timeline_edges(
+            edge + delta, length, targets, self.seconds_per_pixel, snapping,
+        );
+        match self.kind {
+            AnnotationDragKind::Move => {
+                timing.start = snapped.clamp(0.0, (duration - length).max(0.0));
+                timing.end = timing.start + length;
+            }
+            AnnotationDragKind::Leading => {
+                timing.start = snapped.clamp(0.0, (timing.end - AnnotationTiming::MINIMUM_DURATION).max(0.0));
+            }
+            AnnotationDragKind::Trailing => {
+                let minimum_end = timing.start + AnnotationTiming::MINIMUM_DURATION;
+                timing.end = snapped.clamp(minimum_end, duration.max(minimum_end));
+            }
+        }
+        let timing = timing.clamped(duration);
+        let guide = crate::timeline_edit::snap_guide_at_edges(guide, timing.start, timing.end);
+        (Some(timing), guide)
+    }
+}
+
+#[cfg(test)]
+mod annotation_timeline_drag_tests {
+    use super::*;
+
+    fn drag(kind: AnnotationDragKind) -> AnnotationDrag {
+        let timing = AnnotationTiming { start: 2.0, end: 4.0, ..Default::default() };
+        AnnotationDrag {
+            index: 0, kind, start_x: px(100.0), start_scroll: 200.0,
+            original: timing, original_timing: Some(timing), seconds_per_pixel: 0.01,
+        }
+    }
+
+    #[test]
+    fn annotation_drag_keeps_its_range_under_the_pointer_when_scrolled() {
+        let drag = drag(AnnotationDragKind::Move);
+        let (timing, guide) = drag.preview(px(150.0), 250.0, 10.0, &[5.05], true);
+        let timing = timing.unwrap();
+        assert!((timing.start - 3.05).abs() < 1e-9);
+        assert!((timing.end - 5.05).abs() < 1e-9);
+        assert_eq!(guide, Some(5.05));
+        assert_eq!(drag.preview(px(100.0), 200.0, 10.0, &[2.05], true), (drag.original_timing, None));
+    }
+
+    #[test]
+    fn annotation_limits_remove_unreachable_snap_guides() {
+        let drag = drag(AnnotationDragKind::Leading);
+        let (timing, guide) = drag.preview(px(305.0), 200.0, 10.0, &[4.05], true);
+        let timing = timing.unwrap();
+        assert!((timing.start - 3.8).abs() < 1e-9);
+        assert_eq!(guide, None);
+    }
+
+    #[test]
+    fn untouched_untimed_annotation_stays_untimed() {
+        let mut drag = drag(AnnotationDragKind::Move);
+        drag.original_timing = None;
+        assert_eq!(drag.preview(px(100.0), 200.0, 10.0, &[], false), (None, None));
+    }
 }
 
 /// Sliders driven by `Studio::set_slider_value` with ids from `BASE` up.
@@ -957,7 +1034,7 @@ impl Studio {
         let style = self.scene_style();
         let source_size = (source.width(), source.height());
         let time = if self.video_project.is_some() || self.animation_active {
-            self.video_position
+            self.timeline_display_time()
         } else {
             0.0
         };
@@ -1137,7 +1214,7 @@ impl Studio {
         if self.video_playing || !self.camera_overlay.enabled || self.camera_decode_in_flight {
             return;
         }
-        let Some(source_time) = self.video_clip_timeline.content_source_time_at(self.video_position) else {
+        let Some(source_time) = self.video_clip_timeline.content_source_time_at(self.timeline_display_time()) else {
             self.camera_frame_rgba = None;
             return;
         };
@@ -1166,7 +1243,7 @@ impl Studio {
                 }
                 this.camera_decode_in_flight = false;
                 // A seek may have moved again while FFmpeg was decoding.
-                let current = this.video_clip_timeline.content_source_time_at(this.video_position);
+                let current = this.video_clip_timeline.content_source_time_at(this.timeline_display_time());
                 if this.video_playing || this.video_camera_path.as_ref() != Some(&path)
                     || current.is_none_or(|time| (time - source_time).abs() >= 1.0 / 30.0)
                 {
@@ -1395,7 +1472,8 @@ impl Studio {
     /// Author at a fixed frame with complete marks. Timing and animation are
     /// restored immediately when the user scrubs or plays, even with a selection.
     pub(crate) fn annotation_is_live(&self, index: usize) -> bool {
-        if self.video_playing || self.video_seek_drag.is_some() { return false; }
+        if self.video_playing || self.video_seek_drag.is_some() || self.timeline_skim_time().is_some()
+            || (self.timeline_display_time() - self.video_position).abs() > 1e-6 { return false; }
         let editing = self.pointer_is_down || self.editing_text == Some(index)
             || self.annotation_editing_time.is_some_and(|time| (time - self.video_position).abs() < 1e-6);
         if !editing { return false; }
@@ -1425,7 +1503,7 @@ impl Studio {
                 let mark = if self.scene_is_timed() {
                     timed::editor_mark(
                         mark,
-                        self.video_position,
+                        self.timeline_display_time(),
                         self.annotation_is_live(index),
                     )?
                 } else {
@@ -1489,7 +1567,7 @@ impl Studio {
     /// authored transform and no animated tilt).
     pub(crate) fn annotations_paint_flat(&self) -> bool {
         let viewport = if self.scene_is_timed() {
-            self.video_viewport_timeline.frame_at(self.video_position)
+            self.video_viewport_timeline.frame_at(self.timeline_display_time())
         } else {
             ViewportFrame::default()
         };
@@ -1548,7 +1626,7 @@ impl Studio {
             &style,
         );
         let viewport = if self.video_project.is_some() || self.animation_active {
-            self.video_viewport_timeline.frame_at(self.video_position)
+            self.video_viewport_timeline.frame_at(self.timeline_display_time())
         } else {
             ViewportFrame::default()
         };
@@ -1853,7 +1931,7 @@ impl Studio {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let canvas_annotations = self.canvas_annotation_marks();
-        let media_visible = self.image_visible_at(self.video_position);
+        let media_visible = self.image_visible_at(self.timeline_display_time());
         let image = self.scene_preview_image(canvas_width, canvas_height);
         let bounds_store = self.scene_canvas_bounds.clone();
         let media_bounds_store = self.video_media_bounds.clone();
@@ -1863,7 +1941,7 @@ impl Studio {
         let picking = self.video_selected_zoom_cue.is_some();
         let markers = if media_visible { self.motion_marker_points(&projection) } else { Vec::new() };
         let entity = cx.entity();
-        let time = self.video_position;
+        let time = self.timeline_display_time();
         // Annotations paint flat over the media rect; a transformed card
         // hands them to the compositor instead (see `scene_preview_image`).
         let paint_flat = self.annotations_paint_flat();
@@ -3050,47 +3128,23 @@ impl Studio {
         )
     }
 
-    /// Thumbnails for one clip, positioned by source time.
+    /// Stable source-time tiles, with coarse images while detailed samples load.
     pub(crate) fn clip_thumbnails(
         &self,
+        editor_start: f64,
         source_start: f64,
         source_end: f64,
         speed: f64,
         clip_width: f32,
         lane_height: f32,
     ) -> Vec<AnyElement> {
-        if self.video_thumbnails.is_empty() || self.video_source_duration <= 0.0 {
-            return Vec::new();
-        }
-        let count = self.video_thumbnails.len();
-        let interval = self.video_source_duration / count as f64;
-        let clip_duration = ((source_end - source_start) / speed.max(0.01)).max(f64::EPSILON);
-        let mut elements = Vec::new();
-        for (index, thumbnail) in self.video_thumbnails.iter().enumerate() {
-            let time = index as f64 * interval;
-            if time < source_start || time >= source_end {
-                continue;
-            }
-            let x = ((time - source_start) / speed.max(0.01)) / clip_duration * clip_width as f64;
-            let thumb_height = (lane_height - 6.0).max(8.0);
-            let thumb_width = thumb_height * thumbnail.size(0).width.0 as f32
-                / thumbnail.size(0).height.0.max(1) as f32;
-            if x as f32 + thumb_width > clip_width {
-                continue;
-            }
-            elements.push(
-                img(thumbnail.clone())
-                    .absolute()
-                    .left(px(x as f32))
-                    .top(px(3.0))
-                    .w(px(thumb_width))
-                    .h(px(thumb_height))
-                    .rounded_sm()
-                    .opacity(0.85)
-                    .into_any_element(),
-            );
-        }
-        elements
+        self.timeline_thumbnail_tiles(editor_start, source_start, source_end, speed, clip_width)
+            .into_iter().map(|(left, width, thumbnail)| {
+                div().absolute().left(px(left)).top(px(2.0))
+                    .w(px(width)).h(px((lane_height - 4.0).max(8.0))).overflow_hidden()
+                    .child(img(thumbnail).size_full().object_fit(gpui::ObjectFit::Cover).opacity(0.9))
+                    .into_any_element()
+            }).collect()
     }
 
     // ------------------------------------------------------------------
@@ -3354,15 +3408,18 @@ impl Studio {
         if mark.timing.is_none() && kind != AnnotationDragKind::Move {
             return;
         }
+        let original_timing = mark.timing;
         if self.video_playing {
             self.pause_video_playback();
         }
-        self.record_annotation_undo();
+        self.timeline_ui.snap_guide = None;
         self.annotation_drag = Some(AnnotationDrag {
             index,
             kind,
             start_x,
             original,
+            original_timing,
+            start_scroll: self.video_timeline_scroll,
             seconds_per_pixel: self.video_timeline_seconds_per_pixel(),
         });
     }
@@ -3371,38 +3428,40 @@ impl Studio {
         let Some(drag) = self.annotation_drag else {
             return false;
         };
-        let duration = self.video_duration;
-        let delta = f64::from((pointer_x - drag.start_x) / px(1.0)) * drag.seconds_per_pixel;
-        if delta.abs() < 1e-9 {
-            return false;
-        }
-        let Some(mark) = self.annotations.get_mut(drag.index) else {
-            return false;
-        };
-        let mut timing = drag.original;
-        match drag.kind {
-            AnnotationDragKind::Move => {
-                let length = timing.duration();
-                timing.start = (timing.start + delta).clamp(0.0, (duration - length).max(0.0));
-                timing.end = timing.start + length;
-            }
-            AnnotationDragKind::Leading => {
-                timing.start = (timing.start + delta)
-                    .clamp(0.0, timing.end - AnnotationTiming::MINIMUM_DURATION);
-            }
-            AnnotationDragKind::Trailing => {
-                timing.end = (timing.end + delta)
-                    .clamp(timing.start + AnnotationTiming::MINIMUM_DURATION, duration);
-            }
-        }
-        mark.timing = Some(timing.clamped(duration));
+        let targets = self.timeline_snap_targets(None, None, None);
+        let (timing, guide) = drag.preview(
+            pointer_x, self.video_timeline_scroll, self.video_duration, &targets,
+            self.timeline_ui.snap_enabled,
+        );
+        self.timeline_ui.snap_guide = guide;
+        let Some(mark) = self.annotations.get_mut(drag.index) else { return false; };
+        mark.timing = timing;
         true
     }
 
     pub(crate) fn end_annotation_drag(&mut self) -> bool {
-        let ended = self.annotation_drag.take().is_some();
-        self.annotation_edit_preview_pending |= ended;
-        ended
+        let Some(drag) = self.annotation_drag.take() else { return false; };
+        self.timeline_ui.snap_guide = None;
+        if let Some(mark) = self.annotations.get_mut(drag.index) {
+            let current = mark.timing;
+            if current != drag.original_timing {
+                mark.timing = drag.original_timing;
+                self.record_annotation_undo();
+                self.annotations[drag.index].timing = current;
+            }
+        }
+        self.annotation_edit_preview_pending = true;
+        true
+    }
+
+    pub(crate) fn cancel_annotation_timeline_drag(&mut self) -> bool {
+        let Some(drag) = self.annotation_drag.take() else { return false; };
+        if let Some(mark) = self.annotations.get_mut(drag.index) {
+            mark.timing = drag.original_timing;
+        }
+        self.timeline_ui.snap_guide = None;
+        self.annotation_edit_preview_pending = true;
+        true
     }
 
     fn edit_selected_timing(&mut self, edit: impl FnOnce(&mut AnnotationTiming, f64)) {
@@ -3911,6 +3970,7 @@ pub(crate) fn easing_index(easing: MotionEasing) -> usize {
 impl Studio {
     /// Loads waveform buckets and clip thumbnails for the open recording.
     pub(crate) fn spawn_video_extras(&mut self, cx: &mut Context<Self>) {
+        self.reset_timeline_thumbnails();
         let Some(session) = self.video_project.as_ref() else {
             return;
         };
@@ -3920,7 +3980,7 @@ impl Studio {
         let task = cx.background_executor().spawn(async move {
             (
                 crate::recording::video::audio_levels(&path, 240).unwrap_or_default(),
-                crate::recording::video::decode_thumbnails(&path, 24, 28).unwrap_or_default(),
+                crate::recording::video::decode_thumbnails(&path, 32, 56).unwrap_or_default(),
             )
         });
         cx.spawn(async move |weak, cx| {

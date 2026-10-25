@@ -231,7 +231,7 @@ impl Studio {
         let record_area = self.record_area;
         let options = RecordingOptions {
             area: None,
-            prompter_exclusion: None,
+            capture_exclusions: Vec::new(),
             system_audio: self.record_system_audio,
             microphone: self.record_microphone,
             microphone_device: self.microphone_device.clone(),
