@@ -10,6 +10,8 @@ Unmodified upstream CPU shared library. No CUDA or GPU provider is required.
 The library and required notices are embedded in Linux x86_64 builds. At
 first inference they are materialized to a versioned user cache directory.
 Existing library bytes are SHA-256 checked; writes use a unique temporary
-file, fsync and atomic rename. No runtime download is performed. Other
-architectures, unavailable caches, or load failures use the bundled
-portable Rust inference backend and the same model instead.
+file, fsync and atomic rename. No runtime download is performed. For camera
+matting, other architectures, unavailable caches, or load failures use the
+bundled portable Rust inference backend and the same model instead. Neural
+audio requires this native runtime on Linux x86_64 and reports an error when
+it cannot load; it has no portable inference fallback.

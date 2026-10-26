@@ -4,17 +4,15 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Add a draggable teleprompter that follows your voice, with improved word highlighting and recovery after misheard speech. Speech setup includes Auto, GPU, and CPU processing, a bundled Whisper runtime, and persistent diagnostic logs.
-- Transcribe narration locally into subtitles with spoken-word highlighting, then edit footage by transcript, remove filler words, or trim pauses.
-- Add Classic zoom and Glass loupe motion, camera response presets, improved cursor movement, and editable automatic click zooms.
-- Preserve native recording detail in playback, settled previews, zooms, and glass lenses. Compatible Vulkan GPUs can enhance enlarged regions in paused previews and exports; original-source rendering remains available as a fallback.
-- Add webcam Overlay, Fullscreen, and Split layouts, source cropping and focus, and freely draggable camera placement with snap guides. Expand canvas presets and support custom proportions.
-- Add display, window, and area recording modes with a cancellable countdown. Floating recording controls and the camera monitor follow the selected display; GNOME capture protection keeps them and the prompter out of screen recordings when the helper is available.
-- Import video, images, and audio into editable timeline layers. Drag Music / SFX, clips, and motion regions, and zoom the timeline out to 0.1× while preserving playhead placement.
-- Add keystroke captions, speed badges, HEVC, motion blur, audio-only exports, and sharing through a self-hosted upload worker.
-- Reorganize editing controls into dedicated panels and move playback composition off the UI thread. Fix recording dimensions, AVIF imports, camera device selection, and recording-overlay placement.
+- Add five microphone presets: Off, Standard, Loud, Noise reduction, and Podcast. Noise reduction uses bundled MossFormer2 inference; Podcast uses bundled TF-Restormer restoration with voice leveling, EQ, and de-essing. Processing runs locally without downloading enhancement models.
+- Keep microphone and system audio as separate tracks in new recordings, so microphone cleanup leaves system audio unaffected. Preserve both tracks through pause/resume, finalization, and interrupted-recording recovery.
+- Prepare audio once in the background and share the lossless result between playback and export. Add preparation progress, cancellation, retry, and caches for each source and preset. Fix audio changes at normal export speed and shared neural-runtime initialization.
+- Add timed webcam regions with animated transitions between Overlay, Split screen, Camera only, Screen only, and Cutout layouts. Support full or padded splits, portrait and landscape arrangements, camera aspect ratios, and local neural person cutout.
+- Preserve native webcam detail in paused previews and exports. Improve enlarged screen text with independently trained 2× and 4× UI reconstruction models, alpha-aware sampling, and cached GPU rendering.
+- Add a dedicated Animation panel with hover previews for screen and cursor presets, adjustable motion blur, and a project-wide option to start zooms early.
+- Improve Glass loupe and motion-blur playback with shared frame decoding and cancellation of obsolete requests. Refine cursor smoothing, hover handling, idle fade, and independent typing-based cursor hiding.
 
-Validation includes Rust and packaging regressions, native editor workflows covering save/reopen and encoded exports, GPU/CPU rendering comparisons, and replayed Whisper output. The release workflow runs the Rust and packaging suites and confined Snap smoke checks for the versioned packages.
+Validation before release passed 510 Rust tests, with model and editor lifecycle probes run separately. Neural output was compared with independent references on public speech fixtures; rendering checks cover native camera detail and GPU/CPU sampling. The release workflow reruns the Rust and packaging suites, tests the bundled Whisper runtime, and runs confined Snap smoke checks. Compilation jobs are limited to one at a time.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
@@ -55,7 +53,7 @@ cd lahza-1.0.0-linux-x86_64
 ./install.sh
 ```
 
-This installs the binary, bundled Whisper runtime, assets, desktop entry, and icon into `~/.local`. Speech models download during setup. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/lahza` from the extracted bundle. The bundle uses system libraries; it is not a statically linked or universally portable build.
+This installs the binary, bundled Whisper runtime, assets, desktop entry, and icon into `~/.local`. Whisper transcription models download during speech setup; microphone enhancement and camera cutout models are included. Ensure `~/.local/bin` is on `PATH`. You can also run `./bin/lahza` from the extracted bundle. The bundle uses system libraries; it is not a statically linked or universally portable build.
 
 On Ubuntu, install the bundle's runtime dependencies with:
 
@@ -71,6 +69,8 @@ A Vulkan-capable desktop, PipeWire, and the portal backend for your desktop are 
 To verify downloaded files, download `SHA256SUMS` into the same directory and run `sha256sum --ignore-missing -c SHA256SUMS`.
 
 ### Early-release limitations
+
+Podcast preparation is expensive on CPU: measured public fixtures took roughly 12–24 seconds per second of audio, with peak processing memory up to about 2.4 GiB. Completed audio is cached for playback and export; progress and cancellation remain available during preparation. These measurements are hardware- and input-dependent. Older recordings with already-mixed microphone and system audio cannot be separated, so cleanup processes their combined track. Neural audio is supported on Linux x86_64; confined Snap smoke checks do not yet exercise neural inference.
 
 Window recordings use lossless FFV1 to preserve pixels and transparency, so their project files can be larger. A window that grows beyond the recording's initial capture surface stops recording rather than being silently reduced or clipped. Shadow-margin detection relies on alpha edges; ambiguous shapes retain their visible bounds. Layout fixes also apply to existing alpha-capable window recordings, but detail lost through older capture-time downscaling cannot be restored.
 
