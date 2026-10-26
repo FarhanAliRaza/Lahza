@@ -1,0 +1,6 @@
+NASA photograph of astronaut Eileen Collins, public domain.
+Source image: https://raw.githubusercontent.com/scikit-image/scikit-image/v0.25.2/skimage/data/astronaut.png
+Image documentation and provenance: https://scikit-image.org/docs/stable/api/skimage.data.html#skimage.data.astronaut
+Original NASA Great Images record: https://flic.kr/p/r9qvLn
+The scikit-image documentation states: "No known copyright restrictions, released into the public domain."
+Used only as an offline person-segmentation regression fixture. No endorsement implied.

@@ -29,6 +29,7 @@ pub enum PointerStreamKind {
     Drag,
     Press,
     Release,
+    Hover,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,10 +123,26 @@ pub fn sanitize_pointer_capture(
         .collect();
     presses.sort_by(|left, right| stable_time_order(left.1.time, left.0, right.1.time, right.0));
 
+    // Target transitions are accuracy constraints, not travel samples: keep
+    // stationary transitions and never pass them through movement thinning.
+    let mut hovers: Vec<_> = capture.hovers.into_iter().enumerate().filter_map(|(index, mut hover)| {
+        let (x, y) = clamped_unit_point(hover.x, hover.y)?;
+        if !hover.time.is_finite() { return None; }
+        hover.time = hover.time.max(0.0);
+        hover.x = x;
+        hover.y = y;
+        if !hover.artwork_id.as_deref().is_some_and(|id| valid_artwork_ids.contains(id)) {
+            hover.artwork_id = None;
+        }
+        Some((index, hover))
+    }).collect();
+    hovers.sort_by(|left, right| stable_time_order(left.1.time, left.0, right.1.time, right.0));
+
     let mut sanitized = PointerCaptureFile {
         format_version: PointerCaptureFile::CURRENT_FORMAT_VERSION,
         travel,
         presses: presses.into_iter().map(|(_, press)| press).collect(),
+        hovers: hovers.into_iter().map(|(_, hover)| hover).collect(),
         keystrokes: sanitized_keystrokes(capture.keystrokes),
         artwork,
         pause_intervals: sanitized_pauses(capture.pause_intervals),
@@ -136,7 +153,7 @@ pub fn sanitize_pointer_capture(
 }
 
 fn build_stream(capture: PointerCaptureFile) -> PointerStream {
-    let mut ordered = Vec::with_capacity(capture.travel.len() + capture.presses.len());
+    let mut ordered = Vec::with_capacity(capture.travel.len() + capture.presses.len() + capture.hovers.len());
     for (index, sample) in capture.travel.iter().enumerate() {
         if !(sample.time.is_finite() && sample.x.is_finite() && sample.y.is_finite()) {
             continue;
@@ -177,6 +194,14 @@ fn build_stream(capture: PointerCaptureFile) -> PointerStream {
             },
             offset + index * 2 + 1,
         ));
+    }
+    let offset = (capture.travel.len() + capture.presses.len()) * 2;
+    for (index, hover) in capture.hovers.iter().enumerate() {
+        if !(hover.time.is_finite() && hover.x.is_finite() && hover.y.is_finite()) { continue; }
+        ordered.push((PointerStreamEvent {
+            time: hover.time, x: hover.x, y: hover.y, kind: PointerStreamKind::Hover,
+            button: None, artwork_id: hover.artwork_id.clone(),
+        }, offset + index));
     }
     ordered.sort_by(|left, right| {
         left.0
@@ -394,12 +419,31 @@ fn stream_priority(kind: PointerStreamKind) -> u8 {
         PointerStreamKind::Travel | PointerStreamKind::Drag => 0,
         PointerStreamKind::Press => 1,
         PointerStreamKind::Release => 2,
+        PointerStreamKind::Hover => 3,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stationary_hover_constraints_survive_thinning_and_invalid_data_is_removed() {
+        use super::super::model::PointerHoverEvent;
+        let hover = |time, x| PointerHoverEvent { time, x, y: 0.5, artwork_id: Some("unknown".into()) };
+        let mut capture = PointerCaptureFile::default();
+        capture.travel = vec![travel(0.0, 0.5, 0.5), travel(1.0, 0.5, 0.5)];
+        capture.hovers = vec![hover(0.4, 0.5), hover(0.2, 0.5), hover(f64::NAN, 0.5),
+            hover(0.3, 1.0001), hover(0.6, 1.5)];
+        let stream = sanitize_pointer_capture(capture, PointerSanitizeOptions::for_recording(1920.0, 1080.0));
+        let hovers: Vec<_> = stream.samples.iter().filter(|event| event.kind == PointerStreamKind::Hover).collect();
+        assert_eq!(hovers.iter().map(|event| event.time).collect::<Vec<_>>(), vec![0.2, 0.3, 0.4]);
+        assert_eq!(hovers[1].x, 1.0);
+        assert!(hovers.iter().all(|event| event.artwork_id.is_none() && event.button.is_none()));
+        assert_eq!(stream.sanitized_capture.hovers.len(), 3);
+        let again = sanitize_pointer_capture(stream.sanitized_capture.clone(), PointerSanitizeOptions::for_recording(1920.0, 1080.0));
+        assert_eq!(again.samples, stream.samples);
+    }
 
     fn travel(time: f64, x: f64, y: f64) -> PointerTravelSample {
         PointerTravelSample {
@@ -428,7 +472,7 @@ mod tests {
             PointerSanitizeOptions::for_recording(1920.0, 1080.0),
         );
         assert!(stream.sanitized_capture.is_sanitized);
-        assert_eq!(stream.sanitized_capture.format_version, 1);
+        assert_eq!(stream.sanitized_capture.format_version, PointerCaptureFile::CURRENT_FORMAT_VERSION);
         assert_eq!(stream.sanitized_capture.travel.len(), 2);
         assert_eq!(stream.sanitized_capture.travel[0].x, 0.1);
         assert_eq!(stream.sanitized_capture.travel[1].x, 1.0);

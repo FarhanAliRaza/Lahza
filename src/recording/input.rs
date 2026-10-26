@@ -2,7 +2,7 @@ use super::{
     cursor_theme,
     model::{
         KeystrokeEvent, NormalizedPoint, PointerArtwork, PointerCaptureFile, PointerPressEvent,
-        PointerTravelKind, PointerTravelSample, PressPhase,
+        PointerHoverEvent, PointerTravelKind, PointerTravelSample, PressPhase,
     },
     pointer::{sanitize_pointer_capture, PointerSanitizeOptions},
 };
@@ -209,6 +209,12 @@ impl InputCapture {
                 continue;
             };
             match event.kind.as_str() {
+                "hover" => {
+                    let Some((x, y)) = normalized_point(&event, mapping) else { continue; };
+                    capture.hovers.push(PointerHoverEvent {
+                        time, x, y, artwork_id: current_artwork.clone(),
+                    });
+                }
                 "move" | "drag" => {
                     let Some((x, y)) = normalized_point(&event, mapping) else {
                         continue;
@@ -1017,6 +1023,8 @@ fn poll_x11_pointer(event_path: PathBuf, stop: Arc<AtomicBool>, ready: mpsc::Sen
     let mut pointer_y = f64::from(root_y.clamp(0, screen_height - 1));
     let mut last_buttons = 0_u8;
     let mut last_heartbeat = 0_u64;
+    let mut last_hover_target = None;
+    let mut last_hover_poll = 0_u64;
     let mut bytes = [0_u8; 192];
     let mut pending = Vec::with_capacity(192);
     while !stop.load(Ordering::Acquire) {
@@ -1068,6 +1076,16 @@ fn poll_x11_pointer(event_path: PathBuf, stop: Arc<AtomicBool>, ready: mpsc::Sen
             let _ = writer.flush();
         }
         let now_us = monotonic_ns() / 1_000;
+        // Query even while stationary: a window can appear beneath the
+        // pointer. Keep native window identity only in this process.
+        if now_us.saturating_sub(last_hover_poll) >= 16_000 {
+            if let Some((x, y, target)) = query_pointer_state(display, root, screen_width, screen_height) {
+                if write_hover_transition(&mut writer, &mut last_hover_target, now_us, x, y, target).unwrap_or(false) {
+                    let _ = writer.flush();
+                }
+            }
+            last_hover_poll = now_us;
+        }
         if now_us.saturating_sub(last_heartbeat) >= 1_000_000 {
             let _ = write_pointer_travel(&mut writer, now_us, pointer_x, pointer_y, last_buttons);
             let _ = writer.flush();
@@ -1086,6 +1104,15 @@ fn query_pointer_position(
     screen_width: c_int,
     screen_height: c_int,
 ) -> Option<(f64, f64)> {
+    query_pointer_state(display, root, screen_width, screen_height).map(|(x, y, _)| (x, y))
+}
+
+fn query_pointer_state(
+    display: *mut c_void,
+    root: c_ulong,
+    screen_width: c_int,
+    screen_height: c_int,
+) -> Option<(f64, f64, c_ulong)> {
     let mut root_return = 0;
     let mut child_return = 0;
     let mut root_x = 0;
@@ -1110,8 +1137,27 @@ fn query_pointer_position(
         (
             f64::from(root_x.clamp(0, screen_width - 1)),
             f64::from(root_y.clamp(0, screen_height - 1)),
+            child_return,
         )
     })
+}
+
+fn write_hover_transition(
+    writer: &mut impl Write,
+    previous: &mut Option<c_ulong>,
+    now_us: u64,
+    x: f64,
+    y: f64,
+    target: c_ulong,
+) -> io::Result<bool> {
+    let changed = previous.replace(target).is_some_and(|old| old != target);
+    if !changed { return Ok(false); }
+    write_raw_event(writer, RawEvent {
+        mono_us: now_us, kind: "hover".into(), x: Some(x), y: Some(y),
+        button: None, phase: None, key: None, modifiers: Vec::new(), window: None,
+        artwork_id: None, image: None, hotspot: None, size: None,
+    })?;
+    Ok(true)
 }
 
 fn write_button_transitions(
@@ -1271,6 +1317,24 @@ mod tests {
     }
 
     #[test]
+    fn hover_target_changes_are_recorded_without_identity_or_text() {
+        let mut bytes = Vec::new();
+        let mut previous = None;
+        assert!(!write_hover_transition(&mut bytes, &mut previous, 1000, 20.0, 30.0, 42).unwrap());
+        assert!(!write_hover_transition(&mut bytes, &mut previous, 2000, 20.0, 30.0, 42).unwrap());
+        assert!(write_hover_transition(&mut bytes, &mut previous, 3000, 20.0, 30.0, 84).unwrap());
+        assert!(write_hover_transition(&mut bytes, &mut previous, 4000, 20.0, 30.0, 0).unwrap());
+        let text = String::from_utf8(bytes).unwrap();
+        let events: Vec<RawEvent> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].mono_us, 3000);
+        assert!(events.iter().all(|event| event.kind == "hover" && event.x == Some(20.0)
+            && event.key.is_none() && event.button.is_none() && event.artwork_id.is_none()));
+        assert!(!text.contains("target"));
+        assert!(!text.contains("84"));
+    }
+
+    #[test]
     fn cursor_events_from_the_metadata_stream_tag_pointer_samples_by_time() {
         use base64::Engine;
         let directory =
@@ -1325,6 +1389,7 @@ mod tests {
             };
             positions.push(serde_json::to_string(&sample).unwrap());
         }
+        positions.push(serde_json::to_string(&event(4_000, "hover")).unwrap());
         fs::write(&capture.event_path, positions.join("\n")).unwrap();
         let cursors = [
             cursor(500, "arrow", Some(png.clone())),
@@ -1364,6 +1429,10 @@ mod tests {
             ]
         );
         assert_eq!(written.artwork.len(), 2);
+        assert_eq!(written.hovers.len(), 1);
+        assert_eq!(written.hovers[0].time, 0.004);
+        assert_eq!((written.hovers[0].x, written.hovers[0].y), (0.1, 0.1));
+        assert_eq!(written.hovers[0].artwork_id.as_deref(), Some("ibeam"));
         let _ = fs::remove_dir_all(directory);
     }
 

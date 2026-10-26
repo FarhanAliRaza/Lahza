@@ -226,6 +226,8 @@ impl Studio {
                                 cx.notify();
                             })))
                 }))))
+            .child(self.section_header("project-animation", "Animation", None, cx))
+            .when(self.section_open("project-animation"), |this| this.child(self.project_animation_controls(cx)))
             .when(self.video_project.is_some(), |this| this
                 .child(self.section_header("motion-automatic", "Automatic zoom", None, cx))
                 .when(self.section_open("motion-automatic"), |this| this

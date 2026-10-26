@@ -292,30 +292,35 @@ mapping without allocating a full-resolution enlarged canvas. This fixes an
 observed loss of native one-pixel text and strokes before any learned
 enhancement is involved.
 
-Settled previews and export additionally use a bounded Vulkan neural stage
-when the projected source is enlarged. Lahza bundles the public MIT-licensed
-**Anime4K v3.2 Upscale CNN x2 S** model; 4× output applies its 2× network twice,
-with the second pass's learned residual attenuated to 20% to reduce ringing
-on small text. This is a generic animation/line-art model, **not Screen
-Studio's UI-trained screen network**, and its weights are unchanged. Model
-provenance, the license, and the independent compute-port details are in
+Preview and export use a bounded Vulkan neural stage when the projected
+source is enlarged. Lahza UI CNN v1 is independently trained on generated UI
+panels, text, lines, and controls. Its 2× model has four small convolutions;
+its 4× output uses a separate, jointly trained two-stage cascade. No Screen
+Studio source or weights are used. All three coefficient files, MIT notices,
+training scripts, fixed environment, comparison images, and hashes are in
 [`assets/upscaler/README.md`](../assets/upscaler/README.md).
+
+Both scales passed held-out PSNR and gradient-error gates. A fresh 64-scene
+test split, generated after objective selection, improved bilinear PSNR from
+18.987 to 21.991 dB at 2× and from 17.047 to 17.525 dB at 4×, with lower gradient
+and stroke-contrast errors. An unseen-font glyph fixture also improved at
+both scales. These synthetic measurements are not a measurement of parity
+with Screen Studio, and cannot establish recovery of lost source information.
 
 Only the required source region is enhanced. Output is limited to 24 million
 pixels and 8192 pixels per side; 4× falls back to 2× when needed, then to
-ordinary original-source sampling if neither fits. Strength ramps between
-1.02× and 1.2× projected demand, capped at an 85% blend for 2× and 65% for 4×,
-with a separate local gate for ordinary media and glass samples. These blend
-caps also limit changes to small glyphs; the second 4× pass retains its separate
-20% residual attenuation. This independent policy does not reproduce the reference's
-motion attenuation or screen-specific quality models. Enhancement changes
-source RGB beneath annotations and preserves source alpha. Playback uses
-the shared GPU compositor with original-source sampling and no neural
-inference; paused rendering also runs asynchronously. Export shares this
-renderer and enables the high-quality neural path. Unsupported hardware,
-model failure, or GPU failure retains the original-source CPU path. A learned
-filter can change glyph shapes; it is not proof of recovered ground-truth
-detail or a measured match to Screen Studio output.
+original-source sampling if neither fits. Strength ramps between 1.02× and
+1.2× projected demand, attenuates over 4–28 physical pixels of motion and 4–8
+pixels of shutter trail, is quantized to 1/16, and skips below 0.2. A local
+footprint gate avoids enhancement during minification. Alpha-aware mipmaps,
+trilinear level selection, and up to four samples along the footprint's major
+axis handle minification and perspective shear on CPU and GPU. Native f16
+hidden-layer products with f32 accumulation are enabled only when the Vulkan
+device advertises shaderFloat16; input/output convolutions and the first
+4× stage retain f32, and unsupported devices use f32 throughout. Shared source/mipmap/ROI caches reuse work across
+shutter samples. Enhancement changes source RGB beneath annotations and
+preserves original alpha. Unsupported hardware or GPU failure retains the
+original-source CPU renderer; previews continue to render asynchronously.
 
 Opening a recording now promotes its poster to a native frame automatically.
 Starting thumbnail work before capturing a seek's source revision prevents the
@@ -339,11 +344,17 @@ after process-level graphics finalization had begun.
   A monotone residual correction handles otherwise-unsatisfied cold-start or
   recording-end interactions. Smooth / Medium / Rapid / None are selectable;
   legacy project enum values still load. Recorded button, drag, release, and
-  artwork events drive constraints. Dedicated hover metadata is unavailable,
-  so artwork changes supply the available shape-change constraints.
+  artwork events drive constraints. Version-2 captures also store dedicated
+  hover transitions and apply 4 px constraints. X11 detects client-surface
+  changes; GNOME detects surfaces and reactive shell actors. Internal widgets
+  and DOM nodes in ordinary Wayland clients remain outside compositor metadata.
+  Hard groups may remerge across 400 ms; anticipation first uses preceding rest
+  and bounds movement compression to 1.4×.
 - Click scale uses a spring toward 90% while pressed and 100% after release.
-  Idle hiding includes fade and blur, typing hide uses the observed activity
-  threshold, velocity tilt and directional steering are separate choices,
+  Idle hiding includes fade and rendered premultiplied artwork blur; CPU/GPU
+  share padded sprites and corrected hotspots. Typing hide is independent of
+  the idle-hide switch and uses the observed activity threshold. Velocity tilt
+  and directional steering are separate choices,
   and the loop-return duration is configurable. Repeated-source clip mapping,
   speed changes, cut boundaries, artwork timing, and deterministic seeks share
   the same reconstructed timeline.
@@ -382,21 +393,46 @@ after process-level graphics finalization had begun.
   requested frame, source, and scene key. Lens shading caches
   frame constants, skips inactive optical terms, and divides large CPU passes
   across at most four workers. Playback previews preserve aspect ratio within
-  a 1.44-million-pixel budget. Paused editing and export do not apply this
-  output-canvas budget. Playback, settled preview, and export retain native
+  a 1.44-million-pixel budget, reduced when necessary to keep temporal samples
+  within 2.88 million raster pixels in total. Changing this raster density
+  does not invalidate an otherwise compatible playing frame. Paused editing
+  and export do not apply these output budgets. Playback, settled preview, and export retain native
   decoded source dimensions; only interactive timeline scrubbing uses a
   temporary source proxy. See the clarity section above for the separate
   high-quality neural path and its limits.
-- Each region can start its animation 350 ms early, provided another active
-  region does not take priority. This per-region scope is retained in Lahza;
-  the reference inspector changes a project-wide option. Instant regions use exact source-time entry
-  and exit even between baked samples; the zero-delay spring window continues
-  briefly after release. Disabled and removed cues cannot leave a visible lens.
-- Camera layout supports **Overlay / Fullscreen / Split**, aspect choices,
-  crop and focus, mirror, corner radius, shadow, and normal/zoomed sizes. Shared
-  geometry drives preview, export, framing previews, and dragging. Optional
-  native camera capture and device selection persist camera media in the
-  project and follow the recording pause/resume/stop lifecycle.
+- The Animation panel contains screen presets, cursor presets, motion blur,
+  and a project-wide 350 ms early-start preference. Hover demos evaluate the
+  production timelines. Explicit project settings apply to all zooms, including
+  inactive image-sequence scenes; absent overrides retain older authored region
+  settings. Presets, reset, undo/redo, and project save/reopen share this model.
+  Instant regions retain exact source-time entry and exit between baked samples.
+- Adjustable shutter blur samples screen transforms, pointer positions, source
+  frames, media annotations, and camera layouts at the same times in preview
+  and export. Hard zoom/layout boundaries, gaps, and clip cuts constrain the
+  shutter; splitting a continuous clip without changing its timing does not
+  introduce an artificial shutter boundary. The primary playback decoder shares
+  native pictures before transport frame-rate conversion, using encoded PTS,
+  actual intervals, source revisions, and physical asset identity. Bounded
+  caches reuse those pictures; an independent accurate decoder handles uncached
+  seeks and export. A playing request whose pictures have already expired is
+  discarded in favor of the newest queued request, avoiding a duplicate slow
+  seek. Paused previews, including temporary skim proxies, retain exact decoding.
+  Adaptive sampling is bounded; canvas overlays stay above the composited scene.
+  Seek/project changes and shutdown cancel stale decoding.
+- Camera layout supports **Overlay / Camera only / Split screen / Screen only /
+  Cutout**, source/1:1/16:9/9:16/4:3/3:4 aspect choices, framing, mirror, shape,
+  shadow, and normal/zoomed sizes. Timed source-space layout regions have
+  deterministic transitions, interactive move/trim/duplicate/remove, undo, and
+  persistence through cuts, speed changes, and repeated clips. Full split fills
+  both cells with aspect-correct cropping; padded split preserves the scene
+  frame. Shared geometry drives preview, export, hit-testing, and dragging.
+  Camera cutout uses the independently licensed PPHumanSeg model and guided
+  mask enlargement with softness/inset controls; it does not use vendor assets.
+  The packaged native runtime and portable fallback run locally. Refined masks
+  are reused across shutter samples, and shadowless transitions avoid generating
+  an invisible shadow. Paused previews and export retain the camera's native
+  dimensions and frame rate; interactive playback uses a bounded proxy.
+  Native capture/device selection still follows recording pause/resume/stop.
 - Recording now exposes **Display / Window / Area**, countdown, cancellation,
   and close-on-start. Scene styling survives stop/reopen. These are real
   platform capture paths, not mock controls; physical-camera and cross-desktop
@@ -431,7 +467,49 @@ Additional application workflow tests exercise editor controls, save/reopen,
 preview, and encoded exports. Test outcomes should be read alongside the final
 integration run; they do not establish behavior of every physical input device.
 
-Source-clarity validation on 2026-10-25:
+Final nonprivacy implementation validation on 2026-10-26:
+
+- `LAHZA_COMPOSITOR=cpu cargo test --release --workspace -j1 -- --test-threads=2`
+  passed **475 tests**: 434 application tests, 40 annotation tests, and one
+  public-API integration test. There were 52 opt-in application tests ignored
+  by this default run. The production `cargo build --release -j2` also passed.
+- Ten separate release-build native-editor and hardware checks passed and
+  exited 0: UHD playback, editor save/reopen/export, camera-region editing,
+  camera playback, full-scene CPU/GPU agreement, glass agreement, camera
+  shadows, enhancement layering, 2×/4× neural agreement, and temporal video
+  export with a camera region over a hidden base layout. Tests used synthetic
+  video and a public-domain portrait; no user screen, camera, or microphone
+  was recorded for this validation.
+- The native 3840×2160 FFV1 editor fixture, with 70% motion blur, presented
+  27 advancing frames across 33 samples. Maximum preview lag was **434 ms**,
+  passing the tightened 500 ms gate. Its 50 ms UI polling timer measured
+  122.52 ms p95 and 150.26 ms maximum. Settled high-quality Glass took 1.13 s
+  after the exact seek; its UI timer stayed below 109 ms. These are local
+  RTX 3060 fixture measurements, not a universal playback frame-rate promise.
+  Primary native-frame sharing, obsolete-request handling, and retaining the
+  complete shutter before rendering remove the observed duplicate-seek stall.
+- The ordinary camera/cursor/glass workflow presented all 20 sampled frames,
+  with at most **100 ms** preview lag. The encoded hold frame differed from
+  the composed preview by mean channel error **3.987/255**, including H.264
+  loss. Camera layout playback with person cutout and 70% blur presented
+  **100** distinct sampled frames over five seconds, with at most **200 ms**
+  lag and a 52.94 ms maximum UI timer interval. Its adaptive transition raster
+  was 784×441; paused and exported output retain full quality.
+- Native PTS tests cover 60 fps transport, 1×/4× speed, cuts, variable-rate
+  intervals, nanosecond boundaries, nonzero asset offsets, pre-seek preroll,
+  later interval corrections, and superseded worker recovery. The native
+  webcam regression preserves 1280×720 at 60 fps for paused/export decoding.
+- The independently trained UI models passed the held-out 64-scene validation
+  recorded in `assets/upscaler/README.md`. Hardware output agrees with the
+  independent whole-frame convolution reference within 1/255. The six GNOME
+  helper installer tests and JavaScript syntax check passed.
+- Final release screenshots, camera layout examples, frame comparisons, and
+  MP4 are under `/tmp/lahza-release-workflow/artifacts/`. The Animation panel
+  and updated camera selector rows were visually reviewed. The detailed run
+  logs are `/tmp/lahza-release-tests.log`, `/tmp/lahza-release-build.log`, and
+  `/tmp/lahza-release-*.log`.
+
+Earlier source-clarity validation on 2026-10-25:
 
 - The final default workspace suite passed **421 tests**, with 48 opt-in
   display/device/benchmark tests ignored. Both native editor workflows were

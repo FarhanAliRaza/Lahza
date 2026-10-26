@@ -5,12 +5,12 @@ use super::{
     VideoTrimDrag, VideoZoomDrag, VideoZoomDragKind,
 };
 use crate::recording::{
+    audio_processing::{self, ProcessingControl},
     camera_playback::CameraPlaybackDecoder,
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
     model::RecordingSession,
     playback::TimelinePlaybackStream,
     pointer_timeline::PointerTimeline,
-    video::render_denoised_copy,
     viewport::{ViewportTimeline, ZoomCue},
 };
 use gpui::{
@@ -26,6 +26,19 @@ use uuid::Uuid;
 use crate::timeline_edit::{snap_guide_at_edges, snap_timeline_edges};
 
 pub(crate) const MIN_TIMELINE_ZOOM: f64 = 0.1;
+
+/// Dropping a superseded job stops its subprocess without touching another
+/// project's state. The worker owns a clone, not this lifetime guard.
+pub(super) struct AudioPreparation {
+    token: Uuid,
+    pub control: ProcessingControl,
+}
+
+impl Drop for AudioPreparation {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
 
 /// Geometry for a recording's independent, scrollable time ruler.
 struct RecordingTimelineGeometry {
@@ -167,6 +180,7 @@ impl Studio {
         let original_zoom_selection = self.video_selected_zoom_cue;
         self.pause_video_playback();
         self.video_selected_clip = Some(clip_id);
+        self.selected_camera_region = None;
         self.video_selected_zoom_cue = None;
         self.video_seek_drag = None;
         self.video_move_drag = None;
@@ -220,6 +234,7 @@ impl Studio {
         self.finish_annotation_interaction();
         self.pause_video_playback();
         self.video_selected_clip = Some(clip_id);
+        self.selected_camera_region = None;
         self.video_selected_zoom_cue = None;
         self.video_seek_drag = None;
         self.video_trim_drag = None;
@@ -414,7 +429,11 @@ impl Studio {
         }
         self.video_zoom_cues
             .sort_by(|left, right| left.start.total_cmp(&right.start));
-        self.rebuild_video_motion_timelines();
+        // Building the viewport timeline samples the whole recording at 120
+        // Hz. Doing that for every pointer event makes a resize increasingly
+        // expensive (and can lock the UI on longer recordings). The authored
+        // cue is enough to render the timeline while dragging; refresh the
+        // derived motion data once when the gesture is committed.
     }
 
     pub(super) fn commit_video_zoom_drag(&mut self, cx: &mut Context<Self>) {
@@ -425,6 +444,7 @@ impl Studio {
         if self.video_zoom_cues == drag.original_cues {
             return;
         }
+        self.rebuild_video_motion_timelines();
         self.video_undo_stack
             .push(VideoEditSnapshot::Zoom(drag.original_cues));
         self.video_redo_stack.clear();
@@ -485,6 +505,19 @@ impl Studio {
             return;
         };
         match previous {
+            VideoEditSnapshot::AnimationPreferences { settings, cursor_motion } => {
+                self.video_redo_stack.push(self.animation_edit_snapshot());
+                self.restore_animation_preferences(settings, cursor_motion);
+                cx.notify();
+            }
+            VideoEditSnapshot::CameraLayouts { base, regions, selected } => {
+                self.video_redo_stack.push(self.camera_edit_snapshot());
+                self.camera_overlay = base;
+                self.camera_regions = regions;
+                self.selected_camera_region = selected;
+                self.autosave_scene_style();
+                cx.notify();
+            }
             VideoEditSnapshot::Audio(clips) => {
                 self.video_redo_stack.push(VideoEditSnapshot::Audio(std::mem::replace(&mut self.video_audio_clips, clips)));
                 self.save_audio_clips(cx);
@@ -537,6 +570,19 @@ impl Studio {
             return;
         };
         match next {
+            VideoEditSnapshot::AnimationPreferences { settings, cursor_motion } => {
+                self.video_undo_stack.push(self.animation_edit_snapshot());
+                self.restore_animation_preferences(settings, cursor_motion);
+                cx.notify();
+            }
+            VideoEditSnapshot::CameraLayouts { base, regions, selected } => {
+                self.video_undo_stack.push(self.camera_edit_snapshot());
+                self.camera_overlay = base;
+                self.camera_regions = regions;
+                self.selected_camera_region = selected;
+                self.autosave_scene_style();
+                cx.notify();
+            }
             VideoEditSnapshot::Audio(clips) => {
                 self.video_undo_stack.push(VideoEditSnapshot::Audio(std::mem::replace(&mut self.video_audio_clips, clips)));
                 self.save_audio_clips(cx);
@@ -584,6 +630,7 @@ impl Studio {
     }
 
     pub(super) fn delete_selected_video_edit(&mut self, cx: &mut Context<Self>) {
+        if self.remove_selected_camera_region(cx) { return; }
         if self.delete_selected_video_zoom(cx) { return; }
         if self.animation_active && self.video_project.is_none() {
             if self.video_selected_clip.is_some() && self.animation_image_end > self.animation_image_start {
@@ -606,68 +653,103 @@ impl Studio {
         self.video_media_source()
     }
 
-    /// The recording the editor plays and cuts: the noise-reduced copy when
-    /// that option is on and its render has finished, else the original.
+    /// Video always comes from the immutable original. Audio processing has
+    /// its own lossless cache, shared by transport and export.
     pub(super) fn video_media_source(&self) -> Option<PathBuf> {
-        self.video_project
-            .as_ref()
-            .map(|session| Self::media_source_for(session, self.video_noise_reduction))
+        self.video_project.as_ref().map(|session| Self::media_source_for(session))
     }
 
-    pub(super) fn media_source_for(session: &RecordingSession, noise_reduction: bool) -> PathBuf {
-        let denoised = session.denoised_path();
-        if noise_reduction && denoised.exists() {
-            denoised
-        } else {
-            crate::recording::media::source_path(session).unwrap_or_else(|_| session.screen_path())
-        }
+    pub(super) fn media_source_for(session: &RecordingSession) -> PathBuf {
+        crate::recording::media::source_path(session).unwrap_or_else(|_| session.screen_path())
     }
 
-    /// Flips noise reduction, rendering the denoised copy on first use and
-    /// refreshing whatever the editor is playing once it is ready.
+    #[cfg(test)]
     pub(super) fn set_video_noise_reduction(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.video_noise_reduction = enabled;
-        let Some(session) = self.video_project.clone() else {
-            return;
-        };
+        self.set_video_audio_mode(crate::recording::audio_mode::AudioMode::from_legacy(enabled), cx);
+    }
+
+    pub(super) fn set_video_audio_mode(&mut self, mode: crate::recording::audio_mode::AudioMode, cx: &mut Context<Self>) {
         self.pause_video_playback();
-        if !enabled || session.denoised_path().exists() {
-            self.refresh_video_media_source(cx);
+        self.video_audio_mode = mode;
+        self.video_noise_reduction = mode.requires_neural();
+        self.cancel_audio_preparation();
+        self.video_audio_prepare_pending = true;
+        self.prepare_video_audio(cx);
+        self.autosave_scene_style();
+        cx.notify();
+    }
+
+    pub(super) fn cancel_audio_preparation(&mut self) {
+        // Drop cancels the worker. Clearing ownership first makes completion
+        // from the old job harmless even if a replacement has already begun.
+        self.video_audio_job = None;
+        self.video_audio_prepare_pending = false;
+        self.video_audio_play_when_ready = false;
+        self.video_audio_error = None;
+    }
+
+    pub(super) fn pause_audio_preparation(&mut self, cx: &mut Context<Self>) {
+        self.cancel_audio_preparation();
+        self.video_audio_error = Some("Audio preparation paused.".into());
+        cx.notify();
+    }
+
+    pub(super) fn prepare_video_audio(&mut self, cx: &mut Context<Self>) {
+        self.video_audio_prepare_pending = false;
+        if self.video_audio_job.is_some() || self.video_audio_muted { return; }
+        let Some(session) = self.video_project.clone() else { return; };
+        let source = Self::media_source_for(&session);
+        let audio_mode = self.video_audio_mode;
+        self.video_audio_error = None;
+        if audio_processing::source_is_prepared(&source, audio_mode) {
             return;
         }
-        self.video_edit_busy = true;
-        self.toast = Some("Preparing noise-reduced audio…".into());
-        let source = Self::media_source_for(&session, false);
-        let destination = session.denoised_path();
+        let token = Uuid::new_v4();
+        let control = ProcessingControl::default();
+        self.video_audio_job = Some(AudioPreparation { token, control: control.clone() });
+        let worker_source = source.clone();
         let task = cx.background_executor().spawn(async move {
-            render_denoised_copy(&source, &destination).map_err(|error| error.to_string())
+            audio_processing::prepare_source(&worker_source, audio_mode, &control)
+                .map_err(|error| error.to_string())
         });
+        // Progress belongs in the audio panel; preparing audio never locks
+        // timeline editing or uses the unrelated import/export busy flag.
+        cx.spawn(async move |weak, cx| loop {
+            Timer::after(Duration::from_millis(100)).await;
+            let active = weak.update(cx, |this, cx| {
+                let active = this.video_audio_job.as_ref().is_some_and(|job| job.token == token);
+                if active { cx.notify(); }
+                active
+            }).unwrap_or(false);
+            if !active { break; }
+        }).detach();
         cx.spawn(async move |weak, cx| {
             let result = task.await;
             let _ = weak.update(cx, |this, cx| {
-                this.video_edit_busy = false;
-                this.toast = None;
+                if this.video_audio_job.as_ref().map(|job| job.token) != Some(token) {
+                    return;
+                }
+                let same_request = this.video_project.as_ref() == Some(&session)
+                    && this.video_audio_mode == audio_mode
+                    && Self::media_source_for(&session) == source;
+                this.video_audio_job = None;
+                if !same_request { return; }
                 match result {
                     Ok(()) => {
-                        if this.video_project.as_ref() == Some(&session) {
-                            this.refresh_video_media_source(cx);
+                        this.video_audio_error = None;
+                        if std::mem::take(&mut this.video_audio_play_when_ready) {
+                            this.start_video_playback(cx);
                         }
                     }
                     Err(error) => {
-                        this.video_noise_reduction = false;
-                        this.toast = Some(format!("Could not reduce noise: {error}").into());
+                        this.video_audio_play_when_ready = false;
+                        this.video_audio_error = Some(format!("Could not prepare audio: {error}"));
                     }
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        }).detach();
         cx.notify();
-    }
-
-    /// Source changes only require a seek; cuts stay virtual until export.
-    pub(super) fn refresh_video_media_source(&mut self, cx: &mut Context<Self>) {
-        self.seek_video(self.video_position, cx);
     }
 
     /// Keep Fill's follow camera in step with the style and motion edits.
@@ -682,7 +764,7 @@ impl Studio {
             && self.video_viewport_timeline.focus_bounds() != focus_bounds {
             let capture = self.filtered_pointer_capture();
             self.video_viewport_timeline = ViewportTimeline::build_for_viewport(
-                &self.video_zoom_cues, &self.video_pointer_timeline,
+                &self.animation_settings.cues(&self.video_zoom_cues), &self.video_pointer_timeline,
                 &self.video_clip_timeline, &capture, focus_bounds,
             );
         }
@@ -707,11 +789,15 @@ impl Studio {
     }
 
     pub(super) fn rebuild_video_motion_timelines(&mut self) {
+        // Derived render ranges split at physical asset boundaries without
+        // replacing authored edit IDs or merging the user's timeline cuts.
+        self.video_motion_clip_timeline=self.video_media_bank.as_ref().map_or_else(
+            ||self.video_clip_timeline.clone(),|bank|bank.ranges(&self.video_clip_timeline));
         let Some(session) = self.video_project.as_ref() else {
             if self.animation_active {
                 if self.animation_pointer_capture.presses.is_empty() {
                     self.video_viewport_timeline =
-                        ViewportTimeline::build_static(&self.video_zoom_cues, self.video_duration);
+                        ViewportTimeline::build_static(&self.animation_settings.cues(&self.video_zoom_cues), self.video_duration);
                 } else {
                     let (width, height) = self.captured_dimensions.unwrap_or((1200, 720));
                     let clips = RecordingClipTimeline::full(self.video_duration);
@@ -724,7 +810,7 @@ impl Studio {
                         Some(&clips),
                     );
                     self.video_viewport_timeline = ViewportTimeline::build(
-                        &self.video_zoom_cues,
+                        &self.animation_settings.cues(&self.video_zoom_cues),
                         &pointer,
                         &clips,
                         &self.animation_pointer_capture,
@@ -746,7 +832,7 @@ impl Studio {
         );
         pointer.restrict_to_recording(&self.video_clip_timeline, manifest.duration);
         self.video_viewport_timeline = ViewportTimeline::build_for_viewport(
-            &self.video_zoom_cues,
+            &self.animation_settings.cues(&self.video_zoom_cues),
             &pointer,
             &self.video_clip_timeline,
             &capture,
@@ -787,6 +873,8 @@ impl Studio {
             .filter(|id| timeline.segments.iter().any(|clip| clip.id == *id))
             .or_else(|| timeline.segments.first().map(|clip| clip.id));
         self.video_clip_timeline = timeline.clone();
+        self.video_motion_clip_timeline=self.video_media_bank.as_ref().map_or_else(
+            ||timeline.clone(),|bank|bank.ranges(&timeline));
         if mapping_changed {
             self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
             self.camera_decode_in_flight = false;
@@ -904,6 +992,13 @@ impl Studio {
         let Some(path) = self.video_playback_path() else {
             return;
         };
+        if !self.video_audio_muted
+            && !audio_processing::source_is_prepared(&path, self.video_audio_mode)
+        {
+            self.prepare_video_audio(cx);
+            self.video_audio_play_when_ready = self.video_audio_job.is_some();
+            return;
+        }
         self.clear_timeline_preview();
         self.cancel_timeline_edit(cx);
         self.video_seek_drag = None;
@@ -917,8 +1012,19 @@ impl Studio {
         // The scene worker bounds output resolution separately; shrinking the
         // decoded source here would permanently discard detail before zoom.
         let decode_size = self.video_source_size;
+        // Render may not have started deferred thumbnails yet. Fix the source
+        // revision before registering native temporal buffers, exactly as the
+        // explicit-seek path does, so a first-frame render cannot invalidate it.
+        if self.video_extras_pending {
+            self.video_extras_pending = false;
+            self.spawn_video_extras(cx);
+        }
+        let temporal_revision = self.video_extras_token;
         let timeline = self.video_clip_timeline.clone();
         let muted = self.video_audio_muted;
+        let audio_mode = self.video_audio_mode;
+        let audio_control = ProcessingControl::default();
+        self.video_audio_playback_control = Some(audio_control.clone());
         let audio_clips = self.video_project.as_ref().map(|session| self.video_audio_clips.iter().cloned()
             .map(|clip| (session.directory.join(&clip.file), clip)).collect()).unwrap_or_default();
         let generation = self.video_playback_generation.clone();
@@ -996,13 +1102,16 @@ impl Studio {
                     }
                 }
                 let mut stream =
-                    match TimelinePlaybackStream::open(&path, timeline, start_time, decode_size.0, decode_size.1, muted) {
+                    match TimelinePlaybackStream::open_with_audio_processing(&path, timeline, start_time, decode_size.0, decode_size.1, muted, audio_mode, audio_control) {
                         Ok(stream) => stream,
                         Err(error) => {
                             sender.finish(Err(error.to_string()));
                             return;
                         }
                     };
+                // Enabling blur during playback can immediately use native
+                // intervals too; retention is bounded and copies no pixels.
+                stream.enable_temporal_frames(temporal_revision);
                 let mut audio = match crate::recording::media::AudioPlayback::open(audio_clips) {
                     Ok(audio) => audio,
                     Err(error) => { sender.finish(Err(error.to_string())); return; }
@@ -1076,7 +1185,9 @@ impl Studio {
             if weak
                 .update(cx, |this, cx| {
                     if let Some(frame) = latest_frame {
-                        this.camera_decoded_time = camera.as_ref().map_or(-1.0, |(time, _)| *time);
+                        // Playback uses a bounded camera proxy. Pausing must
+                        // replace it with native pixels even at the same PTS.
+                        this.camera_decoded_time = -1.0;
                         this.camera_frame_rgba = camera.map(|(_, image)| image);
                         if let Some(pixels) =
                             image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
@@ -1108,6 +1219,10 @@ impl Studio {
     }
 
     pub(super) fn pause_video_playback(&mut self) {
+        self.video_audio_play_when_ready = false;
+        if let Some(control) = self.video_audio_playback_control.take() {
+            control.cancel();
+        }
         self.camera_decode_token = self.camera_decode_token.wrapping_add(1);
         self.camera_decode_in_flight = false;
         self.video_playback_generation
@@ -1542,6 +1657,7 @@ x11.XCloseDisplay(display)
 
                     let before_split_position = studio.video_clip_timeline.editor_range(clip_id).unwrap().start + 3.0;
                     studio.video_selected_clip = Some(clip_id);
+                    studio.selected_camera_region = None;
                     studio.video_position = before_split_position;
                     studio.split_video_clip(cx);
                     let selected_after_split = studio.video_selected_clip;

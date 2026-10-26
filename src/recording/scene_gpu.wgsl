@@ -7,13 +7,14 @@ struct Params {
     canvas: vec4<u32>, images: array<vec4<u32>, 8>, inverse: array<vec4<f32>, 3>,
     viewport: vec4<f32>, loupe_shape: vec4<f32>, loupe_optics: vec4<f32>,
     enhanced_rect: vec4<f32>, enhanced_info: vec4<f32>,
-    sample_bounds: vec4<f32>, geometry: vec4<f32>,
+    sample_bounds: vec4<f32>, source_mips: array<vec4<u32>, 16>, geometry: vec4<f32>,
     projection: vec4<f32>, media_bounds: vec4<u32>, camera_rect: vec4<f32>, camera_info: vec4<f32>, camera_crop: vec4<f32>,
     draws: array<Draw, 4>,
 }
 var<storage, read> b_params: Params;
 var<storage, read> b_background: array<u32>;
 var<storage, read> b_source: array<u32>;
+var<storage, read> b_source_mips: array<u32>;
 var<storage, read> b_enhanced: array<u32>;
 var<storage, read> b_overlay: array<u32>;
 var<storage, read> b_camera: array<u32>;
@@ -72,11 +73,45 @@ fn rounded_distance(local: vec2<f32>, size: vec2<f32>, radius: f32) -> f32 {
 }
 // Keep source reconstruction separate from layer composition so enhanced
 // source regions can use the same normalized coordinates later.
-fn media_source(source_uv: vec2<f32>, fixed: bool, demand: f32) -> vec4<f32> {
+fn mip_pixel(level: u32, index: u32) -> vec4<f32> {
+    if level==0u { return unpack(b_source[index]); }
+    return unpack(b_source_mips[b_params.source_mips[level].z+index]);
+}
+fn mip_sample(level: u32, uv: vec2<f32>) -> vec4<f32> {
+    let size=b_params.source_mips[level].xy;
+    let p=clamp(uv*vec2<f32>(size)-vec2<f32>(0.5),vec2<f32>(0.0),vec2<f32>(size-vec2<u32>(1u)));
+    let lo=vec2<u32>(floor(p));let hi=min(lo+vec2<u32>(1u),size-vec2<u32>(1u));let f=fract(p);
+    return mix(mix(mip_pixel(level,lo.y*size.x+lo.x),mip_pixel(level,lo.y*size.x+hi.x),f.x),mix(mip_pixel(level,hi.y*size.x+lo.x),mip_pixel(level,hi.y*size.x+hi.x),f.x),f.y);
+}
+// Principal axes of the projected pixel footprint (handles perspective shear).
+fn footprint_axes(dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
+    let a=dx.x*dx.x+dy.x*dy.x;let b=dx.x*dx.y+dy.x*dy.y;let c=dx.y*dx.y+dy.y*dy.y;
+    let discriminant=sqrt((a-c)*(a-c)+4.0*b*b);let eigen=(a+c+discriminant)*0.5;
+    let major=sqrt(max(eigen,0.0));let minor=sqrt(max((a+c-discriminant)*0.5,0.0));
+    let axis=select(vec2<f32>(b,eigen-a),vec2<f32>(eigen-c,b),a>=c);
+    var vector=vec2<f32>(major,0.0);if length(axis)>1e-12 {vector=normalize(axis)*major;}
+    return vec4<f32>(vector,major,minor);
+}
+fn filtered_source(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, fixed: bool) -> vec4<f32> {
+    let axes=footprint_axes(dx,dy);let major=axes.z;let minor=axes.w;
+    let size=vec2<f32>(b_params.images[1].xy);
+    if major<=1.05 { return sample_image(1u,uv*size-vec2<f32>(0.5),fixed); }
+    let vector=axes.xy;let footprint=max(max(minor,major/4.0),1.0);
+    var last=0u;for(var level=1u;level<16u;level++){if b_params.source_mips[level].x==0u{break;}last=level;}
+    let lod=clamp(log2(footprint),0.0,f32(last));let low=u32(floor(lod));let high=min(low+1u,last);
+    let taps=u32(clamp(ceil(major/footprint-1e-4),1.0,4.0));var color=vec4<f32>(0.0);
+    for(var i=0u;i<taps;i++){
+        let offset=(f32(i)+0.5)/f32(taps)-0.5;
+        let at=clamp(uv+vector*offset/size,b_params.sample_bounds.xy,b_params.sample_bounds.zw);
+        color+=mix(mip_sample(low,at),mip_sample(high,at),fract(lod))/f32(taps);
+    }
+    return quantize(color);
+}
+fn media_source(source_uv: vec2<f32>, fixed: bool, demand: f32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     let source_point = source_uv * vec2<f32>(b_params.images[1].xy);
-    let base = sample_image(1u, source_point - vec2<f32>(0.5), fixed);
+    let base = filtered_source(source_uv,dx,dy,fixed);
     let info = b_params.enhanced_info;
-    if info.w <= 0.0 || demand <= 0.0 { return base; }
+    if info.w < 0.2 || demand < 0.2 || footprint_axes(dx,dy).z > 1.0 { return base; }
     let region = b_params.enhanced_rect;
     let local = source_point - region.xy;
     if any(local < vec2<f32>(0.0)) || any(local >= region.zw) { return base; }
@@ -115,7 +150,13 @@ fn media(dst: vec4<f32>, position: vec2<u32>, p: vec2<f32>, continuous: bool) ->
     let density = size / (vec2<f32>(b_params.images[1].xy) * b_params.viewport.zw * ps);
     let magnification = select(1.0, b_params.loupe_shape.w, continuous);
     let demand = clamp((max(density.x, density.y) * magnification - 1.02) / 0.18, 0.0, 1.0);
-    var s = media_source(source_uv, fixed, demand);
+    let footprint = b_params.viewport.zw * vec2<f32>(b_params.images[1].xy) / magnification;
+    // Analytic homography derivatives avoid subtracting nearly equal UVs;
+    // f32 cancellation otherwise changes anisotropic tap counts at large sizes.
+    let denominator=dot(b_params.inverse[2].xyz,vec3<f32>(p,1.0));
+    let dx=(vec2<f32>(b_params.inverse[0].x,b_params.inverse[1].x)-uv*b_params.inverse[2].x)/denominator*footprint;
+    let dy=(vec2<f32>(b_params.inverse[0].y,b_params.inverse[1].y)-uv*b_params.inverse[2].y)/denominator*footprint;
+    var s = media_source(source_uv, fixed, demand, dx, dy);
     if b_params.images[2].z != 0u {
         let annotation = sample_image(2u, source_uv * vec2<f32>(b_params.images[2].xy) - vec2<f32>(0.5), fixed);
         s = over(s, annotation.xyz, annotation.w / 255.0);
@@ -261,9 +302,9 @@ fn loupe(base: vec4<f32>, p: vec2<f32>) -> vec4<f32> {
     return quantize(mix(outside, glass, coverage * optics.z));
 }
 fn camera(dst: vec4<f32>, index: u32, p: vec2<f32>) -> vec4<f32> {
-    if b_params.images[3].z == 0u { return dst; }
+    if b_params.images[3].z == 0u || b_params.camera_info.w <= 0.0 { return dst; }
     var result = dst;
-    if b_params.camera_info.z != 0.0 { result = over(result, vec3<f32>(0.0), b_shadow[index]); }
+    if b_params.camera_info.z != 0.0 { result = over(result, vec3<f32>(0.0), b_shadow[index] * b_params.camera_info.w * b_params.camera_info.z); }
     let rect = b_params.camera_rect;
     if any(p < floor(rect.xy)) || any(p >= ceil(rect.xy + rect.zw)) { return result; }
     let local = p - rect.xy;
@@ -274,7 +315,7 @@ fn camera(dst: vec4<f32>, index: u32, p: vec2<f32>) -> vec4<f32> {
     if b_params.camera_info.y != 0.0 { uv.x = 1.0 - uv.x; }
     let xy = (b_params.camera_crop.xy + uv * b_params.camera_crop.zw) * size - vec2<f32>(0.5);
     let s = sample_image(3u, xy, false);
-    return over(result, s.xyz, coverage * s.w / 255.0);
+    return over(result, s.xyz, coverage * s.w / 255.0 * b_params.camera_info.w);
 }
 @compute @workgroup_size(8, 8, 1)
 fn compose(@builtin(global_invocation_id) id: vec3<u32>) {

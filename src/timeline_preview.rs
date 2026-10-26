@@ -197,6 +197,7 @@ impl Studio {
                     && self.video_trim_drag.is_none()
                     && self.video_move_drag.is_none()
                     && self.video_zoom_drag.is_none()
+                    && self.camera_region_drag.is_none()
                     && self.annotation_drag.is_none()
                     && self.video_audio_drag.is_none()
                     && !self.crop_active

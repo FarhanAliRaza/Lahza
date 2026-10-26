@@ -430,6 +430,7 @@ impl Studio {
             ),
         };
         SceneStyle {
+            animation: self.animation_settings,
             background,
             source_crop: if self.video_project.is_some() { self.video_crop } else { crate::CropRect::UNIT },
             window_frame: self.window_frame,
@@ -456,6 +457,7 @@ impl Studio {
                 .then(|| self.watermark.clone()),
             pointer: self.pointer_style,
             camera: self.camera_overlay,
+            camera_regions: self.camera_regions.clone(),
             input_overlays: self.input_overlays,
             subtitles: self.subtitle_style,
         }
@@ -1365,6 +1367,7 @@ impl Studio {
     /// Select a region through one path so the inspector always starts at
     /// its primary controls, even after editing the canvas transform.
     pub(crate) fn select_motion_region(&mut self, id: uuid::Uuid) {
+        self.selected_camera_region = None;
         if self.video_selected_zoom_cue != Some(id)
             || self.scene_selection != crate::scene_ui::SceneSelection::Scene
         {
@@ -1478,10 +1481,7 @@ impl Studio {
         let glass = cue.presentation == ZoomPresentation::GlassLoupe;
         let style_index = MotionStyle::ALL.iter().position(|style| *style == cue.motion).unwrap_or(0);
         div().flex().flex_col().gap_3()
-            .child(self.scene_toggle_row("motion-early", "Start 350 ms early", cue.start_animation_early, cx, |this| {
-                this.edit_selected_region(|cue| cue.start_animation_early = !cue.start_animation_early);
-            }))
-            .child(div().text_xs().text_color(muted()).child("Applies to this region."))
+            .child(self.project_early_controls(cx))
             .when(glass, |panel| panel
                 .child(self.scene_toggle_row("motion-instant", "Instant animation", cue.skips_easing, cx, |this| {
                     this.edit_selected_region(|cue| cue.skips_easing = !cue.skips_easing);
@@ -1498,10 +1498,7 @@ impl Studio {
                 .child(Self::inspector_label("Zoom animation"))
                 .child(self.segmented("motion-style", &["Hold", "Zoom in", "Zoom out"], style_index,
                     |this, index| { this.edit_selected_region(|cue| cue.motion = MotionStyle::ALL[index]); }, cx))
-                .child(Self::inspector_label("Follow response"))
-                .child(self.segmented("motion-camera-response", &["Standard", "Smooth", "Focused"],
-                    CameraMotion::ALL.iter().position(|motion| *motion == cue.camera_motion).unwrap_or(0),
-                    |this, index| { this.edit_selected_region(|cue| cue.camera_motion = CameraMotion::ALL[index]); }, cx))
+                .child(self.screen_animation_controls(cx))
                 .when(self.scene_has_pointer() && cue.anchor_mode != ZoomAnchorMode::PinnedAnchor, |panel| panel
                     .child(Self::inspector_label("Automatic position"))
                     .child(self.segmented("motion-auto-tracking", &["Follow cursor", "Smart framing"],
@@ -2096,6 +2093,7 @@ impl Studio {
         request.motion_blur = self.export_motion_blur;
         request.include_audio = !self.video_audio_muted;
         request.noise_reduction = self.video_noise_reduction;
+        request.audio_mode = Some(self.video_audio_mode);
         request.audio_clips = self.video_audio_clips.iter().cloned().map(|clip| (session.directory.join(&clip.file), clip)).collect();
         request.recording_duration = Some(self.video_recording_duration);
         request.overlay = self.annotation_overlay_source();
@@ -2103,7 +2101,7 @@ impl Studio {
             self.annotations.clone(), self.selected_canvas_ratio() as f64);
         request.studio_overlays = Some((*self.studio_overlays()).clone());
         let source = SceneSource::Video {
-            media: Self::media_source_for(&session, false),
+            media: Self::media_source_for(&session),
             clips: self.video_clip_timeline.clone(),
             pointer: self
                 .video_pointer_synthesized
@@ -2188,17 +2186,20 @@ impl Studio {
     }
 
     fn image_segment(&self, scene: &ImageScene, aspect: f64) -> ImageSegment {
+        let (viewport, pointer) = crate::animation_ui::image_scene_timelines(
+            &scene.zoom_cues, &scene.pointer_capture, scene.duration, scene.dimensions,
+            self.animation_settings, self.pointer_style.timeline_options(),
+        );
         ImageSegment {
             image: (*scene.rgba).clone(),
-            pointer: scene.pointer.clone(),
-            viewport: scene.viewport.clone(),
+            pointer,
+            viewport: viewport.clone(),
             duration: scene.duration,
             media_start: scene.image_start,
             media_end: Some(scene.image_end),
             canvas_overlay: crate::scene_ui::canvas_overlay_source_for(scene.annotations.clone(), aspect),
             overlay: crate::scene_ui::overlay_source_for(
                 scene.annotations.clone(),
-                scene.viewport.clone(),
                 scene.dimensions.0,
                 scene.dimensions.1,
             ),
@@ -2227,8 +2228,6 @@ impl Studio {
             preset: self.animation_preset,
             pointer_capture: self.animation_pointer_capture.clone(),
             walkthrough_stops: self.walkthrough_stops.clone(),
-            viewport: self.video_viewport_timeline.clone(),
-            pointer: self.animation_pointer_timeline(),
         })
     }
 
@@ -2342,7 +2341,6 @@ impl Studio {
         let duration = self.animation_duration;
         // Each new image starts without motion; presets are applied explicitly.
         let zoom_cues = Vec::new();
-        let viewport = ViewportTimeline::build_static(&zoom_cues, duration);
         let dimensions = (image.width(), image.height());
         let rgba = Arc::new(image.clone());
         self.image_scenes.push(ImageScene {
@@ -2361,8 +2359,6 @@ impl Studio {
             preset: None,
             pointer_capture: Default::default(),
             walkthrough_stops: Vec::new(),
-            viewport,
-            pointer: None,
         });
         let index = self.image_scenes.len() - 1;
         self.load_image_scene(index);

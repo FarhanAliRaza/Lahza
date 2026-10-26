@@ -316,6 +316,7 @@ impl PointerTimeline {
                     PointerStreamKind::Drag => CursorEventKind::Drag,
                     PointerStreamKind::Press => CursorEventKind::Press,
                     PointerStreamKind::Release => CursorEventKind::Release,
+                    PointerStreamKind::Hover => CursorEventKind::Hover,
                 },
                 artwork_change: index > 0 && sample.artwork_id != samples[index - 1].artwork_id,
             })
@@ -350,6 +351,7 @@ impl PointerTimeline {
         let mut artwork_changes = Vec::new();
         let mut click_states = Vec::new();
         let mut buttons = HashSet::new();
+        let mut inferred_drag = false;
         for sample in &samples {
             if artwork_changes
                 .last()
@@ -363,11 +365,13 @@ impl PointerTimeline {
                 }
                 PointerStreamKind::Release => {
                     buttons.remove(&sample.button.unwrap_or(0));
+                    inferred_drag = false;
                 }
-                PointerStreamKind::Travel => buttons.clear(),
-                PointerStreamKind::Drag => {}
+                PointerStreamKind::Travel => { buttons.clear(); inferred_drag = false; }
+                PointerStreamKind::Drag => inferred_drag = true,
+                PointerStreamKind::Hover => {}
             }
-            let pressed = !buttons.is_empty() || sample.kind == PointerStreamKind::Drag;
+            let pressed = !buttons.is_empty() || inferred_drag;
             if click_states
                 .last()
                 .is_none_or(|(_, previous)| *previous != pressed)
@@ -388,6 +392,7 @@ impl PointerTimeline {
         let mut directional: f64 = 0.0;
         let mut sample_index = 0;
         let mut pressed_buttons = HashSet::new();
+        let mut inferred_drag = false;
         let mut current_artwork_id = first.artwork_id.clone();
         let mut cut_index = 0;
         let mut latest_press = None;
@@ -404,6 +409,7 @@ impl PointerTimeline {
                     cut_index += 1;
                 }
                 pressed_buttons.clear();
+                inferred_drag = false;
                 click.snap(1.0);
                 angle.snap(0.0);
                 velocity_ema = 0.0;
@@ -421,11 +427,14 @@ impl PointerTimeline {
                     }
                     PointerStreamKind::Release => {
                         pressed_buttons.remove(&sample.button.unwrap_or(0));
+                        inferred_drag = false;
                     }
                     PointerStreamKind::Travel => {
                         pressed_buttons.clear();
+                        inferred_drag = false;
                     }
-                    PointerStreamKind::Drag => {}
+                    PointerStreamKind::Drag => inferred_drag = true,
+                    PointerStreamKind::Hover => {}
                 }
                 sample_index += 1;
             }
@@ -465,7 +474,7 @@ impl PointerTimeline {
                 MEDIUM,
                 dt,
             );
-            let pressed = !pressed_buttons.is_empty() || latest.kind == PointerStreamKind::Drag;
+            let pressed = !pressed_buttons.is_empty() || inferred_drag;
             let click_target = if pressed { 0.9 } else { 1.0 };
             if let Some(spring) = motion.glide() {
                 advance_scalar(&mut click, click_target, spring, dt);
@@ -844,33 +853,34 @@ mod tests {
 
     #[test]
     fn press_planner_arrives_at_recorded_target_with_bounded_anticipation() {
-        let mut travel: Vec<_> = (0..=5)
+        let mut travel: Vec<_> = (0..=11)
             .map(|i| travel(f64::from(i) * 0.1, 0.1, 0.1, PointerTravelKind::Move))
             .collect();
-        travel.push(self::travel(0.6, 0.9, 0.9, PointerTravelKind::Move));
+        travel.push(self::travel(1.2, 0.9, 0.9, PointerTravelKind::Move));
         let capture = PointerCaptureFile {
             travel,
-            presses: vec![press(0.6, 0.9, PressPhase::Down)],
+            presses: vec![press(1.2, 0.9, PressPhase::Down)],
             ..Default::default()
         };
         let timeline = PointerTimeline::build(
             capture,
-            1.0,
+            1.5,
             1000.0,
             1000.0,
             PointerTimelineOptions::default(),
         );
         let x_at = |time: f64| timeline.frame_at(time).unwrap().location.x;
+        // A 1.2s click permits up to 600ms of look-ahead, never more.
         assert!(
-            x_at(0.08) < 0.12,
+            x_at(0.59) < 0.12,
             "moved before the window opened: {}",
-            x_at(0.08)
+            x_at(0.59)
         );
-        assert!(x_at(0.59) > 0.8, "not approaching click: {}", x_at(0.59));
+        assert!(x_at(1.19) > 0.8, "not approaching click: {}", x_at(1.19));
         assert!(
-            (x_at(0.6) - 0.9).abs() * 1000.0 < 2.0,
+            (x_at(1.2) - 0.9).abs() * 1000.0 < 2.0,
             "missed recorded click: {}",
-            x_at(0.6)
+            x_at(1.2)
         );
     }
 
@@ -1247,6 +1257,31 @@ mod tests {
         assert_eq!(timeline.frame_at(0.50369).unwrap().magnification, 1.0);
         assert_eq!(timeline.frame_at(0.5037).unwrap().magnification, 0.9);
         assert_eq!(timeline.frame_at(0.2).unwrap().tilt_degrees, 0.0);
+    }
+
+    #[test]
+    fn hover_does_not_release_an_inferred_drag_and_survives_clip_mapping() {
+        let capture = PointerCaptureFile {
+            travel: vec![travel(0.0, 0.2, 0.5, PointerTravelKind::Move),
+                travel(0.5, 0.6, 0.5, PointerTravelKind::Drag),
+                travel(0.9, 0.7, 0.5, PointerTravelKind::Move)],
+            hovers: vec![super::super::model::PointerHoverEvent {
+                time: 0.6, x: 0.6, y: 0.5, artwork_id: None,
+            }],
+            ..Default::default()
+        };
+        let timeline = PointerTimeline::build(capture.clone(), 1.2, 1000.0, 1000.0,
+            PointerTimelineOptions { motion: PointerMotion::None, ..Default::default() });
+        assert_eq!(timeline.frame_at(0.7).unwrap().magnification, 0.9);
+        assert_eq!(timeline.frame_at(0.95).unwrap().magnification, 1.0);
+        let stream = sanitize_pointer_capture(capture, PointerSanitizeOptions::for_recording(1000.0, 1000.0));
+        let clips = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.4, 0.8),
+            RecordingClipSegment::new(0.4, 0.8)]);
+        let mapped = timeline_samples(stream.samples, Some(&clips));
+        let times: Vec<_> = mapped.iter().filter(|event| event.kind == PointerStreamKind::Hover)
+            .map(|event| event.time).collect();
+        assert_eq!(times.len(), 2);
+        assert!((times[0] - 0.2).abs() < 1e-9 && (times[1] - 0.6).abs() < 1e-9);
     }
 
     #[test]

@@ -132,10 +132,15 @@ pub fn import_audio(
     let id = Uuid::new_v4();
     let file = PathBuf::from(format!("media/{id}.wav"));
     let destination = asset_path(session, &file)?;
+    // A Lahza capture may contain isolated microphone and desktop tracks.
+    // Import their prepared raw mix, while ordinary music files retain the
+    // existing first-track behavior (including alternative-language media).
+    let prepared = super::audio_processing::ensure_audio(source, false, &Default::default())?;
+    let audio_source = prepared.as_deref().unwrap_or(source);
     let mut command = Command::new("ffmpeg");
     command
         .args(["-v", "error", "-nostdin", "-i"])
-        .arg(source)
+        .arg(audio_source)
         .args([
             "-map",
             "0:a:0",
@@ -628,8 +633,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_media_sources_and_noise_cache_remain_usable_after_import() {
-        use super::super::{media_bank::MediaBank, video::render_denoised_copy};
+    fn legacy_media_sources_reuse_audio_only_cache_after_import() {
+        use super::super::{audio_processing::{ensure_audio, prepare_source, prepared_audio, ProcessingControl}, media_bank::MediaBank};
         let project = Project::new();
         project.video("screen.mkv", "red");
         let legacy = project.0.directory.join("legacy.mkv");
@@ -659,8 +664,8 @@ mod tests {
             .0
             .write_edit_field("mediaSource", &PathBuf::from("legacy.mkv"))
             .unwrap();
-        let cached = project.0.denoised_path();
-        render_denoised_copy(&legacy, &cached).unwrap();
+        let control = ProcessingControl::default();
+        let cached = ensure_audio(&legacy, true, &control).unwrap().unwrap();
         let modified = fs::metadata(&cached).unwrap().modified().unwrap();
         let blue = project.video("blue.mkv", "blue");
         let (file, start, end) = append_media(&project.0, &blue).unwrap();
@@ -668,20 +673,15 @@ mod tests {
         let green = decode_frame(&path, 0.2, 64, 36).unwrap();
         assert!(green.rgba[1] > 100 && green.rgba[0] < 30);
         project.0.write_edit_field("mediaSource", &file).unwrap();
-        let destination = project.0.denoised_path();
-        assert_ne!(destination, cached);
-        // Reuse the previous recording's noise-reduced audio instead of
-        // processing that entire recording again after each import.
-        fs::remove_file(&legacy).unwrap();
-        render_denoised_copy(&path, &destination).unwrap();
-        assert_eq!(fs::metadata(cached).unwrap().modified().unwrap(), modified);
-        let bank = MediaBank::load(&destination).unwrap().unwrap();
-        assert_eq!(
-            bank.entries[0].file,
-            PathBuf::from(RecordingSession::DENOISED_FILE)
-        );
+        // Importing video does not copy or replace the recording to attach
+        // cleaned audio. Existing per-source audio work remains reusable.
+        prepare_source(&path, true, &control).unwrap();
+        assert_eq!(prepared_audio(&legacy, true).unwrap(), Some(cached.clone()));
+        assert_eq!(fs::metadata(&cached).unwrap().modified().unwrap(), modified);
+        let bank = MediaBank::load(&path).unwrap().unwrap();
+        assert_eq!(bank.entries[0].file, PathBuf::from("legacy.mkv"));
         assert!((bank.info().duration - end).abs() < 1e-9);
-        let blue = decode_frame(&destination, start + 0.2, 64, 36).unwrap();
+        let blue = decode_frame(&path, start + 0.2, 64, 36).unwrap();
         assert!(blue.rgba[2] > 200);
     }
 

@@ -33,6 +33,7 @@ mod library;
 mod models;
 mod motion_ui;
 mod motion_overview_ui;
+mod animation_ui;
 mod notifications;
 mod text_field;
 mod text_fields_ui;
@@ -41,6 +42,7 @@ mod preview;
 mod recording;
 mod scene_ui;
 mod scene_preview;
+mod camera_regions_ui;
 mod shell_ui;
 mod template_ui;
 mod theme;
@@ -326,6 +328,8 @@ struct Studio {
     /// Counts preview renders so a superseded render's result is dropped
     /// while playback and seeks stay independent of in-flight renders.
     video_clip_timeline: RecordingClipTimeline,
+    video_media_bank: Option<recording::media_bank::MediaBank>,
+    video_motion_clip_timeline: RecordingClipTimeline,
     video_selected_clip: Option<Uuid>,
     video_undo_stack: Vec<VideoEditSnapshot>,
     video_redo_stack: Vec<VideoEditSnapshot>,
@@ -393,12 +397,20 @@ struct Studio {
     export_loop: bool,
     export_codec: recording::export::VideoCodec,
     export_motion_blur: bool,
+    animation_settings: recording::animation::AnimationSettings,
+    animation_hover: Option<animation_ui::AnimationHover>,
     preset_library: PresetLibrary,
     default_motion_zoom: f64,
     video_audio_levels: Vec<f32>,
     video_audio_clips: Vec<recording::media::AudioClip>,
     video_audio_muted: bool,
     video_noise_reduction: bool,
+    video_audio_mode: recording::audio_mode::AudioMode,
+    video_audio_job: Option<video::AudioPreparation>,
+    video_audio_prepare_pending: bool,
+    video_audio_play_when_ready: bool,
+    video_audio_error: Option<String>,
+    video_audio_playback_control: Option<recording::audio_processing::ProcessingControl>,
     video_thumbnails: Vec<Arc<RenderImage>>,
     video_extras_pending: bool,
     video_extras_token: u64,
@@ -407,6 +419,9 @@ struct Studio {
     video_selected_press: Option<f64>,
     annotation_drag: Option<AnnotationDrag>,
     camera_overlay: CameraOverlay,
+    camera_regions: Vec<recording::camera_timeline::CameraRegion>,
+    selected_camera_region: Option<Uuid>,
+    camera_region_drag: Option<camera_regions_ui::CameraRegionDrag>,
     input_overlays: recording::studio_overlays::InputOverlayStyle,
     /// Fill the fixed-aspect canvas with the recording instead of fitting it.
     content_fill: bool,
@@ -528,9 +543,25 @@ struct Studio {
 #[serde(rename_all = "camelCase", default)]
 struct RecordingExtras {
     audio_muted: bool,
-    /// Run the export audio through a gentle FFT denoiser.
+    /// Compatibility with projects written before microphone presets.
     noise_reduction: bool,
+    #[serde(deserialize_with = "optional_audio_mode")]
+    audio_mode: Option<recording::audio_mode::AudioMode>,
     removed_press_times: Vec<f64>,
+}
+
+// Preserve unrelated project settings when a newer app writes an unknown preset.
+fn optional_audio_mode<'de, D: serde::Deserializer<'de>>(deserializer: D)
+    -> Result<Option<recording::audio_mode::AudioMode>, D::Error>
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+impl RecordingExtras {
+    fn effective_audio_mode(&self) -> recording::audio_mode::AudioMode {
+        self.audio_mode.unwrap_or_else(|| self.noise_reduction.into())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -721,6 +752,8 @@ impl Studio {
             video_import_token: None,
             video_speed_draft: None,
             video_clip_timeline: RecordingClipTimeline::default(),
+            video_media_bank: None,
+            video_motion_clip_timeline: RecordingClipTimeline::default(),
             video_selected_clip: None,
             video_undo_stack: Vec::new(),
             video_redo_stack: Vec::new(),
@@ -781,12 +814,20 @@ impl Studio {
             export_loop: true,
             export_codec: Default::default(),
             export_motion_blur: false,
+            animation_settings: Default::default(),
+            animation_hover: None,
             preset_library: PresetLibrary::load(),
             default_motion_zoom: 2.0,
             video_audio_levels: Vec::new(),
             video_audio_clips: Vec::new(),
             video_audio_muted: false,
             video_noise_reduction: false,
+            video_audio_mode: recording::audio_mode::AudioMode::Off,
+            video_audio_job: None,
+            video_audio_prepare_pending: false,
+            video_audio_play_when_ready: false,
+            video_audio_error: None,
+            video_audio_playback_control: None,
             video_thumbnails: Vec::new(),
             video_extras_pending: false,
             video_extras_token: 0,
@@ -795,6 +836,9 @@ impl Studio {
             video_selected_press: None,
             annotation_drag: None,
             camera_overlay: CameraOverlay::default(),
+            camera_regions: Vec::new(),
+            selected_camera_region: None,
+            camera_region_drag: None,
             input_overlays: Default::default(),
             content_fill: false,
             subtitle_style: Default::default(),
@@ -998,7 +1042,7 @@ impl Studio {
                     cx.notify();
                     return None;
                 }
-                Some((this.camera_frame_generation, this.camera_overlay, this.selected_canvas_ratio() as f64))
+                Some((this.camera_frame_generation, this.camera_edit_overlay(), this.selected_canvas_ratio() as f64))
             });
             let Ok(Some((seen, overlay, canvas_aspect))) = state else {
                 break;
@@ -1267,7 +1311,7 @@ impl Studio {
                 || (command && matches!(keystroke.key.as_str(), "a" | "d")))
             && self.handle_key(event)
         {
-            if self.video_playing { self.pause_video_playback(); }
+            if self.video_playing || self.video_audio_play_when_ready { self.pause_video_playback(); }
             self.annotation_edit_preview_pending = self.selected_annotation.is_some();
             return true;
         }
@@ -1303,7 +1347,7 @@ impl Studio {
         }
         match keystroke.key.as_str() {
             "space" => {
-                if self.video_playing {
+                if self.video_playing || self.video_audio_play_when_ready {
                     self.pause_video_playback();
                 } else {
                     self.start_video_playback(cx);
@@ -1766,6 +1810,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_presets_round_trip_and_migrate_legacy_projects() {
+        use recording::audio_mode::AudioMode;
+        for mode in AudioMode::ALL {
+            let settings = RecordingExtras { audio_mode: Some(mode), audio_muted: true,
+                removed_press_times: vec![1.25], ..Default::default() };
+            let restored: RecordingExtras = serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+            assert_eq!(restored, settings);
+            assert_eq!(restored.effective_audio_mode(), mode);
+        }
+        let legacy: RecordingExtras = serde_json::from_str(r#"{"noiseReduction":true}"#).unwrap();
+        assert_eq!(legacy.effective_audio_mode(), AudioMode::NoiseReduction);
+        let future: RecordingExtras = serde_json::from_str(r#"{"audioMode":"future-preset","noiseReduction":true,"audioMuted":true,"removedPressTimes":[2.0]}"#).unwrap();
+        assert_eq!(future.effective_audio_mode(), AudioMode::NoiseReduction);
+        assert!(future.audio_muted);
+        assert_eq!(future.removed_press_times, vec![2.0]);
+        assert_eq!(RecordingExtras::default().effective_audio_mode(), AudioMode::Off);
+    }
+
 
     #[test]
     #[ignore = "requires a display (can run under Xvfb)"]

@@ -171,9 +171,9 @@ impl Studio {
         let select_tool = self.tool == Tool::Select;
         // Focus / pan-end markers of the selected motion region.
         let motion_markers = if animation_active && media_visible {
-            let (_, projection) =
-                self.preview_projection(f32::from(canvas_width), f32::from(canvas_height));
-            self.motion_marker_points(&projection)
+            let (style,geometry,viewport)=self.preview_geometry_frame(f32::from(canvas_width),f32::from(canvas_height));
+            let projection=geometry.projection(style.transform.with_motion(viewport));
+            self.motion_marker_points(&projection,viewport)
         } else {
             Vec::new()
         };
@@ -810,6 +810,9 @@ impl Studio {
     ) -> AnyElement {
         self.autosave_scene_style();
         self.sync_reframe();
+        if self.video_audio_prepare_pending {
+            self.prepare_video_audio(cx);
+        }
         if self.video_extras_pending {
             self.video_extras_pending = false;
             self.spawn_video_extras(cx);
@@ -862,7 +865,10 @@ impl Studio {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.timeline_pointer_move(event, cx) { cx.notify(); return; }
                 let mut changed = this.update_slider_drag(event);
-                if event.dragging() && this.annotation_drag.is_some() {
+                if event.dragging() && this.camera_region_drag.is_some() {
+                    this.update_camera_region_drag(event.position.x);
+                    changed = true;
+                } else if event.dragging() && this.annotation_drag.is_some() {
                     if this.update_annotation_drag(event.position.x) {
                         changed = true;
                     }
@@ -897,6 +903,7 @@ impl Studio {
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
                     if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
+                    if this.finish_camera_region_drag(cx) { return; }
                     if this.end_motion_transform_drag() {
                         cx.notify();
                     }
@@ -935,6 +942,7 @@ impl Studio {
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
                     if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
+                    if this.finish_camera_region_drag(cx) { return; }
                     this.end_camera_drag();
                     this.end_media_drag();
                     this.end_annotation_drag();

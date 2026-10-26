@@ -1,0 +1,103 @@
+{
+  "model": "Lahza UI CNN v1",
+  "architecture": "4 convolution layers;4 features;positive/negative feature split;luma-residual pixelshuffle2;4x uses a jointly trained two-stage cascade with its own first and second stage",
+  "seed": 1317,
+  "train_seed_range": [
+    100000,
+    100511
+  ],
+  "validation_seed_range": [
+    900000,
+    900063
+  ],
+  "training_images": 512,
+  "validation_images": 64,
+  "steps_per_scale": {
+    "2": 3000,
+    "4": 6000
+  },
+  "torch": "2.5.1+cpu",
+  "numpy": "2.5.2",
+  "pillow": "12.3.0",
+  "device": "cpu",
+  "loss": "RGB MSE + L1 gradient (weight0.015 for2x;0.6 for4x)",
+  "initialization": "MIT Anime4K x2 S",
+  "input_data": "procedural UI,text,lines; no user or vendor screenshots",
+  "font_files": [
+    "DejaVuSans.ttf",
+    "DejaVuSansMono.ttf",
+    "DejaVuSans-Bold.ttf",
+    "DejaVuSerif.ttf"
+  ],
+  "glyph_holdout_font": "DejaVuSerif-Bold.ttf (not used in training)",
+  "training_seconds": 175.13311505317688,
+  "metrics": {
+    "2": {
+      "psnr_bilinear": 19.219242095947266,
+      "psnr_anime4k": 20.33687400817871,
+      "psnr_ui": 22.11827278137207,
+      "edge_error_bilinear": 0.0957060381770134,
+      "edge_error_ui": 0.08980263769626617,
+      "stroke_contrast_error_bilinear": 0.30401477217674255,
+      "stroke_contrast_error_ui": 0.1971779316663742,
+      "glyph_psnr_bilinear": 18.427520751953125,
+      "glyph_psnr_ui": 24.936063766479492,
+      "glyph_stroke_error_bilinear": 0.3359823524951935,
+      "glyph_stroke_error_ui": 0.1692085564136505,
+      "file": "ui-cnn-2x.f32",
+      "sha256": "2dac2f0981f0ac8bb6f6739c653144c417d009bba6e5d4907074689e50dab7bb"
+    },
+    "4": {
+      "psnr_bilinear": 17.335407257080078,
+      "psnr_anime4k": 17.534082412719727,
+      "psnr_ui": 17.75587272644043,
+      "edge_error_bilinear": 0.10101765394210815,
+      "edge_error_ui": 0.0993010625243187,
+      "stroke_contrast_error_bilinear": 0.350229948759079,
+      "stroke_contrast_error_ui": 0.3375355005264282,
+      "glyph_psnr_bilinear": 15.412849426269531,
+      "glyph_psnr_ui": 16.818254470825195,
+      "glyph_stroke_error_bilinear": 0.4465942680835724,
+      "glyph_stroke_error_ui": 0.382835328578949,
+      "file": "ui-cnn-4x.f32",
+      "sha256": "3c8fbb3c5fae255dec345d7c91048e08ca03268b6d07ade28d2e288f74829633",
+      "first_stage_file": "ui-cnn-4x-first.f32",
+      "first_stage_sha256": "c1c6f52a3272d36c37a834957d838ea9fb95578bc1448a6983a29783d149d239"
+    }
+  },
+  "test_seed_range": [
+    950000,
+    950063
+  ],
+  "test_images": 64,
+  "test_metrics": {
+    "2": {
+      "psnr_bilinear": 18.987058639526367,
+      "psnr_ui": 21.990524291992188,
+      "edge_error_bilinear": 0.09719174355268478,
+      "edge_error_ui": 0.0897146612405777,
+      "stroke_contrast_error_bilinear": 0.30535024404525757,
+      "stroke_contrast_error_ui": 0.19630269706249237
+    },
+    "4": {
+      "psnr_bilinear": 17.04714584350586,
+      "psnr_ui": 17.52485466003418,
+      "edge_error_bilinear": 0.10302099585533142,
+      "edge_error_ui": 0.10095185041427612,
+      "stroke_contrast_error_bilinear": 0.35511231422424316,
+      "stroke_contrast_error_ui": 0.3399105668067932
+    }
+  },
+  "test_protocol": "Fresh procedural scenes, generated after objective selection; no optimization on these images.",
+  "font_sha256": {
+    "DejaVuSans.ttf": "b4c632e3cdf9acc7f28758fb5a323c8524d7fc6660d46904d9b6cbe2809c419c",
+    "DejaVuSansMono.ttf": "a54dca07c76d6289e717e75e0a58c0128f6d7269ef3faf76417c9d7d3bba37ab",
+    "DejaVuSans-Bold.ttf": "e1d733afbbfce842a1b43dced0c9885a76a4e67290dc7e690c4e9b76ebfc7d23",
+    "DejaVuSerif.ttf": "a52c2a69dfc93d0b511b98c1019a57eb3d6a62d328bdf1387f00851b02e3a315",
+    "DejaVuSerif-Bold.ttf": "3f704f75238454f68a8202e5098cb0687887480dd63d3dc20b34bdbdfa9d9f3f"
+  },
+  "initialization_sha256": "8e8574fd5ea648f175312fab543720e9589886542c2d27816c950bde72d28b33",
+  "training_script_sha256": "2413f39a8c074dc61847a2a0e92a7a5cbc3a3465783a26365d9591a1fa81080c",
+  "validation_script_sha256": "d5b9dfd964519275d23acea3ee4fd2d03f915fc0dee43d5f23a88cb1ff5a44d6",
+  "requirements_sha256": "2a5ebcdded4ea9826bd6d7b23fb756915058b9a377ca05fa88f1e51c509f1a46"
+}

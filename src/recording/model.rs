@@ -28,8 +28,6 @@ impl RecordingSession {
     pub const RENDER_STAMP_FILE: &'static str = "render.json";
     pub const POSTER_FILE: &'static str = "poster.png";
     pub const REPLACEMENT_AUDIO_STEM: &'static str = "audio-replacement";
-    /// Derived copy of the screen recording with noise-reduced audio.
-    pub const DENOISED_FILE: &'static str = ".audio-denoised.mkv";
 
     pub fn create() -> io::Result<Self> {
         Self::create_in(recordings_root())
@@ -50,19 +48,53 @@ impl RecordingSession {
         Ok(Self { directory })
     }
 
-    pub fn denoised_path(&self) -> PathBuf {
-        if let Ok(Some(source)) = self.read_edit_field::<PathBuf>("mediaSource") {
-            if source.to_string_lossy().ends_with(".media.json") {
-                if let Ok(path) = super::media::asset_path(self, &source) {
-                    return path.with_extension("denoised.media.json");
+    pub fn screen_path(&self) -> PathBuf {
+        self.directory.join(Self::SCREEN_FILE)
+    }
+
+    /// Restore a take interrupted before normal finalization. Native screen
+    /// segments are recovered in order, with all audio streams; the webcam is
+    /// recovered independently and can never replace the screen recording.
+    pub fn recover_interrupted_capture(&self) -> io::Result<bool> {
+        let mut recovered = super::native::recover_interrupted_segments(&self.screen_path())
+            .map_err(io::Error::other)?;
+        if !self.screen_path().metadata().is_ok_and(|meta| meta.len() > 0) {
+            if let Some(raw) = newest_legacy_recording(&self.directory)? {
+                fs::rename(raw, self.screen_path())?;
+                recovered = true;
+            }
+        }
+        if !recovered && self.capture_path().exists() {
+            return Ok(false);
+        }
+        if !self.screen_path().metadata().is_ok_and(|meta| meta.len() > 0) {
+            return Ok(false);
+        }
+        let info = super::video::probe_media(&self.screen_path()).map_err(io::Error::other)?;
+        let mut manifest = self.read_manifest().unwrap_or_default();
+        manifest.duration = info.duration;
+        manifest.pixel_width = info.width;
+        manifest.pixel_height = info.height;
+        manifest.includes_camera = self.camera_path().metadata().is_ok_and(|meta| meta.len() > 0);
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream_tags=title", "-of", "json"])
+            .arg(self.screen_path()).output()?;
+        if probe.status.success() {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&probe.stdout) {
+                for stream in value["streams"].as_array().into_iter().flatten() {
+                    let title = stream["tags"].as_object().and_then(|tags| tags.iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case("title")))
+                        .and_then(|(_, value)| value.as_str()).unwrap_or("");
+                    match title.replace('-', " ").to_ascii_lowercase().as_str() {
+                        "lahza microphone" => manifest.includes_microphone = true,
+                        "lahza system audio" => manifest.includes_system_audio = true,
+                        _ => {}
+                    }
                 }
             }
         }
-        self.directory.join(Self::DENOISED_FILE)
-    }
-
-    pub fn screen_path(&self) -> PathBuf {
-        self.directory.join(Self::SCREEN_FILE)
+        self.write_manifest(&manifest)?;
+        Ok(true)
     }
 
     pub fn pointer_path(&self) -> PathBuf {
@@ -368,14 +400,14 @@ fn recoverable_sessions_in(root: impl AsRef<Path>) -> io::Result<Vec<RecordingSe
     for entry in entries {
         let entry = entry?;
         let directory = entry.path();
-        if directory.extension().and_then(|value| value.to_str()) != Some(SESSION_EXTENSION) {
+        if directory.extension().and_then(|value| value.to_str()) != Some(SESSION_EXTENSION)
+            || !entry.file_type()?.is_dir() {
             continue;
         }
         let session = RecordingSession { directory };
-        if !session.screen_path().exists() {
-            if let Some(raw_output) = newest_raw_recording(&session.directory)? {
-                fs::rename(raw_output, session.screen_path())?;
-            }
+        if let Err(error) = session.recover_interrupted_capture() {
+            eprintln!("Could not recover {}: {error}", session.directory.display());
+            continue;
         }
         if session
             .screen_path()
@@ -390,12 +422,16 @@ fn recoverable_sessions_in(root: impl AsRef<Path>) -> io::Result<Vec<RecordingSe
     Ok(sessions)
 }
 
-fn newest_raw_recording(directory: &Path) -> io::Result<Option<PathBuf>> {
+fn newest_legacy_recording(directory: &Path) -> io::Result<Option<PathBuf>> {
     let mut candidates = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if path.file_name().and_then(|name| name.to_str()) == Some(RecordingSession::CAMERA_FILE) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == RecordingSession::CAMERA_FILE || name == RecordingSession::SCREEN_FILE
+            || name.starts_with("camera-") || name.starts_with("screen-segment-")
+            || name.starts_with("audio-") || name.starts_with('.') {
             continue;
         }
         let supported = matches!(
@@ -516,6 +552,9 @@ pub struct PointerCaptureFile {
     pub format_version: u32,
     pub travel: Vec<PointerTravelSample>,
     pub presses: Vec<PointerPressEvent>,
+    /// Hover-target transitions contain no target identity, label, or text.
+    #[serde(default)]
+    pub hovers: Vec<PointerHoverEvent>,
     pub keystrokes: Vec<KeystrokeEvent>,
     pub artwork: Vec<PointerArtwork>,
     pub pause_intervals: Vec<PauseInterval>,
@@ -523,7 +562,7 @@ pub struct PointerCaptureFile {
 }
 
 impl PointerCaptureFile {
-    pub const CURRENT_FORMAT_VERSION: u32 = 1;
+    pub const CURRENT_FORMAT_VERSION: u32 = 2;
 }
 
 impl Default for PointerCaptureFile {
@@ -532,6 +571,7 @@ impl Default for PointerCaptureFile {
             format_version: Self::CURRENT_FORMAT_VERSION,
             travel: Vec::new(),
             presses: Vec::new(),
+            hovers: Vec::new(),
             keystrokes: Vec::new(),
             artwork: Vec::new(),
             pause_intervals: Vec::new(),
@@ -556,6 +596,16 @@ pub enum PointerTravelKind {
     #[default]
     Move,
     Drag,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointerHoverEvent {
+    pub time: f64,
+    pub x: f64,
+    pub y: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -660,6 +710,29 @@ fn read_optional_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_fixture(path: &Path, frequency: u32) {
+        let result = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=64x48:r=30:d=0.5",
+                "-f", "lavfi", "-i", &format!("sine=frequency={frequency}:sample_rate=48000:duration=0.5"),
+                "-f", "lavfi", "-i", "sine=frequency=1200:sample_rate=48000:duration=0.5",
+                "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                "-metadata:s:a:0", "title=Lahza-Microphone", "-metadata:s:a:1", "title=Lahza-System-Audio"])
+            .arg(path).output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[test]
+    fn pointer_hover_metadata_is_additive_and_contains_no_target_identity() {
+        let old = serde_json::json!({"formatVersion":1,"travel":[],"presses":[],
+            "keystrokes":[],"artwork":[],"pauseIntervals":[],"isSanitized":false});
+        let mut capture: PointerCaptureFile = serde_json::from_value(old).unwrap();
+        assert!(capture.hovers.is_empty());
+        capture.hovers.push(PointerHoverEvent { time: 0.25, x: 0.4, y: 0.6, artwork_id: None });
+        let encoded = serde_json::to_value(&capture).unwrap();
+        assert_eq!(encoded["hovers"][0], serde_json::json!({"time":0.25,"x":0.4,"y":0.6}));
+        assert_eq!(serde_json::from_value::<PointerCaptureFile>(encoded).unwrap(), capture);
+    }
     use crate::recording::viewport::{ZoomAnchorMode, ZoomCue};
 
     #[test]
@@ -668,16 +741,78 @@ mod tests {
             std::env::temp_dir().join(format!("lahza-recovery-test-{}", uuid::Uuid::new_v4()));
         let session = RecordingSession::create_in(&root).unwrap();
         let raw = session.directory.join("2026-08-24 00-01-02.mkv");
-        fs::write(&raw, b"recoverable video").unwrap();
+        recovery_fixture(&raw, 440);
+        let original = fs::read(&raw).unwrap();
 
         let recovered = recoverable_sessions_in(&root).unwrap();
 
         assert_eq!(recovered, vec![session.clone()]);
         assert_eq!(
             fs::read(session.screen_path()).unwrap(),
-            b"recoverable video"
+            original
         );
         assert!(!raw.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_joins_every_paused_segment_and_recovers_camera_separately() {
+        let root = std::env::temp_dir().join(format!("lahza-recovery-paused-{}", Uuid::new_v4()));
+        let session = RecordingSession::create_in(&root).unwrap();
+        // Write reverse order so recovery cannot rely on mtime/newest-file.
+        for index in [1, 0] {
+            recovery_fixture(&session.directory.join(format!("screen-segment-{index:04}.mkv")), 440 + index * 100);
+            recovery_fixture(&session.directory.join(format!("camera-segment-{index:04}.mkv")), 220);
+        }
+        // Older finalizers wrote directly to the final name. Even a nonempty
+        // destination must not hide the complete original segment sequence.
+        fs::write(session.screen_path(), b"partial final file left by an older build").unwrap();
+        fs::write(session.camera_path(), b"partial webcam final file").unwrap();
+        assert_eq!(recoverable_sessions_in(&root).unwrap(), vec![session.clone()]);
+        let manifest = session.read_manifest().unwrap();
+        assert!((manifest.duration - 1.0).abs() < 0.05, "{}", manifest.duration);
+        assert!(manifest.includes_microphone && manifest.includes_system_audio && manifest.includes_camera);
+        assert_eq!((manifest.pixel_width, manifest.pixel_height), (64, 48));
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream_tags=title", "-of", "json"])
+            .arg(session.screen_path()).output().unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        assert_eq!(metadata["streams"].as_array().unwrap().len(), 2);
+        assert!(session.camera_path().is_file());
+        assert!(!session.directory.join("screen-segment-0000.mkv").exists());
+        assert!(!session.directory.join("camera-segment-0001.mkv").exists());
+        let screen = fs::read(session.screen_path()).unwrap();
+        let camera = fs::read(session.camera_path()).unwrap();
+        assert!(!session.recover_interrupted_capture().unwrap());
+        assert_eq!(screen, fs::read(session.screen_path()).unwrap());
+        assert_eq!(camera, fs::read(session.camera_path()).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_recovery_keeps_all_originals_and_does_not_adopt_webcam() {
+        let root = std::env::temp_dir().join(format!("lahza-recovery-failed-{}", Uuid::new_v4()));
+        let broken = RecordingSession::create_in(&root).unwrap();
+        let first = broken.directory.join("screen-segment-0000.mkv");
+        recovery_fixture(&first, 440);
+        let original = fs::read(&first).unwrap();
+        let last = broken.directory.join("screen-segment-0001.mkv");
+        fs::write(&last, b"unrecoverable interrupted header").unwrap();
+        recovery_fixture(&broken.directory.join("camera-segment-0000.mkv"), 220);
+        assert!(broken.recover_interrupted_capture().is_err());
+        assert!(!broken.screen_path().exists());
+        assert_eq!(fs::read(first).unwrap(), original);
+        assert_eq!(fs::read(last).unwrap(), b"unrecoverable interrupted header");
+
+        let camera_only = RecordingSession::create_in(&root).unwrap();
+        let camera = camera_only.directory.join("camera-segment-0000.mkv");
+        recovery_fixture(&camera, 220);
+        let good = RecordingSession::create_in(&root).unwrap();
+        recovery_fixture(&good.screen_path(), 880);
+        // A broken sibling must not hide the usable project from discovery.
+        assert_eq!(recoverable_sessions_in(&root).unwrap(), vec![good]);
+        assert!(camera.exists());
+        assert!(!camera_only.screen_path().exists());
         fs::remove_dir_all(root).unwrap();
     }
 

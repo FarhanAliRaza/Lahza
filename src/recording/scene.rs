@@ -6,6 +6,9 @@
 //! uses the offscreen Vulkan compositor when available, with this CPU renderer
 //! as its reference and fallback.
 
+#[path = "source_sampling.rs"]
+mod sampling;
+
 use image::{Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -242,6 +245,14 @@ pub struct CameraOverlay {
     pub split_flip: bool,
     /// Screen share of a split layout (25-75 percent).
     pub split_ratio: u8,
+    /// Fill the split cells edge to edge rather than using padded camera framing.
+    pub split_full: bool,
+    /// Person-background removal controls, applied before camera composition.
+    pub cutout_softness: u8,
+    pub cutout_inset: i8,
+    /// Evaluated camera-region geometry. Never persisted as authored style.
+    #[serde(skip)]
+    pub pose: Option<super::camera_timeline::CameraPose>,
     pub mirror: bool,
     /// Distance from the canvas edge as a percent of its short side.
     pub margin: u8,
@@ -268,6 +279,10 @@ impl Default for CameraOverlay {
             split_direction: CameraSplitDirection::Auto,
             split_flip: false,
             split_ratio: 60,
+            split_full: false,
+            cutout_softness: 20,
+            cutout_inset: 0,
+            pose: None,
             mirror: false,
             margin: 4,
             shadow: true,
@@ -281,7 +296,8 @@ impl CameraOverlay {
     const SNAP_DISTANCE: f64 = 8.0 / 1080.0;
 
     pub fn aspect_ratio(&self, source_aspect: f64) -> f64 {
-        if self.shape == CameraShape::Circle { 1.0 } else { self.aspect.ratio(source_aspect) }
+        if self.layout == CameraLayout::Cutout { source_aspect }
+        else if self.shape == CameraShape::Circle { 1.0 } else { self.aspect.ratio(source_aspect) }
     }
 
     /// The unzoomed overlay, retained for callers without a source frame.
@@ -336,7 +352,8 @@ impl CameraOverlay {
     }
 
     pub fn radius(&self, rect: Rect) -> f64 {
-        if self.layout == CameraLayout::Fullscreen { return 0.0; }
+        if let Some(pose) = self.pose { return pose.radius_fraction * rect.width.min(rect.height); }
+        if self.layout == CameraLayout::Fullscreen || self.layout == CameraLayout::Cutout || (self.layout == CameraLayout::Split && self.split_full) { return 0.0; }
         let side = rect.width.min(rect.height);
         if self.shape == CameraShape::Circle { return side * 0.5; }
         if self.shape == CameraShape::Squircle {
@@ -348,6 +365,27 @@ impl CameraOverlay {
             CameraShape::Square => 0.03,
         }
     }
+
+    pub fn opacity(&self) -> f64 {
+        self.pose.map_or(if self.enabled && self.layout != CameraLayout::Hidden { 1.0 } else { 0.0 }, |pose| pose.opacity)
+    }
+
+    pub fn cutout_strength(&self) -> f64 {
+        self.pose.map_or(if self.layout == CameraLayout::Cutout {1.0}else{0.0}, |pose|pose.cutout)
+    }
+
+    pub fn full_bleed_strength(&self) -> f64 {
+        self.pose.map_or(if self.enabled && self.layout == CameraLayout::Split && self.split_full {1.0}else{0.0}, |pose|pose.full_bleed)
+    }
+
+    pub fn shadow_strength(&self) -> f64 {
+        if !self.shadow {return 0.0;}
+        self.pose.map_or_else(|| {
+            if self.enabled && !matches!(self.layout,CameraLayout::Fullscreen | CameraLayout::Cutout | CameraLayout::Hidden)
+                && !(self.layout==CameraLayout::Split && self.split_full) {1.0}else{0.0}
+        }, |pose|pose.shadow)
+    }
+
 
 }
 
@@ -375,6 +413,9 @@ pub struct PointerStyle {
     pub hide_when_typing: bool,
     pub idle_hide_delay: f64,
     pub loop_return_duration: f64,
+    /// Runtime shutter override. None retains the legacy cursor smear.
+    #[serde(skip)]
+    pub motion_blur_amount: Option<f64>,
 }
 
 impl PointerStyle {
@@ -413,6 +454,7 @@ impl Default for PointerStyle {
             hide_when_typing: true,
             idle_hide_delay: Self::IDLE_HIDE_DELAY,
             loop_return_duration: 1.0,
+            motion_blur_amount: None,
         }
     }
 }
@@ -452,6 +494,7 @@ impl WindowFrame {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SceneStyle {
+    pub animation: super::animation::AnimationSettings,
     #[serde(default)]
     pub(crate) source_crop: crate::CropRect,
     pub background: SceneBackground,
@@ -490,6 +533,9 @@ pub struct SceneStyle {
     pub pointer: PointerStyle,
     /// How a camera clip is placed; the clip itself lives in the project.
     pub camera: CameraOverlay,
+    /// Source-time camera layouts; empty preserves the legacy global layout.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub camera_regions: Vec<super::camera_timeline::CameraRegion>,
     /// Keystroke captions and the speed badge.
     pub input_overlays: super::studio_overlays::InputOverlayStyle,
     /// Narration subtitle bar.
@@ -499,6 +545,7 @@ pub struct SceneStyle {
 impl Default for SceneStyle {
     fn default() -> Self {
         Self {
+            animation: Default::default(),
             background: SceneBackground::default(),
             source_crop: crate::CropRect::UNIT,
             window_frame: WindowFrame::Off,
@@ -521,6 +568,7 @@ impl Default for SceneStyle {
             watermark: None,
             pointer: PointerStyle::default(),
             camera: CameraOverlay::default(),
+            camera_regions: Vec::new(),
             input_overlays: Default::default(),
             subtitles: Default::default(),
         }
@@ -669,18 +717,20 @@ impl SceneGeometry {
         let crop = style.source_crop.validated();
         let source_width = source_width * crop.width as f64;
         let source_height = source_height * crop.height as f64;
+        let full_bleed = style.camera.full_bleed_strength().clamp(0.0,1.0);
+        let decoration = 1.0-full_bleed;
         let border_width = if style.border {
-            style.border_thickness as f64 * 0.48 * ui_scale
+            style.border_thickness as f64 * 0.48 * ui_scale * decoration
         } else {
             0.0
         };
         // Zero padding means the media reaches the canvas edge; only the
         // border adds space beyond the user's padding setting.
-        let inset = style.padding as f64 * 2.0 * ui_scale + border_width;
+        let inset = style.padding as f64 * 2.0 * ui_scale * decoration + border_width;
         let title_height = if style.window_frame == WindowFrame::Off {
             0.0
         } else {
-            TITLE_BAR_HEIGHT * ui_scale
+            TITLE_BAR_HEIGHT * ui_scale * decoration
         };
         let screen_area = style.camera.screen_area(canvas_width, canvas_height);
         let available_width = (screen_area.width - inset * 2.0).max(1.0);
@@ -695,7 +745,7 @@ impl SceneGeometry {
         } else {
             720.0
         };
-        let media = if style.fills_card() {
+        let mut media = if style.fills_card() {
             Rect { x: screen_area.x + inset, y: screen_area.y + inset + title_height, width: available_width, height: available_height }
         } else {
             let scale = (available_width / source_width).min(available_height / source_height);
@@ -708,6 +758,12 @@ impl SceneGeometry {
                 height,
             }
         };
+        if full_bleed > 0.0 {
+            media.x += (screen_area.x-media.x)*full_bleed;
+            media.y += (screen_area.y-media.y)*full_bleed;
+            media.width += (screen_area.width-media.width)*full_bleed;
+            media.height += (screen_area.height-media.height)*full_bleed;
+        }
         let strength = style.shadow as f64 / 100.0;
         let (radius_scale, offset_scale, opacity_scale) = match style.shadow_style {
             0 => (1.0, 0.3, 1.0),
@@ -716,22 +772,35 @@ impl SceneGeometry {
             _ => (0.8, 0.2, 1.1),
         };
         let shadow_radius = 85.0 * strength * radius_scale * ui_scale;
-        let shadow = (style.shadow > 0).then(|| ShadowSpec {
+        let shadow = (style.shadow > 0 && decoration > 0.0).then(|| ShadowSpec {
             color: unpack(style.shadow_color),
             blur_radius: shadow_radius,
             offset_y: shadow_radius * offset_scale,
-            opacity: ((0.08 + strength * 1.35).min(0.35) * opacity_scale).min(0.5),
+            opacity: ((0.08 + strength * 1.35).min(0.35) * opacity_scale).min(0.5) * decoration,
         });
         Self {
             canvas_width,
             canvas_height,
             media,
-            radius: style.corners as f64 * 0.64 * ui_scale,
+            radius: style.corners as f64 * 0.64 * ui_scale * decoration,
             border_width,
             title_height,
             shadow,
             ui_scale,
         }
+    }
+
+    /// Cheap, allocation-free full-split crop shared by motion estimates,
+    /// handles, preview, and both render backends.
+    pub fn camera_viewport(&self, mut viewport: ViewportFrame, style: &SceneStyle, source: (u32,u32)) -> ViewportFrame {
+        if style.camera.full_bleed_strength() <= 0.0 { return viewport; }
+        let crop=style.source_crop.validated();
+        let source_aspect=source.0.max(1) as f64 * crop.width as f64 /
+            (source.1.max(1) as f64 * crop.height as f64);
+        let aspect=self.media.width / self.media.height.max(1e-6);
+        viewport.fill=if source_aspect>aspect {((aspect/source_aspect).clamp(0.01,1.0),1.0)}
+            else {(1.0,(source_aspect/aspect).clamp(0.01,1.0))};
+        viewport
     }
 
     /// The card rect at scale 1: media, title bar, and border.
@@ -928,7 +997,7 @@ impl MediaProjection {
     }
 
     /// Canvas pixels per media pixel around `(u, v)`.
-    fn screen_scale_at(&self, u: f64, v: f64) -> f64 {
+    pub(super) fn screen_scale_at(&self, u: f64, v: f64) -> f64 {
         let (x, y) = self.project(u, v);
         1.0 / self.pixel_size_at(x, y)
     }
@@ -1249,6 +1318,13 @@ impl SceneCompositor {
     }
 
     /// Composes one output frame.
+    /// Cover-fit a full split screen cell without stretching screen pixels.
+    /// Assigns an absolute fill fraction, so worker planning and renderer
+    /// dispatch may safely both call this helper.
+    pub fn camera_viewport(&self, viewport: ViewportFrame) -> ViewportFrame {
+        self.geometry.camera_viewport(viewport, &self.style, (self.source_width,self.source_height))
+    }
+
     pub fn compose(&self, input: FrameInput<'_>) -> RgbaImage {
         self.compose_layers(input, true, None)
     }
@@ -1260,6 +1336,7 @@ impl SceneCompositor {
         media_visible: bool,
         canvas_overlay: Option<&RgbaImage>,
     ) -> RgbaImage {
+        let input = FrameInput { viewport: self.camera_viewport(input.viewport), ..input };
         let transform = self.style.transform.with_motion(input.viewport);
         let mut output = if media_visible {
             self.card_layer(transform, input.source, input.viewport)
@@ -1273,11 +1350,13 @@ impl SceneCompositor {
         // Keep only the card/background pass immutable. Lens pixels sample
         // original media at fractional coordinates, before canvas reduction.
         let lens_background = lens.map(|_| output.clone());
+        let source_mips = sampling::Pyramid::cropped(input.source,self.style.source_crop.sample_bounds(input.source.width(),input.source.height()));
         if media_visible {
             self.paint_media(
                 &mut output,
                 &projection,
                 input.source,
+                &source_mips,
                 input.overlay,
                 input.viewport,
             );
@@ -1291,6 +1370,8 @@ impl SceneCompositor {
                     geometry: self.geometry,
                     projection: &projection,
                     source: input.source,
+                    source_mips: &source_mips,
+                    magnification: lens.magnification as f64,
                     overlay: input
                         .overlay
                         .filter(|image| image.width() > 0 && image.height() > 0),
@@ -1511,6 +1592,7 @@ impl SceneCompositor {
         output: &mut RgbaImage,
         projection: &MediaProjection,
         source: &RgbaImage,
+        source_mips: &sampling::Pyramid,
         overlay: Option<&RgbaImage>,
         viewport: ViewportFrame,
     ) {
@@ -1527,6 +1609,8 @@ impl SceneCompositor {
             geometry: self.geometry,
             projection,
             source,
+            source_mips,
+            magnification: 1.0,
             overlay,
             left,
             top,
@@ -1560,14 +1644,14 @@ impl SceneCompositor {
         }
         let mut overlay = self.style.camera;
         let rect = overlay.rect_for_frame(self.width as f64, self.height as f64, camera.width() as f64 / camera.height() as f64, zoom);
-        overlay.shadow &= overlay.layout != CameraLayout::Fullscreen;
-        if overlay.shadow {
+        let shadow_strength=overlay.shadow_strength();
+        if shadow_strength > 0.0 {
             let mut cache = self.camera_shadow.borrow_mut();
-            if cache.as_ref().is_none_or(|shadow| shadow.rect != rect) {
+            if cache.as_ref().is_none_or(|shadow| shadow.rect != rect || shadow.radius != overlay.radius(rect)) {
                 *cache = Some(CameraShadow::new(self.width, self.height, overlay, rect));
             }
             let shadow = cache.as_ref().expect("camera shadow just prepared");
-            shadow.paint(output);
+            shadow.paint(output, overlay.opacity()*shadow_strength);
             overlay.shadow = false;
         }
         paint_camera_overlay(output, camera, overlay, rect);
@@ -1629,11 +1713,10 @@ impl SceneCompositor {
                 }
             }
         }
-        let opacity = if style.hide_when_idle {
-            frame.opacity
-        } else {
-            1.0
-        };
+        // The timeline already applies the independent idle/typing options.
+        // Overriding its opacity here also disabled typing hide when idle hide
+        // was off, and revealed the cursor before its first recorded event.
+        let opacity = frame.opacity;
         if opacity <= 0.0 {
             return commands;
         }
@@ -1667,8 +1750,9 @@ impl SceneCompositor {
                 width,
                 height,
                 tilt_degrees: frame.tilt_degrees,
-                smear: cursor_smear(frame.velocity, unit_scale, width),
+                smear: cursor_smear(frame.velocity, unit_scale, width, style.motion_blur_amount.unwrap_or(1.0)),
             };
+            let (bitmap, placement) = blurred_cursor(bitmap.clone(), placement, frame.blur_radius);
             if style.shadow {
                 let shadow = BitmapPlacement {
                     hotspot_x: x + height * 0.05,
@@ -1714,8 +1798,9 @@ impl SceneCompositor {
             width,
             height,
             tilt_degrees: frame.tilt_degrees,
-            smear: cursor_smear(frame.velocity, unit_scale, width),
+            smear: cursor_smear(frame.velocity, unit_scale, width, style.motion_blur_amount.unwrap_or(1.0)),
         };
+        let (asset, placement) = blurred_cursor(asset, placement, frame.blur_radius);
         commands.push(PointerCommand::Bitmap { bitmap: asset, placement, opacity, shadow_only: false });
         commands
     }
@@ -1926,6 +2011,8 @@ struct MediaPainter<'a> {
     geometry: SceneGeometry,
     projection: &'a MediaProjection,
     source: &'a RgbaImage,
+    source_mips: &'a sampling::Pyramid,
+    magnification: f64,
     overlay: Option<&'a RgbaImage>,
     left: f64,
     top: f64,
@@ -1978,6 +2065,18 @@ fn sample_fixed(image: &RgbaImage, x: Tap, y: Tap) -> [u8; 4] {
 }
 
 impl MediaPainter<'_> {
+    fn filtered(&self, px: f64, py: f64, u: f64, v: f64) -> Option<[u8;4]> {
+        let at=self.projection.unproject(px,py);
+        let m=self.projection.inverse;
+        let w=m[2][0]*px+m[2][1]*py+m[2][2];
+        let w=if w.abs()<1e-12 {1e-12}else{w};
+        let dx=((m[0][0]-at.0*m[2][0])/w,(m[1][0]-at.1*m[2][0])/w);
+        let dy=((m[0][1]-at.0*m[2][1])/w,(m[1][1]-at.1*m[2][1])/w);
+        let sx=self.visible_x*self.source.width() as f64/self.magnification;
+        let sy=self.visible_y*self.source.height() as f64/self.magnification;
+        self.source_mips.sample(self.source,(u,v),(dx.0*sx,dx.1*sy),(dy.0*sx,dy.1*sy),self.sample_bounds)
+    }
+
     /// Reconstruct one continuous canvas position from the original source.
     /// Unlike the raster pass, the lens never snaps its source weights to 8.8
     /// or samples four already-reduced canvas pixels.
@@ -2018,11 +2117,11 @@ impl MediaPainter<'_> {
             .clamp(self.sample_bounds.0, self.sample_bounds.2);
         let source_v = (self.top + v.clamp(0.0, 1.0) * self.visible_y)
             .clamp(self.sample_bounds.1, self.sample_bounds.3);
-        let mut color = sample_bilinear(
+        let mut color = self.filtered(px,py,source_u,source_v).unwrap_or_else(|| sample_bilinear(
             self.source,
             source_u * f64::from(self.source.width()) - 0.5,
             source_v * f64::from(self.source.height()) - 0.5,
-        )
+        ))
         .map(f32::from);
         if let Some(overlay) = self.overlay {
             let annotation = sample_bilinear(
@@ -2111,7 +2210,9 @@ impl MediaPainter<'_> {
                     }
                     let px = u * media.width;
                     if interior_row && px > band && px < media.width - band {
-                        let mut sample = sample_fixed(self.source, source_x, source_y);
+                        let media_u=(self.left+u.clamp(0.0,1.0)*self.visible_x).clamp(self.sample_bounds.0,self.sample_bounds.2);
+                        let media_v=(self.top+v.clamp(0.0,1.0)*self.visible_y).clamp(self.sample_bounds.1,self.sample_bounds.3);
+                        let mut sample = self.filtered(x as f64+0.5,py,media_u,media_v).unwrap_or_else(|| sample_fixed(self.source, source_x, source_y));
                         if let (Some(layer), Some(ox), Some(oy)) =
                             (self.overlay, overlay_x, overlay_y)
                         {
@@ -2140,11 +2241,11 @@ impl MediaPainter<'_> {
         }
         let media_u = (self.left + u.clamp(0.0, 1.0) * self.visible_x).clamp(self.sample_bounds.0, self.sample_bounds.2);
         let media_v = (self.top + v.clamp(0.0, 1.0) * self.visible_y).clamp(self.sample_bounds.1, self.sample_bounds.3);
-        let mut sample = sample_bilinear(
+        let mut sample = self.filtered(px,py,media_u,media_v).unwrap_or_else(|| sample_bilinear(
             self.source,
             media_u * f64::from(self.source.width()) - 0.5,
             media_v * f64::from(self.source.height()) - 0.5,
-        );
+        ));
         if let Some(layer) = self.overlay {
             let over = sample_bilinear(
                 layer,
@@ -2230,6 +2331,17 @@ pub fn camera_framing_preview(camera: &RgbaImage, overlay: CameraOverlay) -> Rgb
 }
 
 pub fn camera_framing_preview_in_canvas(camera: &RgbaImage, overlay: CameraOverlay, canvas_aspect: f64) -> RgbaImage {
+    // Framing previews run on a worker; retain one plan instead of rebuilding
+    // the network each time a camera frame or edge setting changes.
+    static MATTING: std::sync::Mutex<Option<super::camera_matting::CameraMatting>> = std::sync::Mutex::new(None);
+    let cutout = if overlay.cutout_strength() > 0.0 {
+        let mut cache = MATTING.lock().unwrap_or_else(|error| error.into_inner());
+        match cache.get_or_insert_with(super::camera_matting::CameraMatting::new).process(camera, overlay) {
+            Ok(image) => Some(image),
+            Err(error) => { eprintln!("Camera framing: {error}"); None }
+        }
+    } else { None };
+    let camera = cutout.as_deref().unwrap_or(camera);
     let mut output = RgbaImage::from_pixel(200, 200, Rgba([251, 251, 251, 255]));
     let composed = overlay.rect_for_frame(canvas_aspect, 1.0,
         camera.width() as f64 / camera.height().max(1) as f64, 1.0);
@@ -2245,6 +2357,7 @@ pub fn camera_framing_preview_in_canvas(camera: &RgbaImage, overlay: CameraOverl
 /// lifetime of a compositor; changing webcam frames must not repeat the blur.
 struct CameraShadow {
     rect: Rect,
+    radius: f64,
     pixels: Vec<(usize, f64)>,
 }
 
@@ -2272,25 +2385,25 @@ impl CameraShadow {
             let alpha = f64::from(value) * 0.35;
             (alpha > 0.001).then_some((index * 4, alpha))
         }).collect();
-        Self { rect, pixels }
+        Self { rect, radius, pixels }
     }
 
-    fn paint(&self, output: &mut RgbaImage) {
+    fn paint(&self, output: &mut RgbaImage, opacity: f64) {
         let raw: &mut [u8] = output.as_mut();
         for &(offset, alpha) in &self.pixels {
-            blend_slice(&mut raw[offset..offset + 4], [0, 0, 0], alpha);
+            blend_slice(&mut raw[offset..offset + 4], [0, 0, 0], alpha * opacity);
         }
     }
 }
 
 /// Shared cover-fit camera renderer for the launcher, editor, and export.
 fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: CameraOverlay, rect: Rect) {
-    if camera.width() == 0 || camera.height() == 0 {
+    if camera.width() == 0 || camera.height() == 0 || overlay.opacity() <= 0.0 {
         return;
     }
     let radius = overlay.radius(rect);
-    if overlay.shadow {
-        CameraShadow::new(output.width(), output.height(), overlay, rect).paint(output);
+    if overlay.shadow_strength() > 0.0 {
+        CameraShadow::new(output.width(), output.height(), overlay, rect).paint(output, overlay.opacity()*overlay.shadow_strength());
     }
     let frame_width = camera.width() as f64;
     let frame_height = camera.height() as f64;
@@ -2319,7 +2432,7 @@ fn paint_camera_overlay(output: &mut RgbaImage, camera: &RgbaImage, overlay: Cam
                 x,
                 y,
                 [sample[0], sample[1], sample[2]],
-                coverage * sample[3] as f64 / 255.0,
+                coverage * sample[3] as f64 / 255.0 * overlay.opacity(),
             );
         }
     }
@@ -2864,10 +2977,11 @@ const CURSOR_RASTER_STEP: f64 = 16.0;
 
 /// Canvas-space trail for a cursor moving at `velocity` (normalized media
 /// units per second) drawn `width` pixels wide.
-fn cursor_smear(velocity: (f64, f64), scale: (f64, f64), width: f64) -> (f64, f64) {
+fn cursor_smear(velocity: (f64, f64), scale: (f64, f64), width: f64, amount: f64) -> (f64, f64) {
+    let amount = if amount.is_finite() { amount.clamp(0.0, 1.0) } else { 1.0 };
     let smear = (
-        velocity.0 * scale.0 / 60.0 * CURSOR_SMEAR_AMOUNT,
-        velocity.1 * scale.1 / 60.0 * CURSOR_SMEAR_AMOUNT,
+        velocity.0 * scale.0 / 60.0 * CURSOR_SMEAR_AMOUNT * amount,
+        velocity.1 * scale.1 / 60.0 * CURSOR_SMEAR_AMOUNT * amount,
     );
     let length = smear.0.hypot(smear.1);
     let limit = CURSOR_SMEAR_MAX_WIDTHS * width;
@@ -2892,6 +3006,76 @@ struct BitmapPlacement {
     /// Motion trail in canvas pixels: the cursor is smeared this far behind
     /// its position.
     smear: (f64, f64),
+}
+
+/// Blur premultiplied artwork once, before either CPU or GPU composition.
+/// Transparent padding preserves the complete halo and the transformed hotspot.
+/// Radius is in the same 60-pixel reference units as the normal cursor size,
+/// so zoom/output scaling need not regenerate a sprite. The cache retains its
+/// source Arc, preventing allocator address reuse from matching another image.
+fn blurred_cursor(
+    bitmap: std::sync::Arc<PointerBitmap>,
+    mut placement: BitmapPlacement,
+    radius: f64,
+) -> (std::sync::Arc<PointerBitmap>, BitmapPlacement) {
+    use std::{collections::VecDeque, sync::{Arc, Mutex, OnceLock}};
+    struct Entry { source: Arc<PointerBitmap>, radius: u16, blurred: Arc<PointerBitmap> }
+    static CACHE: OnceLock<Mutex<VecDeque<Entry>>> = OnceLock::new();
+    let sigma = if radius.is_finite() {
+        (radius.clamp(0.0, 10.0) * bitmap.image.height() as f64 / 60.0).min(128.0)
+    } else { 0.0 };
+    let quantized = (sigma * 8.0).round() as u16;
+    if quantized == 0 { return (bitmap, placement); }
+    let cache = CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+    let hit = {
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        cache.iter().position(|entry| entry.radius == quantized && Arc::ptr_eq(&entry.source, &bitmap))
+            .and_then(|index| cache.remove(index))
+            .map(|entry| { let image = entry.blurred.clone(); cache.push_back(entry); image })
+    };
+    let blurred = hit.unwrap_or_else(|| {
+        let sigma = quantized as f64 / 8.0;
+        let padding = (sigma * 3.0).ceil() as u32 + 2;
+        let (width, height) = (bitmap.image.width() + padding * 2, bitmap.image.height() + padding * 2);
+        let mut image = RgbaImage::new(width, height);
+        for (x, y, pixel) in bitmap.image.enumerate_pixels() {
+            image.put_pixel(x + padding, y + padding, *pixel);
+        }
+        // Blur alpha and RGB together: straight-alpha filtering would create
+        // dark fringes or brighten transparent pixels.
+        for channel in 0..4 {
+            let mut plane: Vec<f32> = image.pixels().map(|pixel| pixel[channel] as f32).collect();
+            blur_plane(&mut plane, width as usize, height as usize, sigma);
+            for (pixel, value) in image.pixels_mut().zip(plane) {
+                pixel[channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let blurred = Arc::new(PointerBitmap {
+            id: format!("{}:idle-blur:{quantized}", bitmap.id), image,
+            anchor: NormalizedPoint {
+                x: (bitmap.anchor.x * bitmap.image.width() as f64 + padding as f64) / width as f64,
+                y: (bitmap.anchor.y * bitmap.image.height() as f64 + padding as f64) / height as f64,
+            },
+            reference_width: bitmap.reference_width * width as f64 / bitmap.image.width() as f64,
+            reference_height: bitmap.reference_height * height as f64 / bitmap.image.height() as f64,
+            shape: bitmap.shape,
+        });
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        // Both entry count and bytes are bounded for recordings with many
+        // large cursor images. A single over-budget image is usable uncached.
+        const BYTE_LIMIT: usize = 8 * 1024 * 1024;
+        if blurred.image.as_raw().len() + bitmap.image.as_raw().len() <= BYTE_LIMIT {
+            cache.push_back(Entry { source: bitmap.clone(), radius: quantized, blurred: blurred.clone() });
+            while cache.len() > 16 || cache.iter().map(|entry|
+                entry.source.image.as_raw().len() + entry.blurred.image.as_raw().len()).sum::<usize>() > BYTE_LIMIT {
+                cache.pop_front();
+            }
+        }
+        blurred
+    });
+    placement.width *= blurred.image.width() as f64 / bitmap.image.width() as f64;
+    placement.height *= blurred.image.height() as f64 / bitmap.image.height() as f64;
+    (blurred, placement)
 }
 
 /// Draws a captured cursor image with its hotspot at the pointer location,
@@ -4133,6 +4317,74 @@ mod tests {
 #[cfg(test)]
 mod cursor_smear_tests {
     use super::*;
+
+    #[test]
+    fn idle_blur_preserves_premultiplication_hotspot_and_cache_identity() {
+        use std::sync::Arc;
+        let bitmap = Arc::new(PointerBitmap {
+            id: "synthetic-opaque-cursor".into(),
+            image: RgbaImage::from_pixel(16, 16, Rgba([100, 50, 25, 128])),
+            anchor: NormalizedPoint { x: 0.125, y: 0.25 },
+            reference_width: 0.016, reference_height: 0.016, shape: None,
+        });
+        let placement = BitmapPlacement { hotspot_x: 37.0, hotspot_y: 53.0,
+            width: 32.0, height: 32.0, tilt_degrees: 27.0, smear: (0.0, 0.0) };
+        let (blurred, padded) = blurred_cursor(bitmap.clone(), placement, 10.0);
+        assert!(blurred.image.width() > bitmap.image.width());
+        let padding = (blurred.image.width() - bitmap.image.width()) / 2;
+        assert!(blurred.image.get_pixel(padding - 2, padding + 8)[3] > 0,
+            "blur must extend beyond the old artwork box");
+        assert!(blurred.image.pixels().all(|pixel| pixel[0] <= pixel[3]
+            && pixel[1] <= pixel[3] && pixel[2] <= pixel[3]));
+        let mass = |image: &RgbaImage| image.pixels().map(|pixel| u64::from(pixel[3])).sum::<u64>();
+        assert!((mass(&blurred.image) as f64 / mass(&bitmap.image) as f64 - 1.0).abs() < 0.03);
+        let padding_canvas = padding as f64 * placement.width / bitmap.image.width() as f64;
+        assert!((blurred.anchor.x * padded.width - padding_canvas - bitmap.anchor.x * placement.width).abs() < 1e-9);
+        assert!((blurred.anchor.y * padded.height - padding_canvas - bitmap.anchor.y * placement.height).abs() < 1e-9);
+        assert_eq!((padded.hotspot_x, padded.hotspot_y), (placement.hotspot_x, placement.hotspot_y));
+        assert!(Arc::ptr_eq(&blurred, &blurred_cursor(bitmap.clone(), placement, 10.0).0));
+        assert!(Arc::ptr_eq(&bitmap, &blurred_cursor(bitmap.clone(), placement, 0.0).0));
+    }
+
+    #[test]
+    fn typing_hide_is_rendered_when_idle_hide_is_disabled() {
+        use super::super::model::{KeystrokeEvent, PointerCaptureFile, PointerTravelKind, PointerTravelSample};
+        let style = SceneStyle { pointer: PointerStyle { hide_when_idle: false,
+            hide_when_typing: true, click_effects: false, ..Default::default() }, ..Default::default() };
+        let capture = PointerCaptureFile {
+            travel: vec![PointerTravelSample { time: 0.0, x: 0.5, y: 0.5,
+                kind: PointerTravelKind::Move, artwork_id: None }],
+            keystrokes: [0.1, 0.2, 0.3].into_iter().map(|time|
+                KeystrokeEvent { time, key: "Space".into(), modifiers: vec![] }).collect(),
+            ..Default::default()
+        };
+        let timeline = super::super::pointer_timeline::PointerTimeline::build(capture,
+            2.0, 400.0, 300.0, style.pointer.timeline_options());
+        let frame = timeline.frame_at(1.0).unwrap();
+        assert!(frame.opacity < 0.05);
+        let compositor = SceneCompositor::new(&style, 400, 300, 400, 300).unwrap();
+        let source = RgbaImage::from_pixel(400, 300, Rgba([255, 255, 255, 255]));
+        let render = |pointer| compositor.compose(FrameInput { source: &source, overlay: None,
+            viewport: ViewportFrame::default(), pointer, camera: None });
+        let plain = render(None);
+        let hidden_pointer = PointerOverlay { frame: frame.clone() };
+        let visible_pointer = PointerOverlay { frame: PointerFrame { opacity: 1.0,
+            blur_radius: 0.0, ..frame } };
+        let hidden = render(Some(&hidden_pointer));
+        let visible = render(Some(&visible_pointer));
+        let difference = |image: &RgbaImage| image.as_raw().iter().zip(plain.as_raw())
+            .map(|(a,b)| u64::from(a.abs_diff(*b))).sum::<u64>();
+        assert!(difference(&visible) > 1000);
+        assert!(difference(&hidden) * 10 < difference(&visible), "typing hide must reach final pixels independently");
+    }
+
+    #[test]
+    fn temporal_compositor_can_disable_or_scale_the_cursor_smear() {
+        assert_eq!(cursor_smear((2.0, 1.0), (500.0, 400.0), 60.0, 0.0), (0.0, 0.0));
+        let full = cursor_smear((2.0, 1.0), (500.0, 400.0), 60.0, 1.0);
+        let half = cursor_smear((2.0, 1.0), (500.0, 400.0), 60.0, 0.5);
+        assert_eq!(half, (full.0 * 0.5, full.1 * 0.5));
+    }
 
     fn compose_with_velocity(velocity: (f64, f64)) -> (RgbaImage, u32, u32) {
         let style = SceneStyle {

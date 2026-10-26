@@ -1,0 +1,4 @@
+# Model weights and runtime libraries must retain their exact bytes.
+*.onnx binary
+*.f32 binary
+*.so.* binary

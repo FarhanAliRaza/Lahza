@@ -284,52 +284,7 @@ pub fn load_or_rebuild_poster(
         .ok_or_else(|| VideoError::Decode("decoded recording preview had invalid pixels".into()))
 }
 
-/// Builds the exact non-destructive clip composition used by Studio preview.
-/// Video PTS and audio PTS are changed together for each clip, then the
-/// resulting streams are concatenated in editor order. The source is never
-/// modified and the destination is replaced only after FFmpeg succeeds.
-/// A gentle FFT denoiser that tracks the noise floor as it goes, so it
-/// only removes steady broadband hiss and leaves speech untouched.
-pub const NOISE_REDUCTION_FILTER: &str = "afftdn=nr=20:tn=1";
-
-/// Writes a copy of `source` with the video stream untouched and the audio
-/// run through [`NOISE_REDUCTION_FILTER`], so the editor can play what the
-/// export will sound like. The file only appears once it is complete.
-pub fn render_denoised_copy(source: &Path, destination: &Path) -> Result<(), VideoError> {
-    if let Some(mut bank) = super::media_bank::MediaBank::load(source)? {
-        for (index, entry) in bank.entries.iter_mut().enumerate() {
-            if !entry.info.has_audio { continue; }
-            let original = source.parent().unwrap().join(&entry.file);
-            let legacy_cache = source.parent().unwrap().join(super::model::RecordingSession::DENOISED_FILE);
-            let cache = if index == 0 && legacy_cache.exists() {
-                legacy_cache
-            } else { original.with_extension("denoised.mkv") };
-            if !cache.exists() { render_denoised_copy(&original, &cache)?; }
-            if entry.info.window_capture { fs::write(cache.with_extension("window.json"), b"{}")?; }
-            entry.file = cache.strip_prefix(source.parent().unwrap()).unwrap().into();
-        }
-        return bank.save(destination);
-    }
-    let temporary = temporary_video_sibling(destination);
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-i"])
-        .arg(source)
-        .args(["-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", "-af"])
-        .arg(NOISE_REDUCTION_FILTER)
-        .args(["-c:a", "libopus", "-b:a", "160k", "-f", "matroska"])
-        .arg(&temporary)
-        .output()?;
-    if !output.status.success() {
-        let _ = fs::remove_file(&temporary);
-        return Err(VideoError::Decode(format!(
-            "ffmpeg could not reduce noise: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    fs::rename(&temporary, destination)?;
-    Ok(())
-}
-
+/// Builds the non-destructive clip composition used by Studio preview.
 pub fn render_clip_preview(
     source: &Path,
     destination: &Path,
@@ -445,7 +400,14 @@ fn render_clip_timeline(
         ));
     }
 
-    let (inputs, filter) = super::media_bank::source_filter(source, &timeline, 0, true, info.has_audio)?;
+    let (mut inputs, mut filter) = super::media_bank::source_filter(source, &timeline, 0, true, false)?;
+    if info.has_audio {
+        let (audio_inputs, audio_filter) = super::export::source_audio_filter(
+            source, &timeline, inputs.len(), false, &Default::default())?;
+        inputs.extend(audio_inputs);
+        filter.push(';');
+        filter.push_str(&audio_filter);
+    }
 
     let temporary = temporary_video_sibling(destination);
     let mut command = Command::new("ffmpeg");
@@ -517,10 +479,15 @@ pub fn audio_levels(path: &Path, buckets: usize) -> Result<Vec<f32>, VideoError>
     if !info.has_audio || buckets == 0 || info.duration <= 0.0 {
         return Ok(Vec::new());
     }
+    // New recordings have independent microphone and desktop streams. The
+    // waveform describes their audible mix, rather than only stream zero.
+    let audio = super::audio_processing::ensure_audio(
+        path, false, &super::audio_processing::ProcessingControl::default(),
+    )?.unwrap_or_else(|| path.to_owned());
     const SAMPLE_RATE: usize = 8_000;
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
-        .arg(path)
+        .arg(&audio)
         .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
         .output()?;
     if !output.status.success() {

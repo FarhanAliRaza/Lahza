@@ -34,6 +34,7 @@ pub(crate) struct PreparedVideoProject {
     frame_rate: f64,
     recording_duration: f64,
     clip_timeline: RecordingClipTimeline,
+    media_bank: Option<recording::media_bank::MediaBank>,
     pointer_capture: PointerCaptureFile,
     saved_style: Option<SceneStyle>,
     source_size: (u32, u32),
@@ -54,6 +55,81 @@ mod recording_lifecycle_tests {
     use super::*;
     use crate::{asset_directory, open_studio_window, Assets};
     use gpui::{AppContext, Application, Timer};
+
+    #[test]
+    #[ignore = "requires an isolated X11 process; synthetic audio only"]
+    fn audio_preparation_is_project_scoped_and_does_not_lock_editing() {
+        let root = std::env::temp_dir().join(format!("lahza-audio-jobs-{}", uuid::Uuid::new_v4()));
+        let bad = RecordingSession::create_in(&root).unwrap();
+        std::fs::write(bad.screen_path(), b"invalid source for a superseded job").unwrap();
+        let good = RecordingSession::create_in(&root).unwrap();
+        assert!(std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=64x48:r=10:d=0.8",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=0.8", "-c:v", "ffv1", "-c:a", "pcm_s16le"])
+            .arg(good.screen_path()).status().unwrap().success());
+        let prepared = PreparedVideoProject::load(good.directory.clone()).unwrap();
+        Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+            let handle = open_studio_window(cx, false, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            let owner = handle.entity(cx).unwrap();
+            cx.spawn(async move |cx| {
+                owner.update(cx, |studio, cx| {
+                    studio.video_project = Some(bad);
+                    studio.set_video_noise_reduction(true, cx);
+                    let superseded = studio.video_audio_job.as_ref().unwrap().control.clone();
+                    studio.apply_video_project(prepared);
+                    assert!(superseded.is_cancelled());
+                    studio.set_video_noise_reduction(true, cx);
+                    assert!(!studio.video_edit_busy, "audio work must leave timeline editing available");
+                    studio.toggle_timeline_playback(cx);
+                    assert!(studio.video_audio_play_when_ready);
+                    studio.toggle_timeline_playback(cx);
+                    assert!(!studio.video_audio_play_when_ready, "Pause must cancel queued playback");
+                    studio.toggle_timeline_playback(cx);
+                    assert!(studio.video_audio_play_when_ready);
+                    studio.start_loading(crate::loading::LoadRequest::Image(
+                        good.directory.join("missing-image.png")), false, cx);
+                    assert!(!studio.video_audio_play_when_ready,
+                        "opening another document must cancel the old project's queued playback");
+                }).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    Timer::after(Duration::from_millis(30)).await;
+                    let ready = owner.update(cx, |studio, _| {
+                        assert_eq!(studio.video_project.as_ref(), Some(&good));
+                        assert!(studio.video_noise_reduction, "stale failure changed the new project's setting");
+                        assert!(!studio.video_edit_busy);
+                        assert!(!studio.video_playing, "old audio started behind the loading screen");
+                        studio.video_audio_job.is_none()
+                    }).unwrap();
+                    if ready { break; }
+                    assert!(Instant::now() < deadline, "audio preparation did not finish");
+                }
+                owner.update(cx, |studio, cx| {
+                    assert!(studio.video_audio_error.is_none(), "{:?}", studio.video_audio_error);
+                    assert!(recording::audio_processing::source_is_prepared(&good.screen_path(), true));
+                    // Closing the editor must invalidate a new pending job,
+                    // without changing unrelated busy/error state afterward.
+                    studio.set_video_noise_reduction(false, cx);
+                    let closing = studio.video_audio_job.as_ref().map(|job| job.control.clone());
+                    studio.close_video_editor(cx);
+                    if let Some(closing) = closing { assert!(closing.is_cancelled()); }
+                }).unwrap();
+                Timer::after(Duration::from_millis(150)).await;
+                owner.update(cx, |studio, _| {
+                    assert!(studio.video_project.is_none());
+                    assert!(studio.video_audio_job.is_none());
+                    assert!(studio.video_audio_error.is_none());
+                    assert!(!studio.video_edit_busy);
+                }).unwrap();
+                let window = owner.update(cx, |studio, _| studio.window_handle).unwrap();
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+                std::fs::remove_dir_all(root).unwrap();
+                cx.update(|cx| cx.quit()).unwrap();
+            }).detach();
+        });
+    }
 
     #[test]
     #[ignore = "requires a native display (run under Xvfb)"]
@@ -124,6 +200,8 @@ mod recording_lifecycle_tests {
 impl PreparedVideoProject {
     pub(crate) fn load(directory: PathBuf) -> Result<Self, String> {
         let session = RecordingSession { directory };
+        session.recover_interrupted_capture()
+            .map_err(|error| format!("Could not recover recording: {error}"))?;
         let mut manifest = session
             .read_manifest()
             .map_err(|error| format!("Could not open recording manifest: {error}"))?;
@@ -148,6 +226,7 @@ impl PreparedVideoProject {
                 .map_err(|error| format!("Could not decode recording preview: {error}"))?;
         let source = recording::media::source_path(&session).map_err(|error| error.to_string())?;
         let source_info = probe_media(&source).map_err(|error| error.to_string())?;
+        let media_bank=recording::media_bank::MediaBank::load(&source).map_err(|error|error.to_string())?;
         let audio_clips = session.read_edit_field::<Vec<recording::media::AudioClip>>("audioClips")
             .map_err(|error| error.to_string())?.unwrap_or_default();
         for clip in &audio_clips {
@@ -190,7 +269,7 @@ impl PreparedVideoProject {
             .map_err(|error| format!("Could not load zoom edits: {error}"))?
             .unwrap_or(generated_zoom_cues);
         let viewport_timeline = ViewportTimeline::build_for_viewport(
-            &zoom_cues,
+            &saved_style.as_ref().map(|style|style.animation).unwrap_or_default().cues(&zoom_cues),
             &pointer_timeline,
             &clip_timeline,
             &pointer_capture,
@@ -218,7 +297,7 @@ impl PreparedVideoProject {
             window_capture: source_info.window_capture,
             recording_duration: manifest.duration,
             pointer_synthesized: manifest.pointer_synthesized,
-            session, poster, source_duration, clip_timeline, pointer_capture, saved_style,
+            session, poster, source_duration, clip_timeline, media_bank, pointer_capture, saved_style,
             source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
             saved_annotations, camera_path, audio_clips, transcript,
         })
@@ -740,6 +819,7 @@ impl Studio {
     /// project's draft file, so reopening the recording restores them.
     pub(super) fn close_video_editor(&mut self, cx: &mut Context<Self>) {
         self.pause_video_playback();
+        self.cancel_audio_preparation();
         self.clear_timeline_preview();
         self.reset_timeline_thumbnails();
         self.reset_timeline_interactions();
@@ -757,6 +837,9 @@ impl Studio {
         self.video_selected_clip = None;
         self.video_selected_zoom_cue = None;
         self.video_camera_path = None;
+        self.camera_regions.clear();
+        self.selected_camera_region = None;
+        self.camera_region_drag = None;
         self.video_audio_clips.clear();
         self.camera_frame_rgba = None;
         // Recording motion must not leak into a later screenshot animation.
@@ -766,6 +849,8 @@ impl Studio {
         self.video_duration = 0.0;
         self.video_source_duration = 0.0;
         self.video_clip_timeline = RecordingClipTimeline::default();
+        self.video_motion_clip_timeline=RecordingClipTimeline::default();
+        self.video_media_bank=None;
         self.toast = None;
         cx.notify();
     }
@@ -801,11 +886,17 @@ impl Studio {
     }
 
     pub(crate) fn apply_video_project(&mut self, prepared: PreparedVideoProject) {
+        self.pause_video_playback();
+        self.cancel_audio_preparation();
+        self.video_audio_prepare_pending = true;
+        self.camera_regions.clear();
+        self.selected_camera_region = None;
+        self.camera_region_drag = None;
         self.clear_timeline_preview();
         self.reset_timeline_thumbnails();
         self.reset_timeline_interactions();
         let PreparedVideoProject {
-            session, poster, source_duration, frame_rate, clip_timeline, pointer_capture, saved_style,
+            session, poster, source_duration, frame_rate, clip_timeline, media_bank, pointer_capture, saved_style,
             source_size, pointer_timeline, zoom_cues, viewport_timeline, saved_extras,
             saved_annotations, window_capture, pointer_synthesized, camera_path, audio_clips, recording_duration,
             transcript,
@@ -838,6 +929,8 @@ impl Studio {
         self.video_playing = false;
         self.video_edit_busy = false;
         self.video_selected_clip = clip_timeline.segments.first().map(|clip| clip.id);
+        self.video_motion_clip_timeline=media_bank.as_ref().map_or_else(||clip_timeline.clone(),|bank|bank.ranges(&clip_timeline));
+        self.video_media_bank=media_bank;
         self.video_clip_timeline = clip_timeline;
         self.video_undo_stack.clear();
         self.video_redo_stack.clear();
@@ -876,7 +969,8 @@ impl Studio {
         let extras = saved_extras.clone().unwrap_or_default();
         self.video_audio_muted = extras.audio_muted;
         self.video_audio_clips = audio_clips;
-        self.video_noise_reduction = extras.noise_reduction;
+        self.video_audio_mode = extras.effective_audio_mode();
+        self.video_noise_reduction = self.video_audio_mode.requires_neural();
         self.video_removed_presses = extras.removed_press_times;
         self.persisted_extras = saved_extras;
         self.enter_video_annotations(saved_annotations);

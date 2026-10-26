@@ -73,6 +73,8 @@ export default class LahzaInputCapture extends Extension {
                 lastY: Number.NaN,
                 lastButtons: 0,
                 lastHeartbeatUs: 0,
+                hoverKnown: false,
+                lastHoverTarget: null,
             };
             this._write({kind: 'ready'});
             this._sampleTimer = GLib.timeout_add(
@@ -123,6 +125,20 @@ export default class LahzaInputCapture extends Extension {
         const nowUs = Number(GLib.get_monotonic_time());
         const moved = x !== this._capture.lastX || y !== this._capture.lastY;
         const heartbeat = nowUs - this._capture.lastHeartbeatUs >= 1_000_000;
+
+        // Actor identity stays in memory only. On client surfaces this sees
+        // surface transitions, not private in-process DOM/widget identities.
+        try {
+            const target = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
+            if (this._capture.hoverKnown && target !== this._capture.lastHoverTarget) {
+                this._write({kind: 'hover', x, y, window: this._focusedWindowRect()});
+            }
+            this._capture.lastHoverTarget = target;
+            this._capture.hoverKnown = true;
+        } catch (_) {
+            // Older compositor APIs can omit actor picking; do not invent
+            // hover events from movement or cursor-image changes instead.
+        }
 
         const changed = buttons ^ this._capture.lastButtons;
         for (let button = 1; button <= 5; button++) {

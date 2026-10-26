@@ -1,0 +1,49 @@
+{
+  "corpus": "CSTR VCTK Corpus: English Multi-speaker Corpus for CSTR Voice Cloning Toolkit (version 0.92)",
+  "creators": [
+    "Junichi Yamagishi",
+    "Christophe Veaux",
+    "Kirsten MacDonald"
+  ],
+  "publisher": "University of Edinburgh, Centre for Speech Technology Research",
+  "year": 2019,
+  "corpus_url": "https://doi.org/10.7488/ds/2645",
+  "license": "CC-BY-4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "license_evidence": "https://datashare.ed.ac.uk/items/30e7453c-9ea8-48b4-8e18-f96d0dc62928/full",
+  "demo_url": "https://tf-restormer.github.io/demo/",
+  "use": "Public speech fixtures for local model validation; not bundled application audio.",
+  "modifications": {
+    "*-clean.wav": "Reference speech served by the TF-Restormer authors; the hash identifies their exact downloaded WAV.",
+    "*-input.wav": "The authors' 16 kHz-to-48 kHz degraded-input demo; the hash identifies their exact downloaded WAV.",
+    "*-noisy.wav": "Generated locally from clean speech by tools/validate_neural_audio.py using seeded mathematical fan, hiss and typing-like noise; not an upstream download.",
+    "*-reference.wav": "The same clean speech scaled to preserve headroom for the generated noise fixture.",
+    "*-moss-python.wav": "Generated locally by tools/validate_mossformer_audio.py using public MossFormer2 weights."
+  },
+  "files": {
+    "p360_072_mic1-clean.wav": {
+      "url": "https://tf-restormer.github.io/demo/samples/vctk_clean/16k_to_48k/clean/p360_072_mic1.wav",
+      "sha256": "a501fe9b60979e9e9a97bca49c99c60d97efa9edeab4cda08c6bc988c870f92a"
+    },
+    "p360_072_mic1-input.wav": {
+      "url": "https://tf-restormer.github.io/demo/samples/vctk_clean/16k_to_48k/input/p360_072_mic1.wav",
+      "sha256": "089dacc16f7225498bac08842a797ff9cb0afae34feed140fb6af8afde41d2cc"
+    },
+    "p362_054_mic1-clean.wav": {
+      "url": "https://tf-restormer.github.io/demo/samples/vctk_clean/16k_to_48k/clean/p362_054_mic1.wav",
+      "sha256": "7a1634f133103640c1805fc4ded843501ca4b6523ecd63d01ffdbf5782d5b7a9"
+    },
+    "p362_054_mic1-input.wav": {
+      "url": "https://tf-restormer.github.io/demo/samples/vctk_clean/16k_to_48k/input/p362_054_mic1.wav",
+      "sha256": "f127f3700a1130ce74a2d6382d0ec67b40f261a63dedb002fa79c720fffd20d1"
+    },
+    "p363_260_mic1-clean.wav": {
+      "url": "https://tf-restormer.github.io/demo/samples/vctk_clean/16k_to_48k/clean/p363_260_mic1.wav",
+      "sha256": "d709808ad9e6e4c8ca59ff6ffa0eed12a6141d2b31ab5d0c5f02de307446a359"
+    },
+    "p363_260_mic1-input.wav": {
+      "url": "https://tf-restormer.github.io/demo/samples/vctk_clean/16k_to_48k/input/p363_260_mic1.wav",
+      "sha256": "45c818d92e6d240bd52c5dcea7a9d77f7f4c981f755fee215e2126f3483f7abb"
+    }
+  }
+}

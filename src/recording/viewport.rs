@@ -420,6 +420,22 @@ impl ViewportTimeline {
 
     pub fn focus_bounds(&self) -> (f64, f64) { self.focus_bounds }
 
+    /// Shutter samples must stay on the same side of an authored instant cut.
+    pub fn constrain_shutter(&self, time:f64, mut start:f64, mut end:f64)->(f64,f64) {
+        for cue in self.cues.iter().filter(|cue|cue.is_enabled && cue.skips_easing) {
+            for slice in self.clips.slices_overlapping(cue.start,cue.end) {
+                for (source, boundary, authored) in [(slice.source_start,slice.editor_start,cue.start),
+                    (slice.source_end,slice.editor_end,cue.end)] {
+                    // Clipping one region into contiguous editing segments
+                    // does not introduce a new authored instant transition.
+                    if (source-authored).abs()>1e-6 {continue;}
+                    if boundary<=time {start=start.max(boundary);} else {end=end.min(boundary-1e-7);}
+                }
+            }
+        }
+        (start.min(time),end.max(time))
+    }
+
     pub fn reframe(&self) -> Option<&Reframe> {
         self.reframe.as_deref()
     }

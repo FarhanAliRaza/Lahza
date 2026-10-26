@@ -22,6 +22,8 @@ pub fn wait_until_ready(
 
 pub struct CameraPlaybackDecoder {
     path: PathBuf,
+    maximum_size: (u32, u32),
+    frame_rate: Option<f64>,
     stream: Option<VideoFrameStream>,
     current: Option<(f64, Arc<RgbaImage>)>,
     exhausted_at: Option<f64>,
@@ -31,8 +33,18 @@ pub struct CameraPlaybackDecoder {
 
 impl CameraPlaybackDecoder {
     pub fn new(path: PathBuf) -> Self {
+        let mut decoder = Self::new_with_size(path, (640, 640));
+        decoder.frame_rate = Some(30.0);
+        decoder
+    }
+
+    /// Export can retain native webcam detail for full-screen/split layouts;
+    /// interactive playback keeps its existing bounded proxy.
+    pub fn new_with_size(path: PathBuf, maximum_size: (u32, u32)) -> Self {
         Self {
             path,
+            maximum_size,
+            frame_rate: None,
             stream: None,
             current: None,
             exhausted_at: None,
@@ -71,9 +83,9 @@ impl CameraPlaybackDecoder {
             self.stream = Some(VideoFrameStream::open_with_frame_rate(
                 &self.path,
                 target,
-                640,
-                640,
-                Some(30.0),
+                self.maximum_size.0,
+                self.maximum_size.1,
+                self.frame_rate,
             )?);
             #[cfg(test)]
             {
@@ -142,6 +154,75 @@ mod tests {
         let (ready, receiver) = mpsc::sync_channel(1);
         drop(ready);
         assert!(!wait_until_ready(&receiver, || false));
+    }
+
+    #[test]
+    fn export_and_paused_camera_decoders_retain_native_detail() {
+        let root =
+            std::env::temp_dir().join(format!("lahza-camera-native-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("camera.mkv");
+        let output = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=1280x720:r=60:d=0.3",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut playing = CameraPlaybackDecoder::new(path.clone());
+        assert_eq!(
+            playing
+                .frame_at(Some(0.0), || false)
+                .unwrap()
+                .unwrap()
+                .1
+                .dimensions(),
+            (640, 360)
+        );
+        assert_eq!(playing.stream.as_ref().unwrap().frame_rate(), 30.0);
+        drop(playing);
+        let mut export = CameraPlaybackDecoder::new_with_size(path.clone(), (1280, 720));
+        assert_eq!(
+            export
+                .frame_at(Some(0.0), || false)
+                .unwrap()
+                .unwrap()
+                .1
+                .dimensions(),
+            (1280, 720)
+        );
+        assert_eq!(export.stream.as_ref().unwrap().frame_rate(), 60.0);
+        drop(export);
+        let paused = super::super::video::decode_frame(&path, 0.0, u32::MAX, u32::MAX).unwrap();
+        assert_eq!((paused.width, paused.height), (1280, 720));
+        let source = super::super::motion_blur::VideoSource {
+            path,
+            size: (u32::MAX, u32::MAX),
+            revision: 0,
+        };
+        let mut temporal = super::super::motion_blur::FrameCache::default();
+        assert_eq!(
+            temporal
+                .frame(&source, 0.0, &|| false)
+                .unwrap()
+                .dimensions(),
+            (1280, 720)
+        );
+        drop(temporal);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

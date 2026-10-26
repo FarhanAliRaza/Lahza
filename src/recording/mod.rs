@@ -1,9 +1,18 @@
 #![allow(dead_code)]
 
 pub mod area;
+pub mod animation;
+pub mod audio_processing;
+pub mod audio_mode;
+pub mod audio_dsp;
+pub mod neural_audio;
+pub mod restoration_audio;
 pub mod area_indicator;
 pub mod camera_preview;
 pub mod camera_layout;
+pub mod camera_timeline;
+pub mod camera_matting;
+mod camera_matting_runtime;
 pub mod camera_playback;
 pub mod capture_exclusion;
 pub mod clips;
@@ -25,6 +34,7 @@ pub mod speech_setup;
 pub mod teleprompter;
 pub mod cloud;
 pub mod motion;
+pub mod motion_blur;
 pub mod loupe;
 pub mod native;
 pub mod overlays;
@@ -40,3 +50,6 @@ mod stream_geometry;
 pub mod templates;
 pub mod video;
 pub mod viewport;
+mod temporal_decode;
+
+mod primary_frames;

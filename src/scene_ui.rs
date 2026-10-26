@@ -25,10 +25,10 @@ use crate::{
         model::NormalizedPoint,
         presets::ScenePreset,
         scene::{
-            CameraLayout, MediaProjection, PointerMotion, PointerOverlay, SceneCompositor,
+            CameraLayout, CameraOverlay, MediaProjection, PointerOverlay, SceneCompositor,
             SceneGeometry, SceneStyle, SceneTransform, WatermarkPosition,
         },
-        viewport::{MotionEasing, ViewportFrame, ViewportTimeline},
+        viewport::{MotionEasing, ViewportFrame},
     },
     timed::{self, AnnotationTiming, EntranceEffect, ExitEffect},
     AnnotationMark, SliderDrag, Studio, Tool, BACKGROUND_PRESETS,
@@ -245,11 +245,19 @@ pub(crate) enum SceneSlider {
     CameraCropX,
     CameraCropY,
     CameraSplitRatio,
+    CameraCutoutSoftness,
+    CameraCutoutInset,
+    MotionBlurAmount,
 }
 
 impl SceneSlider {
+    fn is_camera(self) -> bool {
+        matches!(self, Self::CameraSize | Self::CameraMargin | Self::CameraZoomedSize | Self::CameraCornerRadius
+            | Self::CameraCropZoom | Self::CameraCropX | Self::CameraCropY | Self::CameraSplitRatio
+            | Self::CameraCutoutSoftness | Self::CameraCutoutInset)
+    }
     const BASE: usize = 100;
-    const ALL: [SceneSlider; 30] = [
+    const ALL: [SceneSlider; 33] = [
         SceneSlider::Scale,
         SceneSlider::PositionX,
         SceneSlider::PositionY,
@@ -280,6 +288,9 @@ impl SceneSlider {
         SceneSlider::CameraCropX,
         SceneSlider::CameraCropY,
         SceneSlider::CameraSplitRatio,
+        SceneSlider::CameraCutoutSoftness,
+        SceneSlider::CameraCutoutInset,
+        SceneSlider::MotionBlurAmount,
     ];
 
     pub(crate) fn id(self) -> usize {
@@ -293,6 +304,7 @@ impl SceneSlider {
 
     fn label(self) -> &'static str {
         match self {
+            SceneSlider::MotionBlurAmount => "Motion blur",
             SceneSlider::Scale => "Scale",
             SceneSlider::PositionX => "Position X",
             SceneSlider::PositionY => "Position Y",
@@ -323,12 +335,15 @@ impl SceneSlider {
             SceneSlider::CameraCropX => "Crop horizontal",
             SceneSlider::CameraCropY => "Crop vertical",
             SceneSlider::CameraSplitRatio => "Screen share",
+            SceneSlider::CameraCutoutSoftness => "Edge softness",
+            SceneSlider::CameraCutoutInset => "Edge inset",
 
         }
     }
 
     fn range(self) -> (f64, f64) {
         match self {
+            SceneSlider::MotionBlurAmount => (0.0, 100.0),
             SceneSlider::CursorIdleDelay => (0.5, 5.0),
             SceneSlider::CursorRotation => (0.0, 100.0),
             SceneSlider::CursorLoopDuration => (0.2, 3.0),
@@ -338,6 +353,8 @@ impl SceneSlider {
             SceneSlider::CameraCropX => (0.0, 100.0),
             SceneSlider::CameraCropY => (0.0, 100.0),
             SceneSlider::CameraSplitRatio => (25.0, 75.0),
+            SceneSlider::CameraCutoutSoftness => (0.0, 100.0),
+            SceneSlider::CameraCutoutInset => (-30.0, 30.0),
             SceneSlider::Scale => (SceneTransform::MIN_SCALE, SceneTransform::MAX_SCALE),
             SceneSlider::PositionX | SceneSlider::PositionY =>
                 (-SceneTransform::MAX_POSITION, SceneTransform::MAX_POSITION),
@@ -373,6 +390,7 @@ impl SceneSlider {
             SceneSlider::CameraCropX => 50.0,
             SceneSlider::CameraCropY => 50.0,
             SceneSlider::CameraSplitRatio => 60.0,
+            SceneSlider::CameraCutoutSoftness => 20.0,
             SceneSlider::Scale => 1.0,
             SceneSlider::Perspective => SceneTransform::IDENTITY.perspective,
             SceneSlider::AnchorX | SceneSlider::AnchorY => 0.5,
@@ -419,15 +437,18 @@ impl SceneSlider {
     fn get(self, studio: &Studio) -> f64 {
         let transform = studio.scene_transform;
         match self {
+            SceneSlider::MotionBlurAmount => studio.animation_settings.motion_blur as f64,
             SceneSlider::CursorIdleDelay => studio.pointer_style.idle_hide_delay,
             SceneSlider::CursorRotation => studio.pointer_style.rotation_strength * 100.0,
             SceneSlider::CursorLoopDuration => studio.pointer_style.loop_return_duration,
-            SceneSlider::CameraZoomedSize => studio.camera_overlay.zoomed_size.unwrap_or(studio.camera_overlay.size) as f64,
-            SceneSlider::CameraCornerRadius => studio.camera_overlay.corner_radius.unwrap_or(18) as f64,
-            SceneSlider::CameraCropZoom => studio.camera_overlay.crop_zoom as f64,
-            SceneSlider::CameraCropX => studio.camera_overlay.crop_center.0 * 100.0,
-            SceneSlider::CameraCropY => studio.camera_overlay.crop_center.1 * 100.0,
-            SceneSlider::CameraSplitRatio => studio.camera_overlay.split_ratio as f64,
+            SceneSlider::CameraZoomedSize => studio.camera_edit_overlay().zoomed_size.unwrap_or(studio.camera_edit_overlay().size) as f64,
+            SceneSlider::CameraCornerRadius => studio.camera_edit_overlay().corner_radius.unwrap_or(18) as f64,
+            SceneSlider::CameraCropZoom => studio.camera_edit_overlay().crop_zoom as f64,
+            SceneSlider::CameraCropX => studio.camera_edit_overlay().crop_center.0 * 100.0,
+            SceneSlider::CameraCropY => studio.camera_edit_overlay().crop_center.1 * 100.0,
+            SceneSlider::CameraSplitRatio => studio.camera_edit_overlay().split_ratio as f64,
+            SceneSlider::CameraCutoutSoftness => studio.camera_edit_overlay().cutout_softness as f64,
+            SceneSlider::CameraCutoutInset => studio.camera_edit_overlay().cutout_inset as f64,
             SceneSlider::Scale => transform.scale,
             SceneSlider::PositionX => transform.position_x,
             SceneSlider::PositionY => transform.position_y,
@@ -450,8 +471,8 @@ impl SceneSlider {
                 .and_then(|mark| mark.timing)
                 .map(|timing| timing.transition)
                 .unwrap_or(0.35),
-            SceneSlider::CameraSize => studio.camera_overlay.size as f64,
-            SceneSlider::CameraMargin => studio.camera_overlay.margin as f64,
+            SceneSlider::CameraSize => studio.camera_edit_overlay().size as f64,
+            SceneSlider::CameraMargin => studio.camera_edit_overlay().margin as f64,
             SceneSlider::SubtitlePosition => studio.subtitle_style.vertical_position * 100.0,
             SceneSlider::SubtitleSize => studio.subtitle_style.font_scale * 100.0,
         }
@@ -461,15 +482,21 @@ impl SceneSlider {
         let (min, max) = self.range();
         let value = value.clamp(min, max);
         match self {
+            SceneSlider::MotionBlurAmount => {
+                studio.animation_settings.motion_blur = value.round() as u8;
+                studio.export_motion_blur = false;
+            }
             SceneSlider::CursorIdleDelay => studio.pointer_style.idle_hide_delay = value,
             SceneSlider::CursorRotation => studio.pointer_style.rotation_strength = value / 100.0,
             SceneSlider::CursorLoopDuration => studio.pointer_style.loop_return_duration = value,
-            SceneSlider::CameraZoomedSize => studio.camera_overlay.zoomed_size = Some(value.round() as u8),
-            SceneSlider::CameraCornerRadius => studio.camera_overlay.corner_radius = Some(value.round() as u8),
-            SceneSlider::CameraCropZoom => studio.camera_overlay.crop_zoom = value.round() as u16,
-            SceneSlider::CameraCropX => studio.camera_overlay.crop_center.0 = value / 100.0,
-            SceneSlider::CameraCropY => studio.camera_overlay.crop_center.1 = value / 100.0,
-            SceneSlider::CameraSplitRatio => studio.camera_overlay.split_ratio = value.round() as u8,
+            SceneSlider::CameraZoomedSize => studio.edit_camera_overlay(|camera| camera.zoomed_size = Some(value.round() as u8)),
+            SceneSlider::CameraCornerRadius => studio.edit_camera_overlay(|camera| camera.corner_radius = Some(value.round() as u8)),
+            SceneSlider::CameraCropZoom => studio.edit_camera_overlay(|camera| camera.crop_zoom = value.round() as u16),
+            SceneSlider::CameraCropX => studio.edit_camera_overlay(|camera| camera.crop_center.0 = value / 100.0),
+            SceneSlider::CameraCropY => studio.edit_camera_overlay(|camera| camera.crop_center.1 = value / 100.0),
+            SceneSlider::CameraSplitRatio => studio.edit_camera_overlay(|camera| camera.split_ratio = value.round() as u8),
+            SceneSlider::CameraCutoutSoftness => studio.edit_camera_overlay(|camera| camera.cutout_softness = value.round() as u8),
+            SceneSlider::CameraCutoutInset => studio.edit_camera_overlay(|camera| camera.cutout_inset = value.round() as i8),
             SceneSlider::Scale => studio.scene_transform.scale = value,
             SceneSlider::PositionX => studio.scene_transform.position_x = value,
             SceneSlider::PositionY => studio.scene_transform.position_y = value,
@@ -486,8 +513,8 @@ impl SceneSlider {
             SceneSlider::WatermarkSize => studio.watermark.size = value.round() as u8,
             SceneSlider::WatermarkOpacity => studio.watermark.opacity = value.round() as u8,
             SceneSlider::DefaultZoom => studio.default_motion_zoom = value,
-            SceneSlider::CameraSize => studio.camera_overlay.size = value.round() as u8,
-            SceneSlider::CameraMargin => studio.camera_overlay.margin = value.round() as u8,
+            SceneSlider::CameraSize => studio.edit_camera_overlay(|camera| camera.size = value.round() as u8),
+            SceneSlider::CameraMargin => studio.edit_camera_overlay(|camera| camera.margin = value.round() as u8),
             SceneSlider::SubtitlePosition => studio.subtitle_style.vertical_position = value / 100.0,
             SceneSlider::SubtitleSize => studio.subtitle_style.font_scale = value / 100.0,
             SceneSlider::AnnotationTransition => {
@@ -674,7 +701,7 @@ mod motion_picking_tests {
     fn paused_preview_cache_tracks_motion_edits() {
         let key = PreviewKey {
             style: SceneStyle::default(),
-            canvas: (960, 540),
+            canvas: (960, 540), presentation_canvas:(960,540),
             source_size: (1920, 1080),
             source: 1,
             time_bits: 5.0_f64.to_bits(),
@@ -685,6 +712,7 @@ mod motion_picking_tests {
             generation: 0,
             media: PreviewMedia::Image(1),
             high_quality: true,
+            motion: None,
         };
         let mut edited = key.clone();
         edited.viewport.magnification = 2.0;
@@ -814,7 +842,9 @@ impl Studio {
             self.watermark = watermark;
         }
         self.pointer_style = style.pointer;
+        self.animation_settings = style.animation;
         self.camera_overlay = style.camera;
+        self.camera_regions = style.camera_regions.clone();
         self.input_overlays = style.input_overlays;
         self.content_fill = style.fill;
         self.restore_canvas_ratio(style.aspect);
@@ -850,7 +880,7 @@ impl Studio {
     /// Autosaves scene settings into the recording's edit draft when they
     /// changed since the last save (called from render, skipped mid-drag).
     pub(crate) fn autosave_scene_style(&mut self) {
-        if self.slider_drag.is_some() || self.media_drag.is_some() || self.camera_drag.is_some() {
+        if self.slider_drag.is_some() || self.media_drag.is_some() || self.camera_drag.is_some() || self.camera_region_drag.is_some() {
             return;
         }
         let Some(session) = self.video_project.as_ref() else {
@@ -869,6 +899,7 @@ impl Studio {
         let extras = crate::RecordingExtras {
             audio_muted: self.video_audio_muted,
             noise_reduction: self.video_noise_reduction,
+            audio_mode: Some(self.video_audio_mode),
             removed_press_times: self.video_removed_presses.clone(),
         };
         if self.persisted_extras.as_ref() != Some(&extras) {
@@ -928,6 +959,8 @@ impl Studio {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            if slider.is_camera() { this.record_camera_edit(); }
+                            if slider == SceneSlider::MotionBlurAmount { this.record_animation_edit(); }
                             this.slider_drag = Some(SliderDrag {
                                 slider_id: id,
                                 start_x: event.position.x,
@@ -970,6 +1003,7 @@ impl Studio {
                     .cursor_pointer()
                     .child("−")
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if slider == SceneSlider::MotionBlurAmount && slider.get(this) > slider.range().0 { this.record_animation_edit(); }
                         slider.set(this, slider.get(this) - slider.step());
                         cx.notify();
                     })),
@@ -999,6 +1033,7 @@ impl Studio {
                     .cursor_pointer()
                     .child("+")
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if slider == SceneSlider::MotionBlurAmount && slider.get(this) < slider.range().1 { this.record_animation_edit(); }
                         slider.set(this, slider.get(this) + slider.step());
                         cx.notify();
                     })),
@@ -1017,6 +1052,7 @@ impl Studio {
                         this.cursor_pointer()
                             .hover(|style| style.text_color(ink()))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if slider == SceneSlider::MotionBlurAmount { this.record_animation_edit(); }
                                 slider.set(this, slider.default_value());
                                 cx.notify();
                             }))
@@ -1072,12 +1108,21 @@ impl Studio {
         if self.annotations.is_empty() && self.annotation_draft.is_none() {
             return None;
         }
-        let (width, height) = self.media_dimensions()?;
+        let source_size = self.media_dimensions()?;
+        let (width, height) = source_size;
         // This is a preview texture, not an export. Rasterizing a 4K layer
         // for every pointer sample needlessly stalls the UI thread.
         let (width, height) = annotation_preview_size((width, height), canvas);
         let viewport = self.video_viewport_timeline.frame_at(time);
-        let crop = self.scene_style().source_crop;
+        let mut style = self.scene_style();
+        if self.video_project.is_some() {
+            let source_time = self.video_clip_timeline.content_source_time_at(time).unwrap_or(time);
+            style.camera = style.camera_at(source_time, canvas, self.camera_source_aspect(), viewport.magnification);
+        }
+        let geometry = SceneGeometry::layout(canvas.0 as f64, canvas.1 as f64,
+            source_size.0 as f64, source_size.1 as f64, &style);
+        let viewport = geometry.camera_viewport(viewport, &style, source_size);
+        let crop = style.source_crop;
         let marks: Vec<_> = self.annotations.iter().chain(self.annotation_draft.iter())
             .enumerate().filter(|(_, mark)| !mark.is_canvas())
             .filter_map(|(index, mark)| {
@@ -1120,7 +1165,7 @@ impl Studio {
         } else {
             1.0
         };
-        let canvas = playback_canvas_size((
+        let mut canvas = playback_canvas_size((
             (f32::from(canvas_width) * proxy * self.preview_cache.display_scale).round().max(2.0) as u32,
             (f32::from(canvas_height) * proxy * self.preview_cache.display_scale).round().max(2.0) as u32,
         ), self.video_playing);
@@ -1136,21 +1181,53 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        let overlay = if viewport.loupe.is_some() || !style.transform.with_motion(viewport).is_identity() || self.has_media_image_overlays() {
-            self.preview_overlay(time, canvas)
-        } else {
-            None
-        };
         let has_pointer = (self.video_project.is_some() && self.video_pointer_synthesized)
             || (self.animation_active && self.has_walkthrough());
-        let camera = if self.video_project.is_some() && self.camera_overlay.enabled {
+        let camera = if self.video_project.is_some() && style.has_camera_content() {
             self.camera_frame_rgba.clone()
         } else {
             None
         };
+        let high_quality = !self.video_playing && proxy == 1.0
+            && self.timeline_skim_time().is_none() && self.video_seek_drag.is_none()
+            && (self.video_project.is_none() || self.video_window_capture || source_size == self.video_source_size);
+        let presentation_canvas=canvas;
+        let make_motion=|canvas| {
+            Arc::new(crate::recording::motion_blur::plan(&style,&self.video_viewport_timeline,
+                has_pointer.then_some(&self.video_pointer_timeline),
+                self.video_project.as_ref().map(|_|&self.video_motion_clip_timeline),time,self.video_duration,
+                self.export_frame_rate,canvas,source_size,self.camera_source_aspect(),
+                if high_quality {crate::recording::motion_blur::Quality::High}
+                else {crate::recording::motion_blur::Quality::Playing}))
+        };
+        let mut motion=(self.video_project.is_some() || self.animation_active).then(||make_motion(canvas));
+        if self.video_playing {
+            if let Some(plan)=&motion {
+                let bounded=crate::scene_preview::temporal_playback_canvas_size(canvas,plan.samples.len());
+                if bounded!=canvas {canvas=bounded;motion=Some(make_motion(canvas));}
+            }
+        }
+        let overlay = if !self.annotations_paint_flat() || self.has_media_image_overlays() {
+            self.preview_overlay(time, canvas)
+        } else {
+            None
+        };
+        let temporal_overlay = motion.as_ref().filter(|plan| plan.samples.len() > 1)
+            .and_then(|_| {
+                let marks:Vec<_> = self.annotations.iter().chain(self.annotation_draft.iter())
+                    .enumerate().filter(|(_,mark)| !mark.is_canvas())
+                    .map(|(index,mark)|(mark.clone(),self.annotation_is_live(index))).collect();
+                if marks.is_empty() { return None; }
+                let dimensions=self.media_dimensions()?;
+                Some(crate::scene_preview::TemporalOverlay {marks,size:annotation_preview_size(dimensions,canvas)})
+            });
+        let authored_overlay_signature = temporal_overlay.as_ref().map_or(0, |overlay| {
+            let marks:Vec<_>=overlay.marks.iter().map(|(mark,_)|mark.clone()).collect();
+            timed::marks_signature(&marks)
+        });
         let key = PreviewKey {
             style: style.clone(),
-            canvas,
+            canvas, presentation_canvas,
             source_size,
             source: Arc::as_ptr(&source) as usize
                 ^ camera
@@ -1162,7 +1239,7 @@ impl Studio {
             overlay: overlay
                 .as_ref()
                 .map(|(signature, _)| *signature)
-                .unwrap_or(0),
+                .unwrap_or(0) ^ authored_overlay_signature,
             pointer: has_pointer,
             media_visible: self.image_visible_at(time),
             generation: self.video_playback_generation.load(std::sync::atomic::Ordering::SeqCst),
@@ -1170,10 +1247,8 @@ impl Studio {
                 .unwrap_or_else(|| PreviewMedia::Image(Arc::as_ptr(&source) as usize)),
             // Hover/scrub decodes are deliberately small. Never spend neural
             // work enlarging those proxies; release supplies original pixels.
-            high_quality: !self.video_playing && proxy == 1.0
-                && self.timeline_skim_time().is_none() && self.video_seek_drag.is_none()
-                && (self.video_project.is_none() || self.video_window_capture
-                    || source_size == self.video_source_size),
+            high_quality,
+            motion,
         };
         if let Some((cached, image)) = self.preview_cache.frame.as_ref() {
             if *cached == key {
@@ -1195,8 +1270,14 @@ impl Studio {
         }
         let worker = self.preview_cache.worker.as_ref().unwrap();
         worker.request(PreviewJob {
-            key: key.clone(), source,
+            playing: self.video_playing,
+            key: key.clone(), source, temporal_overlay,
             overlay: overlay.map(|(_, layer)| layer), pointer, camera,
+            screen_video:self.video_playback_path().map(|path|crate::recording::motion_blur::VideoSource {
+                path,size:self.video_source_size,revision:self.video_extras_token}),
+            camera_video:self.video_camera_path.clone().map(|path|crate::recording::motion_blur::VideoSource {
+                path,size:if high_quality {(u32::MAX,u32::MAX)}else{(640,640)},revision:self.video_extras_token}),
+            recording_duration:if self.video_project.is_some(){self.video_recording_duration}else{self.video_duration},
         });
         if let Some(completed) = worker.take_completed(&key) {
             let previous = self.preview_cache.frame.replace((completed.key, completed.image));
@@ -1275,20 +1356,15 @@ impl Studio {
         position: Point<Pixels>,
         canvas: Bounds<Pixels>,
     ) -> Option<NormalizedPoint> {
-        let (_, projection) =
-            self.preview_projection(f32::from(canvas.size.width), f32::from(canvas.size.height));
+        let (style, geometry, viewport) = self.preview_geometry_frame(f32::from(canvas.size.width), f32::from(canvas.size.height));
+        let projection=geometry.projection(style.transform.with_motion(viewport));
         let local_x = f32::from(position.x - canvas.origin.x) as f64;
         let local_y = f32::from(position.y - canvas.origin.y) as f64;
         let (u, v) = projection.unproject(local_x, local_y);
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
             return None;
         }
-        let viewport = if self.video_project.is_some() || self.animation_active {
-            self.video_viewport_timeline.frame_at(self.video_position)
-        } else {
-            ViewportFrame::default()
-        };
-        let (left, top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(viewport);
+        let (left, top, visible_x, visible_y) = style.source_crop.visible_rect(viewport);
         Some(
             NormalizedPoint {
                 x: left + u * visible_x,
@@ -1343,7 +1419,7 @@ impl Studio {
         let Some(path) = self.video_camera_path.clone() else {
             return;
         };
-        if self.video_playing || !self.camera_overlay.enabled || self.camera_decode_in_flight {
+        if self.video_playing || !self.scene_style().has_camera_content() || self.camera_decode_in_flight {
             return;
         }
         let Some(source_time) = self.video_clip_timeline.content_source_time_at(self.timeline_display_time()) else {
@@ -1363,7 +1439,7 @@ impl Studio {
         let token = self.camera_decode_token;
         let decode_path = path.clone();
         let task = cx.background_executor().spawn(async move {
-            crate::recording::video::decode_frame(&decode_path, source_time, 640, 640)
+            crate::recording::video::decode_frame(&decode_path, source_time, u32::MAX, u32::MAX)
                 .ok()
                 .and_then(|frame| RgbaImage::from_raw(frame.width, frame.height, frame.rgba))
         });
@@ -1461,45 +1537,57 @@ impl Studio {
 
     pub(crate) fn camera_style_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         use crate::recording::camera_layout::{CameraAspect, CameraLayout, CameraSplitDirection};
-        let overlay = self.camera_overlay;
+        let overlay = self.camera_edit_overlay();
         div().flex().flex_col().gap_2()
             .child(Self::inspector_label("Layout"))
-            .child(self.segmented("camera-layout", &["Overlay", "Split", "Camera only"], CameraLayout::ALL.iter().position(|v| *v == overlay.layout).unwrap_or(0),
-                |this, i| this.camera_overlay.layout = CameraLayout::ALL[i], cx))
+            .child(self.segmented("camera-layout", &["Overlay", "Split screen", "Cutout"], [CameraLayout::Overlay,CameraLayout::Split,CameraLayout::Cutout].iter().position(|v| *v == overlay.layout).unwrap_or(usize::MAX),
+                |this, i| this.edit_camera_overlay(|camera| { camera.layout = [CameraLayout::Overlay,CameraLayout::Split,CameraLayout::Cutout][i]; camera.enabled = true; }), cx))
+            .child(self.segmented("camera-layout-focus", &["Camera only", "Screen only"], [CameraLayout::Fullscreen,CameraLayout::Hidden].iter().position(|v| *v == overlay.layout).unwrap_or(usize::MAX),
+                |this, i| this.edit_camera_overlay(|camera| { camera.layout = [CameraLayout::Fullscreen,CameraLayout::Hidden][i]; camera.enabled = true; }), cx))
             .when(overlay.layout == CameraLayout::Split, |panel| panel
                 .child(self.segmented("camera-split-direction", &["Auto", "Horizontal", "Vertical"], CameraSplitDirection::ALL.iter().position(|v| *v == overlay.split_direction).unwrap_or(0),
-                    |this, i| this.camera_overlay.split_direction = CameraSplitDirection::ALL[i], cx))
+                    |this, i| this.edit_camera_overlay(|camera| camera.split_direction = CameraSplitDirection::ALL[i]), cx))
                 .child(div().text_xs().text_color(muted()).child("Auto places the camera beside landscape video and below portrait video."))
                 .child(self.scene_slider_row(SceneSlider::CameraSplitRatio, cx))
-                .child(self.scene_toggle_row("camera-split-flip", "Swap sides", overlay.split_flip, cx, |this| this.camera_overlay.split_flip = !this.camera_overlay.split_flip)))
-            .when(overlay.layout == CameraLayout::Overlay, |panel| panel
-                .child(self.segmented("camera-position", &["Top left", "Top right", "Bottom left", "Bottom right"],
-                    if overlay.center.is_some() { usize::MAX } else { WatermarkPosition::ALL.iter().position(|v| *v == overlay.position).unwrap_or(3) },
-                    |this, i| { this.camera_overlay.position = WatermarkPosition::ALL[i]; this.camera_overlay.center = None; }, cx))
+                .child(self.scene_toggle_row("camera-split-full", "Fill split cells", overlay.split_full, cx, |this| this.edit_camera_overlay(|camera| camera.split_full = !camera.split_full)))
+                .child(self.scene_toggle_row("camera-split-flip", "Swap sides", overlay.split_flip, cx, |this| this.edit_camera_overlay(|camera| camera.split_flip = !camera.split_flip))))
+            .when(matches!(overlay.layout, CameraLayout::Overlay | CameraLayout::Cutout), |panel| panel
+                .child(self.segmented("camera-position-top", &["Top left", "Top right"],
+                    if overlay.center.is_some() { usize::MAX } else { WatermarkPosition::ALL[..2].iter().position(|v| *v == overlay.position).unwrap_or(usize::MAX) },
+                    |this, i| this.edit_camera_overlay(|camera| { camera.position = WatermarkPosition::ALL[i]; camera.center = None; }), cx))
+                .child(self.segmented("camera-position-bottom", &["Bottom left", "Bottom right"],
+                    if overlay.center.is_some() { usize::MAX } else { WatermarkPosition::ALL[2..].iter().position(|v| *v == overlay.position).unwrap_or(usize::MAX) },
+                    |this, i| this.edit_camera_overlay(|camera| { camera.position = WatermarkPosition::ALL[i+2]; camera.center = None; }), cx))
                 .child(div().text_xs().text_color(muted()).child("Drag on the canvas to snap to an edge or the center."))
                 .child(self.scene_slider_row(SceneSlider::CameraSize, cx))
                 .child(self.scene_toggle_row("camera-zoom-resize", "Resize during zoom", overlay.zoomed_size.is_some(), cx, |this| {
-                    this.camera_overlay.zoomed_size = if this.camera_overlay.zoomed_size.is_some() { None } else { Some((this.camera_overlay.size * 3 / 4).max(10)) };
+                    this.edit_camera_overlay(|camera| camera.zoomed_size = if camera.zoomed_size.is_some() { None } else { Some((camera.size * 3 / 4).max(10)) });
                 }))
                 .when(overlay.zoomed_size.is_some(), |panel| panel.child(self.scene_slider_row(SceneSlider::CameraZoomedSize, cx))))
-            .when(overlay.layout != CameraLayout::Fullscreen, |panel| panel
+            .when(overlay.layout == CameraLayout::Overlay || (overlay.layout == CameraLayout::Split && !overlay.split_full), |panel| panel
                 .child(Self::inspector_label("Shape & frame"))
                 .child(self.segmented("camera-shape", &["Circle", "Rounded", "Rectangle"], crate::recording::scene::CameraShape::ALL.iter().position(|v| *v == overlay.shape).unwrap_or(0),
-                    |this, i| this.camera_overlay.shape = crate::recording::scene::CameraShape::ALL[i], cx))
+                    |this, i| this.edit_camera_overlay(|camera| camera.shape = crate::recording::scene::CameraShape::ALL[i]), cx))
                 .when(overlay.shape != crate::recording::scene::CameraShape::Circle, |panel| panel
-                    .child(self.segmented("camera-aspect", &["Square", "Original", "16:9", "9:16"], CameraAspect::ALL.iter().position(|v| *v == overlay.aspect).unwrap_or(0),
-                        |this, i| this.camera_overlay.aspect = CameraAspect::ALL[i], cx))
+                    .child(self.segmented("camera-aspect", &["Square", "Original", "16:9", "9:16", "4:3", "3:4"], CameraAspect::ALL.iter().position(|v| *v == overlay.aspect).unwrap_or(0),
+                        |this, i| this.edit_camera_overlay(|camera| camera.aspect = CameraAspect::ALL[i]), cx))
                     .when(overlay.shape == crate::recording::scene::CameraShape::Squircle, |panel| panel.child(self.scene_slider_row(SceneSlider::CameraCornerRadius, cx))))
                 .child(self.scene_slider_row(SceneSlider::CameraMargin, cx))
-                .child(self.scene_toggle_row("camera-shadow", "Shadow", overlay.shadow, cx, |this| this.camera_overlay.shadow = !this.camera_overlay.shadow)))
+                .child(self.scene_toggle_row("camera-shadow", "Shadow", overlay.shadow, cx, |this| this.edit_camera_overlay(|camera| camera.shadow = !camera.shadow))))
+            .when(overlay.layout == CameraLayout::Cutout, |panel| panel
+                .child(div().text_xs().text_color(muted()).child("Remove the webcam background. Edge controls refine hair and clothing."))
+                .child(self.scene_slider_row(SceneSlider::CameraCutoutSoftness, cx))
+                .child(self.scene_slider_row(SceneSlider::CameraCutoutInset, cx))
+                .child(self.scene_slider_row(SceneSlider::CameraMargin, cx)))
+            .when(overlay.layout != CameraLayout::Hidden, |panel| panel
             .child(Self::inspector_label("Framing"))
             .child(self.scene_slider_row(SceneSlider::CameraCropZoom, cx))
             .child(self.scene_slider_row(SceneSlider::CameraCropX, cx))
             .child(self.scene_slider_row(SceneSlider::CameraCropY, cx))
-            .child(self.scene_toggle_row("camera-mirror", "Mirror", overlay.mirror, cx, |this| this.camera_overlay.mirror = !this.camera_overlay.mirror))
+            .child(self.scene_toggle_row("camera-mirror", "Mirror", overlay.mirror, cx, |this| this.edit_camera_overlay(|camera| camera.mirror = !camera.mirror)))
             .child(self.small_button("camera-reset-crop", "Reset framing", true, cx, |this, _| {
-                this.camera_overlay.crop_center = (0.5, 0.5); this.camera_overlay.crop_zoom = 100;
-            }))
+                this.edit_camera_overlay(|camera| { camera.crop_center = (0.5, 0.5); camera.crop_zoom = 100; });
+            })))
             .into_any_element()
     }
 
@@ -1510,64 +1598,11 @@ impl Studio {
                 .child(div().text_sm().text_color(muted()).child("Add a webcam clip to frame your camera alongside the recording."))
                 .child(self.small_button("camera-add", "Add camera clip…", self.export_progress.is_none(), cx, |this, cx| this.import_camera_clip(cx))))
             .when(has_camera, |panel| panel
-                .child(self.scene_toggle_row("camera-enabled", "Show camera", self.camera_overlay.enabled, cx, |this| this.camera_overlay.enabled = !this.camera_overlay.enabled))
+                .child(self.camera_regions_section(cx))
+                .child(self.scene_toggle_row("camera-enabled", "Show camera", self.camera_edit_overlay().enabled, cx, |this| this.edit_camera_overlay(|camera| camera.enabled = !camera.enabled)))
                 .child(self.camera_style_controls(cx))
                 .child(self.small_button("camera-remove", "Remove camera clip", self.export_progress.is_none(), cx, |this, _| this.remove_camera_clip())))
             .into_any_element()
-    }
-
-    /// Timeline lane showing the camera clip's presence.
-    pub(crate) fn camera_lane(
-        &self,
-        timeline_scroll: f64,
-        timeline_content_width: f64,
-        progress: f64,
-    ) -> Option<AnyElement> {
-        let path = self.video_camera_path.as_ref()?;
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "camera".into());
-        let enabled = self.camera_overlay.enabled;
-        Some(
-            div()
-                .relative()
-                .w_full()
-                .h(px(22.0))
-                .flex_none()
-                .overflow_hidden()
-                .rounded_lg()
-                .bg(rgb(0xECEDF1))
-                .children(self.video_clip_timeline.segments.iter().zip(self.video_clip_timeline.clip_starts()).map(|(clip, start)| {
-                    div()
-                        .absolute()
-                        .left(px((start / self.video_timeline_duration() * timeline_content_width - timeline_scroll) as f32))
-                        .top(px(3.0))
-                        .w(px((clip.editor_duration() / self.video_timeline_duration() * timeline_content_width) as f32))
-                        .h(px(16.0))
-                        .rounded_md()
-                        .border_r_1()
-                        .border_color(rgb(0xECEDF1))
-                        .overflow_hidden()
-                        .bg(if enabled { hsla(271.0 / 360.0, 0.6, 0.55, 1.0) } else { hsla(271.0 / 360.0, 0.2, 0.7, 1.0) })
-                        .flex().items_center().px_2().text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xffffff))
-                        .child(format!("Camera · {name}"))
-                }))
-                .child(
-                    div()
-                        .absolute()
-                        .left(px((timeline_content_width * progress - timeline_scroll)
-                            as f32
-                            - 1.0))
-                        .top_0()
-                        .w(px(2.0))
-                        .h_full()
-                        .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
-                )
-                .into_any_element(),
-        )
     }
 
     /// Author at a fixed frame with complete marks. Timing and animation are
@@ -1664,15 +1699,17 @@ impl Studio {
         true
     }
 
-    /// True when GPUI can paint annotations directly over the preview (no
-    /// authored transform and no animated tilt).
+    /// GPUI owns flat media marks only when no temporal composition is needed.
+    /// A blur-enabled scene keeps one owner even on stationary single-sample
+    /// frames, so marks cannot be duplicated or disappear as movement starts.
     pub(crate) fn annotations_paint_flat(&self) -> bool {
         let viewport = if self.scene_is_timed() {
             self.video_viewport_timeline.frame_at(self.timeline_display_time())
         } else {
             ViewportFrame::default()
         };
-        viewport.loupe.is_none() && self.scene_transform.with_motion(viewport).is_identity()
+        !(self.scene_is_timed() && self.animation_settings.motion_blur>0)
+            && viewport.loupe.is_none() && self.scene_transform.with_motion(viewport).is_identity()
     }
 
     fn has_media_image_overlays(&self) -> bool {
@@ -1688,17 +1725,12 @@ impl Studio {
         canvas: Bounds<Pixels>,
         flat: Bounds<Pixels>,
     ) -> Point<Pixels> {
-        let (_, projection) =
-            self.preview_projection(f32::from(canvas.size.width), f32::from(canvas.size.height));
+        let (style, geometry, viewport) = self.preview_geometry_frame(f32::from(canvas.size.width), f32::from(canvas.size.height));
+        let projection=geometry.projection(style.transform.with_motion(viewport));
         let local_x = f32::from(position.x - canvas.origin.x) as f64;
         let local_y = f32::from(position.y - canvas.origin.y) as f64;
         let (u, v) = projection.unproject(local_x, local_y);
-        let viewport = if self.video_project.is_some() || self.animation_active {
-            self.video_viewport_timeline.frame_at(self.video_position)
-        } else {
-            ViewportFrame::default()
-        };
-        let (left, top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(viewport);
+        let (left, top, visible_x, visible_y) = style.source_crop.visible_rect(viewport);
         let media_x = left + u * visible_x;
         let media_y = top + v * visible_y;
         point(
@@ -1707,32 +1739,25 @@ impl Studio {
         )
     }
 
+    /// Time-resolved geometry and crop shared by drawing, picking and handles.
+    pub(crate) fn preview_geometry_frame(&self, canvas_width:f32, canvas_height:f32) -> (SceneStyle,SceneGeometry,ViewportFrame) {
+        let mut style=self.scene_style();
+        let source=if self.video_project.is_some(){self.video_source_size}else{self.captured_dimensions.unwrap_or((1200,720))};
+        let time=self.timeline_display_time();
+        let viewport=if self.video_project.is_some()||self.animation_active {self.video_viewport_timeline.frame_at(time)}else{ViewportFrame::default()};
+        if self.video_project.is_some() {
+            let source_time=self.video_clip_timeline.content_source_time_at(time).unwrap_or(time);
+            style.camera=style.camera_at(source_time,(canvas_width.round() as u32,canvas_height.round() as u32),self.camera_source_aspect(),viewport.magnification);
+        }
+        let geometry=SceneGeometry::layout(canvas_width as f64,canvas_height as f64,source.0 as f64,source.1 as f64,&style);
+        let viewport=geometry.camera_viewport(viewport,&style,source);
+        (style,geometry,viewport)
+    }
+
     /// Geometry and projection of the media on a preview canvas of this size.
-    pub(crate) fn preview_projection(
-        &self,
-        canvas_width: f32,
-        canvas_height: f32,
-    ) -> (SceneGeometry, MediaProjection) {
-        let style = self.scene_style();
-        let (source_width, source_height) = if self.video_project.is_some() {
-            self.video_source_size
-        } else {
-            self.captured_dimensions.unwrap_or((1200, 720))
-        };
-        let geometry = SceneGeometry::layout(
-            canvas_width as f64,
-            canvas_height as f64,
-            source_width as f64,
-            source_height as f64,
-            &style,
-        );
-        let viewport = if self.video_project.is_some() || self.animation_active {
-            self.video_viewport_timeline.frame_at(self.timeline_display_time())
-        } else {
-            ViewportFrame::default()
-        };
-        let projection = geometry.projection(style.transform.with_motion(viewport));
-        (geometry, projection)
+    pub(crate) fn preview_projection(&self, canvas_width:f32, canvas_height:f32) -> (SceneGeometry,MediaProjection) {
+        let (style,geometry,viewport)=self.preview_geometry_frame(canvas_width,canvas_height);
+        (geometry,geometry.projection(style.transform.with_motion(viewport)))
     }
 
     // ------------------------------------------------------------------
@@ -1751,7 +1776,8 @@ impl Studio {
         let local_x = f32::from(position.x - canvas.origin.x);
         let local_y = f32::from(position.y - canvas.origin.y);
         let canvas_size = (f32::from(canvas.size.width), f32::from(canvas.size.height));
-        let (_, projection) = self.preview_projection(canvas_size.0, canvas_size.1);
+        let (style,geometry,viewport)=self.preview_geometry_frame(canvas_size.0,canvas_size.1);
+        let projection=geometry.projection(style.transform.with_motion(viewport));
         let inside = projection.contains(local_x as f64, local_y as f64);
         // A selected motion region turns clicks into focus picks; pressing
         // on a marker drags that marker instead of the default pick.
@@ -1761,7 +1787,7 @@ impl Studio {
             }
             self.pause_video_playback();
             let pick = self
-                .motion_markers()
+                .motion_markers(viewport)
                 .into_iter()
                 .find(|(_, mu, mv)| {
                     let (mx, my) = projection.project(*mu, *mv);
@@ -1772,8 +1798,8 @@ impl Studio {
             let drag = FocusDrag {
                 pick,
                 projection,
-                viewport: self.video_viewport_timeline.frame_at(self.video_position),
-                crop: self.scene_style().source_crop,
+                viewport,
+                crop: style.source_crop,
             };
             self.focus_drag = Some(drag);
             self.pin_focus_at_media(drag.target_at(local_x as f64, local_y as f64), pick, cx);
@@ -1867,7 +1893,7 @@ impl Studio {
     pub(crate) fn camera_bubble_visible(&self) -> bool {
         self.video_project.is_some()
             && self.video_camera_path.is_some()
-            && self.camera_overlay.enabled
+            && self.camera_at_playhead((1920, 1080)).opacity() > 0.0
             && self.video_viewport_timeline.frame_at(self.timeline_display_time()).loupe.is_none_or(|lens| lens.presence < 0.95)
             && self.video_clip_timeline
                 .content_source_time_at(self.video_position)
@@ -1881,54 +1907,51 @@ impl Studio {
             .unwrap_or(1.0)
     }
 
+    pub(crate) fn camera_at_playhead(&self, canvas: (u32, u32)) -> CameraOverlay {
+        let time = self.timeline_display_time();
+        let source_time = self.video_clip_timeline.content_source_time_at(time).unwrap_or(time);
+        self.scene_style().camera_at(source_time, canvas, self.camera_source_aspect(),
+            self.video_viewport_timeline.frame_at(time).magnification)
+    }
+
     /// Starts dragging the camera bubble when the press lands on it.
     pub(crate) fn camera_pointer_down(&mut self, position: Point<Pixels>, canvas: Bounds<Pixels>) -> bool {
-        if !self.camera_bubble_visible() {
-            return false;
-        }
+        if !self.camera_bubble_visible() { return false; }
         let (width, height) = (f32::from(canvas.size.width) as f64, f32::from(canvas.size.height) as f64);
         let source_aspect = self.camera_source_aspect();
         let zoom = self.video_viewport_timeline.frame_at(self.timeline_display_time()).magnification;
-        let rect = self.camera_overlay.rect_for_frame(width, height, source_aspect, zoom);
-        let local = (
-            f32::from(position.x - canvas.origin.x) as f64,
-            f32::from(position.y - canvas.origin.y) as f64,
-        );
-        if !rect.contains(local.0, local.1) {
-            return false;
-        }
+        let effective = self.camera_at_playhead((width.round() as u32, height.round() as u32));
+        let rect = effective.rect_for_frame(width, height, source_aspect, zoom);
+        let local = (f32::from(position.x - canvas.origin.x) as f64, f32::from(position.y - canvas.origin.y) as f64);
+        if !rect.contains(local.0, local.1) { return false; }
         self.pause_video_playback();
+        let source_time = self.video_clip_timeline.content_source_time_at(self.timeline_display_time());
+        self.selected_camera_region = source_time.and_then(|time| self.camera_regions.iter()
+            .filter(|region| region.valid() && time >= region.start && time < region.end)
+            .max_by(|a,b| a.start.total_cmp(&b.start)).map(|region| region.id));
+        self.video_selected_zoom_cue = None;
+        self.video_selected_clip = None;
         self.select_inspector_tab(crate::shell_ui::InspectorTab::Camera);
-        if self.camera_overlay.layout != CameraLayout::Overlay { return true; }
-        self.camera_drag = Some(CameraDrag {
-            start: position,
+        if !matches!(self.camera_edit_overlay().layout, CameraLayout::Overlay | CameraLayout::Cutout) { return true; }
+        self.record_camera_edit();
+        self.camera_drag = Some(CameraDrag { start: position,
             start_center: (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5),
-            canvas_size: (width, height),
-            source_aspect,
-            zoom,
-            guides: (None, None),
-        });
+            canvas_size: (width, height), source_aspect, zoom, guides: (None, None) });
         true
     }
 
     pub(crate) fn update_camera_drag(&mut self, position: Point<Pixels>) -> bool {
-        let Some(drag) = self.camera_drag.as_mut() else {
-            return false;
-        };
-        let proposed = (
-            drag.start_center.0 + f32::from(position.x - drag.start.x) as f64,
-            drag.start_center.1 + f32::from(position.y - drag.start.y) as f64,
-        );
-        let (center, guides) =
-            self.camera_overlay.snapped_center_for_frame(proposed, drag.canvas_size.0, drag.canvas_size.1, drag.source_aspect, drag.zoom);
-        drag.guides = guides;
-        self.camera_overlay.center = Some(center);
+        let Some(drag) = self.camera_drag else { return false; };
+        let proposed = (drag.start_center.0 + f32::from(position.x - drag.start.x) as f64,
+            drag.start_center.1 + f32::from(position.y - drag.start.y) as f64);
+        let (center, guides) = self.camera_edit_overlay().snapped_center_for_frame(proposed,
+            drag.canvas_size.0, drag.canvas_size.1, drag.source_aspect, drag.zoom);
+        self.camera_drag.as_mut().unwrap().guides = guides;
+        self.edit_camera_overlay(|camera| camera.center = Some(center));
         true
     }
 
-    pub(crate) fn end_camera_drag(&mut self) -> bool {
-        self.camera_drag.take().is_some()
-    }
+    pub(crate) fn end_camera_drag(&mut self) -> bool { self.camera_drag.take().is_some() }
 
     pub(crate) fn scene_scroll(&mut self, event: &ScrollWheelEvent) -> bool {
         if self.scene_selection != SceneSelection::Media {
@@ -1948,7 +1971,7 @@ impl Studio {
 
     /// The selected region's focus and pan-end markers as (pick, u, v) in
     /// the visible crop's coordinates, for painting and hit-testing.
-    fn motion_markers(&self) -> Vec<(crate::motion_ui::MotionPick, f64, f64)> {
+    fn motion_markers(&self, frame: ViewportFrame) -> Vec<(crate::motion_ui::MotionPick, f64, f64)> {
         let Some(cue) = self
             .video_selected_zoom_cue
             .and_then(|id| self.video_zoom_cues.iter().find(|cue| cue.id == id))
@@ -1956,7 +1979,6 @@ impl Studio {
             return Vec::new();
         };
         if !cue.has_camera_motion() { return Vec::new(); }
-        let frame = self.video_viewport_timeline.frame_at(self.video_position);
         let (left, top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(frame);
         let to_visible = |p: NormalizedPoint| ((p.x - left) / visible_x, (p.y - top) / visible_y);
         let focus = match cue.anchor_mode {
@@ -1979,11 +2001,12 @@ impl Studio {
     pub(crate) fn motion_marker_points(
         &self,
         projection: &MediaProjection,
+        viewport: ViewportFrame,
     ) -> Vec<(bool, Point<Pixels>)> {
         if self.video_selected_zoom_cue.is_none() || self.video_playing {
             return Vec::new();
         }
-        self.motion_markers()
+        self.motion_markers(viewport)
             .into_iter()
             .filter(|(_, u, v)| (0.0..=1.0).contains(u) && (0.0..=1.0).contains(v))
             .map(|(pick, u, v)| {
@@ -2053,11 +2076,11 @@ impl Studio {
         self.watch_scene_preview(cx);
         let bounds_store = self.scene_canvas_bounds.clone();
         let media_bounds_store = self.video_media_bounds.clone();
-        let (geometry, projection) =
-            self.preview_projection(f32::from(canvas_width), f32::from(canvas_height));
+        let (style_at_time,geometry,frame)=self.preview_geometry_frame(f32::from(canvas_width),f32::from(canvas_height));
+        let projection=geometry.projection(style_at_time.transform.with_motion(frame));
         let show_handles = media_visible && self.scene_selection == SceneSelection::Media;
         let picking = self.video_selected_zoom_cue.is_some();
-        let markers = if media_visible { self.motion_marker_points(&projection) } else { Vec::new() };
+        let markers = if media_visible { self.motion_marker_points(&projection,frame) } else { Vec::new() };
         let entity = cx.entity();
         let time = self.timeline_display_time();
         // Annotations paint flat over the media rect; a transformed card
@@ -2066,8 +2089,9 @@ impl Studio {
         let composite_flat = paint_flat && self.has_media_image_overlays();
         let select_tool = self.tool == Tool::Select;
         let camera_guides = self.camera_drag.map(|drag| drag.guides);
-        let camera_grab = (select_tool && self.camera_bubble_visible() && self.camera_overlay.layout == CameraLayout::Overlay)
-            .then(|| (self.camera_overlay, self.camera_source_aspect(), self.video_viewport_timeline.frame_at(self.timeline_display_time()).magnification));
+        let camera_at_time = self.camera_at_playhead((f32::from(canvas_width).round() as u32, f32::from(canvas_height).round() as u32));
+        let camera_grab = (select_tool && self.camera_bubble_visible() && matches!(camera_at_time.layout, CameraLayout::Overlay | CameraLayout::Cutout))
+            .then(|| (camera_at_time, self.camera_source_aspect(), self.video_viewport_timeline.frame_at(self.timeline_display_time()).magnification));
         let camera_dragging = self.camera_drag.is_some();
         let text_cursor = self.tool == Tool::Text || self.editing_text.is_some();
         let committed_count = self.annotations.len();
@@ -2092,8 +2116,7 @@ impl Studio {
             }
         }
         let caret_visible = self.caret_visible;
-        let frame = self.video_viewport_timeline.frame_at(time);
-        let (view_left, view_top, visible_x, visible_y) = self.scene_style().source_crop.visible_rect(frame);
+        let (view_left, view_top, visible_x, visible_y) = style_at_time.source_crop.visible_rect(frame);
         let view_zoom_x = (1.0 / visible_x) as f32;
         let view_zoom_y = (1.0 / visible_y) as f32;
         let media_rect = geometry.media;
@@ -2633,19 +2656,7 @@ impl Studio {
                         crate::recording::pointer_timeline::PointerRotation::ALL.iter().position(|v| *v == style.rotation).unwrap_or(1),
                         |this, i| { this.pointer_style.rotation = crate::recording::pointer_timeline::PointerRotation::ALL[i]; this.rebuild_video_motion_timelines(); }, cx))
                     .when(style.rotation != crate::recording::pointer_timeline::PointerRotation::Off, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorRotation, cx)))
-                    .child(div().text_xs().text_color(muted()).child("Movement"))
-                    .child(
-                        self.segmented(
-                            "pointer-motion",
-                            &["None", "Smooth", "Medium", "Rapid"],
-                            style.motion.current_index(),
-                            |this, value| {
-                                this.pointer_style.motion = PointerMotion::ALL[value.min(3)];
-                                this.rebuild_video_motion_timelines();
-                            },
-                            cx,
-                        ),
-                    )
+                    .child(self.cursor_animation_controls(cx))
                     .child(self.scene_toggle_row(
                         "pointer-loop",
                         "Return to start at end",
@@ -2741,33 +2752,46 @@ impl Studio {
                     |this| {
                         this.pause_video_playback();
                         this.video_audio_muted = !this.video_audio_muted;
+                        this.cancel_audio_preparation();
+                        this.video_audio_prepare_pending = !this.video_audio_muted;
                     },
                 ))
             })
             .when(has_audio && !self.video_audio_muted, |this| {
-                let enabled = self.video_noise_reduction;
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_sm().child("Reduce noise"))
-                        .child(
-                            div()
-                                .id("audio-noise-reduction")
-                                .cursor_pointer()
-                                .child(self.toggle(enabled))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_video_noise_reduction(!enabled, cx);
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted())
-                        .child("Removes steady background hiss from the preview and the export."),
-                )
+                use crate::recording::audio_mode::AudioMode;
+                this.child(div().text_sm().child("Microphone sound"))
+                    .children(AudioMode::ALL.into_iter().map(|mode| {
+                        let selected = self.video_audio_mode == mode;
+                        div().id(("microphone-audio-mode", mode as usize))
+                            .px_3().py_2().rounded_md().border_1()
+                            .border_color(if selected { rgb(0x2088ff) } else { rgb(0xe5e5e8) })
+                            .bg(if selected { rgb(0xedf5ff) } else { rgb(0xffffff) })
+                            .cursor_pointer().flex().items_center().gap_2()
+                            .child(div().text_color(if selected { rgb(0x2088ff).into() } else { muted() })
+                                .child(if selected { "●" } else { "○" }))
+                            .child(div().flex().flex_col().gap_1()
+                                .child(div().text_sm().child(mode.label()))
+                                .child(div().text_xs().text_color(muted()).child(mode.description())))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_video_audio_mode(mode, cx)))
+                    }))
+                    .child(div().text_xs().text_color(muted())
+                        .child("Processing runs locally. System audio is preserved in new recordings; older combined tracks are processed together."))
+            })
+            .when_some(self.video_audio_job.as_ref(), |panel, job| {
+                panel.child(div().flex().items_center().justify_between().gap_2()
+                    .child(div().flex().flex_col().gap_1()
+                        .child(div().text_xs().text_color(muted()).child(format!(
+                            "{} · {}%", job.control.status(), job.control.progress())))
+                        .when(self.video_audio_play_when_ready, |row| row.child(
+                            div().text_xs().text_color(muted()).child("Playback will start when audio is ready."))))
+                    .child(self.small_button("pause-audio-preparation", "Cancel", true, cx,
+                        |this, cx| this.pause_audio_preparation(cx))))
+            })
+            .when_some(self.video_audio_error.as_ref(), |panel, error| {
+                panel.child(div().flex().flex_col().gap_2()
+                    .child(div().text_xs().text_color(muted()).child(error.clone()))
+                    .child(self.small_button("retry-audio-preparation", "Prepare audio", true, cx,
+                        |this, cx| this.prepare_video_audio(cx))))
             })
             .child(self.imported_audio_controls(cx))
             .into_any_element()
@@ -2881,20 +2905,6 @@ impl Studio {
                 .when(self.export_codec == crate::recording::export::VideoCodec::Hevc, |this| {
                     this.child(div().text_xs().text_color(muted()).child(
                         "Smaller files; some older players and browsers cannot play HEVC.",
-                    ))
-                })
-            })
-            .when(self.video_project.is_some() || self.animation_active, |this| {
-                this.child(self.scene_toggle_row(
-                    "export-motion-blur",
-                    "Motion blur",
-                    self.export_motion_blur,
-                    cx,
-                    |this| this.export_motion_blur = !this.export_motion_blur,
-                ))
-                .when(self.export_motion_blur, |this| {
-                    this.child(div().text_xs().text_color(muted()).child(
-                        "Smooths zooms and pans like a real camera shutter. Moving frames take longer to render.",
                     ))
                 })
             })
@@ -3502,7 +3512,7 @@ impl Studio {
     }
 
     pub(crate) fn select_annotation_for_timing(&mut self, index: usize) {
-        if self.video_playing { self.pause_video_playback(); }
+        if self.video_playing || self.video_audio_play_when_ready { self.pause_video_playback(); }
         self.annotation_editing_time = None;
         // Finishing an empty caption removes it, shifting subsequent row indices.
         let removed = self.editing_text.filter(|editing| {
@@ -3865,11 +3875,10 @@ impl Studio {
     /// at the capture's resolution, re-rendered only when they change.
     pub(crate) fn annotation_overlay_source(
         &self,
-    ) -> Option<crate::recording::export::OverlaySource> {
+    ) -> Option<crate::recording::export::MediaOverlaySource> {
         let (width, height) = self.media_dimensions()?;
         cropped_overlay_source_for(
             self.annotations.clone(),
-            self.video_viewport_timeline.clone(),
             width,
             height,
             self.scene_style().source_crop,
@@ -3877,28 +3886,27 @@ impl Studio {
     }
 }
 
-/// Overlay renderer for `marks` on media of the given size, animated and
-/// pinned through `viewport`.
+/// Overlay renderer for `marks` on media of the given size. The compositor
+/// supplies the effective viewport for each shutter sample.
 pub(crate) fn overlay_source_for(
     marks: Vec<AnnotationMark>,
-    viewport: ViewportTimeline,
     width: u32,
     height: u32,
-) -> Option<crate::recording::export::OverlaySource> {
-    cropped_overlay_source_for(marks, viewport, width, height, crate::CropRect::UNIT)
+) -> Option<crate::recording::export::MediaOverlaySource> {
+    cropped_overlay_source_for(marks, width, height, crate::CropRect::UNIT)
 }
 
 fn cropped_overlay_source_for(
-    marks: Vec<AnnotationMark>, viewport: ViewportTimeline,
+    marks: Vec<AnnotationMark>,
     width: u32, height: u32, crop: crate::CropRect,
-) -> Option<crate::recording::export::OverlaySource> {
+) -> Option<crate::recording::export::MediaOverlaySource> {
     {
         if marks.is_empty() {
             return None;
         }
         let mut cache: Option<(u64, Arc<RgbaImage>)> = None;
-        Some(Box::new(move |time: f64| {
-            let active = timed::active_marks_in_crop(&marks, time, viewport.frame_at(time), crop);
+        Some(Box::new(move |time: f64, viewport: ViewportFrame| {
+            let active = timed::active_marks_in_crop(&marks, time, viewport, crop);
             if active.is_empty() {
                 return None;
             }
@@ -4102,7 +4110,7 @@ impl Studio {
         let Some(session) = self.video_project.as_ref() else {
             return;
         };
-        let path = Self::media_source_for(session, false);
+        let path = Self::media_source_for(session);
         self.video_extras_token = self.video_extras_token.wrapping_add(1);
         let token = self.video_extras_token;
         let task = cx.background_executor().spawn(async move {

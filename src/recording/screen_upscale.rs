@@ -1,5 +1,6 @@
-//! Optional, tiled GPU super-resolution using the public MIT Anime4K x2 S model.
-//! This generic line-art model is not Screen Studio's proprietary UI-trained CNN.
+//! Tiled GPU UI reconstruction, independently trained on generated screen/text
+//! artwork. A 2× model and a separately trained two-stage 4× cascade use no
+//! Screen Studio weights.
 //! The compositor owns the context and submission lifetime; this module only
 //! records commands. See assets/upscaler/README.md for provenance and differences.
 use blade_graphics as gpu;
@@ -12,7 +13,18 @@ const TILE: u32 = 128;
 const HALO: u32 = 4;
 const STRIDE: u32 = TILE + HALO * 2;
 const PARAM_SLOT: usize = 256;
+#[used]
+static MODEL_LICENSE: &str = concat!(
+    include_str!("../../assets/upscaler/LICENSE"),
+    "\nBlade graphics:\n",
+    include_str!("../../vendor/blade-graphics/LICENSE")
+);
 const WEIGHTS: &[u8] = include_bytes!("../../assets/upscaler/anime4k-cnn-x2-s.f32");
+const UI_WEIGHTS: [&[u8]; 3] = [
+    include_bytes!("../../assets/upscaler/ui-cnn-2x.f32"),
+    include_bytes!("../../assets/upscaler/ui-cnn-4x-first.f32"),
+    include_bytes!("../../assets/upscaler/ui-cnn-4x.f32"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UpscalePlan {
@@ -116,7 +128,8 @@ impl Allocation {
 pub struct ScreenUpscaler {
     convolutions: [gpu::ComputePipeline; 4],
     reconstruct: gpu::ComputePipeline,
-    weights: Allocation,
+    weights: [Allocation; 3],
+    pub uses_f16: bool,
     params: Allocation,
     scratch: [Allocation; 2],
     intermediate: Allocation,
@@ -125,32 +138,63 @@ pub struct ScreenUpscaler {
 
 impl ScreenUpscaler {
     pub fn new(context: &gpu::Context) -> Result<Self, String> {
-        let shader = context.try_create_shader(gpu::ShaderDesc {
-            source: include_str!("screen_upscale.wgsl"),
-        })?;
+        std::hint::black_box(MODEL_LICENSE);
+        let native_f16 =
+            context.capabilities().shader_f16 && std::env::var_os("LAHZA_UPSCALE_F32").is_none();
+        let make_source = |half: bool| {
+            if half {
+                include_str!("screen_upscale.wgsl").replacen(
+                    "alias Math = f32;",
+                    "enable f16;\nalias Math = f16;",
+                    1,
+                )
+            } else {
+                include_str!("screen_upscale.wgsl").to_owned()
+            }
+        };
+        let (shader, uses_f16) = match context.try_create_shader(gpu::ShaderDesc {
+            source: &make_source(native_f16),
+        }) {
+            Ok(shader) => (shader, native_f16),
+            Err(_) if native_f16 => (
+                context.try_create_shader(gpu::ShaderDesc {
+                    source: &make_source(false),
+                })?,
+                false,
+            ),
+            Err(error) => return Err(error.to_owned()),
+        };
         shader.check_struct_size::<UpscaleParams>();
         let convolutions = ["conv0", "conv1", "conv2", "conv3"].map(|entry| {
             context.create_compute_pipeline(gpu::ComputePipelineDesc {
-                name: "Anime4K S convolution",
+                name: "Lahza UI CNN convolution",
                 data_layouts: &[&ConvData::layout()],
                 compute: shader.at(entry),
             })
         });
         let reconstruct = context.create_compute_pipeline(gpu::ComputePipelineDesc {
-            name: "Anime4K S reconstruct",
+            name: "Lahza UI CNN reconstruct",
             data_layouts: &[&ReconstructData::layout()],
             compute: shader.at("reconstruct"),
         });
-        let weights = Allocation::new(context, WEIGHTS.len(), gpu::Memory::Shared);
-        // Immutable, mapped model coefficients; no pending submission can read them yet.
-        unsafe {
-            std::ptr::copy_nonoverlapping(WEIGHTS.as_ptr(), weights.buffer.data(), WEIGHTS.len());
-        }
-        context.sync_buffer(weights.buffer);
+        let weights = UI_WEIGHTS.map(|coefficients| {
+            let allocation = Allocation::new(context, coefficients.len(), gpu::Memory::Shared);
+            // Immutable coefficients are uploaded before their first submission.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    coefficients.as_ptr(),
+                    allocation.buffer.data(),
+                    coefficients.len(),
+                );
+            }
+            context.sync_buffer(allocation.buffer);
+            allocation
+        });
         Ok(Self {
             convolutions,
             reconstruct,
             weights,
+            uses_f16,
             params: Allocation::new(context, PARAM_SLOT, gpu::Memory::Shared),
             scratch: std::array::from_fn(|_| {
                 Allocation::new(
@@ -181,7 +225,17 @@ impl ScreenUpscaler {
         let passes = passes(plan, source_size);
         let params: Vec<_> = passes
             .iter()
-            .flat_map(|pass| tile_params(*pass, source_size))
+            .enumerate()
+            .flat_map(|(index, pass)| {
+                tile_params(*pass, source_size)
+                    .into_iter()
+                    .map(move |mut params| {
+                        // Preserve the quantized intermediate exactly enough that
+                        // a half-precision rounding does not propagate into stage2.
+                        params.mapping[2] = u32::from(plan.scale == 4 && index == 0);
+                        params
+                    })
+            })
             .collect();
         self.params.ensure(context, params.len() * PARAM_SLOT);
         for (index, param) in params.iter().enumerate() {
@@ -222,7 +276,10 @@ impl ScreenUpscaler {
                         b_up_source: input,
                         b_up_features: self.scratch[layer % 2].buffer.into(),
                         b_up_result: self.scratch[(layer + 1) % 2].buffer.into(),
-                        b_up_weights: self.weights.buffer.into(),
+                        b_up_weights: self.weights
+                            [if plan.scale == 4 { pass_index + 1 } else { 0 }]
+                        .buffer
+                        .into(),
                     };
                     let mut compute = encoder.compute("neural screen tile convolution");
                     let mut pipeline = compute.with(&self.convolutions[layer]);
@@ -261,13 +318,15 @@ impl ScreenUpscaler {
         }
         context.destroy_compute_pipeline(&mut self.reconstruct);
         for buffer in [
-            &self.weights,
             &self.params,
             &self.scratch[0],
             &self.scratch[1],
             &self.intermediate,
             &self.output,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.weights.iter())
+        {
             context.destroy_buffer(buffer.buffer);
         }
     }
@@ -345,14 +404,9 @@ fn tile_params(pass: Pass, original_size: (u32, u32)) -> Vec<UpscaleParams> {
                     pass.original.x,
                     pass.original.y,
                 ],
-                // Full-strength repetition creates ringing on small UI text.
-                // Only the second pass's learned residual is attenuated.
-                mapping: [
-                    pass.original.scale,
-                    if pass.original.scale == 4 { 200 } else { 1000 },
-                    0,
-                    0,
-                ],
+                // The second stage has its own coefficients, trained on the
+                // first stage's quantized output, and uses the learned residual.
+                mapping: [pass.original.scale, 1000, 0, 0],
             });
         }
     }
@@ -400,9 +454,15 @@ mod tests {
     // Whole-frame CPU oracle, intentionally independent of tile addressing,
     // GPU scratch buffers, dispatches and the production ROI plan.
     fn reference_2x(image: &RgbaImage, strength: f32) -> RgbaImage {
+        reference_stage(image, strength, 0)
+    }
+    fn reference_stage(image: &RgbaImage, strength: f32, stage: usize) -> RgbaImage {
         let w = image.width() as usize;
         let h = image.height() as usize;
-        let weights = coefficients();
+        let weights: Vec<f32> = UI_WEIGHTS[stage]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
         let mut previous = vec![[0.0_f32; 4]; w * h];
         for layer in 0..4 {
             let mut next = vec![[0.0_f32; 4]; w * h];
@@ -458,9 +518,9 @@ mod tests {
         })
     }
     fn reference(image: &RgbaImage, plan: UpscalePlan) -> RgbaImage {
-        let twice = reference_2x(image, 1.0);
+        let twice = reference_stage(image, 1.0, if plan.scale == 4 { 1 } else { 0 });
         let full = if plan.scale == 4 {
-            reference_2x(&twice, 0.2)
+            reference_stage(&twice, 1.0, 2)
         } else {
             twice
         };
@@ -629,6 +689,26 @@ mod tests {
         assert_eq!(std::mem::size_of::<UpscaleParams>(), 96);
     }
 
+    #[test]
+    fn half_precision_shader_requires_native_feature_and_validates() {
+        let source = include_str!("screen_upscale.wgsl").replacen(
+            "alias Math = f32;",
+            "enable f16;\nalias Math = f16;",
+            1,
+        );
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+        assert!(
+            naga::valid::Validator::new(flags, naga::valid::Capabilities::empty())
+                .validate(&module)
+                .is_err()
+        );
+        naga::valid::Validator::new(flags, naga::valid::Capabilities::SHADER_FLOAT16)
+            .validate(&module)
+            .unwrap();
+    }
+
     /// Explicitly run in isolation: production borrows the existing compositor
     /// context, while this fixture alone creates a context for hardware parity.
     #[test]
@@ -638,6 +718,18 @@ mod tests {
             unsafe { gpu::Context::init(gpu::ContextDesc::default()) }.expect("Vulkan context");
         eprintln!("neural GPU: {:?}", context.device_information());
         let mut upscaler = ScreenUpscaler::new(&context).unwrap();
+        eprintln!(
+            "neural precision: {}",
+            if upscaler.uses_f16 {
+                "native f16"
+            } else {
+                "f32"
+            }
+        );
+        assert_eq!(
+            upscaler.uses_f16,
+            context.capabilities().shader_f16 && std::env::var_os("LAHZA_UPSCALE_F32").is_none()
+        );
         let mut encoder = context.create_command_encoder(gpu::CommandEncoderDesc {
             name: "neural parity",
             buffer_count: 1,
@@ -834,7 +926,11 @@ mod tests {
                 }
             }
             durations.sort_by(f64::total_cmp);
-            eprintln!("neural ROI {width}x{height} {scale}x: median {:.2} ms, max {:.2} ms (CPU encode + GPU completion, excludes source upload/readback)", (durations[1] + durations[2]) * 0.5, durations[3]);
+            eprintln!(
+                "neural ROI {width}x{height} {scale}x: median {:.2} ms, max {:.2} ms (CPU encode + GPU completion, excludes source upload/readback)",
+                (durations[1] + durations[2]) * 0.5,
+                durations[3]
+            );
         }
         upscaler.destroy(&context);
         context.destroy_buffer(upload.buffer);

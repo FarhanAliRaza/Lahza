@@ -1,0 +1,7 @@
+OpenCV Zoo https://github.com/opencv/opencv_zoo
+Commit: 48b10fa505aeb51fbd127fc60a5c660040e823b7
+Model: models/human_segmentation_pphumanseg/human_segmentation_pphumanseg_2023mar.onnx
+Model SHA-256: 552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24
+License: Apache-2.0; Copyright (c) 2021 PaddlePaddle Authors
+Unmodified model. Input RGB NCHW 1x3x192x192, normalized (channel /255 -0.5)/0.5.
+Output class probabilities; channel 1 is human foreground.

@@ -105,6 +105,7 @@ impl Studio {
         self.video_trim_drag = None;
         self.video_move_drag = None;
         self.video_zoom_drag = None;
+        self.camera_region_drag = None;
         self.video_audio_drag = None;
         self.annotation_drag = None;
     }
@@ -207,7 +208,7 @@ impl Studio {
     }
 
     fn timeline_drag_active(&self) -> bool {
-        self.video_trim_drag.is_some()
+        self.camera_region_drag.is_some() || self.video_trim_drag.is_some()
             || self.video_move_drag.is_some_and(|d| d.active)
             || self.video_zoom_drag.is_some()
             || self.video_audio_drag.is_some()
@@ -249,6 +250,8 @@ impl Studio {
             self.update_annotation_drag(pointer);
         } else if self.video_trim_drag.is_some() {
             self.update_video_trim(pointer);
+        } else if self.camera_region_drag.is_some() {
+            self.update_camera_region_drag(pointer);
         } else if self.video_zoom_drag.is_some() {
             self.update_video_zoom_drag(pointer);
         } else if self.video_audio_drag.is_some() {
@@ -581,7 +584,7 @@ impl Studio {
                     .tooltip(tooltip("Play / pause · Space"))
                     .child(
                         svg()
-                            .path(if self.video_playing {
+                            .path(if self.video_playing || self.video_audio_play_when_ready {
                                 "icons/pause.svg"
                             } else {
                                 "icons/play.svg"

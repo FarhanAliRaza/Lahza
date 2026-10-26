@@ -10,10 +10,20 @@ use std::{path::PathBuf, sync::{Arc, Condvar, Mutex}, thread::JoinHandle};
 /// build. A 1600x900 pixel budget targets a 30 fps playback frame budget while
 /// leaving normal editor canvases and all paused/export frames unchanged.
 pub(crate) fn playback_canvas_size(canvas: (u32, u32), playing: bool) -> (u32, u32) {
-    const PIXEL_BUDGET: u64 = 1600 * 900;
+    if !playing {return canvas;}
+    bounded_canvas(canvas,1600*900)
+}
+
+/// Multiple shutter samples share a fixed playback work budget. Paused
+/// previews and exports retain their requested canvas and full sample count.
+pub(crate) fn temporal_playback_canvas_size(canvas:(u32,u32), samples:usize)->(u32,u32) {
+    bounded_canvas(canvas, (2*1600*900)/samples.max(1) as u64)
+}
+
+fn bounded_canvas(canvas:(u32,u32), pixel_budget:u64)->(u32,u32) {
     let area = u64::from(canvas.0) * u64::from(canvas.1);
-    if !playing || area <= PIXEL_BUDGET { return canvas; }
-    let scale = (PIXEL_BUDGET as f64 / area as f64).sqrt();
+    if area <= pixel_budget { return canvas; }
+    let scale = (pixel_budget as f64 / area as f64).sqrt();
     let mut width = ((canvas.0 as f64 * scale + 1e-8).floor() as u32).max(1);
     let mut height = ((canvas.1 as f64 * scale + 1e-8).floor() as u32).max(1);
     let aspect = canvas.0 as f64 / canvas.1 as f64;
@@ -37,6 +47,7 @@ pub(crate) enum PreviewMedia {
 pub(crate) struct PreviewKey {
     pub style: SceneStyle,
     pub canvas: (u32, u32),
+    pub presentation_canvas: (u32,u32),
     pub source_size: (u32, u32),
     pub source: usize,
     pub time_bits: u64,
@@ -47,6 +58,7 @@ pub(crate) struct PreviewKey {
     pub generation: u64,
     pub media: PreviewMedia,
     pub high_quality: bool,
+    pub motion: Option<Arc<crate::recording::motion_blur::MotionPlan>>,
 }
 
 impl PreviewKey {
@@ -61,7 +73,7 @@ impl PreviewKey {
 
     pub(crate) fn same_scene(&self, other: &Self) -> bool {
         self.same_media(other) && self.style == other.style
-            && self.canvas == other.canvas && self.source_size == other.source_size
+            && self.presentation_canvas == other.presentation_canvas && self.source_size == other.source_size
     }
 
     /// A displayed frame may briefly scale across a playback proxy change;
@@ -72,11 +84,34 @@ impl PreviewKey {
 }
 
 pub(crate) struct PreviewJob {
+    pub playing: bool,
     pub key: PreviewKey,
     pub source: Arc<RgbaImage>,
     pub overlay: Option<Arc<RgbaImage>>,
     pub pointer: Option<PointerOverlay>,
     pub camera: Option<Arc<RgbaImage>>,
+    pub screen_video: Option<crate::recording::motion_blur::VideoSource>,
+    pub camera_video: Option<crate::recording::motion_blur::VideoSource>,
+    pub recording_duration: f64,
+    pub temporal_overlay: Option<TemporalOverlay>,
+}
+
+/// Authored media marks travel to the render worker once, then animate at
+/// each shutter time without rasterizing subframes on the UI thread.
+pub(crate) struct TemporalOverlay {
+    pub marks: Vec<(crate::AnnotationMark, bool)>,
+    pub size: (u32, u32),
+}
+impl TemporalOverlay {
+    fn render(&self, time: f64, viewport: ViewportFrame, crop: crate::CropRect)
+        -> Option<Arc<RgbaImage>> {
+        let marks: Vec<_> = self.marks.iter().filter_map(|(mark, live)| {
+            crate::timed::editor_mark(mark, time, *live).map(|mark|
+                crate::timed::in_cropped_media_space(mark, viewport, crop))
+        }).collect();
+        if marks.is_empty() { return None; }
+        crate::scene_ui::render_annotation_layer(&marks, self.size.0, self.size.1).map(Arc::new)
+    }
 }
 
 pub(crate) struct CompletedPreview {
@@ -148,6 +183,8 @@ pub(crate) fn shutdown_workers() { WORKERS.drain(); }
 
 /// At most one frame computes, one waits, and one awaits presentation. New
 /// requests replace the waiting frame, so playback never builds up latency.
+enum ComposeFailure { Failed(String), Superseded }
+
 pub(crate) struct PreviewWorker {
     mailbox: Arc<(Mutex<Mailbox>, Condvar)>,
 }
@@ -156,8 +193,113 @@ impl PreviewWorker {
     pub(crate) fn new() -> std::io::Result<Self> {
         let mut cache: Option<(SceneStyle, (u32, u32), (u32, u32), SceneCompositor)> = None;
         let mut renderer = None;
-        Self::spawn(move |job| {
+        let mut screen_frames = crate::recording::motion_blur::FrameCache::default();
+        let mut camera_frames = crate::recording::motion_blur::FrameCache::default();
+        Self::spawn_in_checked(move |job, cancelled| {
+            let mut render_error=None;
+            let mut superseded=false;
+            let output=(|| {
             let key = &job.key;
+            if let Some(plan) = key.motion.as_ref() {
+                use crate::recording::{motion_blur::Accumulator, scene::gpu::RenderQuality};
+                let temporal = plan.samples.len() > 1;
+                if !temporal && key.style.animation.blur_amount() > 0.0 {
+                    if let (Some(video), Some(time)) = (&job.screen_video, plan.samples.first().and_then(|sample| sample.source_time)) {
+                        screen_frames.warm(video, time).ok()?;
+                    }
+                    if let (Some(video), Some(time)) = (&job.camera_video, plan.samples.first().and_then(|sample| sample.source_time)) {
+                        camera_frames.warm(video, time).ok()?;
+                    }
+                }
+                #[cfg(test)] let trace_started=std::time::Instant::now();
+                let renderer=renderer.get_or_insert_with(crate::recording::scene::gpu::Renderer::shared);
+                let mut accumulator:Option<Accumulator>=None;
+                // A live shutter is one transaction. Retain every exact screen
+                // and camera picture before drawing its first sample, so the
+                // transport cannot evict a later sample during GPU work. The
+                // playing planner caps this vector at six Arc pairs; repeated
+                // intervals share pixels. Paused/export sampling stays exact
+                // and does not retain an additional high-quality frame batch.
+                let mut retained=Vec::new();
+                if temporal && job.playing {
+                    let mut screens=Vec::with_capacity(plan.samples.len());
+                    for sample in &plan.samples {
+                        if cancelled() {return None;}
+                        let source=match (&job.screen_video,sample.source_time) {
+                            (Some(video),Some(time))=>match screen_frames.playing_frame(video,time,&||cancelled()).ok()? {
+                                Some(frame)=>frame,
+                                None=>{superseded=true;return None;}
+                            },
+                            _=>job.source.clone(),
+                        };
+                        screens.push(source);
+                    }
+                    // Pin screen buffers before any independent camera seek;
+                    // camera preroll must not age later screen samples out of
+                    // the transport ring while this batch is being prepared.
+                    for (sample,source) in plan.samples.iter().zip(screens) {
+                        if cancelled() {return None;}
+                        let camera=match (&job.camera_video,sample.source_time) {
+                            (Some(video),Some(time)) if sample.camera.opacity()>0.0 && time<job.recording_duration
+                                && camera_frames.contains_time(video,time).ok()?=>
+                                    Some(camera_frames.frame(video,time,&||cancelled()).ok()?),
+                            _=>None,
+                        };
+                        retained.push((source,camera));
+                    }
+                }
+                for (index,sample) in plan.samples.iter().enumerate() {
+                    if cancelled() { return None; }
+                    let (source,camera)=if let Some((source,camera))=retained.get(index) {
+                        (source.clone(),camera.clone())
+                    } else {
+                        let source=if temporal {
+                            match (&job.screen_video,sample.source_time) {
+                                (Some(video),Some(time))=>screen_frames.frame(video,time,&||cancelled()).ok()?,
+                                _=>job.source.clone(),
+                            }
+                        } else {job.source.clone()};
+                        let camera_in_range=match (&job.camera_video,sample.source_time) {
+                            (Some(video),Some(time))=>time<job.recording_duration && camera_frames.contains_time(video,time).ok()?,
+                            _=>false,
+                        };
+                        let camera=if sample.camera.opacity()>0.0 && camera_in_range {
+                            if temporal {match (&job.camera_video,sample.source_time) {
+                                (Some(video),Some(time))=>Some(camera_frames.frame(video,time,&||cancelled()).ok()?),
+                                _=>job.camera.clone(),
+                            }} else {job.camera.clone()}
+                        } else {None};
+                        (source,camera)
+                    };
+                    let mut style=key.style.clone();style.camera=sample.camera;
+                    style.pointer.motion_blur_amount=Some(if temporal {0.0}else{style.animation.blur_amount()});
+                    let size=source.dimensions();
+                    if cache.as_ref().is_none_or(|(old,canvas,source,_)|*old!=style || *canvas!=key.canvas || *source!=size) {
+                        let scene=match cache.as_ref(){
+                            Some((_,_,_,previous))=>previous.rebuild(&style,key.canvas.0,key.canvas.1,size.0,size.1),
+                            None=>SceneCompositor::new(&style,key.canvas.0,key.canvas.1,size.0,size.1),
+                        }.ok()?;
+                        cache=Some((style,key.canvas,size,scene));
+                    }
+                    let sampled_overlay = job.temporal_overlay.as_ref().and_then(|marks|
+                        marks.render(sample.time, cache.as_ref()?.3.camera_viewport(sample.viewport), key.style.source_crop));
+                    let overlay = if job.temporal_overlay.is_some() { sampled_overlay.as_deref() }
+                        else { job.overlay.as_deref() };
+                    let frame=renderer.compose_with_quality(&cache.as_ref()?.3,FrameInput {
+                        source:&source,overlay,viewport:sample.viewport,
+                        pointer:sample.pointer.as_ref(),camera:camera.as_deref(),
+                    },key.media_visible,None,RenderQuality {enhance:key.high_quality,
+                        motion_pixels:plan.motion_pixels,trail_pixels:plan.trail_pixels});
+                    if let Some(error)=renderer.take_camera_error() {
+                        render_error=Some(error);return None;
+                    }
+                    if let Some(sum)=&mut accumulator {sum.add(&frame);} else {accumulator=Some(Accumulator::new(frame));}
+                }
+                #[cfg(test)] if temporal && std::env::var_os("LAHZA_TRACE_TEMPORAL").is_some() {
+                    eprintln!("temporal composed t={:.6} samples={} canvas={:?} total={:?}",key.time(),plan.samples.len(),key.canvas,trace_started.elapsed());
+                }
+                return accumulator.map(|sum|crate::cached_render_image(sum.finish()));
+            }
             let rebuild = cache.as_ref().is_none_or(|(style, canvas, source, _)| {
                 *style != key.style || *canvas != key.canvas || *source != key.source_size
             });
@@ -181,15 +323,32 @@ impl PreviewWorker {
             } else {
                 renderer.compose_fast(scene, input, key.media_visible, None)
             };
+            if let Some(error)=renderer.take_camera_error() {render_error=Some(error);return None;}
             Some(crate::cached_render_image(frame))
-        })
+            })();
+            if superseded {return Err(ComposeFailure::Superseded);}
+            match render_error {Some(error)=>Err(ComposeFailure::Failed(error)),None=>Ok(output)}
+        }, &WORKERS)
     }
 
+    #[cfg(test)]
     fn spawn(compose: impl FnMut(&PreviewJob) -> Option<Arc<RenderImage>> + Send + 'static) -> std::io::Result<Self> {
         Self::spawn_in(compose, &WORKERS)
     }
 
+    #[cfg(test)]
     fn spawn_in(mut compose: impl FnMut(&PreviewJob) -> Option<Arc<RenderImage>> + Send + 'static,
+        registry: &WorkerRegistry) -> std::io::Result<Self> {
+        Self::spawn_in_cancellable(move |job, _| compose(job), registry)
+    }
+
+    #[cfg(test)]
+    fn spawn_in_cancellable(mut compose: impl FnMut(&PreviewJob, &dyn Fn() -> bool) -> Option<Arc<RenderImage>> + Send + 'static,
+        registry: &WorkerRegistry) -> std::io::Result<Self> {
+        Self::spawn_in_checked(move |job,cancelled|Ok(compose(job,cancelled)),registry)
+    }
+
+    fn spawn_in_checked(mut compose: impl FnMut(&PreviewJob, &dyn Fn() -> bool) -> Result<Option<Arc<RenderImage>>,ComposeFailure> + Send + 'static,
         registry: &WorkerRegistry) -> std::io::Result<Self> {
         let mut workers = registry.workers.lock().unwrap_or_else(|error| error.into_inner());
         // A finished thread has completed all captured resource destructors.
@@ -214,13 +373,18 @@ impl PreviewWorker {
             };
             // Expensive composition and RGBA -> BGRA conversion never hold
             // the mailbox lock or execute on the application's UI thread.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compose(&job)));
+            let cancelled = || {
+                let state = shared.0.lock().unwrap_or_else(|error| error.into_inner());
+                state.stopped || state.epoch != epoch
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compose(&job, &cancelled)));
             let mut state = shared.0.lock().unwrap();
             state.active = false;
             if state.stopped { break; }
             if state.epoch == epoch {
                 match result {
-                    Ok(Some(image)) => {
+                    Ok(Err(ComposeFailure::Superseded)) => {}
+                    Ok(Ok(Some(image))) => {
                         state.failure = None;
                         state.completed = Some(CompletedPreview { key: job.key, image });
                     }
@@ -229,9 +393,10 @@ impl PreviewWorker {
                         state.failure = Some(FailedPreview {
                             key: job.key,
                             message: match failed {
-                                Ok(None) => "Could not render the preview. Change the frame or scene to try again.",
-                                _ => "Preview rendering failed unexpectedly. Change the frame or scene to try again.",
-                            }.into(),
+                                Ok(Err(ComposeFailure::Failed(message))) => message,
+                                Ok(Ok(None)) => "Could not render the preview. Change the frame or scene to try again.".into(),
+                                _ => "Preview rendering failed unexpectedly. Change the frame or scene to try again.".into(),
+                            },
                         });
                     }
                 }
@@ -267,6 +432,7 @@ impl PreviewWorker {
             .map(|failure| failure.message)
     }
 
+    #[cfg(test)]
     pub(crate) fn invalidate(&self) {
         let mut state = self.mailbox.0.lock().unwrap();
         if state.requested.take().is_some() {
@@ -307,6 +473,54 @@ mod tests {
     use std::{sync::mpsc, time::{Duration, Instant}};
 
     #[test]
+    fn pinned_full_split_annotations_share_the_effective_viewport_in_preview_and_export() {
+        use crate::recording::scene::{CameraLayout, CameraSplitDirection, SceneBackground};
+        let mark = crate::AnnotationMark {
+            tool: crate::Tool::FilledRectangle,
+            start: crate::NormPoint { x: 0.2, y: 0.2 },
+            end: crate::NormPoint { x: 0.4, y: 0.4 },
+            pinned: true, color: 0xff0000, stroke_width: 3.0,
+            ..Default::default()
+        };
+        let temporal = TemporalOverlay { marks: vec![(mark.clone(), false)], size: (320, 180) };
+        let mut export = crate::scene_ui::overlay_source_for(vec![mark], 320, 180).unwrap();
+        let source = RgbaImage::from_pixel(320, 180, image::Rgba([0, 0, 0, 255]));
+        for direction in [CameraSplitDirection::Horizontal, CameraSplitDirection::Vertical] {
+            let mut style = SceneStyle::default();
+            style.background = SceneBackground::Solid(0x000000);
+            style.camera.layout = CameraLayout::Split;
+            style.camera.split_full = true;
+            style.camera.split_direction = direction;
+            let scene = SceneCompositor::new(&style, 320, 180, 320, 180).unwrap();
+            for zoom in [1.0, 1.8] {
+                let raw = ViewportFrame { magnification: zoom, ..Default::default() };
+                let effective = scene.camera_viewport(raw);
+                assert_ne!(effective.fill, raw.fill);
+                let preview = temporal.render(0.5, effective, crate::CropRect::UNIT).unwrap();
+                let exported = export(0.5, effective).unwrap();
+                assert_eq!(preview, exported, "preview/export share camera cover crop");
+                assert_ne!(preview, temporal.render(0.5, raw, crate::CropRect::UNIT).unwrap(),
+                    "the original viewport would drift pinned annotations");
+                let output = scene.compose(FrameInput { source: &source, overlay: Some(&preview),
+                    viewport: raw, pointer: None, camera: None });
+                let media = scene.geometry().media;
+                let mut red = Vec::new();
+                for (x, y, p) in output.enumerate_pixels() {
+                    if p[0] > 180 && p[1] < 60 && p[2] < 60 {
+                        red.push(((x as f64 - media.x) / media.width,
+                            (y as f64 - media.y) / media.height));
+                    }
+                }
+                assert!(!red.is_empty());
+                let x = red.iter().map(|p| p.0).sum::<f64>() / red.len() as f64;
+                let y = red.iter().map(|p| p.1).sum::<f64>() / red.len() as f64;
+                assert!((x - 0.3).abs() < 0.025 && (y - 0.3).abs() < 0.025,
+                    "pinned rectangle must stay at 30% of the visible media: {direction:?}, {zoom}, {x},{y}");
+            }
+        }
+    }
+
+    #[test]
     fn playback_pixel_budget_preserves_aspect_without_upscaling_or_changing_paused_frames() {
         for canvas in [(320, 180), (960, 540), (900, 1600), (1200, 1200)] {
             assert_eq!(playback_canvas_size(canvas, true), canvas);
@@ -331,14 +545,16 @@ mod tests {
 
     fn job(time: f64) -> PreviewJob {
         PreviewJob {
+            playing: true,
             key: PreviewKey {
-                style: SceneStyle::default(), canvas: (64, 48), source_size: (32, 24),
+                style: SceneStyle::default(), canvas: (64, 48), presentation_canvas:(64,48), source_size: (32, 24),
                 source: 1, time_bits: time.to_bits(), viewport: ViewportFrame::default(),
                 overlay: 0, pointer: false, media_visible: true, generation: 1,
-                media: PreviewMedia::Image(1), high_quality: false,
+                media: PreviewMedia::Image(1), high_quality: false, motion: None,
             },
             source: Arc::new(RgbaImage::from_pixel(32, 24, image::Rgba([30, 60, 90, 255]))),
             overlay: None, pointer: None, camera: None,
+            screen_video:None,camera_video:None,recording_duration:0.0, temporal_overlay:None,
         }
     }
 
@@ -390,7 +606,7 @@ mod tests {
                 1 => next.key.generation += 1,
                 2 => next.key.media = PreviewMedia::Video(PathBuf::from("another-project")),
                 3 => next.key.style.padding += 1,
-                4 => next.key.canvas = (80, 60),
+                4 => {next.key.canvas = (80, 60);next.key.presentation_canvas=(80,60);}
                 _ => next.key.time_bits = 0.0f64.to_bits(),
             }
             let key = next.key.clone();
@@ -439,6 +655,25 @@ mod tests {
             assert!(ready(&worker, &key).key == key,
                 "the replacement must match the complete requested key");
         }
+    }
+
+    #[test]
+    fn expired_playback_jobs_drop_without_failure_and_accept_the_next_frame() {
+        let registry=WorkerRegistry::new();
+        let worker=PreviewWorker::spawn_in_checked(|job,_| {
+            if job.key.time()==1.0 {return Err(ComposeFailure::Superseded);}
+            Ok(Some(crate::cached_render_image((*job.source).clone())))
+        },&registry).unwrap();
+        let first=job(1.0);let key=first.key.clone();worker.request(first);
+        let until=Instant::now()+Duration::from_secs(2);
+        while worker.has_work() {
+            assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(worker.take_failure(&key).is_none());
+        assert!(worker.take_completed(&key).is_none());
+        let next=job(2.0);let key=next.key.clone();worker.request(next);
+        assert_eq!(ready(&worker,&key).key.time(),2.0);
+        registry.drain();
     }
 
     #[test]
@@ -578,6 +813,48 @@ mod tests {
     }
 
     #[test]
+    fn shutter_preview_bounds_total_pixel_work_without_stretching() {
+        for canvas in [(1600,900),(900,1600),(2400,600)] {
+            for samples in 1..=6 {
+                let result=temporal_playback_canvas_size(canvas,samples);
+                assert!(result.0<=canvas.0 && result.1<=canvas.1);
+                assert!(u64::from(result.0)*u64::from(result.1)*samples as u64<=2*1600*900);
+                assert!((result.0 as f64/result.1 as f64-canvas.0 as f64/canvas.1 as f64).abs()<0.005);
+            }
+        }
+        assert_eq!(temporal_playback_canvas_size((1600,900),2),(1600,900));
+        let a=job(1.0).key;let mut b=a.clone();b.canvas=(32,24);
+        assert!(a.compatible(&b),"adaptive raster size must not starve forward playback");
+        b.presentation_canvas=(80,60);
+        assert!(!a.compatible(&b),"a real canvas edit still invalidates the worker");
+    }
+
+    #[test]
+    fn superseded_shutters_and_shutdown_cancel_inflight_decoding() {
+        let registry=WorkerRegistry::new();
+        let (started, starts)=mpsc::channel();
+        let (cancelled_tx, cancelled_rx)=mpsc::channel();
+        let worker=PreviewWorker::spawn_in_cancellable(move |job,cancelled| {
+            started.send(job.key.time()).unwrap();
+            let deadline=Instant::now()+Duration::from_secs(2);
+            while !cancelled() {
+                assert!(Instant::now()<deadline,"worker did not receive cancellation");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cancelled_tx.send(job.key.time()).unwrap();
+            None
+        },&registry).unwrap();
+        worker.request(job(2.0));
+        assert_eq!(starts.recv_timeout(Duration::from_secs(2)).unwrap(),2.0);
+        worker.request(job(1.0)); // A backward seek invalidates the running shutter.
+        assert_eq!(cancelled_rx.recv_timeout(Duration::from_secs(2)).unwrap(),2.0);
+        assert_eq!(starts.recv_timeout(Duration::from_secs(2)).unwrap(),1.0);
+        registry.drain();
+        assert_eq!(cancelled_rx.recv_timeout(Duration::from_secs(2)).unwrap(),1.0);
+        assert!(registry.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn background_fast_composition_matches_cpu_with_rounding() {
         let worker = PreviewWorker::new().unwrap();
         let mut input = job(1.25);
@@ -615,6 +892,7 @@ mod tests {
                 let mut input = job(frame as f64 / 60.0);
                 input.source = source.clone();
                 input.key.canvas = canvas;
+                input.key.presentation_canvas = canvas;
                 input.key.source_size = source.dimensions();
                 input.key.viewport.loupe = Some(crate::recording::viewport::LoupeFrame {
                     center: crate::recording::model::NormalizedPoint { x: 0.3 + frame as f64 * 0.02, y: 0.5 },

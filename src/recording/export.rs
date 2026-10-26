@@ -23,9 +23,9 @@ use super::{
     pointer_timeline::PointerTimeline,
     scene::{FrameInput, PointerOverlay, SceneCompositor, SceneStyle},
     video::{
-        probe_media, VideoError, VideoFrameStream, NOISE_REDUCTION_FILTER,
+        probe_media, VideoError, VideoFrameStream,
     },
-    viewport::ViewportTimeline,
+    viewport::{ViewportFrame, ViewportTimeline},
 };
 
 pub use super::export_encoder::VideoCodec;
@@ -109,9 +109,13 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Produces the media-space overlay (e.g. timed annotations) for a frame
-/// time; returning the same `Arc` for unchanged frames avoids re-rendering.
+/// Canvas overlays are evaluated once at the output frame time.
 pub type OverlaySource = Box<dyn FnMut(f64) -> Option<Arc<RgbaImage>> + Send>;
+
+/// Media overlays receive the compositor's effective viewport, including the
+/// camera split's cover crop. Reusing an Arc avoids rasterizing unchanged marks.
+pub type MediaOverlaySource =
+    Box<dyn FnMut(f64, ViewportFrame) -> Option<Arc<RgbaImage>> + Send>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportFormat {
@@ -169,7 +173,8 @@ impl ExportFormat {
 pub struct ExportProgress {
     completed: AtomicU64,
     total: AtomicU64,
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    audio_preparation: Mutex<Option<super::audio_processing::ProcessingControl>>,
     encoder: Mutex<Option<String>>,
     compositor: Mutex<Option<String>>,
     encoding_started: Mutex<Option<Instant>>,
@@ -177,6 +182,9 @@ pub struct ExportProgress {
 
 impl ExportProgress {
     pub fn remaining_label(&self) -> String {
+        if let Some(control) = self.audio_preparation.lock().unwrap().as_ref() {
+            return format!("Preparing audio… {:.0}%", control.fraction() * 100.0);
+        }
         let elapsed = self.encoding_started.lock().unwrap().map(|start| start.elapsed());
         remaining_label(
             self.completed.load(Ordering::Relaxed),
@@ -286,7 +294,7 @@ pub struct ImageSegment {
     pub pointer: Option<PointerTimeline>,
     pub viewport: ViewportTimeline,
     pub duration: f64,
-    pub overlay: Option<OverlaySource>,
+    pub overlay: Option<MediaOverlaySource>,
     pub canvas_overlay: Option<OverlaySource>,
     pub media_start: f64,
     pub media_end: Option<f64>,
@@ -316,8 +324,9 @@ pub struct SceneExportRequest {
     pub studio_overlays: Option<super::studio_overlays::StudioOverlays>,
     /// Suppress steady background noise in the exported audio.
     pub noise_reduction: bool,
+    pub audio_mode: Option<super::audio_mode::AudioMode>,
     /// Per-frame media-space overlay, such as timed annotations.
-    pub overlay: Option<OverlaySource>,
+    pub overlay: Option<MediaOverlaySource>,
     pub canvas_overlay: Option<OverlaySource>,
     pub media_start: f64,
     pub media_end: Option<f64>,
@@ -350,6 +359,7 @@ impl SceneExportRequest {
             recording_duration: None,
             studio_overlays: None,
             noise_reduction: false,
+            audio_mode: None,
             overlay: None,
             canvas_overlay: None,
             media_start: 0.0,
@@ -371,6 +381,8 @@ enum PreparedSource {
         pointer: Option<PointerTimeline>,
         camera: Option<(super::camera_playback::CameraPlaybackDecoder, f64)>,
         clips: RecordingClipTimeline,
+        temporal_source: super::motion_blur::VideoSource,
+        temporal_camera: Option<super::motion_blur::VideoSource>,
     },
     Image {
         image: RgbaImage,
@@ -428,7 +440,7 @@ pub fn export_scene(
         return Err(VideoError::Cancelled);
     }
 
-    let mut prepared = prepare_source(source, request, frame_rate)?;
+    let mut prepared = prepare_source(source, request, frame_rate, progress)?;
     let result = encode(&mut prepared, request, frame_rate, main_frames, progress);
     prepared.cleanup();
     result
@@ -438,6 +450,7 @@ fn prepare_source(
     source: SceneSource,
     request: &SceneExportRequest,
     frame_rate: f64,
+    progress: &ExportProgress,
 ) -> Result<PreparedSource, VideoError> {
     match source {
         SceneSource::Image { image, pointer } => {
@@ -454,6 +467,7 @@ fn prepare_source(
         } => {
             let info = probe_media(&media)?;
             let clips = clips.normalized(info.duration);
+            let clips=super::media_bank::MediaBank::load(&media)?.map_or_else(||clips.clone(),|bank|bank.ranges(&clips));
             // Output size belongs to the compositor. Decode the full source
             // so zoomed regions can use its detail even in a smaller export.
             let stream = VideoFrameStream::open_timeline(
@@ -464,12 +478,17 @@ fn prepare_source(
                 (frame.width, frame.height)
             } else { stream.dimensions() };
             let audio = (info.has_audio && request.include_audio && request.format.supports_audio())
-                .then(|| super::media_bank::source_filter(&media, &clips, 1, false, true)).transpose()?;
-            let camera = camera.filter(|_| request.style.camera.enabled)
+                .then(|| source_audio_filter(&media, &clips, 1, request.audio_mode.unwrap_or_else(|| request.noise_reduction.into()), progress)).transpose()?;
+            let camera = camera.filter(|_| request.style.has_camera_content())
                 .map(|path| {
-                    let duration = probe_media(&path)?.duration.min(request.recording_duration.unwrap_or(f64::INFINITY));
-                    Ok::<_, VideoError>((super::camera_playback::CameraPlaybackDecoder::new(path), duration))
+                    let camera_info=probe_media(&path)?;
+                    let size=(camera_info.width,camera_info.height);
+                    let duration = camera_info.duration.min(request.recording_duration.unwrap_or(f64::INFINITY));
+                    let temporal=super::motion_blur::VideoSource {path:path.clone(),size,revision:0};
+                    Ok::<_, VideoError>((super::camera_playback::CameraPlaybackDecoder::new_with_size(path,size), duration,temporal))
                 }).transpose()?;
+            let temporal_camera=camera.as_ref().map(|(_,_,source)|source.clone());
+            let camera=camera.map(|(decoder,duration,_)|(decoder,duration));
             Ok(PreparedSource::Video {
                 stream,
                 initial_size,
@@ -477,9 +496,78 @@ fn prepare_source(
                 pointer,
                 camera,
                 clips,
+                temporal_source:super::motion_blur::VideoSource {path:media,size:(info.width,info.height),revision:0},
+                temporal_camera,
             })
         }
     }
+}
+
+/// Prepare each original take once, then apply timeline edits to the same
+/// lossless samples used by playback. Each retained range opens independently
+/// so a late trim does not decode the entire beginning of a recording.
+pub(super) fn source_audio_filter(
+    path: &Path,
+    timeline: &RecordingClipTimeline,
+    first_input: usize,
+    audio_mode: impl Into<super::audio_mode::AudioMode>,
+    progress: &ExportProgress,
+) -> Result<(Vec<super::media_bank::MediaInput>, String), VideoError> {
+    let audio_mode = audio_mode.into();
+    use super::{audio_processing, media_bank::{MediaBank, MediaInput}};
+    let control = audio_processing::ProcessingControl::with_cancel_flag(progress.cancelled.clone());
+    *progress.audio_preparation.lock().unwrap() = Some(control.clone());
+    let result = (|| {
+        audio_processing::prepare_source(path, audio_mode, &control)?;
+        let bank = MediaBank::load(path)?;
+        let ranges = bank.as_ref().map_or_else(|| timeline.clone(), |bank| bank.ranges(timeline));
+        let sources: Vec<_> = if let Some(bank) = &bank {
+            bank.entries.iter().enumerate().map(|(index, entry)|
+                (bank.entry_path(path, index), entry.info.has_audio && !entry.still)).collect()
+        } else {
+            vec![(path.to_owned(), probe_media(path)?.has_audio)]
+        };
+        let mut prepared = Vec::with_capacity(sources.len());
+        for (source, has_audio) in sources {
+            if progress.is_cancelled() { return Err(VideoError::Cancelled); }
+            prepared.push(if has_audio {
+                Some(audio_processing::ensure_audio(&source, audio_mode, &control)?.unwrap_or(source))
+            } else { None });
+        }
+        let mut inputs = Vec::new();
+        let mut filter = String::new();
+        let mut count = 0;
+        for clip in ranges.playback_ranges() {
+            if clip.gap_before > 0.0 {
+                filter.push_str(&format!("anullsrc=r=48000:cl=stereo,atrim=duration={:.9}[a{count}];", clip.gap_before));
+                count += 1;
+            }
+            let (index, offset) = bank.as_ref().map_or((0, 0.0), |bank| bank.locate(clip.source_start));
+            let duration = clip.editor_duration();
+            if let Some(source) = &prepared[index] {
+                let input = first_input + inputs.len();
+                inputs.push(MediaInput {
+                    path: source.clone(), still_duration: None,
+                    seek: (clip.source_start - offset).max(0.0), duration: Some(clip.duration()),
+                });
+                // FFmpeg's WSOLA filter changes samples even at rate 1.0.
+                // An unchanged-speed cut must reuse the prepared waveform;
+                // only actual speed edits need time stretching.
+                let tempo = if clip.speed == 1.0 { String::new() }
+                    else { format!("atempo={:.9},", clip.speed) };
+                filter.push_str(&format!("[{input}:a:0]atrim=start=0:end={:.9},asetpts=PTS-STARTPTS,{tempo}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration={duration:.9}[a{count}];", clip.duration()));
+            } else {
+                filter.push_str(&format!("anullsrc=r=48000:cl=stereo,atrim=duration={duration:.9}[a{count}];"));
+            }
+            count += 1;
+        }
+        if count == 0 { return Err(VideoError::InvalidMedia("the audio edit is empty".into())); }
+        for index in 0..count { filter.push_str(&format!("[a{index}]")); }
+        filter.push_str(&format!("concat=n={count}:v=0:a=1[audio]"));
+        Ok((inputs, filter))
+    })();
+    *progress.audio_preparation.lock().unwrap() = None;
+    result
 }
 
 /// Add the recording audio and music layers as FFmpeg inputs starting at
@@ -489,7 +577,6 @@ fn add_audio_graph(
     command: &mut Command,
     first_input: usize,
     recording: Option<&(Vec<super::media_bank::MediaInput>, String)>,
-    noise_reduction: bool,
     audio_clips: &[(PathBuf, super::media::AudioClip)],
     editor_duration: f64,
     output_duration: f64,
@@ -499,11 +586,7 @@ fn add_audio_graph(
     let mut next_input = first_input;
     if let Some((inputs, filter)) = recording {
         super::media_bank::add_inputs(command, inputs);
-        filters.push(if noise_reduction {
-            format!("{filter};[audio]{NOISE_REDUCTION_FILTER}[recording_audio]")
-        } else {
-            format!("{filter};[audio]anull[recording_audio]")
-        });
+        filters.push(format!("{filter};[audio]anull[recording_audio]"));
         labels.push("[recording_audio]".to_string());
         next_input += inputs.len();
     }
@@ -562,6 +645,7 @@ pub struct AudioExportRequest {
     pub clips: RecordingClipTimeline,
     pub include_recording: bool,
     pub noise_reduction: bool,
+    pub audio_mode: Option<super::audio_mode::AudioMode>,
     pub audio_clips: Vec<(PathBuf, super::media::AudioClip)>,
 }
 
@@ -573,7 +657,7 @@ pub fn export_audio(request: AudioExportRequest, progress: &ExportProgress) -> R
         return Err(VideoError::InvalidMedia("the edit is empty".into()));
     }
     let recording = (info.has_audio && request.include_recording)
-        .then(|| super::media_bank::source_filter(&request.media, &clips, 0, false, true))
+        .then(|| source_audio_filter(&request.media, &clips, 0, request.audio_mode.unwrap_or_else(|| request.noise_reduction.into()), progress))
         .transpose()?;
     let mut command = Command::new("ffmpeg");
     command.args(["-v", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]);
@@ -581,7 +665,6 @@ pub fn export_audio(request: AudioExportRequest, progress: &ExportProgress) -> R
         &mut command,
         0,
         recording.as_ref(),
-        request.noise_reduction,
         &request.audio_clips,
         duration,
         duration,
@@ -639,6 +722,10 @@ pub fn export_audio(request: AudioExportRequest, progress: &ExportProgress) -> R
     progress.completed.store(1000, Ordering::Relaxed);
     fs::rename(&temporary, &request.destination)?;
     Ok(())
+}
+
+fn temporal_decode_error(error:String,progress:&ExportProgress)->VideoError {
+    if progress.is_cancelled() {VideoError::Cancelled} else {VideoError::Decode(error)}
 }
 
 fn encode(
@@ -712,7 +799,6 @@ fn encode(
         &mut command,
         1,
         audio.as_ref(),
-        request.noise_reduction,
         if request.format.supports_audio() { &request.audio_clips } else { &[] },
         request.duration,
         audio_duration,
@@ -794,6 +880,15 @@ fn encode(
 
     *progress.encoding_started.lock().unwrap() = Some(Instant::now());
     let mut compositor_source_size = (source_width, source_height);
+    let (temporal_pointer,temporal_clips,temporal_source,temporal_camera)=match &*prepared {
+        PreparedSource::Video {pointer,clips,temporal_source,temporal_camera,..} =>
+            (pointer.clone(),Some(clips.clone()),Some(temporal_source.clone()),temporal_camera.clone()),
+        PreparedSource::Image {pointer,..}=>(pointer.clone(),None,None,None),
+    };
+    let mut screen_frames=super::motion_blur::FrameCache::default();
+    let mut camera_frames=super::motion_blur::FrameCache::default();
+    let mut render_style=request.style.clone();
+    if request.motion_blur && render_style.animation.motion_blur==0 {render_style.animation.motion_blur=100;}
     let mut last_video_frame: Option<RgbaImage> = None;
     let mut last_camera_frame: Option<RgbaImage> = None;
     let mut write_error: Option<VideoError> = None;
@@ -863,51 +958,57 @@ fn encode(
                 Err(error) => { write_error = Some(VideoError::InvalidMedia(error)); break; }
             }
         }
-        let viewport = request.viewport.frame_at(time);
-        let overlay = request.overlay.as_mut().and_then(|source| source(time));
+        let camera_aspect=last_camera_frame.as_ref().map_or(1.0,|frame|frame.width() as f64/frame.height().max(1) as f64);
+        let plan=super::motion_blur::plan(&render_style,&request.viewport,temporal_pointer.as_ref(),temporal_clips.as_ref(),
+            time,request.duration,frame_rate,(canvas_width,canvas_height),source_frame.dimensions(),camera_aspect,
+            super::motion_blur::Quality::High);
         let canvas_overlay = request.canvas_overlay.as_mut().and_then(|source| source(time));
         let canvas_overlay = match overlay_layers.as_mut() {
             Some(layers) => layers.layer(time, canvas_overlay),
             None => canvas_overlay,
         };
         let media_visible = time >= request.media_start && request.media_end.is_none_or(|end| time < end);
-        let mut output = renderer.compose(&compositor, FrameInput {
-            source: source_frame,
-            overlay: overlay.as_deref(),
-            viewport,
-            pointer: pointer_overlay.as_ref(),
-            camera: last_camera_frame.as_ref(),
-        }, media_visible, canvas_overlay.as_deref());
-        // Motion blur by temporal supersampling: while the camera moves,
-        // average several camera states across the frame's shutter. Settled
-        // frames pay for a single composition.
-        let shutter = 1.0 / frame_rate;
-        if request.motion_blur
-            && camera_moved(request.viewport.frame_at(time - shutter * 0.5), request.viewport.frame_at(time + shutter * 0.5))
-        {
-            let mut sum: Vec<u32> = output.as_raw().iter().map(|&value| value as u32).collect();
-            for sample in 0..MOTION_BLUR_SAMPLES - 1 {
-                let offset = ((sample as f64 + 0.5) / (MOTION_BLUR_SAMPLES - 1) as f64 - 0.5) * shutter;
-                let frame = renderer.compose(&compositor, FrameInput {
-                    source: source_frame,
-                    overlay: overlay.as_deref(),
-                    viewport: request.viewport.frame_at(time + offset),
-                    pointer: pointer_overlay.as_ref(),
-                    camera: last_camera_frame.as_ref(),
-                }, media_visible, canvas_overlay.as_deref());
-                for (total, value) in sum.iter_mut().zip(frame.as_raw()) {
-                    *total += *value as u32;
+        let rendered=(||->Result<RgbaImage,VideoError>{
+            use super::motion_blur::Accumulator;
+            let temporal=plan.samples.len()>1;
+            let mut sum:Option<Accumulator>=None;
+            for sample in &plan.samples {
+                if progress.is_cancelled(){return Err(VideoError::Cancelled);}
+                let decoded=if temporal {match (&temporal_source,sample.source_time){
+                    (Some(video),Some(time))=>Some(screen_frames.frame(video,time,&||progress.is_cancelled()).map_err(|error|temporal_decode_error(error,progress))?),
+                    _=>None,
+                }} else {None};
+                let source=decoded.as_deref().unwrap_or(source_frame);
+                let camera=if temporal {match (&temporal_camera,sample.source_time.filter(|t|*t<request.recording_duration.unwrap_or(f64::INFINITY))){
+                    (Some(video),Some(time)) if sample.camera.opacity()>0.0 && camera_frames.contains_time(video,time)
+                        .map_err(|error|temporal_decode_error(error,progress))? =>
+                        Some(camera_frames.frame(video,time,&||progress.is_cancelled()).map_err(|error|temporal_decode_error(error,progress))?),
+                    _=>None,
+                }}else{None};
+                let camera=if sample.camera.opacity()>0.0 && sample.source_time.is_some_and(|t|
+                    t<request.recording_duration.unwrap_or(f64::INFINITY)) {
+                    if temporal {camera.as_deref()} else {last_camera_frame.as_ref()}
+                } else {None};
+                let mut style=render_style.clone();style.camera=sample.camera;
+                style.pointer.motion_blur_amount=Some(if temporal {0.0}else{style.animation.blur_amount()});
+                if compositor.style()!=&style || compositor.source_size()!=source.dimensions(){
+                    compositor=compositor.rebuild(&style,canvas_width,canvas_height,source.width(),source.height())
+                        .map_err(VideoError::InvalidMedia)?;
+                    compositor_source_size=source.dimensions();
                 }
+                let overlay=request.overlay.as_mut().and_then(|source|source(sample.time, compositor.camera_viewport(sample.viewport)));
+                let frame=renderer.compose_with_quality(&compositor,FrameInput {
+                    source,overlay:overlay.as_deref(),viewport:sample.viewport,
+                    pointer:sample.pointer.as_ref().or(pointer_overlay.as_ref()),camera,
+                },media_visible,canvas_overlay.as_deref(),super::scene::gpu::RenderQuality {
+                    enhance:true,motion_pixels:plan.motion_pixels,trail_pixels:plan.trail_pixels,
+                });
+                if let Some(error)=renderer.take_camera_error() {return Err(VideoError::Decode(error));}
+                if let Some(sum)=&mut sum {sum.add(&frame);}else{sum=Some(Accumulator::new(frame));}
             }
-            let count = MOTION_BLUR_SAMPLES as u32;
-            if let Some(blurred) = RgbaImage::from_raw(
-                output.width(),
-                output.height(),
-                sum.into_iter().map(|total| ((total + count / 2) / count) as u8).collect(),
-            ) {
-                output = blurred;
-            }
-        }
+            sum.map(Accumulator::finish).ok_or_else(||VideoError::InvalidMedia("empty shutter plan".into()))
+        })();
+        let output=match rendered {Ok(frame)=>frame,Err(error)=>{write_error=Some(error);break;}};
         progress.set_compositor_label(renderer.label());
         if let Err(error) = stdin.write_all(output.as_raw()) {
             write_error = Some(VideoError::Decode(format!(
@@ -924,8 +1025,8 @@ fn encode(
         if write_error.is_some() {
             break;
         }
-        let compositor = match SceneCompositor::new(
-            &request.style,
+        let mut compositor = match SceneCompositor::new(
+            &render_style,
             canvas_width,
             canvas_height,
             segment.image.width(),
@@ -946,20 +1047,28 @@ fn encode(
                 return Err(VideoError::Cancelled);
             }
             let time = index as f64 / frame_rate;
-            let pointer_overlay = segment
-                .pointer
-                .as_ref()
-                .and_then(|pointer| pointer.frame_at(time))
-                .map(|frame| PointerOverlay { frame });
-            let overlay = segment.overlay.as_mut().and_then(|source| source(time));
             let canvas_overlay = segment.canvas_overlay.as_mut().and_then(|source| source(time));
-            let output = renderer.compose(&compositor, FrameInput {
-                source: &segment.image,
-                overlay: overlay.as_deref(),
-                viewport: segment.viewport.frame_at(time),
-                pointer: pointer_overlay.as_ref(),
-                camera: None,
-            }, time >= segment.media_start && segment.media_end.is_none_or(|end| time < end), canvas_overlay.as_deref());
+            let plan=super::motion_blur::plan(&render_style,&segment.viewport,segment.pointer.as_ref(),None,
+                time,segment.duration,frame_rate,(canvas_width,canvas_height),segment.image.dimensions(),1.0,
+                super::motion_blur::Quality::High);
+            let mut style=render_style.clone();style.pointer.motion_blur_amount=Some(if plan.samples.len()>1 {0.0}else{style.animation.blur_amount()});
+            if compositor.style()!=&style {
+                compositor=match compositor.rebuild(&style,canvas_width,canvas_height,segment.image.width(),segment.image.height()) {
+                    Ok(scene)=>scene,Err(error)=>{write_error=Some(VideoError::InvalidMedia(error));break 'followers;}
+                };
+            }
+            let mut sum:Option<super::motion_blur::Accumulator>=None;
+            for sample in &plan.samples {
+                if progress.is_cancelled() {write_error=Some(VideoError::Cancelled);break 'followers;}
+                let overlay=segment.overlay.as_mut().and_then(|source|source(sample.time, compositor.camera_viewport(sample.viewport)));
+                let frame=renderer.compose_with_quality(&compositor,FrameInput {
+                    source:&segment.image,overlay:overlay.as_deref(),viewport:sample.viewport,
+                    pointer:sample.pointer.as_ref(),camera:None,
+                },time>=segment.media_start && segment.media_end.is_none_or(|end|time<end),canvas_overlay.as_deref(),
+                super::scene::gpu::RenderQuality {enhance:true,motion_pixels:plan.motion_pixels,trail_pixels:plan.trail_pixels});
+                if let Some(sum)=&mut sum {sum.add(&frame);}else{sum=Some(super::motion_blur::Accumulator::new(frame));}
+            }
+            let output=sum.unwrap().finish();
             progress.set_compositor_label(renderer.label());
             if let Err(error) = stdin.write_all(output.as_raw()) {
                 write_error = Some(VideoError::Decode(format!(
@@ -1136,7 +1245,7 @@ mod tests {
                 1080, SceneStyle::default(), ViewportTimeline::default(), clips.duration());
             let mut prepared = prepare_source(SceneSource::Video {
                 media: media.clone(), clips, pointer: None, camera: None,
-            }, &request, 30.0).unwrap();
+            }, &request, 30.0, &ExportProgress::default()).unwrap();
             assert_eq!(prepared.dimensions(), (width, height));
             let PreparedSource::Video { stream, .. } = &mut prepared else { unreachable!() };
             assert_detail(&stream.next_frame().unwrap().unwrap());
@@ -1189,10 +1298,11 @@ mod tests {
             1080, style.clone(), viewport.clone(), duration);
         request.frame_rate = 30.0;
         request.noise_reduction = document["lahzaExtras"]["noiseReduction"].as_bool().unwrap_or(false);
+        request.audio_mode = serde_json::from_value(document["lahzaExtras"]["audioMode"].clone()).ok();
         request.include_audio = !document["lahzaExtras"]["audioMuted"].as_bool().unwrap_or(false);
         let (width, height) = style.export_canvas_size(info.width, info.height, 1080);
         request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(marks.clone(), width as f64 / height as f64);
-        request.overlay = crate::scene_ui::overlay_source_for(marks, viewport, info.width, info.height);
+        request.overlay = crate::scene_ui::overlay_source_for(marks, info.width, info.height);
         let progress = ExportProgress::default();
         let start = Instant::now();
         export_scene(SceneSource::Video {
@@ -1289,9 +1399,11 @@ mod tests {
             let source = || SceneSource::Video {
                 media: media.clone(), clips: clips.clone(), pointer: None, camera: Some(media.clone()),
             };
-            let before = fs::read_dir(&root).unwrap().count();
-            let mut prepared = prepare_source(source(), &request, 20.0).unwrap();
-            assert_eq!(fs::read_dir(&root).unwrap().count(), before, "preparation created intermediate media");
+            let media_count = || fs::read_dir(&root).unwrap().filter_map(Result::ok)
+                .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.')).count();
+            let before = media_count();
+            let mut prepared = prepare_source(source(), &request, 20.0, &ExportProgress::default()).unwrap();
+            assert_eq!(media_count(), before, "preparation created intermediate video media");
             prepared.cleanup();
             export_scene(source(), &mut request, &ExportProgress::default()).unwrap();
             let info = probe_media(&destination).unwrap();
@@ -1305,6 +1417,48 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporal_video_export_matches_shared_shutter_with_camera_region_over_hidden_base() {
+        use super::super::{camera_layout::CameraLayout, camera_timeline::CameraRegion,
+            motion_blur::{self,Accumulator,FrameCache,Quality,VideoSource}, scene::CameraOverlay};
+        let root=test_root("temporal-camera");
+        let media=test_video(&root);
+        let destination=root.join("shutter.mp4");
+        let clips=RecordingClipTimeline::full(0.6);
+        let mut style=SceneStyle {background:SceneBackground::Solid(0x172033),padding:0,corners:0,
+            shadow:0,border:false,aspect:Some(16.0/9.0),..Default::default()};
+        style.camera.enabled=false;
+        style.animation.motion_blur=100;
+        style.camera_regions.push(CameraRegion {start:0.0,end:0.6,transition:0.35,
+            overlay:CameraOverlay {enabled:true,layout:CameraLayout::Fullscreen,..Default::default()},..Default::default()});
+        let viewport=ViewportTimeline::build_static(&[],0.6);
+        let time=0.2;
+        let plan=motion_blur::plan(&style,&viewport,None,Some(&clips),time,0.6,10.0,
+            (320,180),(320,180),16.0/9.0,Quality::High);
+        assert!(plan.samples.len()>1,"fixture must exercise temporal composition");
+        let descriptor=VideoSource {path:media.clone(),size:(320,180),revision:0};
+        let mut frames=FrameCache::default();let mut expected:Option<Accumulator>=None;
+        for sample in &plan.samples {
+            let image=frames.frame(&descriptor,sample.source_time.unwrap(),&||false).unwrap();
+            let mut sampled=style.clone();sampled.camera=sample.camera;
+            sampled.pointer.motion_blur_amount=Some(0.0);
+            let scene=SceneCompositor::new(&sampled,320,180,320,180).unwrap();
+            let output=scene.compose_layers(FrameInput {source:&image,camera:Some(&image),
+                viewport:sample.viewport,pointer:None,overlay:None},true,None);
+            if let Some(sum)=&mut expected {sum.add(&output);}else{expected=Some(Accumulator::new(output));}
+        }
+        let expected=expected.unwrap().finish();
+        let mut request=SceneExportRequest::new(destination.clone(),ExportFormat::Mp4,180,style,viewport,0.6);
+        request.frame_rate=10.0;request.recording_duration=Some(0.6);
+        export_scene(SceneSource::Video {media:media.clone(),clips,pointer:None,camera:Some(media)},
+            &mut request,&ExportProgress::default()).unwrap();
+        let actual=super::super::video::decode_frame(&destination,time,320,180).unwrap();
+        let mean=actual.rgba.chunks_exact(4).zip(expected.pixels()).map(|(a,b)|
+            (0..3).map(|c|a[c].abs_diff(b[c]) as f64).sum::<f64>()).sum::<f64>()/(320.0*180.0*3.0);
+        assert!(mean<6.0,"temporal export diverged from CPU shutter reference: {mean:.3}/255");
+        drop(frames);fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1390,9 +1544,7 @@ mod tests {
             );
             request.frame_rate = 10.0;
             // A timed overlay: red square for the first half only.
-            let mut calls = 0usize;
-            request.overlay = Some(Box::new(move |time: f64| {
-                calls += 1;
+            request.overlay = Some(Box::new(move |time: f64, _viewport| {
                 (time < 0.5).then(|| {
                     let mut layer = RgbaImage::new(160, 90);
                     for y in 30..60 {
@@ -1613,7 +1765,7 @@ mod tests {
         request.style.camera.shadow = false;
         // Timed annotations travel as an overlay: the whole media turns red
         // for the first half second only (so the check holds under zoom).
-        request.overlay = Some(Box::new(|time: f64| {
+        request.overlay = Some(Box::new(|time: f64, _viewport| {
             (time < 0.5).then(|| Arc::new(RgbaImage::from_pixel(320, 180, Rgba([255, 0, 0, 255]))))
         }));
         export_scene(

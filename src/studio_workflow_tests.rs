@@ -350,13 +350,24 @@ fn studio_uhd_zoom_playback_and_settled_preview_remain_responsive() {
     let mut classic =
         recording::viewport::ZoomCue::pinned(0.0, 1.35, 2.2, NormalizedPoint { x: 0.5, y: 0.5 });
     classic.skips_easing = true;
+    // Start outside the preceding instant cue's 50ms snap window so this
+    // fixture exercises a genuinely animated, multi-sample glass entrance.
     let mut glass =
-        recording::viewport::ZoomCue::pinned(1.4, 3.0, 2.5, NormalizedPoint { x: 0.5, y: 0.5 });
+        recording::viewport::ZoomCue::pinned(1.5, 3.0, 2.5, NormalizedPoint { x: 0.5, y: 0.5 });
     glass.presentation = ZoomPresentation::GlassLoupe;
-    glass.skips_easing = true;
-    session
-        .write_edit_field("zoomCues", &vec![classic, glass])
-        .unwrap();
+    glass.camera_motion = CameraMotion::Smooth;
+    let cues=vec![classic, glass];
+    let style=SceneStyle {
+        animation: recording::animation::AnimationSettings { motion_blur: 70, ..Default::default() },
+        ..Default::default()
+    };
+    let viewport=recording::viewport::ViewportTimeline::build_static(&cues,3.0);
+    assert!((151..180).any(|step| recording::motion_blur::plan(&style,&viewport,None,None,
+        step as f64/100.0,3.0,30.0,(1600,900),(3840,2160),1.0,
+        recording::motion_blur::Quality::Playing).samples.len()>1),
+        "the UHD fixture must contain a real multi-sample entrance");
+    session.write_edit_field("zoomCues", &cues).unwrap();
+    session.write_edit_field("scene", &style).unwrap();
     let project = session.directory.clone();
     let screenshots = artifacts.clone();
     Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
@@ -445,7 +456,8 @@ fn studio_uhd_zoom_playback_and_settled_preview_remain_responsive() {
             let mut max_lag = 0.0_f64;
             let mut saw_classic = false;
             let mut saw_glass = false;
-            while sampled.elapsed() < Duration::from_secs(2) {
+            let mut saw_temporal = false;
+            while sampled.elapsed() < Duration::from_millis(2800) {
                 let scheduled = std::time::Instant::now();
                 Timer::after(Duration::from_millis(50)).await;
                 wakes.push(scheduled.elapsed());
@@ -459,6 +471,7 @@ fn studio_uhd_zoom_playback_and_settled_preview_remain_responsive() {
                     max_lag = max_lag.max(studio.video_position - key.time());
                     saw_glass |= key.viewport.loupe.is_some();
                     saw_classic |= key.viewport.loupe.is_none() && key.viewport.magnification > 1.1;
+                    saw_temporal |= key.motion.as_ref().is_some_and(|plan| plan.samples.len() > 1);
                 }).unwrap();
             }
             let mut distinct = presented.clone();
@@ -466,12 +479,14 @@ fn studio_uhd_zoom_playback_and_settled_preview_remain_responsive() {
             wakes.sort();
             let p95 = wakes[(wakes.len() - 1) * 95 / 100];
             let maximum = *wakes.last().unwrap();
+            eprintln!("UHD playback diagnostic warmup={warmup_elapsed:?}, times={presented:?}, classic={saw_classic}, glass={saw_glass}, temporal={saw_temporal}, lag={max_lag:.3}s, wake p95={p95:?}, max={maximum:?}");
             assert!(distinct.len() >= 3 && presented.last().unwrap() - presented[0] > 0.5,
                 "UHD preview must present advancing frames");
             assert!(saw_classic && saw_glass, "both zoom styles must reach the displayed preview");
+            assert!(saw_temporal, "UHD playback must present a native multi-sample shutter");
             assert!(maximum < Duration::from_secs(1) && p95 < Duration::from_millis(500),
                 "UHD playback blocked UI timers: p95={p95:?}, maximum={maximum:?}");
-            assert!(max_lag < 1.0, "bounded preview accumulated {max_lag:.3}s of latency");
+            assert!(max_lag < 0.5, "bounded preview accumulated {max_lag:.3}s of latency");
             handle.update(cx, |studio, _, cx| {
                 studio.pause_video_playback();
                 studio.seek_video(1.8, cx);
@@ -484,7 +499,8 @@ fn studio_uhd_zoom_playback_and_settled_preview_remain_responsive() {
             save_display(&screenshots.join("glass-native-paused.png"), false);
             eprintln!("UHD UI: {} advancing frames/{} samples, normal open HQ={normal_open_hq:?}, quick-pause HQ={quick_pause_hq:?}, immediate seek HQ={initial_hq:?}, playback warmup={warmup_elapsed:?}, 50ms wake p95={p95:?}, max={maximum:?}, max lag={max_lag:.3}s, paused HQ={paused_hq:?}, paused max wake={paused_max:?}", distinct.len(), presented.len());
             std::fs::write(screenshots.join("metrics.json"), serde_json::to_vec_pretty(&serde_json::json!({
-                "source": [3840, 2160], "presented_frames": distinct.len(), "samples": presented.len(),
+                "source": [3840, 2160], "motion_blur_percent":70, "saw_temporal":saw_temporal,
+                "presented_frames": distinct.len(), "samples": presented.len(),
                 "normal_open_hq_ms": normal_open_hq.as_secs_f64() * 1000.0,
                 "quick_pause_hq_ms": quick_pause_hq.as_secs_f64() * 1000.0,
                 "initial_hq_ms": initial_hq.as_secs_f64() * 1000.0,
@@ -621,6 +637,7 @@ fn studio_camera_cursor_glass_save_reopen_and_export() {
                     })
                     .unwrap();
                 exercise_motion_controls(handle, editor, &screenshots, cx).await;
+                exercise_project_animation_controls(handle, editor, &screenshots, cx).await;
                 handle
                     .update(cx, |studio, _, cx| {
                         assert_eq!(studio.custom_canvas_dimensions, (1400, 1000));
@@ -981,11 +998,15 @@ async fn exercise_motion_controls(
     save_display(&screenshots.join("motion-advanced-expanded.png"), false);
     workflow_click(editor, 1405.0, 639.0, false, cx).await; // motion-early
     handle
-        .update(cx, |studio, _, _| {
+        .update(cx, |studio, _, cx| {
             assert_eq!(
-                studio.selected_region().unwrap().start_animation_early,
-                !before.start_animation_early
+                studio.animation_settings.start_early,
+                Some(!before.start_animation_early)
             );
+            assert_eq!(studio.selected_region().unwrap().start_animation_early, before.start_animation_early,
+                "project overrides must preserve the region's authored legacy setting");
+            studio.undo_video_edit(cx);
+            assert_eq!(studio.animation_settings.start_early, None);
         })
         .unwrap();
     workflow_click(editor, 1405.0, 763.0, false, cx).await; // loupe-glass
@@ -1088,6 +1109,125 @@ async fn exercise_motion_controls(
             );
         })
         .unwrap();
+}
+
+async fn exercise_project_animation_controls(
+    handle: WindowHandle<Studio>,
+    editor: AnyWindowHandle,
+    screenshots: &Path,
+    cx: &mut gpui::AsyncApp,
+) {
+    let (authored, previous_pointer) = handle.update(cx, |studio, window, cx| {
+        studio.select_inspector_tab(shell_ui::InspectorTab::Motion);
+        studio.open_sections.insert("project-animation");
+        studio.animation_settings = Default::default();
+        studio.rebuild_video_motion_timelines();
+        window.refresh();
+        cx.notify();
+        (studio.video_zoom_cues.clone(), studio.pointer_style.motion)
+    }).unwrap();
+    Timer::after(Duration::from_millis(200)).await;
+    editor.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+    Timer::after(Duration::from_millis(100)).await;
+    save_display(&screenshots.join("project-animation-region-settings.png"), false);
+
+    // Choose the first visible screen preset through the native input path.
+    workflow_hover(1170.0, 515.0, cx).await;
+    handle.update(cx, |studio, _, _| assert!(studio.animation_hover.is_some())).unwrap();
+    save_display(&screenshots.join("project-animation-screen-hover.png"), false);
+    workflow_click(editor, 1170.0, 515.0, false, cx).await;
+    handle.update(cx, |studio, _, cx| {
+        assert_eq!(studio.animation_settings.screen_motion, Some(CameraMotion::Focused));
+        assert_eq!(studio.video_zoom_cues, authored);
+        studio.undo_video_edit(cx);
+        assert_eq!(studio.animation_settings.screen_motion, None);
+        studio.redo_video_edit(cx);
+        assert_eq!(studio.animation_settings.screen_motion, Some(CameraMotion::Focused));
+
+    }).unwrap();
+    let undo_count = handle.update(cx, |studio, _, _| studio.video_undo_stack.len()).unwrap();
+    workflow_hover(1385.0, 660.0, cx).await;
+    handle.update(cx, |studio, _, _| assert!(studio.animation_hover.is_some())).unwrap();
+    save_display(&screenshots.join("project-animation-cursor-hover.png"), false);
+    workflow_click(editor, 1385.0, 660.0, false, cx).await;
+    handle.update(cx, |studio, _, cx| {
+        assert_eq!(studio.pointer_style.motion, PointerMotion::Rapid);
+        assert_eq!(studio.video_undo_stack.len(), undo_count + 1);
+        studio.undo_video_edit(cx);
+        assert_eq!(studio.pointer_style.motion, previous_pointer);
+        studio.redo_video_edit(cx);
+        assert_eq!(studio.pointer_style.motion, PointerMotion::Rapid);
+    }).unwrap();
+    workflow_click(editor, 1380.0, 753.0, false, cx).await;
+    let reopened_poster = handle.update(cx, |studio, _, cx| {
+        assert_eq!(studio.animation_settings.motion_blur, 2);
+        studio.undo_video_edit(cx);
+        assert_eq!(studio.animation_settings.motion_blur, 0);
+        studio.redo_video_edit(cx);
+        assert_eq!(studio.animation_settings.motion_blur, 2);
+        studio.set_project_early(Some(true));
+        studio.record_animation_edit();
+        studio.set_scene_slider(scene_ui::SceneSlider::MotionBlurAmount.id(), 65);
+        studio.undo_video_edit(cx);
+        assert_eq!(studio.animation_settings.motion_blur, 2);
+        studio.redo_video_edit(cx);
+        assert_eq!(studio.animation_settings.motion_blur, 65);
+        assert!(!studio.annotations_paint_flat(),"temporal media marks must have one compositor owner");
+        assert!(studio.animation_settings.cues(&authored).iter().all(|cue|
+            cue.camera_motion == CameraMotion::Focused && cue.start_animation_early));
+        let expected = studio.scene_style();
+        studio.autosave_scene_style();
+        let session = studio.video_project.clone().unwrap();
+        let saved: SceneStyle = session.read_edit_field("scene").unwrap().unwrap();
+        assert_eq!(saved.animation, expected.animation);
+        assert_eq!(saved.pointer.motion, PointerMotion::Rapid);
+        studio.open_video_project(session.directory).unwrap();
+        assert_eq!(studio.animation_settings, expected.animation);
+        assert_eq!(studio.pointer_style.motion, PointerMotion::Rapid);
+        assert_eq!(studio.video_zoom_cues, authored);
+        studio.select_inspector_tab(shell_ui::InspectorTab::Motion);
+        studio.open_sections.insert("project-animation");
+        studio.seek_video(0.0, cx);
+        cx.notify();
+        studio.video_frame_rgba.clone()
+    }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        Timer::after(Duration::from_millis(100)).await;
+        let ready = handle.update(cx, |studio, _, cx| {
+            let ready = studio.video_frame_rgba.as_ref().is_some_and(|frame|
+                reopened_poster.as_ref().is_none_or(|poster| !Arc::ptr_eq(frame, poster)))
+                && studio.scene_preview_image_ready(px(700.0), px(500.0)).is_some();
+            cx.notify();
+            ready
+        }).unwrap();
+        if ready { break; }
+        assert!(Instant::now() < deadline, "reopened animation settings must render a decoded frame");
+    }
+    editor.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+    Timer::after(Duration::from_millis(100)).await;
+    save_display(&screenshots.join("project-animation-saved.png"), false);
+    handle.update(cx, |studio, _, cx| {
+        studio.set_screen_animation(None);
+        studio.set_project_early(None);
+        studio.set_cursor_animation(previous_pointer);
+        studio.set_scene_slider(scene_ui::SceneSlider::MotionBlurAmount.id(), 0);
+        assert_eq!(studio.animation_settings.cues(&authored), authored);
+        studio.autosave_scene_style();
+        cx.notify();
+    }).unwrap();
+}
+
+async fn workflow_hover(x: f32, y: f32, _cx: &mut gpui::AsyncApp) {
+    use x11rb::{connection::Connection, protocol::{xproto::ConnectionExt as _, xtest::ConnectionExt as _}};
+    let (connection, index) = x11rb::connect(None).unwrap();
+    let root = connection.setup().roots[index].root;
+    let (drawable, _, _, _) = own_x11_window(&connection, root, false);
+    let origin = connection.translate_coordinates(drawable, root, 0, 0).unwrap().reply().unwrap();
+    connection.xtest_fake_input(x11rb::protocol::xproto::MOTION_NOTIFY_EVENT, 0, 0, root,
+        origin.dst_x + x as i16, origin.dst_y + y as i16, 0).unwrap().check().unwrap();
+    connection.flush().unwrap();
+    Timer::after(Duration::from_millis(350)).await;
 }
 
 fn verify_encoded_workflow(session: &RecordingSession, artifacts: &Path) {

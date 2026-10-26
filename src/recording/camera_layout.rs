@@ -13,10 +13,12 @@ pub enum CameraAspect {
     Source,
     Wide,
     Portrait,
+    Classic,
+    Tall,
 }
 
 impl CameraAspect {
-    pub const ALL: [Self; 4] = [Self::Square, Self::Source, Self::Wide, Self::Portrait];
+    pub const ALL: [Self; 6] = [Self::Square, Self::Source, Self::Wide, Self::Portrait, Self::Classic, Self::Tall];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -24,6 +26,8 @@ impl CameraAspect {
             Self::Source => "Original",
             Self::Wide => "Wide",
             Self::Portrait => "Portrait",
+            Self::Classic => "4:3",
+            Self::Tall => "3:4",
         }
     }
 
@@ -33,6 +37,8 @@ impl CameraAspect {
             Self::Source => valid_aspect(source_aspect),
             Self::Wide => 16.0 / 9.0,
             Self::Portrait => 9.0 / 16.0,
+            Self::Classic => 4.0 / 3.0,
+            Self::Tall => 3.0 / 4.0,
         }
     }
 }
@@ -44,16 +50,20 @@ pub enum CameraLayout {
     Overlay,
     Split,
     Fullscreen,
+    Hidden,
+    Cutout,
 }
 
 impl CameraLayout {
-    pub const ALL: [Self; 3] = [Self::Overlay, Self::Split, Self::Fullscreen];
+    pub const ALL: [Self; 5] = [Self::Overlay, Self::Split, Self::Fullscreen, Self::Hidden, Self::Cutout];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Overlay => "Overlay",
             Self::Split => "Split screen",
             Self::Fullscreen => "Camera only",
+            Self::Hidden => "Screen only",
+            Self::Cutout => "Cutout",
         }
     }
 }
@@ -90,9 +100,15 @@ pub fn layout(overlay: CameraOverlay, width: f64, height: f64, source_aspect: f6
         return CameraGeometry { screen: Rect::default(), camera: Rect::default() };
     }
     let canvas = Rect { x: 0.0, y: 0.0, width, height };
+    if let Some(pose) = overlay.pose {
+        let scale = |rect: Rect| Rect { x: rect.x * width, y: rect.y * height, width: rect.width * width, height: rect.height * height };
+        return CameraGeometry { screen: scale(pose.screen), camera: scale(pose.camera) };
+    }
     let aspect = overlay.aspect_ratio(source_aspect);
     let shortest = width.min(height);
-    let padding = shortest * f64::from(overlay.margin.min(20)) / 100.0;
+    let padding = if overlay.layout == CameraLayout::Split && overlay.split_full {
+        0.0
+    } else { shortest * f64::from(overlay.margin.min(20)) / 100.0 };
     if overlay.enabled && overlay.layout == CameraLayout::Fullscreen {
         return CameraGeometry { screen: canvas, camera: canvas };
     }
@@ -119,7 +135,8 @@ pub fn layout(overlay: CameraOverlay, width: f64, height: f64, source_aspect: f6
         };
         return CameraGeometry {
             screen: rect(screen_start, screen_length),
-            camera: fit_rect(inset(rect(camera_start, camera_length), padding), aspect),
+            camera: if overlay.split_full { rect(camera_start, camera_length) }
+                else { fit_rect(inset(rect(camera_start, camera_length), padding), aspect) },
         };
     }
     let progress = if zoom.is_finite() { ((zoom - 1.0) / 0.5).clamp(0.0, 1.0) } else { 0.0 };
@@ -230,6 +247,37 @@ mod tests {
         assert!(flipped.camera.right() <= flipped.screen.x);
         overlay.layout = CameraLayout::Fullscreen;
         assert_eq!(layout(overlay, 1080.0, 1920.0, 1.0, 1.0).camera, Rect { x: 0.0, y: 0.0, width: 1080.0, height: 1920.0 });
+    }
+
+    #[test]
+    fn full_split_fills_cells_and_padded_split_keeps_aspect() {
+        for (width,height) in [(1920.0,1080.0),(1080.0,1920.0),(1080.0,1080.0)] {
+            let mut overlay=CameraOverlay {layout:CameraLayout::Split,shape:CameraShape::Squircle,
+                aspect:CameraAspect::Tall,split_full:true,..Default::default()};
+            let full=layout(overlay,width,height,4.0/3.0,1.0);
+            assert!((full.screen.width*full.screen.height+full.camera.width*full.camera.height-width*height).abs()<1e-6);
+            assert_eq!(overlay.radius(full.camera),0.0);
+            overlay.split_full=false;
+            let padded=layout(overlay,width,height,4.0/3.0,1.0);
+            assert!((padded.camera.width/padded.camera.height-0.75).abs()<1e-9);
+            assert!(padded.camera.width*padded.camera.height<full.camera.width*full.camera.height);
+        }
+    }
+
+    #[test]
+    fn full_split_screen_geometry_removes_decoration_and_preserves_pixel_aspect() {
+        use super::super::scene::{SceneGeometry,SceneStyle,WindowFrame};
+        for (width,height) in [(1920.0,1080.0),(1080.0,1920.0)] {
+            let style=SceneStyle {padding:40,border:true,window_frame:WindowFrame::Light,
+                camera:CameraOverlay {layout:CameraLayout::Split,split_full:true,..Default::default()},..Default::default()};
+            let geometry=SceneGeometry::layout(width,height,1600.0,900.0,&style);
+            assert_eq!(geometry.media,style.camera.screen_area(width,height));
+            assert_eq!(geometry.radius,0.0);assert_eq!(geometry.border_width,0.0);assert_eq!(geometry.title_height,0.0);
+            assert!(geometry.shadow.is_none());
+            let viewport=geometry.camera_viewport(Default::default(),&style,(1600,900));
+            let visible_aspect=1600.0*viewport.fill.0/(900.0*viewport.fill.1);
+            assert!((visible_aspect-geometry.media.width/geometry.media.height).abs()<1e-9);
+        }
     }
 
     #[test]

@@ -43,7 +43,7 @@ impl Studio {
             return;
         }
         let model = self.speech_model;
-        let source = Self::media_source_for(&session, false);
+        let source = Self::media_source_for(&session);
         let duration = self.video_source_duration;
         let progress = JobProgress::default();
         let downloading = Arc::new(AtomicBool::new(!model.is_installed()));

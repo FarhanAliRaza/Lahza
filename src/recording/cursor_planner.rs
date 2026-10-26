@@ -13,7 +13,10 @@ const MAX_LEAD: f64 = 0.6;
 const APPROACH: f64 = 1.5;
 const GROUP_GAP: f64 = 0.1;
 const MAX_GROUP_DURATION: f64 = 2.0;
-const SPEEDS: [f64; 11] = [1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0];
+const MERGE_GAP: f64 = 0.4;
+const MAX_MERGED_DURATION: f64 = 4.0;
+const MAX_TIME_COMPRESSION: f64 = 1.4;
+const SPEEDS: [f64; 16] = [1.0, 1.25, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.4, 8.0, 10.0, 13.0, 16.0, 20.0, 25.0, 32.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CursorEventKind {
@@ -21,6 +24,7 @@ pub(super) enum CursorEventKind {
     Press,
     Release,
     Drag,
+    Hover,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +41,7 @@ impl CursorSample {
         match self.kind {
             CursorEventKind::Press | CursorEventKind::Release | CursorEventKind::Drag => Some(2.0),
             CursorEventKind::Travel if self.artwork_change => Some(6.0),
+            CursorEventKind::Hover => Some(4.0),
             _ => None,
         }
     }
@@ -85,6 +90,8 @@ pub(super) struct CursorPath {
     knots: Vec<Knot>,
     #[cfg(test)]
     evaluations: usize,
+    #[cfg(test)]
+    merged_groups: usize,
 }
 
 impl CursorPath {
@@ -153,17 +160,18 @@ impl CursorPath {
                 result.push(end, initial, false);
                 continue;
             }
-            let (plans, evaluations) = if let Some(spring) = spring {
+            let (plans, evaluations, merged_groups) = if let Some(spring) = spring {
                 plan(&raw, spring, initial)
             } else {
-                (Vec::new(), 0)
+                (Vec::new(), 0, 0)
             };
             #[cfg(test)]
             {
                 result.evaluations += evaluations;
+                result.merged_groups += merged_groups;
             }
             #[cfg(not(test))]
-            let _ = evaluations;
+            let _ = (evaluations, merged_groups);
             let segment_start = result.knots.len();
             result.push(start, initial, start > 0.0);
             let mut time = start;
@@ -306,15 +314,46 @@ impl CursorPath {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RestSpan { start: f64, end: f64, x: f64, y: f64 }
+
 struct RawPath<'a> {
     samples: &'a [CursorSample],
     start: f64,
     end: f64,
     release_times: Vec<f64>,
     press_indices: Vec<usize>,
+    rests: Vec<RestSpan>,
+    held: Vec<bool>,
 }
 impl<'a> RawPath<'a> {
     fn new(samples: &'a [CursorSample], start: f64, end: f64) -> Self {
+        let mut rests: Vec<RestSpan> = Vec::new();
+        for (index, sample) in samples.iter().enumerate() {
+            let next = samples.get(index + 1);
+            let rest_end = next.map_or(end, |next| next.time).min(end);
+            let stationary = next.is_none_or(|next| {
+                next.time - sample.time > INTERPOLATION_GAP
+                    || (next.x - sample.x).hypot(next.y - sample.y) < 0.01
+            });
+            let rest_start = sample.time.max(start);
+            if stationary && rest_end > rest_start {
+                if let Some(previous) = rests.last_mut().filter(|previous| {
+                    (previous.end - rest_start).abs() < 1e-9
+                        && (previous.x - sample.x).hypot(previous.y - sample.y) < 0.01
+                }) { previous.end = rest_end; }
+                else { rests.push(RestSpan { start: rest_start, end: rest_end, x: sample.x, y: sample.y }); }
+            }
+        }
+        let mut pressed = false;
+        let held = samples.iter().map(|sample| {
+            match sample.kind {
+                CursorEventKind::Press | CursorEventKind::Drag => pressed = true,
+                CursorEventKind::Release | CursorEventKind::Travel => pressed = false,
+                CursorEventKind::Hover => {}
+            }
+            pressed
+        }).collect();
         Self {
             samples,
             start,
@@ -329,6 +368,8 @@ impl<'a> RawPath<'a> {
                 .enumerate()
                 .filter_map(|(index, p)| (p.kind == CursorEventKind::Press).then_some(index))
                 .collect(),
+            rests,
+            held,
         }
     }
     fn at(&self, time: f64) -> CursorSample {
@@ -349,11 +390,11 @@ impl<'a> RawPath<'a> {
         }
     }
     fn target(&self, time: f64, lead: f64) -> CursorSample {
-        let current = self.at(time);
         let mut target_time = (time + lead).min(self.end);
         // Look-ahead can track a drag, but must never chase a different click
         // beyond its release. This also protects stationary held objects.
-        if matches!(current.kind, CursorEventKind::Drag | CursorEventKind::Press) {
+        let index = self.samples.partition_point(|sample| sample.time <= time).saturating_sub(1);
+        if self.held[index] {
             if let Some(release) = self
                 .release_times
                 .get(self.release_times.partition_point(|v| *v < time))
@@ -380,16 +421,46 @@ struct ResponsePlan {
     last: f64,
     lead: f64,
     speed: f64,
+    lead_start: f64,
+    rest_jump: f64,
+    release_at: f64,
 }
 impl ResponsePlan {
+    fn new(raw: &RawPath<'_>, approach: f64, first: f64, last: f64, lead: f64, speed: f64) -> Self {
+        let compression = MAX_TIME_COMPRESSION - 1.0;
+        // Spend available stillness first. Changing the time offset while
+        // both endpoints lie in the same rest leaves the target unchanged.
+        // Otherwise the clock advances at no more than 1.4x until the event.
+        let rest = raw.rests.iter().rev().filter_map(|rest| {
+            let begin = rest.start.max(approach);
+            let end = rest.end.min(first);
+            let jump = lead.min((end - begin - STEP).max(0.0));
+            (jump > 0.0 && first - begin >= (lead - jump) / compression)
+                .then_some((begin, jump))
+        }).next();
+        let (lead_start, rest_jump, lead) = match rest {
+            Some((begin, jump)) => (begin, jump, lead),
+            None => (approach, 0.0, lead.min((first - approach) * compression)),
+        };
+        let release_at = raw.rests.iter().filter(|rest| rest.end > last).find_map(|rest| {
+            let begin = rest.start.max(last);
+            let remaining = (lead - (begin - last) * 0.35).max(0.0);
+            (begin + remaining < rest.end).then_some(begin)
+        }).unwrap_or(f64::INFINITY);
+        Self { approach, first, last, lead, speed, lead_start, rest_jump, release_at }
+    }
+
     fn controls(self, time: f64) -> (f64, f64) {
         if time < self.approach || time > self.last + self.lead / 0.35 + 0.3 {
             return (0.0, 1.0);
         }
-        let lead = if time < self.first {
-            let t =
-                ((time - self.approach) / (self.first - self.approach).max(1e-9)).clamp(0.0, 1.0);
-            self.lead * smooth(t)
+        let lead = if time >= self.release_at {
+            0.0
+        } else if time < self.lead_start {
+            0.0
+        } else if time < self.first {
+            let t = ((time - self.lead_start) / (self.first - self.lead_start).max(1e-9)).clamp(0.0, 1.0);
+            self.rest_jump + (self.lead - self.rest_jump) * t
         } else {
             (self.lead - (time - self.last).max(0.0) * 0.35).max(0.0)
         };
@@ -508,7 +579,7 @@ fn plan(
     raw: &RawPath<'_>,
     spring: SpringConstant,
     initial: CursorState,
-) -> (Vec<ResponsePlan>, usize) {
+) -> (Vec<ResponsePlan>, usize, usize) {
     let constraints: Vec<_> = raw
         .samples
         .iter()
@@ -527,75 +598,94 @@ fn plan(
         }
         groups.push(vec![point]);
     }
+    struct SolvedGroup {
+        points: Vec<CursorSample>, before_time: f64, before: CursorState,
+        prefix: usize, error: f64, end: CursorState, merges: usize,
+    }
+    let mut solved: Vec<SolvedGroup> = Vec::new();
     let mut plans = Vec::new();
-    let mut anchor_time = raw.start;
-    let mut anchor = initial;
     let mut evaluations = 0;
-    for group in groups {
-        let first = group[0].time;
-        let last = group.last().unwrap().time;
-        let approach = (first - APPROACH).max(anchor_time);
-        let state = simulate(raw, Some(spring), &plans, anchor_time, approach, anchor);
-        let baseline = group_error(raw, spring, &plans, approach, state, &group);
-        evaluations += 1;
-        let mut chosen = None;
-        let mut best_error = baseline.0;
-        let mut best_state = baseline.1;
-        if best_error > 0.75 {
-            'search: for speed in SPEEDS {
-                // Start with the spring's steady-state lag. Closely spaced
-                // levels avoid paying for a huge lead when acceleration alone
-                // satisfies the interaction constraints.
-                let lag = (spring.friction / spring.tension / speed).min(MAX_LEAD);
-                // Integration advances to the target at the end of each
-                // millisecond. Include that phase offset at high response
-                // speeds, where one millisecond can otherwise miss a moving
-                // drag by several recording pixels.
-                let mut leads = vec![
-                    0.0,
-                    lag * 0.5,
-                    lag - STEP,
-                    lag - STEP * 0.5,
-                    lag,
-                    lag * 1.5,
-                    lag * 2.0,
-                    0.3,
-                    MAX_LEAD,
-                ];
-                leads.iter_mut().for_each(|v| *v = v.clamp(0.0, MAX_LEAD));
-                leads.sort_by(f64::total_cmp);
-                leads.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-                for lead in leads {
-                    let candidate = ResponsePlan {
-                        approach,
-                        first,
-                        last,
-                        lead,
-                        speed,
-                    };
-                    plans.push(candidate);
-                    let (error, end) = group_error(raw, spring, &plans, approach, state, &group);
-                    plans.pop();
-                    evaluations += 1;
-                    if error < best_error {
-                        best_error = error;
-                        chosen = Some(candidate);
-                        best_state = end;
-                    }
-                    if best_error <= 0.75 {
-                        break 'search;
-                    }
+    let mut merged_groups = 0;
+    for mut group in groups {
+        let mut before_time = solved.last().map_or(raw.start, |g| g.points.last().unwrap().time);
+        let mut before = solved.last().map_or(initial, |g| g.end);
+        let mut prefix = plans.len();
+        let (mut chosen, mut error, mut end, work) = solve_group(raw, spring, &mut plans, before_time, before, &group);
+        evaluations += work;
+        let mut merges = 0;
+        // Revisit difficult neighboring groups jointly. Bound the repair
+        // horizon so a dense recording cannot become a quadratic global solve.
+        while error > 1.0 || solved.last().is_some_and(|previous| previous.error > 1.0) {
+            let Some(previous) = solved.last().filter(|previous| {
+                group[0].time - previous.points.last().unwrap().time <= MERGE_GAP
+                    && group.last().unwrap().time - previous.points[0].time <= MAX_MERGED_DURATION
+                    && previous.merges + merges < 3
+            }) else { break; };
+            let mut together = previous.points.clone();
+            together.extend_from_slice(&group);
+            let mut earlier_plans = plans[..previous.prefix].to_vec();
+            let (joint, joint_error, joint_end, work) = solve_group(
+                raw, spring, &mut earlier_plans, previous.before_time, previous.before, &together);
+            evaluations += work;
+            if joint_error > error.max(previous.error) + 1e-9 { break; }
+            before_time = previous.before_time;
+            before = previous.before;
+            prefix = previous.prefix;
+            merges += previous.merges + 1;
+            merged_groups += 1;
+            group = together;
+            chosen = joint;
+            error = joint_error;
+            end = joint_end;
+            plans.truncate(prefix);
+            solved.pop();
+        }
+        if let Some(plan) = chosen { plans.push(plan); }
+        solved.push(SolvedGroup { points: group, before_time, before, prefix, error, end, merges });
+    }
+    (plans, evaluations, merged_groups)
+}
+
+fn solve_group(
+    raw: &RawPath<'_>, spring: SpringConstant, plans: &mut Vec<ResponsePlan>,
+    before_time: f64, before: CursorState, group: &[CursorSample],
+) -> (Option<ResponsePlan>, f64, CursorState, usize) {
+    let first = group[0].time;
+    let last = group.last().unwrap().time;
+    let approach = (first - APPROACH).max(before_time);
+    let state = simulate(raw, Some(spring), plans, before_time, approach, before);
+    let (mut best_error, mut best_state) = group_error(raw, spring, plans, approach, state, group);
+    let mut evaluations = 1;
+    let mut chosen = None;
+    if best_error > 0.75 {
+        'search: for speed in SPEEDS {
+            let lag = (spring.friction / spring.tension / speed).min(MAX_LEAD);
+            let mut leads = vec![0.0, lag * 0.5, lag - STEP, lag - STEP * 0.5,
+                lag, lag * 1.5, lag * 2.0, 0.3, MAX_LEAD];
+            leads.iter_mut().for_each(|v| *v = v.clamp(0.0, MAX_LEAD));
+            leads.sort_by(f64::total_cmp);
+            leads.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            let mut previous_lead = None;
+            for lead in leads {
+                let candidate = ResponsePlan::new(raw, approach, first, last, lead, speed);
+                if previous_lead == Some((candidate.lead, candidate.lead_start, candidate.rest_jump)) { continue; }
+                previous_lead = Some((candidate.lead, candidate.lead_start, candidate.rest_jump));
+                plans.push(candidate);
+                let (error, end) = group_error(raw, spring, plans, approach, state, group);
+                plans.pop();
+                evaluations += 1;
+                if error < best_error {
+                    best_error = error;
+                    chosen = Some(candidate);
+                    best_state = end;
                 }
+                if best_error <= 0.75 { break 'search; }
             }
         }
-        if let Some(p) = chosen {
-            plans.push(p);
-        }
-        anchor_time = last;
-        anchor = best_state;
     }
-    (plans, evaluations)
+    (chosen, best_error, best_state, evaluations)
 }
+
 fn group_error(
     raw: &RawPath<'_>,
     spring: SpringConstant,
@@ -657,6 +747,64 @@ mod tests {
                 point.x
             );
         }
+    }
+    #[test]
+    fn hover_has_its_own_accuracy_constraint_and_does_not_release_a_drag() {
+        let samples = [
+            sample(0.0, 100.0, CursorEventKind::Travel),
+            sample(0.2, 200.0, CursorEventKind::Press),
+            sample(0.3, 300.0, CursorEventKind::Hover),
+            sample(0.4, 350.0, CursorEventKind::Release),
+            sample(0.5, 900.0, CursorEventKind::Press),
+        ];
+        let raw = RawPath::new(&samples, 0.0, 1.0);
+        assert_eq!(samples[2].tolerance(), Some(4.0));
+        assert_eq!(raw.target(0.3, 0.6).x, 350.0, "hover must not let anticipation cross release");
+        let path = CursorPath::build(&samples, 1.0, Some(SPRING), &[]);
+        assert!((path.at(0.3).x - 300.0).abs() < 4.0);
+    }
+
+    #[test]
+    fn anticipation_uses_rest_and_limits_moving_time_compression() {
+        let mut samples = vec![sample(0.0, 100.0, CursorEventKind::Travel)];
+        samples.extend((0..=50).map(|i| sample(0.5 + i as f64 * 0.01,
+            100.0 + i as f64 * 8.0, CursorEventKind::Travel)));
+        let raw = RawPath::new(&samples, 0.0, 2.0);
+        let plan = ResponsePlan::new(&raw, 0.0, 1.0, 1.0, 0.2, 2.0);
+        assert!(plan.rest_jump > 0.19, "available rest must absorb anticipation");
+        let before = raw.target(0.0, 0.0);
+        let after = raw.target(0.0, plan.controls(0.0).0);
+        assert_eq!((before.x, before.y), (after.x, after.y), "rest lead changes must not jump the target");
+        assert_eq!(plan.controls(1.0).0, 0.0, "trailing rest can remove lead immediately");
+
+        let moving: Vec<_> = (0..=100).map(|i|
+            sample(i as f64 * 0.01, i as f64 * 10.0, CursorEventKind::Travel)).collect();
+        let raw = RawPath::new(&moving, 0.0, 1.0);
+        let plan = ResponsePlan::new(&raw, 0.0, 1.0, 1.0, 0.6, 2.0);
+        assert_eq!(plan.rest_jump, 0.0);
+        for index in 0..999 {
+            let t = index as f64 * STEP;
+            let delta = (t + STEP + plan.controls(t + STEP).0) - (t + plan.controls(t).0);
+            assert!(delta <= STEP * MAX_TIME_COMPRESSION + 1e-10, "moving time was compressed too far: {delta}");
+        }
+    }
+
+    #[test]
+    fn difficult_nearby_groups_remerge_without_crossing_a_cut() {
+        let samples = [
+            sample(0.0, 100.0, CursorEventKind::Travel),
+            sample(0.01, 1900.0, CursorEventKind::Press),
+            sample(0.02, 1900.0, CursorEventKind::Release),
+            sample(0.22, 100.0, CursorEventKind::Press),
+            sample(0.23, 100.0, CursorEventKind::Release),
+        ];
+        let path = CursorPath::build(&samples, 1.0, Some(SPRING), &[]);
+        assert!(path.merged_groups > 0, "cold-start constraint groups should get a joint retry");
+        for point in &samples[1..] {
+            assert!((path.at(point.time).x - point.x).abs() <= 2.0);
+        }
+        let cut = CursorPath::build(&samples, 1.0, Some(SPRING), &[0.1]);
+        assert_eq!(cut.merged_groups, 0, "constraint repair cannot cross an edit boundary");
     }
     #[test]
     fn cut_prevents_anticipation_and_clears_velocity() {

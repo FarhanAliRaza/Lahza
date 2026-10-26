@@ -52,7 +52,11 @@ Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive details
 
 [![Lahza video editor showing a camera overlay, pointer controls, and a multitrack timeline](docs/screenshots/03-video-and-camera.png)](packaging/store/screenshots/03-video-and-camera.png)
 
-Trim, split, and change clip speed. Add zooms, pans, 3D motion, and camera overlays. Customize cursor effects and generate click-based zooms when input metadata is available.
+Trim, split, and change clip speed. Add classic zooms, glass loupe magnification, pans, 3D motion, and camera overlays. Customize cursor effects and generate click-based zooms when input metadata is available.
+
+In **Motion → Animation**, preview screen and cursor presets by hovering, adjust motion blur for both playback and export, and start zooms early across the project. Settings support undo, reset, and save/reopen.
+
+Use the **Camera** timeline lane to switch between an overlay, split screen, camera only, screen only, or a person cutout. Move and trim layout regions to control their timing and transitions. Choose a camera aspect ratio, use padded or full split cells, and adjust cutout edges in the Camera inspector.
 
 Transcribe the narration on this computer into subtitles with an optional spoken-word highlight, then cut footage by transcript: select words, remove filler words, or trim long pauses. Show typed keystrokes and a speed badge on sped-up clips, and drag the camera bubble anywhere with snap guides.
 
@@ -438,7 +442,20 @@ move or resize it, then use the annotation timing controls for its start/end and
 entrance/exit animation. Transparent PNGs are supported, and overlay pixels are
 embedded in the saved annotation.
 
-Use **+ Audio** to add music or a sound effect at the playhead. The **Record → Audio**
+The **Audio → Microphone sound** panel offers **Off**, **Standard**,
+**Loud**, **Noise reduction**, and **Podcast** presets. Noise reduction runs
+MossFormer2; Podcast uses TF-Restormer followed by voice leveling and tone
+processing. Models are bundled for local CPU processing on Linux x86_64.
+Preparation shows progress and can be cancelled; its completed audio is reused
+by playback and export. Podcast takes longer to prepare than Noise reduction.
+
+New recordings keep microphone and system audio separate, so microphone presets
+preserve desktop sound. Older recordings with already mixed audio are processed
+as one track. Preset settings are saved with the project. See
+[the audio architecture](docs/AUDIO_ARCHITECTURE.md) for implementation and
+validation details.
+
+Use **+ Audio** to add music or a sound effect at the playhead. The **Audio**
 panel controls each layer's volume, placement, trimming, and fades. Multiple layers
 mix with the recording in preview and MP4/WebM export. The recording can be muted
 independently. Audio layers retain their editor-time positions when video clips

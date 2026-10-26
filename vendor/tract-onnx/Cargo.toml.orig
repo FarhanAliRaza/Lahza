@@ -1,0 +1,42 @@
+[package]
+name = "tract-onnx"
+version = "0.22.5"
+authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
+license = "MIT OR Apache-2.0"
+description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
+repository = "https://github.com/snipsco/tract"
+keywords = [ "TensorFlow", "NeuralNetworks", "ONNX" ]
+categories = [ "science" ]
+autobenches = false
+edition = "2024"
+exclude = [ "test_cases" ]
+# build = "build-proto-rs"
+rust-version = "1.85"
+
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+bytes.workspace = true
+derive-new.workspace = true
+log.workspace = true
+memmap2.workspace = true
+num-integer.workspace = true
+prost.workspace = true
+smallvec.workspace = true
+tract-nnef.workspace = true
+tract-hir.workspace = true
+tract-onnx-opl.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true
+tempfile.workspace = true
+
+# [build-dependencies]
+# protobuf-src = "1.0.5+3.19.3"
+# prost-build = "0.11.1"
+
+[features]
+default = []
+getrandom-js = ["tract-onnx-opl/getrandom-js"]

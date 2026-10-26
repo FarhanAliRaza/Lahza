@@ -1,6 +1,7 @@
 //! Import controls shared with the recording's existing clip and annotation editors.
 use crate::{
     recording::{
+        self,
         clips::RecordingClipSegment,
         media::{self, AudioClip},
     },
@@ -17,7 +18,7 @@ pub(crate) enum ImportKind {
 }
 
 enum Imported {
-    Clip(std::path::PathBuf, f64, f64),
+    Clip(std::path::PathBuf, f64, f64, Option<recording::media_bank::MediaBank>),
     Image(String, u32, u32),
     Audio(AudioClip),
 }
@@ -222,7 +223,11 @@ impl Studio {
                 .spawn(async move {
                     match kind {
                         ImportKind::Clip => media::append_media(&project, &source)
-                            .map(|(file, start, end)| Imported::Clip(file, start, end))
+                            .and_then(|(file,start,end)| {
+                                let path=media::asset_path(&project,&file)?;
+                                let bank=recording::media_bank::MediaBank::load(&path)?;
+                                Ok(Imported::Clip(file,start,end,bank))
+                            })
                             .map_err(|e| e.to_string()),
                         ImportKind::Audio => media::import_audio(&project, &source, start)
                             .map(Imported::Audio)
@@ -256,7 +261,7 @@ impl Studio {
                 this.video_edit_busy = false;
                 this.toast = None;
                 match result {
-                    Ok(Imported::Clip(file, start, end)) => {
+                    Ok(Imported::Clip(file, start, end, bank)) => {
                         let mut timeline = this.video_clip_timeline.clone();
                         let mut clip = RecordingClipSegment::new(start, end);
                         clip.source_bounds = Some([start, end]);
@@ -265,14 +270,15 @@ impl Studio {
                         if let Err(error) = session.write_edit_field("mediaSource", &file) {
                             this.toast = Some(format!("Could not save import: {error}").into());
                         } else {
+                            this.video_media_bank=bank;
                             this.video_source_duration = end;
                             let position = this.video_duration;
                             this.apply_video_clip_timeline(timeline, Some(id), true, cx);
                             this.video_extras_pending = true;
                             this.seek_video(position, cx);
-                            if this.video_noise_reduction {
-                                this.set_video_noise_reduction(true, cx);
-                            }
+                            this.cancel_audio_preparation();
+                            this.video_audio_prepare_pending = true;
+                            this.prepare_video_audio(cx);
                         }
                     }
                     Ok(Imported::Audio(clip)) => {
@@ -533,10 +539,11 @@ impl Studio {
         let mut request = AudioExportRequest {
             destination: Default::default(),
             format,
-            media: Self::media_source_for(&session, false),
+            media: Self::media_source_for(&session),
             clips: self.video_clip_timeline.clone(),
             include_recording: !self.video_audio_muted,
             noise_reduction: self.video_noise_reduction,
+            audio_mode: Some(self.video_audio_mode),
             audio_clips: self
                 .video_audio_clips
                 .iter()
@@ -811,7 +818,7 @@ mod tests {
                                 studio.scene_preview_image_ready(px(480.0), px(270.0)).unwrap();
                                 let (signature, preview) = studio.preview_cache.overlay.as_ref().expect("flat image overlays must be composited, not painted as snapping sprites");
                                 assert_ne!(*signature, 0);
-                                assert_eq!(preview.as_ref(), export(time).unwrap().as_ref(), "{effect:?} at {time}: preview and export must agree");
+                                assert_eq!(preview.as_ref(), export(time, studio.video_viewport_timeline.frame_at(time)).unwrap().as_ref(), "{effect:?} at {time}: preview and export must agree");
                             }
                         }
                         studio.video_playing = false;

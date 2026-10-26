@@ -1023,21 +1023,119 @@ fn finalize_recording(
 
 fn recover_segment(path: &Path) -> Result<(), String> {
     let recovered = path.with_extension("recovered.mkv");
+    remux_recovered_segment(path, &recovered)?;
+    fs::rename(recovered, path).map_err(|error| format!("could not install recovered recording: {error}"))
+}
+
+fn remux_recovered_segment(path: &Path, recovered: &Path) -> Result<(), String> {
     let result = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-copyts", "-copytb", "1", "-i"])
         .arg(path)
         .args(["-map", "0", "-c", "copy"])
-        .arg(&recovered)
+        .arg(recovered)
         .output()
         .map_err(|error| format!("could not recover recording: {error}"))?;
     if !result.status.success()
-        || !super::video::probe_media(&recovered).is_ok_and(|info| info.duration.is_finite() && info.duration > 0.0)
+        || !super::video::probe_media(recovered).is_ok_and(|info| info.duration.is_finite() && info.duration > 0.0)
     {
-        let _ = fs::remove_file(&recovered);
+        let _ = fs::remove_file(recovered);
         return Err(format!("could not finalize recording; captured segments remain at {}: {}",
             path.display(), String::from_utf8_lossy(&result.stderr).trim()));
     }
-    fs::rename(recovered, path).map_err(|error| format!("could not install recovered recording: {error}"))
+    Ok(())
+}
+
+fn interrupted_segments(directory: &Path, role: &str) -> Result<Vec<PathBuf>, String> {
+    let prefix = format!("{role}-segment-");
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue; };
+        let Some(number) = name.strip_prefix(&prefix).and_then(|name| name.strip_suffix(".mkv")) else { continue; };
+        let Ok(index) = number.parse::<usize>() else { continue; };
+        if name != format!("{prefix}{index:04}.mkv") || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        segments.push((index, entry.path()));
+    }
+    segments.sort_by_key(|(index, _)| *index);
+    if segments.iter().enumerate().any(|(expected, (actual, _))| expected != *actual) {
+        return Err(format!("Some {role} recording segments are missing; the remaining files have been kept in {}", directory.display()));
+    }
+    Ok(segments.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Reconstruct every ordered native segment, never a webcam or newest-only
+/// substitute for the screen. Work on remuxed copies so a failed repair leaves
+/// every original available for another recovery attempt.
+pub(super) fn recover_interrupted_segments(output: &Path) -> Result<bool, String> {
+    let directory = output.parent().ok_or("recording has no project directory")?;
+    let screen_exists = output.metadata().is_ok_and(|meta| meta.len() > 0);
+    // Older builds concatenated directly into screen.mkv. A crash could leave
+    // a nonempty partial final file next to every original segment. Prefer the
+    // complete contiguous source set even when that destination already exists.
+    let screen = match interrupted_segments(directory, "screen") {
+        Ok(segments) => segments,
+        Err(error) if screen_exists && valid_finalized_media(output) => {
+            // A crash after atomic installation can interrupt source cleanup.
+            // An incomplete remainder cannot reconstruct the complete take.
+            eprintln!("Keeping finalized screen recording: {error}");
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    let camera_output = camera_path(output);
+    let camera = interrupted_segments(directory, "camera").unwrap_or_else(|error| {
+        eprintln!("Webcam recovery: {error}");
+        Vec::new()
+    });
+    if screen.is_empty() && (!screen_exists || camera.is_empty()) {
+        return Ok(false);
+    }
+    let work = directory.join(format!(".recovery-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&work).map_err(|e| format!("could not create recovery workspace: {e}"))?;
+    let repair = |sources: &[PathBuf], destination: &Path, role: &str| -> Result<(), String> {
+        let copies: Vec<_> = sources.iter().enumerate()
+            .map(|(index, _)| work.join(format!("{role}-{index:04}.mkv"))).collect();
+        for (source, copy) in sources.iter().zip(&copies) {
+            remux_recovered_segment(source, copy)?;
+        }
+        let completed = work.join(format!("{role}.mkv"));
+        finalize_segments(&copies, &completed)?;
+        let completed_duration = super::video::probe_media(&completed).map_err(|e| e.to_string())?.duration;
+        if let Ok(existing) = super::video::probe_media(destination) {
+            if existing.duration > completed_duration + 0.15 {
+                return Err(format!("The remaining {role} segments are shorter than the existing recording; all originals were kept"));
+            }
+        }
+        if role == "camera" {
+            let screen_duration = super::video::probe_media(output).map_err(|e| e.to_string())?.duration;
+            if (screen_duration - completed_duration).abs() > 0.15 {
+                return Err("Recovered webcam duration does not match the screen; the original camera segments were kept".into());
+            }
+        }
+        fs::rename(&completed, destination).map_err(|e| format!("could not install recovered {role}: {e}"))?;
+        for source in sources {
+            let _ = fs::remove_file(source);
+        }
+        Ok(())
+    };
+    if !screen.is_empty() {
+        if let Err(error) = repair(&screen, output, "screen") {
+            let _ = fs::remove_dir_all(&work);
+            return Err(error);
+        }
+    }
+    if !camera.is_empty() {
+        if !screen.is_empty() && camera.len() != screen.len() {
+            eprintln!("Webcam recovery: screen and camera segment counts differ; camera files remain in {}", directory.display());
+        } else if let Err(error) = repair(&camera, &camera_output, "camera") {
+            eprintln!("Webcam recovery: {error}");
+        }
+    }
+    let _ = fs::remove_dir_all(&work);
+    Ok(true)
 }
 
 fn camera_segment_path(output: &Path, index: usize) -> PathBuf {
@@ -1329,6 +1427,39 @@ impl Drop for SegmentPipeline {
 pub(super) const WINDOW_ENCODER: &str =
     "video/x-raw,format=BGRA ! avenc_ffv1 name=screen_encoder threads=0";
 
+/// Separate encoded streams retain source identity through pause/resume and
+/// recovery. Cleaning a microphone must never filter desktop music or calls.
+/// Both branches use the screen pipeline's running-time clock.
+fn capture_audio_branch(source: &str, role: &str, stream_index: usize) -> String {
+    format!(
+        "{source} ! audio/x-raw,rate=48000 ! queue ! audioconvert ! audioresample ! \
+         opusenc name=audio_encoder_{role} bitrate=160000 ! queue ! mux.audio_{stream_index} "
+    )
+}
+
+fn tag_capture_audio(pipeline: &gst::Pipeline) {
+    for (role, title) in [
+        ("microphone", "Lahza-Microphone"),
+        ("system", "Lahza-System-Audio"),
+    ] {
+        let Some(encoder) = pipeline.by_name(&format!("audio_encoder_{role}")) else {
+            continue;
+        };
+        // Opus encoder TagSetter metadata is not forwarded as Matroska stream
+        // tags. Send a stream-scoped tag before its first encoded buffer. Use
+        // stable identifiers: some matroskamux versions serialize spaces with
+        // quotes/escapes, making roles unreliable to identify with ffprobe.
+        encoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |pad, _| {
+            let mut tags = gst::TagList::new();
+            let tags_mut = tags.get_mut().unwrap();
+            tags_mut.set_scope(gst::TagScope::Stream);
+            tags_mut.add::<gst::tags::Title>(&title, gst::TagMergeMode::Replace);
+            pad.push_event(gst::event::Tag::new(tags));
+            gst::PadProbeReturn::Remove
+        });
+    }
+}
+
 fn build_segment_pipeline(
     output: &Path,
     index: usize,
@@ -1364,7 +1495,7 @@ fn build_segment_pipeline(
          pipewiresrc name=screen_source fd={} path={} always-copy=true \
          keepalive-time=1000 ! {capture_filter}{} ! {crop_filter}\
          queue max-size-buffers=4 leaky=downstream ! \
-         {encoder} ! queue ! mux. ",
+         {encoder} ! queue ! mux.video_0 ",
         path.display(),
         portal_fd,
         node,
@@ -1374,41 +1505,18 @@ fn build_segment_pipeline(
             stream_geometry::FILTER
         },
     );
-    // Sources capture at the device's native 48 kHz so PipeWire does not
-    // resample for the client. A lone source feeds the encoder directly:
-    // `audiomixer` is a live element with a deadline that discards buffers
-    // arriving late and pads silence, which under encoder load clicks at
-    // every 10 ms output block. Mixing two sources needs it, so give it a
-    // latency budget large enough to absorb those stalls.
-    const ENCODE: &str = "audioconvert ! audioresample ! opusenc bitrate=160000 ! queue ! mux. ";
-    let audio_sources = [
-        options
-            .system_audio
-            .then_some("device=@DEFAULT_MONITOR@".to_string()),
-        options.microphone.then(|| {
-            options
-                .microphone_device
-                .as_deref()
-                .map(|name| format!("device=\"{name}\""))
-                .unwrap_or_default()
-        }),
-    ];
-    let audio_sources: Vec<String> = audio_sources.into_iter().flatten().collect();
-    match audio_sources.as_slice() {
-        [] => {}
-        [source] => description.push_str(&format!(
-            "pulsesrc {source} ! audio/x-raw,rate=48000 ! queue ! {ENCODE}"
-        )),
-        sources => {
-            description.push_str(&format!(
-                "audiomixer name=audio_mix latency=1000000000 ! {ENCODE}"
-            ));
-            for source in sources {
-                description.push_str(&format!(
-                    "pulsesrc {source} ! audio/x-raw,rate=48000 ! queue ! audio_mix. "
-                ));
-            }
-        }
+    // Explicit pad names keep microphone first and system second when both
+    // are enabled. Tags, rather than track positions, identify a single source.
+    if options.microphone {
+        description.push_str(&capture_audio_branch(
+            "pulsesrc name=microphone_source", "microphone", 0,
+        ));
+    }
+    if options.system_audio {
+        description.push_str(&capture_audio_branch(
+            "pulsesrc name=system_audio_source device=@DEFAULT_MONITOR@",
+            "system", usize::from(options.microphone),
+        ));
     }
     if camera_device.is_some() {
         // The webcam shares the screen pipeline's clock, so both files carry
@@ -1436,6 +1544,10 @@ fn build_segment_pipeline(
         .map_err(|error| format!("could not build GStreamer pipeline: {error}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "GStreamer did not create a pipeline".to_string())?;
+    tag_capture_audio(&pipeline);
+    if let Some(device) = options.microphone_device.as_deref().filter(|_| options.microphone) {
+        pipeline.by_name("microphone_source").unwrap().set_property("device", device);
+    }
     if let Some(device) = camera_device {
         pipeline.by_name("camera_source").ok_or_else(|| "GStreamer pipeline has no webcam source".to_string())?
             .set_property("device", device);
@@ -1568,24 +1680,33 @@ fn finalize_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> 
     if usable.is_empty() {
         return Err("the encoder produced no video".into());
     }
-    let _ = fs::remove_file(output);
+    // FFmpeg's concat demuxer can finish successfully after a bad later input,
+    // leaving a playable but shortened file. Validate every source before
+    // allowing installation or removal of any captured segment.
+    if usable.len() != segments.len() || usable.iter().any(|path| !valid_finalized_media(path)) {
+        return Err("Some captured segments are missing or incomplete; all original files were kept".into());
+    }
     if usable.len() == 1 {
         fs::rename(usable[0], output)
             .or_else(|_| {
-                fs::copy(usable[0], output)?;
+                let temporary = output.with_file_name(format!(".finalizing-{}.mkv", uuid::Uuid::new_v4()));
+                if let Err(error) = fs::copy(usable[0], &temporary).and_then(|_| fs::rename(&temporary, output)) {
+                    let _ = fs::remove_file(temporary);
+                    return Err(error);
+                }
                 fs::remove_file(usable[0])
             })
             .map_err(|error| format!("could not install recording: {error}"))?;
         return Ok(());
     }
 
-    let list = output.with_file_name("segments.txt");
+    let list = output.with_file_name(format!(".segments-{}.txt", uuid::Uuid::new_v4()));
     let contents = usable
         .iter()
-        .map(|path| format!("file '{}'\n", path.display()))
+        .map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''")))
         .collect::<String>();
-    // Session paths are generated by Lahza and contain no quotes.
     fs::write(&list, contents).map_err(|error| format!("could not list segments: {error}"))?;
+    let temporary = output.with_file_name(format!(".finalizing-{}.mkv", uuid::Uuid::new_v4()));
     let result = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -1599,26 +1720,162 @@ fn finalize_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> 
             "-i",
         ])
         .arg(&list)
-        .args(["-c", "copy"])
-        .arg(output)
+        .args(["-map", "0", "-c", "copy"])
+        .arg(&temporary)
         .output()
         .map_err(|error| format!("could not start FFmpeg: {error}"))?;
     let _ = fs::remove_file(&list);
-    if !result.status.success() {
+    if !result.status.success() || !valid_finalized_media(&temporary) {
+        let _ = fs::remove_file(&temporary);
         return Err(format!(
             "could not join paused recording segments: {}",
             String::from_utf8_lossy(&result.stderr).trim()
         ));
     }
+    fs::rename(&temporary, output).map_err(|error| format!("could not install recording: {error}"))?;
     for path in usable {
         let _ = fs::remove_file(path);
     }
     Ok(())
 }
 
+fn valid_finalized_media(path: &Path) -> bool {
+    super::video::probe_media(path).is_ok_and(|info| {
+        info.duration.is_finite() && info.duration > 0.0 && info.width > 0 && info.height > 0
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_separate_audio(path: &Path, microphone: bool, system: bool) {
+        gst::init().unwrap();
+        let mut description = format!(
+            "matroskamux name=mux ! filesink location=\"{}\" \
+             videotestsrc num-buffers=30 ! video/x-raw,width=96,height=64,framerate=30/1 ! \
+             vp8enc deadline=1 ! queue ! mux.video_0 ", path.display(),
+        );
+        if microphone {
+            description.push_str(&capture_audio_branch(
+                "audiotestsrc num-buffers=100 samplesperbuffer=480 freq=440", "microphone", 0,
+            ));
+        }
+        if system {
+            description.push_str(&capture_audio_branch(
+                "audiotestsrc num-buffers=100 samplesperbuffer=480 freq=880", "system", usize::from(microphone),
+            ));
+        }
+        let pipeline = gst::parse::launch(&description).unwrap().downcast::<gst::Pipeline>().unwrap();
+        tag_capture_audio(&pipeline);
+        pipeline.use_clock(Some(&gst::SystemClock::obtain()));
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let message = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        match message.as_ref().map(|message| message.view()) {
+            Some(gst::MessageView::Eos(_)) => {}
+            other => panic!("synthetic capture did not finish: {other:?}"),
+        }
+    }
+
+    fn audio_titles(path: &Path) -> Vec<String> {
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream_tags=title", "-of", "json"])
+            .arg(path).output().unwrap();
+        assert!(probe.status.success(), "{}", String::from_utf8_lossy(&probe.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        value["streams"].as_array().unwrap().iter().map(|stream| {
+            stream["tags"].as_object().unwrap().iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("title"))
+                .unwrap().1.as_str().unwrap().to_string()
+        }).collect()
+    }
+
+    fn assert_isolated_tone(path: &Path, stream: usize, wanted: f64, unwanted: f64, start: f64) {
+        let decoded = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", &start.to_string(), "-i"])
+            .arg(path).args(["-map", &format!("0:a:{stream}"), "-t", "0.25", "-ac", "1", "-ar", "48000", "-f", "f32le", "pipe:1"])
+            .output().unwrap();
+        assert!(decoded.status.success(), "{}", String::from_utf8_lossy(&decoded.stderr));
+        let samples: Vec<_> = decoded.stdout.chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()) as f64).collect();
+        assert!(samples.len() > 10_000, "audio disappeared from stream {stream}");
+        let magnitude = |frequency: f64| {
+            let (real, imaginary) = samples.iter().enumerate().fold((0.0, 0.0), |(real, imaginary), (index, sample)| {
+                let phase = std::f64::consts::TAU * frequency * index as f64 / 48_000.0;
+                (real + sample * phase.cos(), imaginary + sample * phase.sin())
+            });
+            real.hypot(imaginary) / samples.len() as f64
+        };
+        let wanted_level = magnitude(wanted);
+        assert!(wanted_level > 0.2, "missing {wanted} Hz tone: {wanted_level}");
+        assert!(magnitude(unwanted) < wanted_level * 0.03, "audio sources were mixed together");
+    }
+
+    #[test]
+    fn isolated_audio_roles_survive_pause_join_and_recovery() {
+        let root = std::env::temp_dir().join(format!("lahza-isolated-audio-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("screen.mkv");
+        let segments: Vec<_> = (0..2).map(|index| segment_path(&output, index)).collect();
+        let expected = vec!["Lahza-Microphone".to_string(), "Lahza-System-Audio".to_string()];
+        for segment in &segments {
+            synthetic_separate_audio(segment, true, true);
+            assert_eq!(audio_titles(segment), expected);
+        }
+        recover_segment(&segments[0]).unwrap();
+        assert_eq!(audio_titles(&segments[0]), expected, "source-loss recovery changed roles");
+        finalize_segments(&segments, &output).unwrap();
+        assert_eq!(audio_titles(&output), expected, "pause/resume dropped or reordered a source");
+        assert!(segments.iter().all(|path| !path.exists()));
+        let info = super::super::video::probe_media(&output).unwrap();
+        assert!(info.duration > 1.9 && info.duration < 2.2, "{}", info.duration);
+        for start in [0.25, 1.25] {
+            assert_isolated_tone(&output, 0, 440.0, 880.0, start);
+            assert_isolated_tone(&output, 1, 880.0, 440.0, start);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_audio_source_keeps_its_role_without_a_position_assumption() {
+        let root = std::env::temp_dir().join(format!("lahza-single-audio-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("screen.mkv");
+        for (microphone, system, title, frequency) in [
+            (true, false, "Lahza-Microphone", 440.0),
+            (false, true, "Lahza-System-Audio", 880.0),
+        ] {
+            let segment = segment_path(&output, 0);
+            synthetic_separate_audio(&segment, microphone, system);
+            finalize_segments(&[segment], &output).unwrap();
+            assert_eq!(audio_titles(&output), vec![title]);
+            assert_isolated_tone(&output, 0, frequency, if microphone { 880.0 } else { 440.0 }, 0.25);
+        }
+        synthetic_separate_audio(&output, false, false);
+        assert!(audio_titles(&output).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_finalization_keeps_existing_output_and_every_source() {
+        let root = std::env::temp_dir().join(format!("lahza-finalize-atomic-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("screen.mkv");
+        synthetic_separate_audio(&output, true, true);
+        let original_output = fs::read(&output).unwrap();
+        let first = segment_path(&output, 0);
+        fs::copy(&output, &first).unwrap();
+        let last = segment_path(&output, 1);
+        fs::write(&last, b"unfinished segment").unwrap();
+        assert!(finalize_segments(&[first.clone(), last.clone()], &output).is_err());
+        assert_eq!(fs::read(&output).unwrap(), original_output);
+        assert_eq!(fs::read(&first).unwrap(), original_output);
+        assert_eq!(fs::read(&last).unwrap(), b"unfinished segment");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn countdown_publishes_remaining_time_and_cancels_before_capture() {

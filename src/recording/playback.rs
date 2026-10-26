@@ -1,5 +1,6 @@
-//! Non-destructive preview transport: seek the original media, including its
-//! audio, to each retained range. Only export materializes the composition.
+//! Non-destructive preview transport: seek original video and the shared
+//! source-time audio asset to each retained range on one pipeline clock.
+//! Only export materializes the edited composition.
 use super::{
     clips::RecordingClipTimeline,
     video::{decode_dimensions, present_frame, probe_media, DecodedFrame, VideoError, PLAYBACK_FLAGS},
@@ -25,6 +26,9 @@ pub struct TimelinePlaybackStream {
     sink: Option<gst::Element>,
     active: Option<usize>,
     gap_clock: Option<(Instant, f64)>,
+    temporal_frames: Option<super::primary_frames::PrimaryFrames>,
+    audio_mode: super::audio_mode::AudioMode,
+    audio_control: super::audio_processing::ProcessingControl,
     #[cfg(test)]
     pub(super) audio_samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
 }
@@ -32,12 +36,27 @@ pub struct TimelinePlaybackStream {
 impl TimelinePlaybackStream {
     pub fn open(
         path: &Path,
-        mut timeline: RecordingClipTimeline,
+        timeline: RecordingClipTimeline,
         start: f64,
         maximum_width: u32,
         maximum_height: u32,
         muted: bool,
     ) -> Result<Self, VideoError> {
+        Self::open_with_audio_processing(path, timeline, start, maximum_width,
+            maximum_height, muted, false, Default::default())
+    }
+
+    pub fn open_with_audio_processing(
+        path: &Path,
+        mut timeline: RecordingClipTimeline,
+        start: f64,
+        maximum_width: u32,
+        maximum_height: u32,
+        muted: bool,
+        audio_mode: impl Into<super::audio_mode::AudioMode>,
+        audio_control: super::audio_processing::ProcessingControl,
+    ) -> Result<Self, VideoError> {
+        let audio_mode = audio_mode.into();
         gst::init().map_err(|e| VideoError::Decode(e.to_string()))?;
         let info = probe_media(path)?;
         let (width, height) =
@@ -60,12 +79,22 @@ impl TimelinePlaybackStream {
             sink: None,
             active: None,
             gap_clock: None,
+            temporal_frames: None,
+            audio_mode,
+            audio_control,
             #[cfg(test)]
             audio_samples: Default::default(),
         })
     }
 
-    fn start_clip(&mut self, index: usize, source_time: f64) -> Result<(), VideoError> {
+    /// Share encoded source intervals before transport cadence conversion.
+    pub fn enable_temporal_frames(&mut self, revision: u64) {
+        self.temporal_frames = Some(super::primary_frames::PrimaryFrames::new(
+            super::motion_blur::VideoSource { path: self.path.clone(), size: (self.width, self.height), revision },
+            (self.width, self.height), self.window_capture));
+    }
+
+    fn start_clip(&mut self, index: usize, source_time: f64, cancelled: &dyn Fn() -> bool) -> Result<(), VideoError> {
         self.stop();
         let clip = &self.timeline.segments[index];
         let (path, offset, borders) = if let Some(bank) = &self.bank {
@@ -86,7 +115,7 @@ impl TimelinePlaybackStream {
         // Dimensions are already fitted. Padding for subpixel aspect-ratio
         // rounding would add opaque black edges to transparent windows.
         let sink = gst::parse::bin_from_description(&format!(
-            "videoconvert ! videoscale add-borders={borders} ! video/x-raw,format=RGBA,width={},height={},pixel-aspect-ratio=1/1 ! videorate ! video/x-raw,framerate=30/1 ! appsink name=frames sync=true max-buffers=2 drop=false wait-on-eos=false", self.width, self.height
+            "videoconvert ! videoscale add-borders={borders} ! video/x-raw,format=RGBA,width={},height={},pixel-aspect-ratio=1/1 ! identity name=native_temporal ! videorate ! video/x-raw,framerate=30/1 ! appsink name=frames sync=true max-buffers=2 drop=false wait-on-eos=false", self.width, self.height
         ), true).map_err(|e| VideoError::Decode(e.to_string()))?;
         let frames = sink.by_name("frames").unwrap();
         let uri = gst::glib::filename_to_uri(&path, None)
@@ -97,7 +126,23 @@ impl TimelinePlaybackStream {
         let audio_filter = gst::parse::bin_from_description("scaletempo ! volume name=recording_gain", true)
             .map_err(|e| VideoError::Decode(format!("could not prepare recording audio: {e}")))?;
         audio_filter.by_name("recording_gain").unwrap().set_property("mute", self.muted);
-        let pipeline = gst::ElementFactory::make("playbin")
+        let prepared_audio = if self.muted { None } else {
+            super::audio_processing::ensure_audio_with_cancel(
+                &path, self.audio_mode, &self.audio_control, cancelled)?
+        };
+        let pipeline = if let Some(audio) = prepared_audio {
+            // Original video and prepared audio live in one pipeline so rate
+            // seeks, start time, pause, and the audio clock apply to both.
+            let audio_output: gst::Element = {
+                #[cfg(test)]
+                { test_audio_sink(self.audio_samples.clone()).upcast() }
+                #[cfg(not(test))]
+                { gst::ElementFactory::make("autoaudiosink").build()
+                    .map_err(|e| VideoError::Decode(e.to_string()))? }
+            };
+            prepared_audio_pipeline(&path, &audio, &sink, &audio_filter, &audio_output)?
+        } else {
+            let pipeline = gst::ElementFactory::make("playbin")
             .property_from_str("flags", &format!("{PLAYBACK_FLAGS}+force-filters"))
             .property("uri", uri.as_str())
             .property("video-sink", &sink)
@@ -108,8 +153,10 @@ impl TimelinePlaybackStream {
             .property("mute", false)
             .build()
             .map_err(|e| VideoError::Decode(e.to_string()))?;
-        #[cfg(test)]
-        pipeline.set_property("audio-sink", test_audio_sink(self.audio_samples.clone()));
+            #[cfg(test)]
+            pipeline.set_property("audio-sink", test_audio_sink(self.audio_samples.clone()));
+            pipeline
+        };
         // Store before changing state so every failure is cleaned up by Drop.
         self.pipeline = Some(pipeline.clone());
         self.sink = Some(frames);
@@ -121,6 +168,25 @@ impl TimelinePlaybackStream {
             .state(gst::ClockTime::from_seconds(5))
             .0
             .map_err(|e| VideoError::Decode(e.to_string()))?;
+        if let Some(cache) = self.temporal_frames.clone() {
+            let asset = self.bank.as_ref().map_or(0, |bank| bank.locate(source_time).0);
+            let bounds = self.bank.as_ref().map_or((0.0, f64::INFINITY), |bank|
+                (offset, offset + bank.entries[asset].info.duration));
+            let bounds=(bounds.0.max(source_time),bounds.1.min(clip.source_end));
+            sink.by_name("native_temporal").unwrap().static_pad("src").unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+                    if let Some(buffer) = info.buffer() {
+                        let origin = buffer.pts().and_then(|pts| {
+                            let event = pad.sticky_event::<gst::event::Segment>(0)?;
+                            let segment = event.segment().downcast_ref::<gst::ClockTime>()?;
+                            let stream_time = segment.to_stream_time(pts)?;
+                            Some(stream_time.nseconds() as f64 / 1e9 - pts.nseconds() as f64 / 1e9)
+                        }).unwrap_or(0.0);
+                        cache.push(buffer.clone(), asset, offset + origin, bounds, index);
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+        }
         pipeline
             .seek(
                 clip.speed,
@@ -163,11 +229,12 @@ impl TimelinePlaybackStream {
             }
             self.gap_clock = None;
             if self.active != Some(location.segment_index) {
-                self.start_clip(location.segment_index, location.source_time)?;
+                self.start_clip(location.segment_index, location.source_time, &cancelled)?;
             }
             if let Some((frame, clock, start)) = &self.still_frame {
                 std::thread::sleep(Duration::from_millis(16));
-                let end = location.editor_start + self.timeline.segments[location.segment_index].editor_duration();
+                let end: f64 = self.timeline.segments[..=location.segment_index].iter()
+                    .map(|clip| clip.slot_duration()).sum();
                 self.position = (start + clock.elapsed().as_secs_f64()).min(end);
                 let mut frame = frame.clone();
                 frame.time = self.position.min(end - 1e-9);
@@ -180,8 +247,13 @@ impl TimelinePlaybackStream {
                 let buffer = sample
                     .buffer()
                     .ok_or_else(|| VideoError::Decode("preview sample has no buffer".into()))?;
-                let pts = buffer
-                    .pts()
+                // Demuxers may preserve a positive container timestamp origin
+                // in buffer PTS while seeks use normalized stream time. The
+                // prepared audio uses that same normalized source clock.
+                let pts = buffer.pts().and_then(|pts| {
+                    sample.segment().and_then(|segment| segment.downcast_ref::<gst::ClockTime>())
+                        .map_or(Some(pts), |segment| segment.to_stream_time(pts))
+                })
                     .map(|t| t.nseconds() as f64 / 1e9 + self.source_offset)
                     .ok_or_else(|| VideoError::Decode("preview frame has no timestamp".into()))?;
                 let clip = &self.timeline.segments[location.segment_index];
@@ -214,8 +286,12 @@ impl TimelinePlaybackStream {
                 }
             }
             if sink.property::<bool>("eos") {
-                self.position = location.editor_start
-                    + self.timeline.segments[location.segment_index].editor_duration();
+                // Use the same accumulation order as timeline lookup/duration.
+                // Adding gap + duration in a different order can leave the
+                // playhead one ULP before the boundary and reopen an exhausted
+                // asset forever (especially with media-bank source offsets).
+                self.position = self.timeline.segments[..=location.segment_index].iter()
+                    .map(|clip| clip.slot_duration()).sum();
                 self.stop();
             }
         }
@@ -234,6 +310,59 @@ impl Drop for TimelinePlaybackStream {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn prepared_audio_pipeline(
+    video: &Path,
+    audio: &Path,
+    video_sink: &gst::Bin,
+    audio_filter: &gst::Bin,
+    audio_sink: &gst::Element,
+) -> Result<gst::Element, VideoError> {
+    let pipeline = gst::Pipeline::new();
+    let build_source = |path: &Path, media_type: &str| -> Result<gst::Element, VideoError> {
+        let uri = gst::glib::filename_to_uri(path, None)
+            .map_err(|e| VideoError::Decode(e.to_string()))?;
+        gst::ElementFactory::make("uridecodebin")
+            .property("uri", uri.as_str())
+            // Decodebin checks decoder template caps before instantiation.
+            // ANY features accept decoders advertising both system/GPU memory;
+            // the downstream conversion bin negotiates usable CPU buffers.
+            .property("caps", gst::Caps::builder(media_type).any_features().build())
+            .property("expose-all-streams", false)
+            .build().map_err(|e| VideoError::Decode(e.to_string()))
+    };
+    let video_source = build_source(video, "video/x-raw")?;
+    let audio_source = build_source(audio, "audio/x-raw")?;
+    let video_queue = gst::ElementFactory::make("queue").build()
+        .map_err(|e| VideoError::Decode(e.to_string()))?;
+    let deinterlace = gst::ElementFactory::make("deinterlace").build()
+        .map_err(|e| VideoError::Decode(e.to_string()))?;
+    let audio_queue = gst::ElementFactory::make("queue").build()
+        .map_err(|e| VideoError::Decode(e.to_string()))?;
+    let convert = gst::ElementFactory::make("audioconvert").build()
+        .map_err(|e| VideoError::Decode(e.to_string()))?;
+    let resample = gst::ElementFactory::make("audioresample").build()
+        .map_err(|e| VideoError::Decode(e.to_string()))?;
+    pipeline.add_many([
+        &video_source, &audio_source, &video_queue, &deinterlace, &audio_queue, &convert, &resample,
+        video_sink.upcast_ref(), audio_filter.upcast_ref(), audio_sink,
+    ]).map_err(|e| VideoError::Decode(e.to_string()))?;
+    gst::Element::link_many([&video_queue, &deinterlace, video_sink.upcast_ref()])
+        .map_err(|e| VideoError::Decode(e.to_string()))?;
+    gst::Element::link_many([&audio_queue, &convert, &resample, audio_filter.upcast_ref(), audio_sink])
+        .map_err(|e| VideoError::Decode(e.to_string()))?;
+    for (source, queue, media_type) in [
+        (video_source, video_queue, "video/"), (audio_source, audio_queue, "audio/"),
+    ] {
+        source.connect_pad_added(move |_, pad| {
+            let matches = pad.current_caps().and_then(|caps|
+                caps.structure(0).map(|s| s.name().starts_with(media_type))).unwrap_or(false);
+            let sink = queue.static_pad("sink").expect("queue has a sink");
+            if matches && !sink.is_linked() { let _ = pad.link(&sink); }
+        });
+    }
+    Ok(pipeline.upcast())
 }
 
 /// Capture the samples after production audio filters without a sound device.
@@ -256,6 +385,215 @@ mod tests {
     use super::super::clips::RecordingClipSegment;
     use super::*;
     use std::{fs, process::Command};
+
+    #[test]
+    fn prepared_audio_is_shared_by_preview_and_export_across_cuts_and_speed() {
+        use super::super::{audio_processing, export};
+        let root = std::env::temp_dir().join(format!("lahza-audio-consumers-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("separate.mkv");
+        let output = Command::new("ffmpeg").args([
+            "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:s=64x36:r=30:d=3",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+            "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=3",
+            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "ffv1", "-c:a", "pcm_s16le",
+            "-metadata:s:a:0", "title=Lahza-Microphone", "-metadata:s:a:1", "title=Lahza-System-Audio",
+        ]).arg(&path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let bank_path = root.join("takes.media.json");
+        let entry = super::super::media_bank::MediaEntry {
+            file: "separate.mkv".into(), info: probe_media(&path).unwrap(), still: false,
+        };
+        super::super::media_bank::MediaBank { entries: vec![entry.clone(), entry] }
+            .save(&bank_path).unwrap();
+        let decode = |path: &Path| -> Vec<f32> {
+            let output = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(path)
+                .args(["-vn", "-ac", "1", "-ar", "48000", "-f", "f32le", "pipe:1"]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            output.stdout.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect()
+        };
+        let amplitude = |samples: &[f32], frequency: f64| -> f64 {
+            let (sin, cos) = samples.iter().enumerate().fold((0.0, 0.0), |(s, c), (i, x)| {
+                let angle = std::f64::consts::TAU * frequency * i as f64 / 48000.0;
+                (s + f64::from(*x) * angle.sin(), c + f64::from(*x) * angle.cos())
+            });
+            sin.hypot(cos) * 2.0 / samples.len() as f64
+        };
+        for (index, audio_mode) in super::super::audio_mode::AudioMode::ALL.into_iter().enumerate() {
+            let noise_reduction = index % 2 != 0; // Exercise both direct media and media-bank source offsets.
+            let media = if noise_reduction { &bank_path } else { &path };
+            let control = audio_processing::ProcessingControl::default();
+            let prepared = audio_processing::ensure_audio(&path, audio_mode, &control).unwrap().unwrap();
+            let reference = decode(&prepared);
+            assert!(amplitude(&reference[24000..72000], 880.0) > 0.05, "system audio disappeared");
+            let simple = RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.5, 1.5)]);
+            let exported = root.join(format!("simple-{}.wav", audio_mode.cache_key()));
+            export::export_audio(export::AudioExportRequest {
+                destination: exported.clone(), format: export::AudioFormat::Wav,
+                media: media.clone(), clips: simple.clone(), include_recording: true,
+                noise_reduction: false, audio_mode: Some(audio_mode), audio_clips: Vec::new(),
+            }, &export::ExportProgress::default()).unwrap();
+            let samples = decode(&exported);
+            assert_eq!(samples.len(), 48000);
+            // One clean take feeds export before cutting. A second adaptive
+            // denoise pass, or using the embedded first track, fails this.
+            let error = samples.iter().zip(&reference[24000..72000])
+                .map(|(a, b)| f64::from((a - b).abs())).sum::<f64>() / 48000.0;
+            assert!(error < 0.00005, "export did not reuse prepared samples: {error}");
+
+            let mut first = RecordingClipSegment::new(0.4, 1.2);
+            first.speed = 2.0;
+            // Cleaned playback crosses a virtual media-bank asset boundary;
+            // each FLAC still uses local source time rather than bank time.
+            let offset = if noise_reduction { 3.0 } else { 0.0 };
+            let mut second = RecordingClipSegment::new(1.8 + offset, 2.6 + offset);
+            second.gap_before = 0.15;
+            let timeline = RecordingClipTimeline::new(vec![first, second]);
+            let mut preview = TimelinePlaybackStream::open_with_audio_processing(
+                media, timeline.clone(), 0.0, 64, 36, false, audio_mode, control,
+            ).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut frames = Vec::new();
+            loop {
+                match preview.next_frame(|| Instant::now() > deadline) {
+                    Ok(Some(frame)) => frames.push(frame.time),
+                    Ok(None) => break,
+                    Err(error) => panic!("prepared mode={audio_mode:?} failed: {error}; position={}, active={:?}, offset={}, frames={frames:?}", preview.position, preview.active, preview.source_offset),
+                }
+            }
+            assert!(Instant::now() < deadline, "prepared mode={audio_mode:?} stalled: position={}, active={:?}, offset={}, frames={frames:?}", preview.position, preview.active, preview.source_offset);
+            preview.stop();
+            let played = preview.audio_samples.lock().unwrap();
+            assert!((played.len() as f64 / 48000.0 - 1.2).abs() < 0.16,
+                "prepared audio was not cut/time-stretched: {} samples", played.len());
+            assert!(amplitude(&played[played.len()/3..played.len()*2/3], 880.0) > 0.025,
+                "preview lost system audio or altered its pitch");
+            assert!(frames.windows(2).all(|pair| pair[1] >= pair[0]));
+            assert!(frames.last().copied().unwrap_or(0.0) > timeline.duration() - 0.1);
+            drop(played);
+            drop(preview);
+        }
+        // Other consumers must not silently choose only microphone stream 0.
+        let session = super::super::model::RecordingSession::create_in(root.join("projects")).unwrap();
+        let imported = super::super::media::import_audio(&session, &path, 0.0).unwrap();
+        let imported = decode(&super::super::media::asset_path(&session, &imported.file).unwrap());
+        assert!(amplitude(&imported[24000..72000], 440.0) > 0.05);
+        assert!(amplitude(&imported[24000..72000], 880.0) > 0.05);
+        let clip_export = root.join("clip.mp4");
+        super::super::video::export_clip_timeline(&path, &clip_export,
+            &RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.5, 1.5)])).unwrap();
+        let clip_audio = decode(&clip_export);
+        assert!(amplitude(&clip_audio[12000..36000], 440.0) > 0.05);
+        assert!(amplitude(&clip_audio[12000..36000], 880.0) > 0.05);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_playback_keeps_delayed_microphone_aligned_to_video() {
+        let root = std::env::temp_dir().join(format!("lahza-audio-offset-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        for origin in [0, 2] {
+            let path = root.join(format!("delayed-{origin}.mkv"));
+            let output = Command::new("ffmpeg").args([
+                "-v", "error", "-y", "-f", "lavfi", "-i", "color=blue:s=64x36:r=30:d=1.5",
+                "-itsoffset", "0.35", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+                "-map", "0:v", "-map", "1:a", "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                "-metadata:s:a:0", "title=Lahza-Microphone",
+            ]).args(["-output_ts_offset", &origin.to_string()]).arg(&path).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let mut preview = TimelinePlaybackStream::open(&path, RecordingClipTimeline::full(1.5),
+                0.0, 64, 36, false).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut frames = Vec::new();
+            while let Some(frame) = preview.next_frame(|| Instant::now() > deadline).unwrap() { frames.push(frame.time); }
+            assert!(frames.len() >= 40 && frames[0] < 0.05, "container origin leaked into source clock: {origin}, {frames:?}");
+            assert!(Instant::now() < deadline, "delayed audio prevented preroll");
+            preview.stop();
+            let played = preview.audio_samples.lock().unwrap();
+            assert!(played.len() > 60000);
+            let rms = |samples: &[f32]| (samples.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
+            assert!(rms(&played[0..12000]) < 0.0001, "microphone moved earlier than capture time");
+            assert!(rms(&played[24000..48000]) > 0.01, "delayed microphone disappeared");
+            drop(played);
+            drop(preview);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn primary_temporal_tap_keeps_native_60fps_across_transport_speed_and_cuts() {
+        let root=std::env::temp_dir().join(format!("lahza-primary-pts-{}",uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path=root.join("numbered.mkv");
+        let encoded=Command::new("ffmpeg").args(["-v","error","-y","-f","lavfi","-i",
+            "nullsrc=s=64x48:r=60:d=2,format=gbrp,geq=r='N*2':g=0:b=0,format=bgra","-c:v","ffv1"])
+            .arg(&path).output().unwrap();
+        assert!(encoded.status.success(),"{}",String::from_utf8_lossy(&encoded.stderr));
+        let timestamps=Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","frame=best_effort_timestamp_time","-of","csv=p=0"])
+            .arg(&path).output().unwrap();
+        assert!(timestamps.status.success());
+        let encoded_pts:Vec<f64>=String::from_utf8(timestamps.stdout).unwrap().lines()
+            .filter_map(|line|line.trim().parse().ok()).collect();
+        assert_eq!(encoded_pts.len(),120);
+        for speed in [1.0,4.0] {
+            let first=RecordingClipSegment::new(0.2,0.7);
+            let mut second=RecordingClipSegment::new(1.0,1.5);second.speed=speed;
+            let timeline=RecordingClipTimeline::new(vec![first,second]);
+            let mut stream=TimelinePlaybackStream::open(&path,timeline.clone(),0.0,64,48,true).unwrap();
+            stream.enable_temporal_frames(42);
+            let source=super::super::motion_blur::VideoSource {path:path.clone(),size:(64,48),revision:42};
+            let mut checked=0;
+            while let Some(frame)=stream.next_frame(||false).unwrap() {
+                let location=timeline.location_at(frame.time).unwrap();
+                let clip=&timeline.segments[location.segment_index];
+                let center=location.source_time;
+                // The native tap is ahead of the 30fps transport sink. Its
+                // six-frame ring must still contain the prior/current 1x
+                // shutter intervals, including native pictures videorate drops.
+                if center-clip.source_start<0.05 || clip.source_end-center<0.05 {continue;}
+                let targets=if clip.speed==1.0 {vec![center-0.01,center+0.005]}else{vec![center]};
+                for target in targets {
+                    let cached=super::super::primary_frames::frame(&source,(64,48),0,target)
+                        .unwrap_or_else(||panic!("missing native ring interval speed={speed}, source={center}, target={target}"));
+                    let red=cached.image.get_pixel(32,24)[0];
+                    // Matroska stores these PTS in milliseconds, so 1.066666
+                    // is still the preceding picture until encoded PTS1.067.
+                    let normalized=super::super::temporal_decode::source_clock(target);
+                    let expected=encoded_pts.partition_point(|pts|*pts<=normalized).saturating_sub(1) as i32*2;
+                    assert!((i32::from(red)-expected).abs()<=1,"resampled timestamp leaked into native cache: {target}, {red}, expected {expected}");
+                    assert!(cached.end-cached.start<0.018,"native60fps must not become30fps intervals");
+                    checked+=1;
+                }
+            }
+            assert!(checked>10);
+            drop(stream);
+        }
+        // Keep irregular source pictures. The primary tap must retain their
+        // holds across the regular transport cadence without nominal-FPS gaps.
+        let vfr=root.join("variable.mkv");
+        let selected=[0usize,7,30,70,95];
+        let encoded=Command::new("ffmpeg").args(["-v","error","-y","-i"]).arg(&path)
+            .args(["-vf","select='eq(n,0)+eq(n,7)+eq(n,30)+eq(n,70)+eq(n,95)'","-fps_mode","vfr","-c:v","ffv1"])
+            .arg(&vfr).output().unwrap();
+        assert!(encoded.status.success());
+        let info=probe_media(&vfr).unwrap();
+        let timeline=RecordingClipTimeline::new(vec![RecordingClipSegment::new(0.0,info.duration)]);
+        let mut stream=TimelinePlaybackStream::open(&vfr,timeline,0.0,64,48,true).unwrap();
+        stream.enable_temporal_frames(43);
+        let source=super::super::motion_blur::VideoSource {path:vfr,size:(64,48),revision:43};
+        let mut held=0;
+        while let Some(frame)=stream.next_frame(||false).unwrap() {
+            if frame.time<0.05 || frame.time>=encoded_pts[95] {continue;}
+            let cached=super::super::primary_frames::frame(&source,(64,48),0,frame.time)
+                .unwrap_or_else(||panic!("native VFR hold missing at {}",frame.time));
+            let native=selected.iter().copied().take_while(|index|encoded_pts[*index]<=super::super::temporal_decode::source_clock(frame.time)).last().unwrap();
+            assert!((i32::from(cached.image.get_pixel(32,24)[0])-native as i32*2).abs()<=1);
+            held+=1;
+        }
+        assert!(held>25);
+        drop(stream);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     #[ignore = "set LAHZA_SYNC_RECORDING to a recording package for real-media diagnostics"]

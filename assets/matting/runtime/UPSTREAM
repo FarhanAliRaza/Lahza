@@ -1,0 +1,15 @@
+Microsoft ONNX Runtime 1.31.0, CPU, Linux x86_64.
+Source: https://github.com/microsoft/onnxruntime/releases/tag/v1.31.0
+Download: https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz
+Upstream git commit: 402979ac1bef89dcd55add41eaa7277c407599eb
+Archive SHA-256: cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57
+libonnxruntime.so.1.31.0 SHA-256: 469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e
+License: MIT; full upstream LICENSE and ThirdPartyNotices.txt retained.
+Unmodified upstream CPU shared library. No CUDA or GPU provider is required.
+
+The library and required notices are embedded in Linux x86_64 builds. At
+first inference they are materialized to a versioned user cache directory.
+Existing library bytes are SHA-256 checked; writes use a unique temporary
+file, fsync and atomic rename. No runtime download is performed. Other
+architectures, unavailable caches, or load failures use the bundled
+portable Rust inference backend and the same model instead.

@@ -7,8 +7,7 @@ use crate::{
         self,
         clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
         model::PointerCaptureFile,
-        pointer_timeline::PointerTimeline,
-        viewport::{MotionPreset, ViewportTimeline, ZoomCue},
+        viewport::{MotionPreset, ZoomCue},
     },
 };
 use gpui::{Pixels, RenderImage};
@@ -35,8 +34,6 @@ pub(crate) struct ImageScene {
     pub(crate) preset: Option<MotionPreset>,
     pub(crate) pointer_capture: PointerCaptureFile,
     pub(crate) walkthrough_stops: Vec<recording::model::NormalizedPoint>,
-    pub(crate) viewport: ViewportTimeline,
-    pub(crate) pointer: Option<PointerTimeline>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -198,6 +195,15 @@ pub(crate) struct VideoZoomDrag {
 
 #[derive(Clone, Debug)]
 pub(crate) enum VideoEditSnapshot {
+    AnimationPreferences {
+        settings: recording::animation::AnimationSettings,
+        cursor_motion: recording::pointer_timeline::PointerMotion,
+    },
+    CameraLayouts {
+        base: recording::scene::CameraOverlay,
+        regions: Vec<recording::camera_timeline::CameraRegion>,
+        selected: Option<Uuid>,
+    },
     Audio(Vec<recording::media::AudioClip>),
     Crop(CropRect),
     Annotations(Vec<AnnotationMark>),

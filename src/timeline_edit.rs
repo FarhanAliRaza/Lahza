@@ -171,6 +171,7 @@ impl Studio {
     /// draft. Committed edits remain available through ordinary undo.
     pub(crate) fn cancel_timeline_edit(&mut self, cx: &mut Context<Self>) -> bool {
         let mut cancelled = self.cancel_motion_creation();
+        cancelled |= self.cancel_camera_region_drag();
         if let Some(drag) = self.video_move_drag.take() {
             self.video_selected_clip = drag.original_selection;
             self.video_selected_zoom_cue = drag.original_zoom_selection;

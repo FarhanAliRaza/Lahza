@@ -112,7 +112,9 @@ pub(crate) struct LoadingState {
 
 impl Studio {
     pub(crate) fn start_loading(&mut self, request: LoadRequest, discover_devices: bool, cx: &mut Context<Self>) {
-        if self.video_playing { self.pause_video_playback(); }
+        // Cancel queued playback too: preparation can finish while the next
+        // document is loading, before it replaces the current project.
+        self.pause_video_playback();
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         self.loading = Some(LoadingState { request: request.clone(), started: Instant::now(), error: None });

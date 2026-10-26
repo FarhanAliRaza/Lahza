@@ -1670,7 +1670,7 @@ impl Studio {
 
     pub(crate) fn toggle_timeline_playback(&mut self, cx: &mut Context<Self>) {
         if self.video_project.is_some() {
-            if self.video_playing {
+            if self.video_playing || self.video_audio_play_when_ready {
                 self.pause_video_playback();
             } else {
                 self.start_video_playback(cx);
@@ -1823,7 +1823,7 @@ impl Studio {
         }
         ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
         let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
-        let camera_lane = self.camera_lane(timeline_scroll, timeline_content_width, progress);
+        let camera_lane = self.camera_region_lane(timeline_scroll, timeline_content_width, progress, cx);
         let clip_lane: Vec<AnyElement> = if is_video {
             self.video_clip_lane(
                 timeline_duration,
@@ -2068,7 +2068,7 @@ impl Studio {
                             .h_full()
                             .overflow_hidden()
                             .cursor_pointer()
-                            .on_hover(cx.listener(|this, hover, _, cx| {
+                            .on_hover(cx.listener(|this, hover: &bool, _, cx| {
                                 this.timeline_ui.ruler_hover = *hover;
                                 if !hover {
                                     this.update_timeline_skim(None, cx);
@@ -2236,7 +2236,7 @@ impl Studio {
                                             }
                                         },
                                     ))
-                                    .on_hover(cx.listener(|this, hover, _, cx| {
+                                    .on_hover(cx.listener(|this, hover: &bool, _, cx| {
                                         if !hover {
                                             this.timeline_ui.hover_time = None;
                                             this.update_timeline_skim(None, cx);
@@ -2399,7 +2399,7 @@ impl Studio {
                     d.child(div().relative().px_2().rounded_md().bg(hsla(0.0, 0.0, 0.0, 0.45)).child(label))
                 })
                 .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
-                .on_hover(cx.listener(move |this, hover, _, cx| {
+                .on_hover(cx.listener(move |this, hover: &bool, _, cx| {
                     if *hover { this.timeline_ui.hovered_clip = Some(clip_id); }
                     else if this.timeline_ui.hovered_clip == Some(clip_id) { this.timeline_ui.hovered_clip = None; }
                     cx.notify();

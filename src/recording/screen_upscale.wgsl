@@ -1,5 +1,6 @@
-// Independent tiled inference for the MIT-licensed Anime4K CNN x2 S model.
-// Coefficients and attribution are in assets/upscaler; no vendor screen model.
+alias Math = f32;
+// Independent tiled inference for the MIT-licensed Lahza UI CNN cascade.
+// Generated UI/text training, model coefficients and provenance: assets/upscaler.
 struct UpscaleParams {
     sizes: vec4<u32>, // source width/height, output width/height
     region: vec4<u32>,
@@ -38,16 +39,25 @@ fn convolve(layer: u32, id: vec3<u32>) {
     for (var sign = 0u; sign < signs; sign++) {
         for (var tap = 0u; tap < 9u; tap++) {
             let offset = vec2<i32>(i32(tap / 3u) - 1, i32(tap % 3u) - 1);
-            var value: vec4<f32>;
-            if layer == 0u { value = read_source(p + offset); }
+            var raw: vec4<f32>;
+            if layer == 0u { raw = read_source(p + offset); }
             else {
-                value = read_features(p + offset);
-                if sign == 1u { value = -value; }
-                value = max(value, vec4<f32>(0.0));
+                raw = read_features(p + offset);
+                if sign == 1u { raw = -raw; }
+                raw = max(raw, vec4<f32>(0.0));
             }
             let base = layer * 73u + (sign * 9u + tap) * 4u;
-            let weights = mat4x4<f32>(b_up_weights[base], b_up_weights[base + 1u], b_up_weights[base + 2u], b_up_weights[base + 3u]);
-            result += weights * value;
+            // Preserve source and reconstruction precision; the two hidden
+            // convolutions use native half products with f32 accumulation.
+            if layer == 0u || layer == 3u || b_up_params.mapping.z != 0u {
+                let weights = mat4x4<f32>(b_up_weights[base],b_up_weights[base+1u],b_up_weights[base+2u],b_up_weights[base+3u]);
+                result += weights * raw;
+            } else {
+                let value=vec4<Math>(raw);
+                let weights = mat4x4<Math>(vec4<Math>(b_up_weights[base]), vec4<Math>(b_up_weights[base + 1u]), vec4<Math>(b_up_weights[base + 2u]), vec4<Math>(b_up_weights[base + 3u]));
+                result += vec4<f32>(weights[0] * value.x) + vec4<f32>(weights[1] * value.y)
+                    + vec4<f32>(weights[2] * value.z) + vec4<f32>(weights[3] * value.w);
+            }
         }
     }
     b_up_result[id.y * stride + id.x] = result + b_up_weights[layer * 73u + 72u];
