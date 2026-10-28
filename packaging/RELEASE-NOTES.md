@@ -4,15 +4,16 @@ A native Linux screenshot, recording, and motion studio built with Rust and GPUI
 
 ### Changed in this release
 
-- Add five microphone presets: Off, Standard, Loud, Noise reduction, and Podcast. Noise reduction uses bundled MossFormer2 inference; Podcast uses bundled TF-Restormer restoration with voice leveling, EQ, and de-essing. Processing runs locally without downloading enhancement models.
-- Keep microphone and system audio as separate tracks in new recordings, so microphone cleanup leaves system audio unaffected. Preserve both tracks through pause/resume, finalization, and interrupted-recording recovery.
-- Prepare audio once in the background and share the lossless result between playback and export. Add preparation progress, cancellation, retry, and caches for each source and preset. Fix audio changes at normal export speed and shared neural-runtime initialization.
-- Add timed webcam regions with animated transitions between Overlay, Split screen, Camera only, Screen only, and Cutout layouts. Support full or padded splits, portrait and landscape arrangements, camera aspect ratios, and local neural person cutout.
-- Preserve native webcam detail in paused previews and exports. Improve enlarged screen text with independently trained 2× and 4× UI reconstruction models, alpha-aware sampling, and cached GPU rendering.
-- Add a dedicated Animation panel with hover previews for screen and cursor presets, adjustable motion blur, and a project-wide option to start zooms early.
-- Improve Glass loupe and motion-blur playback with shared frame decoding and cancellation of obsolete requests. Refine cursor smoothing, hover handling, idle fade, and independent typing-based cursor hiding.
+- Redesign the editor around one design system: Inter typography, consistent spacing, shared buttons, sliders, toggles, and fields, and an ink accent with red reserved for recording and the playhead.
+- Add dark mode. Choose System, Light, or Dark under Appearance in the launcher, or cycle it from the editor's top bar; the choice is remembered.
+- Improve keyboard access: visible focus, Tab navigation, arrow keys in segmented controls, `[` and `]` to trim to the playhead, Alt+arrow nudging, and global capture shortcuts (Ctrl+Alt+S, Ctrl+Alt+P) through the desktop portal.
+- Rework the timeline: a readable time ruler, labelled regions, clearer trim handles, right-click menus, and a simpler toolbar with visible Snap and Skim states.
+- Make destructive actions safer with two-step Discard and Restart and undo from notifications. Notifications now explain failures and offer a follow-up action.
+- Show the current selection in the inspector header, simplify the export panel with a summary of what will be written, and widen the inspector on large windows.
+- Remove the share-to-server upload. Export saves files locally.
+- Keep sliders responsive while dragging: cursor and zoom sliders no longer rebuild motion timelines or re-read pointer data on every move.
 
-Validation before release passed 510 Rust tests, with model and editor lifecycle probes run separately. Neural output was compared with independent references on public speech fixtures; rendering checks cover native camera detail and GPU/CPU sampling. The release workflow reruns the Rust and packaging suites, tests the bundled Whisper runtime, and runs confined Snap smoke checks. Compilation jobs are limited to one at a time.
+The release workflow reruns the Rust and packaging suites, tests the bundled Whisper runtime, and runs confined Snap smoke checks.
 
 Snap builds are installed and tested under strict confinement in CI, including synthetic window recording with alpha, H.264/AAC export, and frame decoding. Desktop source-picker and device behavior still depend on your Linux desktop.
 
