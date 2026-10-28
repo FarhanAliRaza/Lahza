@@ -76,7 +76,7 @@ Start with ready-made layouts for product launches, tutorials, social posts, cha
 
 [![Lahza export panel showing MP4, WebM, GIF, resolution, and frame rate options](docs/screenshots/04-export-formats.png)](packaging/store/screenshots/04-export-formats.png)
 
-Save screenshots as **PNG** and videos or animations as **MP4** (H.264 or HEVC), **WebM**, or **GIF**. Export up to **4K** at **30 or 60 fps**, with optional motion blur, size estimates and progress tracking. Fixed-aspect canvases such as 9:16 or 4:5 can **Fill** the frame with a camera that follows the cursor. Export the mixed audio alone as **M4A** or **WAV**, subtitles as **SRT**, or upload to your own share server and copy the link.
+Save screenshots as **PNG** and videos or animations as **MP4** (H.264 or HEVC), **WebM**, or **GIF**. Export up to **4K** at **30 or 60 fps**, with optional motion blur, size estimates and progress tracking. Fixed-aspect canvases such as 9:16 or 4:5 can **Fill** the frame with a camera that follows the cursor. Export the mixed audio alone as **M4A** or **WAV** or subtitles as **SRT**.
 
 ## Quick start
 

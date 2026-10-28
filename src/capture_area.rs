@@ -1,5 +1,6 @@
 //! Area selection on a preview of the monitor authorized by the portal.
 
+use crate::controls::{button, ButtonKind, ButtonSize};
 use crate::{
     cached_render_image,
     recording::area::{AreaPreset, AreaRequest, RecordingArea},
@@ -58,6 +59,7 @@ fn open_picker(request: AreaRequest, cx: &mut App) -> gpui::Result<gpui::WindowH
             ..Default::default()
         },
         move |window, cx| {
+            theme::follow_appearance(window);
             let picker = cx.new(|cx| AreaPicker::new(request, cx));
             window.focus(&picker.read(cx).focus);
             let weak = picker.downgrade();
@@ -81,7 +83,22 @@ enum AreaDrag {
         start: (f32, f32),
         area: RecordingArea,
     },
+    /// Redraw from the corner opposite a handle; an edge handle holds the
+    /// other axis where it was.
+    Resize {
+        anchor: (f32, f32),
+        hold_x: Option<f32>,
+        hold_y: Option<f32>,
+    },
 }
+
+/// Handle positions as fractions of the selection, corners and edges.
+const HANDLES: [(f32, f32); 8] = [
+    (0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 0.5),
+    (1.0, 1.0), (0.5, 1.0), (0.0, 1.0), (0.0, 0.5),
+];
+const HANDLE_VISUAL: f32 = 10.0;
+const HANDLE_HIT: f32 = 24.0;
 
 const RATIOS: &[(&str, AreaPreset)] = &[
     ("Free", AreaPreset::Free),
@@ -170,9 +187,26 @@ impl AreaPicker {
         }
     }
 
+    fn begin_resize(&mut self, handle: (f32, f32)) {
+        let Some(area) = self.selection else { return };
+        let (width, height) = (area.source_width as f32, area.source_height as f32);
+        let (left, top) = (area.left as f32 / width, area.top as f32 / height);
+        let right = (area.left + area.width) as f32 / width;
+        let bottom = (area.top + area.height) as f32 / height;
+        self.dragging = Some(AreaDrag::Resize {
+            anchor: (if handle.0 == 0.0 { right } else { left }, if handle.1 == 0.0 { bottom } else { top }),
+            hold_x: (handle.0 == 0.5).then_some(right),
+            hold_y: (handle.1 == 0.5).then_some(bottom),
+        });
+    }
+
     fn update_drag(&mut self, end: (f32, f32)) {
         self.selection = match self.dragging {
             Some(AreaDrag::Draw { start }) => self.preset.draw(start, end, self.source_size),
+            Some(AreaDrag::Resize { anchor, hold_x, hold_y }) => self
+                .preset
+                .draw(anchor, (hold_x.unwrap_or(end.0), hold_y.unwrap_or(end.1)), self.source_size)
+                .or(self.selection),
             Some(AreaDrag::Move { start, area }) => Some(area.at(
                 area.left as f32 + (end.0 - start.0) * self.source_size.0 as f32,
                 area.top as f32 + (end.1 - start.1) * self.source_size.1 as f32,
@@ -211,15 +245,9 @@ impl AreaPicker {
                     .rounded_md()
                     .text_sm()
                     .border_1()
-                    .border_color(if active { theme::blue() } else { theme::line() })
-                    .bg(if active {
-                        gpui::hsla(0.58, 0.8, 0.95, 1.0)
-                    } else {
-                        gpui::white()
-                    })
-                    .text_color(if active {
-                        theme::blue()
-                    } else if enabled {
+                    .border_color(if active { theme::accent() } else { theme::line() })
+                    .bg(if active { theme::accent_tint() } else { theme::surface() })
+                    .text_color(if enabled {
                         theme::ink()
                     } else {
                         theme::muted()
@@ -315,14 +343,14 @@ impl Render for AreaPicker {
             .child(
                 div()
                     .text_lg()
-                    .font_weight(gpui::FontWeight::BOLD)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child("Select recording area"),
             )
             .child(div().text_sm().text_color(theme::muted()).child(
                 if matches!(self.preset, AreaPreset::Size(..)) {
                     "Drag to position the selected size on your screen."
                 } else {
-                    "Drag inside to move. Shift-drag to draw a new area."
+                    "Drag to draw an area. Drag inside it to move; Shift-drag inside to redraw."
                 },
             ))
             .child(self.preset_row("area-ratio", "Shape", RATIOS, cx))
@@ -380,17 +408,67 @@ impl Render for AreaPicker {
                         let y = area.top as f32 / area.source_height as f32 * height;
                         let w = area.width as f32 / area.source_width as f32 * width;
                         let h = area.height as f32 / area.source_height as f32 * height;
-                        this.child(
+                        // Dim everything outside the selection.
+                        let shade = |left: f32, top: f32, w: f32, h: f32| {
                             div()
                                 .absolute()
-                                .left(px(x))
-                                .top(px(y))
-                                .w(px(w))
-                                .h(px(h))
-                                .border_2()
-                                .border_color(theme::blue())
-                                .bg(gpui::hsla(0.58, 0.8, 0.5, 0.15)),
-                        )
+                                .left(px(left))
+                                .top(px(top))
+                                .w(px(w.max(0.0)))
+                                .h(px(h.max(0.0)))
+                                .bg(gpui::black().opacity(0.45))
+                        };
+                        let resizable = !matches!(self.preset, AreaPreset::Size(..));
+                        this.child(shade(0.0, 0.0, width, y))
+                            .child(shade(0.0, y + h, width, height - y - h))
+                            .child(shade(0.0, y, x, h))
+                            .child(shade(x + w, y, width - x - w, h))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(x))
+                                    .top(px(y))
+                                    .w(px(w))
+                                    .h(px(h))
+                                    .border_2()
+                                    .border_color(theme::selection()),
+                            )
+                            .when(resizable, |this| {
+                                this.children(HANDLES.into_iter().enumerate().map(|(index, handle)| {
+                                    let cursor = match handle {
+                                        (0.5, _) => gpui::CursorStyle::ResizeUpDown,
+                                        (_, 0.5) => gpui::CursorStyle::ResizeLeftRight,
+                                        (a, b) if a == b => gpui::CursorStyle::ResizeUpLeftDownRight,
+                                        _ => gpui::CursorStyle::ResizeUpRightDownLeft,
+                                    };
+                                    div()
+                                        .id(("area-handle", index))
+                                        .absolute()
+                                        .left(px(x + w * handle.0 - HANDLE_HIT / 2.0))
+                                        .top(px(y + h * handle.1 - HANDLE_HIT / 2.0))
+                                        .size(px(HANDLE_HIT))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor(cursor)
+                                        .child(
+                                            div()
+                                                .size(px(HANDLE_VISUAL))
+                                                .rounded(px(2.0))
+                                                .bg(gpui::white())
+                                                .border_1()
+                                                .border_color(theme::selection()),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.begin_resize(handle);
+                                                cx.notify();
+                                            }),
+                                        )
+                                }))
+                            })
                     }),
             )
             .child(
@@ -401,33 +479,15 @@ impl Render for AreaPicker {
                     .gap_3()
                     .child(div().flex_1().text_sm().child(label))
                     .child(
-                        div()
-                            .id("cancel-recording-area")
-                            .px_4()
-                            .py_2()
-                            .rounded_lg()
-                            .bg(gpui::white())
-                            .cursor_pointer()
-                            .child("Cancel")
+                        button("cancel-recording-area", "Cancel", ButtonKind::Secondary, ButtonSize::Md)
                             .on_click(cx.listener(|this, _, window, _| {
                                 this.finish(None, window);
                                 window.remove_window();
                             })),
                     )
                     .child(
-                        div()
-                            .id("confirm-recording-area")
-                            .px_4()
-                            .py_2()
-                            .rounded_lg()
-                            .bg(if area.is_some() {
-                                theme::blue()
-                            } else {
-                                theme::muted()
-                            })
-                            .text_color(gpui::white())
-                            .when(area.is_some(), |this| this.cursor_pointer())
-                            .child("Start recording")
+                        button("confirm-recording-area", "Start recording  ↵", ButtonKind::Primary, ButtonSize::Md)
+                            .disabled(area.is_none())
                             .on_click(cx.listener(|this, _, window, _| {
                                 if let Some(area) = this.area() {
                                     this.finish(Some(area), window);

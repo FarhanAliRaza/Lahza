@@ -187,8 +187,7 @@ impl Studio {
                     .max_w(px(380.0))
                     .p_5()
                     .rounded_lg()
-                    .bg(gpui::white())
-                    .shadow_lg()
+                    .float()
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -196,7 +195,7 @@ impl Studio {
                     .text_sm()
                     .child(
                         div()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("Allow device access"),
                     )
                     .child(div().whitespace_normal().child(prompt.message.clone()))
@@ -205,15 +204,12 @@ impl Studio {
                         element
                             .child(div().whitespace_normal().child(commands.clone()))
                             .child(
-                                div()
-                                    .id("copy-capture-permissions")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(0x18181b))
-                                    .text_color(gpui::white())
-                                    .cursor_pointer()
-                                    .child("Copy commands")
+                                crate::controls::button(
+                                    "copy-capture-permissions",
+                                    "Copy commands",
+                                    crate::controls::ButtonKind::Primary,
+                                    crate::controls::ButtonSize::Md,
+                                )
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             commands.clone(),
@@ -227,12 +223,12 @@ impl Studio {
                             .justify_between()
                             .gap_3()
                             .child(
-                                div()
-                                    .id("cancel-capture-access")
-                                    .px_3()
-                                    .py_2()
-                                    .cursor_pointer()
-                                    .child("Cancel")
+                                crate::controls::button(
+                                    "cancel-capture-access",
+                                    "Cancel",
+                                    crate::controls::ButtonKind::Ghost,
+                                    crate::controls::ButtonSize::Md,
+                                )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if !this.capture_access_busy {
                                             this.capture_access_prompt = None;
@@ -241,16 +237,12 @@ impl Studio {
                                     })),
                             )
                             .child(
-                                div()
-                                    .id("retry-capture-access")
-                                    .px_3()
-                                    .py_2()
-                                    .cursor_pointer()
-                                    .child(if self.capture_access_busy {
-                                        "Checking…"
-                                    } else {
-                                        "Try again"
-                                    })
+                                crate::controls::button(
+                                    "retry-capture-access",
+                                    if self.capture_access_busy { "Checking…" } else { "Try again" },
+                                    crate::controls::ButtonKind::Secondary,
+                                    crate::controls::ButtonSize::Md,
+                                )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.request_capture_access(action, cx)
                                     })),

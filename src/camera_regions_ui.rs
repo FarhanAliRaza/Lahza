@@ -5,10 +5,13 @@ use crate::{
     Studio, VideoEditSnapshot, VideoZoomDragKind,
 };
 use gpui::{
-    div, hsla, prelude::*, px, rgb, AnyElement, Context, CursorStyle, FontWeight, IntoElement,
+    div, prelude::*, px, AnyElement, Context, CursorStyle, FontWeight, IntoElement,
     MouseButton, MouseDownEvent, Pixels,
 };
 use uuid::Uuid;
+
+/// Instant, Quick and Smooth layout transitions, in seconds.
+const TRANSITIONS: [f64; 3] = [0.0, 0.18, 0.35];
 
 #[derive(Clone)]
 pub(crate) struct CameraRegionDrag {
@@ -120,6 +123,9 @@ impl Studio {
     }
 
     pub(crate) fn remove_selected_camera_region(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.video_edit_busy {
+            return false;
+        }
         let Some(id) = self.selected_camera_region else {
             return false;
         };
@@ -135,7 +141,10 @@ impl Studio {
         true
     }
 
-    fn duplicate_camera_region(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn duplicate_camera_region(&mut self, cx: &mut Context<Self>) {
+        if self.video_edit_busy {
+            return;
+        }
         let Some(mut copy) = self
             .selected_camera_region
             .and_then(|id| self.camera_regions.iter().find(|r| r.id == id))
@@ -165,29 +174,6 @@ impl Studio {
         cx.notify();
     }
 
-    fn change_camera_transition(&mut self, seconds: f64, cx: &mut Context<Self>) {
-        let Some(id) = self.selected_camera_region else {
-            return;
-        };
-        let Some(region) = self.camera_regions.iter().find(|r| r.id == id) else {
-            return;
-        };
-        let duration = seconds
-            .clamp(0.0, 2.0)
-            .min((region.end - region.start) * 0.5);
-        if (region.transition - duration).abs() < 1e-9 {
-            return;
-        }
-        self.record_camera_edit();
-        self.camera_regions
-            .iter_mut()
-            .find(|r| r.id == id)
-            .unwrap()
-            .transition = duration;
-        self.autosave_scene_style();
-        cx.notify();
-    }
-
     pub(crate) fn camera_regions_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected = self
             .selected_camera_region
@@ -209,49 +195,47 @@ impl Studio {
                 cx,
                 |this, cx| this.add_camera_region(this.video_position, cx),
             ))
-            .child(self.small_button(
-                "camera-layout-base",
-                if selected.is_some() {
-                    "Edit project default"
-                } else {
-                    "Editing project default"
-                },
-                true,
-                cx,
-                |this, cx| {
-                    this.selected_camera_region = None;
-                    cx.notify();
-                },
-            ));
+            .child(
+                div()
+                    .id("camera-layout-default")
+                    .rounded_md()
+                    .p_2()
+                    .cursor_pointer()
+                    .bg(if selected.is_none() {
+                        crate::lane_camera().opacity(0.16)
+                    } else {
+                        crate::control_bg()
+                    })
+                    .hover(|s| s.bg(crate::lane_camera().opacity(0.16)))
+                    .text_xs()
+                    .child(format!("Default · {}", self.camera_overlay.layout.label()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selected_camera_region = None;
+                        cx.notify();
+                    })),
+            );
         if let Some(region) = selected {
-            let duration = region.transition;
-            panel=panel.child(div().rounded_lg().p_2().bg(rgb(0xf2eafa)).flex().flex_col().gap_2()
-                .child(div().text_xs().child(format!("Selected layout · {:.2}s–{:.2}s",region.start,region.end)))
+            let half = (region.end - region.start) * 0.5;
+            let transition = TRANSITIONS
+                .iter()
+                .position(|preset| (preset.min(half) - region.transition).abs() < 1e-9)
+                .unwrap_or(usize::MAX);
+            panel=panel.child(div().rounded_lg().p_2().bg(crate::lane_camera().opacity(0.10)).flex().flex_col().gap_2()
+                .child(div().text_xs().child(format!("Selected layout · {}",crate::units::fmt_seconds_range(region.start,region.end))))
                 .child(self.segmented("camera-layout-transition", &["Instant","Quick","Smooth"],
-                    if duration<=0.0 {0}else if duration<=0.2 {1}else{2},
+                    transition,
                     |this,index| {
                         if let Some(id)=this.selected_camera_region {
                             this.record_camera_edit();
                             if let Some(region)=this.camera_regions.iter_mut().find(|r|r.id==id) {
-                                region.transition=[0.0_f64,0.18,0.35][index].min((region.end-region.start)*0.5);
+                                region.transition=TRANSITIONS[index].min((region.end-region.start)*0.5);
                             }
                         }
                     },cx))
-                .child(div().flex().gap_1()
-                    .child(self.small_button("camera-transition-less","−",duration>0.0,cx,move|this,cx|this.change_camera_transition(duration-0.05,cx)))
-                    .child(div().flex_1().text_xs().child(format!("Transition {:.2}s",duration)))
-                    .child(self.small_button("camera-transition-more","+",duration<2.0,cx,move|this,cx|this.change_camera_transition(duration+0.05,cx))))
                 .child(div().flex().gap_2()
-                    .child(self.small_button("camera-layout-copy","Duplicate",true,cx,|this,cx|this.duplicate_camera_region(cx)))
-                    .child(self.small_button("camera-layout-delete","Remove",true,cx,|this,cx|{this.remove_selected_camera_region(cx);}))))
-                .child(div().text_xs().text_color(muted()).child("These controls affect the selected purple region. Drag its middle to move it or its edges to trim."));
-        } else {
-            panel = panel.child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("The project default applies outside layout regions."),
-            );
+                    .child(self.small_button("camera-layout-copy","Duplicate",!self.video_edit_busy,cx,|this,cx|this.duplicate_camera_region(cx))))
+                .child(div().flex().justify_end()
+                    .child(self.selection_action_button("camera-layout-delete",true,!self.video_edit_busy,cx,|this,cx|{this.remove_selected_camera_region(cx);}))));
         }
         for (index, region) in self.camera_regions.iter().enumerate() {
             let id = region.id;
@@ -263,17 +247,16 @@ impl Studio {
                     .p_2()
                     .cursor_pointer()
                     .bg(if self.selected_camera_region == Some(id) {
-                        rgb(0xe9dbf7)
+                        crate::lane_camera().opacity(0.16)
                     } else {
-                        rgb(0xf1f1f2)
+                        crate::control_bg()
                     })
-                    .hover(|s| s.bg(rgb(0xe9dbf7)))
+                    .hover(|s| s.bg(crate::lane_camera().opacity(0.16)))
                     .text_xs()
                     .child(format!(
-                        "{} · {:.2}–{:.2}s",
+                        "{} · {}",
                         region.overlay.layout.label(),
-                        region.start,
-                        region.end
+                        crate::units::fmt_seconds_range(region.start, region.end)
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_camera_region(id, cx);
@@ -289,7 +272,7 @@ impl Studio {
         panel.into_any_element()
     }
 
-    fn begin_camera_region_drag(
+    pub(crate) fn begin_camera_region_drag(
         &mut self,
         id: Uuid,
         kind: VideoZoomDragKind,
@@ -441,7 +424,7 @@ impl Studio {
             .h(px(28.0))
             .overflow_hidden()
             .rounded_lg()
-            .bg(rgb(0xeeeaf3))
+            .bg(crate::control_bg())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -453,6 +436,7 @@ impl Studio {
                     }
                 }),
             );
+        let mut handles = Vec::new();
         for (index, region) in self.camera_regions.iter().enumerate() {
             for (slice_index, slice) in self
                 .video_clip_timeline
@@ -462,89 +446,104 @@ impl Studio {
             {
                 let (id, start, end) = (region.id, slice.editor_start, slice.editor_end);
                 let selected = self.selected_camera_region == Some(id);
-                let mut item = div()
-                    .id(("camera-region", index * 4096 + slice_index))
-                    .absolute()
-                    .left(px(
-                        (start / self.video_timeline_duration() * width - scroll) as f32,
-                    ))
-                    .top(px(3.0))
-                    .w(px(
-                        ((end - start) / self.video_timeline_duration() * width) as f32
-                    ))
-                    .h(px(22.0))
-                    .min_w(px(8.0))
-                    .rounded_md()
-                    .overflow_hidden()
-                    .bg(if selected {
-                        rgb(0x8842c4)
-                    } else {
-                        rgb(0xa36ad0)
-                    })
-                    .border_1()
-                    .border_color(if selected {
-                        rgb(0x5d2090)
-                    } else {
-                        rgb(0xb886df)
-                    })
-                    .cursor(CursorStyle::OpenHand)
-                    .text_xs()
-                    .text_color(rgb(0xffffff))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .child(region.overlay.layout.label())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.begin_camera_region_drag(
-                                id,
-                                VideoZoomDragKind::Move,
-                                event.position.x,
-                                start,
-                                end,
-                                cx,
-                            );
-                            cx.stop_propagation();
-                        }),
-                    );
-                for (trailing, kind) in [
-                    (false, VideoZoomDragKind::Leading),
-                    (true, VideoZoomDragKind::Trailing),
+                let duration = self.video_timeline_duration();
+                let left = (start / duration * width - scroll) as f32;
+                let region_width = ((end - start) / duration * width) as f32;
+                let moving = self.camera_region_drag.as_ref().is_some_and(|drag| {
+                    drag.region.id == id && matches!(drag.kind, VideoZoomDragKind::Move)
+                });
+                let key = index * 4096 + slice_index;
+                lane = lane.child(
+                    div()
+                        .id(("camera-region", key))
+                        .absolute()
+                        .left(px(left))
+                        .top(px(3.0))
+                        .w(px(region_width))
+                        .h(px(22.0))
+                        .min_w(px(8.0))
+                        .rounded_md()
+                        .overflow_hidden()
+                        .bg(if selected {
+                            gpui::Hsla { l: crate::lane_camera().l - 0.08, ..crate::lane_camera() }
+                        } else {
+                            crate::lane_camera()
+                        })
+                        .border_2()
+                        .border_color(if selected { crate::ink() } else { gpui::transparent_black() })
+                        .when(!selected, |d| d.hover(|s| s.border_color(crate::ink().opacity(0.4))))
+                        .cursor(if moving { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                        .when(selected && !moving, |d| {
+                            d.tooltip(crate::timeline_ui::tooltip(crate::timeline_ui::REGION_KEYS_HELP))
+                        })
+                        .text_xs()
+                        .text_color(gpui::white())
+                        .flex()
+                        .items_center()
+                        .when(region_width >= crate::timeline_ui::REGION_LABEL_MIN_WIDTH, |d| {
+                            d.child(crate::timeline_ui::region_label(region.overlay.layout.label()))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.begin_camera_region_drag(
+                                    id,
+                                    VideoZoomDragKind::Move,
+                                    event.position.x,
+                                    start,
+                                    end,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_timeline_context(
+                                    crate::timeline_ui::TimelineContextTarget::Camera(id),
+                                    event.position,
+                                    cx,
+                                );
+                            }),
+                        ),
+                );
+                for (leading, kind) in [
+                    (true, VideoZoomDragKind::Leading),
+                    (false, VideoZoomDragKind::Trailing),
                 ] {
-                    item = item.child(
-                        div()
-                            .id((
-                                "camera-region-edge",
-                                (index * 4096 + slice_index) * 2 + usize::from(trailing),
-                            ))
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(7.0))
-                            .when(trailing, |d| d.right_0())
-                            .when(!trailing, |d| d.left_0())
-                            .cursor(CursorStyle::ResizeLeftRight)
-                            .hover(|s| s.bg(hsla(0.0, 0.0, 1.0, 0.25)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.begin_camera_region_drag(
-                                        id,
-                                        kind,
-                                        event.position.x,
-                                        start,
-                                        end,
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                            ),
+                    handles.push(
+                        crate::timeline_ui::trim_handle(
+                            ("camera-region-edge", key * 2 + usize::from(!leading)),
+                            -(scroll as f32),
+                            if leading { left } else { left + region_width },
+                            leading,
+                            region_width,
+                            3.0,
+                            22.0,
+                            selected,
+                            true,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.begin_camera_region_drag(
+                                    id,
+                                    kind,
+                                    event.position.x,
+                                    start,
+                                    end,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        ),
                     );
                 }
-                lane = lane.child(item);
             }
         }
+        lane = lane.children(handles);
         if self.camera_regions.is_empty() {
             lane = lane.child(
                 div()
@@ -563,7 +562,7 @@ impl Studio {
                     .top_0()
                     .w(px(2.0))
                     .h_full()
-                    .bg(rgb(0x30343b)),
+                    .bg(crate::brand()),
             )
             .into_any_element(),
         )

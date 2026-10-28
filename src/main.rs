@@ -1,5 +1,5 @@
 use gpui::{
-    div, point, prelude::*, px, rgb, size, svg, AnyElement, AnyWindowHandle, App, Application,
+    div, point, prelude::*, px, size, svg, AnyElement, AnyWindowHandle, App, Application,
     AssetSource, AsyncApp, Bounds, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
     MouseMoveEvent, Pixels, Point, Render, RenderImage, SharedString, Task, Timer, TitlebarOptions,
     Window, WindowBounds, WindowDecorations, WindowHandle, WindowOptions,
@@ -35,6 +35,7 @@ mod motion_ui;
 mod motion_overview_ui;
 mod animation_ui;
 mod notifications;
+use notifications::Notification;
 mod text_field;
 mod text_fields_ui;
 mod preset_cards;
@@ -47,6 +48,7 @@ mod shell_ui;
 mod template_ui;
 mod theme;
 mod timed;
+mod units;
 mod video;
 mod media_ui;
 mod overlays_ui;
@@ -55,7 +57,6 @@ mod speech_ui;
 mod teleprompter_ui;
 mod recording_overlay_ui;
 mod recording_overlay_drag;
-mod cloud_ui;
 mod timeline_ui;
 mod timeline_edit;
 mod timeline_preview;
@@ -70,7 +71,10 @@ use models::{
     VideoZoomDragKind, ANNOTATION_COLORS, CROP_HANDLES,
 };
 use theme::{
-    blue, brand_wordmark, brand_wordmark_latin, gradient_layers, ink, line, muted, panel,
+    accent, accent_hover, accent_tint, brand, brand_hover, brand_wordmark, brand_wordmark_latin,
+    canvas_well, control_bg, control_hover, control_selected, danger, danger_tint, focus_ring,
+    gradient_layers, ink, lane_camera, lane_clip, lane_video, lane_zoom, line, muted,
+    on_accent, panel, ring, selection, selection_fill, surface, TextRoles,
     BACKGROUND_PRESETS, CURATED_WALLPAPERS, GRADIENT_BACKGROUNDS, SOLID_BACKGROUNDS,
 };
 
@@ -94,6 +98,13 @@ use recording::{
     video::DecodedFrame,
     viewport::{visible_rect, MotionPreset, ViewportTimeline, ZoomCue},
 };
+
+/// Inter faces for the interface; requested by family name throughout.
+const INTERFACE_FONTS: [&[u8]; 3] = [
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+];
 
 struct Assets {
     base: PathBuf,
@@ -271,6 +282,14 @@ struct Studio {
     recording_controller: Option<RecordingController<NativeRecorder>>,
     recording_state: RecordingState,
     recording_busy: bool,
+    /// Discard/Restart armed by a first click; the second click within
+    /// three seconds runs it.
+    armed_recording_action: Option<&'static str>,
+    armed_recording_timer: Option<Task<()>>,
+    /// Desktop-wide Stop/Pause shortcuts (XDG GlobalShortcuts portal).
+    global_shortcuts: Option<Task<()>>,
+    /// Bound trigger per shortcut id, as the portal describes it.
+    global_shortcut_triggers: Vec<(String, String)>,
     recording_window_minimized: bool,
     recording_pill: Option<WindowHandle<recording_overlay_ui::RecordingPill>>,
     recording_camera_window: Option<WindowHandle<recording_overlay_ui::RecordingCamera>>,
@@ -308,6 +327,8 @@ struct Studio {
     camera_poll_running: bool,
     recording_camera_enabled: bool,
     video_project: Option<RecordingSession>,
+    /// `input.json` parsed once per recording; it is only written at capture.
+    pointer_capture_cache: std::cell::RefCell<Option<(PathBuf, Arc<PointerCaptureFile>)>>,
     /// Directory of the recording closed by switching to Static or Motion,
     /// so the Video tab returns to it instead of asking again.
     last_video_project: Option<PathBuf>,
@@ -333,6 +354,8 @@ struct Studio {
     video_selected_clip: Option<Uuid>,
     video_undo_stack: Vec<VideoEditSnapshot>,
     video_redo_stack: Vec<VideoEditSnapshot>,
+    /// Undo/redo of the last closed recording, restored if it reopens.
+    parked_video_history: Option<(PathBuf, Vec<VideoEditSnapshot>, Vec<VideoEditSnapshot>)>,
     video_playback_generation: Arc<AtomicU64>,
     video_seek_drag: Option<(Pixels, f64)>,
     video_trim_drag: Option<VideoTrimDrag>,
@@ -341,7 +364,6 @@ struct Studio {
     video_zoom_cues: Vec<ZoomCue>,
     video_selected_zoom_cue: Option<Uuid>,
     video_zoom_drag: Option<VideoZoomDrag>,
-    motion_zoom_track: Option<(Pixels, Pixels)>,
     /// Seconds visible at 1×; changed only by opening a recording or explicit fit.
     video_timeline_span: f64,
     video_timeline_extent: f64,
@@ -432,6 +454,10 @@ struct Studio {
     video_transcript: Option<recording::transcript::Transcript>,
     /// Bumped on every transcript edit so derived overlays rebuild.
     video_transcript_revision: u64,
+    /// Cached speech tool check; see `SpeechAvailability`.
+    speech_availability: std::cell::Cell<Option<speech_ui::SpeechAvailability>>,
+    /// Transcript panel layout, cached by transcript revision and clips.
+    transcript_layout: std::cell::RefCell<Option<transcript_ui::TranscriptLayout>>,
     video_overlay_cache: Option<(overlays_ui::OverlayKey, Arc<recording::studio_overlays::StudioOverlays>)>,
     speech_model: recording::transcription::SpeechModel,
     speech_processing: recording::speech_runtime::ProcessingMode,
@@ -441,6 +467,8 @@ struct Studio {
     speech_processing_status: Option<String>,
     subtitle_speech_advanced_open: bool,
     transcription_job: Option<transcript_ui::TranscriptionJob>,
+    /// Why the last transcription failed; shown inline with Retry.
+    transcription_error: Option<String>,
     /// The transcript editor replaces the Record tab while open.
     transcript_open: bool,
     transcript_selected_cue: Option<Uuid>,
@@ -449,11 +477,6 @@ struct Studio {
     teleprompter: recording::teleprompter::TeleprompterSettings,
     teleprompter_advanced_open: bool,
     prompter_window: Option<teleprompter_ui::PrompterHandle>,
-    cloud: recording::cloud::CloudSettings,
-    /// The sharing server form is open.
-    cloud_editing: bool,
-    share_title: String,
-    last_share_url: Option<SharedString>,
     video_camera_path: Option<PathBuf>,
     camera_frame_rgba: Option<Arc<image::RgbaImage>>,
     camera_decoded_time: f64,
@@ -531,7 +554,13 @@ struct Studio {
     toast: Option<notifications::Notification>,
     toast_timer: Option<Task<()>>,
     toast_timer_id: Option<u64>,
+    /// The toast under the pointer; its timer waits.
+    toast_hovered: Option<u64>,
+    /// The dismissed toast while it fades out.
+    toast_exiting: Option<notifications::Notification>,
     slider_drag: Option<SliderDrag>,
+    /// A cursor slider changed mid-drag; the motion timelines rebuild on release.
+    motion_timelines_stale: bool,
     motion_transform_drag: Option<motion_ui::MotionTransformDrag>,
     image_trim_drag: Option<motion_ui::ImageTrimDrag>,
     canvas_annotation_drag: bool,
@@ -567,8 +596,21 @@ impl RecordingExtras {
 #[derive(Clone, Copy)]
 struct SliderDrag {
     slider_id: usize,
-    start_x: Pixels,
-    start_value: u8,
+    /// Track left edge and width when the press began; the value follows the
+    /// pointer's absolute position along it.
+    track_left: Pixels,
+    track_width: Pixels,
+    /// Last value applied, so moves within one step do no work.
+    value: u8,
+}
+
+impl SliderDrag {
+    /// Slider position (0–100) under `x`.
+    fn value_at(&self, x: Pixels) -> u8 {
+        ((x - self.track_left) / self.track_width.max(px(1.0)) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -706,6 +748,10 @@ impl Studio {
             recording_controller: None,
             recording_state: RecordingState::Idle,
             recording_busy: false,
+            armed_recording_action: None,
+            armed_recording_timer: None,
+            global_shortcuts: None,
+            global_shortcut_triggers: Vec::new(),
             recording_window_minimized: false,
             recording_pill: None,
             recording_camera_window: None,
@@ -737,6 +783,7 @@ impl Studio {
             camera_poll_running: false,
             recording_camera_enabled: false,
             video_project: None,
+            pointer_capture_cache: Default::default(),
             last_video_project: None,
             video_frame: None,
             video_crop: CropRect::UNIT,
@@ -757,6 +804,7 @@ impl Studio {
             video_selected_clip: None,
             video_undo_stack: Vec::new(),
             video_redo_stack: Vec::new(),
+            parked_video_history: None,
             video_playback_generation: Arc::new(AtomicU64::new(0)),
             video_seek_drag: None,
             video_trim_drag: None,
@@ -765,7 +813,6 @@ impl Studio {
             video_zoom_cues: Vec::new(),
             video_selected_zoom_cue: None,
             video_zoom_drag: None,
-            motion_zoom_track: None,
             video_timeline_span: 1.0,
             video_timeline_extent: 1.0,
             video_timeline_zoom: 1.0,
@@ -845,6 +892,8 @@ impl Studio {
             video_keystrokes: Vec::new(),
             video_transcript: None,
             video_transcript_revision: 0,
+            speech_availability: Default::default(),
+            transcript_layout: Default::default(),
             video_overlay_cache: None,
             speech_model: Default::default(),
             speech_processing: recording::speech_runtime::load_processing_mode(),
@@ -854,16 +903,13 @@ impl Studio {
             speech_processing_status: None,
             subtitle_speech_advanced_open: false,
             transcription_job: None,
+            transcription_error: None,
             transcript_open: false,
             transcript_selected_cue: None,
             transcript_selection: None,
             teleprompter: recording::teleprompter::TeleprompterSettings::load(),
             teleprompter_advanced_open: false,
             prompter_window: None,
-            cloud: recording::cloud::CloudSettings::load(),
-            cloud_editing: false,
-            share_title: String::new(),
-            last_share_url: None,
             video_camera_path: None,
             camera_frame_rgba: None,
             camera_decoded_time: -1.0,
@@ -934,7 +980,10 @@ impl Studio {
             toast: None,
             toast_timer: None,
             toast_timer_id: None,
+            toast_hovered: None,
+            toast_exiting: None,
             slider_drag: None,
+            motion_timelines_stale: false,
             motion_transform_drag: None,
             image_trim_drag: None,
             canvas_annotation_drag: false,
@@ -1016,7 +1065,7 @@ impl Studio {
                 Ok(preview) => self.camera_preview = Some(preview),
                 Err(error) => {
                     self.record_camera = false;
-                    self.toast = Some(format!("Webcam preview unavailable: {error}").into());
+                    self.toast = Some(crate::Notification::error(format!("Webcam preview unavailable: {error}")));
                     return;
                 }
             }
@@ -1033,7 +1082,7 @@ impl Studio {
                     this.camera_preview = None;
                     this.camera_frames.clear();
                     this.record_camera = false;
-                    this.toast = Some(format!("Camera disconnected: {error}").into());
+                    this.toast = Some(crate::Notification::error(format!("Camera disconnected: {error}")));
                 }
                 if !this.wants_camera_preview() {
                     this.camera_poll_running = false;
@@ -1092,7 +1141,14 @@ impl Studio {
         let mut capture = self
             .video_project
             .as_ref()
-            .and_then(|session| session.read_pointer_capture().ok())
+            .and_then(|session| {
+                let mut cache = self.pointer_capture_cache.borrow_mut();
+                if cache.as_ref().is_none_or(|(directory, _)| *directory != session.directory) {
+                    let capture = session.read_pointer_capture().ok()?;
+                    *cache = Some((session.directory.clone(), Arc::new(capture)));
+                }
+                cache.as_ref().map(|(_, capture)| (**capture).clone())
+            })
             .unwrap_or_default();
         if !self.video_removed_presses.is_empty() {
             let removed = &self.video_removed_presses;
@@ -1266,27 +1322,33 @@ impl Studio {
             return false;
         };
         if !event.dragging() {
-            self.slider_drag = None;
+            self.end_slider_drag();
             return false;
         }
 
-        let value = if drag.slider_id == MOTION_ZOOM_SLIDER {
-            self.motion_zoom_track.map(|(left, width)| {
-                ((event.position.x - left) / width * 100.0).round().clamp(0.0, 100.0) as u8
-            })
-        } else { None }.unwrap_or_else(|| {
-            let delta = (event.position.x - drag.start_x) / px(1.0);
-            (drag.start_value as f32 + delta).round().clamp(0.0, 100.0) as u8
-        });
+        let value = drag.value_at(event.position.x);
+        if value == drag.value {
+            return false;
+        }
+        self.slider_drag = Some(SliderDrag { value, ..drag });
         self.set_slider_value(drag.slider_id, value);
         true
+    }
+
+    /// Ends a slider drag and runs the rebuild it deferred.
+    fn end_slider_drag(&mut self) -> Option<SliderDrag> {
+        let drag = self.slider_drag.take();
+        if std::mem::take(&mut self.motion_timelines_stale) {
+            self.rebuild_video_motion_timelines();
+        }
+        drag
     }
 
     fn handle_video_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.crop_active {
             match event.keystroke.key.as_str() {
                 "escape" => self.cancel_crop(),
-                "enter" => { if let Err(error) = self.apply_crop() { self.toast = Some(error.into()); } }
+                "enter" => { if let Err(error) = self.apply_crop() { self.toast = Some(crate::Notification::error(error)); } }
                 _ => {}
             }
             return true;
@@ -1505,10 +1567,16 @@ impl Studio {
 impl Studio {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.drop_retired_images(window);
-        if self.loading.is_some() { return self.render_loading(window, cx); }
+        if self.loading.as_ref().is_some_and(|loading| loading.visible()) {
+            return self.render_loading(window, cx);
+        }
         self.preview_cache.display_scale = window.scale_factor();
         self.sync_camera_preview(cx);
         if self.launcher_active {
+            // The launcher's Enter/S shortcuts need a keyboard target too.
+            if window.focused(cx).is_none() {
+                self.focus_handle.focus(window);
+            }
             return self.render_launcher(window, cx);
         }
         if std::mem::take(&mut self.launcher_window) {
@@ -1538,6 +1606,7 @@ impl Studio {
         if self.video_project.is_some() {
             return self.render_video(window, cx);
         }
+        self.fit_timeline_to_window(window.viewport_size());
         let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
         let composited = if self.preview_needs_compositor() {
             self.scene_preview_image(canvas_width, canvas_height)
@@ -1549,15 +1618,15 @@ impl Studio {
             .mock_capture(cx, canvas_width, canvas_height, composited)
             .into_any_element();
         let top_bar = self.top_bar(cx);
-        let canvas_area = self.canvas_area(canvas, cx);
+        let canvas_area = self.canvas_area(canvas);
         let timeline = self.animation_active.then(|| self.timeline_bar(cx));
-        let sidebar = self.inspector_visible.then(|| self.sidebar(cx));
+        let sidebar = self.inspector_visible.then(|| self.sidebar(window.viewport_size().width, cx));
 
         let editor = div()
             .size_full()
             .min_w(px(shell_ui::EDITOR_MIN_WIDTH))
             .min_h(px(shell_ui::EDITOR_MIN_HEIGHT))
-            .bg(rgb(0xf3f3f4))
+            .bg(canvas_well())
             .text_color(ink())
             .font_family("Inter")
             .flex()
@@ -1573,6 +1642,10 @@ impl Studio {
                     return;
                 }
                 if this.native_text_focused(window, cx) { return; }
+                if crate::controls::tab_navigation(event, window) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.animation_active && event.keystroke.key == "escape" && this.handle_timeline_shortcut(event, cx) {
                     cx.stop_propagation(); cx.notify(); return;
                 }
@@ -1621,6 +1694,7 @@ impl Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    this.end_focus_drag();
                     if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     this.end_image_trim();
                     this.end_motion_transform_drag();
@@ -1636,7 +1710,7 @@ impl Studio {
                     let motion_slider = this
                         .slider_drag
                         .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER);
-                    this.slider_drag = None;
+                    this.end_slider_drag();
                     if rebuild {
                         let _ = this.rebuild_redactions();
                     }
@@ -1649,6 +1723,7 @@ impl Studio {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    this.end_focus_drag();
                     if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     this.end_image_trim();
                     this.end_motion_transform_drag();
@@ -1664,7 +1739,7 @@ impl Studio {
                     let motion_slider = this
                         .slider_drag
                         .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER);
-                    this.slider_drag = None;
+                    this.end_slider_drag();
                     if rebuild {
                         let _ = this.rebuild_redactions();
                     }
@@ -1728,9 +1803,14 @@ fn open_studio_window(
             ..Default::default()
         },
         move |window, cx| {
+            theme::follow_appearance(window);
             let studio = build(window.window_handle(), cx);
             studio.update(cx, |_, cx| {
                 cx.observe_window_activation(window, |studio, window, cx| {
+                    // Tools may have been installed while the window was away.
+                    if window.is_window_active() {
+                        studio.refresh_speech_availability();
+                    }
                     if window.is_window_active() && studio.recording_window_minimized {
                         studio.recording_window_minimized = false;
                         cx.notify();
@@ -1760,6 +1840,8 @@ fn main() {
         println!("Lahza {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // Read the desktop animation preference off the UI thread.
+    std::thread::spawn(theme::animations_enabled);
     let initial_recording = arguments
         .iter()
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("lahzarec"))
@@ -1791,6 +1873,11 @@ fn main() {
             cx.text_system()
                 .add_fonts(fonts::HANDWRITTEN_FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect())
                 .expect("failed to load bundled handwritten font");
+            cx.text_system()
+                .add_fonts(INTERFACE_FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect())
+                .expect("failed to load bundled Inter font");
+            theme::load_theme_preference();
+            theme::set_appearance(cx.window_appearance());
             let starts_in_editor = initial_recording.is_some() || initial_image.is_some();
             open_studio_window(cx, starts_in_editor, move |window_handle, cx| {
                 cx.new(|cx| {

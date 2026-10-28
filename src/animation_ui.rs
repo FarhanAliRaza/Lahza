@@ -7,7 +7,7 @@ use crate::recording::{
     viewport::{CameraMotion, ViewportTimeline, ZoomCue},
 };
 use crate::scene_ui::SceneSlider;
-use crate::{blue, ink, muted, Studio, VideoEditSnapshot};
+use crate::{TextRoles, accent, line, muted, Studio, VideoEditSnapshot};
 use gpui::{div, prelude::*, px, rgb, svg, AnyElement, Context, FontWeight, Timer};
 use std::time::{Duration, Instant};
 
@@ -183,6 +183,9 @@ impl Studio {
         hovered: bool,
         cx: &mut Context<Self>,
     ) {
+        if !crate::theme::animations_enabled() {
+            return;
+        }
         if !hovered {
             if self
                 .animation_hover
@@ -273,7 +276,7 @@ impl Studio {
                         .left(gpui::relative(0.05 + value.clamp(0.0, 1.0) * 0.7))
                         .top(px(8.0))
                         .size(px(15.0))
-                        .text_color(ink()),
+                        .text_color(rgb(0x253752)),
                 )
                 .into_any_element(),
         }
@@ -289,9 +292,9 @@ impl Studio {
         });
         let status = match selected {
             Some(motion) => format!("{} · every zoom", screen_label(motion)),
-            None if mixed => "Per-region · mixed responses".into(),
+            None if mixed => "Per zoom · mixed".into(),
             None => format!(
-                "Per-region · {}",
+                "Per zoom · {}",
                 screen_label(legacy.unwrap_or(CameraMotion::Standard))
             ),
         };
@@ -312,7 +315,7 @@ impl Studio {
                     )
                     .child(self.small_button(
                         "animation-screen-reset",
-                        "Use region settings",
+                        "Use per-zoom settings",
                         selected.is_some(),
                         cx,
                         |this, cx| {
@@ -339,11 +342,7 @@ impl Studio {
                             .p_1()
                             .rounded_md()
                             .border_2()
-                            .border_color(if selected == Some(motion) {
-                                blue()
-                            } else {
-                                rgb(0xe0e4eb).into()
-                            })
+                            .border_color(if selected == Some(motion) { accent() } else { line() })
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -360,7 +359,7 @@ impl Studio {
                     }),
                 ),
             )
-            .child(div().text_xs().text_color(muted()).child(status))
+            .child(div().hint().child(status))
             .into_any_element()
     }
 
@@ -427,11 +426,7 @@ impl Studio {
                                     .p_1()
                                     .rounded_md()
                                     .border_2()
-                                    .border_color(if selected == motion {
-                                        blue()
-                                    } else {
-                                        rgb(0xe0e4eb).into()
-                                    })
+                                    .border_color(if selected == motion { accent() } else { line() })
                                     .flex()
                                     .flex_col()
                                     .gap_1()
@@ -448,7 +443,7 @@ impl Studio {
                             }),
                     ),
             )
-            .child(div().text_xs().text_color(muted()).child(text))
+            .child(div().hint().child(text))
             .into_any_element()
     }
 
@@ -464,17 +459,17 @@ impl Studio {
                 cx,
                 |this| this.set_project_early(Some(!this.project_early_enabled())),
             ))
-            .child(div().text_xs().text_color(muted()).child(
+            .child(div().hint().child(
                 if self.animation_settings.start_early.is_some() {
                     "Applies to every zoom in this project."
                 } else {
-                    "Per-region; changing applies to every zoom."
+                    "Set per zoom. Changing it applies to every zoom."
                 },
             ))
             .when(self.animation_settings.start_early.is_some(), |panel| {
                 panel.child(self.small_button(
                     "animation-early-reset",
-                    "Use region settings",
+                    "Use per-zoom settings",
                     true,
                     cx,
                     |this, cx| {

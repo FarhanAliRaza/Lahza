@@ -7,7 +7,7 @@ use crate::recording::teleprompter::{
 };
 use crate::recording::capture_exclusion::CaptureExclusion;
 use crate::recording_overlay_drag::OverlayDrag;
-use crate::{blue, line, muted, Studio};
+use crate::{ink, line, muted, Studio};
 use gpui::{
     div, point, prelude::*, px, rgb, size, AnyElement, Bounds, Context, FontWeight,
     MouseButton, PathPromptOptions, ScrollWheelEvent, SharedString, Timer, Window,
@@ -77,6 +77,8 @@ pub(crate) struct Prompter {
     shown_line: f32,
     follower: Option<SpeechFollower>,
     status: SharedString,
+    /// Taken on click, so Page Up/Down, arrows and Space move by line.
+    focus: gpui::FocusHandle,
     _ticker: gpui::Task<()>,
 }
 
@@ -169,6 +171,7 @@ impl Prompter {
             shown_line: 0.0,
             follower,
             status,
+            focus: cx.focus_handle(),
             _ticker: ticker,
         }
     }
@@ -188,11 +191,19 @@ impl Prompter {
             gpui::ScrollDelta::Lines(delta) => -delta.y,
             gpui::ScrollDelta::Pixels(delta) => -f32::from(delta.y) / self.line_height(),
         };
-        if lines.abs() < 0.3 || self.layout.is_empty() {
+        if lines.abs() < 0.3 {
+            return;
+        }
+        self.step_line(lines > 0.0, cx);
+    }
+
+    /// Move the reading position one line forward or back.
+    fn step_line(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.layout.is_empty() {
             return;
         }
         let current = highlighted_line(&self.layout, self.position.load(Ordering::Relaxed));
-        let target = if lines > 0.0 {
+        let target = if forward {
             (current + 1).min(self.layout.lines.len() - 1)
         } else {
             current.saturating_sub(1)
@@ -245,6 +256,19 @@ impl Render for Prompter {
             .font_family("Inter")
             .bg(rgb(0x111214))
             .text_color(gpui::white())
+            .track_focus(&self.focus)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, _| this.focus.focus(window)))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "pagedown" | "down" | "space" => this.step_line(true, cx),
+                    "pageup" | "up" => this.step_line(false, cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag.end()))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.drag.end()))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.scroll(event, cx)))
@@ -327,6 +351,7 @@ impl Studio {
             },
             move |window, cx| {
                 window.set_window_title(window_exclusion.title());
+                crate::theme::follow_appearance(window);
                 cx.new(|cx| Prompter::new(
                     &settings, microphone, microphone_device.as_deref(), window_exclusion, window, cx,
                 ))
@@ -372,7 +397,7 @@ impl Studio {
 
     fn save_teleprompter(&mut self) {
         if let Err(error) = self.teleprompter.save() {
-            self.toast = Some(format!("Could not save the teleprompter script: {error}").into());
+            self.toast = Some(crate::Notification::error(format!("Could not save the teleprompter script: {error}")));
         }
     }
 
@@ -408,7 +433,7 @@ impl Studio {
             let _ = weak.update(cx, |this, cx| {
                 match text {
                     Ok(text) => this.set_teleprompter_script(text),
-                    Err(error) => this.toast = Some(format!("Could not read {}: {error}", path.display()).into()),
+                    Err(error) => this.toast = Some(crate::Notification::error(format!("Could not read {}: {error}", path.display()))),
                 }
                 cx.notify();
             });
@@ -418,7 +443,28 @@ impl Studio {
 
     fn paste_teleprompter_script(&mut self, cx: &mut Context<Self>) {
         match cx.read_from_clipboard().and_then(|item| item.text()) {
-            Some(text) => self.set_teleprompter_script(text),
+            Some(text) => {
+                let previous = self.teleprompter.has_script().then(|| {
+                    (self.teleprompter.script.clone(), self.teleprompter.enabled)
+                });
+                self.set_teleprompter_script(text);
+                // Offer the replaced script back, unless the paste was refused.
+                if let Some((script, enabled)) = previous.filter(|(script, _)| *script != self.teleprompter.script) {
+                    self.toast = Some(crate::notifications::Notification::with_action(
+                        "Script replaced",
+                        "Undo",
+                        move |this, _| {
+                            if this.recording_state != crate::RecordingState::Idle || this.recording_busy {
+                                this.toast = Some("Finish recording before changing the script".into());
+                                return;
+                            }
+                            this.teleprompter.script = script.clone();
+                            this.teleprompter.enabled = enabled;
+                            this.save_teleprompter();
+                        },
+                    ));
+                }
+            }
             None => self.toast = Some("The clipboard has no text".into()),
         }
     }
@@ -431,28 +477,12 @@ impl Studio {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Studio, &mut Context<Studio>) + 'static,
     ) -> AnyElement {
-        div()
-            .id(id)
-            .h(px(28.0))
-            .px_3()
-            .flex()
-            .items_center()
-            .rounded_md()
-            .border_1()
-            .border_color(line())
-            .bg(gpui::white())
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .opacity(if enabled { 1.0 } else { 0.45 })
-            .when(enabled, |this| {
-                this.cursor_pointer()
-                    .hover(|style| style.bg(rgb(0xf0f0f2)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        on_click(this, cx);
-                        cx.notify();
-                    }))
-            })
-            .child(label.into())
+        crate::controls::button(id, label, crate::controls::ButtonKind::Secondary, crate::controls::ButtonSize::Sm)
+            .disabled(!enabled)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                on_click(this, cx);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -469,13 +499,13 @@ impl Studio {
             "launcher-teleprompter",
             "icons/text.svg",
             "Teleprompter",
-            subtitle,
+            Some(subtitle.into_any_element()),
             settings.enabled,
             cx.listener(|this, _, _, cx| {
                 // The capture source is fixed for this take. Enabling a
                 // script after monitor capture starts would record it.
                 if this.recording_state != crate::RecordingState::Idle || this.recording_busy {
-                    this.toast = Some("Teleprompter settings can be changed after recording".into());
+                    this.toast = Some("Stop recording to change the script".into());
                     cx.notify();
                     return;
                 }
@@ -572,7 +602,7 @@ impl Studio {
                                 .id("teleprompter-advanced")
                                 .flex().items_center().gap_1().py_1()
                                 .text_xs().text_color(muted()).cursor_pointer()
-                                .hover(|style| style.text_color(blue()))
+                                .hover(|style| style.text_color(ink()))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.teleprompter_advanced_open = !this.teleprompter_advanced_open;
                                     cx.notify();

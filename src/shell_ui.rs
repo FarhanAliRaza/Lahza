@@ -3,17 +3,17 @@
 //! timeline bar. Mode-specific code only supplies the canvas and the lanes.
 
 use gpui::{
-    canvas, div, hsla, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight,
-    Hsla, MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size,
+    canvas, div, hsla, prelude::*, px, rgb, svg, AnyElement, Context, CursorStyle, FontWeight, MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size,
     Window,
 };
 
 use crate::{
-    blue,
-    controls::SliderTarget,
-    ink, line,
+    accent, accent_tint, brand, canvas_well, lane_video, control_bg, control_hover, control_selected,
+    controls::{button, field, hint, icon_button, ButtonKind, ButtonSize, SliderTarget},
+    theme::{RADIUS_MD, SPACE_1, SPACE_3},
+    danger, danger_tint, ink, line, on_accent, surface, TextRoles,
     motion_ui::{ANIMATION_DURATIONS, BORDER_COLORS},
-    muted, panel,
+    muted,
     recording::{
         clips::ClipEdge, scene::WindowFrame, viewport::MotionPreset,
     },
@@ -21,11 +21,21 @@ use crate::{
     timestamped_export_name, Studio, Tool, VideoMoveDrag,
 };
 
-pub(crate) const INSPECTOR_WIDTH: f32 = 404.0;
+const INSPECTOR_WIDTH: f32 = 404.0;
+/// Inspector width at `WIDE_WINDOW` and wider.
+const INSPECTOR_WIDTH_WIDE: f32 = 440.0;
+const WIDE_WINDOW: f32 = 1800.0;
 pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
-const CANVAS_PADDING: f32 = 40.0;
+/// Canvas well padding; less vertical so the canvas keeps its height.
+const CANVAS_PADDING_X: f32 = 40.0;
+const CANVAS_PADDING_Y: f32 = 24.0;
+/// Default lane area height; it grows on tall windows until resized by hand.
+pub(crate) const DEFAULT_LANE_HEIGHT: f32 = 176.0;
+const MAX_LANE_HEIGHT: f32 = 340.0;
 const TIMELINE_CONTROLS_HEIGHT: f32 = 78.0;
 const SCENE_STRIP_HEIGHT: f32 = 42.0;
+/// Label column shared by the scene strip, the ruler and every lane.
+const TRACK_LABEL_WIDTH: f32 = 104.0;
 const TIMELINE_LANES_HEIGHT: f32 = 64.0;
 
 pub(crate) const EDITOR_MIN_WIDTH: f32 = 980.0;
@@ -54,7 +64,7 @@ impl EditorMode {
 
     fn label(self) -> &'static str {
         match self {
-            EditorMode::Static => "Static",
+            EditorMode::Static => "Image",
             EditorMode::Motion => "Motion",
             EditorMode::Video => "Video",
         }
@@ -88,7 +98,7 @@ impl InspectorTab {
 
     fn label(self) -> &'static str {
         match self {
-            InspectorTab::Design => "General",
+            InspectorTab::Design => "Style",
             InspectorTab::Annotate => "Annotate",
             InspectorTab::Motion => "Motion",
             InspectorTab::Camera => "Camera",
@@ -126,7 +136,7 @@ fn divider() -> AnyElement {
     div()
         .w(px(1.0))
         .h(px(22.0))
-        .mx_1()
+        .mx_2()
         .bg(line())
         .into_any_element()
 }
@@ -162,8 +172,27 @@ impl Studio {
         }
     }
 
+    /// The segment the mode switcher highlights. A recording keeps its
+    /// motion controls in the Motion tab, so that tab reads as Motion.
+    fn displayed_mode(&self) -> EditorMode {
+        let mode = self.editor_mode();
+        if mode == EditorMode::Video
+            && self.inspector_visible
+            && self.inspector_tab == InspectorTab::Motion
+        {
+            EditorMode::Motion
+        } else {
+            mode
+        }
+    }
+
     pub(crate) fn switch_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
         if mode == self.editor_mode() {
+            // Video highlighted as Motion: Video returns to the general tab.
+            if mode == EditorMode::Video && self.displayed_mode() == EditorMode::Motion {
+                self.select_inspector_tab(InspectorTab::Design);
+                cx.notify();
+            }
             return;
         }
         if self.crop_active {
@@ -288,7 +317,7 @@ impl Studio {
         }
         let directory = crate::library::screenshots_root();
         if let Err(error) = std::fs::create_dir_all(&directory) {
-            self.toast = Some(format!("Could not create screenshot folder: {error}").into());
+            self.toast = Some(crate::Notification::error(format!("Could not create screenshot folder: {error}")));
             cx.notify();
             return;
         }
@@ -306,10 +335,10 @@ impl Studio {
                         Ok(()) => crate::notifications::Notification::exported(
                             format!("Exported to {}", path.display()), path,
                         ),
-                        Err(error) => format!("Export failed: {error}").into(),
+                        Err(error) => crate::notifications::failure("Export failed", &error, path.parent()),
                     },
                     Ok(None) => "Export cancelled".into(),
-                    Err(error) => format!("Export failed: {error}").into(),
+                    Err(error) => crate::Notification::error(format!("Export failed: {error}")),
                 });
                 cx.notify();
             })
@@ -338,38 +367,51 @@ impl Studio {
         }
     }
 
+    pub(crate) fn inspector_width(viewport_width: Pixels) -> f32 {
+        if viewport_width >= px(WIDE_WINDOW) { INSPECTOR_WIDTH_WIDE } else { INSPECTOR_WIDTH }
+    }
+
+    /// Until the user drags the timeline edge, its lanes take a share of
+    /// tall windows instead of a fixed height.
+    pub(crate) fn fit_timeline_to_window(&mut self, viewport: Size<Pixels>) {
+        if self.timeline_ui.lane_height_resized {
+            return;
+        }
+        let extra = (f32::from(viewport.height) - 900.0).max(0.0) * 0.25;
+        self.timeline_ui.lane_height = (DEFAULT_LANE_HEIGHT + extra).min(MAX_LANE_HEIGHT);
+    }
+
     /// The preview size that fits between the top bar, the timeline, and the
     /// inspector.
     pub(crate) fn canvas_budget(&self, viewport: Size<Pixels>) -> (Pixels, Pixels) {
         let inspector = if self.inspector_visible {
-            INSPECTOR_WIDTH
+            Self::inspector_width(viewport.width)
         } else {
             0.0
         };
         let width = (viewport.width.max(px(EDITOR_MIN_WIDTH))
-            - px(CANVAS_PADDING * 2.0 + inspector)).max(px(1.0));
+            - px(CANVAS_PADDING_X * 2.0 + inspector)).max(px(1.0));
         let height = (viewport.height.max(px(EDITOR_MIN_HEIGHT))
-            - px(TOP_BAR_HEIGHT + CANVAS_PADDING * 2.0 + self.timeline_bar_height()))
+            - px(TOP_BAR_HEIGHT + CANVAS_PADDING_Y * 2.0 + self.timeline_bar_height()))
         .max(px(1.0));
         self.preview_canvas_size(width, height)
     }
 
-    /// The canvas workspace with its export status overlay.
-    pub(crate) fn canvas_area(&self, canvas: AnyElement, cx: &mut Context<Self>) -> AnyElement {
-        let export_overlay = self.export_status_overlay(cx);
+    /// The canvas workspace. The export panel stacks with the toasts.
+    pub(crate) fn canvas_area(&self, canvas: AnyElement) -> AnyElement {
         div()
             .relative()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
-            .p(px(CANVAS_PADDING))
+            .px(px(CANVAS_PADDING_X))
+            .py(px(CANVAS_PADDING_Y))
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(0xe9ebef))
-            .child(div().flex_none().shadow_lg().child(canvas))
-            .when_some(export_overlay, |this, overlay| this.child(overlay))
+            .bg(canvas_well())
+            .child(div().flex_none().card().shadow(crate::theme::canvas_shadow()).child(canvas))
             .into_any_element()
     }
 
@@ -382,63 +424,49 @@ impl Studio {
         id: &'static str,
         icon: &'static str,
         label: Option<&'static str>,
+        tooltip: Option<&'static str>,
         enabled: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Studio, &mut Window, &mut Context<Studio>) + 'static,
     ) -> AnyElement {
-        let color = if enabled { ink() } else { muted() };
-        div()
-            .id(id)
-            .h(px(32.0))
-            .when(label.is_some(), |this| this.px_2())
-            .when(label.is_none(), |this| this.w(px(32.0)).justify_center())
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_2()
-            .rounded_md()
-            .text_sm()
-            .text_color(color)
-            .opacity(if enabled { 1.0 } else { 0.45 })
-            .when(enabled, |this| {
-                this.cursor_pointer()
-                    .hover(|style| style.bg(rgb(0xeeeeef)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        on_click(this, window, cx);
-                        cx.notify();
-                    }))
-            })
-            .child(svg().path(icon).size(px(17.0)).text_color(color))
-            .when_some(label, |this, label| this.child(label))
+        let base = match label {
+            Some(label) => button(id, label, ButtonKind::Ghost, ButtonSize::Md).icon(icon),
+            None => icon_button(id, icon, ButtonKind::Ghost, ButtonSize::Md),
+        };
+        base.disabled(!enabled)
+            .tooltip_opt(tooltip)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                on_click(this, window, cx);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
     fn mode_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.editor_mode();
+        let current = self.displayed_mode();
         div()
             .flex()
             .flex_none()
             .h(px(34.0))
             .p(px(3.0))
             .rounded_lg()
-            .bg(rgb(0xf0f0f1))
+            .bg(control_bg())
             .children(
                 EditorMode::ALL
                     .into_iter()
                     .enumerate()
                     .map(|(index, mode)| {
                         let selected = mode == current;
-                        div()
-                            .id(("editor-mode", index))
+                        crate::controls::keyboard_focusable(div().id(("editor-mode", index)))
                             .px_4()
                             .h_full()
                             .flex()
                             .items_center()
-                            .rounded_md()
+                            .rounded(px(crate::theme::inner_radius(crate::theme::RADIUS_LG, 3.0)))
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if selected { ink() } else { muted() })
-                            .when(selected, |this| this.bg(rgb(0xffffff)).shadow_sm())
+                            .when(selected, |this| this.bg(control_selected()).shadow_sm())
                             .cursor_pointer()
                             .child(mode.label())
                             .on_click(cx.listener(move |this, _, _, cx| this.switch_mode(mode, cx)))
@@ -456,17 +484,7 @@ impl Studio {
             )
         });
         let text_button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .px_3()
-                .h(px(32.0))
-                .flex()
-                .items_center()
-                .rounded_md()
-                .text_sm()
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(0xeeeeef)))
-                .child(label)
+            button(id, label, ButtonKind::Ghost, ButtonSize::Md)
         };
         div()
             .flex()
@@ -481,7 +499,7 @@ impl Studio {
                 cx,
             )))
             .when_some(crop_pixel_size, |this, value| {
-                this.child(div().px_2().text_xs().text_color(muted()).child(value))
+                this.child(div().px_2().text_xs().tabular().text_color(muted()).child(value))
             })
             .child(
                 text_button("crop-reset", "Reset").on_click(cx.listener(|this, _, _, cx| {
@@ -496,22 +514,10 @@ impl Studio {
                 })),
             )
             .child(
-                div()
-                    .id("crop-apply")
-                    .px_4()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .rounded_md()
-                    .bg(blue())
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xffffff))
-                    .cursor_pointer()
-                    .child("Crop")
+                button("crop-apply", "Crop", ButtonKind::Primary, ButtonSize::Md)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Err(error) = this.apply_crop() {
-                            this.toast = Some(error.into());
+                            this.toast = Some(crate::Notification::error(error));
                         }
                         cx.notify();
                     })),
@@ -536,7 +542,6 @@ impl Studio {
                     .id("wordmark-drag")
                     .h_full()
                     .pl_4()
-                    .pr_3()
                     .flex()
                     .items_center()
                     .child(crate::brand_wordmark_latin(110.0, 22.0))
@@ -551,29 +556,8 @@ impl Studio {
             .child(divider())
             .when(!self.crop_active, |this| {
                 this.child(
-                    div()
-                        .id("bar-record-new")
-                        .ml_2()
-                        .px_3()
-                        .h(px(32.0))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .rounded_md()
-                        .bg(rgb(0xf0f1f3))
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(ink())
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0xe5e7eb)))
-                        .child(
-                            svg()
-                                .path("icons/record.svg")
-                                .size(px(17.0))
-                                .text_color(ink()),
-                        )
-                        .child("New capture")
+                    button("bar-record-new", "New capture", ButtonKind::Secondary, ButtonSize::Md)
+                        .icon("icons/record.svg")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_recorder_window(cx);
                             cx.notify();
@@ -592,6 +576,7 @@ impl Studio {
                     "bar-undo",
                     "icons/undo.svg",
                     None,
+                    Some("Undo · Ctrl+Z"),
                     can_undo,
                     cx,
                     |this, _, cx| this.undo_current(cx),
@@ -600,6 +585,7 @@ impl Studio {
                     "bar-redo",
                     "icons/redo.svg",
                     None,
+                    Some("Redo · Ctrl+Shift+Z"),
                     can_redo,
                     cx,
                     |this, _, cx| this.redo_current(cx),
@@ -610,6 +596,7 @@ impl Studio {
                         "bar-crop",
                         "icons/crop.svg",
                         Some("Crop"),
+                        None,
                         if mode == EditorMode::Video { self.video_frame.is_some() && !self.video_edit_busy } else { self.captured_path.is_some() },
                         cx,
                         |this, _, cx| {
@@ -622,75 +609,61 @@ impl Studio {
                     ))
                 })
                 .child(
-                    div()
-                        .id("bar-export")
-                        .h(px(32.0))
-                        .px_3()
-                        .ml_1()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .rounded_md()
-                        .bg(blue())
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xffffff))
-                        .opacity(if export_busy { 0.5 } else { 1.0 })
-                        .when(!export_busy, |this| {
-                            this.cursor_pointer()
-                                .hover(|style| style.bg(hsla(211.0 / 360.0, 0.95, 0.48, 1.0)))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.stop_editing_text();
-                                    if this.editor_mode() == EditorMode::Static {
-                                        this.export_current(cx);
-                                    } else {
-                                        this.select_inspector_tab(InspectorTab::Export);
-                                        this.inspector_visible = true;
-                                    }
-                                    cx.notify();
-                                }))
-                        })
-                        .child(
-                            svg()
-                                .path("icons/upload.svg")
-                                .size(px(15.0))
-                                .text_color(rgb(0xffffff)),
-                        )
-                        .child("Export"),
-                )
-                .child(
-                    div()
-                        .id("bar-sidebar")
-                        .size(px(32.0))
-                        .ml_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(!self.inspector_visible, |this| this.bg(rgb(0xe7f1ff)))
-                        .hover(|style| style.bg(rgb(0xeeeeef)))
-                        .child(svg().path("icons/sidebar.svg").size(px(17.0)).text_color(
-                            if self.inspector_visible {
-                                muted()
+                    div().ml_1().child(
+                        button(
+                            "bar-export",
+                            // Outside image mode the button only opens the tab.
+                            if mode == EditorMode::Static { "Export" } else { "Export…" },
+                            // The Export tab has its own primary action.
+                            if self.effective_tab() == InspectorTab::Export && self.inspector_visible {
+                                ButtonKind::Secondary
                             } else {
-                                blue()
+                                ButtonKind::Primary
                             },
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.inspector_visible = !this.inspector_visible;
-                            cx.notify();
-                        })),
+                            ButtonSize::Md,
+                        )
+                            .icon("icons/upload.svg")
+                            .disabled(export_busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stop_editing_text();
+                                if this.editor_mode() == EditorMode::Static {
+                                    this.export_current(cx);
+                                } else {
+                                    this.select_inspector_tab(InspectorTab::Export);
+                                    this.inspector_visible = true;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+                )
+                .child({
+                    let preference = crate::theme::theme_preference();
+                    icon_button("bar-theme", preference.icon(), ButtonKind::Ghost, ButtonSize::Md)
+                        .tooltip(format!("Appearance: {} · click for {}", preference.label(), preference.next().label()))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            crate::theme::set_theme_preference(preference.next(), cx);
+                        }))
+                })
+                .child(
+                    div().ml_1().child(
+                        icon_button("bar-sidebar", "icons/sidebar.svg", ButtonKind::Ghost, ButtonSize::Md)
+                            .selected(!self.inspector_visible)
+                            .tooltip(if self.inspector_visible { "Hide inspector" } else { "Show inspector" })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.inspector_visible = !this.inspector_visible;
+                                cx.notify();
+                            })),
+                    ),
                 )
             })
-            .pr_3();
+            .pr_4();
 
         div()
             .h(px(TOP_BAR_HEIGHT))
             .flex_none()
             .flex()
             .items_center()
-            .bg(rgb(0xffffff))
+            .bg(surface())
             .border_b_1()
             .border_color(line())
             .child(
@@ -792,16 +765,10 @@ impl Studio {
             .items_center()
             .justify_between()
             .h(px(40.0))
-            .mt_1()
             .border_t_1()
             .border_color(line())
             .cursor_pointer()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
+            .child(div().section_title().child(title))
             .child(
                 div()
                     .flex()
@@ -851,13 +818,13 @@ impl Studio {
     }
 
     fn tab_label(text: &'static str) -> AnyElement {
-        div()
-            .mt_2()
-            .text_sm()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(ink())
-            .child(text)
-            .into_any_element()
+        div().section_title().child(text).into_any_element()
+    }
+
+    /// Hairline between sections; with the tab's 12 px gap on either side
+    /// it makes the 24 px section break.
+    pub(crate) fn section_divider() -> AnyElement {
+        div().flex_none().h(px(1.0)).bg(line()).into_any_element()
     }
 
     fn design_tab(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -876,23 +843,28 @@ impl Studio {
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(SPACE_3))
             .child(Self::tab_label("Canvas"))
-            .child(div().text_xs().text_color(muted()).child("Aspect ratio"))
-            .child(self.canvas_aspect_picker(cx))
+            .child(field("Aspect ratio", self.canvas_aspect_picker(cx)))
             .when(self.video_project.is_some() && self.aspect_ratio != 0, |this| {
-                this.child(self.segmented(
-                    "content-fill",
-                    &["Fit", "Fill"],
-                    usize::from(self.content_fill),
-                    |this, value| this.content_fill = value == 1,
-                    cx,
-                ))
-                .child(div().text_xs().text_color(muted()).child(if self.content_fill {
-                    "Crops the recording to the canvas; the camera follows your cursor."
-                } else {
-                    "Shows the whole recording on the background."
-                }))
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(SPACE_1))
+                        .child(self.segmented(
+                            "content-fill",
+                            &["Fit", "Fill"],
+                            usize::from(self.content_fill),
+                            |this, value| this.content_fill = value == 1,
+                            cx,
+                        ))
+                        .child(hint(if self.content_fill {
+                            "Crops the recording to the canvas; the camera follows your cursor."
+                        } else {
+                            "Shows the whole recording on the background."
+                        })),
+                )
             })
             .child(self.slider_row(
                 SliderTarget::Padding,
@@ -902,6 +874,7 @@ impl Studio {
                 |this, value| this.padding = value,
                 cx,
             ))
+            .child(Self::section_divider())
             .child(Self::tab_label("Background"))
             .child(self.segmented(
                 "fill-type",
@@ -923,7 +896,7 @@ impl Studio {
             .when(self.section_open("effects"), |this| {
                 this.child(self.background_effects_section(cx))
             })
-            .child(div().h(px(4.0)))
+            .child(Self::section_divider())
             .child(Self::tab_label("Image appearance"))
             .child(self.slider_row(
                 SliderTarget::Corners,
@@ -933,8 +906,8 @@ impl Studio {
                 |this, value| this.corners = value,
                 cx,
             ))
-            .child(div().text_xs().text_color(muted()).child("Window frame"))
-            .child(
+            .child(field(
+                "Window frame",
                 self.segmented(
                     "window-frame",
                     &["None", "Light", "Dark"],
@@ -945,7 +918,7 @@ impl Studio {
                     |this, value| this.window_frame = WindowFrame::ALL[value.min(2)],
                     cx,
                 ),
-            )
+            ))
             .child(self.section_header(
                 "border",
                 "Border",
@@ -957,21 +930,10 @@ impl Studio {
                 cx,
             ))
             .when(self.section_open("border"), |this| {
-                this.child(div().flex().items_center().gap_2().children(
+                this.child(div().flex().items_center().gap(px(2.0)).children(
                     BORDER_COLORS.iter().enumerate().map(|(index, color)| {
-                        let selected = self.border_color == index;
-                        div()
-                            .id(("border-color", index))
-                            .size(px(24.0))
-                            .rounded_full()
-                            .bg(rgb(*color))
-                            .border_2()
-                            .border_color(if selected {
-                                ink()
-                            } else {
-                                Hsla::from(rgb(0xd4d5d8))
-                            })
-                            .cursor_pointer()
+                        let name = ["Yellow", "Green", "Teal", "Blue", "Purple", "Pink"][index];
+                        crate::controls::swatch(("border-color", index), name, self.border_color == index, rgb(*color), None)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.border_color = index;
                                 this.border = true;
@@ -996,6 +958,7 @@ impl Studio {
                     cx,
                 ))
             })
+            .child(Self::section_divider())
             .child(Self::tab_label("Shadow"))
             .child(self.slider_row(
                 SliderTarget::Shadow,
@@ -1005,15 +968,15 @@ impl Studio {
                 |this, value| this.shadow = value,
                 cx,
             ))
-            .child(self.shadow_color_picker(cx))
-            .child(div().text_xs().text_color(muted()).child("Style"))
-            .child(self.segmented(
-                "shadow-style",
-                &["Soft", "Long", "Glow", "Crisp"],
-                self.shadow_style,
-                |this, value| this.shadow_style = value,
-                cx,
-            ))
+            .when(self.shadow > 0, |this| this
+                .child(self.shadow_color_picker(cx))
+                .child(field("Style", self.segmented(
+                    "shadow-style",
+                    &["Soft", "Long", "Glow", "Crisp"],
+                    self.shadow_style,
+                    |this, value| this.shadow_style = value,
+                    cx,
+                ))))
             .child(self.section_header(
                 "watermark",
                 "Watermark",
@@ -1030,7 +993,7 @@ impl Studio {
             .when(self.section_open("watermark"), |this| {
                 this.child(self.watermark_section(cx))
             })
-            .child(div().h(px(4.0)))
+            .child(Self::section_divider())
             .child(Self::tab_label("Presets"))
             .child(self.quick_presets_row(cx))
             .child(self.section_header("saved-presets", "Saved presets", None, cx))
@@ -1040,6 +1003,8 @@ impl Studio {
             .into_any_element()
     }
 
+    /// Compact aspect picker: four columns of tiles with the ratio's shape
+    /// beside its name.
     pub(crate) fn canvas_aspect_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let presets = [
             ("Auto", 0, 1.6), ("16:9", 4, 16.0 / 9.0), ("9:16", 5, 9.0 / 16.0),
@@ -1048,18 +1013,20 @@ impl Studio {
             ("21:9", 9, 21.0 / 9.0), ("Custom", 10, 1.4),
         ];
         div().flex().flex_col().gap_2()
-            .child(div().grid().grid_cols(3).gap_2().children(presets.into_iter().map(|(label, index, ratio)| {
+            .child(div().grid().grid_cols(4).gap_2().children(presets.into_iter().map(|(label, index, ratio)| {
                 let active = self.aspect_ratio == index;
-                let width = 32.0_f32.min(22.0 * ratio);
+                let width = 16.0_f32.min(16.0 * ratio);
                 let height = width / ratio;
-                div().id(("canvas-aspect", index)).h(px(64.0)).rounded_lg()
-                    .border_1().border_color(if active { blue() } else { line() })
-                    .bg(if active { rgb(0xe7f1ff) } else { rgb(0xffffff) })
-                    .flex().flex_col().items_center().justify_center().gap_1()
-                    .cursor_pointer().hover(|style| style.bg(rgb(0xeef4fb)))
-                    .child(div().w(px(width)).h(px(height)).rounded(px(3.0))
-                        .border_1().border_color(if active { blue() } else { muted() }))
-                    .child(div().text_xs().text_color(if active { blue() } else { ink() }).child(label))
+                crate::controls::keyboard_focusable(div().id(("canvas-aspect", index)))
+                    .h(px(40.0)).px_2().rounded(px(RADIUS_MD))
+                    .border_1().border_color(if active { accent() } else { line() })
+                    .bg(if active { accent_tint() } else { surface() })
+                    .flex().items_center().justify_center().gap(px(6.0))
+                    .cursor_pointer().when(!active, |this| this.hover(|style| style.bg(control_bg())))
+                    .child(div().flex_none().size(px(16.0)).flex().items_center().justify_center()
+                        .child(div().w(px(width)).h(px(height)).rounded(px(2.0))
+                            .border_1().border_color(if active { accent() } else { muted() })))
+                    .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(ink()).truncate().child(label))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.aspect_ratio = index;
                         if index == 10 { this.custom_canvas_draft = this.custom_canvas_dimensions; }
@@ -1071,7 +1038,6 @@ impl Studio {
                     .child(div().flex_1().min_w_0().child(self.text_fields.aspect_width.clone()))
                     .child(div().text_sm().text_color(muted()).child(":"))
                     .child(div().flex_1().min_w_0().child(self.text_fields.aspect_height.clone())))
-                    .child(div().text_xs().text_color(muted()).child("Enter width and height proportions, then press Enter."))
             })
             .into_any_element()
     }
@@ -1095,7 +1061,7 @@ impl Studio {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .child(div().text_xs().text_color(muted()).child(format!("{selection_count} selected")))
+                        .child(div().hint().child(format!("{selection_count} selected")))
                         .child(self.small_button(
                             "annotation-delete-selection",
                             if selection_count == self.annotations.len() { "Delete all" } else { "Delete selected" },
@@ -1104,7 +1070,7 @@ impl Studio {
                             |this, _| {
                                 if this.delete_selected_annotations() && this.processed_capture_path.is_some() {
                                     if let Err(error) = this.rebuild_redactions() {
-                                        this.toast = Some(error.into());
+                                        this.toast = Some(crate::Notification::error(error));
                                     }
                                 }
                             },
@@ -1143,7 +1109,7 @@ impl Studio {
                             .items_center()
                             .gap_1()
                             .rounded_md()
-                            .bg(if selected_indices.contains(&index) { rgb(0xe7f1ff) } else { rgb(0xf0f1f3) })
+                            .bg(if selected_indices.contains(&index) { accent_tint() } else { control_bg() })
                             .child(
                                 div()
                                     .id(("annotation-list", index))
@@ -1198,6 +1164,7 @@ impl Studio {
                             .child(
                                 div()
                                     .id(("annotation-row-delete", index))
+                                    .tooltip(crate::timeline_ui::tooltip("Delete annotation"))
                                     .flex()
                                     .flex_none()
                                     .items_center()
@@ -1206,7 +1173,7 @@ impl Studio {
                                     .mr_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xfee2e2)))
+                                    .hover(|style| style.bg(danger_tint()).text_color(danger()))
                                     .child(
                                         svg()
                                             .path("icons/trash.svg")
@@ -1219,7 +1186,7 @@ impl Studio {
                                             && this.processed_capture_path.is_some()
                                         {
                                             if let Err(error) = this.rebuild_redactions() {
-                                                this.toast = Some(error.into());
+                                                this.toast = Some(crate::Notification::error(error));
                                             }
                                         }
                                         this.tool = Tool::Select;
@@ -1248,46 +1215,40 @@ impl Studio {
     /// Animated-screenshot settings: duration, motion preset, scenes, and
     /// the cursor walkthrough.
     fn animation_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let duration_index = ANIMATION_DURATIONS
-            .iter()
-            .position(|value| (*value - self.animation_duration).abs() < 1e-9)
-            .unwrap_or(usize::MAX);
         let selected_preset = self.animation_preset.filter(|_| !self.video_zoom_cues.is_empty());
+        let duration = self.animation_duration;
+        let step = |id: &'static str, label: &'static str, tip: &'static str, enabled: bool, delta: f64| {
+            button(id, label, ButtonKind::Secondary, ButtonSize::Sm)
+                .tooltip(tip)
+                .disabled(!enabled)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_animation_duration((this.animation_duration + delta).max(1.0));
+                    cx.notify();
+                }))
+        };
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(SPACE_3))
             .child(Self::tab_label("Scene duration"))
-            .child(self.segmented(
-                "animation-duration",
-                &["3 s", "5 s", "8 s", "10 s"],
-                duration_index,
-                |this, index| this.set_animation_duration(ANIMATION_DURATIONS[index]),
-                cx,
-            ))
-            .child(div().text_xs().text_color(muted()).child(format!(
-                "Image: {:.2}s – {:.2}s · Drag either edge to trim.",
-                self.image_trim_drag.map(|drag| drag.start).unwrap_or(self.animation_image_start),
-                self.image_trim_drag.map(|drag| drag.end).unwrap_or(self.animation_image_end))))
-            .child(div().flex().items_center().justify_between()
-                .child(div().text_xs().child(format!("Scene length: {:.2}s", self.animation_duration)))
-                .child(self.small_button("extend-scene", "+ 5 seconds", true, cx, |this, _| {
-                    this.set_animation_duration(this.animation_duration + 5.0);
+            .child(div().flex().items_center().gap_1()
+                .child(step("animation-duration-shorter", "−", "Shorter", duration > 1.0, -1.0))
+                .child(div().w(px(56.0)).h(px(28.0)).flex().items_center().justify_center()
+                    .rounded_md().bg(control_bg()).text_xs().tabular()
+                    .child(crate::units::fmt_seconds(duration)))
+                .child(step("animation-duration-longer", "+", "Longer", true, 1.0))
+                .child(div().flex_1())
+                .children(ANIMATION_DURATIONS.into_iter().enumerate().map(|(index, preset)| {
+                    button(("animation-duration", index), format!("{preset:.0} s"), ButtonKind::Ghost, ButtonSize::Sm)
+                        .selected((preset - duration).abs() < 1e-9)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_animation_duration(preset);
+                            cx.notify();
+                        }))
                 })))
             .child(Self::tab_label("Motion preset"))
             .child(
-                div().text_xs().text_color(muted()).child(
-                    selected_preset
-                        .map(|preset| preset.label())
-                        .unwrap_or(if self.video_zoom_cues.is_empty() {
-                            "No motion applied"
-                        } else {
-                            "Custom motion"
-                        }),
-                ),
-            )
-            .child(
-                div().flex().flex_wrap().gap(px(6.0)).children(
+                div().grid().grid_cols(3).gap_2().children(
                     MotionPreset::ALL
                         .into_iter()
                         .enumerate()
@@ -1300,24 +1261,19 @@ impl Studio {
                             let selected = selected_preset == Some(preset);
                             div()
                                 .id(("animation-preset", index))
-                                .w(px(90.0))
                                 .flex()
                                 .flex_col()
                                 .rounded_md()
                                 .overflow_hidden()
                                 .border_2()
-                                .border_color(if selected {
-                                    blue()
-                                } else {
-                                    rgb(0xe4e4e7).into()
-                                })
-                                .bg(rgb(0xf0f0f1))
+                                .border_color(if selected { accent() } else { line() })
+                                .bg(control_bg())
                                 .cursor_pointer()
                                 .hover(move |style| {
                                     if selected {
                                         style
                                     } else {
-                                        style.border_color(rgb(0xc8c8cc))
+                                        style.border_color(muted())
                                     }
                                 })
                                 .child(
@@ -1335,8 +1291,9 @@ impl Studio {
                                         .items_center()
                                         .justify_center()
                                         .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(if selected { blue() } else { ink() })
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ink())
+                                        .truncate()
                                         .child(preset.label()),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1354,33 +1311,18 @@ impl Studio {
                     .items_center()
                     .gap_1()
                     .child(
-                        div()
-                            .id("walkthrough-toggle")
-                            .px_3()
-                            .h(px(30.0))
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if self.walkthrough_mode {
-                                blue()
-                            } else {
-                                rgb(0xf0f0f1).into()
-                            })
-                            .text_color(if self.walkthrough_mode {
-                                rgb(0xffffff).into()
-                            } else {
-                                ink()
-                            })
-                            .cursor_pointer()
-                            .child(if self.walkthrough_mode {
+                        button(
+                            "walkthrough-toggle",
+                            if self.walkthrough_mode {
                                 "Placing stops… (Enter to finish)"
                             } else if self.has_walkthrough() {
                                 "Add more stops"
                             } else {
                                 "Place cursor stops"
-                            })
+                            },
+                            if self.walkthrough_mode { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            ButtonSize::Md,
+                        )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.walkthrough_mode = !this.walkthrough_mode;
                                 this.video_selected_zoom_cue = None;
@@ -1404,7 +1346,6 @@ impl Studio {
                         ))
                     }),
             )
-            .child(div().h(px(1.0)).mt_1().bg(line()))
             .into_any_element()
     }
 
@@ -1412,8 +1353,7 @@ impl Studio {
         div()
             .flex()
             .items_center()
-            .gap_3()
-            .child(div().text_xs().text_color(muted()).child("Scenes"))
+            .child(Self::track_label("Scenes", 30.0))
             .child(
                 div()
                     .flex()
@@ -1433,17 +1373,10 @@ impl Studio {
                             .rounded_md()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if selected {
-                                blue()
-                            } else {
-                                rgb(0xf0f0f1).into()
-                            })
-                            .text_color(if selected {
-                                rgb(0xffffff).into()
-                            } else {
-                                ink()
-                            })
+                            .bg(if selected { accent() } else { control_bg() })
+                            .text_color(if selected { on_accent() } else { ink() })
                             .cursor_pointer()
+                            .when(!selected, |this| this.hover(|style| style.bg(control_hover())))
                             .child(format!("{}", index + 1))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.switch_image_scene(index, cx);
@@ -1459,7 +1392,7 @@ impl Studio {
                     .when(self.image_scenes.len() > 1, |this| {
                         this.child(self.small_button(
                             "image-scene-remove",
-                            "Remove scene",
+                            "Delete scene",
                             true,
                             cx,
                             |this, cx| this.remove_image_scene(cx),
@@ -1495,24 +1428,99 @@ impl Studio {
         if self.transcript_open && self.video_transcript.is_some() {
             return self.transcript_panel(cx);
         }
+        let overlays = self.input_overlays;
+        let keystrokes_captured = !self.video_keystrokes.is_empty();
         div()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(Self::tab_label("Subtitles & transcript"))
+            .gap(px(SPACE_3))
             .child(self.subtitle_section(cx))
-            .child(self.section_header("keystrokes", "Keystrokes", None, cx))
-            .when(self.section_open("keystrokes"), |this| {
+            .child(self.section_header(
+                "keystrokes",
+                "Keystrokes",
+                Some(if keystrokes_captured {
+                    self.header_switch("keystrokes-switch", "keystrokes", overlays.keystrokes, cx, |this| {
+                        this.input_overlays.keystrokes = !this.input_overlays.keystrokes;
+                    })
+                } else {
+                    div()
+                        .id("keystrokes-switch")
+                        .opacity(0.4)
+                        .tooltip(crate::timeline_ui::tooltip(
+                            "No keystrokes in this recording. Record with the Lahza GNOME Shell extension enabled.",
+                        ))
+                        .child(self.toggle(false))
+                        .into_any_element()
+                }),
+                cx,
+            ))
+            .when(keystrokes_captured && overlays.keystrokes && self.section_open("keystrokes"), |this| {
                 this.child(self.keystroke_section(cx))
             })
-            .child(self.section_header("speed-badge", "Speed badge", None, cx))
+            .child(self.section_header(
+                "speed-badge",
+                "Speed badge",
+                Some(self.header_switch("speed-badge-switch", "speed-badge", overlays.speed_badge, cx, |this| {
+                    this.input_overlays.speed_badge = !this.input_overlays.speed_badge;
+                })),
+                cx,
+            ))
             .when(self.section_open("speed-badge"), |this| {
                 this.child(self.speed_badge_section(cx))
             })
             .into_any_element()
     }
 
-    pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Header naming the selected object, with a way back to the tab. The
+    /// rail already names the tab, so without a selection there is none.
+    fn inspector_context(&self, tab: InspectorTab, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (title, trailing) = match tab {
+            InspectorTab::Motion => {
+                let cue = self.selected_region()?;
+                let slices = self.video_clip_timeline.slices_overlapping(cue.start, cue.end);
+                let range = slices.first().zip(slices.last())
+                    .map(|(first, last)| crate::units::fmt_seconds_range(first.editor_start, last.editor_end))
+                    .unwrap_or_else(|| "Outside current edit".to_string());
+                let kind = if cue.transform.is_none() || cue.has_camera_motion() { "Zoom" } else { "Transform" };
+                let enabled = cue.is_enabled;
+                let switch = div()
+                    .id("motion-enabled-toggle")
+                    .cursor_pointer()
+                    .tooltip(crate::timeline_ui::tooltip(if enabled { "Turn off zoom" } else { "Turn on zoom" }))
+                    .child(self.toggle(enabled))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.edit_selected_region(|cue| cue.is_enabled = !cue.is_enabled);
+                        cx.notify();
+                    }))
+                    .into_any_element();
+                (format!("{kind} · {range}"), Some(switch))
+            }
+            InspectorTab::Annotate => {
+                let mark = self.selected_annotation.and_then(|index| self.annotations.get(index))?;
+                let text = mark.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let title = if mark.tool == Tool::Text && !text.is_empty() {
+                    format!("{} · {text}", mark.tool.label())
+                } else {
+                    mark.tool.label().to_string()
+                };
+                (title, None)
+            }
+            _ => return None,
+        };
+        Some(div().h(px(52.0)).flex_none().pl_2().pr_4().flex().items_center().gap_2()
+            .border_b_1().border_color(line())
+            .child(icon_button("inspector-back", "icons/chevron-left.svg", ButtonKind::Ghost, ButtonSize::Sm)
+                .tooltip("Back")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_inspector_tab(tab);
+                    cx.notify();
+                })))
+            .child(div().flex_1().min_w_0().truncate().panel_title().child(title))
+            .when_some(trailing, |this, trailing| this.child(trailing))
+            .into_any_element())
+    }
+
+    pub(crate) fn sidebar(&self, viewport_width: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.editor_mode();
         let tab = self.effective_tab();
         let body = match tab {
@@ -1526,42 +1534,33 @@ impl Studio {
             InspectorTab::Export => div()
                 .flex()
                 .flex_col()
-                .gap_3()
-                .child(Self::tab_label("Export settings"))
+                .gap(px(SPACE_3))
                 .child(self.export_section(cx))
                 .child(
                     div()
-                        .id("export-start")
-                        .h(px(36.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .bg(blue())
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xffffff))
-                        .opacity(if self.export_progress.is_some() {
-                            0.5
-                        } else {
-                            1.0
-                        })
-                        .child(if self.export_progress.is_some() {
-                            "Exporting…"
-                        } else {
-                            "Export file…"
-                        })
-                        .when(self.export_progress.is_none(), |this| {
-                            this.cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_current(cx);
-                                    cx.notify();
-                                }))
-                        }),
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ink())
+                        .tabular()
+                        .child(self.export_summary()),
+                )
+                .child(
+                    button(
+                        "export-start",
+                        if self.export_progress.is_some() { "Exporting…" } else { "Export file…" },
+                        ButtonKind::Primary,
+                        ButtonSize::Md,
+                    )
+                    .full_width()
+                    .disabled(self.export_progress.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_current(cx);
+                        cx.notify();
+                    })),
                 )
                 .when(self.video_project.is_some(), |this| {
-                    this.child(Self::tab_label("Share"))
-                        .child(self.share_section(cx))
+                    this.child(Self::section_divider())
+                        .child(self.audio_only_section(cx))
                 })
                 .into_any_element(),
         };
@@ -1596,24 +1595,23 @@ impl Studio {
                             .gap_1()
                             .rounded_md()
                             .cursor_pointer()
-                            .when(selected, |this| this.bg(rgb(0xe7f1ff)))
+                            .when(selected, |this| this.bg(accent_tint()))
                             .hover(move |style| {
                                 if selected {
                                     style
                                 } else {
-                                    style.bg(rgb(0xf1f1f2))
+                                    style.bg(control_bg())
                                 }
                             })
                             .child(
                                 svg()
                                     .path(candidate.icon())
                                     .size(px(17.0))
-                                    .text_color(if selected { blue() } else { muted() }),
+                                    .text_color(if selected { ink() } else { muted() }),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .micro()
                                     .text_color(if selected { ink() } else { muted() })
                                     .child(candidate.label()),
                             )
@@ -1624,21 +1622,19 @@ impl Studio {
                     }),
             );
         div()
-            .w(px(INSPECTOR_WIDTH))
+            .w(px(Self::inspector_width(viewport_width)))
             .flex_none()
             .h_full()
             .relative()
             .flex()
-            .bg(panel())
+            .bg(surface())
             .border_l_1()
             .border_color(line())
             .child(tabs)
             .child(
                 div()
                     .flex_1().min_w_0().h_full().flex().flex_col()
-                    .child(div().h(px(52.0)).flex_none().px_4().flex().items_center()
-                        .border_b_1().border_color(line()).text_sm().font_weight(FontWeight::SEMIBOLD)
-                        .child(tab.label()))
+                    .when_some(self.inspector_context(tab, cx), |this, header| this.child(header))
                     .child(div()
                     .id("inspector-scroll")
                     .track_scroll(&self.inspector_scroll)
@@ -1648,8 +1644,7 @@ impl Studio {
                     .p_4()
                     .flex()
                     .flex_col()
-                    .child(div().flex_none().w_full().child(body))
-                    .child(div().flex_none().mt_5().child(crate::theme::credit_footer()))),
+                    .child(div().flex_none().w_full().child(body))),
             )
             .when(self.crop_active, |this| {
                 this.opacity(0.52).child(
@@ -1698,6 +1693,8 @@ impl Studio {
     /// camera, and audio lanes.
     fn track_label(label: &'static str, height: f32) -> AnyElement {
         div()
+            .w(px(TRACK_LABEL_WIDTH))
+            .pr_3()
             .h(px(height))
             .flex_none()
             .flex()
@@ -1750,13 +1747,8 @@ impl Studio {
                                 .w(px(((range.end - range.start) * scale).max(3.0) as f32))
                                 .rounded_md()
                                 .border_2()
-                                .border_color(blue())
-                                .bg(hsla(
-                                    217.0 / 360.0,
-                                    0.9,
-                                    0.6,
-                                    if clip.id == drag.clip_id { 0.35 } else { 0.16 },
-                                ))
+                                .border_color(lane_video())
+                                .bg(lane_video().opacity(if clip.id == drag.clip_id { 0.35 } else { 0.16 }))
                                 .into_any_element(),
                         )
                     })
@@ -1780,6 +1772,7 @@ impl Studio {
         let mut ruler_tick = (visible_start / ruler_step).floor() * ruler_step;
         while ruler_tick <= timeline_duration.min(visible_end + ruler_step) + 1e-6 {
             let x = (ruler_tick / timeline_duration * timeline_content_width) as f32;
+            // Bands, top to bottom: labels, click markers, ticks.
             ruler_marks.push(
                 div()
                     .absolute()
@@ -1787,22 +1780,20 @@ impl Studio {
                     .bottom_0()
                     .w(px(1.0))
                     .h(px(5.0))
-                    .bg(hsla(0.0, 0.0, 0.0, 0.30))
+                    .bg(ink().opacity(0.30))
                     .into_any_element(),
             );
-            let label = if ruler_step < 1.0 {
-                crate::timeline_edit::precise_timecode(ruler_tick)
-            } else {
-                Self::video_timecode(ruler_tick)
-            };
             ruler_marks.push(
                 div()
                     .absolute()
-                    .left(px(x + 5.0))
-                    .top(px(19.0))
-                    .text_xs()
+                    .left(px(x + 4.0))
+                    .top(px(4.0))
+                    .micro()
+                    .line_height(px(14.0))
+                    .tabular()
+                    .whitespace_nowrap()
                     .text_color(muted())
-                    .child(label)
+                    .child(crate::units::ruler_time(ruler_tick, ruler_step < 1.0))
                     .into_any_element(),
             );
             let half = ruler_tick + ruler_step / 2.0;
@@ -1815,7 +1806,7 @@ impl Studio {
                         .bottom_0()
                         .w(px(1.0))
                         .h(px(3.0))
-                        .bg(hsla(0.0, 0.0, 0.0, 0.15))
+                        .bg(ink().opacity(0.15))
                         .into_any_element(),
                 );
             }
@@ -1847,37 +1838,37 @@ impl Studio {
             let image_duration = (image_end - image_start).max(0.0);
             let label = if self.image_scenes.len() > 1 {
                 format!(
-                    "Scene {} · {:.2}s",
+                    "Scene {} · {}",
                     self.image_scene_index + 1,
-                    image_duration
+                    crate::units::fmt_seconds(image_duration)
                 )
             } else {
-                format!("Image · {:.2}s", image_duration)
+                format!("Image · {}", crate::units::fmt_seconds(image_duration))
             };
             if image_duration <= 0.0 {
                 Vec::new()
             } else {
-                vec![div()
+                let left = (timeline_content_width * image_start / timeline_duration) as f32;
+                let width =
+                    ((timeline_content_width * image_duration / timeline_duration) as f32).max(32.0);
+                let selected = self.video_selected_clip.is_some();
+                let mut elements = vec![div()
                     .id("image-timeline-clip")
-                    .cursor(CursorStyle::ClosedHand)
+                    .cursor(if self.image_trim_drag.is_some() {
+                        CursorStyle::ClosedHand
+                    } else {
+                        CursorStyle::OpenHand
+                    })
                     .absolute()
-                    .left(px(
-                        (timeline_content_width * image_start / timeline_duration) as f32,
-                    ))
+                    .left(px(left))
                     .overflow_hidden()
                     .h_full()
-                    .w(px(
-                        (timeline_content_width * image_duration / timeline_duration).max(32.0)
-                            as f32,
-                    ))
+                    .w(px(width))
                     .flex_none()
                     .rounded_md()
                     .border_2()
-                    .border_color(if self.video_selected_clip.is_some() {
-                        ink()
-                    } else {
-                        hsla(0.0, 0.0, 0.0, 0.0)
-                    })
+                    .border_color(if selected { ink() } else { gpui::transparent_black() })
+                    .when(!selected, |d| d.hover(|s| s.border_color(ink().opacity(0.4))))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1896,76 +1887,42 @@ impl Studio {
                             cx.notify();
                         }),
                     )
-                    .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(hsla(0.0, 0.0, 1.0, 0.92))
-                    .child(
-                        div()
-                            .px_2()
-                            .rounded_md()
-                            .bg(hsla(0.0, 0.0, 0.0, 0.35))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .id("image-trim-start")
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .h_full()
-                            .w(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor(CursorStyle::ResizeLeftRight)
-                            .bg(hsla(0.0, 0.0, 0.0, 0.12))
-                            .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
-                            .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    this.begin_image_trim(event.position.x, ClipEdge::Leading);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("image-trim-end")
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .h_full()
-                            .w(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor(CursorStyle::ResizeLeftRight)
-                            .bg(hsla(0.0, 0.0, 0.0, 0.12))
-                            .hover(|style| style.bg(hsla(0.0, 0.0, 0.0, 0.3)))
-                            .child(div().w(px(3.0)).h(px(16.0)).rounded_sm().bg(rgb(0xffffff)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    this.begin_image_trim(event.position.x, ClipEdge::Trailing);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .into_any_element()]
+                    .bg(lane_video())
+                    .when(selected || width >= 96.0, |d| d.child(Self::clip_duration_pill(label)))
+                    .into_any_element()];
+                for edge in [ClipEdge::Leading, ClipEdge::Trailing] {
+                    let leading = edge == ClipEdge::Leading;
+                    elements.push(
+                        crate::timeline_ui::trim_handle(
+                            if leading { "image-trim-start" } else { "image-trim-end" },
+                            0.0,
+                            if leading { left } else { left + width },
+                            leading,
+                            width,
+                            0.0,
+                            48.0,
+                            selected,
+                            false,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.begin_image_trim(event.position.x, edge);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                elements
             }
         };
         let motion_track = self.motion_track(timeline_scroll, timeline_content_width, progress, cx);
         let annotation_track =
             self.annotation_track(timeline_scroll, timeline_content_width, progress, cx);
         let audio_height = if audio_lane.is_some() { 26.0 } else { 0.0 };
-        let camera_height = if camera_lane.is_some() { 26.0 } else { 0.0 };
+        let camera_height = if camera_lane.is_some() { 32.0 } else { 0.0 };
         let annotation_height = if annotation_track.is_some() {
             self.annotation_lane_height() + 4.0
         } else {
@@ -2027,7 +1984,7 @@ impl Studio {
             .px_4()
             .flex()
             .flex_col()
-            .bg(rgb(0xffffff))
+            .bg(surface())
             .border_t_1()
             .border_color(line())
             .child(self.timeline_resize_handle(cx))
@@ -2052,14 +2009,7 @@ impl Studio {
                     .flex_none()
                     .h(px(38.0))
                     .items_center()
-                    .child(
-                        div()
-                            .w(px(104.0))
-                            .flex_none()
-                            .text_xs()
-                            .text_color(muted())
-                            .child("Time"),
-                    )
+                    .child(Self::track_label("Time", 38.0))
                     .child(
                         div()
                             .id("timeline-ruler")
@@ -2126,16 +2076,15 @@ impl Studio {
                                         .w(px(head_width))
                                         .h(px(18.0))
                                         .rounded_sm()
-                                        .bg(blue())
+                                        .bg(brand())
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .text_xs()
-                                        .text_color(rgb(0xffffff))
+                                        .tabular()
+                                        .text_color(gpui::white())
                                         .child(if expanded {
-                                            crate::timeline_edit::precise_timecode(
-                                                self.video_position,
-                                            )
+                                            crate::units::timecode(self.video_position)
                                         } else {
                                             "▾".to_owned()
                                         }),
@@ -2183,8 +2132,7 @@ impl Studio {
                             .flex_none()
                             .child(
                                 div()
-                                    .w(px(104.0))
-                                    .pr_3()
+                                    .w(px(TRACK_LABEL_WIDTH))
                                     .flex_none()
                                     .flex()
                                     .flex_col()
@@ -2193,7 +2141,7 @@ impl Studio {
                                         if is_video { "Video" } else { "Image" },
                                         48.0,
                                     ))
-                                    .child(Self::track_label("Motion", self.motion_lane_height()))
+                                    .child(Self::track_label("Zooms", self.motion_lane_height()))
                                     .when(annotation_track.is_some(), |d| {
                                         d.child(Self::track_label(
                                             "Annotations",
@@ -2201,7 +2149,7 @@ impl Studio {
                                         ))
                                     })
                                     .when(camera_lane.is_some(), |d| {
-                                        d.child(Self::track_label("Camera", 22.0))
+                                        d.child(Self::track_label("Camera", 28.0))
                                     })
                                     .when(audio_lane.is_some(), |d| {
                                         d.child(Self::track_label("Audio", 22.0))
@@ -2251,7 +2199,7 @@ impl Studio {
                                             .flex_none()
                                             .overflow_hidden()
                                             .rounded_lg()
-                                            .bg(rgb(0xECEDF1))
+                                            .bg(control_bg())
                                             .child(
                                                 div()
                                                     .absolute()
@@ -2309,7 +2257,7 @@ impl Studio {
                                                 .top_0()
                                                 .bottom_0()
                                                 .w(px(1.0))
-                                                .bg(rgb(0x8b95a5)),
+                                                .bg(muted()),
                                         )
                                     })
                                     .when_some(snap_x, |d, x| {
@@ -2320,7 +2268,7 @@ impl Studio {
                                                 .top_0()
                                                 .bottom_0()
                                                 .w(px(1.0))
-                                                .bg(rgb(0xe08a26)),
+                                                .bg(crate::theme::selection()),
                                         )
                                     })
                                     .when(playhead_visible, |d| {
@@ -2331,7 +2279,7 @@ impl Studio {
                                                 .top_0()
                                                 .bottom_0()
                                                 .w(px(2.0))
-                                                .bg(blue()),
+                                                .bg(brand()),
                                         )
                                     }),
                             ),
@@ -2348,7 +2296,7 @@ impl Studio {
                         .py_1()
                         .rounded_md()
                         .bg(ink())
-                        .text_color(rgb(0xffffff))
+                        .text_color(surface())
                         .text_xs()
                         .child(text),
                 )
@@ -2357,8 +2305,25 @@ impl Studio {
             .into_any_element()
     }
 
+    /// Duration pill pinned to a clip's top-left corner.
+    fn clip_duration_pill(label: String) -> gpui::Div {
+        div()
+            .absolute()
+            .top(px(4.0))
+            .left(px(4.0))
+            .px(px(6.0))
+            .rounded_sm()
+            .bg(hsla(0.0, 0.0, 0.0, 0.45))
+            .micro()
+            .line_height(px(14.0))
+            .tabular()
+            .whitespace_nowrap()
+            .text_color(gpui::white())
+            .child(label)
+    }
+
     /// The recording's clips on the track: draggable to reposition, with
-    /// trim handles on the selected clip.
+    /// trim handles on every clip edge.
     fn video_clip_lane(
         &self,
         timeline_duration: f64,
@@ -2369,6 +2334,7 @@ impl Studio {
     ) -> Vec<AnyElement> {
         let scale = timeline_content_width / timeline_duration.max(f64::EPSILON);
         let mut elements = Vec::new();
+        let mut handles = Vec::new();
         let mut selected_handles = Vec::new();
         for clip in &self.video_clip_timeline.segments {
             let clip_id = clip.id;
@@ -2385,20 +2351,20 @@ impl Studio {
                 .id(("video-clip", clip_id.as_u128() as u64))
                 .absolute().left(px(left)).top_0().h_full().w(px(width))
                 .rounded_md().border_2()
-                .border_color(if selected { blue() } else if hovered { hsla(217.0 / 360.0, 0.8, 0.68, 0.75) } else { hsla(0.0, 0.0, 0.0, 0.0) })
-                .bg(hsla(217.0 / 360.0, 0.86, 0.58, 1.0))
-                .flex().items_center().justify_center().overflow_hidden()
-                .text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xffffff))
+                .border_color(if selected { ink() } else if hovered { ink().opacity(0.4) } else { gpui::transparent_black() })
+                .bg(lane_video())
+                .overflow_hidden()
                 .when(dragging, |d| d.opacity(0.4))
                 .children(self.clip_thumbnails(range.start, clip.source_start, clip.source_end, clip.speed, width, 48.0))
                 .when(!selected, |d| d.child(div().absolute().size_full().bg(hsla(0.0, 0.0, 0.0, if hovered { 0.06 } else { 0.16 }))))
-                .when(width >= 52.0, |d| {
+                .when(width >= 52.0 && (selected || hovered || width >= 96.0), |d| {
                     let label = if (clip.speed - 1.0).abs() > f64::EPSILON {
-                        format!("{:.1}s · {}×", clip.editor_duration(), clip.speed)
-                    } else { format!("{:.1}s", clip.editor_duration()) };
-                    d.child(div().relative().px_2().rounded_md().bg(hsla(0.0, 0.0, 0.0, 0.45)).child(label))
+                        format!("{} · {}", crate::units::fmt_seconds(clip.editor_duration()), crate::units::fmt_zoom(clip.speed))
+                    } else { crate::units::fmt_seconds(clip.editor_duration()) };
+                    d.child(Self::clip_duration_pill(label))
                 })
                 .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                .when(selected && !dragging, |d| d.tooltip(crate::timeline_ui::tooltip(crate::timeline_ui::REGION_KEYS_HELP)))
                 .on_hover(cx.listener(move |this, hover: &bool, _, cx| {
                     if *hover { this.timeline_ui.hovered_clip = Some(clip_id); }
                     else if this.timeline_ui.hovered_clip == Some(clip_id) { this.timeline_ui.hovered_clip = None; }
@@ -2417,37 +2383,32 @@ impl Studio {
                 }));
             elements.push(body.into_any_element());
 
-            if !selected || dragging { continue; }
+            if dragging { continue; }
             for edge in [ClipEdge::Leading, ClipEdge::Trailing] {
                 let leading = edge == ClipEdge::Leading;
-                let edge_x = if leading { left } else { left + true_width };
-                let narrow = true_width < 32.0;
-                // Keep 16px hit targets outside the clipped thumbnail body.
-                // Tiny clips use separate vertical halves, so neither edge
-                // steals the other's target (including a clip at time zero).
-                let hit_left = (edge_x - if leading { 5.0 } else { 11.0 }).max(0.0);
-                let grip_left = (edge_x - hit_left - 1.5).clamp(0.0, 13.0);
-                let height = if narrow { 24.0 } else { 48.0 };
-                let top = if narrow && !leading { 24.0 } else { 0.0 };
-                let handle = div()
-                    .id((if leading { "video-trim-leading" } else { "video-trim-trailing" }, clip_id.as_u128() as u64))
-                    .absolute().left(px(hit_left)).top(px(top)).w(px(16.0)).h(px(height))
-                    .occlude().cursor(CursorStyle::ResizeLeftRight)
-                    .tooltip(crate::timeline_ui::tooltip(if leading { "Drag to trim start · Escape cancels" } else { "Drag to trim end · Escape cancels" }))
-                    .child(div().absolute().left(px(grip_left)).top(px((height - 18.0) / 2.0)).w(px(3.0)).h(px(18.0))
-                        .rounded_sm().bg(rgb(0xffffff)).shadow_sm())
-                    .hover(|s| s.bg(hsla(217.0 / 360.0, 0.8, 0.55, 0.35)))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.focus_handle.focus(window);
-                        this.begin_video_trim(clip_id, edge, event.position.x);
-                        cx.notify();
-                    }));
-                selected_handles.push(handle.into_any_element());
+                let handle = crate::timeline_ui::trim_handle(
+                    (if leading { "video-trim-leading" } else { "video-trim-trailing" }, clip_id.as_u128() as u64),
+                    0.0,
+                    if leading { left } else { left + true_width },
+                    leading,
+                    true_width,
+                    0.0,
+                    48.0,
+                    selected,
+                    true,
+                )
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.focus_handle.focus(window);
+                    this.begin_video_trim(clip_id, edge, event.position.x);
+                    cx.notify();
+                }));
+                if selected { selected_handles.push(handle.into_any_element()); } else { handles.push(handle.into_any_element()); }
             }
         }
         // Hitboxes are above all clip bodies; the selected clip wins a
-        // shared boundary over a neighboring clip's move target.
+        // shared boundary over a neighboring clip's handle or move target.
+        elements.extend(handles);
         elements.extend(selected_handles);
         elements
     }

@@ -1,12 +1,12 @@
 //! Still-image canvas painting and video editor layout.
 
 use super::{
-    blue, fitted_image_bounds, gradient_layers, ink, line, muted, paint_annotation,
+    fitted_image_bounds, gradient_layers, ink, line, muted, paint_annotation,
     paint_crop_overlay, paint_highlights, recording, scene_ui, timed, visible_rect, AnnotationMark,
     SceneSelection, Studio, Tool, GRADIENT_BACKGROUNDS, MOTION_ZOOM_SLIDER, SOLID_BACKGROUNDS,
 };
 use gpui::{
-    canvas, div, hsla, img, point, prelude::*, px, rgb, size, svg, AnyElement, Background,
+    canvas, div, img, point, prelude::*, px, rgb, size, svg, AnyElement, Background,
     Bounds, BoxShadow, ContentMask, Context, CursorStyle, FontWeight, Hsla, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
     RenderImage, ScrollWheelEvent, Window,
@@ -263,9 +263,9 @@ impl Studio {
                     // Keep the empty-state backing out of loaded screenshots so
                     // those margins reveal the scene background, as in export.
                     .when(!has_capture, |this| {
-                        this.bg(rgb(0xfafafa))
+                        this.bg(crate::surface())
                             .border_1()
-                            .border_color(rgb(0xd6dde6))
+                            .border_color(line())
                     })
                     .overflow_hidden()
                     .rounded(corner_radius)
@@ -279,7 +279,7 @@ impl Studio {
                                 svg()
                                     .path("icons/capture.svg")
                                     .size(px(46.0))
-                                    .text_color(hsla(220.0 / 360.0, 0.05, 0.78, 1.0)),
+                                    .text_color(muted().opacity(0.6)),
                             )
                             .child(
                                 div()
@@ -298,83 +298,37 @@ impl Studio {
                                     .items_center()
                                     .gap_2()
                                     .child(
-                                        div()
-                                            .id("empty-take-screenshot")
-                                            .px_4()
-                                            .h(px(36.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .rounded_lg()
-                                            .bg(blue())
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xffffff))
-                                            .cursor_pointer()
-                                            .hover(|style| {
-                                                style.bg(hsla(211.0 / 360.0, 0.88, 0.45, 1.0))
-                                            })
-                                            .child(
-                                                svg()
-                                                    .path("icons/capture.svg")
-                                                    .size(px(16.0))
-                                                    .text_color(rgb(0xffffff)),
-                                            )
-                                            .child("Take screenshot")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.begin_screen_capture(cx)
-                                            })),
+                                        crate::controls::button(
+                                            "empty-take-screenshot",
+                                            "Take screenshot",
+                                            crate::controls::ButtonKind::Primary,
+                                            crate::controls::ButtonSize::Md,
+                                        )
+                                        .icon("icons/capture.svg")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.begin_screen_capture(cx)
+                                        })),
                                     )
                                     .child(
-                                        div()
-                                            .id("empty-record-video")
-                                            .px_4()
-                                            .h(px(36.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .rounded_lg()
-                                            .border_1()
-                                            .border_color(line())
-                                            .bg(rgb(0xffffff))
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xf0f1f3)))
-                                            .child(
-                                                svg()
-                                                    .path("icons/record.svg")
-                                                    .size(px(16.0))
-                                                    .text_color(rgb(0xd92d3a)),
-                                            )
-                                            .child("Record video")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.start_recording(cx)
-                                            })),
+                                        crate::controls::button(
+                                            "empty-record-video",
+                                            "Record video",
+                                            crate::controls::ButtonKind::Secondary,
+                                            crate::controls::ButtonSize::Md,
+                                        )
+                                        .icon("icons/record.svg")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.start_recording(cx)
+                                        })),
                                     )
                                     .child(
-                                        div()
-                                            .id("empty-open-recording")
-                                            .px_4()
-                                            .h(px(36.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .rounded_lg()
-                                            .border_1()
-                                            .border_color(line())
-                                            .bg(rgb(0xffffff))
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xf0f1f3)))
-                                            .child(
-                                                svg()
-                                                    .path("icons/play.svg")
-                                                    .size(px(16.0))
-                                                    .text_color(ink()),
-                                            )
-                                            .child("Open recording")
+                                        crate::controls::button(
+                                            "empty-open-recording",
+                                            "Open recording",
+                                            crate::controls::ButtonKind::Secondary,
+                                            crate::controls::ButtonSize::Md,
+                                        )
+                                        .icon("icons/play.svg")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.open_video_project_dialog(cx)
                                             })),
@@ -755,7 +709,7 @@ impl Studio {
                                     cx.notify();
                                     return;
                                 }
-                                this.focus_drag = None;
+                                if this.end_focus_drag() { cx.notify(); }
                                 this.end_media_drag();
                                 let flat = if composited_active {
                                     this.flat_pointer_position(
@@ -825,6 +779,7 @@ impl Studio {
         self.promote_paused_video_frame(cx);
         self.refresh_timeline_thumbnails(cx);
         self.ensure_camera_frame(cx);
+        self.fit_timeline_to_window(window.viewport_size());
         let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
         let video_canvas = if self.crop_active {
             self.video_crop_canvas(canvas_width, canvas_height, cx)
@@ -832,16 +787,16 @@ impl Studio {
             self.scene_canvas(canvas_width, canvas_height, cx)
         };
         let top_bar = self.top_bar(cx);
-        let canvas_area = self.canvas_area(video_canvas, cx);
+        let canvas_area = self.canvas_area(video_canvas);
         let timeline = if self.crop_active { div().into_any_element() } else { self.timeline_bar(cx) };
-        let sidebar = (self.inspector_visible && !self.crop_active).then(|| self.sidebar(cx));
+        let sidebar = (self.inspector_visible && !self.crop_active).then(|| self.sidebar(window.viewport_size().width, cx));
         let speed_dialog = self.video_speed_dialog(cx);
 
         let editor = div()
             .size_full()
             .min_w(px(crate::shell_ui::EDITOR_MIN_WIDTH))
             .min_h(px(crate::shell_ui::EDITOR_MIN_HEIGHT))
-            .bg(rgb(0xf3f3f4))
+            .bg(crate::canvas_well())
             .text_color(ink())
             .font_family("Inter")
             .flex()
@@ -853,6 +808,10 @@ impl Studio {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.native_text_focused(window, cx) { return; }
+                if crate::controls::tab_navigation(event, window) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.capture_access_prompt.is_some() {
                     cx.stop_propagation();
                     return;
@@ -902,6 +861,7 @@ impl Studio {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if this.end_focus_drag() { cx.notify(); }
                     if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     if this.finish_camera_region_drag(cx) { return; }
                     if this.end_motion_transform_drag() {
@@ -919,7 +879,7 @@ impl Studio {
                     if this.finish_audio_drag(event.position.x, cx)
                         || this.finish_video_move_drag(event.position.x, cx)
                     {
-                        this.slider_drag = None;
+                        this.end_slider_drag();
                         return;
                     }
                     if this.video_zoom_drag.is_some() {
@@ -930,8 +890,7 @@ impl Studio {
                         this.finish_timeline_scrub(cx);
                     }
                     if this
-                        .slider_drag
-                        .take()
+                        .end_slider_drag()
                         .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER)
                     {
                         this.persist_video_zoom_cues(cx);
@@ -941,6 +900,7 @@ impl Studio {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if this.end_focus_drag() { cx.notify(); }
                     if this.finish_timeline_pointer(event.position.x, cx) { cx.notify(); return; }
                     if this.finish_camera_region_drag(cx) { return; }
                     this.end_camera_drag();
@@ -957,8 +917,7 @@ impl Studio {
                     }
                     this.end_motion_transform_drag();
                     if this
-                        .slider_drag
-                        .take()
+                        .end_slider_drag()
                         .is_some_and(|drag| drag.slider_id == MOTION_ZOOM_SLIDER)
                     {
                         this.persist_video_zoom_cues(cx);

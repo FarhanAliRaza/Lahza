@@ -7,7 +7,7 @@ use crate::recording::{
     scene::Rect,
     studio_overlays::{InputOverlayStyle, OverlayPlacement, OverlayShape, StudioOverlays, SubtitleStyle},
 };
-use crate::{muted, Studio};
+use crate::Studio;
 use gpui::{
     div, point, prelude::*, px, quad, size, AnyElement, App, Bounds, Context, Hsla, PathBuilder,
     Pixels, Point, Rgba, TextRun, Window,
@@ -78,58 +78,38 @@ impl Studio {
         cx: &mut Context<Self>,
         set: fn(&mut Studio, OverlayPlacement),
     ) -> AnyElement {
-        let index = |row: &[OverlayPlacement; 3]| {
-            row.iter().position(|item| *item == selected).unwrap_or(usize::MAX)
+        const PLACEMENTS: [OverlayPlacement; 6] = [
+            OverlayPlacement::TopLeft,
+            OverlayPlacement::TopCenter,
+            OverlayPlacement::TopRight,
+            OverlayPlacement::BottomLeft,
+            OverlayPlacement::BottomCenter,
+            OverlayPlacement::BottomRight,
+        ];
+        let control_id = match id {
+            "keystroke" => "keystroke-position",
+            _ => "speed-position",
         };
-        let (top_id, bottom_id) = match id {
-            "keystroke" => ("keystroke-top", "keystroke-bottom"),
-            _ => ("speed-top", "speed-bottom"),
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_xs().text_color(muted()).child("Top"))
-            .child(self.segmented(
-                top_id,
-                &["Left", "Center", "Right"],
-                index(&OverlayPlacement::TOP),
-                move |this, index| set(this, OverlayPlacement::TOP[index]),
+        crate::controls::field(
+            "Position",
+            self.position_grid(
+                control_id,
+                &["Top left", "Top center", "Top right", "Bottom left", "Bottom center", "Bottom right"],
+                3,
+                PLACEMENTS.iter().position(|item| *item == selected).unwrap_or(usize::MAX),
+                move |this, index| set(this, PLACEMENTS[index]),
                 cx,
-            ))
-            .child(div().text_xs().text_color(muted()).child("Bottom"))
-            .child(self.segmented(
-                bottom_id,
-                &["Left", "Center", "Right"],
-                index(&OverlayPlacement::BOTTOM),
-                move |this, index| set(this, OverlayPlacement::BOTTOM[index]),
-                cx,
-            ))
-            .into_any_element()
+            ),
+        )
+        .into_any_element()
     }
 
     /// Record → Keystrokes: typed-key captions from the recording's input log.
     pub(crate) fn keystroke_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let style = self.input_overlays;
-        let captured = !self.video_keystrokes.is_empty();
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(self.scene_toggle_row("keystrokes-enabled", "Show keystrokes", style.keystrokes, cx, |this| {
-                this.input_overlays.keystrokes = !this.input_overlays.keystrokes
-            }))
-            .when(!captured, |this| {
-                this.child(div().text_xs().text_color(muted()).child(
-                    "No keystrokes were captured for this recording. Enable the Lahza GNOME Shell extension before recording to capture typed keys.",
-                ))
-            })
-            .when(style.keystrokes, |this| {
-                this.child(self.placement_rows("keystroke", style.keystroke_placement, cx, |this, placement| {
-                    this.input_overlays.keystroke_placement = placement
-                }))
-            })
-            .into_any_element()
+        self.placement_rows("keystroke", style.keystroke_placement, cx, |this, placement| {
+            this.input_overlays.keystroke_placement = placement
+        })
     }
 
     /// Record → Speed badge: a "2× ›››" pill while sped-up clips play.
@@ -139,11 +119,8 @@ impl Studio {
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.scene_toggle_row("speed-badge-enabled", "Show speed badge", style.speed_badge, cx, |this| {
-                this.input_overlays.speed_badge = !this.input_overlays.speed_badge
-            }))
             .when(!self.has_speed_changes(), |this| {
-                this.child(div().text_xs().text_color(muted()).child(
+                this.child(crate::controls::hint(
                     "Shows while a clip plays faster than 1×. Set a clip's speed from the timeline.",
                 ))
             })

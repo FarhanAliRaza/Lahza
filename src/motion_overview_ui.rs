@@ -1,7 +1,7 @@
 //! Zoom creation and overview, shared with the selected-region inspector.
 use crate::recording::viewport::{AutoZoomStyle, ZoomPresentation};
 use crate::scene_ui::SceneSlider;
-use crate::{blue, ink, muted, Studio};
+use crate::{TextRoles, accent, accent_tint, control_bg, control_hover, ink, line, muted, surface, Studio};
 use gpui::{div, prelude::*, px, rgb, svg, AnyElement, Context, FontWeight};
 
 /// Small original illustrations explain whether the whole frame or a local
@@ -116,8 +116,8 @@ impl Studio {
                         .p(px(5.0))
                         .rounded_lg()
                         .border_2()
-                        .border_color(if active { blue() } else { rgb(0xe0e4eb).into() })
-                        .bg(if active { rgb(0xf0f6ff) } else { rgb(0xffffff) })
+                        .border_color(if active { accent() } else { line() })
+                        .bg(if active { accent_tint() } else { surface() })
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -131,12 +131,12 @@ impl Studio {
                                 .justify_center()
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(if active { blue() } else { ink() })
+                                .text_color(ink())
                                 .child(title),
                         )
                         .when(!busy, |this| {
                             this.cursor_pointer()
-                                .hover(|style| style.border_color(rgb(0x6c9ddd)))
+                                .hover(|style| style.border_color(muted()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if selected.is_some() {
                                         this.edit_selected_region(|cue| {
@@ -193,33 +193,30 @@ impl Studio {
         });
         div().flex().flex_col().gap_3()
             .child(div().flex().items_center().justify_between()
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Add zoom"))
-                .child(div().text_xs().text_color(muted()).child(format!("At {:.1}s", self.timeline_display_time()))))
+                .child(div().section_title().child("Add zoom"))
+                .child(div().hint().child(format!("At {}", crate::units::fmt_seconds(self.timeline_display_time())))))
             .child(self.motion_style_choices(None, cx))
-            .child(div().text_xs().text_color(muted()).child("Enlarge the frame, or magnify one area."))
-            .when(regions.is_empty(), |this| this.child(div().py_3().text_xs().text_color(muted())
-                .child("Add a zoom at the playhead. Drag its edges on the timeline to set its duration.")))
             .when(!regions.is_empty(), |this| this
                 .child(div().flex().items_center().justify_between()
-                    .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child("Your zooms"))
-                    .child(div().text_xs().text_color(muted()).child(regions.len().to_string())))
-                .child(div().id("motion-region-list").flex().flex_col().gap_1().max_h(px(200.0)).overflow_y_scroll()
+                    .child(div().field_label().child("Zooms"))
+                    .child(div().hint().child(regions.len().to_string())))
+                .child(div().flex().flex_col().gap_1()
                     .children(regions.into_iter().map(|(index, cue, range)| {
                     let title = if cue.transform.is_some() && !cue.has_camera_motion() { "Transform" }
                         else if cue.presentation == ZoomPresentation::GlassLoupe { "Glass loupe" } else { "Classic zoom" };
-                    let detail = range.map(|(start, end, _)| format!("{:.1}× · {start:.1}s – {end:.1}s", cue.zoom))
-                        .unwrap_or_else(|| format!("{:.1}× · Outside current edit", cue.zoom));
+                    let detail = range.map(|(start, end, _)| format!("{} · {}", crate::units::fmt_zoom(cue.zoom), crate::units::fmt_seconds_range(start, end)))
+                        .unwrap_or_else(|| format!("{} · Outside current edit", crate::units::fmt_zoom(cue.zoom)));
                     let cue_id = cue.id;
-                    div().id(("motion-region-select", index)).flex_none().px_3().py_2().rounded_md().bg(rgb(0xf5f6f8))
+                    div().id(("motion-region-select", index)).flex_none().px_3().py_2().rounded_md().bg(control_bg())
                         .flex().items_center().justify_between().gap_2()
                         .opacity(if cue.is_enabled { 1.0 } else { 0.6 })
                         .child(div().flex().flex_col().gap_1().min_w_0()
-                            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(title))
-                            .child(div().text_xs().text_color(muted()).child(detail)))
+                            .child(div().row_label().child(title))
+                            .child(div().hint().child(detail)))
                         .child(div().flex().items_center().gap_1().flex_none()
-                            .when(!cue.is_enabled, |this| this.child(div().text_xs().text_color(muted()).child("Off")))
+                            .when(!cue.is_enabled, |this| this.child(div().hint().child("Off")))
                             .child(svg().path("icons/chevron-right.svg").size(px(14.0)).text_color(muted())))
-                        .when(!busy, |this| this.cursor_pointer().hover(|style| style.bg(rgb(0xeaf1fc)))
+                        .when(!busy, |this| this.cursor_pointer().hover(|style| style.bg(control_hover()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_motion_region(cue_id);
                                 if let Some((_, _, midpoint)) = range { this.seek_video(midpoint, cx); }
@@ -227,22 +224,21 @@ impl Studio {
                             })))
                 }))))
             .child(self.section_header("project-animation", "Animation", None, cx))
-            .when(self.section_open("project-animation"), |this| this.child(self.project_animation_controls(cx)))
+            .when(self.section_open("project-animation"), |this| this
+                .child(self.project_animation_controls(cx))
+                .child(self.scene_slider_row(SceneSlider::DefaultZoom, cx)))
             .when(self.video_project.is_some(), |this| this
                 .child(self.section_header("motion-automatic", "Automatic zoom", None, cx))
                 .when(self.section_open("motion-automatic"), |this| this
-                    .child(div().flex().flex_wrap().gap_2()
-                        .child(self.small_button("motion-regenerate", "Compact clicks", !busy && has_clicks, cx,
+                    .child(div().flex().items_center().gap_2()
+                        .child(div().flex_1().row_label().child("Zoom on clicks"))
+                        .child(self.small_button("motion-regenerate", "Tight", !busy && has_clicks, cx,
                             |this, cx| this.regenerate_motion_from_clicks(AutoZoomStyle::Compact, cx)))
-                        .child(self.small_button("motion-regenerate-cinematic", "Cinematic clicks", !busy && has_clicks, cx,
+                        .child(self.small_button("motion-regenerate-cinematic", "Relaxed", !busy && has_clicks, cx,
                             |this, cx| this.regenerate_motion_from_clicks(AutoZoomStyle::Cinematic, cx))))
-                    .child(div().text_xs().text_color(muted()).child(if has_clicks {
-                        "Build zooms from recorded clicks. Replaces existing regions; Undo restores them."
+                    .child(div().hint().child(if has_clicks {
+                        "Builds zooms from recorded clicks and replaces the current ones. Undo restores them."
                     } else { "This recording has no captured clicks. Add a zoom above to choose its focus manually." }))))
-            .child(self.section_header("motion-defaults", "New zoom defaults", None, cx))
-            .when(self.section_open("motion-defaults"), |this| this
-                .child(self.scene_slider_row(SceneSlider::DefaultZoom, cx))
-                .child(div().text_xs().text_color(muted()).child("Starting magnification for new zooms.")))
             .into_any_element()
     }
 }

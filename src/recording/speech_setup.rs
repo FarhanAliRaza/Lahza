@@ -81,11 +81,11 @@ fn check_inner(progress: &JobProgress) -> Result<String, VideoError> {
         return Err(VideoError::Cancelled);
     }
     let executable = transcription::whisper_executable()
-        .ok_or_else(|| invalid("Set up voice recognition to install Whisper."))?;
+        .ok_or_else(|| invalid("Set up the speech model to install Whisper."))?;
     let model = SpeechModel::Base;
     if !model.is_installed() {
         return Err(invalid(
-            "Set up voice recognition to download the speech model.",
+            "Download the speech model to transcribe.",
         ));
     }
     progress.set(0.0);

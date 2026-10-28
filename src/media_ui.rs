@@ -268,7 +268,7 @@ impl Studio {
                         let id = clip.id;
                         timeline.segments.push(clip);
                         if let Err(error) = session.write_edit_field("mediaSource", &file) {
-                            this.toast = Some(format!("Could not save import: {error}").into());
+                            this.toast = Some(crate::Notification::error(format!("Could not save import: {error}")));
                         } else {
                             this.video_media_bank=bank;
                             this.video_source_duration = end;
@@ -327,7 +327,7 @@ impl Studio {
                         this.autosave_scene_style();
                     }
                     Err(error) => {
-                        this.toast = Some(format!("Could not import media: {error}").into())
+                        this.toast = Some(crate::Notification::error(format!("Could not import media: {error}")))
                     }
                 }
                 cx.notify();
@@ -340,10 +340,40 @@ impl Studio {
         self.pause_video_playback();
         if let Some(session) = &self.video_project {
             if let Err(error) = session.write_edit_field("audioClips", &self.video_audio_clips) {
-                self.toast = Some(format!("Could not save audio: {error}").into());
+                self.toast = Some(crate::Notification::error(format!("Could not save audio: {error}")));
             }
         }
         cx.notify();
+    }
+
+    pub(crate) fn delete_audio_clip(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        if self.video_edit_busy || !self.video_audio_clips.iter().any(|clip| clip.id == id) {
+            return;
+        }
+        self.video_undo_stack
+            .push(VideoEditSnapshot::Audio(self.video_audio_clips.clone()));
+        self.video_redo_stack.clear();
+        self.video_audio_clips.retain(|clip| clip.id != id);
+        self.save_audio_clips(cx);
+    }
+
+    /// Places a copy right after the original on its own layer.
+    pub(crate) fn duplicate_audio_clip(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        if self.video_edit_busy {
+            return;
+        }
+        let Some(index) = self.video_audio_clips.iter().position(|clip| clip.id == id) else {
+            return;
+        };
+        let mut copy = self.video_audio_clips[index].clone();
+        copy.id = uuid::Uuid::new_v4();
+        copy.start = (copy.start + copy.duration)
+            .min((self.video_timeline_duration() - copy.duration).max(0.0));
+        self.video_undo_stack
+            .push(VideoEditSnapshot::Audio(self.video_audio_clips.clone()));
+        self.video_redo_stack.clear();
+        self.video_audio_clips.insert(index + 1, copy);
+        self.save_audio_clips(cx);
     }
 
     fn edit_audio(
@@ -367,8 +397,8 @@ impl Studio {
 
     pub(crate) fn imported_audio_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_2()
-            .child(self.small_button("add-background-audio", "Add music / sound effect", !self.video_edit_busy, cx, |this, cx| this.import_timeline_media(ImportKind::Audio, cx)))
-            .child(div().text_xs().text_color(crate::muted()).child("Audio starts at the playhead and mixes with the recording. Drag a layer on the Music / SFX lane to move it, or drag its edges to trim."));
+            .child(self.small_button("add-background-audio", "Add music / sound effect", !self.video_edit_busy, cx, |this, cx| this.import_timeline_media(ImportKind::Audio, cx)));
+        let busy = self.video_edit_busy;
         for clip in &self.video_audio_clips {
             let id = clip.id;
             let name = clip.name.clone();
@@ -376,15 +406,13 @@ impl Studio {
                           label: &str,
                           action: fn(&mut Self, uuid::Uuid, &mut Context<Self>),
                           cx: &mut Context<Self>| {
-                div()
-                    .id(gpui::SharedString::from(format!("audio-{id}-{suffix}")))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(gpui::rgb(0xf1f1f2))
-                    .text_xs()
-                    .cursor_pointer()
-                    .child(label.to_string())
+                crate::controls::button(
+                    gpui::SharedString::from(format!("audio-{id}-{suffix}")),
+                    label.to_string(),
+                    crate::controls::ButtonKind::Secondary,
+                    crate::controls::ButtonSize::Sm,
+                )
+                    .disabled(busy)
                     .on_click(cx.listener(move |this, _, _, cx| action(this, id, cx)))
             };
             list = list.child(
@@ -398,11 +426,10 @@ impl Studio {
                     .rounded_md()
                     .child(div().text_xs().child(name))
                     .child(div().text_xs().text_color(crate::muted()).child(format!(
-                        "{:.1}s – {:.1}s · {}% · trim {:.1}s",
-                        clip.start,
-                        clip.start + clip.duration,
-                        (clip.volume * 100.0).round(),
-                        clip.source_start
+                        "{} · {} · trim {}",
+                        crate::units::fmt_seconds_range(clip.start, clip.start + clip.duration),
+                        crate::units::percent(clip.volume as f64),
+                        crate::units::fmt_seconds(clip.source_start)
                     )))
                     .child(
                         div()
@@ -479,11 +506,7 @@ impl Studio {
                             ))
                             .child(button(
                                 "fade",
-                                if clip.fade_in > 0.0 {
-                                    "Fades: on"
-                                } else {
-                                    "Fades: off"
-                                },
+                                "Fade in/out",
                                 |this, id, cx| {
                                     this.edit_audio(
                                         id,
@@ -500,21 +523,11 @@ impl Studio {
                                     )
                                 },
                                 cx,
-                            ))
+                            ).selected(clip.fade_in > 0.0))
                             .child(button(
                                 "delete",
-                                "Remove",
-                                |this, id, cx| {
-                                    if this.video_edit_busy {
-                                        return;
-                                    }
-                                    this.video_undo_stack.push(VideoEditSnapshot::Audio(
-                                        this.video_audio_clips.clone(),
-                                    ));
-                                    this.video_redo_stack.clear();
-                                    this.video_audio_clips.retain(|clip| clip.id != id);
-                                    this.save_audio_clips(cx);
-                                },
+                                "Delete",
+                                |this, id, cx| this.delete_audio_clip(id, cx),
                                 cx,
                             )),
                     ),
@@ -585,6 +598,7 @@ impl Studio {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Audio".into())
                     .into();
+                this.watch_export_progress(progress.clone(), |_| {}, cx);
                 cx.notify();
                 Some(progress)
             }) else {
@@ -595,21 +609,6 @@ impl Studio {
             let task = cx
                 .background_executor()
                 .spawn(async move { export_audio(request, &job).map_err(|error| error.to_string()) });
-            let ticker = progress.clone();
-            let weak_ticker = weak.clone();
-            cx.spawn(async move |cx| loop {
-                gpui::Timer::after(std::time::Duration::from_millis(120)).await;
-                let active = weak_ticker
-                    .update(cx, |this, cx| {
-                        cx.notify();
-                        this.export_progress.as_ref().is_some_and(|active| std::sync::Arc::ptr_eq(active, &ticker))
-                    })
-                    .unwrap_or(false);
-                if !active {
-                    break;
-                }
-            })
-            .detach();
             let result = task.await;
             let _ = weak.update(cx, |this, cx| {
                 this.export_progress = None;
@@ -619,7 +618,7 @@ impl Studio {
                         destination,
                     ),
                     Err(error) if error == "export cancelled" => "Export cancelled".into(),
-                    Err(error) => format!("Export failed: {error}").into(),
+                    Err(error) => crate::notifications::failure("Export failed", &error, destination.parent()),
                 });
                 cx.notify();
             });
@@ -641,51 +640,40 @@ impl Studio {
             .flex_none()
             .h(px(self.video_audio_clips.len() as f32 * ROW))
             .overflow_hidden();
+        let mut handles = Vec::new();
         for (index, clip) in self.video_audio_clips.iter().enumerate() {
             let id = clip.id;
             let left = (clip.start / seconds_per_pixel - scroll) as f32;
             let width = ((clip.duration / seconds_per_pixel) as f32).max(3.0);
-            let handle = |kind: AudioDragKind, cx: &mut Context<Self>| {
-                div()
-                    .id((if kind == AudioDragKind::Leading { "audio-trim-leading" } else { "audio-trim-trailing" }, id.as_u128() as u64))
-                    .absolute()
-                    .top_0()
-                    .h_full()
-                    .w(px((width * 0.25).min(8.0)))
-                    .when(kind == AudioDragKind::Leading, |this| this.left_0())
-                    .when(kind == AudioDragKind::Trailing, |this| this.right_0())
-                    .bg(gpui::rgba(0x1f6f5f80))
-                    .cursor(CursorStyle::ResizeLeftRight)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.focus_handle.focus(window);
-                            this.begin_audio_drag(id, kind, event.position.x);
-                            cx.notify();
-                        }),
-                    )
-            };
+            let top = index as f32 * ROW;
             lane = lane.child(
                 div()
                     .id(("audio-layer", id.as_u128() as u64))
                     .absolute()
-                    .top(px(index as f32 * ROW))
+                    .top(px(top))
                     .left(px(left))
                     .w(px(width))
                     .h(px(ROW - 2.0))
-                    .rounded_sm()
-                    .bg(gpui::rgb(0xccebe5))
+                    .rounded_md()
+                    .border_2()
+                    .border_color(gpui::transparent_black())
+                    .hover(|s| s.border_color(crate::ink().opacity(0.4)))
+                    .bg(crate::theme::lane_audio())
+                    .text_color(gpui::white())
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .flex()
+                    .items_center()
                     .when(dragging == Some(id), |this| this.opacity(0.6))
                     .cursor(if dragging == Some(id) { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .px_2()
-                            .text_xs()
-                            .whitespace_nowrap()
-                            .child(format!("{} · {}%", clip.name, (clip.volume * 100.0).round())),
-                    )
+                    .when(width >= crate::timeline_ui::REGION_LABEL_MIN_WIDTH, |this| {
+                        this.child(crate::timeline_ui::region_label(format!(
+                            "{} · {}",
+                            clip.name,
+                            crate::units::percent(clip.volume)
+                        )))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -695,10 +683,44 @@ impl Studio {
                             cx.notify();
                         }),
                     )
-                    .child(handle(AudioDragKind::Leading, cx))
-                    .child(handle(AudioDragKind::Trailing, cx)),
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_timeline_context(
+                                crate::timeline_ui::TimelineContextTarget::Audio(id),
+                                event.position,
+                                cx,
+                            );
+                        }),
+                    ),
             );
+            for (leading, kind) in [(true, AudioDragKind::Leading), (false, AudioDragKind::Trailing)] {
+                handles.push(
+                    crate::timeline_ui::trim_handle(
+                        (if leading { "audio-trim-leading" } else { "audio-trim-trailing" }, id.as_u128() as u64),
+                        -(scroll as f32),
+                        if leading { left } else { left + width },
+                        leading,
+                        width,
+                        top,
+                        ROW - 2.0,
+                        false,
+                        false,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.focus_handle.focus(window);
+                            this.begin_audio_drag(id, kind, event.position.x);
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
         }
+        lane = lane.children(handles);
         lane.into_any_element()
     }
 }

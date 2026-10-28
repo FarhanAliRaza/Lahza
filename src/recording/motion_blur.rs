@@ -11,6 +11,7 @@ use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
+    Interactive,
     Playing,
     High,
 }
@@ -242,6 +243,13 @@ pub fn plan(
     camera_aspect: f64,
     quality: Quality,
 ) -> MotionPlan {
+    if quality == Quality::Interactive {
+        return MotionPlan {
+            samples: vec![sample(style, viewport, pointer, clips, time, canvas, camera_aspect)],
+            motion_pixels: 0.0,
+            trail_pixels: 0.0,
+        };
+    }
     let fps = if frame_rate.is_finite() {
         frame_rate.clamp(1.0, 240.0)
     } else {
@@ -292,6 +300,7 @@ pub fn plan(
         .fold(0.0_f64, f64::max)
     };
     let (limit, spacing) = match quality {
+        Quality::Interactive => (1, f64::INFINITY),
         Quality::Playing => (6, 16.0),
         Quality::High => (16, 4.0),
     };

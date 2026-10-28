@@ -46,14 +46,20 @@ fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
-/// Camera frame for `preset` at the current wall-clock loop position.
-fn frame_now(preset: MotionPreset) -> ViewportFrame {
+/// Camera frame for `preset`: the wall-clock loop position while it
+/// animates, otherwise a fixed frame partway in so the still card still
+/// shows what the preset does.
+fn frame_now(preset: MotionPreset, animate: bool) -> ViewportFrame {
     let index = MotionPreset::ALL
         .iter()
         .position(|candidate| *candidate == preset)
         .unwrap_or(0);
-    let elapsed = epoch().elapsed().as_secs_f64();
-    let time = (elapsed % (PREVIEW_DURATION + PREVIEW_HOLD)).min(PREVIEW_DURATION);
+    let time = if animate {
+        let elapsed = epoch().elapsed().as_secs_f64();
+        (elapsed % (PREVIEW_DURATION + PREVIEW_HOLD)).min(PREVIEW_DURATION)
+    } else {
+        PREVIEW_DURATION * 0.45
+    };
     timelines()[index].frame_at(time)
 }
 
@@ -80,7 +86,11 @@ fn project(u: f64, v: f64, frame: ViewportFrame, bounds: Bounds<Pixels>) -> gpui
 }
 
 fn paint_preview(preset: MotionPreset, bounds: Bounds<Pixels>, window: &mut Window) {
-    let frame = frame_now(preset);
+    // Only the card under the pointer loops: every animation frame repaints
+    // the whole editor. Its card's hover style refreshes the window when the
+    // pointer enters or leaves, which starts and stops the loop.
+    let animate = crate::theme::animations_enabled() && bounds.contains(&window.mouse_position());
+    let frame = frame_now(preset, animate);
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for (x, y, w, h, hue, saturation, lightness) in WINDOW_PARTS {
             let mut builder = PathBuilder::fill();
@@ -102,8 +112,9 @@ fn paint_preview(preset: MotionPreset, bounds: Bounds<Pixels>, window: &mut Wind
             }
         }
     });
-    // Keep looping while the cards are on screen.
-    window.request_animation_frame();
+    if animate {
+        window.request_animation_frame();
+    }
 }
 
 /// The animated preview area of a preset card; size it from the caller.

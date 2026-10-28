@@ -12,9 +12,6 @@ pub(crate) enum Target {
     Time(usize, bool),
     /// A subtitle cue's text, by cue id.
     Cue(uuid::Uuid),
-    CloudUrl,
-    CloudToken,
-    ShareTitle,
     None,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,10 +303,10 @@ impl TextField {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let index = self.index(event.position);
         self.focus.focus(window);
         self.selecting = true;
         self.marked = None;
-        let index = self.index(event.position);
         if event.click_count >= 3 {
             self.buffer.select(0, false);
             self.buffer.select(self.buffer.state.text.len(), true);
@@ -426,8 +423,12 @@ impl TextField {
                     self.parent_focus.focus(window);
                 }
             }
-            "enter" => {
+            // An open IME composition takes the first Enter/Escape, as in
+            // the multiline branches above.
+            "enter" | "escape" if self.marked.is_some() => {
                 self.marked = None;
+            }
+            "enter" => {
                 if self.buffer.multiline {
                     self.emit(EventKind::Commit, cx);
                 }
@@ -567,7 +568,7 @@ impl TextField {
                         point(p.x + x0, p.y),
                         size((x1 - x0).abs().max(px(2.)), px(layout.line_height)),
                     ),
-                    rgba(0x2997ff55),
+                    crate::selection_fill(),
                 ));
                 let _ = line.paint(*p, px(layout.line_height), window, cx);
             }
@@ -587,7 +588,7 @@ impl TextField {
                                 px(1.),
                             ),
                         ),
-                        rgb(0x2997ff),
+                        crate::selection(),
                     ));
                 }
             }
@@ -748,9 +749,13 @@ impl Render for TextField {
             .py_1()
             .border_1()
             .rounded_md()
-            .border_color(rgb(if focused { 0x2997ff } else { 0xd9d9dc }))
-            .bg(white())
-            .text_color(rgb(0x202124))
+            .border_color(crate::line())
+            // 2 px ring; padding gives back the extra pixel so text stays put.
+            .when(focused, |this| {
+                this.border_2().border_color(crate::focus_ring()).px(px(7.)).py(px(3.))
+            })
+            .bg(crate::surface())
+            .text_color(crate::ink())
             .text_size(px(14.))
             .line_height(px(22.))
             .track_focus(&self.focus)
@@ -790,7 +795,7 @@ impl Render for TextField {
                             input.buffer.state.text.replace(['\r', '\n'], " ").into()
                         };
                         let color = if empty {
-                            rgb(0x85858c).into()
+                            crate::muted()
                         } else {
                             style.color
                         };
@@ -845,7 +850,7 @@ impl Render for TextField {
                                             bounds.bottom(),
                                         ),
                                     ),
-                                    rgba(if focused { 0x2997ff55 } else { 0x99999933 }),
+                                    if focused { crate::selection_fill() } else { crate::muted().opacity(0.2) },
                                 ));
                             }
                             let _ = line.paint(origin, px(22.), window, cx);
@@ -861,7 +866,7 @@ impl Render for TextField {
                                             bounds.bottom(),
                                         ),
                                     ),
-                                    rgb(0x2997ff),
+                                    crate::selection(),
                                 ));
                             }
                             if focused && blink && selection.is_empty() {
@@ -873,7 +878,7 @@ impl Render for TextField {
                                         ),
                                         size(px(1.), bounds.size.height - px(4.)),
                                     ),
-                                    rgb(0x202124),
+                                    crate::ink(),
                                 ));
                             }
                         });

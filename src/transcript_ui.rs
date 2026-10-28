@@ -8,14 +8,124 @@ use crate::recording::{
     transcription::{self, JobProgress, SpeechModel},
 };
 use crate::scene_ui::SceneSlider;
-use crate::{blue, ink, line, muted, Studio, VideoEditSnapshot};
+use crate::controls::{button, ButtonKind, ButtonSize};
+use crate::{accent, brand, control_bg, ink, line, muted, Studio, TextRoles, VideoEditSnapshot};
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, Context, FontWeight, SharedString, Timer,
+    div, prelude::*, px, AnyElement, Context, SharedString, Timer,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// What the transcript panel derives from the transcript and the clip
+/// timeline, rebuilt only when either changes so playback frames only
+/// look up the speaking word.
+pub(crate) struct TranscriptLayout {
+    revision: u64,
+    clips: RecordingClipTimeline,
+    fillers: usize,
+    pauses: usize,
+    /// Per word: still in the edit, and its editor start time.
+    words: Vec<(bool, Option<f64>)>,
+    /// (editor start, editor end, word index) of present words, by start.
+    spoken: Vec<(f64, f64, usize)>,
+    cues: Vec<CueLayout>,
+}
+
+struct CueLayout {
+    /// Index into `Transcript::cues`.
+    cue: usize,
+    words: std::ops::Range<usize>,
+    stamp: SharedString,
+    /// The caption text was edited away from its words.
+    edited: bool,
+}
+
+impl TranscriptLayout {
+    fn build(
+        transcript: &crate::recording::transcript::Transcript,
+        clips: &RecordingClipTimeline,
+        source_duration: f64,
+        revision: u64,
+    ) -> Self {
+        let still_present = |(start, end): &(f64, f64)| !clips.slices_overlapping(*start, *end).is_empty();
+        let fillers = planner::filler_cut_ranges(&transcript.words, source_duration)
+            .iter()
+            .filter(|range| still_present(range))
+            .count();
+        let pauses = planner::silence_cut_ranges(&transcript.words, source_duration)
+            .iter()
+            .filter(|range| still_present(range))
+            .count();
+        let words: Vec<_> = transcript
+            .words
+            .iter()
+            .map(|word| {
+                let present = clips.editor_time_for_event((word.start + word.end) * 0.5).is_some();
+                (present, clips.editor_time_for_event(word.start))
+            })
+            .collect();
+        let mut spoken: Vec<_> = transcript
+            .words
+            .iter()
+            .zip(&words)
+            .enumerate()
+            .filter_map(|(index, (word, (present, start)))| {
+                let start = start.filter(|_| *present)?;
+                Some((start, start + (word.end - word.start).max(0.05), index))
+            })
+            .collect();
+        spoken.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Words grouped under the cue they start in.
+        let mut order: Vec<_> = (0..transcript.cues.len()).collect();
+        order.sort_by(|a, b| transcript.cues[*a].start.total_cmp(&transcript.cues[*b].start));
+        let mut word_index = 0;
+        let mut cues = Vec::with_capacity(order.len());
+        for (position, &cue_index) in order.iter().enumerate() {
+            let cue = &transcript.cues[cue_index];
+            let next_start = order
+                .get(position + 1)
+                .map_or(f64::INFINITY, |next| transcript.cues[*next].start);
+            let start_index = word_index;
+            while word_index < transcript.words.len()
+                && transcript.words[word_index].start < next_start - 0.001
+            {
+                word_index += 1;
+            }
+            let editor_start = clips.editor_time_for_event(cue.start).or_else(|| {
+                clips.slices_overlapping(cue.start, cue.end).first().map(|slice| slice.editor_start)
+            });
+            let stamp = match editor_start {
+                Some(time) => format!("{}:{:02}", (time / 60.0) as u64, (time % 60.0) as u64),
+                None => "cut".into(),
+            };
+            let joined = transcript.words[start_index..word_index]
+                .iter()
+                .map(|word| word.display())
+                .collect::<Vec<_>>()
+                .join(" ");
+            cues.push(CueLayout {
+                cue: cue_index,
+                words: start_index..word_index,
+                stamp: stamp.into(),
+                edited: cue.text.trim() != joined,
+            });
+        }
+        Self { revision, clips: clips.clone(), fillers, pauses, words, spoken, cues }
+    }
+
+    /// The present word under the playhead, by binary search.
+    fn speaking(&self, playhead: f64) -> Option<usize> {
+        let after = self.spoken.partition_point(|(start, _, _)| *start <= playhead);
+        self.spoken[..after]
+            .iter()
+            .rev()
+            .take(2)
+            .find(|(_, end, _)| playhead < *end)
+            .map(|(_, _, index)| *index)
+    }
+}
 
 /// A transcription running in the background.
 pub(crate) struct TranscriptionJob {
@@ -37,11 +147,18 @@ impl Studio {
         let Some(session) = self.video_project.clone() else {
             return;
         };
-        if transcription::whisper_executable().is_none() {
-            self.toast = Some("Set up voice recognition in Processing before transcribing.".into());
+        // Starting a job is rare; check the disk rather than the cache.
+        self.refresh_speech_availability();
+        if !self.speech_availability().whisper {
+            self.toast = Some(crate::notifications::Notification::with_action(
+                "Download the speech model to transcribe",
+                "Download",
+                |this, cx| this.start_speech_setup(true, cx),
+            ));
             cx.notify();
             return;
         }
+        self.transcription_error = None;
         let model = self.speech_model;
         let source = Self::media_source_for(&session);
         let duration = self.video_source_duration;
@@ -82,6 +199,8 @@ impl Studio {
         cx.spawn(async move |weak, cx| {
             let result = task.await;
             let _ = weak.update(cx, |this, cx| {
+                // The job may have downloaded a model.
+                this.refresh_speech_availability();
                 let Some(job) = this.transcription_job.take() else {
                     return;
                 };
@@ -107,7 +226,7 @@ impl Studio {
                         this.toast = Some("Transcription cancelled".into());
                     }
                     Err(error) => {
-                        this.toast = Some(format!("Transcription failed: {error}").into());
+                        this.transcription_error = Some(format!("Transcription failed: {error}"));
                     }
                 }
                 cx.notify();
@@ -128,14 +247,14 @@ impl Studio {
         self.video_transcript_revision += 1;
         if let Some(session) = self.video_project.as_ref() {
             if let Err(error) = session.write_edit_field("transcript", &self.video_transcript) {
-                self.toast = Some(format!("Could not autosave transcript: {error}").into());
+                self.toast = Some(crate::Notification::error(format!("Could not autosave transcript: {error}")));
             }
         }
         cx.notify();
     }
 
     fn remove_transcript(&mut self, cx: &mut Context<Self>) {
-        if self.video_transcript.is_none() {
+        if self.video_edit_busy || self.video_transcript.is_none() {
             return;
         }
         self.video_undo_stack
@@ -246,25 +365,22 @@ impl Studio {
         self.cut_source_ranges(ranges, cx);
     }
 
-    /// Cuts still present in the edit, counted so the buttons can say how
-    /// much they would remove.
-    fn pending_cut_counts(&self) -> (usize, usize) {
-        let Some(transcript) = self.video_transcript.as_ref() else {
-            return (0, 0);
-        };
-        let still_present = |(start, end): &(f64, f64)| {
-            !self.video_clip_timeline.slices_overlapping(*start, *end).is_empty()
-        };
-        (
-            planner::filler_cut_ranges(&transcript.words, self.video_source_duration)
-                .iter()
-                .filter(|range| still_present(range))
-                .count(),
-            planner::silence_cut_ranges(&transcript.words, self.video_source_duration)
-                .iter()
-                .filter(|range| still_present(range))
-                .count(),
-        )
+    /// The panel's derived layout, rebuilt when the transcript or the clip
+    /// timeline changed since the last render.
+    fn transcript_layout(&self) -> Option<std::cell::Ref<'_, TranscriptLayout>> {
+        let transcript = self.video_transcript.as_ref()?;
+        let stale = self.transcript_layout.borrow().as_ref().is_none_or(|layout| {
+            layout.revision != self.video_transcript_revision || layout.clips != self.video_clip_timeline
+        });
+        if stale {
+            *self.transcript_layout.borrow_mut() = Some(TranscriptLayout::build(
+                transcript,
+                &self.video_clip_timeline,
+                self.video_source_duration,
+                self.video_transcript_revision,
+            ));
+        }
+        std::cell::Ref::filter_map(self.transcript_layout.borrow(), Option::as_ref).ok()
     }
 
     fn click_transcript_word(&mut self, index: usize, extend: bool, cx: &mut Context<Self>) {
@@ -337,10 +453,10 @@ impl Studio {
                 this.toast = Some(match selected {
                     Some(path) => match std::fs::write(&path, srt) {
                         Ok(()) => crate::notifications::Notification::exported(
-                            format!("Saved subtitles to {}", path.display()),
+                            format!("Saved captions to {}", path.display()),
                             path,
                         ),
-                        Err(error) => format!("Could not save subtitles: {error}").into(),
+                        Err(error) => crate::Notification::error(format!("Could not save captions: {error}")),
                     },
                     None => "Export cancelled".into(),
                 });
@@ -363,39 +479,28 @@ impl Studio {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Studio, &mut Context<Studio>) + 'static,
     ) -> AnyElement {
-        div()
-            .id(id.into())
-            .px_3()
-            .h(px(30.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .bg(if primary { blue() } else { rgb(0xf0f0f1).into() })
-            .text_color(if primary { rgb(0xffffff).into() } else { ink() })
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .opacity(if enabled { 1.0 } else { 0.4 })
-            .when(enabled, |this| {
-                this.cursor_pointer()
-                    .hover(|style| style.opacity(0.88))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        on_click(this, cx);
-                        cx.notify();
-                    }))
-            })
-            .child(label.into())
-            .into_any_element()
+        button(
+            gpui::ElementId::Name(id.into()),
+            label,
+            if primary { ButtonKind::Primary } else { ButtonKind::Secondary },
+            ButtonSize::Sm,
+        )
+        .disabled(!enabled)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            on_click(this, cx);
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     /// Record → Subtitles.
     pub(crate) fn subtitle_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut section = div().flex().flex_col().gap_2()
+        let mut section = div().flex().flex_col().gap(px(crate::theme::SPACE_3))
             .child(
                 div().id("subtitle-speech-advanced")
                     .flex().items_center().gap_1().py_1()
                     .text_xs().text_color(muted()).cursor_pointer()
-                    .hover(|style| style.text_color(blue()))
+                    .hover(|style| style.text_color(ink()))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.subtitle_speech_advanced_open = !this.subtitle_speech_advanced_open;
                         cx.notify();
@@ -418,21 +523,21 @@ impl Studio {
             let label = if job.downloading.load(Ordering::Relaxed) {
                 format!("Downloading speech model… {percent:.0}%")
             } else {
-                format!("Transcribing narration… {percent:.0}%")
+                format!("Transcribing… {percent:.0}%")
             };
             return section
-                .child(div().text_sm().child(label))
+                .child(div().row_label().child(label))
                 .child(
                     div()
                         .h(px(4.0))
                         .w_full()
                         .rounded_full()
-                        .bg(rgb(0xe4e4e7))
+                        .bg(control_bg())
                         .child(
                             div()
                                 .h_full()
                                 .rounded_full()
-                                .bg(blue())
+                                .bg(accent())
                                 .w(gpui::relative(job.progress.get() as f32)),
                         ),
                 )
@@ -442,21 +547,31 @@ impl Studio {
                 .into_any_element();
         }
         let Some(transcript) = self.video_transcript.as_ref() else {
-            let installed = transcription::whisper_executable().is_some();
+            let available = self.speech_availability();
+            let installed = available.whisper;
             let model = self.speech_model;
-            section = section.child(div().text_xs().text_color(muted()).child(
-                "Turn the narration into subtitles on this computer. Nothing is uploaded.",
-            ));
+            section = section.child(div().hint().child(
+                "Transcribe speech into captions on this computer. Nothing is uploaded.",
+            ))
+            .when_some(self.transcription_error.clone(), |section, error| {
+                section.child(crate::controls::inline_error(error).child(self.small_button(
+                    "transcribe-retry",
+                    "Retry",
+                    !self.video_edit_busy && self.speech_setup_job.is_none(),
+                    cx,
+                    |this, cx| this.start_transcription(cx),
+                )))
+            });
             if !installed {
                 return section
-                    .child(div().text_xs().text_color(muted()).child(
-                        "Set up voice recognition above to transcribe this recording.",
+                    .child(div().hint().child(
+                        "Download the speech model above to transcribe this recording.",
                     ))
                     .into_any_element();
             }
             let selected = SpeechModel::ALL.iter().position(|m| *m == model).unwrap_or(0);
-            let label = if model.is_installed() {
-                "Transcribe narration".to_string()
+            let label = if available.model_installed(model) {
+                "Transcribe".to_string()
             } else {
                 format!("Download model ({} MB) and transcribe", model.megabytes())
             };
@@ -468,7 +583,7 @@ impl Studio {
                     |this, index| this.speech_model = SpeechModel::ALL[index],
                     cx,
                 ))
-                .child(div().text_xs().text_color(muted()).child(match model {
+                .child(div().hint().child(match model {
                     SpeechModel::Base => "Quick and good for clear speech.",
                     SpeechModel::Small => "Slower, better with accents and noise.",
                 }))
@@ -485,7 +600,7 @@ impl Studio {
         let cue_count = transcript.cues.len();
         let style = self.subtitle_style;
         section
-            .child(div().text_xs().text_color(muted()).child(format!(
+            .child(div().hint().child(format!(
                 "{cue_count} caption{}{}",
                 if cue_count == 1 { "" } else { "s" },
                 transcript
@@ -494,7 +609,7 @@ impl Studio {
                     .map(|language| format!(" · {}", language.to_uppercase()))
                     .unwrap_or_default()
             )))
-            .child(self.scene_toggle_row("subtitles-visible", "Show subtitles", style.visible, cx, |this| {
+            .child(self.scene_toggle_row("subtitles-visible", "Show captions", style.visible, cx, |this| {
                 this.subtitle_style.visible = !this.subtitle_style.visible
             }))
             .when(style.visible, |this| {
@@ -527,7 +642,7 @@ impl Studio {
                         cx,
                         |this, cx| this.start_transcription(cx),
                     ))
-                    .child(self.text_button("transcript-remove", "Remove", true, false, cx, |this, cx| {
+                    .child(self.text_button("transcript-remove", "Remove", !self.video_edit_busy, false, cx, |this, cx| {
                         this.remove_transcript(cx)
                     })),
             )
@@ -537,20 +652,19 @@ impl Studio {
     /// The transcript editor, shown in place of the Record tab: caption text
     /// editing and cutting footage by words.
     pub(crate) fn transcript_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(transcript) = self.video_transcript.as_ref() else {
+        let (Some(transcript), Some(layout)) = (self.video_transcript.as_ref(), self.transcript_layout()) else {
             return div().into_any_element();
         };
-        let clips = &self.video_clip_timeline;
-        let (fillers, pauses) = self.pending_cut_counts();
+        let (fillers, pauses) = (layout.fillers, layout.pauses);
         let selection = self
             .transcript_selection
             .map(|(anchor, head)| (anchor.min(head), anchor.max(head)));
-        let playhead = self.video_position;
+        let speaking_word = layout.speaking(self.video_position);
         let header = div()
             .flex()
             .items_center()
             .justify_between()
-            .child(div().text_sm().font_weight(FontWeight::BOLD).child("Transcript"))
+            .child(div().section_title().child("Transcript"))
             .child(self.text_button("transcript-done", "Done", true, false, cx, |this, _| {
                 this.transcript_open = false;
                 this.transcript_selected_cue = None;
@@ -586,40 +700,22 @@ impl Studio {
                 cx,
                 |this, cx| this.trim_pauses(cx),
             ));
-        let hint = div().text_xs().text_color(muted()).child(
+        let hint = div().hint().child(
             "Click a word to jump to it; Shift-click to select a range. Click a time to edit that caption's text.",
         );
-        // Words grouped under the cue they start in.
-        let mut cues = transcript.cues.clone();
-        cues.sort_by(|a, b| a.start.total_cmp(&b.start));
-        let mut word_index = 0;
         let words = &transcript.words;
         let mut list = div().flex().flex_col().gap_2();
-        for (cue_index, cue) in cues.iter().enumerate() {
-            let next_start = cues.get(cue_index + 1).map_or(f64::INFINITY, |next| next.start);
-            let start_index = word_index;
-            while word_index < words.len() && words[word_index].start < next_start - 0.001 {
-                word_index += 1;
-            }
+        for (cue_index, cue_layout) in layout.cues.iter().enumerate() {
+            let cue = &transcript.cues[cue_layout.cue];
             let cue_id = cue.id;
             let editing = self.transcript_selected_cue == Some(cue_id);
-            let editor_start = clips.editor_time_for_event(cue.start).or_else(|| {
-                clips.slices_overlapping(cue.start, cue.end).first().map(|slice| slice.editor_start)
-            });
-            let stamp = match editor_start {
-                Some(time) => format!("{}:{:02}", (time / 60.0) as u64, (time % 60.0) as u64),
-                None => "cut".into(),
-            };
+            let stamp = cue_layout.stamp.clone();
             let mut flow = div().flex().flex_wrap().gap(px(2.0));
-            for index in start_index..word_index {
+            for index in cue_layout.words.clone() {
                 let word = &words[index];
-                let present = clips.editor_time_for_event((word.start + word.end) * 0.5).is_some();
+                let present = layout.words[index].0;
                 let selected = selection.is_some_and(|(first, last)| index >= first && index <= last);
-                let speaking = present
-                    && clips.editor_time_for_event(word.start).is_some_and(|start| {
-                        let end = start + (word.end - word.start).max(0.05);
-                        playhead >= start && playhead < end
-                    });
+                let speaking = speaking_word == Some(index);
                 let filler = planner::is_filler(word);
                 flow = flow.child(
                     div()
@@ -629,10 +725,10 @@ impl Studio {
                         .text_sm()
                         .cursor_pointer()
                         .when(!present, |this| this.line_through().text_color(muted()).opacity(0.6))
-                        .when(present && filler, |this| this.text_color(rgb(0xb45309)))
-                        .when(speaking, |this| this.bg(rgb(0xfff3c4)))
-                        .when(selected, |this| this.bg(rgb(0xcfe0ff)))
-                        .hover(|style| style.bg(rgb(0xececee)))
+                        .when(present && filler, |this| this.text_color(crate::theme::warning()))
+                        .when(speaking, |this| this.bg(brand().opacity(0.16)))
+                        .when(selected, |this| this.bg(crate::selection_fill()))
+                        .hover(|style| style.bg(control_bg()))
                         .child(word.display().to_string())
                         .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                             this.click_transcript_word(index, event.modifiers().shift, cx);
@@ -647,7 +743,7 @@ impl Studio {
                     .p_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(if editing { blue() } else { line() })
+                    .border_color(if editing { accent() } else { line() })
                     .child(
                         div()
                             .id(("transcript-cue", cue_index))
@@ -671,8 +767,7 @@ impl Studio {
                             })),
                     )
                     .when(editing, |this| this.child(self.text_fields.cue.clone()))
-                    .when(!editing && cue.text.trim() != words[start_index..word_index]
-                        .iter().map(|w| w.display()).collect::<Vec<_>>().join(" "), |this| {
+                    .when(!editing && cue_layout.edited, |this| {
                         // The caption was edited; show what the bar displays.
                         this.child(div().text_xs().italic().text_color(muted()).child(format!("Caption: {}", cue.text)))
                     })

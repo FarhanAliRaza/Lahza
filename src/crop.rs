@@ -532,7 +532,7 @@ impl Studio {
         let image = match image::open(&snapshot.path) {
             Ok(image) => image.to_rgba8(),
             Err(error) => {
-                self.toast = Some(format!("Could not restore crop: {error}").into());
+                self.toast = Some(crate::Notification::error(format!("Could not restore crop: {error}")));
                 return false;
             }
         };

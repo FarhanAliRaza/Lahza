@@ -6,11 +6,54 @@ use crate::recording::{
     transcription::{self, JobProgress, SpeechModel},
     video::VideoError,
 };
-use crate::{blue, ink, line, muted, RecordingState, Studio};
-use gpui::{div, prelude::*, px, rgb, AnyElement, Context, FontWeight, Timer};
+use crate::controls::{button, option_button, segmented_track, ButtonKind, ButtonSize};
+use crate::{muted, RecordingState, Studio, TextRoles};
+use gpui::{div, prelude::*, AnyElement, Context, Timer};
 use std::{sync::Arc, time::Duration};
 
+/// Which speech tools are on disk. Finding them walks `$PATH` and stats
+/// model files, so the result is cached on `Studio` and refreshed after
+/// setup or transcription jobs and when the window regains focus.
+#[derive(Clone, Copy)]
+pub(crate) struct SpeechAvailability {
+    pub(crate) whisper: bool,
+    stream: bool,
+    /// Indexed like `SpeechModel::ALL`.
+    models: [bool; SpeechModel::ALL.len()],
+}
+
+impl SpeechAvailability {
+    fn probe() -> Self {
+        Self {
+            whisper: transcription::whisper_executable().is_some(),
+            stream: whisper_stream_executable().is_some(),
+            models: SpeechModel::ALL.map(SpeechModel::is_installed),
+        }
+    }
+
+    pub(crate) fn model_installed(&self, model: SpeechModel) -> bool {
+        SpeechModel::ALL
+            .iter()
+            .position(|candidate| *candidate == model)
+            .is_some_and(|index| self.models[index])
+    }
+}
+
 impl Studio {
+    pub(crate) fn speech_availability(&self) -> SpeechAvailability {
+        if let Some(availability) = self.speech_availability.get() {
+            return availability;
+        }
+        let availability = SpeechAvailability::probe();
+        self.speech_availability.set(Some(availability));
+        availability
+    }
+
+    /// Forget the cached tool check; the next read probes again.
+    pub(crate) fn refresh_speech_availability(&self) {
+        self.speech_availability.set(None);
+    }
+
     pub(crate) fn initialize_speech_processing(&mut self, cx: &mut Context<Self>) {
         if !self.speech_setup_needed() && self.speech_runtime_status == RuntimeStatus::Checking {
             self.start_speech_setup(false, cx);
@@ -33,9 +76,8 @@ impl Studio {
     }
 
     pub(crate) fn speech_setup_needed(&self) -> bool {
-        transcription::whisper_executable().is_none()
-            || whisper_stream_executable().is_none()
-            || !SpeechModel::Base.is_installed()
+        let available = self.speech_availability();
+        !available.whisper || !available.stream || !available.model_installed(SpeechModel::Base)
     }
 
     fn speech_settings_available(&self) -> bool {
@@ -52,7 +94,7 @@ impl Studio {
             return;
         }
         if let Err(error) = speech_runtime::save_processing_mode(mode) {
-            self.toast = Some(format!("Could not save speech processing: {error}").into());
+            self.toast = Some(crate::Notification::error(format!("Could not save speech processing: {error}")));
             cx.notify();
             return;
         }
@@ -104,11 +146,12 @@ impl Studio {
             let result = task.await;
             let _ = weak.update(cx, |this, cx| {
                 this.speech_setup_job = None;
+                this.refresh_speech_availability();
                 this.speech_runtime_status = speech_runtime::current_status();
                 this.speech_processing_status = match result {
-                    Ok(_) => None,
-                    Err(VideoError::Cancelled) => Some("Voice setup cancelled.".into()),
-                    Err(error) => Some(format!("Voice setup failed: {error}")),
+                    // Only failures leave a status; it shows as an inline error.
+                    Ok(_) | Err(VideoError::Cancelled) => None,
+                    Err(error) => Some(format!("Speech model setup failed: {error}")),
                 };
                 cx.notify();
             });
@@ -144,7 +187,8 @@ impl Studio {
                     .child(
                         div()
                             .id("speech-notice-cancel")
-                            .text_color(blue())
+                            .text_color(crate::ink())
+                            .underline()
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(job) = &this.speech_setup_job {
@@ -163,51 +207,26 @@ impl Studio {
         }
         let mut notice = div().id(id).flex().flex_col().gap_2().min_w_0();
         if let Some(status) = &self.speech_processing_status {
-            notice = notice.child(
-                div()
-                    .id("speech-notice-status")
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(muted())
-                    .child(status.clone())
-                    .tooltip(crate::timeline_ui::tooltip(status.clone())),
-            );
+            notice = notice.child(crate::controls::inline_error(status.clone()));
         }
         if install {
             let enabled = self.speech_settings_available();
             notice = notice.child(
-                div()
-                    .id("speech-notice-setup")
-                    .h(px(28.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(line())
-                    .bg(rgb(0xffffff))
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .opacity(if enabled { 1.0 } else { 0.45 })
-                    .when(enabled, |this| {
-                        this.cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.start_speech_setup(true, cx);
-                            }))
-                    })
-                    .child(self.speech_setup_label()),
+                button("speech-notice-setup", self.speech_setup_label(), ButtonKind::Secondary, ButtonSize::Sm)
+                    .disabled(!enabled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_speech_setup(true, cx);
+                    })),
             );
         }
         Some(notice.into_any_element())
     }
 
     fn speech_setup_label(&self) -> String {
-        if !SpeechModel::Base.is_installed() {
-            format!("Set up voice · {} MB", SpeechModel::Base.megabytes())
+        if !self.speech_availability().model_installed(SpeechModel::Base) {
+            format!("Download speech model · {} MB", SpeechModel::Base.megabytes())
         } else {
-            "Set up voice".into()
+            "Set up speech model".into()
         }
     }
 
@@ -217,34 +236,17 @@ impl Studio {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let enabled = self.speech_settings_available();
-        let mut modes = div().flex().gap_1();
+        let mut modes = segmented_track();
         for (index, mode) in ProcessingMode::ALL.into_iter().enumerate() {
             let selected = self.speech_processing == mode;
             modes = modes.child(
-                div()
-                    .id(("speech-processing-mode", index))
+                option_button(("speech-processing-mode", index), selected)
                     .flex_1()
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if selected { blue() } else { line() })
-                    .bg(if selected {
-                        rgb(0xeaf2ff)
-                    } else {
-                        rgb(0xffffff)
-                    })
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if selected { blue() } else { ink() })
-                    .opacity(if enabled { 1.0 } else { 0.45 })
+                    .when(!enabled, |this| this.opacity(0.45).cursor_default())
                     .when(enabled, |this| {
-                        this.cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_speech_processing(mode, cx);
-                            }))
+                        this.on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_speech_processing(mode, cx);
+                        }))
                     })
                     .child(mode.label()),
             );
@@ -255,10 +257,7 @@ impl Studio {
             .flex_col()
             .gap_2()
             .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Processing"),
+                div().field_label().child("Processing"),
             )
             .child(modes);
         if let Some(progress) = self.speech_setup_job.as_ref() {
@@ -268,12 +267,13 @@ impl Studio {
                 "Checking…".into()
             };
             panel = panel
-                .child(div().text_xs().text_color(muted()).child(label))
+                .child(div().hint().child(label))
                 .child(
                     div()
                         .id("speech-setup-cancel")
                         .text_xs()
-                        .text_color(blue())
+                        .text_color(crate::ink())
+                        .underline()
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(job) = &this.speech_setup_job {
@@ -285,10 +285,10 @@ impl Studio {
                 );
         } else {
             if let Some(status) = &self.speech_processing_status {
-                panel = panel.child(div().text_xs().text_color(muted()).child(status.clone()));
+                panel = panel.child(crate::controls::inline_error(status.clone()));
             } else if self.speech_runtime_status != RuntimeStatus::Checking {
                 panel = panel.child(
-                    div().text_xs().text_color(muted()).child(
+                    div().hint().child(
                         self.speech_runtime_status
                             .validate(self.speech_processing)
                             .err()
@@ -303,51 +303,19 @@ impl Studio {
                 "Check".into()
             };
             panel = panel.child(
-                div()
-                    .id("speech-setup")
-                    .h(px(28.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(line())
-                    .bg(rgb(0xffffff))
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .opacity(if enabled { 1.0 } else { 0.45 })
-                    .when(enabled, |this| {
-                        this.cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.start_speech_setup(install, cx);
-                            }))
-                    })
-                    .child(setup_label),
+                button("speech-setup", setup_label, ButtonKind::Secondary, ButtonSize::Sm)
+                    .disabled(!enabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.start_speech_setup(install, cx);
+                    })),
             );
             if !install && speech_setup::can_install_runtime() {
                 panel = panel.child(
-                    div()
-                        .id("speech-install-runtime")
-                        .h(px(28.0))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(line())
-                        .bg(rgb(0xffffff))
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .opacity(if enabled { 1.0 } else { 0.45 })
-                        .when(enabled, |this| {
-                            this.cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.start_speech_setup(true, cx);
-                                }))
-                        })
-                        .child("Install GPU support"),
+                    button("speech-install-runtime", "Install GPU support", ButtonKind::Secondary, ButtonSize::Sm)
+                        .disabled(!enabled)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_speech_setup(true, cx);
+                        })),
                 );
             }
         }

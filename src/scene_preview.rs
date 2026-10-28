@@ -203,7 +203,7 @@ impl PreviewWorker {
             if let Some(plan) = key.motion.as_ref() {
                 use crate::recording::{motion_blur::Accumulator, scene::gpu::RenderQuality};
                 let temporal = plan.samples.len() > 1;
-                if !temporal && key.style.animation.blur_amount() > 0.0 {
+                if !temporal && (job.playing || key.high_quality) && key.style.animation.blur_amount() > 0.0 {
                     if let (Some(video), Some(time)) = (&job.screen_video, plan.samples.first().and_then(|sample| sample.source_time)) {
                         screen_frames.warm(video, time).ok()?;
                     }

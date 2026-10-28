@@ -1,5 +1,6 @@
 //! Protected, recording-scoped controls and a webcam monitor. Moving either
 //! window only moves the monitor; the saved camera composition stays intact.
+use crate::theme::TextRoles;
 use crate::recording::camera_preview::{CameraFrame, CameraFrames};
 use crate::recording::capture_exclusion::CaptureExclusion;
 use crate::recording::native::CaptureSourceGeometry;
@@ -7,7 +8,7 @@ use crate::recording::scene::{CameraOverlay, Rect};
 use crate::recording_overlay_drag::OverlayDrag;
 use crate::{cached_render_image, RecordingAction, RecordingState, Studio};
 use gpui::{
-    div, point, prelude::*, px, rgb, size, AnyElement, Bounds, Context, FontWeight, MouseButton,
+    div, point, prelude::*, px, rgb, size, svg, AnyElement, Bounds, Context, FontWeight, MouseButton,
     Pixels, RenderImage, Timer, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowKind, WindowOptions,
 };
@@ -113,7 +114,7 @@ fn restore_controls(studio: &WeakEntity<Studio>, cx: &mut gpui::AsyncApp) {
     let _ = studio.update(cx, |studio, cx| {
         studio.close_recording_overlays(cx);
         studio.restore_recording_window(cx);
-        studio.toast = Some("Floating controls closed because capture protection was lost".into());
+        studio.toast = Some("Recording controls closed so they would not appear in the video".into());
         cx.notify();
     });
 }
@@ -212,13 +213,13 @@ impl RecordingPill {
             .items_center()
             .justify_center()
             .rounded_full()
-            .bg(if stop { rgb(0xd63245) } else { rgb(0x32343b) })
+            .bg(if stop { crate::brand() } else { rgb(0x32343b).into() })
             .text_color(gpui::white())
             .tooltip(crate::timeline_ui::tooltip(label))
             .when(!enabled, |this| this.opacity(0.4))
             .when(enabled, |this| {
                 this.cursor_pointer()
-                    .hover(move |style| style.bg(if stop { rgb(0xf04458) } else { rgb(0x494c55) }))
+                    .hover(move |style| style.bg(if stop { crate::brand_hover() } else { rgb(0x494c55).into() }))
                     .on_click(cx.listener(move |this, _, _, cx| this.action(action, cx)))
             })
             .child(if stop {
@@ -228,10 +229,10 @@ impl RecordingPill {
                     .bg(gpui::white())
                     .into_any_element()
             } else if self.snapshot.state == RecordingState::Paused {
-                div()
-                    .text_size(px(14.0))
-                    .line_height(px(16.0))
-                    .child("▶")
+                svg()
+                    .path("icons/play.svg")
+                    .size(px(14.0))
+                    .text_color(gpui::white())
                     .into_any_element()
             } else {
                 div()
@@ -311,11 +312,11 @@ impl Render for RecordingPill {
                                     .child("⠿"),
                             )
                             .child(div().size(px(7.0)).rounded_full().bg(if paused {
-                                rgb(0xf0b963)
+                                gpui::Hsla::from(rgb(0xf0b963))
                             } else if self.snapshot.state == RecordingState::Recording {
-                                rgb(0xf04458)
+                                crate::brand()
                             } else {
-                                rgb(0x999eab)
+                                gpui::Hsla::from(rgb(0x999eab))
                             }))
                             .child(
                                 div()
@@ -326,13 +327,13 @@ impl Render for RecordingPill {
                                         div()
                                             .text_size(px(13.0))
                                             .line_height(px(16.0))
-                                            .font_family("monospace")
+                                            .tabular()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(self.snapshot.timecode.clone()),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(10.0))
+                                            .text_size(px(11.0))
                                             .line_height(px(12.0))
                                             .text_color(rgb(0xb5b8c3))
                                             .child(self.snapshot.label().to_owned()),
@@ -1016,6 +1017,7 @@ impl Studio {
                 overlay_options(overlay_bounds(bounds, false), display_id),
                 move |window, cx| {
                     window.set_window_title(exclusion.title());
+                    crate::theme::follow_appearance(window);
                     cx.new(|cx| RecordingPill::new(studio, initial, exclusion, window, cx))
                 },
             )

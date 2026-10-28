@@ -366,6 +366,16 @@ impl CameraOverlay {
         }
     }
 
+    /// The editor no longer offers the "Screen only" layout; a saved one
+    /// becomes a hidden overlay, which renders the same.
+    pub fn without_hidden_layout(mut self) -> Self {
+        if self.layout == CameraLayout::Hidden {
+            self.layout = CameraLayout::Overlay;
+            self.enabled = false;
+        }
+        self
+    }
+
     pub fn opacity(&self) -> f64 {
         self.pose.map_or(if self.enabled && self.layout != CameraLayout::Hidden { 1.0 } else { 0.0 }, |pose| pose.opacity)
     }

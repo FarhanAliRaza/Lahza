@@ -352,6 +352,7 @@ impl Studio {
     }
 
     pub(super) fn start_recording(&mut self, cx: &mut Context<Self>) {
+        self.ensure_global_shortcuts(cx);
         if self.recording_state != RecordingState::Idle || self.recording_busy {
             return;
         }
@@ -365,7 +366,7 @@ impl Studio {
         let prompter_exclusion = match self.open_prompter(cx) {
             Ok(exclusion) => exclusion,
             Err(error) => {
-                self.toast = Some(error.into());
+                self.toast = Some(crate::Notification::error(error));
                 cx.notify();
                 return;
             }
@@ -539,14 +540,14 @@ impl Studio {
                         this.restore_recording_window(cx);
                         this.recording_state = controller.state();
                         this.recording_controller = None;
-                        this.toast = Some(if cancelled { "Recording cancelled".into() } else { format!("Recording could not start: {error}").into() });
+                        this.toast = Some(if cancelled { "Recording cancelled".into() } else { crate::Notification::error(format!("Recording could not start: {error}")) });
                     }
                     Err(error) => {
                         this.close_prompter(cx);
                         this.close_recording_overlays(cx);
                         this.restore_recording_window(cx);
                         this.recording_state = RecordingState::Idle;
-                        this.toast = Some(error.into());
+                        this.toast = Some(crate::Notification::error(error));
                     }
                 }
                 if this.recording_close_requested && this.recording_state == RecordingState::Idle {
@@ -651,19 +652,16 @@ impl Studio {
                     Ok(path) => match action {
                         RecordingAction::Pause => {
                             this.pause_prompter(true, cx);
-                            this.toast = Some("Recording paused".into());
                         }
                         RecordingAction::Resume => {
                             this.pause_prompter(false, cx);
                             this.recording_started_at = Some(Instant::now());
-                            this.toast = Some("Recording resumed".into());
                         }
                         RecordingAction::Restart => {
                             this.position_recording_overlays(controller.source_geometry(), cx);
                             this.recording_elapsed = Duration::ZERO;
                             this.recording_started_at = Some(Instant::now());
                             this.recording_session_path = path;
-                            this.toast = Some("Recording restarted".into());
                             // A new take reads the script from the top.
                             this.reset_prompter(cx);
                         }
@@ -677,7 +675,7 @@ impl Studio {
                                 this.start_loading(crate::loading::LoadRequest::Recording(path.clone()), false, cx);
                                 let mut message = format!("Recording saved to {}", path.display());
                                 if !warnings.is_empty() { message.push_str(&format!(" — {}", warnings.join(" "))); }
-                                this.toast = Some(message.into());
+                                this.toast = Some(crate::Notification::saved(message, path));
                             }
                         }
                         RecordingAction::Discard => {
@@ -691,7 +689,7 @@ impl Studio {
                         if controller.state() == RecordingState::Recording && !controller.has_stopped() {
                             this.recording_started_at = Some(Instant::now());
                         }
-                        this.toast = Some(if controller.state() == RecordingState::Idle {
+                        this.toast = Some(crate::Notification::error(if controller.state() == RecordingState::Idle {
                             let recovery = controller.session().map(|session| {
                                 this.recording_session_path = Some(session.directory.clone());
                                 format!(" Files were preserved at {}.", session.directory.display())
@@ -699,7 +697,7 @@ impl Studio {
                             format!("Recording ended, but could not be saved: {error}.{recovery}")
                         } else {
                             format!("Recording action failed: {error}")
-                        }.into());
+                        }));
                         if matches!(action, RecordingAction::Restart)
                             && matches!(
                                 controller.state(),
@@ -749,7 +747,7 @@ impl Studio {
         }
         let Some(mut controller) = self.recording_controller.take() else {
             self.toast =
-                Some("Could not safely close: the recording controller is unavailable".into());
+                Some(crate::Notification::error("Could not safely close: the recording controller is unavailable"));
             cx.notify();
             return;
         };
@@ -791,17 +789,16 @@ impl Studio {
                                 this.recording_session_path = Some(session.directory.clone());
                                 format!(" Files were preserved at {}.", session.directory.display())
                             }).unwrap_or_default();
-                            this.toast = Some(format!("Recording ended, but could not be saved: {error}.{recovery}").into());
+                            this.toast = Some(crate::Notification::error(format!("Recording ended, but could not be saved: {error}.{recovery}")));
                             this.recording_controller = None;
                             this.sync_camera_preview(cx);
                         } else {
                             if controller.state() == RecordingState::Recording && !controller.has_stopped() {
                                 this.recording_started_at = Some(Instant::now());
                             }
-                            this.toast = Some(
-                                format!("Could not safely close; recording was preserved: {error}")
-                                    .into(),
-                            );
+                            this.toast = Some(crate::Notification::error(format!(
+                                "Could not safely close; recording was preserved: {error}"
+                            )));
                             this.recording_controller = Some(controller);
                         }
                     }
@@ -832,8 +829,11 @@ impl Studio {
         self.sync_camera_preview(cx);
         let frame = self.video_frame.take();
         self.retire_image(frame);
-        self.video_undo_stack.clear();
-        self.video_redo_stack.clear();
+        // Keep the history so switching back to this recording can still undo.
+        let undo = std::mem::take(&mut self.video_undo_stack);
+        let redo = std::mem::take(&mut self.video_redo_stack);
+        self.parked_video_history =
+            self.last_video_project.clone().map(|directory| (directory, undo, redo));
         self.video_selected_clip = None;
         self.video_selected_zoom_cue = None;
         self.video_camera_path = None;
@@ -932,8 +932,17 @@ impl Studio {
         self.video_motion_clip_timeline=media_bank.as_ref().map_or_else(||clip_timeline.clone(),|bank|bank.ranges(&clip_timeline));
         self.video_media_bank=media_bank;
         self.video_clip_timeline = clip_timeline;
-        self.video_undo_stack.clear();
-        self.video_redo_stack.clear();
+        let reopened = self.video_project.as_ref().map(|session| session.directory.clone());
+        match self.parked_video_history.take() {
+            Some((directory, undo, redo)) if Some(&directory) == reopened.as_ref() => {
+                self.video_undo_stack = undo;
+                self.video_redo_stack = redo;
+            }
+            _ => {
+                self.video_undo_stack.clear();
+                self.video_redo_stack.clear();
+            }
+        }
         self.video_seek_drag = None;
         self.video_trim_drag = None;
         self.video_move_drag = None;
@@ -999,7 +1008,7 @@ impl Studio {
                 .map_err(|error| format!("Could not decode screenshot: {error}"))
         }) {
             Ok((path, image)) => self.apply_capture_image(path, image),
-            Err(error) => self.toast = Some(format!("Capture failed or was cancelled: {error}").into()),
+            Err(error) => self.toast = Some(crate::Notification::error(format!("Capture failed or was cancelled: {error}"))),
         }
     }
 
@@ -1041,7 +1050,6 @@ impl Studio {
         self.walkthrough_mode = false;
         self.animation_pointer_capture = PointerCaptureFile::default();
         self.video_pointer_timeline = PointerTimeline::default();
-        self.toast = Some("Screenshot captured — editing controls are active".into());
     }
 
     pub(super) fn begin_screen_capture(&mut self, cx: &mut Context<Self>) {

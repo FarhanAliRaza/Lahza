@@ -1,5 +1,6 @@
 //! Video timeline editing, preview rendering, playback, and clip controls.
 
+use crate::theme::TextRoles;
 use super::{
     muted, PlaybackMailbox, PlaybackUpdates, Studio, VideoEditSnapshot, VideoMoveDrag,
     VideoTrimDrag, VideoZoomDrag, VideoZoomDragKind,
@@ -14,7 +15,7 @@ use crate::recording::{
     viewport::{ViewportTimeline, ZoomCue},
 };
 use gpui::{
-    div, hsla, prelude::*, px, rgb, AnyElement, Context, FontWeight, IntoElement, MouseButton,
+    div, hsla, prelude::*, px, AnyElement, Context, FontWeight, IntoElement, MouseButton,
     Pixels, Timer,
 };
 use std::{
@@ -463,7 +464,7 @@ impl Studio {
             return;
         };
         if let Err(error) = session.write_zoom_cues_draft(&self.video_zoom_cues) {
-            self.toast = Some(format!("Could not autosave motion edit: {error}").into());
+            self.toast = Some(crate::Notification::error(format!("Could not autosave zoom edit: {error}")));
         }
     }
 
@@ -788,6 +789,28 @@ impl Studio {
         });
     }
 
+    /// Zoom edits do not change cursor motion or the clip ranges. Reuse those
+    /// timelines instead of decoding cursor artwork and resampling it again.
+    pub(crate) fn rebuild_video_viewport_timeline(&mut self) {
+        let cues = self.animation_settings.cues(&self.video_zoom_cues);
+        if self.video_project.is_some() {
+            self.video_viewport_timeline = ViewportTimeline::build_for_viewport(
+                &cues, &self.video_pointer_timeline, &self.video_clip_timeline,
+                &self.filtered_pointer_capture(),
+                self.scene_style().focus_bounds(self.video_source_size.0, self.video_source_size.1),
+            );
+        } else if self.animation_active {
+            self.video_viewport_timeline = if self.animation_pointer_capture.presses.is_empty() {
+                ViewportTimeline::build_static(&cues, self.video_duration)
+            } else {
+                ViewportTimeline::build(
+                    &cues, &self.video_pointer_timeline,
+                    &RecordingClipTimeline::full(self.video_duration), &self.animation_pointer_capture,
+                )
+            };
+        }
+    }
+
     pub(super) fn rebuild_video_motion_timelines(&mut self) {
         // Derived render ranges split at physical asset boundaries without
         // replacing authored edit IDs or merging the user's timeline cuts.
@@ -893,7 +916,7 @@ impl Studio {
             return;
         };
         if let Err(error) = session.write_clip_timeline_draft(&timeline) {
-            self.toast = Some(format!("Could not autosave clip edit: {error}").into());
+            self.toast = Some(crate::Notification::error(format!("Could not autosave clip edit: {error}")));
             cx.notify();
             return;
         }
@@ -1202,7 +1225,7 @@ impl Studio {
                     if let Some(result) = terminal {
                         this.video_playing = false;
                         if let Err(error) = result {
-                            this.toast = Some(format!("Playback failed: {error}").into());
+                            this.toast = Some(crate::Notification::error(format!("Playback failed: {error}")));
                         } else {
                             this.video_position = this.video_duration;
                         }
@@ -1280,7 +1303,7 @@ impl Studio {
         let new_timeline = self.video_clip_timeline.replacing(changed.clone());
         let old_end = self.video_clip_timeline.duration();
         let new_end = new_timeline.duration();
-        let seconds = |value: f64| format!("{value:.1}s");
+        let seconds = crate::units::fmt_seconds;
         let row = |label: &'static str, before: String, after: String| {
             div()
                 .flex()
@@ -1304,11 +1327,11 @@ impl Studio {
                 .items_center()
                 .justify_center()
                 .rounded_md()
-                .bg(rgb(0xf3f3f4))
+                .bg(crate::control_bg())
                 .opacity(if enabled { 1.0 } else { 0.35 })
                 .when(enabled, |this| {
                     this.cursor_pointer()
-                        .hover(|style| style.bg(rgb(0xe4e4e7)))
+                        .hover(|style| style.bg(crate::control_hover()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(draft) = this.video_speed_draft {
                                 this.video_speed_draft =
@@ -1320,22 +1343,12 @@ impl Studio {
                 .child(glyph)
         };
         let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .px_4()
-                .h(px(32.0))
-                .flex()
-                .items_center()
-                .rounded_md()
-                .text_sm()
-                .cursor_pointer()
-                .when(primary, |this| {
-                    this.bg(rgb(0x2563eb))
-                        .text_color(rgb(0xffffff))
-                        .hover(|style| style.bg(rgb(0x1d4ed8)))
-                })
-                .when(!primary, |this| this.hover(|style| style.bg(rgb(0xeeeeef))))
-                .child(label)
+            crate::controls::button(
+                id,
+                label,
+                if primary { crate::controls::ButtonKind::Primary } else { crate::controls::ButtonKind::Ghost },
+                crate::controls::ButtonSize::Md,
+            )
         };
         let unchanged = (draft - current_speed).abs() < 0.001;
         Some(
@@ -1363,8 +1376,7 @@ impl Studio {
                         .flex_col()
                         .gap_3()
                         .rounded_lg()
-                        .bg(rgb(0xffffff))
-                        .shadow_lg()
+                        .float()
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(div().font_weight(FontWeight::SEMIBOLD).child("Clip speed"))
                         .child(
@@ -1384,7 +1396,8 @@ impl Studio {
                                         .w(px(64.0))
                                         .text_center()
                                         .text_lg()
-                                        .font_weight(FontWeight::BOLD)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .tabular()
                                         .child(format!("{draft}×")),
                                 )
                                 .child(step(
@@ -1418,14 +1431,15 @@ impl Studio {
                                 ))
                                 .child(
                                     button("video-speed-apply", "Apply", true)
-                                        .opacity(if unchanged { 0.5 } else { 1.0 })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.video_speed_draft = None;
                                             if !unchanged {
                                                 this.set_selected_video_clip_speed(draft, cx);
                                             }
                                             cx.notify();
-                                        })),
+                                        }))
+                                        .into_div()
+                                        .opacity(if unchanged { 0.5 } else { 1.0 }),
                                 ),
                         ),
                 ),
@@ -1563,6 +1577,7 @@ x11.XCloseDisplay(display)
                 studio.launcher_active = false;
                 studio.launcher_window = false;
                 studio.video_project = Some(session);
+                studio.transcription_error = None;
                 studio.video_clip_timeline = RecordingClipTimeline::full(10.0);
                 studio.video_duration = 10.0;
                 studio.video_source_duration = 10.0;

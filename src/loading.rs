@@ -1,7 +1,11 @@
 //! Responsive startup and document loading, before the editor is ready to paint.
+use crate::controls::{button, ButtonKind, ButtonSize};
 use crate::{capture::PreparedVideoProject, Studio};
-use gpui::{canvas, div, point, prelude::*, px, rgb, AnyElement, Context, FontWeight, PathBuilder, Window};
-use std::{path::PathBuf, time::Instant};
+use gpui::{canvas, div, point, prelude::*, px, AnyElement, Context, FontWeight, PathBuilder, Timer, Window};
+use std::{path::PathBuf, time::{Duration, Instant}};
+
+/// Quick loads keep the previous content up instead of flashing a spinner.
+const LOADING_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub(crate) enum LoadRequest {
@@ -110,6 +114,15 @@ pub(crate) struct LoadingState {
     error: Option<String>,
 }
 
+impl LoadingState {
+    /// Startup and failures show at once; other loads after `LOADING_DELAY`.
+    pub(crate) fn visible(&self) -> bool {
+        matches!(self.request, LoadRequest::Launch)
+            || self.error.is_some()
+            || self.started.elapsed() >= LOADING_DELAY
+    }
+}
+
 impl Studio {
     pub(crate) fn start_loading(&mut self, request: LoadRequest, discover_devices: bool, cx: &mut Context<Self>) {
         // Cancel queued playback too: preparation can finish while the next
@@ -120,6 +133,15 @@ impl Studio {
         self.loading = Some(LoadingState { request: request.clone(), started: Instant::now(), error: None });
         self.toast = None;
         cx.notify();
+        cx.spawn(async move |weak, cx| {
+            Timer::after(LOADING_DELAY).await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.load_generation == generation && this.loading.is_some() {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         let task = cx.background_executor().spawn(async move {
             let devices = discover_devices.then(|| {
                 (crate::microphone_devices(), crate::camera_devices())
@@ -181,15 +203,24 @@ impl Studio {
         let request = loading.request.clone();
         let phase = loading.started.elapsed().as_secs_f32() * 4.5;
         if error.is_none() { window.request_animation_frame(); }
-        div().size_full().bg(rgb(0xf7f8fa)).text_color(crate::ink()).font_family("Inter")
+        if window.focused(cx).is_none() { self.focus_handle.focus(window); }
+        let cancellable = !matches!(request, LoadRequest::Launch);
+        div().size_full().bg(crate::panel()).text_color(crate::ink()).font_family("Inter")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                if cancellable && event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.dismiss_loading(cx);
+                }
+            }))
             .flex().flex_col().items_center().justify_center().p_6()
             .child(div().w(px(340.)).max_w_full().flex().flex_col().items_center().gap_5()
                 .child(crate::brand_wordmark_latin(180., 36.))
-                .child(div().h(px(1.)).w(px(40.)).bg(rgb(0xe1e4e9)))
+                .child(div().h(px(1.)).w(px(40.)).bg(crate::line()))
                 .when(error.is_none(), |this| this.child(
                     canvas(|bounds, _, _| bounds, move |_, bounds, window, _| {
                         let center = bounds.center();
-                        for (start, length, color) in [(0., std::f32::consts::TAU, rgb(0xe1e4e9)), (phase, 4.0, rgb(0xd03734))] {
+                        for (start, length, color) in [(0., std::f32::consts::TAU, crate::line()), (phase, 4.0, crate::accent())] {
                             let mut path = PathBuilder::stroke(px(2.5));
                             for step in 0..=48 {
                                 let angle = start + length * step as f32 / 48.;
@@ -200,24 +231,27 @@ impl Studio {
                         }
                     }).size(px(32.))
                 ))
-                .child(div().text_lg().font_weight(FontWeight::MEDIUM)
-                    .child(if error.is_some() { "Couldn't finish opening" } else { loading.request.title() }))
-                .when_some(loading.request.filename(), |this, name| this.child(
+                .child(div().max_w_full().truncate().text_lg().font_weight(FontWeight::MEDIUM)
+                    .child(match (&error, loading.request.filename()) {
+                        (Some(_), Some(name)) => format!("Could not open {name}"),
+                        (Some(_), None) => "Could not open".to_string(),
+                        (None, _) => loading.request.title().to_string(),
+                    }))
+                .when_some(loading.request.filename().filter(|_| error.is_none()), |this, name| this.child(
                     div().w_full().text_center().text_sm().text_color(crate::muted()).truncate().child(name)
                 ))
                 .when(error.is_none() && !matches!(loading.request, LoadRequest::Launch), |this| this.child(
-                    div().id("loading-cancel").px_4().py_2().rounded_md().text_sm().text_color(crate::muted())
-                        .cursor_pointer().hover(|style| style.bg(rgb(0xe9ebef))).child("Cancel")
+                    button("loading-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Md)
                         .on_click(cx.listener(|this, _, _, cx| this.dismiss_loading(cx)))
                 ))
                 .when_some(error, |this, error| this
                     .child(div().w_full().text_sm().text_center().text_color(crate::muted()).child(error))
                     .child(div().flex().gap_3()
-                        .child(div().id("loading-back").px_4().py_2().rounded_md().bg(rgb(0xe9ebef)).cursor_pointer().child("Go back")
+                        .child(button("loading-back", "Go back", ButtonKind::Secondary, ButtonSize::Md)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.dismiss_loading(cx);
                             })))
-                        .child(div().id("loading-retry").px_4().py_2().rounded_md().bg(crate::blue()).text_color(rgb(0xffffff)).cursor_pointer().child("Try again")
+                        .child(button("loading-retry", "Try again", ButtonKind::Primary, ButtonSize::Md)
                             .on_click(cx.listener(move |this, _, _, cx| this.start_loading(request.clone(), false, cx))))
                     )
                 )

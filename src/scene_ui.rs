@@ -17,7 +17,8 @@ use std::{
 };
 
 use crate::{
-    blue, cached_render_image, ink, line, muted, paint_annotation,
+    accent, accent_tint, brand, cached_render_image, control_bg, control_hover, danger,
+    danger_tint, ink, lane_clip, line, muted, on_accent, paint_annotation, surface, TextRoles,
     paint_highlights,
     recording::{
         cursor_assets::CursorFamily,
@@ -28,11 +29,13 @@ use crate::{
             CameraLayout, CameraOverlay, MediaProjection, PointerOverlay, SceneCompositor,
             SceneGeometry, SceneStyle, SceneTransform, WatermarkPosition,
         },
-        viewport::{MotionEasing, ViewportFrame},
+        viewport::{MotionEasing, ViewportFrame, ZoomCue},
     },
     timed::{self, AnnotationTiming, EntranceEffect, ExitEffect},
-    AnnotationMark, SliderDrag, Studio, Tool, BACKGROUND_PRESETS,
+    AnnotationMark, Studio, Tool, VideoEditSnapshot, BACKGROUND_PRESETS,
 };
+use crate::controls::{field, hint, inline_error};
+use crate::theme::{SPACE_1, SPACE_3};
 
 /// Pack non-overlapping intervals together without ever stacking busy rows.
 fn annotation_lane_rows(marks: &[AnnotationMark], duration: f64) -> Vec<usize> {
@@ -96,15 +99,15 @@ pub(crate) struct MediaDrag {
     pub pivot: (f32, f32),
 }
 
-/// Keep a gesture in the coordinate system visible when it began. Editing
-/// the target changes the viewport, so using the new crop would feed the
-/// edit back into the next mouse move.
-#[derive(Clone, Copy, Debug)]
+/// Keep the preview parked while its marker moves in source coordinates.
+/// Rebuild the camera and save one undo entry when the gesture ends.
+#[derive(Clone, Debug)]
 pub(crate) struct FocusDrag {
     pick: crate::motion_ui::MotionPick,
     projection: MediaProjection,
     viewport: ViewportFrame,
     crop: crate::CropRect,
+    original_cues: Vec<ZoomCue>,
 }
 
 impl FocusDrag {
@@ -410,14 +413,14 @@ impl SceneSlider {
     fn format(self, value: f64) -> String {
         match self {
             SceneSlider::Scale | SceneSlider::DefaultZoom => format!("{value:.2}×"),
-            SceneSlider::PositionX | SceneSlider::PositionY => format!("{:.0}", value * 100.0),
+            SceneSlider::PositionX | SceneSlider::PositionY => format!("{:.0}%", value * 100.0),
             SceneSlider::RotationX | SceneSlider::RotationY | SceneSlider::RotationZ => {
                 format!("{value:.0}°")
             }
             SceneSlider::Perspective | SceneSlider::AnchorX | SceneSlider::AnchorY => {
                 format!("{:.0}%", value * 100.0)
             }
-            SceneSlider::CursorIdleDelay | SceneSlider::CursorLoopDuration | SceneSlider::AnnotationTransition => format!("{value:.2}s"),
+            SceneSlider::CursorIdleDelay | SceneSlider::CursorLoopDuration | SceneSlider::AnnotationTransition => format!("{value:.2} s"),
             _ => format!("{value:.0}%"),
         }
     }
@@ -532,7 +535,12 @@ impl SceneSlider {
             }
         }
         if matches!(self, Self::CursorIdleDelay | Self::CursorRotation | Self::CursorLoopDuration) {
-            studio.rebuild_video_motion_timelines();
+            // Rebuilding plans the whole recording; mid-drag it waits for release.
+            if studio.slider_drag.is_some() {
+                studio.motion_timelines_stale = true;
+            } else {
+                studio.rebuild_video_motion_timelines();
+            }
         }
     }
 }
@@ -571,6 +579,104 @@ mod motion_picking_tests {
         assert_eq!(annotation_preview_size((3840, 2160), (480, 270)), (720, 405));
         assert_eq!(annotation_preview_size((800, 600), (960, 540)), (800, 600));
         assert_eq!(annotation_preview_size((2160, 3840), (540, 960)), (810, 1440));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 process, FFmpeg and graphics driver; Xvfb supported"]
+    fn focus_drag_reuses_preview_and_corner_scaling_skips_expensive_effects() {
+        use crate::*;
+        let directory = std::env::temp_dir().join(format!("lahza-focus-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::env::set_var("LAHZA_CONFIG_DIR", directory.join("settings"));
+        std::env::set_var("LAHZA_RECORDINGS_DIR", directory.join("recordings"));
+        std::env::set_var("XDG_CONFIG_HOME", directory.join("xdg-config"));
+        let session = RecordingSession { directory: directory.clone() };
+        assert!(std::process::Command::new("ffmpeg").args([
+            "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=10",
+            "-t", "5", "-c:v", "ffv1", "-y",
+        ]).arg(session.screen_path()).status().unwrap().success());
+        session.write_manifest(&crate::recording::model::CaptureManifest {
+            duration: 5.0, pixel_width: 320, pixel_height: 180, ..Default::default()
+        }).unwrap();
+        let project = directory.clone();
+        Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+            let handle = open_studio_window(cx, true, |handle, cx| {
+                cx.new(|cx| Studio::new(handle, None, None, cx))
+            }).unwrap();
+            handle.update(cx, |studio, _, cx| {
+                studio.open_video_project(project).unwrap();
+                studio.video_position = 2.0;
+                let mut cue = ZoomCue::pinned(0.0, 5.0, 2.0, NormalizedPoint { x: 0.5, y: 0.5 });
+                cue.skips_easing = true;
+                studio.video_selected_zoom_cue = Some(cue.id);
+                studio.video_zoom_cues = vec![cue];
+                studio.rebuild_video_motion_timelines();
+                studio.persist_video_zoom_cues_quiet();
+                let bounds = Bounds::new(point(px(0.), px(0.)), size(px(480.), px(270.)));
+                for pick in [crate::motion_ui::MotionPick::Focus, crate::motion_ui::MotionPick::PanEnd] {
+                    studio.video_selected_zoom_cue = Some(studio.video_zoom_cues[0].id);
+                    studio.motion_pick = pick;
+                    let original = studio.video_zoom_cues.clone();
+                    let undo_count = studio.video_undo_stack.len();
+                    let frame = studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
+                    let viewport = studio.video_viewport_timeline.frame_at(2.0);
+                    let (_, projection) = studio.preview_projection(480., 270.);
+                    let (x, y) = projection.project(0.5, 0.8);
+                    assert!(studio.scene_pointer_down(point(px(x as f32), px(y as f32)), bounds,
+                        &Modifiers::default(), 1, cx));
+                    assert_eq!(studio.focus_drag.as_ref().unwrap().pick, pick);
+                    let started = std::time::Instant::now();
+                    for sample in 0..60 {
+                        studio.drag_motion_marker(point(px(x as f32 + sample as f32), px(y as f32 + 10.)), bounds, cx);
+                        let next = studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
+                        assert!(Arc::ptr_eq(&frame, &next), "focus samples must reuse the parked composition");
+                        assert_eq!(studio.video_viewport_timeline.frame_at(2.0), viewport);
+                        assert_eq!(studio.video_undo_stack.len(), undo_count);
+                    }
+                    eprintln!("60 {pick:?} samples with cached preview: {:?}", started.elapsed());
+                    assert_eq!(studio.video_project.as_ref().unwrap().effective_zoom_cues().unwrap(), Some(original.clone()),
+                        "dragging must not autosave each pointer sample");
+                    assert!(studio.end_focus_drag());
+                    assert!(!studio.end_focus_drag(), "release handlers must commit only once");
+                    let edited = studio.video_zoom_cues.clone();
+                    assert_ne!(edited, original);
+                    assert_eq!(studio.video_undo_stack.len(), undo_count + 1);
+                    assert_eq!(studio.video_project.as_ref().unwrap().effective_zoom_cues().unwrap(), Some(edited.clone()));
+                    studio.undo_video_edit(cx);
+                    assert_eq!(studio.video_zoom_cues, original);
+                    studio.redo_video_edit(cx);
+                    assert_eq!(studio.video_zoom_cues, edited);
+                }
+
+                studio.video_selected_zoom_cue = None;
+                studio.scene_selection = SceneSelection::Media;
+                for native_window in [false, true] {
+                    studio.video_window_capture = native_window;
+                    for corner in 0..4 {
+                        let (_, projection) = studio.preview_projection(480., 270.);
+                        let (x, y) = projection.quad[corner];
+                        assert!(studio.scene_pointer_down(point(px(x as f32), px(y as f32)), bounds,
+                            &Modifiers::default(), 1, cx));
+                        assert_eq!(studio.media_drag.unwrap().kind, MediaDragKind::Scale);
+                        studio.update_media_drag(point(px(x as f32 + 5.), px(y as f32 + 5.)));
+                        studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
+                        let key = &studio.preview_cache.frame.as_ref().unwrap().0;
+                        assert!(!key.high_quality);
+                        let motion = key.motion.as_ref().unwrap();
+                        assert_eq!(motion.samples.len(), 1, "corner scaling must render only the current frame");
+                        assert_eq!(motion.samples[0].time, studio.timeline_display_time());
+                        assert!(studio.end_media_drag());
+                        studio.scene_preview_image_ready(px(480.), px(270.)).unwrap();
+                        let key = &studio.preview_cache.frame.as_ref().unwrap().0;
+                        assert!(key.high_quality, "release must restore full quality");
+                        assert!(key.motion.is_some());
+                    }
+                }
+            }).unwrap();
+            cx.quit();
+        });
+        crate::scene_preview::shutdown_workers();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -754,7 +860,7 @@ mod motion_picking_tests {
                 (source.y - top) / visible_y,
             );
             for pick in [crate::motion_ui::MotionPick::Focus, crate::motion_ui::MotionPick::PanEnd] {
-                let drag = FocusDrag { pick, projection, viewport, crop };
+                let drag = FocusDrag { pick, projection, viewport, crop, original_cues: Vec::new() };
                 let target = drag.target_at(x, y);
                 assert!((target.x - source.x).abs() < 1e-9);
                 assert!((target.y - source.y).abs() < 1e-9);
@@ -843,8 +949,11 @@ impl Studio {
         }
         self.pointer_style = style.pointer;
         self.animation_settings = style.animation;
-        self.camera_overlay = style.camera;
+        self.camera_overlay = style.camera.without_hidden_layout();
         self.camera_regions = style.camera_regions.clone();
+        for region in &mut self.camera_regions {
+            region.overlay = region.overlay.without_hidden_layout();
+        }
         self.input_overlays = style.input_overlays;
         self.content_fill = style.fill;
         self.restore_canvas_ratio(style.aspect);
@@ -889,7 +998,7 @@ impl Studio {
         let style = self.scene_style();
         if self.persisted_scene_style.as_ref() != Some(&style) {
             if let Err(error) = session.write_edit_field("scene", &style) {
-                self.toast = Some(format!("Could not autosave scene settings: {error}").into());
+                self.toast = Some(crate::Notification::error(format!("Could not autosave scene settings: {error}")));
             }
             self.persisted_scene_style = Some(style);
         }
@@ -904,7 +1013,7 @@ impl Studio {
         };
         if self.persisted_extras.as_ref() != Some(&extras) {
             if let Err(error) = session.write_edit_field("lahzaExtras", &extras) {
-                self.toast = Some(format!("Could not autosave settings: {error}").into());
+                self.toast = Some(crate::Notification::error(format!("Could not autosave settings: {error}")));
             }
             self.persisted_extras = Some(extras);
         }
@@ -915,7 +1024,7 @@ impl Studio {
             || self.editing_text.is_some();
         if !interacting && self.persisted_annotations.as_ref() != Some(&self.annotations) {
             if let Err(error) = session.write_edit_field("annotations", &self.annotations) {
-                self.toast = Some(format!("Could not autosave annotations: {error}").into());
+                self.toast = Some(crate::Notification::error(format!("Could not autosave annotations: {error}")));
             }
             self.persisted_annotations = Some(self.annotations.clone());
         }
@@ -938,128 +1047,32 @@ impl Studio {
         let value = slider.get(self);
         let (min, max) = slider.range();
         let fraction = ((value - min) / (max - min)).clamp(0.0, 1.0);
-        let slider_value = (fraction * 100.0).round() as u8;
-        let id = slider.id();
-        let is_default = (value - slider.default_value()).abs() < 1e-6;
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .id(("scene-slider", id))
-                    .relative()
-                    .flex_1()
-                    .h(px(36.0))
-                    .rounded_lg()
-                    .bg(rgb(0xf1f1f2))
-                    .overflow_hidden()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            if slider.is_camera() { this.record_camera_edit(); }
-                            if slider == SceneSlider::MotionBlurAmount { this.record_animation_edit(); }
-                            this.slider_drag = Some(SliderDrag {
-                                slider_id: id,
-                                start_x: event.position.x,
-                                start_value: slider_value,
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(gpui::relative(fraction as f32))
-                            .bg(hsla(211.0 / 360.0, 0.9, 0.88, 0.45)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .px_3()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(slider.label()),
-                    ),
-            )
-            .child(
-                div()
-                    .id(("scene-slider-minus", id))
-                    .w(px(26.0))
-                    .h(px(36.0))
-                    .rounded_lg()
-                    .bg(rgb(0xf1f1f2))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .child("−")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if slider == SceneSlider::MotionBlurAmount && slider.get(this) > slider.range().0 { this.record_animation_edit(); }
-                        slider.set(this, slider.get(this) - slider.step());
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .w(px(60.0))
-                    .h(px(36.0))
-                    .rounded_lg()
-                    .bg(rgb(0xf1f1f2))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .child(slider.format(value)),
-            )
-            .child(
-                div()
-                    .id(("scene-slider-plus", id))
-                    .w(px(26.0))
-                    .h(px(36.0))
-                    .rounded_lg()
-                    .bg(rgb(0xf1f1f2))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .child("+")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if slider == SceneSlider::MotionBlurAmount && slider.get(this) < slider.range().1 { this.record_animation_edit(); }
-                        slider.set(this, slider.get(this) + slider.step());
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id(("scene-slider-reset", id))
-                    .w(px(22.0))
-                    .h(px(36.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(muted())
-                    .opacity(if is_default { 0.0 } else { 1.0 })
-                    .when(!is_default, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.text_color(ink()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if slider == SceneSlider::MotionBlurAmount { this.record_animation_edit(); }
-                                slider.set(this, slider.default_value());
-                                cx.notify();
-                            }))
-                    })
-                    .child("×"),
-            )
-            .into_any_element()
+        let row = crate::controls::SliderRow {
+            slider_id: slider.id(),
+            label: slider.label().into(),
+            fraction: fraction as f32,
+            value: slider.format(value).into(),
+            can_decrease: value > min + 1e-9,
+            can_increase: value < max - 1e-9,
+            show_reset: (value - slider.default_value()).abs() >= 1e-6,
+        };
+        self.slider_control(
+            row,
+            move |this| {
+                if slider.is_camera() { this.record_camera_edit(); }
+                if slider == SceneSlider::MotionBlurAmount { this.record_animation_edit(); }
+                true
+            },
+            move |this, steps| {
+                if slider == SceneSlider::MotionBlurAmount { this.record_animation_edit(); }
+                slider.set(this, slider.get(this) + steps as f64 * slider.step());
+            },
+            move |this| {
+                if slider == SceneSlider::MotionBlurAmount { this.record_animation_edit(); }
+                slider.set(this, slider.default_value());
+            },
+            cx,
+        )
     }
 
     pub(crate) fn scene_toggle_row(
@@ -1070,21 +1083,11 @@ impl Studio {
         cx: &mut Context<Self>,
         on_toggle: impl Fn(&mut Studio) + 'static,
     ) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(div().text_sm().child(label))
-            .child(
-                div()
-                    .id(id)
-                    .cursor_pointer()
-                    .child(self.toggle(enabled))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        on_toggle(this);
-                        cx.notify();
-                    })),
-            )
+        crate::controls::toggle_row(id, label, enabled)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                on_toggle(this);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -1155,11 +1158,10 @@ impl Studio {
         // preview during scaling so text detail does not appear to disappear.
         let annotation_proxy = self.pointer_is_down && !self.annotations_paint_flat()
             && !self.canvas_annotation_drag;
+        let editing = self.slider_drag.is_some() || self.media_drag.is_some()
+            || self.camera_drag.is_some() || self.motion_transform_drag.is_some();
         let proxy = if annotation_proxy || (!(self.video_project.is_some() && self.video_window_capture)
-            && (self.slider_drag.is_some()
-                || self.media_drag.is_some()
-                || self.camera_drag.is_some()
-                || self.motion_transform_drag.is_some()))
+            && editing)
         {
             0.5
         } else {
@@ -1188,7 +1190,7 @@ impl Studio {
         } else {
             None
         };
-        let high_quality = !self.video_playing && proxy == 1.0
+        let high_quality = !self.video_playing && !editing && proxy == 1.0
             && self.timeline_skim_time().is_none() && self.video_seek_drag.is_none()
             && (self.video_project.is_none() || self.video_window_capture || source_size == self.video_source_size);
         let presentation_canvas=canvas;
@@ -1197,9 +1199,12 @@ impl Studio {
                 has_pointer.then_some(&self.video_pointer_timeline),
                 self.video_project.as_ref().map(|_|&self.video_motion_clip_timeline),time,self.video_duration,
                 self.export_frame_rate,canvas,source_size,self.camera_source_aspect(),
-                if high_quality {crate::recording::motion_blur::Quality::High}
+                if editing {crate::recording::motion_blur::Quality::Interactive}
+                else if high_quality {crate::recording::motion_blur::Quality::High}
                 else {crate::recording::motion_blur::Quality::Playing}))
         };
+        // Direct manipulation needs the current frame, not a multi-frame
+        // shutter or neural enhancement on every pointer sample.
         let mut motion=(self.video_project.is_some() || self.animation_active).then(||make_motion(canvas));
         if self.video_playing {
             if let Some(plan)=&motion {
@@ -1263,7 +1268,7 @@ impl Studio {
             match PreviewWorker::new() {
                 Ok(worker) => self.preview_cache.worker = Some(worker),
                 Err(error) => {
-                    self.toast = Some(format!("Preview worker could not start: {error}").into());
+                    self.toast = Some(crate::Notification::error(format!("Preview worker could not start: {error}")));
                     return self.preview_cache.frame.as_ref().map(|(_, image)| image.clone());
                 }
             }
@@ -1284,7 +1289,7 @@ impl Studio {
             self.retire_image(previous.map(|(_, image)| image));
         }
         if let Some(message) = self.preview_cache.worker.as_ref().unwrap().take_failure(&key) {
-            self.toast = Some(message.into());
+            self.toast = Some(crate::Notification::error(message));
         }
         self.preview_cache.frame.as_ref()
             .filter(|(shown, _)| shown.same_media(&key))
@@ -1509,7 +1514,7 @@ impl Studio {
                         }
                     }
                     Err(error) => {
-                        this.toast = Some(format!("Could not add camera clip: {error}").into());
+                        this.toast = Some(crate::Notification::error(format!("Could not add camera clip: {error}")));
                     }
                 }
                 cx.notify();
@@ -1537,50 +1542,48 @@ impl Studio {
 
     pub(crate) fn camera_style_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         use crate::recording::camera_layout::{CameraAspect, CameraLayout, CameraSplitDirection};
+        const LAYOUTS: [CameraLayout; 4] = [CameraLayout::Overlay, CameraLayout::Split, CameraLayout::Cutout, CameraLayout::Fullscreen];
         let overlay = self.camera_edit_overlay();
-        div().flex().flex_col().gap_2()
-            .child(Self::inspector_label("Layout"))
-            .child(self.segmented("camera-layout", &["Overlay", "Split screen", "Cutout"], [CameraLayout::Overlay,CameraLayout::Split,CameraLayout::Cutout].iter().position(|v| *v == overlay.layout).unwrap_or(usize::MAX),
-                |this, i| this.edit_camera_overlay(|camera| { camera.layout = [CameraLayout::Overlay,CameraLayout::Split,CameraLayout::Cutout][i]; camera.enabled = true; }), cx))
-            .child(self.segmented("camera-layout-focus", &["Camera only", "Screen only"], [CameraLayout::Fullscreen,CameraLayout::Hidden].iter().position(|v| *v == overlay.layout).unwrap_or(usize::MAX),
-                |this, i| this.edit_camera_overlay(|camera| { camera.layout = [CameraLayout::Fullscreen,CameraLayout::Hidden][i]; camera.enabled = true; }), cx))
+        div().flex().flex_col().gap(px(SPACE_3))
+            .child(field("Layout", self.segmented("camera-layout", &["Overlay", "Split screen", "Cutout", "Camera only"], LAYOUTS.iter().position(|v| *v == overlay.layout).unwrap_or(usize::MAX),
+                |this, i| this.edit_camera_overlay(|camera| { camera.layout = LAYOUTS[i]; camera.enabled = true; }), cx)))
             .when(overlay.layout == CameraLayout::Split, |panel| panel
                 .child(self.segmented("camera-split-direction", &["Auto", "Horizontal", "Vertical"], CameraSplitDirection::ALL.iter().position(|v| *v == overlay.split_direction).unwrap_or(0),
                     |this, i| this.edit_camera_overlay(|camera| camera.split_direction = CameraSplitDirection::ALL[i]), cx))
-                .child(div().text_xs().text_color(muted()).child("Auto places the camera beside landscape video and below portrait video."))
+                .child(hint("Auto places the camera beside landscape video and below portrait video."))
                 .child(self.scene_slider_row(SceneSlider::CameraSplitRatio, cx))
                 .child(self.scene_toggle_row("camera-split-full", "Fill split cells", overlay.split_full, cx, |this| this.edit_camera_overlay(|camera| camera.split_full = !camera.split_full)))
                 .child(self.scene_toggle_row("camera-split-flip", "Swap sides", overlay.split_flip, cx, |this| this.edit_camera_overlay(|camera| camera.split_flip = !camera.split_flip))))
             .when(matches!(overlay.layout, CameraLayout::Overlay | CameraLayout::Cutout), |panel| panel
-                .child(self.segmented("camera-position-top", &["Top left", "Top right"],
-                    if overlay.center.is_some() { usize::MAX } else { WatermarkPosition::ALL[..2].iter().position(|v| *v == overlay.position).unwrap_or(usize::MAX) },
-                    |this, i| this.edit_camera_overlay(|camera| { camera.position = WatermarkPosition::ALL[i]; camera.center = None; }), cx))
-                .child(self.segmented("camera-position-bottom", &["Bottom left", "Bottom right"],
-                    if overlay.center.is_some() { usize::MAX } else { WatermarkPosition::ALL[2..].iter().position(|v| *v == overlay.position).unwrap_or(usize::MAX) },
-                    |this, i| this.edit_camera_overlay(|camera| { camera.position = WatermarkPosition::ALL[i+2]; camera.center = None; }), cx))
-                .child(div().text_xs().text_color(muted()).child("Drag on the canvas to snap to an edge or the center."))
+                .child(div().flex().flex_col().gap(px(SPACE_1))
+                    .child(field("Position", self.position_grid("camera-position", &["Top left", "Top right", "Bottom left", "Bottom right"], 2,
+                        if overlay.center.is_some() { usize::MAX } else { WatermarkPosition::ALL.iter().position(|v| *v == overlay.position).unwrap_or(usize::MAX) },
+                        |this, i| this.edit_camera_overlay(|camera| { camera.position = WatermarkPosition::ALL[i]; camera.center = None; }), cx)))
+                    .child(hint("Drag on the canvas to snap to an edge or the center.")))
                 .child(self.scene_slider_row(SceneSlider::CameraSize, cx))
                 .child(self.scene_toggle_row("camera-zoom-resize", "Resize during zoom", overlay.zoomed_size.is_some(), cx, |this| {
                     this.edit_camera_overlay(|camera| camera.zoomed_size = if camera.zoomed_size.is_some() { None } else { Some((camera.size * 3 / 4).max(10)) });
                 }))
                 .when(overlay.zoomed_size.is_some(), |panel| panel.child(self.scene_slider_row(SceneSlider::CameraZoomedSize, cx))))
             .when(overlay.layout == CameraLayout::Overlay || (overlay.layout == CameraLayout::Split && !overlay.split_full), |panel| panel
-                .child(Self::inspector_label("Shape & frame"))
+                .child(Self::section_divider())
+                .child(div().section_title().child("Shape & frame"))
                 .child(self.segmented("camera-shape", &["Circle", "Rounded", "Rectangle"], crate::recording::scene::CameraShape::ALL.iter().position(|v| *v == overlay.shape).unwrap_or(0),
                     |this, i| this.edit_camera_overlay(|camera| camera.shape = crate::recording::scene::CameraShape::ALL[i]), cx))
                 .when(overlay.shape != crate::recording::scene::CameraShape::Circle, |panel| panel
-                    .child(self.segmented("camera-aspect", &["Square", "Original", "16:9", "9:16", "4:3", "3:4"], CameraAspect::ALL.iter().position(|v| *v == overlay.aspect).unwrap_or(0),
+                    .child(self.option_grid("camera-aspect", &["Square", "Original", "16:9", "9:16", "4:3", "3:4"], 3, CameraAspect::ALL.iter().position(|v| *v == overlay.aspect).unwrap_or(0),
                         |this, i| this.edit_camera_overlay(|camera| camera.aspect = CameraAspect::ALL[i]), cx))
                     .when(overlay.shape == crate::recording::scene::CameraShape::Squircle, |panel| panel.child(self.scene_slider_row(SceneSlider::CameraCornerRadius, cx))))
                 .child(self.scene_slider_row(SceneSlider::CameraMargin, cx))
                 .child(self.scene_toggle_row("camera-shadow", "Shadow", overlay.shadow, cx, |this| this.edit_camera_overlay(|camera| camera.shadow = !camera.shadow))))
             .when(overlay.layout == CameraLayout::Cutout, |panel| panel
-                .child(div().text_xs().text_color(muted()).child("Remove the webcam background. Edge controls refine hair and clothing."))
+                .child(hint("Remove the webcam background. Edge controls refine hair and clothing."))
                 .child(self.scene_slider_row(SceneSlider::CameraCutoutSoftness, cx))
                 .child(self.scene_slider_row(SceneSlider::CameraCutoutInset, cx))
                 .child(self.scene_slider_row(SceneSlider::CameraMargin, cx)))
             .when(overlay.layout != CameraLayout::Hidden, |panel| panel
-            .child(Self::inspector_label("Framing"))
+            .child(Self::section_divider())
+            .child(div().section_title().child("Framing"))
             .child(self.scene_slider_row(SceneSlider::CameraCropZoom, cx))
             .child(self.scene_slider_row(SceneSlider::CameraCropX, cx))
             .child(self.scene_slider_row(SceneSlider::CameraCropY, cx))
@@ -1785,7 +1788,9 @@ impl Studio {
             if self.selected_region().is_some_and(|cue| !cue.has_camera_motion()) {
                 return true;
             }
-            self.pause_video_playback();
+            if self.video_playing || self.video_audio_play_when_ready {
+                self.pause_video_playback();
+            }
             let pick = self
                 .motion_markers(viewport)
                 .into_iter()
@@ -1800,9 +1805,11 @@ impl Studio {
                 projection,
                 viewport,
                 crop: style.source_crop,
+                original_cues: self.video_zoom_cues.clone(),
             };
+            let target = drag.target_at(local_x as f64, local_y as f64);
             self.focus_drag = Some(drag);
-            self.pin_focus_at_media(drag.target_at(local_x as f64, local_y as f64), pick, cx);
+            self.pin_focus_at_media(target, pick, cx);
             return true;
         }
         if self.scene_selection == SceneSelection::Media {
@@ -2026,7 +2033,7 @@ impl Studio {
         canvas: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let Some(drag) = self.focus_drag else {
+        let Some(drag) = self.focus_drag.as_ref() else {
             return;
         };
         let local_x = f32::from(position.x - canvas.origin.x);
@@ -2045,21 +2052,40 @@ impl Studio {
         pick: crate::motion_ui::MotionPick,
         cx: &mut Context<Self>,
     ) {
-        match pick {
+        let mutate = |cue: &mut ZoomCue| match pick {
             crate::motion_ui::MotionPick::Focus => {
-                self.mutate_selected_zoom_cue(cx, |cue| {
-                    cue.anchor_mode = crate::recording::viewport::ZoomAnchorMode::PinnedAnchor;
-                    cue.pinned_point = target;
-                });
+                cue.anchor_mode = crate::recording::viewport::ZoomAnchorMode::PinnedAnchor;
+                cue.pinned_point = target;
             }
             crate::motion_ui::MotionPick::PanEnd => {
-                self.mutate_selected_zoom_cue(cx, |cue| {
-                    cue.anchor_mode = crate::recording::viewport::ZoomAnchorMode::PinnedAnchor;
-                    cue.pan_to = Some(target);
-                });
+                cue.anchor_mode = crate::recording::viewport::ZoomAnchorMode::PinnedAnchor;
+                cue.pan_to = Some(target);
             }
+        };
+        if self.focus_drag.is_some() {
+            if self.video_edit_busy { return; }
+            if let Some(cue) = self.video_zoom_cues.iter_mut()
+                .find(|cue| Some(cue.id) == self.video_selected_zoom_cue)
+            {
+                // Paint the marker over the parked preview. Rebuilding the
+                // camera here also rereads and resamples the entire recording.
+                mutate(cue);
+            }
+        } else {
+            self.mutate_selected_zoom_cue(cx, mutate);
         }
         cx.notify();
+    }
+
+    pub(crate) fn end_focus_drag(&mut self) -> bool {
+        let Some(drag) = self.focus_drag.take() else { return false; };
+        if drag.original_cues != self.video_zoom_cues {
+            self.video_undo_stack.push(VideoEditSnapshot::Zoom(drag.original_cues));
+            self.video_redo_stack.clear();
+            self.rebuild_video_viewport_timeline();
+            self.persist_video_zoom_cues_quiet();
+        }
+        true
     }
 
     /// The composited scene canvas with selection handles, used by the
@@ -2251,7 +2277,7 @@ impl Studio {
                             gpui::CursorStyle::OpenHand
                         } else { studio.annotation_cursor(mouse, interaction_bounds, &cursor_bounds) };
                         if let Some((guide_x, guide_y)) = camera_guides {
-                            let guide = hsla(212.0 / 360.0, 1.0, 0.56, 1.0);
+                            let guide = crate::selection();
                             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                                 if let Some(x) = guide_x {
                                     window.paint_quad(gpui::fill(
@@ -2400,7 +2426,7 @@ impl Studio {
                                     cx.notify();
                                     return;
                                 }
-                                this.focus_drag = None;
+                                if this.end_focus_drag() { cx.notify(); }
                                 if !this.pointer_is_down {
                                     return;
                                 }
@@ -2458,10 +2484,7 @@ impl Studio {
                         .items_center()
                         .justify_between()
                         .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::BOLD)
-                                .child("Image properties"),
+                            div().section_title().child("Image properties"),
                         )
                         .child(self.small_button(
                             "transform-done",
@@ -2582,13 +2605,14 @@ impl Studio {
                 this.child(
                     self.text_fields.watermark.clone(),
                 )
-                .child(self.segmented(
+                .child(field("Position", self.position_grid(
                     "watermark-position",
                     &["Top left", "Top right", "Bottom left", "Bottom right"],
+                    2,
                     position_index,
                     |this, index| this.watermark.position = WatermarkPosition::ALL[index],
                     cx,
-                ))
+                )))
                 .child(self.scene_slider_row(SceneSlider::WatermarkSize, cx))
                 .child(self.scene_slider_row(SceneSlider::WatermarkOpacity, cx))
             })
@@ -2596,12 +2620,15 @@ impl Studio {
     }
 
     pub(crate) fn pointer_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::recording::pointer_timeline::PointerRotation;
         let style = self.pointer_style;
         let selected_press = self.video_selected_press;
+        let title = |text: &'static str| div().section_title().child(text);
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(SPACE_3))
+            .child(title("Cursor"))
             .child(self.scene_toggle_row(
                 "pointer-visible",
                 "Show cursor",
@@ -2610,65 +2637,68 @@ impl Studio {
                 |this| this.pointer_style.visible = !this.pointer_style.visible,
             ))
             .when(style.visible, |this| {
-                this.child(div().text_xs().text_color(muted()).child("Style"))
-                    .child(
-                        self.segmented(
-                            "pointer-family",
-                            &["Recorded", "macOS", "Tahoe", "Windows"],
-                            CursorFamily::ALL
-                                .iter()
-                                .position(|family| *family == style.family)
-                                .unwrap_or(0),
-                            |this, value| {
-                                this.pointer_style.family = CursorFamily::ALL[value.min(3)];
-                            },
-                            cx,
-                        ),
-                    )
-                    .child(self.scene_slider_row(SceneSlider::PointerScale, cx))
-                    // Styled cursor artwork carries its own shadow.
-                    .when(style.family == CursorFamily::Recorded, |this| {
-                        this.child(self.scene_toggle_row(
-                            "pointer-shadow",
-                            "Cursor shadow",
-                            style.shadow,
-                            cx,
-                            |this| this.pointer_style.shadow = !this.pointer_style.shadow,
-                        ))
-                    })
-                    .child(self.scene_toggle_row(
-                        "pointer-hide-idle",
-                        "Hide when idle",
-                        style.hide_when_idle,
-                        cx,
-                        |this| {
-                            this.pointer_style.hide_when_idle = !this.pointer_style.hide_when_idle;
-                            this.rebuild_video_motion_timelines();
+                this.child(field(
+                    "Style",
+                    self.segmented(
+                        "pointer-family",
+                        &["Recorded", "macOS", "macOS (new)", "Windows"],
+                        CursorFamily::ALL
+                            .iter()
+                            .position(|family| *family == style.family)
+                            .unwrap_or(0),
+                        |this, value| {
+                            this.pointer_style.family = CursorFamily::ALL[value.min(3)];
                         },
+                        cx,
+                    ),
+                ))
+                .child(self.scene_slider_row(SceneSlider::PointerScale, cx))
+                // Styled cursor artwork carries its own shadow.
+                .when(style.family == CursorFamily::Recorded, |this| {
+                    this.child(self.scene_toggle_row(
+                        "pointer-shadow",
+                        "Cursor shadow",
+                        style.shadow,
+                        cx,
+                        |this| this.pointer_style.shadow = !this.pointer_style.shadow,
                     ))
-                    .when(style.hide_when_idle, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorIdleDelay, cx)))
-                    .child(self.scene_toggle_row("pointer-hide-typing", "Hide while typing", style.hide_when_typing, cx, |this| {
-                        this.pointer_style.hide_when_typing = !this.pointer_style.hide_when_typing;
+                })
+                .child(Self::section_divider())
+                .child(title("Hide & motion"))
+                .child(self.scene_toggle_row(
+                    "pointer-hide-idle",
+                    "Hide when idle",
+                    style.hide_when_idle,
+                    cx,
+                    |this| {
+                        this.pointer_style.hide_when_idle = !this.pointer_style.hide_when_idle;
                         this.rebuild_video_motion_timelines();
-                    }))
-                    .child(div().text_xs().text_color(muted()).child("Rotation"))
-                    .child(self.segmented("pointer-rotation", &["Off", "Tilt", "Direction"],
-                        crate::recording::pointer_timeline::PointerRotation::ALL.iter().position(|v| *v == style.rotation).unwrap_or(1),
-                        |this, i| { this.pointer_style.rotation = crate::recording::pointer_timeline::PointerRotation::ALL[i]; this.rebuild_video_motion_timelines(); }, cx))
-                    .when(style.rotation != crate::recording::pointer_timeline::PointerRotation::Off, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorRotation, cx)))
-                    .child(self.cursor_animation_controls(cx))
-                    .child(self.scene_toggle_row(
-                        "pointer-loop",
-                        "Return to start at end",
-                        style.loop_to_start,
-                        cx,
-                        |this| {
-                            this.pointer_style.loop_to_start = !this.pointer_style.loop_to_start;
-                            this.rebuild_video_motion_timelines();
-                        },
-                    ))
-                    .when(style.loop_to_start, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorLoopDuration, cx)))
+                    },
+                ))
+                .when(style.hide_when_idle, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorIdleDelay, cx)))
+                .child(self.scene_toggle_row("pointer-hide-typing", "Hide while typing", style.hide_when_typing, cx, |this| {
+                    this.pointer_style.hide_when_typing = !this.pointer_style.hide_when_typing;
+                    this.rebuild_video_motion_timelines();
+                }))
+                .child(field("Rotation", self.segmented("pointer-rotation", &["Off", "Tilt", "Direction"],
+                    PointerRotation::ALL.iter().position(|v| *v == style.rotation).unwrap_or(1),
+                    |this, i| { this.pointer_style.rotation = PointerRotation::ALL[i]; this.rebuild_video_motion_timelines(); }, cx)))
+                .when(style.rotation != PointerRotation::Off, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorRotation, cx)))
+                .child(self.cursor_animation_controls(cx))
+                .child(self.scene_toggle_row(
+                    "pointer-loop",
+                    "Return to start at end",
+                    style.loop_to_start,
+                    cx,
+                    |this| {
+                        this.pointer_style.loop_to_start = !this.pointer_style.loop_to_start;
+                        this.rebuild_video_motion_timelines();
+                    },
+                ))
+                .when(style.loop_to_start, |panel| panel.child(self.scene_slider_row(SceneSlider::CursorLoopDuration, cx)))
             })
+            .child(Self::section_divider())
+            .child(title("Clicks"))
             .child(self.scene_toggle_row(
                 "pointer-clicks",
                 "Click effects",
@@ -2677,21 +2707,10 @@ impl Studio {
                 |this| this.pointer_style.click_effects = !this.pointer_style.click_effects,
             ))
             .when(style.click_effects, |this| {
-                this.child(div().flex().items_center().gap_2().children(
+                this.child(div().flex().items_center().gap(px(2.0)).children(
                     CLICK_COLORS.into_iter().enumerate().map(|(index, color)| {
-                        let selected = style.click_color == color;
-                        div()
-                            .id(("click-color", index))
-                            .size(px(24.0))
-                            .rounded_full()
-                            .bg(rgb(color))
-                            .border_2()
-                            .border_color(if selected {
-                                ink()
-                            } else {
-                                Hsla::from(rgb(0xd4d5d8))
-                            })
-                            .cursor_pointer()
+                        let name = ["Blue", "Red", "Orange", "Green", "Purple", "White"][index];
+                        crate::controls::swatch(("click-color", index), name, style.click_color == color, rgb(color), None)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pointer_style.click_color = color;
                                 cx.notify();
@@ -2705,27 +2724,16 @@ impl Studio {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted())
-                                .child(format!("Click at {time:.2}s selected")),
-                        )
+                        .child(hint(format!("Click at {} selected", crate::units::fmt_seconds(time))))
                         .child(self.small_button(
                             "pointer-remove-click",
-                            "Remove click",
+                            "Delete click",
                             true,
                             cx,
                             |this, cx| this.remove_selected_press(cx),
                         )),
                 )
             })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("Click markers on the ruler select individual clicks."),
-            )
             .into_any_element()
     }
 
@@ -2734,7 +2742,7 @@ impl Studio {
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(SPACE_3))
             .when(!has_audio, |this| {
                 this.child(
                     div()
@@ -2746,7 +2754,7 @@ impl Studio {
             .when(has_audio, |this| {
                 this.child(self.scene_toggle_row(
                     "audio-mute",
-                    "Recording audio",
+                    "Include audio",
                     !self.video_audio_muted,
                     cx,
                     |this| {
@@ -2759,45 +2767,41 @@ impl Studio {
             })
             .when(has_audio && !self.video_audio_muted, |this| {
                 use crate::recording::audio_mode::AudioMode;
-                this.child(div().text_sm().child("Microphone sound"))
+                this.child(div().field_label().child("Microphone sound"))
                     .children(AudioMode::ALL.into_iter().map(|mode| {
                         let selected = self.video_audio_mode == mode;
                         div().id(("microphone-audio-mode", mode as usize))
                             .px_3().py_2().rounded_md().border_1()
-                            .border_color(if selected { rgb(0x2088ff) } else { rgb(0xe5e5e8) })
-                            .bg(if selected { rgb(0xedf5ff) } else { rgb(0xffffff) })
+                            .border_color(if selected { accent() } else { line() })
+                            .bg(if selected { accent_tint() } else { surface() })
                             .cursor_pointer().flex().items_center().gap_2()
-                            .child(div().text_color(if selected { rgb(0x2088ff).into() } else { muted() })
-                                .child(if selected { "●" } else { "○" }))
-                            .child(div().flex().flex_col().gap_1()
-                                .child(div().text_sm().child(mode.label()))
-                                .child(div().text_xs().text_color(muted()).child(mode.description())))
+                            .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
+                                .child(div().row_label().child(mode.label()))
+                                .child(hint(mode.description())))
                             .on_click(cx.listener(move |this, _, _, cx| this.set_video_audio_mode(mode, cx)))
                     }))
-                    .child(div().text_xs().text_color(muted())
-                        .child("Processing runs locally. System audio is preserved in new recordings; older combined tracks are processed together."))
             })
             .when_some(self.video_audio_job.as_ref(), |panel, job| {
                 panel.child(div().flex().items_center().justify_between().gap_2()
-                    .child(div().flex().flex_col().gap_1()
-                        .child(div().text_xs().text_color(muted()).child(format!(
+                    .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
+                        .child(div().hint().child(format!(
                             "{} · {}%", job.control.status(), job.control.progress())))
                         .when(self.video_audio_play_when_ready, |row| row.child(
-                            div().text_xs().text_color(muted()).child("Playback will start when audio is ready."))))
+                            div().hint().child("Playback will start when audio is ready."))))
                     .child(self.small_button("pause-audio-preparation", "Cancel", true, cx,
                         |this, cx| this.pause_audio_preparation(cx))))
             })
             .when_some(self.video_audio_error.as_ref(), |panel, error| {
-                panel.child(div().flex().flex_col().gap_2()
-                    .child(div().text_xs().text_color(muted()).child(error.clone()))
-                    .child(self.small_button("retry-audio-preparation", "Prepare audio", true, cx,
+                panel.child(inline_error(error.clone())
+                    .child(self.small_button("retry-audio-preparation", "Retry", true, cx,
                         |this, cx| this.prepare_video_audio(cx))))
             })
             .child(self.imported_audio_controls(cx))
             .into_any_element()
     }
 
-    pub(crate) fn export_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// "3840 × 2160 · 30 fps · 20.5 s · about 55 MB" for the current settings.
+    pub(crate) fn export_summary(&self) -> String {
         let (source_width, source_height) = if self.video_project.is_some() {
             self.video_source_size
         } else {
@@ -2806,10 +2810,19 @@ impl Studio {
         let style = self.scene_style();
         let height = self.export_resolution.canvas_height(source_height);
         let (width, height) = style.export_canvas_size(source_width, source_height, height);
-        let format = self.export_format;
         let frame_rate = self.export_frame_rate;
         let duration = self.video_duration.max(0.0);
-        let estimate = estimate_size_bytes(format, self.export_codec, width, height, frame_rate, duration);
+        let estimate = estimate_size_bytes(self.export_format, self.export_codec, width, height, frame_rate, duration);
+        format!(
+            "{width} × {height} · {frame_rate:.0} fps · {} · about {}",
+            crate::units::fmt_seconds(duration),
+            format_size(estimate)
+        )
+    }
+
+    pub(crate) fn export_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let format = self.export_format;
+        let frame_rate = self.export_frame_rate;
         let resolution_index = ExportResolution::ALL
             .iter()
             .position(|resolution| *resolution == self.export_resolution)
@@ -2826,9 +2839,8 @@ impl Studio {
         div()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(div().text_xs().text_color(muted()).child("Format"))
-            .child(self.segmented(
+            .gap(px(SPACE_3))
+            .child(field("Format", self.segmented(
                 "export-section-format",
                 &["MP4", "WebM", "GIF"],
                 format_index,
@@ -2837,43 +2849,23 @@ impl Studio {
                     this.export_frame_rate = this.export_format.default_frame_rate();
                 },
                 cx,
-            ))
-            .child(
-                div()
-                    .mt_2()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("Resolution"),
-            )
-            .child(self.segmented(
+            )))
+            .child(field("Resolution", self.segmented(
                 "export-resolution",
                 &["Original", "720p", "1080p", "1440p", "4K"],
                 resolution_index,
                 |this, index| this.export_resolution = ExportResolution::ALL[index],
                 cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted())
-                            .w(px(72.0))
-                            .child("Frame rate"),
-                    )
-                    .child(div().flex_1().child(self.segmented(
-                        "export-frame-rate",
-                        &["30 fps", "60 fps"],
-                        fps_index,
-                        |this, index| {
-                            this.export_frame_rate = if index == 1 { 60.0 } else { 30.0 }
-                        },
-                        cx,
-                    ))),
-            )
+            )))
+            .child(field("Frame rate", self.segmented(
+                "export-frame-rate",
+                &["30 fps", "60 fps"],
+                fps_index,
+                |this, index| {
+                    this.export_frame_rate = if index == 1 { 60.0 } else { 30.0 }
+                },
+                cx,
+            )))
             .when(format == ExportFormat::Gif, |this| {
                 this.child(self.scene_toggle_row(
                     "export-loop",
@@ -2891,51 +2883,48 @@ impl Studio {
                 this.child(
                     div()
                         .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_xs().text_color(muted()).w(px(72.0)).child("Codec"))
-                        .child(div().flex_1().child(self.segmented(
+                        .flex_col()
+                        .gap(px(SPACE_1))
+                        .child(field("Codec", self.segmented(
                             "export-codec",
                             &["H.264", "HEVC"],
                             codec_index,
                             |this, index| this.export_codec = crate::recording::export::VideoCodec::ALL[index],
                             cx,
-                        ))),
-                )
-                .when(self.export_codec == crate::recording::export::VideoCodec::Hevc, |this| {
-                    this.child(div().text_xs().text_color(muted()).child(
-                        "Smaller files; some older players and browsers cannot play HEVC.",
-                    ))
-                })
-            })
-            .child(div().text_xs().text_color(muted()).child(format!(
-                "{width} × {height} · {frame_rate:.0} fps · {:.1}s · about {}",
-                duration,
-                format_size(estimate)
-            )))
-            .when(self.video_project.is_some(), |this| {
-                this.child(div().mt_2().text_xs().text_color(muted()).child("Audio only"))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(self.small_button(
-                                "export-audio-m4a",
-                                "Export M4A…",
-                                self.export_progress.is_none(),
-                                cx,
-                                |this, cx| this.export_audio_only(crate::recording::export::AudioFormat::M4a, cx),
+                        )))
+                        .when(self.export_codec == crate::recording::export::VideoCodec::Hevc, |this| {
+                            this.child(hint(
+                                "Smaller files; some older players and browsers cannot play HEVC.",
                             ))
-                            .child(self.small_button(
-                                "export-audio-wav",
-                                "Export WAV…",
-                                self.export_progress.is_none(),
-                                cx,
-                                |this, cx| this.export_audio_only(crate::recording::export::AudioFormat::Wav, cx),
-                            )),
-                    )
+                        }),
+                )
             })
             .into_any_element()
+    }
+
+    /// Export → Audio only: the soundtrack without video.
+    pub(crate) fn audio_only_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        field(
+            "Audio only",
+            div()
+                .flex()
+                .gap_2()
+                .child(self.small_button(
+                    "export-audio-m4a",
+                    "Export M4A…",
+                    self.export_progress.is_none(),
+                    cx,
+                    |this, cx| this.export_audio_only(crate::recording::export::AudioFormat::M4a, cx),
+                ))
+                .child(self.small_button(
+                    "export-audio-wav",
+                    "Export WAV…",
+                    self.export_progress.is_none(),
+                    cx,
+                    |this, cx| this.export_audio_only(crate::recording::export::AudioFormat::Wav, cx),
+                )),
+        )
+        .into_any_element()
     }
 
     pub(crate) fn preset_library_section(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2980,7 +2969,7 @@ impl Studio {
                             .flex()
                             .items_center()
                             .rounded_md()
-                            .bg(rgb(0xf0f0f1))
+                            .bg(control_bg())
                             .overflow_hidden()
                             .child(
                                 div()
@@ -2992,7 +2981,7 @@ impl Studio {
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xe4e4e7)))
+                                    .hover(|style| style.bg(control_hover()))
                                     .child(name)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.apply_saved_preset(index);
@@ -3002,6 +2991,7 @@ impl Studio {
                             .child(
                                 div()
                                     .id(("preset-delete", index))
+                                    .tooltip(crate::timeline_ui::tooltip("Delete preset"))
                                     .w(px(24.0))
                                     .h(px(30.0))
                                     .flex()
@@ -3010,7 +3000,7 @@ impl Studio {
                                     .text_xs()
                                     .text_color(muted())
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0xfee2e2)).text_color(rgb(0xb91c1c)))
+                                    .hover(|style| style.bg(danger_tint()).text_color(danger()))
                                     .child("×")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.delete_saved_preset(index);
@@ -3043,17 +3033,10 @@ impl Studio {
                             .rounded_md()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if selected {
-                                blue()
-                            } else {
-                                Hsla::from(rgb(0xf0f0f1))
-                            })
-                            .text_color(if selected {
-                                Hsla::from(rgb(0xffffff))
-                            } else {
-                                ink()
-                            })
+                            .bg(if selected { accent() } else { control_bg() })
+                            .text_color(if selected { on_accent() } else { ink() })
                             .cursor_pointer()
+                            .when(!selected, |this| this.hover(|style| style.bg(control_hover())))
                             .child(preset.name)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.apply_background_preset(index);
@@ -3076,7 +3059,7 @@ impl Studio {
                 self.toast =
                     Some(format!("Saved {}", self.preset_library.presets[index].name).into())
             }
-            Err(error) => self.toast = Some(format!("Could not save preset: {error}").into()),
+            Err(error) => self.toast = Some(crate::Notification::error(format!("Could not save preset: {error}"))),
         }
     }
 
@@ -3093,9 +3076,16 @@ impl Studio {
     pub(crate) fn delete_saved_preset(&mut self, index: usize) {
         if let Some(preset) = self.preset_library.remove(index) {
             if let Err(error) = self.preset_library.save() {
-                self.toast = Some(format!("Could not update presets: {error}").into());
+                self.toast = Some(crate::Notification::error(format!("Could not update presets: {error}")));
             } else {
-                self.toast = Some(format!("Deleted {}", preset.name).into());
+                let message = format!("Deleted {}", preset.name);
+                self.toast = Some(crate::notifications::Notification::with_action(message, "Undo", move |this, _| {
+                    let index = index.min(this.preset_library.presets.len());
+                    this.preset_library.presets.insert(index, preset.clone());
+                    if let Err(error) = this.preset_library.save() {
+                        this.toast = Some(crate::Notification::error(format!("Could not update presets: {error}")));
+                    }
+                }));
             }
         }
     }
@@ -3141,22 +3131,35 @@ impl Studio {
             };
             let x = editor_time / timeline_duration * timeline_content_width;
             let selected = self.video_selected_press == Some(time);
+            // 16 px hit area around the 8 px dot, in the ruler's marker
+            // band between the labels and the ticks.
             markers.push(
                 div()
                     .id(("press-marker", index))
                     .absolute()
-                    .left(px(x as f32 - 4.0))
-                    .bottom(px(1.0))
-                    .size(px(8.0))
-                    .rounded_full()
-                    .bg(if selected {
-                        ink()
-                    } else {
-                        Hsla::from(rgb(self.pointer_style.click_color))
-                    })
-                    .border_1()
-                    .border_color(hsla(0.0, 0.0, 1.0, 0.9))
+                    .left(px(x as f32 - 8.0))
+                    .top(px(17.0))
+                    .size(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor_pointer()
+                    .tooltip(crate::timeline_ui::tooltip(format!(
+                        "Click · {}",
+                        crate::units::timecode(editor_time)
+                    )))
+                    .child(
+                        div()
+                            .size(px(8.0))
+                            .rounded_full()
+                            .bg(if selected {
+                                ink()
+                            } else {
+                                Hsla::from(rgb(self.pointer_style.click_color))
+                            })
+                            .border_1()
+                            .border_color(hsla(0.0, 0.0, 1.0, 0.9)),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -3228,7 +3231,7 @@ impl Studio {
                 .flex_none()
                 .overflow_hidden()
                 .rounded_lg()
-                .bg(rgb(0xECEDF1))
+                .bg(control_bg())
                 .child(
                     div()
                         .absolute()
@@ -3239,7 +3242,7 @@ impl Studio {
                         .children(bars)
                         .children(self.video_clip_timeline.clip_starts().into_iter().skip(1).map(|start| {
                             div().absolute().left(px((start / duration * timeline_content_width) as f32))
-                                .top_0().w(px(1.0)).h_full().bg(rgb(0xECEDF1))
+                                .top_0().w(px(1.0)).h_full().bg(control_bg())
                         }))
                         .child(
                             div()
@@ -3248,7 +3251,7 @@ impl Studio {
                                 .top_0()
                                 .w(px(2.0))
                                 .h_full()
-                                .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
+                                .bg(brand()),
                         ),
                 )
                 .when(muted_lane, |this| {
@@ -3321,6 +3324,7 @@ impl Studio {
             }
         }
         let mut regions: Vec<AnyElement> = Vec::new();
+        let mut handles: Vec<AnyElement> = Vec::new();
         for (index, mark) in self.annotations.iter().enumerate() {
             let timing = mark.timing.unwrap_or(AnnotationTiming {
                 start: 0.0,
@@ -3333,17 +3337,9 @@ impl Studio {
                 3.0 + rows.get(index).copied().unwrap_or(0) as f32 * Self::ANNOTATION_ROW_HEIGHT;
             let is_selected = selected == Some(index);
             let whole = mark.timing.is_none();
-            let name = if mark.tool == Tool::Text && !mark.text.trim().is_empty() {
-                let text = mark.text.trim();
-                if text.chars().count() > 28 {
-                    format!("{}…", text.chars().take(27).collect::<String>())
-                } else {
-                    text.to_string()
-                }
-            } else {
-                mark.tool.label().to_string()
-            };
-            let label = format!("{name}{}", if whole { " · whole scene" } else { "" });
+            let moving = self.annotation_drag.as_ref().is_some_and(|drag| {
+                drag.index == index && matches!(drag.kind, AnnotationDragKind::Move)
+            });
             regions.push(
                 div()
                     .id(("annotation-region", index))
@@ -3354,26 +3350,33 @@ impl Studio {
                     .h(px(22.0))
                     .rounded_md()
                     .border_2()
-                    .border_color(if is_selected {
-                        hsla(222.0 / 360.0, 0.2, 0.15, 1.0)
-                    } else {
-                        hsla(0.0, 0.0, 0.0, 0.0)
-                    })
+                    .border_color(if is_selected { ink() } else { gpui::transparent_black() })
                     .bg(if is_selected {
-                        hsla(188.0 / 360.0, 0.7, 0.36, 1.0)
+                        Hsla { l: lane_clip().l - 0.06, ..lane_clip() }
                     } else {
-                        hsla(188.0 / 360.0, 0.6, 0.45, 1.0)
+                        lane_clip()
                     })
+                    .when(!is_selected, |this| this.hover(|s| s.border_color(ink().opacity(0.4))))
                     .when(whole, |this| this.opacity(0.7))
-                    .text_color(rgb(0xffffff))
+                    .text_color(gpui::white())
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .flex()
                     .items_center()
-                    .justify_center()
                     .overflow_hidden()
-                    .cursor(CursorStyle::PointingHand)
-                    .when(width >= 60.0, |this| this.child(label))
+                    .cursor(if moving { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                    .when(width as f32 >= crate::timeline_ui::REGION_LABEL_MIN_WIDTH, |this| {
+                        let name = if mark.tool == Tool::Text && !mark.text.trim().is_empty() {
+                            mark.text.trim()
+                        } else {
+                            mark.tool.label()
+                        };
+                        this.child(crate::timeline_ui::region_label(if whole {
+                            format!("{name} · whole scene")
+                        } else {
+                            name.to_string()
+                        }))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -3389,59 +3392,41 @@ impl Studio {
                             cx.notify();
                         }),
                     )
-                    .when(is_selected && !whole, |this| {
-                        this.child(
-                            div()
-                                .id(("annotation-leading", index))
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .w(px(8.0))
-                                .h_full()
-                                .rounded_l_md()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.begin_annotation_drag(
-                                            index,
-                                            AnnotationDragKind::Leading,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id(("annotation-trailing", index))
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .w(px(8.0))
-                                .h_full()
-                                .rounded_r_md()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.begin_annotation_drag(
-                                            index,
-                                            AnnotationDragKind::Trailing,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                    })
                     .into_any_element(),
             );
+            if whole {
+                continue;
+            }
+            for (leading, kind) in [
+                (true, AnnotationDragKind::Leading),
+                (false, AnnotationDragKind::Trailing),
+            ] {
+                handles.push(
+                    crate::timeline_ui::trim_handle(
+                        (if leading { "annotation-leading" } else { "annotation-trailing" }, index),
+                        0.0,
+                        (if leading { left } else { left + width }) as f32,
+                        leading,
+                        width as f32,
+                        top,
+                        22.0,
+                        is_selected,
+                        false,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.select_annotation_for_timing(index);
+                            this.begin_annotation_drag(index, kind, event.position.x);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                );
+            }
         }
+        regions.extend(handles);
         Some(
             div()
                 .id("annotation-track")
@@ -3453,7 +3438,7 @@ impl Studio {
                 .overflow_y_scroll()
                 .track_scroll(&self.annotation_timeline_scroll)
                 .rounded_lg()
-                .bg(rgb(0xECEDF1))
+                .bg(control_bg())
                 .child(
                     div()
                         .relative()
@@ -3473,7 +3458,7 @@ impl Studio {
                                 .top_0()
                                 .w(px(2.0))
                                 .h_full()
-                                .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
+                                .bg(brand()),
                         ),
                 )
                 .on_mouse_down(
@@ -3648,11 +3633,14 @@ impl Studio {
         _value: f64,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
-        div().w(px(88.0)).child(if start {
-            self.text_fields.start.clone()
-        } else {
-            self.text_fields.end.clone()
-        }).into_any_element()
+        div().w(px(88.0)).flex().items_center().gap_1()
+            .child(div().flex_1().min_w_0().child(if start {
+                self.text_fields.start.clone()
+            } else {
+                self.text_fields.end.clone()
+            }))
+            .child(div().text_xs().text_color(muted()).child("s"))
+            .into_any_element()
     }
 
     /// Timing panel for the selected annotation in an animated screenshot.
@@ -3692,19 +3680,15 @@ impl Studio {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(div().size(px(10.0)).rounded_full().bg(hsla(
-                                    188.0 / 360.0,
-                                    0.6,
-                                    0.45,
-                                    1.0,
-                                )))
-                                .child(div().text_sm().font_weight(FontWeight::BOLD).child(title)),
+                                .child(div().size(px(10.0)).rounded_full().bg(lane_clip()))
+                                .child(div().section_title().child(title)),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(muted())
-                                .child(format!("{:.2}s – {:.2}s", timing.start, timing.end)),
+                                .tabular()
+                                .child(crate::units::fmt_seconds_range(timing.start, timing.end)),
                         ),
                 )
                 .child(self.scene_toggle_row(
@@ -3727,8 +3711,6 @@ impl Studio {
                         }
                     },
                 ))
-                .when(mark.is_canvas(), |panel| panel.child(div().text_xs().text_color(muted())
-                    .child("Independent text: stays on the canvas when the image moves or ends.")))
                 .when(!mark.is_canvas(), |panel| panel.child(self.scene_toggle_row(
                     "annotation-pinned",
                     "Ignore camera zoom",
@@ -3806,18 +3788,12 @@ impl Studio {
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(muted())
-                            .child("Times are in seconds. Enter to apply; Escape to cancel."),
-                    )
-                    .child(
-                        div()
                             .mt_3()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Animation"),
                     )
-                    .child(div().text_xs().text_color(muted()).child("Entrance"))
+                    .child(div().field_label().child("Entrance"))
                     .child(self.segmented(
                         "annotation-entrance-a",
                         &["Cut", "Fade", "Pop", "Slide up"],
@@ -3852,7 +3828,7 @@ impl Studio {
                         },
                         cx,
                     ))
-                    .child(div().text_xs().text_color(muted()).child("Exit"))
+                    .child(div().field_label().child("Exit"))
                     .child(self.segmented(
                         "annotation-exit",
                         &["Cut", "Fade", "Shrink", "Slide out"],
@@ -4075,7 +4051,7 @@ fn paint_selection_handles(
     }
     builder.line_to(corners[0]);
     if let Ok(path) = builder.build() {
-        window.paint_path(path, hsla(211.0 / 360.0, 1.0, 0.55, 0.9));
+        window.paint_path(path, crate::selection().opacity(0.9));
     }
     for corner in corners {
         window.paint_quad(quad(
@@ -4084,9 +4060,9 @@ fn paint_selection_handles(
                 size: size(px(12.0), px(12.0)),
             },
             px(3.0),
-            rgb(0xffffff),
+            gpui::white(),
             px(2.0),
-            rgb(0x2997ff),
+            crate::selection(),
             Default::default(),
         ));
     }

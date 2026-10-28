@@ -17,7 +17,6 @@ use uuid::Uuid;
 #[derive(Default)]
 pub(crate) struct TimelineMotionState {
     pub(crate) creation: Option<MotionCreationDrag>,
-    pub(crate) hovered_region: Option<Uuid>,
 }
 
 #[derive(Clone, Copy)]
@@ -149,7 +148,7 @@ impl Studio {
         }
         let slices = creation_slices(&self.video_clip_timeline, drag.start, drag.current);
         if slices.is_empty() {
-            self.toast = Some("Drag a longer range over a clip to add motion".into());
+            self.toast = Some("Drag a longer range over a clip to add a zoom".into());
             cx.notify();
             return true;
         }
@@ -261,8 +260,8 @@ impl Studio {
                             .rounded_md()
                             .border_2()
                             .border_dashed()
-                            .border_color(hsla(24.0 / 360.0, 0.95, 0.48, 1.0))
-                            .bg(hsla(24.0 / 360.0, 0.95, 0.55, 0.22))
+                            .border_color(crate::lane_zoom())
+                            .bg(crate::lane_zoom().opacity(0.22))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -270,7 +269,7 @@ impl Studio {
                             .text_xs()
                             .text_color(crate::ink())
                             .when(right - left >= 60.0, |this| {
-                                this.child(format!("{:.2}s", slice.editor_end - slice.editor_start))
+                                this.child(crate::units::fmt_seconds(slice.editor_end - slice.editor_start))
                             }),
                     )
                 }))

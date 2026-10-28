@@ -7,7 +7,7 @@ use gpui::{
 };
 
 use crate::{
-    ink, line, muted,
+    ink, muted, TextRoles,
     recording::{
         scene::SceneBackground,
         templates::{self, SceneTemplate},
@@ -101,7 +101,8 @@ impl Studio {
         let preview = div()
             .w_full()
             .h(px(44.0))
-            .rounded_md()
+            // Concentric with the card: its 8 px radius less the 4 px padding.
+            .rounded(px(crate::theme::inner_radius(crate::theme::RADIUS_LG, 4.0)))
             .overflow_hidden()
             .relative()
             .bg(match &template.style.background {
@@ -126,21 +127,7 @@ impl Studio {
                         this.border_1()
                             .border_color(Hsla::from(rgb(template.style.border_color)))
                     }),
-            )
-            .when(!template.marks.is_empty(), |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .right(px(4.0))
-                        .top(px(4.0))
-                        .px(px(4.0))
-                        .rounded_sm()
-                        .bg(hsla(0.0, 0.0, 0.0, 0.55))
-                        .text_color(rgb(0xffffff))
-                        .text_size(px(9.0))
-                        .child("Aa"),
-                )
-            });
+            );
         div()
             .id(gpui::SharedString::from(format!("template-card-{id}")))
             .flex()
@@ -148,20 +135,19 @@ impl Studio {
             .gap_1()
             .p_1()
             .rounded_lg()
-            .border_1()
-            .border_color(line())
-            .bg(rgb(0xffffff))
+            .card()
+            .bg(crate::surface())
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0xf3f4f6)))
+            .hover(|style| style.bg(crate::control_bg()))
             .child(preview)
             .child(
                 div()
                     .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(ink())
                     .child(name),
             )
-            .child(div().text_size(px(10.0)).text_color(muted()).child(tagline))
+            .child(div().text_size(px(11.0)).text_color(muted()).child(tagline))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(template) = templates::find(id) {
                     this.apply_template(&template, cx);
@@ -190,7 +176,7 @@ impl Studio {
             rows.push(row.into_any_element());
         }
         let hint = if self.video_project.is_some() {
-            "Sets the look, adds intro motion and captions; your later motion regions stay."
+            "Sets the look, adds intro motion and captions. Your zooms stay."
         } else {
             "Turns the screenshot into a short animated scene with captions you can edit."
         };
@@ -199,7 +185,7 @@ impl Studio {
             .flex_col()
             .gap_2()
             .children(rows)
-            .child(div().text_xs().text_color(muted()).child(hint))
+            .child(div().hint().child(hint))
             .into_any_element()
     }
 }

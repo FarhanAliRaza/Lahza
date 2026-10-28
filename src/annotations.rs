@@ -1,6 +1,6 @@
 //! Connect annotation gestures to Studio selection, undo, media coordinates, and text input.
 use super::{AnnotationMark, AnnotationTiming, NormPoint, Studio, Tool, ANNOTATION_COLORS};
-use gpui::{point, px, quad, rgb, size, App, Bounds, KeyDownEvent, Pixels, Point, Window};
+use gpui::{point, px, quad, size, App, Bounds, KeyDownEvent, Pixels, Point, Window};
 use lahza_annotations::canvas::{
     annotation_snap_bounds, constrained_delta, handles, hit_mark, hit_selection_box, mark_screen_bounds,
     paint_snap_guide, translate_mark, translation_limits,
@@ -485,9 +485,9 @@ impl Studio {
                 window.paint_quad(quad(
                     bounds,
                     px(0.),
-                    gpui::rgba(0x2997ff15),
+                    crate::selection().opacity(0.08),
                     px(1.),
-                    rgb(0x2997ff),
+                    crate::selection(),
                     Default::default(),
                 ));
             }
@@ -1667,7 +1667,7 @@ impl Studio {
                 "escape" => self.cancel_crop(),
                 "enter" => {
                     if let Err(error) = self.apply_crop() {
-                        self.toast = Some(error.into());
+                        self.toast = Some(crate::Notification::error(error));
                     }
                 }
                 _ => return false,

@@ -1,7 +1,7 @@
-use crate::{blue, cached_render_image, ink, library, line, muted, recording, Studio};
-use gpui::{div, img, prelude::*, px, svg, AnyElement, Context, ObjectFit, RenderImage};
+use crate::{cached_render_image, canvas_well, control_bg, ink, library, muted, recording, surface, Studio, TextRoles};
+use gpui::{div, img, prelude::*, px, svg, AnyElement, Context, ObjectFit, RenderImage, SharedString};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
 };
@@ -9,6 +9,8 @@ use std::{
 #[derive(Default)]
 pub(crate) struct LibraryState {
     thumbnails: VecDeque<(PathBuf, Option<Arc<RenderImage>>)>,
+    /// "Mar 4, 2026 · 1:05" per item, read with its thumbnail.
+    details: HashMap<PathBuf, SharedString>,
     pending: HashSet<PathBuf>,
     generation: u64,
     pub loading: bool,
@@ -44,6 +46,7 @@ impl Studio {
                 }
                 this.library_state.loading = false;
                 // Refresh modified images and retry failed previews on a tab refresh.
+                this.library_state.details.clear();
                 for (_, image) in this.library_state.thumbnails.drain(..) {
                     this.retired_images.extend(image);
                 }
@@ -75,14 +78,15 @@ impl Studio {
             let path = path.clone();
             let worker_path = path.clone();
             let generation = self.library_state.generation;
-            let task = cx
-                .background_executor()
-                .spawn(async move { load_thumbnail(&worker_path, projects) });
+            let task = cx.background_executor().spawn(async move {
+                (load_thumbnail(&worker_path, projects), item_details(&worker_path, projects))
+            });
             cx.spawn(async move |weak, cx| {
-                let pixels = task.await;
+                let (pixels, details) = task.await;
                 let _ = weak.update(cx, |this, cx| {
                     this.library_state.pending.remove(&path);
                     if generation == this.library_state.generation {
+                        this.library_state.details.insert(path.clone(), details.into());
                         this.library_state
                             .thumbnails
                             .push_back((path, pixels.map(cached_render_image)));
@@ -103,7 +107,7 @@ impl Studio {
             .flex_none()
             .rounded_md()
             .overflow_hidden()
-            .bg(gpui::rgb(0xeeeeef))
+            .bg(canvas_well())
             .flex()
             .items_center()
             .justify_center()
@@ -149,10 +153,9 @@ impl Studio {
                     .h_full()
                     .px_2()
                     .rounded_lg()
-                    .bg(gpui::white())
-                    .border_1()
-                    .border_color(line())
-                    .hover(|style| style.bg(gpui::rgb(0xf3f3f5)))
+                    .bg(surface())
+                    .card()
+                    .hover(|style| style.bg(control_bg()))
                     .cursor_pointer()
                     .flex()
                     .items_center()
@@ -166,17 +169,15 @@ impl Studio {
                             .flex_col()
                             .gap_1()
                             .child(div().text_sm().text_color(ink()).truncate().child(name))
-                            .child(div().text_xs().text_color(muted()).child(if projects {
-                                "Video project"
-                            } else {
-                                "Screenshot"
-                            })),
+                            .child(div().hint().tabular().truncate().child(
+                                self.library_state.details.get(&path).cloned().unwrap_or_default(),
+                            )),
                     )
                     .child(
                         svg()
                             .path("icons/chevron-right.svg")
                             .size(px(15.0))
-                            .text_color(blue()),
+                            .text_color(muted()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let request = if projects { crate::loading::LoadRequest::Recording(path.clone()) }
@@ -187,6 +188,24 @@ impl Studio {
             )
             .into_any_element()
     }
+}
+
+/// Modified date, then the recording's length or the image's size.
+fn item_details(path: &std::path::Path, projects: bool) -> String {
+    let modified = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(|time| chrono::DateTime::<chrono::Local>::from(time).format("%b %-d, %Y").to_string())
+        .ok();
+    let extent = if projects {
+        recording::model::RecordingSession { directory: path.to_path_buf() }
+            .read_manifest()
+            .ok()
+            .filter(|manifest| manifest.duration > 0.0)
+            .map(|manifest| crate::units::ruler_time(manifest.duration, false))
+    } else {
+        image::image_dimensions(path).ok().map(|(width, height)| format!("{width} × {height}"))
+    };
+    [modified, extent].into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }
 
 /// Decode off the UI thread and retain only a display-sized image.

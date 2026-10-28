@@ -4,7 +4,7 @@
 //! workflow.
 
 use gpui::{
-    div, hsla, prelude::*, px, rgb, AnyElement, Context, CursorStyle, FontWeight, MouseButton,
+    div, prelude::*, px, AnyElement, Context, CursorStyle, FontWeight, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, Timer,
 };
 use image::RgbaImage;
@@ -13,8 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::controls::{button, ButtonKind, ButtonSize};
+use crate::theme::TextRoles;
 use crate::{
-    line, muted,
+    muted,
     recording::{
         clips::{ClipEdge, RecordingClipTimeline},
         export::{
@@ -28,7 +30,7 @@ use crate::{
             TransformMotion, ViewportTimeline, ZoomAnchorMode, ZoomCue, ZoomPresentation,
         },
     },
-    xml_escape, ImageScene, SliderDrag, Studio, VideoEditSnapshot, VideoZoomDragKind,
+    xml_escape, ImageScene, Studio, VideoEditSnapshot, VideoZoomDragKind,
     GRADIENT_BACKGROUNDS, SOLID_BACKGROUNDS,
 };
 
@@ -385,12 +387,10 @@ mod motion_lane_tests {
     }
 }
 
+/// Zoom lane fill; selected regions are a shade darker.
 pub(crate) fn orange(selected: bool) -> gpui::Hsla {
-    if selected {
-        hsla(24.0 / 360.0, 0.95, 0.47, 1.0)
-    } else {
-        hsla(24.0 / 360.0, 0.95, 0.56, 1.0)
-    }
+    let lane = crate::lane_zoom();
+    if selected { gpui::Hsla { l: lane.l - 0.06, ..lane } } else { lane }
 }
 
 fn zoom_from_slider(value: u8) -> f64 {
@@ -566,7 +566,7 @@ impl Studio {
         self.video_undo_stack
             .push(VideoEditSnapshot::Zoom(original));
         self.video_redo_stack.clear();
-        self.rebuild_video_motion_timelines();
+        self.rebuild_video_viewport_timeline();
         self.persist_video_zoom_cues_quiet();
         true
     }
@@ -589,21 +589,19 @@ impl Studio {
             return;
         }
         cue.zoom = zoom;
-        self.rebuild_video_motion_timelines();
+        self.rebuild_video_viewport_timeline();
     }
 
-    pub(crate) fn begin_motion_zoom_slider(&mut self, start_x: Pixels, start_value: u8) {
+    /// Starts a zoom slider gesture with one undo entry; false when editing is blocked.
+    pub(crate) fn begin_motion_zoom_slider(&mut self) -> bool {
         if self.video_edit_busy || self.video_selected_zoom_cue.is_none() {
-            return;
+            return false;
         }
+        self.pause_video_playback();
         self.video_undo_stack
             .push(VideoEditSnapshot::Zoom(self.video_zoom_cues.clone()));
         self.video_redo_stack.clear();
-        self.slider_drag = Some(SliderDrag {
-            slider_id: MOTION_ZOOM_SLIDER,
-            start_x,
-            start_value,
-        });
+        true
     }
 
     /// Slider callback from `set_slider_value`.
@@ -640,7 +638,7 @@ impl Studio {
             }
         }
         if generated == self.video_zoom_cues {
-            self.toast = Some("Motion already matches the automatic suggestion".into());
+            self.toast = Some("Zooms already match your clicks".into());
             cx.notify();
             return;
         }
@@ -673,6 +671,7 @@ impl Studio {
     ) -> Vec<AnyElement> {
         let selected_zoom_cue = self.video_selected_zoom_cue;
         let mut lane: Vec<AnyElement> = Vec::new();
+        let mut handles: Vec<AnyElement> = Vec::new();
         for region in motion_lane_layout(
             &self.video_zoom_cues,
             &self.video_clip_timeline,
@@ -687,9 +686,12 @@ impl Studio {
             let left = region.left;
             let width = region.width;
             let selected = selected_zoom_cue == Some(cue_id);
-            let hovered = self.timeline_motion.hovered_region == Some(cue_id);
-            let label = cue.summary();
             let enabled = cue.is_enabled;
+            let top = 3.0 + region.row as f32 * MOTION_ROW_HEIGHT;
+            let moving = self
+                .video_zoom_drag
+                .as_ref()
+                .is_some_and(|drag| drag.original_cue.id == cue_id && matches!(drag.kind, VideoZoomDragKind::Move));
             lane.push(
                 div()
                     .id((
@@ -698,37 +700,32 @@ impl Studio {
                     ))
                     .absolute()
                     .left(px(left as f32))
-                    .top(px(3.0 + region.row as f32 * MOTION_ROW_HEIGHT))
+                    .top(px(top))
                     .w(px(width as f32))
                     .h(px(24.0))
                     .rounded_md()
                     .border_2()
                     .border_color(if selected {
-                        crate::blue()
+                        crate::ink()
                     } else {
-                        hsla(0.0, 0.0, 0.0, 0.0)
+                        gpui::transparent_black()
                     })
                     .bg(orange(selected))
                     .when(!enabled, |this| this.opacity(0.45))
-                    .text_color(rgb(0xffffff))
+                    .text_color(gpui::white())
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .flex()
                     .items_center()
-                    .justify_center()
                     .overflow_hidden()
-                    .cursor(CursorStyle::PointingHand)
-                    .hover(|style| style.bg(orange(true)))
-                    .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                        let next = if *hovering { Some(cue_id) }
-                            else if this.timeline_motion.hovered_region == Some(cue_id) { None }
-                            else { this.timeline_motion.hovered_region };
-                        if next != this.timeline_motion.hovered_region {
-                            this.timeline_motion.hovered_region = next;
-                            cx.notify();
-                        }
-                    }))
-                    .when(width >= 44.0, |this| this.child(label))
+                    .cursor(if moving { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                    .when(selected && !moving, |this| {
+                        this.tooltip(crate::timeline_ui::tooltip(crate::timeline_ui::REGION_KEYS_HELP))
+                    })
+                    .when(!selected, |this| this.hover(|style| style.border_color(crate::ink().opacity(0.4))))
+                    .when(width as f32 >= crate::timeline_ui::REGION_LABEL_MIN_WIDTH, |this| {
+                        this.child(crate::timeline_ui::region_label(cue.summary()))
+                    })
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.open_timeline_context(crate::timeline_ui::TimelineContextTarget::Motion(cue_id), event.position, cx);
@@ -756,69 +753,44 @@ impl Studio {
                             cx.notify();
                         }),
                     )
-                    .when(selected || hovered, |this| {
-                        this.child(
-                            div()
-                                .id((
-                                    "motion-region-leading",
-                                    cue_id.as_u128() as u64 ^ segment_index as u64,
-                                ))
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .w(px(10.0))
-                                .h_full()
-                                .rounded_l_md()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.begin_video_zoom_drag(
-                                            cue_id,
-                                            VideoZoomDragKind::Leading,
-                                            editor_start,
-                                            editor_end,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id((
-                                    "motion-region-trailing",
-                                    cue_id.as_u128() as u64 ^ !(segment_index as u64),
-                                ))
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .w(px(10.0))
-                                .h_full()
-                                .rounded_r_md()
-                                .bg(hsla(0.0, 0.0, 1.0, 0.38))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.begin_video_zoom_drag(
-                                            cue_id,
-                                            VideoZoomDragKind::Trailing,
-                                            editor_start,
-                                            editor_end,
-                                            event.position.x,
-                                        );
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                    })
                     .into_any_element(),
             );
+            for (leading, kind) in [(true, VideoZoomDragKind::Leading), (false, VideoZoomDragKind::Trailing)] {
+                handles.push(
+                    crate::timeline_ui::trim_handle(
+                        (
+                            if leading { "motion-region-leading" } else { "motion-region-trailing" },
+                            (cue_id.as_u128() as u64).wrapping_add(segment_index as u64),
+                        ),
+                        0.0,
+                        (if leading { left } else { left + width }) as f32,
+                        leading,
+                        width as f32,
+                        top,
+                        24.0,
+                        selected,
+                        true,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_video_zoom_drag(
+                                cue_id,
+                                kind,
+                                editor_start,
+                                editor_end,
+                                event.position.x,
+                            );
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                );
+            }
         }
+        // Handles sit above every region body so a neighbor never hides one.
+        lane.extend(handles);
         lane
     }
 
@@ -857,7 +829,8 @@ impl Studio {
             .flex_none()
             .overflow_hidden()
             .rounded_lg()
-            .bg(rgb(0xECEDF1))
+            .bg(crate::control_bg())
+            .cursor(CursorStyle::Crosshair)
             .child(
                 div()
                     .absolute()
@@ -873,7 +846,7 @@ impl Studio {
                             .top_0()
                             .w(px(2.0))
                             .h_full()
-                            .bg(hsla(222.0 / 360.0, 0.2, 0.15, 0.7)),
+                            .bg(crate::brand()),
                     ),
             )
             .when(empty && self.timeline_motion.creation.is_none(), |this| {
@@ -884,7 +857,7 @@ impl Studio {
                         .top(px(7.0))
                         .text_xs()
                         .text_color(muted())
-                        .child("Drag to add motion · double-click for a quick region"),
+                        .child("Drag to add a zoom"),
                 )
             })
             .when_some(self.motion_creation_preview(), |this, preview| this.child(preview))
@@ -920,11 +893,7 @@ impl Studio {
     // ------------------------------------------------------------------
 
     pub(crate) fn inspector_label(text: &'static str) -> AnyElement {
-        div()
-            .text_xs()
-            .text_color(muted())
-            .child(text)
-            .into_any_element()
+        div().field_label().child(text).into_any_element()
     }
 
     pub(crate) fn selection_action_button(
@@ -935,35 +904,19 @@ impl Studio {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Studio, &mut Context<Studio>) + 'static,
     ) -> AnyElement {
-        div()
-            .id(id)
-            .px_3()
-            .h(px(30.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .rounded_md()
-            .bg(rgb(if delete { 0xfee2e2 } else { 0xf0f0f1 }))
-            .text_color(rgb(if delete { 0xb91c1c } else { 0x27272a }))
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .opacity(if enabled { 1.0 } else { 0.4 })
-            .when(enabled, |button| {
-                button.cursor_pointer()
-                    .hover(move |style| style.bg(rgb(if delete { 0xfecaca } else { 0xe4e4e7 })))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        on_click(this, cx);
-                        cx.notify();
-                    }))
-            })
-            .child(gpui::svg()
-                .path(if delete { "icons/trash.svg" } else { "icons/close.svg" })
-                .size(px(14.0))
-                .flex_none()
-                .text_color(rgb(if delete { 0xb91c1c } else { 0x27272a })))
-            .child(if delete { "Delete" } else { "Deselect" })
-            .into_any_element()
+        button(
+            id,
+            if delete { "Delete" } else { "Deselect" },
+            if delete { ButtonKind::Danger } else { ButtonKind::Secondary },
+            ButtonSize::Sm,
+        )
+        .icon(if delete { "icons/trash.svg" } else { "icons/close.svg" })
+        .disabled(!enabled)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            on_click(this, cx);
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     pub(crate) fn small_button(
@@ -974,82 +927,40 @@ impl Studio {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Studio, &mut Context<Studio>) + 'static,
     ) -> AnyElement {
-        div()
-            .id(id)
-            .px_3()
-            .h(px(30.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .bg(rgb(0xf0f0f1))
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .opacity(if enabled { 1.0 } else { 0.4 })
-            .when(enabled, |this| {
-                this.cursor_pointer()
-                    .hover(|style| style.bg(rgb(0xe4e4e7)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        on_click(this, cx);
-                        cx.notify();
-                    }))
-            })
-            .child(label)
+        button(id, label, ButtonKind::Secondary, ButtonSize::Sm)
+            .disabled(!enabled)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                on_click(this, cx);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
     fn motion_zoom_slider(&self, zoom: f64, cx: &mut Context<Self>) -> AnyElement {
-        let value = slider_from_zoom(zoom);
-        let measured = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<Pixels>>));
-        let track = measured.clone();
-        div().flex().flex_none().items_center().gap_2()
-            .child(div().id("motion-zoom-slider").relative().flex_1().min_w(px(72.0)).h(px(40.0))
-                .cursor_pointer()
-                .child(gpui::canvas(
-                    move |bounds, _, _| { measured.set(Some(bounds)); bounds },
-                    move |_, bounds, window, _| {
-                        let left = bounds.origin.x + px(8.0);
-                        let width = (bounds.size.width - px(16.0)).max(px(1.0));
-                        let top = bounds.origin.y + px(17.0);
-                        let progress = width * (value as f32 / 100.0);
-                        for (length, color) in [(width, rgb(0xe2e5ea).into()), (progress, crate::blue())] {
-                            window.paint_quad(gpui::fill(gpui::Bounds::new(gpui::point(left, top), gpui::size(length, px(6.0))), color));
-                        }
-                        window.paint_quad(gpui::quad(
-                            gpui::Bounds::new(gpui::point(left + progress - px(7.0), top - px(4.0)), gpui::size(px(14.0), px(14.0))),
-                            px(7.0), rgb(0xffffff), px(2.0), crate::blue(), gpui::BorderStyle::Solid,
-                        ));
-                    },
-                ).absolute().inset_0().size_full())
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    let Some(bounds) = track.get() else { return; };
-                    if this.video_edit_busy { return; }
-                    let left = bounds.origin.x + px(8.0);
-                    let width = (bounds.size.width - px(16.0)).max(px(1.0));
-                    let value = ((event.position.x - left) / width * 100.0).round().clamp(0.0, 100.0) as u8;
-                    this.pause_video_playback();
-                    this.begin_motion_zoom_slider(event.position.x, value);
-                    this.motion_zoom_track = Some((left, width));
-                    this.set_motion_zoom_slider(value);
-                    cx.stop_propagation();
-                    cx.notify();
-                })))
-            .children((0..3).map(|slot| {
-                if slot == 1 {
-                    return div().w(px(58.0)).h(px(40.0)).rounded_md().bg(rgb(0xf0f0f1))
-                        .flex().items_center().justify_center().text_sm().child(format!("{zoom:.1}×")).into_any_element();
-                }
-                let sign = if slot == 0 { -1.0 } else { 1.0 };
-                div().id(if slot == 0 { "motion-zoom-minus" } else { "motion-zoom-plus" })
-                    .w(px(28.0)).h(px(40.0)).rounded_md().bg(rgb(0xf0f0f1))
-                    .flex().items_center().justify_center().child(if slot == 0 { "−" } else { "+" })
-                    .when(!self.video_edit_busy, |this| this.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                        this.edit_selected_region(|cue| cue.zoom = (cue.zoom + sign * 0.1).clamp(ZoomCue::MINIMUM_ZOOM, ZoomCue::MAXIMUM_ZOOM));
-                        cx.notify();
-                    })))
-                    .into_any_element()
-            }))
-            .into_any_element()
+        let busy = self.video_edit_busy;
+        let row = crate::controls::SliderRow {
+            slider_id: MOTION_ZOOM_SLIDER,
+            label: "Zoom level".into(),
+            fraction: slider_from_zoom(zoom) as f32 / 100.0,
+            value: crate::units::fmt_zoom(zoom).into(),
+            can_decrease: !busy && zoom > ZoomCue::MINIMUM_ZOOM + 1e-6,
+            can_increase: !busy && zoom < ZoomCue::MAXIMUM_ZOOM - 1e-6,
+            show_reset: !busy && (zoom - self.default_motion_zoom).abs() > 1e-6,
+        };
+        self.slider_control(
+            row,
+            |this| this.begin_motion_zoom_slider(),
+            |this, steps| {
+                this.edit_selected_region(|cue| {
+                    cue.zoom = (cue.zoom + steps as f64 * 0.1).clamp(ZoomCue::MINIMUM_ZOOM, ZoomCue::MAXIMUM_ZOOM)
+                });
+            },
+            |this| {
+                let zoom = this.default_motion_zoom;
+                this.edit_selected_region(|cue| cue.zoom = zoom);
+            },
+            cx,
+        )
     }
 
     fn preview_motion_endpoint(&mut self, endpoint: usize, cx: &mut Context<Self>) {
@@ -1130,7 +1041,7 @@ impl Studio {
         if *transform == previous {
             return false;
         }
-        self.rebuild_video_motion_timelines();
+        self.rebuild_video_viewport_timeline();
         true
     }
 
@@ -1157,18 +1068,7 @@ impl Studio {
             .flex_col()
             .gap_2()
             .child(Self::inspector_label("Card transform"))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("Position, scale, and rotation relative to scene layout."),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("Drag values left/right. Editing Start or End seeks to that endpoint. Hold Shift for fine adjustments."),
-            )
+            .child(div().hint().child("Drag a value. Shift for fine steps."))
             .child(
                 div()
                     .flex()
@@ -1183,6 +1083,8 @@ impl Studio {
         .into_iter()
         .enumerate()
         {
+            let label_name = label;
+            let busy = self.video_edit_busy;
             let mut row = div()
                 .flex()
                 .items_center()
@@ -1202,7 +1104,7 @@ impl Studio {
                     .items_center()
                     .justify_between()
                     .rounded_md()
-                    .bg(rgb(0xf1f1f2));
+                    .bg(crate::control_bg());
                 for (direction, label) in [(0, "−"), (1, "+")] {
                     if direction == 1 {
                         cell = cell.child(
@@ -1216,7 +1118,7 @@ impl Studio {
                                 .justify_center()
                                 .text_xs()
                                 .cursor(CursorStyle::ResizeLeftRight)
-                                .hover(|style| style.bg(rgb(0xe4e4e7)))
+                                .hover(|style| style.bg(crate::control_hover()))
                                 .child(value_label.clone())
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -1243,10 +1145,18 @@ impl Studio {
                             .items_center()
                             .justify_center()
                             .text_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xe4e4e7)))
+                            .tooltip(crate::timeline_ui::tooltip(format!(
+                                "{} {}",
+                                if direction == 0 { "Decrease" } else { "Increase" },
+                                label_name.to_lowercase()
+                            )))
+                            .when(busy, |this| this.opacity(0.4))
+                            .when(!busy, |this| this.cursor_pointer().hover(|style| style.bg(crate::control_hover())))
                             .child(label)
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.video_edit_busy {
+                                    return;
+                                }
                                 this.preview_motion_endpoint(endpoint, cx);
                                 this.edit_selected_region(|cue| {
                                     let Some(motion) = cue.transform.as_mut() else {
@@ -1308,18 +1218,23 @@ impl Studio {
 
     fn loupe_parameter(&self, index: usize, label: &'static str, value: f64, minimum: f64, maximum: f64, step: f64, cx: &mut Context<Self>) -> AnyElement {
         div().flex().items_center().justify_between().gap_2()
-            .child(div().text_sm().child(label))
+            .child(div().row_label().child(label))
             .child(div().flex().items_center().gap_1()
                 .children((0..3).map(|slot| {
                     if slot == 1 {
-                        return div().w(px(48.0)).h(px(32.0)).rounded_md().bg(rgb(0xf0f0f1))
-                            .flex().items_center().justify_center().text_xs()
+                        return div().w(px(48.0)).h(px(32.0)).rounded_md().bg(crate::control_bg())
+                            .flex().items_center().justify_center().text_xs().tabular()
                             .child(format!("{:.0}%", value * 100.0)).into_any_element();
                     }
                     let direction = usize::from(slot == 2);
                     let sign = if direction == 0 { -1.0 } else { 1.0 };
                     div().id(("loupe-parameter", index * 2 + direction))
-                        .w(px(28.0)).h(px(32.0)).rounded_md().bg(rgb(0xf0f0f1))
+                        .tooltip(crate::timeline_ui::tooltip(format!(
+                            "{} {}",
+                            if direction == 0 { "Decrease" } else { "Increase" },
+                            label.to_lowercase()
+                        )))
+                        .w(px(28.0)).h(px(32.0)).rounded_md().bg(crate::control_bg())
                         .flex().items_center().justify_center().child(if direction == 0 { "−" } else { "+" })
                         .opacity(if self.video_edit_busy { 0.4 } else { 1.0 })
                         .when(!self.video_edit_busy, |this| this.cursor_pointer()
@@ -1350,11 +1265,14 @@ impl Studio {
         self.rebuild_video_motion_timelines(); self.persist_video_zoom_cues_quiet();
     }
 
-    pub(crate) fn apply_selected_motion_style_to_all(&mut self) {
+    /// Copy the selected zoom's level and animation settings to every zoom.
+    pub(crate) fn apply_selected_zoom_to_all(&mut self) {
         let Some(selected) = self.selected_region() else { return; };
         if self.video_edit_busy { return; }
         let original = self.video_zoom_cues.clone();
+        let copy_level = selected.transform.is_none() || selected.has_camera_motion();
         for cue in &mut self.video_zoom_cues {
+            if copy_level && (cue.transform.is_none() || cue.has_camera_motion()) { cue.zoom = selected.zoom; }
             cue.presentation = selected.presentation; cue.loupe = selected.loupe;
             cue.camera_motion = selected.camera_motion; cue.easing = selected.easing;
             cue.skips_easing = selected.skips_easing; cue.start_animation_early = selected.start_animation_early;
@@ -1378,20 +1296,6 @@ impl Studio {
         self.motion_pick = MotionPick::Focus;
     }
 
-    pub(crate) fn apply_selected_zoom_level_to_all(&mut self) {
-        let Some(selected) = self.selected_region() else { return; };
-        if self.video_edit_busy { return; }
-        let original = self.video_zoom_cues.clone();
-        for cue in &mut self.video_zoom_cues {
-            if cue.transform.is_none() || cue.has_camera_motion() { cue.zoom = selected.zoom; }
-        }
-        if original == self.video_zoom_cues { return; }
-        self.video_undo_stack.push(VideoEditSnapshot::Zoom(original));
-        self.video_redo_stack.clear();
-        self.rebuild_video_motion_timelines();
-        self.persist_video_zoom_cues_quiet();
-    }
-
     /// A source-frame position picker, independent of the current zoom. The
     /// bitmap and hit test share the same fitted rectangle, including letterbox.
     fn motion_position_preview(&self, cue: &ZoomCue, cx: &mut Context<Self>) -> AnyElement {
@@ -1410,7 +1314,7 @@ impl Studio {
         div()
             .id("motion-position-preview")
             .relative().w_full().h(px(104.0)).flex_none()
-            .rounded_md().overflow_hidden().bg(rgb(0xe9edf2))
+            .rounded_md().overflow_hidden().bg(crate::canvas_well())
             .cursor(CursorStyle::Crosshair)
             .when_some(image, |this, image| this.child(
                 gpui::img(image).absolute().inset_0().size_full().object_fit(gpui::ObjectFit::Contain)
@@ -1428,7 +1332,7 @@ impl Studio {
                     );
                     window.paint_quad(gpui::quad(
                         gpui::Bounds::new(center - gpui::point(px(7.0), px(7.0)), gpui::size(px(14.0), px(14.0))),
-                        px(7.0), crate::blue(), px(2.0), rgb(0xffffff), gpui::BorderStyle::Solid,
+                        px(7.0), crate::selection(), px(2.0), gpui::white(), gpui::BorderStyle::Solid,
                     ));
                 },
             ).absolute().inset_0().size_full())
@@ -1467,11 +1371,11 @@ impl Studio {
             )))
             .when(manual, |panel| panel
                 .child(self.motion_position_preview(cue, cx))
-                .child(div().text_xs().text_color(muted()).child(
+                .child(div().hint().child(
                     if self.motion_pick == MotionPick::PanEnd { "Click the preview to set the pan destination." }
                     else { "Click the preview to set the zoom position." }
                 )))
-            .when(!manual, |panel| panel.child(div().text_xs().text_color(muted()).child(
+            .when(!manual, |panel| panel.child(div().hint().child(
                 "Keeps the cursor and its surrounding activity in view."
             )))
             .into_any_element()
@@ -1511,10 +1415,9 @@ impl Studio {
                 crate::scene_ui::easing_index(cue.easing),
                 |this, index| { this.edit_selected_region(|cue| cue.easing = crate::recording::viewport::MotionEasing::ALL[index]); }, cx))
             .child(Self::inspector_label("Source timing"))
-            .child(div().text_xs().text_color(muted()).child("Fine-tune in the source clip, or drag the region edges in the timeline."))
             .children([false, true].into_iter().map(|end| {
                 div().flex().items_center().justify_between().gap_2()
-                    .child(div().text_sm().child(format!("{}  {:.2} s", if end { "End" } else { "Start" }, if end { cue.end } else { cue.start })))
+                    .child(div().row_label().child(format!("{} {}", if end { "End" } else { "Start" }, crate::units::fmt_seconds(if end { cue.end } else { cue.start }))))
                     .child(div().flex().gap_1()
                         .children([-0.1, 0.1].into_iter().enumerate().map(|(direction, delta)| {
                             let id = match (end, direction) {
@@ -1530,8 +1433,6 @@ impl Studio {
                             })
                         })))
             }))
-            .child(self.small_button("motion-apply-style", "Apply animation settings to all", !self.video_edit_busy, cx,
-                |this, _| this.apply_selected_motion_style_to_all()))
             .into_any_element()
     }
 
@@ -1592,7 +1493,7 @@ impl Studio {
                 .child(Self::inspector_label("Pan position"))
                 .child(self.segmented("motion-pick", &["Start position", "End position"], usize::from(self.motion_pick == MotionPick::PanEnd),
                     |this, index| { this.motion_pick = if index == 0 { MotionPick::Focus } else { MotionPick::PanEnd }; }, cx))
-                .child(div().text_xs().text_color(muted()).child("Click the canvas to set this position. Adding an end position creates a pan."))
+                .child(div().hint().child("Click the canvas to set this position. Adding an end position creates a pan."))
                 .when(cue.pan_to.is_some(), |panel| panel.child(self.small_button("motion-clear-pan", "Remove pan", !self.video_edit_busy, cx,
                     |this, _| { this.edit_selected_region(|cue| cue.pan_to = None); this.motion_pick = MotionPick::Focus; }))))
             .into_any_element()
@@ -1604,38 +1505,14 @@ impl Studio {
         let cue = self.selected_region()?;
         let has_camera = cue.transform.is_none() || cue.has_camera_motion();
         let glass = cue.presentation == ZoomPresentation::GlassLoupe;
-        let slices = self.video_clip_timeline.slices_overlapping(cue.start, cue.end);
-        let time_label = slices.first().zip(slices.last())
-            .map(|(first, last)| format!("{:.1} s – {:.1} s", first.editor_start, last.editor_end))
-            .unwrap_or_else(|| "Outside current edit".to_string());
         Some(div().flex().flex_col().gap_3()
-            .child(div().flex().items_center().justify_between()
-                .child(self.small_button("motion-deselect", "‹ All motion", true, cx, |this, _| {
-                    this.select_inspector_tab(crate::shell_ui::InspectorTab::Motion);
-                }))
-                .child(div().text_xs().text_color(muted()).child(time_label)))
-            .child(div().flex().items_center().justify_between()
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(if has_camera { "Zoom" } else { "Transform" }))
-                .child(div().flex().items_center().gap_2()
-                    .child(div().text_xs().text_color(muted()).child(if cue.is_enabled { "On" } else { "Off" }))
-                    .child(div().id("motion-enabled-toggle").cursor_pointer().child(self.toggle(cue.is_enabled))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.edit_selected_region(|cue| cue.is_enabled = !cue.is_enabled); cx.notify();
-                        })))))
             .when(has_camera, |panel| panel
-                .child(Self::inspector_label("Zoom style"))
-                .child(self.motion_style_choices(Some(cue.presentation), cx))
-                .when(glass, |panel| panel.child(self.loupe_parameter(0, "Glass Loupe size", cue.loupe.radius, 0.25, 0.75, 0.01, cx)))
+                .child(crate::controls::field("Zoom style", self.motion_style_choices(Some(cue.presentation), cx)))
+                .when(glass, |panel| panel.child(self.loupe_parameter(0, "Loupe size", cue.loupe.radius, 0.25, 0.75, 0.01, cx)))
                 .when(!glass, |panel| panel.child(self.scene_toggle_row("motion-instant", "Instant animation", cue.skips_easing, cx, |this| {
                     this.edit_selected_region(|cue| cue.skips_easing = !cue.skips_easing);
                 })))
                 .child(self.motion_position_controls(&cue, cx))
-                .child(div().flex().items_center().justify_between()
-                    .child(Self::inspector_label("Zoom level"))
-                    .child(self.small_button("motion-zoom-reset", "Reset", !self.video_edit_busy, cx, |this, _| {
-                        let zoom = this.default_motion_zoom;
-                        this.edit_selected_region(|cue| cue.zoom = zoom);
-                    })))
                 .child(self.motion_zoom_slider(cue.zoom, cx)))
             .when(!has_camera, |panel| panel.child(self.motion_region_transform_controls(&cue, cx)))
             .child(self.section_header("motion-advanced", "Advanced", None, cx))
@@ -1645,9 +1522,11 @@ impl Studio {
                 .when(self.section_open("motion-transform"), |panel| panel.child(self.motion_region_transform_controls(&cue, cx))))
             .child(div().flex().flex_wrap().gap_2()
                 .child(self.small_button("motion-duplicate", "Duplicate", !self.video_edit_busy, cx, |this, _| this.duplicate_selected_motion()))
-                .when(has_camera && self.video_zoom_cues.len() > 1, |panel| panel.child(self.small_button(
-                    "motion-apply-zoom", "Apply zoom level to all", !self.video_edit_busy, cx, |this, _| this.apply_selected_zoom_level_to_all(),
-                )))
+                .when(self.video_zoom_cues.len() > 1, |panel| panel.child(self.small_button(
+                    "motion-apply-all", "Apply to all zooms", !self.video_edit_busy, cx, |this, _| this.apply_selected_zoom_to_all(),
+                ))))
+            // Delete sits on its own row, away from the everyday actions.
+            .child(div().flex().justify_end()
                 .child(self.selection_action_button("motion-delete", true, !self.video_edit_busy, cx, |this, cx| { this.delete_selected_video_zoom(cx); })))
             .into_any_element())
     }
@@ -2059,7 +1938,7 @@ impl Studio {
         // Export is the single "keep my work" action: promote the autosaved
         // edit draft to the project before rendering the file.
         if let Err(error) = session.commit_draft() {
-            self.toast = Some(format!("Could not save recording edits: {error}").into());
+            self.toast = Some(crate::Notification::error(format!("Could not save recording edits: {error}")));
             cx.notify();
             return;
         }
@@ -2124,7 +2003,7 @@ impl Studio {
         // Annotations travel as a timed overlay so entrance and exit effects
         // render frame by frame; the media itself is the processed capture.
         if let Err(error) = self.rebuild_redactions() {
-            self.toast = Some(format!("Export failed: {error}").into());
+            self.toast = Some(crate::Notification::error(format!("Export failed: {error}")));
             cx.notify();
             return;
         }
@@ -2324,7 +2203,7 @@ impl Studio {
             let _ = weak.update(cx, |this, cx| {
                 match loaded {
                     Ok((path, image)) => this.add_image_scene(path, image),
-                    Err(error) => this.toast = Some(format!("Could not add image: {error}").into()),
+                    Err(error) => this.toast = Some(crate::Notification::error(format!("Could not add image: {error}"))),
                 }
                 cx.notify();
             });
@@ -2422,7 +2301,7 @@ impl Studio {
                 }
                 Err(error) => {
                     let _ = weak.update(cx, |this, cx| {
-                        this.toast = Some(format!("Export failed: {error}").into());
+                        this.toast = Some(crate::Notification::error(format!("Export failed: {error}")));
                         cx.notify();
                     });
                     return;
@@ -2473,21 +2352,7 @@ impl Studio {
         let task = cx.background_executor().spawn(async move {
             export_scene(source, &mut request, &progress).map_err(|error| error.to_string())
         });
-        // Keep the progress bar fresh while the background render runs.
-        cx.spawn(async move |weak, cx| loop {
-            Timer::after(Duration::from_millis(120)).await;
-            let active = weak
-                .update(cx, |this, cx| {
-                    cx.notify();
-                    this.export_progress.as_ref()
-                        .is_some_and(|active| Arc::ptr_eq(active, &job_progress))
-                })
-                .unwrap_or(false);
-            if !active {
-                break;
-            }
-        })
-        .detach();
+        self.watch_export_progress(job_progress, |_| {}, cx);
         cx.spawn(async move |weak, cx| {
             let result = task.await;
             let _ = weak.update(cx, |this, cx| {
@@ -2500,7 +2365,7 @@ impl Studio {
                         )
                     }
                     Err(error) if error == "export cancelled" => "Export cancelled".into(),
-                    Err(error) => format!("Export failed: {error}").into(),
+                    Err(error) => crate::notifications::failure("Export failed", &error, destination.parent()),
                 });
                 cx.notify();
             });
@@ -2515,6 +2380,54 @@ impl Studio {
         }
     }
 
+    /// Keeps the export panel fresh while `progress` runs. Every repaint
+    /// rebuilds the whole editor, so it polls the job and notifies only
+    /// when something the panel shows has changed (whole percent, ETA,
+    /// stage labels), not on every tick.
+    pub(crate) fn watch_export_progress(
+        &self,
+        progress: Arc<ExportProgress>,
+        before: impl Fn(&mut Studio) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |weak, cx| {
+            let mut shown = String::new();
+            loop {
+                Timer::after(Duration::from_millis(120)).await;
+                let active = weak
+                    .update(cx, |this, cx| {
+                        let active = this
+                            .export_progress
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &progress));
+                        if !active {
+                            return false;
+                        }
+                        before(this);
+                        let showing = format!(
+                            "{}|{:.0}|{}|{:?}|{:?}|{}",
+                            this.export_label,
+                            progress.fraction() * 100.0,
+                            progress.remaining_label(),
+                            progress.encoder_label(),
+                            progress.compositor_label(),
+                            progress.is_cancelled(),
+                        );
+                        if showing != shown {
+                            shown = showing;
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// A nonmodal job panel. Only the panel itself occupies pointer space,
     /// leaving the canvas and timeline available while the snapshot renders.
     pub(crate) fn export_status_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2525,21 +2438,15 @@ impl Studio {
         let label = if cancelling {
             "Cancelling…".to_string()
         } else {
-            format!("{} {:.0}%", self.export_label, fraction * 100.0)
+            format!("{} {}", self.export_label, crate::units::percent(fraction as f64))
         };
         Some(
             div()
-                .absolute()
-                .bottom(px(16.0))
-                .right(px(16.0))
-                .w(px(320.0))
+                .w(px(356.0))
                 .p_4()
                 .rounded_xl()
-                .border_1()
-                .border_color(line())
-                .bg(rgb(0xffffff))
+                .float()
                 .text_color(crate::ink())
-                .shadow_lg()
                 .flex()
                 .flex_col()
                 .gap_3()
@@ -2549,18 +2456,14 @@ impl Studio {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(label))
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).tabular().child(label))
                         .child(
-                            div()
-                                .id("export-collapse")
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .text_xs()
-                                .text_color(muted())
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0xf1f2f4)))
-                                .child(if collapsed { "Expand" } else { "Minimize" })
+                            button(
+                                "export-collapse",
+                                if collapsed { "Expand" } else { "Minimize" },
+                                ButtonKind::Ghost,
+                                ButtonSize::Sm,
+                            )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.export_panel_collapsed = !this.export_panel_collapsed;
                                     cx.notify();
@@ -2572,12 +2475,12 @@ impl Studio {
                         .child(div().text_xs().text_color(muted()).text_ellipsis().child(self.export_filename.clone()))
                         .child(div().text_xs().text_color(muted())
                             .child("Keep editing. This export uses the version you started with."))
-                        .children(progress.compositor_label().map(|label| div().text_xs().text_color(muted()).child(format!("Composition: {label}"))))
-                        .children(progress.encoder_label().map(|label| div().text_xs().text_color(muted()).child(format!("Encoding: {label}"))))
+                        .children(progress.compositor_label().map(|label| div().hint().child(format!("Composition: {label}"))))
+                        .children(progress.encoder_label().map(|label| div().hint().child(format!("Encoding: {label}"))))
                 })
                 .child(
-                    div().w_full().h(px(5.0)).rounded_full().bg(rgb(0xe9ebef)).overflow_hidden()
-                        .child(div().h_full().w(gpui::relative(fraction as f32)).rounded_full().bg(orange(false))),
+                    div().w_full().h(px(5.0)).rounded_full().bg(crate::control_bg()).overflow_hidden()
+                        .child(div().h_full().w(gpui::relative(fraction as f32)).rounded_full().bg(crate::accent())),
                 )
                 .when(!collapsed, |panel| {
                     panel.child(
@@ -2588,18 +2491,12 @@ impl Studio {
                                 progress.remaining_label()
                             }))
                             .child(
-                                div().id("export-cancel").px_2().py_1().rounded_md()
-                                    .border_1().border_color(line()).text_xs()
-                                    .opacity(if cancelling { 0.5 } else { 1.0 })
-                                    .child("Cancel")
-                                    .when(!cancelling, |button| {
-                                        button.cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0xf1f2f4)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.cancel_export();
-                                                cx.notify();
-                                            }))
-                                    }),
+                                button("export-cancel", "Cancel", ButtonKind::Secondary, ButtonSize::Sm)
+                                    .disabled(cancelling)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_export();
+                                        cx.notify();
+                                    })),
                             ),
                     )
                 })

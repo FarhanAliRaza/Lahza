@@ -374,7 +374,7 @@ impl Studio {
                                 }
                             }
                             Err(error) if !request.hover => {
-                                this.toast = Some(format!("Could not seek: {error}").into())
+                                this.toast = Some(crate::Notification::error(format!("Could not seek: {error}")))
                             }
                             Err(_) => {}
                         }

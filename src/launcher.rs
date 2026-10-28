@@ -1,12 +1,13 @@
 //! Capture launcher layout, source selectors, and recorder window lifecycle.
 
 use super::{
-    blue, brand_wordmark, ink, library, line, muted, open_studio_window, panel, recording,
+    accent, accent_tint, brand, brand_wordmark, control_bg, control_hover, ink, library, line, muted, on_accent, open_studio_window, panel, recording,
+    surface, TextRoles,
     RecordingOptions, RecordingState, Studio,
 };
 use crate::capture_access::CaptureAccess;
 use gpui::{
-    div, img, point, prelude::*, px, rgb, svg, AnyElement, App, ClickEvent, Context,
+    div, img, point, prelude::*, px, svg, AnyElement, App, ClickEvent, Context,
     FontWeight, IntoElement, ObjectFit, Window,
 };
 
@@ -17,23 +18,22 @@ impl Studio {
         id: &'static str,
         icon: &'static str,
         title: &'static str,
-        content: impl IntoElement,
+        content: Option<AnyElement>,
         enabled: bool,
         on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
         let editable = self.recording_state == RecordingState::Idle && !self.capture_access_busy;
         div().id(id).flex_none().p_3().flex().flex_col().gap_2()
-            .rounded_lg().border_1().border_color(line()).bg(gpui::white())
+            .rounded_lg().border_1().border_color(line()).bg(surface())
             .child(div().h(px(24.0)).flex().items_center().gap_2()
                 .child(svg().path(icon).size(px(17.0)).flex_none()
-                    .text_color(if enabled { blue() } else { muted() }))
+                    .text_color(if enabled { ink() } else { muted() }))
                 .child(div().flex_1().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
                 .child(div().id((id, 0usize)).h(px(28.0)).flex().items_center().gap_2()
                     .when(editable, |button| button.cursor_pointer().on_click(on_toggle))
                     .when(!editable, |button| button.opacity(0.5).cursor(gpui::CursorStyle::OperationNotAllowed))
-                    .child(div().text_xs().text_color(muted()).child(if enabled { "On" } else { "Off" }))
                     .child(self.toggle(enabled))))
-            .child(content)
+            .children(content)
             .into_any_element()
     }
 
@@ -84,11 +84,11 @@ impl Studio {
         div().id(id).relative().w_full().h(px(38.0)).flex_none()
             .flex().items_center().gap_2().pl_3().pr_2()
             .rounded_md().border_1().text_sm()
-            .border_color(if open { blue() } else { rgb(0xc8cdd5).into() })
-            .bg(if open { rgb(0xf0f6ff) } else { rgb(0xf8f9fb) })
+            .border_color(if open { accent() } else { line() })
+            .bg(control_bg())
             .text_color(ink())
             .when(editable, |field| field.cursor_pointer()
-                .hover(|field| field.border_color(blue()).bg(rgb(0xf0f6ff)))
+                .hover(|field| field.border_color(muted()).bg(control_hover()))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.focus_handle.focus(window);
@@ -101,7 +101,7 @@ impl Studio {
             .child(gpui::canvas(move |bounds, _, _| measure.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
             .child(div().flex_1().min_w_0().truncate().child(label))
             .child(div().w(px(24.0)).h(px(24.0)).flex_none().flex().items_center().justify_center()
-                .child(svg().path("icons/chevron-down.svg").size(px(16.0)).text_color(if open { blue() } else { muted() })))
+                .child(svg().path("icons/chevron-down.svg").size(px(16.0)).text_color(if open { ink() } else { muted() })))
             .when(open && editable, |field| {
                 let close = set_open.clone();
                 field.child(gpui::deferred(
@@ -111,7 +111,7 @@ impl Studio {
                         .position(menu_position)
                         .snap_to_window_with_margin(gpui::Edges { top: px(8.0), right: px(8.0), bottom: px(8.0), left: px(8.0) })
                         .child(div().id((id, 1usize)).w(width).rounded_lg()
-                            .border_1().border_color(line()).bg(gpui::white()).shadow_lg()
+                            .float()
                             .flex().flex_col().text_color(ink()).text_sm()
                             .on_click(|_, _, cx| cx.stop_propagation())
                             .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -129,18 +129,18 @@ impl Studio {
                                     let is_selected = *selected == name;
                                     let pick = pick.clone();
                                     div().id((id, index + 2)).min_h(px(38.0)).flex_none().px_2().py_2()
-                                        .rounded_md().flex().items_center().gap_2()
+                                        .rounded(px(crate::theme::inner_radius(crate::theme::RADIUS_LG, 4.0))).flex().items_center().gap_2()
                                         .when(!loading, |row| row.cursor_pointer())
                                         .when(loading, |row| row.opacity(0.5).cursor(gpui::CursorStyle::OperationNotAllowed))
-                                        .bg(if is_selected { rgb(0xe7f1ff) } else { rgb(0xffffff) })
-                                        .hover(|row| row.bg(rgb(0xf0f4f9)))
+                                        .when(is_selected, |row| row.bg(accent_tint()))
+                                        .hover(|row| row.bg(control_bg()))
                                         .child(svg().path(icon).size(px(16.0)).flex_none()
-                                            .text_color(if is_selected { blue() } else { muted() }))
+                                            .text_color(if is_selected { ink() } else { muted() }))
                                         .child(div().flex_1().min_w_0().text_size(px(13.0)).line_height(px(18.0))
-                                            .font_weight(if is_selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                            .font_weight(if is_selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                                             .child(entry))
                                         .child(svg().path("icons/check.svg").size(px(16.0)).flex_none()
-                                            .text_color(if is_selected { blue() } else { gpui::transparent_black() }))
+                                            .text_color(if is_selected { ink() } else { gpui::transparent_black() }))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             if loading { return; }
@@ -151,9 +151,9 @@ impl Studio {
                                 .when(empty, |list| list.child(div().px_3().py_2().text_xs().text_color(muted())
                                     .child(if loading { "Looking for connected devices…" } else { "No devices found. Connect one, then refresh." }))))
                             .child(div().border_t_1().border_color(line()).p_1()
-                                .child(div().id((id, 10001usize)).h(px(34.0)).px_2().rounded_md().flex().items_center()
-                                    .text_xs().text_color(if loading { muted() } else { blue() })
-                                    .when(!loading, |button| button.cursor_pointer().hover(|button| button.bg(rgb(0xf0f4f9)))
+                                .child(div().id((id, 10001usize)).h(px(34.0)).px_2().rounded(px(crate::theme::inner_radius(crate::theme::RADIUS_LG, 4.0))).flex().items_center()
+                                    .text_xs().text_color(if loading { muted() } else { ink() })
+                                    .when(!loading, |button| button.cursor_pointer().hover(|button| button.bg(control_bg()))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation(); refresh(this, cx); cx.notify();
                                         })))
@@ -219,7 +219,7 @@ impl Studio {
                 self.recorder_window = Some(handle);
                 cx.activate(true);
             }
-            Err(error) => self.toast = Some(format!("Could not open recorder: {error}").into()),
+            Err(error) => self.toast = Some(crate::Notification::error(format!("Could not open recorder: {error}"))),
         }
         cx.notify();
     }
@@ -239,12 +239,35 @@ impl Studio {
             .flex()
             .flex_col()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && (this.launcher_camera_menu_open || this.launcher_mic_menu_open) {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let menu_open = this.launcher_camera_menu_open || this.launcher_mic_menu_open;
+                if event.keystroke.key == "escape" && menu_open {
                     this.launcher_camera_menu_open = false;
                     this.launcher_mic_menu_open = false;
                     cx.stop_propagation(); cx.notify();
+                    return;
                 }
+                if this.native_text_focused(window, cx) { return; }
+                if crate::controls::tab_navigation(event, window) {
+                    cx.stop_propagation();
+                    return;
+                }
+                // Enter records and S takes a screenshot from the Capture tab.
+                if menu_open
+                    || this.capture_access_prompt.is_some()
+                    || event.keystroke.modifiers.modified()
+                    || this.launcher_tab != 0
+                    || this.recording_state != RecordingState::Idle
+                {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "enter" => this.start_recording(cx),
+                    "s" => this.begin_screen_capture(cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+                cx.notify();
             }))
             .child(
                 div()
@@ -285,11 +308,12 @@ impl Studio {
                                     .justify_center()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .bg(if active { ink() } else { gpui::white() })
-                                    .text_color(if active { gpui::white() } else { ink() })
+                                    .bg(if active { accent() } else { surface() })
+                                    .text_color(if active { on_accent() } else { ink() })
                                     .border_1()
-                                    .border_color(if active { ink() } else { line() })
+                                    .border_color(if active { accent() } else { line() })
                                     .cursor_pointer()
+                                    .when(!active, |this| this.hover(|style| style.bg(control_bg())))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.launcher_tab = tab;
                                         this.refresh_library(cx);
@@ -318,14 +342,13 @@ impl Studio {
                                 .grid_cols(2)
                                 .gap_2()
                                 .child(
-                                    div()
-                                        .id("launcher-screenshot")
+                                    crate::controls::keyboard_focusable(div().id("launcher-screenshot"))
                                         .h(px(82.0))
                                         .rounded_xl()
-                                        .bg(gpui::white())
+                                        .bg(surface())
                                         .border_1()
                                         .border_color(line())
-                                        .hover(|s| s.bg(rgb(0xe5f2ff)))
+                                        .hover(|s| s.bg(control_bg()))
                                         .cursor_pointer()
                                         .flex()
                                         .flex_col()
@@ -336,27 +359,21 @@ impl Studio {
                                             svg()
                                                 .path("icons/capture.svg")
                                                 .size(px(24.0))
-                                                .text_color(blue()),
+                                                .text_color(ink()),
                                         )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::BOLD)
-                                                .child("Screenshot"),
-                                        )
+                                        .child(launcher_tile_label("Screenshot", "S"))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.begin_screen_capture(cx)
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("launcher-record")
+                                    crate::controls::keyboard_focusable(div().id("launcher-record"))
                                         .h(px(82.0))
                                         .rounded_xl()
-                                        .bg(gpui::white())
+                                        .bg(surface())
                                         .border_1()
                                         .border_color(line())
-                                        .hover(|s| s.bg(rgb(0xffe9eb)))
+                                        .hover(|s| s.bg(brand().opacity(0.08)))
                                         .cursor_pointer()
                                         .flex()
                                         .flex_col()
@@ -367,9 +384,9 @@ impl Studio {
                                             svg()
                                                 .path("icons/record.svg")
                                                 .size(px(24.0))
-                                                .text_color(rgb(0xe33442)),
+                                                .text_color(brand()),
                                         )
-                                        .child(div().text_sm().font_weight(FontWeight::BOLD).child(
+                                        .child(launcher_tile_label(
                                             if recording {
                                                 "Recording…"
                                             } else if self.record_area {
@@ -379,6 +396,7 @@ impl Studio {
                                             } else {
                                                 "Record screen"
                                             },
+                                            "↵",
                                         ))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if this.recording_state == RecordingState::Idle {
@@ -393,13 +411,13 @@ impl Studio {
                             if self.record_area { 2 } else if self.recording_source == recording::native::RecordingSource::Window { 1 } else { 0 },
                             |this, i| { this.record_area = i == 2; this.recording_source = if i == 1 { recording::native::RecordingSource::Window } else { recording::native::RecordingSource::Screen }; }, cx))
                         .child(div().text_xs().text_color(muted()).child("Countdown"))
-                        .child(self.segmented("recording-countdown", &["Off", "3 sec", "5 sec", "10 sec"], [0, 3, 5, 10].iter().position(|v| *v == self.recording_countdown).unwrap_or(1),
+                        .child(self.segmented("recording-countdown", &["Off", "3 s", "5 s", "10 s"], [0, 3, 5, 10].iter().position(|v| *v == self.recording_countdown).unwrap_or(1),
                             |this, i| this.recording_countdown = [0, 3, 5, 10][i], cx)))
                     .child(self.launcher_source_row(
                         "launcher-camera",
                         "icons/video.svg",
                         "Camera",
-                        self.launcher_device_select(
+                        Some(self.launcher_device_select(
                             "launcher-camera-select", "camera", "icons/video.svg", window,
                             &self.camera_devices,
                             &self.camera_device,
@@ -424,7 +442,7 @@ impl Studio {
                             },
                             |this, cx| this.request_capture_access(CaptureAccess::CameraPicker, cx),
                             cx,
-                        ),
+                        ).into_any_element()),
                         self.record_camera,
                         cx.listener(|this, _, _, cx| {
                             if this.recording_state != RecordingState::Idle { return; }
@@ -462,7 +480,7 @@ impl Studio {
                         "launcher-mic",
                         "icons/microphone.svg",
                         "Microphone",
-                        self.launcher_device_select(
+                        Some(self.launcher_device_select(
                             "launcher-mic-select", "microphone", "icons/microphone.svg", window,
                             &self.microphone_devices,
                             &self.microphone_device,
@@ -483,7 +501,7 @@ impl Studio {
                             },
                             |this, cx| this.request_capture_access(CaptureAccess::MicrophonePicker, cx),
                             cx,
-                        ),
+                        ).into_any_element()),
                         self.record_microphone,
                         cx.listener(|this, _, _, cx| {
                             if this.recording_state != RecordingState::Idle { return; }
@@ -499,7 +517,7 @@ impl Studio {
                         "launcher-system-audio",
                         "icons/volume.svg",
                         "System audio",
-                        div().text_xs().text_color(muted()).child("Sound playing on this computer"),
+                        None,
                         self.record_system_audio,
                         cx.listener(|this, _, _, cx| {
                             if this.recording_state != RecordingState::Idle { return; }
@@ -512,6 +530,14 @@ impl Studio {
                         }),
                     ))
                     .child(self.launcher_teleprompter(recording, cx))
+                    .child(div().text_xs().text_color(muted()).child("Appearance"))
+                    .child(self.segmented(
+                        "launcher-appearance",
+                        &["System", "Light", "Dark"],
+                        crate::theme::theme_preference() as usize,
+                        |_, index| crate::theme::store_theme_preference(crate::theme::ThemePreference::ALL[index]),
+                        cx,
+                    ))
                     .child(crate::theme::credit_footer())
                     .into_any_element()
             } else {
@@ -524,37 +550,77 @@ impl Studio {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(
-                        div().text_xs().text_color(muted()).child(
-                            if self.launcher_tab == 1 {
-                                recording::model::recordings_root()
-                            } else {
-                                library::screenshots_root()
-                            }
-                            .display()
-                            .to_string(),
-                        ),
-                    )
+                    .child({
+                        let folder = if self.launcher_tab == 1 {
+                            recording::model::recordings_root()
+                        } else {
+                            library::screenshots_root()
+                        };
+                        let location = folder.display().to_string();
+                        div()
+                            .id("library-open-folder")
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .py_1()
+                            .text_xs()
+                            .text_color(muted())
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(ink()))
+                            .tooltip(crate::timeline_ui::tooltip(location.clone()))
+                            .child(svg().path("icons/folder.svg").size(px(14.0)).flex_none().text_color(muted()))
+                            .child(div().flex_1().min_w_0().truncate().child(location))
+                            .child(div().flex_none().text_color(ink()).underline().child("Open folder ↗"))
+                            .on_click(move |_, _, cx| {
+                                let _ = std::fs::create_dir_all(&folder);
+                                cx.open_url(&format!("file://{}", folder.display()));
+                            })
+                    })
                     .when(items.is_empty(), |this| {
+                        let projects = self.launcher_tab == 1;
                         this.child(
                             div()
-                                .h(px(180.0))
+                                .h(px(220.0))
                                 .flex()
                                 .flex_col()
                                 .items_center()
                                 .justify_center()
-                                .gap_2()
-                                .text_color(muted())
+                                .gap_3()
                                 .child(
                                     svg()
-                                        .path("icons/folder.svg")
+                                        .path(if projects { "icons/video.svg" } else { "icons/capture.svg" })
                                         .size(px(28.0))
                                         .text_color(muted()),
                                 )
-                                .child(if self.library_state.loading {
+                                .child(div().section_title().child(if self.library_state.loading {
                                     "Loading…"
+                                } else if projects {
+                                    "No recordings yet"
                                 } else {
-                                    "No saved items yet"
+                                    "No screenshots yet"
+                                }))
+                                .when(!self.library_state.loading, |this| {
+                                    this.child(
+                                        crate::controls::button(
+                                            "library-empty-capture",
+                                            if projects { "Record screen" } else { "Take screenshot" },
+                                            crate::controls::ButtonKind::Primary,
+                                            crate::controls::ButtonSize::Md,
+                                        )
+                                        .icon(if projects { "icons/record.svg" } else { "icons/capture.svg" })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.launcher_tab = 0;
+                                            if projects {
+                                                if this.recording_state == RecordingState::Idle {
+                                                    this.start_recording(cx);
+                                                }
+                                            } else {
+                                                this.begin_screen_capture(cx);
+                                            }
+                                            cx.notify();
+                                        })),
+                                    )
                                 }),
                         )
                     })
@@ -579,4 +645,28 @@ impl Studio {
             })
             .into_any_element()
     }
+}
+
+/// Tile title with the key that triggers it.
+fn launcher_tile_label(label: &'static str, key: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(label))
+        .child(
+            div()
+                .min_w(px(18.0))
+                .h(px(18.0))
+                .px_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(crate::theme::RADIUS_SM))
+                .border_1()
+                .border_color(line())
+                .micro()
+                .text_color(muted())
+                .child(key),
+        )
 }

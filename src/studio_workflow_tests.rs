@@ -688,7 +688,7 @@ fn studio_camera_cursor_glass_save_reopen_and_export() {
                         studio.edit_selected_region(|cue| {
                             cue.presentation = ZoomPresentation::Classic;
                         });
-                        studio.apply_selected_motion_style_to_all();
+                        studio.apply_selected_zoom_to_all();
                         assert!(studio
                             .video_zoom_cues
                             .iter()
@@ -699,7 +699,7 @@ fn studio_camera_cursor_glass_save_reopen_and_export() {
                             ZoomPresentation::GlassLoupe
                         );
                         studio.video_selected_zoom_cue = Some(studio.video_zoom_cues[0].id);
-                        studio.apply_selected_motion_style_to_all();
+                        studio.apply_selected_zoom_to_all();
                         for motion in PointerMotion::ALL {
                             studio.pointer_style.motion = motion;
                             studio.rebuild_video_motion_timelines();
@@ -1052,7 +1052,7 @@ async fn exercise_motion_controls(
         .unwrap();
     save_display(&screenshots.join("motion-primary-controls.png"), false);
 
-    workflow_click(editor, 1160.0, 143.0, false, cx).await; // motion-deselect / All motion
+    workflow_click(editor, 1122.0, 86.0, false, cx).await; // inspector-back
     handle
         .update(cx, |studio, _, _| {
             assert!(studio.video_selected_zoom_cue.is_none());
