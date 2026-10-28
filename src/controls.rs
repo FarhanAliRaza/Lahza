@@ -181,7 +181,8 @@ impl Button {
             (ButtonKind::Danger, _) => {
                 (danger_tint(), danger(), danger_tint(), danger_tint(), danger().opacity(0.45))
             }
-            (_, true) => (accent_tint(), ink(), accent_tint(), accent_tint(), line()),
+            // Raised fill plus a full-contrast ring, so "on" reads in both themes.
+            (_, true) => (control_selected(), ink(), accent(), control_selected(), accent()),
             (ButtonKind::Secondary, false) => {
                 (control_bg(), ink(), line(), control_hover(), line())
             }
