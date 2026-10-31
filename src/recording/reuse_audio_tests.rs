@@ -417,6 +417,17 @@ fn write_wav(path: &Path, samples: &[f32]) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Without a GPU: the bundled weights match their pinned hash and every layer
+/// the shaders read parses with its expected shape.
+#[test]
+fn bundled_model_loads() {
+    assert_eq!(format!("{:x}", Sha256::digest(MODEL)), MODEL_SHA256);
+    let (weights, packed) = load_weights(MODEL).unwrap();
+    assert_eq!(weights.tf.len(), 30);
+    assert!(packed.len() > 9_000_000, "packed {} values", packed.len());
+    assert!(packed.iter().all(|value| value.is_finite()));
+}
+
 #[test]
 fn shader_variants_validate() {
     for (input, output) in VARIANTS {

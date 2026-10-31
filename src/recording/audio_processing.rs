@@ -19,6 +19,26 @@ use std::{
 // Bump whenever selection, DSP, sample format, alignment, or model changes.
 const PIPELINE_VERSION: &str = "source-audio-v3-neural-flac24-48k";
 
+#[cfg(not(test))]
+use super::reuse_audio::enhance_file as enhance_microphone;
+
+/// Pipeline tests check caching, mixing and track handling, not the model;
+/// running it there needs a GPU (CI has none). The model's own load and
+/// hardware tests live in `reuse_audio`. Set LAHZA_TEST_REAL_REUSE=1 to run
+/// real inference here.
+#[cfg(test)]
+fn enhance_microphone(
+    input: &Path, output: &Path, channels: usize, cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(f64), notice: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    if std::env::var_os("LAHZA_TEST_REAL_REUSE").is_some() {
+        return super::reuse_audio::enhance_file(input, output, channels, cancelled, progress, notice);
+    }
+    fs::copy(input, output).map_err(|error| error.to_string())?;
+    progress(1.0);
+    Ok(())
+}
+
 fn processing_identity(mode: AudioMode) -> String {
     let model = if mode.requires_neural() { super::reuse_audio::MODEL_ID } else { "none" };
     format!("{}:{}:{}", mode.cache_key(), super::audio_dsp::DSP_VERSION, model)
@@ -441,7 +461,7 @@ fn prepare_microphone(source: &Path, stream: u32, duration: f64, origin: f64,
     fs::remove_file(&decoded)?;
     let neural_input = if mode.requires_neural() {
         control.set_status("Enhancing microphone audio");
-        super::reuse_audio::enhance_file(&normalized, &enhanced, 2, &stopped,
+        enhance_microphone(&normalized, &enhanced, 2, &stopped,
             &mut |fraction| control.set_progress(base + share * (0.2 + 0.6 * fraction)),
             &mut |notice| control.set_status(notice))
             .map_err(&failure)?;
