@@ -1,6 +1,6 @@
 //! Swaps captured cursor bitmaps for the high-resolution versions shipped by
-//! the user's Xcursor theme, mirroring how Screen Studio replaces known
-//! system cursors when the cursor is enlarged, and records which shape each
+//! the user's Xcursor theme, replacing known system cursors with sharp
+//! artwork when the cursor is enlarged, and records which shape each
 //! captured cursor is so it can be redrawn in another cursor style.
 
 use super::{

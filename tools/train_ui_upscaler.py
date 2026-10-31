@@ -3,7 +3,7 @@
 
 Requires torch, numpy, Pillow. Reproducible seeds, train/validation separation,
 source coefficients, complete metrics, and weight hashes are recorded with output.
-No user screenshots, Screen Studio source, or Screen Studio weights are training inputs.
+No user screenshots or third-party weights are training inputs.
 """
 
 from pathlib import Path

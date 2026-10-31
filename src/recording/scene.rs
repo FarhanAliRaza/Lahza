@@ -700,7 +700,7 @@ impl Rect {
     }
 }
 
-/// Screen Studio's split rule: the screen covers its cell, cropping the
+/// Split rule: the screen covers its cell, cropping the
 /// overflow. When the crop runs along the split axis and there is padding,
 /// it may shrink by up to 10% instead, leaving a small gap over a deep crop.
 fn split_cover(cell: Rect, source_width: f64, source_height: f64, side_by_side: bool, relax: bool) -> Rect {
@@ -796,8 +796,8 @@ impl SceneGeometry {
                 height,
             }
         };
-        // Split screen covers its cell like Screen Studio rather than leaving
-        // a letterboxed screen; Fill already covers the card.
+        // Split screen covers its cell rather than leaving a letterboxed
+        // screen; Fill already covers the card.
         let split = style.camera.split_strength().clamp(0.0, 1.0);
         if split > 0.0 && !style.fills_card() {
             let cell = Rect { x: screen_area.x + inset, y: screen_area.y + inset + title_height,
@@ -3006,7 +3006,7 @@ const CAPTURED_CURSOR_BOOST: f64 = 2.5;
 /// on a 1080 px tall screen.
 const ASSET_CURSOR_HEIGHT: f64 = 60.0 / 1080.0;
 /// Motion smear length as a fraction of the distance the cursor travels in
-/// one 60 Hz frame (Cap's default amount, Screen Studio semantics).
+/// one 60 Hz frame (Cap's default amount).
 const CURSOR_SMEAR_AMOUNT: f64 = 1.0;
 /// Longest smear, in cursor widths; only pathological jumps hit it.
 const CURSOR_SMEAR_MAX_WIDTHS: f64 = 4.0;

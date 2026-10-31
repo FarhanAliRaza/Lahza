@@ -203,7 +203,7 @@ pub struct PointerFrame {
     pub opacity: f64,
     pub blur_radius: f64,
     /// Smoothed cursor velocity in normalized media units per second; the
-    /// painter smears the cursor along it, as Cap and Screen Studio do.
+    /// painter smears the cursor along it as a motion trail.
     pub velocity: (f64, f64),
     pub press: Option<PointerPressFrame>,
 }

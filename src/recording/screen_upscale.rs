@@ -1,6 +1,6 @@
 //! Tiled GPU UI reconstruction, independently trained on natively rendered
 //! screen content. Separate 2× and 4× models predict an RGB residual over
-//! bilinear sampling; neither uses Screen Studio weights.
+//! bilinear sampling.
 //! The compositor owns the context and submission lifetime; this module only
 //! records commands. See assets/upscaler/README.md for provenance and training.
 use blade_graphics as gpu;

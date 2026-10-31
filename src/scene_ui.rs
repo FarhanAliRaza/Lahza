@@ -1609,8 +1609,8 @@ impl Studio {
     }
 
     /// Whether fitting the recording whole leaves background showing beside
-    /// it, as a landscape recording does on a 9:16 canvas. Screen Studio
-    /// offers "Avoid empty area" (our Fill) only in that case.
+    /// it, as a landscape recording does on a 9:16 canvas. "Avoid empty
+    /// area" (canvas Fill) is offered only in that case.
     fn fit_leaves_empty_space(&self) -> bool {
         let mut style = self.scene_style();
         let Some(aspect) = style.aspect.filter(|aspect| aspect.is_finite() && *aspect > 0.0) else {
