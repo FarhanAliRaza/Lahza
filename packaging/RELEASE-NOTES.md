@@ -1,17 +1,15 @@
-## Lahza v1.0.2
+## Lahza v2.0.0
 
 A native Linux screenshot, recording, and motion studio built with Rust and GPUI.
 
 ### Changed in this release
 
-- Redesign the editor around one design system: Inter typography, consistent spacing, shared buttons, sliders, toggles, and fields, and an ink accent with red reserved for recording and the playhead.
-- Add dark mode. Choose System, Light, or Dark under Appearance in the launcher, or cycle it from the editor's top bar; the choice is remembered.
-- Improve keyboard access: visible focus, Tab navigation, arrow keys in segmented controls, `[` and `]` to trim to the playhead, Alt+arrow nudging, and global capture shortcuts (Ctrl+Alt+S, Ctrl+Alt+P) through the desktop portal.
-- Rework the timeline: a readable time ruler, labelled regions, clearer trim handles, right-click menus, and a simpler toolbar with visible Snap and Skim states.
-- Make destructive actions safer with two-step Discard and Restart and undo from notifications. Notifications now explain failures and offer a follow-up action.
-- Show the current selection in the inspector header, simplify the export panel with a summary of what will be written, and widen the inspector on large windows.
-- Remove the share-to-server upload. Export saves files locally.
-- Keep sliders responsive while dragging: cursor and zoom sliders no longer rebuild motion timelines or re-read pointer data on every move.
+- Replace the microphone presets with **Enhance audio**, which runs NVIDIA's RE-USE speech enhancement model on the GPU (any Vulkan GPU) to remove background noise and room echo, then levels the voice. The model is bundled and runs locally; without a GPU it falls back to the CPU, very slowly, with a warning. The timeline waveform switches to the cleaned audio once it is ready. Projects saved with Standard or Loud open as Off; Noise reduction and Podcast open as Enhance audio.
+- Animate camera layout edits. Switching layout, position, shape, or size, and undo/redo, now eases from the camera on screen instead of jumping. Dragging still follows the pointer, and releasing a drag eases into the snapped spot. Respects GNOME's Animations setting.
+- Split screen now fills its half of the canvas instead of shrinking the recording to fit, cropping the overflow. On a 9:16 canvas the screen is no longer a thin strip.
+- Add **Avoid empty area** to the Overlay and Cutout camera layouts. It appears when fitting the whole recording would leave background beside it, such as a landscape recording on 9:16, and crops the recording to fill the canvas while the camera follows your cursor. It is the same setting as Fill under Style → Canvas.
+- Keep the preview responsive while dragging. Resizing or moving the recording on the canvas, scrubbing sliders, and dragging the camera no longer cancel every preview frame, so the canvas follows the pointer instead of catching up when you pause.
+- Upscale zoomed screen footage with a new model trained on interface content.
 
 The release workflow reruns the Rust and packaging suites, tests the bundled Whisper runtime, and runs confined Snap smoke checks.
 
@@ -30,10 +28,10 @@ For Debian updates, run `lahza-update --install`. Snap updates are managed by sn
 
 ### Download and install
 
-**Ubuntu 24.04 amd64 — recommended:** download `lahza_1.0.2_amd64.deb`, then run:
+**Ubuntu 24.04 amd64 — recommended:** download `lahza_2.0.0_amd64.deb`, then run:
 
 ```bash
-sudo apt install ./lahza_1.0.2_amd64.deb
+sudo apt install ./lahza_2.0.0_amd64.deb
 ```
 
 Launch **Lahza** from your app menu, or run `lahza`.
@@ -46,11 +44,11 @@ sudo snap install lahza
 
 The stable channel receives this version after the release workflow and Store review succeed. Camera and audio recording require additional permission setup. Lahza now prompts when access is missing: choose Copy commands, paste and run them in Terminal, then return and choose Try again.
 
-**Binary bundle:** download `lahza-1.0.2-linux-x86_64.tar.gz`, then run:
+**Binary bundle:** download `lahza-2.0.0-linux-x86_64.tar.gz`, then run:
 
 ```bash
-tar -xzf lahza-1.0.2-linux-x86_64.tar.gz
-cd lahza-1.0.2-linux-x86_64
+tar -xzf lahza-2.0.0-linux-x86_64.tar.gz
+cd lahza-2.0.0-linux-x86_64
 ./install.sh
 ```
 
@@ -69,9 +67,9 @@ A Vulkan-capable desktop, PipeWire, and the portal backend for your desktop are 
 
 To verify downloaded files, download `SHA256SUMS` into the same directory and run `sha256sum --ignore-missing -c SHA256SUMS`.
 
-### Early-release limitations
+### Known limitations
 
-Podcast preparation is expensive on CPU: measured public fixtures took roughly 12–24 seconds per second of audio, with peak processing memory up to about 2.4 GiB. Completed audio is cached for playback and export; progress and cancellation remain available during preparation. These measurements are hardware- and input-dependent. Older recordings with already-mixed microphone and system audio cannot be separated, so cleanup processes their combined track. Neural audio is supported on Linux x86_64; confined Snap smoke checks do not yet exercise neural inference.
+Enhance audio needs a Vulkan GPU for practical speed; on the CPU it is very slow. Completed audio is cached for playback and export; progress and cancellation remain available during preparation. Older recordings with already-mixed microphone and system audio cannot be separated, so cleanup processes their combined track. Confined Snap smoke checks do not yet exercise neural inference.
 
 Window recordings use lossless FFV1 to preserve pixels and transparency, so their project files can be larger. A window that grows beyond the recording's initial capture surface stops recording rather than being silently reduced or clipped. Shadow-margin detection relies on alpha edges; ambiguous shapes retain their visible bounds. Layout fixes also apply to existing alpha-capable window recordings, but detail lost through older capture-time downscaling cannot be restored.
 
