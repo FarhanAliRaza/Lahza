@@ -24,8 +24,10 @@ use super::reuse_audio::enhance_file as enhance_microphone;
 
 /// Pipeline tests check caching, mixing and track handling, not the model;
 /// running it there needs a GPU (CI has none). The model's own load and
-/// hardware tests live in `reuse_audio`. Set LAHZA_TEST_REAL_REUSE=1 to run
-/// real inference here.
+/// hardware tests live in `reuse_audio`. The stand-in outputs silence of the
+/// same length: the fixtures' microphone is pure noise, which the model
+/// removes, so the mix stays under the limiter exactly as with real
+/// inference. Set LAHZA_TEST_REAL_REUSE=1 to run the model here.
 #[cfg(test)]
 fn enhance_microphone(
     input: &Path, output: &Path, channels: usize, cancelled: &dyn Fn() -> bool,
@@ -34,7 +36,8 @@ fn enhance_microphone(
     if std::env::var_os("LAHZA_TEST_REAL_REUSE").is_some() {
         return super::reuse_audio::enhance_file(input, output, channels, cancelled, progress, notice);
     }
-    fs::copy(input, output).map_err(|error| error.to_string())?;
+    let length = fs::metadata(input).map_err(|error| error.to_string())?.len();
+    fs::File::create(output).and_then(|file| file.set_len(length)).map_err(|error| error.to_string())?;
     progress(1.0);
     Ok(())
 }
