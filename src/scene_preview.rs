@@ -59,6 +59,10 @@ pub(crate) struct PreviewKey {
     pub media: PreviewMedia,
     pub high_quality: bool,
     pub motion: Option<Arc<crate::recording::motion_blur::MotionPlan>>,
+    /// Nonzero during one continuous edit (a drag, scrub or camera handoff).
+    /// Its frames may stand in for each other like playback frames, so
+    /// pointer moves faster than a compose no longer cancel every frame.
+    pub gesture: u64,
 }
 
 impl PreviewKey {
@@ -72,7 +76,8 @@ impl PreviewKey {
     }
 
     pub(crate) fn same_scene(&self, other: &Self) -> bool {
-        self.same_media(other) && self.style == other.style
+        self.same_media(other)
+            && (self.style == other.style || (self.gesture != 0 && self.gesture == other.gesture))
             && self.presentation_canvas == other.presentation_canvas && self.source_size == other.source_size
     }
 
@@ -550,7 +555,7 @@ mod tests {
                 style: SceneStyle::default(), canvas: (64, 48), presentation_canvas:(64,48), source_size: (32, 24),
                 source: 1, time_bits: time.to_bits(), viewport: ViewportFrame::default(),
                 overlay: 0, pointer: false, media_visible: true, generation: 1,
-                media: PreviewMedia::Image(1), high_quality: false, motion: None,
+                media: PreviewMedia::Image(1), high_quality: false, motion: None, gesture: 0,
             },
             source: Arc::new(RgbaImage::from_pixel(32, 24, image::Rgba([30, 60, 90, 255]))),
             overlay: None, pointer: None, camera: None,

@@ -14,22 +14,13 @@ use super::audio_mode::AudioMode;
 use std::{
     collections::VecDeque,
     fs::{self, File},
-    io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
 pub const DSP_VERSION: &str = "speech-dsp-v3-conservative-leveler-48k";
 const BLOCK_MS: usize = 20;
 const CONTEXT_BLOCKS: usize = 200;
-const BANDS: [f64; 25] = [
-    63., 80., 100., 125., 160., 200., 250., 315., 400., 500., 630., 800., 1000., 1250., 1600.,
-    2000., 2500., 3150., 4000., 5000., 6300., 8000., 10000., 12500., 16000.,
-];
-const PODCAST_TARGET: [f64; 25] = [
-    -15.3, -1.3, 4.6, 5.9, 4.7, 7.7, 6.7, 6., 6.2, 8.2, 6.9, 4.3, 2., 2., -0.2, -4.3, -3.9, -6.9,
-    -8.2, -7.3, -8.9, -7.8, -12.1, -20., -29.1,
-];
-
 #[derive(Clone, Debug, Default)]
 pub struct NormalizationReport {
     pub frames: u64,
@@ -363,7 +354,6 @@ struct Analysis {
     histogram: [u64; 121],
     voiced: [u64; 121],
     peak: f64,
-    band_energy: [f64; 25],
     samples: u64,
 }
 impl Default for Analysis {
@@ -372,7 +362,6 @@ impl Default for Analysis {
             histogram: [0; 121],
             voiced: [0; 121],
             peak: 0.,
-            band_energy: [0.; 25],
             samples: 0,
         }
     }
@@ -396,20 +385,11 @@ fn scan(
     reader: &mut dyn Read,
     rate: u32,
     channels: usize,
-    mode: AudioMode,
     count: u64,
     check: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(f64),
 ) -> Result<Analysis, String> {
     let mut result = Analysis::default();
-    let mut bands: Vec<Vec<_>> = (0..channels)
-        .map(|_| {
-            BANDS
-                .iter()
-                .map(|hz| Biquad::bandpass(f64::from(rate), *hz, 4.318))
-                .collect()
-        })
-        .collect();
     loop {
         cancelled(check)?;
         let values = read_samples(reader, rate as usize * BLOCK_MS / 1000 * channels)?;
@@ -428,16 +408,6 @@ fn scan(
                 .map(|x| f64::from(*x).abs())
                 .fold(0., f64::max),
         );
-        if mode == AudioMode::Podcast {
-            for frame in values.chunks_exact(channels) {
-                // Average channel energies, not antiphase waveforms.
-                for (channel, x) in frame.iter().enumerate() {
-                    for (i, band) in bands[channel].iter_mut().enumerate() {
-                        result.band_energy[i] += band.tick(f64::from(*x)).powi(2) / channels as f64;
-                    }
-                }
-            }
-        }
         result.samples += values.len() as u64;
         progress(0.2 * result.samples as f64 / count.max(1) as f64);
     }
@@ -460,37 +430,20 @@ struct Profile {
     pause_gain: f64,
 }
 impl Profile {
-    fn for_mode(mode: AudioMode) -> Self {
-        if mode == AudioMode::Podcast {
-            Self {
-                target: -18.,
-                window: 50,
-                look: 3,
-                rise: 2000.,
-                fall: 800.,
-                floor: -68.,
-                hold: 20.,
-                gain_min: -30.,
-                gain_max: 30.,
-                fade: 30.,
-                minimum_pause: 150,
-                pause_gain: 0.001,
-            }
-        } else {
-            Self {
-                target: -16.,
-                window: 20,
-                look: 3,
-                rise: 400.,
-                fall: 150.,
-                floor: -60.,
-                hold: 35.,
-                gain_min: -20.,
-                gain_max: 30.,
-                fade: 400.,
-                minimum_pause: 50,
-                pause_gain: 0.1,
-            }
+    fn voice() -> Self {
+        Self {
+            target: -16.,
+            window: 20,
+            look: 3,
+            rise: 400.,
+            fall: 150.,
+            floor: -60.,
+            hold: 35.,
+            gain_min: -20.,
+            gain_max: 30.,
+            fade: 400.,
+            minimum_pause: 50,
+            pause_gain: 0.1,
         }
     }
 }
@@ -538,110 +491,9 @@ impl Activity {
     }
 }
 
-/// Apply Podcast's pre-restoration pause treatment to normalized microphone
-/// samples. This is bounded, deterministic activity detection, not a semantic
-/// speech classifier. Short pauses and nearby breaths are retained; long quiet
-/// regions fade toward silence without removing samples or changing gain.
-/// Keep the ungated normalized file as finish_file's sibilance reference.
-pub fn prepare_restoration_file(
-    input: &Path,
-    output: &Path,
-    channels: usize,
-    check: &dyn Fn() -> bool,
-    progress: &mut dyn FnMut(f64),
-) -> Result<(), String> {
-    const RATE: u32 = 48_000;
-    validate(channels, RATE)?;
-    separate_output(input, output)?;
-    let count = sample_count(input, channels)?;
-    let mut reader = BufReader::new(File::open(input).map_err(|e| e.to_string())?);
-    let analysis = scan(
-        &mut reader,
-        RATE,
-        channels,
-        AudioMode::Loud,
-        count,
-        check,
-        progress,
-    )?;
-    if analysis.samples != count {
-        return Err("Audio input changed during pause analysis".into());
-    }
-    reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-    let profile = Profile::for_mode(AudioMode::Podcast);
-    let activity = Activity::new(&analysis, profile);
-    let mut writer = BufWriter::new(File::create(output).map_err(|e| e.to_string())?);
-    let mut pending = VecDeque::new();
-    let mut eof = false;
-    let mut index = 0u64;
-    let mut last_active: Option<u64> = None;
-    let mut inactive_past = 0;
-    let mut gain = 1.0_f64;
-    let fade_step = 1.0 / (profile.fade * 0.001 * f64::from(RATE));
-    let fade_blocks = (profile.fade / BLOCK_MS as f64).ceil() as usize;
-    let mut written = 0u64;
-    loop {
-        cancelled(check)?;
-        while !eof && pending.len() < CONTEXT_BLOCKS {
-            let samples = read_samples(&mut reader, RATE as usize * BLOCK_MS / 1000 * channels)?;
-            if samples.is_empty() {
-                eof = true;
-                break;
-            }
-            let f = features(&samples, channels, RATE);
-            pending.push_back(Block {
-                samples,
-                reference: None,
-                f,
-                rf: f,
-                active: activity.active(f),
-                level_active: activity.level_active(f),
-            });
-        }
-        let Some(mut block) = pending.pop_front() else {
-            break;
-        };
-        if block.active {
-            last_active = Some(index);
-        }
-        let next_active = pending.iter().position(|block| block.active).map(|n| n + 1);
-        let near = last_active.is_some_and(|last| index - last <= 75)
-            || next_active.is_some_and(|n| n <= 75);
-        let human = block.active || activity.nearby_human(block.f, near);
-        let future_silence = pending.iter().take_while(|block| !block.active).count();
-        let keep = human
-            || next_active.is_some_and(|n| n <= fade_blocks)
-            || inactive_past + future_silence + 1 < profile.minimum_pause;
-        if human {
-            inactive_past = 0;
-        } else {
-            inactive_past += 1;
-        }
-        for frame in block.samples.chunks_exact_mut(channels) {
-            gain = fade_toward(gain, if keep { 1.0 } else { 0.0 }, fade_step);
-            for sample in frame {
-                *sample *= gain as f32;
-            }
-        }
-        write_samples(&mut writer, &block.samples)?;
-        written += block.samples.len() as u64;
-        index += 1;
-        progress(0.2 + 0.8 * written as f64 / count.max(1) as f64);
-    }
-    if written != count {
-        return Err("Audio input changed during pause preparation".into());
-    }
-    writer.flush().map_err(|e| e.to_string())?;
-    cancelled(check)?;
-    progress(1.0);
-    Ok(())
-}
-
 struct Block {
     samples: Vec<f32>,
-    reference: Option<Vec<f32>>,
     f: Features,
-    rf: Features,
     active: bool,
     level_active: bool,
 }
@@ -649,67 +501,23 @@ struct VoiceState {
     channels: usize,
     rate: f64,
     profile: Profile,
-    mode: AudioMode,
     filters: Vec<Biquad>,
-    eq: Vec<Vec<Biquad>>,
-    midband: Vec<Biquad>,
-    highband: Vec<Biquad>,
-    presence: Vec<Biquad>,
-    noise_band: Vec<(Biquad, Biquad)>,
     gain_db: f64,
     started: bool,
     gate: f64,
     compression: f64,
-    low_cut: f64,
-    high_cut: f64,
-    random: u64,
     min_gain: f64,
     max_gain: f64,
-    sibilance_gain: f64,
 }
 impl VoiceState {
-    fn new(rate: u32, channels: usize, mode: AudioMode, analysis: &Analysis) -> Self {
+    fn new(rate: u32, channels: usize, analysis: &Analysis) -> Self {
         let rate = f64::from(rate);
-        let profile = Profile::for_mode(mode);
-        let reference = db(analysis.band_energy[12].max(1e-24).sqrt());
-        let correction: Vec<_> = analysis
-            .band_energy
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let observed = db(e.max(1e-24).sqrt()) - reference;
-                // Neighboring third-octave peak filters overlap; half correction
-                // avoids doubling the requested per-band adjustment.
-                ((PODCAST_TARGET[i] - PODCAST_TARGET[12]) - observed).clamp(-15., 12.) * 0.5
-            })
-            .collect();
+        let profile = Profile::voice();
         Self {
             channels,
             rate,
             profile,
-            mode,
             filters: (0..channels).map(|_| Biquad::highpass(rate, 70.)).collect(),
-            eq: (0..channels)
-                .map(|_| {
-                    BANDS
-                        .iter()
-                        .zip(&correction)
-                        .map(|(hz, gain)| Biquad::peak(rate, *hz, 4.318, *gain))
-                        .collect()
-                })
-                .collect(),
-            midband: (0..channels)
-                .map(|_| Biquad::bandpass(rate, 360., 0.8))
-                .collect(),
-            highband: (0..channels)
-                .map(|_| Biquad::bandpass(rate, 6600., 0.7))
-                .collect(),
-            presence: (0..channels)
-                .map(|_| Biquad::peak(rate, 4000., 4.8, -3.))
-                .collect(),
-            noise_band: (0..channels)
-                .map(|_| (Biquad::highpass(rate, 4000.), Biquad::lowpass(rate, 16000.)))
-                .collect(),
             // The take was already scanned. Starting from its first active
             // frame can over-amplify a quiet lead-in and overdrive the first
             // word. Seed gain from the take's robust speech level instead.
@@ -718,15 +526,11 @@ impl VoiceState {
             started: true,
             gate: 1.,
             compression: 1.,
-            low_cut: 1.,
-            high_cut: 1.,
-            random: 0x6c61687a615f6175,
             min_gain: 0.,
             max_gain: 0.,
-            sibilance_gain: 0.,
         }
     }
-    fn process(&mut self, block: &mut Block, desired_gain: Option<f64>, keep: bool, restore: bool) {
+    fn process(&mut self, block: &mut Block, desired_gain: Option<f64>, keep: bool) {
         let desired = desired_gain
             .unwrap_or(self.gain_db)
             .clamp(self.profile.gain_min, self.profile.gain_max);
@@ -744,67 +548,18 @@ impl VoiceState {
         );
         let gate_target = if keep { 1. } else { self.profile.pause_gain };
         let gate_step = 1.0 / (self.profile.fade * 0.001 * self.rate);
-        let low_target = if self.mode == AudioMode::Podcast {
-            amp(-((db(block.f.low_mid) - db(block.f.upper_mid) - 7.5).max(0.)).min(4.))
-        } else {
-            1.
-        };
-        let high_target = if self.mode == AudioMode::Podcast {
-            amp(-((db(block.f.high) + self.gain_db - (-23.)).max(0.) * 0.75).min(8.))
-        } else {
-            1.
-        };
-        let restoration = if restore {
-            block.rf.high.min(block.rf.rms * amp(-12.)) * 1.3
-        } else {
-            0.
-        };
         for frame in block.samples.chunks_exact_mut(self.channels) {
             self.gain_db += gain_alpha * (desired - self.gain_db);
             self.min_gain = self.min_gain.min(self.gain_db);
             self.max_gain = self.max_gain.max(self.gain_db);
             self.gate = fade_toward(self.gate, gate_target, gate_step);
-            self.low_cut +=
-                coefficient(if low_target < self.low_cut { 15. } else { 80. }, self.rate)
-                    * (low_target - self.low_cut);
-            self.high_cut += coefficient(
-                if high_target < self.high_cut { 1. } else { 50. },
-                self.rate,
-            ) * (high_target - self.high_cut);
-            self.sibilance_gain +=
-                coefficient(30., self.rate) * (restoration - self.sibilance_gain);
-            // One excitation per frame preserves dual-mono recordings. Filter
-            // state remains independent for genuinely different stereo inputs.
-            self.random ^= self.random << 13;
-            self.random ^= self.random >> 7;
-            self.random ^= self.random << 17;
-            let noise = (self.random as i64 as f64 / i64::MAX as f64) * 1.732;
             let mut values = [0.; 2];
             for (ch, value) in frame.iter().enumerate() {
-                let mut x = f64::from(*value);
-                if self.mode == AudioMode::Podcast {
-                    // Deterministic band-limited noise restores short original
-                    // fricatives only, never continuous noise or an absent word.
-                    let (hp, lp) = &mut self.noise_band[ch];
-                    x += lp.tick(hp.tick(noise)) * self.sibilance_gain;
-                    for eq in &mut self.eq[ch] {
-                        x = eq.tick(x);
-                    }
-                    x += self.midband[ch].tick(x) * (self.low_cut - 1.);
-                }
-                x *= amp(self.gain_db);
-                if self.mode == AudioMode::Podcast {
-                    x += self.highband[ch].tick(x) * (self.high_cut - 1.);
-                }
-                x = self.filters[ch].tick(x);
-                if self.mode == AudioMode::Podcast {
-                    x = self.presence[ch].tick(x);
-                }
-                values[ch] = x;
+                values[ch] = self.filters[ch].tick(f64::from(*value) * amp(self.gain_db));
             }
             // Portable soft-knee compressor. Apple's DynamicsProcessor
             // headroom/master-gain controls do not map numerically to this.
-            if self.mode != AudioMode::Podcast {
+            {
                 let level = db(values[..self.channels]
                     .iter()
                     .map(|x| x.abs())
@@ -843,7 +598,7 @@ struct Limiter {
     limited: u64,
 }
 impl Limiter {
-    fn new(rate: u32, channels: usize, podcast: bool) -> Self {
+    fn new(rate: u32, channels: usize) -> Self {
         Self {
             frames: VecDeque::new(),
             peaks: VecDeque::new(),
@@ -852,7 +607,7 @@ impl Limiter {
             look: (rate as usize / 500).max(1),
             channels,
             gain: 1.,
-            release: coefficient(if podcast { 100. } else { 50. }, f64::from(rate)),
+            release: coefficient(50., f64::from(rate)),
             limited: 0,
         }
     }
@@ -896,11 +651,8 @@ impl Limiter {
 }
 
 /// Finish an already-normalized (and, for neural modes, enhanced) take.
-/// The reference is the normalized ORIGINAL input, used only to recover short
-/// sibilants lost by Podcast processing. Files must have identical frame counts.
 pub fn finish_file(
     input: &Path,
-    reference: Option<&Path>,
     output: &Path,
     sample_rate: u32,
     channels: usize,
@@ -910,37 +662,14 @@ pub fn finish_file(
 ) -> Result<DspReport, String> {
     validate(channels, sample_rate)?;
     separate_output(input, output)?;
-    if let Some(reference) = reference {
-        separate_output(reference, output)?;
-    }
     let count = sample_count(input, channels)?;
-    if let Some(reference) = reference {
-        if sample_count(reference, channels)? != count {
-            return Err("Neural audio changed the microphone duration".into());
-        }
-    }
     let mut input_file = BufReader::new(File::open(input).map_err(|e| e.to_string())?);
-    let mut reference_file = reference
-        .map(|path| File::open(path).map(BufReader::new))
-        .transpose()
-        .map_err(|e| e.to_string())?;
     let mut output_file = BufWriter::new(File::create(output).map_err(|e| e.to_string())?);
-    finish_stream(
-        &mut input_file,
-        reference_file.as_mut().map(|r| r as &mut dyn Read),
-        &mut output_file,
-        count,
-        sample_rate,
-        channels,
-        mode,
-        check,
-        progress,
-    )
+    finish_stream(&mut input_file, &mut output_file, count, sample_rate, channels, mode, check, progress)
 }
 
 fn finish_stream(
     input: &mut (impl Read + Seek),
-    mut reference: Option<&mut dyn Read>,
     output: &mut dyn Write,
     count: u64,
     sample_rate: u32,
@@ -949,7 +678,7 @@ fn finish_stream(
     check: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(f64),
 ) -> Result<DspReport, String> {
-    if matches!(mode, AudioMode::Off | AudioMode::Standard) {
+    if mode == AudioMode::Off {
         let mut report = DspReport::default();
         loop {
             cancelled(check)?;
@@ -972,20 +701,17 @@ fn finish_stream(
         progress(1.);
         return Ok(report);
     }
-    let analysis = scan(input, sample_rate, channels, mode, count, check, progress)?;
+    let analysis = scan(input, sample_rate, channels, count, check, progress)?;
     input.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-    let profile = Profile::for_mode(mode);
+    let profile = Profile::voice();
     let activity = Activity::new(&analysis, profile);
-    let reference_db = activity.reference_db;
-    let noise_db = activity.noise_db;
-    let mut state = VoiceState::new(sample_rate, channels, mode, &analysis);
-    let mut limiter = Limiter::new(sample_rate, channels, mode == AudioMode::Podcast);
+    let mut state = VoiceState::new(sample_rate, channels, &analysis);
+    let mut limiter = Limiter::new(sample_rate, channels);
     let mut pending = VecDeque::<Block>::new();
     let mut history = VecDeque::<(f64, bool)>::new();
     let mut index = 0u64;
     let mut last_active: Option<u64> = None;
     let mut inactive_past = 0usize;
-    let mut sibilant_past = 0usize;
     let mut eof = false;
     let mut active_frames = 0u64;
     let mut report = DspReport {
@@ -1000,25 +726,10 @@ fn finish_stream(
                 eof = true;
                 break;
             }
-            let ref_values = reference
-                .as_deref_mut()
-                .map(|reader| read_samples(reader, samples.len()))
-                .transpose()?;
-            if ref_values
-                .as_ref()
-                .is_some_and(|r| r.len() != samples.len())
-            {
-                return Err("Neural reference changed duration during processing".into());
-            }
             let f = features(&samples, channels, sample_rate);
-            let rf = ref_values
-                .as_ref()
-                .map_or(f, |v| features(v, channels, sample_rate));
             pending.push_back(Block {
                 samples,
-                reference: ref_values,
                 f,
-                rf,
                 active: activity.active(f),
                 level_active: activity.level_active(f),
             });
@@ -1069,30 +780,7 @@ fn finish_stream(
         } else {
             None
         };
-        let candidate = |b: &Block| {
-            b.reference.is_some()
-                && db(b.rf.high) > db(b.rf.mid) + 3.
-                && db(b.rf.high) > noise_db + 20.
-                && db(b.rf.rms) > reference_db - 20.
-        };
-        let is_sibilant = candidate(&block);
-        let sibilant_length =
-            sibilant_past + 1 + pending.iter().take_while(|b| candidate(b)).count();
-        // Sibilants have a much narrower speech-neighborhood than retained
-        // breaths: 150 ms, rounded up to one 20 ms analysis block.
-        let near_sibilant = last_active.is_some_and(|last| index - last <= 8)
-            || next_active.is_some_and(|n| n <= 8);
-        let restore = mode == AudioMode::Podcast
-            && near_sibilant
-            && is_sibilant
-            && (2..=10).contains(&sibilant_length)
-            && block.f.high < block.rf.high * 0.5;
-        if is_sibilant {
-            sibilant_past += 1;
-        } else {
-            sibilant_past = 0;
-        }
-        state.process(&mut block, desired, keep, restore);
+        state.process(&mut block, desired, keep);
         let frames = (block.samples.len() / channels) as u64;
         if block.active {
             active_frames += frames;
@@ -1133,69 +821,6 @@ fn finish_stream(
     output.flush().map_err(|e| e.to_string())?;
     cancelled(check)?;
     progress(1.);
-    Ok(report)
-}
-
-/// In-memory convenience for small callers/tests. Neural modes require the
-/// separate normalization → actual inference → finishing sequence.
-pub fn process_interleaved(
-    samples: &mut [f32],
-    sample_rate: u32,
-    channels: usize,
-    mode: AudioMode,
-    check: &dyn Fn() -> bool,
-    progress: &mut dyn FnMut(f64),
-) -> Result<DspReport, String> {
-    validate(channels, sample_rate)?;
-    if samples.len() % channels != 0 || samples.iter().any(|x| !x.is_finite()) {
-        return Err("Invalid microphone samples".into());
-    }
-    if mode.requires_neural() {
-        return Err("Neural modes require a successful model pass before finishing".into());
-    }
-    let input_peak = samples.iter().map(|x| x.abs()).fold(0., f32::max);
-    {
-        let gain = if mode != AudioMode::Off && input_peak > 1e-12 {
-            amp(-6.) / f64::from(input_peak)
-        } else {
-            1.
-        };
-        let mut energy = [0.; 2];
-        for (i, x) in samples.iter().enumerate() {
-            energy[i % channels] += f64::from(*x).powi(2);
-        }
-        let quieter = usize::from(energy[1] < energy[0]);
-        let repair = channels == 2
-            && energy[1 - quieter] > 1e-16
-            && energy[quieter] < energy[1 - quieter] * 0.001;
-        for frame in samples.chunks_exact_mut(channels) {
-            cancelled(check)?;
-            if repair {
-                frame[quieter] = frame[1 - quieter];
-            }
-            for x in frame {
-                *x = (f64::from(*x) * gain) as f32;
-            }
-        }
-    }
-    let bytes: Vec<u8> = samples.iter().flat_map(|x| x.to_le_bytes()).collect();
-    let mut reader = Cursor::new(bytes);
-    let mut output = Vec::new();
-    let mut report = finish_stream(
-        &mut reader,
-        None,
-        &mut output,
-        samples.len() as u64,
-        sample_rate,
-        channels,
-        mode,
-        check,
-        progress,
-    )?;
-    for (value, bytes) in samples.iter_mut().zip(output.chunks_exact(4)) {
-        *value = f32::from_le_bytes(bytes.try_into().unwrap());
-    }
-    report.input_peak = input_peak;
     Ok(report)
 }
 
@@ -1274,15 +899,12 @@ mod tests {
     fn finish(
         fixture: &Fixture,
         samples: &[f32],
-        reference: Option<&[f32]>,
         mode: AudioMode,
     ) -> (Vec<f32>, DspReport) {
         let source = fixture.write("input.raw", samples);
-        let reference = reference.map(|samples| fixture.write("reference.raw", samples));
         let output = fixture.path("output.raw");
         let report = finish_file(
             &source,
-            reference.as_deref(),
             &output,
             RATE,
             1,
@@ -1305,7 +927,7 @@ mod tests {
             &source,
             &normalized,
             2,
-            AudioMode::Standard,
+            AudioMode::NoiseReduction,
             &|| false,
             &mut |_| {},
         )
@@ -1316,11 +938,10 @@ mod tests {
         let output = fixture.path("standard.raw");
         finish_file(
             &normalized,
-            None,
             &output,
             RATE,
             2,
-            AudioMode::Standard,
+            AudioMode::Off,
             &|| false,
             &mut |_| {},
         )
@@ -1378,7 +999,7 @@ mod tests {
             .collect();
         samples.extend(&gap);
         samples.extend(voiced(3., 0.035));
-        let (processed, report) = finish(&fixture, &samples, None, AudioMode::Loud);
+        let (processed, report) = finish(&fixture, &samples, AudioMode::NoiseReduction);
         let quiet = rms(region(&processed, 2., 2.8));
         let loud = rms(region(&processed, 5., 5.8));
         let resumed = rms(region(&processed, 12., 12.8));
@@ -1419,7 +1040,7 @@ mod tests {
                 *sample += voice;
             }
         }
-        let (processed, report) = finish(&fixture, &samples, None, AudioMode::NoiseReduction);
+        let (processed, report) = finish(&fixture, &samples, AudioMode::NoiseReduction);
         let leading_noise = rms(region(&processed, 0.3, 0.9));
         let between_noise = rms(region(&processed, 2.2, 2.8));
         let speech = rms(region(&processed, 1.05, 1.65));
@@ -1451,11 +1072,10 @@ mod tests {
         let output = fixture.path("limited.raw");
         let report = finish_file(
             &source,
-            None,
             &output,
             RATE,
             2,
-            AudioMode::Loud,
+            AudioMode::NoiseReduction,
             &|| false,
             &mut |_| {},
         )
@@ -1485,178 +1105,6 @@ mod tests {
     }
 
     #[test]
-    fn podcast_deessing_reduces_harsh_sibilance_without_inventing_continuous_noise() {
-        let mut samples = voiced(2., 0.2);
-        let hiss = tone(0.12, 0.5, 7000.);
-        for (x, h) in samples[(0.8 * f64::from(RATE)) as usize..]
-            .iter_mut()
-            .zip(hiss)
-        {
-            *x += h;
-        }
-        let fixture = Fixture::new();
-        let (processed, report) = finish(&fixture, &samples, Some(&samples), AudioMode::Podcast);
-        assert_eq!(samples.len(), processed.len());
-        assert!(report.output_peak <= 0.950001);
-        assert!(processed.iter().all(|x| x.is_finite()));
-        let mut filter = Biquad::bandpass(f64::from(RATE), 7000., 3.);
-        let input_high: Vec<_> = samples
-            .iter()
-            .map(|x| filter.tick(f64::from(*x)) as f32)
-            .collect();
-        let mut filter = Biquad::bandpass(f64::from(RATE), 7000., 3.);
-        let output_high: Vec<_> = processed
-            .iter()
-            .map(|x| filter.tick(f64::from(*x)) as f32)
-            .collect();
-        assert!(
-            rms(region(&output_high, 0.82, 0.90)) < rms(region(&input_high, 0.82, 0.90)) * 0.7,
-            "harsh S energy was not reduced"
-        );
-        let silence = vec![0.; (RATE * 5) as usize];
-        let (processed, report) = finish(&fixture, &silence, Some(&silence), AudioMode::Podcast);
-        assert!(processed.iter().all(|x| *x == 0.));
-        assert_eq!(report.output_peak, 0.);
-    }
-
-    #[test]
-    fn podcast_preparation_keeps_short_pauses_and_full_speech_onsets() {
-        let fixture = Fixture::new();
-        let mut samples = voiced(1., 0.2);
-        let mut random = 91u64;
-        let noise = |length: usize, random: &mut u64| -> Vec<f32> {
-            (0..length)
-                .map(|_| {
-                    *random ^= *random << 13;
-                    *random ^= *random >> 7;
-                    *random ^= *random << 17;
-                    (*random as i64 as f64 / i64::MAX as f64 * 0.00001) as f32
-                })
-                .collect()
-        };
-        samples.extend(noise(RATE as usize, &mut random));
-        samples.extend(voiced(1., 0.2));
-        samples.extend(noise((RATE * 5) as usize, &mut random));
-        samples.extend(voiced(1., 0.2));
-        let source = fixture.write("preparation.raw", &samples);
-        let target = fixture.path("prepared.raw");
-        prepare_restoration_file(&source, &target, 1, &|| false, &mut |_| {}).unwrap();
-        let result = fixture.read("prepared.raw");
-        assert_eq!(result.len(), samples.len());
-        assert_eq!(
-            region(&result, 1., 2.),
-            region(&samples, 1., 2.),
-            "short pause changed"
-        );
-        assert!(
-            region(&result, 4., 7.).iter().all(|x| *x == 0.),
-            "long pause remained before inference"
-        );
-        assert_eq!(
-            region(&result, 8., 8.2),
-            region(&samples, 8., 8.2),
-            "speech onset faded in late"
-        );
-        let checks = AtomicUsize::new(0);
-        assert!(prepare_restoration_file(
-            &source,
-            &target,
-            1,
-            &|| checks.fetch_add(1, Ordering::Relaxed) > 8,
-            &mut |_| {}
-        )
-        .unwrap_err()
-        .contains("cancelled"));
-    }
-
-    #[test]
-    fn podcast_spectrum_analysis_is_symmetric_and_sibilance_preserves_dual_mono() {
-        let fixture = Fixture::new();
-        let left = voiced(1., 0.15);
-        let right = tone(1., 0.1, 1500.);
-        let stereo: Vec<f32> = left
-            .iter()
-            .zip(&right)
-            .flat_map(|(l, r)| [*l, *r])
-            .collect();
-        let reversed: Vec<f32> = left
-            .iter()
-            .zip(&right)
-            .flat_map(|(l, r)| [*r, *l])
-            .collect();
-        let source = fixture.write("stereo.raw", &stereo);
-        let reverse = fixture.write("reverse.raw", &reversed);
-        let a = fixture.path("a.raw");
-        let b = fixture.path("b.raw");
-        finish_file(
-            &source,
-            None,
-            &a,
-            RATE,
-            2,
-            AudioMode::Podcast,
-            &|| false,
-            &mut |_| {},
-        )
-        .unwrap();
-        finish_file(
-            &reverse,
-            None,
-            &b,
-            RATE,
-            2,
-            AudioMode::Podcast,
-            &|| false,
-            &mut |_| {},
-        )
-        .unwrap();
-        for (a, b) in fixture
-            .read("a.raw")
-            .chunks_exact(2)
-            .zip(fixture.read("b.raw").chunks_exact(2))
-        {
-            assert!(
-                (a[0] - b[1]).abs() < 1e-6 && (a[1] - b[0]).abs() < 1e-6,
-                "Podcast preferred the left channel"
-            );
-        }
-        let voice = voiced(1., 0.15);
-        let mut reference = voice.clone();
-        for (x, h) in reference[(RATE / 2) as usize..]
-            .iter_mut()
-            .zip(tone(0.1, 0.4, 7000.))
-        {
-            *x += h;
-        }
-        let source = fixture.write(
-            "dual.raw",
-            &voice.iter().flat_map(|x| [*x, *x]).collect::<Vec<_>>(),
-        );
-        let reference = fixture.write(
-            "dual-ref.raw",
-            &reference.iter().flat_map(|x| [*x, *x]).collect::<Vec<_>>(),
-        );
-        finish_file(
-            &source,
-            Some(&reference),
-            &a,
-            RATE,
-            2,
-            AudioMode::Podcast,
-            &|| false,
-            &mut |_| {},
-        )
-        .unwrap();
-        assert!(
-            fixture
-                .read("a.raw")
-                .chunks_exact(2)
-                .all(|frame| frame[0] == frame[1]),
-            "restoring a mono voice widened its stereo image"
-        );
-    }
-
-    #[test]
     fn output_aliases_are_rejected_before_truncating_input() {
         let fixture = Fixture::new();
         let source = fixture.write("input.raw", &voiced(0.1, 0.2));
@@ -1667,23 +1115,21 @@ mod tests {
             &source,
             &alias,
             1,
-            AudioMode::Standard,
+            AudioMode::NoiseReduction,
             &|| false,
             &mut |_| {}
         )
         .is_err());
         assert!(finish_file(
             &source,
-            None,
             &alias,
             RATE,
             1,
-            AudioMode::Loud,
+            AudioMode::NoiseReduction,
             &|| false,
             &mut |_| {}
         )
         .is_err());
-        assert!(prepare_restoration_file(&source, &alias, 1, &|| false, &mut |_| {}).is_err());
         assert_eq!(fs::read(&source).unwrap(), original);
     }
 
@@ -1691,7 +1137,7 @@ mod tests {
     fn file_processing_is_continuous_across_context_boundary_and_cancellable() {
         let fixture = Fixture::new();
         let samples = voiced(9., 0.1);
-        let (output, _) = finish(&fixture, &samples, None, AudioMode::Loud);
+        let (output, _) = finish(&fixture, &samples, AudioMode::NoiseReduction);
         for time in [3.99, 4.01, 7.99, 8.01] {
             let at = (time * f64::from(RATE)) as usize;
             assert!(
@@ -1704,11 +1150,10 @@ mod tests {
         let checks = AtomicUsize::new(0);
         let result = finish_file(
             &source,
-            None,
             &destination,
             RATE,
             1,
-            AudioMode::Loud,
+            AudioMode::NoiseReduction,
             &|| checks.fetch_add(1, Ordering::Relaxed) > 8,
             &mut |_| {},
         );
@@ -1718,34 +1163,10 @@ mod tests {
             &bad,
             &destination,
             1,
-            AudioMode::Standard,
-            &|| false,
-            &mut |_| {}
-        )
-        .is_err());
-        let mismatched = fixture.write("short.raw", &[0.; 10]);
-        assert!(finish_file(
-            &source,
-            Some(&mismatched),
-            &destination,
-            RATE,
-            1,
-            AudioMode::Podcast,
-            &|| false,
-            &mut |_| {}
-        )
-        .unwrap_err()
-        .contains("duration"));
-        let mut input = vec![0.; 20];
-        assert!(process_interleaved(
-            &mut input,
-            RATE,
-            1,
             AudioMode::NoiseReduction,
             &|| false,
             &mut |_| {}
         )
-        .unwrap_err()
-        .contains("model"));
+        .is_err());
     }
 }

@@ -989,7 +989,11 @@ impl Compositor {
             self.enhanced_region = None;
         }
         let mut enhanced_buffer = self.images[1].device.into();
-        if quality.strength() >= 0.2 && visible && !self.enhancement_failed {
+        if scene.style.enhance_screen
+            && quality.strength() >= 0.2
+            && visible
+            && !self.enhancement_failed
+        {
             if let Some((plan, strength)) = enhancement_plan(scene, input)
                 .map(|(plan, strength)| {
                     (

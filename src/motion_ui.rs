@@ -449,6 +449,7 @@ impl Studio {
             aspect_dimensions: (self.aspect_ratio == 10).then_some(self.custom_canvas_dimensions),
             // Fill needs the follow camera, which only recordings build.
             fill: self.content_fill && self.aspect_ratio != 0 && self.video_project.is_some(),
+            enhance_screen: self.enhance_screen,
             background_blur: self.background_blur,
             background_noise: self.background_noise,
             vignette: self.vignette,
@@ -458,6 +459,7 @@ impl Studio {
             pointer: self.pointer_style,
             camera: self.camera_overlay,
             camera_regions: self.camera_regions.clone(),
+            camera_handoff: None,
             input_overlays: self.input_overlays,
             subtitles: self.subtitle_style,
         }

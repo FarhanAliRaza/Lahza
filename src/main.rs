@@ -401,6 +401,10 @@ struct Studio {
     scene_selection: SceneSelection,
     media_drag: Option<MediaDrag>,
     camera_drag: Option<scene_ui::CameraDrag>,
+    /// The preview style before a camera edit and when easing from it began.
+    camera_handoff: Option<(Box<SceneStyle>, std::time::Instant)>,
+    /// The preview style last rendered, so the next edit can ease from it.
+    camera_shown: Option<SceneStyle>,
     /// Which motion marker (focus or pan end) the pointer is dragging.
     focus_drag: Option<scene_ui::FocusDrag>,
     scene_canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -436,6 +440,7 @@ struct Studio {
     video_thumbnails: Vec<Arc<RenderImage>>,
     video_extras_pending: bool,
     video_extras_token: u64,
+    video_levels_token: u64,
     video_press_times: Vec<f64>,
     video_removed_presses: Vec<f64>,
     video_selected_press: Option<f64>,
@@ -447,6 +452,8 @@ struct Studio {
     input_overlays: recording::studio_overlays::InputOverlayStyle,
     /// Fill the fixed-aspect canvas with the recording instead of fitting it.
     content_fill: bool,
+    /// Neural upscaling of zoomed-in recording pixels.
+    enhance_screen: bool,
     subtitle_style: recording::studio_overlays::SubtitleStyle,
     /// Recorded keystrokes on the source timeline.
     video_keystrokes: Vec<recording::model::KeystrokeEvent>,
@@ -847,6 +854,8 @@ impl Studio {
             scene_selection: SceneSelection::Scene,
             media_drag: None,
             camera_drag: None,
+            camera_handoff: None,
+            camera_shown: None,
             focus_drag: None,
             scene_canvas_bounds: scene_ui::scene_canvas_bounds_store(),
             preview_cache: PreviewCache::default(),
@@ -878,6 +887,7 @@ impl Studio {
             video_thumbnails: Vec::new(),
             video_extras_pending: false,
             video_extras_token: 0,
+            video_levels_token: 0,
             video_press_times: Vec::new(),
             video_removed_presses: Vec::new(),
             video_selected_press: None,
@@ -888,6 +898,7 @@ impl Studio {
             camera_region_drag: None,
             input_overlays: Default::default(),
             content_fill: false,
+            enhance_screen: true,
             subtitle_style: Default::default(),
             video_keystrokes: Vec::new(),
             video_transcript: None,
@@ -1571,6 +1582,7 @@ impl Studio {
             return self.render_loading(window, cx);
         }
         self.preview_cache.display_scale = window.scale_factor();
+        self.update_camera_handoff(window);
         self.sync_camera_preview(cx);
         if self.launcher_active {
             // The launcher's Enter/S shortcuts need a keyboard target too.

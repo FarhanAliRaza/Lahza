@@ -975,6 +975,9 @@ impl Studio {
             self.apply_scene_style(style);
         }
         self.persisted_scene_style = saved_style;
+        // A newly opened project starts at rest, not easing from the last one.
+        self.camera_handoff = None;
+        self.camera_shown = None;
         let extras = saved_extras.clone().unwrap_or_default();
         self.video_audio_muted = extras.audio_muted;
         self.video_audio_clips = audio_clips;

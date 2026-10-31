@@ -1,8 +1,8 @@
-//! Tiled GPU UI reconstruction, independently trained on generated screen/text
-//! artwork. A 2× model and a separately trained two-stage 4× cascade use no
-//! Screen Studio weights.
+//! Tiled GPU UI reconstruction, independently trained on natively rendered
+//! screen content. Separate 2× and 4× models predict an RGB residual over
+//! bilinear sampling; neither uses Screen Studio weights.
 //! The compositor owns the context and submission lifetime; this module only
-//! records commands. See assets/upscaler/README.md for provenance and differences.
+//! records commands. See assets/upscaler/README.md for provenance and training.
 use blade_graphics as gpu;
 use bytemuck::{Pod, Zeroable};
 use gpu::ShaderData as _;
@@ -10,7 +10,8 @@ use gpu::ShaderData as _;
 pub const MAX_OUTPUT_PIXELS: u64 = 24_000_000;
 pub const MAX_OUTPUT_SIDE: u32 = 8192;
 const TILE: u32 = 128;
-const HALO: u32 = 4;
+// At least the deepest model's layer count; must match HALO in the shader.
+const HALO: u32 = 8;
 const STRIDE: u32 = TILE + HALO * 2;
 const PARAM_SLOT: usize = 256;
 #[used]
@@ -19,12 +20,60 @@ static MODEL_LICENSE: &str = concat!(
     "\nBlade graphics:\n",
     include_str!("../../vendor/blade-graphics/LICENSE")
 );
-const WEIGHTS: &[u8] = include_bytes!("../../assets/upscaler/anime4k-cnn-x2-s.f32");
-const UI_WEIGHTS: [&[u8]; 3] = [
-    include_bytes!("../../assets/upscaler/ui-cnn-2x.f32"),
-    include_bytes!("../../assets/upscaler/ui-cnn-4x-first.f32"),
-    include_bytes!("../../assets/upscaler/ui-cnn-4x.f32"),
+
+/// A plain 3×3 convolution network: head (RGB → channels), `layers - 2`
+/// hidden convolutions, and a tail fed by the last hidden and head features.
+struct Model {
+    scale: u32,
+    channels: u32,
+    layers: u32,
+    weights: &'static [u8],
+}
+const MODELS: [Model; 2] = [
+    Model {
+        scale: 2,
+        channels: 16,
+        layers: 6,
+        weights: include_bytes!("../../assets/upscaler/ui-cnn-v2-2x.f32"),
+    },
+    Model {
+        scale: 4,
+        channels: 24,
+        layers: 7,
+        weights: include_bytes!("../../assets/upscaler/ui-cnn-v2-4x.f32"),
+    },
 ];
+const HEAD: u32 = 0;
+const BODY: u32 = 1;
+const TAIL: u32 = 2;
+
+impl Model {
+    fn for_scale(scale: u32) -> &'static Model {
+        MODELS.iter().find(|model| model.scale == scale).unwrap()
+    }
+    /// Per layer: weight offset in vec4s, input groups, output groups, kind.
+    fn layers(&self) -> Vec<[u32; 4]> {
+        let hidden = self.channels.div_ceil(4);
+        let mut offset = 0;
+        (0..self.layers)
+            .map(|index| {
+                let (inputs, outputs, kind) = match index {
+                    0 => (1, hidden, HEAD),
+                    i if i + 1 == self.layers => {
+                        (hidden, (3 * self.scale * self.scale).div_ceil(4), TAIL)
+                    }
+                    _ => (hidden, hidden, BODY),
+                };
+                let layer = [offset, inputs, outputs, kind];
+                offset += outputs * 9 * inputs * 4 + outputs;
+                layer
+            })
+            .collect()
+    }
+    fn max_groups(&self) -> u32 {
+        self.layers().iter().map(|layer| layer[2]).max().unwrap()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UpscalePlan {
@@ -76,8 +125,7 @@ struct UpscaleParams {
     region: [u32; 4],
     tile: [i32; 4],
     tile_output: [u32; 4],
-    original: [u32; 4],
-    mapping: [u32; 4],
+    layer: [u32; 4],
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -85,6 +133,7 @@ struct ConvData {
     b_up_params: gpu::BufferPiece,
     b_up_source: gpu::BufferPiece,
     b_up_features: gpu::BufferPiece,
+    b_up_skip: gpu::BufferPiece,
     b_up_result: gpu::BufferPiece,
     b_up_weights: gpu::BufferPiece,
 }
@@ -94,7 +143,6 @@ struct ReconstructData {
     b_up_params: gpu::BufferPiece,
     b_up_source: gpu::BufferPiece,
     b_up_features: gpu::BufferPiece,
-    b_up_alpha: gpu::BufferPiece,
     b_up_output: gpu::BufferPiece,
 }
 
@@ -126,13 +174,13 @@ impl Allocation {
 }
 
 pub struct ScreenUpscaler {
-    convolutions: [gpu::ComputePipeline; 4],
+    convolution: gpu::ComputePipeline,
     reconstruct: gpu::ComputePipeline,
-    weights: [Allocation; 3],
+    weights: [Allocation; 2],
     pub uses_f16: bool,
     params: Allocation,
-    scratch: [Allocation; 2],
-    intermediate: Allocation,
+    /// Head features (kept for the tail's skip) and two ping-pong buffers.
+    scratch: [Allocation; 3],
     output: Allocation,
 }
 
@@ -165,19 +213,25 @@ impl ScreenUpscaler {
             Err(error) => return Err(error.to_owned()),
         };
         shader.check_struct_size::<UpscaleParams>();
-        let convolutions = ["conv0", "conv1", "conv2", "conv3"].map(|entry| {
-            context.create_compute_pipeline(gpu::ComputePipelineDesc {
-                name: "Lahza UI CNN convolution",
-                data_layouts: &[&ConvData::layout()],
-                compute: shader.at(entry),
-            })
+        let convolution = context.create_compute_pipeline(gpu::ComputePipelineDesc {
+            name: "Lahza UI CNN convolution",
+            data_layouts: &[&ConvData::layout()],
+            compute: shader.at("conv"),
         });
         let reconstruct = context.create_compute_pipeline(gpu::ComputePipelineDesc {
             name: "Lahza UI CNN reconstruct",
             data_layouts: &[&ReconstructData::layout()],
             compute: shader.at("reconstruct"),
         });
-        let weights = UI_WEIGHTS.map(|coefficients| {
+        let weights = MODELS.each_ref().map(|model| {
+            let coefficients = model.weights;
+            let [offset, inputs, outputs, _] = *model.layers().last().unwrap();
+            assert_eq!(
+                (offset + outputs * 9 * inputs * 4 + outputs) as usize * 16,
+                coefficients.len(),
+                "model coefficients must match the {}× layer table",
+                model.scale
+            );
             let allocation = Allocation::new(context, coefficients.len(), gpu::Memory::Shared);
             // Immutable coefficients are uploaded before their first submission.
             unsafe {
@@ -190,8 +244,10 @@ impl ScreenUpscaler {
             context.sync_buffer(allocation.buffer);
             allocation
         });
+        let groups = MODELS.iter().map(Model::max_groups).max().unwrap();
+        assert!(groups <= 12, "MAX_GROUPS in the shader bounds every layer");
         Ok(Self {
-            convolutions,
+            convolution,
             reconstruct,
             weights,
             uses_f16,
@@ -199,11 +255,10 @@ impl ScreenUpscaler {
             scratch: std::array::from_fn(|_| {
                 Allocation::new(
                     context,
-                    (STRIDE * STRIDE * 16) as usize,
+                    (STRIDE * STRIDE * groups * 16) as usize,
                     gpu::Memory::Device,
                 )
             }),
-            intermediate: Allocation::new(context, 16, gpu::Memory::Device),
             output: Allocation::new(context, 16, gpu::Memory::Device),
         })
     }
@@ -222,24 +277,20 @@ impl ScreenUpscaler {
         let (width, height) = plan.validate(source_size)?;
         self.output
             .ensure(context, width as usize * height as usize * 4);
-        let passes = passes(plan, source_size);
-        let params: Vec<_> = passes
+        let model = Model::for_scale(plan.scale);
+        let layers = model.layers();
+        let weights = self.weights[if plan.scale == 4 { 1 } else { 0 }]
+            .buffer
+            .into();
+        let tiles = tile_params(plan, source_size);
+        self.params
+            .ensure(context, tiles.len() * layers.len() * PARAM_SLOT);
+        for (index, param) in tiles
             .iter()
+            .flat_map(|tile| layers.iter().map(|layer| UpscaleParams { layer: *layer, ..*tile }))
             .enumerate()
-            .flat_map(|(index, pass)| {
-                tile_params(*pass, source_size)
-                    .into_iter()
-                    .map(move |mut params| {
-                        // Preserve the quantized intermediate exactly enough that
-                        // a half-precision rounding does not propagate into stage2.
-                        params.mapping[2] = u32::from(plan.scale == 4 && index == 0);
-                        params
-                    })
-            })
-            .collect();
-        self.params.ensure(context, params.len() * PARAM_SLOT);
-        for (index, param) in params.iter().enumerate() {
-            let bytes = bytemuck::bytes_of(param);
+        {
+            let bytes = bytemuck::bytes_of(&param);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -249,59 +300,47 @@ impl ScreenUpscaler {
             }
         }
         context.sync_buffer(self.params.buffer);
-        if plan.scale == 4 {
-            self.intermediate.ensure(
-                context,
-                passes[0].region.width as usize * passes[0].region.height as usize * 16,
-            );
-        }
-        let mut index = 0;
-        for (pass_index, pass) in passes.into_iter().enumerate() {
-            let input = if pass_index == 0 {
-                source
-            } else {
-                self.intermediate.buffer.into()
-            };
-            let output = if plan.scale == 4 && pass_index == 0 {
-                self.intermediate.buffer
-            } else {
-                self.output.buffer
-            };
-            for param in tile_params(pass, source_size) {
-                let param_buffer = self.params.buffer.at((index * PARAM_SLOT) as u64);
-                index += 1;
-                for layer in 0..4 {
-                    let data = ConvData {
-                        b_up_params: param_buffer,
-                        b_up_source: input,
-                        b_up_features: self.scratch[layer % 2].buffer.into(),
-                        b_up_result: self.scratch[(layer + 1) % 2].buffer.into(),
-                        b_up_weights: self.weights
-                            [if plan.scale == 4 { pass_index + 1 } else { 0 }]
-                        .buffer
-                        .into(),
-                    };
-                    let mut compute = encoder.compute("neural screen tile convolution");
-                    let mut pipeline = compute.with(&self.convolutions[layer]);
-                    pipeline.bind(0, &data);
-                    pipeline.dispatch([STRIDE.div_ceil(8), STRIDE.div_ceil(8), 1]);
+        for (tile_index, tile) in tiles.iter().enumerate() {
+            // The head writes scratch 0, which stays bound as the tail's skip;
+            // later layers ping-pong between scratch 1 and 2.
+            let (mut features, mut result) = (1, 0);
+            let mut param = self.params.buffer.at(0);
+            for layer_index in 0..layers.len() {
+                param = self
+                    .params
+                    .buffer
+                    .at(((tile_index * layers.len() + layer_index) * PARAM_SLOT) as u64);
+                if layer_index > 0 {
+                    features = result;
+                    result = if features == 1 { 2 } else { 1 };
                 }
-                let data = ReconstructData {
-                    b_up_params: param_buffer,
-                    b_up_source: input,
-                    b_up_features: self.scratch[0].buffer.into(),
-                    b_up_alpha: source,
-                    b_up_output: output.into(),
+                let data = ConvData {
+                    b_up_params: param,
+                    b_up_source: source,
+                    b_up_features: self.scratch[features].buffer.into(),
+                    b_up_skip: self.scratch[0].buffer.into(),
+                    b_up_result: self.scratch[result].buffer.into(),
+                    b_up_weights: weights,
                 };
-                let mut compute = encoder.compute("neural screen tile reconstruction");
-                let mut pipeline = compute.with(&self.reconstruct);
+                let mut compute = encoder.compute("neural screen tile convolution");
+                let mut pipeline = compute.with(&self.convolution);
                 pipeline.bind(0, &data);
-                pipeline.dispatch([
-                    (param.tile[2] as u32 * 2).div_ceil(8),
-                    (param.tile[3] as u32 * 2).div_ceil(8),
-                    1,
-                ]);
+                pipeline.dispatch([STRIDE.div_ceil(8), STRIDE.div_ceil(8), 1]);
             }
+            let data = ReconstructData {
+                b_up_params: param,
+                b_up_source: source,
+                b_up_features: self.scratch[result].buffer.into(),
+                b_up_output: self.output.buffer.into(),
+            };
+            let mut compute = encoder.compute("neural screen tile reconstruction");
+            let mut pipeline = compute.with(&self.reconstruct);
+            pipeline.bind(0, &data);
+            pipeline.dispatch([
+                (tile.tile[2] as u32 * plan.scale).div_ceil(8),
+                (tile.tile[3] as u32 * plan.scale).div_ceil(8),
+                1,
+            ]);
         }
         Ok(EnhancedRegion {
             buffer: self.output.buffer.into(),
@@ -313,82 +352,28 @@ impl ScreenUpscaler {
 
     /// Call only after the compositor's final GPU submission has completed.
     pub fn destroy(&mut self, context: &gpu::Context) {
-        for pipeline in &mut self.convolutions {
-            context.destroy_compute_pipeline(pipeline);
-        }
+        context.destroy_compute_pipeline(&mut self.convolution);
         context.destroy_compute_pipeline(&mut self.reconstruct);
-        for buffer in [
-            &self.params,
-            &self.scratch[0],
-            &self.scratch[1],
-            &self.intermediate,
-            &self.output,
-        ]
-        .into_iter()
-        .chain(self.weights.iter())
+        for buffer in [&self.params, &self.output]
+            .into_iter()
+            .chain(self.scratch.iter())
+            .chain(self.weights.iter())
         {
             context.destroy_buffer(buffer.buffer);
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct Pass {
-    source: (u32, u32),
-    region: UpscalePlan,
-    original: UpscalePlan,
-}
-fn passes(plan: UpscalePlan, source: (u32, u32)) -> Vec<Pass> {
-    if plan.scale == 2 {
-        return vec![Pass {
-            source,
-            region: plan,
-            original: plan,
-        }];
-    }
-    // Two original pixels cover the next network's 4-pixel radius at 2x;
-    // one extra pixel covers reconstruction's half-pixel bilinear footprint.
-    let x = plan.x.saturating_sub(3);
-    let y = plan.y.saturating_sub(3);
-    let right = (plan.x + plan.width).saturating_add(3).min(source.0);
-    let bottom = (plan.y + plan.height).saturating_add(3).min(source.1);
-    let expanded = UpscalePlan {
-        x,
-        y,
-        width: right - x,
-        height: bottom - y,
-        scale: 2,
-    };
-    vec![
-        Pass {
-            source,
-            region: expanded,
-            original: expanded,
-        },
-        Pass {
-            source: (expanded.width * 2, expanded.height * 2),
-            region: UpscalePlan {
-                x: (plan.x - x) * 2,
-                y: (plan.y - y) * 2,
-                width: plan.width * 2,
-                height: plan.height * 2,
-                scale: 2,
-            },
-            original: plan,
-        },
-    ]
-}
-fn tile_params(pass: Pass, original_size: (u32, u32)) -> Vec<UpscaleParams> {
+fn tile_params(region: UpscalePlan, source: (u32, u32)) -> Vec<UpscaleParams> {
     let mut result = Vec::new();
-    let region = pass.region;
     for y in (0..region.height).step_by(TILE as usize) {
         for x in (0..region.width).step_by(TILE as usize) {
             result.push(UpscaleParams {
                 sizes: [
-                    pass.source.0,
-                    pass.source.1,
-                    region.width * 2,
-                    region.height * 2,
+                    source.0,
+                    source.1,
+                    region.width * region.scale,
+                    region.height * region.scale,
                 ],
                 region: [region.x, region.y, region.width, region.height],
                 tile: [
@@ -397,16 +382,8 @@ fn tile_params(pass: Pass, original_size: (u32, u32)) -> Vec<UpscaleParams> {
                     (region.width - x).min(TILE) as i32,
                     (region.height - y).min(TILE) as i32,
                 ],
-                tile_output: [x, y, STRIDE, 0],
-                original: [
-                    original_size.0,
-                    original_size.1,
-                    pass.original.x,
-                    pass.original.y,
-                ],
-                // The second stage has its own coefficients, trained on the
-                // first stage's quantized output, and uses the learned residual.
-                mapping: [pass.original.scale, 1000, 0, 0],
+                tile_output: [x, y, STRIDE, region.scale],
+                layer: [0; 4],
             });
         }
     }
@@ -417,13 +394,6 @@ fn tile_params(pass: Pass, original_size: (u32, u32)) -> Vec<UpscaleParams> {
 mod tests {
     use super::*;
     use image::{Rgba, RgbaImage};
-
-    fn coefficients() -> Vec<f32> {
-        WEIGHTS
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .collect()
-    }
 
     fn source_pixel(image: &RgbaImage, x: i32, y: i32) -> [f32; 4] {
         image
@@ -453,95 +423,80 @@ mod tests {
 
     // Whole-frame CPU oracle, intentionally independent of tile addressing,
     // GPU scratch buffers, dispatches and the production ROI plan.
-    fn reference_2x(image: &RgbaImage, strength: f32) -> RgbaImage {
-        reference_stage(image, strength, 0)
-    }
-    fn reference_stage(image: &RgbaImage, strength: f32, stage: usize) -> RgbaImage {
-        let w = image.width() as usize;
-        let h = image.height() as usize;
-        let weights: Vec<f32> = UI_WEIGHTS[stage]
+    fn reference(image: &RgbaImage, plan: UpscalePlan) -> RgbaImage {
+        let model = Model::for_scale(plan.scale);
+        let weights: Vec<f32> = model
+            .weights
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        let mut previous = vec![[0.0_f32; 4]; w * h];
-        for layer in 0..4 {
-            let mut next = vec![[0.0_f32; 4]; w * h];
+        let w = image.width() as usize;
+        let h = image.height() as usize;
+        let rgb: Vec<f32> = (0..h * w * 4)
+            .map(|i| {
+                let p = source_pixel(image, (i / 4 % w) as i32, (i / 4 / w) as i32);
+                if i % 4 == 3 { 0.0 } else { p[i % 4] }
+            })
+            .collect();
+        // Planar-by-group features: pixel-major, `groups` vec4s per pixel.
+        let convolve = |input: &[f32], skip: Option<&[f32]>, layer: [u32; 4]| {
+            let [offset, inputs, outputs, kind] = layer.map(|v| v as usize);
+            let mut out = vec![0.0_f32; w * h * outputs * 4];
             for y in 0..h {
                 for x in 0..w {
-                    let mut sum = [0.0_f32; 4];
-                    for sign in 0..if layer == 0 { 1 } else { 2 } {
-                        for dx in -1..=1 {
-                            for dy in -1..=1 {
-                                let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
-                                let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
-                                let value = if layer == 0 {
-                                    source_pixel(image, sx as i32, sy as i32)
-                                } else {
-                                    previous[sy * w + sx]
-                                        .map(|v| (if sign == 0 { v } else { -v }).max(0.0))
-                                };
-                                let tap = sign * 9 + ((dx + 1) * 3 + dy + 1) as usize;
-                                let offset = layer * 292 + tap * 16;
-                                for row in 0..4 {
-                                    let mut product = 0.0;
-                                    for col in 0..4 {
-                                        product += weights[offset + col * 4 + row] * value[col];
+                    for og in 0..outputs {
+                        let mut sum = [0.0_f32; 4];
+                        for tap in 0..9 {
+                            let sx = (x as i32 + tap as i32 % 3 - 1).clamp(0, w as i32 - 1) as usize;
+                            let sy = (y as i32 + tap as i32 / 3 - 1).clamp(0, h as i32 - 1) as usize;
+                            for ig in 0..inputs {
+                                let at = ((sy * w + sx) * inputs + ig) * 4;
+                                let base = (offset + ((og * 9 + tap) * inputs + ig) * 4) * 4;
+                                for col in 0..4 {
+                                    let value = input[at + col] + skip.map_or(0.0, |s| s[at + col]);
+                                    for row in 0..4 {
+                                        sum[row] += weights[base + col * 4 + row] * value;
                                     }
-                                    sum[row] += product;
                                 }
                             }
                         }
+                        let bias = (offset + outputs * 9 * inputs * 4 + og) * 4;
+                        for row in 0..4 {
+                            let v = sum[row] + weights[bias + row];
+                            out[((y * w + x) * outputs + og) * 4 + row] =
+                                if kind as u32 == TAIL { v } else { v.max(0.0) };
+                        }
                     }
-                    for row in 0..4 {
-                        sum[row] += weights[layer * 292 + 288 + row];
-                    }
-                    next[y * w + x] = sum;
                 }
             }
-            previous = next;
+            out
+        };
+        let layers = model.layers();
+        let head = convolve(&rgb, None, layers[0]);
+        let mut hidden = head.clone();
+        for layer in &layers[1..layers.len() - 1] {
+            hidden = convolve(&hidden, None, *layer);
         }
-        RgbaImage::from_fn(image.width() * 2, image.height() * 2, |x, y| {
+        let tail = *layers.last().unwrap();
+        let residual = convolve(&hidden, Some(&head), tail);
+        let s = plan.scale;
+        RgbaImage::from_fn(plan.width * s, plan.height * s, |x, y| {
+            let (fx, fy) = (plan.x * s + x, plan.y * s + y);
             let base = bilinear(
                 image,
-                (x as f32 + 0.5) / 2.0 - 0.5,
-                (y as f32 + 0.5) / 2.0 - 0.5,
+                (fx as f32 + 0.5) / s as f32 - 0.5,
+                (fy as f32 + 0.5) / s as f32 - 0.5,
             );
-            let residual = previous[y as usize / 2 * w + x as usize / 2]
-                [(y % 2 * 2 + x % 2) as usize]
-                * strength;
+            let pixel = ((fy / s) as usize * w + (fx / s) as usize) * tail[2] as usize * 4;
+            let sub = (fy % s * s + fx % s) as usize;
+            let r = |c: usize| residual[pixel + c * (s * s) as usize + sub];
             Rgba([
-                byte(base[0] + residual),
-                byte(base[1] + residual),
-                byte(base[2] + residual),
+                byte(base[0] + r(0)),
+                byte(base[1] + r(1)),
+                byte(base[2] + r(2)),
                 byte(base[3]),
             ])
         })
-    }
-    fn reference(image: &RgbaImage, plan: UpscalePlan) -> RgbaImage {
-        let twice = reference_stage(image, 1.0, if plan.scale == 4 { 1 } else { 0 });
-        let full = if plan.scale == 4 {
-            reference_stage(&twice, 1.0, 2)
-        } else {
-            twice
-        };
-        let mut result = image::imageops::crop_imm(
-            &full,
-            plan.x * plan.scale,
-            plan.y * plan.scale,
-            plan.width * plan.scale,
-            plan.height * plan.scale,
-        )
-        .to_image();
-        for (x, y, pixel) in result.enumerate_pixels_mut() {
-            pixel.0[3] = byte(
-                bilinear(
-                    image,
-                    plan.x as f32 + (x as f32 + 0.5) / plan.scale as f32 - 0.5,
-                    plan.y as f32 + (y as f32 + 0.5) / plan.scale as f32 - 0.5,
-                )[3],
-            );
-        }
-        result
     }
 
     fn fixture() -> RgbaImage {
@@ -550,44 +505,6 @@ mod tests {
             let tone = if line { 65 } else { 165 };
             Rgba([tone, tone + 15, tone + 30, ((x * 3 + y * 7) % 256) as u8])
         })
-    }
-
-    #[test]
-    fn public_model_coefficients_match_the_pinned_glsl() {
-        let source = include_str!("../../assets/upscaler/anime4k-cnn-x2-s.glsl");
-        let mut expected = Vec::new();
-        for block in source.split("//!DESC ").skip(1).take(4) {
-            let mut layer = Vec::new();
-            for line in block.lines().filter(|line| line.contains("mat4(")) {
-                let numbers = line
-                    .split("mat4(")
-                    .nth(1)
-                    .unwrap()
-                    .split(')')
-                    .next()
-                    .unwrap();
-                layer.extend(numbers.split(',').map(|v| v.trim().parse::<f32>().unwrap()));
-            }
-            assert!(layer.len() == 144 || layer.len() == 288);
-            layer.resize(288, 0.0);
-            let bias = block
-                .split("result += vec4(")
-                .nth(1)
-                .unwrap()
-                .split(')')
-                .next()
-                .unwrap();
-            layer.extend(bias.split(',').map(|v| v.trim().parse::<f32>().unwrap()));
-            expected.extend(layer);
-        }
-        assert_eq!(expected.len(), 1168);
-        assert_eq!(
-            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            coefficients()
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -617,57 +534,45 @@ mod tests {
         ] {
             assert!(bad.validate((10000, 10000)).is_err());
         }
-        let p = passes(base, (145, 35));
-        assert_eq!(p.len(), 2);
-        assert_eq!(p[0].region.x, 7);
-        assert_eq!(p[1].region.x, 6);
-        for pass in p {
-            for param in tile_params(pass, (145, 35)) {
-                assert!(param.tile[2] <= TILE as i32 && param.tile[3] <= TILE as i32);
-                assert_eq!(param.tile_output[2], STRIDE);
-            }
+        for param in tile_params(base, (145, 35)) {
+            assert!(param.tile[2] <= TILE as i32 && param.tile[3] <= TILE as i32);
+            assert_eq!(param.tile_output[2..], [STRIDE, 4]);
         }
+        for model in &MODELS {
+            assert!(model.layers <= HALO, "halo covers every convolution");
+        }
+        let groups = MODELS.iter().map(Model::max_groups).max().unwrap();
         assert!(
-            STRIDE * STRIDE * 16 * 2 < 1024 * 1024,
-            "scratch stays below 1 MiB"
+            STRIDE * STRIDE * groups * 16 * 3 < 16 * 1024 * 1024,
+            "scratch stays below 16 MiB"
         );
     }
 
     #[test]
-    fn reference_adds_luma_detail_without_neural_alpha_or_chroma() {
+    fn reference_adds_detail_without_neural_alpha() {
         let image = fixture();
-        let plan = UpscalePlan {
-            x: 3,
-            y: 1,
-            width: 139,
-            height: 33,
-            scale: 2,
-        };
-        let output = reference(&image, plan);
-        let mut changed = 0;
-        for (x, y, pixel) in output.enumerate_pixels() {
-            let base = bilinear(
-                &image,
-                plan.x as f32 + (x as f32 + 0.5) / 2.0 - 0.5,
-                plan.y as f32 + (y as f32 + 0.5) / 2.0 - 0.5,
-            )
-            .map(byte);
-            assert_eq!(pixel.0[3], base[3]);
-            if pixel.0[..3].iter().all(|v| *v > 0 && *v < 255) {
-                assert!(
-                    ((pixel.0[1] as i32 - pixel.0[0] as i32) - (base[1] as i32 - base[0] as i32))
-                        .abs()
-                        <= 1
-                );
-                assert!(
-                    ((pixel.0[2] as i32 - pixel.0[1] as i32) - (base[2] as i32 - base[1] as i32))
-                        .abs()
-                        <= 1
-                );
+        for scale in [2, 4] {
+            let plan = UpscalePlan {
+                x: 3,
+                y: 1,
+                width: 139,
+                height: 33,
+                scale,
+            };
+            let output = reference(&image, plan);
+            let mut changed = 0;
+            for (x, y, pixel) in output.enumerate_pixels() {
+                let base = bilinear(
+                    &image,
+                    plan.x as f32 + (x as f32 + 0.5) / scale as f32 - 0.5,
+                    plan.y as f32 + (y as f32 + 0.5) / scale as f32 - 0.5,
+                )
+                .map(byte);
+                assert_eq!(pixel.0[3], base[3]);
+                changed += usize::from(pixel.0[0].abs_diff(base[0]) > 2);
             }
-            changed += usize::from(pixel.0[0].abs_diff(base[0]) > 2);
+            assert!(changed > 100, "network must infer detail, not just resize");
         }
-        assert!(changed > 100, "network must infer detail, not just resize");
     }
 
     #[test]
@@ -685,8 +590,8 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
-        assert_eq!(module.entry_points.len(), 5);
-        assert_eq!(std::mem::size_of::<UpscaleParams>(), 96);
+        assert_eq!(module.entry_points.len(), 2);
+        assert_eq!(std::mem::size_of::<UpscaleParams>(), 80);
     }
 
     #[test]
@@ -835,21 +740,6 @@ mod tests {
                     })
                     .save(directory.join(format!("bilinear-{}x.png", plan.scale)))
                     .unwrap();
-                    if plan.scale == 4 {
-                        let twice = reference_2x(&source, 1.0);
-                        RgbaImage::from_fn(enhanced.width, enhanced.height, |x, y| {
-                            Rgba(
-                                bilinear(
-                                    &twice,
-                                    (x as f32 + 0.5) / 2.0 - 0.5,
-                                    (y as f32 + 0.5) / 2.0 - 0.5,
-                                )
-                                .map(byte),
-                            )
-                        })
-                        .save(directory.join("neural-2x-bilinear-4x.png"))
-                        .unwrap();
-                    }
                 }
             }
             for (a, b) in actual

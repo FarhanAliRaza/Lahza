@@ -281,6 +281,27 @@ mod tests {
     }
 
     #[test]
+    fn padded_split_screen_covers_its_cell_instead_of_letterboxing() {
+        use super::super::scene::{SceneGeometry,SceneStyle};
+        for (width,height) in [(1920.0,1080.0),(1080.0,1920.0)] {
+            let style=SceneStyle {padding:20,
+                camera:CameraOverlay {layout:CameraLayout::Split,..Default::default()},..Default::default()};
+            let geometry=SceneGeometry::layout(width,height,1600.0,900.0,&style);
+            let cell=style.camera.screen_area(width,height);
+            assert!(geometry.media.width<=cell.width+1e-9 && geometry.media.height<=cell.height+1e-9);
+            if height>width {
+                // A 16:9 screen fitted to the top cell's width would be
+                // width/1.78 tall; covering fills the cell's height instead.
+                assert!(geometry.media.height>geometry.media.width/(16.0/9.0)*1.2,
+                    "portrait split must not letterbox the screen");
+            }
+            let viewport=geometry.camera_viewport(Default::default(),&style,(1600,900));
+            let visible_aspect=1600.0*viewport.fill.0/(900.0*viewport.fill.1);
+            assert!((visible_aspect-geometry.media.width/geometry.media.height).abs()<1e-9);
+        }
+    }
+
+    #[test]
     fn crop_center_zoom_and_mirror_keep_the_same_selected_content() {
         let mut overlay = CameraOverlay { crop_center: (1.0, 0.0), crop_zoom: 200, ..Default::default() };
         let rect = Rect { x: 0.0, y: 0.0, width: 200.0, height: 200.0 };

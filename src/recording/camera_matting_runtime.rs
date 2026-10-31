@@ -64,14 +64,14 @@ mod linux_x86_64 {
     }
 
     pub(crate) fn load(model: &[u8]) -> Result<ort::session::Session, String> {
-        load_with_options(model, false)
-    }
-
-    /// Restoration uses large attention workspaces with variable frame counts.
-    /// Releasing them after each run prevents its cached session from retaining
-    /// a multi-gigabyte CPU arena while the editor is idle.
-    pub(crate) fn load_audio(model: &[u8]) -> Result<ort::session::Session, String> {
-        load_with_options(model, true)
+        let environment = environment()?;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+        ort::session::Session::builder(&environment)
+            .map_err(|error| error.to_string())?
+            .with_intra_threads(threads)
+            .map_err(|error| error.to_string())?
+            .commit_from_memory(model)
+            .map_err(|error| error.to_string())
     }
 
     fn environment() -> Result<ort::environment::Environment, String> {
@@ -81,7 +81,7 @@ mod linux_x86_64 {
         // Initialization includes fallible filesystem and dynamic-library work.
         // Cache only success so fixing a cache-directory/library error permits
         // a later retry. Serialize the build and recheck after taking the lock
-        // so concurrently starting camera/audio models cannot build two envs.
+        // so concurrently starting camera models cannot build two envs.
         let _initializing = ENVIRONMENT_INIT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -112,31 +112,6 @@ mod linux_x86_64 {
             .map_err(|error| error.to_string())?
             .with_telemetry(false)
             .build()
-            .map_err(|error| error.to_string())
-    }
-
-    fn load_with_options(model: &[u8], bounded_audio: bool) -> Result<ort::session::Session, String> {
-        let environment = environment()?;
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(if bounded_audio { 2 } else { 4 });
-        let builder = ort::session::Session::builder(&environment)
-            .map_err(|error| error.to_string())?
-            .with_intra_threads(threads)
-            .map_err(|error| error.to_string())?;
-        let mut builder = if bounded_audio {
-            builder
-                .with_memory_pattern(false)
-                .map_err(|error| error.to_string())?
-                .with_execution_providers([ort::ep::CPU::default()
-                    .with_arena_allocator(false)
-                    .build()])
-                .map_err(|error| error.to_string())?
-        } else {
-            builder
-        };
-        builder
-            .commit_from_memory(model)
             .map_err(|error| error.to_string())
     }
 
@@ -189,4 +164,4 @@ mod linux_x86_64 {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(super) use linux_x86_64::{load, load_audio};
+pub(super) use linux_x86_64::load;

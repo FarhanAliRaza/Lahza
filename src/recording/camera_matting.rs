@@ -501,6 +501,7 @@ mod tests {
                 cutout: mix,
                 full_bleed: 0.0,
                 shadow: 0.0,
+                split: 0.0,
             });
             let mixed = matte.process(&source, overlay).unwrap();
             let strength = (mix * 65535.0).round() as f32 / 65535.0;

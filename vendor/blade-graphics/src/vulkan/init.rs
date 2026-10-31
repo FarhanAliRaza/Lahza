@@ -449,11 +449,18 @@ impl super::Context {
             .core
             .enumerate_physical_devices()
             .map_err(super::PlatformError::Init)?;
-        let (physical_device, capabilities) = physical_devices
+        // Prefer hardware: software rasterizers (lavapipe) are a last resort,
+        // whatever order the loader lists devices in.
+        let mut candidates: Vec<_> = physical_devices
             .into_iter()
-            .find_map(|phd| {
+            .filter_map(|phd| {
                 inspect_adapter(phd, &instance, driver_api_version, &desc).map(|caps| (phd, caps))
             })
+            .collect();
+        candidates.sort_by_key(|(_, caps)| caps.device_information.is_software_emulated);
+        let (physical_device, capabilities) = candidates
+            .into_iter()
+            .next()
             .ok_or_else(|| NotSupportedError::NoSupportedDeviceFound)?;
 
         log::debug!("Adapter {:#?}", capabilities);

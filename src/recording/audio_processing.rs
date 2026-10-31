@@ -20,11 +20,7 @@ use std::{
 const PIPELINE_VERSION: &str = "source-audio-v3-neural-flac24-48k";
 
 fn processing_identity(mode: AudioMode) -> String {
-    let model = match mode {
-        AudioMode::NoiseReduction => super::neural_audio::MODEL_ID,
-        AudioMode::Podcast => super::restoration_audio::MODEL_ID,
-        _ => "none",
-    };
+    let model = if mode.requires_neural() { super::reuse_audio::MODEL_ID } else { "none" };
     format!("{}:{}:{}", mode.cache_key(), super::audio_dsp::DSP_VERSION, model)
 }
 
@@ -426,7 +422,6 @@ fn prepare_microphone(source: &Path, stream: u32, duration: f64, origin: f64,
     let decoded = directory.join(format!("{stream}-decoded.f32"));
     let normalized = directory.join(format!("{stream}-normalized.f32"));
     let enhanced = directory.join(format!("{stream}-enhanced.f32"));
-    let gated = directory.join(format!("{stream}-speech.f32"));
     let finished = directory.join(format!("{stream}-finished.f32"));
     control.set_status("Preparing microphone");
     let mut command = Command::new("ffmpeg");
@@ -444,35 +439,23 @@ fn prepare_microphone(source: &Path, stream: u32, duration: f64, origin: f64,
         &mut |fraction| control.set_progress(base + share * (0.1 + 0.1 * fraction)))
         .map_err(&failure)?;
     fs::remove_file(&decoded)?;
-    let neural_input = match mode {
-        AudioMode::NoiseReduction => {
-            control.set_status("Removing background noise");
-            super::neural_audio::enhance_file(&normalized, &enhanced, 2, &stopped,
-                &mut |fraction| control.set_progress(base + share * (0.2 + 0.6 * fraction)))
-                .map_err(&failure)?;
-            &enhanced
-        }
-        AudioMode::Podcast => {
-            control.set_status("Softening pauses before restoration");
-            super::audio_dsp::prepare_restoration_file(&normalized, &gated, 2, &stopped,
-                &mut |fraction| control.set_progress(base + share * (0.2 + 0.05 * fraction)))
-                .map_err(&failure)?;
-            control.set_status("Enhancing microphone speech");
-            super::restoration_audio::enhance_file(&gated, &enhanced, 2, &stopped,
-                &mut |fraction| control.set_progress(base + share * (0.25 + 0.55 * fraction)))
-                .map_err(&failure)?;
-            &enhanced
-        }
-        _ => &normalized,
+    let neural_input = if mode.requires_neural() {
+        control.set_status("Enhancing microphone audio");
+        super::reuse_audio::enhance_file(&normalized, &enhanced, 2, &stopped,
+            &mut |fraction| control.set_progress(base + share * (0.2 + 0.6 * fraction)),
+            &mut |notice| control.set_status(notice))
+            .map_err(&failure)?;
+        &enhanced
+    } else {
+        &normalized
     };
     control.set_status("Finishing microphone sound");
-    super::audio_dsp::finish_file(neural_input, Some(&normalized), &finished,
+    super::audio_dsp::finish_file(neural_input, &finished,
         48000, 2, mode, &stopped,
         &mut |fraction| control.set_progress(base + share * (0.8 + 0.2 * fraction)))
         .map_err(&failure)?;
     let _ = fs::remove_file(&normalized);
     let _ = fs::remove_file(&enhanced);
-    let _ = fs::remove_file(&gated);
     control.check(cancelled)?;
     Ok(finished)
 }
@@ -589,7 +572,7 @@ mod tests {
         let source = PathBuf::from(std::env::var_os("LAHZA_AUDIO_FIXTURE").expect("explicit speech fixture"));
         let directory = PathBuf::from(std::env::var_os("LAHZA_AUDIO_OUTPUT").expect("explicit output directory"));
         fs::create_dir_all(&directory).unwrap();
-        let selection = std::env::var("LAHZA_AUDIO_MODES").unwrap_or_else(|_| "standard,loud,noise-reduction,podcast".into());
+        let selection = std::env::var("LAHZA_AUDIO_MODES").unwrap_or_else(|_| "off,noise-reduction".into());
         let mut report = Vec::new();
         for mode in AudioMode::ALL.into_iter().filter(|mode| selection.split(',').any(|key| key == mode.cache_key())) {
             let began = std::time::Instant::now();
@@ -630,11 +613,19 @@ mod tests {
             .arg(&source).args(["-map", "0:a:0", "-c:a", "pcm_f32le"]).arg(&mic_source).status().unwrap();
         assert!(output_status.success());
         let mic_asset = ensure_audio(&mic_source, true, &ProcessingControl::default()).unwrap().unwrap();
-        let mic = samples(&mic_asset, "0:a:0", None);
-        let system = samples(&source, "0:a:1", None);
+        // The leveled microphone peaks at 0.95, so the expected mix is the
+        // preparation's own amix + limiter over the separately prepared
+        // microphone and the untouched system track, not a raw sum.
+        let mix = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&mic_asset).arg("-i").arg(&source)
+            .args(["-filter_complex", "[0:a:0]aformat=sample_fmts=fltp:channel_layouts=stereo[m];\
+                [1:a:1]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo[s];\
+                [m][s]amix=inputs=2:normalize=0:duration=longest,alimiter=limit=0.95:level=0:latency=1",
+                "-ar", "48000", "-ac", "2", "-f", "f32le", "pipe:1"]).output().unwrap();
+        assert!(mix.status.success(), "{}", String::from_utf8_lossy(&mix.stderr));
+        let expected: Vec<f32> = mix.stdout.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         assert_eq!(output.len(), 96000);
-        let max_error = output.iter().zip(mic.iter().zip(&system)).map(|(actual, (mic, system))|
-            (actual - (mic + system)).abs()).fold(0.0_f32, f32::max);
+        let max_error = output.iter().zip(&expected).map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
         assert!(max_error < 0.000002, "system track changed or denoiser order changed: {max_error}");
         let before = fs::metadata(&prepared).unwrap().modified().unwrap();
         assert_eq!(ensure_audio(&source, true, &ProcessingControl::default()).unwrap(), Some(prepared.clone()));
@@ -642,6 +633,25 @@ mod tests {
         let raw = ensure_audio(&source, false, &ProcessingControl::default()).unwrap().unwrap();
         assert_ne!(raw, prepared);
         assert_ne!(samples(&raw, "0:a:0", None), output);
+    }
+
+    #[test]
+    fn waveform_switches_to_cleaned_audio_once_prepared() {
+        use super::super::video::audio_levels;
+        let fixture = Fixture::new();
+        let source = fixture.path("screen.mkv");
+        ffmpeg(&["-f", "lavfi", "-i", "testsrc=size=64x36:rate=10:duration=1",
+            "-f", "lavfi", "-i", "anoisesrc=color=white:amplitude=0.15:sample_rate=48000:duration=1:seed=73",
+            "-f", "lavfi", "-i", "sine=frequency=997:sample_rate=48000:duration=1",
+            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "ffv1", "-c:a", "pcm_f32le", "-ac", "2",
+            "-metadata:s:a:0", "title=Lahza-Microphone", "-metadata:s:a:1", "title=Lahza-System-Audio"], &source);
+        let raw = audio_levels(&source, 64, AudioMode::Off).unwrap();
+        // Before preparation the enhanced preset shows the unprocessed mix.
+        assert_eq!(audio_levels(&source, 64, AudioMode::NoiseReduction).unwrap(), raw);
+        ensure_audio(&source, AudioMode::NoiseReduction, &ProcessingControl::default()).unwrap();
+        let cleaned = audio_levels(&source, 64, AudioMode::NoiseReduction).unwrap();
+        assert_eq!(cleaned.len(), raw.len());
+        assert_ne!(cleaned, raw, "waveform still shows the unprocessed audio");
     }
 
     #[test]

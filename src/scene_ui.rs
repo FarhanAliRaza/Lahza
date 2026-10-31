@@ -552,6 +552,9 @@ pub(crate) struct PreviewCache {
     worker: Option<PreviewWorker>,
     pub(crate) display_scale: f32,
     polling: bool,
+    /// Counts continuous edits; see `PreviewKey::gesture`.
+    gesture: u64,
+    editing: bool,
 }
 
 impl Default for PreviewCache {
@@ -562,6 +565,8 @@ impl Default for PreviewCache {
             worker: None,
             display_scale: 1.0,
             polling: false,
+            gesture: 0,
+            editing: false,
         }
     }
 }
@@ -819,6 +824,7 @@ mod motion_picking_tests {
             media: PreviewMedia::Image(1),
             high_quality: true,
             motion: None,
+            gesture: 0,
         };
         let mut edited = key.clone();
         edited.viewport.magnification = 2.0;
@@ -877,6 +883,10 @@ fn handle_hit(quad: &[(f64, f64); 4], x: f64, y: f64) -> Option<usize> {
         .position(|(qx, qy)| (qx - x).abs() <= 9.0 && (qy - y).abs() <= 9.0)
 }
 
+
+/// Seconds a camera edit eases over: a resize/move of an on-screen
+/// element, so ease-in-out (the quintic in `blend`), kept under 300 ms.
+const CAMERA_HANDOFF_SECONDS: f64 = 0.28;
 impl Studio {
     // ------------------------------------------------------------------
     // Scene state helpers
@@ -956,6 +966,7 @@ impl Studio {
         }
         self.input_overlays = style.input_overlays;
         self.content_fill = style.fill;
+        self.enhance_screen = style.enhance_screen;
         self.restore_canvas_ratio(style.aspect);
         if let Some((width, height)) = style.aspect_dimensions.filter(|(w, h)|
             (1..=10000).contains(w) && (1..=10000).contains(h)
@@ -1095,6 +1106,55 @@ impl Studio {
     // Composited preview
     // ------------------------------------------------------------------
 
+    /// The style the editor preview draws: the authored style plus any
+    /// camera handoff in flight. Export and autosave keep `scene_style`.
+    pub(crate) fn preview_scene_style(&self) -> SceneStyle {
+        let mut style = self.scene_style();
+        style.camera_handoff = self.camera_handoff.as_ref().map(|(from, start)| {
+            crate::recording::camera_timeline::CameraHandoff {
+                from: from.clone(),
+                progress: (start.elapsed().as_secs_f64() / CAMERA_HANDOFF_SECONDS).min(1.0),
+            }
+        });
+        style
+    }
+
+    /// Camera edits (layout, position, shape, undo) ease from the pose on
+    /// screen instead of jumping. Direct manipulation follows the pointer;
+    /// releasing a bubble drag still eases into the snapped spot.
+    pub(crate) fn update_camera_handoff(&mut self, window: &mut Window) {
+        // Hold the finished handoff until its final pose is on screen. Ending
+        // earlier cancels the in-flight frame, so the preview would stall a
+        // step short and then jump once the full-quality frame arrives.
+        let final_shown = self.preview_cache.frame.as_ref()
+            .and_then(|(key, _)| key.style.camera_handoff.as_ref())
+            .is_some_and(|handoff| handoff.progress >= 1.0);
+        if self.camera_handoff.as_ref().is_some_and(|(_, start)| {
+            let elapsed = start.elapsed().as_secs_f64();
+            elapsed >= CAMERA_HANDOFF_SECONDS && (final_shown || elapsed >= CAMERA_HANDOFF_SECONDS + 0.5)
+        }) {
+            self.camera_handoff = None;
+        }
+        if self.video_project.is_none() {
+            self.camera_shown = None;
+            return;
+        }
+        let mut shown = self.preview_scene_style();
+        if let Some(previous) = self.camera_shown.take() {
+            let edited = previous.camera != shown.camera || previous.camera_regions != shown.camera_regions;
+            let direct = self.camera_drag.is_some() || self.slider_drag.is_some()
+                || self.camera_region_drag.is_some();
+            if edited && !direct && crate::theme::animations_enabled() {
+                self.camera_handoff = Some((Box::new(previous), std::time::Instant::now()));
+                shown = self.preview_scene_style();
+            }
+        }
+        if self.camera_handoff.is_some() {
+            window.request_animation_frame();
+        }
+        self.camera_shown = Some(shown);
+    }
+
     /// The RGBA media the preview composites: the current video frame or
     /// the processed screenshot.
     fn preview_source(&self) -> Option<Arc<RgbaImage>> {
@@ -1117,7 +1177,7 @@ impl Studio {
         // for every pointer sample needlessly stalls the UI thread.
         let (width, height) = annotation_preview_size((width, height), canvas);
         let viewport = self.video_viewport_timeline.frame_at(time);
-        let mut style = self.scene_style();
+        let mut style = self.preview_scene_style();
         if self.video_project.is_some() {
             let source_time = self.video_clip_timeline.content_source_time_at(time).unwrap_or(time);
             style.camera = style.camera_at(source_time, canvas, self.camera_source_aspect(), viewport.magnification);
@@ -1158,10 +1218,17 @@ impl Studio {
         // preview during scaling so text detail does not appear to disappear.
         let annotation_proxy = self.pointer_is_down && !self.annotations_paint_flat()
             && !self.canvas_annotation_drag;
-        let editing = self.slider_drag.is_some() || self.media_drag.is_some()
+        let dragging = self.slider_drag.is_some() || self.media_drag.is_some()
             || self.camera_drag.is_some() || self.motion_transform_drag.is_some();
+        // A camera handoff composes at full size so its last frame matches
+        // the settled one; a half-size proxy would pop sharper at the end.
+        let editing = dragging || self.camera_handoff.is_some();
+        if editing && !self.preview_cache.editing {
+            self.preview_cache.gesture += 1;
+        }
+        self.preview_cache.editing = editing;
         let proxy = if annotation_proxy || (!(self.video_project.is_some() && self.video_window_capture)
-            && editing)
+            && dragging)
         {
             0.5
         } else {
@@ -1171,7 +1238,7 @@ impl Studio {
             (f32::from(canvas_width) * proxy * self.preview_cache.display_scale).round().max(2.0) as u32,
             (f32::from(canvas_height) * proxy * self.preview_cache.display_scale).round().max(2.0) as u32,
         ), self.video_playing);
-        let style = self.scene_style();
+        let style = self.preview_scene_style();
         let source_size = (source.width(), source.height());
         let time = if self.video_project.is_some() || self.animation_active {
             self.timeline_display_time()
@@ -1254,6 +1321,7 @@ impl Studio {
             // work enlarging those proxies; release supplies original pixels.
             high_quality,
             motion,
+            gesture: if editing { self.preview_cache.gesture } else { 0 },
         };
         if let Some((cached, image)) = self.preview_cache.frame.as_ref() {
             if *cached == key {
@@ -1540,6 +1608,26 @@ impl Studio {
         }
     }
 
+    /// Whether fitting the recording whole leaves background showing beside
+    /// it, as a landscape recording does on a 9:16 canvas. Screen Studio
+    /// offers "Avoid empty area" (our Fill) only in that case.
+    fn fit_leaves_empty_space(&self) -> bool {
+        let mut style = self.scene_style();
+        let Some(aspect) = style.aspect.filter(|aspect| aspect.is_finite() && *aspect > 0.0) else {
+            return false;
+        };
+        if self.video_project.is_none() {
+            return false;
+        }
+        let (width, height) = (1000.0 * aspect, 1000.0);
+        let source = (self.video_source_size.0 as f64, self.video_source_size.1 as f64);
+        style.fill = false;
+        let fit = SceneGeometry::layout(width, height, source.0, source.1, &style).media;
+        style.fill = true;
+        let fill = SceneGeometry::layout(width, height, source.0, source.1, &style).media;
+        fit.width < fill.width - 1.0 || fit.height < fill.height - 1.0
+    }
+
     pub(crate) fn camera_style_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         use crate::recording::camera_layout::{CameraAspect, CameraLayout, CameraSplitDirection};
         const LAYOUTS: [CameraLayout; 4] = [CameraLayout::Overlay, CameraLayout::Split, CameraLayout::Cutout, CameraLayout::Fullscreen];
@@ -1564,7 +1652,11 @@ impl Studio {
                 .child(self.scene_toggle_row("camera-zoom-resize", "Resize during zoom", overlay.zoomed_size.is_some(), cx, |this| {
                     this.edit_camera_overlay(|camera| camera.zoomed_size = if camera.zoomed_size.is_some() { None } else { Some((camera.size * 3 / 4).max(10)) });
                 }))
-                .when(overlay.zoomed_size.is_some(), |panel| panel.child(self.scene_slider_row(SceneSlider::CameraZoomedSize, cx))))
+                .when(overlay.zoomed_size.is_some(), |panel| panel.child(self.scene_slider_row(SceneSlider::CameraZoomedSize, cx)))
+                .when(self.fit_leaves_empty_space(), |panel| panel
+                    .child(self.scene_toggle_row("camera-avoid-empty", "Avoid empty area", self.content_fill, cx,
+                        |this| this.content_fill = !this.content_fill))
+                    .child(hint("Crops the recording to fill the canvas; the camera follows your cursor."))))
             .when(overlay.layout == CameraLayout::Overlay || (overlay.layout == CameraLayout::Split && !overlay.split_full), |panel| panel
                 .child(Self::section_divider())
                 .child(div().section_title().child("Shape & frame"))
@@ -1744,7 +1836,7 @@ impl Studio {
 
     /// Time-resolved geometry and crop shared by drawing, picking and handles.
     pub(crate) fn preview_geometry_frame(&self, canvas_width:f32, canvas_height:f32) -> (SceneStyle,SceneGeometry,ViewportFrame) {
-        let mut style=self.scene_style();
+        let mut style=self.preview_scene_style();
         let source=if self.video_project.is_some(){self.video_source_size}else{self.captured_dimensions.unwrap_or((1200,720))};
         let time=self.timeline_display_time();
         let viewport=if self.video_project.is_some()||self.animation_active {self.video_viewport_timeline.frame_at(time)}else{ViewportFrame::default()};
@@ -1901,7 +1993,6 @@ impl Studio {
         self.video_project.is_some()
             && self.video_camera_path.is_some()
             && self.camera_at_playhead((1920, 1080)).opacity() > 0.0
-            && self.video_viewport_timeline.frame_at(self.timeline_display_time()).loupe.is_none_or(|lens| lens.presence < 0.95)
             && self.video_clip_timeline
                 .content_source_time_at(self.video_position)
                 .is_some_and(|time| time < self.video_recording_duration)
@@ -1917,7 +2008,7 @@ impl Studio {
     pub(crate) fn camera_at_playhead(&self, canvas: (u32, u32)) -> CameraOverlay {
         let time = self.timeline_display_time();
         let source_time = self.video_clip_timeline.content_source_time_at(time).unwrap_or(time);
-        self.scene_style().camera_at(source_time, canvas, self.camera_source_aspect(),
+        self.preview_scene_style().camera_at(source_time, canvas, self.camera_source_aspect(),
             self.video_viewport_timeline.frame_at(time).magnification)
     }
 
@@ -4090,23 +4181,46 @@ impl Studio {
         self.video_extras_token = self.video_extras_token.wrapping_add(1);
         let token = self.video_extras_token;
         let task = cx.background_executor().spawn(async move {
-            (
-                crate::recording::video::audio_levels(&path, 240).unwrap_or_default(),
-                crate::recording::video::decode_thumbnails(&path, 32, 56).unwrap_or_default(),
-            )
+            crate::recording::video::decode_thumbnails(&path, 32, 56).unwrap_or_default()
         });
         cx.spawn(async move |weak, cx| {
-            let (levels, thumbnails) = task.await;
+            let thumbnails = task.await;
             let _ = weak.update(cx, |this, cx| {
                 if this.video_extras_token != token || this.video_project.is_none() {
                     return;
                 }
-                this.video_audio_levels = levels;
                 let previous = std::mem::replace(
                     &mut this.video_thumbnails,
                     thumbnails.into_iter().map(cached_render_image).collect(),
                 );
                 this.retired_images.extend(previous);
+                cx.notify();
+            });
+        })
+        .detach();
+        self.refresh_audio_levels(cx);
+    }
+
+    /// Redraws the waveform for the current microphone preset: the cleaned
+    /// audio once it is prepared, otherwise the unprocessed mix.
+    pub(crate) fn refresh_audio_levels(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.video_project.as_ref() else {
+            return;
+        };
+        let path = Self::media_source_for(session);
+        let mode = self.video_audio_mode;
+        self.video_levels_token = self.video_levels_token.wrapping_add(1);
+        let token = self.video_levels_token;
+        let task = cx.background_executor().spawn(async move {
+            crate::recording::video::audio_levels(&path, 240, mode).unwrap_or_default()
+        });
+        cx.spawn(async move |weak, cx| {
+            let levels = task.await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.video_levels_token != token || this.video_project.is_none() {
+                    return;
+                }
+                this.video_audio_levels = levels;
                 cx.notify();
             });
         })

@@ -4,25 +4,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AudioMode {
+    /// Earlier Standard and Loud presets (DSP only) open as Off.
     #[default]
-    #[serde(alias = "channel-fix")]
+    #[serde(alias = "channel-fix", alias = "standard", alias = "voice", alias = "normalized", alias = "loud")]
     Off,
-    #[serde(alias = "voice", alias = "normalized")]
-    Standard,
-    Loud,
-    #[serde(alias = "noiseReduction")]
+    /// "Enhance audio" (RE-USE); the earlier Podcast preset opens as this.
+    #[serde(alias = "noiseReduction", alias = "podcast")]
     NoiseReduction,
-    Podcast,
 }
 
 impl AudioMode {
-    pub const ALL: [Self; 5] = [
-        Self::Off,
-        Self::Standard,
-        Self::Loud,
-        Self::NoiseReduction,
-        Self::Podcast,
-    ];
+    pub const ALL: [Self; 2] = [Self::Off, Self::NoiseReduction];
     pub fn from_legacy(reduce_noise: bool) -> Self {
         if reduce_noise {
             Self::NoiseReduction
@@ -33,36 +25,25 @@ impl AudioMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
-            Self::Standard => "Standard",
-            Self::Loud => "Loud",
-            Self::NoiseReduction => "Noise reduction",
-            Self::Podcast => "Podcast",
+            Self::NoiseReduction => "Enhance audio",
         }
     }
     pub fn description(self) -> &'static str {
         match self {
             Self::Off => "Keep the microphone level and repair a quiet stereo channel.",
-            Self::Standard => "Balance the recording level and repair a quiet stereo channel.",
-            Self::Loud => "Keep speech at a consistent level and soften long pauses.",
             Self::NoiseReduction => {
-                "Remove background noise locally, then balance the voice level."
-            }
-            Self::Podcast => {
-                "Enhance the voice locally, shape its tone, and soften harsh S sounds."
+                "Remove background noise and room echo locally, then balance the voice level."
             }
         }
     }
     pub fn cache_key(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Standard => "standard",
-            Self::Loud => "loud",
             Self::NoiseReduction => "noise-reduction",
-            Self::Podcast => "podcast",
         }
     }
     pub fn requires_neural(self) -> bool {
-        matches!(self, Self::NoiseReduction | Self::Podcast)
+        self == Self::NoiseReduction
     }
 }
 impl From<bool> for AudioMode {
@@ -84,10 +65,10 @@ mod tests {
                 mode
             );
         }
-        assert_eq!(
-            serde_json::from_str::<AudioMode>("\"voice\"").unwrap(),
-            AudioMode::Standard
-        );
+        assert_eq!(serde_json::from_str::<AudioMode>("\"podcast\"").unwrap(), AudioMode::NoiseReduction);
+        for removed in ["standard", "voice", "normalized", "loud"] {
+            assert_eq!(serde_json::from_str::<AudioMode>(&format!("\"{removed}\"")).unwrap(), AudioMode::Off);
+        }
         assert_eq!(
             serde_json::from_str::<AudioMode>("\"channel-fix\"").unwrap(),
             AudioMode::Off

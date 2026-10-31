@@ -866,6 +866,15 @@ impl Studio {
                         })),
                 )
             })
+            .when(self.video_project.is_some(), |this| {
+                this.child(self.scene_toggle_row(
+                    "enhance-screen",
+                    "Upscale zoomed footage",
+                    self.enhance_screen,
+                    cx,
+                    |this| this.enhance_screen = !this.enhance_screen,
+                ))
+            })
             .child(self.slider_row(
                 SliderTarget::Padding,
                 "Padding",

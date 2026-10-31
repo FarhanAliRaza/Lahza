@@ -17,8 +17,7 @@
     "*-clean.wav": "Reference speech served by the TF-Restormer authors; the hash identifies their exact downloaded WAV.",
     "*-input.wav": "The authors' 16 kHz-to-48 kHz degraded-input demo; the hash identifies their exact downloaded WAV.",
     "*-noisy.wav": "Generated locally from clean speech by tools/validate_neural_audio.py using seeded mathematical fan, hiss and typing-like noise; not an upstream download.",
-    "*-reference.wav": "The same clean speech scaled to preserve headroom for the generated noise fixture.",
-    "*-moss-python.wav": "Generated locally by tools/validate_mossformer_audio.py using public MossFormer2 weights."
+    "*-reference.wav": "The same clean speech scaled to preserve headroom for the generated noise fixture."
   },
   "files": {
     "p360_072_mic1-clean.wav": {

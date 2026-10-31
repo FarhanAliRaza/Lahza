@@ -5,6 +5,7 @@
 /dist/
 /prebuilt/
 /ignore/
+/notes/
 /*.snap
 *.log
 

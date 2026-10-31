@@ -388,6 +388,10 @@ impl CameraOverlay {
         self.pose.map_or(if self.enabled && self.layout == CameraLayout::Split && self.split_full {1.0}else{0.0}, |pose|pose.full_bleed)
     }
 
+    pub fn split_strength(&self) -> f64 {
+        self.pose.map_or(if self.enabled && self.layout == CameraLayout::Split {1.0}else{0.0}, |pose|pose.split)
+    }
+
     pub fn shadow_strength(&self) -> f64 {
         if !self.shadow {return 0.0;}
         self.pose.map_or_else(|| {
@@ -532,6 +536,8 @@ pub struct SceneStyle {
     /// With a fixed aspect: crop the media to fill the card (a follow camera
     /// keeps the action in frame) instead of fitting it whole.
     pub fill: bool,
+    /// Neural upscaling of zoomed-in screen pixels.
+    pub enhance_screen: bool,
     /// 0-100 blur of the background layer.
     pub background_blur: u8,
     /// 0-100 film grain on the background layer.
@@ -546,6 +552,9 @@ pub struct SceneStyle {
     /// Source-time camera layouts; empty preserves the legacy global layout.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub camera_regions: Vec<super::camera_timeline::CameraRegion>,
+    /// Editor-preview easing after a camera edit; see `CameraHandoff`.
+    #[serde(skip)]
+    pub camera_handoff: Option<super::camera_timeline::CameraHandoff>,
     /// Keystroke captions and the speed badge.
     pub input_overlays: super::studio_overlays::InputOverlayStyle,
     /// Narration subtitle bar.
@@ -571,6 +580,7 @@ impl Default for SceneStyle {
             aspect: None,
             aspect_dimensions: None,
             fill: false,
+            enhance_screen: true,
             background_blur: 0,
             background_noise: 0,
             vignette: 0,
@@ -579,6 +589,7 @@ impl Default for SceneStyle {
             pointer: PointerStyle::default(),
             camera: CameraOverlay::default(),
             camera_regions: Vec::new(),
+            camera_handoff: None,
             input_overlays: Default::default(),
             subtitles: Default::default(),
         }
@@ -689,6 +700,23 @@ impl Rect {
     }
 }
 
+/// Screen Studio's split rule: the screen covers its cell, cropping the
+/// overflow. When the crop runs along the split axis and there is padding,
+/// it may shrink by up to 10% instead, leaving a small gap over a deep crop.
+fn split_cover(cell: Rect, source_width: f64, source_height: f64, side_by_side: bool, relax: bool) -> Rect {
+    let fit = (cell.width / source_width).min(cell.height / source_height);
+    let cover = (cell.width / source_width).max(cell.height / source_height);
+    let along_split = if side_by_side {
+        source_width * cover > cell.width + 0.5
+    } else {
+        source_height * cover > cell.height + 0.5
+    };
+    let scale = if relax && along_split { fit.max(cover * 0.9) } else { cover };
+    let width = (source_width * scale).min(cell.width);
+    let height = (source_height * scale).min(cell.height);
+    Rect { x: cell.x + (cell.width - width) * 0.5, y: cell.y + (cell.height - height) * 0.5, width, height }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowSpec {
     pub color: [u8; 3],
@@ -768,6 +796,19 @@ impl SceneGeometry {
                 height,
             }
         };
+        // Split screen covers its cell like Screen Studio rather than leaving
+        // a letterboxed screen; Fill already covers the card.
+        let split = style.camera.split_strength().clamp(0.0, 1.0);
+        if split > 0.0 && !style.fills_card() {
+            let cell = Rect { x: screen_area.x + inset, y: screen_area.y + inset + title_height,
+                width: available_width, height: available_height };
+            let side_by_side = screen_area.height / canvas_height.max(1.0) > screen_area.width / canvas_width.max(1.0);
+            let cover = split_cover(cell, source_width, source_height, side_by_side, style.padding > 0);
+            media.x += (cover.x-media.x)*split;
+            media.y += (cover.y-media.y)*split;
+            media.width += (cover.width-media.width)*split;
+            media.height += (cover.height-media.height)*split;
+        }
         if full_bleed > 0.0 {
             media.x += (screen_area.x-media.x)*full_bleed;
             media.y += (screen_area.y-media.y)*full_bleed;
@@ -803,7 +844,8 @@ impl SceneGeometry {
     /// Cheap, allocation-free full-split crop shared by motion estimates,
     /// handles, preview, and both render backends.
     pub fn camera_viewport(&self, mut viewport: ViewportFrame, style: &SceneStyle, source: (u32,u32)) -> ViewportFrame {
-        if style.camera.full_bleed_strength() <= 0.0 { return viewport; }
+        let split = style.camera.split_strength() > 0.0 && !style.fills_card();
+        if style.camera.full_bleed_strength() <= 0.0 && !split { return viewport; }
         let crop=style.source_crop.validated();
         let source_aspect=source.0.max(1) as f64 * crop.width as f64 /
             (source.1.max(1) as f64 * crop.height as f64);
@@ -1373,6 +1415,13 @@ impl SceneCompositor {
             if let Some(pointer) = input.pointer {
                 self.paint_pointer(&mut output, &projection, pointer, input.viewport);
             }
+        }
+        // The camera stays on the stage beneath the glass; the lens magnifies
+        // only the card and media it samples, never the camera.
+        if let Some(camera) = input.camera.filter(|_| self.style.camera.enabled) {
+            self.paint_camera(&mut output, camera, input.viewport.magnification);
+        }
+        if media_visible {
             if let (Some(lens), Some(background)) = (lens, lens_background.as_ref()) {
                 let (left, top, visible_x, visible_y) =
                     self.style.source_crop.visible_rect(input.viewport);
@@ -1414,25 +1463,6 @@ impl SceneCompositor {
                     }
                     color
                 });
-            }
-        }
-        if let Some(camera) = input.camera {
-            if self.style.camera.enabled {
-                let presence = if media_visible {
-                    input.viewport.loupe.map_or(0.0, |lens| lens.presence.clamp(0.0, 1.0))
-                } else { 0.0 };
-                if presence <= 0.0 {
-                    self.paint_camera(&mut output, camera, input.viewport.magnification);
-                } else if presence < 1.0 {
-                    let mut with_camera = output.clone();
-                    self.paint_camera(&mut with_camera, camera, input.viewport.magnification);
-                    for (base, painted) in output.pixels_mut().zip(with_camera.pixels()) {
-                        for channel in 0..4 {
-                            base[channel] = (base[channel] as f64 * presence
-                                + painted[channel] as f64 * (1.0 - presence)).round() as u8;
-                        }
-                    }
-                }
             }
         }
         if let Some(watermark) = self.watermark.as_ref() {
@@ -4722,7 +4752,7 @@ mod loupe_composition_tests {
     }
 
     #[test]
-    fn lens_hides_camera_and_keeps_canvas_overlays_above_glass() {
+    fn lens_keeps_camera_on_stage_and_canvas_overlays_above_glass() {
         let style = SceneStyle::default();
         let scene = SceneCompositor::new(&style,240,160,120,80).unwrap();
         let source = RgbaImage::from_pixel(120,80,Rgba([30,60,90,255]));
@@ -4730,7 +4760,12 @@ mod loupe_composition_tests {
         let input = FrameInput {source:&source,overlay:None,
             viewport:ViewportFrame {loupe:Some(lens()),..Default::default()}, pointer:None,camera:None};
         let expected = scene.compose(input);
-        assert_eq!(scene.compose(FrameInput {camera:Some(&camera),..input}),expected);
+        // The camera stays visible beside the lens, which never magnifies it.
+        let with_camera = scene.compose(FrameInput {camera:Some(&camera),..input});
+        let rect = style.camera.rect(240.0,160.0);
+        let center = ((rect.x+rect.width*0.5) as u32, (rect.y+rect.height*0.5) as u32);
+        assert_eq!(with_camera.get_pixel(center.0,center.1).0, [240,30,10,255]);
+        assert_eq!(with_camera.get_pixel(120,80), expected.get_pixel(120,80));
         let caption = RgbaImage::from_pixel(240,160,Rgba([20,230,40,255]));
         let composited = scene.compose_layers(input,true,Some(&caption));
         assert!(composited.pixels().all(|p| p.0 == [20,230,40,255]));

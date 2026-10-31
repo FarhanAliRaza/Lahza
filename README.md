@@ -442,12 +442,15 @@ move or resize it, then use the annotation timing controls for its start/end and
 entrance/exit animation. Transparent PNGs are supported, and overlay pixels are
 embedded in the saved annotation.
 
-The **Audio → Microphone sound** panel offers **Off**, **Standard**,
-**Loud**, **Noise reduction**, and **Podcast** presets. Noise reduction runs
-MossFormer2; Podcast uses TF-Restormer followed by voice leveling and tone
-processing. Models are bundled for local CPU processing on Linux x86_64.
-Preparation shows progress and can be cancelled; its completed audio is reused
-by playback and export. Podcast takes longer to prepare than Noise reduction.
+The **Audio → Microphone sound** panel offers **Off** and **Enhance audio**.
+Enhance audio runs NVIDIA's RE-USE speech enhancement model on the GPU (any
+Vulkan GPU) to remove background noise and room echo, then levels the voice.
+The model is bundled and runs locally. Without a GPU it still runs on the CPU,
+very slowly, with a warning. Preparation shows progress and can be cancelled;
+its completed audio is reused by playback and export, and the timeline waveform
+switches to the cleaned audio once it is ready. Projects saved with the earlier
+Standard or Loud presets open as Off; Noise reduction and Podcast open as
+Enhance audio.
 
 New recordings keep microphone and system audio separate, so microphone presets
 preserve desktop sound. Older recordings with already mixed audio are processed

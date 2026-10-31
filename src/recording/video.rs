@@ -459,7 +459,10 @@ fn render_clip_timeline(
 
 /// Root-mean-square loudness per bucket across the whole file (0..1), for
 /// the timeline's audio lane. Files without audio produce an empty list.
-pub fn audio_levels(path: &Path, buckets: usize) -> Result<Vec<f32>, VideoError> {
+/// Waveform buckets for the audible mix. With an enhancement `mode`, the
+/// prepared (cleaned) audio is drawn once it exists; preparation is never
+/// started here, so until then the unprocessed mix is shown.
+pub fn audio_levels(path: &Path, buckets: usize, mode: super::audio_mode::AudioMode) -> Result<Vec<f32>, VideoError> {
     if let Some(bank) = super::media_bank::MediaBank::load(path)? {
         let mut levels = vec![0.0; buckets];
         let duration = bank.info().duration;
@@ -469,7 +472,7 @@ pub fn audio_levels(path: &Path, buckets: usize) -> Result<Vec<f32>, VideoError>
             offset += entry.info.duration;
             let end = ((offset / duration * buckets as f64).round() as usize).min(buckets);
             if entry.info.has_audio && end > start {
-                let values = audio_levels(&bank.entry_path(path, index), end - start)?;
+                let values = audio_levels(&bank.entry_path(path, index), end - start, mode)?;
                 if values.len() == end - start { levels[start..end].copy_from_slice(&values); }
             }
         }
@@ -481,9 +484,17 @@ pub fn audio_levels(path: &Path, buckets: usize) -> Result<Vec<f32>, VideoError>
     }
     // New recordings have independent microphone and desktop streams. The
     // waveform describes their audible mix, rather than only stream zero.
-    let audio = super::audio_processing::ensure_audio(
-        path, false, &super::audio_processing::ProcessingControl::default(),
-    )?.unwrap_or_else(|| path.to_owned());
+    let prepared = if mode.requires_neural() {
+        super::audio_processing::prepared_audio(path, mode).ok().flatten()
+    } else {
+        None
+    };
+    let audio = match prepared {
+        Some(prepared) => prepared,
+        None => super::audio_processing::ensure_audio(
+            path, false, &super::audio_processing::ProcessingControl::default(),
+        )?.unwrap_or_else(|| path.to_owned()),
+    };
     const SAMPLE_RATE: usize = 8_000;
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
@@ -1671,7 +1682,7 @@ mod tests {
             eprintln!("FFmpeg unavailable; skipping audio level test");
             return;
         };
-        let levels = audio_levels(&path, 12).unwrap();
+        let levels = audio_levels(&path, 12, crate::recording::audio_mode::AudioMode::Off).unwrap();
         assert_eq!(levels.len(), 12);
         assert!(levels.iter().any(|level| *level > 0.5));
         assert!(levels.iter().all(|level| (0.0..=1.0).contains(level)));
@@ -1680,7 +1691,7 @@ mod tests {
         assert_eq!(thumbnails[0].height(), 36);
         assert!(thumbnails[0].pixels().any(|pixel| pixel[0] > 0));
         let silent = test_video().unwrap();
-        assert!(audio_levels(&silent.1, 8).unwrap().is_empty());
+        assert!(audio_levels(&silent.1, 8, crate::recording::audio_mode::AudioMode::Off).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(silent.0).unwrap();
     }

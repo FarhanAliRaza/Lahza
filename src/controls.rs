@@ -1234,7 +1234,7 @@ impl Studio {
             )),
             _ => {
                 let paths = &CURATED_WALLPAPERS;
-                div().grid().grid_cols(3).gap_2().w_full().children(
+                div().grid().grid_cols(3).gap_2().w_full().flex_none().children(
                     paths
                         .iter()
                         .enumerate()

@@ -65,6 +65,18 @@ pub struct CameraPose {
     pub cutout: f64,
     pub full_bleed: f64,
     pub shadow: f64,
+    /// Split-screen strength: the screen covers its cell instead of fitting.
+    pub split: f64,
+}
+
+/// Editor-preview handoff from the camera shown before an edit, so a layout
+/// change eases into place instead of jumping. `from` is the style that was
+/// on screen, including any handoff it was itself running. Never authored,
+/// persisted or exported.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CameraHandoff {
+    pub from: Box<SceneStyle>,
+    pub progress: f64,
 }
 
 fn pose(mut overlay: CameraOverlay, canvas: (u32, u32), aspect: f64, zoom: f64) -> CameraPose {
@@ -99,6 +111,7 @@ fn pose(mut overlay: CameraOverlay, canvas: (u32, u32), aspect: f64, zoom: f64) 
         },
         full_bleed: overlay.full_bleed_strength(),
         shadow,
+        split: overlay.split_strength(),
     }
 }
 
@@ -138,6 +151,7 @@ fn blend(
         cutout: lerp(a.cutout, b.cutout),
         full_bleed: lerp(a.full_bleed, b.full_bleed),
         shadow: lerp(a.shadow, b.shadow),
+        split: lerp(a.split, b.split),
     });
     to.enabled = a.opacity > 0.0 || b.opacity > 0.0;
     to.shadow = a.shadow > 0.0 || b.shadow > 0.0;
@@ -159,7 +173,18 @@ impl SceneStyle {
         camera_aspect: f64,
         zoom: f64,
     ) -> CameraOverlay {
-        self.camera_before(source_time, canvas, camera_aspect, zoom, f64::INFINITY)
+        let target = self.camera_before(source_time, canvas, camera_aspect, zoom, f64::INFINITY);
+        match &self.camera_handoff {
+            Some(handoff) if handoff.progress < 1.0 => blend(
+                handoff.from.camera_at(source_time, canvas, camera_aspect, zoom),
+                target,
+                handoff.progress,
+                canvas,
+                camera_aspect,
+                zoom,
+            ),
+            _ => target,
+        }
     }
 
     fn camera_before(
@@ -170,8 +195,7 @@ impl SceneStyle {
         zoom: f64,
         start_limit: f64,
     ) -> CameraOverlay {
-        let mut base = self.camera;
-        base.pose = None;
+        let base = self.camera_card(self.camera, canvas);
         if !source_time.is_finite() {
             return base;
         }
@@ -183,8 +207,7 @@ impl SceneStyle {
             })
             .max_by(|a, b| a.start.total_cmp(&b.start).then(a.id.cmp(&b.id)));
         if let Some(region) = active {
-            let mut target = region.overlay;
-            target.pose = None;
+            let mut target = self.camera_card(region.overlay, canvas);
             let duration = region.transition_duration();
             if duration > 0.0 && source_time < region.start + duration {
                 // Start at the actual outgoing pose, including an unfinished
@@ -218,7 +241,7 @@ impl SceneStyle {
                 let duration = previous.transition_duration();
                 if duration > 0.0 {
                     return blend(
-                        previous.overlay,
+                        self.camera_card(previous.overlay, canvas),
                         target,
                         (source_time - previous.end) / duration,
                         canvas,
@@ -240,7 +263,7 @@ impl SceneStyle {
             let duration = previous.transition_duration();
             if duration > 0.0 && source_time < previous.end + duration {
                 return blend(
-                    previous.overlay,
+                    self.camera_card(previous.overlay, canvas),
                     base,
                     (source_time - previous.end) / duration,
                     canvas,
@@ -252,12 +275,47 @@ impl SceneStyle {
         base
     }
 
+    /// Camera only sits on the background like the screen card: the same
+    /// padding and corner radius. Zero padding keeps it edge to edge.
+    fn camera_card(&self, mut overlay: CameraOverlay, canvas: (u32, u32)) -> CameraOverlay {
+        overlay.pose = None;
+        if !overlay.enabled || overlay.layout != CameraLayout::Fullscreen || self.padding == 0 {
+            return overlay;
+        }
+        let (width, height) = (canvas.0.max(1) as f64, canvas.1.max(1) as f64);
+        // Matches SceneGeometry's card inset and radius.
+        let ui_scale = (height / super::scene::REFERENCE_CANVAS_HEIGHT).max(0.05);
+        let inset = (self.padding as f64 * 2.0 * ui_scale).min(width.min(height) * 0.45);
+        let camera = Rect {
+            x: inset / width,
+            y: inset / height,
+            width: 1.0 - 2.0 * inset / width,
+            height: 1.0 - 2.0 * inset / height,
+        };
+        let side = (width - 2.0 * inset).min(height - 2.0 * inset).max(1e-6);
+        overlay.pose = Some(CameraPose {
+            screen: Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            camera,
+            radius_fraction: (self.corners as f64 * 0.64 * ui_scale / side).min(0.5),
+            opacity: 1.0,
+            cutout: 0.0,
+            full_bleed: 0.0,
+            shadow: if overlay.shadow { 1.0 } else { 0.0 },
+            split: 0.0,
+        });
+        overlay
+    }
+
     pub fn has_camera_content(&self) -> bool {
         (self.camera.enabled && self.camera.layout != CameraLayout::Hidden)
             || self
                 .camera_regions
                 .iter()
                 .any(|r| r.valid() && r.overlay.enabled && r.overlay.layout != CameraLayout::Hidden)
+            || self
+                .camera_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.from.has_camera_content())
     }
 }
 
@@ -321,7 +379,10 @@ mod tests {
         });
         let boundary = style.camera_at(3.0, (1920, 1080), 1.0, 1.0);
         assert_eq!(boundary.opacity(), 1.0);
-        assert_eq!(boundary.pose.unwrap().camera.width, 1.0);
+        // Camera only is inset by the default 20 padding: 72 px per side at 1080p.
+        assert!((boundary.pose.unwrap().camera.width - (1.0 - 144.0 / 1920.0)).abs() < 1e-9);
+        let edge_to_edge = SceneStyle { padding: 0, ..style.clone() };
+        assert_eq!(edge_to_edge.camera_at(2.0, (1920, 1080), 1.0, 1.0).pose, None);
         let middle = style.camera_at(3.175, (1920, 1080), 1.0, 1.0);
         assert!((middle.opacity() - 0.5).abs() < 1e-9);
         assert_eq!(style.camera_at(3.5, (1920, 1080), 1.0, 1.0).opacity(), 0.0);

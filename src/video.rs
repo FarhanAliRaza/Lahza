@@ -676,6 +676,7 @@ impl Studio {
         self.cancel_audio_preparation();
         self.video_audio_prepare_pending = true;
         self.prepare_video_audio(cx);
+        self.refresh_audio_levels(cx);
         self.autosave_scene_style();
         cx.notify();
     }
@@ -738,6 +739,7 @@ impl Studio {
                 match result {
                     Ok(()) => {
                         this.video_audio_error = None;
+                        this.refresh_audio_levels(cx);
                         if std::mem::take(&mut this.video_audio_play_when_ready) {
                             this.start_video_playback(cx);
                         }

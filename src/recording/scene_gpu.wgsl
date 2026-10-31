@@ -322,8 +322,8 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= b_params.canvas.xy) { return; }
     let index = id.y * b_params.canvas.x + id.x;
     let p = vec2<f32>(id.xy) + vec2<f32>(0.5);
-    var color = loupe(screen_pixel(id.xy), p);
-    color = quantize(mix(camera(color, index, p), color, b_params.loupe_optics.z));
+    // The camera stays on the stage beneath the glass, as on the CPU path.
+    var color = loupe(camera(screen_pixel(id.xy), index, p), p);
     if b_params.images[7].z != 0u {
         let s = unpack(b_watermark[index]);
         color = over(color, s.xyz, s.w / 255.0);
