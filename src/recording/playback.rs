@@ -584,8 +584,14 @@ mod tests {
         let mut held=0;
         while let Some(frame)=stream.next_frame(||false).unwrap() {
             if frame.time<0.05 || frame.time>=encoded_pts[95] {continue;}
-            let cached=super::super::primary_frames::frame(&source,(64,48),0,frame.time)
-                .unwrap_or_else(||panic!("native VFR hold missing at {}",frame.time));
+            // The tap stores frames on its own thread; on a loaded CI runner the
+            // transport can hand out a frame a moment before its hold is cached.
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+            let cached=loop {
+                if let Some(cached)=super::super::primary_frames::frame(&source,(64,48),0,frame.time) {break cached;}
+                assert!(std::time::Instant::now()<deadline,"native VFR hold missing at {}",frame.time);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
             let native=selected.iter().copied().take_while(|index|encoded_pts[*index]<=super::super::temporal_decode::source_clock(frame.time)).last().unwrap();
             assert!((i32::from(cached.image.get_pixel(32,24)[0])-native as i32*2).abs()<=1);
             held+=1;
