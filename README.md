@@ -29,13 +29,39 @@ sudo snap install lahza
 
 ## Features
 
+### New in 2.0
+
+**Camera layouts that move.** Switch between overlay, split screen, and camera only, or move the camera to another corner, and it animates there instead of jumping.
+
+![Lahza animating the camera from an overlay into split screen, then camera only, and back to a corner](docs/screenshots/camera-layouts.gif)
+
+**Vertical video that fills the frame.** On 9:16 and other portrait canvases, split screen fills its half of the canvas instead of shrinking the recording to a strip.
+
+[![Lahza on a 9:16 canvas with the screen recording filling the top half and the camera below](docs/screenshots/split-screen-9x16.png)](packaging/store/screenshots/02-camera-split-9x16.png)
+
+With an overlay or cutout camera, **Avoid empty area** crops the recording to fill the canvas, and the view follows your cursor.
+
+![Lahza on a 9:16 canvas with Avoid empty area on, so the recording fills the frame](docs/screenshots/avoid-empty-area.png)
+
+**Glass loupe.** Magnify part of the recording under a glass lens instead of zooming the whole frame. Choose it per zoom region and set its size and magnification.
+
+[![Lahza glass loupe magnifying part of a recording, with the loupe size and zoom level controls](docs/screenshots/glass-loupe.png)](packaging/store/screenshots/01-glass-loupe.png)
+
+**Upscale zoomed footage.** A model trained on interface text sharpens what a zoom magnifies, on your GPU.
+
+[![The same 3.3× zoom with the upscaler off and on; text edges are crisper with it on](docs/screenshots/upscale-compare.png)](packaging/store/screenshots/04-upscale-zoom.png)
+
+**Enhance audio.** NVIDIA's RE-USE speech model removes background noise and room echo from your microphone on the GPU, then levels your voice. It runs on this computer, and the timeline waveform switches to the cleaned audio when it is ready.
+
+[![Lahza Audio panel with Enhance audio selected and the cleaned waveform on the timeline](docs/screenshots/enhance-audio.png)](packaging/store/screenshots/03-enhance-audio.png)
+
+![The same microphone track before and after Enhance audio: the constant noise floor is gone, leaving only speech](docs/screenshots/enhance-audio-waveform.png)
+
 ### Capture and record
 
 Capture screens, windows, or areas. Record with system and microphone audio, pause and resume, and save editable projects with autosave.
 
 ### Design the scene
-
-[![Lahza screenshot editor showing wallpaper choices and image appearance controls](docs/screenshots/01-screenshot-styling.png)](packaging/store/screenshots/01-screenshot-styling.png)
 
 Style your captures with backgrounds, rounded corners, shadows, and window frames. Add effects and watermarks, adjust 3D perspective, and save reusable presets.
 
@@ -44,13 +70,9 @@ Style your captures with backgrounds, rounded corners, shadows, and window frame
 Annotations move and resize freely by default. Hold **Ctrl** to align with
 image/canvas guides while moving or resizing.
 
-![Lahza annotation tools with text styling and timed captions on the video timeline](docs/screenshots/05-annotations.png)
-
 Add arrows, shapes, text, numbered steps, and highlights. Blur sensitive details, crop screenshots, and animate annotations with custom timing.
 
 ### Edit recordings
-
-[![Lahza video editor showing a camera overlay, pointer controls, and a multitrack timeline](docs/screenshots/03-video-and-camera.png)](packaging/store/screenshots/03-video-and-camera.png)
 
 Trim, split, and change clip speed. Add classic zooms, glass loupe magnification, pans, 3D motion, and camera overlays. Customize cursor effects and generate click-based zooms when input metadata is available.
 
@@ -62,19 +84,13 @@ Transcribe the narration on this computer into subtitles with an optional spoken
 
 ### Animate still images
 
-[![Lahza Motion editor with a floating card preset and timed captions](docs/screenshots/02-motion-and-captions.png)](packaging/store/screenshots/02-motion-and-captions.png)
-
 Turn screenshots into animated scenes with zoom, pan, and 3D presets. Combine images, timed captions, and cursor walkthroughs.
 
 ### Start from a template
 
-![Lahza template browser showing product launch, feature spotlight, tutorial, and other animated scene presets](docs/screenshots/06-scene-templates.png)
-
 Start with ready-made layouts for product launches, tutorials, social posts, changelogs, and more. Customize their styling, motion, and captions.
 
 ### Export
-
-[![Lahza export panel showing MP4, WebM, GIF, resolution, and frame rate options](docs/screenshots/04-export-formats.png)](packaging/store/screenshots/04-export-formats.png)
 
 Save screenshots as **PNG** and videos or animations as **MP4** (H.264 or HEVC), **WebM**, or **GIF**. Export up to **4K** at **30 or 60 fps**, with optional motion blur, size estimates and progress tracking. Fixed-aspect canvases such as 9:16 or 4:5 can **Fill** the frame with a camera that follows the cursor. Export the mixed audio alone as **M4A** or **WAV** or subtitles as **SRT**.
 

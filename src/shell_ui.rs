@@ -1257,7 +1257,7 @@ impl Studio {
                 })))
             .child(Self::tab_label("Motion preset"))
             .child(
-                div().grid().grid_cols(3).gap_2().children(
+                div().grid().grid_cols(3).gap_2().w_full().flex_none().children(
                     MotionPreset::ALL
                         .into_iter()
                         .enumerate()
@@ -1272,6 +1272,9 @@ impl Studio {
                                 .id(("animation-preset", index))
                                 .flex()
                                 .flex_col()
+                                // Clipping zeroes the measured height; state it
+                                // (52 preview + 20 label + 2×2 border).
+                                .h(px(76.0))
                                 .rounded_md()
                                 .overflow_hidden()
                                 .border_2()

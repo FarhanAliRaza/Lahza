@@ -1,27 +1,26 @@
 # Snap Store screenshots
 
-These four real application screenshots are ordered to show Lahza's workflow:
+These four real application screenshots show what is new in Lahza 2.0:
 
-| File | Feature | Original capture (2026-09-07) |
-| --- | --- | --- |
-| `screenshots/01-screenshot-styling.png` | Wallpaper backgrounds and image appearance | `14-54-03.png` |
-| `screenshots/02-motion-and-captions.png` | Motion presets, 3D tilt, and timed captions | `15-17-52.png` |
-| `screenshots/03-video-and-camera.png` | Video timeline, camera overlay, pointer controls, and audio | `15-29-38.png` |
-| `screenshots/04-export-formats.png` | MP4, WebM, GIF, resolution, and frame rate | `15-30-04.png` |
+| File | Feature |
+| --- | --- |
+| `screenshots/01-glass-loupe.png` | Glass loupe zoom with loupe size and zoom level |
+| `screenshots/02-camera-split-9x16.png` | 9:16 split screen: the recording fills its half |
+| `screenshots/03-enhance-audio.png` | Enhance audio (RE-USE) with the cleaned waveform |
+| `screenshots/04-upscale-zoom.png` | Upscale zoomed footage on a 3.3× zoom |
 
-Sources were selected from `Screenshot From 2026-09-07 <time>.png` in the
-maintainer's Pictures/Screenshots directory. Originals are untouched.
+They were captured on 2026-10-31 from a private headless GNOME Shell session
+with one virtual 1920 × 1080 monitor, driven and captured through Mutter's
+RemoteDesktop and ScreenCast APIs. The Lahza window is cropped to its
+1440 × 900 bounds. The screen recording is GNOME Settings, recorded in the same
+virtual session. The camera bubble is covered with a cartoon placeholder
+(pasted over the captured frame, matching its rounded corners).
 
-Store images are RGB PNGs under 2 MB each, preserving the captures' natural
-proportions without upscaling. The styling and motion images are
-**1440 × 937** (the transparent outer margin is removed). Neither has added
-padding. The Store requires aspect ratios between 1:2 and 2:1, so the
-3440 × 1408 video/export captures have 156 pixels of neutral padding above
-and below, producing **3440 × 1720** store images. Controls and timelines remain visible.
-README copies in `docs/screenshots/` are **1280 pixels wide**, proportionally
-downscaled with Lanczos resampling from the unpadded captures and linked to
-the larger store files. These
-are documentation assets, outside the application's bundled `assets/` directory.
+Store images are RGB PNGs under 2 MB each at **1440 × 900** (aspect 1.6,
+inside the Store's 1:2–2:1 range), with no padding or upscaling. README images
+in `docs/screenshots/` are 1280 px wide (Lanczos), plus the camera layout
+animation GIF and two before/after strips (upscaler, Enhance audio). These are
+documentation assets, outside the application's bundled `assets/` directory.
 
 The [Store media API](https://dashboard.snapcraft.io/docs/reference/v1/snap.html)
 validates image dimensions, aspect ratios, and file sizes during upload.

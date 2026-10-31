@@ -52,6 +52,7 @@ jobs:
             libspa-0.2-dev \
             libsdl2-dev \
             libvulkan-dev \
+            mesa-vulkan-drivers \
             libxkbcommon-dev \
             libxkbcommon-x11-dev
 
