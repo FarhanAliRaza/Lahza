@@ -219,12 +219,12 @@ impl Renderer {
                 // Outer groups sample inner ones, so draw into a scratch
                 // buffer and copy it in place.
                 let mut target = vec![[0.0f32; 4]; n];
-                let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic };
+                let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic, ops: &list.ops };
                 raster::raster(list, &g.target, &src, &mut target, raster::Write::Replace, self.threads);
                 groups[g.offset as usize..g.offset as usize + n].copy_from_slice(&target);
                 raster::blur(&mut groups, g.offset as usize, g.target.width as usize, g.target.height as usize, g.sigma, g.clamp, self.threads);
             }
-            let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic };
+            let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic, ops: &list.ops };
             raster::raster(list, &list.main(), &src, &mut accum, raster::Write::Accumulate(weight), self.threads);
         }
         let mut out = vec![0u8; w * h * 4];

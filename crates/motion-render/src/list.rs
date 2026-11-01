@@ -12,7 +12,7 @@
 use crate::font::Fonts;
 use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
-use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, ShapeState};
+use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PostKind, ShapeState};
 use lahza_motion_core::document::{Blend, GradientKind, MatteMode, ShapeKind};
 use lahza_motion_core::value::Color;
 
@@ -113,6 +113,8 @@ pub struct DisplayList {
     pub group_texels: u32,
     /// Path segments [x0, y0, x1, y1] in each path's own space.
     pub segments: Vec<[f32; 4]>,
+    /// Post programs of composited groups (see `raster::OP_*`).
+    pub ops: Vec<[f32; 4]>,
 }
 
 impl DisplayList {
@@ -131,6 +133,7 @@ impl DisplayList {
         out.extend_from_slice(bytemuck::cast_slice(&self.prims));
         out.extend_from_slice(bytemuck::cast_slice(&self.stops));
         out.extend_from_slice(bytemuck::cast_slice(&self.segments));
+        out.extend_from_slice(bytemuck::cast_slice(&self.ops));
         out
     }
 }
@@ -141,12 +144,7 @@ fn premul(c: Color, opacity: f64) -> [f32; 4] {
 }
 
 fn blend_code(b: Blend) -> u32 {
-    match b {
-        Blend::Normal => 0,
-        Blend::Add => 1,
-        Blend::Multiply => 2,
-        Blend::Screen => 3,
-    }
+    b.code()
 }
 
 #[derive(Clone)]
@@ -243,6 +241,70 @@ impl Builder<'_> {
         (group.offset, origin, f, (gw, gh))
     }
 
+    /// Encodes post effects for a group whose texel is `f` canvas px.
+    fn program(&mut self, effects: &[EffectState], f: [f64; 2], list: &mut DisplayList) -> (u32, u32) {
+        use crate::raster::*;
+        let start = list.ops.len();
+        let k = (self.scale / ((f[0] + f[1]) / 2.0)) as f32; // canvas px → texels
+        let col = |c: Color| [c.0[0] as f32, c.0[1] as f32, c.0[2] as f32, c.0[3] as f32];
+        for e in effects {
+            let EffectState::Post(p) = e else { continue };
+            let v = p.v.map(|x| x as f32);
+            let mut body: Vec<[f32; 4]> = Vec::new();
+            let head: [f32; 4] = match p.kind {
+                PostKind::Exposure => [OP_EXPOSURE, 0.0, v[0], 0.0],
+                PostKind::BrightnessContrast => [OP_BRIGHTNESS_CONTRAST, 0.0, v[0], v[1]],
+                PostKind::Levels => {
+                    body.push([v[2], v[3], v[4], 0.0]);
+                    [OP_LEVELS, 0.0, v[0], v[1]]
+                }
+                PostKind::HueSaturation => {
+                    body.push([v[2], 0.0, 0.0, 0.0]);
+                    [OP_HUE_SATURATION, 0.0, v[0], v[1]]
+                }
+                PostKind::Tint => {
+                    body.push(col(p.colors[0]));
+                    body.push(col(p.colors[1]));
+                    [OP_TINT, 0.0, v[0], 0.0]
+                }
+                PostKind::GradientMap => {
+                    let stops = p.stops.as_deref().map(|s| s.as_slice()).unwrap_or(&[]);
+                    for (o, c) in stops {
+                        body.push([*o as f32, 0.0, 0.0, 0.0]);
+                        body.push(col(*c));
+                    }
+                    [OP_GRADIENT_MAP, 0.0, v[0], stops.len() as f32]
+                }
+                PostKind::Invert => [OP_INVERT, 0.0, v[0], 0.0],
+                PostKind::Fill => {
+                    body.push(col(p.colors[0]));
+                    [OP_FILL, 0.0, v[0], 0.0]
+                }
+                PostKind::Lut => {
+                    let Some(lut) = p.path.as_deref().and_then(|path| self.images.lut(path)) else { continue };
+                    body.extend_from_slice(&lut.1);
+                    [OP_LUT, 0.0, v[0], lut.0 as f32]
+                }
+                PostKind::Displace => {
+                    body.push([v[2], p.seed as f32, 0.0, 0.0]);
+                    [OP_DISPLACE, 0.0, v[0] * k, (v[1] * k).max(1e-3)]
+                }
+                PostKind::DirectionalBlur => [OP_DIRECTIONAL_BLUR, 0.0, v[0] * k, v[1] * k],
+                PostKind::RgbSplit => [OP_RGB_SPLIT, 0.0, v[0] * k, v[1] * k],
+                PostKind::Vignette => [OP_VIGNETTE, 0.0, v[0], v[1].clamp(0.0, 1.0)],
+                PostKind::Grain => {
+                    body.push([(p.seed % 16_777_216) as f32, 0.0, 0.0, 0.0]);
+                    [OP_GRAIN, 0.0, v[0], (v[1] * k).max(1e-3)]
+                }
+            };
+            let mut head = head;
+            head[1] = (1 + body.len()) as f32;
+            list.ops.push(head);
+            list.ops.extend(body);
+        }
+        (start as u32, (list.ops.len() - start) as u32)
+    }
+
     fn emit(&mut self, layer: &LayerState, root: Affine, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         if !layer.is_isolated() {
             out.extend(self.layer_items(layer, root, &mut list.stops, &mut list.segments));
@@ -277,6 +339,7 @@ impl Builder<'_> {
         let mut blur = 0.0f64;
         let mut clamp = false;
         let mut reach = 0.0f64;
+        let mut post_pad = 0.0f64;
         for e in &layer.effects {
             match e {
                 EffectState::Blur { sigma, repeat_edges } => {
@@ -285,6 +348,11 @@ impl Builder<'_> {
                 }
                 EffectState::Shadow { offset, sigma, .. } => reach = reach.max(3.0 * sigma + offset.x().abs().max(offset.y().abs())),
                 EffectState::Glow { sigma, .. } => reach = reach.max(3.0 * sigma),
+                EffectState::Post(p) => match p.kind {
+                    PostKind::Displace => post_pad += p.v[0].abs(),
+                    PostKind::DirectionalBlur | PostKind::RgbSplit => post_pad += p.v[0].hypot(p.v[1]),
+                    _ => {}
+                },
             }
         }
         let blur = blur * scale;
@@ -294,7 +362,7 @@ impl Builder<'_> {
             bb = [bb[0].min(b[0]), bb[1].min(b[1]), bb[2].max(b[2]), bb[3].max(b[3])];
         }
         let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
-        let pad = 3.0 * blur + 2.0;
+        let pad = 3.0 * blur + 2.0 + post_pad * scale;
         let rect = [(bb[0] - pad).floor().max(0.0), (bb[1] - pad).floor().max(0.0), (bb[2] + pad).ceil().min(cw), (bb[3] + pad).ceil().min(ch)];
         let wide = |reach: f64| [(bb[0] - reach).floor().max(0.0), (bb[1] - reach).floor().max(0.0), (bb[2] + reach).ceil().min(cw), (bb[3] + reach).ceil().min(ch)];
         let factor_for = |sigma: f64| if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
@@ -366,6 +434,12 @@ impl Builder<'_> {
                     ..Default::default()
                 },
             };
+            let mut prim = prim;
+            let (start, len) = self.program(&layer.effects, f, list);
+            if len > 0 {
+                prim.paint[2] = f32::from_bits(start);
+                prim.paint[3] = f32::from_bits(len);
+            }
             if let Some((prim, _)) = with_inverse(prim, forward, group_opacity) {
                 out.push(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
             }

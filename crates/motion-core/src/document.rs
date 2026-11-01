@@ -317,6 +317,32 @@ pub enum Blend {
     Add,
     Multiply,
     Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    #[serde(rename = "color_dodge")]
+    ColorDodge,
+    #[serde(rename = "color_burn")]
+    ColorBurn,
+    #[serde(rename = "hard_light")]
+    HardLight,
+    #[serde(rename = "soft_light")]
+    SoftLight,
+    Difference,
+    Exclusion,
+    Subtract,
+    Divide,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl Blend {
+    /// Shader code of the mode.
+    pub fn code(self) -> u32 {
+        self as u32
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -338,6 +364,117 @@ pub enum Effect {
         #[serde(default = "twelve")]
         radius: Property<f64>,
     },
+    /// Exposure in stops.
+    Exposure {
+        #[serde(default = "zero_prop")]
+        stops: Property<f64>,
+    },
+    /// Brightness −1…1 and contrast −1…1 (0 leaves the picture alone).
+    #[serde(rename = "brightness_contrast")]
+    BrightnessContrast {
+        #[serde(default = "zero_prop")]
+        brightness: Property<f64>,
+        #[serde(default = "zero_prop")]
+        contrast: Property<f64>,
+    },
+    /// Input black/white points, gamma, output black/white (0…1).
+    Levels {
+        #[serde(default = "zero_prop")]
+        in_black: Property<f64>,
+        #[serde(default = "one_prop")]
+        in_white: Property<f64>,
+        #[serde(default = "one_prop")]
+        gamma: Property<f64>,
+        #[serde(default = "zero_prop")]
+        out_black: Property<f64>,
+        #[serde(default = "one_prop")]
+        out_white: Property<f64>,
+    },
+    /// Hue rotation in degrees, saturation and lightness offsets (−1…1).
+    #[serde(rename = "hue_saturation")]
+    HueSaturation {
+        #[serde(default = "zero_prop")]
+        hue: Property<f64>,
+        #[serde(default = "zero_prop")]
+        saturation: Property<f64>,
+        #[serde(default = "zero_prop")]
+        lightness: Property<f64>,
+    },
+    /// Map blacks to `black` and whites to `white`.
+    Tint {
+        #[serde(default = "black_prop")]
+        black: Property<Color>,
+        #[serde(default = "white")]
+        white: Property<Color>,
+        #[serde(default = "one_prop")]
+        amount: Property<f64>,
+    },
+    /// Map luminance through a gradient (duotones, heat maps).
+    #[serde(rename = "gradient_map")]
+    GradientMap {
+        stops: Vec<(f64, Color)>,
+        #[serde(default = "one_prop")]
+        amount: Property<f64>,
+    },
+    Invert {
+        #[serde(default = "one_prop")]
+        amount: Property<f64>,
+    },
+    /// Replace colour, keep alpha.
+    Fill {
+        color: Property<Color>,
+        #[serde(default = "one_prop")]
+        amount: Property<f64>,
+    },
+    /// A 3D LUT from a .cube file (project-relative).
+    Lut {
+        path: String,
+        #[serde(default = "one_prop")]
+        amount: Property<f64>,
+    },
+    /// Turbulent displacement in pixels; `scale` is the feature size in px,
+    /// `speed` how fast the field evolves (per second).
+    Displace {
+        #[serde(default = "ten")]
+        amount: Property<f64>,
+        #[serde(default = "hundred_f")]
+        scale: Property<f64>,
+        #[serde(default = "one_prop")]
+        speed: Property<f64>,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Motion-style blur along `angle` (degrees) over `length` px.
+    #[serde(rename = "directional_blur")]
+    DirectionalBlur {
+        #[serde(default = "zero_prop")]
+        angle: Property<f64>,
+        #[serde(default = "twelve")]
+        length: Property<f64>,
+    },
+    /// Chromatic aberration: red and blue shifted apart by `amount` px.
+    #[serde(rename = "rgb_split")]
+    RgbSplit {
+        #[serde(default = "four_f")]
+        amount: Property<f64>,
+        #[serde(default = "zero_prop")]
+        angle: Property<f64>,
+    },
+    Vignette {
+        #[serde(default = "half_f")]
+        amount: Property<f64>,
+        #[serde(default = "half_f")]
+        softness: Property<f64>,
+    },
+    /// Film grain; a new pattern each frame (held on stepped frames).
+    Grain {
+        #[serde(default = "grain_amount")]
+        amount: Property<f64>,
+        #[serde(default = "one_prop")]
+        size: Property<f64>,
+        #[serde(default)]
+        seed: u32,
+    },
     /// Glow: a blurred, tinted copy added on top.
     Glow {
         #[serde(default = "white")]
@@ -354,6 +491,21 @@ fn shadow_color() -> Property<Color> {
 }
 fn shadow_offset() -> Property<Vec2> {
     Property::Constant(Vec2::new(0.0, 12.0))
+}
+fn black_prop() -> Property<Color> {
+    Property::Constant(Color::BLACK)
+}
+fn hundred_f() -> Property<f64> {
+    Property::Constant(100.0)
+}
+fn four_f() -> Property<f64> {
+    Property::Constant(4.0)
+}
+fn half_f() -> Property<f64> {
+    Property::Constant(0.5)
+}
+fn grain_amount() -> Property<f64> {
+    Property::Constant(0.08)
 }
 fn twelve() -> Property<f64> {
     Property::Constant(12.0)

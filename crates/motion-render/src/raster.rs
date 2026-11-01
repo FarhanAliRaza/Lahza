@@ -9,6 +9,7 @@ pub struct Sources<'a> {
     pub images: &'a [u32],
     pub groups: &'a [[f32; 4]],
     pub footage: &'a [u32],
+    pub ops: &'a [[f32; 4]],
 }
 
 type V2 = [f32; 2];
@@ -270,7 +271,7 @@ pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], segments: &[[f32; 4]], src:
             if cov <= 0.0 {
                 return out;
             }
-            let mut c = sample_image(src, prim, l);
+            let mut c = if prim.paint[3].to_bits() > 0 { sample_post(src, prim, l, src.ops) } else { sample_image(src, prim, l) };
             if prim.kind[0] == PRIM_MATTE {
                 let mut matte = *prim;
                 matte.geom2[0] = prim.geom2[1];
@@ -293,13 +294,342 @@ pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], segments: &[[f32; 4]], src:
     out.map(|c| c * opacity)
 }
 
+type V3 = [f32; 3];
+
+fn lum3(c: V3) -> f32 {
+    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+}
+
+fn clip_color(c: V3) -> V3 {
+    let l = lum3(c);
+    let n = c[0].min(c[1]).min(c[2]);
+    let x = c[0].max(c[1]).max(c[2]);
+    let mut c = c;
+    if n < 0.0 {
+        c = c.map(|v| l + (v - l) * l / (l - n).max(1e-6));
+    }
+    if x > 1.0 {
+        c = c.map(|v| l + (v - l) * (1.0 - l) / (x - l).max(1e-6));
+    }
+    c
+}
+
+fn set_lum(c: V3, l: f32) -> V3 {
+    let d = l - lum3(c);
+    clip_color(c.map(|v| v + d))
+}
+
+fn sat3(c: V3) -> f32 {
+    c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+}
+
+fn set_sat(c: V3, s: f32) -> V3 {
+    let mx = c[0].max(c[1]).max(c[2]);
+    let mn = c[0].min(c[1]).min(c[2]);
+    if mx > mn {
+        c.map(|v| (v - mn) * s / (mx - mn))
+    } else {
+        [0.0; 3]
+    }
+}
+
+fn soft_light_d(b: f32) -> f32 {
+    if b <= 0.25 {
+        ((16.0 * b - 12.0) * b + 4.0) * b
+    } else {
+        b.sqrt()
+    }
+}
+
+/// One channel of a separable blend mode B(backdrop, source).
+fn blend_channel(b: f32, s: f32, mode: u32) -> f32 {
+    match mode {
+        2 => b * s,
+        3 => b + s - b * s,
+        4 => blend_channel(s, b, 9),
+        5 => b.min(s),
+        6 => b.max(s),
+        7 => {
+            if b <= 0.0 {
+                0.0
+            } else if s >= 1.0 {
+                1.0
+            } else {
+                (b / (1.0 - s)).min(1.0)
+            }
+        }
+        8 => {
+            if b >= 1.0 {
+                1.0
+            } else if s <= 0.0 {
+                0.0
+            } else {
+                1.0 - ((1.0 - b) / s).min(1.0)
+            }
+        }
+        9 => {
+            if s <= 0.5 {
+                b * 2.0 * s
+            } else {
+                let t = 2.0 * s - 1.0;
+                b + t - b * t
+            }
+        }
+        10 => {
+            if s <= 0.5 {
+                b - (1.0 - 2.0 * s) * b * (1.0 - b)
+            } else {
+                b + (2.0 * s - 1.0) * (soft_light_d(b) - b)
+            }
+        }
+        11 => (b - s).abs(),
+        12 => b + s - 2.0 * b * s,
+        13 => (b - s).max(0.0),
+        14 => {
+            if s <= 0.0 {
+                1.0
+            } else {
+                (b / s).min(1.0)
+            }
+        }
+        _ => s,
+    }
+}
+
+/// Composites premultiplied `s` over `d` with blend `mode` (W3C
+/// compositing; codes follow `Blend`).
 pub fn blend(d: [f32; 4], s: [f32; 4], mode: u32) -> [f32; 4] {
     match mode {
+        0 => std::array::from_fn(|i| s[i] + d[i] * (1.0 - s[3])),
         1 => std::array::from_fn(|i| (s[i] + d[i]).min(1.0)),
-        2 => std::array::from_fn(|i| s[i] * d[i] + s[i] * (1.0 - d[3]) + d[i] * (1.0 - s[3])),
-        3 => std::array::from_fn(|i| s[i] + d[i] - s[i] * d[i]),
-        _ => std::array::from_fn(|i| s[i] + d[i] * (1.0 - s[3])),
+        _ => {
+            let (sa, da) = (s[3], d[3]);
+            let cs: V3 = std::array::from_fn(|i| if sa > 0.0 { (s[i] / sa).clamp(0.0, 1.0) } else { 0.0 });
+            let cb: V3 = std::array::from_fn(|i| if da > 0.0 { (d[i] / da).clamp(0.0, 1.0) } else { 0.0 });
+            let mixed: V3 = match mode {
+                15 => set_lum(set_sat(cs, sat3(cb)), lum3(cb)),
+                16 => set_lum(set_sat(cb, sat3(cs)), lum3(cb)),
+                17 => set_lum(cs, lum3(cb)),
+                18 => set_lum(cb, lum3(cs)),
+                m => std::array::from_fn(|i| blend_channel(cb[i], cs[i], m)),
+            };
+            let mut out = [0.0; 4];
+            for i in 0..3 {
+                out[i] = s[i] * (1.0 - da) + d[i] * (1.0 - sa) + sa * da * mixed[i];
+            }
+            out[3] = sa + da - sa * da;
+            out
+        }
     }
+}
+
+// ------------------------------------------------------------ post program
+
+pub const OP_EXPOSURE: f32 = 1.0;
+pub const OP_BRIGHTNESS_CONTRAST: f32 = 2.0;
+pub const OP_LEVELS: f32 = 3.0;
+pub const OP_HUE_SATURATION: f32 = 4.0;
+pub const OP_TINT: f32 = 5.0;
+pub const OP_GRADIENT_MAP: f32 = 6.0;
+pub const OP_INVERT: f32 = 7.0;
+pub const OP_LUT: f32 = 8.0;
+pub const OP_FILL: f32 = 9.0;
+pub const OP_DISPLACE: f32 = 20.0;
+pub const OP_DIRECTIONAL_BLUR: f32 = 21.0;
+pub const OP_RGB_SPLIT: f32 = 22.0;
+pub const OP_VIGNETTE: f32 = 30.0;
+pub const OP_GRAIN: f32 = 31.0;
+
+/// Integer hash → [0, 1). Same bits on CPU and GPU.
+pub fn hash(x: i32, y: i32, seed: u32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(374_761_393).wrapping_add((y as u32).wrapping_mul(668_265_263)).wrapping_add(seed.wrapping_mul(1_442_695_041));
+    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    h ^= h >> 16;
+    (h >> 8) as f32 / 16_777_216.0
+}
+
+fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
+    let (ix, iy) = (x.floor(), y.floor());
+    let (fx, fy) = (x - ix, y - iy);
+    let (ix, iy) = (ix as i32, iy as i32);
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sy = fy * fy * (3.0 - 2.0 * fy);
+    let a = hash(ix, iy, seed);
+    let b = hash(ix + 1, iy, seed);
+    let c = hash(ix, iy + 1, seed);
+    let d = hash(ix + 1, iy + 1, seed);
+    let top = a + (b - a) * sx;
+    let bottom = c + (d - c) * sx;
+    (top + (bottom - top) * sy) * 2.0 - 1.0
+}
+
+fn luma3(c: V3) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+fn apply_color(op: &[[f32; 4]], c: V3, l: V2, size: V2) -> V3 {
+    let h = op[0];
+    let mix3 = |a: V3, b: V3, t: f32| -> V3 { std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t) };
+    match h[0] {
+        OP_EXPOSURE => c.map(|v| v * h[2].exp2()),
+        OP_BRIGHTNESS_CONTRAST => c.map(|v| (v - 0.5) * (1.0 + h[3]) + 0.5 + h[2]),
+        OP_LEVELS => {
+            let (ib, iw, g, ob, ow) = (h[2], h[3], op[1][0], op[1][1], op[1][2]);
+            c.map(|v| {
+                let x = clamp01((v - ib) / (iw - ib).max(1e-5));
+                ob + x.powf(1.0 / g.max(1e-3)) * (ow - ob)
+            })
+        }
+        OP_HUE_SATURATION => {
+            let (hue, sat, light) = (h[2], h[3], op[1][0]);
+            let (s, k) = hue.to_radians().sin_cos();
+            let m = [
+                [0.213 + k * 0.787 - s * 0.213, 0.715 - k * 0.715 - s * 0.715, 0.072 - k * 0.072 + s * 0.928],
+                [0.213 - k * 0.213 + s * 0.143, 0.715 + k * 0.285 + s * 0.140, 0.072 - k * 0.072 - s * 0.283],
+                [0.213 - k * 0.213 - s * 0.787, 0.715 - k * 0.715 + s * 0.715, 0.072 + k * 0.928 + s * 0.072],
+            ];
+            let r: V3 = std::array::from_fn(|i| m[i][0] * c[0] + m[i][1] * c[1] + m[i][2] * c[2]);
+            let y = luma3(r);
+            let r = r.map(|v| y + (v - y) * (1.0 + sat));
+            if light >= 0.0 {
+                r.map(|v| v + (1.0 - v) * light)
+            } else {
+                r.map(|v| v * (1.0 + light))
+            }
+        }
+        OP_TINT => {
+            let (b, w) = (op[1], op[2]);
+            let y = clamp01(luma3(c));
+            mix3(c, std::array::from_fn(|i| b[i] + (w[i] - b[i]) * y), h[2])
+        }
+        OP_GRADIENT_MAP => {
+            let n = h[3] as usize;
+            let y = clamp01(luma3(c));
+            let stop = |i: usize| (op[1 + i * 2][0], [op[2 + i * 2][0], op[2 + i * 2][1], op[2 + i * 2][2]]);
+            let mut g = stop(0).1;
+            if y > stop(0).0 {
+                g = stop(n - 1).1;
+                for i in 0..n.saturating_sub(1) {
+                    let (oa, ca) = stop(i);
+                    let (ob, cb) = stop(i + 1);
+                    if y <= ob {
+                        g = mix3(ca, cb, clamp01((y - oa) / (ob - oa).max(1e-6)));
+                        break;
+                    }
+                }
+            }
+            mix3(c, g, h[2])
+        }
+        OP_INVERT => mix3(c, c.map(|v| 1.0 - v), h[2]),
+        OP_FILL => mix3(c, [op[1][0], op[1][1], op[1][2]], h[2]),
+        OP_LUT => {
+            let n = h[3] as usize;
+            if n < 2 {
+                return c;
+            }
+            let k = (n - 1) as f32;
+            let p = c.map(|v| clamp01(v) * k);
+            let i0 = p.map(|v| (v.floor() as usize).min(n - 2));
+            let f: V3 = std::array::from_fn(|i| p[i] - i0[i] as f32);
+            let at = |r: usize, g: usize, b: usize| -> V3 {
+                let e = op[1 + r + g * n + b * n * n];
+                [e[0], e[1], e[2]]
+            };
+            let mut out = [0.0; 3];
+            for (dr, wr) in [(0, 1.0 - f[0]), (1, f[0])] {
+                for (dg, wg) in [(0, 1.0 - f[1]), (1, f[1])] {
+                    for (db, wb) in [(0, 1.0 - f[2]), (1, f[2])] {
+                        let e = at(i0[0] + dr, i0[1] + dg, i0[2] + db);
+                        for i in 0..3 {
+                            out[i] += e[i] * wr * wg * wb;
+                        }
+                    }
+                }
+            }
+            mix3(c, out, h[2])
+        }
+        OP_VIGNETTE => {
+            let q = [l[0] / size[0].max(1e-6) * 2.0 - 1.0, l[1] / size[1].max(1e-6) * 2.0 - 1.0];
+            let r = len(q) / std::f32::consts::SQRT_2;
+            let inner = 1.0 - h[3];
+            let t = clamp01((r - inner) / (1.0 - inner).max(1e-4));
+            let v = t * t * (3.0 - 2.0 * t) * h[2];
+            c.map(|x| x * (1.0 - v))
+        }
+        OP_GRAIN => {
+            let size = h[3].max(1e-3);
+            let n = hash((l[0] / size).floor() as i32, (l[1] / size).floor() as i32, op[1][0] as u32) - 0.5;
+            c.map(|v| v + n * h[2])
+        }
+        _ => c,
+    }
+}
+
+/// Samples a group texture through its post program (displacement,
+/// directional blur, RGB split, then colour ops, vignette and grain).
+fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] {
+    let start = prim.paint[2].to_bits() as usize;
+    let end = start + prim.paint[3].to_bits() as usize;
+    let size = [prim.geom[0], prim.geom[1]];
+    let mut uv = l;
+    let mut blur: Option<V2> = None;
+    let mut split: Option<V2> = None;
+    let mut i = start;
+    while i < end {
+        let h = ops[i];
+        match h[0] {
+            OP_DISPLACE => {
+                let (amount, scale, time, seed) = (h[2], h[3].max(1e-3), ops[i + 1][0], ops[i + 1][1] as u32);
+                let p = [uv[0] / scale + time, uv[1] / scale + time * 0.7];
+                uv = [uv[0] + amount * value_noise(p[0], p[1], seed), uv[1] + amount * value_noise(p[0], p[1], seed ^ 0x9e37_79b9)];
+            }
+            OP_DIRECTIONAL_BLUR => blur = Some([h[2], h[3]]),
+            OP_RGB_SPLIT => split = Some([h[2], h[3]]),
+            _ => {}
+        }
+        i += h[1] as usize;
+    }
+    let base = |p: V2| sample_image(src, prim, p);
+    let tap = |p: V2| -> [f32; 4] {
+        match blur {
+            Some(d) => {
+                let mut acc = [0.0f32; 4];
+                const N: usize = 9;
+                for k in 0..N {
+                    let t = k as f32 / (N - 1) as f32 - 0.5;
+                    let c = base([p[0] + d[0] * t, p[1] + d[1] * t]);
+                    for j in 0..4 {
+                        acc[j] += c[j] / N as f32;
+                    }
+                }
+                acc
+            }
+            None => base(p),
+        }
+    };
+    let mut c = tap(uv);
+    if let Some(d) = split {
+        let r = tap([uv[0] + d[0], uv[1] + d[1]]);
+        let b = tap([uv[0] - d[0], uv[1] - d[1]]);
+        let a = c[3].max(r[3]).max(b[3]);
+        c = [r[0], c[1], b[2], a];
+    }
+    let a = c[3];
+    if a <= 0.0 {
+        return c;
+    }
+    let mut rgb: V3 = [c[0] / a, c[1] / a, c[2] / a];
+    let mut i = start;
+    while i < end {
+        let h = ops[i];
+        let n = h[1] as usize;
+        if h[0] < 20.0 || h[0] >= 30.0 {
+            rgb = apply_color(&ops[i..i + n], rgb, l, size);
+        }
+        i += n;
+    }
+    let rgb = rgb.map(clamp01);
+    [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
 }
 
 #[derive(Clone, Copy)]

@@ -23,6 +23,7 @@ pub struct Images {
     entries: HashMap<String, Option<Texture>>,
     pub generation: u64,
     pub warnings: Vec<String>,
+    luts: HashMap<String, Option<std::sync::Arc<(usize, Vec<[f32; 4]>)>>>,
 }
 
 pub fn pack(c: [u8; 4]) -> u32 {
@@ -31,7 +32,7 @@ pub fn pack(c: [u8; 4]) -> u32 {
 
 impl Images {
     pub fn new(root: Option<&Path>) -> Self {
-        Self { root: root.map(Path::to_path_buf), texels: Vec::new(), entries: HashMap::new(), generation: 1, warnings: Vec::new() }
+        Self { root: root.map(Path::to_path_buf), texels: Vec::new(), entries: HashMap::new(), generation: 1, warnings: Vec::new(), luts: HashMap::new() }
     }
 
     pub fn get(&mut self, src: &str) -> Option<Texture> {
@@ -63,6 +64,27 @@ impl Images {
         };
         self.entries.insert(src.to_string(), texture);
         texture
+    }
+
+    /// A 3D LUT from a .cube file: (size, entries with red fastest).
+    pub fn lut(&mut self, path: &str) -> Option<std::sync::Arc<(usize, Vec<[f32; 4]>)>> {
+        if let Some(l) = self.luts.get(path) {
+            return l.clone();
+        }
+        let full = match &self.root {
+            Some(r) => r.join(path),
+            None => PathBuf::from(path),
+        };
+        let parsed = std::fs::read_to_string(&full).map_err(|e| e.to_string()).and_then(|t| parse_cube(&t));
+        let lut = match parsed {
+            Ok(l) => Some(std::sync::Arc::new(l)),
+            Err(e) => {
+                self.warnings.push(format!("LUT '{path}': {e}"));
+                None
+            }
+        };
+        self.luts.insert(path.to_string(), lut.clone());
+        lut
     }
 
     /// Registers in-memory pixels under `name` (contact sheets, tests).
@@ -131,4 +153,34 @@ impl Images {
         self.generation += 1;
         Some(Texture { offset, width: w, height: h, levels })
     }
+}
+
+/// Parses an Adobe/Resolve .cube 3D LUT (red varies fastest).
+pub fn parse_cube(text: &str) -> Result<(usize, Vec<[f32; 4]>), String> {
+    let mut size = 0usize;
+    let mut entries = Vec::new();
+    let (mut lo, mut hi) = ([0.0f32; 3], [1.0f32; 3]);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("TITLE") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts[0] {
+            "LUT_3D_SIZE" => size = parts.get(1).and_then(|v| v.parse().ok()).ok_or("bad LUT_3D_SIZE")?,
+            "LUT_1D_SIZE" => return Err("1D LUTs are not supported".into()),
+            "DOMAIN_MIN" => lo = [1, 2, 3].map(|i| parts.get(i).and_then(|v| v.parse().ok()).unwrap_or(0.0)),
+            "DOMAIN_MAX" => hi = [1, 2, 3].map(|i| parts.get(i).and_then(|v| v.parse().ok()).unwrap_or(1.0)),
+            _ => {
+                let v: Vec<f32> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+                if v.len() == 3 {
+                    entries.push([(v[0] - lo[0]) / (hi[0] - lo[0]), (v[1] - lo[1]) / (hi[1] - lo[1]), (v[2] - lo[2]) / (hi[2] - lo[2]), 1.0]);
+                }
+            }
+        }
+    }
+    if size < 2 || size > 128 || entries.len() != size * size * size {
+        return Err(format!("expected LUT_3D_SIZE N with N³ entries, got size {size} and {} entries", entries.len()));
+    }
+    Ok((size, entries))
 }

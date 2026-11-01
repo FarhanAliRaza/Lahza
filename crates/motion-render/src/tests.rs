@@ -171,11 +171,16 @@ fn gpu_matches_cpu() {
         {"id": "t", "kind": "text", "text": "Sync the peak", "size": 28, "color": "#ffffff", "transform": {"position": [160, 150], "rotation": -4},
          "animators": [{"at": 0, "from": {"y": 30, "opacity": 0, "scale": 0.5}, "dur": "10f"}]},
         {"id": "b", "kind": "shape", "shape": "capsule", "size": [80, 24], "fill": "#ffd23f", "effects": [{"type": "blur", "radius": 9}], "transform": {"position": [240, 130]}},
+        {"id": "fx", "kind": "shape", "shape": "rect", "size": [120, 60], "fill": {"gradient": "linear", "from": [-60, 0], "to": [60, 0], "stops": [[0, "#ff0000"], [1, "#00ffff"]]},
+         "blend": "soft_light", "transform": {"position": [230, 40]},
+         "effects": [{"type": "hue_saturation", "hue": 40, "saturation": 0.3}, {"type": "levels", "gamma": 1.4}, {"type": "gradient_map", "stops": [[0, "#101030"], [1, "#ffe0a0"]], "amount": 0.5},
+                     {"type": "displace", "amount": 3, "scale": 12}, {"type": "rgb_split", "amount": 2}, {"type": "directional_blur", "angle": 30, "length": 6},
+                     {"type": "vignette", "amount": 0.5}, {"type": "grain", "amount": 0.1}]},
         {"id": "m", "kind": "shape", "shape": "path", "d": "M -40 -30 C 0 -60 40 -30 40 0 L 0 40 Z", "fill": "#ffffff", "transform": {"position": [60, 40]}},
         {"id": "g", "kind": "comp", "transform": {"opacity": 0.8}, "matte": {"layer": "m", "mode": "luma"},
          "effects": [{"type": "shadow", "offset": [4, 6], "radius": 3}, {"type": "glow", "color": "#88ccff", "radius": 6, "intensity": 0.6}],
          "layers": [
-            {"id": "g1", "kind": "shape", "shape": "rect", "size": [70, 50], "fill": "#3366ff", "transform": {"position": [55, 40]}},
+            {"id": "g1", "kind": "shape", "shape": "rect", "size": [70, 50], "fill": "#3366ff", "blend": "overlay", "transform": {"position": [55, 40]}},
             {"id": "g2", "kind": "comp", "effects": [{"type": "blur", "radius": 2}], "layers": [
                 {"id": "g3", "kind": "shape", "shape": "path", "d": "M -30 0 Q 0 -40 30 0", "stroke": {"color": "#ff8800", "width": 5}, "trim": [0.1, 0.8], "transform": {"position": [60, 45]}}]}]}
     ]));
@@ -512,3 +517,112 @@ fn export_mixes_footage_audio() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+
+fn one_pixel(layers: serde_json::Value, bg: &str) -> [u8; 4] {
+    let mut p = project(layers);
+    p.settings.background = lahza_motion_core::value::Color::parse(bg).unwrap();
+    cpu().render(&Compiled::new(&p), 0.0).get_pixel(160, 90).0
+}
+
+#[test]
+fn blend_modes_follow_the_compositing_formulas() {
+    // Backdrop (64, 128, 192) under source (128, 64, 255), both opaque.
+    let b = [64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0];
+    let s = [128.0 / 255.0, 64.0 / 255.0, 1.0];
+    let modes: &[(&str, fn(f64, f64) -> f64)] = &[
+        ("multiply", |b, s| b * s),
+        ("screen", |b, s| b + s - b * s),
+        ("overlay", |b, s| if b <= 0.5 { 2.0 * b * s } else { 1.0 - 2.0 * (1.0 - b) * (1.0 - s) }),
+        ("darken", f64::min),
+        ("lighten", f64::max),
+        ("difference", |b, s| (b - s).abs()),
+        ("exclusion", |b, s| b + s - 2.0 * b * s),
+        ("subtract", |b, s| (b - s).max(0.0)),
+        ("hard_light", |b, s| if s <= 0.5 { 2.0 * b * s } else { 1.0 - 2.0 * (1.0 - b) * (1.0 - s) }),
+        ("color_dodge", |b, s| if s >= 1.0 { 1.0 } else { (b / (1.0 - s)).min(1.0) }),
+        ("color_burn", |b, s| if s <= 0.0 { 0.0 } else { 1.0 - ((1.0 - b) / s).min(1.0) }),
+    ];
+    for (mode, f) in modes {
+        let got = one_pixel(json!([
+            {"id": "s", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#8040ff", "blend": mode, "transform": {"position": [160, 90]}}
+        ]), "#4080c0");
+        for i in 0..3 {
+            let want = (f(b[i], s[i]) * 255.0).round();
+            assert!((got[i] as f64 - want).abs() <= 1.0, "{mode} channel {i}: got {} want {want}", got[i]);
+        }
+    }
+    // Non-separable: luminosity keeps the backdrop's hue and takes the source's luminance.
+    let lumi = one_pixel(json!([{"id": "s", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ffffff", "blend": "luminosity", "transform": {"position": [160, 90]}}]), "#ff0000");
+    assert_eq!(lumi, [255, 255, 255, 255]);
+    let colour = one_pixel(json!([{"id": "s", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ff0000", "blend": "color", "transform": {"position": [160, 90]}}]), "#808080");
+    assert!(colour[0] > colour[1] && colour[1] == colour[2], "{colour:?}");
+}
+
+fn with_effect(fill: &str, effect: serde_json::Value) -> [u8; 4] {
+    one_pixel(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [300, 160], "fill": fill, "transform": {"position": [160, 90]}, "effects": [effect]}]), "#000000")
+}
+
+#[test]
+fn colour_effects() {
+    assert_eq!(with_effect("#404040", json!({"type": "exposure", "stops": 1}))[0], 128);
+    assert_eq!(with_effect("#ff8000", json!({"type": "invert"})), [0, 127, 255, 255]);
+    let levels = with_effect("#808080", json!({"type": "levels", "in_black": 0.25, "in_white": 0.75}));
+    assert!((levels[0] as i32 - 128).abs() <= 2, "{levels:?}");
+    let hue = with_effect("#ff0000", json!({"type": "hue_saturation", "hue": 180}));
+    assert!(hue[0] < 60 && hue[1] > 100 && hue[2] > 100, "red turns cyan: {hue:?}");
+    let grey = with_effect("#ff0000", json!({"type": "hue_saturation", "saturation": -1}));
+    assert!(grey[0] == grey[1] && grey[1] == grey[2], "{grey:?}");
+    let tint = with_effect("#ffffff", json!({"type": "tint", "black": "#000000", "white": "#00ff00"}));
+    assert_eq!(tint, [0, 255, 0, 255]);
+    let map = with_effect("#000000", json!({"type": "gradient_map", "stops": [[0, "#ff00ff"], [1, "#ffff00"]]}));
+    assert_eq!(map, [255, 0, 255, 255]);
+    assert_eq!(with_effect("#123456", json!({"type": "fill", "color": "#ffffff"})), [255, 255, 255, 255]);
+    // A .cube LUT that swaps red and blue.
+    let dir = std::env::temp_dir().join(format!("lahza-lut-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cube = String::from("LUT_3D_SIZE 2\n");
+    for b in 0..2 {
+        for g in 0..2 {
+            for r in 0..2 {
+                cube.push_str(&format!("{b} {g} {r}\n"));
+            }
+        }
+    }
+    std::fs::write(dir.join("swap.cube"), cube).unwrap();
+    let mut p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [300, 160], "fill": "#ff8000", "transform": {"position": [160, 90]},
+        "effects": [{"type": "lut", "path": "swap.cube"}]}]));
+    p.settings.background = lahza_motion_core::value::Color::BLACK;
+    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
+    let swapped = r.render(&Compiled::new(&p), 0.0).get_pixel(160, 90).0;
+    assert_eq!(swapped, [0, 128, 255, 255]);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn stylize_effects() {
+    let row = |effect: serde_json::Value, t: f64| -> Vec<u8> {
+        let p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ffffff", "transform": {"position": [160, 90]}, "effects": [effect]}]));
+        let img = cpu().render(&Compiled::new(&p), t);
+        (90..130).map(|x| img.get_pixel(x, 90).0[0]).collect()
+    };
+    // Directional blur smears the left edge (x = 110) horizontally.
+    let blur = row(json!({"type": "directional_blur", "angle": 0, "length": 30}), 0.0);
+    assert!(blur.iter().filter(|v| **v > 10 && **v < 245).count() > 10, "{blur:?}");
+    // RGB split shows coloured fringes at the edge.
+    let p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ffffff", "transform": {"position": [160, 90]}, "effects": [{"type": "rgb_split", "amount": 6}]}]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    assert!((100..120).any(|x| { let c = img.get_pixel(x, 90).0; c[0] != c[2] }), "fringe");
+    // Displacement moves the straight edge.
+    let d = row(json!({"type": "displace", "amount": 8, "scale": 20}), 0.0);
+    let straight = row(json!({"type": "exposure", "stops": 0}), 0.0);
+    assert_ne!(d, straight);
+    // Grain: deterministic, different on the next frame.
+    let g0 = row(json!({"type": "grain", "amount": 0.3}), 0.0);
+    assert_eq!(g0, row(json!({"type": "grain", "amount": 0.3}), 0.0));
+    assert_ne!(g0, row(json!({"type": "grain", "amount": 0.3}), 1.0 / 30.0));
+    // Vignette darkens corners, not the centre.
+    let p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [320, 180], "fill": "#ffffff", "transform": {"position": [160, 90]}, "effects": [{"type": "vignette", "amount": 0.8}]}]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    assert_eq!(img.get_pixel(160, 90).0[0], 255);
+    assert!(img.get_pixel(2, 2).0[0] < 120);
+}

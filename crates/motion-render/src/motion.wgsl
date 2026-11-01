@@ -45,6 +45,7 @@ var<storage, read> b_images: array<u32>;
 var<storage, read> b_groups: array<vec4<f32>>;
 var<storage, read> b_segs: array<vec4<f32>>;
 var<storage, read> b_footage: array<u32>;
+var<storage, read> b_ops: array<vec4<f32>>;
 var<storage, read_write> b_target: array<vec4<f32>>;
 
 var<uniform> u_blur: BlurPass;
@@ -300,7 +301,8 @@ fn shade(prim: Prim, p: vec2<f32>) -> vec4<f32> {
         let edge = max(max(-l.x, l.x - w), max(-l.y, l.y - h));
         let cov = clamp01(0.5 - edge / max(aa, 1e-6));
         if cov <= 0.0 { return out; }
-        var c = sample_image(prim, l);
+        var c: vec4<f32>;
+        if bitcast<u32>(prim.paint.w) > 0u { c = sample_post(prim, l); } else { c = sample_image(prim, l); }
         if prim.kind.x == 3u {
             var matte = prim;
             matte.geom2.x = prim.geom2.y;
@@ -323,13 +325,262 @@ fn shade(prim: Prim, p: vec2<f32>) -> vec4<f32> {
     return out * opacity;
 }
 
-fn blend(d: vec4<f32>, s: vec4<f32>, mode: u32) -> vec4<f32> {
+fn lum3(c: vec3<f32>) -> f32 { return 0.3 * c.x + 0.59 * c.y + 0.11 * c.z; }
+
+fn clip_color(c_in: vec3<f32>) -> vec3<f32> {
+    var c = c_in;
+    let l = lum3(c);
+    let n = min(min(c.x, c.y), c.z);
+    let x = max(max(c.x, c.y), c.z);
+    if n < 0.0 { c = vec3<f32>(l) + (c - vec3<f32>(l)) * l / max(l - n, 1e-6); }
+    if x > 1.0 { c = vec3<f32>(l) + (c - vec3<f32>(l)) * (1.0 - l) / max(x - l, 1e-6); }
+    return c;
+}
+
+fn set_lum(c: vec3<f32>, l: f32) -> vec3<f32> {
+    return clip_color(c + vec3<f32>(l - lum3(c)));
+}
+
+fn sat3(c: vec3<f32>) -> f32 { return max(max(c.x, c.y), c.z) - min(min(c.x, c.y), c.z); }
+
+fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
+    let mx = max(max(c.x, c.y), c.z);
+    let mn = min(min(c.x, c.y), c.z);
+    if mx > mn { return (c - vec3<f32>(mn)) * s / (mx - mn); }
+    return vec3<f32>(0.0);
+}
+
+fn soft_light_d(b: f32) -> f32 {
+    if b <= 0.25 { return ((16.0 * b - 12.0) * b + 4.0) * b; }
+    return sqrt(b);
+}
+
+fn hard_light(b: f32, s: f32) -> f32 {
+    if s <= 0.5 { return b * 2.0 * s; }
+    let t = 2.0 * s - 1.0;
+    return b + t - b * t;
+}
+
+fn blend_channel(b: f32, s: f32, mode: u32) -> f32 {
     switch mode {
-        case 1u: { return min(s + d, vec4<f32>(1.0)); }
-        case 2u: { return s * d + s * (1.0 - d.w) + d * (1.0 - s.w); }
-        case 3u: { return s + d - s * d; }
-        default: { return s + d * (1.0 - s.w); }
+        case 2u: { return b * s; }
+        case 3u: { return b + s - b * s; }
+        case 4u: { return hard_light(s, b); }
+        case 5u: { return min(b, s); }
+        case 6u: { return max(b, s); }
+        case 7u: {
+            if b <= 0.0 { return 0.0; }
+            if s >= 1.0 { return 1.0; }
+            return min(b / (1.0 - s), 1.0);
+        }
+        case 8u: {
+            if b >= 1.0 { return 1.0; }
+            if s <= 0.0 { return 0.0; }
+            return 1.0 - min((1.0 - b) / s, 1.0);
+        }
+        case 9u: { return hard_light(b, s); }
+        case 10u: {
+            if s <= 0.5 { return b - (1.0 - 2.0 * s) * b * (1.0 - b); }
+            return b + (2.0 * s - 1.0) * (soft_light_d(b) - b);
+        }
+        case 11u: { return abs(b - s); }
+        case 12u: { return b + s - 2.0 * b * s; }
+        case 13u: { return max(b - s, 0.0); }
+        case 14u: {
+            if s <= 0.0 { return 1.0; }
+            return min(b / s, 1.0);
+        }
+        default: { return s; }
     }
+}
+
+fn blend(d: vec4<f32>, s: vec4<f32>, mode: u32) -> vec4<f32> {
+    if mode == 0u { return s + d * (1.0 - s.w); }
+    if mode == 1u { return min(s + d, vec4<f32>(1.0)); }
+    let sa = s.w;
+    let da = d.w;
+    var cs = vec3<f32>(0.0);
+    var cb = vec3<f32>(0.0);
+    if sa > 0.0 { cs = clamp(s.xyz / sa, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if da > 0.0 { cb = clamp(d.xyz / da, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    var m: vec3<f32>;
+    switch mode {
+        case 15u: { m = set_lum(set_sat(cs, sat3(cb)), lum3(cb)); }
+        case 16u: { m = set_lum(set_sat(cb, sat3(cs)), lum3(cb)); }
+        case 17u: { m = set_lum(cs, lum3(cb)); }
+        case 18u: { m = set_lum(cb, lum3(cs)); }
+        default: { m = vec3<f32>(blend_channel(cb.x, cs.x, mode), blend_channel(cb.y, cs.y, mode), blend_channel(cb.z, cs.z, mode)); }
+    }
+    let rgb = s.xyz * (1.0 - da) + d.xyz * (1.0 - sa) + sa * da * m;
+    return vec4<f32>(rgb, sa + da - sa * da);
+}
+
+// ------------------------------------------------------------ post program
+
+fn hash(x: i32, y: i32, seed: u32) -> f32 {
+    var h = u32(x) * 374761393u + u32(y) * 668265263u + seed * 1442695041u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h = h ^ (h >> 16u);
+    return f32(h >> 8u) / 16777216.0;
+}
+
+fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
+    let ix = floor(x);
+    let iy = floor(y);
+    let fx = x - ix;
+    let fy = y - iy;
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sy = fy * fy * (3.0 - 2.0 * fy);
+    let a = hash(i32(ix), i32(iy), seed);
+    let b = hash(i32(ix) + 1, i32(iy), seed);
+    let c = hash(i32(ix), i32(iy) + 1, seed);
+    let d = hash(i32(ix) + 1, i32(iy) + 1, seed);
+    let top = a + (b - a) * sx;
+    let bottom = c + (d - c) * sx;
+    return (top + (bottom - top) * sy) * 2.0 - 1.0;
+}
+
+fn luma3(c: vec3<f32>) -> f32 { return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z; }
+
+fn apply_color(i: u32, c: vec3<f32>, l: vec2<f32>, size: vec2<f32>) -> vec3<f32> {
+    let h = b_ops[i];
+    let op = h.x;
+    if op == 1.0 { return c * exp2(h.z); }
+    if op == 2.0 { return (c - vec3<f32>(0.5)) * (1.0 + h.w) + vec3<f32>(0.5 + h.z); }
+    if op == 3.0 {
+        let e = b_ops[i + 1u];
+        let x = clamp((c - vec3<f32>(h.z)) / max(h.w - h.z, 1e-5), vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec3<f32>(e.y) + pow(x, vec3<f32>(1.0 / max(e.x, 1e-3))) * (e.z - e.y);
+    }
+    if op == 4.0 {
+        let s = sin(radians(h.z));
+        let k = cos(radians(h.z));
+        let r = vec3<f32>(
+            dot(vec3<f32>(0.213 + k * 0.787 - s * 0.213, 0.715 - k * 0.715 - s * 0.715, 0.072 - k * 0.072 + s * 0.928), c),
+            dot(vec3<f32>(0.213 - k * 0.213 + s * 0.143, 0.715 + k * 0.285 + s * 0.140, 0.072 - k * 0.072 - s * 0.283), c),
+            dot(vec3<f32>(0.213 - k * 0.213 - s * 0.787, 0.715 - k * 0.715 + s * 0.715, 0.072 + k * 0.928 + s * 0.072), c));
+        let y = luma3(r);
+        let r2 = vec3<f32>(y) + (r - vec3<f32>(y)) * (1.0 + h.w);
+        let light = b_ops[i + 1u].x;
+        if light >= 0.0 { return r2 + (vec3<f32>(1.0) - r2) * light; }
+        return r2 * (1.0 + light);
+    }
+    if op == 5.0 {
+        let y = clamp(luma3(c), 0.0, 1.0);
+        let g = mix(b_ops[i + 1u].xyz, b_ops[i + 2u].xyz, y);
+        return mix(c, g, h.z);
+    }
+    if op == 6.0 {
+        let n = u32(h.w);
+        let y = clamp(luma3(c), 0.0, 1.0);
+        var g = b_ops[i + 2u].xyz;
+        if y > b_ops[i + 1u].x {
+            g = b_ops[i + 2u * n].xyz;
+            for (var k = 0u; k + 1u < n; k++) {
+                let oa = b_ops[i + 1u + k * 2u].x;
+                let ob = b_ops[i + 3u + k * 2u].x;
+                if y <= ob {
+                    g = mix(b_ops[i + 2u + k * 2u].xyz, b_ops[i + 4u + k * 2u].xyz, clamp((y - oa) / max(ob - oa, 1e-6), 0.0, 1.0));
+                    break;
+                }
+            }
+        }
+        return mix(c, g, h.z);
+    }
+    if op == 7.0 { return mix(c, vec3<f32>(1.0) - c, h.z); }
+    if op == 9.0 { return mix(c, b_ops[i + 1u].xyz, h.z); }
+    if op == 8.0 {
+        let n = u32(h.w);
+        if n < 2u { return c; }
+        let k = f32(n - 1u);
+        let p = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)) * k;
+        let i0 = min(vec3<u32>(floor(p)), vec3<u32>(n - 2u));
+        let f = p - vec3<f32>(i0);
+        var out = vec3<f32>(0.0);
+        for (var dr = 0u; dr < 2u; dr++) {
+            for (var dg = 0u; dg < 2u; dg++) {
+                for (var db = 0u; db < 2u; db++) {
+                    let w = select(1.0 - f.x, f.x, dr == 1u) * select(1.0 - f.y, f.y, dg == 1u) * select(1.0 - f.z, f.z, db == 1u);
+                    let e = b_ops[i + 1u + (i0.x + dr) + (i0.y + dg) * n + (i0.z + db) * n * n];
+                    out += e.xyz * w;
+                }
+            }
+        }
+        return mix(c, out, h.z);
+    }
+    if op == 30.0 {
+        let q = l / max(size, vec2<f32>(1e-6)) * 2.0 - vec2<f32>(1.0);
+        let r = length(q) / 1.41421356;
+        let inner = 1.0 - h.w;
+        let t = clamp((r - inner) / max(1.0 - inner, 1e-4), 0.0, 1.0);
+        let v = t * t * (3.0 - 2.0 * t) * h.z;
+        return c * (1.0 - v);
+    }
+    if op == 31.0 {
+        let sz = max(h.w, 1e-3);
+        let n = hash(i32(floor(l.x / sz)), i32(floor(l.y / sz)), u32(b_ops[i + 1u].x)) - 0.5;
+        return c + vec3<f32>(n * h.z);
+    }
+    return c;
+}
+
+fn tap(prim: Prim, p: vec2<f32>, blur: vec2<f32>, has_blur: bool) -> vec4<f32> {
+    if !has_blur { return sample_image(prim, p); }
+    var acc = vec4<f32>(0.0);
+    for (var k = 0; k < 9; k++) {
+        let t = f32(k) / 8.0 - 0.5;
+        acc += sample_image(prim, p + blur * t) / 9.0;
+    }
+    return acc;
+}
+
+fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
+    let start = bitcast<u32>(prim.paint.z);
+    let end = start + bitcast<u32>(prim.paint.w);
+    let size = prim.geom.xy;
+    var uv = l;
+    var blur = vec2<f32>(0.0);
+    var has_blur = false;
+    var split = vec2<f32>(0.0);
+    var has_split = false;
+    var i = start;
+    while i < end {
+        let h = b_ops[i];
+        if h.x == 20.0 {
+            let e = b_ops[i + 1u];
+            let scale = max(h.w, 1e-3);
+            let px = uv.x / scale + e.x;
+            let py = uv.y / scale + e.x * 0.7;
+            let seed = u32(e.y);
+            uv = uv + h.z * vec2<f32>(value_noise(px, py, seed), value_noise(px, py, seed ^ 0x9e3779b9u));
+        } else if h.x == 21.0 {
+            blur = h.zw;
+            has_blur = true;
+        } else if h.x == 22.0 {
+            split = h.zw;
+            has_split = true;
+        }
+        i += u32(h.y);
+    }
+    var c = tap(prim, uv, blur, has_blur);
+    if has_split {
+        let r = tap(prim, uv + split, blur, has_blur);
+        let b = tap(prim, uv - split, blur, has_blur);
+        c = vec4<f32>(r.x, c.y, b.z, max(max(c.w, r.w), b.w));
+    }
+    let a = c.w;
+    if a <= 0.0 { return c; }
+    var rgb = c.xyz / a;
+    i = start;
+    while i < end {
+        let h = b_ops[i];
+        if h.x < 20.0 || h.x >= 30.0 {
+            rgb = apply_color(i, rgb, l, size);
+        }
+        i += u32(h.y);
+    }
+    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(rgb * a, a);
 }
 
 @compute @workgroup_size(16, 16, 1)

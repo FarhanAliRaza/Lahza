@@ -111,6 +111,43 @@ pub enum EffectState {
     Blur { sigma: f64, repeat_edges: bool },
     Shadow { color: Color, offset: Vec2, sigma: f64 },
     Glow { color: Color, sigma: f64, intensity: f64 },
+    /// Per-pixel post effects applied when the layer is composited.
+    Post(PostState),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PostKind {
+    Exposure,
+    BrightnessContrast,
+    Levels,
+    HueSaturation,
+    Tint,
+    GradientMap,
+    Invert,
+    Fill,
+    Lut,
+    Displace,
+    DirectionalBlur,
+    RgbSplit,
+    Vignette,
+    Grain,
+}
+
+/// Evaluated post effect: numbers in `v` by kind (lengths in canvas px):
+/// exposure [stops]; brightness_contrast [b, c]; levels [in_b, in_w, γ,
+/// out_b, out_w]; hue_saturation [hue°, sat, light]; tint [amount] with
+/// colours [black, white]; gradient_map [amount] + stops; invert [amount];
+/// fill [amount] + colours[0]; lut [amount] + path; displace [amount,
+/// scale, time]; directional_blur [dx, dy]; rgb_split [dx, dy]; vignette
+/// [amount, softness]; grain [amount, size] + seed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PostState {
+    pub kind: PostKind,
+    pub v: [f64; 5],
+    pub colors: [Color; 2],
+    pub stops: Option<Arc<Vec<(f64, Color)>>>,
+    pub path: Option<Arc<str>>,
+    pub seed: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -268,7 +305,17 @@ impl CScene {
     }
 }
 
+struct CPost {
+    kind: PostKind,
+    v: Vec<Prop<f64>>,
+    colors: Vec<Prop<Color>>,
+    stops: Option<Arc<Vec<(f64, Color)>>>,
+    path: Option<Arc<str>>,
+    seed: u32,
+}
+
 enum CEffect {
+    Post(CPost),
     Blur(Prop<f64>, bool),
     Shadow { color: Prop<Color>, offset: Prop<Vec2>, radius: Prop<f64> },
     Glow { color: Prop<Color>, radius: Prop<f64>, intensity: Prop<f64> },
@@ -538,6 +585,13 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn post(&mut self, kind: PostKind, v: &[&Property<f64>], colors: &[&Property<Color>], id: &str, what: &dyn Fn(&str) -> String, start: f64, step: Option<Step>, shift: f64) -> CEffect {
+        let v = v.iter().enumerate().map(|(i, p)| self.prop(p, id, &what(&format!("v{i}")), start, step, shift)).collect();
+        let colors = colors.iter().enumerate().map(|(i, p)| self.prop(p, id, &what(&format!("color{i}")), start, step, shift)).collect();
+        CEffect::Post(CPost { kind, v, colors, stops: None, path: None, seed: 0 })
+    }
+
     fn time(&mut self, r: &TimeRef, element: &str, what: &str) -> Option<f64> {
         match self.windows.resolve(r) {
             Ok(t) => Some(t),
@@ -628,6 +682,52 @@ impl<'a> Compiler<'a> {
                     offset: self.prop(offset, id, &what("offset"), start, step, shift),
                     radius: self.prop(radius, id, &what("radius"), start, step, shift),
                 },
+                Effect::Exposure { stops } => self.post(PostKind::Exposure, &[stops], &[], id, &what, start, step, shift),
+                Effect::BrightnessContrast { brightness, contrast } => self.post(PostKind::BrightnessContrast, &[brightness, contrast], &[], id, &what, start, step, shift),
+                Effect::Levels { in_black, in_white, gamma, out_black, out_white } => {
+                    self.post(PostKind::Levels, &[in_black, in_white, gamma, out_black, out_white], &[], id, &what, start, step, shift)
+                }
+                Effect::HueSaturation { hue, saturation, lightness } => self.post(PostKind::HueSaturation, &[hue, saturation, lightness], &[], id, &what, start, step, shift),
+                Effect::Tint { black, white, amount } => self.post(PostKind::Tint, &[amount], &[black, white], id, &what, start, step, shift),
+                Effect::GradientMap { stops, amount } => {
+                    let mut e = self.post(PostKind::GradientMap, &[amount], &[], id, &what, start, step, shift);
+                    if let CEffect::Post(p) = &mut e {
+                        let mut s = stops.clone();
+                        s.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        if s.is_empty() {
+                            self.errors.push(format!("{id}.{}: gradient_map needs stops", what("stops")));
+                            s.push((0.0, Color::BLACK));
+                        }
+                        p.stops = Some(Arc::new(s));
+                    }
+                    e
+                }
+                Effect::Invert { amount } => self.post(PostKind::Invert, &[amount], &[], id, &what, start, step, shift),
+                Effect::Fill { color, amount } => self.post(PostKind::Fill, &[amount], &[color], id, &what, start, step, shift),
+                Effect::Lut { path, amount } => {
+                    let mut e = self.post(PostKind::Lut, &[amount], &[], id, &what, start, step, shift);
+                    if let CEffect::Post(p) = &mut e {
+                        p.path = Some(path.as_str().into());
+                    }
+                    e
+                }
+                Effect::Displace { amount, scale, speed, seed } => {
+                    let mut e = self.post(PostKind::Displace, &[amount, scale, speed], &[], id, &what, start, step, shift);
+                    if let CEffect::Post(p) = &mut e {
+                        p.seed = *seed;
+                    }
+                    e
+                }
+                Effect::DirectionalBlur { angle, length } => self.post(PostKind::DirectionalBlur, &[angle, length], &[], id, &what, start, step, shift),
+                Effect::RgbSplit { amount, angle } => self.post(PostKind::RgbSplit, &[amount, angle], &[], id, &what, start, step, shift),
+                Effect::Vignette { amount, softness } => self.post(PostKind::Vignette, &[amount, softness], &[], id, &what, start, step, shift),
+                Effect::Grain { amount, size, seed } => {
+                    let mut e = self.post(PostKind::Grain, &[amount, size], &[], id, &what, start, step, shift);
+                    if let CEffect::Post(p) = &mut e {
+                        p.seed = *seed;
+                    }
+                    e
+                }
                 Effect::Glow { color, radius, intensity } => CEffect::Glow {
                     color: self.prop(color, id, &what("color"), start, step, shift),
                     radius: self.prop(radius, id, &what("radius"), start, step, shift),
@@ -1195,6 +1295,39 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: 
                 let o = offset.at(t);
                 // Offsets follow the layer's scale, not its rotation (AE).
                 Some(EffectState::Shadow { color: clamp_color(color.at(t)), offset: Vec2::new(o.x() * scale, o.y() * scale), sigma: radius.at(t).max(0.0) * scale })
+            }
+            CEffect::Post(p) => {
+                let mut v = [0.0; 5];
+                for (slot, prop) in v.iter_mut().zip(&p.v) {
+                    *slot = prop.at(t);
+                }
+                let mut colors = [Color::BLACK, Color::WHITE];
+                for (slot, prop) in colors.iter_mut().zip(&p.colors) {
+                    *slot = clamp_color(prop.at(t));
+                }
+                match p.kind {
+                    // Lengths follow the layer's scale.
+                    PostKind::Displace => {
+                        v[0] *= scale;
+                        v[1] *= scale;
+                        v[2] *= t;
+                    }
+                    PostKind::DirectionalBlur => {
+                        let (s, c) = v[0].to_radians().sin_cos();
+                        let len = v[1] * scale;
+                        v = [c * len, s * len, 0.0, 0.0, 0.0];
+                    }
+                    PostKind::RgbSplit => {
+                        let (s, c) = v[1].to_radians().sin_cos();
+                        let len = v[0] * scale;
+                        v = [c * len, s * len, 0.0, 0.0, 0.0];
+                    }
+                    PostKind::Grain => v[1] *= scale,
+                    _ => {}
+                }
+                // Grain changes every frame (and holds on stepped frames).
+                let seed = if p.kind == PostKind::Grain { p.seed.wrapping_add((t * 240.0).floor() as i64 as u32) } else { p.seed };
+                Some(EffectState::Post(PostState { kind: p.kind, v, colors, stops: p.stops.clone(), path: p.path.clone(), seed }))
             }
             CEffect::Glow { color, radius, intensity } => {
                 Some(EffectState::Glow { color: clamp_color(color.at(t)), sigma: radius.at(t).max(0.0) * scale, intensity: intensity.at(t).max(0.0) })
