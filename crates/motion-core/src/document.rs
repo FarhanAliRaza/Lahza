@@ -469,6 +469,7 @@ pub enum LayerKind {
     Shape(ShapeLayer),
     Text(TextLayer),
     Image(ImageLayer),
+    Video(VideoLayer),
     Comp(CompLayer),
 }
 
@@ -478,6 +479,7 @@ impl LayerKind {
             LayerKind::Shape(_) => "shape",
             LayerKind::Text(_) => "text",
             LayerKind::Image(_) => "image",
+            LayerKind::Video(_) => "video",
             LayerKind::Comp(_) => "comp",
         }
     }
@@ -847,6 +849,48 @@ pub struct ImageLayer {
     /// Display size in pixels; default the image's own size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<Property<Vec2>>,
+}
+
+/// Footage: a video file (mp4, mov, webm, mkv; alpha from ProRes 4444,
+/// VP8/VP9 alpha or PNG/QT-RLE) or an image sequence (`"renders/shot_####.png"`,
+/// Blender-style, or a folder of frames).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoLayer {
+    pub src: String,
+    /// Display size in pixels; default the footage's own size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Property<Vec2>>,
+    /// Source time (seconds) shown at the layer's start.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub trim: f64,
+    /// Playback rate (2 = twice as fast).
+    #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")]
+    pub speed: f64,
+    /// Restart from `trim` when the source ends; otherwise hold the last frame.
+    #[serde(default, rename = "loop", skip_serializing_if = "std::ops::Not::not")]
+    pub looped: bool,
+    /// Time remap: the source time (seconds) to show, animatable. Overrides
+    /// trim and speed (freeze frames, speed ramps, reverse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_remap: Option<Property<f64>>,
+    /// Image sequences: frames per second (default the project's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<Fps>,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub volume_db: f64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mute: bool,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+fn one_f64() -> f64 {
+    1.0
+}
+fn is_one_f64(v: &f64) -> bool {
+    *v == 1.0
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

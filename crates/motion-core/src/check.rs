@@ -225,6 +225,12 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
             if let LayerKind::Image(img) = &l.kind {
                 used.push((l.id.clone(), img.src.clone()));
             }
+            if let LayerKind::Video(v) = &l.kind {
+                // Sequences are checked by their first frame's folder.
+                if !v.src.contains('#') {
+                    used.push((l.id.clone(), v.src.clone()));
+                }
+            }
         });
     }
     for clip in project.audio.clips() {
@@ -232,7 +238,7 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
     }
     for (element, path) in used {
         if let Some(dir) = options.dir {
-            if !dir.join(&path).is_file() {
+            if !dir.join(&path).exists() {
                 issues.push(issue(Severity::Error, "structure", Some(&element), None, format!("missing file '{path}'")));
             }
         }
@@ -299,6 +305,10 @@ pub fn bounds(layer: &LayerState, measure: Option<Measure>) -> Option<[f64; 4]> 
         }
         Content::Image { size: Some(size), .. } => (size.x() / 2.0, size.y() / 2.0),
         Content::Image { size: None, .. } => return None,
+        Content::Video(v) => match v.size {
+            Some(size) => (size.x() / 2.0, size.y() / 2.0),
+            None => return None,
+        },
         Content::Text(_) => return measure.and_then(|m| m(layer)),
     };
     let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)].map(|(x, y)| layer.matrix.apply(x, y));

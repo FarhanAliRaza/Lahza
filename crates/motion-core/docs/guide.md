@@ -23,6 +23,15 @@
    `sheet: true` at the scene's sync points. Look at the frames; fix; repeat.
 6. **Render** a draft (`quality: "draft"`), then the final.
 
+## Footage and 3D
+
+- Footage: `media_import` a clip or image sequence, then add a
+  `{"kind": "video", "src": …}` layer (trim, speed, loop, time_remap).
+- 3D: write a Blender `bpy` script and run it with `blender_run`. It renders
+  a transparent PNG sequence into `assets/blender/<name>/` that you place as
+  a video layer, so 3D objects composite with type, shapes and effects.
+  Match `frames` to the scene's span; use `fps` of the project.
+
 ## Timing rules that make it look professional
 
 - **Sync the peak, not the start.** Put `"anchor": "peak"` on transitions

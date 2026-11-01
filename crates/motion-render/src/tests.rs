@@ -396,3 +396,119 @@ fn covered_background_does_not_leak_through_a_whip() {
         assert!(worst <= 2, "t={t}: green {worst} at ({x}, {y}) leaks from the covered background; row {:?}", (x.saturating_sub(8)..x + 8).map(|x| img.get_pixel(x.min(1365), 90).0[1]).collect::<Vec<_>>());
     }
 }
+
+fn ffmpeg(args: &[&str]) -> bool {
+    std::process::Command::new("ffmpeg").args(["-v", "error", "-y"]).args(args).status().is_ok_and(|s| s.success())
+}
+
+/// red 0–1 s, green 1–2 s, blue 2–3 s at 30 fps, with a 440 Hz tone.
+fn rgb_video(dir: &std::path::Path) -> bool {
+    std::fs::create_dir_all(dir).unwrap();
+    ffmpeg(&[
+        "-f", "lavfi", "-i", "color=c=red:s=64x36:r=30:d=1",
+        "-f", "lavfi", "-i", "color=c=lime:s=64x36:r=30:d=1",
+        "-f", "lavfi", "-i", "color=c=blue:s=64x36:r=30:d=1",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+        "-filter_complex", "[0][1][2]concat=n=3:v=1:a=0[v]", "-map", "[v]", "-map", "3:a",
+        "-c:v", "libx264", "-g", "15", "-pix_fmt", "yuv444p", "-crf", "0", "-c:a", "aac",
+        dir.join("rgb.mp4").to_str().unwrap(),
+    ])
+}
+
+fn footage_project(dir: &std::path::Path, layer: serde_json::Value) -> (Compiled, Project) {
+    let _ = dir;
+    let mut p = project(json!([layer]));
+    p.settings.duration = 4.0;
+    (Compiled::new(&p), p)
+}
+
+fn dominant(img: &image::RgbaImage) -> char {
+    let p = img.get_pixel(160, 90).0;
+    if p[0] > 200 && p[1] < 60 { 'r' } else if p[1] > 200 && p[0] < 60 { 'g' } else if p[2] > 200 && p[0] < 60 { 'b' } else { '?' }
+}
+
+#[test]
+fn video_footage_frames_trim_speed_loop_remap() {
+    let dir = std::env::temp_dir().join(format!("lahza-footage-{}", std::process::id()));
+    if !rgb_video(&dir) {
+        eprintln!("skipping: ffmpeg cannot make the test video");
+        return;
+    }
+    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
+    let mut colours = |layer: serde_json::Value, times: &[f64]| -> String {
+        let (c, _) = footage_project(&dir, layer);
+        times.iter().map(|t| dominant(&r.render(&c, *t))).collect()
+    };
+    let base = json!({"id": "v", "kind": "video", "src": "rgb.mp4", "size": [320, 180], "transform": {"position": [160, 90]}});
+    assert_eq!(colours(base.clone(), &[0.0, 0.5, 0.99, 1.0, 1.5, 2.2, 2.97]), "rrrggbb");
+    let mut trimmed = base.clone();
+    trimmed["trim"] = json!(1.0);
+    assert_eq!(colours(trimmed, &[0.0, 0.9, 1.1]), "ggb");
+    let mut fast = base.clone();
+    fast["speed"] = json!(2.0);
+    assert_eq!(colours(fast.clone(), &[0.25, 0.75, 1.25, 1.9]), "rgbb", "speed 2, holding the last frame");
+    fast["loop"] = json!(true);
+    // 2× speed: 1.6 s → source 3.2 s → 0.2 s after the wrap; 2.1 s → 1.2 s.
+    assert_eq!(colours(fast, &[1.6, 2.1]), "rg", "looping restarts");
+    let mut remap = base.clone();
+    remap["time_remap"] = json!({"keys": [{"at": 0, "v": 2.5}, {"at": 2, "v": 0.2}]});
+    assert_eq!(colours(remap, &[0.0, 1.0, 1.99]), "bgr", "reverse through time remap");
+    // Playing forward reads the stream in order: few seeks for many frames.
+    let (c, _) = footage_project(&dir, base);
+    let seeks = r.footage.seeks;
+    for n in 0..60 {
+        r.render(&c, n as f64 / 30.0);
+    }
+    assert!(r.footage.seeks - seeks <= 2, "{} seeks", r.footage.seeks - seeks);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn image_sequences_and_alpha_video() {
+    let dir = std::env::temp_dir().join(format!("lahza-seq-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("shot")).unwrap();
+    for (i, c) in [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 128]].iter().enumerate() {
+        image::RgbaImage::from_pixel(16, 9, image::Rgba(*c)).save(dir.join(format!("shot/f_{:04}.png", i + 1))).unwrap();
+    }
+    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
+    let layer = json!({"id": "s", "kind": "video", "src": "shot/f_####.png", "fps": 10, "size": [320, 180], "transform": {"position": [160, 90]}});
+    let (c, _) = footage_project(&dir, layer);
+    assert_eq!(dominant(&r.render(&c, 0.05)), 'r');
+    assert_eq!(dominant(&r.render(&c, 0.15)), 'g');
+    let half = r.render(&c, 0.25).get_pixel(160, 90).0;
+    assert!((half[2] as i32 - 128).abs() <= 2 && half[0] == 0, "half-transparent blue over black: {half:?}");
+    // A folder works the same.
+    let (c, _) = footage_project(&dir, json!({"id": "s", "kind": "video", "src": "shot", "fps": 10, "size": [320, 180], "transform": {"position": [160, 90]}}));
+    assert_eq!(dominant(&r.render(&c, 0.15)), 'g');
+    // VP9 with alpha (how Blender or AE hand over transparent footage).
+    if ffmpeg(&["-f", "lavfi", "-i", "color=c=white@0.5:s=64x36:r=30:d=1,format=rgba", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", dir.join("alpha.webm").to_str().unwrap()]) {
+        let info = crate::footage::probe(&dir.join("alpha.webm")).unwrap();
+        assert!(info.has_alpha, "{info:?}");
+        let (c, _) = footage_project(&dir, json!({"id": "a", "kind": "video", "src": "alpha.webm", "size": [320, 180], "transform": {"position": [160, 90]}}));
+        let p = r.render(&c, 0.5).get_pixel(160, 90).0;
+        assert!((p[0] as i32 - 128).abs() <= 6, "white at 50% over black: {p:?}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn export_mixes_footage_audio() {
+    let dir = std::env::temp_dir().join(format!("lahza-footage-audio-{}", std::process::id()));
+    if !rgb_video(&dir) {
+        return;
+    }
+    let mut p = project(json!([{"id": "v", "kind": "video", "src": "rgb.mp4", "trim": 0.5, "speed": 1.5, "transform": {"position": [160, 90]}, "time": {"start": 0.5}}]));
+    p.settings.duration = 2.0;
+    let c = Compiled::new(&p);
+    let clips = c.footage_audio();
+    assert_eq!(clips.len(), 1);
+    assert_eq!((clips[0].start, clips[0].trim, clips[0].speed), (0.5, 0.5, 1.5));
+    let out = dir.join("out.mp4");
+    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() } };
+    let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
+    assert_eq!(report.frames, 60);
+    let info = crate::footage::probe(&out).unwrap();
+    assert!(info.has_audio, "footage sound is in the export");
+    std::fs::remove_dir_all(&dir).ok();
+}
+

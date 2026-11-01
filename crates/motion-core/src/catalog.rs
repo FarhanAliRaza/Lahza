@@ -187,6 +187,12 @@ pub fn catalog_json() -> Value {
                 }]
             },
             "image": {"src": "project-relative PNG/JPEG/WebP", "size": "[w, h] display px (default natural)"},
+            "video": {
+                "src": "video file (mp4/mov/webm/mkv; alpha from ProRes 4444, VP8/VP9 alpha, PNG/QT-RLE), an image sequence \"shot_####.png\" (Blender style) or a folder of frames; import with media_import or make with blender_run",
+                "size": "[w, h] display px (default the footage size)", "trim": "source seconds at the layer start", "speed": "rate (default 1)",
+                "loop": "restart at trim when the source ends (default: hold the last frame)", "time_remap": "animatable source seconds (freeze, ramps, reverse); overrides trim/speed",
+                "fps": "image sequences: frames per second (default the project's)", "volume_db": "sound level in the mix", "mute": "bool"
+            },
             "comp": {"layers": "nested layers; transform and stepping apply to all children; with opacity < 1, a blend mode, effects or a matte the comp is drawn as one picture"}
         },
         "scene": {

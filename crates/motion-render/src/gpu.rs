@@ -47,6 +47,7 @@ struct RasterData {
     b_images: gpu::BufferPiece,
     b_groups: gpu::BufferPiece,
     b_segs: gpu::BufferPiece,
+    b_footage: gpu::BufferPiece,
     b_target: gpu::BufferPiece,
 }
 
@@ -126,6 +127,7 @@ pub struct Gpu {
     indices: Buffer,
     stops: Buffer,
     segs: Buffer,
+    footage: Buffer,
     atlas: Buffer,
     images: Buffer,
     groups: Buffer,
@@ -229,6 +231,7 @@ impl Gpu {
             indices: Buffer::new(&context, "motion indices", 1 << 16, true),
             stops: Buffer::new(&context, "motion stops", 1 << 12, true),
             segs: Buffer::new(&context, "motion segments", 1 << 12, true),
+            footage: Buffer::new(&context, "motion footage", 1 << 12, true),
             atlas: Buffer::new(&context, "motion atlas", (ATLAS_SIZE * ATLAS_SIZE) as usize, true),
             images: Buffer::new(&context, "motion images", 1 << 12, true),
             groups: Buffer::new(&context, "motion groups", 1 << 12, false),
@@ -248,7 +251,7 @@ impl Gpu {
     }
 
     /// Renders weighted sub-samples (weights sum to 1) to straight RGBA8.
-    pub fn render(&mut self, samples: &[DisplayList], fonts: &Fonts, images: &Images) -> Result<Vec<u8>, String> {
+    pub fn render(&mut self, samples: &[DisplayList], fonts: &Fonts, images: &Images, footage: &[u32]) -> Result<Vec<u8>, String> {
         let main = samples.first().ok_or("nothing to render")?.main();
         let (w, h) = (main.width, main.height);
         if w.div_ceil(TILE) > 65535 || h.div_ceil(TILE) > 65535 {
@@ -263,6 +266,8 @@ impl Gpu {
         self.indices.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.indices))?;
         self.stops.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.stops))?;
         self.segs.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.segments))?;
+        // Footage frames change every frame and upload every time.
+        self.footage.upload(ctx, &mut self.encoder, bytemuck::cast_slice(footage))?;
         if self.atlas_generation != fonts.generation {
             self.atlas.upload(ctx, &mut self.encoder, &fonts.atlas)?;
             self.atlas_generation = fonts.generation;
@@ -286,6 +291,7 @@ impl Gpu {
             b_images: s.images.device.into(),
             b_groups: groups.into(),
             b_segs: s.segs.device.into(),
+            b_footage: s.footage.device.into(),
             b_target: target.into(),
         };
         for (i, (main, groups)) in targets.iter().enumerate() {
@@ -377,6 +383,7 @@ impl Drop for Gpu {
             &mut self.indices,
             &mut self.stops,
             &mut self.segs,
+            &mut self.footage,
             &mut self.atlas,
             &mut self.images,
             &mut self.groups,

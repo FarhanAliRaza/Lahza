@@ -125,9 +125,36 @@ pub enum Content {
     Shape(ShapeState),
     Text(TextState),
     Image { src: Arc<str>, size: Option<Vec2> },
+    /// A footage frame: the renderer decodes `source_time` of `src`.
+    Video(VideoState),
     /// A comp drawn as one picture (AE precomp): children carry absolute
     /// matrices; the group's opacity, blend, effects and matte apply once.
     Group(Vec<LayerState>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoState {
+    pub src: Arc<str>,
+    pub size: Option<Vec2>,
+    /// Seconds into the source (before looping).
+    pub source_time: f64,
+    pub looped: bool,
+    /// For looping: where the loop restarts.
+    pub trim: f64,
+    /// Image sequences: frames per second.
+    pub fps: f64,
+}
+
+/// Where a footage layer's sound plays, for the audio mix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FootageAudio {
+    pub src: Arc<str>,
+    /// Timeline seconds where the layer starts and ends.
+    pub start: f64,
+    pub end: f64,
+    pub trim: f64,
+    pub speed: f64,
+    pub gain_db: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -290,7 +317,20 @@ enum CKind {
     Shape(CShape),
     Text(CText),
     Image { src: Arc<str>, size: Option<Prop<Vec2>> },
+    Video(CVideo),
     Comp(Vec<CLayer>),
+}
+
+struct CVideo {
+    src: Arc<str>,
+    size: Option<Prop<Vec2>>,
+    trim: f64,
+    speed: f64,
+    looped: bool,
+    remap: Option<Prop<f64>>,
+    fps: f64,
+    gain_db: f64,
+    mute: bool,
 }
 
 struct CShape {
@@ -647,6 +687,17 @@ impl<'a> Compiler<'a> {
                 src: img.src.as_str().into(),
                 size: img.size.as_ref().map(|s| self.prop(s, id, "size", start, step, shift)),
             },
+            LayerKind::Video(v) => CKind::Video(CVideo {
+                src: v.src.as_str().into(),
+                size: v.size.as_ref().map(|s| self.prop(s, id, "size", start, step, shift)),
+                trim: v.trim,
+                speed: if v.speed.is_finite() && v.speed != 0.0 { v.speed } else { 1.0 },
+                looped: v.looped,
+                remap: v.time_remap.as_ref().map(|r| self.prop(r, id, "time_remap", start, step, shift)),
+                fps: v.fps.unwrap_or(self.windows.base.fps).as_f64(),
+                gain_db: v.volume_db,
+                mute: v.mute,
+            }),
             LayerKind::Comp(comp) => CKind::Comp(self.layers(&comp.layers, step, shift - offset)),
         };
         CLayer {
@@ -875,6 +926,39 @@ impl Compiled {
 
     pub fn fps(&self) -> Fps {
         self.settings.fps
+    }
+
+    /// Sound of footage layers (constant speed, not muted, no time remap),
+    /// clipped to the scenes that show them.
+    pub fn footage_audio(&self) -> Vec<FootageAudio> {
+        fn walk(layers: &[CLayer], scene: (f64, f64), shift: f64, out: &mut Vec<FootageAudio>) {
+            for l in layers {
+                match &l.kind {
+                    CKind::Video(v) if !v.mute && v.remap.is_none() && !l.hidden => {
+                        // Layer times are content times: timeline = content − shift.
+                        let start = (l.start - shift).max(scene.0);
+                        let end = (l.end - shift).min(scene.1);
+                        if end > start {
+                            out.push(FootageAudio {
+                                src: v.src.clone(),
+                                start,
+                                end,
+                                trim: v.trim + (start - (l.start - shift)) * v.speed,
+                                speed: v.speed,
+                                gain_db: v.gain_db,
+                            });
+                        }
+                    }
+                    CKind::Comp(children) => walk(children, scene, shift + l.offset, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for s in &self.scenes {
+            walk(&s.layers, (s.start, s.end), s.pre_roll, &mut out);
+        }
+        out
     }
 
     /// Resolved [start, end) of a scene or layer by id.
@@ -1161,6 +1245,17 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: 
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
+        CKind::Video(v) => Content::Video(VideoState {
+            src: v.src.clone(),
+            size: v.size.as_ref().map(|s| s.at(t)),
+            source_time: match &v.remap {
+                Some(r) => r.at(t),
+                None => v.trim + (t - l.start) * v.speed,
+            },
+            looped: v.looped,
+            trim: v.trim,
+            fps: v.fps,
+        }),
     };
     out.push(LayerState { id: l.id.clone(), matrix, opacity: parent_opacity * own_opacity, blend: l.blend, effects, matte, content });
 }

@@ -13,6 +13,7 @@
 
 pub mod export;
 pub mod font;
+pub mod footage;
 pub mod gpu;
 pub mod images;
 pub mod list;
@@ -78,6 +79,7 @@ pub struct Stats {
 pub struct Renderer {
     pub fonts: Fonts,
     pub images: Images,
+    pub footage: footage::Footage,
     gpu: Option<gpu::Gpu>,
     gpu_error: Option<String>,
     options: RenderOptions,
@@ -99,6 +101,7 @@ impl Renderer {
         Self {
             fonts: Fonts::new(root),
             images: Images::new(root),
+            footage: footage::Footage::new(root),
             gpu,
             gpu_error,
             options,
@@ -136,6 +139,7 @@ impl Renderer {
     pub fn warnings(&self) -> Vec<String> {
         let mut w = self.fonts.warnings.clone();
         w.extend(self.images.warnings.iter().cloned());
+        w.extend(self.footage.warnings.iter().cloned());
         w.sort();
         w.dedup();
         w
@@ -166,14 +170,17 @@ impl Renderer {
     pub fn render_states(&mut self, states: &[FrameState]) -> RgbaImage {
         let started = Instant::now();
         let scale = self.options.scale;
+        self.footage.begin_frame();
         let lists: Vec<DisplayList> = states
             .iter()
-            .map(|s| Builder { fonts: &mut self.fonts, images: &mut self.images, scale }.build(s))
+            .map(|s| Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, scale }.build(s))
             .collect();
         let mut key = Vec::new();
         for l in &lists {
             key.extend(l.signature());
         }
+        // Footage pixels are part of the picture.
+        key.extend(self.footage.signature());
         let built = Instant::now();
         self.stats.build_ms += (built - started).as_secs_f64() * 1000.0;
         self.stats.frames += 1;
@@ -184,7 +191,7 @@ impl Renderer {
             }
         }
         let main = lists[0].main();
-        let bytes = match self.gpu.as_mut().map(|g| g.render(&lists, &self.fonts, &self.images)) {
+        let bytes = match self.gpu.as_mut().map(|g| g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic)) {
             Some(Ok(bytes)) => bytes,
             Some(Err(e)) => {
                 // Sticky fallback: the same lists render on the CPU.
@@ -212,12 +219,12 @@ impl Renderer {
                 // Outer groups sample inner ones, so draw into a scratch
                 // buffer and copy it in place.
                 let mut target = vec![[0.0f32; 4]; n];
-                let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups };
+                let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic };
                 raster::raster(list, &g.target, &src, &mut target, raster::Write::Replace, self.threads);
                 groups[g.offset as usize..g.offset as usize + n].copy_from_slice(&target);
                 raster::blur(&mut groups, g.offset as usize, g.target.width as usize, g.target.height as usize, g.sigma, g.clamp, self.threads);
             }
-            let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups };
+            let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic };
             raster::raster(list, &list.main(), &src, &mut accum, raster::Write::Accumulate(weight), self.threads);
         }
         let mut out = vec![0u8; w * h * 4];

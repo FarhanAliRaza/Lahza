@@ -44,6 +44,7 @@ var<storage, read> b_atlas: array<u32>;
 var<storage, read> b_images: array<u32>;
 var<storage, read> b_groups: array<vec4<f32>>;
 var<storage, read> b_segs: array<vec4<f32>>;
+var<storage, read> b_footage: array<u32>;
 var<storage, read_write> b_target: array<vec4<f32>>;
 
 var<uniform> u_blur: BlurPass;
@@ -229,6 +230,7 @@ fn unpack(v: u32) -> vec4<f32> {
 fn image_texel(source: u32, offset: u32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
     let i = u32(i32(offset) + clamp(y, 0, h - 1) * w + clamp(x, 0, w - 1));
     if source == 1u { return b_groups[i]; }
+    if source == 2u { return unpack(b_footage[i]); }
     return unpack(b_images[i]);
 }
 

@@ -8,6 +8,7 @@ pub struct Sources<'a> {
     pub atlas: &'a [u8],
     pub images: &'a [u32],
     pub groups: &'a [[f32; 4]],
+    pub footage: &'a [u32],
 }
 
 type V2 = [f32; 2];
@@ -189,10 +190,10 @@ fn unpack(v: u32) -> [f32; 4] {
 
 fn image_texel(src: &Sources, source: u32, offset: u32, w: i32, h: i32, x: i32, y: i32) -> [f32; 4] {
     let i = (offset as i32 + y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize;
-    if source == 1 {
-        src.groups[i]
-    } else {
-        unpack(src.images[i])
+    match source {
+        1 => src.groups[i],
+        2 => unpack(src.footage[i]),
+        _ => unpack(src.images[i]),
     }
 }
 

@@ -162,6 +162,43 @@ fn audio_inputs(project: &Project, compiled: &Compiled, dir: &Path, start: f64) 
             labels.push(n);
         }
     }
+    // Sound of footage layers.
+    for clip in compiled.footage_audio() {
+        let path = dir.join(&*clip.src);
+        if !crate::footage::probe(&path).is_ok_and(|i| i.has_audio) {
+            continue;
+        }
+        let from = clip.start - start;
+        let skip = clip.trim + (-from).max(0.0) * clip.speed;
+        let length = (clip.end - clip.start.max(start)).max(0.0) * clip.speed;
+        if length <= 0.0 {
+            continue;
+        }
+        args.extend(["-ss".into(), format!("{skip:.6}"), "-t".into(), format!("{length:.6}"), "-i".into(), path.to_string_lossy().into_owned()]);
+        // atempo takes 0.5–2 per stage; chain stages for other speeds.
+        let mut tempo = Vec::new();
+        let mut k = clip.speed.abs().clamp(0.01, 100.0);
+        while k > 2.0 {
+            tempo.push("atempo=2".to_string());
+            k /= 2.0;
+        }
+        while k < 0.5 {
+            tempo.push("atempo=0.5".to_string());
+            k *= 2.0;
+        }
+        if (k - 1.0).abs() > 1e-6 {
+            tempo.push(format!("atempo={k:.6}"));
+        }
+        let delay = (from.max(0.0) * 1000.0).round() as u64;
+        let name = format!("f{index}");
+        let mut chain = vec!["aresample=48000".to_string()];
+        chain.extend(tempo);
+        chain.push(format!("adelay={delay}:all=1"));
+        chain.push(format!("volume={:.3}dB", clip.gain_db));
+        parts.push(format!("[{index}:a]{}[{name}]", chain.join(",")));
+        index += 1;
+        labels.push(name);
+    }
     match (music, &vo) {
         (Some((m, Some(duck))), Some(v)) => {
             // Narration drives a compressor on the music: about `duck` dB.

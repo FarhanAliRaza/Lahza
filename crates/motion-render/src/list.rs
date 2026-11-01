@@ -21,6 +21,10 @@ pub const TILE: u32 = 16;
 pub const PRIM_SHAPE: u32 = 0;
 pub const PRIM_GLYPH: u32 = 1;
 pub const PRIM_IMAGE: u32 = 2;
+/// Image sources (kind.y of image primitives).
+pub const SOURCE_POOL: u32 = 0;
+pub const SOURCE_GROUP: u32 = 1;
+pub const SOURCE_FOOTAGE: u32 = 2;
 /// Group A masked by group B (same size): geom2 = [A offset, B offset, mode].
 pub const PRIM_MATTE: u32 = 3;
 
@@ -181,6 +185,7 @@ struct Pending {
 pub struct Builder<'a> {
     pub fonts: &'a mut Fonts,
     pub images: &'a mut Images,
+    pub footage: &'a mut crate::footage::Footage,
     /// Output scale (0.5 for half-resolution previews).
     pub scale: f64,
 }
@@ -523,6 +528,28 @@ impl Builder<'_> {
                     if let Some((prim, _)) = with_inverse(prim, forward, opacity) {
                         items.push(Item { prim, forward, bounds: [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64] });
                     }
+                }
+            }
+            Content::Video(v) => {
+                let Some(tex) = self.footage.frame(&v.src, v.source_time, v.looped, v.trim, v.fps) else { return items };
+                let (dw, dh) = match v.size {
+                    Some(s) => (s.x(), s.y()),
+                    None => (tex.width as f64, tex.height as f64),
+                };
+                if dw <= 0.0 || dh <= 0.0 {
+                    return items;
+                }
+                let forward = matrix
+                    .then(Affine::translate(-dw / 2.0, -dh / 2.0))
+                    .then(Affine::scale(dw / tex.width as f64, dh / tex.height as f64));
+                let prim = Prim {
+                    kind: [PRIM_IMAGE, SOURCE_FOOTAGE, blend, 0],
+                    geom: [tex.width as f32, tex.height as f32, tex.levels as f32, 0.0],
+                    geom2: [f32::from_bits(tex.offset), 0.0, 0.0, 0.0],
+                    ..Default::default()
+                };
+                if let Some((prim, _)) = with_inverse(prim, forward, layer.opacity) {
+                    items.push(Item { prim, forward, bounds: [0.0, 0.0, tex.width as f64, tex.height as f64] });
                 }
             }
             Content::Image { src, size } => {

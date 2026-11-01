@@ -126,6 +126,29 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: false,
         },
         ToolDef {
+            name: "media_import",
+            description: "Copy footage (video file, image, image sequence \"shot_####.png\" or a folder of frames) into the project's assets, record its source and licence, and report size, fps, duration, alpha and audio. Then add it with a {\"kind\": \"video\", \"src\": …} layer.",
+            schema: obj(json!({"path": {"type": "string"}, "licence": {"type": "string", "description": "default user-supplied"}, "source": {"type": "string", "description": "where it came from (default user)"}, "copy": {"type": "boolean", "default": true}}), &["path"]),
+            read_only: false,
+        },
+        ToolDef {
+            name: "blender_run",
+            description: "Run Blender headless to make 3D footage: give a bpy Python `script` (it can build or load a scene; the dict LAHZA holds out, width, height, fps, frame_start, frame_end) and/or a `blend` file. Lahza sets resolution, fps, frame range, transparent film and a PNG RGBA sequence output first, your script may override them, then renders the animation into assets/blender/<name>/. Returns the footage src to use in a video layer. Long renders: wait=false and poll render_status.",
+            schema: obj(json!({
+                "name": {"type": "string", "description": "output name (letters, digits, - _)"},
+                "script": {"type": "string", "description": "bpy Python run after the defaults are set"},
+                "blend": {"type": "string", "description": ".blend file to open first"},
+                "frames": {"type": "array", "items": {"type": "integer"}, "description": "[start, end], default [1, fps × project duration]"},
+                "resolution": {"type": "array", "items": {"type": "integer"}, "description": "[w, h], default the project size"},
+                "engine": {"type": "string", "enum": ["CYCLES", "BLENDER_EEVEE", "BLENDER_WORKBENCH"], "description": "default CYCLES (works without a display); EEVEE is much faster with a GPU and a display"},
+                "samples": {"type": "integer", "default": 32},
+                "transparent": {"type": "boolean", "default": true},
+                "render": {"type": "boolean", "default": true, "description": "false only runs the script (e.g. to export a glTF)"},
+                "timeout": {"type": "number", "description": "seconds, default 1800"},
+                "wait": {"type": "boolean", "default": true}}), &["name"]),
+            read_only: false,
+        },
+        ToolDef {
             name: "audio_analyze",
             description: "Analyse music into marker tracks: tempo (a tempo map when it changes), meter (3/4 or 4/4), first downbeat, beat/bar/half/sixteenth/triplet grids, onsets per band, hit, stop (silence→hit), drop (bass dropout before a downbeat), music.start/end. Defaults to the project's music.",
             schema: obj(json!({"path": {"type": "string", "description": "audio file; registered as the music when the project has none"}, "offset": {"type": "number", "description": "timeline time of the file's start"}}), &[]),
@@ -147,8 +170,8 @@ struct Job {
     output: PathBuf,
     progress: Arc<Progress>,
     started: Instant,
-    handle: Option<std::thread::JoinHandle<Result<ExportReport, String>>>,
-    result: Option<Result<ExportReport, String>>,
+    handle: Option<std::thread::JoinHandle<Result<Value, String>>>,
+    result: Option<Result<Value, String>>,
 }
 
 pub struct Toolbox {
@@ -228,6 +251,8 @@ impl Toolbox {
             "render_status" => self.render_status(&args),
             "history" => self.history(&args),
             "audio_analyze" => self.audio_analyze(&args),
+            "media_import" => self.media_import(&args),
+            "blender_run" => self.blender_run(&args),
             other => Err(format!("unknown tool '{other}'")),
         }
     }
@@ -390,6 +415,7 @@ impl Toolbox {
                             lahza_motion_core::document::LayerKind::Text(t) => out["text"] = json!(t.text),
                             lahza_motion_core::document::LayerKind::Shape(s) => out["shape"] = json!(s.shape),
                             lahza_motion_core::document::LayerKind::Image(i) => out["src"] = json!(i.src),
+                            lahza_motion_core::document::LayerKind::Video(v) => out["src"] = json!(v.src),
                             lahza_motion_core::document::LayerKind::Comp(_) => out["layers"] = json!(layers(l.children(), compiled)),
                         }
                         if !animated.is_empty() {
@@ -680,7 +706,7 @@ impl Toolbox {
         let dir2 = dir.clone();
         let handle = std::thread::spawn(move || {
             let compiled = Compiled::new(&project);
-            export::export(&project, &compiled, &dir2, &options, &p2)
+            export::export(&project, &compiled, &dir2, &options, &p2).map(|r: ExportReport| serde_json::to_value(r).unwrap_or_default())
         });
         let id = format!("render-{}", self.jobs.len() + 1);
         self.jobs.push((id.clone(), Job { project: dir, output, progress, started: Instant::now(), handle: Some(handle), result: None }));
@@ -718,7 +744,7 @@ impl Toolbox {
                 }
                 Some(Ok(report)) => {
                     v["state"] = json!("done");
-                    v["report"] = serde_json::to_value(report).unwrap_or_default();
+                    v["report"] = report.clone();
                 }
                 Some(Err(e)) => {
                     v["state"] = json!("failed");
@@ -895,4 +921,226 @@ fn transcript_words(v: &Value) -> Option<Vec<(String, f64, f64)>> {
 
 pub fn png_base64(png: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(png)
+}
+
+const BLENDER_WRAPPER: &str = r#"
+import bpy, json, os, sys, traceback
+LAHZA = json.loads(os.environ["LAHZA_BLENDER"])
+scene = bpy.context.scene
+r = scene.render
+r.resolution_x, r.resolution_y = LAHZA["width"], LAHZA["height"]
+r.resolution_percentage = 100
+r.fps = int(round(LAHZA["fps"]))
+r.fps_base = r.fps / LAHZA["fps"]
+scene.frame_start, scene.frame_end = LAHZA["frame_start"], LAHZA["frame_end"]
+r.film_transparent = LAHZA["transparent"]
+r.image_settings.file_format = "PNG"
+r.image_settings.color_mode = "RGBA" if LAHZA["transparent"] else "RGB"
+r.image_settings.color_depth = "8"
+r.filepath = os.path.join(LAHZA["out"], LAHZA["name"] + "_####")
+try:
+    r.engine = LAHZA["engine"]
+except Exception:
+    pass
+if r.engine == "CYCLES":
+    scene.cycles.samples = LAHZA["samples"]
+    scene.cycles.device = "GPU" if os.environ.get("LAHZA_BLENDER_GPU") else "CPU"
+    # Some builds (e.g. Ubuntu's) ship without OpenImageDenoise.
+    scene.cycles.use_denoising = bool(getattr(bpy.app.build_options, "openimagedenoise", False))
+script = LAHZA.get("script")
+if script:
+    try:
+        exec(compile(open(script).read(), script, "exec"), {"bpy": bpy, "LAHZA": LAHZA, "__name__": "__main__"})
+    except Exception:
+        traceback.print_exc()
+        sys.exit(3)
+if LAHZA["render"]:
+    bpy.ops.render.render(animation=True)
+print("LAHZA_DONE " + json.dumps({"frame_start": scene.frame_start, "frame_end": scene.frame_end,
+    "width": r.resolution_x, "height": r.resolution_y, "fps": r.fps / r.fps_base, "engine": r.engine}))
+"#;
+
+impl Toolbox {
+    fn media_import(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let path = get_str(args, "path").ok_or("media_import needs \"path\"")?;
+        let copy = args.get("copy").and_then(Value::as_bool).unwrap_or(true);
+        let abs = self.path(path);
+        // Sequences: "shot_####.png" or a folder of frames.
+        let (rel, probe_src) = if path.contains('#') || abs.is_dir() {
+            let folder = if abs.is_dir() { abs.clone() } else { abs.parent().map(Path::to_path_buf).unwrap_or_default() };
+            let rel = match folder.strip_prefix(&dir) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) if copy => {
+                    let name = folder.file_name().ok_or("bad folder")?.to_string_lossy().into_owned();
+                    let dest = dir.join("assets").join(&name);
+                    copy_dir(&folder, &dest)?;
+                    format!("assets/{name}")
+                }
+                Err(_) => return Err("sequences outside the project must be copied (copy: true)".into()),
+            };
+            let src = if abs.is_dir() { rel.clone() } else { format!("{rel}/{}", abs.file_name().unwrap().to_string_lossy()) };
+            (src.clone(), src)
+        } else {
+            let rel = match abs.strip_prefix(&dir) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) if copy => import_asset(&dir, &abs)?,
+                Err(_) => return Err("files outside the project must be copied (copy: true)".into()),
+            };
+            (rel.clone(), rel)
+        };
+        let mut footage = lahza_motion_render::footage::Footage::new(Some(&dir));
+        let info = footage.info(&probe_src).ok_or_else(|| format!("cannot read '{probe_src}' as footage: {}", footage.warnings.join("; ")))?;
+        let mut project = self.state(&dir).project.clone();
+        if !project.assets.iter().any(|a| a.path == rel) {
+            project.assets.push(Asset {
+                path: rel.clone(),
+                source: get_str(args, "source").unwrap_or("user").into(),
+                licence: get_str(args, "licence").unwrap_or("user-supplied").into(),
+                credit: None,
+            });
+            self.save(&dir, project)?;
+        }
+        Ok(Output::json(json!({
+            "src": rel, "info": info,
+            "layer": {"kind": "video", "src": rel, "transform": {"position": [self.state(&dir).project.settings.width / 2, self.state(&dir).project.settings.height / 2]}},
+        })))
+    }
+
+    fn blender_run(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let name = get_str(args, "name").ok_or("blender_run needs \"name\"")?.to_string();
+        if !lahza_motion_core::document::valid_id(&name) {
+            return Err("name: letters, digits, '-' and '_' only".into());
+        }
+        let blender = which("blender").ok_or("Blender is not installed (Ubuntu: sudo apt install blender, or set LAHZA_BLENDER to its path)")?;
+        let settings = self.state(&dir).project.settings.clone();
+        let out = dir.join("assets").join("blender").join(&name);
+        // A fresh render replaces the previous one.
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        let scripts = dir.join("blender");
+        std::fs::create_dir_all(&scripts).map_err(|e| e.to_string())?;
+        let script_path = match get_str(args, "script") {
+            Some(code) => {
+                let p = scripts.join(format!("{name}.py"));
+                std::fs::write(&p, code).map_err(|e| e.to_string())?;
+                Some(p)
+            }
+            None => None,
+        };
+        let blend = match get_str(args, "blend") {
+            Some(b) => {
+                let p = self.path(b);
+                let p = if p.exists() { p } else { dir.join(b) };
+                if !p.is_file() {
+                    return Err(format!("{} does not exist", p.display()));
+                }
+                Some(p)
+            }
+            None => None,
+        };
+        if script_path.is_none() && blend.is_none() {
+            return Err("give a bpy \"script\", a \"blend\" file, or both".into());
+        }
+        let fps = settings.fps.as_f64();
+        let frames = args.get("frames").and_then(Value::as_array).filter(|a| a.len() == 2);
+        let (fs, fe) = match frames {
+            Some(a) => (a[0].as_i64().unwrap_or(1), a[1].as_i64().unwrap_or(1)),
+            None => (1, (settings.duration * fps).round().max(1.0) as i64),
+        };
+        let res = args.get("resolution").and_then(Value::as_array).filter(|a| a.len() == 2);
+        let (w, h) = match res {
+            Some(a) => (a[0].as_u64().unwrap_or(1920), a[1].as_u64().unwrap_or(1080)),
+            None => (settings.width as u64, settings.height as u64),
+        };
+        let config = json!({
+            "out": out, "name": name, "width": w, "height": h, "fps": fps, "frame_start": fs, "frame_end": fe,
+            "engine": get_str(args, "engine").unwrap_or("CYCLES"), "samples": args.get("samples").and_then(Value::as_u64).unwrap_or(32),
+            "transparent": args.get("transparent").and_then(Value::as_bool).unwrap_or(true),
+            "render": args.get("render").and_then(Value::as_bool).unwrap_or(true),
+            "script": script_path,
+        });
+        let wrapper = scripts.join("_lahza_wrapper.py");
+        std::fs::write(&wrapper, BLENDER_WRAPPER).map_err(|e| e.to_string())?;
+        let timeout = std::time::Duration::from_secs_f64(get_f64(args, "timeout").unwrap_or(1800.0).max(1.0));
+        let rel_pattern = format!("assets/blender/{name}/{name}_####.png");
+        let source = match (&script_path, &blend) {
+            (Some(s), _) => format!("blender script {}", s.strip_prefix(&dir).unwrap_or(s).display()),
+            (None, Some(b)) => format!("blender file {}", b.display()),
+            _ => unreachable!(),
+        };
+        let dir2 = dir.clone();
+        let rel2 = rel_pattern.clone();
+        let progress = Arc::new(Progress::default());
+        progress.total.store((fe - fs + 1).max(1) as u64, Ordering::Relaxed);
+        let p2 = progress.clone();
+        let out2 = out.clone();
+        let handle = std::thread::spawn(move || -> Result<Value, String> {
+            let mut cmd = std::process::Command::new(blender);
+            cmd.args(["-b", "--factory-startup"]);
+            if let Some(b) = &blend {
+                cmd.arg(b);
+            }
+            cmd.arg("--python").arg(&wrapper).env("LAHZA_BLENDER", config.to_string()).current_dir(&dir2);
+            cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn().map_err(|e| format!("cannot start Blender: {e}"))?;
+            let started = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let tail = |s: &str| s.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                    let done = stdout.lines().find_map(|l| l.strip_prefix("LAHZA_DONE ")).and_then(|j| serde_json::from_str::<Value>(j).ok());
+                    if !status.success() || done.is_none() {
+                        return Err(format!("Blender failed ({status}):\n{}\n{}", tail(&stderr), tail(&stdout)));
+                    }
+                    let count = std::fs::read_dir(&out2).map(|r| r.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "png")).count()).unwrap_or(0);
+                    p2.done.store(count as u64, Ordering::Relaxed);
+                    return Ok(json!({"src": rel2, "frames": count, "blender": done, "seconds": started.elapsed().as_secs_f64(),
+                        "layer": {"kind": "video", "src": rel2, "fps": done.as_ref().and_then(|d| d.get("fps")).cloned().unwrap_or(json!(fps))}}));
+                }
+                if p2.cancel.load(Ordering::Relaxed) || started.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(if started.elapsed() > timeout { "Blender timed out".into() } else { "cancelled".into() });
+                }
+                let count = std::fs::read_dir(&out2).map(|r| r.flatten().count()).unwrap_or(0);
+                p2.done.store(count as u64, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
+        // Record the asset now; the files appear as Blender renders.
+        let mut project = self.state(&dir).project.clone();
+        if !project.assets.iter().any(|a| a.path == rel_pattern) {
+            project.assets.push(Asset { path: rel_pattern.clone(), source, licence: "generated".into(), credit: None });
+            self.save(&dir, project)?;
+        }
+        let id = format!("blender-{}", self.jobs.len() + 1);
+        self.jobs.push((id.clone(), Job { project: dir, output: out, progress, started: Instant::now(), handle: Some(handle), result: None }));
+        if args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
+            let job = &mut self.jobs.last_mut().unwrap().1;
+            let result = job.handle.take().unwrap().join().unwrap_or_else(|_| Err("Blender job panicked".into()));
+            job.result = Some(result);
+        }
+        self.render_status(&json!({"job": id}))
+    }
+}
+
+fn which(program: &str) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("LAHZA_BLENDER").filter(|_| program == "blender") {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var_os("PATH")?.to_str()?.split(':').map(|d| Path::new(d).join(program)).find(|p| p.is_file())
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    for e in std::fs::read_dir(from).map_err(|e| e.to_string())?.flatten() {
+        if e.path().is_file() {
+            std::fs::copy(e.path(), to.join(e.file_name())).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
