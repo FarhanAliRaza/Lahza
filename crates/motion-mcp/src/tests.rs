@@ -70,3 +70,22 @@ fn edits_made_on_disk_are_picked_up() {
     assert_eq!(tl["scenes"][0]["layers"][0]["id"], "box");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn undo_and_redo_through_history() {
+    let (mut tb, dir) = toolbox("redo");
+    tb.call("project_create", json!({"path": "p", "duration": 2})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add", "scene": "s1", "id": "a", "kind": "shape", "shape": "rect"}]})).unwrap();
+    let layers = |tb: &mut Toolbox| tb.call("timeline_get", json!({})).unwrap().json["scenes"][0]["layers"].as_array().unwrap().len();
+    assert_eq!(layers(&mut tb), 1);
+    tb.call("history", json!({"undo": 1})).unwrap();
+    assert_eq!(layers(&mut tb), 0);
+    tb.call("history", json!({"redo": true})).unwrap();
+    assert_eq!(layers(&mut tb), 1);
+    // Redo once only; then undo works again.
+    assert!(tb.call("history", json!({"redo": true})).is_err());
+    tb.call("history", json!({"undo": 1})).unwrap();
+    assert_eq!(layers(&mut tb), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -121,8 +121,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef { name: "render_status", description: "Progress and result of render jobs.", schema: json!({"type": "object", "properties": {"job": {"type": "string"}}}), read_only: true },
         ToolDef {
             name: "history",
-            description: "Recent edits by person and agent; undo the last n steps or back to an entry.",
-            schema: obj(json!({"limit": {"type": "integer", "default": 20}, "undo": {"type": "integer"}, "undo_to": {"type": "integer"}}), &[]),
+            description: "Recent edits by person and agent; undo the last n steps or back to an entry; redo the last undo.",
+            schema: obj(json!({"limit": {"type": "integer", "default": 20}, "undo": {"type": "integer"}, "undo_to": {"type": "integer"}, "redo": {"type": "boolean"}}), &[]),
             read_only: false,
         },
         ToolDef {
@@ -764,6 +764,21 @@ impl Toolbox {
         let entries = io::read_history(&dir).map_err(|e| e.to_string())?;
         let undo_n = args.get("undo").and_then(Value::as_u64);
         let undo_to = args.get("undo_to").and_then(Value::as_u64);
+        if args.get("redo").and_then(Value::as_bool).unwrap_or(false) {
+            // Redo = revert the most recent undo that is still in effect.
+            let undo = entries.iter().rev().find(|e| !e.undoes.is_empty() && !e.undone).ok_or("nothing to redo")?;
+            let applied = edit::apply(&self.state(&dir).project, &undo.inverse).map_err(|e| format!("redo failed (the project changed in a conflicting way): {e}"))?;
+            self.save(&dir, applied.project)?;
+            let mut u = undo.clone();
+            u.undone = true;
+            io::write_history(&dir, &u).map_err(|e| e.to_string())?;
+            for e in entries.iter().filter(|e| undo.undoes.contains(&e.n)) {
+                let mut e = e.clone();
+                e.undone = false;
+                io::write_history(&dir, &e).map_err(|e| e.to_string())?;
+            }
+            return Ok(Output::json(json!({"redone": undo.undoes})));
+        }
         if undo_n.is_some() || undo_to.is_some() {
             let live: Vec<&HistoryEntry> = entries.iter().filter(|e| !e.undone && e.undoes.is_empty()).collect();
             let targets: Vec<&HistoryEntry> = match (undo_n, undo_to) {

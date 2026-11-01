@@ -86,47 +86,56 @@ frame evaluation 0.16 ms and display-list build 0.8 ms per frame; raster on a
 numbers (the RTX 3060 target) still need measuring on that machine. The full
 20 s promo exported at 0.85× real time on the 4-core CPU path.
 
-## Compared with After Effects
+## Editor
 
-What an agent can make today: beat- and word-synced motion graphics and
-kinetic typography — shapes and Bézier paths with draw-on, per-glyph text
-(shaped, any script with a suitable font), images, precomps, track mattes,
-blur/shadow/glow, transitions, motion blur — rendered on the GPU and
-checked frame by frame for sync. That covers promos, idents, title
-sequences, lower thirds, explainer graphics without footage, and
-logo reveals.
+`lahza project.lahza` opens the motion editor:
+- **Preview:** rendered on a worker thread (GPU when available), with a half-size proxy while playing or dragging.
+- **Timeline:** the ruler, beat/bar/hit and word markers, scenes, and layer bars with key diamonds.
+- **Inspector:** scrubbable transform values (3D values on 3D layers).
+- **Shortcuts:** Space plays, arrows step frames, Home/End jump, Delete removes the selected layer, Ctrl+Z / Ctrl+Shift+Z undo and redo.
 
-| After Effects | Lahza motion |
+Click a layer in the preview or the timeline and drag it to move it. Drag a value to change it; on an animated property this adds a key at the playhead. Drag a key diamond to retime it; hold Shift to snap it to the nearest beat, which writes `beat:N` so the key stays in sync.
+
+Every edit goes through the same tools the MCP server uses, so a person and an agent share one history and undo stack. Edits an agent makes over MCP appear live.
+
+## 3D with Blender
+
+`blender_run` runs Blender headless. It takes an agent-written `bpy` script and/or a `.blend` file, and renders a transparent PNG sequence into `assets/blender/<name>/`. A `video` layer then places it, so 3D assets composite with type, shapes, effects, mattes and 2.5D layers in one timeline. Blender handles real 3D (geometry, lights, materials); Lahza handles motion, timing and composition. Cycles works without a display. EEVEE is much faster with a GPU and a display.
+
+## Compared with After Effects and browser editors
+
+| Capability | Lahza motion |
 |---|---|
-| Keyframes, graph-editor easing, springs | ✔ measured presets, raw bezier/power/exp/spring/bounce, moves anchored by start/peak/land/end to markers |
-| Audio-driven timing (markers by hand) | ✔ automatic: beats, bars (3/4, 4/4), tempo maps, hits, stops, drops, words |
-| Wiggle / looping expressions | ✔ drift, wiggle, sine additive tracks; no general expressions yet |
-| Shape layers, trim paths | ✔ primitives + SVG Bézier paths, fill, stroke, trim |
-| Text animators | ✔ per glyph/word/line, stagger orders, ranges; HarfBuzz shaping, bidi |
+| Keyframes, easing, springs | ✔ measured presets plus raw curves; moves anchored by start, peak, land or end to markers |
+| Audio-driven timing | ✔ automatic beats, bars (3/4 and 4/4), tempo maps, hits, stops, drops and words |
+| Wiggle and loop expressions | ✔ drift, wiggle and sine additive tracks; no general expressions yet |
+| Shape layers, trim paths, **morphs** | ✔ primitives and Bézier paths with fill, stroke and trim; keyed path morphs between any shapes |
+| Text animators | ✔ per glyph, word or line, with stagger orders and ranges; HarfBuzz shaping and bidi |
 | Precomps, parenting, time offset | ✔ comps render as one picture when they need to; parenting; time offsets; stepped time |
-| Track mattes | ✔ alpha, luma, inverted |
-| Effects | ✔ Gaussian blur (repeat edges), drop shadow, glow — ✘ everything else (colour correction, LUTs, grain, distortions, fractal noise, …) |
-| Blend modes | ✔ normal, add, multiply, screen — ✘ the other ~20 |
-| Transitions | ✔ fade, push, slide, zoom, wipe, whip — ✘ object/matte wipes, zoom-through into a nested scene |
+| Track mattes | ✔ alpha, luma and inverted |
+| **Footage** | ✔ video and image sequences with alpha: trim, speed, loop, time remap, sound in the mix |
+| **Blend modes** | ✔ all of AE's separable and non-separable modes (19) |
+| **Effects** | ✔ blur, shadow, glow, exposure, brightness/contrast, levels, hue/saturation, tint, gradient map, invert, fill, `.cube` LUT, displacement, directional blur, RGB split, vignette, grain |
+| Transitions | ✔ fade, push, slide, zoom, wipe and whip |
 | Motion blur | ✔ shutter angle per scene |
-| Footage | ✔ stills — ✘ **video layers** (Lahza recordings arrive in phase 4) |
-| 3D | ✘ **3D layers, cameras, lights**, extruded text (phases 3/5) |
-| Masks on a layer | ◐ via track mattes (a shape layer as matte); no per-layer mask paths with feather/expansion |
-| Path morph, booleans, repeaters, particles, text on a path | ✘ (phase 2) |
-| Expressions / scripting | ✘ (planned as `code_put`: expressions, shaders, WASM) |
-| Motion tracking, rotoscoping, keying | ✘ (camera matting exists in the recorder, not wired in) |
-| Timeline UI | ✘ — agent and CLI only; the editor UI is the next phase |
+| **3D** | ✔ 2.5D layers (z, x/y rotation, perspective camera with orbit and dolly, depth sort); real 3D comes from Blender |
+| **Timeline UI** | ✔ editor window (see above) |
+| Masks on a layer | ◐ through track mattes; no per-layer mask paths with feather |
+| Expressions, scripting | ✘ (planned: `code_put` for expressions, shaders, WASM) |
+| Particles, repeaters, booleans, text on a path | ✘ |
+| Motion tracking, rotoscoping, keying | ✘ |
 
-The biggest gaps for "AE-class" in order of value: **video layers**, **the
-editor UI**, **2.5D/3D camera with layers in depth**, **more effects
-(colour, grain, displacement) and blend modes**, **path morph and
-repeaters**, **expressions**.
+Against Chrome-based editors (Remotion, Hyperframes and other React or canvas tools), Lahza has these advantages:
+- Native GPU compute rendering, with the CPU path drawing the same picture.
+- Deterministic frames, and exports that pipe straight to a hardware encoder.
+- Timing derived from the audio.
+- Sync checked frame by frame.
+- One project format that agents and people edit together.
 
 ## Known limits
 
-- The MCP server works on project files (it re-reads changes made on disk);
-  a live link into a running editor comes with the editor UI.
-- Effects on a matted layer: the shadow and glow use the unmatted picture.
-- Trim on a filled path trims the stroke only.
-- Tools from the design that depend on undecided asset sourcing or later
-  phases: `code_put`, `voiceover`, `ocr`, `assets_search`/`assets_fetch`.
+- **Editor:** it doesn't yet edit text or effects in the inspector; agents and JSON do that. There are no graph editor, multi-select or copy/paste yet.
+- **Shadow and glow on a matted layer:** they use the unmatted picture.
+- **Trim on a filled path:** it trims only the stroke.
+- **2.5D:** intersecting 3D planes are not split, because layers sort by their origin.
+- **Missing design tools:** `code_put`, `voiceover`, `ocr` and `assets_search`/`assets_fetch`. These depend on asset sourcing, which is undecided, or on later phases.

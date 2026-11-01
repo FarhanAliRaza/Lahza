@@ -32,6 +32,7 @@ mod launcher_recording;
 mod library;
 mod models;
 mod motion_ui;
+mod motion_editor;
 mod motion_overview_ui;
 mod animation_ui;
 mod notifications;
@@ -1861,6 +1862,11 @@ fn main() {
     }
     // Read the desktop animation preference off the UI thread.
     std::thread::spawn(theme::animations_enabled);
+    // `lahza project.lahza` opens the motion editor.
+    let initial_motion = arguments
+        .iter()
+        .find(|path| path.join("project.json").is_file() && path.extension().and_then(|e| e.to_str()) != Some("lahzarec"))
+        .cloned();
     let initial_recording = arguments
         .iter()
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("lahzarec"))
@@ -1897,6 +1903,13 @@ fn main() {
                 .expect("failed to load bundled Inter font");
             theme::load_theme_preference();
             theme::set_appearance(cx.window_appearance());
+            if let Some(dir) = initial_motion.clone() {
+                if let Err(e) = motion_editor::open(dir, cx).map(|_| ()) {
+                    eprintln!("lahza: {e}");
+                    cx.quit();
+                }
+                return;
+            }
             let starts_in_editor = initial_recording.is_some() || initial_image.is_some();
             open_studio_window(cx, starts_in_editor, move |window_handle, cx| {
                 cx.new(|cx| {
