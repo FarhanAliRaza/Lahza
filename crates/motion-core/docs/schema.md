@@ -50,7 +50,21 @@ start, else the project end. A cut on a marker leads it by one frame unless
 
 Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 `scale`, `rotation`, `opacity`), `time` (`start`, `end`, `duration`,
-`step_fps`, `step_phase`, `offset`), `blend`, `effects`, `parent`, `hidden`.
+`step_fps`, `step_phase`, `offset`), `blend`, `effects` (`blur`, `shadow`,
+`glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `hidden`.
+
+Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
+`star`, `line`, `path` with SVG `d`), `text`, `image`, `comp`.
+
+```json
+{"id": "route", "kind": "shape", "shape": "path", "d": "M -300 0 C -100 -200 100 200 300 0",
+ "stroke": {"color": "#ffd23f", "width": 8},
+ "trim": {"keys": [{"at": "word:route", "from": [0, 0], "v": [0, 1], "ease": "glide", "dur": "20f", "anchor": "start"}]}}
+```
+
+Scenes may arrive with a transition centred on their cut:
+`"transition": {"type": "whip", "dur": "8f", "direction": "left"}`
+(`fade`, `push`, `slide`, `zoom`, `wipe`, `whip`).
 
 Shapes and text are centred on their origin: `position` places their centre.
 

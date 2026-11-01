@@ -12,8 +12,8 @@
 use crate::font::Fonts;
 use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
-use lahza_motion_core::compile::{Affine, Content, FrameState, LayerState, PaintState};
-use lahza_motion_core::document::{Blend, GradientKind, ShapeKind};
+use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, ShapeState};
+use lahza_motion_core::document::{Blend, GradientKind, MatteMode, ShapeKind};
 use lahza_motion_core::value::Color;
 
 pub const TILE: u32 = 16;
@@ -21,6 +21,8 @@ pub const TILE: u32 = 16;
 pub const PRIM_SHAPE: u32 = 0;
 pub const PRIM_GLYPH: u32 = 1;
 pub const PRIM_IMAGE: u32 = 2;
+/// Group A masked by group B (same size): geom2 = [A offset, B offset, mode].
+pub const PRIM_MATTE: u32 = 3;
 
 pub const SHAPE_ELLIPSE: u32 = 0;
 pub const SHAPE_RECT: u32 = 1;
@@ -28,9 +30,15 @@ pub const SHAPE_CAPSULE: u32 = 2;
 pub const SHAPE_ARC: u32 = 3;
 pub const SHAPE_LINE: u32 = 4;
 pub const SHAPE_STAR: u32 = 5;
+/// Flattened Bézier path: geom2 = [first segment, count, open (1) / filled (0)].
+pub const SHAPE_PATH: u32 = 6;
 
 pub const FLAG_FILL: u32 = 1;
 pub const FLAG_STROKE: u32 = 2;
+/// Image: colour = fill × sample alpha (shadows).
+pub const FLAG_TINT_ALPHA: u32 = 4;
+/// Image: colour = fill × sample (glows).
+pub const FLAG_TINT_MUL: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -83,6 +91,8 @@ pub struct Group {
     pub offset: u32,
     /// Gaussian sigma in group pixels.
     pub sigma: f32,
+    /// Blur clamps to edge pixels instead of transparent.
+    pub clamp: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -97,6 +107,8 @@ pub struct DisplayList {
     pub stops: Vec<[f32; 4]>,
     /// Texels (vec4 f32) all groups need.
     pub group_texels: u32,
+    /// Path segments [x0, y0, x1, y1] in each path's own space.
+    pub segments: Vec<[f32; 4]>,
 }
 
 impl DisplayList {
@@ -114,6 +126,7 @@ impl DisplayList {
         }
         out.extend_from_slice(bytemuck::cast_slice(&self.prims));
         out.extend_from_slice(bytemuck::cast_slice(&self.stops));
+        out.extend_from_slice(bytemuck::cast_slice(&self.segments));
         out
     }
 }
@@ -132,6 +145,7 @@ fn blend_code(b: Blend) -> u32 {
     }
 }
 
+#[derive(Clone)]
 struct Item {
     prim: Prim,
     /// Forward transform (local → canvas) and local bounds, for binning.
@@ -150,11 +164,18 @@ fn with_inverse(mut prim: Prim, forward: Affine, opacity: f64) -> Option<(Prim, 
 
 /// Rebinds an item to a target whose pixel (gx, gy) is canvas
 /// `origin + factor·(gx, gy)`.
-fn retarget(item: &Item, origin: [f64; 2], factor: f64) -> Option<Prim> {
-    let to_canvas = Affine::translate(origin[0], origin[1]).then(Affine::scale(factor, factor));
+fn retarget(item: &Item, origin: [f64; 2], factor: [f64; 2]) -> Option<Prim> {
+    let to_canvas = Affine::translate(origin[0], origin[1]).then(Affine::scale(factor[0], factor[1]));
     let forward = to_canvas.inverse()?.then(item.forward);
     let (p, _) = with_inverse(item.prim, forward, item.prim.inv_y[3] as f64)?;
     Some(p)
+}
+
+struct Pending {
+    group: Group,
+    items: Vec<Item>,
+    origin: [f64; 2],
+    factor: [f64; 2],
 }
 
 pub struct Builder<'a> {
@@ -170,65 +191,22 @@ impl Builder<'_> {
         let h = ((frame.height as f64 * self.scale).round() as u32).max(1);
         let root = Affine::scale(self.scale, self.scale);
         let mut list = DisplayList::default();
+        let mut pending: Vec<Pending> = Vec::new();
         let mut main_items: Vec<Item> = Vec::new();
-        let mut group_items: Vec<(Group, Vec<Item>, [f64; 2], f64)> = Vec::new();
         for layer in &frame.layers {
-            let items = self.layer_items(layer, root, &mut list.stops);
-            if items.is_empty() {
-                continue;
-            }
-            let sigma = layer.blur * self.scale;
-            if sigma < 0.3 {
-                main_items.extend(items);
-                continue;
-            }
-            // Blurred layer → group.
-            let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-            for it in &items {
-                let b = canvas_bounds(it);
-                bb = [bb[0].min(b[0]), bb[1].min(b[1]), bb[2].max(b[2]), bb[3].max(b[3])];
-            }
-            let pad = 3.0 * sigma;
-            let x0 = (bb[0] - pad).floor().max(0.0);
-            let y0 = (bb[1] - pad).floor().max(0.0);
-            let x1 = (bb[2] + pad).ceil().min(w as f64);
-            let y1 = (bb[3] + pad).ceil().min(h as f64);
-            if x1 <= x0 || y1 <= y0 {
-                continue;
-            }
-            let factor = if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
-            let gw = ((x1 - x0) / factor).ceil().max(1.0) as u32;
-            let gh = ((y1 - y0) / factor).ceil().max(1.0) as u32;
-            let group = Group {
-                target: Target::new(gw, gh, 0, [0.0; 4]),
-                offset: list.group_texels,
-                sigma: (sigma / factor) as f32,
-            };
-            list.group_texels += gw * gh;
-            // The composite: an image primitive sampling the group texels.
-            let forward = Affine::translate(x0, y0).then(Affine::scale(factor, factor));
-            let prim = Prim {
-                kind: [PRIM_IMAGE, 1, blend_code(layer.blend), 0],
-                geom: [gw as f32, gh as f32, 1.0, 0.0],
-                geom2: [f32::from_bits(group.offset), 0.0, 0.0, 0.0],
-                ..Default::default()
-            };
-            if let Some((prim, _)) = with_inverse(prim, forward, 1.0) {
-                main_items.push(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
-            }
-            group_items.push((group, items, [x0, y0], factor));
+            self.emit(layer, root, (w, h), &mut list, &mut pending, &mut main_items);
         }
         let background = premul(frame.background, 1.0);
-        // Group targets first, then the main target.
+        // Groups first (inner before outer), then the main target.
         let mut range_base = 0;
-        for (mut group, items, origin, factor) in group_items {
+        for Pending { mut group, items, origin, factor } in pending {
             group.target.range_base = range_base;
             let prims: Vec<(Prim, [f64; 4])> = items
                 .iter()
                 .filter_map(|it| {
                     let p = retarget(it, origin, factor)?;
                     let b = canvas_bounds(it);
-                    Some((p, [(b[0] - origin[0]) / factor, (b[1] - origin[1]) / factor, (b[2] - origin[0]) / factor, (b[3] - origin[1]) / factor]))
+                    Some((p, [(b[0] - origin[0]) / factor[0], (b[1] - origin[1]) / factor[1], (b[2] - origin[0]) / factor[0], (b[3] - origin[1]) / factor[1]]))
                 })
                 .collect();
             bin(&mut list, &group.target, prims);
@@ -242,11 +220,185 @@ impl Builder<'_> {
         list
     }
 
-    fn layer_items(&mut self, layer: &LayerState, root: Affine, stops: &mut Vec<[f32; 4]>) -> Vec<Item> {
+    /// Reserves an offscreen group over canvas rect `rect` for `items`,
+    /// blurred by `sigma` canvas pixels (drawn at reduced resolution for
+    /// large blurs). Returns (group offset, origin, factor, size).
+    /// The texel grid fits `rect` exactly (per-axis factor ≈ `factor`), so
+    /// edge texels are fully covered.
+    #[allow(clippy::too_many_arguments)]
+    fn reserve(&self, list: &mut DisplayList, pending: &mut Vec<Pending>, items: Vec<Item>, rect: [f64; 4], sigma: f64, factor: f64, clamp: bool) -> (u32, [f64; 2], [f64; 2], (u32, u32)) {
+        let (w, h) = ((rect[2] - rect[0]).max(1.0), (rect[3] - rect[1]).max(1.0));
+        let gw = (w / factor).ceil().max(1.0) as u32;
+        let gh = (h / factor).ceil().max(1.0) as u32;
+        let f = [w / gw as f64, h / gh as f64];
+        let group = Group { target: Target::new(gw, gh, 0, [0.0; 4]), offset: list.group_texels, sigma: (sigma / ((f[0] + f[1]) / 2.0)) as f32, clamp };
+        list.group_texels += gw * gh;
+        let origin = [rect[0], rect[1]];
+        pending.push(Pending { group, items, origin, factor: f });
+        (group.offset, origin, f, (gw, gh))
+    }
+
+    fn emit(&mut self, layer: &LayerState, root: Affine, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
+        if !layer.is_isolated() {
+            out.extend(self.layer_items(layer, root, &mut list.stops, &mut list.segments));
+            return;
+        }
+        let scale = self.scale;
+        // The layer's own picture, in canvas space.
+        let mut items = Vec::new();
+        let group_opacity = match &layer.content {
+            Content::Group(children) => {
+                let inner = root.then(layer.matrix);
+                for c in children {
+                    self.emit(c, inner, canvas, list, pending, &mut items);
+                }
+                layer.opacity
+            }
+            _ => {
+                let bare = LayerState { effects: Vec::new(), matte: None, ..layer.clone() };
+                items = self.layer_items(&bare, root, &mut list.stops, &mut list.segments);
+                1.0
+            }
+        };
+        let inverted = matches!(layer.matte.as_deref(), Some(m) if matches!(m.mode, MatteMode::AlphaInverted | MatteMode::LumaInverted));
+        if items.is_empty() {
+            return;
+        }
+        if let Some(m) = &layer.matte {
+            if m.source.is_none() && !inverted {
+                return;
+            }
+        }
+        let mut blur = 0.0f64;
+        let mut clamp = false;
+        let mut reach = 0.0f64;
+        for e in &layer.effects {
+            match e {
+                EffectState::Blur { sigma, repeat_edges } => {
+                    blur = (blur * blur + sigma * sigma).sqrt();
+                    clamp |= *repeat_edges;
+                }
+                EffectState::Shadow { offset, sigma, .. } => reach = reach.max(3.0 * sigma + offset.x().abs().max(offset.y().abs())),
+                EffectState::Glow { sigma, .. } => reach = reach.max(3.0 * sigma),
+            }
+        }
+        let blur = blur * scale;
+        let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for it in &items {
+            let b = canvas_bounds(it);
+            bb = [bb[0].min(b[0]), bb[1].min(b[1]), bb[2].max(b[2]), bb[3].max(b[3])];
+        }
+        let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
+        let pad = 3.0 * blur + 2.0;
+        let rect = [(bb[0] - pad).floor().max(0.0), (bb[1] - pad).floor().max(0.0), (bb[2] + pad).ceil().min(cw), (bb[3] + pad).ceil().min(ch)];
+        let wide = |reach: f64| [(bb[0] - reach).floor().max(0.0), (bb[1] - reach).floor().max(0.0), (bb[2] + reach).ceil().min(cw), (bb[3] + reach).ceil().min(ch)];
+        let factor_for = |sigma: f64| if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
+        let blend = blend_code(layer.blend);
+        // Effects below the layer.
+        for e in &layer.effects {
+            if let EffectState::Shadow { color, offset, sigma } = e {
+                let sigma = sigma * scale;
+                let r = wide(reach * scale + 2.0);
+                if r[2] <= r[0] || r[3] <= r[1] {
+                    continue;
+                }
+                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), r, sigma, factor_for(sigma), false);
+                let forward = Affine::translate(offset.x() * scale, offset.y() * scale).then(Affine::translate(origin[0], origin[1])).then(Affine::scale(f[0], f[1]));
+                let prim = Prim {
+                    kind: [PRIM_IMAGE, 1, 0, FLAG_TINT_ALPHA],
+                    geom: [gw as f32, gh as f32, 1.0, 0.0],
+                    geom2: [f32::from_bits(off), 0.0, 0.0, 0.0],
+                    fill: premul(*color, 1.0),
+                    ..Default::default()
+                };
+                if let Some((prim, _)) = with_inverse(prim, forward, group_opacity) {
+                    out.push(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
+                }
+            }
+        }
+        if rect[2] > rect[0] && rect[3] > rect[1] {
+            let factor = factor_for(blur);
+            let matte = layer.matte.as_ref().and_then(|m| m.source.as_ref().map(|src| (m.mode, src)));
+            let matte_items = matte.map(|(_, src)| {
+                let mut mi = Vec::new();
+                self.emit(src, root, canvas, list, pending, &mut mi);
+                mi
+            });
+            // Repeat-edge blur needs the content's exact rectangle: an
+            // anti-aliasing margin would make the repeated edge transparent.
+            let rect = if clamp {
+                let mut t = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+                for it in &items {
+                    let b = tight_bounds(it);
+                    t = [t[0].min(b[0]), t[1].min(b[1]), t[2].max(b[2]), t[3].max(b[3])];
+                }
+                [t[0].round().max(0.0), t[1].round().max(0.0), t[2].round().min(cw), t[3].round().min(ch)]
+            } else {
+                rect
+            };
+            let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), rect, blur, factor, clamp);
+            let forward = Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1]));
+            let prim = match (matte, matte_items) {
+                (Some((mode, _)), Some(mi)) => {
+                    let (moff, ..) = self.reserve(list, pending, mi, rect, 0.0, factor, false);
+                    let mode = match mode {
+                        MatteMode::Alpha => 0.0,
+                        MatteMode::AlphaInverted => 1.0,
+                        MatteMode::Luma => 2.0,
+                        MatteMode::LumaInverted => 3.0,
+                    };
+                    Prim {
+                        kind: [PRIM_MATTE, 1, blend, 0],
+                        geom: [gw as f32, gh as f32, 1.0, 0.0],
+                        geom2: [f32::from_bits(off), f32::from_bits(moff), mode, 0.0],
+                        ..Default::default()
+                    }
+                }
+                _ => Prim {
+                    kind: [PRIM_IMAGE, 1, blend, 0],
+                    geom: [gw as f32, gh as f32, 1.0, 0.0],
+                    geom2: [f32::from_bits(off), 0.0, 0.0, 0.0],
+                    ..Default::default()
+                },
+            };
+            if let Some((prim, _)) = with_inverse(prim, forward, group_opacity) {
+                out.push(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
+            }
+        }
+        // Effects above the layer.
+        for e in &layer.effects {
+            if let EffectState::Glow { color, sigma, intensity } = e {
+                let sigma = sigma * scale;
+                let r = wide(3.0 * sigma + 2.0);
+                if r[2] <= r[0] || r[3] <= r[1] || *intensity <= 0.0 {
+                    continue;
+                }
+                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), r, sigma, factor_for(sigma), false);
+                let forward = Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1]));
+                let k = *intensity as f32;
+                let prim = Prim {
+                    kind: [PRIM_IMAGE, 1, 1, FLAG_TINT_MUL],
+                    geom: [gw as f32, gh as f32, 1.0, 0.0],
+                    geom2: [f32::from_bits(off), 0.0, 0.0, 0.0],
+                    fill: [color.0[0] as f32 * k, color.0[1] as f32 * k, color.0[2] as f32 * k, color.0[3] as f32 * k],
+                    ..Default::default()
+                };
+                if let Some((prim, _)) = with_inverse(prim, forward, group_opacity) {
+                    out.push(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
+                }
+            }
+        }
+    }
+
+    fn layer_items(&mut self, layer: &LayerState, root: Affine, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
         let matrix = root.then(layer.matrix);
         let blend = blend_code(layer.blend);
         let mut items = Vec::new();
         match &layer.content {
+            Content::Group(_) => {}
+            Content::Shape(s) if s.shape == ShapeKind::Path => {
+                items.extend(path_items(s, matrix, layer.opacity, blend, stops, segments));
+            }
             Content::Shape(s) => {
                 let mut prim = Prim { kind: [PRIM_SHAPE, 0, blend, 0], ..Default::default() };
                 let (hw, hh) = (s.size.x() / 2.0, s.size.y() / 2.0);
@@ -294,6 +446,7 @@ impl Builder<'_> {
                         prim.geom = [(-len / 2.0 + len * t0) as f32, (-len / 2.0 + len * t1) as f32, half_t as f32, 0.0];
                         bounds_half = (hw + half_t, half_t);
                     }
+                    ShapeKind::Path => unreachable!("paths are handled above"),
                     ShapeKind::Polygon | ShapeKind::Star => {
                         prim.kind[1] = SHAPE_STAR;
                         let n = s.sides.max(3) as f64;
@@ -400,6 +553,20 @@ impl Builder<'_> {
     }
 }
 
+/// Canvas bounds without the anti-aliasing margins.
+fn tight_bounds(item: &Item) -> [f64; 4] {
+    let m = item.prim.inv_x[3] as f64 * 1.5;
+    let [x0, y0, x1, y1] = item.bounds;
+    let inner = if item.prim.kind[0] == PRIM_SHAPE { [x0 + m, y0 + m, x1 - m, y1 - m] } else { item.bounds };
+    let pts = [(inner[0], inner[1]), (inner[2], inner[1]), (inner[2], inner[3]), (inner[0], inner[3])].map(|(x, y)| item.forward.apply(x, y));
+    [
+        pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+        pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+        pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+        pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+    ]
+}
+
 fn canvas_bounds(item: &Item) -> [f64; 4] {
     let [x0, y0, x1, y1] = item.bounds;
     let pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| item.forward.apply(x, y));
@@ -435,5 +602,151 @@ fn bin(list: &mut DisplayList, target: &Target, prims: Vec<(Prim, [f64; 4])>) {
         list.ranges.push(list.indices.len() as u32);
         list.ranges.push(tile.len() as u32);
         list.indices.extend(tile);
+    }
+}
+
+/// Flattened subpaths of SVG path data, in layer units (each a polyline,
+/// with whether it was closed).
+pub fn flatten(d: &str, tolerance: f64) -> Result<Vec<(Vec<(f64, f64)>, bool)>, String> {
+    let path = kurbo::BezPath::from_svg(d).map_err(|e| format!("bad path data: {e}"))?;
+    let mut out: Vec<(Vec<(f64, f64)>, bool)> = Vec::new();
+    kurbo::flatten(&path, tolerance.max(1e-4), |el| match el {
+        kurbo::PathEl::MoveTo(p) => out.push((vec![(p.x, p.y)], false)),
+        kurbo::PathEl::LineTo(p) => {
+            if let Some(last) = out.last_mut() {
+                last.0.push((p.x, p.y));
+            }
+        }
+        kurbo::PathEl::ClosePath => {
+            if let Some(last) = out.last_mut() {
+                last.1 = true;
+            }
+        }
+        _ => {}
+    });
+    Ok(out.into_iter().filter(|(pts, _)| pts.len() >= 2).collect())
+}
+
+/// The part of the polylines between fractions [t0, t1] of total length.
+fn trim(subpaths: &[(Vec<(f64, f64)>, bool)], t0: f64, t1: f64) -> Vec<Vec<(f64, f64)>> {
+    let lines: Vec<Vec<(f64, f64)>> = subpaths
+        .iter()
+        .map(|(pts, closed)| {
+            let mut p = pts.clone();
+            if *closed && p.first() != p.last() {
+                p.push(p[0]);
+            }
+            p
+        })
+        .collect();
+    let seg_len = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let total: f64 = lines.iter().flat_map(|l| l.windows(2).map(|w| seg_len(w[0], w[1]))).sum();
+    let (from, to) = (t0 * total, t1 * total);
+    let mut out = Vec::new();
+    let mut acc = 0.0;
+    for line in &lines {
+        let mut cur: Vec<(f64, f64)> = Vec::new();
+        for w in line.windows(2) {
+            let l = seg_len(w[0], w[1]);
+            let (a, b) = (acc, acc + l);
+            acc = b;
+            if b < from || a > to || l <= 0.0 {
+                if !cur.is_empty() && a > to {
+                    break;
+                }
+                continue;
+            }
+            let lerp = |x: f64| {
+                let k = ((x - a) / l).clamp(0.0, 1.0);
+                (w[0].0 + (w[1].0 - w[0].0) * k, w[0].1 + (w[1].1 - w[0].1) * k)
+            };
+            if cur.is_empty() {
+                cur.push(lerp(from.max(a)));
+            }
+            cur.push(lerp(to.min(b)));
+        }
+        if cur.len() >= 2 {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+fn push_segments(lines: &[Vec<(f64, f64)>], close: bool, segments: &mut Vec<[f32; 4]>) -> (u32, u32, [f64; 4]) {
+    let first = segments.len() as u32;
+    let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for line in lines {
+        let mut pts = line.clone();
+        if close && pts.first() != pts.last() {
+            pts.push(pts[0]);
+        }
+        for w in pts.windows(2) {
+            segments.push([w[0].0 as f32, w[0].1 as f32, w[1].0 as f32, w[1].1 as f32]);
+        }
+        for p in &pts {
+            b = [b[0].min(p.0), b[1].min(p.1), b[2].max(p.0), b[3].max(p.1)];
+        }
+    }
+    (first, segments.len() as u32 - first, b)
+}
+
+fn path_items(s: &ShapeState, matrix: Affine, opacity: f64, blend: u32, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
+    let mut items = Vec::new();
+    let Some(d) = &s.path else { return items };
+    // Flatten finely enough for the on-screen size (¼ px).
+    let tolerance = 0.25 / matrix.max_scale().max(1e-6);
+    let Ok(subpaths) = flatten(d, tolerance) else { return items };
+    let mut add = |prim: Prim, bounds: [f64; 4], pad: f64| {
+        if let Some((prim, _)) = with_inverse(prim, matrix, opacity) {
+            let pad = pad + prim.inv_x[3] as f64 * 1.5;
+            items.push(Item { prim, forward: matrix, bounds: [bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad] });
+        }
+    };
+    if let Some(fill) = &s.fill {
+        let lines: Vec<Vec<(f64, f64)>> = subpaths.iter().map(|(p, _)| p.clone()).collect();
+        let (first, count, b) = push_segments(&lines, true, segments);
+        let mut prim = Prim { kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_FILL], geom2: [f32::from_bits(first), f32::from_bits(count), 0.0, 0.0], ..Default::default() };
+        set_fill(&mut prim, fill, stops);
+        add(prim, b, 0.0);
+    }
+    if let Some((color, width)) = s.stroke {
+        let (t0, t1) = (s.trim.x().clamp(0.0, 1.0), s.trim.y().clamp(0.0, 1.0));
+        if width > 0.0 && color.0[3] > 0.0 && t1 > t0 {
+            let lines = trim(&subpaths, t0, t1);
+            let (first, count, b) = push_segments(&lines, false, segments);
+            if count > 0 {
+                let prim = Prim {
+                    kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_STROKE],
+                    geom2: [f32::from_bits(first), f32::from_bits(count), 1.0, 0.0],
+                    stroke: premul(color, 1.0),
+                    paint: [width as f32, 0.0, 0.0, 0.0],
+                    ..Default::default()
+                };
+                add(prim, b, width / 2.0);
+            }
+        }
+    }
+    items
+}
+
+fn set_fill(prim: &mut Prim, fill: &PaintState, stops: &mut Vec<[f32; 4]>) {
+    match fill {
+        PaintState::Solid(c) => prim.fill = premul(*c, 1.0),
+        PaintState::Gradient(g) => {
+            prim.fill = [1.0; 4];
+            prim.paint[1] = match g.kind {
+                GradientKind::Linear => 1.0,
+                GradientKind::Radial => 2.0,
+            };
+            prim.paint[2] = (stops.len() / 2) as f32;
+            prim.paint[3] = g.stops.len() as f32;
+            let mut sorted = g.stops.clone();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (offset, color) in sorted {
+                stops.push([offset as f32, 0.0, 0.0, 0.0]);
+                stops.push(premul(color, 1.0));
+            }
+            prim.paint2 = [g.from.x() as f32, g.from.y() as f32, g.to.x() as f32, g.to.y() as f32];
+        }
     }
 }

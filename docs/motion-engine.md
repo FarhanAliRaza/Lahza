@@ -8,9 +8,9 @@ exporter are unchanged.
 
 | Crate | What it does |
 |---|---|
-| [`crates/motion-core`](../crates/motion-core) | Project document, rational time, stepped clocks, the measured curve presets, marker tracks, time references with sync anchors, additive tracks, per-glyph text animators, atomic edit ops with inverses, `check`. Pure Rust, no GPU, no I/O beyond project folders. |
-| [`crates/motion-audio`](../crates/motion-audio) | Music → marker tracks: tempo, first downbeat, beat/bar/half/sixteenth/triplet grids, straight vs triplet feel, onsets per band (refined to ~1 ms), `hit`, `stop` (silence→hit), `drop` (bass dropout before a downbeat), `music.start/end`. |
-| [`crates/motion-render`](../crates/motion-render) | Display list of SDF shapes, SDF glyphs and images binned into 16×16 tiles; Vulkan compute rasteriser on `blade-graphics` with a CPU path that runs the same math; Gaussian blur at reduced resolution; shutter motion blur; frame cache; export through ffmpeg (NVENC/VAAPI/libx264, VP9, GIF) with audio mix and ducking; contact sheets. |
+| [`crates/motion-core`](../crates/motion-core) | Project document, rational time, stepped clocks, the measured curve presets, marker tracks, time references with sync anchors, additive tracks, per-glyph text animators, precomps, track mattes, effects, scene transitions, atomic edit ops with inverses, `check`. Pure Rust, no GPU, no I/O beyond project folders. |
+| [`crates/motion-audio`](../crates/motion-audio) | Music → marker tracks: tempo (with a tempo map when it changes), meter (3/4, 4/4), first downbeat, beat/bar/half/sixteenth/triplet grids, straight vs triplet feel, onsets per band (refined to ~1 ms), `hit`, `stop` (silence→hit), `drop` (bass dropout before a downbeat), `music.start/end`. |
+| [`crates/motion-render`](../crates/motion-render) | Display list of SDF shapes, Bézier paths, HarfBuzz-shaped SDF glyphs and images binned into 16×16 tiles; Vulkan compute rasteriser on `blade-graphics` with a CPU path that runs the same math; offscreen groups for precomps, mattes, blur/shadow/glow (large blurs at reduced resolution); shutter motion blur; frame cache; export through ffmpeg (NVENC/VAAPI/libx264, VP9, GIF) with audio mix and ducking; contact sheets. |
 | [`crates/motion-mcp`](../crates/motion-mcp) | `lahza mcp` (MCP server on the official `rmcp` SDK) and `lahza motion …` (CLI). Both run one transport-free `Toolbox`. |
 
 ## Use it from an agent
@@ -86,14 +86,47 @@ frame evaluation 0.16 ms and display-list build 0.8 ms per frame; raster on a
 numbers (the RTX 3060 target) still need measuring on that machine. The full
 20 s promo exported at 0.85× real time on the 4-core CPU path.
 
-## Not in phase 1 yet
+## Compared with After Effects
 
-- Editor UI for motion projects, and the live socket from the MCP server
-  into a running editor (the server works on files and picks up changes made
-  by others on disk).
-- Text shaping beyond advances (no kerning/ligatures), masks, paths, booleans,
-  effects other than blur, transitions other than cuts, 2.5D/3D (phases 2–5).
-- Blur on a comp blurs each child separately rather than the flattened group.
-- Beat grids assume a constant tempo and 4/4 bars.
+What an agent can make today: beat- and word-synced motion graphics and
+kinetic typography — shapes and Bézier paths with draw-on, per-glyph text
+(shaped, any script with a suitable font), images, precomps, track mattes,
+blur/shadow/glow, transitions, motion blur — rendered on the GPU and
+checked frame by frame for sync. That covers promos, idents, title
+sequences, lower thirds, explainer graphics without footage, and
+logo reveals.
+
+| After Effects | Lahza motion |
+|---|---|
+| Keyframes, graph-editor easing, springs | ✔ measured presets, raw bezier/power/exp/spring/bounce, moves anchored by start/peak/land/end to markers |
+| Audio-driven timing (markers by hand) | ✔ automatic: beats, bars (3/4, 4/4), tempo maps, hits, stops, drops, words |
+| Wiggle / looping expressions | ✔ drift, wiggle, sine additive tracks; no general expressions yet |
+| Shape layers, trim paths | ✔ primitives + SVG Bézier paths, fill, stroke, trim |
+| Text animators | ✔ per glyph/word/line, stagger orders, ranges; HarfBuzz shaping, bidi |
+| Precomps, parenting, time offset | ✔ comps render as one picture when they need to; parenting; time offsets; stepped time |
+| Track mattes | ✔ alpha, luma, inverted |
+| Effects | ✔ Gaussian blur (repeat edges), drop shadow, glow — ✘ everything else (colour correction, LUTs, grain, distortions, fractal noise, …) |
+| Blend modes | ✔ normal, add, multiply, screen — ✘ the other ~20 |
+| Transitions | ✔ fade, push, slide, zoom, wipe, whip — ✘ object/matte wipes, zoom-through into a nested scene |
+| Motion blur | ✔ shutter angle per scene |
+| Footage | ✔ stills — ✘ **video layers** (Lahza recordings arrive in phase 4) |
+| 3D | ✘ **3D layers, cameras, lights**, extruded text (phases 3/5) |
+| Masks on a layer | ◐ via track mattes (a shape layer as matte); no per-layer mask paths with feather/expansion |
+| Path morph, booleans, repeaters, particles, text on a path | ✘ (phase 2) |
+| Expressions / scripting | ✘ (planned as `code_put`: expressions, shaders, WASM) |
+| Motion tracking, rotoscoping, keying | ✘ (camera matting exists in the recorder, not wired in) |
+| Timeline UI | ✘ — agent and CLI only; the editor UI is the next phase |
+
+The biggest gaps for "AE-class" in order of value: **video layers**, **the
+editor UI**, **2.5D/3D camera with layers in depth**, **more effects
+(colour, grain, displacement) and blend modes**, **path morph and
+repeaters**, **expressions**.
+
+## Known limits
+
+- The MCP server works on project files (it re-reads changes made on disk);
+  a live link into a running editor comes with the editor UI.
+- Effects on a matted layer: the shadow and glow use the unmatted picture.
+- Trim on a filled path trims the stroke only.
 - Tools from the design that depend on undecided asset sourcing or later
   phases: `code_put`, `voiceover`, `ocr`, `assets_search`/`assets_fetch`.

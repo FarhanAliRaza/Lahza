@@ -127,7 +127,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "audio_analyze",
-            description: "Analyse music into marker tracks: tempo, first downbeat, beat/bar/half/sixteenth/triplet grids, onsets per band, hit, stop (silence→hit), drop (bass dropout before a downbeat), music.start/end. Defaults to the project's music.",
+            description: "Analyse music into marker tracks: tempo (a tempo map when it changes), meter (3/4 or 4/4), first downbeat, beat/bar/half/sixteenth/triplet grids, onsets per band, hit, stop (silence→hit), drop (bass dropout before a downbeat), music.start/end. Defaults to the project's music.",
             schema: obj(json!({"path": {"type": "string", "description": "audio file; registered as the music when the project has none"}, "offset": {"type": "number", "description": "timeline time of the file's start"}}), &[]),
             read_only: false,
         },

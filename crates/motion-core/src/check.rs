@@ -274,6 +274,21 @@ fn same_picture(a: &FrameState, b: &FrameState) -> bool {
 /// the measure callback.
 pub fn bounds(layer: &LayerState, measure: Option<Measure>) -> Option<[f64; 4]> {
     let (hw, hh) = match &layer.content {
+        Content::Group(children) => {
+            let mut b: Option<[f64; 4]> = None;
+            for c in children {
+                let mut c = c.clone();
+                c.matrix = layer.matrix.then(c.matrix);
+                if let Some(cb) = bounds(&c, measure) {
+                    b = Some(match b {
+                        None => cb,
+                        Some(b) => [b[0].min(cb[0]), b[1].min(cb[1]), b[2].max(cb[2]), b[3].max(cb[3])],
+                    });
+                }
+            }
+            return b;
+        }
+        Content::Shape(s) if s.shape == crate::document::ShapeKind::Path => return None,
         Content::Shape(s) => {
             let stroke = s.stroke.map(|(_, w)| w / 2.0).unwrap_or(0.0);
             (s.size.x() / 2.0 + stroke, match s.shape {

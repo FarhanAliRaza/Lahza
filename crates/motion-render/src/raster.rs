@@ -90,9 +90,40 @@ fn sd_star(p: V2, g: [f32; 4]) -> f32 {
     (if cross > 0.0 { -dist } else { dist }) - round
 }
 
-fn shape_distance(prim: &Prim, l: V2) -> f32 {
+/// Distance to a flattened path; negative inside (non-zero winding) for
+/// filled paths.
+fn sd_path(prim: &Prim, l: V2, segments: &[[f32; 4]]) -> f32 {
+    let first = prim.geom2[0].to_bits() as usize;
+    let count = prim.geom2[1].to_bits() as usize;
+    let open = prim.geom2[2] > 0.5;
+    let mut best = f32::MAX;
+    let mut winding = 0i32;
+    for s in &segments[first..first + count] {
+        let e = [s[2] - s[0], s[3] - s[1]];
+        let w = [l[0] - s[0], l[1] - s[1]];
+        let t = clamp01((w[0] * e[0] + w[1] * e[1]) / (e[0] * e[0] + e[1] * e[1]).max(1e-12));
+        let dx = w[0] - e[0] * t;
+        let dy = w[1] - e[1] * t;
+        best = best.min(dx * dx + dy * dy);
+        if !open && (s[1] <= l[1]) != (s[3] <= l[1]) {
+            let x = s[0] + (l[1] - s[1]) / (s[3] - s[1]) * e[0];
+            if x > l[0] {
+                winding += if s[3] > s[1] { 1 } else { -1 };
+            }
+        }
+    }
+    let d = best.sqrt();
+    if winding != 0 {
+        -d
+    } else {
+        d
+    }
+}
+
+fn shape_distance(prim: &Prim, l: V2, segments: &[[f32; 4]]) -> f32 {
     let g = prim.geom;
     match prim.kind[1] {
+        SHAPE_PATH => sd_path(prim, l, segments),
         SHAPE_ELLIPSE => sd_ellipse(l, [g[0], g[1]]),
         SHAPE_RECT => sd_rect(l, [g[0], g[1]], g[2]),
         SHAPE_CAPSULE => sd_capsule(l, [g[0], g[1]]),
@@ -190,8 +221,12 @@ fn sample_image(src: &Sources, prim: &Prim, l: V2) -> [f32; 4] {
     mix4(mix4(a, b, fx), mix4(c, d, fx), fy)
 }
 
+fn luma(c: [f32; 4]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
 /// Premultiplied colour of one primitive at target pixel centre `p`.
-pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], src: &Sources) -> [f32; 4] {
+pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], segments: &[[f32; 4]], src: &Sources) -> [f32; 4] {
     let l = [
         prim.inv_x[0] * p[0] + prim.inv_x[1] * p[1] + prim.inv_x[2],
         prim.inv_y[0] * p[0] + prim.inv_y[1] * p[1] + prim.inv_y[2],
@@ -201,7 +236,7 @@ pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], src: &Sources) -> [f32; 4] 
     let mut out = [0.0f32; 4];
     match prim.kind[0] {
         PRIM_SHAPE => {
-            let d = shape_distance(prim, l);
+            let d = shape_distance(prim, l, segments);
             if prim.kind[3] & FLAG_FILL != 0 {
                 let cov = clamp01(0.5 - d / aa);
                 if cov > 0.0 {
@@ -234,7 +269,24 @@ pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], src: &Sources) -> [f32; 4] 
             if cov <= 0.0 {
                 return out;
             }
-            out = sample_image(src, prim, l).map(|c| c * cov);
+            let mut c = sample_image(src, prim, l);
+            if prim.kind[0] == PRIM_MATTE {
+                let mut matte = *prim;
+                matte.geom2[0] = prim.geom2[1];
+                let m = sample_image(src, &matte, l);
+                let k = match prim.geom2[2] as u32 {
+                    0 => m[3],
+                    1 => 1.0 - m[3],
+                    2 => luma(m),
+                    _ => 1.0 - luma(m),
+                };
+                c = c.map(|v| v * clamp01(k));
+            } else if prim.kind[3] & FLAG_TINT_ALPHA != 0 {
+                c = prim.fill.map(|f| f * c[3]);
+            } else if prim.kind[3] & FLAG_TINT_MUL != 0 {
+                c = std::array::from_fn(|i| c[i] * prim.fill[i]);
+            }
+            out = c.map(|v| v * cov);
         }
     }
     out.map(|c| c * opacity)
@@ -289,7 +341,7 @@ fn raster_band(list: &DisplayList, target: &Target, src: &Sources, ty: u32, band
                 let mut c = target.background;
                 for &i in indices {
                     let prim = &list.prims[i as usize];
-                    let s = shade(prim, p, &list.stops, src);
+                    let s = shade(prim, p, &list.stops, &list.segments, src);
                     if s[3] > 0.0 {
                         c = blend(c, s, prim.kind[2]);
                     }
@@ -309,7 +361,7 @@ fn raster_band(list: &DisplayList, target: &Target, src: &Sources, ty: u32, band
 }
 
 /// Separable Gaussian blur of one group in place (zero outside).
-pub fn blur(buf: &mut [[f32; 4]], offset: usize, w: usize, h: usize, sigma: f32, threads: usize) {
+pub fn blur(buf: &mut [[f32; 4]], offset: usize, w: usize, h: usize, sigma: f32, clamp: bool, threads: usize) {
     if sigma <= 0.0 {
         return;
     }
@@ -334,8 +386,11 @@ pub fn blur(buf: &mut [[f32; 4]], offset: usize, w: usize, h: usize, sigma: f32,
                             let mut acc = [0.0f32; 4];
                             for (k, wt) in weights.iter().enumerate() {
                                 let d = k as i32 - radius;
-                                let (sx, sy) = if horizontal { (x as i32 + d, y as i32) } else { (x as i32, y as i32 + d) };
-                                if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 {
+                                let (mut sx, mut sy) = if horizontal { (x as i32 + d, y as i32) } else { (x as i32, y as i32 + d) };
+                                if clamp {
+                                    sx = sx.clamp(0, w as i32 - 1);
+                                    sy = sy.clamp(0, h as i32 - 1);
+                                } else if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 {
                                     continue;
                                 }
                                 let s = src[sy as usize * w + sx as usize];

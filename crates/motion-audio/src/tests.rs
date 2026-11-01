@@ -212,3 +212,47 @@ fn reference_videos() {
     }
 }
 
+
+#[test]
+fn accelerando_follows_the_tempo() {
+    // 100 → 132 BPM over 16 s: a fixed grid drifts by beats; the tracker follows.
+    let mut s = Synth::new(17.0);
+    let mut t = 0.5;
+    let mut truth = Vec::new();
+    let mut k = 0;
+    while t < 16.5 {
+        truth.push(t);
+        if k % 4 == 0 { s.kick(t, 0.9) } else { s.kick(t, 0.45) }
+        let bpm = 100.0 + 32.0 * (t / 16.5);
+        let beat = 60.0 / bpm;
+        s.hat(t + beat / 2.0, 0.25);
+        t += beat;
+        k += 1;
+    }
+    let a = analyze(&s.buf, SR, 0.0);
+    assert!(a.tempo_varies, "{:?}", a.summary());
+    let beats = track(&a, "beat");
+    let inner: Vec<f64> = truth[2..truth.len() - 2].to_vec();
+    if std::env::var_os("LAHZA_AUDIO_DEBUG").is_some() {
+        eprintln!("truth {:?}", truth.iter().map(|t| (t * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+        eprintln!("beats {:?}", beats.markers.iter().map(|m| (m.t * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+    }
+    let err = grid_error(beats, inner.into_iter());
+    assert!(err < 0.03, "beat error {err}");
+    assert!((a.first_downbeat - 0.5).abs() < 0.04, "{}", a.first_downbeat);
+}
+
+#[test]
+fn waltz_has_three_beats_per_bar() {
+    let beat = 60.0 / 150.0;
+    let mut s = Synth::new(14.0);
+    for k in 0..32 {
+        let t = 0.4 + k as f64 * beat;
+        if k % 3 == 0 { s.kick(t, 0.9) } else { s.hat(t, 0.4) }
+    }
+    let a = analyze(&s.buf, SR, 0.0);
+    assert_eq!(a.beats_per_bar, 3, "{:?}", a.summary());
+    assert!((a.first_downbeat - 0.4).abs() < 0.04, "{}", a.first_downbeat);
+    let bars = track(&a, "bar");
+    assert!((bars.markers[1].t - (0.4 + 3.0 * beat)).abs() < 0.03);
+}

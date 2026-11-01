@@ -3568,11 +3568,14 @@ dependencies = [
  "blade-macros",
  "bytemuck",
  "image",
+ "kurbo",
  "lahza-motion-core",
  "naga",
+ "rustybuzz 0.20.1",
  "serde",
  "serde_json",
  "ttf-parser 0.25.1",
+ "unicode-bidi",
 ]
 
 [[package]]

@@ -167,6 +167,9 @@ pub struct Scene {
     pub pre_roll: Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<Color>,
+    /// How this scene arrives from the previous one (default: a cut).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<Transition>,
     #[serde(default, skip_serializing_if = "Camera::is_default")]
     pub camera: Camera,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +192,7 @@ impl Scene {
             duration: None,
             pre_roll: None,
             background: None,
+            transition: None,
             camera: Camera::default(),
             motion_blur: None,
             step_fps: None,
@@ -319,7 +323,108 @@ pub enum Blend {
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Effect {
     /// Gaussian blur; radius is the standard deviation in pixels.
-    Blur { radius: Property<f64> },
+    Blur {
+        radius: Property<f64>,
+        /// Extend edge pixels instead of fading to transparent (AE "repeat edge pixels").
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        repeat_edges: bool,
+    },
+    /// Drop shadow: a blurred, tinted copy of the layer's alpha beneath it.
+    Shadow {
+        #[serde(default = "shadow_color")]
+        color: Property<Color>,
+        #[serde(default = "shadow_offset")]
+        offset: Property<Vec2>,
+        #[serde(default = "twelve")]
+        radius: Property<f64>,
+    },
+    /// Glow: a blurred, tinted copy added on top.
+    Glow {
+        #[serde(default = "white")]
+        color: Property<Color>,
+        #[serde(default = "twelve")]
+        radius: Property<f64>,
+        #[serde(default = "one_prop")]
+        intensity: Property<f64>,
+    },
+}
+
+fn shadow_color() -> Property<Color> {
+    Property::Constant(Color([0.0, 0.0, 0.0, 0.5]))
+}
+fn shadow_offset() -> Property<Vec2> {
+    Property::Constant(Vec2::new(0.0, 12.0))
+}
+fn twelve() -> Property<f64> {
+    Property::Constant(12.0)
+}
+
+/// Track matte: the layer shows only where the `layer` (a sibling, which
+/// is then not drawn itself) is opaque (`alpha`) or bright (`luma`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Matte {
+    pub layer: String,
+    #[serde(default)]
+    pub mode: MatteMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatteMode {
+    #[default]
+    Alpha,
+    AlphaInverted,
+    Luma,
+    LumaInverted,
+}
+
+/// How a scene arrives from the previous one, centred on its cut.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Transition {
+    #[serde(rename = "type")]
+    pub kind: TransitionKind,
+    #[serde(default = "transition_dur")]
+    pub dur: Duration,
+    #[serde(default = "gesture")]
+    pub ease: Ease,
+    #[serde(default)]
+    pub direction: Direction,
+}
+
+fn transition_dur() -> Duration {
+    Duration::Frames(10.0)
+}
+fn gesture() -> Ease {
+    Ease::Preset(crate::curve::Preset::Gesture)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransitionKind {
+    /// Cross-dissolve.
+    Fade,
+    /// Both scenes move together.
+    Push,
+    /// The new scene slides over the old.
+    Slide,
+    /// The old scene zooms past the camera while the new one settles in.
+    Zoom,
+    /// A hard edge reveals the new scene.
+    Wipe,
+    /// A fast push with motion smear (peak speed on the cut).
+    Whip,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    #[default]
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// A layer: common fields plus the fields of its `kind`.
@@ -346,6 +451,8 @@ pub struct Common {
     /// Transform parent: a layer id in the same layer list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matte: Option<Matte>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
 }
@@ -354,7 +461,7 @@ fn is_normal(b: &Blend) -> bool {
     *b == Blend::Normal
 }
 
-const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "hidden"];
+const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "hidden"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -468,6 +575,9 @@ pub enum ShapeKind {
     Star,
     /// Horizontal stroke of length `size.x`, width `thickness`, centred; use `trim`.
     Line,
+    /// Bézier path from SVG path data `d` (layer space; fill uses non-zero
+    /// winding, `stroke` draws the outline, `trim` draws it on).
+    Path,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -490,6 +600,9 @@ pub struct ShapeLayer {
     /// Draw-on for line, ring and arc: visible fraction [from, to] in 0..1.
     #[serde(default = "full_trim", skip_serializing_if = "is_full_trim")]
     pub trim: Property<Vec2>,
+    /// SVG path data for `shape: "path"`, e.g. "M -50 0 C -50 -60 50 -60 50 0 Z".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<Paint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,7 +745,7 @@ fn default_font() -> String {
 fn ninety_six() -> Property<f64> {
     Property::Constant(96.0)
 }
-fn white() -> Property<Color> {
+pub(crate) fn white() -> Property<Color> {
     Property::Constant(Color::WHITE)
 }
 fn line_height() -> f64 {

@@ -46,6 +46,7 @@ struct RasterData {
     b_atlas: gpu::BufferPiece,
     b_images: gpu::BufferPiece,
     b_groups: gpu::BufferPiece,
+    b_segs: gpu::BufferPiece,
     b_target: gpu::BufferPiece,
 }
 
@@ -124,6 +125,7 @@ pub struct Gpu {
     ranges: Buffer,
     indices: Buffer,
     stops: Buffer,
+    segs: Buffer,
     atlas: Buffer,
     images: Buffer,
     groups: Buffer,
@@ -147,16 +149,25 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let range_base = (out.ranges.len() / 2) as u32;
         let stop_base = (out.stops.len() / 2) as f32;
         let texel_base = out.group_texels;
+        let seg_base = out.segments.len() as u32;
         for p in &list.prims {
             let mut p: Prim = *p;
             if p.paint[1] > 0.5 {
                 p.paint[2] += stop_base;
             }
-            if p.kind[0] == crate::list::PRIM_IMAGE && p.kind[1] == 1 {
-                p.geom2[0] = f32::from_bits(p.geom2[0].to_bits() + texel_base);
+            let rebase = |v: f32, by: u32| f32::from_bits(v.to_bits() + by);
+            match p.kind[0] {
+                crate::list::PRIM_IMAGE if p.kind[1] == 1 => p.geom2[0] = rebase(p.geom2[0], texel_base),
+                crate::list::PRIM_MATTE => {
+                    p.geom2[0] = rebase(p.geom2[0], texel_base);
+                    p.geom2[1] = rebase(p.geom2[1], texel_base);
+                }
+                crate::list::PRIM_SHAPE if p.kind[1] == crate::list::SHAPE_PATH => p.geom2[0] = rebase(p.geom2[0], seg_base),
+                _ => {}
             }
             out.prims.push(p);
         }
+        out.segments.extend_from_slice(&list.segments);
         out.indices.extend(list.indices.iter().map(|i| i + prim_base));
         for pair in list.ranges.chunks_exact(2) {
             out.ranges.push(pair[0] + index_base);
@@ -217,6 +228,7 @@ impl Gpu {
             ranges: Buffer::new(&context, "motion ranges", 1 << 16, true),
             indices: Buffer::new(&context, "motion indices", 1 << 16, true),
             stops: Buffer::new(&context, "motion stops", 1 << 12, true),
+            segs: Buffer::new(&context, "motion segments", 1 << 12, true),
             atlas: Buffer::new(&context, "motion atlas", (ATLAS_SIZE * ATLAS_SIZE) as usize, true),
             images: Buffer::new(&context, "motion images", 1 << 12, true),
             groups: Buffer::new(&context, "motion groups", 1 << 12, false),
@@ -250,6 +262,7 @@ impl Gpu {
         self.ranges.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ranges))?;
         self.indices.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.indices))?;
         self.stops.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.stops))?;
+        self.segs.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.segments))?;
         if self.atlas_generation != fonts.generation {
             self.atlas.upload(ctx, &mut self.encoder, &fonts.atlas)?;
             self.atlas_generation = fonts.generation;
@@ -272,6 +285,7 @@ impl Gpu {
             b_atlas: s.atlas.device.into(),
             b_images: s.images.device.into(),
             b_groups: groups.into(),
+            b_segs: s.segs.device.into(),
             b_target: target.into(),
         };
         for (i, (main, groups)) in targets.iter().enumerate() {
@@ -280,7 +294,9 @@ impl Gpu {
                 let data = raster_data(
                     Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, 0, 0], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
                     self.groups.device,
-                    self.groups_tmp.device,
+                    // Outer groups sample inner ones in other regions of
+                    // the same buffer; regions never overlap.
+                    self.groups.device,
                     self,
                 );
                 {
@@ -289,11 +305,16 @@ impl Gpu {
                     pc.bind(0, &data);
                     pc.dispatch([t.tiles_x, t.tiles_y, 1]);
                 }
+                if g.sigma <= 0.0 {
+                    // Same as the CPU path: no blur pass (σ = 0 would make
+                    // the Gaussian weights NaN).
+                    continue;
+                }
                 let radius = (g.sigma * 3.0).ceil();
                 let norm: f32 = (-(radius as i32)..=radius as i32).map(|d| (-(d * d) as f32 / (2.0 * g.sigma * g.sigma)).exp()).sum();
                 for (horizontal, src, dst) in [(1u32, self.groups.device, self.groups_tmp.device), (0, self.groups_tmp.device, self.groups.device)] {
                     let data = BlurData {
-                        u_blur: BlurPass { size: [t.width, t.height, g.offset, horizontal], sigma: [g.sigma, radius, 1.0 / norm, 0.0] },
+                        u_blur: BlurPass { size: [t.width, t.height, g.offset, horizontal], sigma: [g.sigma, radius, 1.0 / norm, if g.clamp { 1.0 } else { 0.0 }] },
                         b_blur_src: src.into(),
                         b_blur_dst: dst.into(),
                     };
@@ -355,6 +376,7 @@ impl Drop for Gpu {
             &mut self.ranges,
             &mut self.indices,
             &mut self.stops,
+            &mut self.segs,
             &mut self.atlas,
             &mut self.images,
             &mut self.groups,

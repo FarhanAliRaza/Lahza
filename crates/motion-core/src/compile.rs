@@ -93,9 +93,31 @@ pub struct LayerState {
     pub matrix: Affine,
     pub opacity: f64,
     pub blend: Blend,
-    /// Gaussian sigma in canvas pixels.
-    pub blur: f64,
+    /// Applied to the layer as one picture, in order (canvas pixels).
+    pub effects: Vec<EffectState>,
+    pub matte: Option<Box<MatteState>>,
     pub content: Content,
+}
+
+impl LayerState {
+    /// Needs its own offscreen pass (effects, matte or a grouped comp).
+    pub fn is_isolated(&self) -> bool {
+        !self.effects.is_empty() || self.matte.is_some() || matches!(self.content, Content::Group(_))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EffectState {
+    Blur { sigma: f64, repeat_edges: bool },
+    Shadow { color: Color, offset: Vec2, sigma: f64 },
+    Glow { color: Color, sigma: f64, intensity: f64 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatteState {
+    pub mode: MatteMode,
+    /// The matte layer; `None` when it is not visible at this time.
+    pub source: Option<LayerState>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +125,9 @@ pub enum Content {
     Shape(ShapeState),
     Text(TextState),
     Image { src: Arc<str>, size: Option<Vec2> },
+    /// A comp drawn as one picture (AE precomp): children carry absolute
+    /// matrices; the group's opacity, blend, effects and matte apply once.
+    Group(Vec<LayerState>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +142,8 @@ pub struct ShapeState {
     pub trim: Vec2,
     pub fill: Option<PaintState>,
     pub stroke: Option<(Color, f64)>,
+    /// SVG path data for `ShapeKind::Path`.
+    pub path: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,7 +223,28 @@ pub struct CScene {
     camera_position: Option<Prop<Vec2>>,
     camera_zoom: Prop<f64>,
     camera_rotation: Prop<f64>,
+    transition: Option<CTransition>,
     pub layers: Vec<CLayer>,
+}
+
+struct CTransition {
+    kind: TransitionKind,
+    dur: f64,
+    curve: Curve,
+    direction: Direction,
+}
+
+impl CScene {
+    /// Half the incoming transition (the scene shows this much early).
+    pub fn lead_in(&self) -> f64 {
+        self.transition.as_ref().map(|t| t.dur / 2.0).unwrap_or(0.0)
+    }
+}
+
+enum CEffect {
+    Blur(Prop<f64>, bool),
+    Shadow { color: Prop<Color>, offset: Prop<Vec2>, radius: Prop<f64> },
+    Glow { color: Prop<Color>, radius: Prop<f64>, intensity: Prop<f64> },
 }
 
 pub struct CLayer {
@@ -212,7 +260,10 @@ pub struct CLayer {
     rotation: Prop<f64>,
     opacity: Prop<f64>,
     blend: Blend,
-    blur: Option<Prop<f64>>,
+    effects: Vec<CEffect>,
+    matte: Option<(usize, MatteMode)>,
+    /// Used as another layer's matte: not drawn by itself.
+    is_matte: bool,
     parent: Option<usize>,
     hidden: bool,
     kind: CKind,
@@ -253,6 +304,7 @@ struct CShape {
     trim: Prop<Vec2>,
     fill: Option<CPaint>,
     stroke: Option<(Prop<Color>, Prop<f64>)>,
+    path: Option<Arc<str>>,
 }
 
 enum CPaint {
@@ -472,6 +524,10 @@ impl<'a> Compiler<'a> {
         for layer in layers {
             out.push(self.layer(layer, inherited, shift, &ids));
         }
+        let sources: Vec<usize> = out.iter().filter_map(|l| l.matte.map(|m| m.0)).collect();
+        for i in sources {
+            out[i].is_matte = true;
+        }
         // Reject parent cycles.
         for i in 0..out.len() {
             let mut seen = HashSet::new();
@@ -522,10 +578,30 @@ impl<'a> Compiler<'a> {
         let scale = self.prop(&t.scale, id, "transform.scale", start, step, shift);
         let rotation = self.prop(&t.rotation, id, "transform.rotation", start, step, shift);
         let opacity = self.prop(&t.opacity, id, "transform.opacity", start, step, shift);
-        let blur = c.effects.iter().find_map(|e| match e {
-            Effect::Blur { radius } => Some(radius),
+        let mut effects = Vec::new();
+        for (i, e) in c.effects.iter().enumerate() {
+            let what = |f: &str| format!("effects.{i}.{f}");
+            effects.push(match e {
+                Effect::Blur { radius, repeat_edges } => CEffect::Blur(self.prop(radius, id, &what("radius"), start, step, shift), *repeat_edges),
+                Effect::Shadow { color, offset, radius } => CEffect::Shadow {
+                    color: self.prop(color, id, &what("color"), start, step, shift),
+                    offset: self.prop(offset, id, &what("offset"), start, step, shift),
+                    radius: self.prop(radius, id, &what("radius"), start, step, shift),
+                },
+                Effect::Glow { color, radius, intensity } => CEffect::Glow {
+                    color: self.prop(color, id, &what("color"), start, step, shift),
+                    radius: self.prop(radius, id, &what("radius"), start, step, shift),
+                    intensity: self.prop(intensity, id, &what("intensity"), start, step, shift),
+                },
+            });
+        }
+        let matte = c.matte.as_ref().and_then(|m| match siblings.get(m.layer.as_str()) {
+            Some(i) if m.layer != id => Some((*i, m.mode)),
+            _ => {
+                self.errors.push(format!("{id}.matte: no sibling layer '{}'", m.layer));
+                None
+            }
         });
-        let blur = blur.map(|r| self.prop(r, id, "effects.blur.radius", start, step, shift));
         let parent = c.parent.as_ref().and_then(|p| match siblings.get(p.as_str()) {
             Some(i) => Some(*i),
             None => {
@@ -556,6 +632,14 @@ impl<'a> Compiler<'a> {
                     trim: self.prop(&s.trim, id, "trim", start, step, shift),
                     fill,
                     stroke,
+                    path: match (s.shape, &s.d) {
+                        (ShapeKind::Path, Some(d)) => Some(d.as_str().into()),
+                        (ShapeKind::Path, None) => {
+                            self.errors.push(format!("{id}: shape \"path\" needs \"d\" (SVG path data)"));
+                            None
+                        }
+                        _ => None,
+                    },
                 })
             }
             LayerKind::Text(tx) => CKind::Text(self.text(tx, id, start, step, shift)),
@@ -577,7 +661,9 @@ impl<'a> Compiler<'a> {
             rotation,
             opacity,
             blend: c.blend,
-            blur,
+            effects,
+            matte,
+            is_matte: false,
             parent,
             hidden: c.hidden,
             kind,
@@ -763,6 +849,12 @@ impl Compiled {
             let camera_zoom = c.prop(&scene.camera.zoom, id, "camera.zoom", start, None, pre_roll);
             let camera_rotation = c.prop(&scene.camera.rotation, id, "camera.rotation", start, None, pre_roll);
             let layers = c.layers(&scene.layers, step, pre_roll);
+            let transition = scene.transition.as_ref().map(|t| CTransition {
+                kind: t.kind,
+                dur: t.dur.seconds(&c.windows.base).unwrap_or(0.0).max(0.0),
+                curve: Curve::compile(&t.ease, &c.windows.base).unwrap_or(Curve::Linear),
+                direction: t.direction,
+            });
             scenes.push(CScene {
                 id: id.into(),
                 start,
@@ -773,6 +865,7 @@ impl Compiled {
                 camera_position,
                 camera_zoom,
                 camera_rotation,
+                transition,
                 layers,
             });
         }
@@ -812,7 +905,6 @@ impl Compiled {
 
     /// Everything visible at timeline time `t`, in paint order.
     pub fn frame(&self, t: f64) -> FrameState {
-        let (w, h) = (self.settings.width as f64, self.settings.height as f64);
         let mut frame = FrameState {
             t,
             scene: None,
@@ -821,18 +913,134 @@ impl Compiled {
             height: self.settings.height,
             layers: Vec::new(),
         };
+        // A transition centred on scene j's cut shows j−1 and j together.
+        for j in (1..self.scenes.len()).rev() {
+            let b = &self.scenes[j];
+            let Some(tr) = b.transition.as_ref().filter(|tr| tr.dur > 0.0) else { continue };
+            let from = b.start - tr.dur / 2.0;
+            if t < from || t >= b.start + tr.dur / 2.0 {
+                continue;
+            }
+            let a = &self.scenes[j - 1];
+            let p = tr.curve.progress(t - from, tr.dur);
+            // The outgoing scene holds its last moment, the incoming its first.
+            let ta = t.min(a.end - 1e-6).max(a.start);
+            let tb = t.max(b.start);
+            frame.scene = Some(b.id.clone());
+            frame.background = a.background;
+            frame.layers = self.transition(a, b, tr, p, ta, tb);
+            return frame;
+        }
         let Some(scene) = self.scene_at(t) else { return frame };
         frame.scene = Some(scene.id.clone());
         frame.background = scene.background;
-        let tc = t + scene.pre_roll;
+        self.scene_layers(scene, t, &mut frame.layers);
+        frame
+    }
+
+    fn camera(&self, scene: &CScene, tc: f64) -> Affine {
+        let (w, h) = (self.settings.width as f64, self.settings.height as f64);
         let zoom = scene.camera_zoom.at(tc);
         let center = scene.camera_position.as_ref().map(|p| p.at(tc)).unwrap_or(Vec2::new(w / 2.0, h / 2.0));
-        let camera = Affine::translate(w / 2.0, h / 2.0)
+        Affine::translate(w / 2.0, h / 2.0)
             .then(Affine::scale(zoom, zoom))
             .then(Affine::rotate(-scene.camera_rotation.at(tc)))
-            .then(Affine::translate(-center.x(), -center.y()));
-        emit(&scene.layers, tc, None, camera, 1.0, 0.0, &mut frame.layers);
-        frame
+            .then(Affine::translate(-center.x(), -center.y()))
+    }
+
+    fn scene_layers(&self, scene: &CScene, t: f64, out: &mut Vec<LayerState>) {
+        let tc = t + scene.pre_roll;
+        emit(&scene.layers, tc, None, self.camera(scene, tc), 1.0, out);
+    }
+
+    /// A whole scene as one group with its background, for transitions.
+    fn scene_group(&self, scene: &CScene, t: f64, matrix: Affine, opacity: f64) -> LayerState {
+        let (w, h) = (self.settings.width as f64, self.settings.height as f64);
+        let mut layers = vec![canvas_rect(&format!("{}-background", scene.id), w, h, scene.background)];
+        self.scene_layers(scene, t, &mut layers);
+        LayerState { id: scene.id.clone(), matrix, opacity, blend: Blend::Normal, effects: Vec::new(), matte: None, content: Content::Group(layers) }
+    }
+
+    fn transition(&self, a: &CScene, b: &CScene, tr: &CTransition, p: f64, ta: f64, tb: f64) -> Vec<LayerState> {
+        let (w, h) = (self.settings.width as f64, self.settings.height as f64);
+        let (dx, dy) = match tr.direction {
+            Direction::Left => (-w, 0.0),
+            Direction::Right => (w, 0.0),
+            Direction::Up => (0.0, -h),
+            Direction::Down => (0.0, h),
+        };
+        // Whole-pixel offsets: the two scenes' edges meet exactly, with no
+        // partially covered seam for the background to show through.
+        let shift = |k: f64| Affine::translate((dx * k).round(), (dy * k).round());
+        // The incoming scene sits exactly one canvas behind the outgoing
+        // one (rounding each separately could open a one-pixel gap).
+        let behind = |k: f64| Affine::translate((dx * k).round() - dx, (dy * k).round() - dy);
+        let about_centre = |k: f64| Affine::translate(w / 2.0, h / 2.0).then(Affine::scale(k, k)).then(Affine::translate(-w / 2.0, -h / 2.0));
+        let id = Affine::IDENTITY;
+        match tr.kind {
+            TransitionKind::Fade => vec![self.scene_group(a, ta, id, 1.0), self.scene_group(b, tb, id, p)],
+            TransitionKind::Push => vec![
+                self.scene_group(a, ta, shift(p), 1.0),
+                self.scene_group(b, tb, behind(p), 1.0),
+            ],
+            TransitionKind::Slide => vec![
+                self.scene_group(a, ta, id, 1.0),
+                self.scene_group(b, tb, shift(p - 1.0), 1.0),
+            ],
+            TransitionKind::Zoom => vec![
+                self.scene_group(a, ta, about_centre(4f64.powf(p)), (1.0 - p).clamp(0.0, 1.0)),
+                self.scene_group(b, tb, about_centre(0.5f64.powf(1.0 - p)), p.clamp(0.0, 1.0)),
+            ],
+            TransitionKind::Whip => {
+                let sigma = 120.0 * p * (1.0 - p) * (w / 1920.0);
+                let mut ga = self.scene_group(a, ta, shift(p), 1.0);
+                let mut gb = self.scene_group(b, tb, behind(p), 1.0);
+                if sigma > 0.3 {
+                    ga.effects.push(EffectState::Blur { sigma, repeat_edges: true });
+                    gb.effects.push(EffectState::Blur { sigma, repeat_edges: true });
+                }
+                vec![ga, gb]
+            }
+            TransitionKind::Wipe => {
+                // The revealed part grows from the edge opposite `direction`.
+                let (rw, rh, cx, cy) = match tr.direction {
+                    Direction::Left => (w * p, h, w * (1.0 - p / 2.0), h / 2.0),
+                    Direction::Right => (w * p, h, w * p / 2.0, h / 2.0),
+                    Direction::Up => (w, h * p, w / 2.0, h * (1.0 - p / 2.0)),
+                    Direction::Down => (w, h * p, w / 2.0, h * p / 2.0),
+                };
+                let mut gb = self.scene_group(b, tb, id, 1.0);
+                let mut mask = canvas_rect(&format!("{}-wipe", b.id), rw.max(0.0), rh.max(0.0), Color::WHITE);
+                mask.matrix = Affine::translate(cx, cy);
+                gb.matte = Some(Box::new(MatteState { mode: MatteMode::Alpha, source: Some(mask) }));
+                vec![self.scene_group(a, ta, id, 1.0), gb]
+            }
+        }
+    }
+}
+
+/// A solid rectangle covering w × h, centred on the canvas.
+fn canvas_rect(id: &str, w: f64, h: f64, color: Color) -> LayerState {
+    LayerState {
+        id: id.into(),
+        matrix: Affine::translate(w / 2.0, h / 2.0),
+        opacity: 1.0,
+        blend: Blend::Normal,
+        effects: Vec::new(),
+        matte: None,
+        content: Content::Shape(ShapeState {
+            shape: ShapeKind::Rect,
+            size: Vec2::new(w, h),
+            radius: 0.0,
+            thickness: 0.0,
+            sides: 4,
+            inner: 0.5,
+            angles: Vec2::ZERO,
+            trim: Vec2::new(0.0, 1.0),
+            fill: Some(PaintState::Solid(color)),
+            stroke: None,
+            path: None,
+        }),
     }
 }
 
@@ -864,45 +1072,97 @@ fn clock(step: Option<Step>, t: f64) -> f64 {
     }
 }
 
-fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, parent: Affine, parent_opacity: f64, parent_blur: f64, out: &mut Vec<LayerState>) {
+fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, parent: Affine, parent_opacity: f64, out: &mut Vec<LayerState>) {
     let mut cache = vec![None; layers.len()];
-    for (i, l) in layers.iter().enumerate() {
-        if l.hidden || tc < l.start - 1e-9 || tc >= l.end - 1e-9 {
+    for i in 0..layers.len() {
+        if layers[i].is_matte {
             continue;
         }
-        let step = l.step.or(inherited);
-        let t = clock(step, tc);
-        let opacity = parent_opacity * l.opacity.at(t).clamp(0.0, 1.0);
-        if opacity <= 0.0 {
-            continue;
-        }
-        let matrix = parent.then(layer_matrix(layers, i, tc, inherited, &mut cache));
-        let blur = parent_blur + l.blur.as_ref().map(|b| b.at(t).max(0.0) * matrix.max_scale()).unwrap_or(0.0);
-        let content = match &l.kind {
-            CKind::Comp(children) => {
-                emit(children, tc - l.offset, step, matrix, opacity, blur, out);
-                continue;
-            }
-            CKind::Shape(s) => Content::Shape(ShapeState {
-                shape: s.shape,
-                size: s.size.at(t),
-                radius: s.radius.at(t).max(0.0),
-                thickness: s.thickness.at(t).max(0.0),
-                sides: s.sides,
-                inner: s.inner.at(t).clamp(0.0, 1.0),
-                angles: s.angles.at(t),
-                trim: s.trim.at(t),
-                fill: s.fill.as_ref().map(|f| match f {
-                    CPaint::Solid(p) => PaintState::Solid(clamp_color(p.at(t))),
-                    CPaint::Gradient(g) => PaintState::Gradient(g.clone()),
-                }),
-                stroke: s.stroke.as_ref().map(|(c, w)| (clamp_color(c.at(t)), w.at(t).max(0.0))),
-            }),
-            CKind::Text(tx) => Content::Text(text_state(tx, t)),
-            CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
-        };
-        out.push(LayerState { id: l.id.clone(), matrix, opacity, blend: l.blend, blur, content });
+        layer(layers, i, tc, inherited, parent, parent_opacity, &mut cache, false, out);
     }
+}
+
+/// Emits layer `i`: flattened comps push their children into `out`;
+/// everything else pushes one state. `isolate` forces comps into a group
+/// (matte sources).
+#[allow(clippy::too_many_arguments)]
+fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: Affine, parent_opacity: f64, cache: &mut [Option<Affine>], isolate: bool, out: &mut Vec<LayerState>) {
+    let l = &layers[i];
+    if l.hidden || tc < l.start - 1e-9 || tc >= l.end - 1e-9 {
+        return;
+    }
+    let step = l.step.or(inherited);
+    let t = clock(step, tc);
+    let own_opacity = l.opacity.at(t).clamp(0.0, 1.0);
+    if own_opacity * parent_opacity <= 0.0 {
+        return;
+    }
+    let matrix = parent.then(layer_matrix(layers, i, tc, inherited, cache));
+    let scale = matrix.max_scale();
+    let effects: Vec<EffectState> = l
+        .effects
+        .iter()
+        .filter_map(|e| match e {
+            CEffect::Blur(r, repeat_edges) => {
+                let sigma = r.at(t).max(0.0) * scale;
+                (sigma > 0.05).then_some(EffectState::Blur { sigma, repeat_edges: *repeat_edges })
+            }
+            CEffect::Shadow { color, offset, radius } => {
+                let o = offset.at(t);
+                // Offsets follow the layer's scale, not its rotation (AE).
+                Some(EffectState::Shadow { color: clamp_color(color.at(t)), offset: Vec2::new(o.x() * scale, o.y() * scale), sigma: radius.at(t).max(0.0) * scale })
+            }
+            CEffect::Glow { color, radius, intensity } => {
+                Some(EffectState::Glow { color: clamp_color(color.at(t)), sigma: radius.at(t).max(0.0) * scale, intensity: intensity.at(t).max(0.0) })
+            }
+        })
+        .collect();
+    let matte = l.matte.map(|(mi, mode)| {
+        let mut src = Vec::new();
+        layer(layers, mi, tc, inherited, parent, 1.0, cache, true, &mut src);
+        Box::new(MatteState { mode, source: src.pop() })
+    });
+    let content = match &l.kind {
+        CKind::Comp(children) => {
+            let ct = tc - l.offset;
+            let group = isolate || !effects.is_empty() || matte.is_some() || l.blend != Blend::Normal || own_opacity < 1.0 && children.len() > 1;
+            if !group {
+                emit(children, ct, step, matrix, parent_opacity * own_opacity, out);
+                return;
+            }
+            let mut inner = Vec::new();
+            emit(children, ct, step, matrix, 1.0, &mut inner);
+            out.push(LayerState {
+                id: l.id.clone(),
+                matrix: Affine::IDENTITY,
+                opacity: parent_opacity * own_opacity,
+                blend: l.blend,
+                effects,
+                matte,
+                content: Content::Group(inner),
+            });
+            return;
+        }
+        CKind::Shape(s) => Content::Shape(ShapeState {
+            shape: s.shape,
+            size: s.size.at(t),
+            radius: s.radius.at(t).max(0.0),
+            thickness: s.thickness.at(t).max(0.0),
+            sides: s.sides,
+            inner: s.inner.at(t).clamp(0.0, 1.0),
+            angles: s.angles.at(t),
+            trim: s.trim.at(t),
+            fill: s.fill.as_ref().map(|f| match f {
+                CPaint::Solid(p) => PaintState::Solid(clamp_color(p.at(t))),
+                CPaint::Gradient(g) => PaintState::Gradient(g.clone()),
+            }),
+            stroke: s.stroke.as_ref().map(|(c, w)| (clamp_color(c.at(t)), w.at(t).max(0.0))),
+            path: s.path.clone(),
+        }),
+        CKind::Text(tx) => Content::Text(text_state(tx, t)),
+        CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
+    };
+    out.push(LayerState { id: l.id.clone(), matrix, opacity: parent_opacity * own_opacity, blend: l.blend, effects, matte, content });
 }
 
 fn clamp_color(c: Color) -> Color {

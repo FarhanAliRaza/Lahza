@@ -35,7 +35,8 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
             matrix: Affine::translate(x + tw / 2.0, y + th / 2.0),
             opacity: 1.0,
             blend: Blend::Normal,
-            blur: 0.0,
+            effects: Vec::new(),
+            matte: None,
             content: Content::Image { src: name.as_str().into(), size: Some(Vec2::new(tw, th)) },
         });
         let text: Arc<str> = label.as_str().into();
@@ -45,7 +46,8 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
             matrix: Affine::translate(x + 4.0, y + th + LABEL / 2.0),
             opacity: 1.0,
             blend: Blend::Normal,
-            blur: 0.0,
+            effects: Vec::new(),
+            matte: None,
             content: Content::Text(TextState {
                 text,
                 font: "Inter Medium".into(),

@@ -170,7 +170,14 @@ fn gpu_matches_cpu() {
         {"id": "s", "kind": "shape", "shape": "polygon", "sides": 6, "size": 70, "radius": 6, "fill": "#33ddaa", "stroke": {"color": "#ffffff", "width": 3}, "transform": {"position": [230, 70], "scale": [1.3, 0.8]}},
         {"id": "t", "kind": "text", "text": "Sync the peak", "size": 28, "color": "#ffffff", "transform": {"position": [160, 150], "rotation": -4},
          "animators": [{"at": 0, "from": {"y": 30, "opacity": 0, "scale": 0.5}, "dur": "10f"}]},
-        {"id": "b", "kind": "shape", "shape": "capsule", "size": [80, 24], "fill": "#ffd23f", "effects": [{"type": "blur", "radius": 9}], "transform": {"position": [240, 130]}}
+        {"id": "b", "kind": "shape", "shape": "capsule", "size": [80, 24], "fill": "#ffd23f", "effects": [{"type": "blur", "radius": 9}], "transform": {"position": [240, 130]}},
+        {"id": "m", "kind": "shape", "shape": "path", "d": "M -40 -30 C 0 -60 40 -30 40 0 L 0 40 Z", "fill": "#ffffff", "transform": {"position": [60, 40]}},
+        {"id": "g", "kind": "comp", "transform": {"opacity": 0.8}, "matte": {"layer": "m", "mode": "luma"},
+         "effects": [{"type": "shadow", "offset": [4, 6], "radius": 3}, {"type": "glow", "color": "#88ccff", "radius": 6, "intensity": 0.6}],
+         "layers": [
+            {"id": "g1", "kind": "shape", "shape": "rect", "size": [70, 50], "fill": "#3366ff", "transform": {"position": [55, 40]}},
+            {"id": "g2", "kind": "comp", "effects": [{"type": "blur", "radius": 2}], "layers": [
+                {"id": "g3", "kind": "shape", "shape": "path", "d": "M -30 0 Q 0 -40 30 0", "stroke": {"color": "#ff8800", "width": 5}, "trim": [0.1, 0.8], "transform": {"position": [60, 45]}}]}]}
     ]));
     p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 4 });
     let c = Compiled::new(&p);
@@ -194,6 +201,10 @@ fn gpu_matches_cpu() {
             }
         }
         let mean = total as f64 / (a.len() as f64);
+        if let Ok(dir) = std::env::var("LAHZA_MOTION_DUMP") {
+            a.save(format!("{dir}/gpu-{t}.png")).unwrap();
+            b.save(format!("{dir}/cpu-{t}.png")).unwrap();
+        }
         assert!(max <= 3 && mean < 0.05, "t={t}: max diff {max}, mean {mean}");
         // And the GPU is deterministic too.
         let mut again = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
@@ -254,5 +265,134 @@ fn benchmark_200_shapes_and_text_1080p() {
             r.stats.build_ms / r.stats.frames as f64,
             r.stats.raster_ms / r.stats.frames as f64
         );
+    }
+}
+
+fn avg(img: &image::RgbaImage, x: u32, y: u32) -> [f64; 3] {
+    let p = img.get_pixel(x, y).0;
+    [p[0] as f64, p[1] as f64, p[2] as f64]
+}
+
+#[test]
+fn text_is_shaped_with_kerning() {
+    let mut fonts = font::Fonts::new(None);
+    let width = |fonts: &mut font::Fonts, s: &str| {
+        let t = lahza_motion_core::compile::TextState {
+            text: s.into(), font: "Inter SemiBold".into(), size: 100.0, color: lahza_motion_core::value::Color::WHITE,
+            tracking: 0.0, line_height: 1.2, align: lahza_motion_core::document::Align::Left, glyphs: Vec::new(),
+            pivots: vec![u32::MAX; s.chars().count()].into(),
+        };
+        let l = fonts.layout(&t);
+        l.bounds[2] - l.bounds[0]
+    };
+    let av = width(&mut fonts, "AV");
+    let apart = width(&mut fonts, "A") + width(&mut fonts, "V");
+    assert!(av < apart - 2.0, "kerned AV {av} vs {apart}");
+}
+
+#[test]
+fn precomp_opacity_applies_to_the_flattened_group() {
+    let p = project(json!([{"id": "g", "kind": "comp", "transform": {"opacity": 0.5}, "layers": [
+        {"id": "a", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ffffff", "transform": {"position": [130, 90]}},
+        {"id": "b", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ffffff", "transform": {"position": [190, 90]}}
+    ]}]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    // Overlap (160) looks the same as a single rect (100): one picture at 50%.
+    assert_eq!(px(&img, 160, 90), px(&img, 100, 90));
+    assert!((px(&img, 100, 90)[0] as i32 - 128).abs() <= 1);
+}
+
+#[test]
+fn track_mattes() {
+    let layers = |mode: &str| json!([
+        {"id": "m", "kind": "shape", "shape": "circle", "size": 80, "fill": "#ffffff", "transform": {"position": [160, 90]}},
+        {"id": "r", "kind": "shape", "shape": "rect", "size": [200, 120], "fill": "#ff0000", "transform": {"position": [160, 90]}, "matte": {"layer": "m", "mode": mode}}
+    ]);
+    let alpha = cpu().render(&Compiled::new(&project(layers("alpha"))), 0.0);
+    assert_eq!(px(&alpha, 160, 90), [255, 0, 0, 255], "inside the matte");
+    assert_eq!(px(&alpha, 80, 90), [0, 0, 0, 255], "outside the matte; the matte layer itself is not drawn");
+    let inv = cpu().render(&Compiled::new(&project(layers("alpha_inverted"))), 0.0);
+    assert_eq!(px(&inv, 160, 90), [0, 0, 0, 255]);
+    assert_eq!(px(&inv, 80, 90), [255, 0, 0, 255]);
+    let luma = cpu().render(&Compiled::new(&project(layers("luma"))), 0.0);
+    assert_eq!(px(&luma, 160, 90), [255, 0, 0, 255]);
+}
+
+#[test]
+fn shadow_and_glow() {
+    let p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [80, 40], "fill": "#808080", "transform": {"position": [160, 90]},
+        "effects": [{"type": "shadow", "color": "#000000", "offset": [0, 30], "radius": 4}, {"type": "glow", "color": "#ffffff", "radius": 8, "intensity": 1}]}]));
+    let mut p2 = p.clone();
+    p2.settings.background = lahza_motion_core::value::Color::parse("#ffffff").unwrap();
+    let on_white = cpu().render(&Compiled::new(&p2), 0.0);
+    // Below the rect the shadow darkens the white background.
+    assert!(px(&on_white, 160, 90 + 20 + 15)[0] < 150, "{:?}", px(&on_white, 160, 125));
+    let on_black = cpu().render(&Compiled::new(&p), 0.0);
+    // Just left of the rect the glow brightens the black background.
+    assert!(px(&on_black, 160 - 40 - 4, 80)[0] > 15, "{:?}", px(&on_black, 116, 80));
+    // The rect itself got brighter from the additive glow.
+    assert!(px(&on_black, 160, 90)[0] > 128);
+}
+
+#[test]
+fn bezier_paths_fill_and_trim() {
+    let p = project(json!([
+        {"id": "tri", "kind": "shape", "shape": "path", "d": "M 0 -50 L 50 40 L -50 40 Z", "fill": "#00ff00", "transform": {"position": [90, 90]}},
+        {"id": "arc", "kind": "shape", "shape": "path", "d": "M -60 0 C -60 -60 60 -60 60 0", "stroke": {"color": "#ffffff", "width": 8}, "trim": [0, 0.5], "transform": {"position": [240, 110]}}
+    ]));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let img = cpu().render(&c, 0.0);
+    assert_eq!(px(&img, 90, 100), [0, 255, 0, 255]);
+    assert_eq!(px(&img, 50, 60), [0, 0, 0, 255], "outside the triangle");
+    // Left half of the curve is drawn, the right half is trimmed away.
+    assert_eq!(px(&img, 180, 110)[0], 255);
+    assert_eq!(px(&img, 300, 110)[0], 0);
+}
+
+#[test]
+fn scene_transitions() {
+    let scenes = |kind: &str| {
+        let mut p = Project::new(320, 180, Fps::whole(30), 4.0);
+        p.scenes.push(serde_json::from_value(json!({"id": "a", "background": "#ff0000"})).unwrap());
+        p.scenes.push(serde_json::from_value(json!({"id": "b", "start": 2, "background": "#0000ff",
+            "transition": {"type": kind, "dur": 1, "ease": "linear", "direction": "left"}})).unwrap());
+        Compiled::new(&p)
+    };
+    let fade = cpu().render(&scenes("fade"), 2.0);
+    let c = avg(&fade, 160, 90);
+    assert!((c[0] - 128.0).abs() < 3.0 && (c[2] - 128.0).abs() < 3.0, "{c:?}");
+    let wipe = cpu().render(&scenes("wipe"), 2.0);
+    assert_eq!(px(&wipe, 40, 90), [255, 0, 0, 255]);
+    assert_eq!(px(&wipe, 280, 90), [0, 0, 255, 255]);
+    let push = cpu().render(&scenes("push"), 2.0);
+    assert_eq!(px(&push, 40, 90), [255, 0, 0, 255]);
+    assert_eq!(px(&push, 280, 90), [0, 0, 255, 255]);
+    // Whip blurs with repeated edges: the frame border keeps full colour.
+    let whip = cpu().render(&scenes("whip"), 1.8);
+    assert_eq!(px(&whip, 0, 0), [255, 0, 0, 255], "no dark fade at the frame edge");
+    assert_eq!(px(&whip, 0, 179), [255, 0, 0, 255]);
+    // Before and after the transition window: plain cuts.
+    assert_eq!(px(&cpu().render(&scenes("zoom"), 1.4), 160, 90), [255, 0, 0, 255]);
+    assert_eq!(px(&cpu().render(&scenes("whip"), 2.6), 160, 90), [0, 0, 255, 255]);
+}
+
+
+
+#[test]
+fn covered_background_does_not_leak_through_a_whip() {
+    // Scene a: yellow background fully covered by a black rect.
+    // 1366 wide: the whip blur runs at reduced resolution on a grid that
+    // does not divide the width evenly.
+    let mut p = Project::new(1366, 180, Fps::whole(30), 4.0);
+    p.scenes.push(serde_json::from_value(json!({"id": "a", "background": "#d7ff3a", "layers": [
+        {"id": "k", "kind": "shape", "shape": "rect", "size": [1366, 180], "fill": "#000000", "transform": {"position": [683, 90]}}]})).unwrap());
+    p.scenes.push(serde_json::from_value(json!({"id": "b", "start": 2, "background": "#000000",
+        "transition": {"type": "whip", "dur": 1, "ease": "linear", "direction": "left"}})).unwrap());
+    let c = Compiled::new(&p);
+    for t in [1.6, 1.75, 1.9, 2.0, 2.2] {
+        let img = cpu().render(&c, t);
+        let (x, y, worst) = img.enumerate_pixels().map(|(x, y, p)| (x, y, p.0[1])).max_by_key(|v| v.2).unwrap();
+        assert!(worst <= 2, "t={t}: green {worst} at ({x}, {y}) leaks from the covered background; row {:?}", (x.saturating_sub(8)..x + 8).map(|x| img.get_pixel(x.min(1365), 90).0[1]).collect::<Vec<_>>());
     }
 }

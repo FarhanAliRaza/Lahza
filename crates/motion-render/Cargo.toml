@@ -11,6 +11,9 @@ blade-graphics = { workspace = true }
 blade-macros = { workspace = true }
 bytemuck = { workspace = true }
 image = { workspace = true }
+kurbo = { workspace = true }
+rustybuzz = { workspace = true }
+unicode-bidi = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ttf-parser = { workspace = true }

@@ -109,6 +109,7 @@ fn promo_ops(largest_hit: &str) -> Vec<Value> {
         json!({"op": "add", "id": id, "kind": "text", "text": text, "size": 190, "color": "#ffffff",
             "transform": {"position": [960, y], "scale": {"keys": [{"at": at, "from": 1.0, "v": 1.0}], "add": [{"type": "drift", "rate": 0.0015, "per": "frame", "mode": "mul", "from": at}]}},
             "time": {"start": at},
+            "effects": [{"type": "shadow", "color": "#00000099", "offset": [0, 10], "radius": 10}],
             "animators": [{"at": at, "anchor": "start", "stagger": "1f", "dur": "8f", "ease": "enter", "from": {"y": 120, "opacity": 0, "scale": 0.7}}]})
     };
     let mut ops = vec![
@@ -126,6 +127,7 @@ fn promo_ops(largest_hit: &str) -> Vec<Value> {
         "transform": {"position": {"keys": [{"at": 0, "v": [-960, 540]}, {"at": "beat:16", "v": [960, 540], "ease": "gesture", "dur": "10f", "anchor": "peak", "lead": -1}]}}}));
     ops.extend([
         json!({"op": "add_scene", "id": "peak", "start": "bar:5", "end": "stop:1",
+            "transition": {"type": "whip", "dur": "8f", "direction": "left"},
             "camera": {"zoom": {"keys": [{"at": "bar:5", "v": 1.0}, {"at": "stop:1", "v": 1.06, "ease": "push"}]}}}),
         json!({"op": "add", "scene": "peak", "id": "sync", "kind": "text", "text": "SYNC THE PEAK", "size": 150, "color": "#d7ff3a",
             "transform": {"position": [960, 480]},
@@ -133,9 +135,18 @@ fn promo_ops(largest_hit: &str) -> Vec<Value> {
         json!({"op": "add", "scene": "peak", "id": "line", "kind": "shape", "shape": "line", "size": [1100, 0], "thickness": 14, "fill": "#ffffff",
             "transform": {"position": [960, 640]},
             "trim": {"keys": [{"at": 0, "v": [0, 0]}, {"at": "beat:21", "v": [0, 1], "ease": "gesture", "dur": "12f", "anchor": "peak"}]}}),
+        // A swoosh drawn on through a soft matte (path + track matte).
+        json!({"op": "add", "scene": "peak", "id": "swoosh-matte", "kind": "shape", "shape": "rect", "size": [1920, 300],
+            "fill": {"gradient": "linear", "from": [-960, 0], "to": [960, 0], "stops": [[0, "#ffffff00"], [0.3, "#ffffff"], [1, "#ffffff"]]},
+            "transform": {"position": [960, 820]}}),
+        json!({"op": "add", "scene": "peak", "id": "swoosh", "kind": "shape", "shape": "path", "d": "M -700 40 C -300 -120 300 160 700 -40",
+            "stroke": {"color": "#d7ff3a", "width": 10}, "transform": {"position": [960, 820]},
+            "matte": {"layer": "swoosh-matte", "mode": "alpha"},
+            "trim": {"keys": [{"at": "beat:22", "from": [0, 0], "v": [0, 1], "ease": "glide", "dur": "16f", "anchor": "start"}]}}),
         json!({"op": "add_scene", "id": "logo", "start": largest_hit, "end": 20.0, "background": "#0b0b0b"}),
         json!({"op": "add", "scene": "logo", "id": "mark", "kind": "shape", "shape": "ring", "size": 420, "thickness": 18, "fill": "#d7ff3a",
             "transform": {"position": [960, 540], "scale": {"keys": [{"at": largest_hit, "from": 0.4, "v": 1, "ease": "land", "anchor": "start"}], "add": [{"type": "drift", "rate": 0.003, "per": "frame", "mode": "mul", "from": largest_hit}]}},
+            "effects": [{"type": "glow", "color": "#d7ff3a", "radius": 18, "intensity": 0.9}],
             "trim": {"keys": [{"at": largest_hit, "from": [0, 0], "v": [0, 1], "ease": "settle", "dur": "20f", "anchor": "start"}]}}),
         json!({"op": "add", "scene": "logo", "id": "name", "kind": "text", "text": "LAHZA", "size": 120, "color": "#ffffff",
             "transform": {"position": [960, 540], "scale": {"keys": [{"at": largest_hit, "from": 2.2, "v": 1, "ease": "slam", "anchor": "end"}], "add": [{"type": "drift", "rate": 0.002, "per": "frame", "mode": "mul", "from": largest_hit}]},

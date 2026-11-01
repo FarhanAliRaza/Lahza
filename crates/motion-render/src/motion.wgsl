@@ -43,6 +43,7 @@ var<storage, read> b_stops: array<vec4<f32>>;
 var<storage, read> b_atlas: array<u32>;
 var<storage, read> b_images: array<u32>;
 var<storage, read> b_groups: array<vec4<f32>>;
+var<storage, read> b_segs: array<vec4<f32>>;
 var<storage, read_write> b_target: array<vec4<f32>>;
 
 var<uniform> u_blur: BlurPass;
@@ -129,9 +130,39 @@ fn sd_star(p: vec2<f32>, g: vec4<f32>) -> f32 {
     return sd - round;
 }
 
+fn sd_path(prim: Prim, l: vec2<f32>) -> f32 {
+    let first = bitcast<u32>(prim.geom2.x);
+    let count = bitcast<u32>(prim.geom2.y);
+    let open = prim.geom2.z > 0.5;
+    var best = 3.0e38;
+    var winding = 0;
+    for (var i = 0u; i < count; i++) {
+        let s = b_segs[first + i];
+        let e = s.zw - s.xy;
+        let w = l - s.xy;
+        let t = clamp01(dot(w, e) / max(dot(e, e), 1e-12));
+        let q = w - e * t;
+        best = min(best, dot(q, q));
+        if !open && ((s.y <= l.y) != (s.w <= l.y)) {
+            let x = s.x + (l.y - s.y) / (s.w - s.y) * e.x;
+            if x > l.x {
+                if s.w > s.y { winding += 1; } else { winding -= 1; }
+            }
+        }
+    }
+    let d = sqrt(best);
+    if winding != 0 { return -d; }
+    return d;
+}
+
+fn luma(c: vec4<f32>) -> f32 {
+    return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+}
+
 fn shape_distance(prim: Prim, l: vec2<f32>) -> f32 {
     let g = prim.geom;
     switch prim.kind.y {
+        case 6u: { return sd_path(prim, l); }
         case 0u: { return sd_ellipse(l, g.xy); }
         case 1u: { return sd_rect(l, g.xy, g.z); }
         case 2u: { return sd_capsule(l, g.xy); }
@@ -267,7 +298,25 @@ fn shade(prim: Prim, p: vec2<f32>) -> vec4<f32> {
         let edge = max(max(-l.x, l.x - w), max(-l.y, l.y - h));
         let cov = clamp01(0.5 - edge / max(aa, 1e-6));
         if cov <= 0.0 { return out; }
-        out = sample_image(prim, l) * cov;
+        var c = sample_image(prim, l);
+        if prim.kind.x == 3u {
+            var matte = prim;
+            matte.geom2.x = prim.geom2.y;
+            let m = sample_image(matte, l);
+            var k: f32;
+            switch u32(prim.geom2.z) {
+                case 0u: { k = m.w; }
+                case 1u: { k = 1.0 - m.w; }
+                case 2u: { k = luma(m); }
+                default: { k = 1.0 - luma(m); }
+            }
+            c = c * clamp01(k);
+        } else if (prim.kind.w & 4u) != 0u {
+            c = prim.fill * c.w;
+        } else if (prim.kind.w & 8u) != 0u {
+            c = c * prim.fill;
+        }
+        out = c * cov;
     }
     return out * opacity;
 }
@@ -324,7 +373,10 @@ fn blur(@builtin(global_invocation_id) id: vec3<u32>) {
         var sx = i32(id.x);
         var sy = i32(id.y);
         if horizontal { sx += d; } else { sy += d; }
-        if sx < 0 || sy < 0 || sx >= i32(w) || sy >= i32(h) { continue; }
+        if u_blur.sigma.w > 0.5 {
+            sx = clamp(sx, 0, i32(w) - 1);
+            sy = clamp(sy, 0, i32(h) - 1);
+        } else if sx < 0 || sy < 0 || sx >= i32(w) || sy >= i32(h) { continue; }
         let wt = exp(-f32(d * d) / (2.0 * sigma * sigma)) * inv_norm;
         acc += b_blur_src[base + u32(sy) * w + u32(sx)] * wt;
     }

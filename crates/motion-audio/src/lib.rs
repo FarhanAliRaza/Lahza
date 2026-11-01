@@ -30,6 +30,8 @@ pub struct Analysis {
     pub first_beat: f64,
     pub first_downbeat: f64,
     pub beats_per_bar: u32,
+    /// True when beats follow a changing tempo instead of a fixed grid.
+    pub tempo_varies: bool,
     /// "straight" or "triplet".
     pub feel: String,
     /// Mean onset strength at beat fractions 0, 1/3, 1/2, 2/3.
@@ -367,9 +369,7 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
     while phase - beat >= music_start - beat * 0.25 {
         phase -= beat;
     }
-    let beats: Vec<f64> = (0..).map(|k| phase + k as f64 * beat).take_while(|t| *t <= music_end + 1e-9).collect();
-    // Bar phase: the beat offset (of 4) with the most low-band onset energy.
-    let beats_per_bar = 4u32;
+    let grid: Vec<f64> = (0..).map(|k| phase + k as f64 * beat).take_while(|t| *t <= music_end + 1e-9).collect();
     // Window max of an envelope around time t (−20…+40 ms).
     let window_max = |band: &[f32], t: f64| -> f64 {
         let a = ((t - 0.02 - env.t0) / env.dt).floor().max(0.0) as usize;
@@ -379,27 +379,60 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
     let low_max = env.bands[0].iter().copied().fold(0.0f32, f32::max).max(1e-9) as f64;
     let energy_max = env.low_energy.iter().copied().fold(0.0f32, f32::max).max(1e-12) as f64;
     let beat_max = env.beat_env.iter().copied().fold(0.0f32, f32::max).max(1e-9) as f64;
-    let bar_scores: Vec<f64> = (0..beats_per_bar as usize)
-        .map(|o| {
-            let picked: Vec<f64> = beats
-                .iter()
-                .skip(o)
-                .step_by(beats_per_bar as usize)
-                .map(|t| {
-                    window_max(&env.low_energy, *t + 0.02) / energy_max
-                        + 0.5 * window_max(&env.bands[0], *t) / low_max
-                        + 0.25 * window_max(&env.beat_env, *t) / beat_max
-                })
-                .collect();
-            picked.iter().sum::<f64>() / picked.len().max(1) as f64
+    // Tempo changes: a dynamic-programming beat tracker (Ellis 2007) seeded
+    // with the period. It replaces the constant grid only when it fits the
+    // onsets clearly better, so steady music keeps an exact grid.
+    let fit = |b: &[f64]| b.iter().map(|t| window_max(&env.beat_env, *t)).sum::<f64>() / b.len().max(1) as f64 / beat_max;
+    // Kicks and snares mark beats, so the tracker hears the low band too.
+    let accent_env: Vec<f32> = env
+        .beat_env
+        .iter()
+        .zip(&env.bands[0])
+        .map(|(b, l)| (*b as f64 / beat_max + *l as f64 / low_max) as f32)
+        .collect();
+    let tracked = track_beats(&accent_env, period_frames, first, last.max(first + 1))
+        .into_iter()
+        .map(|i| env.t0 + i as f64 * env.dt)
+        .collect::<Vec<f64>>();
+    let mut tracked = align_to_onsets(tracked, &refined);
+    // On the beat or between beats? Compare kick energy.
+    if tracked.len() >= 3 {
+        let mids: Vec<f64> = tracked.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
+        let kick = |ts: &[f64]| ts.iter().map(|t| window_max(&env.low_energy, *t + 0.02)).sum::<f64>() / ts.len() as f64;
+        if kick(&mids) > 1.2 * kick(&tracked[..tracked.len() - 1]) {
+            tracked = mids;
+        }
+    }
+    let tempo_map = tracked.len() >= 8 && fit(&tracked) > 1.15 * fit(&grid);
+    let beats: Vec<f64> = if tempo_map { tracked } else { grid };
+    let beat = if tempo_map {
+        let mut d: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+        d.sort_by(f64::total_cmp);
+        d[d.len() / 2]
+    } else {
+        beat
+    };
+    // Meter and bar phase: accents (kick energy) repeat every 3 or 4 beats.
+    let accent: Vec<f64> = beats
+        .iter()
+        .map(|t| {
+            window_max(&env.low_energy, *t + 0.02) / energy_max + 0.5 * window_max(&env.bands[0], *t) / low_max + 0.25 * window_max(&env.beat_env, *t) / beat_max
         })
         .collect();
-    let bar_offset = bar_scores
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    let mean_accent = accent.iter().sum::<f64>() / accent.len().max(1) as f64;
+    let best_phase = |m: usize| -> (usize, f64) {
+        (0..m)
+            .map(|o| {
+                let picked: Vec<f64> = accent.iter().skip(o).step_by(m).copied().collect();
+                (o, picked.iter().sum::<f64>() / picked.len().max(1) as f64)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((0, 0.0))
+    };
+    let (o4, s4) = best_phase(4);
+    let (o3, s3) = best_phase(3);
+    // 4/4 unless 3/4 is clearly stronger (contrast of the downbeat accent).
+    let (beats_per_bar, bar_offset) = if s3 / mean_accent.max(1e-9) > 1.12 * s4 / mean_accent.max(1e-9) { (3u32, o3) } else { (4u32, o4) };
     let downbeats: Vec<f64> = beats.iter().skip(bar_offset).step_by(beats_per_bar as usize).copied().collect();
     // Feel: onset strength at beat fractions.
     let frac = |f: f64| -> f64 {
@@ -420,9 +453,11 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
     let track = |name: &str, times: Vec<f64>| MarkerTrack::from_times(name, times.into_iter().map(shift));
     let sub = |div: usize| -> Vec<f64> {
         let mut v = Vec::new();
-        for t in &beats {
+        for (i, t) in beats.iter().enumerate() {
+            // Subdivide each beat by its own length (tempo maps).
+            let len = beats.get(i + 1).map(|n| n - t).unwrap_or(beat);
             for k in 0..div {
-                let s = t + beat * k as f64 / div as f64;
+                let s = t + len * k as f64 / div as f64;
                 if s <= music_end {
                     v.push(s);
                 }
@@ -555,6 +590,7 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
         first_beat: shift(beats.first().copied().unwrap_or(0.0)),
         first_downbeat: shift(downbeats.first().copied().unwrap_or(0.0)),
         beats_per_bar,
+        tempo_varies: tempo_map,
         feel: feel.into(),
         phase_strength: phase_strength.map(round3),
         grid_confidence: round3(grid_confidence),
@@ -562,6 +598,64 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
         music_end: shift(music_end),
         tracks,
     }
+}
+
+/// Dynamic-programming beat tracking: maximise onset strength at beats
+/// minus a penalty on deviations from the period (log-ratio squared).
+fn track_beats(env: &[f32], period: f64, start: usize, end: usize) -> Vec<usize> {
+    let end = end.min(env.len());
+    if end <= start + 4 || period < 2.0 {
+        return Vec::new();
+    }
+    let seg = &env[start..end];
+    let mean = seg.iter().map(|v| *v as f64).sum::<f64>() / seg.len() as f64;
+    let sd = (seg.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / seg.len() as f64).sqrt().max(1e-9);
+    let o: Vec<f64> = seg.iter().map(|v| *v as f64 / sd).collect();
+    let n = o.len();
+    let tightness = 100.0;
+    let mut score = vec![0.0f64; n];
+    let mut back = vec![usize::MAX; n];
+    let (lo, hi) = ((period * 0.5).round() as usize, (period * 2.0).round() as usize);
+    for t in 0..n {
+        let mut best = (0.0f64, usize::MAX);
+        if t >= lo {
+            for tau in t.saturating_sub(hi)..=t - lo {
+                let r = ((t - tau) as f64 / period).ln();
+                let v = score[tau] - tightness * r * r;
+                if back[t] == usize::MAX && best.1 == usize::MAX || v > best.0 {
+                    best = (v, tau);
+                }
+            }
+        }
+        score[t] = o[t] + if best.1 == usize::MAX { 0.0 } else { best.0.max(0.0) };
+        back[t] = if best.1 != usize::MAX && best.0 > 0.0 { best.1 } else { usize::MAX };
+    }
+    // Start from the best beat within the last period.
+    let tail = n.saturating_sub(period.ceil() as usize);
+    let mut t = (tail..n).max_by(|a, b| score[*a].total_cmp(&score[*b])).unwrap_or(n - 1);
+    let mut beats = vec![t];
+    while back[t] != usize::MAX {
+        t = back[t];
+        beats.push(t);
+    }
+    beats.reverse();
+    beats.into_iter().map(|b| b + start).collect()
+}
+
+/// Shifts tracked beats by the median offset to nearby refined onsets
+/// (removes the envelope's frame-time bias).
+fn align_to_onsets(beats: Vec<f64>, onsets: &[f64]) -> Vec<f64> {
+    let mut offsets: Vec<f64> = beats
+        .iter()
+        .filter_map(|b| onsets.iter().map(|o| o - b).min_by(|x, y| x.abs().total_cmp(&y.abs())))
+        .filter(|d| d.abs() < 0.05)
+        .collect();
+    if offsets.len() < 4 {
+        return beats;
+    }
+    offsets.sort_by(f64::total_cmp);
+    let shift = offsets[offsets.len() / 2];
+    beats.into_iter().map(|b| b + shift).collect()
 }
 
 /// Moves an onset estimate onto the transient: the peak of a short-window

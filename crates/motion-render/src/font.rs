@@ -264,18 +264,11 @@ impl Fonts {
         let n = lines.len() as f64;
         for (li, line) in lines.iter().enumerate() {
             let baseline = cap * px / 2.0 + (li as f64 - (n - 1.0) / 2.0) * line_step;
-            let ids: Vec<(char, u16, f64)> = {
-                let face = self.fonts[font].face();
-                line.chars()
-                    .map(|c| {
-                        let g = face.glyph_index(c).map(|g| g.0).unwrap_or(0);
-                        let adv = face.glyph_hor_advance(ttf_parser::GlyphId(g)).unwrap_or(0) as f64 * px;
-                        (c, g, adv)
-                    })
-                    .collect()
-            };
-            let count = ids.len();
-            let width: f64 = ids.iter().map(|g| g.2).sum::<f64>() + tracking * count.saturating_sub(1) as f64;
+            // Shape with HarfBuzz rules (kerning, ligatures, marks) per
+            // bidi run, laid out in visual order.
+            let shaped = shape_line(&self.fonts[font].data, line, px);
+            let count = shaped.len();
+            let width: f64 = shaped.iter().map(|g| g.advance).sum::<f64>() + tracking * count.saturating_sub(1) as f64;
             let mut pen = match text.align {
                 Align::Left => 0.0,
                 Align::Center => -width / 2.0,
@@ -283,22 +276,23 @@ impl Fonts {
             };
             x_min = x_min.min(pen);
             x_max = x_max.max(pen + width);
-            for (c, g, adv) in ids {
-                let unit = text.pivots.get(char_index).copied().unwrap_or(u32::MAX);
+            for g in shaped {
+                let ci = char_index + g.char_offset;
+                let unit = text.pivots.get(ci).copied().unwrap_or(u32::MAX);
                 if unit != u32::MAX {
                     let b = boxes.entry(unit).or_insert([f64::INFINITY, baseline - cap * px, f64::NEG_INFINITY, baseline]);
                     b[0] = b[0].min(pen);
-                    b[2] = b[2].max(pen + adv);
+                    b[2] = b[2].max(pen + g.advance);
                 }
-                if !c.is_whitespace() {
-                    let atlas = self.glyph(font, g);
+                if !g.whitespace {
+                    let atlas = self.glyph(font, g.id);
                     if !atlas.empty {
-                        glyphs.push(PlacedGlyph { char_index, atlas, pen: [pen, baseline], scale: atlas_scale });
+                        glyphs.push(PlacedGlyph { char_index: ci, atlas, pen: [pen + g.x_offset, baseline - g.y_offset], scale: atlas_scale });
                     }
                 }
-                pen += adv + tracking;
-                char_index += 1;
+                pen += g.advance + tracking;
             }
+            char_index += line.chars().count();
             char_index += 1; // the '\n'
         }
         let ascent = self.fonts[font].ascender as f64 * px;
@@ -334,6 +328,54 @@ impl Fonts {
             .then(Affine::translate(-cx, -cy));
         (animate.then(base), state.opacity)
     }
+}
+
+struct Shaped {
+    id: u16,
+    /// Index (in chars) of the cluster's first character within the line.
+    char_offset: usize,
+    advance: f64,
+    x_offset: f64,
+    y_offset: f64,
+    whitespace: bool,
+}
+
+fn shape_line(data: &[u8], line: &str, px: f64) -> Vec<Shaped> {
+    let mut out = Vec::new();
+    if line.is_empty() {
+        return out;
+    }
+    let Some(face) = rustybuzz::Face::from_slice(data, 0) else { return out };
+    // byte offset → char index
+    let mut char_of = vec![0usize; line.len() + 1];
+    for (ci, (b, _)) in line.char_indices().enumerate() {
+        char_of[b] = ci;
+    }
+    let info = unicode_bidi::BidiInfo::new(line, None);
+    for para in &info.paragraphs {
+        let (levels, runs) = info.visual_runs(para, para.range.clone());
+        for run in runs {
+            let rtl = levels[run.start].is_rtl();
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(&line[run.clone()]);
+            buffer.set_direction(if rtl { rustybuzz::Direction::RightToLeft } else { rustybuzz::Direction::LeftToRight });
+            buffer.guess_segment_properties();
+            let glyphs = rustybuzz::shape(&face, &[], buffer);
+            for (gi, gp) in glyphs.glyph_infos().iter().zip(glyphs.glyph_positions()) {
+                let byte = run.start + gi.cluster as usize;
+                let ch = line[byte..].chars().next().unwrap_or(' ');
+                out.push(Shaped {
+                    id: gi.glyph_id as u16,
+                    char_offset: char_of[byte.min(line.len())],
+                    advance: gp.x_advance as f64 * px,
+                    x_offset: gp.x_offset as f64 * px,
+                    y_offset: gp.y_offset as f64 * px,
+                    whitespace: ch.is_whitespace(),
+                });
+            }
+        }
+    }
+    out
 }
 
 fn segment_distance2(px: f32, py: f32, s: &[f32; 4]) -> f32 {
@@ -417,5 +459,15 @@ mod tests {
         let row: Vec<u8> = (x0..x1).map(|x| at(x, mid_y)).collect();
         assert!(row.iter().any(|v| *v > 160), "{row:?}");
         assert!(row[row.len() / 2] < 128, "counter of O must be outside");
+    }
+
+    #[test]
+    fn bidi_runs_are_shaped_in_visual_order() {
+        // "ab" then a Hebrew (RTL) run: the RTL clusters come out reversed.
+        let line = "ab \u{05D0}\u{05D1}\u{05D2}";
+        let shaped = shape_line(INTER_REGULAR, line, 0.1);
+        let offsets: Vec<usize> = shaped.iter().map(|g| g.char_offset).collect();
+        assert_eq!(&offsets[..3], &[0, 1, 2], "{offsets:?}");
+        assert_eq!(&offsets[3..], &[5, 4, 3], "{offsets:?}");
     }
 }

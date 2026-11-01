@@ -153,13 +153,20 @@ pub fn catalog_json() -> Value {
             "transform": {"position": "[x, y] canvas px (default [0,0])", "anchor": "[x, y] pivot in layer space", "scale": "[sx, sy] or number", "rotation": "degrees clockwise", "opacity": "0..1"},
             "time": {"start": "time (default parent start)", "end": "time", "duration": "duration", "step_fps": "stepped clock, e.g. 12 (0 = off)", "step_phase": "seconds", "offset": "comps: children see t - offset"},
             "blend": "normal | add | multiply | screen",
-            "effects": [{"type": "blur", "radius": "sigma in px (animatable)"}],
+            "effects": [
+                {"type": "blur", "radius": "sigma in px (animatable)"},
+                {"type": "shadow", "color": "default #00000080", "offset": "[x, y] px (default [0, 12])", "radius": "blur sigma (default 12)"},
+                {"type": "glow", "color": "tint (white keeps the layer's colours)", "radius": "sigma (default 12)", "intensity": "default 1"}
+            ],
+            "effects_note": "effects apply to the layer as one picture; on a comp they apply to the flattened comp (like an AE precomp)",
+            "matte": {"layer": "sibling layer id used as a track matte (not drawn itself)", "mode": "alpha | alpha_inverted | luma | luma_inverted"},
             "parent": "transform parent: sibling layer id",
             "hidden": "bool"
         },
         "layer_kinds": {
             "shape": {
-                "shape": "circle | rect | capsule | ring | arc | polygon | star | line",
+                "shape": "circle | rect | capsule | ring | arc | polygon | star | line | path",
+                "d": "path only: SVG path data in layer space (M L H V C S Q T A Z, absolute or relative); fill uses non-zero winding; trim draws the stroke on",
                 "size": "[w, h] (default [100, 100]); circle/ring/arc/polygon/star use size[0] as diameter",
                 "radius": "corner rounding (rect, polygon, star)", "thickness": "ring, arc and line width (default 10)",
                 "sides": "polygon sides / star points (default 5)", "inner": "star inner radius ratio (default 0.5)",
@@ -180,16 +187,18 @@ pub fn catalog_json() -> Value {
                 }]
             },
             "image": {"src": "project-relative PNG/JPEG/WebP", "size": "[w, h] display px (default natural)"},
-            "comp": {"layers": "nested layers; transform, opacity and stepping apply to all children"}
+            "comp": {"layers": "nested layers; transform and stepping apply to all children; with opacity < 1, a blend mode, effects or a matte the comp is drawn as one picture"}
         },
         "scene": {
             "id": "stable id", "start": "time (cuts on markers lead −1 f by default)", "lead": "frames",
             "end": "time (default next scene's start or the project end)", "duration": "duration",
             "pre_roll": "open this far into the animation", "background": "colour",
+            "transition": {"type": "fade | push | slide | zoom | wipe | whip", "dur": "default \"10f\", centred on the cut", "ease": "default gesture (peak speed on the cut)", "direction": "left | right | up | down"},
             "camera": {"position": "[x, y] point shown at the canvas centre", "zoom": "number", "rotation": "degrees"},
             "motion_blur": {"shutter": "degrees (180 film-like)", "samples": 8},
             "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first"
         },
+        "text_shaping": "HarfBuzz shaping (kerning, ligatures, marks) with bidi runs; use a project font for scripts Inter lacks (Arabic, Urdu, Devanagari…)",
         "edit_ops": ["add", "add_scene", "set", "remove", "move", "key", "anchor", "group", "ungroup"],
         "style_packs": styles_json(),
     })
