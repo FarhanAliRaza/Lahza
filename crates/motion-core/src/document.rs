@@ -754,9 +754,11 @@ pub struct ShapeLayer {
     /// Draw-on for line, ring and arc: visible fraction [from, to] in 0..1.
     #[serde(default = "full_trim", skip_serializing_if = "is_full_trim")]
     pub trim: Property<Vec2>,
-    /// SVG path data for `shape: "path"`, e.g. "M -50 0 C -50 -60 50 -60 50 0 Z".
+    /// Path for `shape: "path"`: SVG path data ("M -50 0 C …"), or keys
+    /// that morph between paths: `{"keys": [{"at": …, "v": "M …"}, {"at":
+    /// "beat:5", "v": {"shape": "star", "size": 200}, "ease": "gesture"}]}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub d: Option<String>,
+    pub d: Option<PathData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<Paint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -795,6 +797,144 @@ fn full_trim() -> Property<Vec2> {
 }
 fn is_full_trim(p: &Property<Vec2>) -> bool {
     *p == full_trim()
+}
+
+/// Path data: one path, or keys morphing between paths.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathData {
+    Static(PathValue),
+    Keys(Vec<PathKey>),
+}
+
+/// SVG path data, or a primitive converted to a path.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PathValue {
+    Svg(String),
+    Shape(PathShape),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathShape {
+    /// circle, rect, capsule, polygon, star
+    pub shape: ShapeKind,
+    #[serde(default = "hundred_vec")]
+    pub size: Vec2,
+    #[serde(default)]
+    pub radius: f64,
+    #[serde(default = "five")]
+    pub sides: u32,
+    #[serde(default = "half")]
+    pub inner: f64,
+}
+
+fn hundred_vec() -> Vec2 {
+    Vec2::new(100.0, 100.0)
+}
+fn half() -> f64 {
+    0.5
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathKey {
+    #[serde(alias = "t")]
+    pub at: TimeRef,
+    #[serde(alias = "value", alias = "to")]
+    pub v: PathValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ease: Option<Ease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<Lead>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dur: Option<Duration>,
+}
+
+impl Serialize for PathData {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PathData::Static(v) => v.serialize(s),
+            PathData::Keys(k) => serde_json::json!({"keys": k}).serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PathData {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(d)?;
+        if let Some(keys) = value.get("keys") {
+            let keys: Vec<PathKey> = serde_json::from_value(keys.clone()).map_err(D::Error::custom)?;
+            if keys.is_empty() {
+                return Err(D::Error::custom("path keys must not be empty"));
+            }
+            return Ok(PathData::Keys(keys));
+        }
+        serde_json::from_value(value).map(PathData::Static).map_err(|e| D::Error::custom(format!("path: SVG path data or {{\"shape\": …}}: {e}")))
+    }
+}
+
+impl PathValue {
+    /// SVG path data for this value (primitives become closed outlines,
+    /// starting at the top and running clockwise).
+    pub fn svg(&self) -> String {
+        match self {
+            PathValue::Svg(d) => d.clone(),
+            PathValue::Shape(p) => primitive_path(p),
+        }
+    }
+}
+
+fn primitive_path(p: &PathShape) -> String {
+    let (hw, hh) = (p.size.x() / 2.0, p.size.y() / 2.0);
+    let pts = |n: usize, f: &dyn Fn(usize) -> (f64, f64)| -> String {
+        let mut d = String::new();
+        for i in 0..n {
+            let (x, y) = f(i);
+            d.push_str(&format!("{} {:.4} {:.4} ", if i == 0 { "M" } else { "L" }, x, y));
+        }
+        d.push('Z');
+        d
+    };
+    match p.shape {
+        ShapeKind::Circle | ShapeKind::Ring | ShapeKind::Arc => {
+            // Four cubic arcs (k = 0.5523), clockwise from the top.
+            let k = 0.552_284_75;
+            format!(
+                "M 0 {t} C {a} {t} {r} {b} {r} 0 C {r} {c} {a} {bt} 0 {bt} C {na} {bt} {nr} {c} {nr} 0 C {nr} {b} {na} {t} 0 {t} Z",
+                t = -hh, r = hw, bt = hh, nr = -hw, a = k * hw, na = -k * hw, b = -k * hh, c = k * hh
+            )
+        }
+        ShapeKind::Polygon | ShapeKind::Star => {
+            let n = p.sides.max(3) as usize;
+            let inner = if p.shape == ShapeKind::Star { p.inner } else { 1.0 };
+            let count = if p.shape == ShapeKind::Star { n * 2 } else { n };
+            pts(count, &|i| {
+                let a = std::f64::consts::TAU * i as f64 / count as f64;
+                let r = if i % 2 == 1 && p.shape == ShapeKind::Star { hw * inner } else { hw };
+                (r * a.sin(), -r * a.cos())
+            })
+        }
+        ShapeKind::Capsule => {
+            let r = hw.min(hh);
+            format!("M {x0} {t} L {x1} {t} A {r} {r} 0 0 1 {x1} {b} L {x0} {b} A {r} {r} 0 0 1 {x0} {t} Z", x0 = -hw + r, x1 = hw - r, t = -r, b = r, r = r)
+        }
+        ShapeKind::Line => format!("M {} 0 L {} 0", -hw, hw),
+        _ => {
+            let r = p.radius.clamp(0.0, hw.min(hh));
+            if r <= 0.0 {
+                format!("M 0 {t} L {hw} {t} L {hw} {b} L {nw} {b} L {nw} {t} Z", t = -hh, b = hh, hw = hw, nw = -hw)
+            } else {
+                format!(
+                    "M 0 {t} L {x1} {t} A {r} {r} 0 0 1 {hw} {y0} L {hw} {y1} A {r} {r} 0 0 1 {x1} {b} L {x0} {b} A {r} {r} 0 0 1 {nw} {y1} L {nw} {y0} A {r} {r} 0 0 1 {x0} {t} Z",
+                    t = -hh, b = hh, hw = hw, nw = -hw, x0 = -hw + r, x1 = hw - r, y0 = -hh + r, y1 = hh - r, r = r
+                )
+            }
+        }
+    }
 }
 
 /// A fill: a colour (animatable) or a gradient.

@@ -206,8 +206,16 @@ pub struct ShapeState {
     pub trim: Vec2,
     pub fill: Option<PaintState>,
     pub stroke: Option<(Color, f64)>,
-    /// SVG path data for `ShapeKind::Path`.
-    pub path: Option<Arc<str>>,
+    /// Path for `ShapeKind::Path`, possibly mid-morph.
+    pub path: Option<PathMorph>,
+}
+
+/// `from` morphing toward `to` by `t` (0…1; springs may overshoot).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathMorph {
+    pub from: Arc<str>,
+    pub to: Option<Arc<str>>,
+    pub t: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -391,7 +399,7 @@ struct CShape {
     trim: Prop<Vec2>,
     fill: Option<CPaint>,
     stroke: Option<(Prop<Color>, Prop<f64>)>,
-    path: Option<Arc<str>>,
+    path: Option<(Vec<Arc<str>>, Prop<f64>)>,
 }
 
 enum CPaint {
@@ -773,7 +781,32 @@ impl<'a> Compiler<'a> {
                     fill,
                     stroke,
                     path: match (s.shape, &s.d) {
-                        (ShapeKind::Path, Some(d)) => Some(d.as_str().into()),
+                        (ShapeKind::Path, Some(PathData::Static(v))) => Some((vec![v.svg().into()], Prop::constant(0.0))),
+                        (ShapeKind::Path, Some(PathData::Keys(keys))) => {
+                            // Key i's value is path i; the morph index animates
+                            // with the usual eases, anchors and leads.
+                            let paths: Vec<Arc<str>> = keys.iter().map(|k| k.v.svg().into()).collect();
+                            let index = Property::Animated(crate::property::Animated {
+                                keys: keys
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, k)| crate::property::Key {
+                                        at: k.at.clone(),
+                                        v: i as f64,
+                                        from: None,
+                                        ease: k.ease.clone(),
+                                        anchor: k.anchor,
+                                        lead: k.lead,
+                                        dur: k.dur,
+                                        space: None,
+                                    })
+                                    .collect(),
+                                add: Vec::new(),
+                                step_fps: None,
+                                base: None,
+                            });
+                            Some((paths, self.prop(&index, id, "d", start, step, shift)))
+                        }
                         (ShapeKind::Path, None) => {
                             self.errors.push(format!("{id}: shape \"path\" needs \"d\" (SVG path data)"));
                             None
@@ -1374,7 +1407,25 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: 
                 CPaint::Gradient(g) => PaintState::Gradient(g.clone()),
             }),
             stroke: s.stroke.as_ref().map(|(c, w)| (clamp_color(c.at(t)), w.at(t).max(0.0))),
-            path: s.path.clone(),
+            path: s.path.as_ref().map(|(paths, index)| {
+                let x = index.at(t);
+                let last = paths.len() - 1;
+                let i = (x.floor().max(0.0) as usize).min(last.saturating_sub(1));
+                if last == 0 {
+                    PathMorph { from: paths[0].clone(), to: None, t: 0.0 }
+                } else {
+                    // Overshooting springs extrapolate past the last path.
+                    let t = if x >= last as f64 { x - (last - 1) as f64 } else { x - i as f64 };
+                    let i = if x >= last as f64 { last - 1 } else { i };
+                    if t.abs() < 1e-9 {
+                        PathMorph { from: paths[i].clone(), to: None, t: 0.0 }
+                    } else if (t - 1.0).abs() < 1e-9 {
+                        PathMorph { from: paths[i + 1].clone(), to: None, t: 0.0 }
+                    } else {
+                        PathMorph { from: paths[i].clone(), to: Some(paths[i + 1].clone()), t }
+                    }
+                }
+            }),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },

@@ -181,7 +181,7 @@ pub fn catalog_json() -> Value {
         "layer_kinds": {
             "shape": {
                 "shape": "circle | rect | capsule | ring | arc | polygon | star | line | path",
-                "d": "path only: SVG path data in layer space (M L H V C S Q T A Z, absolute or relative); fill uses non-zero winding; trim draws the stroke on",
+                "d": "path only: SVG path data in layer space (M L H V C S Q T A Z, absolute or relative), or a primitive {\"shape\": \"circle|rect|capsule|polygon|star\", \"size\", \"radius\", \"sides\", \"inner\"}, or keys that MORPH: {\"keys\": [{\"at\", \"v\": path or primitive, \"ease\", \"anchor\", \"lead\", \"dur\"}]} (outlines are resampled and aligned, so any two shapes morph); fill uses non-zero winding; trim draws the stroke on",
                 "size": "[w, h] (default [100, 100]); circle/ring/arc/polygon/star use size[0] as diameter",
                 "radius": "corner rounding (rect, polygon, star)", "thickness": "ring, arc and line width (default 10)",
                 "sides": "polygon sides / star points (default 5)", "inner": "star inner radius ratio (default 0.5)",

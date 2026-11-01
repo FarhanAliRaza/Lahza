@@ -12,7 +12,7 @@
 use crate::font::Fonts;
 use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
-use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PostKind, ShapeState};
+use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PathMorph, PostKind, ShapeState};
 use lahza_motion_core::document::{Blend, GradientKind, MatteMode, ShapeKind};
 use lahza_motion_core::value::Color;
 
@@ -793,10 +793,10 @@ fn push_segments(lines: &[Vec<(f64, f64)>], close: bool, segments: &mut Vec<[f32
 
 fn path_items(s: &ShapeState, matrix: Affine, opacity: f64, blend: u32, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
     let mut items = Vec::new();
-    let Some(d) = &s.path else { return items };
+    let Some(m) = &s.path else { return items };
     // Flatten finely enough for the on-screen size (¼ px).
     let tolerance = 0.25 / matrix.max_scale().max(1e-6);
-    let Ok(subpaths) = flatten(d, tolerance) else { return items };
+    let Ok(subpaths) = morph(m, tolerance) else { return items };
     let mut add = |prim: Prim, bounds: [f64; 4], pad: f64| {
         if let Some((prim, _)) = with_inverse(prim, matrix, opacity) {
             let pad = pad + prim.inv_x[3] as f64 * 1.5;
@@ -850,4 +850,93 @@ fn set_fill(prim: &mut Prim, fill: &PaintState, stops: &mut Vec<[f32; 4]>) {
             prim.paint2 = [g.from.x() as f32, g.from.y() as f32, g.to.x() as f32, g.to.y() as f32];
         }
     }
+}
+
+type Poly = (Vec<(f64, f64)>, bool);
+
+/// `n` points evenly spaced along a polyline (closed: around the loop).
+fn resample(pts: &[(f64, f64)], closed: bool, n: usize) -> Vec<(f64, f64)> {
+    let mut p = pts.to_vec();
+    if closed && p.first() != p.last() {
+        p.push(p[0]);
+    }
+    let lens: Vec<f64> = p.windows(2).map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt()).collect();
+    let total: f64 = lens.iter().sum();
+    if total <= 0.0 || p.len() < 2 {
+        return vec![p[0]; n];
+    }
+    let steps = if closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(n);
+    let (mut seg, mut acc) = (0usize, 0.0f64);
+    for i in 0..n {
+        let target = total * i as f64 / steps.max(1) as f64;
+        while seg + 1 < lens.len() && acc + lens[seg] < target {
+            acc += lens[seg];
+            seg += 1;
+        }
+        let k = if lens[seg] > 0.0 { ((target - acc) / lens[seg]).clamp(0.0, 1.0) } else { 0.0 };
+        out.push((p[seg].0 + (p[seg + 1].0 - p[seg].0) * k, p[seg].1 + (p[seg + 1].1 - p[seg].1) * k));
+    }
+    out
+}
+
+fn centroid(pts: &[(f64, f64)]) -> (f64, f64) {
+    let n = pts.len().max(1) as f64;
+    (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n)
+}
+
+/// Point correspondence for closed outlines: the rotation (and direction)
+/// of `b` that sits closest to `a`.
+fn align(a: &[(f64, f64)], b: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let n = a.len();
+    let stride = (n / 64).max(1);
+    let cost = |c: &[(f64, f64)], off: usize| -> f64 {
+        (0..n).step_by(stride).map(|i| {
+            let q = c[(i + off) % n];
+            (q.0 - a[i].0).powi(2) + (q.1 - a[i].1).powi(2)
+        }).sum()
+    };
+    let reversed: Vec<(f64, f64)> = b.iter().rev().copied().collect();
+    let mut best = (f64::INFINITY, 0usize, false);
+    for (rev, c) in [(false, b), (true, reversed.as_slice())] {
+        for off in 0..n {
+            let v = cost(c, off);
+            if v < best.0 {
+                best = (v, off, rev);
+            }
+        }
+    }
+    let c = if best.2 { &reversed } else { b };
+    (0..n).map(|i| c[(i + best.1) % n]).collect()
+}
+
+/// Outlines of a path, interpolated when it is mid-morph.
+pub fn morph(m: &PathMorph, tolerance: f64) -> Result<Vec<Poly>, String> {
+    let a = flatten(&m.from, tolerance)?;
+    let Some(to) = &m.to else { return Ok(a) };
+    let b = flatten(to, tolerance)?;
+    let t = m.t;
+    let count = a.len().max(b.len());
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        // A subpath without a partner grows from (or shrinks to) a point.
+        let (pa, ca) = a.get(i).cloned().unwrap_or_else(|| {
+            let c = centroid(&b[i].0);
+            (vec![c, c], b[i].1)
+        });
+        let (pb, cb) = b.get(i).cloned().unwrap_or_else(|| {
+            let c = centroid(&a[i].0);
+            (vec![c, c], a[i].1)
+        });
+        let closed = ca || cb;
+        let n = pa.len().max(pb.len()).clamp(32, 4096);
+        let ra = resample(&pa, closed, n);
+        let mut rb = resample(&pb, closed, n);
+        if closed {
+            rb = align(&ra, &rb);
+        }
+        let pts = ra.iter().zip(&rb).map(|(p, q)| (p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t)).collect();
+        out.push((pts, closed));
+    }
+    Ok(out)
 }

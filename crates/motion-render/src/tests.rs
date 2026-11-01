@@ -626,3 +626,45 @@ fn stylize_effects() {
     assert_eq!(img.get_pixel(160, 90).0[0], 255);
     assert!(img.get_pixel(2, 2).0[0] < 120);
 }
+
+#[test]
+fn primitives_as_paths_match_the_shapes() {
+    for spec in [json!({"shape": "circle", "size": 120}), json!({"shape": "rect", "size": [160, 100], "radius": 20}), json!({"shape": "star", "size": 140, "sides": 5, "inner": 0.45}), json!({"shape": "capsule", "size": [180, 60]})] {
+        let mut native = spec.clone();
+        native["id"] = json!("a");
+        native["kind"] = json!("shape");
+        native["fill"] = json!("#ffffff");
+        native["transform"] = json!({"position": [160, 90]});
+        let path = json!({"id": "a", "kind": "shape", "shape": "path", "d": spec.clone(), "fill": "#ffffff", "transform": {"position": [160, 90]}});
+        let a = cpu().render(&Compiled::new(&project(json!([native]))), 0.0);
+        let b = cpu().render(&Compiled::new(&project(json!([path]))), 0.0);
+        let differ = a.pixels().zip(b.pixels()).filter(|(p, q)| p.0[0].abs_diff(q.0[0]) > 96).count();
+        assert!(differ < 60, "{spec}: {differ} pixels differ");
+    }
+}
+
+#[test]
+fn path_morph_follows_eases_and_anchors() {
+    let mut p = project(json!([{"id": "m", "kind": "shape", "shape": "path", "fill": "#ffffff", "transform": {"position": [160, 90]},
+        "d": {"keys": [
+            {"at": 0, "v": {"shape": "circle", "size": 100}},
+            {"at": "beat:2", "v": {"shape": "star", "size": 160, "sides": 5, "inner": 0.4}, "ease": "gesture", "dur": "12f", "anchor": "peak"}
+        ]}}]));
+    p.markers.insert(MarkerTrack::from_times("beat", [0.5, 1.0, 1.5]));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let mut r = cpu();
+    let lit = |img: &image::RgbaImage| img.pixels().filter(|p| p.0[0] > 128).count();
+    let circle = lit(&r.render(&c, 0.0));
+    let star = lit(&r.render(&c, 1.9));
+    let mid = lit(&r.render(&c, 1.0));
+    assert!((circle as f64 - std::f64::consts::PI * 2500.0).abs() < 200.0, "{circle}");
+    assert!(mid != circle && mid != star, "{circle} {mid} {star}");
+    // The star's tip (top) is far above the circle's edge.
+    assert_eq!(r.render(&c, 1.9).get_pixel(160, 90 - 70).0[0], 255);
+    assert_eq!(r.render(&c, 0.0).get_pixel(160, 90 - 70).0[0], 0);
+    // check sees the morph's anchor and measures it on the frame grid.
+    let report = lahza_motion_core::check::check(&p, &c, &Default::default());
+    let sync = report.syncs.iter().find(|s| s.element == "m" && s.what == "d").expect("morph sync point");
+    assert!(sync.drift_frames.abs() <= 0.5, "{sync:?}");
+}
