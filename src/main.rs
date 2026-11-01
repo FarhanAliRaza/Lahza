@@ -1848,6 +1848,12 @@ fn open_studio_window(
 }
 
 fn main() {
+    // `lahza mcp` (agent interface) and `lahza motion …` (motion engine CLI)
+    // run headless and never open a window.
+    let words: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = lahza_motion_mcp::run_cli(&words) {
+        std::process::exit(code);
+    }
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     if arguments.iter().any(|argument| argument == "--version") {
         println!("Lahza {}", env!("CARGO_PKG_VERSION"));

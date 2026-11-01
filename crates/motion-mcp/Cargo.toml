@@ -1,0 +1,21 @@
+[package]
+name = "lahza-motion-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Motion engine agent interface: MCP server (`lahza mcp`) and `lahza motion` CLI"
+
+[[bin]]
+name = "lahza-motion"
+path = "src/bin/lahza-motion.rs"
+
+[dependencies]
+lahza-motion-audio = { path = "../motion-audio" }
+lahza-motion-core = { path = "../motion-core" }
+lahza-motion-render = { path = "../motion-render" }
+base64 = { workspace = true }
+image = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

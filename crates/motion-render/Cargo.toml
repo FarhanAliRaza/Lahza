@@ -1,0 +1,19 @@
+[package]
+name = "lahza-motion-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Motion engine renderer: SDF shapes, SDF glyphs, images and blur on Vulkan compute, with an identical CPU fallback"
+
+[dependencies]
+lahza-motion-core = { path = "../motion-core" }
+blade-graphics = { workspace = true }
+blade-macros = { workspace = true }
+bytemuck = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ttf-parser = { workspace = true }
+
+[dev-dependencies]
+naga = { workspace = true }

@@ -463,6 +463,18 @@ scripts against the reference numbers.
   sync drift over ±1 f.
 - Follow the project rules in `CLAUDE.md`; tests run in CI.
 
+### 12.2 Phase 1 status
+
+Built: `crates/motion-core`, `motion-audio`, `motion-render` (Vulkan compute
++ CPU fallback with identical math), `motion-mcp` (`lahza mcp`, `lahza
+motion …`). Usage, verification results, measured performance and what is
+still missing are in [`docs/motion-engine.md`](../docs/motion-engine.md).
+Open against the acceptance list: real-time 1080p60 and faster-than-real-time
+export need measuring on the RTX 3060 (only llvmpipe and a 4-core CPU were
+available while building); the agent benchmark exists as the scripted test
+`crates/motion-mcp/tests/promo.rs` and still wants a run by a live agent
+over MCP. Next: the editor UI for motion projects (phase 1b), then phase 2.
+
 ## 13. Open questions
 
 - Asset sourcing (maps, archives, data, TTS voice, music): deferred, see section 0.
