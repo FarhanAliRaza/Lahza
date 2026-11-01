@@ -1098,18 +1098,21 @@ impl Toolbox {
                 cmd.arg(b);
             }
             cmd.arg("--python").arg(&wrapper).env("LAHZA_BLENDER", config.to_string()).current_dir(&dir2);
-            cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            // Blender prints a lot while rendering: write it to a log file
+            // (an undrained pipe would block Blender once it fills).
+            let log_path = dir2.join("blender").join(format!("{}.log", config["name"].as_str().unwrap_or("blender")));
+            let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+            let log_err = log.try_clone().map_err(|e| e.to_string())?;
+            cmd.stdout(log).stderr(log_err);
             let mut child = cmd.spawn().map_err(|e| format!("cannot start Blender: {e}"))?;
             let started = Instant::now();
             loop {
                 if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let output = std::fs::read_to_string(&log_path).unwrap_or_default();
                     let tail = |s: &str| s.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-                    let done = stdout.lines().find_map(|l| l.strip_prefix("LAHZA_DONE ")).and_then(|j| serde_json::from_str::<Value>(j).ok());
+                    let done = output.lines().find_map(|l| l.strip_prefix("LAHZA_DONE ")).and_then(|j| serde_json::from_str::<Value>(j).ok());
                     if !status.success() || done.is_none() {
-                        return Err(format!("Blender failed ({status}):\n{}\n{}", tail(&stderr), tail(&stdout)));
+                        return Err(format!("Blender failed ({status}); log {}:\n{}", log_path.display(), tail(&output)));
                     }
                     let count = std::fs::read_dir(&out2).map(|r| r.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "png")).count()).unwrap_or(0);
                     p2.done.store(count as u64, Ordering::Relaxed);
