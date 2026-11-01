@@ -32,7 +32,7 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
         let y = GAP + row * (th + LABEL + GAP);
         layers.push(LayerState {
             id: name.as_str().into(),
-            matrix: Affine::translate(x + tw / 2.0, y + th / 2.0),
+            matrix: Affine::translate(x + tw / 2.0, y + th / 2.0).into(),
             opacity: 1.0,
             blend: Blend::Normal,
             effects: Vec::new(),
@@ -43,7 +43,7 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
         let count = text.chars().count();
         layers.push(LayerState {
             id: format!("label-{i}").into(),
-            matrix: Affine::translate(x + 4.0, y + th + LABEL / 2.0),
+            matrix: Affine::translate(x + 4.0, y + th + LABEL / 2.0).into(),
             opacity: 1.0,
             blend: Blend::Normal,
             effects: Vec::new(),

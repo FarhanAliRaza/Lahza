@@ -176,6 +176,9 @@ fn gpu_matches_cpu() {
          "effects": [{"type": "hue_saturation", "hue": 40, "saturation": 0.3}, {"type": "levels", "gamma": 1.4}, {"type": "gradient_map", "stops": [[0, "#101030"], [1, "#ffe0a0"]], "amount": 0.5},
                      {"type": "displace", "amount": 3, "scale": 12}, {"type": "rgb_split", "amount": 2}, {"type": "directional_blur", "angle": 30, "length": 6},
                      {"type": "vignette", "amount": 0.5}, {"type": "grain", "amount": 0.1}]},
+        {"id": "c3", "kind": "comp", "three_d": true, "transform": {"position": [160, 120], "rotation_y": 35, "rotation_x": -20, "z": 60},
+         "layers": [{"id": "c3a", "kind": "shape", "shape": "rect", "size": [90, 50], "radius": 8, "fill": "#7b61ff", "stroke": {"color": "#ffffff", "width": 2}},
+                    {"id": "c3t", "kind": "text", "text": "3D", "size": 30, "color": "#ffffff"}]},
         {"id": "m", "kind": "shape", "shape": "path", "d": "M -40 -30 C 0 -60 40 -30 40 0 L 0 40 Z", "fill": "#ffffff", "transform": {"position": [60, 40]}},
         {"id": "g", "kind": "comp", "transform": {"opacity": 0.8}, "matte": {"layer": "m", "mode": "luma"},
          "effects": [{"type": "shadow", "offset": [4, 6], "radius": 3}, {"type": "glow", "color": "#88ccff", "radius": 6, "intensity": 0.6}],
@@ -667,4 +670,45 @@ fn path_morph_follows_eases_and_anchors() {
     let report = lahza_motion_core::check::check(&p, &c, &Default::default());
     let sync = report.syncs.iter().find(|s| s.element == "m" && s.what == "d").expect("morph sync point");
     assert!(sync.drift_frames.abs() <= 0.5, "{sync:?}");
+}
+
+fn lit_span(img: &image::RgbaImage, y: u32, channel: usize) -> (u32, u32) {
+    let xs: Vec<u32> = (0..img.width()).filter(|x| img.get_pixel(*x, y).0[channel] > 128).collect();
+    (xs.first().copied().unwrap_or(0), xs.last().copied().unwrap_or(0))
+}
+
+#[test]
+fn three_d_layers_perspective_and_depth() {
+    // Turned 60° about y: about half as wide.
+    let turned = cpu().render(&Compiled::new(&project(json!([{"id": "a", "kind": "shape", "shape": "rect", "size": [160, 100], "fill": "#ffffff", "three_d": true,
+        "transform": {"position": [160, 90], "rotation_y": 60}}]))), 0.0);
+    let (x0, x1) = lit_span(&turned, 90, 0);
+    assert!(((x1 - x0) as i32 - 80).abs() <= 6, "width {}", x1 - x0);
+    // Tilted back about x: a trapezoid, narrower at the top (farther away).
+    let tilted = cpu().render(&Compiled::new(&project(json!([{"id": "a", "kind": "shape", "shape": "rect", "size": [200, 120], "fill": "#ffffff", "three_d": true,
+        "transform": {"position": [160, 90], "rotation_x": 50}}]))), 0.0);
+    let ys: Vec<u32> = (0..180).filter(|y| tilted.get_pixel(160, *y).0[0] > 128).collect();
+    let (top, bottom) = (lit_span(&tilted, ys[2], 0), lit_span(&tilted, ys[ys.len() - 3], 0));
+    assert!(top.1 - top.0 + 4 < bottom.1 - bottom.0, "top {top:?} bottom {bottom:?}");
+    // Depth beats list order: the nearer red plane covers the farther blue one.
+    let sorted = cpu().render(&Compiled::new(&project(json!([
+        {"id": "near", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ff0000", "three_d": true, "transform": {"position": [160, 90], "z": -100}},
+        {"id": "far", "kind": "shape", "shape": "rect", "size": [200, 200], "fill": "#0000ff", "three_d": true, "transform": {"position": [160, 90], "z": 300}}
+    ]))), 0.0);
+    assert_eq!(px(&sorted, 160, 90), [255, 0, 0, 255]);
+    // Camera orbit moves 3D layers; 2D layers stay put as overlays.
+    let mut p = project(json!([
+        {"id": "card", "kind": "shape", "shape": "rect", "size": [60, 60], "fill": "#00ff00", "three_d": true, "transform": {"position": [160, 90], "z": 200}},
+        {"id": "hud", "kind": "shape", "shape": "rect", "size": [20, 20], "fill": "#ffffff", "transform": {"position": [20, 20]}}
+    ]));
+    p.scenes[0].camera.orbit = lahza_motion_core::property::Property::Constant(lahza_motion_core::value::Vec2::new(25.0, 0.0));
+    let orbit = cpu().render(&Compiled::new(&p), 0.0);
+    let (g0, g1) = lit_span(&orbit, 90, 1);
+    assert!((g0 + g1) / 2 != 160, "the 3D card moved: {g0}..{g1}");
+    assert_eq!(px(&orbit, 20, 20), [255, 255, 255, 255], "the 2D overlay did not move");
+    // Dollied past the plane: it is behind the camera and not drawn.
+    let mut p = project(json!([{"id": "a", "kind": "shape", "shape": "rect", "size": [100, 100], "fill": "#ffffff", "three_d": true, "transform": {"position": [160, 90]}}]));
+    p.scenes[0].camera.dolly = lahza_motion_core::property::Property::Constant(lahza_motion_core::space::focal(180.0, 39.6) + 50.0);
+    let behind = cpu().render(&Compiled::new(&p), 0.0);
+    assert!(behind.pixels().all(|q| q.0[0] < 10), "nothing behind the camera is drawn");
 }

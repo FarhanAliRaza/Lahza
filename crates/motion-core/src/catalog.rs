@@ -175,6 +175,8 @@ pub fn catalog_json() -> Value {
             "effects_order": "shadow (below), then the layer through displace → directional_blur → rgb_split → colour effects in list order → vignette → grain, then glow (above); blur applies to the layer's picture first",
             "effects_note": "effects apply to the layer as one picture; on a comp they apply to the flattened comp (like an AE precomp)",
             "matte": {"layer": "sibling layer id used as a track matte (not drawn itself)", "mode": "alpha | alpha_inverted | luma | luma_inverted"},
+            "three_d": "bool: place the layer in 3D (uses transform.z, rotation_x, rotation_y and the scene camera's fov/orbit/dolly); 3D layers sort back to front among their neighbours; children of a 3D comp lie on its plane",
+            "transform_3d": {"z": "depth, + is away from the viewer", "rotation_x": "degrees, + tilts the top away", "rotation_y": "degrees, + turns the right side away"},
             "parent": "transform parent: sibling layer id",
             "hidden": "bool"
         },
@@ -215,7 +217,7 @@ pub fn catalog_json() -> Value {
             "end": "time (default next scene's start or the project end)", "duration": "duration",
             "pre_roll": "open this far into the animation", "background": "colour",
             "transition": {"type": "fade | push | slide | zoom | wipe | whip", "dur": "default \"10f\", centred on the cut", "ease": "default gesture (peak speed on the cut)", "direction": "left | right | up | down"},
-            "camera": {"position": "[x, y] point shown at the canvas centre", "zoom": "number", "rotation": "degrees"},
+            "camera": {"position": "[x, y] point of interest shown at the canvas centre", "zoom": "number", "rotation": "degrees (roll)", "fov": "3D: vertical degrees (39.6 keeps z = 0 at 1:1)", "orbit": "3D: [yaw, pitch] degrees around the point of interest", "dolly": "3D: px toward the point of interest"},
             "motion_blur": {"shutter": "degrees (180 film-like)", "samples": 8},
             "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first"
         },

@@ -6,6 +6,7 @@ struct Prim {
     kind: vec4<u32>,
     inv_x: vec4<f32>,
     inv_y: vec4<f32>,
+    inv_w: vec4<f32>,
     geom: vec4<f32>,
     geom2: vec4<f32>,
     fill: vec4<f32>,
@@ -263,11 +264,17 @@ fn sample_image(prim: Prim, l: vec2<f32>) -> vec4<f32> {
     return mix(mix(a, b, fx), mix(c, d, fx), fy);
 }
 
-fn shade(prim: Prim, p: vec2<f32>) -> vec4<f32> {
+fn shade(prim_in: Prim, p: vec2<f32>) -> vec4<f32> {
+    var prim = prim_in;
+    let w = prim.inv_w.x * p.x + prim.inv_w.y * p.y + prim.inv_w.z;
+    if w <= 0.0 { return vec4<f32>(0.0); }
     let l = vec2<f32>(
-        prim.inv_x.x * p.x + prim.inv_x.y * p.y + prim.inv_x.z,
-        prim.inv_y.x * p.x + prim.inv_y.y * p.y + prim.inv_y.z,
+        (prim.inv_x.x * p.x + prim.inv_x.y * p.y + prim.inv_x.z) / w,
+        (prim.inv_y.x * p.x + prim.inv_y.y * p.y + prim.inv_y.z) / w,
     );
+    if prim.inv_w.x != 0.0 || prim.inv_w.y != 0.0 {
+        prim.inv_x.w = max(sqrt(abs(prim.inv_w.w) / (w * w * w)), 1e-9);
+    }
     let aa = prim.inv_x.w;
     let opacity = prim.inv_y.w;
     var out = vec4<f32>(0.0);

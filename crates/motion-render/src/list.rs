@@ -12,6 +12,7 @@
 use crate::font::Fonts;
 use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
+use lahza_motion_core::space::Proj;
 use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PathMorph, PostKind, ShapeState};
 use lahza_motion_core::document::{Blend, GradientKind, MatteMode, ShapeKind};
 use lahza_motion_core::value::Color;
@@ -54,6 +55,9 @@ pub struct Prim {
     pub inv_x: [f32; 4],
     /// local.y = x·px + y·py + z; w = opacity.
     pub inv_y: [f32; 4],
+    /// Projective row: local = (inv_x·p, inv_y·p) / (inv_w·p); w = det of
+    /// the inverse (per-pixel anti-aliasing width √|det / w³|).
+    pub inv_w: [f32; 4],
     pub geom: [f32; 4],
     pub geom2: [f32; 4],
     /// Premultiplied fill colour.
@@ -151,16 +155,27 @@ fn blend_code(b: Blend) -> u32 {
 struct Item {
     prim: Prim,
     /// Forward transform (local → canvas) and local bounds, for binning.
-    forward: Affine,
+    forward: Proj,
     bounds: [f64; 4],
 }
 
-fn with_inverse(mut prim: Prim, forward: Affine, opacity: f64) -> Option<(Prim, Affine)> {
-    let inv = forward.inverse()?;
-    let [a, b, c, d, e, f] = inv.0;
-    let aa = inv.determinant().abs().sqrt().max(1e-9);
-    prim.inv_x = [a as f32, c as f32, e as f32, aa as f32];
-    prim.inv_y = [b as f32, d as f32, f as f32, opacity as f32];
+fn with_inverse(mut prim: Prim, forward: impl Into<Proj>, opacity: f64) -> Option<(Prim, Proj)> {
+    let forward: Proj = forward.into();
+    let mut inv = forward.inverse()?;
+    // Normalise so |w| ≈ 1 near the layer (keeps f32 well conditioned);
+    // by the magnitude only, since w's sign marks points behind the camera.
+    let k = inv.0[8].abs();
+    if k > 1e-12 && !inv.is_affine() {
+        inv = Proj(inv.0.map(|v| v / k));
+    }
+    let m = inv.0;
+    let det = inv.determinant();
+    // Nominal pixel size in local units (exact for affine layers; at the
+    // local origin for perspective ones, which shade it per pixel).
+    let aa = if inv.is_affine() { det.abs().sqrt() } else { 1.0 / forward.local_scale(0.0, 0.0).max(1e-12) }.max(1e-9);
+    prim.inv_x = [m[0] as f32, m[1] as f32, m[2] as f32, aa as f32];
+    prim.inv_y = [m[3] as f32, m[4] as f32, m[5] as f32, opacity as f32];
+    prim.inv_w = [m[6] as f32, m[7] as f32, m[8] as f32, det as f32];
     Some((prim, inv))
 }
 
@@ -168,7 +183,7 @@ fn with_inverse(mut prim: Prim, forward: Affine, opacity: f64) -> Option<(Prim, 
 /// `origin + factor·(gx, gy)`.
 fn retarget(item: &Item, origin: [f64; 2], factor: [f64; 2]) -> Option<Prim> {
     let to_canvas = Affine::translate(origin[0], origin[1]).then(Affine::scale(factor[0], factor[1]));
-    let forward = to_canvas.inverse()?.then(item.forward);
+    let forward = Proj::from(to_canvas.inverse()?).then(item.forward);
     let (p, _) = with_inverse(item.prim, forward, item.prim.inv_y[3] as f64)?;
     Some(p)
 }
@@ -192,7 +207,7 @@ impl Builder<'_> {
     pub fn build(&mut self, frame: &FrameState) -> DisplayList {
         let w = ((frame.width as f64 * self.scale).round() as u32).max(1);
         let h = ((frame.height as f64 * self.scale).round() as u32).max(1);
-        let root = Affine::scale(self.scale, self.scale);
+        let root = Proj::from(Affine::scale(self.scale, self.scale));
         let mut list = DisplayList::default();
         let mut pending: Vec<Pending> = Vec::new();
         let mut main_items: Vec<Item> = Vec::new();
@@ -305,7 +320,7 @@ impl Builder<'_> {
         (start as u32, (list.ops.len() - start) as u32)
     }
 
-    fn emit(&mut self, layer: &LayerState, root: Affine, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
+    fn emit(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         if !layer.is_isolated() {
             out.extend(self.layer_items(layer, root, &mut list.stops, &mut list.segments));
             return;
@@ -376,7 +391,7 @@ impl Builder<'_> {
                     continue;
                 }
                 let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), r, sigma, factor_for(sigma), false);
-                let forward = Affine::translate(offset.x() * scale, offset.y() * scale).then(Affine::translate(origin[0], origin[1])).then(Affine::scale(f[0], f[1]));
+                let forward = Proj::from(Affine::translate(offset.x() * scale, offset.y() * scale).then(Affine::translate(origin[0], origin[1])).then(Affine::scale(f[0], f[1])));
                 let prim = Prim {
                     kind: [PRIM_IMAGE, 1, 0, FLAG_TINT_ALPHA],
                     geom: [gw as f32, gh as f32, 1.0, 0.0],
@@ -410,7 +425,7 @@ impl Builder<'_> {
                 rect
             };
             let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), rect, blur, factor, clamp);
-            let forward = Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1]));
+            let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1])));
             let prim = match (matte, matte_items) {
                 (Some((mode, _)), Some(mi)) => {
                     let (moff, ..) = self.reserve(list, pending, mi, rect, 0.0, factor, false);
@@ -453,7 +468,7 @@ impl Builder<'_> {
                     continue;
                 }
                 let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), r, sigma, factor_for(sigma), false);
-                let forward = Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1]));
+                let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1])));
                 let k = *intensity as f32;
                 let prim = Prim {
                     kind: [PRIM_IMAGE, 1, 1, FLAG_TINT_MUL],
@@ -469,7 +484,7 @@ impl Builder<'_> {
         }
     }
 
-    fn layer_items(&mut self, layer: &LayerState, root: Affine, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
+    fn layer_items(&mut self, layer: &LayerState, root: Proj, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
         let matrix = root.then(layer.matrix);
         let blend = blend_code(layer.blend);
         let mut items = Vec::new();
@@ -655,28 +670,31 @@ impl Builder<'_> {
 }
 
 /// Canvas bounds without the anti-aliasing margins.
+fn bounds_of(pts: [(f64, f64); 4], pad: f64) -> [f64; 4] {
+    // A plane crossing the camera has no finite bounds: cover everything.
+    if pts.iter().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+        return [-1e9, -1e9, 1e9, 1e9];
+    }
+    [
+        pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) - pad,
+        pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min) - pad,
+        pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max) + pad,
+        pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max) + pad,
+    ]
+}
+
 fn tight_bounds(item: &Item) -> [f64; 4] {
     let m = item.prim.inv_x[3] as f64 * 1.5;
     let [x0, y0, x1, y1] = item.bounds;
     let inner = if item.prim.kind[0] == PRIM_SHAPE { [x0 + m, y0 + m, x1 - m, y1 - m] } else { item.bounds };
     let pts = [(inner[0], inner[1]), (inner[2], inner[1]), (inner[2], inner[3]), (inner[0], inner[3])].map(|(x, y)| item.forward.apply(x, y));
-    [
-        pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
-        pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
-        pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
-        pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
-    ]
+    bounds_of(pts, 0.0)
 }
 
 fn canvas_bounds(item: &Item) -> [f64; 4] {
     let [x0, y0, x1, y1] = item.bounds;
     let pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| item.forward.apply(x, y));
-    [
-        pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) - 1.0,
-        pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min) - 1.0,
-        pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max) + 1.0,
-        pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max) + 1.0,
-    ]
+    bounds_of(pts, 1.0)
 }
 
 /// Appends prims and their per-tile index lists for one target.
@@ -791,7 +809,7 @@ fn push_segments(lines: &[Vec<(f64, f64)>], close: bool, segments: &mut Vec<[f32
     (first, segments.len() as u32 - first, b)
 }
 
-fn path_items(s: &ShapeState, matrix: Affine, opacity: f64, blend: u32, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
+fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
     let mut items = Vec::new();
     let Some(m) = &s.path else { return items };
     // Flatten finely enough for the on-screen size (¼ px).

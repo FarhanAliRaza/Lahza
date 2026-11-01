@@ -229,10 +229,27 @@ fn luma(c: [f32; 4]) -> f32 {
 
 /// Premultiplied colour of one primitive at target pixel centre `p`.
 pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], segments: &[[f32; 4]], src: &Sources) -> [f32; 4] {
+    let w = prim.inv_w[0] * p[0] + prim.inv_w[1] * p[1] + prim.inv_w[2];
+    if w <= 0.0 {
+        // Behind the camera.
+        return [0.0; 4];
+    }
     let l = [
-        prim.inv_x[0] * p[0] + prim.inv_x[1] * p[1] + prim.inv_x[2],
-        prim.inv_y[0] * p[0] + prim.inv_y[1] * p[1] + prim.inv_y[2],
+        (prim.inv_x[0] * p[0] + prim.inv_x[1] * p[1] + prim.inv_x[2]) / w,
+        (prim.inv_y[0] * p[0] + prim.inv_y[1] * p[1] + prim.inv_y[2]) / w,
     ];
+    // Perspective: the pixel's footprint in local units varies across the
+    // plane (√|det(H⁻¹)| / |w|^1.5); affine layers keep the stored width.
+    let projective = prim.inv_w[0] != 0.0 || prim.inv_w[1] != 0.0;
+    let local;
+    let prim = if projective {
+        let mut q = *prim;
+        q.inv_x[3] = (prim.inv_w[3].abs() / (w * w * w)).sqrt().max(1e-9);
+        local = q;
+        &local
+    } else {
+        prim
+    };
     let aa = prim.inv_x[3];
     let opacity = prim.inv_y[3];
     let mut out = [0.0f32; 4];

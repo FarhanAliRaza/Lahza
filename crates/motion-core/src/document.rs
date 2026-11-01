@@ -213,11 +213,27 @@ pub struct Camera {
     /// Degrees.
     #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
     pub rotation: Property<f64>,
+    /// 3D layers: vertical field of view in degrees (39.6 maps z = 0 1:1).
+    #[serde(default = "default_fov", skip_serializing_if = "is_default_fov")]
+    pub fov: Property<f64>,
+    /// 3D layers: [yaw, pitch] degrees around the point of interest.
+    #[serde(default = "zero_vec", skip_serializing_if = "is_zero_vec")]
+    pub orbit: Property<Vec2>,
+    /// 3D layers: move toward the point of interest (px).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub dolly: Property<f64>,
+}
+
+fn default_fov() -> Property<f64> {
+    Property::Constant(39.6)
+}
+fn is_default_fov(p: &Property<f64>) -> bool {
+    *p == default_fov()
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Self { position: None, zoom: one_prop(), rotation: zero_prop() }
+        Self { position: None, zoom: one_prop(), rotation: zero_prop(), fov: default_fov(), orbit: zero_vec(), dolly: zero_prop() }
     }
 }
 
@@ -256,6 +272,14 @@ pub struct Transform {
     pub rotation: Property<f64>,
     #[serde(default = "one_prop", skip_serializing_if = "is_one")]
     pub opacity: Property<f64>,
+    /// 3D layers: depth (away from the viewer).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub z: Property<f64>,
+    /// 3D layers: tilt about x and turn about y, degrees.
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub rotation_x: Property<f64>,
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub rotation_y: Property<f64>,
 }
 
 impl Default for Transform {
@@ -266,6 +290,9 @@ impl Default for Transform {
             scale: one_vec(),
             rotation: zero_prop(),
             opacity: one_prop(),
+            z: zero_prop(),
+            rotation_x: zero_prop(),
+            rotation_y: zero_prop(),
         }
     }
 }
@@ -605,6 +632,10 @@ pub struct Common {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matte: Option<Matte>,
+    /// Place the layer in 3D (z, rotation_x/y, the scene's 3D camera);
+    /// 3D layers sort by depth among their neighbours.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub three_d: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
 }
@@ -613,7 +644,7 @@ fn is_normal(b: &Blend) -> bool {
     *b == Blend::Normal
 }
 
-const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "hidden"];
+const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "three_d", "hidden"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]

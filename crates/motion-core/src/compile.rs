@@ -8,6 +8,7 @@ use crate::markers::Markers;
 use crate::property::{compile as compile_prop, Ctx, Prop, Property, SyncPoint};
 use crate::time::{Duration, Fps, Lead, Step, TimeBase};
 use crate::timeref::{Anchor, Edge, ElementTimes, TimeRef};
+use crate::space::{Camera3, Mat4, Proj};
 use crate::value::{Animatable, Color, Vec2};
 use crate::Result;
 use std::collections::{HashMap, HashSet};
@@ -89,8 +90,9 @@ pub struct FrameState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerState {
     pub id: Arc<str>,
-    /// Layer space → canvas pixels, camera included.
-    pub matrix: Affine,
+    /// Layer space → canvas pixels, camera included (a homography for
+    /// 3D layers, affine otherwise).
+    pub matrix: Proj,
     pub opacity: f64,
     pub blend: Blend,
     /// Applied to the layer as one picture, in order (canvas pixels).
@@ -295,6 +297,9 @@ pub struct CScene {
     camera_position: Option<Prop<Vec2>>,
     camera_zoom: Prop<f64>,
     camera_rotation: Prop<f64>,
+    camera_fov: Prop<f64>,
+    camera_orbit: Prop<Vec2>,
+    camera_dolly: Prop<f64>,
     transition: Option<CTransition>,
     pub layers: Vec<CLayer>,
 }
@@ -341,6 +346,10 @@ pub struct CLayer {
     scale: Prop<Vec2>,
     rotation: Prop<f64>,
     opacity: Prop<f64>,
+    z: Prop<f64>,
+    rotation_x: Prop<f64>,
+    rotation_y: Prop<f64>,
+    three_d: bool,
     blend: Blend,
     effects: Vec<CEffect>,
     matte: Option<(usize, MatteMode)>,
@@ -680,6 +689,9 @@ impl<'a> Compiler<'a> {
         let scale = self.prop(&t.scale, id, "transform.scale", start, step, shift);
         let rotation = self.prop(&t.rotation, id, "transform.rotation", start, step, shift);
         let opacity = self.prop(&t.opacity, id, "transform.opacity", start, step, shift);
+        let z = self.prop(&t.z, id, "transform.z", start, step, shift);
+        let rotation_x = self.prop(&t.rotation_x, id, "transform.rotation_x", start, step, shift);
+        let rotation_y = self.prop(&t.rotation_y, id, "transform.rotation_y", start, step, shift);
         let mut effects = Vec::new();
         for (i, e) in c.effects.iter().enumerate() {
             let what = |f: &str| format!("effects.{i}.{f}");
@@ -844,6 +856,10 @@ impl<'a> Compiler<'a> {
             scale,
             rotation,
             opacity,
+            z,
+            rotation_x,
+            rotation_y,
+            three_d: c.three_d,
             blend: c.blend,
             effects,
             matte,
@@ -1032,6 +1048,9 @@ impl Compiled {
             let camera_position = scene.camera.position.as_ref().map(|p| c.prop(p, id, "camera.position", start, None, pre_roll));
             let camera_zoom = c.prop(&scene.camera.zoom, id, "camera.zoom", start, None, pre_roll);
             let camera_rotation = c.prop(&scene.camera.rotation, id, "camera.rotation", start, None, pre_roll);
+            let camera_fov = c.prop(&scene.camera.fov, id, "camera.fov", start, None, pre_roll);
+            let camera_orbit = c.prop(&scene.camera.orbit, id, "camera.orbit", start, None, pre_roll);
+            let camera_dolly = c.prop(&scene.camera.dolly, id, "camera.dolly", start, None, pre_roll);
             let layers = c.layers(&scene.layers, step, pre_roll);
             let transition = scene.transition.as_ref().map(|t| CTransition {
                 kind: t.kind,
@@ -1049,6 +1068,9 @@ impl Compiled {
                 camera_position,
                 camera_zoom,
                 camera_rotation,
+                camera_fov,
+                camera_orbit,
+                camera_dolly,
                 transition,
                 layers,
             });
@@ -1155,23 +1177,28 @@ impl Compiled {
         frame
     }
 
-    fn camera(&self, scene: &CScene, tc: f64) -> Affine {
+    fn camera(&self, scene: &CScene, tc: f64) -> Space {
         let (w, h) = (self.settings.width as f64, self.settings.height as f64);
         let zoom = scene.camera_zoom.at(tc);
+        let roll = scene.camera_rotation.at(tc);
         let center = scene.camera_position.as_ref().map(|p| p.at(tc)).unwrap_or(Vec2::new(w / 2.0, h / 2.0));
-        Affine::translate(w / 2.0, h / 2.0)
+        let flat = Affine::translate(w / 2.0, h / 2.0)
             .then(Affine::scale(zoom, zoom))
-            .then(Affine::rotate(-scene.camera_rotation.at(tc)))
-            .then(Affine::translate(-center.x(), -center.y()))
+            .then(Affine::rotate(-roll))
+            .then(Affine::translate(-center.x(), -center.y()));
+        let orbit = scene.camera_orbit.at(tc);
+        let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, scene.camera_fov.at(tc), (orbit.x(), orbit.y()), scene.camera_dolly.at(tc));
+        Space { world: Mat4::IDENTITY, flat, cam, three_d: false }
     }
 
     fn scene_layers(&self, scene: &CScene, t: f64, out: &mut Vec<LayerState>) {
         let tc = t + scene.pre_roll;
-        emit(&scene.layers, tc, None, self.camera(scene, tc), 1.0, out);
+        emit(&scene.layers, tc, None, &self.camera(scene, tc), 1.0, out);
     }
 
     /// A whole scene as one group with its background, for transitions.
     fn scene_group(&self, scene: &CScene, t: f64, matrix: Affine, opacity: f64) -> LayerState {
+        let matrix = Proj::from(matrix);
         let (w, h) = (self.settings.width as f64, self.settings.height as f64);
         let mut layers = vec![canvas_rect(&format!("{}-background", scene.id), w, h, scene.background)];
         self.scene_layers(scene, t, &mut layers);
@@ -1228,7 +1255,7 @@ impl Compiled {
                 };
                 let mut gb = self.scene_group(b, tb, id, 1.0);
                 let mut mask = canvas_rect(&format!("{}-wipe", b.id), rw.max(0.0), rh.max(0.0), Color::WHITE);
-                mask.matrix = Affine::translate(cx, cy);
+                mask.matrix = Affine::translate(cx, cy).into();
                 gb.matte = Some(Box::new(MatteState { mode: MatteMode::Alpha, source: Some(mask) }));
                 vec![self.scene_group(a, ta, id, 1.0), gb]
             }
@@ -1240,7 +1267,7 @@ impl Compiled {
 fn canvas_rect(id: &str, w: f64, h: f64, color: Color) -> LayerState {
     LayerState {
         id: id.into(),
-        matrix: Affine::translate(w / 2.0, h / 2.0),
+        matrix: Affine::translate(w / 2.0, h / 2.0).into(),
         opacity: 1.0,
         blend: Blend::Normal,
         effects: Vec::new(),
@@ -1261,7 +1288,28 @@ fn canvas_rect(id: &str, w: f64, h: f64, color: Color) -> LayerState {
     }
 }
 
-fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, cache: &mut [Option<Affine>]) -> Affine {
+/// Where layers are being placed: the comp chain's world transform and the
+/// scene's cameras (flat for 2D layers, perspective for 3D ones).
+#[derive(Clone, Copy)]
+struct Space {
+    world: Mat4,
+    flat: Affine,
+    cam: Camera3,
+    /// Inside a 3D comp: everything is on its plane, projected.
+    three_d: bool,
+}
+
+impl Space {
+    fn screen(&self, world: Mat4, three_d: bool) -> Proj {
+        if three_d {
+            self.cam.project.then(world).plane()
+        } else {
+            Proj::from(self.flat.then(world.to_affine()))
+        }
+    }
+}
+
+fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, cache: &mut [Option<Mat4>]) -> Mat4 {
     if let Some(m) = cache[i] {
         return m;
     }
@@ -1270,10 +1318,12 @@ fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, c
     let p = l.position.at(t);
     let s = l.scale.at(t);
     let a = l.anchor.at(t);
-    let local = Affine::translate(p.x(), p.y())
-        .then(Affine::rotate(l.rotation.at(t)))
-        .then(Affine::scale(s.x(), s.y()))
-        .then(Affine::translate(-a.x(), -a.y()));
+    let local = Mat4::translate(p.x(), p.y(), l.z.at(t))
+        .then(Mat4::rotate_y(l.rotation_y.at(t)))
+        .then(Mat4::rotate_x(l.rotation_x.at(t)))
+        .then(Mat4::rotate_z(l.rotation.at(t)))
+        .then(Mat4::scale(s.x(), s.y(), 1.0))
+        .then(Mat4::translate(-a.x(), -a.y(), 0.0));
     let m = match l.parent {
         Some(pi) => layer_matrix(layers, pi, tc, inherited, cache).then(local),
         None => local,
@@ -1289,13 +1339,38 @@ fn clock(step: Option<Step>, t: f64) -> f64 {
     }
 }
 
-fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, parent: Affine, parent_opacity: f64, out: &mut Vec<LayerState>) {
+fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, space: &Space, parent_opacity: f64, out: &mut Vec<LayerState>) {
     let mut cache = vec![None; layers.len()];
-    for i in 0..layers.len() {
+    // Paint order, with runs of 3D layers sorted back to front by depth.
+    let mut order: Vec<usize> = (0..layers.len()).collect();
+    let mut i = 0;
+    while i < order.len() {
+        if !(layers[order[i]].three_d || space.three_d) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < order.len() && (layers[order[i]].three_d || space.three_d) {
+            i += 1;
+        }
+        let mut depth: Vec<(f64, usize)> = order[start..i]
+            .iter()
+            .map(|&k| {
+                let world = space.world.then(layer_matrix(layers, k, tc, inherited, &mut cache));
+                (space.cam.view.then(world).apply(0.0, 0.0, 0.0)[2], k)
+            })
+            .collect();
+        // Stable: equal depths keep list order.
+        depth.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (slot, (_, k)) in order[start..i].iter_mut().zip(depth) {
+            *slot = k;
+        }
+    }
+    for i in order {
         if layers[i].is_matte {
             continue;
         }
-        layer(layers, i, tc, inherited, parent, parent_opacity, &mut cache, false, out);
+        layer(layers, i, tc, inherited, space, parent_opacity, &mut cache, false, out);
     }
 }
 
@@ -1303,7 +1378,7 @@ fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, parent: Affine, par
 /// everything else pushes one state. `isolate` forces comps into a group
 /// (matte sources).
 #[allow(clippy::too_many_arguments)]
-fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: Affine, parent_opacity: f64, cache: &mut [Option<Affine>], isolate: bool, out: &mut Vec<LayerState>) {
+fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &Space, parent_opacity: f64, cache: &mut [Option<Mat4>], isolate: bool, out: &mut Vec<LayerState>) {
     let l = &layers[i];
     if l.hidden || tc < l.start - 1e-9 || tc >= l.end - 1e-9 {
         return;
@@ -1314,8 +1389,11 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: 
     if own_opacity * parent_opacity <= 0.0 {
         return;
     }
-    let matrix = parent.then(layer_matrix(layers, i, tc, inherited, cache));
+    let world = space.world.then(layer_matrix(layers, i, tc, inherited, cache));
+    let three_d = space.three_d || l.three_d;
+    let matrix = space.screen(world, three_d);
     let scale = matrix.max_scale();
+    let inner = Space { world, three_d, ..*space };
     let effects: Vec<EffectState> = l
         .effects
         .iter()
@@ -1369,7 +1447,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: 
         .collect();
     let matte = l.matte.map(|(mi, mode)| {
         let mut src = Vec::new();
-        layer(layers, mi, tc, inherited, parent, 1.0, cache, true, &mut src);
+        layer(layers, mi, tc, inherited, space, 1.0, cache, true, &mut src);
         Box::new(MatteState { mode, source: src.pop() })
     });
     let content = match &l.kind {
@@ -1377,14 +1455,15 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, parent: 
             let ct = tc - l.offset;
             let group = isolate || !effects.is_empty() || matte.is_some() || l.blend != Blend::Normal || own_opacity < 1.0 && children.len() > 1;
             if !group {
-                emit(children, ct, step, matrix, parent_opacity * own_opacity, out);
+                emit(children, ct, step, &inner, parent_opacity * own_opacity, out);
                 return;
             }
-            let mut inner = Vec::new();
-            emit(children, ct, step, matrix, 1.0, &mut inner);
+            let mut kids = Vec::new();
+            emit(children, ct, step, &inner, 1.0, &mut kids);
+            let inner = kids;
             out.push(LayerState {
                 id: l.id.clone(),
-                matrix: Affine::IDENTITY,
+                matrix: Proj::IDENTITY,
                 opacity: parent_opacity * own_opacity,
                 blend: l.blend,
                 effects,

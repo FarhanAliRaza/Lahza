@@ -656,7 +656,7 @@ impl Toolbox {
         let mut listed = Vec::new();
         for (label, t) in &times {
             // The frame nearest the reference: where a cut or anchor on it lands.
-            let n = fps.nearest_frame(*t).max(0);
+            let n = fps.nearest_frame(*t).clamp(0, compiled.frame_count().saturating_sub(1) as i64);
             let ft = fps.time_of(n);
             let image = renderer.render(&compiled, ft);
             listed.push(json!({"at": label, "t": round(ft), "frame": n}));
