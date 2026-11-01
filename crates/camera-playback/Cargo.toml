@@ -1,0 +1,14 @@
+[package]
+name = "lahza-camera-playback"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Persistent source-time webcam decoding for preview and export"
+
+[dependencies]
+lahza-video = { path = "../video" }
+image = { workspace = true }
+
+[dev-dependencies]
+lahza-motion-blur = { path = "../motion-blur" }
+uuid = { workspace = true }

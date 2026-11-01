@@ -1,0 +1,15 @@
+[package]
+name = "lahza-transcription"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "On-device narration transcription through whisper.cpp"
+
+[dependencies]
+lahza-clips = { path = "../clips" }
+lahza-speech-runtime = { path = "../speech-runtime" }
+lahza-transcript = { path = "../transcript" }
+lahza-video = { path = "../video" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

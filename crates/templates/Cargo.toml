@@ -1,0 +1,12 @@
+[package]
+name = "lahza-templates"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Curated scene templates: look, layout, pose, motion, and captions"
+
+[dependencies]
+lahza-backgrounds = { path = "../backgrounds" }
+lahza-scene-model = { path = "../scene-model" }
+lahza-viewport = { path = "../viewport" }
+lahza-annotations = { workspace = true }

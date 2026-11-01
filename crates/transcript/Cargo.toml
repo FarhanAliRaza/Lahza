@@ -1,0 +1,11 @@
+[package]
+name = "lahza-transcript"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Narration transcript of a recording as timed words"
+
+[dependencies]
+lahza-clips = { path = "../clips" }
+serde = { workspace = true }
+uuid = { workspace = true }

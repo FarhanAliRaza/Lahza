@@ -1,0 +1,17 @@
+[package]
+name = "lahza-teleprompter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Teleprompter script model and voice following"
+
+[dependencies]
+lahza-model = { path = "../model" }
+lahza-speech-diagnostics = { path = "../speech-diagnostics" }
+lahza-speech-runtime = { path = "../speech-runtime" }
+lahza-transcription = { path = "../transcription" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

@@ -40,7 +40,7 @@ mod text_field;
 mod text_fields_ui;
 mod preset_cards;
 mod preview;
-mod recording;
+use lahza_recording as recording;
 mod scene_ui;
 mod scene_preview;
 mod camera_regions_ui;
@@ -89,7 +89,8 @@ use recording::{
     camera_preview::{CameraFrames, CameraPreview},
     clips::RecordingClipTimeline,
     export::{ExportFormat, ExportProgress, ExportResolution},
-    model::{PointerCaptureFile, RecordingSession},
+    model::PointerCaptureFile,
+    project::RecordingSession,
     native::{camera_devices, microphone_devices, NativeRecorder, RecordingOptions},
     pointer_timeline::PointerTimeline,
     presets::PresetLibrary,

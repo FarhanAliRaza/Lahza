@@ -1,0 +1,12 @@
+[package]
+name = "lahza-cursor-theme"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Swaps captured cursor bitmaps for high-resolution theme cursors"
+
+[dependencies]
+lahza-cursor-assets = { path = "../cursor-assets" }
+lahza-model = { path = "../model" }
+base64 = { workspace = true }
+image = { workspace = true }

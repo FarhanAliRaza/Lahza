@@ -579,7 +579,7 @@ mod tests {
         use crate::{
             asset_directory, open_studio_window,
             recording::{
-                camera_layout::CameraLayout, clips::RecordingClipTimeline, model::RecordingSession,
+                camera_layout::CameraLayout, clips::RecordingClipTimeline, project::RecordingSession,
                 scene::SceneStyle,
             },
             Assets,
@@ -729,7 +729,8 @@ mod tests {
             open_studio_window,
             recording::{
                 camera_layout::CameraLayout,
-                model::{CaptureManifest, RecordingSession},
+                model::CaptureManifest,
+                project::RecordingSession,
                 scene::SceneStyle,
             },
             Assets,

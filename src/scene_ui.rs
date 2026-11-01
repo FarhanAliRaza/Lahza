@@ -4212,7 +4212,7 @@ impl Studio {
         self.video_levels_token = self.video_levels_token.wrapping_add(1);
         let token = self.video_levels_token;
         let task = cx.background_executor().spawn(async move {
-            crate::recording::video::audio_levels(&path, 240, mode).unwrap_or_default()
+            crate::recording::audio_processing::audio_levels(&path, 240, mode).unwrap_or_default()
         });
         cx.spawn(async move |weak, cx| {
             let levels = task.await;
@@ -4354,5 +4354,131 @@ mod canvas_caption_tests {
         assert!(!mark.is_canvas());
         mark.canvas = true;
         assert!(mark.is_canvas());
+    }
+}
+
+/// Exports that draw annotations through this module's overlay sources.
+#[cfg(test)]
+mod export_tests {
+    use crate::recording::{
+        export::{export_scene, ExportFormat, ExportProgress, SceneExportRequest, SceneSource},
+        pointer_timeline::PointerTimeline,
+        scene::{SceneBackground, SceneStyle},
+        video::{self, probe_media},
+        viewport::ViewportTimeline,
+    };
+    use image::{Rgba, RgbaImage};
+    use std::{fs, path::PathBuf, process::{Command, Stdio}, time::Instant};
+
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "lahza-scene-export-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    #[ignore = "set LAHZA_EXPORT_PROJECT to benchmark 20 seconds of a saved recording"]
+    fn benchmark_saved_recording_export() {
+        use crate::recording::project::RecordingSession;
+        let session = RecordingSession {
+            directory: std::env::var_os("LAHZA_EXPORT_PROJECT").expect("recording directory").into(),
+        };
+        let document = session.effective_edit_document().unwrap().unwrap();
+        let style: SceneStyle = serde_json::from_value(document["scene"].clone()).unwrap();
+        let info = probe_media(&session.screen_path()).unwrap();
+        let clips = session.effective_clip_timeline(info.duration).unwrap();
+        let capture = session.read_pointer_capture().unwrap();
+        let pointer = PointerTimeline::build_with_clip_timeline(
+            capture.clone(), info.duration, info.width as f64, info.height as f64,
+            style.pointer.timeline_options(), Some(&clips),
+        );
+        let cues: Vec<crate::recording::viewport::ZoomCue> = document.get("zoomCues").cloned()
+            .map(|value| serde_json::from_value(value).unwrap()).unwrap_or_default();
+        let viewport = ViewportTimeline::build(&cues, &pointer, &clips, &capture);
+        let marks: Vec<crate::AnnotationMark> = document.get("annotations").cloned()
+            .map(|value| serde_json::from_value(value).unwrap()).unwrap_or_default();
+        let root = test_root("benchmark");
+        let destination = root.join("sample.mp4");
+        let duration = clips.duration().min(20.0);
+        let mut request = SceneExportRequest::new(destination.clone(), ExportFormat::Mp4,
+            1080, style.clone(), viewport.clone(), duration);
+        request.frame_rate = 30.0;
+        request.noise_reduction = document["lahzaExtras"]["noiseReduction"].as_bool().unwrap_or(false);
+        request.audio_mode = serde_json::from_value(document["lahzaExtras"]["audioMode"].clone()).ok();
+        request.include_audio = !document["lahzaExtras"]["audioMuted"].as_bool().unwrap_or(false);
+        let (width, height) = style.export_canvas_size(info.width, info.height, 1080);
+        request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(marks.clone(), width as f64 / height as f64);
+        request.overlay = crate::scene_ui::overlay_source_for(marks, info.width, info.height);
+        let progress = ExportProgress::default();
+        let start = Instant::now();
+        export_scene(SceneSource::Video {
+            media: session.screen_path(), clips, pointer: Some(pointer),
+            camera: session.camera_path().exists().then(|| session.camera_path()),
+        }, &mut request, &progress).unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!("Saved project: {duration:.1}s at {width}x{height}/30fps exported in {elapsed:.2}s ({:.2}x realtime), compositor={:?}, encoder={:?}, output={}",
+            duration / elapsed, progress.compositor_label(), progress.encoder_label(), destination.display());
+        let output = probe_media(&destination).unwrap();
+        assert_eq!((output.width, output.height), (width, height));
+        assert!((output.duration - duration).abs() < 0.15);
+    }
+
+    #[test]
+    fn canvas_text_exports_after_the_image_clip_ends() {
+        if !ffmpeg_available() { return; }
+        let root = test_root("late-canvas-text");
+        let destination = root.join("late.mp4");
+        let style = SceneStyle {
+            background: SceneBackground::Solid(0),
+            padding: 0, corners: 0, shadow: 0, border: false,
+            aspect: Some(16.0 / 9.0),
+            ..SceneStyle::default()
+        };
+        let mut request = SceneExportRequest::new(destination.clone(), ExportFormat::Mp4,
+            180, style, ViewportTimeline::default(), 1.2);
+        request.frame_rate = 10.0;
+        request.media_start = 0.2;
+        request.media_end = Some(0.4);
+        request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(vec![crate::AnnotationMark {
+            tool: crate::Tool::Text,
+            text: "AFTER".into(),
+            canvas: true,
+            color: 0xff0000,
+            font_size: 100.0,
+            start: crate::NormPoint { x: 0.05, y: 0.25 },
+            end: crate::NormPoint { x: 0.45, y: 0.5 },
+            timing: Some(crate::timed::AnnotationTiming {
+                start: 0.6, end: 1.2,
+                entrance: crate::timed::EntranceEffect::None,
+                exit: crate::timed::ExitEffect::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }], 16.0 / 9.0);
+        export_scene(SceneSource::Image {
+            image: RgbaImage::from_pixel(160, 90, Rgba([0, 255, 0, 255])), pointer: None,
+        }, &mut request, &ExportProgress::default()).unwrap();
+        assert!((probe_media(&destination).unwrap().duration - 1.2).abs() < 0.15);
+        let before = video::decode_frame(&destination, 0.0, 320, 180).unwrap();
+        assert!(before.rgba.chunks_exact(4).all(|p| p[0] < 10 && p[1] < 10 && p[2] < 10), "image has not started");
+        let early = video::decode_frame(&destination, 0.3, 320, 180).unwrap();
+        assert!(early.rgba.chunks_exact(4).any(|p| p[1] > 180 && p[0] < 50));
+        let late = video::decode_frame(&destination, 0.8, 320, 180).unwrap();
+        assert!(!late.rgba.chunks_exact(4).any(|p| p[1] > 180 && p[0] < 50), "image has ended");
+        assert!(late.rgba.chunks_exact(4).any(|p| p[0] > 150 && p[1] < 80), "later canvas text is visible");
+        fs::remove_dir_all(root).unwrap();
     }
 }

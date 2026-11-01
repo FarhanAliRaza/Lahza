@@ -9,7 +9,7 @@ use crate::recording::{
     audio_processing::{self, ProcessingControl},
     camera_playback::CameraPlaybackDecoder,
     clips::{ClipEdge, RecordingClipSegment, RecordingClipTimeline},
-    model::RecordingSession,
+    project::RecordingSession,
     playback::TimelinePlaybackStream,
     pointer_timeline::PointerTimeline,
     viewport::{ViewportTimeline, ZoomCue},

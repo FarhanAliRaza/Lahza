@@ -1,0 +1,28 @@
+[package]
+name = "lahza-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Screen, webcam, and audio recording through the desktop portal and GStreamer"
+
+[dependencies]
+lahza-area = { path = "../area" }
+lahza-area-indicator = { path = "../area-indicator" }
+lahza-camera-preview = { path = "../camera-preview" }
+lahza-capture-exclusion = { path = "../capture-exclusion" }
+lahza-input = { path = "../input" }
+lahza-project = { path = "../project" }
+lahza-stream-geometry = { path = "../stream-geometry" }
+ashpd = { workspace = true }
+async-io = { workspace = true }
+futures-util = { workspace = true }
+gstreamer = { workspace = true }
+
+[dev-dependencies]
+lahza-scene = { path = "../scene" }
+lahza-video = { path = "../video" }
+lahza-viewport = { path = "../viewport" }
+gstreamer-video = { workspace = true }
+image = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

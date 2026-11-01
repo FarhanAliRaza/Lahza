@@ -1,0 +1,10 @@
+[package]
+name = "lahza-camera-preview"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Live webcam preview frames for the Studio canvas"
+
+[dependencies]
+gstreamer = { workspace = true }
+gstreamer-video = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "lahza-media"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Project-owned imports and editor-time audio layers"
+
+[features]
+# Capture audio in a sink instead of a sound device, for other crates' tests.
+test-support = []
+
+[dependencies]
+lahza-audio-processing = { path = "../audio-processing" }
+lahza-import-image = { path = "../import-image" }
+lahza-project = { path = "../project" }
+lahza-video = { path = "../video" }
+gstreamer = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+lahza-clips = { path = "../clips" }
+lahza-playback = { path = "../playback", features = ["test-support"] }

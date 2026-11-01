@@ -1,0 +1,11 @@
+[package]
+name = "lahza-temporal-decode"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native sequential decoding for forward shutters with exact seeks"
+
+[dependencies]
+lahza-video = { path = "../video" }
+gstreamer = { workspace = true }
+image = { workspace = true }

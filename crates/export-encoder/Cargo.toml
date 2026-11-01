@@ -1,0 +1,9 @@
+[package]
+name = "lahza-export-encoder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Export progress and hardware encoder selection by a real, bounded encode"
+
+[dependencies]
+lahza-audio-processing = { path = "../audio-processing" }

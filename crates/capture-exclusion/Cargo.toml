@@ -1,0 +1,13 @@
+[package]
+name = "lahza-capture-exclusion"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Recording-scoped requests for the GNOME helper to omit floating windows"
+
+[dependencies]
+lahza-input = { path = "../input" }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

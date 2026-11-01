@@ -1,0 +1,15 @@
+[package]
+name = "lahza-area"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Area selection from the live portal stream before encoding starts"
+
+[dependencies]
+lahza-camera-preview = { path = "../camera-preview" }
+lahza-capture-exclusion = { path = "../capture-exclusion" }
+gstreamer = { workspace = true }
+
+[dev-dependencies]
+lahza-video = { path = "../video" }
+uuid = { workspace = true }

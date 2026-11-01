@@ -121,7 +121,7 @@ impl Studio {
         let job = progress.clone();
         let task = cx.background_executor().spawn(async move {
             if install {
-                speech_setup::setup(&job)
+                speech_setup::setup(&job, env!("CARGO_PKG_VERSION"))
             } else {
                 speech_setup::check(&job)
             }

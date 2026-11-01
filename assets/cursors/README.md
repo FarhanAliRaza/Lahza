@@ -11,4 +11,4 @@ recorded pointer in a chosen cursor style (Cap does the same).
   https://github.com/CapSoftware/Cap (`crates/cursor-info/assets/windows`).
   The artwork remains Microsoft's.
 
-Hotspots (as fractions of the SVG box) live in `src/recording/cursor_assets.rs`.
+Hotspots (as fractions of the SVG box) live in `crates/cursor-assets/src/cursor_assets.rs`.

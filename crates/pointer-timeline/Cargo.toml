@@ -1,0 +1,18 @@
+[package]
+name = "lahza-pointer-timeline"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Smoothed pointer motion, cursor artwork, and click effects over time"
+
+[dependencies]
+lahza-clips = { path = "../clips" }
+lahza-cursor-assets = { path = "../cursor-assets" }
+lahza-cursor-planner = { path = "../cursor-planner" }
+lahza-model = { path = "../model" }
+lahza-motion = { path = "../motion" }
+lahza-pointer = { path = "../pointer" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

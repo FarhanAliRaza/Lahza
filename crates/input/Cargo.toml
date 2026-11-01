@@ -1,0 +1,19 @@
+[package]
+name = "lahza-input"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pointer and keystroke capture during a recording"
+
+[dependencies]
+lahza-cursor-theme = { path = "../cursor-theme" }
+lahza-model = { path = "../model" }
+lahza-pointer = { path = "../pointer" }
+base64 = { workspace = true }
+image = { workspace = true }
+libc = { workspace = true }
+libspa-sys = { workspace = true }
+pipewire = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

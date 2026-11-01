@@ -1,0 +1,10 @@
+[package]
+name = "lahza-speech-diagnostics"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Durable diagnostics for each voice-follow session"
+
+[dependencies]
+chrono = { workspace = true }
+uuid = { workspace = true }

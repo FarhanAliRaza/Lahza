@@ -11,7 +11,7 @@ GPU and no ONNX Runtime or CUDA.
   SHA-256 `06badaf4029b297f97f7fe48d62990b48d5482608210df577354e0d4e0ed70e1`
   (equal to Hugging Face's LFS record). Checked at load.
 - License: OpenMDW-1.1, retained in `re-use/LICENSE` and embedded in the binary.
-- Implementation: `src/recording/reuse_audio.rs` and `reuse_audio.wgsl`.
+- Implementation: `crates/reuse-audio/src/reuse_audio.rs` and `reuse_audio.wgsl`.
 
 ## Processing
 

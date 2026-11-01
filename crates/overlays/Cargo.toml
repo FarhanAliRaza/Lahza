@@ -1,0 +1,9 @@
+[package]
+name = "lahza-overlays"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Keystroke caption timeline and pointer press effect geometry"
+
+[dependencies]
+lahza-model = { path = "../model" }

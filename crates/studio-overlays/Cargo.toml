@@ -1,0 +1,16 @@
+[package]
+name = "lahza-studio-overlays"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Keystroke captions, subtitles, and narration drawn above the finished scene"
+
+[dependencies]
+lahza-clips = { path = "../clips" }
+lahza-model = { path = "../model" }
+lahza-overlays = { path = "../overlays" }
+lahza-rect = { path = "../rect" }
+lahza-transcript = { path = "../transcript" }
+image = { workspace = true }
+lahza-annotations = { workspace = true }
+serde = { workspace = true }

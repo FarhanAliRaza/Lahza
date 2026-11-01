@@ -1,0 +1,15 @@
+[package]
+name = "lahza-session"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Recording lifecycle: start, pause, resume, stop, and elapsed time"
+
+[dependencies]
+lahza-model = { path = "../model" }
+lahza-native = { path = "../native" }
+lahza-project = { path = "../project" }
+lahza-video = { path = "../video" }
+
+[dev-dependencies]
+uuid = { workspace = true }

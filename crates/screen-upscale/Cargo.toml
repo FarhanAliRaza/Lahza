@@ -1,0 +1,15 @@
+[package]
+name = "lahza-screen-upscale"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Tiled GPU reconstruction of UI pixels for upscaled exports"
+
+[dependencies]
+blade-graphics = { workspace = true }
+blade-macros = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+naga = { workspace = true }

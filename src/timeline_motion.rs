@@ -361,7 +361,7 @@ mod tests {
 #[cfg(test)]
 mod native_tests {
     use super::*;
-    use crate::recording::model::RecordingSession;
+    use crate::recording::project::RecordingSession;
     use crate::timed::AnnotationTiming;
     use crate::{asset_directory, open_studio_window, AnnotationMark, Assets};
     use gpui::{point, Application, Timer};

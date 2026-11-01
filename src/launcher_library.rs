@@ -27,7 +27,7 @@ impl Studio {
         self.library_state.loading = true;
         let task = cx.background_executor().spawn(async move {
             let root = if projects {
-                recording::model::recordings_root()
+                recording::project::recordings_root()
             } else {
                 library::screenshots_root()
             };
@@ -197,7 +197,7 @@ fn item_details(path: &std::path::Path, projects: bool) -> String {
         .map(|time| chrono::DateTime::<chrono::Local>::from(time).format("%b %-d, %Y").to_string())
         .ok();
     let extent = if projects {
-        recording::model::RecordingSession { directory: path.to_path_buf() }
+        recording::project::RecordingSession { directory: path.to_path_buf() }
             .read_manifest()
             .ok()
             .filter(|manifest| manifest.duration > 0.0)
@@ -211,7 +211,7 @@ fn item_details(path: &std::path::Path, projects: bool) -> String {
 /// Decode off the UI thread and retain only a display-sized image.
 fn load_thumbnail(path: &std::path::Path, projects: bool) -> Option<image::RgbaImage> {
     let source = if projects {
-        let poster = path.join(recording::model::RecordingSession::POSTER_FILE);
+        let poster = path.join(recording::project::RecordingSession::POSTER_FILE);
         if poster.exists() {
             poster
         } else {
@@ -259,7 +259,7 @@ mod tests {
             (192, 108)
         );
         image::RgbaImage::new(1280, 720)
-            .save(root.join(recording::model::RecordingSession::POSTER_FILE))
+            .save(root.join(recording::project::RecordingSession::POSTER_FILE))
             .unwrap();
         let thumbnail = load_thumbnail(&root, true).unwrap();
         assert!(thumbnail.pixels().all(|pixel| pixel[3] == 0));

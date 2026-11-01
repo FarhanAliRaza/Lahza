@@ -1,0 +1,13 @@
+[package]
+name = "lahza-import-image"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Still-image import with content detection and decoder fallback"
+
+[dependencies]
+lahza-video = { path = "../video" }
+image = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

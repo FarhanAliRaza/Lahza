@@ -1,0 +1,13 @@
+[package]
+name = "lahza-clips"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Non-destructive clip timeline: segments, speed, gaps, and order over source time"
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

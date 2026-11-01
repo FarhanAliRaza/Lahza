@@ -1,0 +1,9 @@
+[package]
+name = "lahza-pointer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Sanitizes captured pointer streams into ordered events"
+
+[dependencies]
+lahza-model = { path = "../model" }

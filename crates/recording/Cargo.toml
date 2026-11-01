@@ -1,0 +1,66 @@
+[package]
+name = "lahza-recording"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Capture, editing, compositing, and export engine for Lahza"
+
+[dependencies]
+lahza-animation = { path = "../animation" }
+lahza-area = { path = "../area" }
+lahza-area-indicator = { path = "../area-indicator" }
+lahza-audio-dsp = { path = "../audio-dsp" }
+lahza-audio-mode = { path = "../audio-mode" }
+lahza-audio-processing = { path = "../audio-processing" }
+lahza-backgrounds = { path = "../backgrounds" }
+lahza-camera-matting = { path = "../camera-matting" }
+lahza-camera-matting-runtime = { path = "../camera-matting-runtime" }
+lahza-camera-playback = { path = "../camera-playback" }
+lahza-camera-preview = { path = "../camera-preview" }
+lahza-capture-exclusion = { path = "../capture-exclusion" }
+lahza-clips = { path = "../clips" }
+lahza-cursor-assets = { path = "../cursor-assets" }
+lahza-cursor-planner = { path = "../cursor-planner" }
+lahza-cursor-theme = { path = "../cursor-theme" }
+lahza-export = { path = "../export" }
+lahza-export-encoder = { path = "../export-encoder" }
+lahza-import-image = { path = "../import-image" }
+lahza-input = { path = "../input" }
+lahza-loupe = { path = "../loupe" }
+lahza-media = { path = "../media" }
+lahza-model = { path = "../model" }
+lahza-motion = { path = "../motion" }
+lahza-motion-blur = { path = "../motion-blur" }
+lahza-native = { path = "../native" }
+lahza-overlays = { path = "../overlays" }
+lahza-playback = { path = "../playback" }
+lahza-pointer = { path = "../pointer" }
+lahza-pointer-timeline = { path = "../pointer-timeline" }
+lahza-presets = { path = "../presets" }
+lahza-primary-frames = { path = "../primary-frames" }
+lahza-project = { path = "../project" }
+lahza-rect = { path = "../rect" }
+lahza-reuse-audio = { path = "../reuse-audio" }
+lahza-scene = { path = "../scene" }
+lahza-scene-model = { path = "../scene-model" }
+lahza-screen-upscale = { path = "../screen-upscale" }
+lahza-session = { path = "../session" }
+lahza-speech-diagnostics = { path = "../speech-diagnostics" }
+lahza-speech-runtime = { path = "../speech-runtime" }
+lahza-speech-setup = { path = "../speech-setup" }
+lahza-stream-geometry = { path = "../stream-geometry" }
+lahza-studio-overlays = { path = "../studio-overlays" }
+lahza-teleprompter = { path = "../teleprompter" }
+lahza-templates = { path = "../templates" }
+lahza-temporal-decode = { path = "../temporal-decode" }
+lahza-transcript = { path = "../transcript" }
+lahza-transcription = { path = "../transcription" }
+lahza-video = { path = "../video" }
+lahza-viewport = { path = "../viewport" }
+
+[dev-dependencies]
+lahza-media = { path = "../media", features = ["test-support"] }
+lahza-playback = { path = "../playback", features = ["test-support"] }
+gstreamer = { workspace = true }
+image = { workspace = true }
+uuid = { workspace = true }

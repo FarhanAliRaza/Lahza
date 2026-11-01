@@ -3,7 +3,7 @@
 //! transcript-driven cuts), and SubRip export.
 use crate::recording::{
     clips::RecordingClipTimeline,
-    model::RecordingSession,
+    project::RecordingSession,
     transcript::planner,
     transcription::{self, JobProgress, SpeechModel},
 };

@@ -1,0 +1,13 @@
+[package]
+name = "lahza-speech-setup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Installs a matched Whisper runtime and prepares on-device speech recognition"
+
+[dependencies]
+lahza-speech-runtime = { path = "../speech-runtime" }
+lahza-teleprompter = { path = "../teleprompter" }
+lahza-transcription = { path = "../transcription" }
+lahza-video = { path = "../video" }
+uuid = { workspace = true }

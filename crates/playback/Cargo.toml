@@ -1,0 +1,25 @@
+[package]
+name = "lahza-playback"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Non-destructive preview transport over the clip timeline"
+
+[features]
+# Capture audio in a sink instead of a sound device, for other crates' tests.
+test-support = []
+
+[dependencies]
+lahza-audio-mode = { path = "../audio-mode" }
+lahza-audio-processing = { path = "../audio-processing" }
+lahza-clips = { path = "../clips" }
+lahza-motion-blur = { path = "../motion-blur" }
+lahza-primary-frames = { path = "../primary-frames" }
+lahza-video = { path = "../video" }
+gstreamer = { workspace = true }
+
+[dev-dependencies]
+lahza-camera-playback = { path = "../camera-playback" }
+lahza-temporal-decode = { path = "../temporal-decode" }
+serde_json = { workspace = true }
+uuid = { workspace = true }

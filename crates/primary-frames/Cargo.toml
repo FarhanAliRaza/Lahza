@@ -1,0 +1,15 @@
+[package]
+name = "lahza-primary-frames"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native frame buffers shared by the main transport and temporal preview"
+
+[dependencies]
+lahza-temporal-decode = { path = "../temporal-decode" }
+lahza-video = { path = "../video" }
+gstreamer = { workspace = true }
+image = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

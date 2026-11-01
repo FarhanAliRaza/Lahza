@@ -1,0 +1,9 @@
+[package]
+name = "lahza-cursor-planner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Deterministic cursor path reconstruction in recording pixels"
+
+[dependencies]
+lahza-motion = { path = "../motion" }

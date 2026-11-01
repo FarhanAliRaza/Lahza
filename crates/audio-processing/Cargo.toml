@@ -1,0 +1,18 @@
+[package]
+name = "lahza-audio-processing"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Source-time audio preparation and waveforms shared by playback and export"
+
+[dependencies]
+lahza-audio-dsp = { path = "../audio-dsp" }
+lahza-audio-mode = { path = "../audio-mode" }
+lahza-model = { path = "../model" }
+lahza-reuse-audio = { path = "../reuse-audio" }
+lahza-video = { path = "../video" }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }

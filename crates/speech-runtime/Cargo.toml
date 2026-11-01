@@ -1,0 +1,12 @@
+[package]
+name = "lahza-speech-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Speech processing preferences, Whisper runtime discovery, and evidence from Whisper"
+
+[dependencies]
+lahza-model = { path = "../model" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

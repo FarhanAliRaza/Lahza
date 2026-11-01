@@ -1,0 +1,12 @@
+[package]
+name = "lahza-camera-matting-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bundled ONNX Runtime loader for webcam matting on Linux x86_64"
+
+[dependencies]
+sha2 = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+ort = { workspace = true }

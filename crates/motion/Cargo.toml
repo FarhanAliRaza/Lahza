@@ -1,0 +1,8 @@
+[package]
+name = "lahza-motion"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Damped spring motion shared by camera and cursor animation"
+
+[dependencies]

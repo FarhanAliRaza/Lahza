@@ -1,0 +1,8 @@
+[package]
+name = "lahza-backgrounds"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Solid and gradient scene background presets shared by the editor and templates"
+
+[dependencies]

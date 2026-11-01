@@ -1,0 +1,13 @@
+[package]
+name = "lahza-stream-geometry"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Frame size and crop geometry of the capture stream"
+
+[dependencies]
+gstreamer = { workspace = true }
+gstreamer-video = { workspace = true }
+
+[dev-dependencies]
+lahza-video = { path = "../video" }

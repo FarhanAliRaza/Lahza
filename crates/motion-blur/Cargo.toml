@@ -1,0 +1,21 @@
+[package]
+name = "lahza-motion-blur"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cut-aware shutter sampling for preview and export"
+
+[dependencies]
+lahza-clips = { path = "../clips" }
+lahza-pointer-timeline = { path = "../pointer-timeline" }
+lahza-primary-frames = { path = "../primary-frames" }
+lahza-scene-model = { path = "../scene-model" }
+lahza-temporal-decode = { path = "../temporal-decode" }
+lahza-video = { path = "../video" }
+lahza-viewport = { path = "../viewport" }
+image = { workspace = true }
+
+[dev-dependencies]
+lahza-model = { path = "../model" }
+gstreamer = { workspace = true }
+uuid = { workspace = true }

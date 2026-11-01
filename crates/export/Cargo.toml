@@ -1,0 +1,27 @@
+[package]
+name = "lahza-export"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Scene export to MP4, WebM, GIF, and images, plus edited clip rendering"
+
+[dependencies]
+lahza-audio-mode = { path = "../audio-mode" }
+lahza-audio-processing = { path = "../audio-processing" }
+lahza-camera-playback = { path = "../camera-playback" }
+lahza-clips = { path = "../clips" }
+lahza-export-encoder = { path = "../export-encoder" }
+lahza-media = { path = "../media" }
+lahza-motion-blur = { path = "../motion-blur" }
+lahza-pointer-timeline = { path = "../pointer-timeline" }
+lahza-scene = { path = "../scene" }
+lahza-studio-overlays = { path = "../studio-overlays" }
+lahza-video = { path = "../video" }
+lahza-viewport = { path = "../viewport" }
+image = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+lahza-model = { path = "../model" }
+lahza-playback = { path = "../playback", features = ["test-support"] }
+lahza-scene-model = { path = "../scene-model" }

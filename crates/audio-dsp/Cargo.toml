@@ -1,0 +1,9 @@
+[package]
+name = "lahza-audio-dsp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local speech post-processing, independent of the neural model runtime"
+
+[dependencies]
+lahza-audio-mode = { path = "../audio-mode" }

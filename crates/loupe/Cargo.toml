@@ -1,0 +1,13 @@
+[package]
+name = "lahza-loupe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Magnifying lens over the composed screen and pointer"
+
+[dependencies]
+lahza-viewport = { path = "../viewport" }
+image = { workspace = true }
+
+[dev-dependencies]
+lahza-model = { path = "../model" }

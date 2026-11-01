@@ -1,0 +1,20 @@
+[package]
+name = "lahza-scene-model"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Scene style and geometry with the camera layout and timeline it embeds"
+
+[dependencies]
+lahza-animation = { path = "../animation" }
+lahza-cursor-assets = { path = "../cursor-assets" }
+lahza-pointer-timeline = { path = "../pointer-timeline" }
+lahza-rect = { path = "../rect" }
+lahza-studio-overlays = { path = "../studio-overlays" }
+lahza-viewport = { path = "../viewport" }
+serde = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+lahza-clips = { path = "../clips" }
+serde_json = { workspace = true }

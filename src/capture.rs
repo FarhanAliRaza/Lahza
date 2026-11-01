@@ -9,7 +9,8 @@ use crate::{
     recording::{
         self,
         clips::RecordingClipTimeline,
-        model::{PointerCaptureFile, RecordingSession},
+        model::PointerCaptureFile,
+        project::RecordingSession,
         native::{NativeRecorder, RecordingOptions},
         pointer_timeline::PointerTimeline,
         scene::SceneStyle,

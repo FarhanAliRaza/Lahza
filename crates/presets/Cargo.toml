@@ -1,0 +1,15 @@
+[package]
+name = "lahza-presets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Saved scene presets stored in the user's config directory"
+
+[dependencies]
+lahza-model = { path = "../model" }
+lahza-scene-model = { path = "../scene-model" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

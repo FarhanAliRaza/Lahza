@@ -1,0 +1,14 @@
+[package]
+name = "lahza-video"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Video probing, decoding, streaming, and the media bank of imported assets"
+
+[dependencies]
+lahza-clips = { path = "../clips" }
+gstreamer = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

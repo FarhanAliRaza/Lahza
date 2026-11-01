@@ -3,7 +3,7 @@
 Lahza UI CNN v2 enlarges zoomed screen recordings. It is trained on natively
 rendered screen content: documentation pages, code editors, terminals and
 procedural UI. Separate 2× and 4× models run on the GPU in
-`src/recording/screen_upscale.wgsl`.
+`crates/screen-upscale/src/screen_upscale.wgsl`.
 
 | File | Role |
 | --- | --- |

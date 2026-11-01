@@ -1,0 +1,13 @@
+[package]
+name = "lahza-cursor-assets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Vector cursor artwork and decoded cursor bitmaps for re-rendering the pointer"
+
+[dependencies]
+lahza-model = { path = "../model" }
+base64 = { workspace = true }
+image = { workspace = true }
+resvg = { workspace = true }
+serde = { workspace = true }

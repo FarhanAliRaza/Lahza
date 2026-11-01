@@ -564,6 +564,55 @@ impl Drop for PreviewDecoder {
 mod tests {
     use super::*;
 
+    /// The paused decoder must replace a lightweight scrub frame with
+    /// original detail when the settled request asks for native dimensions.
+    #[test]
+    fn paused_preview_keeps_uhd_source_detail() {
+        let ffmpeg = std::process::Command::new("ffmpeg").arg("-version").output();
+        if !ffmpeg.is_ok_and(|output| output.status.success()) {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("lahza-preview-detail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (still, media) = (root.join("fine-lines.png"), root.join("screen.mkv"));
+        let (width, height) = (3840, 2160);
+        // Single-pixel stems disappear if the source is reduced before zoom.
+        let source = image::RgbaImage::from_fn(width, height, |x, y| {
+            if (1500..1756).contains(&x) && (900..1028).contains(&y) {
+                let level = if (x + y / 16) % 2 == 0 { 255 } else { 0 };
+                image::Rgba([level, level, level, 255])
+            } else {
+                image::Rgba([23, 47, 83, 255])
+            }
+        });
+        source.save(&still).unwrap();
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-loop", "1", "-framerate", "30", "-i"])
+            .arg(&still)
+            .args(["-frames:v", "9", "-c:v", "ffv1", "-level", "3", "-pix_fmt", "bgra", "-threads", "2", "-y"])
+            .arg(&media).output().unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+
+        let mut proxy = PreviewDecoder::open(media.clone(), (1280, 720)).unwrap();
+        let frame = proxy.frame(0.1, &|| false).unwrap();
+        assert_eq!((frame.width, frame.height), (1280, 720));
+        drop(frame);
+        drop(proxy);
+        let mut paused = PreviewDecoder::open(media, (width, height)).unwrap();
+        let frame = paused.frame(0.1, &|| false).unwrap();
+        assert_eq!((frame.width, frame.height), (width, height));
+        for y in 910..930 {
+            for x in 1510..1740 {
+                let offset = ((y * width + x) * 4) as usize;
+                assert_eq!(&frame.rgba[offset..offset + 4], &source.get_pixel(x, y).0,
+                    "source pixel {x},{y} changed before composition");
+            }
+        }
+        drop(frame);
+        drop(paused);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn persistent_preview_preserves_transparent_window_pixels() {
         gst::init().unwrap();

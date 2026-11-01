@@ -1,0 +1,14 @@
+[package]
+name = "lahza-animation"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Project-wide animation preferences for zooms and camera motion"
+
+[dependencies]
+lahza-viewport = { path = "../viewport" }
+serde = { workspace = true }
+
+[dev-dependencies]
+lahza-model = { path = "../model" }
+serde_json = { workspace = true }

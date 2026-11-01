@@ -552,7 +552,7 @@ impl Studio {
                     .gap_2()
                     .child({
                         let folder = if self.launcher_tab == 1 {
-                            recording::model::recordings_root()
+                            recording::project::recordings_root()
                         } else {
                             library::screenshots_root()
                         };

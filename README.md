@@ -189,6 +189,8 @@ available input metadata.
 `src/main.rs` owns application startup, shared Studio state, and editor coordination. Editor behavior is split by responsibility:
 
 - [`crates/annotations`](crates/annotations): shared annotation models, geometry, snapping, text layout, painting, export, and animation, with its own fonts and fixtures.
+- `crates/*` (one crate per engine module, such as `clips`, `video`, `scene`, `export`, `native`, `speech-setup`): the GPUI-free engine for capture, media processing, compositing, export, speech, and project persistence. Modules that share types in both directions stay together (`video` with `media_bank`; `scene-model` with the camera layout and timeline; `viewport` with the source crop). External dependency versions live once in the root `[workspace.dependencies]`.
+- [`crates/recording`](crates/recording): re-exports every engine crate under its module name, so the app reaches them as `crate::recording::<module>`, and holds the tests that span several engine crates.
 - `models.rs`: crop, scene, and timeline editing data types.
 - `annotations.rs` and `timed.rs`: connect the annotation crate to Studio input, selection, undo, and video timing.
 - `crop.rs`: crop editing operations and painting.
@@ -197,7 +199,7 @@ available input metadata.
 - `controls.rs`, `preview.rs`, and `launcher.rs`: editor controls, canvas layout, and launcher UI.
 - `theme.rs`: shared colors, branding, and background presets.
 
-The existing `recording/` modules own media processing and persistence. Keep new editor features in the module that owns their behavior; use explicit imports and limit helper visibility to the callers that need it.
+The engine crates own media processing and persistence; they must not depend on GPUI or the app, and a new dependency between them must not form a cycle. Keep new editor features in the module that owns their behavior; use explicit imports and limit helper visibility to the callers that need it.
 
 ### Development checks
 

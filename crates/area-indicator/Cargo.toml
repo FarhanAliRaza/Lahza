@@ -1,0 +1,11 @@
+[package]
+name = "lahza-area-indicator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Click-through desktop border around an active area recording"
+
+[dependencies]
+lahza-area = { path = "../area" }
+lahza-input = { path = "../input" }
+x11rb = { workspace = true }

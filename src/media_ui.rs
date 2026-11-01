@@ -44,9 +44,7 @@ pub(crate) struct AudioDrag {
     active: bool,
 }
 
-impl AudioClip {
-    const MINIMUM_DURATION: f64 = 0.12;
-}
+const MINIMUM_AUDIO_CLIP_DURATION: f64 = 0.12;
 
 impl Studio {
     pub(crate) fn begin_audio_drag(&mut self, id: uuid::Uuid, kind: AudioDragKind, start_x: Pixels) {
@@ -116,7 +114,7 @@ impl Studio {
                 guide = target;
                 let shift = (new_start - original.start).clamp(
                     -original.source_start.min(original.start),
-                    original.duration - AudioClip::MINIMUM_DURATION,
+                    original.duration - MINIMUM_AUDIO_CLIP_DURATION,
                 );
                 clip.start = original.start + shift;
                 clip.source_start = original.source_start + shift;
@@ -125,12 +123,12 @@ impl Studio {
             AudioDragKind::Trailing => {
                 let (new_end, target) = snapped(original.start + original.duration + delta, 0.0);
                 guide = target;
-                let mut longest = (workspace - original.start).max(AudioClip::MINIMUM_DURATION);
+                let mut longest = (workspace - original.start).max(MINIMUM_AUDIO_CLIP_DURATION);
                 if original.source_duration > 0.0 {
                     longest = longest.min(original.source_duration - original.source_start);
                 }
                 clip.duration = (new_end - original.start)
-                    .clamp(AudioClip::MINIMUM_DURATION.min(longest), longest);
+                    .clamp(MINIMUM_AUDIO_CLIP_DURATION.min(longest), longest);
             }
         }
         let (start, end) = match kind {

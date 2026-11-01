@@ -1,0 +1,16 @@
+[package]
+name = "lahza-camera-matting"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local person segmentation for the webcam with the bundled PPHumanSeg model"
+
+[dependencies]
+lahza-camera-matting-runtime = { path = "../camera-matting-runtime" }
+lahza-scene-model = { path = "../scene-model" }
+image = { workspace = true }
+tract-linalg = { workspace = true }
+tract-onnx = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+ort = { workspace = true }

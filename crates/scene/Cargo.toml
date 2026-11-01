@@ -1,0 +1,30 @@
+[package]
+name = "lahza-scene"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Scene compositor for screenshots and recordings, on the CPU and Vulkan"
+
+[dependencies]
+lahza-camera-matting = { path = "../camera-matting" }
+lahza-cursor-assets = { path = "../cursor-assets" }
+lahza-loupe = { path = "../loupe" }
+lahza-model = { path = "../model" }
+lahza-overlays = { path = "../overlays" }
+lahza-pointer-timeline = { path = "../pointer-timeline" }
+lahza-scene-model = { path = "../scene-model" }
+lahza-screen-upscale = { path = "../screen-upscale" }
+lahza-viewport = { path = "../viewport" }
+ash = { workspace = true }
+blade-graphics = { workspace = true }
+blade-macros = { workspace = true }
+bytemuck = { workspace = true }
+image = { workspace = true }
+lahza-annotations = { workspace = true }
+
+[dev-dependencies]
+lahza-motion-blur = { path = "../motion-blur" }
+lahza-video = { path = "../video" }
+base64 = { workspace = true }
+naga = { workspace = true }
+serde_json = { workspace = true }

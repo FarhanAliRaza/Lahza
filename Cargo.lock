@@ -3228,35 +3228,34 @@ dependencies = [
 name = "lahza"
 version = "2.0.0"
 dependencies = [
- "ash",
  "ashpd 0.12.3",
  "async-io",
  "base64",
- "blade-graphics",
- "blade-macros",
- "bytemuck",
  "chrono",
  "futures-util",
  "gpui",
  "gstreamer",
- "gstreamer-video",
  "image",
  "lahza-annotations",
+ "lahza-recording",
  "libc",
- "libspa-sys",
- "naga",
- "ort",
- "pipewire",
  "resvg",
  "rustfft",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "tract-linalg",
- "tract-onnx",
  "unicode-segmentation",
  "uuid",
  "x11rb",
+]
+
+[[package]]
+name = "lahza-animation"
+version = "0.1.0"
+dependencies = [
+ "lahza-model",
+ "lahza-viewport",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3272,6 +3271,636 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "lahza-area"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "lahza-camera-preview",
+ "lahza-capture-exclusion",
+ "lahza-video",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-area-indicator"
+version = "0.1.0"
+dependencies = [
+ "lahza-area",
+ "lahza-input",
+ "x11rb",
+]
+
+[[package]]
+name = "lahza-audio-dsp"
+version = "0.1.0"
+dependencies = [
+ "lahza-audio-mode",
+]
+
+[[package]]
+name = "lahza-audio-mode"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lahza-audio-processing"
+version = "0.1.0"
+dependencies = [
+ "lahza-audio-dsp",
+ "lahza-audio-mode",
+ "lahza-model",
+ "lahza-reuse-audio",
+ "lahza-video",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-backgrounds"
+version = "0.1.0"
+
+[[package]]
+name = "lahza-camera-matting"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "lahza-camera-matting-runtime",
+ "lahza-scene-model",
+ "ort",
+ "tract-linalg",
+ "tract-onnx",
+]
+
+[[package]]
+name = "lahza-camera-matting-runtime"
+version = "0.1.0"
+dependencies = [
+ "ort",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "lahza-camera-playback"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "lahza-motion-blur",
+ "lahza-video",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-camera-preview"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "gstreamer-video",
+]
+
+[[package]]
+name = "lahza-capture-exclusion"
+version = "0.1.0"
+dependencies = [
+ "lahza-input",
+ "libc",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-clips"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-cursor-assets"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "image",
+ "lahza-model",
+ "resvg",
+ "serde",
+]
+
+[[package]]
+name = "lahza-cursor-planner"
+version = "0.1.0"
+dependencies = [
+ "lahza-motion",
+]
+
+[[package]]
+name = "lahza-cursor-theme"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "image",
+ "lahza-cursor-assets",
+ "lahza-model",
+]
+
+[[package]]
+name = "lahza-export"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "lahza-audio-mode",
+ "lahza-audio-processing",
+ "lahza-camera-playback",
+ "lahza-clips",
+ "lahza-export-encoder",
+ "lahza-media",
+ "lahza-model",
+ "lahza-motion-blur",
+ "lahza-playback",
+ "lahza-pointer-timeline",
+ "lahza-scene",
+ "lahza-scene-model",
+ "lahza-studio-overlays",
+ "lahza-video",
+ "lahza-viewport",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-export-encoder"
+version = "0.1.0"
+dependencies = [
+ "lahza-audio-processing",
+]
+
+[[package]]
+name = "lahza-import-image"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "lahza-video",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-input"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "image",
+ "lahza-cursor-theme",
+ "lahza-model",
+ "lahza-pointer",
+ "libc",
+ "libspa-sys",
+ "pipewire",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-loupe"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "lahza-model",
+ "lahza-viewport",
+]
+
+[[package]]
+name = "lahza-media"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "image",
+ "lahza-audio-processing",
+ "lahza-clips",
+ "lahza-import-image",
+ "lahza-playback",
+ "lahza-project",
+ "lahza-video",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-model"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-motion"
+version = "0.1.0"
+
+[[package]]
+name = "lahza-motion-blur"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "image",
+ "lahza-clips",
+ "lahza-model",
+ "lahza-pointer-timeline",
+ "lahza-primary-frames",
+ "lahza-scene-model",
+ "lahza-temporal-decode",
+ "lahza-video",
+ "lahza-viewport",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-native"
+version = "0.1.0"
+dependencies = [
+ "ashpd 0.12.3",
+ "async-io",
+ "futures-util",
+ "gstreamer",
+ "gstreamer-video",
+ "image",
+ "lahza-area",
+ "lahza-area-indicator",
+ "lahza-camera-preview",
+ "lahza-capture-exclusion",
+ "lahza-input",
+ "lahza-project",
+ "lahza-scene",
+ "lahza-stream-geometry",
+ "lahza-video",
+ "lahza-viewport",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-overlays"
+version = "0.1.0"
+dependencies = [
+ "lahza-model",
+]
+
+[[package]]
+name = "lahza-playback"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "lahza-audio-mode",
+ "lahza-audio-processing",
+ "lahza-camera-playback",
+ "lahza-clips",
+ "lahza-motion-blur",
+ "lahza-primary-frames",
+ "lahza-temporal-decode",
+ "lahza-video",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-pointer"
+version = "0.1.0"
+dependencies = [
+ "lahza-model",
+]
+
+[[package]]
+name = "lahza-pointer-timeline"
+version = "0.1.0"
+dependencies = [
+ "lahza-clips",
+ "lahza-cursor-assets",
+ "lahza-cursor-planner",
+ "lahza-model",
+ "lahza-motion",
+ "lahza-pointer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lahza-presets"
+version = "0.1.0"
+dependencies = [
+ "lahza-model",
+ "lahza-scene-model",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-primary-frames"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "image",
+ "lahza-temporal-decode",
+ "lahza-video",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-project"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lahza-clips",
+ "lahza-model",
+ "lahza-scene-model",
+ "lahza-video",
+ "lahza-viewport",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-recording"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "image",
+ "lahza-animation",
+ "lahza-area",
+ "lahza-area-indicator",
+ "lahza-audio-dsp",
+ "lahza-audio-mode",
+ "lahza-audio-processing",
+ "lahza-backgrounds",
+ "lahza-camera-matting",
+ "lahza-camera-matting-runtime",
+ "lahza-camera-playback",
+ "lahza-camera-preview",
+ "lahza-capture-exclusion",
+ "lahza-clips",
+ "lahza-cursor-assets",
+ "lahza-cursor-planner",
+ "lahza-cursor-theme",
+ "lahza-export",
+ "lahza-export-encoder",
+ "lahza-import-image",
+ "lahza-input",
+ "lahza-loupe",
+ "lahza-media",
+ "lahza-model",
+ "lahza-motion",
+ "lahza-motion-blur",
+ "lahza-native",
+ "lahza-overlays",
+ "lahza-playback",
+ "lahza-pointer",
+ "lahza-pointer-timeline",
+ "lahza-presets",
+ "lahza-primary-frames",
+ "lahza-project",
+ "lahza-rect",
+ "lahza-reuse-audio",
+ "lahza-scene",
+ "lahza-scene-model",
+ "lahza-screen-upscale",
+ "lahza-session",
+ "lahza-speech-diagnostics",
+ "lahza-speech-runtime",
+ "lahza-speech-setup",
+ "lahza-stream-geometry",
+ "lahza-studio-overlays",
+ "lahza-teleprompter",
+ "lahza-templates",
+ "lahza-temporal-decode",
+ "lahza-transcript",
+ "lahza-transcription",
+ "lahza-video",
+ "lahza-viewport",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-rect"
+version = "0.1.0"
+
+[[package]]
+name = "lahza-reuse-audio"
+version = "0.1.0"
+dependencies = [
+ "blade-graphics",
+ "blade-macros",
+ "bytemuck",
+ "naga",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "lahza-scene"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "base64",
+ "blade-graphics",
+ "blade-macros",
+ "bytemuck",
+ "image",
+ "lahza-annotations",
+ "lahza-camera-matting",
+ "lahza-cursor-assets",
+ "lahza-loupe",
+ "lahza-model",
+ "lahza-motion-blur",
+ "lahza-overlays",
+ "lahza-pointer-timeline",
+ "lahza-scene-model",
+ "lahza-screen-upscale",
+ "lahza-video",
+ "lahza-viewport",
+ "naga",
+ "serde_json",
+]
+
+[[package]]
+name = "lahza-scene-model"
+version = "0.1.0"
+dependencies = [
+ "lahza-animation",
+ "lahza-clips",
+ "lahza-cursor-assets",
+ "lahza-pointer-timeline",
+ "lahza-rect",
+ "lahza-studio-overlays",
+ "lahza-viewport",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-screen-upscale"
+version = "0.1.0"
+dependencies = [
+ "blade-graphics",
+ "blade-macros",
+ "bytemuck",
+ "image",
+ "naga",
+]
+
+[[package]]
+name = "lahza-session"
+version = "0.1.0"
+dependencies = [
+ "lahza-model",
+ "lahza-native",
+ "lahza-project",
+ "lahza-video",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-speech-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-speech-runtime"
+version = "0.1.0"
+dependencies = [
+ "lahza-model",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-speech-setup"
+version = "0.1.0"
+dependencies = [
+ "lahza-speech-runtime",
+ "lahza-teleprompter",
+ "lahza-transcription",
+ "lahza-video",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-stream-geometry"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "gstreamer-video",
+ "lahza-video",
+]
+
+[[package]]
+name = "lahza-studio-overlays"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "lahza-annotations",
+ "lahza-clips",
+ "lahza-model",
+ "lahza-overlays",
+ "lahza-rect",
+ "lahza-transcript",
+ "serde",
+]
+
+[[package]]
+name = "lahza-teleprompter"
+version = "0.1.0"
+dependencies = [
+ "lahza-model",
+ "lahza-speech-diagnostics",
+ "lahza-speech-runtime",
+ "lahza-transcription",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-templates"
+version = "0.1.0"
+dependencies = [
+ "lahza-annotations",
+ "lahza-backgrounds",
+ "lahza-scene-model",
+ "lahza-viewport",
+]
+
+[[package]]
+name = "lahza-temporal-decode"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "image",
+ "lahza-video",
+]
+
+[[package]]
+name = "lahza-transcript"
+version = "0.1.0"
+dependencies = [
+ "lahza-clips",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-transcription"
+version = "0.1.0"
+dependencies = [
+ "lahza-clips",
+ "lahza-speech-runtime",
+ "lahza-transcript",
+ "lahza-video",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-video"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "image",
+ "lahza-clips",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lahza-viewport"
+version = "0.1.0"
+dependencies = [
+ "lahza-clips",
+ "lahza-model",
+ "lahza-motion",
+ "lahza-pointer-timeline",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
