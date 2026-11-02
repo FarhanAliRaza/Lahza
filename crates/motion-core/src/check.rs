@@ -135,7 +135,13 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
             }
         };
         let drift = (achieved - s.requested) * f;
-        if drift.abs() > options.tolerance_frames + 1e-6 {
+        // A stepped layer only changes on its steps: it can't land closer
+        // than one step, so that is its tolerance.
+        let tolerance = match &s.kind {
+            SyncKind::Move { step: Some(st), .. } if st.fps > 0.0 => options.tolerance_frames.max(f / st.fps),
+            _ => options.tolerance_frames,
+        };
+        if drift.abs() > tolerance + 1e-6 {
             issues.push(issue(
                 Severity::Error,
                 "timing",
@@ -479,6 +485,10 @@ mod tests {
         let s = r.syncs.iter().find(|s| s.element == "dot").unwrap();
         // 8 fps holds of 4,4,4,3 frames move the measured peak.
         assert!(s.drift_frames.abs() > 0.0, "{s:?}");
+        // Within one step (30/8 frames) that is as close as the layer can
+        // land: not an error.
+        assert!(s.drift_frames.abs() <= 30.0 / 8.0, "{s:?}");
+        assert!(!r.issues.iter().any(|i| i.kind == "timing" && i.element.as_deref() == Some("dot")), "{:?}", r.issues);
     }
 
     #[test]
