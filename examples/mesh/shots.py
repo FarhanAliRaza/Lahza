@@ -5,8 +5,9 @@
 Builds a 720×900 project like the event-opener replica's 3D shots, with
 every object real geometry lit in the engine (no Blender, no tracing):
 
-  unites  — a smooth, lit torus arc that draws itself around the word
-  viewport — glossy petals (extruded, bevelled) and rounded cubes orbiting
+  unites  — a smooth, lit torus arc that draws itself around a glass ball
+  viewport — glossy petals (extruded, bevelled) and rounded cubes orbiting,
+             dropping soft shadows onto the flat background
   rings   — three glossy rings, each split into 4 coloured segments
 
 then a contact sheet per scene and an MP4. Set SKIP_RENDER=1 for sheets only.
@@ -54,7 +55,7 @@ unites = {
          "transform": {"position": [CX, CY - 40], "rotation_x": 58, "rotation_y": -14,
                        "rotation": keys((0, -20), (2.0, 25), ease="linear")}},
         {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 62},
-         "material": {"preset": "chrome", "color": "#dfe6ff"},
+         "material": {"preset": "glass", "color": "#e6ecff", "ior": 1.5, "thickness": 90},
          "transform": {"position": [CX, CY - 40], "z": 0,
                        "scale": keys((0.3, 0), (0.75, 1), ease="land")}},
         {"id": "word", "kind": "text", "text": "unites", "size": 96, "color": "#ffffff", "font": "Inter SemiBold",
@@ -70,7 +71,13 @@ viewport = {
     "id": "viewport", "start": 2.0, "end": 4.5, "background": "#f3f1ec",
     "camera": {"fov": 40, "orbit": keys((2.0, [0, 18]), (4.5, [0, 6]))},
     "environment": {"preset": "soft"},
+    "lights": [{"from": [-0.7, -1, -1.1], "softness": 0.6}, {"from": [0.8, -0.3, 0.9], "intensity": 0.6}],
     "layers": [
+        # A backdrop that only takes shadows: the objects drop soft shadows
+        # onto the flat background.
+        {"id": "backdrop", "kind": "mesh", "mesh": {"type": "plane", "size": [1600, 1800]},
+         "material": {"preset": "shadow", "opacity": 0.35},
+         "transform": {"position": [CX, CY], "z": 140}},
         {"id": "flower", "kind": "instancer",
          "layout": {"type": "radial", "count": 6, "radius": 120, "align": True},
          "palette": pastels,

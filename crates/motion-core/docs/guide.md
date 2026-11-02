@@ -182,13 +182,20 @@ reference.
 - **Lighting**: the scene's `lights` (default: a key from the upper left
   in front and a rim from behind on the right) and `environment` (what
   glossy surfaces reflect: `studio`, `soft`, `sunset`, `night`, `none`).
+  The key casts soft shadows (`softness`); add a `plane` floor (`rotation_x:
+  90`) to catch them, or a plane with the `shadow` preset to drop them
+  onto a 2D background. Glass (`preset: glass`) refracts the layers behind
+  it (`ior`, `thickness`); rough glass is frosted.
+- **Depth**: meshes, and flat 3D layers next to them (text and shapes with
+  `three_d`), share one depth test: text can pass through a ring, a card
+  can cut through a box, whatever the layer order.
   Match the reference: where the highlights sit gives the key direction,
   a bright outline on the far side means a rim light, dark glossy objects
   with thin streaks mean the `night` environment.
 - **Camera**: the scene camera's `fov`, `orbit`, `dolly`, depth of field
   (`aperture`, `focus`) and motion blur all apply.
 - Blender (`blender_run`) is for what meshes can't do: fluids, cloth,
-  sculpted or imported models, true refraction and soft shadows.
+  sculpted or imported models, caustics and global illumination.
 
 ```json
 {"id": "ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 220, "tube": 46},

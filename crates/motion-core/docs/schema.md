@@ -267,6 +267,7 @@ Geometry (numbers animatable unless noted):
 | `type` | fields |
 |---|---|
 | `sphere` | `radius` (100) |
+| `plane` | `size` [w, h] ([100, 100]): a flat rectangle, both sides (floors, walls, backdrops; `rotation_x: 90` lays it flat) |
 | `box` | `size` [w, h] ([100, 100]), `depth` (100), `bevel` (edge radius) |
 | `cylinder` | `radius` (50), `top` (top radius: cones), `height` along y (100), `bevel` |
 | `capsule` | `radius` (50), `height` end to end along y (200) |
@@ -279,11 +280,30 @@ A torus faces the camera like a `ring` shape; tilt it with `rotation_x`.
 `transform.scale_z` scales depth (meshes default to `scale`'s x).
 
 Material: `preset` (`matte`, `plastic`, `glossy`, `coated`, `metal`,
-`chrome`, `glass`, `emissive`, `flat`) then any of `color`, `metallic`
-(0..1), `roughness` (0 mirror … 1 diffuse), `clearcoat` (0..1),
+`chrome`, `glass`, `emissive`, `flat`, `shadow`) then any of `color`,
+`metallic` (0..1), `roughness` (0 mirror … 1 diffuse), `clearcoat` (0..1),
 `clearcoat_roughness`, `emissive` (colour), `emissive_strength`, `opacity`,
-`transmission` (0..1, glass), `unlit` (bool), `faceted` (bool: one normal
-per triangle). Colours and numbers are animatable.
+`transmission` (0..1, glass), `ior` (glass: 1 no bending, 1.45 default,
+2.4 diamond), `thickness` (glass: px the light travels inside, default 60),
+`unlit` (bool), `faceted` (bool: one normal per triangle). Colours and
+numbers are animatable.
+
+Glass (`transmission` > 0) refracts what is drawn before it: the layers
+behind are seen bent through it (by `ior` and `thickness`), tinted by its
+colour, blurred by its `roughness` (frosted glass). The `shadow` preset is
+invisible except for the shadows falling on it (`color` tints them,
+`opacity` is their strength): a `plane` with it drops meshes' shadows onto
+2D backgrounds.
+
+Depth: mesh layers in the same layer list hide each other where nearer,
+also when one has effects, a matte or depth of field. Meshes that let
+what is behind show (opacity < 1, glass, a blend mode) are drawn after the
+opaque ones and never hide them. Flat 3D layers (`three_d` shapes, text,
+images, footage) in a list with meshes join the same depth test as cards
+(their picture on a quad; where the picture is under half opaque it hides
+nothing), and lists of two or more tilted 3D layers do too, so planes cut
+through each other and through meshes. Coplanar layers keep their layer
+order.
 
 ```json
 {"id": "coin", "kind": "mesh", "mesh": {"type": "extrude", "d": {"shape": "circle", "size": 300}, "depth": 30, "bevel": 6},
@@ -304,7 +324,11 @@ Scenes light meshes with `lights` and `environment`:
 `from` points toward a directional light (y down, z away: `[-1, -1, -1]`
 is upper left, in front); `position` places a point light in world px.
 Colours and intensities are animatable. Without `lights` a scene has a key
-from the upper left front and a rim from behind on the right. The
+from the upper left front and a rim from behind on the right. Lights cast
+soft shadows from every mesh onto every other mesh of the layer list:
+`shadow` (bool; default true for the first directional or point light,
+false for the rest) and `softness` (0 sharp … 1 very soft, default 0.35;
+animatable). The
 environment (`studio` default, `soft`, `sunset`, `night`, `none`; `sky`,
 `horizon`, `ground` override its colours) is what glossy surfaces reflect
 and gives soft ambient light.

@@ -153,7 +153,7 @@ Every edit goes through the same tools the MCP server uses, so a person and an a
 
 ## 3D objects in the engine
 
-`mesh` layers are real lit 3D objects rendered by the engine itself, live in the preview and identical on GPU and CPU: spheres, rounded boxes, cylinders and cones, capsules, tori and torus arcs split into coloured segments, outlines extruded with bevels (logos, letters, coins), profiles revolved about an axis, and tubes swept along paths that grow with `trim`. Materials are physically based (presets glossy, coated, metal, chrome, glass, emissive, matte, flat; roughness, clear coat, per-part materials) under the scene's lights and a procedural studio environment. Meshes next to each other share a depth buffer, so they intersect correctly; they sort by depth with 2.5D planes and take effects, mattes, depth of field and motion blur like any layer. The display list bins each batch's triangles into the renderer's 16×16 tiles; each pixel finds the nearest triangle at 8 samples (watertight edges) and shades each winner once.
+`mesh` layers are real lit 3D objects rendered by the engine itself, live in the preview and identical on GPU and CPU: spheres, rounded boxes, cylinders and cones, capsules, tori and torus arcs split into coloured segments, outlines extruded with bevels (logos, letters, coins), profiles revolved about an axis, and tubes swept along paths that grow with `trim`. Materials are physically based (presets glossy, coated, metal, chrome, glass, emissive, matte, flat, shadow; roughness, clear coat, per-part materials) under the scene's lights and a procedural studio environment. Lights cast soft shadows (CPU-built shadow maps, filtered on the GPU), glass refracts and frosts what is behind it, and flat 3D layers join the meshes' depth test as cards. Meshes next to each other share a depth buffer, so they intersect correctly; they sort by depth with 2.5D planes and take effects, mattes, depth of field and motion blur like any layer. The display list bins each batch's triangles into the renderer's 16×16 tiles; each pixel finds the nearest triangle at 8 samples (watertight edges) and shades each winner once.
 
 ## 3D with Blender
 
@@ -194,8 +194,8 @@ Against Chrome-based editors (Remotion, Hyperframes and other React or canvas to
 - **Editor:** it doesn't yet edit text or effects in the inspector; agents and JSON do that. There are no graph editor, multi-select or copy/paste yet.
 - **Shadow and glow on a matted layer:** they use the unmatted picture.
 - **Trim on a filled path:** it trims only the stroke.
-- **2.5D:** intersecting 3D planes are not split, because layers sort by their origin. Meshes intersect each other correctly, but sort against planes by origin.
-- **Meshes:** no cast shadows or true refraction (glass reflects and lets the background through); a mesh with effects is drawn on its own (no shared depth buffer with its neighbours).
+- **3D depth:** meshes and flat 3D layers in one layer list share a depth test (flat layers as alpha-tested cards), so they intersect in any order; 3D layers in different comps still sort by origin. Cards are cut at half opacity: a plane with layer opacity below 1, a blend mode or effects is drawn as before (sorted by origin).
+- **Meshes:** shadows are shadow maps (soft, from directional and point lights); there is no global illumination or caustics. Glass refracts what is drawn before it in its layer list (screen space: nothing outside the frame, no glass behind glass).
 - **Motion pieces:** an over-the-video piece takes the recording's shape; the
   editor's guide shows the raw recording from the piece's start, so cuts
   inside a piece's range are not reflected there. Speed-changed footage and

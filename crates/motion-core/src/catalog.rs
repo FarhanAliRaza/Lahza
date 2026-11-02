@@ -247,6 +247,7 @@ pub fn catalog_json() -> Value {
                 "note": "a lit 3D object rendered in the engine (no Blender): always 3D, sorts by depth with 3D layers; meshes next to each other in the layer list share a depth buffer and intersect correctly. Space: x right, y down, z away; centred on the layer origin; transform rotation_x/rotation_y/rotation/z/scale (+ scale_z, default scale.x) place it. Build real objects this way instead of faking 3D with flat shapes",
                 "mesh": [
                     {"type": "sphere", "radius": "px (default 100)"},
+                    {"type": "plane", "size": "[w, h] (default [100, 100]): flat rectangle, both sides; floors and backdrops (rotation_x 90 lays it flat)"},
                     {"type": "box", "size": "[w, h] (default [100, 100])", "depth": "px (default 100)", "bevel": "edge radius px"},
                     {"type": "cylinder", "radius": "px (default 50)", "top": "top radius (cone/frustum; default = radius)", "height": "along y (default 100)", "bevel": "rim radius px"},
                     {"type": "capsule", "radius": "px (default 50)", "height": "end to end along y (default 200)"},
@@ -257,11 +258,13 @@ pub fn catalog_json() -> Value {
                 ],
                 "segments": "split rings, revolves and sweeps into this many pieces (default 1)", "gap": "degrees between pieces (sweeps: fraction of the length)",
                 "colors": "[colour, …] one per piece in turn (animatable)",
-                "material": {"preset": "matte | plastic | glossy (default) | coated (lacquer: crisp reflections over colour) | metal | chrome | glass | emissive | flat (unlit flat colour)",
+                "material": {"preset": "matte | plastic | glossy (default) | coated (lacquer: crisp reflections over colour) | metal | chrome | glass (refracts what is behind) | emissive | flat (unlit flat colour) | shadow (invisible except shadows: drops shadows onto 2D layers)",
+                    "ior": "glass: index of refraction (default 1.45)", "thickness": "glass: px light travels inside (default 60)",
                     "color": "base colour (animatable)", "metallic": "0..1", "roughness": "0 mirror … 1 diffuse", "clearcoat": "0..1 lacquer layer", "clearcoat_roughness": "0..1",
                     "emissive": "colour it glows with", "emissive_strength": "multiplier", "opacity": "0..1", "transmission": "0..1 glass (background shows through, edges reflect)", "unlit": "bool", "faceted": "bool: low-poly normals"},
                 "parts": {"front": "material over `material` for the part", "back": "…", "side": "…", "bevel": "…", "caps": "…"},
-                "detail": "tessellation multiplier (default 1)"
+                "detail": "tessellation multiplier (default 1)",
+                "depth": "meshes and flat 3D layers in the same layer list share one depth test (planes cut through meshes, any order); see-through meshes (opacity, glass, blend) draw after the opaque ones"
             }
         },
         "scene": {
@@ -270,7 +273,7 @@ pub fn catalog_json() -> Value {
             "pre_roll": "open this far into the animation", "background": "colour",
             "transition": {"type": "fade | push | slide | zoom | wipe | whip", "dur": "default \"10f\", centred on the cut", "ease": "default gesture (peak speed on the cut)", "direction": "left | right | up | down"},
             "camera": {"position": "[x, y] point of interest shown at the canvas centre", "zoom": "number", "rotation": "degrees (roll)", "fov": "3D: vertical degrees (39.6 keeps z = 0 at 1:1)", "orbit": "3D: [yaw, pitch] degrees around the point of interest", "dolly": "3D: px toward the point of interest", "aperture": "3D depth of field: blur radius px per 100 px of depth from the focus plane (0 = off; animatable)", "focus": "3D depth of field: sharp plane as a depth like a layer's z (0 = point of interest, default; animatable for rack focus) or a top-level layer id to keep sharp"},
-            "lights": [{"type": "directional (default) | point | ambient", "from": "directional: [x, y, z] toward the light (y down, z away: [-1, -1, -1] = upper left, in front)", "position": "point: [x, y, z] world px", "color": "colour (animatable)", "intensity": "animatable (default 1)", "note": "for mesh layers; default rig: key from the upper left front + rim from behind right"}],
+            "lights": [{"type": "directional (default) | point | ambient", "from": "directional: [x, y, z] toward the light (y down, z away: [-1, -1, -1] = upper left, in front)", "position": "point: [x, y, z] world px", "color": "colour (animatable)", "intensity": "animatable (default 1)", "shadow": "bool: cast soft shadows (default: the first directional/point light only)", "softness": "0 sharp … 1 very soft (default 0.35, animatable)", "note": "for mesh layers; default rig: key from the upper left front (casts shadows) + rim from behind right"}],
             "environment": {"preset": "studio (default) | soft | sunset | night | none", "intensity": "animatable", "rotation": "degrees about the vertical axis", "sky": "colour", "horizon": "colour", "ground": "colour", "note": "what glossy meshes reflect and their ambient light"},
             "motion_blur": {"shutter": "degrees (180 film-like)", "samples": 8},
             "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first"
