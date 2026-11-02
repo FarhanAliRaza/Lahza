@@ -323,7 +323,12 @@ fn track_mattes() {
     assert_eq!(px(&inv, 160, 90), [0, 0, 0, 255]);
     assert_eq!(px(&inv, 80, 90), [255, 0, 0, 255]);
     let luma = cpu().render(&Compiled::new(&project(layers("luma"))), 0.0);
-    assert_eq!(px(&luma, 160, 90), [255, 0, 0, 255]);
+    assert_eq!(px(&luma, 160, 90), [255, 0, 0, 255]);    // A hidden matte source (the After Effects habit) still mattes.
+    let mut hidden = layers("alpha_inverted");
+    hidden[0]["hidden"] = json!(true);
+    let inv_hidden = cpu().render(&Compiled::new(&project(hidden)), 0.0);
+    assert_eq!(px(&inv_hidden, 160, 90), [0, 0, 0, 255]);
+    assert_eq!(px(&inv_hidden, 80, 90), [255, 0, 0, 255]);
 }
 
 #[test]

@@ -1380,7 +1380,9 @@ fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, space: &Space, pare
 #[allow(clippy::too_many_arguments)]
 fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &Space, parent_opacity: f64, cache: &mut [Option<Mat4>], isolate: bool, out: &mut Vec<LayerState>) {
     let l = &layers[i];
-    if l.hidden || tc < l.start - 1e-9 || tc >= l.end - 1e-9 {
+    // A matte source still shapes its layer when hidden (hiding the
+    // source is how After Effects users mark it); it never draws itself.
+    if (l.hidden && !isolate) || tc < l.start - 1e-9 || tc >= l.end - 1e-9 {
         return;
     }
     let step = l.step.or(inherited);

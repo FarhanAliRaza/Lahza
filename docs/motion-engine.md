@@ -25,7 +25,8 @@ dependencies. Pass `--cpu` to force the CPU renderer.
 
 Tools: `project_create`, `project_open`, `project_info`, `timeline_get`,
 `markers_query`, `markers_import`, `edit_apply`, `check`, `snapshot`,
-`render`, `render_status`, `history`, `audio_analyze`.
+`render`, `render_status`, `history`, `audio_analyze`, `media_import`,
+`blender_run`, `recording_info`, `recording_place`.
 Resources: `lahza://guide` (the production loop and timing rules),
 `lahza://schema` (the project format), `lahza://catalog` (presets with
 their measured numbers, curves, anchors, references, layer kinds, ops),
@@ -86,11 +87,37 @@ frame evaluation 0.16 ms and display-list build 0.8 ms per frame; raster on a
 numbers (the RTX 3060 target) still need measuring on that machine. The full
 20 s promo exported at 0.85× real time on the 4-core CPU path.
 
+## Motion inside screen recordings
+
+Motion designs live inside the recording they belong to, at
+`<recording>.lahzarec/motion/<name>.lahza/`. The recording's edit document
+lists where each plays (`motionPieces`: start on the edited video,
+placement, opacity). Pieces share the recording's files: `../../screen.mkv`
+is the raw recording, and media imported into a piece goes to the
+recording's `media/` folder.
+
+- **Over the video** pieces are drawn in the recording's own pixels, under
+  the annotations, so the video's zooms, crop and camera moves carry them.
+  Titles, callouts, highlights, stickers.
+- **Full screen** pieces cover the frame like an inserted clip: intros,
+  chapter cards, outros. A piece can use the recording itself as footage.
+
+In the studio the complexity stays out of the way: a **Motion** lane shows
+one bar per piece (drag to move it), and selecting one shows its placement,
+opacity, **Edit design** and Delete. **Edit design** opens the motion editor
+in the same window, with the recording under an over-the-video piece as a
+guide, and **‹ Video** returns. Pieces play in the preview with their
+sound, and export renders them at export size. An agent adds and moves
+pieces with `project_create {recording}` and `recording_place`; the studio
+picks the change up live.
+
 ## Editor
 
-`lahza project.lahza` opens the motion editor:
+`lahza project.lahza` opens a standalone motion project in the editor; pieces
+inside a recording open from the studio instead:
 - **Preview:** rendered on a worker thread (GPU when available), with a half-size proxy while playing or dragging.
-- **Timeline:** the ruler, beat/bar/hit and word markers, scenes, and layer bars with key diamonds.
+- **Timeline:** the ruler, beat/bar/hit and word markers, the sound's waveform, scenes, and layer bars with key diamonds.
+- **Sound:** music, narration, effects and footage sound play in sync while playing.
 - **Inspector:** scrubbable transform values (3D values on 3D layers).
 - **Shortcuts:** Space plays, arrows step frames, Home/End jump, Delete removes the selected layer, Ctrl+Z / Ctrl+Shift+Z undo and redo.
 
@@ -138,4 +165,8 @@ Against Chrome-based editors (Remotion, Hyperframes and other React or canvas to
 - **Shadow and glow on a matted layer:** they use the unmatted picture.
 - **Trim on a filled path:** it trims only the stroke.
 - **2.5D:** intersecting 3D planes are not split, because layers sort by their origin.
+- **Motion pieces:** an over-the-video piece takes the recording's shape; the
+  editor's guide shows the raw recording from the piece's start, so cuts
+  inside a piece's range are not reflected there. Speed-changed footage and
+  music ducking play only in exports.
 - **Missing design tools:** `code_put`, `voiceover`, `ocr` and `assets_search`/`assets_fetch`. These depend on asset sourcing, which is undecided, or on later phases.

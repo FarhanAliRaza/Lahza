@@ -10,7 +10,7 @@
 //! render a half-size proxy, a paused frame renders at full preview size
 //! with motion blur. GPU images are released with `Window::drop_image`.
 
-use crate::controls::{icon_button, ButtonKind, ButtonSize};
+use crate::controls::{button, icon_button, ButtonKind, ButtonSize};
 use crate::motion_sound::{self, Player, Wave};
 use crate::theme::{self, TextRoles};
 use gpui::{
@@ -202,9 +202,47 @@ pub(crate) struct MotionEditor {
     waves: Arc<Vec<Wave>>,
     wave_signature: String,
     wave_inbox: Arc<Mutex<Option<(String, Vec<Wave>)>>>,
+    /// Shown inside the studio window, with a way back to the video.
+    pub(crate) embedded: bool,
+    /// The recording under an over-the-video piece while it is edited.
+    guide: Option<Guide>,
 }
 
-fn stamp(dir: &Path) -> SystemTime {
+/// A reference picture under the design: never saved, never selectable.
+#[derive(Clone, Debug)]
+pub(crate) struct Guide {
+    /// Footage path as seen from the project (`../../screen.mkv`).
+    pub src: String,
+    /// Footage time at the project's time zero.
+    pub source_start: f64,
+}
+
+const GUIDE_ID: &str = "__guide";
+
+/// Compiles `project`, with `guide` as a muted footage layer under every
+/// scene when there is one.
+fn compile_with_guide(project: &Project, guide: Option<&Guide>) -> Compiled {
+    let Some(guide) = guide else { return Compiled::new(project) };
+    let plain = Compiled::new(project);
+    let mut with = project.clone();
+    let (w, h) = (project.settings.width as f64, project.settings.height as f64);
+    for (scene, c) in with.scenes.iter_mut().zip(&plain.scenes) {
+        let layer = json!({"id": GUIDE_ID, "kind": "video", "src": guide.src, "size": [w, h], "mute": true,
+            "trim": round(guide.source_start + c.start), "transform": {"position": [w / 2.0, h / 2.0]}});
+        if let Ok(layer) = serde_json::from_value::<Layer>(layer) {
+            scene.layers.insert(0, layer);
+        }
+    }
+    Compiled::new(&with)
+}
+
+/// Emitted by an embedded editor's "Back to video".
+pub(crate) struct CloseSpace;
+
+impl gpui::EventEmitter<CloseSpace> for MotionEditor {}
+
+/// Newest modification time of a motion project's files.
+pub(crate) fn stamp(dir: &Path) -> SystemTime {
     let mut latest = SystemTime::UNIX_EPOCH;
     let mut look = |p: &Path| {
         if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified()) {
@@ -322,7 +360,7 @@ fn all_states(layers: &[LayerState], parent: lahza_motion_core::space::Proj, out
 }
 
 impl MotionEditor {
-    fn new(dir: PathBuf, cx: &mut Context<Self>) -> Result<Self, String> {
+    pub(crate) fn new(dir: PathBuf, cx: &mut Context<Self>) -> Result<Self, String> {
         let project = io::load(&dir).map_err(|e| e.to_string())?;
         let compiled = Arc::new(Compiled::new(&project));
         let rows = layer_rows(&project, &compiled);
@@ -361,14 +399,35 @@ impl MotionEditor {
             waves: Arc::default(),
             wave_signature: String::new(),
             wave_inbox: Arc::default(),
+            embedded: false,
+            guide: None,
         };
         let mut editor = editor;
         editor.refresh_waves();
         Ok(editor)
     }
 
+    /// Releases this editor's GPU images (call when it goes away).
+    pub(crate) fn release_images(&mut self, window: &mut Window) {
+        self.player = None;
+        for image in self.retired.drain(..).chain(self.frame.take()) {
+            let _ = window.drop_image(image);
+        }
+    }
+
+    pub(crate) fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    /// Shows `guide` under the design (over-the-video pieces).
+    pub(crate) fn set_guide(&mut self, guide: Option<Guide>) {
+        self.guide = guide;
+        self.compiled = Arc::new(compile_with_guide(&self.project, self.guide.as_ref()));
+        self.dirty = true;
+    }
+
     /// Ticks at 60 Hz: playback, finished frames, and live reload.
-    fn start_ticking(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_ticking(&mut self, cx: &mut Context<Self>) {
         let mut last = Instant::now();
         cx.spawn(async move |weak, cx| loop {
             Timer::after(Duration::from_millis(16)).await;
@@ -444,7 +503,7 @@ impl MotionEditor {
         match io::load(&self.dir) {
             Ok(p) => {
                 self.project = p;
-                self.compiled = Arc::new(Compiled::new(&self.project));
+                self.compiled = Arc::new(compile_with_guide(&self.project, self.guide.as_ref()));
                 self.rows = layer_rows(&self.project, &self.compiled);
                 self.stamp = stamp(&self.dir);
                 self.dirty = true;
@@ -477,7 +536,7 @@ impl MotionEditor {
     /// Shows ops without saving them (live drags).
     fn preview(&mut self, ops: &[Value]) {
         if let Ok(a) = edit::apply(&self.project, ops) {
-            self.compiled = Arc::new(Compiled::new(&a.project));
+            self.compiled = Arc::new(compile_with_guide(&a.project, self.guide.as_ref()));
             self.dirty = true;
         }
     }
@@ -621,7 +680,7 @@ impl MotionEditor {
                 Content::Group(_) => None,
                 _ => lahza_motion_core::check::bounds(l, None),
             }?;
-            (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]).then(|| l.id.to_string())
+            (&*l.id != GUIDE_ID && x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]).then(|| l.id.to_string())
         })
     }
 
@@ -667,6 +726,8 @@ impl MotionEditor {
             "-" => self.zoom = (self.zoom / 1.25).max(5.0),
             _ => return,
         }
+        // Inside the studio, keys must not also drive the video behind.
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -787,6 +848,18 @@ impl MotionEditor {
             .px_3()
             .border_b_1()
             .border_color(theme::line())
+            .when(self.embedded, |d| {
+                d.child(
+                    button("motion-space-back", "Video", ButtonKind::Secondary, ButtonSize::Sm)
+                        .icon("icons/chevron-left.svg")
+                        .tooltip("Back to the video timeline")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.player = None;
+                            this.playing = false;
+                            cx.emit(CloseSpace);
+                        })),
+                )
+            })
             .child(div().panel_title().child(name))
             .child(div().w(px(16.0)))
             .child(icon_button("motion-back", "icons/skip-back.svg", ButtonKind::Ghost, ButtonSize::Sm).tooltip("Start (Home)").on_click(cx.listener(|this, _, _, cx| {

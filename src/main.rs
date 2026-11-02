@@ -33,6 +33,8 @@ mod library;
 mod models;
 mod motion_ui;
 mod motion_editor;
+mod motion_piece_ui;
+mod motion_pieces;
 mod motion_sound;
 mod motion_overview_ui;
 mod animation_ui;
@@ -545,6 +547,14 @@ struct Studio {
     /// never frees a `RenderImage` on its own.
     retired_images: Vec<Arc<RenderImage>>,
     captured_dimensions: Option<(u32, u32)>,
+    /// Motion designs placed on the open recording's timeline.
+    motion_pieces: Option<crate::motion_pieces::MotionPieces>,
+    /// Bumped to stop the motion pieces' polling task.
+    motion_pieces_loop: u64,
+    selected_motion_piece: Option<String>,
+    motion_piece_drag: Option<crate::motion_piece_ui::PieceDrag>,
+    /// A motion piece open for editing in place of the video timeline.
+    motion_space: Option<gpui::Entity<crate::motion_editor::MotionEditor>>,
     effect_revision: u64,
     annotations: Vec<AnnotationMark>,
     undo_stack: Vec<Vec<AnnotationMark>>,
@@ -976,6 +986,11 @@ impl Studio {
             displayed_capture_image: None,
             retired_images: Vec::new(),
             captured_dimensions: None,
+            motion_pieces: None,
+            motion_pieces_loop: 0,
+            selected_motion_piece: None,
+            motion_piece_drag: None,
+            motion_space: None,
             effect_revision: 0,
             annotations: Vec::new(),
             undo_stack: Vec::new(),
@@ -1303,6 +1318,7 @@ impl Studio {
                 }
             }
             MOTION_ZOOM_SLIDER => self.set_motion_zoom_slider(value),
+            crate::motion_piece_ui::PIECE_OPACITY_SLIDER => self.set_motion_piece_opacity(value),
             id if id >= 100 => {
                 self.set_scene_slider(id, value);
             }

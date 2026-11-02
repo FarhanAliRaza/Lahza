@@ -32,6 +32,26 @@
   a video layer, so 3D objects composite with type, shapes and effects.
   Match `frames` to the scene's span; use `fps` of the project.
 
+## Motion inside a screen recording
+
+A person editing a Lahza screen recording (`*.lahzarec`) can ask for a
+motion design in it. Work inside the recording so it shows up on their
+video timeline:
+
+1. `recording_info {recording}`: size, the edited video's length, shared
+   media, pieces already placed.
+2. `project_create {path: "intro", recording}`: the piece is made inside
+   the recording, at its shape. For a piece drawn over the video, keep the
+   background clear (`"#00000000"`); coordinates are the recording's pixels.
+3. Use the recording's files where they are: the raw recording is
+   `"../../screen.mkv"`; `media_import` of any other file copies it into
+   the recording's shared `media/`.
+4. `edit_apply`, `check`, `snapshot` as usual.
+5. `recording_place {start, placement}`: `overlay` draws it on the
+   recording (it follows the video's zooms and camera), `full` covers the
+   frame like an inserted clip. Call again to move it; `remove: true` takes
+   it off. The person sees it live and can open it in the editor.
+
 ## Timing rules that make it look professional
 
 - **Sync the peak, not the start.** Put `"anchor": "peak"` on transitions
