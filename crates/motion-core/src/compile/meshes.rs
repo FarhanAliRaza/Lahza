@@ -495,16 +495,12 @@ impl CMesh {
 impl MeshState {
     /// Canvas bounds of the mesh's local box (None when it crosses the camera).
     pub fn screen_bounds(&self) -> Option<[f64; 4]> {
-        let mesh = crate::mesh::generate(&self.params).ok()?;
-        if mesh.positions.is_empty() {
-            return None;
-        }
-        let (lo, hi) = mesh.bounds();
+        let (lo, hi) = self.params.local_bounds()?;
         let m = self.camera.project.then(self.world);
         let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for k in 0..8 {
             let c = [if k & 1 == 0 { lo[0] } else { hi[0] }, if k & 2 == 0 { lo[1] } else { hi[1] }, if k & 4 == 0 { lo[2] } else { hi[2] }];
-            let [x, y, _, w] = m.apply(c[0] as f64, c[1] as f64, c[2] as f64);
+            let [x, y, _, w] = m.apply(c[0], c[1], c[2]);
             if w <= 1e-6 {
                 return None;
             }

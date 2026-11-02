@@ -216,6 +216,53 @@ impl MeshParams {
     }
 }
 
+impl MeshParams {
+    /// Local bounds [min, max] without generating the mesh (a slightly
+    /// loose box: arcs count as full rings).
+    pub fn local_bounds(&self) -> Option<([f64; 3], [f64; 3])> {
+        let sym = |x: f64, y: f64, z: f64| Some(([-x, -y, -z], [x, y, z]));
+        let path_box = |m: &PathMorph| -> Option<[f64; 4]> {
+            let subpaths = crate::path::morph(m, 1.0).ok()?;
+            let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+            for (pts, _) in &subpaths {
+                for p in pts {
+                    b = [b[0].min(p.0), b[1].min(p.1), b[2].max(p.0), b[3].max(p.1)];
+                }
+            }
+            b[0].is_finite().then_some(b)
+        };
+        match &self.shape {
+            MeshShape::Sphere { radius } => sym(*radius, *radius, *radius),
+            MeshShape::Box { size, .. } => sym(size[0].abs() / 2.0, size[1].abs() / 2.0, size[2].abs() / 2.0),
+            MeshShape::Cylinder { radius, top, height, .. } => {
+                let r = radius.max(*top);
+                sym(r, height.abs() / 2.0, r)
+            }
+            MeshShape::Capsule { radius, height } => sym(*radius, (height.abs() / 2.0).max(*radius), *radius),
+            MeshShape::Torus { radius, tube, .. } => sym(radius + tube, radius + tube, *tube),
+            MeshShape::Extrude { path, depth, .. } => {
+                let b = path_box(path)?;
+                Some(([b[0], b[1], -depth / 2.0], [b[2], b[3], depth / 2.0]))
+            }
+            MeshShape::Revolve { profile, axis_y, .. } => {
+                let b = path_box(profile)?;
+                let r = b[0].abs().max(b[2].abs());
+                if *axis_y {
+                    Some(([-r, b[1], -r], [r, b[3], r]))
+                } else {
+                    Some(([-r, -r, b[1]], [r, r, b[3]]))
+                }
+            }
+            MeshShape::Sweep { path, radius, width, head, .. } => {
+                let b = path_box(path)?;
+                let pad = radius.max(*head);
+                let z = radius.max(width / 2.0).max(*head);
+                Some(([b[0] - pad, b[1] - pad, -z], [b[2] + pad, b[3] + pad, z]))
+            }
+        }
+    }
+}
+
 /// Segments for a circle of radius `r` (one every ~9 px, scaled by detail).
 fn circle_steps(r: f64, detail: f64, span: f64) -> usize {
     let n = (r.abs() * span / 9.0 * detail).ceil();
@@ -1287,6 +1334,28 @@ mod tests {
         let area: f64 = tris.iter().map(|t| cross2(outer[t[0]], outer[t[1]], outer[t[2]]).abs() / 2.0).sum();
         assert!((area - signed_area(&outer).abs()).abs() < 1e-6);
         assert_eq!(tris.len(), 38);
+    }
+
+    #[test]
+    fn local_bounds_contain_the_mesh() {
+        let shapes = [
+            MeshShape::Sphere { radius: 50.0 },
+            MeshShape::Box { size: [100.0, 60.0, 40.0], bevel: 8.0 },
+            MeshShape::Cylinder { radius: 40.0, top: 20.0, height: 90.0, bevel: 5.0 },
+            MeshShape::Capsule { radius: 20.0, height: 120.0 },
+            MeshShape::Torus { radius: 100.0, tube: 20.0, angles: [0.0, 200.0], caps: Caps::Round },
+            MeshShape::Extrude { path: path("M -50 -40 L 60 -40 L 0 70 Z"), depth: 30.0, bevel: 4.0 },
+            MeshShape::Revolve { profile: path("M 0 -50 L 40 0 L 0 50"), angles: [0.0, 360.0], axis_y: true },
+            MeshShape::Sweep { path: path("M -100 0 C 0 -80 50 80 100 0"), radius: 12.0, width: 40.0, profile: SweepProfile::Circle, trim: [0.0, 1.0], caps: Caps::Round, head: 20.0 },
+        ];
+        for shape in shapes {
+            let p = params(shape);
+            let (lo, hi) = p.local_bounds().unwrap();
+            let (mlo, mhi) = generate(&p).unwrap().bounds();
+            for k in 0..3 {
+                assert!(lo[k] <= mlo[k] as f64 + 1e-3 && hi[k] >= mhi[k] as f64 - 1e-3, "{:?}: {lo:?} {hi:?} vs {mlo:?} {mhi:?}", p.shape);
+            }
+        }
     }
 
     #[test]
