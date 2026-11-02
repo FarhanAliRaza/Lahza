@@ -3242,6 +3242,7 @@ dependencies = [
  "lahza-motion-render",
  "lahza-recording",
  "libc",
+ "log",
  "resvg",
  "rustfft",
  "serde",

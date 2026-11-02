@@ -1848,7 +1848,26 @@ fn open_studio_window(
     )
 }
 
+/// Prints `log` records (GPUI's renderer and platform messages among them)
+/// to stderr when `LAHZA_LOG` is set: `LAHZA_LOG=debug lahza …`.
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record) {
+        eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
+    }
+    fn flush(&self) {}
+}
+
 fn main() {
+    if let Ok(level) = std::env::var("LAHZA_LOG") {
+        if log::set_logger(&StderrLog).is_ok() {
+            log::set_max_level(level.parse().unwrap_or(log::LevelFilter::Info));
+        }
+    }
     // `lahza mcp` (agent interface) and `lahza motion …` (motion engine CLI)
     // run headless and never open a window.
     let words: Vec<String> = std::env::args().skip(1).collect();
@@ -1866,7 +1885,9 @@ fn main() {
     let initial_motion = arguments
         .iter()
         .find(|path| path.join("project.json").is_file() && path.extension().and_then(|e| e.to_str()) != Some("lahzarec"))
-        .cloned();
+        // The editor's toolbox resolves paths against the project's parent,
+        // so a relative argument would be joined twice.
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()));
     let initial_recording = arguments
         .iter()
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("lahzarec"))
