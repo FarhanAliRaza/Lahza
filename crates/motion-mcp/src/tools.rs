@@ -187,15 +187,19 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "blender_run",
-            description: "Run Blender headless to make 3D footage: give a bpy Python `script` (it can build or load a scene; the dict LAHZA holds out, width, height, fps, frame_start, frame_end) and/or a `blend` file. Lahza sets resolution, fps, frame range, transparent film and a PNG RGBA sequence output first, your script may override them, then renders the animation into assets/blender/<name>/. Returns the footage src to use in a video layer. Long renders: wait=false and poll render_status.",
+            description: "Run Blender headless to make 3D footage: give a bpy Python `script` (it can build or load a scene) and/or a `blend` file. Lahza sets resolution, fps, frame range, transparent film, a PNG RGBA sequence output, the GPU (OptiX/CUDA/HIP devices on, CPU when none) and the quality first; your script may override them. The script sees the dict LAHZA (out, width, height, fps, frame_start, frame_end, at, quality) with the project's timing: LAHZA[\"markers\"][\"beat\"] = {\"seconds\": […], \"frames\": […]} for every marker track (beat, bar, hit, word with \"labels\", …) and LAHZA[\"elements\"][\"title\"] = {start, end, start_frame, end_frame} for every scene and layer (by id and name), plus frame_of(seconds); frames count from frame_start at project time `at`, so key 3D moves on those frames to land on the timeline. quality \"preview\" renders a few frames (preview_frames) at half size, EEVEE (Cycles 8 samples without it), no motion blur, into assets/blender/<name>-preview/ and returns a sheet of them; \"final\" renders every frame with `samples`, denoising and motion blur into assets/blender/<name>/ and returns the footage src for a video layer. Reports seconds per frame. Long renders: wait=false and poll render_status.",
             schema: obj(json!({
                 "name": {"type": "string", "description": "output name (letters, digits, - _)"},
                 "script": {"type": "string", "description": "bpy Python run after the defaults are set"},
                 "blend": {"type": "string", "description": ".blend file to open first"},
+                "quality": {"type": "string", "enum": ["preview", "final"], "default": "final", "description": "preview: a few half-size frames to check the look and timing; final: the footage"},
+                "preview_frames": {"type": "integer", "default": 6},
                 "frames": {"type": "array", "items": {"type": "integer"}, "description": "[start, end], default [1, fps × project duration]"},
+                "at": {"type": "number", "default": 0, "description": "project seconds shown by frame_start (where the footage layer starts); marker frames count from it"},
                 "resolution": {"type": "array", "items": {"type": "integer"}, "description": "[w, h], default the project size"},
-                "engine": {"type": "string", "enum": ["CYCLES", "BLENDER_EEVEE", "BLENDER_WORKBENCH"], "description": "default CYCLES (works without a display); EEVEE is much faster with a GPU and a display"},
-                "samples": {"type": "integer", "default": 32},
+                "engine": {"type": "string", "enum": ["CYCLES", "BLENDER_EEVEE", "BLENDER_WORKBENCH"], "description": "default CYCLES for final, EEVEE for preview"},
+                "samples": {"type": "integer", "default": 64, "description": "final quality (preview uses 8)"},
+                "gpu": {"type": "boolean", "default": true, "description": "false renders on the CPU"},
                 "transparent": {"type": "boolean", "default": true},
                 "render": {"type": "boolean", "default": true, "description": "false only runs the script (e.g. to export a glTF)"},
                 "timeout": {"type": "number", "description": "seconds, default 1800"},
@@ -203,8 +207,31 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: false,
         },
         ToolDef {
+            name: "track",
+            description: "Follow a target through a video (a reference) and measure it per frame: t, frame, x/y (centroid), bbox [x, y, w, h], area, angle (principal axis from image moments, degrees clockwise) and mean colour, in source pixels. Target: `color` \"#rrggbb\" ± `tolerance` (RGB distance, default 40; `region` [x, y, w, h] limits the search), or `point` [x, y] (the colour blob under it in the first frame, followed as the connected region nearest its last position), or `box` [x, y, w, h] (that picture matched frame to frame within `search` px; translation only, angle 0). With `keys` it also returns transform keys (position, scale from the area, rotation from the angle, one per frame) and, given keys.layer, edit_apply ops that set them. Use it instead of measuring frames by hand; feed a move's samples to fit_curve to get one eased key instead of per-frame keys.",
+            schema: obj(json!({
+                "video": {"type": "string", "description": "video file (absolute, or relative to the working folder or project)"},
+                "color": {"type": "string"}, "tolerance": {"type": "number", "default": 40},
+                "region": {"type": "array", "items": {"type": "number"}, "description": "[x, y, w, h] in source pixels"},
+                "point": {"type": "array", "items": {"type": "number"}, "description": "[x, y] in source pixels on the first frame"},
+                "box": {"type": "array", "items": {"type": "number"}, "description": "[x, y, w, h] in source pixels on the first frame"},
+                "search": {"type": "number", "description": "box: pixels to search per frame (default the box size)"},
+                "from": {"type": "number", "default": 0}, "to": {"type": "number"},
+                "width": {"type": "integer", "description": "processing width (default source, at most 960)"},
+                "keys": {"type": "object", "description": "{scale: canvas px per source px (default 1), offset: [x, y], at: timeline seconds of `from` (default 0), base_scale: 1, rotate: true, layer: id} → keys and ops"}}), &["video"]),
+            read_only: true,
+        },
+        ToolDef {
+            name: "fit_curve",
+            description: "Fit the engine's eases to a measured move: `samples` [[t, value], …] with a number or [x, y] per sample (positions are fitted along the line of the move; e.g. track's x/y). Tries linear, power in/out/in-out (n), exp (tau), spring (zeta, hz), bezier, bounce and every named preset, searching start, duration and the ease's parameters; from/to by least squares. Returns `best` with ease, start, end, duration, from, to, rms_error, relative_error (of the travel) and `key` — {at, anchor: \"start\", dur, from, v, ease}, ready for a key op — plus the runners-up. A named preset or simpler ease wins when it fits about as well.",
+            schema: obj(json!({
+                "samples": {"type": "array", "items": {"type": "array"}, "description": "[[t, value], …], value a number or [x, y]"},
+                "fps": {"type": "number", "description": "frame rate for frame-based eases (default the project's, else 30)"}}), &["samples"]),
+            read_only: true,
+        },
+        ToolDef {
             name: "audio_analyze",
-            description: "Analyse music into marker tracks: tempo (a tempo map when it changes), meter (3/4 or 4/4), first downbeat, beat/bar/half/sixteenth/triplet grids, onsets per band, hit, stop (silence→hit), drop (bass dropout before a downbeat), music.start/end. Defaults to the project's music.",
+            description: "Analyse music into marker tracks: tempo (a tempo map when it changes), meter (3/4 or 4/4), first downbeat, beat/bar/half/sixteenth/triplet grids, onsets per band, hit, stop (silence→hit, or the music cutting to a reverb tail or ringing hit), drop (bass dropout before a downbeat), music.start/end. Reports the feel (straight, or triplet for a shuffle or compound swing) with feel_confidence, and tempo_confidence with the alternatives: other groupings of the same pulse (3:4, 2:3; e.g. 133 BPM in triplets vs 100 BPM in sixteenths) when the onsets cannot tell them apart. Defaults to the project's music.",
             schema: obj(json!({"path": {"type": "string", "description": "audio file; registered as the music when the project has none"}, "offset": {"type": "number", "description": "timeline time of the file's start"}}), &[]),
             read_only: false,
         },
@@ -312,6 +339,8 @@ impl Toolbox {
             "audio_analyze" => self.audio_analyze(&args),
             "media_import" => self.media_import(&args),
             "blender_run" => self.blender_run(&args),
+            "track" => self.track(&args),
+            "fit_curve" => self.fit_curve(&args),
             other => Err(format!("unknown tool '{other}'")),
         }
     }
@@ -1543,12 +1572,13 @@ pub fn png_base64(png: &[u8]) -> String {
 }
 
 const BLENDER_WRAPPER: &str = r#"
-import bpy, json, os, sys, traceback
-LAHZA = json.loads(os.environ["LAHZA_BLENDER"])
+import bpy, json, os, sys, time, traceback
+LAHZA = json.load(open(os.environ["LAHZA_BLENDER"]))
 scene = bpy.context.scene
 r = scene.render
+preview = LAHZA["quality"] == "preview"
 r.resolution_x, r.resolution_y = LAHZA["width"], LAHZA["height"]
-r.resolution_percentage = 100
+r.resolution_percentage = 50 if preview else 100
 r.fps = int(round(LAHZA["fps"]))
 r.fps_base = r.fps / LAHZA["fps"]
 scene.frame_start, scene.frame_end = LAHZA["frame_start"], LAHZA["frame_end"]
@@ -1557,26 +1587,100 @@ r.image_settings.file_format = "PNG"
 r.image_settings.color_mode = "RGBA" if LAHZA["transparent"] else "RGB"
 r.image_settings.color_depth = "8"
 r.filepath = os.path.join(LAHZA["out"], LAHZA["name"] + "_####")
+r.use_motion_blur = not preview
+
+def set_engine(names):
+    for name in names:
+        try:
+            r.engine = name
+            return
+        except Exception:
+            pass
+
+# Preview: EEVEE when this build has it (it renders headless on a GPU).
+set_engine([LAHZA["engine"]] if LAHZA.get("engine") else ["BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES"] if preview else ["CYCLES"])
+
+def enable_gpu():
+    """Turn on every device of the best GPU backend; CPU when none."""
+    try:
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+    except Exception:
+        return "CPU", []
+    for kind in ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL"):
+        try:
+            prefs.compute_device_type = kind
+        except Exception:
+            continue
+        prefs.get_devices()
+        found = [d for d in prefs.devices if d.type == kind]
+        if found:
+            for d in prefs.devices:
+                d.use = d.type == kind
+            return kind, [d.name for d in found]
+    try:
+        prefs.compute_device_type = "NONE"
+    except Exception:
+        pass
+    return "CPU", []
+
+device, devices = enable_gpu() if LAHZA["gpu"] else ("CPU", [])
+scene.cycles.device = "CPU" if device == "CPU" else "GPU"
+samples = 8 if preview else LAHZA["samples"]
+scene.cycles.samples = samples
 try:
-    r.engine = LAHZA["engine"]
+    scene.eevee.taa_render_samples = samples
 except Exception:
     pass
-if r.engine == "CYCLES":
-    scene.cycles.samples = LAHZA["samples"]
-    scene.cycles.device = "GPU" if os.environ.get("LAHZA_BLENDER_GPU") else "CPU"
+scene.cycles.use_denoising = not preview
+if not preview:
     # Some builds (e.g. Ubuntu's) ship without OpenImageDenoise.
-    scene.cycles.use_denoising = bool(getattr(bpy.app.build_options, "openimagedenoise", False))
+    oidn = getattr(bpy.app.build_options, "openimagedenoise", True)
+    if oidn:
+        scene.cycles.denoiser = "OPENIMAGEDENOISE"
+    elif device == "OPTIX":
+        scene.cycles.denoiser = "OPTIX"
+    else:
+        scene.cycles.use_denoising = False
+
+def frame_of(seconds):
+    """Blender frame showing project time `seconds` (frame_start lands at LAHZA["at"])."""
+    return LAHZA["frame_start"] + round((seconds - LAHZA["at"]) * LAHZA["fps"])
+
 script = LAHZA.get("script")
 if script:
     try:
-        exec(compile(open(script).read(), script, "exec"), {"bpy": bpy, "LAHZA": LAHZA, "__name__": "__main__"})
+        exec(compile(open(script).read(), script, "exec"), {"bpy": bpy, "LAHZA": LAHZA, "frame_of": frame_of, "__name__": "__main__"})
     except Exception:
         traceback.print_exc()
         sys.exit(3)
+
+times = []
+started = [0.0]
+def before(scene, *_):
+    started[0] = time.perf_counter()
+def after(scene, *_):
+    s = round(time.perf_counter() - started[0], 3)
+    times.append({"frame": scene.frame_current, "seconds": s})
+    print("LAHZA_FRAME %d %.3f" % (scene.frame_current, s), flush=True)
+bpy.app.handlers.render_pre.append(before)
+bpy.app.handlers.render_post.append(after)
+
 if LAHZA["render"]:
-    bpy.ops.render.render(animation=True)
+    if preview:
+        # A few frames spread over the range, for a look at the timing.
+        fs, fe, n = scene.frame_start, scene.frame_end, max(1, LAHZA["preview_frames"])
+        frames = sorted({round(fs + (fe - fs) * i / max(1, n - 1)) for i in range(n)})
+        for f in frames:
+            scene.frame_set(f)
+            r.filepath = os.path.join(LAHZA["out"], "%s_%04d.png" % (LAHZA["name"], f))
+            bpy.ops.render.render(write_still=True)
+    else:
+        bpy.ops.render.render(animation=True)
 print("LAHZA_DONE " + json.dumps({"frame_start": scene.frame_start, "frame_end": scene.frame_end,
-    "width": r.resolution_x, "height": r.resolution_y, "fps": r.fps / r.fps_base, "engine": r.engine}))
+    "width": r.resolution_x * r.resolution_percentage // 100, "height": r.resolution_y * r.resolution_percentage // 100,
+    "fps": r.fps / r.fps_base, "engine": r.engine, "device": device, "devices": devices,
+    "samples": scene.cycles.samples if r.engine == "CYCLES" else samples, "motion_blur": r.use_motion_blur,
+    "denoise": r.engine == "CYCLES" and scene.cycles.use_denoising, "frame_times": times}))
 "#;
 
 impl Toolbox {
@@ -1643,7 +1747,14 @@ impl Toolbox {
         }
         let blender = which("blender").ok_or("Blender is not installed (Ubuntu: sudo apt install blender, or set LAHZA_BLENDER to its path)")?;
         let settings = self.state(&dir).project.settings.clone();
-        let out = dir.join("assets").join("blender").join(&name);
+        let preview = match get_str(args, "quality").unwrap_or("final") {
+            "preview" => true,
+            "final" => false,
+            other => return Err(format!("quality '{other}': use preview or final")),
+        };
+        // A preview never replaces the final frames.
+        let folder = if preview { format!("{name}-preview") } else { name.clone() };
+        let out = dir.join("assets").join("blender").join(&folder);
         // A fresh render replaces the previous one.
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
@@ -1682,17 +1793,25 @@ impl Toolbox {
             Some(a) => (a[0].as_u64().unwrap_or(1920), a[1].as_u64().unwrap_or(1080)),
             None => (settings.width as u64, settings.height as u64),
         };
+        let at = get_f64(args, "at").unwrap_or(0.0);
         let config = json!({
             "out": out, "name": name, "width": w, "height": h, "fps": fps, "frame_start": fs, "frame_end": fe,
-            "engine": get_str(args, "engine").unwrap_or("CYCLES"), "samples": args.get("samples").and_then(Value::as_u64).unwrap_or(32),
+            "quality": if preview { "preview" } else { "final" }, "preview_frames": args.get("preview_frames").and_then(Value::as_u64).unwrap_or(6),
+            "engine": get_str(args, "engine"), "samples": args.get("samples").and_then(Value::as_u64).unwrap_or(64),
+            "gpu": args.get("gpu").and_then(Value::as_bool).unwrap_or(true),
             "transparent": args.get("transparent").and_then(Value::as_bool).unwrap_or(true),
             "render": args.get("render").and_then(Value::as_bool).unwrap_or(true),
-            "script": script_path,
+            "script": script_path, "at": at,
+            "markers": self.blender_markers(&dir, fps, fs, at),
+            "elements": self.blender_elements(&dir, fps, fs, at),
         });
         let wrapper = scripts.join("_lahza_wrapper.py");
         std::fs::write(&wrapper, BLENDER_WRAPPER).map_err(|e| e.to_string())?;
+        // A file, not the environment: marker lists outgrow an env variable.
+        let config_path = scripts.join(format!("{name}.lahza.json"));
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()).map_err(|e| e.to_string())?;
         let timeout = std::time::Duration::from_secs_f64(get_f64(args, "timeout").unwrap_or(1800.0).max(1.0));
-        let rel_pattern = format!("assets/blender/{name}/{name}_####.png");
+        let rel_pattern = format!("assets/blender/{folder}/{name}_####.png");
         let source = match (&script_path, &blend) {
             (Some(s), _) => format!("blender script {}", s.strip_prefix(&dir).unwrap_or(s).display()),
             (None, Some(b)) => format!("blender file {}", b.display()),
@@ -1701,7 +1820,8 @@ impl Toolbox {
         let dir2 = dir.clone();
         let rel2 = rel_pattern.clone();
         let progress = Arc::new(Progress::default());
-        progress.total.store((fe - fs + 1).max(1) as u64, Ordering::Relaxed);
+        let preview_count = args.get("preview_frames").and_then(Value::as_u64).unwrap_or(6).clamp(1, (fe - fs + 1).max(1) as u64);
+        progress.total.store(if preview { preview_count } else { (fe - fs + 1).max(1) as u64 }, Ordering::Relaxed);
         let p2 = progress.clone();
         let out2 = out.clone();
         let handle = std::thread::spawn(move || -> Result<Value, String> {
@@ -1710,7 +1830,7 @@ impl Toolbox {
             if let Some(b) = &blend {
                 cmd.arg(b);
             }
-            cmd.arg("--python").arg(&wrapper).env("LAHZA_BLENDER", config.to_string()).current_dir(&dir2);
+            cmd.arg("--python").arg(&wrapper).env("LAHZA_BLENDER", &config_path).current_dir(&dir2);
             // Blender prints a lot while rendering: write it to a log file
             // (an undrained pipe would block Blender once it fills).
             let log_path = dir2.join("blender").join(format!("{}.log", config["name"].as_str().unwrap_or("blender")));
@@ -1729,8 +1849,19 @@ impl Toolbox {
                     }
                     let count = std::fs::read_dir(&out2).map(|r| r.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "png")).count()).unwrap_or(0);
                     p2.done.store(count as u64, Ordering::Relaxed);
-                    return Ok(json!({"src": rel2, "frames": count, "blender": done, "seconds": started.elapsed().as_secs_f64(),
-                        "layer": {"kind": "video", "src": rel2, "fps": done.as_ref().and_then(|d| d.get("fps")).cloned().unwrap_or(json!(fps))}}));
+                    let mut done = done.unwrap_or_default();
+                    let frame_times = done.as_object_mut().and_then(|d| d.remove("frame_times")).unwrap_or(json!([]));
+                    let per_frame: Vec<f64> = frame_times.as_array().into_iter().flatten().filter_map(|f| f["seconds"].as_f64()).collect();
+                    let mut report = json!({"src": rel2, "frames": count, "blender": done, "seconds": round(started.elapsed().as_secs_f64()),
+                        "frame_times": frame_times,
+                        "seconds_per_frame": if per_frame.is_empty() { Value::Null } else { json!(round(per_frame.iter().sum::<f64>() / per_frame.len() as f64)) },
+                        "layer": {"kind": "video", "src": rel2, "fps": done.get("fps").cloned().unwrap_or(json!(fps))}});
+                    if preview {
+                        report["preview"] = json!(true);
+                        report["note"] = json!("a few frames at half size for a look: render quality \"final\" for the footage");
+                        report.as_object_mut().map(|r| r.remove("layer"));
+                    }
+                    return Ok(report);
                 }
                 if p2.cancel.load(Ordering::Relaxed) || started.elapsed() > timeout {
                     let _ = child.kill();
@@ -1744,18 +1875,138 @@ impl Toolbox {
         });
         // Record the asset now; the files appear as Blender renders.
         let mut project = self.state(&dir).project.clone();
-        if !project.assets.iter().any(|a| a.path == rel_pattern) {
+        if !preview && !project.assets.iter().any(|a| a.path == rel_pattern) {
             project.assets.push(Asset { path: rel_pattern.clone(), source, licence: "generated".into(), credit: None });
             self.save(&dir, project)?;
         }
         let id = format!("blender-{}", self.jobs.len() + 1);
-        self.jobs.push((id.clone(), Job { project: dir, output: out, progress, started: Instant::now(), handle: Some(handle), result: None }));
+        self.jobs.push((id.clone(), Job { project: dir, output: out.clone(), progress, started: Instant::now(), handle: Some(handle), result: None }));
         if args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
             let job = &mut self.jobs.last_mut().unwrap().1;
             let result = job.handle.take().unwrap().join().unwrap_or_else(|_| Err("Blender job panicked".into()));
             job.result = Some(result);
         }
-        self.render_status(&json!({"job": id}))
+        let mut status = self.render_status(&json!({"job": id}))?;
+        // A preview comes back as a sheet of its frames.
+        if preview && status.json["state"] == "done" {
+            let mut cells = Vec::new();
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&out).map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "png")).collect()).unwrap_or_default();
+            files.sort();
+            for f in &files {
+                if let Ok(img) = image::open(f) {
+                    let n: i64 = f.file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit('_').next()).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    cells.push((format!("f{n} · {:.2}s", at + (n - fs) as f64 / fps), img.to_rgba8()));
+                }
+            }
+            if !cells.is_empty() {
+                let columns = (cells.len() as f64).sqrt().ceil().clamp(1.0, 4.0) as u32;
+                status.images.push(lahza_motion_render::encode_png(&sheet::contact_sheet(&cells, columns, 320)));
+            }
+        }
+        Ok(status)
+    }
+
+    /// Marker tracks for a Blender script: seconds, the Blender frame
+    /// showing each (frame_start lands on `at`), and labels (words).
+    fn blender_markers(&mut self, dir: &Path, fps: f64, frame_start: i64, at: f64) -> Value {
+        let frame = |t: f64| frame_start + ((t - at) * fps).round() as i64;
+        let tracks = &self.state(dir).project.markers.tracks;
+        let mut out = Map::new();
+        for (name, track) in tracks {
+            let mut v = json!({
+                "seconds": track.markers.iter().map(|m| round(m.t)).collect::<Vec<_>>(),
+                "frames": track.markers.iter().map(|m| frame(m.t)).collect::<Vec<_>>(),
+            });
+            if track.markers.iter().any(|m| m.label.is_some()) {
+                v["labels"] = json!(track.markers.iter().map(|m| m.label.clone().unwrap_or_default()).collect::<Vec<_>>());
+            }
+            out.insert(name.clone(), v);
+        }
+        Value::Object(out)
+    }
+
+    /// Resolved start and end of every scene and layer (by id, and by name
+    /// when it has one), in seconds and Blender frames.
+    fn blender_elements(&mut self, dir: &Path, fps: f64, frame_start: i64, at: f64) -> Value {
+        let compiled = self.compiled(dir);
+        let frame = |t: f64| frame_start + ((t - at) * fps).round() as i64;
+        let window = |start: f64, end: f64| json!({"start": round(start), "end": round(end), "start_frame": frame(start), "end_frame": frame(end)});
+        let mut out = Map::new();
+        fn walk(list: &[lahza_motion_core::document::Layer], compiled: &Compiled, out: &mut Map<String, Value>, window: &dyn Fn(f64, f64) -> Value) {
+            for l in list {
+                if let Some((s, e)) = compiled.element_window(&l.id) {
+                    out.insert(l.id.to_string(), window(s, e));
+                    if let Some(name) = &l.common.name {
+                        out.entry(name.clone()).or_insert_with(|| window(s, e));
+                    }
+                }
+                walk(l.children(), compiled, out, window);
+            }
+        }
+        let project = &self.state(dir).project;
+        for (scene, c) in project.scenes.iter().zip(&compiled.scenes) {
+            out.insert(scene.id.to_string(), window(c.start, c.end));
+            walk(&scene.layers, &compiled, &mut out, &window);
+        }
+        Value::Object(out)
+    }
+
+    /// A file named by the agent: absolute, or relative to the working
+    /// folder or (failing that) the current project.
+    fn input_file(&self, p: &str) -> PathBuf {
+        let abs = self.path(p);
+        match &self.current {
+            Some(dir) if !abs.exists() && dir.join(p).exists() => dir.join(p),
+            _ => abs,
+        }
+    }
+
+    fn track(&mut self, args: &Value) -> ToolResult {
+        let video = self.input_file(get_str(args, "video").ok_or("track needs \"video\"")?);
+        let target = crate::measure::Target::from_json(args)?;
+        let from = get_f64(args, "from").unwrap_or(0.0);
+        let width = args.get("width").and_then(Value::as_u64).map(|w| w as u32);
+        let (info, samples) = crate::measure::track(&video, &target, from, get_f64(args, "to"), width)?;
+        let found = samples.iter().filter(|s| s.found).count();
+        let mut out = json!({
+            "video": video.display().to_string(), "size": [info.width, info.height], "fps": round(info.fps),
+            "frames": samples.len(), "found": found,
+            "track": samples.iter().map(|s| s.to_json()).collect::<Vec<_>>(),
+        });
+        if let Some(k) = args.get("keys").filter(|k| k.is_object()) {
+            let offset = k.get("offset").and_then(Value::as_array).map(|a| [a.first().and_then(Value::as_f64).unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]).unwrap_or([0.0, 0.0]);
+            let rotate = k.get("rotate").and_then(Value::as_bool).unwrap_or(!matches!(target, crate::measure::Target::Box { .. }));
+            let keys = crate::measure::keys(&samples, from, get_f64(k, "at").unwrap_or(0.0), get_f64(k, "scale").unwrap_or(1.0), offset, get_f64(k, "base_scale").unwrap_or(1.0), rotate);
+            if let (Some(layer), Some(map)) = (get_str(k, "layer"), keys.as_object()) {
+                out["ops"] = json!(map.iter().map(|(path, v)| json!({"op": "set", "target": format!("{layer}.{path}"), "value": v})).collect::<Vec<_>>());
+            }
+            out["keys"] = keys;
+        }
+        Ok(Output::json(out))
+    }
+
+    fn fit_curve(&mut self, args: &Value) -> ToolResult {
+        let list = args.get("samples").and_then(Value::as_array).ok_or("fit_curve needs \"samples\": [[t, value], …]")?;
+        let mut samples = Vec::with_capacity(list.len());
+        for s in list {
+            let pair = s.as_array().filter(|a| a.len() == 2).ok_or("each sample is [t, value]")?;
+            let t = pair[0].as_f64().ok_or("sample times are numbers")?;
+            let v: Vec<f64> = match &pair[1] {
+                Value::Number(n) => vec![n.as_f64().unwrap_or(0.0)],
+                Value::Array(a) => a.iter().map(|x| x.as_f64().ok_or("sample values are numbers or [x, y]")).collect::<Result<_, _>>()?,
+                _ => return Err("sample values are numbers or [x, y]".into()),
+            };
+            samples.push((t, v));
+        }
+        let project_fps = match (get_str(args, "project"), &self.current) {
+            (None, None) => None,
+            _ => self.dir(args).ok().map(|dir| self.state(&dir).project.settings.fps),
+        };
+        let fps = match get_f64(args, "fps") {
+            Some(f) => Fps::from_f64(f).map_err(|e| e.to_string())?,
+            None => project_fps.unwrap_or(Fps::whole(30)),
+        };
+        crate::measure::fit_curve(&samples, fps).map(Output::json)
     }
 }
 

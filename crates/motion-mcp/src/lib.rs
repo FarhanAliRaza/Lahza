@@ -1,6 +1,7 @@
 //! Agent interface of the motion engine: the MCP server (`lahza mcp`) and
 //! the `lahza motion` command line. Both run the same [`tools::Toolbox`].
 
+pub mod measure;
 pub mod server;
 pub mod tools;
 
@@ -19,6 +20,9 @@ Usage:
   lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [-o out.png]
   lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [-o compare.png]
                                           (no --at: every frame, first to last, plus a side-by-side video)
+  lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
+                    [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
+  lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
 
 Times and references: 2.5, \"48f\", beat:17, bar:5, word:canal, hit:2, \"#title.end + 0.25\".";
@@ -234,6 +238,57 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                     }
                 }
             }
+        }
+        "track" => {
+            let mut a = json!({"video": target.clone().ok_or("track needs a video")?});
+            let nums = |s: String| -> Result<Value, String> { s.split(',').map(|v| v.trim().parse::<f64>().map(|x| json!(x)).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>().map(Value::Array) };
+            for k in ["color"] {
+                if let Some(v) = flag(args, &format!("--{k}")) {
+                    a[k] = json!(v);
+                }
+            }
+            for k in ["point", "box", "region"] {
+                if let Some(v) = flag(args, &format!("--{k}")) {
+                    a[k] = nums(v)?;
+                }
+            }
+            for k in ["tolerance", "search", "from", "to", "width"] {
+                if let Some(v) = flag(args, &format!("--{k}")) {
+                    a[k] = json!(v.parse::<f64>().map_err(|e| e.to_string())?);
+                }
+            }
+            if let Some(w) = a.get("width").and_then(Value::as_f64) {
+                a["width"] = json!(w as u64);
+            }
+            if has(args, "--keys") || flag(args, "--layer").is_some() {
+                let mut k = json!({});
+                if let Some(s) = flag(args, "--scale") {
+                    k["scale"] = json!(s.parse::<f64>().map_err(|e| e.to_string())?);
+                }
+                if let Some(at) = flag(args, "--at") {
+                    k["at"] = json!(at.parse::<f64>().map_err(|e| e.to_string())?);
+                }
+                if let Some(l) = flag(args, "--layer") {
+                    k["layer"] = json!(l);
+                }
+                a["keys"] = k;
+            }
+            print(&tb.call("track", a)?.json);
+        }
+        "fit" => {
+            let file = target.clone().ok_or("fit needs a samples JSON file ([[t, value], …], or a track output)")?;
+            let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+            let v: Value = serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
+            // A track output: its found frames' centroids.
+            let samples = match v.get("track").and_then(Value::as_array) {
+                Some(rows) => rows.iter().filter(|r| r["found"] == true).map(|r| json!([r["t"], [r["x"], r["y"]]])).collect(),
+                None => v.get("samples").cloned().unwrap_or(v),
+            };
+            let mut a = json!({"samples": samples});
+            if let Some(f) = flag(args, "--fps") {
+                a["fps"] = json!(f.parse::<f64>().map_err(|e| e.to_string())?);
+            }
+            print(&tb.call("fit_curve", a)?.json);
         }
         "help" | "--help" | "-h" => println!("{USAGE}"),
         other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
