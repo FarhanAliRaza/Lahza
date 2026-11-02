@@ -89,3 +89,56 @@ fn undo_and_redo_through_history() {
     assert_eq!(layers(&mut tb), 0);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_motion_piece_lives_inside_a_recording_and_shares_its_files() {
+    let (mut tb, dir) = toolbox("recording");
+    let rec = dir.join("demo.lahzarec");
+    std::fs::create_dir_all(&rec).unwrap();
+    std::fs::write(rec.join("edit.json"), json!({"formatVersion": 6, "clips": [
+        {"id": "a", "sourceStart": 0.0, "sourceEnd": 1.5, "speed": 1.0},
+        {"id": "b", "sourceStart": 1.5, "sourceEnd": 2.0, "speed": 0.5, "gapBefore": 0.25}
+    ]}).to_string()).unwrap();
+    let ff = |args: &[&str]| assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y"]).args(args).status().unwrap().success());
+    ff(&["-f", "lavfi", "-i", "testsrc=s=640x400:d=2:r=30", "-c:v", "libx264", "-pix_fmt", "yuv420p", rec.join("screen.mkv").to_str().unwrap()]);
+    ff(&["-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", dir.join("logo.png").to_str().unwrap()]);
+
+    let info = tb.call("recording_info", json!({"recording": "demo.lahzarec"})).unwrap().json;
+    assert_eq!(info["size"], json!([640, 400]));
+    assert_eq!(info["duration"], 2.75);
+    let created = tb.call("project_create", json!({"path": "intro", "recording": "demo.lahzarec", "duration": 3, "background": "#00000000"})).unwrap().json;
+    assert_eq!(created["settings"]["width"], 1920);
+    assert_eq!(created["settings"]["height"], 1200);
+    assert!(rec.join("motion/intro.lahza/project.json").is_file());
+
+    // The recording is used in place; other files go to the shared media folder.
+    let screen = tb.call("media_import", json!({"path": "demo.lahzarec/screen.mkv"})).unwrap().json;
+    assert_eq!(screen["src"], "../../screen.mkv");
+    let logo = tb.call("media_import", json!({"path": "logo.png"})).unwrap().json;
+    assert_eq!(logo["src"], "../../media/logo.png");
+    assert!(rec.join("media/logo.png").is_file());
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "id": "rec", "kind": "video", "src": "../../screen.mkv", "size": [960, 600], "transform": {"position": [960, 600]}},
+        {"op": "add", "id": "logo", "kind": "image", "src": "../../media/logo.png", "transform": {"position": [200, 200]}}
+    ]})).unwrap();
+    let check = tb.call("check", json!({})).unwrap().json;
+    assert_eq!(check["errors"], 0, "{check:#}");
+    let shot = tb.call("snapshot", json!({"at": [1.0]})).unwrap();
+    assert!(!shot.images.is_empty());
+
+    // Place it on the video, move it, remove it.
+    let placed = tb.call("recording_place", json!({"start": 1.25, "placement": "full", "name": "Intro"})).unwrap().json;
+    assert_eq!(placed["pieces"][0]["piece"]["folder"], "motion/intro.lahza");
+    assert_eq!(placed["pieces"][0]["piece"]["placement"], "full");
+    assert_eq!(placed["pieces"][0]["duration"], 3.0);
+    let draft: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rec.join("edit.draft.json")).unwrap()).unwrap();
+    assert_eq!(draft["clips"].as_array().unwrap().len(), 2, "other keys survive");
+    let moved = tb.call("recording_place", json!({"start": 0.5})).unwrap().json;
+    assert_eq!(moved["pieces"][0]["piece"]["start"], 0.5);
+    assert_eq!(moved["pieces"][0]["piece"]["placement"], "full", "unchanged fields are kept");
+    assert_eq!(tb.call("project_info", json!({})).unwrap().json["recording"]["placed"]["name"], "Intro");
+    let removed = tb.call("recording_place", json!({"remove": true})).unwrap().json;
+    assert!(removed["pieces"].as_array().unwrap().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}

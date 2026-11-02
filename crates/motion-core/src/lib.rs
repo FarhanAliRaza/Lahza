@@ -16,6 +16,7 @@ pub mod edit;
 pub mod io;
 pub mod markers;
 pub mod property;
+pub mod recording;
 pub mod space;
 pub mod time;
 pub mod timeref;

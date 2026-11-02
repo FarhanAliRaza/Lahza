@@ -11,6 +11,7 @@ use lahza_motion_core::document::{Asset, AudioClip, Project};
 use lahza_motion_core::edit;
 use lahza_motion_core::io::{self, HistoryEntry};
 use lahza_motion_core::markers::{Marker, MarkerTrack, Markers};
+use lahza_motion_core::recording;
 use lahza_motion_core::time::{Fps, TimeBase};
 use lahza_motion_core::timeref::TimeRef;
 use lahza_motion_core::value::Color;
@@ -59,9 +60,10 @@ pub fn tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "project_create",
-            description: "Create a motion project folder. Optionally copy a music file into assets/ and register it. Then add scenes and layers with edit_apply.",
+            description: "Create a motion project folder. Optionally copy a music file into assets/ and register it. Then add scenes and layers with edit_apply. With `recording` (a Lahza screen recording, *.lahzarec) the project is created inside it as a motion piece: sized to the recording, sharing its files (the raw recording is \"../../screen.mkv\"; media_import puts other files in the recording's shared media/). Place it on the video with recording_place.",
             schema: json!({"type": "object", "required": ["path"], "properties": {
-                "path": {"type": "string", "description": "new folder; \".lahza\" is appended when missing"},
+                "path": {"type": "string", "description": "new folder; \".lahza\" is appended when missing. With `recording`, just a name (\"intro\")"},
+                "recording": {"type": "string", "description": "a *.lahzarec folder to create the piece in"},
                 "width": {"type": "integer", "default": 1920}, "height": {"type": "integer", "default": 1080},
                 "fps": {"type": ["number", "string"], "default": 30}, "duration": {"type": "number", "default": 10},
                 "style": {"type": "string", "description": "style pack (see lahza://styles)"},
@@ -69,6 +71,23 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "music": {"type": "string", "description": "audio file to copy in as the music track"},
                 "licence": {"type": "string", "description": "licence of the music (default user-supplied)"},
                 "overwrite": {"type": "boolean"}}}),
+            read_only: false,
+        },
+        ToolDef {
+            name: "recording_info",
+            description: "A Lahza screen recording (*.lahzarec): its size, the edited video's duration, transcript availability, shared media files (as paths usable from a piece inside it) and the motion pieces placed on its timeline.",
+            schema: obj(json!({"recording": {"type": "string"}}), &["recording"]),
+            read_only: true,
+        },
+        ToolDef {
+            name: "recording_place",
+            description: "Place the current motion piece (a project made with project_create {recording}) on its recording's video timeline, move it, or remove it. `overlay` draws it over the video (keep the background transparent, \"#00000000\"); `full` covers the frame like an inserted clip. The studio shows the change live; its sound joins the video's mix.",
+            schema: obj(json!({
+                "start": {"type": "number", "description": "seconds on the edited video"},
+                "placement": {"type": "string", "enum": ["overlay", "full"], "default": "overlay"},
+                "opacity": {"type": "number", "default": 1},
+                "name": {"type": "string", "description": "label on the timeline"},
+                "remove": {"type": "boolean"}}), &[]),
             read_only: false,
         },
         ToolDef { name: "project_open", description: "Open an existing project folder and make it current.", schema: json!({"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}), read_only: true },
@@ -241,6 +260,8 @@ impl Toolbox {
                 self.project_info(&json!({"project": dir}))
             }
             "project_info" => self.project_info(&args),
+            "recording_info" => self.recording_info(&args),
+            "recording_place" => self.recording_place(&args),
             "timeline_get" => self.timeline_get(&args),
             "markers_query" => self.markers_query(&args),
             "markers_import" => self.markers_import(&args),
@@ -316,7 +337,27 @@ impl Toolbox {
     }
 
     fn project_create(&mut self, args: &Value) -> ToolResult {
-        let mut path = self.path(get_str(args, "path").ok_or("project_create needs \"path\"")?);
+        let name = get_str(args, "path").ok_or("project_create needs \"path\"")?;
+        let recording = match get_str(args, "recording") {
+            Some(r) => {
+                let r = self.path(r);
+                if !recording::is_recording(&r) {
+                    return Err(format!("{} is not a Lahza recording (*.lahzarec folder)", r.display()));
+                }
+                Some(r)
+            }
+            None => None,
+        };
+        let mut path = match &recording {
+            Some(rec) => {
+                let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("motion").to_string();
+                if !lahza_motion_core::document::valid_id(&stem) {
+                    return Err("with `recording`, path is a name: letters, digits, '-' and '_'".into());
+                }
+                rec.join(recording::MOTION_DIR).join(stem)
+            }
+            None => self.path(name),
+        };
         if path.extension().and_then(|e| e.to_str()) != Some("lahza") {
             path = path.with_extension("lahza");
         }
@@ -327,9 +368,11 @@ impl Toolbox {
             Some(v) => serde_json::from_value::<Fps>(v.clone()).map_err(|e| e.to_string())?,
             None => Fps::whole(30),
         };
+        // Inside a recording: 1920 on the long side, at the recording's shape.
+        let (dw, dh) = recording.as_deref().and_then(recording_size).map(|(w, h)| fit_long_side(w, h, 1920)).unwrap_or((1920, 1080));
         let mut project = Project::new(
-            args.get("width").and_then(Value::as_u64).unwrap_or(1920) as u32,
-            args.get("height").and_then(Value::as_u64).unwrap_or(1080) as u32,
+            args.get("width").and_then(Value::as_u64).unwrap_or(dw as u64) as u32,
+            args.get("height").and_then(Value::as_u64).unwrap_or(dh as u64) as u32,
             fps,
             get_f64(args, "duration").unwrap_or(10.0),
         );
@@ -350,10 +393,10 @@ impl Toolbox {
         io::save(&path, &project).map_err(|e| e.to_string())?;
         self.open(&path)?;
         let mut info = self.project_info(&json!({"project": path}))?;
-        info.json["next"] = json!(if project.audio.music.is_some() {
-            "run audio_analyze, then add scenes on bars with edit_apply"
-        } else {
-            "add scenes and layers with edit_apply"
+        info.json["next"] = json!(match (&recording, project.audio.music.is_some()) {
+            (Some(_), _) => "add scenes and layers with edit_apply (\"../../screen.mkv\" is the recording), then recording_place it on the video",
+            (None, true) => "run audio_analyze, then add scenes on bars with edit_apply",
+            (None, false) => "add scenes and layers with edit_apply",
         });
         Ok(info)
     }
@@ -381,7 +424,76 @@ impl Toolbox {
             "errors": compiled.errors.iter().take(20).collect::<Vec<_>>(),
             "error_count": compiled.errors.len(),
             "renderer": open.renderer.as_ref().map(|r| r.backend_label()),
+            "recording": recording::recording_of(&dir).map(|rec| json!({
+                "path": rec,
+                "placed": recording::read_pieces(&rec).into_iter().find(|p| rec.join(&p.folder) == dir),
+            })),
         })))
+    }
+
+    fn recording_info(&mut self, args: &Value) -> ToolResult {
+        let rec = self.path(get_str(args, "recording").ok_or("recording_info needs \"recording\"")?);
+        if !recording::is_recording(&rec) {
+            return Err(format!("{} is not a Lahza recording (*.lahzarec folder)", rec.display()));
+        }
+        let doc = recording::read_edit(&rec);
+        let media: Vec<String> = std::fs::read_dir(rec.join("media"))
+            .map(|rd| rd.flatten().map(|e| format!("../../media/{}", e.file_name().to_string_lossy())).collect())
+            .unwrap_or_default();
+        let pieces: Vec<Value> = recording::read_pieces(&rec)
+            .into_iter()
+            .map(|p| {
+                let duration = io::load(&p.dir(&rec)).map(|m| m.settings.duration).ok();
+                json!({"piece": p, "duration": duration})
+            })
+            .collect();
+        let words = doc["transcript"]["words"].as_array().map(|w| w.len()).unwrap_or(0);
+        Ok(Output::json(json!({
+            "recording": rec,
+            "size": recording_size(&rec),
+            "duration": edited_duration(&rec, &doc),
+            "transcript_words": words,
+            "shared": {"recording": "../../screen.mkv", "media": media},
+            "pieces": pieces,
+            "next": "project_create {path: name, recording} → edit_apply → recording_place {start, placement}",
+        })))
+    }
+
+    fn recording_place(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let rec = recording::recording_of(&dir).ok_or("this project is not inside a recording: create it with project_create {path, recording}")?;
+        let folder = dir.strip_prefix(&rec).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+        let mut pieces = recording::read_pieces(&rec);
+        let existing = pieces.iter().position(|p| p.folder == folder);
+        if args.get("remove").and_then(Value::as_bool).unwrap_or(false) {
+            let i = existing.ok_or("this piece is not on the timeline")?;
+            pieces.remove(i);
+        } else {
+            let placement = match get_str(args, "placement") {
+                Some(p) => serde_json::from_value(json!(p)).map_err(|_| "placement: overlay or full")?,
+                None => existing.map(|i| pieces[i].placement).unwrap_or_default(),
+            };
+            let start = get_f64(args, "start").or(existing.map(|i| pieces[i].start)).ok_or("recording_place needs \"start\"")?;
+            if !(start.is_finite() && start >= 0.0) {
+                return Err("start must be ≥ 0 seconds".into());
+            }
+            let stem = dir.file_stem().and_then(|s| s.to_str()).unwrap_or("motion").to_string();
+            let piece = recording::MotionPiece {
+                id: existing.map(|i| pieces[i].id.clone()).unwrap_or_else(|| format!("{stem}-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0))),
+                name: get_str(args, "name").map(str::to_string).or(existing.map(|i| pieces[i].name.clone())).unwrap_or(stem),
+                folder,
+                start,
+                placement,
+                opacity: get_f64(args, "opacity").or(existing.map(|i| pieces[i].opacity)).unwrap_or(1.0).clamp(0.0, 1.0),
+                hidden: false,
+            };
+            match existing {
+                Some(i) => pieces[i] = piece,
+                None => pieces.push(piece),
+            }
+        }
+        recording::write_pieces(&rec, &pieces)?;
+        self.recording_info(&json!({"recording": rec}))
     }
 
     fn timeline_get(&mut self, args: &Value) -> ToolResult {
@@ -875,6 +987,52 @@ impl Toolbox {
 }
 
 /// Copies a file into `<project>/assets/` and returns its relative path.
+/// A free name for `file` in `folder` (`shot.png`, `shot-2.png`, …).
+fn unique_file(folder: &Path, file: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    if !file.is_file() {
+        return Err(format!("{} does not exist", file.display()));
+    }
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("media");
+    let ext = file.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    (1..1000)
+        .map(|i| folder.join(if i == 1 { format!("{stem}{ext}") } else { format!("{stem}-{i}{ext}") }))
+        .find(|p| !p.exists())
+        .ok_or_else(|| "no free file name".to_string())
+}
+
+/// Pixel size of a recording's screen video.
+fn recording_size(rec: &Path) -> Option<(u32, u32)> {
+    let info = lahza_motion_render::footage::probe(&rec.join("screen.mkv")).ok()?;
+    (info.width > 0 && info.height > 0).then_some((info.width, info.height))
+}
+
+/// `long` pixels on the long side, even dimensions, same shape.
+fn fit_long_side(w: u32, h: u32, long: u32) -> (u32, u32) {
+    let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+    if w >= h {
+        (long, even(long as f64 * h as f64 / w as f64))
+    } else {
+        (even(long as f64 * w as f64 / h as f64), long)
+    }
+}
+
+/// Length of the edited video: its clips in order, or the raw recording.
+fn edited_duration(rec: &Path, doc: &Value) -> Option<f64> {
+    if let Some(clips) = doc["clips"].as_array().filter(|c| !c.is_empty()) {
+        let total = clips
+            .iter()
+            .map(|c| {
+                let a = c["sourceStart"].as_f64().or(c["start"].as_f64()).unwrap_or(0.0);
+                let b = c["sourceEnd"].as_f64().or(c["end"].as_f64()).unwrap_or(a);
+                (b - a).max(0.0) / c["speed"].as_f64().filter(|s| *s > 0.0).unwrap_or(1.0) + c["gapBefore"].as_f64().unwrap_or(0.0)
+            })
+            .sum::<f64>();
+        return Some(round(total));
+    }
+    lahza_motion_render::footage::probe_sound(&rec.join("screen.mkv")).ok().map(|(d, _)| round(d))
+}
+
 fn import_asset(dir: &Path, file: &Path) -> Result<String, String> {
     if !file.is_file() {
         return Err(format!("{} does not exist", file.display()));
@@ -997,10 +1155,19 @@ impl Toolbox {
             let src = if abs.is_dir() { rel.clone() } else { format!("{rel}/{}", abs.file_name().unwrap().to_string_lossy()) };
             (src.clone(), src)
         } else {
-            let rel = match abs.strip_prefix(&dir) {
-                Ok(r) => r.to_string_lossy().into_owned(),
-                Err(_) if copy => import_asset(&dir, &abs)?,
-                Err(_) => return Err("files outside the project must be copied (copy: true)".into()),
+            let shared = recording::recording_of(&dir);
+            let rel = match (abs.strip_prefix(&dir), &shared) {
+                (Ok(r), _) => r.to_string_lossy().into_owned(),
+                // Files of the recording are used where they are.
+                (Err(_), Some(rec)) if abs.starts_with(rec) => recording::shared_path(&dir, rec, &abs).ok_or("bad path")?,
+                // Other files go to the recording's shared media folder.
+                (Err(_), Some(rec)) if copy => {
+                    let dest = unique_file(&rec.join("media"), &abs)?;
+                    std::fs::copy(&abs, &dest).map_err(|e| format!("copying {}: {e}", abs.display()))?;
+                    recording::shared_path(&dir, rec, &dest).ok_or("bad path")?
+                }
+                (Err(_), _) if copy => import_asset(&dir, &abs)?,
+                (Err(_), _) => return Err("files outside the project must be copied (copy: true)".into()),
             };
             (rel.clone(), rel)
         };
