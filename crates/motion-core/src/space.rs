@@ -235,6 +235,16 @@ impl Camera3 {
         let intrinsics = Mat4([k, 0.0, width / 2.0, 0.0, 0.0, k, height / 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
         Camera3 { view, project: intrinsics.then(view), focal: k, centre: (width / 2.0, height / 2.0) }
     }
+
+    /// Lens shift: the image of the 3D scene moves by `shift` px without
+    /// the camera turning (perspective and converging lines unchanged).
+    pub fn shifted(mut self, shift: (f64, f64)) -> Self {
+        self.centre = (self.centre.0 + shift.0, self.centre.1 + shift.1);
+        let k = self.focal;
+        let intrinsics = Mat4([k, 0.0, self.centre.0, 0.0, 0.0, k, self.centre.1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        self.project = intrinsics.then(self.view);
+        self
+    }
 }
 
 /// Focal length in px for a vertical field of view (AE's default camera
@@ -257,6 +267,19 @@ mod tests {
         let far = cam.project.then(Mat4::translate(0.0, 0.0, 1000.0)).plane();
         let (x, _) = far.apply(0.0, 540.0);
         assert!(x > 0.0 && x < 960.0);
+    }
+
+    #[test]
+    fn lens_shift_moves_the_picture_without_turning() {
+        let cam = Camera3::new(1920.0, 1080.0, (960.0, 540.0), 1.0, 0.0, 39.6, (0.0, 0.0), 0.0);
+        let shifted = cam.shifted((0.0, 200.0));
+        for (x, y, z) in [(100.0, 200.0, 0.0), (500.0, -300.0, 400.0)] {
+            let a = cam.project.apply(x, y, z);
+            let b = shifted.project.apply(x, y, z);
+            assert!((b[0] / b[3] - a[0] / a[3]).abs() < 1e-9);
+            assert!((b[1] / b[3] - a[1] / a[3] - 200.0).abs() < 1e-9);
+        }
+        assert_eq!(shifted.view, cam.view);
     }
 
     #[test]

@@ -386,6 +386,7 @@ pub struct CScene {
     camera_fov: Prop<f64>,
     camera_orbit: Prop<Vec2>,
     camera_dolly: Prop<f64>,
+    camera_shift: Prop<Vec2>,
     camera_focus: Option<CFocus>,
     camera_aperture: Prop<f64>,
     lighting: CLighting,
@@ -1306,6 +1307,7 @@ impl Compiled {
             let camera_fov = c.prop(&scene.camera.fov, id, "camera.fov", start, None, pre_roll);
             let camera_orbit = c.prop(&scene.camera.orbit, id, "camera.orbit", start, None, pre_roll);
             let camera_dolly = c.prop(&scene.camera.dolly, id, "camera.dolly", start, None, pre_roll);
+            let camera_shift = c.prop(&scene.camera.shift, id, "camera.shift", start, None, pre_roll);
             let camera_aperture = c.prop(&scene.camera.aperture, id, "camera.aperture", start, None, pre_roll);
             let camera_focus = match &scene.camera.focus {
                 None => None,
@@ -1339,6 +1341,7 @@ impl Compiled {
                 camera_fov,
                 camera_orbit,
                 camera_dolly,
+                camera_shift,
                 camera_focus,
                 camera_aperture,
                 lighting,
@@ -1459,7 +1462,8 @@ impl Compiled {
             .then(Affine::translate(-center.x(), -center.y()));
         let orbit = scene.camera_orbit.at(tc);
         let (fov, dolly) = (scene.camera_fov.at(tc), scene.camera_dolly.at(tc));
-        let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, fov, (orbit.x(), orbit.y()), dolly);
+        let shift = scene.camera_shift.at(tc);
+        let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, fov, (orbit.x(), orbit.y()), dolly).shifted((shift.x(), shift.y()));
         let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None };
         let aperture = scene.camera_aperture.at(tc);
         if aperture > 0.0 {

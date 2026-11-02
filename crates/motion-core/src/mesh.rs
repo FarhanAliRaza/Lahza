@@ -224,6 +224,51 @@ impl MeshParams {
 }
 
 impl MeshParams {
+    /// What generation will change from the parameters asked for (bevels
+    /// and tubes too big for the shape), as messages for `check`.
+    pub fn adjustments(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut note = |what: &str, asked: f64, used: f64, why: &str| {
+            if asked > used + 1e-6 {
+                out.push(format!("{what} {asked:.1} is too big and is drawn as {used:.1} ({why})"));
+            }
+        };
+        match &self.shape {
+            MeshShape::Box { size, bevel } => {
+                let h = size.map(|v| v.abs() / 2.0);
+                note("bevel", *bevel, bevel.max(0.0).min(h[0]).min(h[1]).min(h[2]), "half the smallest side");
+            }
+            MeshShape::Cylinder { radius, top, height, bevel } => {
+                note("bevel", *bevel, bevel.max(0.0).min(height / 2.0).min(radius.max(*top) * 0.999), "half the height or the radius");
+            }
+            MeshShape::Torus { radius, tube, .. } => note("tube", *tube, tube.max(0.0).min(radius.max(0.0)), "the ring's radius"),
+            MeshShape::Extrude { path, depth, bevel } => {
+                let d = depth.max(0.0) / 2.0;
+                let mut b = bevel.max(0.0).min(d);
+                let mut why = "half the depth";
+                if let Ok(subpaths) = crate::path::morph(path, 0.5) {
+                    for r in regions(subpaths.into_iter().map(|(p, _)| p).collect()) {
+                        for c in &r {
+                            let (mut lo, mut hi) = ((f64::INFINITY, f64::INFINITY), (f64::NEG_INFINITY, f64::NEG_INFINITY));
+                            for p in c {
+                                lo = (lo.0.min(p.0), lo.1.min(p.1));
+                                hi = (hi.0.max(p.0), hi.1.max(p.1));
+                            }
+                            let cap = (hi.0 - lo.0).min(hi.1 - lo.1) * 0.3;
+                            if cap < b {
+                                b = cap;
+                                why = "30% of the outline's narrowest part";
+                            }
+                        }
+                    }
+                }
+                note("bevel", *bevel, b, why);
+            }
+            _ => {}
+        }
+        out
+    }
+
     /// Local bounds [min, max] without generating the mesh (a slightly
     /// loose box: arcs count as full rings).
     pub fn local_bounds(&self) -> Option<([f64; 3], [f64; 3])> {

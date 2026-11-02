@@ -245,6 +245,11 @@ pub struct Camera {
     /// 3D layers: move toward the point of interest (px).
     #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
     pub dolly: Property<f64>,
+    /// 3D layers: lens shift in px: moves the picture of the 3D scene
+    /// without turning the camera, so verticals stay parallel (frame a tall
+    /// object from below without its sides converging).
+    #[serde(default = "zero_vec", skip_serializing_if = "is_zero_vec")]
+    pub shift: Property<Vec2>,
     /// Depth of field: the sharp plane, as a depth like a layer's `z`
     /// (0 = the point of interest's plane) or a layer id to keep sharp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -291,7 +296,7 @@ fn is_default_fov(p: &Property<f64>) -> bool {
 
 impl Default for Camera {
     fn default() -> Self {
-        Self { position: None, zoom: one_prop(), rotation: zero_prop(), fov: default_fov(), orbit: zero_vec(), dolly: zero_prop(), focus: None, aperture: zero_prop() }
+        Self { position: None, zoom: one_prop(), rotation: zero_prop(), fov: default_fov(), orbit: zero_vec(), dolly: zero_prop(), shift: zero_vec(), focus: None, aperture: zero_prop() }
     }
 }
 

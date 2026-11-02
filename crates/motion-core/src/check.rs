@@ -178,6 +178,7 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
     let mut safe_reported = std::collections::HashSet::new();
     let mut overlap_reported = std::collections::HashSet::new();
     let mut contrast_reported = std::collections::HashSet::new();
+    let mut mesh_reported = std::collections::HashSet::new();
     let (w, h) = (compiled.settings.width as f64, compiled.settings.height as f64);
     let safe = [w * 0.05, h * 0.05, w * 0.95, h * 0.95];
     let layout_every = (f / 4.0).round().max(1.0) as u64;
@@ -198,6 +199,13 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
         if n % layout_every == 0 {
             let mut text_boxes: Vec<(&str, [f64; 4])> = Vec::new();
             for layer in &frame.layers {
+                if let Content::Mesh(m) = &layer.content {
+                    for message in m.params.adjustments() {
+                        if mesh_reported.insert(format!("{}:{message}", layer.id)) {
+                            issues.push(issue(Severity::Warning, "mesh", Some(&layer.id), Some(t), message));
+                        }
+                    }
+                }
                 let Some(b) = bounds(layer, options.measure) else { continue };
                 let visible = layer.opacity >= 0.5 && b[2] > 0.0 && b[3] > 0.0 && b[0] < w && b[1] < h;
                 if !visible {

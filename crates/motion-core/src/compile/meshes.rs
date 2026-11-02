@@ -573,7 +573,7 @@ pub(super) fn light_meshes(layers: &mut [LayerState], lighting: &Arc<Lighting>) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::time::Fps;
 
@@ -619,5 +619,25 @@ mod tests {
         };
         // Depth scale = parent 1 × own 0.5 × scale_z 0.5, then 2 × 1 × 0.5.
         assert!((z(0.0) - 0.25).abs() < 1e-9 && (z(1.0) - 1.0).abs() < 1e-9, "{} {}", z(0.0), z(1.0));
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::tests::compiled;
+
+    #[test]
+    fn check_says_when_a_bevel_is_too_big() {
+        let c = compiled(serde_json::json!({"layers": [
+            {"id": "b", "kind": "mesh", "mesh": {"type": "box", "size": [100, 100], "depth": 40, "bevel": 35}},
+            {"id": "ok", "kind": "mesh", "mesh": {"type": "box", "size": [100, 100], "depth": 40, "bevel": 10}},
+            {"id": "x", "kind": "mesh", "mesh": {"type": "extrude", "d": {"shape": "rect", "size": [200, 20]}, "depth": 80, "bevel": 15}}]}));
+        let mut p = crate::document::Project::new(640, 360, crate::time::Fps::whole(30), 2.0);
+        p.scenes.push(serde_json::from_value(serde_json::json!({"id": "s1", "layers": []})).unwrap());
+        let report = crate::check::check(&p, &c, &Default::default());
+        let mesh: Vec<_> = report.issues.iter().filter(|i| i.kind == "mesh").collect();
+        assert_eq!(mesh.len(), 2, "{mesh:?}");
+        assert!(mesh.iter().any(|i| i.element.as_deref() == Some("b") && i.message.contains("bevel 35.0 is too big and is drawn as 20.0")));
+        assert!(mesh.iter().any(|i| i.element.as_deref() == Some("x") && i.message.contains("narrowest")));
     }
 }

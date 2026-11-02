@@ -53,6 +53,21 @@ Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 `step_fps`, `step_phase`, `offset`), `blend`, `effects` (`blur`, `shadow`,
 `glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `follow`, `hidden`.
 
+3D layers (`three_d`, and every `mesh`) also take `transform.z`,
+`rotation_x`, `rotation_y` and `scale_z`. Space is x right, y down, z away
+from the viewer; angles are degrees. A layer's point p goes to its
+parent's space as
+
+    position(x, y, z) · Ry(rotation_y) · Rx(rotation_x) · Rz(rotation) · S · (p − anchor)
+
+so it is scaled first, then turned clockwise on screen (`rotation`), then
+tilted (`rotation_x`: positive tips the top away), then turned
+(`rotation_y`: positive turns the right side away), then moved; a parent's
+transform applies after its child's. S scales x and y by `scale` and depth
+by the mean of |scale x| and |scale y| times `scale_z` (default 1), so a
+scale animation or a scaled parent scales depth too. To turn about another
+axis first, parent the layer to a null and rotate that.
+
 Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
 `star`, `line`, `path` with SVG `d`, `field`), `text`, `image`, `video`, `comp`,
 `instancer`, `mesh` (lit 3D objects, see [mesh](#mesh)).
@@ -277,7 +292,7 @@ Geometry (numbers animatable unless noted):
 | `sweep` | `d` path in the layer plane, `radius` (10), `profile`: `circle` \| `square` \| `ribbon`, `width` (ribbon, 40), `trim` [from, to] (0..1), `caps`: `round` (default) \| `flat`, `head` (radius of a leading ball) |
 
 A torus faces the camera like a `ring` shape; tilt it with `rotation_x`.
-`transform.scale_z` scales depth (meshes default to `scale`'s x).
+Depth scales with `scale` (times `transform.scale_z`, default 1).
 
 Material: `preset` (`matte`, `plastic`, `glossy`, `coated`, `metal`,
 `chrome`, `glass`, `emissive`, `flat`, `shadow`) then any of `color`,
