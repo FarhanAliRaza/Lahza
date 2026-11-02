@@ -329,3 +329,64 @@ fn meshes_drawn_on_their_own_still_share_depth() {
         assert!((r[0] as i32 - 128).abs() <= 3 && (r[2] as i32 - 128).abs() <= 3, "order {order}: {r:?}");
     }
 }
+
+fn shadow_scene(floor: serde_json::Value, softness: f64) -> Project {
+    scene(640, 400, json!({"camera": {"orbit": [0, 18]}, "lights": [{"from": [-0.8, -1.2, -0.5], "softness": softness}],
+        "layers": [
+            {"id": "bg", "kind": "shape", "shape": "rect", "size": [640, 400], "fill": {"gradient": "linear", "from": [0, -200], "to": [0, 200], "stops": [[0, "#e9e4da"], [1, "#c9c2b4"]]}, "transform": {"position": [320, 200]}},
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 700]}, "material": floor, "transform": {"position": [320, 300], "rotation_x": 90}},
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 70}, "material": {"preset": "glossy", "color": "#ff3b5c"}, "transform": {"position": [240, 230]}},
+            {"id": "ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 70, "tube": 18}, "material": {"preset": "coated", "color": "#2d5bff"}, "transform": {"position": [430, 220], "rotation_y": 30}}
+        ]}))
+}
+
+#[test]
+#[ignore]
+fn dump_shadows() {
+    let out = std::env::var("LAHZA_MESH_OUT").unwrap_or_else(|_| "/tmp".into());
+    for (name, floor, soft) in [("floor", json!({"preset": "matte", "color": "#e8e2d6"}), 0.35), ("catcher", json!({"preset": "shadow"}), 0.6), ("hard", json!({"preset": "matte", "color": "#e8e2d6"}), 0.0)] {
+        let t = std::time::Instant::now();
+        let img = render(&shadow_scene(floor, soft), 0.0);
+        eprintln!("{name}: {:?}", t.elapsed());
+        img.save(format!("{out}/shadow-{name}.png")).unwrap();
+    }
+}
+
+#[test]
+fn meshes_cast_soft_shadows() {
+    let floor = json!({"preset": "matte", "color": "#e8e2d6"});
+    let lit = render(&shadow_scene(floor.clone(), 0.35), 0.0);
+    // Where the ball's shadow falls (behind it, away from the key on the
+    // upper left) the floor is much darker than open floor.
+    let shade = luma(px(&lit, 330, 280));
+    let open = luma(px(&lit, 120, 360));
+    assert!(open - shade > 50.0, "shadow {shade} vs open floor {open}");
+    // Without shadows from that light the floor there is open floor.
+    let mut p = shadow_scene(floor.clone(), 0.35);
+    p.scenes[0].lights[0].shadow = Some(false);
+    let off = render(&p, 0.0);
+    assert!((luma(px(&off, 330, 280)) - luma(px(&off, 300, 360))).abs() < 25.0);
+    // Softer shadows have a wider penumbra: more in-between pixels across
+    // the shadow's edge.
+    let edge = |img: &image::RgbaImage| (250..420).filter(|&x| { let l = luma(px(img, x, 285)); l > shade + 15.0 && l < open - 15.0 }).count();
+    let (hard, soft) = (edge(&render(&shadow_scene(floor.clone(), 0.0), 0.0)), edge(&render(&shadow_scene(floor, 1.0), 0.0)));
+    assert!(soft > hard + 4, "penumbra soft {soft} vs hard {hard}");
+    // A shadow catcher is invisible except for the shadows: the 2D
+    // background shows through, darkened only in the shadow.
+    let catcher = render(&shadow_scene(json!({"preset": "shadow"}), 0.35), 0.0);
+    let bg = |y: f64| 0xe9 as f64 + (0xc9 as f64 - 0xe9 as f64) * (y / 400.0);
+    let open_c = px(&catcher, 120, 360);
+    assert!((open_c[0] as f64 - bg(360.0)).abs() < 4.0, "open catcher shows the background: {open_c:?}");
+    assert!(luma(px(&catcher, 330, 280)) < bg(280.0) - 40.0);
+}
+
+#[test]
+fn gpu_matches_cpu_shadows_and_occluders() {
+    let mut p = shadow_scene(json!({"preset": "matte", "color": "#e8e2d6"}), 0.5);
+    p.scenes[0].lights.push(serde_json::from_value(json!({"type": "point", "position": [520, 80, -100], "intensity": 0.5, "softness": 0.1})).unwrap());
+    p.scenes[0].layers.push(serde_json::from_value(json!({"id": "glow", "kind": "mesh", "mesh": {"type": "box", "size": [60, 60], "depth": 60, "bevel": 10},
+        "material": {"preset": "glossy", "color": "#ffd23f"}, "effects": [{"type": "glow", "radius": 6}], "transform": {"position": [320, 250], "rotation_y": 30}})).unwrap());
+    p.scenes[0].layers.push(serde_json::from_value(json!({"id": "catch", "kind": "mesh", "mesh": {"type": "plane", "size": [200, 200]}, "material": {"preset": "shadow"},
+        "transform": {"position": [540, 300], "rotation_x": 90}})).unwrap());
+    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0005);
+}

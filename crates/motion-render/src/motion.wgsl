@@ -723,6 +723,88 @@ fn env_light(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
     return c;
 }
 
+const SHADOW_TAP_X = array<f32, 8>(-0.613, 0.170, -0.299, 0.645, -0.651, 0.421, -0.084, 0.874);
+const SHADOW_TAP_Y = array<f32, 8>(0.617, -0.040, -0.792, 0.493, -0.075, -0.718, 0.290, -0.130);
+const NO_SURFACE: f32 = -1.0e30;
+
+fn shadow_lit(s: f32, c: f32, bias: f32, point: bool) -> f32 {
+    if s <= NO_SURFACE * 0.5 { return 1.0; }
+    var lit: bool;
+    if point { lit = s <= 0.0 || 1.0 / s >= c * (1.0 - bias); } else { lit = s <= c + bias; }
+    if lit { return 1.0; }
+    return 0.0;
+}
+
+fn shadow_texel(base: u32, size: i32, i: i32, j: i32, c: f32, bias: f32, point: bool) -> f32 {
+    if i < 0 || j < 0 || i >= size || j >= size { return 1.0; }
+    let k = u32(j * size + i);
+    return shadow_lit(b_mesh[base + 6u + k / 4u][k % 4u], c, bias, point);
+}
+
+// Mirrors `shadow` in mesh3d.rs.
+fn shadow(base: u32, p: vec3<f32>, n_in: vec3<f32>) -> f32 {
+    let h0 = b_mesh[base];
+    let h1 = b_mesh[base + 1u];
+    let u = b_mesh[base + 2u];
+    let v = b_mesh[base + 3u];
+    let a = b_mesh[base + 4u];
+    let pos = b_mesh[base + 5u];
+    let point = h0.x > 0.5;
+    let size = i32(h0.y);
+    var offset = u.w;
+    if point { offset = offset * max(dot(p - pos.xyz, a.xyz), 1.0); }
+    var tw = a.xyz;
+    if point { tw = pos.xyz - p; }
+    let toward = tw / max(sqrt(dot(tw, tw)), 1e-20);
+    var n = n_in;
+    if dot(n, toward) < 0.0 { n = -n; }
+    let po = p + n * offset;
+    let cs = max(dot(n, toward), 0.05);
+    let slope = min(sqrt(max(1.0 - cs * cs, 0.0)) / cs, 4.0);
+    let bias = h1.z + u.w * h1.w * slope;
+    var tu: f32;
+    var tv: f32;
+    var c: f32;
+    if point {
+        let q = po - pos.xyz;
+        let z = dot(q, a.xyz);
+        if z < 1.0 { return 1.0; }
+        tu = dot(q, u.xyz) / z;
+        tv = dot(q, v.xyz) / z;
+        c = z;
+    } else {
+        tu = dot(po, u.xyz);
+        tv = dot(po, v.xyz);
+        c = dot(po, a.xyz);
+    }
+    let x = (tu - h0.z) * h1.x - 0.5;
+    let y = (tv - h0.w) * h1.y - 0.5;
+    var sum = 0.0;
+    for (var t = 0u; t < 8u; t++) {
+        let sx = x + SHADOW_TAP_X[t] * h1.w;
+        let sy = y + SHADOW_TAP_Y[t] * h1.w;
+        let fx = floor(sx);
+        let fy = floor(sy);
+        let ax = sx - fx;
+        let ay = sy - fy;
+        let i = i32(fx);
+        let j = i32(fy);
+        let t00 = shadow_texel(base, size, i, j, c, bias, point);
+        let t10 = shadow_texel(base, size, i + 1, j, c, bias, point);
+        let t01 = shadow_texel(base, size, i, j + 1, c, bias, point);
+        let t11 = shadow_texel(base, size, i + 1, j + 1, c, bias, point);
+        let top = t00 + (t10 - t00) * ax;
+        let bottom = t01 + (t11 - t01) * ax;
+        sum += top + (bottom - top) * ay;
+    }
+    return sum / 8.0;
+}
+
+// The shadow map linked from light i's colour row (0: none).
+fn shadow_of(lb: u32, i: u32) -> i32 {
+    return bitcast<i32>(b_mesh[lb + 7u + i * 2u + 1u].w);
+}
+
 fn to_world(lb: u32, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(dot(b_mesh[lb + 1u].xyz, v), dot(b_mesh[lb + 2u].xyz, v), dot(b_mesh[lb + 3u].xyz, v));
 }
@@ -840,6 +922,21 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let base = m0.xyz;
     let opacity = m0.w;
     let emissive = m2.xyz;
+    if (flags & 8u) != 0u {
+        var blocked = 0.0;
+        var total = 0.0;
+        for (var i = 0u; i < u32(b_mesh[lb].x); i++) {
+            let off = shadow_of(lb, i);
+            if off != 0 {
+                let w = dot(b_mesh[lb + 7u + i * 2u + 1u].xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
+                blocked += w * (1.0 - shadow(u32(i32(lb) + off), p, n));
+                total += w;
+            }
+        }
+        var sa = 0.0;
+        if total > 0.0 { sa = blocked / total * opacity; }
+        return vec4<f32>(encode(base.x) * sa, encode(base.y) * sa, encode(base.z) * sa, sa);
+    }
     if (flags & 1u) != 0u {
         let c = base + emissive;
         return vec4<f32>(encode(c.x) * opacity, encode(c.y) * opacity, encode(c.z) * opacity, opacity);
@@ -859,7 +956,7 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let lights = u32(b_mesh[lb].x);
     for (var i = 0u; i < lights; i++) {
         let row = b_mesh[lb + 7u + i * 2u];
-        let col = b_mesh[lb + 7u + i * 2u + 1u].xyz;
+        var col = b_mesh[lb + 7u + i * 2u + 1u].xyz;
         let kind = u32(row.w);
         if kind == 2u {
             d_light = d_light + diffuse * col;
@@ -872,6 +969,8 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
         }
         let n_l = dot(n, l);
         if n_l <= 0.0 { continue; }
+        let soff = shadow_of(lb, i);
+        if soff != 0 { col = col * shadow(u32(i32(lb) + soff), p, n); }
         let hh = l + v;
         let h = hh / max(sqrt(dot(hh, hh)), 1e-20);
         let n_h = max(dot(n, h), 0.0);

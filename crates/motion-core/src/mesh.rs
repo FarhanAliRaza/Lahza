@@ -125,6 +125,8 @@ pub enum SweepProfile {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MeshShape {
     Sphere { radius: f64 },
+    /// A flat rectangle in the layer plane, seen from both sides.
+    Plane { size: [f64; 2] },
     /// `size` [w, h, d]; `bevel` rounds every edge.
     Box { size: V3, bevel: f64 },
     /// Axis along y; `top` radius makes a cone or frustum.
@@ -175,6 +177,11 @@ impl MeshParams {
             MeshShape::Sphere { radius } => {
                 f(1.0);
                 f(*radius);
+            }
+            MeshShape::Plane { size } => {
+                f(9.0);
+                f(size[0]);
+                f(size[1]);
             }
             MeshShape::Box { size, bevel } => {
                 f(2.0);
@@ -233,6 +240,7 @@ impl MeshParams {
         };
         match &self.shape {
             MeshShape::Sphere { radius } => sym(*radius, *radius, *radius),
+            MeshShape::Plane { size } => sym(size[0].abs() / 2.0, size[1].abs() / 2.0, 0.0),
             MeshShape::Box { size, .. } => sym(size[0].abs() / 2.0, size[1].abs() / 2.0, size[2].abs() / 2.0),
             MeshShape::Cylinder { radius, top, height, .. } => {
                 let r = radius.max(*top);
@@ -297,6 +305,25 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
             revolve_pieces(&mut mesh, &[profile], (0.0, 360.0), 1, 0.0, true, circle_steps(r, detail, TAU), false);
         }
         MeshShape::Box { size, bevel } => rounded_box(&mut mesh, *size, *bevel, detail),
+        MeshShape::Plane { size } => {
+            // A grid, so lighting interpolates smoothly across big planes.
+            let (hw, hh) = (size[0].abs() / 2.0, size[1].abs() / 2.0);
+            let n = (((hw.max(hh) * 2.0) / 200.0 * detail).ceil() as usize).clamp(1, 16);
+            let base = mesh.positions.len() as u32;
+            for j in 0..=n {
+                for i in 0..=n {
+                    let (x, y) = (-hw + 2.0 * hw * i as f64 / n as f64, -hh + 2.0 * hh * j as f64 / n as f64);
+                    mesh.vertex([x, y, 0.0], [0.0, 0.0, -1.0]);
+                }
+            }
+            let w = (n + 1) as u32;
+            for j in 0..n as u32 {
+                for i in 0..n as u32 {
+                    let a = base + j * w + i;
+                    mesh.quad(a, a + 1, a + w + 1, a + w, tag(PART_FRONT, 0) | TWO_SIDED);
+                }
+            }
+        }
         MeshShape::Cylinder { radius, top, height, bevel } => {
             let lines = cylinder_profile(radius.max(0.0), top.max(0.0), height.max(0.0), *bevel, detail);
             let steps = circle_steps(radius.max(*top), detail, TAU);

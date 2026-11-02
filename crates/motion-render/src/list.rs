@@ -407,8 +407,9 @@ impl Builder<'_> {
     }
 
     fn place_mesh(&mut self, list: &mut DisplayList, item: &Item, target: &Target, origin: [f64; 2], factor: [f64; 2]) -> Option<(Prim, [f64; 4])> {
-        let batch = self.meshes.batches.get(item.prim.kind[1] as usize)?;
-        batch.place(&mut list.mesh, &mut list.bins, target, origin, factor, item.prim.kind[2])
+        let cache = &mut *self.meshes;
+        let batch = cache.batches.get(item.prim.kind[1] as usize)?;
+        batch.place(&mut list.mesh, &mut list.bins, &mut cache.placed, target, origin, factor, item.prim.kind[2])
     }
 
     /// A mesh item: a new batch, or `m` added to the batch of the item just

@@ -1969,6 +1969,12 @@ fn is_one_u32(v: &u32) -> bool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum MeshDef {
+    /// A flat rectangle (both sides): floors, walls, backdrops that take
+    /// shadows. Tilt it with rotation_x (90 lays it flat).
+    Plane {
+        #[serde(default = "hundred")]
+        size: Property<Vec2>,
+    },
     Sphere {
         #[serde(default = "hundred_f")]
         radius: Property<f64>,
@@ -2159,6 +2165,9 @@ pub enum MaterialPreset {
     Emissive,
     /// Unlit flat colour.
     Flat,
+    /// Invisible except for the shadows falling on it (`color` tints them,
+    /// `opacity` is their strength): drops meshes' shadows onto 2D layers.
+    Shadow,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2214,8 +2223,20 @@ pub struct Light {
     pub color: Property<Color>,
     #[serde(default = "one_prop", skip_serializing_if = "is_one")]
     pub intensity: Property<f64>,
+    /// Cast shadows (default: only the first directional or point light).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<bool>,
+    /// Shadow edge: 0 sharp … 1 very soft (default 0.35).
+    #[serde(default = "shadow_softness", skip_serializing_if = "is_shadow_softness")]
+    pub softness: Property<f64>,
 }
 
+fn shadow_softness() -> Property<f64> {
+    Property::Constant(0.35)
+}
+fn is_shadow_softness(p: &Property<f64>) -> bool {
+    *p == shadow_softness()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

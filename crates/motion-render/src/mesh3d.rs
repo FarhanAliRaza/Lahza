@@ -25,11 +25,16 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct MeshCache {
     meshes: HashMap<Vec<u8>, (Arc<Mesh>, u64)>,
+    /// Per generated mesh: each triangle's outward winding (+1/−1, 0 open).
+    sides: HashMap<usize, Arc<Vec<f32>>>,
     frame: u64,
     /// Batches of the display list being built.
     pub(crate) batches: Vec<Batch>,
     /// The layer lists being emitted (innermost last).
     runs: Vec<Run>,
+    /// Shadow maps already written to the display list being built
+    /// (by address), and where.
+    pub(crate) placed: HashMap<usize, u32>,
     serial: u64,
     pub warnings: Vec<String>,
 }
@@ -68,9 +73,12 @@ impl MeshCache {
         self.frame += 1;
         self.batches.clear();
         self.runs.clear();
+        self.placed.clear();
         if self.meshes.len() > 96 {
             let keep = self.frame.saturating_sub(4);
             self.meshes.retain(|_, (_, used)| *used >= keep);
+            let live: std::collections::HashSet<usize> = self.meshes.values().map(|(m, _)| Arc::as_ptr(m) as usize).collect();
+            self.sides.retain(|k, _| live.contains(k));
         }
     }
 
@@ -113,10 +121,19 @@ impl MeshCache {
     /// opaque meshes over it as occluders.
     pub(crate) fn close_run(&mut self) {
         let Some(run) = self.runs.pop() else { return };
-        if run.meshes.len() < 2 {
+        if run.meshes.is_empty() {
             return;
         }
+        // Shadows: every mesh of the list casts onto every other.
+        let shadows = self.shadow_maps(&run);
         let mut batches = std::mem::take(&mut self.batches);
+        for b in batches.iter_mut().filter(|b| b.list == run.serial) {
+            b.shadows = shadows.clone();
+        }
+        if run.meshes.len() < 2 {
+            self.batches = batches;
+            return;
+        }
         for b in batches.iter_mut().filter(|b| b.list == run.serial) {
             for rm in &run.meshes {
                 let overlaps = rm.bounds[2] >= b.bounds[0] && rm.bounds[0] <= b.bounds[2] && rm.bounds[3] >= b.bounds[1] && rm.bounds[1] <= b.bounds[3];
@@ -126,6 +143,79 @@ impl MeshCache {
             }
         }
         self.batches = batches;
+    }
+
+    /// One light-space depth map per shadow-casting light of the list's
+    /// lighting, from all of its meshes (back faces too).
+    fn shadow_maps(&mut self, run: &Run) -> Arc<Vec<Option<Arc<ShadowMap>>>> {
+        let Some(first) = run.meshes.first() else { return Arc::default() };
+        let Some(lighting) = first.state.lighting.clone() else { return Arc::default() };
+        if !lighting.lights.iter().any(|l| l.shadow && l.color.iter().any(|c| *c > 0.0)) {
+            return Arc::default();
+        }
+        // Camera-space geometry of every mesh, indexed; each closed
+        // triangle's outward side (+1/−1 on its winding), 0 when open.
+        let mut caster = Caster::default();
+        for rm in &run.meshes {
+            let Some(mesh) = self.get(&rm.state) else { continue };
+            let mv = rm.state.camera.view.then(rm.state.world);
+            let m3 = mv.0;
+            let det = m3[0] * (m3[5] * m3[10] - m3[6] * m3[9]) - m3[1] * (m3[4] * m3[10] - m3[6] * m3[8]) + m3[2] * (m3[4] * m3[9] - m3[5] * m3[8]);
+            let base = caster.verts.len() as u32;
+            caster.verts.extend(mesh.positions.iter().map(|p| {
+                let q = mv.apply(p[0] as f64, p[1] as f64, p[2] as f64);
+                [q[0], q[1], q[2]]
+            }));
+            let sides = self
+                .sides
+                .entry(Arc::as_ptr(&mesh) as usize)
+                .or_insert_with(|| {
+                    Arc::new(
+                        mesh.tris
+                            .iter()
+                            .zip(&mesh.tags)
+                            .map(|(t, &tag)| {
+                                if tag & TWO_SIDED != 0 {
+                                    return 0.0;
+                                }
+                                let p = t.map(|i| mesh.positions[i as usize].map(|v| v as f64));
+                                let n = t.iter().fold([0.0; 3], |acc, &i| add(acc, mesh.normals[i as usize].map(|v| v as f64)));
+                                dot(cross(sub(p[1], p[0]), sub(p[2], p[0])), n).signum() as f32
+                            })
+                            .collect(),
+                    )
+                })
+                .clone();
+            let flip = det.signum() as f32;
+            caster.tris.extend(mesh.tris.iter().map(|t| t.map(|i| i + base)));
+            caster.sides.extend(sides.iter().map(|s| s * flip));
+        }
+        let tris = &caster;
+        let view = first.state.camera.view;
+        let scale = first.root.max_scale().clamp(0.25, 2.0);
+        let size = ((1024.0 * scale / 4.0).round() as usize * 4).clamp(256, 2048);
+        let maps = lighting
+            .lights
+            .iter()
+            .map(|l| {
+                if !l.shadow || tris.tris.is_empty() {
+                    return None;
+                }
+                let v = view.0;
+                let r = [[v[0], v[1], v[2]], [v[4], v[5], v[6]], [v[8], v[9], v[10]]];
+                let rot = |d: [f64; 3]| [0, 1, 2].map(|k| r[k][0] * d[0] + r[k][1] * d[1] + r[k][2] * d[2]);
+                match l.kind {
+                    LightKind::Directional => ShadowMap::directional(&tris, rot(l.vector), size, l.softness),
+                    LightKind::Point => {
+                        let p = view.apply(l.vector[0], l.vector[1], l.vector[2]);
+                        ShadowMap::point(&tris, [p[0], p[1], p[2]], size, l.softness)
+                    }
+                    LightKind::Ambient => None,
+                }
+                .map(Arc::new)
+            })
+            .collect();
+        Arc::new(maps)
     }
 
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
@@ -174,6 +264,209 @@ pub(crate) struct Batch {
     pub(crate) list: u64,
     pub(crate) members: Vec<usize>,
     pub(crate) see_through: bool,
+    /// Per light of the lighting: its shadow map, if it casts shadows.
+    shadows: Arc<Vec<Option<Arc<ShadowMap>>>>,
+}
+
+/// A light-space depth map: how close to the light the nearest surface is
+/// at each texel. Rows: [kind (0 directional, 1 point), size, u0, v0],
+/// [texels per unit u, v, bias, filter radius in texels], [U, normal
+/// offset], [V, 0], [toward the light (directional) or axis (point), 0],
+/// [light position, 0], then the texels, 4 per row.
+pub(crate) struct ShadowMap {
+    rows: Vec<[f32; 4]>,
+}
+
+const NO_SURFACE: f32 = -1.0e30;
+
+fn unit3(v: [f64; 3]) -> [f64; 3] {
+    let l = dot(v, v).sqrt().max(1e-12);
+    [v[0] / l, v[1] / l, v[2] / l]
+}
+
+/// Two unit vectors completing `d` to an orthonormal basis.
+fn basis(d: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let helper = if d[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    let u = unit3(cross(helper, d));
+    (u, cross(d, u))
+}
+
+/// The meshes of a layer list as shadow casters (camera space).
+#[derive(Default)]
+struct Caster {
+    verts: Vec<[f64; 3]>,
+    tris: Vec<[u32; 3]>,
+    /// Which winding faces out (+1/−1); 0 for open, two-sided surfaces.
+    sides: Vec<f32>,
+}
+
+impl ShadowMap {
+    fn directional(c: &Caster, toward: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
+        let l = unit3(toward);
+        let (u, v) = basis(l);
+        let proj: Vec<(f64, f64, f64)> = c.verts.iter().map(|&p| (dot(p, u), dot(p, v), dot(p, l))).collect();
+        Self::build(c, &proj, &|_| l, size, softness, 0, l, [0.0; 3], u, v)
+    }
+
+    fn point(c: &Caster, pos: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
+        // Aim at the middle of the geometry.
+        let mut m = [0.0; 3];
+        for p in &c.verts {
+            m = add(m, *p);
+        }
+        let n = c.verts.len().max(1) as f64;
+        let axis = unit3(sub([m[0] / n, m[1] / n, m[2] / n], pos));
+        let (u, v) = basis(axis);
+        let proj: Vec<(f64, f64, f64)> = c
+            .verts
+            .iter()
+            .map(|&p| {
+                let q = sub(p, pos);
+                let z = dot(q, axis);
+                if z < 1.0 {
+                    return (f64::NAN, f64::NAN, f64::NAN);
+                }
+                // Closeness 1/z interpolates linearly across the map.
+                ((dot(q, u) / z).clamp(-3.0, 3.0), (dot(q, v) / z).clamp(-3.0, 3.0), 1.0 / z)
+            })
+            .collect();
+        Self::build(c, &proj, &|p| sub(pos, p), size, softness, 1, axis, pos, u, v)
+    }
+
+    /// Rasterises the casters' light-facing triangles (projected per
+    /// vertex as (u, v, closeness)) keeping the nearest surface per texel.
+    #[allow(clippy::too_many_arguments)]
+    fn build(c: &Caster, proj: &[(f64, f64, f64)], toward: &(dyn Fn([f64; 3]) -> [f64; 3] + Sync), size: usize, softness: f64, kind: u32, axis: [f64; 3], pos: [f64; 3], u: [f64; 3], v: [f64; 3]) -> Option<ShadowMap> {
+        // Closed surfaces only need their sides facing the light.
+        let faces = |i: usize| {
+            let t = c.tris[i];
+            if t.iter().any(|&k| !proj[k as usize].0.is_finite()) {
+                return false;
+            }
+            if c.sides[i] == 0.0 {
+                return true;
+            }
+            let p = t.map(|k| c.verts[k as usize]);
+            let g = cross(sub(p[1], p[0]), sub(p[2], p[0]));
+            dot(g, toward(p[0])) * c.sides[i] as f64 >= 0.0
+        };
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+        let chunk = c.tris.len().div_ceil(threads).max(1);
+        let keep: Vec<usize> = std::thread::scope(|scope| {
+            let faces = &faces;
+            let jobs: Vec<_> = (0..c.tris.len()).step_by(chunk).map(|a| scope.spawn(move || (a..(a + chunk).min(c.tris.len())).filter(|&i| faces(i)).collect::<Vec<usize>>())).collect();
+            jobs.into_iter().flat_map(|j| j.join().expect("shadow casters")).collect()
+        });
+        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for &i in &keep {
+            for &k in &c.tris[i] {
+                let p = proj[k as usize];
+                b = [b[0].min(p.0), b[1].min(p.1), b[2].max(p.0), b[3].max(p.1)];
+            }
+        }
+        if !(b[2] > b[0] && b[3] > b[1]) {
+            return None;
+        }
+        let n = size as f64;
+        // A two-texel margin all round.
+        let (pu, pv) = ((b[2] - b[0]) * 2.0 / n, (b[3] - b[1]) * 2.0 / n);
+        let (u0, v0) = (b[0] - pu, b[1] - pv);
+        let (su, sv) = (n / (b[2] - b[0] + 2.0 * pu), n / (b[3] - b[1] + 2.0 * pv));
+        let mut texels = vec![NO_SURFACE; size * size];
+        // Triangles in texel space, sorted into the threads' bands of rows.
+        let tex: Vec<[(f64, f64, f64); 3]> = keep.iter().map(|&i| c.tris[i].map(|k| {
+            let q = proj[k as usize];
+            ((q.0 - u0) * su, (q.1 - v0) * sv, q.2)
+        })).collect();
+        // Many thin bands dealt out in turn, so busy regions spread over
+        // every thread.
+        let nbands = threads * 8;
+        let band = size.div_ceil(nbands);
+        let nbands = size.div_ceil(band);
+        let mut bands: Vec<Vec<u32>> = vec![Vec::new(); nbands];
+        for (i, p) in tex.iter().enumerate() {
+            let lo = (p[0].1.min(p[1].1).min(p[2].1) - 0.5).ceil().max(0.0) as usize;
+            let hi = (p[0].1.max(p[1].1).max(p[2].1) - 0.5).floor().clamp(-1.0, n - 1.0);
+            if hi < lo as f64 {
+                continue;
+            }
+            for bi in lo / band..=(hi as usize / band).min(nbands - 1) {
+                bands[bi].push(i as u32);
+            }
+        }
+        let mut work: Vec<Vec<(usize, &mut [f32], &Vec<u32>)>> = (0..threads).map(|_| Vec::new()).collect();
+        for ((k, rows), list) in texels.chunks_mut(band * size).enumerate().zip(&bands) {
+            work[k % threads].push((k, rows, list));
+        }
+        std::thread::scope(|scope| {
+            for jobs in work {
+                let tex = &tex;
+                scope.spawn(move || {
+                  for (k, rows, list) in jobs {
+                    let (y_lo, y_hi) = (k * band, (k * band + rows.len() / size).min(size));
+                    for &ti in list {
+                        let p = tex[ti as usize];
+                        let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[1].1 - p[0].1) * (p[2].0 - p[0].0);
+                        if area.abs() < 1e-12 {
+                            continue;
+                        }
+                        let ys = (p[0].1.min(p[1].1).min(p[2].1) - 0.5).ceil().max(y_lo as f64) as usize;
+                        let ye = ((p[0].1.max(p[1].1).max(p[2].1) - 0.5).floor() + 1.0).min(y_hi as f64);
+                        let xs = (p[0].0.min(p[1].0).min(p[2].0) - 0.5).ceil().max(0.0) as usize;
+                        let xe = ((p[0].0.max(p[1].0).max(p[2].0) - 0.5).floor() + 1.0).min(n);
+                        if ye <= ys as f64 || xe <= xs as f64 {
+                            continue;
+                        }
+                        // Edge functions (weights of the opposite vertex) as
+                        // planes: w = a·x + b·y + c; closeness likewise.
+                        let plane = |a: (f64, f64, f64), b: (f64, f64, f64)| {
+                            let (ea, eb) = (-(b.1 - a.1) / area, (b.0 - a.0) / area);
+                            (ea, eb, -(ea * a.0 + eb * a.1))
+                        };
+                        let e = [plane(p[1], p[2]), plane(p[2], p[0]), plane(p[0], p[1])];
+                        let cz = (
+                            e[0].0 * p[0].2 + e[1].0 * p[1].2 + e[2].0 * p[2].2,
+                            e[0].1 * p[0].2 + e[1].1 * p[1].2 + e[2].1 * p[2].2,
+                            e[0].2 * p[0].2 + e[1].2 * p[1].2 + e[2].2 * p[2].2,
+                        );
+                        let x0 = xs as f64 + 0.5;
+                        for y in ys..ye as usize {
+                            let cy = y as f64 + 0.5;
+                            let row = &mut rows[(y - y_lo) * size..(y - y_lo + 1) * size];
+                            let mut w = [0, 1, 2].map(|k| e[k].0 * x0 + e[k].1 * cy + e[k].2);
+                            let mut c = cz.0 * x0 + cz.1 * cy + cz.2;
+                            for t in &mut row[xs..xe as usize] {
+                                if w[0] >= 0.0 && w[1] >= 0.0 && w[2] >= 0.0 && c as f32 > *t {
+                                    *t = c as f32;
+                                }
+                                w[0] += e[0].0;
+                                w[1] += e[1].0;
+                                w[2] += e[2].0;
+                                c += cz.0;
+                            }
+                        }
+                    }
+                  }
+                });
+            }
+        });
+        // Bias: directional in px along the light; point as a fraction of
+        // the distance (both about a texel and a half).
+        let texel = (1.0 / su).max(1.0 / sv);
+        let bias = if kind == 0 { 1.5 * texel + 0.5 } else { 1.5 * texel };
+        let radius = 1.0 + softness * 10.0;
+        let f = |a: [f64; 3], w: f64| [a[0] as f32, a[1] as f32, a[2] as f32, w as f32];
+        let mut rows = vec![
+            [kind as f32, size as f32, u0 as f32, v0 as f32],
+            [su as f32, sv as f32, bias as f32, radius as f32],
+            f(u, texel),
+            f(v, 0.0),
+            f(axis, 0.0),
+            f(pos, 0.0),
+        ];
+        rows.extend(texels.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]));
+        Some(ShadowMap { rows })
+    }
 }
 
 impl Batch {
@@ -187,6 +480,10 @@ const NEAR: f64 = 1.0;
 pub const FLAG_UNLIT: u32 = 1;
 pub const FLAG_FACETED: u32 = 2;
 pub const FLAG_OCCLUDER: u32 = 4;
+pub const FLAG_SHADOW_CATCHER: u32 = 8;
+
+/// Shadow filter taps (a Poisson disk on the unit circle).
+pub const SHADOW_TAPS: [[f32; 2]; 8] = [[-0.613, 0.617], [0.170, -0.040], [-0.299, -0.792], [0.645, 0.493], [-0.651, -0.075], [0.421, -0.718], [-0.084, 0.290], [0.874, -0.130]];
 /// Most triangles one batch may hold (beyond this, meshes are skipped).
 const MAX_TRIS: usize = 4_000_000;
 
@@ -201,7 +498,7 @@ fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64) -> [[f3
     if !m.colors.is_empty() && !m.own_color[part] {
         color = m.colors[segment as usize % m.colors.len()];
     }
-    let flags = (mat.unlit as u32) | ((mat.faceted as u32) << 1);
+    let flags = (mat.unlit as u32) * FLAG_UNLIT | (mat.faceted as u32) * FLAG_FACETED | (mat.shadow_catcher as u32) * FLAG_SHADOW_CATCHER;
     [
         [srgb_to_linear(color.0[0]) as f32, srgb_to_linear(color.0[1]) as f32, srgb_to_linear(color.0[2]) as f32, (color.0[3] * mat.opacity * opacity) as f32],
         [mat.metallic as f32, mat.roughness as f32, mat.clearcoat as f32, mat.clearcoat_roughness as f32],
@@ -262,6 +559,7 @@ impl Batch {
             list: 0,
             members: Vec::new(),
             see_through: false,
+            shadows: Arc::default(),
         })
     }
 
@@ -386,7 +684,8 @@ impl Batch {
     /// Writes the batch for `target` (whose pixel (x, y) is canvas
     /// `origin + factor·(x, y)`) into the list's mesh buffers and returns
     /// its primitive, or None when nothing lands on the target.
-    pub(crate) fn place(&self, mesh_rows: &mut Vec<[f32; 4]>, bins: &mut Vec<u32>, target: &Target, origin: [f64; 2], factor: [f64; 2], blend: u32) -> Option<(Prim, [f64; 4])> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place(&self, mesh_rows: &mut Vec<[f32; 4]>, bins: &mut Vec<u32>, placed: &mut HashMap<usize, u32>, target: &Target, origin: [f64; 2], factor: [f64; 2], blend: u32) -> Option<(Prim, [f64; 4])> {
         let (tw_px, th_px) = (target.width as f64, target.height as f64);
         let to_target = |s: [f64; 2]| [(s[0] - origin[0]) / factor[0], (s[1] - origin[1]) / factor[1]];
         // Triangles on the target with their edge and depth planes.
@@ -556,6 +855,19 @@ impl Batch {
         mesh_rows.extend_from_slice(&self.materials);
         let light_base = mesh_rows.len() as u32;
         mesh_rows.extend_from_slice(&self.light_rows);
+        // Shadow maps (shared by the list's batches: written once), linked
+        // from each light's colour row as an offset from the light block.
+        for (i, map) in self.shadows.iter().enumerate() {
+            let Some(map) = map else { continue };
+            let key = Arc::as_ptr(map) as usize;
+            let at = *placed.entry(key).or_insert_with(|| {
+                let at = mesh_rows.len() as u32;
+                mesh_rows.extend_from_slice(&map.rows);
+                at
+            });
+            let row = light_base as usize + 7 + i * 2 + 1;
+            mesh_rows[row][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
+        }
         let b = |v: u32| f32::from_bits(v);
         let prim = Prim {
             kind: [PRIM_MESH, 0, blend, 0],
@@ -694,6 +1006,78 @@ fn env(m: &[[f32; 4]], lb: usize, d: F3, r: f32) -> F3 {
     c
 }
 
+/// Whether a texel's surface leaves a point at closeness `c` lit.
+fn shadow_lit(s: f32, c: f32, bias: f32, point: bool) -> f32 {
+    if s <= NO_SURFACE * 0.5 {
+        return 1.0;
+    }
+    let lit = if point { s <= 0.0 || 1.0 / s >= c * (1.0 - bias) } else { s <= c + bias };
+    if lit {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// How much of a light reaches camera-space point `p` (normal `n`) past
+/// the shadow map at row `base`: 1 lit … 0 in shadow, soft at the edges.
+fn shadow(m: &[[f32; 4]], base: usize, p: F3, n: F3) -> f32 {
+    let (h0, h1) = (m[base], m[base + 1]);
+    let (u, v, a, pos) = (m[base + 2], m[base + 3], m[base + 4], m[base + 5]);
+    let point = h0[0] > 0.5;
+    let size = h0[1] as i32;
+    let mut offset = u[3];
+    if point {
+        offset *= fdot(fsub(p, f3(pos)), f3(a)).max(1.0);
+    }
+    // Step off the surface toward the light (whichever side faces it).
+    let toward = fnorm(if point { fsub(f3(pos), p) } else { f3(a) });
+    let n = if fdot(n, toward) < 0.0 { fmul(n, -1.0) } else { n };
+    let po = fadd(p, fmul(n, offset));
+    // The filter reaches `radius` texels across a surface sloping away
+    // from the light: bias by the depth it climbs there.
+    let cos = fdot(n, toward).max(0.05);
+    let slope = ((1.0 - cos * cos).max(0.0).sqrt() / cos).min(4.0);
+    // (Point maps compare distances as fractions: texels are angles.)
+    let bias = h1[2] + u[3] * h1[3] * slope;
+    let (tu, tv, c) = if point {
+        let q = fsub(po, f3(pos));
+        let z = fdot(q, f3(a));
+        if z < 1.0 {
+            return 1.0;
+        }
+        (fdot(q, f3(u)) / z, fdot(q, f3(v)) / z, z)
+    } else {
+        (fdot(po, f3(u)), fdot(po, f3(v)), fdot(po, f3(a)))
+    };
+    let x = (tu - h0[2]) * h1[0] - 0.5;
+    let y = (tv - h0[3]) * h1[1] - 0.5;
+    let texel = |i: i32, j: i32| -> f32 {
+        if i < 0 || j < 0 || i >= size || j >= size {
+            return 1.0;
+        }
+        let k = (j * size + i) as usize;
+        shadow_lit(m[base + 6 + k / 4][k % 4], c, bias, point)
+    };
+    let mut sum = 0.0;
+    for t in SHADOW_TAPS {
+        let (sx, sy) = (x + t[0] * h1[3], y + t[1] * h1[3]);
+        let (fx, fy) = (sx.floor(), sy.floor());
+        let (ax, ay) = (sx - fx, sy - fy);
+        let (i, j) = (fx as i32, fy as i32);
+        let top = texel(i, j) + (texel(i + 1, j) - texel(i, j)) * ax;
+        let bottom = texel(i, j + 1) + (texel(i + 1, j + 1) - texel(i, j + 1)) * ax;
+        sum += top + (bottom - top) * ay;
+    }
+    sum / SHADOW_TAPS.len() as f32
+}
+
+/// The shadow map linked from light `i`'s colour row, if any.
+fn shadow_of(m: &[[f32; 4]], lb: usize, i: usize) -> Option<usize> {
+    let off = m[lb + 7 + i * 2 + 1][3].to_bits() as i32;
+    (off != 0).then(|| (lb as i64 + off as i64) as usize)
+}
+
 fn to_world(m: &[[f32; 4]], lb: usize, v: F3) -> F3 {
     [fdot(f3(m[lb + 1]), v), fdot(f3(m[lb + 2]), v), fdot(f3(m[lb + 3]), v)]
 }
@@ -779,7 +1163,21 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
     let base = f3(m0);
     let opacity = m0[3];
     let emissive = f3(m2);
-    if flags & 1 != 0 {
+    if flags & FLAG_SHADOW_CATCHER != 0 {
+        // Only the shadows: how much of the shadowing light is blocked.
+        let (mut blocked, mut total) = (0.0f32, 0.0f32);
+        for i in 0..m[lb][0] as usize {
+            if let Some(sm) = shadow_of(m, lb, i) {
+                let w = fdot(f3(m[lb + 7 + i * 2 + 1]), [0.2126, 0.7152, 0.0722]);
+                blocked += w * (1.0 - shadow(m, sm, p, n));
+                total += w;
+            }
+        }
+        let a = if total > 0.0 { blocked / total * opacity } else { 0.0 };
+        let c = base.map(encode);
+        return [c[0] * a, c[1] * a, c[2] * a, a];
+    }
+    if flags & FLAG_UNLIT != 0 {
         let c = fadd(base, emissive).map(|x| encode(x));
         return [c[0] * opacity, c[1] * opacity, c[2] * opacity, opacity];
     }
@@ -806,6 +1204,10 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
         if n_l <= 0.0 {
             continue;
         }
+        let col = match shadow_of(m, lb, i) {
+            Some(sm) => fmul(col, shadow(m, sm, p, n)),
+            None => col,
+        };
         let h = fnorm(fadd(l, v));
         let n_h = fdot(n, h).max(0.0);
         let v_h = fdot(v, h).max(0.0);

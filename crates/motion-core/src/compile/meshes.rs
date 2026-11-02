@@ -34,6 +34,8 @@ pub struct MaterialState {
     pub transmission: f64,
     pub unlit: bool,
     pub faceted: bool,
+    /// Shows only the shadows falling on it.
+    pub shadow_catcher: bool,
 }
 
 impl MaterialState {
@@ -49,6 +51,7 @@ impl MaterialState {
             transmission: 0.0,
             unlit: false,
             faceted: false,
+            shadow_catcher: false,
         };
         match p {
             MaterialPreset::Matte => MaterialState { roughness: 0.85, ..base },
@@ -60,6 +63,7 @@ impl MaterialState {
             MaterialPreset::Glass => MaterialState { roughness: 0.04, transmission: 0.92, ..base },
             MaterialPreset::Emissive => MaterialState { roughness: 0.5, ..base },
             MaterialPreset::Flat => MaterialState { unlit: true, ..base },
+            MaterialPreset::Shadow => MaterialState { color: Color::BLACK, opacity: 0.55, shadow_catcher: true, ..base },
         }
     }
 }
@@ -78,6 +82,9 @@ pub struct LightState {
     pub vector: [f64; 3],
     /// Linear colour × intensity.
     pub color: [f64; 3],
+    pub shadow: bool,
+    /// 0 sharp … 1 very soft.
+    pub softness: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,6 +172,7 @@ impl CMaterial {
 
 pub(super) enum CMeshShape {
     Sphere(Prop<f64>),
+    Plane(Prop<Vec2>),
     Box(Prop<Vec2>, Prop<f64>, Prop<f64>),
     Cylinder(Prop<f64>, Option<Prop<f64>>, Prop<f64>, Prop<f64>),
     Capsule(Prop<f64>, Prop<f64>),
@@ -266,6 +274,7 @@ impl Compiler<'_> {
         let p = |prop: &Property<f64>, what: &str, this: &mut Self| this.prop(prop, id, what, start, step, shift);
         let shape = match &m.mesh {
             MeshDef::Sphere { radius } => CMeshShape::Sphere(p(radius, "mesh.radius", self)),
+            MeshDef::Plane { size } => CMeshShape::Plane(self.prop(size, id, "mesh.size", start, step, shift)),
             MeshDef::Box { size, depth, bevel } => {
                 CMeshShape::Box(self.prop(size, id, "mesh.size", start, step, shift), p(depth, "mesh.depth", self), p(bevel, "mesh.bevel", self))
             }
@@ -329,6 +338,9 @@ impl Compiler<'_> {
 
     pub(super) fn lighting(&mut self, scene: &Scene, pre_roll: f64, start: f64) -> CLighting {
         let id = scene.id.as_str();
+        // Only the first directional or point light casts shadows unless
+        // others ask (each shadow costs a depth map per frame).
+        let key = scene.lights.iter().position(|l| l.kind != LightKind::Ambient);
         let lights = if scene.lights.is_empty() {
             default_rig()
         } else {
@@ -349,6 +361,8 @@ impl Compiler<'_> {
                         vector,
                         color: self.prop(&l.color, id, &format!("lights.{i}.color"), start, None, pre_roll),
                         intensity: self.prop(&l.intensity, id, &format!("lights.{i}.intensity"), start, None, pre_roll),
+                        shadow: l.shadow.unwrap_or(Some(i) == key) && l.kind != LightKind::Ambient,
+                        softness: self.prop(&l.softness, id, &format!("lights.{i}.softness"), start, None, pre_roll),
                     }
                 })
                 .collect()
@@ -367,8 +381,16 @@ impl Compiler<'_> {
 }
 
 fn default_rig() -> Vec<CLight> {
-    let light = |vector: [f64; 3], intensity: f64| CLight { kind: LightKind::Directional, vector: unit(vector), color: Prop::constant(Color::WHITE), intensity: Prop::constant(intensity) };
-    vec![light([-0.55, -0.8, -0.7], 1.0), light([0.75, -0.35, 0.8], 0.7)]
+    let light = |vector: [f64; 3], intensity: f64, shadow: bool| CLight {
+        kind: LightKind::Directional,
+        vector: unit(vector),
+        color: Prop::constant(Color::WHITE),
+        intensity: Prop::constant(intensity),
+        shadow,
+        softness: Prop::constant(0.35),
+    };
+    // The key casts shadows; the rim only outlines.
+    vec![light([-0.55, -0.8, -0.7], 1.0, true), light([0.75, -0.35, 0.8], 0.7, false)]
 }
 
 pub(super) struct CLight {
@@ -376,6 +398,8 @@ pub(super) struct CLight {
     vector: [f64; 3],
     color: Prop<Color>,
     intensity: Prop<f64>,
+    shadow: bool,
+    softness: Prop<f64>,
 }
 
 pub(super) struct CLighting {
@@ -395,7 +419,7 @@ impl CLighting {
             .iter()
             .map(|l| {
                 let c = clamp_color(l.color.at(tc));
-                LightState { kind: l.kind, vector: l.vector, color: linear(c, l.intensity.at(tc).max(0.0) * c.0[3]) }
+                LightState { kind: l.kind, vector: l.vector, color: linear(c, l.intensity.at(tc).max(0.0) * c.0[3]), shadow: l.shadow, softness: l.softness.at(tc).clamp(0.0, 1.0) }
             })
             .collect();
         let k = self.intensity.at(tc).max(0.0);
@@ -444,6 +468,10 @@ impl CMesh {
         let path = |(paths, index): &(Vec<Arc<str>>, Prop<f64>)| path_morph(paths, index.at(t));
         let shape = match &self.shape {
             CMeshShape::Sphere(r) => MeshShape::Sphere { radius: r.at(t) },
+            CMeshShape::Plane(size) => {
+                let s = size.at(t);
+                MeshShape::Plane { size: [s.x(), s.y()] }
+            }
             CMeshShape::Box(size, depth, bevel) => {
                 let s = size.at(t);
                 MeshShape::Box { size: [s.x(), s.y(), depth.at(t)], bevel: bevel.at(t) }
