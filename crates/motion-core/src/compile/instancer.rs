@@ -567,7 +567,7 @@ pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, 
         if alpha <= 0.0 || scale <= 0.0 {
             continue;
         }
-        let m = Mat4::translate(x + dx, y + dy, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, 1.0));
+        let m = Mat4::translate(x + dx, y + dy, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, scale.abs()));
         let copy = Space { world: inner.world.then(m), ..*inner };
         let first = out.len();
         emit(&n.layers, tc - base.delay, step, &copy, opacity * alpha, out);

@@ -1637,11 +1637,9 @@ fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, s
     let s = l.scale.at(t);
     let a = l.anchor.at(t);
     // Depth scale: meshes scale uniformly with x unless told otherwise.
-    let sz = match &l.scale_z {
-        Some(p) => p.at(t),
-        None if matches!(l.kind, CKind::Mesh(_)) => s.x(),
-        None => 1.0,
-    };
+    // Depth scales with the layer's scale (so pop-ins and scaled parents
+    // scale depth too), times `scale_z`.
+    let sz = (s.x().abs() + s.y().abs()) / 2.0 * l.scale_z.as_ref().map(|p| p.at(t)).unwrap_or(1.0);
     let local = |origin: Mat4| {
         origin
             .then(Mat4::rotate_y(l.rotation_y.at(t)))

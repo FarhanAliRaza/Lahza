@@ -361,9 +361,13 @@ impl Compiler<'_> {
                 .iter()
                 .enumerate()
                 .map(|(i, l)| {
-                    let vector = match l.kind {
-                        LightKind::Point => l.position.unwrap_or([0.0, 0.0, -500.0]),
-                        _ => unit(l.from.unwrap_or([-1.0, -1.0, -1.0])),
+                    let (what, fallback) = match l.kind {
+                        LightKind::Point => (("position", &l.position), [0.0, 0.0, -500.0]),
+                        _ => (("from", &l.from), [-1.0, -1.0, -1.0]),
+                    };
+                    let vector = match what.1 {
+                        Some(p) => self.prop(p, id, &format!("lights.{i}.{}", what.0), start, None, pre_roll),
+                        None => Prop::constant(crate::value::Vec3(fallback)),
                     };
                     if l.kind == LightKind::Point && l.position.is_none() {
                         self.errors.push(format!("{id}.lights.{i}: a point light needs \"position\""));
@@ -395,7 +399,7 @@ impl Compiler<'_> {
 fn default_rig() -> Vec<CLight> {
     let light = |vector: [f64; 3], intensity: f64, shadow: bool| CLight {
         kind: LightKind::Directional,
-        vector: unit(vector),
+        vector: Prop::constant(crate::value::Vec3(unit(vector))),
         color: Prop::constant(Color::WHITE),
         intensity: Prop::constant(intensity),
         shadow,
@@ -407,7 +411,8 @@ fn default_rig() -> Vec<CLight> {
 
 pub(super) struct CLight {
     kind: LightKind,
-    vector: [f64; 3],
+    /// Directional: toward the light (any length); point: position.
+    vector: Prop<crate::value::Vec3>,
     color: Prop<Color>,
     intensity: Prop<f64>,
     shadow: bool,
@@ -431,7 +436,9 @@ impl CLighting {
             .iter()
             .map(|l| {
                 let c = clamp_color(l.color.at(tc));
-                LightState { kind: l.kind, vector: l.vector, color: linear(c, l.intensity.at(tc).max(0.0) * c.0[3]), shadow: l.shadow, softness: l.softness.at(tc).clamp(0.0, 1.0) }
+                let v = l.vector.at(tc).0;
+                let vector = if l.kind == LightKind::Point { v } else { unit(v) };
+                LightState { kind: l.kind, vector, color: linear(c, l.intensity.at(tc).max(0.0) * c.0[3]), shadow: l.shadow, softness: l.softness.at(tc).clamp(0.0, 1.0) }
             })
             .collect();
         let k = self.intensity.at(tc).max(0.0);
@@ -562,5 +569,55 @@ pub(super) fn light_meshes(layers: &mut [LayerState], lighting: &Arc<Lighting>) 
         if let Some(src) = l.matte.as_mut().and_then(|m| m.source.as_mut()) {
             light_meshes(std::slice::from_mut(src), lighting);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::time::Fps;
+
+    pub(crate) fn compiled(scene: serde_json::Value) -> Compiled {
+        let mut p = Project::new(640, 360, Fps::whole(30), 2.0);
+        let mut s = scene;
+        s["id"] = serde_json::json!("s1");
+        p.scenes.push(serde_json::from_value(s).unwrap());
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        c
+    }
+
+    fn mesh(c: &Compiled, t: f64, id: &str) -> MeshState {
+        c.frame(t).layers.iter().find_map(|l| match &l.content {
+            Content::Mesh(m) if &*l.id == id => Some((**m).clone()),
+            _ => None,
+        }).unwrap()
+    }
+
+    #[test]
+    fn lights_move() {
+        let c = compiled(serde_json::json!({"lights": [
+            {"type": "point", "position": {"keys": [{"at": 0, "v": [0, 0, -100]}, {"at": 1, "v": [600, 0, -100]}]}},
+            {"from": {"keys": [{"at": 0, "v": [-1, 0, 0]}, {"at": 1, "v": [1, 0, 0]}]}}],
+            "layers": [{"id": "m", "kind": "mesh", "mesh": {"type": "sphere"}}]}));
+        let (a, b) = (mesh(&c, 0.0, "m"), mesh(&c, 1.0, "m"));
+        let (la, lb) = (a.lighting.unwrap(), b.lighting.unwrap());
+        assert_eq!(la.lights[0].vector, [0.0, 0.0, -100.0]);
+        assert_eq!(lb.lights[0].vector, [600.0, 0.0, -100.0]);
+        assert!((la.lights[1].vector[0] + 1.0).abs() < 1e-9 && (lb.lights[1].vector[0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn depth_scales_with_animated_scale_and_parents() {
+        let c = compiled(serde_json::json!({"layers": [
+            {"id": "null", "kind": "shape", "shape": "circle", "size": 1, "transform": {"scale": {"keys": [{"at": 0, "v": 1}, {"at": 1, "v": 2}]}}},
+            {"id": "m", "kind": "mesh", "mesh": {"type": "sphere"}, "parent": "null",
+             "transform": {"scale": {"keys": [{"at": 0, "v": 0.5}, {"at": 1, "v": 1}]}, "scale_z": 0.5}}]}));
+        let z = |t: f64| {
+            let w = mesh(&c, t, "m").world.0;
+            (w[2] * w[2] + w[6] * w[6] + w[10] * w[10]).sqrt()
+        };
+        // Depth scale = parent 1 × own 0.5 × scale_z 0.5, then 2 × 1 × 0.5.
+        assert!((z(0.0) - 0.25).abs() < 1e-9 && (z(1.0) - 1.0).abs() < 1e-9, "{} {}", z(0.0), z(1.0));
     }
 }

@@ -31,7 +31,7 @@ pub use markers::{Marker, MarkerTrack, Markers};
 pub use property::{Key, Property};
 pub use time::{Duration, Fps};
 pub use timeref::{Anchor, TimeRef};
-pub use value::{Color, Vec2};
+pub use value::{Color, Vec2, Vec3};
 
 /// Errors are plain messages: they are shown to people and agents as-is,
 /// so each one names the field or reference at fault.

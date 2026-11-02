@@ -338,7 +338,8 @@ pub struct Transform {
     pub rotation_x: Property<f64>,
     #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
     pub rotation_y: Property<f64>,
-    /// 3D layers: depth scale (meshes default to `scale`'s x, planes to 1).
+    /// 3D layers: depth scale relative to `scale` (depth scales with the
+    /// mean of |scale x| and |scale y|, times this; default 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale_z: Option<Property<f64>>,
 }
@@ -2223,9 +2224,9 @@ pub struct Light {
     #[serde(rename = "type", default)]
     pub kind: LightKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<[f64; 3]>,
+    pub from: Option<Property<crate::value::Vec3>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub position: Option<[f64; 3]>,
+    pub position: Option<Property<crate::value::Vec3>>,
     #[serde(default = "white_prop")]
     pub color: Property<Color>,
     #[serde(default = "one_prop", skip_serializing_if = "is_one")]

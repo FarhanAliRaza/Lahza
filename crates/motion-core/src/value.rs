@@ -103,6 +103,48 @@ impl<'de> Deserialize<'de> for Vec2 {
     }
 }
 
+/// A 3D point or direction. Deserialises from `[x, y, z]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Vec3(pub [f64; 3]);
+
+impl Vec3 {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Vec3([x, y, z])
+    }
+}
+
+impl Animatable for Vec3 {
+    const COMPONENTS: usize = 3;
+    fn get(&self, i: usize) -> f64 {
+        self.0[i]
+    }
+    fn from_fn(mut f: impl FnMut(usize) -> f64) -> Self {
+        Vec3([f(0), f(1), f(2)])
+    }
+}
+
+impl Serialize for Vec3 {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Vec3 {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Array(a) if a.len() == 3 => {
+                let mut v = [0.0; 3];
+                for (slot, x) in v.iter_mut().zip(&a) {
+                    *slot = x.as_f64().ok_or_else(|| D::Error::custom("vector components must be numbers"))?;
+                }
+                Ok(Vec3(v))
+            }
+            other => Err(D::Error::custom(format!("expected [x, y, z], got {other}"))),
+        }
+    }
+}
+
 /// Straight (not premultiplied) sRGB colour with alpha, components 0..1.
 /// Deserialises from "#rgb", "#rrggbb", "#rrggbbaa", or [r, g, b(, a)] in 0..1.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
