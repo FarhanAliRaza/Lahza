@@ -21,8 +21,10 @@ pub const PART_BACK: u32 = 1;
 pub const PART_SIDE: u32 = 2;
 pub const PART_BEVEL: u32 = 3;
 pub const PART_CAPS: u32 = 4;
-pub const PARTS: usize = 5;
-pub const PART_NAMES: [&str; PARTS] = ["front", "back", "side", "bevel", "caps"];
+/// Revolved surfaces facing the axis (a ring's inner wall).
+pub const PART_INSIDE: u32 = 5;
+pub const PARTS: usize = 6;
+pub const PART_NAMES: [&str; PARTS] = ["front", "back", "side", "bevel", "caps", "inside"];
 /// Tag bit: the surface is open (seen from both sides).
 pub const TWO_SIDED: u32 = 1 << 31;
 
@@ -155,6 +157,8 @@ pub struct MeshParams {
     pub gap: f64,
     /// Tessellation multiplier (1 = smooth at the size drawn).
     pub detail: f64,
+    /// Relative sizes of the pieces, in turn (empty: all equal).
+    pub spans: Vec<f64>,
 }
 
 impl MeshParams {
@@ -165,6 +169,10 @@ impl MeshParams {
         f(self.segments as f64);
         f(self.gap);
         f(self.detail);
+        f(self.spans.len() as f64);
+        for s in &self.spans {
+            f(*s);
+        }
         let mut text = String::new();
         let mut path = |m: &PathMorph, f: &mut dyn FnMut(f64)| {
             f(m.t);
@@ -325,19 +333,35 @@ fn circle_steps(r: f64, detail: f64, span: f64) -> usize {
 
 /// The pieces of an angle range: `count` spans with `gap` degrees between
 /// them (between neighbours only, unless the range is a full turn).
-fn pieces(a0: f64, a1: f64, count: u32, gap: f64) -> Vec<(f64, f64)> {
+fn pieces(a0: f64, a1: f64, count: u32, gap: f64, spans: &[f64]) -> Vec<(f64, f64)> {
     let count = count.max(1) as usize;
     let span = a1 - a0;
     let full = span.abs() >= 360.0 - 1e-9;
     let gaps = if full { count } else { count - 1 };
     let gap = gap.max(0.0).min(span.abs() / gaps.max(1) as f64 * 0.95) * span.signum();
-    let each = (span - gap * gaps as f64) / count as f64;
-    (0..count)
-        .map(|i| {
-            let s = a0 + (each + gap) * i as f64 + if full { gap / 2.0 } else { 0.0 };
-            (s, s + each)
+    let weights = piece_weights(count, spans);
+    let total: f64 = weights.iter().sum();
+    let room = span - gap * gaps as f64;
+    let mut s = a0 + if full { gap / 2.0 } else { 0.0 };
+    weights
+        .iter()
+        .map(|w| {
+            let e = s + room * w / total;
+            let piece = (s, e);
+            s = e + gap;
+            piece
         })
         .collect()
+}
+
+/// Each piece's relative size: `spans` in turn (all 1 when empty).
+fn piece_weights(count: usize, spans: &[f64]) -> Vec<f64> {
+    let w: Vec<f64> = (0..count).map(|i| if spans.is_empty() { 1.0 } else { spans[i % spans.len()].max(0.0) }).collect();
+    if w.iter().sum::<f64>() > 0.0 {
+        w
+    } else {
+        vec![1.0; count]
+    }
 }
 
 pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
@@ -347,7 +371,7 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
         MeshShape::Sphere { radius } => {
             let r = radius.max(0.0);
             let profile = Profile::arc((0.0, 0.0), r, -FRAC_PI_2, FRAC_PI_2, circle_steps(r, detail, PI), PART_SIDE);
-            revolve_pieces(&mut mesh, &[profile], (0.0, 360.0), 1, 0.0, true, circle_steps(r, detail, TAU), false);
+            revolve_pieces(&mut mesh, &[profile], (0.0, 360.0), 1, 0.0, &[], circle_steps(r, detail, TAU), false, false);
         }
         MeshShape::Box { size, bevel } => rounded_box(&mut mesh, *size, *bevel, detail),
         MeshShape::Plane { size } => {
@@ -372,7 +396,7 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
         MeshShape::Cylinder { radius, top, height, bevel } => {
             let lines = cylinder_profile(radius.max(0.0), top.max(0.0), height.max(0.0), *bevel, detail);
             let steps = circle_steps(radius.max(*top), detail, TAU);
-            revolve_pieces(&mut mesh, &lines, (0.0, 360.0), params.segments, params.gap, true, steps, true);
+            revolve_pieces(&mut mesh, &lines, (0.0, 360.0), params.segments, params.gap, &params.spans, steps, true, false);
         }
         MeshShape::Capsule { radius, height } => {
             let r = radius.max(0.0);
@@ -380,15 +404,15 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
             let n = circle_steps(r, detail, FRAC_PI_2);
             let mut p = Profile::arc((0.0, -half), r, -FRAC_PI_2, 0.0, n, PART_SIDE);
             p.extend(Profile::arc((0.0, half), r, 0.0, FRAC_PI_2, n, PART_SIDE));
-            revolve_pieces(&mut mesh, &[p], (0.0, 360.0), params.segments, params.gap, true, circle_steps(r, detail, TAU), true);
+            revolve_pieces(&mut mesh, &[p], (0.0, 360.0), params.segments, params.gap, &params.spans, circle_steps(r, detail, TAU), true, false);
         }
         MeshShape::Torus { radius, tube, angles, caps } => {
             let (r, t) = (radius.max(0.0), tube.max(0.0).min(radius.max(0.0)));
             let ring = Profile::arc((r, 0.0), t, -PI, PI, circle_steps(t, detail, TAU), PART_SIDE);
             let steps = circle_steps(r + t, detail, TAU);
             let n = params.segments.max(1);
-            for (k, (a0, a1)) in pieces(angles[0], angles[1], n, params.gap).into_iter().enumerate() {
-                let piece = revolve(&ring_profile(&ring), a0.to_radians(), a1.to_radians(), steps, k as u32, false, false);
+            for (k, (a0, a1)) in pieces(angles[0], angles[1], n, params.gap, &params.spans).into_iter().enumerate() {
+                let piece = revolve(&ring_profile(&ring), a0.to_radians(), a1.to_radians(), steps, k as u32, false, true);
                 mesh.append(&piece);
                 if (a1 - a0).abs() < 360.0 - 1e-9 {
                     for (a, dir) in [(a0, -1.0), (a1, 1.0)] {
@@ -416,14 +440,14 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
                 lines.extend(Profile::from_polyline(pts, *closed, PART_SIDE));
             }
             let steps = circle_steps(reach, detail, TAU);
-            revolve_pieces(&mut mesh, &lines, (angles[0], angles[1]), params.segments, params.gap, closed_all, steps, *axis_y);
+            revolve_pieces(&mut mesh, &lines, (angles[0], angles[1]), params.segments, params.gap, &params.spans, steps, *axis_y, true);
             if !closed_all {
                 for t in &mut mesh.tags {
                     *t |= TWO_SIDED;
                 }
             }
             if closed_all && (angles[1] - angles[0]).abs() < 360.0 - 1e-9 || params.segments > 1 {
-                for (k, (a0, a1)) in pieces(angles[0], angles[1], params.segments, params.gap).into_iter().enumerate() {
+                for (k, (a0, a1)) in pieces(angles[0], angles[1], params.segments, params.gap, &params.spans).into_iter().enumerate() {
                     if (a1 - a0).abs() >= 360.0 - 1e-9 {
                         continue;
                     }
@@ -437,7 +461,7 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
             }
         }
         MeshShape::Sweep { path, radius, width, profile, trim, caps, head } => {
-            sweep(&mut mesh, path, *radius, *width, *profile, *trim, *caps, *head, params.segments, params.gap, detail)?
+            sweep(&mut mesh, path, *radius, *width, *profile, *trim, *caps, *head, params.segments, params.gap, &params.spans, detail)?
         }
     }
     Ok(mesh)
@@ -618,19 +642,44 @@ fn tangent_dir(axis_y: bool, a: f64) -> V3 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn revolve_pieces(mesh: &mut Mesh, lines: &[Profile], angles: (f64, f64), segments: u32, gap: f64, _closed: bool, steps: usize, axis_y: bool) {
-    for (k, (a0, a1)) in pieces(angles.0, angles.1, segments, gap).into_iter().enumerate() {
-        let piece = revolve(lines, a0.to_radians(), a1.to_radians(), steps, k as u32, axis_y, true);
+fn revolve_pieces(mesh: &mut Mesh, lines: &[Profile], angles: (f64, f64), segments: u32, gap: f64, spans: &[f64], steps: usize, axis_y: bool, classify: bool) {
+    for (k, (a0, a1)) in pieces(angles.0, angles.1, segments, gap, spans).into_iter().enumerate() {
+        let piece = revolve(lines, a0.to_radians(), a1.to_radians(), steps, k as u32, axis_y, classify);
         mesh.append(&piece);
     }
 }
 
 /// Turns profile runs from `a0` to `a1` radians in `steps` per full turn.
-fn revolve(lines: &[Profile], a0: f64, a1: f64, steps: usize, segment: u32, axis_y: bool, _caps_hint: bool) -> Mesh {
+/// The part of a revolved band by which way it faces: along the axis
+/// (front toward −axis, back toward +axis), away from it (side) or toward
+/// it (inside).
+fn facing_part(nr: f64, nh: f64) -> u32 {
+    if nh.abs() > nr.abs() * 1.2 {
+        if nh < 0.0 {
+            PART_FRONT
+        } else {
+            PART_BACK
+        }
+    } else if nr >= 0.0 {
+        PART_SIDE
+    } else {
+        PART_INSIDE
+    }
+}
+
+/// `classify`: side surfaces take their part from the way they face.
+fn revolve(lines: &[Profile], a0: f64, a1: f64, steps: usize, segment: u32, axis_y: bool, classify: bool) -> Mesh {
     let mut m = Mesh::default();
     let n = ((steps as f64 * (a1 - a0).abs() / TAU).ceil() as usize).max(1);
     for line in lines {
-        let t = tag(line.part, segment);
+        let part_of = |j: usize| {
+            if classify && line.part == PART_SIDE {
+                let (p, q) = (line.pts[j], line.pts[j + 1]);
+                tag(facing_part(p.nr + q.nr, p.nh + q.nh), segment)
+            } else {
+                tag(line.part, segment)
+            }
+        };
         let mut prev: Option<Vec<u32>> = None;
         for i in 0..=n {
             let a = a0 + (a1 - a0) * i as f64 / n as f64;
@@ -642,6 +691,7 @@ fn revolve(lines: &[Profile], a0: f64, a1: f64, steps: usize, segment: u32, axis
                     if p.r.abs() < 1e-9 && q.r.abs() < 1e-9 {
                         continue;
                     }
+                    let t = part_of(j);
                     if p.r.abs() < 1e-9 {
                         m.tri(prev[j], ring[j + 1], prev[j + 1], t);
                     } else if q.r.abs() < 1e-9 {
@@ -1119,7 +1169,7 @@ fn extrude(mesh: &mut Mesh, path: &PathMorph, depth: f64, bevel: f64, detail: f6
 // ----------------------------------------------------------------- sweep
 
 #[allow(clippy::too_many_arguments)]
-fn sweep(mesh: &mut Mesh, path: &PathMorph, radius: f64, width: f64, profile: SweepProfile, trim: [f64; 2], caps: Caps, head: f64, segments: u32, gap: f64, detail: f64) -> Result<(), String> {
+fn sweep(mesh: &mut Mesh, path: &PathMorph, radius: f64, width: f64, profile: SweepProfile, trim: [f64; 2], caps: Caps, head: f64, segments: u32, gap: f64, spans: &[f64], detail: f64) -> Result<(), String> {
     let subpaths = crate::path::morph(path, 0.25 / detail)?;
     let (t0, t1) = (trim[0].clamp(0.0, 1.0), trim[1].clamp(0.0, 1.0));
     if t1 <= t0 {
@@ -1129,10 +1179,14 @@ fn sweep(mesh: &mut Mesh, path: &PathMorph, radius: f64, width: f64, profile: Sw
     let count = segments.max(1);
     let span = t1 - t0;
     let gap = gap.max(0.0).min(span / count as f64 * 0.9);
-    let each = (span - gap * (count - 1) as f64) / count as f64;
+    let weights = piece_weights(count as usize, spans);
+    let total: f64 = weights.iter().sum();
+    let room = span - gap * (count - 1) as f64;
+    let mut a = t0;
     for k in 0..count {
-        let a = t0 + (each + gap) * k as f64;
+        let each = room * weights[k as usize] / total;
         let lines = crate::path::trim(&subpaths, a, a + each);
+        a += each + gap;
         for line in lines {
             tube(mesh, &line, r, width, profile, caps, k, detail);
         }
@@ -1141,7 +1195,7 @@ fn sweep(mesh: &mut Mesh, path: &PathMorph, radius: f64, width: f64, profile: Sw
         if let Some((p, _)) = crate::path::point_at(&subpaths, t1) {
             let n = circle_steps(head, detail, TAU);
             let profile = Profile::arc((0.0, 0.0), head, -FRAC_PI_2, FRAC_PI_2, n / 2, PART_CAPS);
-            let mut ball = revolve(&[profile], 0.0, TAU, n, count - 1, true, true);
+            let mut ball = revolve(&[profile], 0.0, TAU, n, count - 1, true, false);
             for q in &mut ball.positions {
                 q[0] += p.0 as f32;
                 q[1] += p.1 as f32;
@@ -1276,7 +1330,7 @@ mod tests {
     use super::*;
 
     fn params(shape: MeshShape) -> MeshParams {
-        MeshParams { shape, segments: 1, gap: 0.0, detail: 1.0 }
+        MeshParams { shape, segments: 1, gap: 0.0, detail: 1.0, spans: Vec::new() }
     }
 
     fn path(d: &str) -> PathMorph {
@@ -1322,7 +1376,7 @@ mod tests {
 
     #[test]
     fn torus_faces_the_camera_and_splits_into_coloured_segments() {
-        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 4, gap: 10.0, detail: 1.0 }).unwrap();
+        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 4, gap: 10.0, detail: 1.0, spans: Vec::new() }).unwrap();
         let (lo, hi) = t.bounds();
         assert!(hi[0] > 225.0 && hi[0] < 230.01 && (lo[2] + 30.0).abs() < 0.5 && (hi[2] - 30.0).abs() < 0.5, "{lo:?} {hi:?}");
         let segs: std::collections::BTreeSet<u32> = t.tags.iter().map(|x| tag_segment(*x)).collect();
@@ -1428,6 +1482,34 @@ mod tests {
                 assert!(lo[k] <= mlo[k] as f64 + 1e-3 && hi[k] >= mhi[k] as f64 - 1e-3, "{:?}: {lo:?} {hi:?} vs {mlo:?} {mhi:?}", p.shape);
             }
         }
+    }
+
+    #[test]
+    fn rings_tag_faces_and_size_pieces() {
+        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 2, gap: 0.0, detail: 1.0, spans: vec![1.0, 3.0] }).unwrap();
+        let parts: std::collections::BTreeSet<u32> = t.tags.iter().map(|x| tag_part(*x)).collect();
+        assert!([PART_FRONT, PART_BACK, PART_SIDE, PART_INSIDE].iter().all(|p| parts.contains(p)), "{parts:?}");
+        // Front faces face the camera (−z), inside faces the axis.
+        for (tri, tag) in t.tris.iter().zip(&t.tags) {
+            let n = tri.iter().fold([0.0f32; 3], |a, &i| { let v = t.normals[i as usize]; [a[0] + v[0], a[1] + v[1], a[2] + v[2]] });
+            let p = t.positions[tri[0] as usize];
+            match tag_part(*tag) {
+                PART_FRONT => assert!(n[2] < 0.0),
+                PART_BACK => assert!(n[2] > 0.0),
+                PART_INSIDE => assert!(n[0] * p[0] + n[1] * p[1] < 0.0),
+                _ => {}
+            }
+        }
+        // Spans [1, 3]: piece 0 is a quarter turn, piece 1 three quarters.
+        let angle = |seg: u32| {
+            let pts: Vec<f64> = t.tris.iter().zip(&t.tags).filter(|(_, g)| tag_segment(**g) == seg).flat_map(|(tri, _)| tri.iter().map(|&i| {
+                let p = t.positions[i as usize];
+                (p[0] as f64).atan2(-(p[1] as f64)).to_degrees().rem_euclid(360.0)
+            })).collect();
+            pts.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - pts.iter().cloned().fold(f64::INFINITY, f64::min)
+        };
+        assert!((angle(0) - 90.0).abs() < 1.0, "{}", angle(0));
+        assert!(angle(1) > 260.0);
     }
 
     #[test]

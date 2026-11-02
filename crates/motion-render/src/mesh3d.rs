@@ -545,15 +545,36 @@ const MAX_TRIS: usize = 4_000_000;
 
 use lahza_motion_core::compile::srgb_to_linear;
 
+/// A piece's colour for a part: the part's own `colors`, else the layer's
+/// `colors` (unless the part sets its own colour), else the material's.
+fn piece_color(m: &MeshState, part: usize, segment: u32) -> lahza_motion_core::value::Color {
+    let own = &m.part_colors[part];
+    if !own.is_empty() {
+        own[segment as usize % own.len()]
+    } else if !m.colors.is_empty() && !m.own_color[part] {
+        m.colors[segment as usize % m.colors.len()]
+    } else {
+        m.materials[part].color
+    }
+}
+
+/// How many distinct colours a part cycles through.
+fn piece_colors(m: &MeshState, part: usize) -> usize {
+    if !m.part_colors[part].is_empty() {
+        m.part_colors[part].len()
+    } else if !m.colors.is_empty() && !m.own_color[part] {
+        m.colors.len()
+    } else {
+        1
+    }
+}
+
 /// Rows of one material: [rgb linear, opacity], [metallic, roughness,
 /// clear coat, its roughness], [emissive rgb, flags (1 unlit, 2 faceted)],
 /// [transmission, 0, 0, 0].
 fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64) -> [[f32; 4]; 4] {
     let mat = &m.materials[part];
-    let mut color = mat.color;
-    if !m.colors.is_empty() && !m.own_color[part] {
-        color = m.colors[segment as usize % m.colors.len()];
-    }
+    let color = piece_color(m, part, segment);
     let flags = (mat.unlit as u32) * FLAG_UNLIT | (mat.faceted as u32) * FLAG_FACETED | (mat.shadow_catcher as u32) * FLAG_SHADOW_CATCHER;
     [
         [srgb_to_linear(color.0[0]) as f32, srgb_to_linear(color.0[1]) as f32, srgb_to_linear(color.0[2]) as f32, (color.0[3] * mat.opacity * opacity) as f32],
@@ -731,7 +752,7 @@ impl Batch {
             (verts.len() - 1) as u32
         };
         // Material slots by (part, colour), filled on first use.
-        let colors_n = m.colors.len().max(1);
+        let colors_n = (0..PARTS).map(|p| piece_colors(m, p)).max().unwrap_or(1);
         let mut slots = vec![u32::MAX; PARTS * colors_n];
         for (t, &tag) in mesh.tris.iter().zip(&mesh.tags) {
             let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
@@ -751,7 +772,7 @@ impl Batch {
             let material = match (occluder, self.occluder) {
                 (true, Some(o)) => o,
                 _ => {
-                    let colors = if m.colors.is_empty() || m.own_color[part] { 1 } else { m.colors.len() as u32 };
+                    let colors = piece_colors(m, part) as u32;
                     let mslot = &mut slots[part * colors_n + (segment % colors) as usize];
                     if *mslot == u32::MAX {
                         *mslot = (self.materials.len() / 4) as u32;

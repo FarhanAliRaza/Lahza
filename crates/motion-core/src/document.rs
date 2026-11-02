@@ -1958,6 +1958,10 @@ pub struct MeshLayer {
     /// One colour per piece, in turn (parts with their own colour keep it).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub colors: Vec<Property<Color>>,
+    /// Relative sizes of the pieces, in turn (`[1, 2]`: every other piece
+    /// twice as long). Default: all equal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<f64>,
     /// Tessellation (1 = smooth at the drawn size; 2 = twice as fine).
     #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")]
     pub detail: f64,
@@ -2149,6 +2153,10 @@ pub struct Material {
     /// what is behind shifts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thickness: Option<Property<f64>>,
+    /// One colour per piece, in turn, for this part (over the layer's
+    /// `colors`): two-tone segmented rings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub colors: Vec<Property<Color>>,
     /// Ignore lights: the flat colour (flat-shaded idents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlit: Option<bool>,
@@ -2196,6 +2204,9 @@ pub struct Parts {
     pub bevel: Option<Material>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caps: Option<Material>,
+    /// Revolves and rings: the surface facing the axis (inner wall).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside: Option<Material>,
 }
 
 impl Parts {
@@ -2203,8 +2214,8 @@ impl Parts {
         *self == Parts::default()
     }
     /// In `mesh::PART_*` order.
-    pub fn list(&self) -> [Option<&Material>; 5] {
-        [self.front.as_ref(), self.back.as_ref(), self.side.as_ref(), self.bevel.as_ref(), self.caps.as_ref()]
+    pub fn list(&self) -> [Option<&Material>; 6] {
+        [self.front.as_ref(), self.back.as_ref(), self.side.as_ref(), self.bevel.as_ref(), self.caps.as_ref(), self.inside.as_ref()]
     }
 }
 

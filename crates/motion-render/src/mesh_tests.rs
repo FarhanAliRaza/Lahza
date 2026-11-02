@@ -502,3 +502,21 @@ fn gpu_matches_cpu_cards() {
     ]}));
     crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.001);
 }
+
+#[test]
+fn two_tone_rings_colour_parts_per_segment() {
+    // Front faces cycle red/green per segment; the sides stay blue.
+    let img = render(&one(json!({"id": "r", "kind": "mesh", "mesh": {"type": "torus", "radius": 80, "tube": 20}, "segments": 2, "spans": [1, 3],
+        "material": {"preset": "flat", "color": "#0000ff"}, "parts": {"front": {"colors": ["#ff0000", "#00ff00"]}},
+        "transform": {"position": [160, 120]}})), 0.0);
+    // Segment 0 spans 0–90° (up-right), segment 1 the other three quarters.
+    let d = 80.0 / std::f64::consts::SQRT_2;
+    assert_eq!(px(&img, (160.0 + d) as u32, (120.0 - d) as u32), [255, 0, 0, 255]);
+    assert_eq!(px(&img, (160.0 - d) as u32, (120.0 + d) as u32), [0, 255, 0, 255]);
+    assert_eq!(px(&img, (160.0 + d) as u32, (120.0 + d) as u32), [0, 255, 0, 255]);
+    // Seen edge-on-ish, the outer side shows blue.
+    let tilted = render(&one(json!({"id": "r", "kind": "mesh", "mesh": {"type": "torus", "radius": 80, "tube": 20}, "segments": 2,
+        "material": {"preset": "flat", "color": "#0000ff"}, "parts": {"front": {"colors": ["#ff0000", "#00ff00"]}},
+        "transform": {"position": [160, 120], "rotation_x": 75}})), 0.0);
+    assert!(tilted.pixels().filter(|p| p.0 == [0, 0, 255, 255]).count() > 300);
+}

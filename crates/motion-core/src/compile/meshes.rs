@@ -17,6 +17,8 @@ pub struct MeshState {
     /// Per-segment colours; a part whose own material sets a colour keeps it.
     pub colors: Vec<Color>,
     pub own_color: [bool; PARTS],
+    /// Per-segment colours of each part (over `colors` and `own_color`).
+    pub part_colors: [Vec<Color>; PARTS],
     /// The scene's lights (set for every mesh of a frame).
     pub lighting: Option<Arc<Lighting>>,
 }
@@ -195,6 +197,8 @@ pub(super) struct CMesh {
     materials: Vec<CMaterial>,
     own_color: [bool; PARTS],
     colors: Vec<Prop<Color>>,
+    part_colors: Vec<Vec<Prop<Color>>>,
+    spans: Vec<f64>,
     segments: u32,
     gap: Prop<f64>,
     detail: f64,
@@ -222,6 +226,7 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         clearcoat_roughness: o.clearcoat_roughness.clone().or_else(|| base.clearcoat_roughness.clone()),
         emissive: o.emissive.clone().or_else(|| base.emissive.clone()),
         emissive_strength: o.emissive_strength.clone().or_else(|| base.emissive_strength.clone()),
+        colors: if o.colors.is_empty() { base.colors.clone() } else { o.colors.clone() },
         opacity: o.opacity.clone().or_else(|| base.opacity.clone()),
         transmission: o.transmission.clone().or_else(|| base.transmission.clone()),
         ior: o.ior.clone().or_else(|| base.ior.clone()),
@@ -321,6 +326,12 @@ impl Compiler<'_> {
             },
         };
         let parts = m.parts.list();
+        let part_colors = (0..PARTS)
+            .map(|i| {
+                let merged = merge(&m.material, parts[i]);
+                merged.colors.iter().enumerate().map(|(k, c)| self.prop(c, id, &format!("{}.colors.{k}", if parts[i].is_some() { format!("parts.{}", crate::mesh::PART_NAMES[i]) } else { "material".into() }), start, step, shift)).collect()
+            })
+            .collect();
         let materials = (0..PARTS)
             .map(|i| {
                 let merged = merge(&m.material, parts[i]);
@@ -341,6 +352,8 @@ impl Compiler<'_> {
             materials,
             own_color,
             colors,
+            part_colors,
+            spans: m.spans.iter().map(|s| s.max(0.0)).collect(),
             segments: m.segments.clamp(1, 360),
             gap: self.prop(&m.gap, id, "gap", start, step, shift),
             detail: m.detail,
@@ -514,7 +527,7 @@ impl CMesh {
                 MeshShape::Sweep { path: path(p), radius: radius.at(t), width: width.at(t), profile: *profile, trim: [tr.x(), tr.y()], caps: *caps, head: head.at(t) }
             }
         };
-        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail };
+        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone() };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         match &*last {
             Some(p) if **p == params => p.clone(),
@@ -534,6 +547,7 @@ impl CMesh {
             materials: std::array::from_fn(|i| self.materials[i].at(t)),
             colors: self.colors.iter().map(|c| clamp_color(c.at(t))).collect(),
             own_color: self.own_color,
+            part_colors: std::array::from_fn(|i| self.part_colors[i].iter().map(|c| clamp_color(c.at(t))).collect()),
             lighting: None,
         }
     }

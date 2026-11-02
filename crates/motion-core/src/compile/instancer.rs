@@ -473,6 +473,7 @@ fn tint(state: &mut LayerState, c: Color, a: f64) {
         Content::Mesh(m) => {
             m.materials.iter_mut().for_each(|mat| mix(&mut mat.color));
             m.colors.iter_mut().for_each(|x| mix(x));
+            m.part_colors.iter_mut().flatten().for_each(|x| mix(x));
         }
         _ => {}
     }
