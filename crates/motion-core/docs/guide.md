@@ -61,8 +61,9 @@ shot 2 (3.82–5.10 s, sync: hit:2 lands, bar:3 out)
     one soft specular streak per segment, contact shadow below
   motion: segments fly in from 4 directions ("snap"), meet on hit:2
     (anchor: land), ring turns 20° on its y axis with a drift; out on bar:3
-  build: Blender (blender_run, bevelled torus, 4 materials, keys from
-    LAHZA markers), placed as a video layer; title as engine text above
+  build: engine 3D mesh: torus, segments 4, gap 6, colors ×4, material
+    preset coated; one layer per segment (angles keyed) so each can fly
+    in; default key + rim lights, studio environment
 - title: text, "LAHZA", 1 line, heavy weight
   material: flat white; lighting: none (edge light from the ring's key side)
   motion: per-glyph enter, 1 f stagger, starting at hit:2 + 2f
@@ -149,11 +150,58 @@ camera), never the geometry itself (see
   keys. Prefer this over per-frame keys: one eased key stays editable and
   snaps to beats.
 
-## Footage and 3D
+## 3D objects (meshes)
+
+Anything that reads as a solid object (rings, tori, discs, coins, petals,
+cubes, pills, tubes that grow, extruded logos and letters) is a `mesh`
+layer: real geometry, lit and shaded in the engine, live in the preview.
+Never fake one with flat shapes, gradients or a traced outline; a flat
+shape has no shading and `compare` will report it flatter than the
+reference.
+
+- **Geometry**: `sphere`, `box` (bevel rounds the edges), `cylinder`
+  (`top` makes cones), `capsule`, `torus` (`angles` makes an arc, `caps`
+  flat or round), `extrude` (any outline, holes kept, `bevel`), `revolve`
+  (lathe a profile about y or z), `sweep` (a tube along a path, `trim`
+  grows it, `head` puts a ball on the front).
+- **Structure**: `segments` + `gap` split a ring, revolve or sweep into
+  pieces; `colors` colours them in turn. Measure the count from the
+  reference (count the pieces, don't guess).
+- **Placement**: the usual transform; `rotation_x`/`rotation_y` tilt and
+  turn it, `z` moves it in depth, `scale` scales it (depth follows x unless
+  `scale_z`). Parent several meshes to a null to move them as one object.
+  Mesh layers next to each other in the list share a depth buffer, so
+  interlocking rings and objects passing through each other are right.
+- **Material**: start from a `preset`: `glossy` (default) for plastic
+  toys and UI objects, `coated` for lacquered/car-paint looks with crisp
+  reflections, `metal`/`chrome`, `glass`, `matte`, `emissive` (glows
+  without light), `flat` (unlit flat colour for flat-shaded idents). Then
+  set `color`, `roughness`, `clearcoat`. `parts` gives the front, back,
+  side, bevel or caps their own material (a coin with a gold rim).
+- **Lighting**: the scene's `lights` (default: a key from the upper left
+  in front and a rim from behind on the right) and `environment` (what
+  glossy surfaces reflect: `studio`, `soft`, `sunset`, `night`, `none`).
+  Match the reference: where the highlights sit gives the key direction,
+  a bright outline on the far side means a rim light, dark glossy objects
+  with thin streaks mean the `night` environment.
+- **Camera**: the scene camera's `fov`, `orbit`, `dolly`, depth of field
+  (`aperture`, `focus`) and motion blur all apply.
+- Blender (`blender_run`) is for what meshes can't do: fluids, cloth,
+  sculpted or imported models, true refraction and soft shadows.
+
+```json
+{"id": "ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 220, "tube": 46},
+ "segments": 4, "gap": 6, "colors": ["#ff3d7f", "#ffd23f", "#2d5bff", "#00d4a6"],
+ "material": {"preset": "coated"},
+ "transform": {"position": [960, 540], "rotation_x": 60,
+               "rotation": {"keys": [{"at": 0, "v": 0}, {"at": 4, "v": 90}]}}}
+```
+
+## Footage and Blender
 
 - Footage: `media_import` a clip or image sequence, then add a
   `{"kind": "video", "src": …}` layer (trim, speed, loop, time_remap).
-- 3D: write a Blender `bpy` script and run it with `blender_run`. It renders
+- Blender (fluids, complex models): write a `bpy` script and run it with `blender_run`. It renders
   a transparent PNG sequence into `assets/blender/<name>/` that you place as
   a video layer, so 3D objects composite with type, shapes and effects.
   Match `frames` to the scene's span; use `fps` of the project.

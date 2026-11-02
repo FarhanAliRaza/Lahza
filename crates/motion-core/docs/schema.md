@@ -55,7 +55,7 @@ Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 
 Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
 `star`, `line`, `path` with SVG `d`, `field`), `text`, `image`, `video`, `comp`,
-`instancer`.
+`instancer`, `mesh` (lit 3D objects, see [mesh](#mesh)).
 
 ```json
 {"id": "route", "kind": "shape", "shape": "path", "d": "M -300 0 C -100 -200 100 200 300 0",
@@ -244,6 +244,70 @@ per text layer.
  "transform": {"scale": {"keys": [{"at": "beat:5", "from": 0, "v": 1, "ease": "pop", "anchor": "start"}],
                          "add": [{"type": "drift", "rate": 0.01, "per": "frame", "mode": "mul"}]}}}
 ```
+
+### mesh
+
+A lit 3D object rendered by the engine (no Blender). Always 3D: it sorts by
+depth with other 3D layers, and mesh layers next to each other share one
+depth buffer, so they intersect correctly. Space is the layer's: x right,
+y down, z away from the viewer, centred on the layer origin.
+
+| field | meaning |
+|---|---|
+| `mesh` | geometry, by `type` (below) |
+| `material` | surface (below); default preset `glossy`, white |
+| `parts` | `front`, `back`, `side`, `bevel`, `caps`: a material over `material` for that part |
+| `segments` | split rings, revolves and sweeps into this many pieces (default 1) |
+| `gap` | between pieces: degrees (sweeps: a fraction of the length); animatable |
+| `colors` | one colour per piece, in turn (animatable); parts with their own colour keep it |
+| `detail` | tessellation multiplier (default 1: smooth at the drawn size) |
+
+Geometry (numbers animatable unless noted):
+
+| `type` | fields |
+|---|---|
+| `sphere` | `radius` (100) |
+| `box` | `size` [w, h] ([100, 100]), `depth` (100), `bevel` (edge radius) |
+| `cylinder` | `radius` (50), `top` (top radius: cones), `height` along y (100), `bevel` |
+| `capsule` | `radius` (50), `height` end to end along y (200) |
+| `torus` | `radius` to the tube centre (100), `tube` (20), `angles` [from, to] degrees, 0 = up, clockwise ([0, 360]), `caps`: `flat` \| `round` (not animatable) |
+| `extrude` | `d` closed outline (SVG path, `{"shape": …}` primitive or morph keys; holes kept), `depth` (40), `bevel` |
+| `revolve` | `profile` path in (x = distance from the axis, y = along it), `angles`, `axis`: `y` (standing, default) \| `z` (facing the camera) |
+| `sweep` | `d` path in the layer plane, `radius` (10), `profile`: `circle` \| `square` \| `ribbon`, `width` (ribbon, 40), `trim` [from, to] (0..1), `caps`: `round` (default) \| `flat`, `head` (radius of a leading ball) |
+
+A torus faces the camera like a `ring` shape; tilt it with `rotation_x`.
+`transform.scale_z` scales depth (meshes default to `scale`'s x).
+
+Material: `preset` (`matte`, `plastic`, `glossy`, `coated`, `metal`,
+`chrome`, `glass`, `emissive`, `flat`) then any of `color`, `metallic`
+(0..1), `roughness` (0 mirror … 1 diffuse), `clearcoat` (0..1),
+`clearcoat_roughness`, `emissive` (colour), `emissive_strength`, `opacity`,
+`transmission` (0..1, glass), `unlit` (bool), `faceted` (bool: one normal
+per triangle). Colours and numbers are animatable.
+
+```json
+{"id": "coin", "kind": "mesh", "mesh": {"type": "extrude", "d": {"shape": "circle", "size": 300}, "depth": 30, "bevel": 6},
+ "material": {"preset": "metal", "color": "#ffc030"}, "parts": {"side": {"color": "#b07a10", "roughness": 0.5}},
+ "transform": {"position": [960, 540], "rotation_y": {"keys": [{"at": 0, "v": 0}, {"at": 2, "v": 360, "ease": "glide"}]}}}
+```
+
+Scenes light meshes with `lights` and `environment`:
+
+```json
+"lights": [{"type": "directional", "from": [-1, -1, -1], "intensity": 1.1},
+           {"type": "directional", "from": [1, -0.4, 1], "color": "#a0c8ff", "intensity": 0.7},
+           {"type": "point", "position": [960, 300, -400], "intensity": 0.5},
+           {"type": "ambient", "intensity": 0.05}],
+"environment": {"preset": "studio", "intensity": 1, "rotation": 0}
+```
+
+`from` points toward a directional light (y down, z away: `[-1, -1, -1]`
+is upper left, in front); `position` places a point light in world px.
+Colours and intensities are animatable. Without `lights` a scene has a key
+from the upper left front and a rim from behind on the right. The
+environment (`studio` default, `soft`, `sunset`, `night`, `none`; `sky`,
+`horizon`, `ground` override its colours) is what glossy surfaces reflect
+and gives soft ambient light.
 
 ## Properties
 

@@ -1696,11 +1696,15 @@ except Exception:
 scene.cycles.use_denoising = not preview
 if not preview:
     # Some builds (e.g. Ubuntu's) ship without OpenImageDenoise.
+    # The flag isn't reliable either, so try the denoisers in turn.
     oidn = getattr(bpy.app.build_options, "openimagedenoise", True)
-    if oidn:
-        scene.cycles.denoiser = "OPENIMAGEDENOISE"
-    elif device == "OPTIX":
-        scene.cycles.denoiser = "OPTIX"
+    choices = (["OPENIMAGEDENOISE"] if oidn else []) + (["OPTIX"] if device == "OPTIX" else [])
+    for choice in choices:
+        try:
+            scene.cycles.denoiser = choice
+            break
+        except (TypeError, ValueError):
+            pass
     else:
         scene.cycles.use_denoising = False
 

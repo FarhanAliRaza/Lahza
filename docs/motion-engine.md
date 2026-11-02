@@ -151,6 +151,10 @@ Click a layer in the preview or the timeline and drag it to move it. Drag a valu
 
 Every edit goes through the same tools the MCP server uses, so a person and an agent share one history and undo stack. Edits an agent makes over MCP appear live.
 
+## 3D objects in the engine
+
+`mesh` layers are real lit 3D objects rendered by the engine itself, live in the preview and identical on GPU and CPU: spheres, rounded boxes, cylinders and cones, capsules, tori and torus arcs split into coloured segments, outlines extruded with bevels (logos, letters, coins), profiles revolved about an axis, and tubes swept along paths that grow with `trim`. Materials are physically based (presets glossy, coated, metal, chrome, glass, emissive, matte, flat; roughness, clear coat, per-part materials) under the scene's lights and a procedural studio environment. Meshes next to each other share a depth buffer, so they intersect correctly; they sort by depth with 2.5D planes and take effects, mattes, depth of field and motion blur like any layer. The display list bins each batch's triangles into the renderer's 16×16 tiles; each pixel finds the nearest triangle at 8 samples (watertight edges) and shades each winner once.
+
 ## 3D with Blender
 
 `blender_run` runs Blender headless. It takes an agent-written `bpy` script and/or a `.blend` file, and renders a transparent PNG sequence into `assets/blender/<name>/`. A `video` layer then places it, so 3D assets composite with type, shapes, effects, mattes and 2.5D layers in one timeline. Blender handles real 3D (geometry, lights, materials); Lahza handles motion, timing and composition. Cycles works without a display. EEVEE is much faster with a GPU and a display.
@@ -171,7 +175,7 @@ Every edit goes through the same tools the MCP server uses, so a person and an a
 | **Effects** | ✔ blur, shadow, glow, exposure, brightness/contrast, levels, hue/saturation, tint, gradient map, invert, fill, `.cube` LUT, displacement, directional blur, RGB split, vignette, grain |
 | Transitions | ✔ fade, push, slide, zoom, wipe and whip |
 | Motion blur | ✔ shutter angle per scene |
-| **3D** | ✔ 2.5D layers (z, x/y rotation, perspective camera with orbit and dolly, depth sort); real 3D comes from Blender |
+| **3D** | ✔ lit 3D meshes in the engine (primitives, extrude, revolve, sweep; PBR materials, lights, environment, depth buffer) plus 2.5D layers (z, x/y rotation, perspective camera with orbit and dolly, depth sort); Blender for fluids and complex models |
 | **Timeline UI** | ✔ editor window (see above) |
 | Masks on a layer | ◐ through track mattes; no per-layer mask paths with feather |
 | Expressions, scripting | ✘ (planned: `code_put` for expressions, shaders, WASM) |
@@ -190,7 +194,8 @@ Against Chrome-based editors (Remotion, Hyperframes and other React or canvas to
 - **Editor:** it doesn't yet edit text or effects in the inspector; agents and JSON do that. There are no graph editor, multi-select or copy/paste yet.
 - **Shadow and glow on a matted layer:** they use the unmatted picture.
 - **Trim on a filled path:** it trims only the stroke.
-- **2.5D:** intersecting 3D planes are not split, because layers sort by their origin.
+- **2.5D:** intersecting 3D planes are not split, because layers sort by their origin. Meshes intersect each other correctly, but sort against planes by origin.
+- **Meshes:** no cast shadows or true refraction (glass reflects and lets the background through); a mesh with effects is drawn on its own (no shared depth buffer with its neighbours).
 - **Motion pieces:** an over-the-video piece takes the recording's shape; the
   editor's guide shows the raw recording from the piece's start, so cuts
   inside a piece's range are not reflected there. Speed-changed footage and
