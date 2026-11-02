@@ -686,8 +686,9 @@ pub const SHADING_MEANINGFUL: f64 = 1.0;
 /// Ours ÷ reference below this is "flatter than the reference".
 pub const SHADING_FLAT_RATIO: f64 = 0.5;
 /// Fewer interior pixels than this share of the frame: nothing to measure
-/// (line art, thin type).
-pub const SHADING_MIN_INTERIOR: f64 = 0.02;
+/// (line art, thin type). Low enough that thin glossy tubes and rings
+/// still count at the full run's 270 px.
+pub const SHADING_MIN_INTERIOR: f64 = 0.005;
 
 /// How much shading lives *inside* shapes: the mean low-to-mid-frequency
 /// luminance slope (levels per 1% of the frame width) over interior pixels,
@@ -696,9 +697,9 @@ pub const SHADING_MIN_INTERIOR: f64 = 0.02;
 /// fills, posterised polygons and line art read about 0. `None` when the
 /// frame has almost no interior to measure.
 ///
-/// Edges: Sobel above [`SHADING_EDGE`], dilated by the reach of the slope
-/// (2b + 1 px, b = width / 135, at least 1) so a shape's own outline never
-/// leaks in. Background: pixels within 24 levels (per channel) of the most
+/// Edges: Sobel above [`SHADING_EDGE`], dilated by b + 1 px (b = width /
+/// 135, at least 1) so a shape's own outline barely leaks in while thin
+/// lit objects (tubes, rings with highlight streaks) keep an interior. Background: pixels within 24 levels (per channel) of the most
 /// common colour. Slope: central difference over ±b px of the luminance
 /// box-blurred by b px; slopes under [`SHADING_FLOOR`] count as 0.
 pub fn shading(img: &image::RgbaImage) -> Option<f64> {
@@ -708,7 +709,7 @@ pub fn shading(img: &image::RgbaImage) -> Option<f64> {
         return None;
     }
     let b = ((w as f64 / 135.0).round() as usize).max(1);
-    let reach = 2 * b + 1;
+    let reach = b + 1;
     let (e, _, _) = edges(img);
     // Edge mask dilated by `reach` (separable max via running counts).
     let edge: Vec<bool> = e.iter().map(|&v| v > SHADING_EDGE).collect();

@@ -94,7 +94,8 @@ Each frame and scene also reports `shading_ours`, `shading_reference` and
 `shading_ratio` (ours ÷ reference): how much light lives *inside* shapes.
 It is the mean luminance slope, in levels per 1% of the frame width, over
 interior pixels: pixels away from drawn edges (Sobel above 60, a step of
-15+ levels, widened by the slope's reach) and not the background (the
+15+ levels, widened by about 1% of the width; thin lit tubes and rings
+still have an interior) and not the background (the
 most common colour ± 24); slopes under 0.5 count as flat. A lit 3D object
 reads several units; flat fills, posterised polygons and line art read
 about 0; gradient fills, glows and soft backgrounds count as shading too.

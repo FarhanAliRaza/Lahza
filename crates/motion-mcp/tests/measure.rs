@@ -167,9 +167,10 @@ fn shading_flags_a_flat_disc_against_a_lit_one() {
         let ours = discs(w, ONE, &flat);
         let reference = discs(w, ONE, &lit(KEY));
         let (o, r, v) = verdict(&ours, &reference);
-        assert!(r.unwrap() > 2.0 && o.unwrap() < 0.1, "w {w}: ours {o:?}, reference {r:?}");
+        assert!(r.unwrap() > 2.0 && o.unwrap() < 0.05 * r.unwrap(), "w {w}: ours {o:?}, reference {r:?}");
         let v = v.unwrap_or_else(|| panic!("w {w}: not flagged ({o:?} vs {r:?})"));
-        assert!(v.starts_with("ours is flatter than the reference (shading 0%"), "{v}");
+        let pct: f64 = v.trim_start_matches("ours is flatter than the reference (shading ").split('%').next().unwrap().parse().unwrap();
+        assert!(pct < 5.0, "{v}");
         // Light from the top left falling off to the bottom right.
         let ramp = discs(w, ONE, &|_, x, y| BASE.map(|c| c * (0.95 - 0.3 * (x + y))));
         assert!(verdict(&ours, &ramp).2.is_some(), "w {w}: directional shading not flagged: {:?}", verdict(&ours, &ramp));

@@ -470,6 +470,10 @@ fn tint(state: &mut LayerState, c: Color, a: f64) {
         }
         Content::Text(t) => mix(&mut t.color),
         Content::Group(children) => children.iter_mut().for_each(|s| tint(s, c, a)),
+        Content::Mesh(m) => {
+            m.materials.iter_mut().for_each(|mat| mix(&mut mat.color));
+            m.colors.iter_mut().for_each(|x| mix(x));
+        }
         _ => {}
     }
 }
@@ -745,6 +749,17 @@ mod tests {
         let mut other = l;
         other["random"]["seed"] = json!(6);
         assert_ne!(Compiled::new(&project(json!([other]))).frame(0.0), f);
+    }
+
+    #[test]
+    fn palettes_colour_mesh_copies() {
+        let c = compiled(json!([{"id": "n", "kind": "instancer", "layout": {"type": "line", "count": 2}, "palette": ["#ff0000", "#0000ff"],
+            "layers": [{"id": "m", "kind": "mesh", "mesh": {"type": "sphere", "radius": 10}}]}]));
+        let colours: Vec<crate::value::Color> = c.frame(0.5).layers.iter().filter_map(|l| match &l.content {
+            Content::Mesh(m) => Some(m.materials[crate::mesh::PART_SIDE as usize].color),
+            _ => None,
+        }).collect();
+        assert_eq!(colours, vec![crate::value::Color::parse("#ff0000").unwrap(), crate::value::Color::parse("#0000ff").unwrap()]);
     }
 
     #[test]
