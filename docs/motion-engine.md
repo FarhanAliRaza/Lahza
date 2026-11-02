@@ -101,7 +101,11 @@ riser, ding, sparkle and glitch (`lahza://catalog` lists what each is for).
   places an effect at the playhead (on a selected layer's start it anchors
   to that layer). Drag a sound to retime it: it snaps to a layer's start or
   end and then follows that layer, or to a key; Shift snaps to beats.
-  Selecting one shows its time, gain (±3 dB) and Delete.
+  Drag a bar's ends to trim it and the dots on its top corners to fade it
+  in and out (the envelope is drawn over the waveform); trimming the start
+  of an anchored sound keeps the anchor (`#card.start + 0.120`). Selecting
+  one shows its time, what plays of the file, gain (±3 dB), fade in and out
+  (50 ms steps), Reset trim and fades, and Delete.
 - **Video timeline:** **+ Media → Sound effect…** adds one at the playhead
   on the Music / SFX lane, where it can be moved, trimmed and faded like any
   audio clip.

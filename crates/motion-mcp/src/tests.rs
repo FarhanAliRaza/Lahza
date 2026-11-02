@@ -155,6 +155,8 @@ fn sound_effects_follow_their_animation_into_the_render() {
     assert_eq!(out["created"], json!(["pop1", "pop2"]));
     assert_eq!(out["path"], "assets/sfx/pop.wav");
     assert!(dir.join("p.lahza/assets/sfx/pop.wav").is_file());
+    let report = tb.call("check", json!({})).unwrap().json;
+    assert!(!report.to_string().contains("has no asset entry"), "built-in sounds are registered assets: {report:#}");
     // Moving the animation moves its sound; the sound can be retimed by id.
     tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "card.time.start", "value": 1.2}, {"op": "remove", "id": "pop2"}]})).unwrap();
     let info = tb.call("project_info", json!({})).unwrap().json;
@@ -204,5 +206,32 @@ fn sounds_on_a_recordings_own_timeline() {
     assert!((clip["volume"].as_f64().unwrap() - 0.501).abs() < 0.01);
     assert!(rec.join("media/sfx-click.wav").is_file());
     assert_eq!(draft["clips"].as_array().unwrap().len(), 2, "other keys survive");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sound_trim_and_fades_shape_the_render() {
+    let (mut tb, dir) = toolbox("fades");
+    tb.call("project_create", json!({"path": "p", "duration": 3, "width": 320, "height": 180})).unwrap();
+    assert!(std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-y"])
+        .arg(dir.join("p.lahza/assets/tone.wav"))
+        .status().unwrap().success());
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add_sound", "id": "tone", "path": "assets/tone.wav", "at": 0.5, "trim": 1.0, "length": 2.0, "fade_in": 0.5, "fade_out": 0.5}
+    ]})).unwrap();
+    let mp4 = dir.join("out.mp4");
+    tb.call("render", json!({"output": mp4, "quality": "draft", "wait": true})).unwrap();
+    let pcm = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&mp4)
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "f32le", "-"]).output().unwrap().stdout;
+    let s: Vec<f32> = pcm.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let level = |a: f64, b: f64| s[((a * 8000.0) as usize).min(s.len())..((b * 8000.0) as usize).min(s.len())].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let full = level(1.3, 1.7);
+    assert!(full > 0.1, "full level mid-clip (the sine source is 1/8): {full}");
+    assert!(level(0.0, 0.45) < 0.01, "silent before it starts");
+    assert!(level(0.5, 0.6) < full * 0.35, "fading in: {}", level(0.5, 0.6));
+    assert!(level(2.4, 2.5) < full * 0.35, "fading out: {}", level(2.4, 2.5));
+    assert!(level(2.55, 3.0) < 0.01, "cut after its length: {}", level(2.55, 3.0));
     std::fs::remove_dir_all(&dir).ok();
 }

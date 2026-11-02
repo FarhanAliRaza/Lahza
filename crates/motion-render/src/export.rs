@@ -151,7 +151,22 @@ fn audio_inputs(project: &Project, compiled: &Compiled, dir: &Path, start: f64) 
         args.extend(["-i".into(), path.to_string_lossy().into_owned()]);
         let delay = (at.max(0.0) * 1000.0).round() as u64;
         let name = format!("{label}{index}");
-        parts.push(format!("[{index}:a]aresample=48000,adelay={delay}:all=1,volume={:.3}dB[{name}]", clip.gain_db));
+        // Fades, in the clip's own time (before the delay): what plays is
+        // its length, or the rest of the file after the trim.
+        let skipped = (-at).max(0.0);
+        let mut fades = String::new();
+        if clip.fade_in > skipped {
+            fades.push_str(&format!("afade=t=in:st=0:d={:.6},", clip.fade_in - skipped));
+        }
+        if clip.fade_out > 0.0 {
+            let total = clip.length.or_else(|| crate::footage::probe_sound(&path).ok().map(|(d, _)| d - clip.trim));
+            if let Some(total) = total {
+                let played = (total - skipped).max(0.0);
+                let fade = clip.fade_out.min(played);
+                fades.push_str(&format!("afade=t=out:st={:.6}:d={:.6},", (played - fade).max(0.0), fade.max(0.001)));
+            }
+        }
+        parts.push(format!("[{index}:a]aresample=48000,{fades}adelay={delay}:all=1,volume={:.3}dB[{name}]", clip.gain_db));
         index += 1;
         Some(name)
     };

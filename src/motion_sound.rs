@@ -32,7 +32,7 @@ pub(crate) struct Placed {
 pub(crate) fn placed(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<Placed> {
     let end = project.settings.duration;
     let mut out = Vec::new();
-    let mut push = |id: Option<String>, path: PathBuf, at: f64, trim: f64, gain_db: f64, length: Option<f64>, name: &str| {
+    let mut push = |id: Option<String>, path: PathBuf, at: f64, trim: f64, gain_db: f64, length: Option<f64>, fades: (f64, f64), name: &str| {
         let Ok((source_duration, has_audio)) = lahza_motion_render::footage::probe_sound(&path) else { return };
         if !has_audio {
             return;
@@ -55,8 +55,9 @@ pub(crate) fn placed(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<
             source_start,
             duration,
             volume: 10f64.powf(gain_db / 20.0).min(2.0),
-            fade_in: 0.0,
-            fade_out: 0.0,
+            // A clip that starts before zero has used up part of its fade in.
+            fade_in: (fades.0 - (start - at)).clamp(0.0, duration),
+            fade_out: fades.1.clamp(0.0, duration),
             source_duration,
         };
         out.push(Placed { id, path, clip });
@@ -67,11 +68,11 @@ pub(crate) fn placed(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<
         let at = compiled.resolve(&project.markers, &clip.at).unwrap_or(0.0);
         let file = clip.path.rsplit('/').next().unwrap_or(&clip.path).to_string();
         let name = clip.name.clone().unwrap_or_else(|| if id.is_empty() { file } else { id.clone() });
-        push((!id.is_empty()).then_some(id), dir.join(&clip.path), at, clip.trim, clip.gain_db, clip.length, &name);
+        push((!id.is_empty()).then_some(id), dir.join(&clip.path), at, clip.trim, clip.gain_db, clip.length, (clip.fade_in, clip.fade_out), &name);
     }
     for footage in compiled.footage_audio() {
         if (footage.speed - 1.0).abs() < 1e-3 {
-            push(None, dir.join(&*footage.src), footage.start, footage.trim, footage.gain_db, Some(footage.end - footage.start), &footage.src);
+            push(None, dir.join(&*footage.src), footage.start, footage.trim, footage.gain_db, Some(footage.end - footage.start), (0.0, 0.0), &footage.src);
         }
     }
     out
@@ -127,23 +128,49 @@ impl Drop for Player {
     }
 }
 
-/// Peak levels of one sound, placed on the timeline.
+/// One sound on the timeline, with the peaks of its whole file so a trim
+/// can be widened again while dragging.
 #[derive(Clone, Debug)]
 pub(crate) struct Wave {
     pub id: Option<String>,
     pub name: String,
+    /// Timeline start, file offset and seconds played.
     pub start: f64,
+    pub source_start: f64,
     pub duration: f64,
-    /// 0..1 peaks, `BUCKETS_PER_SECOND` per second.
-    pub peaks: Vec<f32>,
+    pub source_duration: f64,
+    pub fade_in: f64,
+    pub fade_out: f64,
+    /// Display gain: the clip's volume over the project's loudest moment.
+    pub gain: f32,
+    /// Whole-file peaks, `BUCKETS_PER_SECOND` per second.
+    pub file: Arc<Vec<f32>>,
 }
 
 impl Wave {
-    /// The loudest peak between `t0` and `t1` (timeline seconds).
+    /// Fade envelope (0..1) at timeline time `t`.
+    pub(crate) fn envelope(&self, t: f64) -> f32 {
+        let local = t - self.start;
+        if local < 0.0 || local > self.duration {
+            return 0.0;
+        }
+        let fin = if self.fade_in > 0.0 { (local / self.fade_in).min(1.0) } else { 1.0 };
+        let fout = if self.fade_out > 0.0 { ((self.duration - local) / self.fade_out).min(1.0) } else { 1.0 };
+        (fin * fout) as f32
+    }
+
+    /// The loudest displayed peak between `t0` and `t1` (timeline seconds),
+    /// with gain and fades applied.
     pub(crate) fn peak(&self, t0: f64, t1: f64) -> f32 {
-        let a = ((t0 - self.start) * BUCKETS_PER_SECOND).floor().max(0.0) as usize;
-        let b = (((t1 - self.start) * BUCKETS_PER_SECOND).ceil().max(0.0) as usize).min(self.peaks.len());
-        self.peaks.get(a..b).map(|s| s.iter().copied().fold(0.0, f32::max)).unwrap_or(0.0)
+        let (t0, t1) = (t0.max(self.start), t1.min(self.start + self.duration));
+        if t1 <= t0 {
+            return 0.0;
+        }
+        let to_bucket = |t: f64| (self.source_start + t - self.start) * BUCKETS_PER_SECOND;
+        let a = to_bucket(t0).floor().max(0.0) as usize;
+        let b = (to_bucket(t1).ceil().max(0.0) as usize).min(self.file.len());
+        let raw = self.file.get(a..b).map(|s| s.iter().copied().fold(0.0, f32::max)).unwrap_or(0.0);
+        raw * self.gain * self.envelope((t0 + t1) / 2.0)
     }
 }
 
@@ -177,18 +204,32 @@ pub(crate) fn waves(project: &Project, compiled: &Compiled, dir: &Path, cache: &
     let mut waves = Vec::new();
     for p in placed(project, compiled, dir) {
         let Some(file) = file_peaks(cache, &p.path) else { continue };
-        let first = (p.clip.source_start * BUCKETS_PER_SECOND).round() as usize;
-        let count = (p.clip.duration * BUCKETS_PER_SECOND).round() as usize;
-        let gain = p.clip.volume as f32;
-        let peaks = (first..first + count).map(|i| file.get(i).copied().unwrap_or(0.0) * gain).collect();
-        waves.push(Wave { id: p.id, name: p.clip.name, start: p.clip.start, duration: p.clip.duration, peaks });
+        let c = &p.clip;
+        waves.push(Wave {
+            id: p.id,
+            name: c.name.clone(),
+            start: c.start,
+            source_start: c.source_start,
+            duration: c.duration,
+            source_duration: c.source_duration,
+            fade_in: c.fade_in,
+            fade_out: c.fade_out,
+            gain: c.volume as f32,
+            file,
+        });
     }
-    let loudest = waves.iter().flat_map(|w| w.peaks.iter().copied()).fold(0.0f32, f32::max);
+    // Normalise: the loudest played moment of the project reaches 1.
+    let loudest = waves
+        .iter()
+        .map(|w| {
+            let a = (w.source_start * BUCKETS_PER_SECOND) as usize;
+            let b = (((w.source_start + w.duration) * BUCKETS_PER_SECOND).ceil() as usize).min(w.file.len());
+            w.file.get(a..b).map(|s| s.iter().copied().fold(0.0, f32::max)).unwrap_or(0.0) * w.gain
+        })
+        .fold(0.0f32, f32::max);
     if loudest > 0.0 {
         for w in &mut waves {
-            for p in &mut w.peaks {
-                *p /= loudest;
-            }
+            w.gain /= loudest;
         }
     }
     waves
@@ -252,7 +293,7 @@ mod tests {
         assert_eq!(waves.len(), 1);
         assert!(waves[0].peak(0.0, 0.4) == 0.0, "silent before the music starts");
         assert!(waves[0].peak(1.0, 1.2) > 0.9, "full level mid-tone");
-        assert_eq!(waves[0].peaks.len(), 150);
+        assert!((waves[0].duration - 1.5).abs() < 0.01);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

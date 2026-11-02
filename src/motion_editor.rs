@@ -126,11 +126,104 @@ impl Drop for Worker {
 #[derive(Clone)]
 enum Drag {
     Scrub,
-    /// Retiming a sound: the time under the pointer at press, and its start.
-    Sound { id: String, grab: f64, from: f64 },
+    /// Editing a sound: what is dragged, the time under the pointer at
+    /// press, and the sound as it was.
+    Sound { id: String, part: SoundPart, grab: f64, orig: SoundShape },
     Key { layer: String, path: String, index: usize, from: f64 },
     Move { layer: String, start: (f32, f32), origin: Vec2 },
     Value { layer: String, field: Field, start_x: f32, origin: f64 },
+}
+
+/// The handle of a sound bar being dragged.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SoundPart {
+    Move,
+    /// Leading edge: trims the start of the file (the sound starts later).
+    Start,
+    /// Trailing edge: how long it plays.
+    End,
+    FadeIn,
+    FadeOut,
+}
+
+/// Where and how a sound plays, for drag previews.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct SoundShape {
+    start: f64,
+    trim: f64,
+    length: f64,
+    fade_in: f64,
+    fade_out: f64,
+    source_duration: f64,
+}
+
+const MIN_SOUND: f64 = 0.05;
+
+impl SoundShape {
+    fn of(w: &Wave) -> Self {
+        Self { start: w.start, trim: w.source_start, length: w.duration, fade_in: w.fade_in, fade_out: w.fade_out, source_duration: w.source_duration }
+    }
+
+    /// The shape after dragging `part` by `d` seconds.
+    fn dragged(self, part: SoundPart, d: f64) -> Self {
+        let mut s = self;
+        match part {
+            SoundPart::Move => s.start = (self.start + d).max(0.0),
+            SoundPart::Start => {
+                let d = d.max(-self.trim).max(-self.start).min(self.length - MIN_SOUND);
+                s.start += d;
+                s.trim += d;
+                s.length -= d;
+                s.fade_in = s.fade_in.min(s.length);
+                s.fade_out = s.fade_out.min(s.length - s.fade_in);
+            }
+            SoundPart::End => {
+                let longest = if self.source_duration > 0.0 { self.source_duration - self.trim } else { f64::INFINITY };
+                s.length = (self.length + d).clamp(MIN_SOUND.min(longest), longest);
+                s.fade_out = s.fade_out.min(s.length);
+                s.fade_in = s.fade_in.min(s.length - s.fade_out);
+            }
+            SoundPart::FadeIn => s.fade_in = (self.fade_in + d).clamp(0.0, self.length - self.fade_out),
+            SoundPart::FadeOut => s.fade_out = (self.fade_out - d).clamp(0.0, self.length - self.fade_in),
+        }
+        s
+    }
+
+    fn apply(self, w: &Wave) -> Wave {
+        Wave { start: self.start, source_start: self.trim, duration: self.length, fade_in: self.fade_in, fade_out: self.fade_out, ..w.clone() }
+    }
+}
+
+/// `at` moved by `d` seconds, keeping a reference (`#card.start + 0.12`).
+fn shift_time(at: &Value, d: f64, fps: f64) -> Value {
+    if let Some(n) = at.as_f64() {
+        return json!(round((n + d).max(0.0)));
+    }
+    let Some(text) = at.as_str() else { return json!(round(d.max(0.0))) };
+    let (base, mut offset) = split_offset(text, fps);
+    offset += d;
+    if offset.abs() < 5e-4 {
+        json!(base)
+    } else {
+        json!(format!("{base} {} {:.3}", if offset < 0.0 { "-" } else { "+" }, offset.abs()))
+    }
+}
+
+/// "#card.start + 4f" → ("#card.start", 4 frames in seconds).
+fn split_offset(text: &str, fps: f64) -> (String, f64) {
+    let at = text.rfind(" + ").or_else(|| text.rfind(" - "));
+    if let Some(i) = at {
+        let sign = if &text[i..i + 3] == " - " { -1.0 } else { 1.0 };
+        let tail = text[i + 3..].trim();
+        let value = match tail.strip_suffix('f') {
+            Some(frames) => frames.trim().parse::<f64>().ok().map(|f| f / fps),
+            None => tail.strip_suffix('s').unwrap_or(tail).trim().parse::<f64>().ok(),
+        };
+        if let Some(v) = value {
+            return (text[..i].trim().to_string(), sign * v);
+        }
+    }
+    (text.to_string(), 0.0)
 }
 
 /// A scrubbable inspector value: property path and vector component.
@@ -212,8 +305,8 @@ pub(crate) struct MotionEditor {
     peaks: PeakCache,
     /// The "+ Sound" menu is open.
     sound_menu: bool,
-    /// A sound being dragged: its id and start while dragging.
-    sound_preview: Option<(String, f64)>,
+    /// A sound being dragged: its id and shape while dragging.
+    sound_preview: Option<(String, SoundShape)>,
 }
 
 /// A reference picture under the design: never saved, never selectable.
@@ -764,9 +857,9 @@ impl MotionEditor {
                     self.seek(t);
                 }
             }
-            Drag::Sound { id, grab, from } => {
+            Drag::Sound { id, part, grab, orig } => {
                 if let Some(t) = self.time_at(x) {
-                    self.sound_preview = Some((id, (from + t - grab).max(0.0)));
+                    self.sound_preview = Some((id, orig.dragged(part, t - grab)));
                 }
             }
             Drag::Key { layer, path, index, .. } => {
@@ -806,13 +899,27 @@ impl MotionEditor {
         let Some(drag) = self.drag.take() else { return };
         match drag {
             Drag::Scrub => {}
-            Drag::Sound { id, grab, from } => {
+            Drag::Sound { id, part, grab, orig } => {
                 self.sound_preview = None;
                 if let Some(t) = self.time_at(x) {
-                    let start = (from + t - grab).max(0.0);
-                    if (start - from).abs() * self.zoom >= 2.0 || shift {
-                        let at = self.sound_anchor(start, shift);
-                        self.commit(vec![json!({"op": "set", "target": format!("{id}.at"), "value": at})]);
+                    let new = orig.dragged(part, t - grab);
+                    let moved = (t - grab).abs() * self.zoom >= 2.0;
+                    let set = |field: &str, value: Value| json!({"op": "set", "target": format!("{id}.{field}"), "value": value});
+                    let ops = match part {
+                        SoundPart::Move if moved || shift => vec![set("at", self.sound_anchor(new.start, shift))],
+                        SoundPart::Start if moved => {
+                            let at = self.sound_clip(&id).and_then(|c| serde_json::to_value(&c.at).ok()).unwrap_or(json!(0));
+                            let fps = self.project.settings.fps.as_f64();
+                            vec![set("at", shift_time(&at, new.start - orig.start, fps)), set("trim", json!(round(new.trim))), set("length", json!(round(new.length)))]
+                        }
+                        SoundPart::End if moved => vec![set("length", json!(round(new.length)))],
+                        SoundPart::FadeIn | SoundPart::FadeOut if moved => {
+                            vec![set("fade_in", json!(round(new.fade_in))), set("fade_out", json!(round(new.fade_out)))]
+                        }
+                        _ => Vec::new(),
+                    };
+                    if !ops.is_empty() {
+                        self.commit(ops);
                     }
                 }
             }
@@ -931,6 +1038,25 @@ impl MotionEditor {
                 .child(div().row_label().child(format!("Starts at {at}{}", wave.as_ref().map(|w| format!("  ({:.2} s, {:.2} s long)", w.start, w.duration)).unwrap_or_default())))
                 .child(div().text_size(px(12.0)).text_color(theme::muted()).child("Drag it on the timeline: it snaps to a layer's start or end and then follows that layer. Shift snaps to beats."))
                 .child(div().flex().items_center().gap_2().child(div().row_label().child(format!("Gain {gain:+.1} dB"))).child(step("−3 dB", -3.0, id.to_string())).child(step("+3 dB", 3.0, id.to_string())))
+                .children(wave.as_ref().map(|w| {
+                    div().text_size(px(12.0)).text_color(theme::muted()).child(format!(
+                        "Plays {:.2} s of the file's {:.2} s, from {:.2} s. Drag the bar's ends to trim; drag the dots on its top to fade.",
+                        w.duration, w.source_duration, w.source_start
+                    ))
+                }))
+                .child(self.sound_fade_row(id, "Fade in", "fade_in", clip.fade_in, wave.as_ref().map_or(0.0, |w| w.duration - w.fade_out), cx))
+                .child(self.sound_fade_row(id, "Fade out", "fade_out", clip.fade_out, wave.as_ref().map_or(0.0, |w| w.duration - w.fade_in), cx))
+                .when(clip.trim != 0.0 || clip.length.is_some() || clip.fade_in != 0.0 || clip.fade_out != 0.0, |d| {
+                    let id = id.to_string();
+                    d.child(button("sound-reset", "Reset trim and fades", ButtonKind::Secondary, ButtonSize::Sm).on_click(cx.listener(move |this, _, _, cx| {
+                        let set = |f: &str, v: Option<Value>| match v {
+                            Some(v) => json!({"op": "set", "target": format!("{id}.{f}"), "value": v}),
+                            None => json!({"op": "set", "target": format!("{id}.{f}")}),
+                        };
+                        this.commit(vec![set("trim", Some(json!(0.0))), set("length", None), set("fade_in", Some(json!(0.0))), set("fade_out", Some(json!(0.0)))]);
+                        cx.notify();
+                    })))
+                })
                 .child(
                     button("sound-delete", "Delete sound", ButtonKind::Danger, ButtonSize::Sm).icon("icons/trash.svg").on_click(cx.listener(move |this, _, _, cx| {
                         this.selected = None;
@@ -941,34 +1067,56 @@ impl MotionEditor {
         )
     }
 
+    /// "Fade in 0.10 s  [−] [+]": steps of 50 ms, up to `most` seconds.
+    fn sound_fade_row(&self, id: &str, label: &'static str, field: &'static str, value: f64, most: f64, cx: &mut Context<Self>) -> gpui::Div {
+        let stepper = |sign: f64| {
+            let id = id.to_string();
+            button(SharedString::from(format!("sound-{field}-{sign}")), if sign < 0.0 { "−" } else { "+" }, ButtonKind::Secondary, ButtonSize::Sm)
+                .disabled(if sign < 0.0 { value <= 0.0 } else { value >= most - 1e-6 })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let v = round((value + sign * 0.05).clamp(0.0, most.max(0.0)));
+                    this.commit(vec![json!({"op": "set", "target": format!("{id}.{field}"), "value": v})]);
+                    cx.notify();
+                }))
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().row_label().w(px(110.0)).child(format!("{label} {value:.2} s")))
+            .child(stepper(-1.0))
+            .child(stepper(1.0))
+    }
+
     /// One row per sound: its waveform in a bar where it plays.
     fn sound_rows(&self, width: f32, cx: &mut Context<Self>) -> Vec<gpui::Div> {
         let mut rows = Vec::new();
         for (i, wave) in self.waves.iter().enumerate() {
-            let start = match (&self.sound_preview, &wave.id) {
-                (Some((pid, s)), Some(id)) if pid == id => *s,
-                _ => wave.start,
+            let shape = match (&self.sound_preview, &wave.id) {
+                (Some((pid, shape)), Some(id)) if pid == id => *shape,
+                _ => SoundShape::of(wave),
             };
-            let (x0, x1) = (self.x_of(start), self.x_of(start + wave.duration));
+            let shown = shape.apply(wave);
+            let (x0, x1) = (self.x_of(shape.start), self.x_of(shape.start + shape.length));
             let selected = wave.id.is_some() && wave.id == self.selected;
             let anchor = wave.id.as_deref().and_then(|id| self.sound_clip(id)).and_then(|c| serde_json::to_value(&c.at).ok()).and_then(|v| v.as_str().map(str::to_string));
             let label = format!("♪ {}{}", wave.name, anchor.map(|a| format!("  {a}")).unwrap_or_default());
             let mut track = div().relative().flex_1().h(px(ROW)).overflow_hidden();
             if x1 > 0.0 && x0 < width {
-                let (w, zoom, colour) = (wave.clone(), self.zoom, theme::lane_audio());
+                let (w, zoom, colour, line) = (shown.clone(), self.zoom, theme::lane_audio(), theme::ink());
                 let bar_w = (x1 - x0).max(3.0);
+                let bar_h = ROW - 6.0;
                 let mut bar = div()
                     .id(("motion-sound", i))
                     .absolute()
                     .left(px(x0))
                     .w(px(bar_w))
                     .top(px(3.0))
-                    .h(px(ROW - 6.0))
+                    .h(px(bar_h))
                     .rounded(px(3.0))
                     .bg(colour.opacity(if selected { 0.35 } else { 0.18 }))
                     .border_1()
                     .border_color(if selected { theme::accent() } else { colour.opacity(0.5) })
-                    .overflow_hidden()
                     .child(
                         canvas(
                             |_, _, _| {},
@@ -985,6 +1133,12 @@ impl MotionEditor {
                                             colour,
                                         ));
                                     }
+                                    // The fade envelope as a line over the fades.
+                                    let env = w.envelope(t0 + 1.0 / zoom);
+                                    if env < 0.999 {
+                                        let y = 1.0 + (1.0 - env) * (bh - 2.0);
+                                        window.paint_quad(gpui::fill(Bounds::new(gpui::point(bounds.origin.x + px(x), bounds.origin.y + px(y - 0.75)), size(px(2.0), px(1.5))), line.opacity(0.7)));
+                                    }
                                     x += 2.0;
                                 }
                             },
@@ -993,18 +1147,55 @@ impl MotionEditor {
                         .size_full(),
                     );
                 if let Some(id) = wave.id.clone() {
-                    bar = bar.cursor_ew_resize().on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    let press = |part: SoundPart, id: String| {
+                        cx.listener(move |this: &mut Self, e: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             window.focus(&this.focus);
                             this.selected = Some(id.clone());
                             if let Some(grab) = this.time_at(f32::from(e.position.x)) {
-                                this.drag = Some(Drag::Sound { id: id.clone(), grab, from: start });
+                                this.drag = Some(Drag::Sound { id: id.clone(), part, grab, orig: shape });
                             }
                             cx.notify();
-                        }),
-                    );
+                        })
+                    };
+                    bar = bar.cursor_grab().on_mouse_down(MouseButton::Left, press(SoundPart::Move, id.clone()));
+                    // Trim edges: the outer 5 px of each end.
+                    for (part, left) in [(SoundPart::Start, true), (SoundPart::End, false)] {
+                        let edge = div().id(SharedString::from(format!("sound-trim-{id}-{left}"))).absolute().top_0().bottom_0().w(px(5.0)).cursor_ew_resize();
+                        let edge = if left { edge.left_0() } else { edge.right_0() };
+                        bar = bar.child(edge.hover(|s| s.bg(theme::accent().opacity(0.35))).on_mouse_down(MouseButton::Left, press(part, id.clone())));
+                    }
+                    // Fade handles on the top edge, at the end of each fade.
+                    if bar_w >= 24.0 {
+                        let fin = (shape.fade_in * zoom) as f32;
+                        let fout = bar_w - (shape.fade_out * zoom) as f32;
+                        for (part, x, tip) in [(SoundPart::FadeIn, fin.clamp(6.0, bar_w - 6.0), "Fade in"), (SoundPart::FadeOut, fout.clamp(6.0, bar_w - 6.0), "Fade out")] {
+                            bar = bar.child(
+                                // A 12 px target around an 8 px dot.
+                                div()
+                                    .id(SharedString::from(format!("sound-fade-{id}-{tip}")))
+                                    .absolute()
+                                    .top(px(-5.0))
+                                    .left(px(x - 6.0))
+                                    .size(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_ew_resize()
+                                    .group("fade-dot")
+                                    .child(
+                                        div()
+                                            .size(px(8.0))
+                                            .rounded_full()
+                                            .bg(gpui::white())
+                                            .border_1()
+                                            .border_color(theme::ink().opacity(0.6))
+                                            .group_hover("fade-dot", |s| s.bg(theme::accent())),
+                                    )
+                                    .on_mouse_down(MouseButton::Left, press(part, id.clone())),
+                            );
+                        }
+                    }
                 }
                 track = track.child(bar);
             }
@@ -1543,6 +1734,37 @@ pub(crate) fn open(dir: PathBuf, cx: &mut App) -> Result<gpui::WindowHandle<Moti
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sound_drags_trim_and_fade_within_the_file() {
+        let shape = SoundShape { start: 1.0, trim: 0.0, length: 2.0, fade_in: 0.0, fade_out: 0.0, source_duration: 3.0 };
+        // Leading trim: starts later in the file and later on the timeline.
+        let t = shape.dragged(SoundPart::Start, 0.5);
+        assert_eq!((t.start, t.trim, t.length), (1.5, 0.5, 1.5));
+        // Cannot trim before the file's start or past zero.
+        assert_eq!(shape.dragged(SoundPart::Start, -2.0).trim, 0.0);
+        // Trailing trim stays inside the file and keeps a minimum.
+        assert_eq!(shape.dragged(SoundPart::End, 5.0).length, 3.0);
+        assert_eq!(shape.dragged(SoundPart::End, -5.0).length, MIN_SOUND);
+        // Fades: the out handle is dragged left; fades never overlap.
+        let f = shape.dragged(SoundPart::FadeIn, 0.4).dragged(SoundPart::FadeOut, -0.3);
+        assert!((f.fade_in - 0.4).abs() < 1e-9 && (f.fade_out - 0.3).abs() < 1e-9);
+        assert!((shape.dragged(SoundPart::FadeIn, 9.0).fade_in - 2.0).abs() < 1e-9);
+        let both = SoundShape { fade_in: 1.5, ..shape }.dragged(SoundPart::FadeOut, -9.0);
+        assert!((both.fade_out - 0.5).abs() < 1e-9);
+        // Trimming shortens fades that no longer fit.
+        let short = SoundShape { fade_in: 1.0, fade_out: 0.8, ..shape }.dragged(SoundPart::End, -1.5);
+        assert!(short.fade_in + short.fade_out <= short.length + 1e-9);
+    }
+
+    #[test]
+    fn trimming_an_anchored_sound_keeps_its_anchor() {
+        assert_eq!(shift_time(&json!(1.0), 0.25, 30.0), json!(1.25));
+        assert_eq!(shift_time(&json!("#card.start"), 0.12, 30.0), json!("#card.start + 0.120"));
+        assert_eq!(shift_time(&json!("#card.start - 3f"), 0.1, 30.0), json!("#card.start + 0.000").as_str().map(|_| json!("#card.start")).unwrap());
+        assert_eq!(shift_time(&json!("beat:9 + 0.5"), -0.75, 30.0), json!("beat:9 - 0.250"));
+        assert_eq!(split_offset("#a.end + 6f", 30.0), ("#a.end".to_string(), 0.2));
+    }
     use super::*;
     use gpui::{point, Application, Modifiers};
 

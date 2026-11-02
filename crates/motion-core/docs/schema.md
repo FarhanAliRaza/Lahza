@@ -118,7 +118,8 @@ Values: numbers; `[x, y]` vectors (scale also takes one number); colours
 
 Fields: `path`, `at` (any time reference: an effect anchored to a layer,
 `#card.start`, moves when the layer moves), `trim` (seconds skipped in the
-file), `gain_db`, `length` (seconds to play), `name`, `id`. Add one with
+file), `gain_db`, `length` (seconds to play), `fade_in` and `fade_out`
+(seconds, at the ends of what plays), `name`, `id`. Add one with
 `{"op": "add_sound", "path": …, "at": …}` (`"kind": "music"` or `"vo"` for
 those); then `set` and `remove` work on its id (`whoosh1.at`), and music and
 narration answer to `music` and `vo`. Built-in effects (`sfx_add`):

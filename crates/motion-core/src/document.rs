@@ -140,6 +140,11 @@ pub struct AudioClip {
     /// Seconds to play; the rest of the file is cut. None plays it all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<f64>,
+    /// Seconds of fade at the start and at the end of what plays.
+    #[serde(default, skip_serializing_if = "zero")]
+    pub fade_in: f64,
+    #[serde(default, skip_serializing_if = "zero")]
+    pub fade_out: f64,
     /// Music only: lower by this much under narration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duck_db: Option<f64>,
@@ -1276,4 +1281,8 @@ mod tests {
         let LayerKind::Shape(s) = &grad.kind else { panic!() };
         assert!(matches!(s.fill, Some(Paint::Gradient(_))));
     }
+}
+
+fn zero(v: &f64) -> bool {
+    *v == 0.0
 }
