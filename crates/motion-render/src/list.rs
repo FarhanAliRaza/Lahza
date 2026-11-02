@@ -9,13 +9,13 @@
 //! downsampled offscreen target (large blurs run at 1/2…1/8 resolution, as
 //! `blur_plane` does), blurred there, and composited as one image primitive.
 
-use crate::font::Fonts;
+use crate::font::{self, Fonts};
 use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
 use lahza_motion_core::path::{self, morph, trim};
 use lahza_motion_core::space::Proj;
-use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PostKind, ShapeState};
-use lahza_motion_core::document::{Blend, Gradient, GradientKind, LineCap, LineJoin, MatteMode, ShapeKind, StrokeStyle};
+use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PostKind, ShapeState, TextState};
+use lahza_motion_core::document::{Blend, Gradient, GradientKind, LineCap, LineJoin, MatteMode, ShapeKind, StrokeAlign, StrokeStyle};
 use lahza_motion_core::value::{Color, Vec2};
 
 pub const TILE: u32 = 16;
@@ -45,6 +45,12 @@ pub const FLAG_STROKE: u32 = 2;
 pub const FLAG_TINT_ALPHA: u32 = 4;
 /// Image: colour = fill × sample (glows).
 pub const FLAG_TINT_MUL: u32 = 8;
+/// Glyph: rim light over the fill (colour in `stroke`).
+pub const FLAG_EDGE: u32 = 16;
+/// Glyph wipe masks (kind.y of glyph primitives): none, linear, |linear|, radial.
+pub const WIPE_LINEAR: u32 = 1;
+pub const WIPE_CENTER: u32 = 2;
+pub const WIPE_RADIAL: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -146,6 +152,43 @@ impl DisplayList {
 fn premul(c: Color, opacity: f64) -> [f32; 4] {
     let a = (c.0[3] * opacity) as f32;
     [c.0[0] as f32 * a, c.0[1] as f32 * a, c.0[2] as f32 * a, a]
+}
+
+/// Text styling in atlas texels (the distance field's units). Glyph prims
+/// use paint = [weight, stroke band inner, outer, edge depth] (paint.y stays
+/// ≤ 0: the GPU merge treats paint.y > 0.5 as a gradient), geom2 = [wipe
+/// opacity from, to, light direction] and paint2 = wipe parameters.
+struct GlyphStyle {
+    weight: f32,
+    /// Outline band [inner, outer] around the weighted edge, and colour.
+    stroke: Option<([f32; 2], [f32; 4])>,
+    /// Rim colour, depth and light direction (layer space, towards the light).
+    edge: Option<([f32; 4], f32, [f64; 2])>,
+}
+
+impl GlyphStyle {
+    fn new(text: &TextState) -> Self {
+        let texels = font::ATLAS_EM as f64 / text.size;
+        // The atlas stores distances up to SPREAD texels from the outline.
+        let reach = (font::SPREAD - 1.0) as f64;
+        let weight = (text.weight * texels).clamp(-reach, reach);
+        let stroke = text.stroke.and_then(|(c, w, align)| {
+            let w = w * texels;
+            let (lo, hi) = match align {
+                StrokeAlign::Outside => (0.0, w),
+                StrokeAlign::Center => (-w / 2.0, w / 2.0),
+                StrokeAlign::Inside => (-w, 0.0),
+            };
+            let (lo, hi) = (lo.max(-reach - weight), hi.min(reach - weight));
+            (hi > lo && c.0[3] > 0.0).then(|| ([lo as f32, hi as f32], premul(c, 1.0)))
+        });
+        let edge = text.edge.and_then(|(c, w, angle)| {
+            let depth = (w * texels).min(reach + weight);
+            let (s, co) = angle.to_radians().sin_cos();
+            (depth > 1e-3 && c.0[3] > 0.0).then(|| (premul(c, 1.0), depth as f32, [s, -co]))
+        });
+        Self { weight: weight as f32, stroke, edge }
+    }
 }
 
 fn blend_code(b: Blend) -> u32 {
@@ -623,24 +666,69 @@ impl Builder<'_> {
                     return items;
                 }
                 let layout = self.fonts.layout(text);
+                let (glyphs, wipe) = font::sweep(&layout, text);
+                let style = GlyphStyle::new(text);
                 let color = premul(text.color, 1.0);
+                let mut strokes = Vec::new();
                 for g in &layout.glyphs {
-                    let (glyph_xf, glyph_opacity) = Fonts::glyph_transform(&layout, text, g);
+                    let (glyph_xf, glyph_opacity) = Fonts::glyph_transform(&layout, text, &glyphs, g);
                     let opacity = layer.opacity * glyph_opacity;
                     if opacity <= 0.0 {
                         continue;
                     }
                     let forward = matrix.then(glyph_xf);
                     let r = g.atlas.rect;
-                    let prim = Prim {
+                    let bounds = [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64];
+                    let mut prim = Prim {
                         kind: [PRIM_GLYPH, 0, blend, FLAG_FILL],
                         geom: [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32],
                         fill: color,
+                        paint: [style.weight, 0.0, 0.0, 0.0],
                         ..Default::default()
                     };
-                    if let Some((prim, _)) = with_inverse(prim, forward, opacity) {
-                        items.push(Item { prim, forward, bounds: [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64] });
+                    if let Some(w) = &wipe {
+                        (prim.kind[1], prim.paint2) = w.params(glyph_xf);
+                        prim.geom2[0] = w.opacity[0];
+                        prim.geom2[1] = w.opacity[1];
                     }
+                    if let Some((band, stroke_color)) = style.stroke {
+                        let mut s = prim;
+                        s.kind[3] = FLAG_STROKE;
+                        s.fill = stroke_color;
+                        s.paint = [style.weight, band[0], band[1], 0.0];
+                        if let Some((s, _)) = with_inverse(s, forward, opacity) {
+                            strokes.push(Item { prim: s, forward, bounds });
+                        }
+                    }
+                    if let Some((edge_color, depth, light)) = style.edge {
+                        // Light direction into atlas space (normals turn
+                        // with the glyph).
+                        if let Some(inv) = glyph_xf.inverse() {
+                            let [a, b, c, d, _, _] = inv.0;
+                            let (lx, ly) = (a * light[0] + c * light[1], b * light[0] + d * light[1]);
+                            let n = lx.hypot(ly).max(1e-12);
+                            prim.kind[3] |= FLAG_EDGE;
+                            prim.stroke = edge_color;
+                            prim.paint[3] = depth;
+                            prim.geom2[2] = (lx / n) as f32;
+                            prim.geom2[3] = (ly / n) as f32;
+                        }
+                    }
+                    if color[3] <= 0.0 && prim.kind[3] & FLAG_EDGE == 0 {
+                        continue;
+                    }
+                    if let Some((prim, _)) = with_inverse(prim, forward, opacity) {
+                        items.push(Item { prim, forward, bounds });
+                    }
+                }
+                // Outside outlines sit under every fill (one outline around
+                // touching letters); centred and inside ones on top.
+                match text.stroke.map(|s| s.2) {
+                    Some(StrokeAlign::Outside) => {
+                        strokes.extend(items);
+                        items = strokes;
+                    }
+                    _ => items.extend(strokes),
                 }
             }
             Content::Video(v) => {

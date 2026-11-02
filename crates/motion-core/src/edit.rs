@@ -518,7 +518,8 @@ fn property_default(doc: &Value, id: &str, path: &str) -> Option<Value> {
     Some(match path {
         "transform.position" | "transform.anchor" => json!([0, 0]),
         "transform.scale" => json!([1, 1]),
-        "transform.rotation" | "camera.rotation" | "radius" | "tracking" => json!(0),
+        "transform.rotation" | "camera.rotation" | "radius" | "tracking" | "weight" | "edge.angle" => json!(0),
+        "edge.width" => json!(3),
         "transform.opacity" | "camera.zoom" => json!(1),
         "camera.position" => {
             let w = doc.pointer("/settings/width").and_then(Value::as_f64).unwrap_or(1920.0);

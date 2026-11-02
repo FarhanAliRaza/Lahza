@@ -58,6 +58,11 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
                 align: Align::Left,
                 glyphs: Vec::new(),
                 pivots: vec![u32::MAX; count].into(),
+                weight: 0.0,
+                stroke: None,
+                edge: None,
+                sweeps: Vec::new(),
+                units: Vec::new().into(),
             }),
         });
     }

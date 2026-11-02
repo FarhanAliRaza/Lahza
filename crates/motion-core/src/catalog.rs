@@ -195,9 +195,15 @@ pub fn catalog_json() -> Value {
             },
             "text": {
                 "text": "string; \\n breaks lines", "font": "Inter | Inter Medium | Inter SemiBold | project-relative .ttf/.otf",
-                "size": "px (default 96)", "color": "colour", "tracking": "1/1000 em", "line_height": 1.15, "align": "left | center | right",
+                "size": "px (default 96)", "color": "colour (a transparent colour with a stroke gives outline-only type)", "tracking": "1/1000 em", "line_height": 1.15, "align": "left | center | right",
+                "stroke": {"color": "colour (animatable)", "width": "px (animatable, default 4)", "align": "outside (default; drawn under all fills, so touching letters share one outline) | center | inside (both over the fill)"},
+                "weight": "faux bold: px the glyph edges move outward, negative thins (animatable)",
+                "edge": {"color": "rim colour (default white)", "width": "px inside the edge (default 3)", "angle": "where the light comes from, degrees, 0 = above, clockwise (animatable)", "note": "rim light: the colour over the fill along edges facing the light, fading inward"},
+                "outline_reach": "weight + outside stroke reach at most ~0.11 em past the glyph outline (larger values are clamped)",
                 "animators": [{
-                    "unit": "glyph | word | line", "order": "forward | reverse | center | edges | random", "seed": 0,
+                    "unit": "glyph | word | line",
+                    "order": "forward | reverse | center | edges | random, or by position: {\"axis\": \"x\" | \"y\" | degrees (sweep direction, 0 = rightward, clockwise), \"from\": \"start\" | \"end\" | \"center\"} or {\"radial\": [fx, fy] (centre as fractions of the text block)}; each unit's delay = its position (0 first … 1 last) × stagger × (units − 1); add \"feather\": 0..1 (fraction of the text extent) to reveal opacity as a soft wipe through the glyphs (one feathered animator per layer; other channels stay per unit)",
+                    "seed": 0,
                     "stagger": "per-unit delay (default \"1f\")", "at": "time of the first unit's anchor", "anchor": "default start",
                     "lead": "frames", "dur": "per-unit duration", "ease": "default enter",
                     "from": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "to": "same fields (default identity)",

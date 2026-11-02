@@ -1215,8 +1215,56 @@ pub struct TextLayer {
     pub line_height: f64,
     #[serde(default, skip_serializing_if = "is_center")]
     pub align: Align,
+    /// Outline drawn from the glyphs' distance field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<TextStroke>,
+    /// Faux bold: px the glyph edges move outward (negative thins).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub weight: Property<f64>,
+    /// Directional rim light along the inside of the glyph edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<TextEdge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animators: Vec<TextAnimator>,
+}
+
+/// Text outline; `width` in px, `align` places it outside (default), centred
+/// on or inside the glyph edge.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextStroke {
+    pub color: Property<Color>,
+    #[serde(default = "four")]
+    pub width: Property<f64>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub align: StrokeAlign,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StrokeAlign {
+    #[default]
+    Outside,
+    Center,
+    Inside,
+}
+
+/// Rim light: `color` laid over the fill within `width` px inside the edge,
+/// strongest where the edge faces the light. `angle` is where the light
+/// comes from, degrees (0 = above, clockwise).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextEdge {
+    #[serde(default = "white")]
+    pub color: Property<Color>,
+    #[serde(default = "three")]
+    pub width: Property<f64>,
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub angle: Property<f64>,
+}
+
+fn three() -> Property<f64> {
+    Property::Constant(3.0)
 }
 
 fn default_font() -> String {
@@ -1260,6 +1308,75 @@ pub enum Order {
     Random,
 }
 
+/// Animator order: by unit index (`"forward"`, …) or by position.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UnitOrder {
+    Index(Order),
+    Spatial(SpatialOrder),
+}
+
+impl Default for UnitOrder {
+    fn default() -> Self {
+        UnitOrder::Index(Order::Forward)
+    }
+}
+
+/// Position-driven order: each unit's delay is its position across the
+/// text (0…1) times the stagger span. Either `axis` (`"x"`, `"y"` or the
+/// sweep direction in degrees, 0 = rightward, clockwise) with `from`, or
+/// `radial`: a centre in fractions of the text block ([0.5, 0.5] = middle).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpatialOrder {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<Axis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radial: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub from: SweepFrom,
+    /// Soft reveal: opacity becomes a gradient wipe this wide (fraction of
+    /// the text's extent) instead of whole units fading.
+    #[serde(default, skip_serializing_if = "zero")]
+    pub feather: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Axis {
+    Named(AxisName),
+    Degrees(f64),
+}
+
+impl Axis {
+    /// Sweep direction in degrees (0 = +x, 90 = +y).
+    pub fn degrees(self) -> f64 {
+        match self {
+            Axis::Named(AxisName::X) => 0.0,
+            Axis::Named(AxisName::Y) => 90.0,
+            Axis::Degrees(d) => d,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AxisName {
+    X,
+    Y,
+}
+
+/// Where a spatial sweep begins: the axis' start, its end, or its middle
+/// (outward). For `radial`, `end` runs from the outside in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SweepFrom {
+    #[default]
+    Start,
+    End,
+    Center,
+}
+
 /// Per-unit transform offsets. Positions add, scale multiplies, opacity
 /// multiplies. Missing fields are the identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1286,7 +1403,7 @@ pub struct TextAnimator {
     #[serde(default)]
     pub unit: Unit,
     #[serde(default)]
-    pub order: Order,
+    pub order: UnitOrder,
     #[serde(default)]
     pub seed: u32,
     #[serde(default = "one_frame")]

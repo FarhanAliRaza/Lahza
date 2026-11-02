@@ -99,6 +99,19 @@ video timeline:
   for arrows). Animate only the path's `trim`; never key the handle's
   position frame by frame.
 
+## Display type
+
+- **Outlines** are one field: `"stroke": {"color", "width"}` on the text
+  (`"align": "center"` or `"inside"` for hollow type with a transparent
+  `color`). Never stack offset copies of a layer to fake an outline.
+- **Bolder or thinner** type is `"weight"` (px, animatable), not
+  duplicated layers.
+- **Rim-lit or bevelled** letters: `"edge": {"color", "width", "angle"}`
+  lights the edges that face the light.
+- **Reveals that sweep across the text** use a positional `order`
+  (`{"axis": "x"}`, `{"radial": [0.5, 0.5]}`) on one animator, not one
+  layer per letter; add `"feather"` for a soft wipe through the glyphs.
+
 ## Review checklist
 
 - `check` has no errors; every anchored key's drift is within ±1 frame.

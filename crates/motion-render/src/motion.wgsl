@@ -225,6 +225,31 @@ fn sample_atlas(l: vec2<f32>, r: vec4<f32>) -> f32 {
     return top + (bottom - top) * fy;
 }
 
+fn edge_light(prim: Prim, l: vec2<f32>, d: f32, c: vec4<f32>) -> vec4<f32> {
+    let r = prim.geom;
+    let gx = sample_atlas(l + vec2<f32>(1.0, 0.0), r) - sample_atlas(l - vec2<f32>(1.0, 0.0), r);
+    let gy = sample_atlas(l + vec2<f32>(0.0, 1.0), r) - sample_atlas(l - vec2<f32>(0.0, 1.0), r);
+    let n = sqrt(gx * gx + gy * gy);
+    if n <= 1e-6 { return c; }
+    let facing = clamp01(-(gx * prim.geom2.z + gy * prim.geom2.w) / n);
+    let rim = facing * clamp01(1.0 + d / prim.paint.w);
+    let e = prim.stroke;
+    return e * rim + c * (1.0 - e.w * rim);
+}
+
+fn wipe(prim: Prim, l: vec2<f32>) -> f32 {
+    let q = prim.paint2;
+    var r: f32;
+    if prim.kind.y == 3u {
+        r = length(l - q.xy) * q.z;
+    } else {
+        r = q.x * l.x + q.y * l.y + q.z;
+        if prim.kind.y == 2u { r = abs(r); }
+    }
+    let m = clamp01(q.w - r);
+    return clamp01(prim.geom2.x + (prim.geom2.y - prim.geom2.x) * m);
+}
+
 fn unpack(v: u32) -> vec4<f32> {
     return vec4<f32>(vec4<u32>(v, v >> 8u, v >> 16u, v >> 24u) & vec4<u32>(255u)) / 255.0;
 }
@@ -299,9 +324,17 @@ fn shade(prim_in: Prim, p: vec2<f32>) -> vec4<f32> {
         let r = prim.geom;
         if l.x < r.x || l.y < r.y || l.x > r.z || l.y > r.w { return out; }
         let v = sample_atlas(l, r);
-        let d = (0.5 - v) * 2.0 * SPREAD;
-        let cov = clamp01(0.5 - d / aa);
-        out = prim.fill * cov;
+        let d = (0.5 - v) * 2.0 * SPREAD - prim.paint.x;
+        if (prim.kind.w & 2u) != 0u {
+            let mid = (prim.paint.y + prim.paint.z) * 0.5;
+            let half = (prim.paint.z - prim.paint.y) * 0.5;
+            out = prim.fill * clamp01(0.5 - (abs(d - mid) - half) / aa);
+        } else {
+            var c = prim.fill;
+            if (prim.kind.w & 16u) != 0u { c = edge_light(prim, l, d, c); }
+            out = c * clamp01(0.5 - d / aa);
+        }
+        if prim.kind.y != 0u { out = out * wipe(prim, l); }
     } else {
         let w = prim.geom.x;
         let h = prim.geom.y;

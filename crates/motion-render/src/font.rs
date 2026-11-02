@@ -6,8 +6,9 @@
 //! any size, scale and rotation from that atlas, so per-glyph animation
 //! never re-rasterises text.
 
-use lahza_motion_core::compile::{Affine, GlyphState, TextState};
-use lahza_motion_core::document::Align;
+use lahza_motion_core::compile::{apply_unit, Affine, GlyphState, TextState};
+use lahza_motion_core::document::{Align, SpatialOrder, SweepFrom};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -78,6 +79,9 @@ pub struct Layout {
     pub bounds: [f64; 4],
     /// Per char: unit pivot point (layer space).
     pub unit_centers: HashMap<u32, (f64, f64)>,
+    /// Per char (`text.chars()`): its advance box [x0, y0, x1, y1] from the
+    /// cap height to the baseline; infinite for chars inside a cluster.
+    pub char_boxes: Vec<[f64; 4]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +265,7 @@ impl Fonts {
         let mut x_min = f64::INFINITY;
         let mut x_max = f64::NEG_INFINITY;
         let mut boxes: HashMap<u32, [f64; 4]> = HashMap::new();
+        let mut char_boxes = vec![EMPTY_BOX; text.text.chars().count()];
         let n = lines.len() as f64;
         for (li, line) in lines.iter().enumerate() {
             let baseline = cap * px / 2.0 + (li as f64 - (n - 1.0) / 2.0) * line_step;
@@ -278,6 +283,9 @@ impl Fonts {
             x_max = x_max.max(pen + width);
             for g in shaped {
                 let ci = char_index + g.char_offset;
+                if let Some(b) = char_boxes.get_mut(ci) {
+                    *b = union(*b, [pen, baseline - cap * px, pen + g.advance, baseline]);
+                }
                 let unit = text.pivots.get(ci).copied().unwrap_or(u32::MAX);
                 if unit != u32::MAX {
                     let b = boxes.entry(unit).or_insert([f64::INFINITY, baseline - cap * px, f64::NEG_INFINITY, baseline]);
@@ -305,6 +313,7 @@ impl Fonts {
             glyphs,
             bounds: [x_min, first_baseline - ascent, x_max, last_baseline + 0.25 * text.size],
             unit_centers: boxes.into_iter().map(|(u, b)| (u, ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0))).collect(),
+            char_boxes,
         });
         self.layouts.insert(key, layout.clone());
         layout
@@ -312,11 +321,11 @@ impl Fonts {
 
     /// Atlas texel → layer space transform of one glyph, with its unit's
     /// animation applied about the unit's centre.
-    pub fn glyph_transform(layout: &Layout, text: &TextState, g: &PlacedGlyph) -> (Affine, f64) {
+    pub fn glyph_transform(layout: &Layout, text: &TextState, glyphs: &[GlyphState], g: &PlacedGlyph) -> (Affine, f64) {
         let base = Affine::translate(g.pen[0], g.pen[1])
             .then(Affine::scale(g.scale, g.scale))
             .then(Affine::translate(g.atlas.origin[0] as f64 - g.atlas.rect[0] as f64, g.atlas.origin[1] as f64 - g.atlas.rect[1] as f64));
-        let Some(state) = text.glyphs.get(g.char_index) else { return (base, 1.0) };
+        let Some(state) = glyphs.get(g.char_index) else { return (base, 1.0) };
         if *state == GlyphState::IDENTITY {
             return (base, 1.0);
         }
@@ -328,6 +337,176 @@ impl Fonts {
             .then(Affine::translate(-cx, -cy));
         (animate.then(base), state.opacity)
     }
+}
+
+const EMPTY_BOX: [f64; 4] = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+
+fn union(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+/// The ordering key of a spatial sweep at a layer-space point: smaller
+/// keys go first.
+#[derive(Clone, Copy, Debug)]
+enum Key {
+    /// sign · (p · dir)
+    Linear { dir: [f64; 2], sign: f64 },
+    /// |p · dir − mid|
+    Center { dir: [f64; 2], mid: f64 },
+    /// sign · |p − centre|
+    Radial { centre: [f64; 2], sign: f64 },
+}
+
+impl Key {
+    fn new(order: &SpatialOrder, bounds: [f64; 4], centres: &[[f64; 2]]) -> Key {
+        if let Some([fx, fy]) = order.radial {
+            let centre = [bounds[0] + fx * (bounds[2] - bounds[0]), bounds[1] + fy * (bounds[3] - bounds[1])];
+            return Key::Radial { centre, sign: if order.from == SweepFrom::End { -1.0 } else { 1.0 } };
+        }
+        let (s, c) = order.axis.map_or(0.0, |a| a.degrees()).to_radians().sin_cos();
+        let dir = [c, s];
+        match order.from {
+            SweepFrom::Start => Key::Linear { dir, sign: 1.0 },
+            SweepFrom::End => Key::Linear { dir, sign: -1.0 },
+            SweepFrom::Center => {
+                let (lo, hi) = centres.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    let k = p[0] * dir[0] + p[1] * dir[1];
+                    (lo.min(k), hi.max(k))
+                });
+                Key::Center { dir, mid: if lo.is_finite() { (lo + hi) / 2.0 } else { 0.0 } }
+            }
+        }
+    }
+
+    fn at(&self, p: [f64; 2]) -> f64 {
+        match *self {
+            Key::Linear { dir, sign } => sign * (p[0] * dir[0] + p[1] * dir[1]),
+            Key::Center { dir, mid } => (p[0] * dir[0] + p[1] * dir[1] - mid).abs(),
+            Key::Radial { centre, sign } => sign * (p[0] - centre[0]).hypot(p[1] - centre[1]),
+        }
+    }
+
+    /// Smallest and largest key over a box.
+    fn range(&self, b: [f64; 4]) -> (f64, f64) {
+        let corners = [[b[0], b[1]], [b[2], b[1]], [b[0], b[3]], [b[2], b[3]]];
+        let (mut lo, mut hi) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(self.at(*p)), hi.max(self.at(*p))));
+        match *self {
+            Key::Linear { .. } => {}
+            Key::Center { dir, mid } => {
+                let k: Vec<f64> = corners.iter().map(|p| p[0] * dir[0] + p[1] * dir[1]).collect();
+                if k.iter().any(|v| *v <= mid) && k.iter().any(|v| *v >= mid) {
+                    lo = 0.0;
+                }
+            }
+            Key::Radial { centre, sign } => {
+                // The box's nearest point to the centre (inside: the centre).
+                let near = [centre[0].clamp(b[0], b[2]), centre[1].clamp(b[1], b[3])];
+                let d = (near[0] - centre[0]).hypot(near[1] - centre[1]);
+                if sign > 0.0 {
+                    lo = d;
+                } else {
+                    hi = -d;
+                }
+            }
+        }
+        (lo, hi)
+    }
+}
+
+/// A feathered sweep's opacity wipe, in layer space.
+#[derive(Clone, Copy, Debug)]
+pub struct Wipe {
+    key: Key,
+    /// Key at position 0 and key units per position unit · feather.
+    k0: f64,
+    scale: f64,
+    /// Wipe middle in position units / feather, + 0.5.
+    front: f64,
+    /// Opacity where the wipe has not / has passed.
+    pub opacity: [f32; 2],
+}
+
+impl Wipe {
+    /// Shader parameters for one glyph whose atlas → layer transform is
+    /// `xf` (a similarity): mode (kind.y) and [u, v, k, c] so that the mask
+    /// is clamp(c − r) with r = u·x + v·y + k (mode 1), |u·x + v·y + k|
+    /// (mode 2) or |(x, y) − (u, v)|·k (mode 3).
+    pub fn params(&self, xf: Affine) -> (u32, [f32; 4]) {
+        let [a, b, c, d, e, f] = xf.0;
+        let c0 = self.front + self.k0 / self.scale;
+        match self.key {
+            Key::Linear { dir, sign } => {
+                let u = sign * (a * dir[0] + b * dir[1]) / self.scale;
+                let v = sign * (c * dir[0] + d * dir[1]) / self.scale;
+                let k = sign * (e * dir[0] + f * dir[1]) / self.scale;
+                (crate::list::WIPE_LINEAR, [u as f32, v as f32, k as f32, c0 as f32])
+            }
+            Key::Center { dir, mid } => {
+                let u = (a * dir[0] + b * dir[1]) / self.scale;
+                let v = (c * dir[0] + d * dir[1]) / self.scale;
+                let k = (e * dir[0] + f * dir[1] - mid) / self.scale;
+                (crate::list::WIPE_CENTER, [u as f32, v as f32, k as f32, c0 as f32])
+            }
+            Key::Radial { centre, sign } => {
+                let q = xf.inverse().map_or((0.0, 0.0), |inv| inv.apply(centre[0], centre[1]));
+                let k = sign * xf.determinant().abs().sqrt() / self.scale;
+                (crate::list::WIPE_RADIAL, [q.0 as f32, q.1 as f32, k as f32, c0 as f32])
+            }
+        }
+    }
+}
+
+/// Glyph states with the position-ordered animators (`sweeps`) applied
+/// from the laid-out unit positions, and the first feathered sweep's wipe.
+pub fn sweep<'a>(layout: &Layout, text: &'a TextState) -> (Cow<'a, [GlyphState]>, Option<Wipe>) {
+    if text.sweeps.is_empty() {
+        return (Cow::Borrowed(&text.glyphs), None);
+    }
+    let n = layout.char_boxes.len();
+    let mut glyphs = text.glyphs.clone();
+    glyphs.resize(n, GlyphState::IDENTITY);
+    let mut wipe = None;
+    for sw in &text.sweeps {
+        // Unit boxes from their characters' boxes.
+        let unit_of = |ci: usize| text.units.get(ci).map_or(u32::MAX, |u| u[sw.unit.min(2)]);
+        let count = (0..n).map(unit_of).filter(|u| *u != u32::MAX).max().map_or(0, |u| u as usize + 1);
+        let mut boxes = vec![EMPTY_BOX; count];
+        for (ci, b) in layout.char_boxes.iter().enumerate() {
+            let u = unit_of(ci);
+            if u != u32::MAX && b[0].is_finite() {
+                boxes[u as usize] = union(boxes[u as usize], *b);
+            }
+        }
+        let (lo, hi) = (sw.range.0, sw.range.1.min(count));
+        let centres: Vec<Option<[f64; 2]>> =
+            boxes.iter().enumerate().map(|(u, b)| (u >= lo && u < hi && b[0].is_finite()).then(|| [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0])).collect();
+        let present: Vec<[f64; 2]> = centres.iter().flatten().copied().collect();
+        let key = Key::new(&sw.order, layout.bounds, &present);
+        let (kmin, kmax) = present.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(key.at(*p)), b.max(key.at(*p))));
+        let extent = kmax - kmin;
+        let position: Vec<f64> = centres.iter().map(|c| c.map_or(0.0, |p| if extent > 1e-9 { (key.at(p) - kmin) / extent } else { 0.0 })).collect();
+        let feathered = wipe.is_none() && sw.order.feather > 1e-6;
+        if feathered {
+            let (b0, b1) = key.range(layout.bounds);
+            let ext = if b1 - b0 > 1e-9 { b1 - b0 } else { 1.0 };
+            let f = sw.order.feather;
+            wipe = Some(Wipe {
+                key,
+                k0: b0,
+                scale: ext * f,
+                front: sw.front() / f + 0.5,
+                opacity: [sw.from[4].clamp(0.0, 1.0) as f32, sw.to[4].clamp(0.0, 1.0) as f32],
+            });
+        }
+        for (ci, g) in glyphs.iter_mut().enumerate() {
+            let u = unit_of(ci);
+            if u == u32::MAX || (u as usize) < lo || u as usize >= hi {
+                continue;
+            }
+            apply_unit(g, sw.values(position[u as usize]), !feathered);
+        }
+    }
+    (Cow::Owned(glyphs), wipe)
 }
 
 struct Shaped {

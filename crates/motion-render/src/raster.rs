@@ -185,6 +185,40 @@ fn sample_atlas(atlas: &[u8], l: V2, r: [f32; 4]) -> f32 {
     top + (bottom - top) * fy
 }
 
+/// Rim light: the edge colour over `c`, by how much the outline faces the
+/// light (paint.w deep inside the edge; light direction in geom2.zw).
+fn edge_light(atlas: &[u8], prim: &Prim, l: V2, d: f32, c: [f32; 4]) -> [f32; 4] {
+    let r = prim.geom;
+    let gx = sample_atlas(atlas, [l[0] + 1.0, l[1]], r) - sample_atlas(atlas, [l[0] - 1.0, l[1]], r);
+    let gy = sample_atlas(atlas, [l[0], l[1] + 1.0], r) - sample_atlas(atlas, [l[0], l[1] - 1.0], r);
+    let n = (gx * gx + gy * gy).sqrt();
+    if n <= 1e-6 {
+        return c;
+    }
+    // The field grows inward: the outward normal is −gradient.
+    let facing = clamp01(-(gx * prim.geom2[2] + gy * prim.geom2[3]) / n);
+    let rim = facing * clamp01(1.0 + d / prim.paint[3]);
+    let e = prim.stroke;
+    std::array::from_fn(|i| e[i] * rim + c[i] * (1.0 - e[3] * rim))
+}
+
+/// Feathered reveal mask of a glyph (kind.y selects the form).
+fn wipe(prim: &Prim, l: V2) -> f32 {
+    let q = prim.paint2;
+    let r = if prim.kind[1] == WIPE_RADIAL {
+        len([l[0] - q[0], l[1] - q[1]]) * q[2]
+    } else {
+        let r = q[0] * l[0] + q[1] * l[1] + q[2];
+        if prim.kind[1] == WIPE_CENTER {
+            r.abs()
+        } else {
+            r
+        }
+    };
+    let m = clamp01(q[3] - r);
+    clamp01(prim.geom2[0] + (prim.geom2[1] - prim.geom2[0]) * m)
+}
+
 fn unpack(v: u32) -> [f32; 4] {
     [(v & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, ((v >> 16) & 255) as f32 / 255.0, ((v >> 24) & 255) as f32 / 255.0]
 }
@@ -277,9 +311,25 @@ pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], segments: &[[f32; 4]], src:
                 return out;
             }
             let v = sample_atlas(src.atlas, l, r);
-            let d = (0.5 - v) * 2.0 * SPREAD;
-            let cov = clamp01(0.5 - d / aa);
-            out = prim.fill.map(|c| c * cov);
+            // Distance to the weighted outline, atlas texels (+ outside).
+            let d = (0.5 - v) * 2.0 * SPREAD - prim.paint[0];
+            if prim.kind[3] & FLAG_STROKE != 0 {
+                let mid = (prim.paint[1] + prim.paint[2]) * 0.5;
+                let half = (prim.paint[2] - prim.paint[1]) * 0.5;
+                let cov = clamp01(0.5 - ((d - mid).abs() - half) / aa);
+                out = prim.fill.map(|c| c * cov);
+            } else {
+                let mut c = prim.fill;
+                if prim.kind[3] & FLAG_EDGE != 0 {
+                    c = edge_light(src.atlas, prim, l, d, c);
+                }
+                let cov = clamp01(0.5 - d / aa);
+                out = c.map(|c| c * cov);
+            }
+            if prim.kind[1] != 0 {
+                let k = wipe(prim, l);
+                out = out.map(|c| c * k);
+            }
         }
         _ => {
             let (w, h) = (prim.geom[0], prim.geom[1]);
