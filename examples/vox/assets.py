@@ -37,26 +37,51 @@ def noise(w, h, scale, octaves=4):
 
 
 def paper(w, h):
-    base = np.array([244, 240, 231], np.float32)
-    n = noise(w, h, 220) - 0.5
-    fine = rng.normal(0, 1, (h, w)).astype(np.float32)
+    """Rough craft paper: mottled tone, visible fibres, specks, two soft
+    folds and a darker edge, so the collage reads as printed and taped."""
+    base = np.array([238, 231, 216], np.float32)
     img = np.ones((h, w, 3), np.float32) * base
-    img += n[..., None] * 16
-    img += fine[..., None] * 2.2
-    # Fibres: faint short strokes.
-    layer = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(layer)
-    for _ in range(1400):
-        x, y = rng.uniform(0, w), rng.uniform(0, h)
-        a = rng.uniform(0, math.pi)
-        length = rng.uniform(6, 26)
-        d.line([(x, y), (x + math.cos(a) * length, y + math.sin(a) * length)], fill=int(rng.uniform(20, 60)), width=1)
-    fib = np.asarray(layer.filter(ImageFilter.GaussianBlur(0.6)), np.float32) / 255.0
-    img -= fib[..., None] * 14
-    # Soft vignette.
-    yy, xx = np.mgrid[0:h, 0:w]
+    # Mottling at two scales (warm/cool, light/dark).
+    big = noise(w, h, 420, 3) - 0.5
+    mid = noise(w, h, 90, 3) - 0.5
+    img += big[..., None] * np.array([34, 30, 22], np.float32)
+    img += mid[..., None] * np.array([16, 15, 12], np.float32)
+    # Fine tooth.
+    img += rng.normal(0, 4.5, (h, w))[..., None].astype(np.float32)
+    # Fibres: short dark and light strands.
+    for shade, count, strength in ((np.array([120, 96, 70], np.float32), 3000, 20), (np.array([255, 252, 244], np.float32), 3200, 26)):
+        layer = Image.new("L", (w, h), 0)
+        d = ImageDraw.Draw(layer)
+        for _ in range(count):
+            x, y = rng.uniform(0, w), rng.uniform(0, h)
+            a = rng.uniform(0, math.pi)
+            length = rng.uniform(5, 34)
+            pts = [(x, y)]
+            for _k in range(3):
+                a += rng.normal(0, 0.35)
+                x, y = x + math.cos(a) * length / 3, y + math.sin(a) * length / 3
+                pts.append((x, y))
+            d.line(pts, fill=int(rng.uniform(90, 255)), width=1)
+        fib = np.asarray(layer.filter(ImageFilter.GaussianBlur(0.5)), np.float32) / 255.0
+        img += (shade - img) * fib[..., None] * strength / 255.0 * 2.2
+    # Specks of pulp and dust.
+    sp = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(sp)
+    for _ in range(900):
+        x, y, r = rng.uniform(0, w), rng.uniform(0, h), rng.uniform(0.6, 2.2)
+        d.ellipse([x - r, y - r, x + r, y + r], fill=int(rng.uniform(80, 220)))
+    speck = np.asarray(sp.filter(ImageFilter.GaussianBlur(0.4)), np.float32) / 255.0
+    img *= (1 - 0.35 * speck)[..., None]
+    # Two soft folds: a light ridge beside a shadowed valley.
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    for (x0, y0, ang) in ((0, h * 0.37, 0.06), (w * 0.62, 0, 1.49)):
+        nx, ny = -math.sin(ang), math.cos(ang)
+        dist = (xx - x0) * nx + (yy - y0) * ny
+        fold = np.exp(-(dist / 5.0) ** 2) * -22 + np.exp(-((dist - 9) / 14.0) ** 2) * 10 - np.exp(-((dist + 10) / 18.0) ** 2) * 7
+        img += fold[..., None]
+    # Darker, warmer edges.
     r = np.hypot((xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2))
-    img *= (1 - 0.07 * np.clip(r - 0.6, 0, 1))[..., None]
+    img *= (1 - 0.16 * np.clip(r - 0.55, 0, 1) ** 1.5)[..., None]
     return Image.fromarray(np.uint8(np.clip(img, 0, 255)))
 
 

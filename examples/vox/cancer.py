@@ -170,7 +170,9 @@ def win(layer, start=None, end=None):
 # --- building blocks -------------------------------------------------------------
 
 def paper(sid):
-    return {"id": f"{sid}-paper", "kind": "image", "src": "assets/art/paper.png", "size": [W, H], "transform": tr(C)}
+    """The page: textured paper with film grain that boils at 12 fps."""
+    return {"id": f"{sid}-paper", "kind": "image", "src": "assets/art/paper.png", "size": [W, H], "transform": tr(C),
+            "effects": [{"type": "grain", "amount": 0.09, "size": 1.7, "seed": 7}]}
 
 
 def text(id, s, size, pos, color=INK, font=BOLD, **extra):
@@ -188,8 +190,37 @@ def highlight(id, at, pos, width, height=60, dur="7f", color=YELLOW):
 def card(id, size, pos, at, rotation=-2.0, fill=CREAM):
     """A cut-out card with a soft drop shadow, popping in."""
     return {"id": id, "kind": "shape", "shape": "rect", "size": size, "radius": 6, "fill": fill,
-            "effects": [{"type": "shadow", "color": "#00000038", "offset": [8, 14], "radius": 14}],
+            "effects": [{"type": "grain", "amount": 0.07, "size": 1.5, "seed": 3}, {"type": "shadow", "color": "#00000038", "offset": [8, 14], "radius": 14}],
             "transform": tr(pos, rotation=rotation, scale=tween(at, 0.6, 1, "8f", "land"), opacity=fade_in(at, "3f"))}
+
+
+def moire_rings(id, center, radius, color, start, end, opacity=0.3, step=15, drift=46):
+    """Two sets of concentric rings sliding over each other: live moiré."""
+    n = int(radius / step)
+    def rings(tag):
+        return [{"id": f"{id}-{tag}{k}", "kind": "shape", "shape": "ring", "size": (k + 1) * step * 2, "thickness": step * 0.42, "fill": color,
+                 "transform": tr([0, 0])} for k in range(n)]
+    a = {"id": f"{id}-A", "kind": "comp", "transform": tr([0, 0]), "layers": rings("a")}
+    b = {"id": f"{id}-B", "kind": "comp", "layers": rings("b"),
+         "transform": tr([0, 0], position=keys((start, [-drift, -drift * 0.4]), (end, [drift, drift * 0.7]), ease="linear"))}
+    return win({"id": id, "kind": "comp", "blend": "multiply", "layers": [a, b],
+                "transform": tr(center, scale=tween(start, 0.85, 1, "10f", "land"),
+                                opacity={"keys": [{"at": q(start - 1 / 12), "from": 0, "v": opacity, "ease": "enter", "dur": "6f", "anchor": "start"}]})}, start, end)
+
+
+def moire_lines(id, center, size, color, start, end, opacity=0.25, spacing=13, turn=9):
+    """Two line gratings, one turning slowly over the other, inside a box."""
+    w, h = size
+    n = int(h * 1.5 / spacing)
+    def grating(tag, rotation):
+        line = {"id": f"{id}-{tag}l", "kind": "shape", "shape": "line", "size": [w * 1.6, 0], "thickness": spacing * 0.45, "fill": color}
+        return {"id": f"{id}-{tag}", "kind": "instancer", "layout": {"type": "line", "count": n, "from": [0, -h * 0.75], "to": [0, h * 0.75]},
+                "transform": tr([0, 0], rotation=rotation), "layers": [line]}
+    mask = {"id": f"{id}-mask", "kind": "shape", "shape": "rect", "size": [w, h], "radius": 18, "fill": "#ffffff", "hidden": True}
+    lines = {"id": f"{id}-lines", "kind": "comp", "matte": {"layer": f"{id}-mask", "mode": "alpha"},
+             "layers": [grating("a", 0), grating("b", keys((start, -turn / 2), (end, turn / 2), ease="linear"))]}
+    return win({"id": id, "kind": "comp", "blend": "multiply", "layers": [mask, lines],
+                "transform": tr(center, opacity={"keys": [{"at": q(start - 1 / 12), "from": 0, "v": opacity, "ease": "enter", "dur": "6f", "anchor": "start"}]})}, start, end)
 
 
 def tape(id, pos, at, rotation):
@@ -197,11 +228,11 @@ def tape(id, pos, at, rotation):
 
 
 def chapter(sid, label, start):
-    w = 26 * len(label) * 0.62 + 60
+    w = 36 * len(label) * 0.64 + 80
     return [
-        {"id": f"{sid}-tag", "kind": "shape", "shape": "rect", "size": [w, 64], "radius": 32, "fill": INK,
+        {"id": f"{sid}-tag", "kind": "shape", "shape": "rect", "size": [w, 80], "radius": 40, "fill": INK,
          "transform": tr([W / 2, 190], scale=tween(start + 0.1, 0.5, 1, "7f", "land"))},
-        text(f"{sid}-tagtx", label, 28, [W / 2, 190], CREAM, SEMI, tracking=80, transform=tr([W / 2, 192], opacity=fade_in(start + 0.15, "3f"))),
+        text(f"{sid}-tagtx", label, 36, [W / 2, 190], CREAM, SEMI, tracking=70, transform=tr([W / 2, 192], opacity=fade_in(start + 0.15, "3f"))),
     ]
 
 
@@ -227,7 +258,7 @@ def captions(sid, end):
         words = len(line["text"].split())
         per = max(1, round((line["end"] - line["start"]) / words * 30 * 0.9))
         long = len(line["text"]) > 70
-        out.append(win(text(f"{sid}-cap{n}", wrap(line["text"], 30 if long else 24), 50 if long else 58, [W / 2, 1655], INK, BOLD, line_height=1.18,
+        out.append(win(text(f"{sid}-cap{n}", wrap(line["text"], 30 if long else 25), 46 if long else 54, [W / 2, CAPTION_Y], INK, BOLD, line_height=1.16,
                             animators=[{"unit": "word", "at": q(T(i, -0.02)), "from": {"opacity": 0.22}, "stagger": f"{per}f", "dur": "3f", "ease": "enter"}]),
                        T(i, -0.1), round(nxt, 3)))
     return out
@@ -236,10 +267,25 @@ def captions(sid, end):
 TRANSITIONS = {"many": "push", "self": "slide", "typo": "push", "crowd": "slide", "spread": "push", "hope": "wipe", "end": "push"}
 
 
+# Shorts-safe layout: everything a scene draws (designed on the full
+# 1080×1920 page) sits in a stage scaled into the middle band, clear of
+# the platform's top bar, side buttons and bottom captions; the narration
+# captions sit just below the stage.
+STAGE_SCALE = 0.8
+STAGE_FROM = [W / 2, 905]
+STAGE_TO = [W / 2, 845]
+CAPTION_Y = 1410
+
+
 def scene(sid, layers, step=12, camera=None, lights=None, environment=None):
     start, end = scene_window(sid)
+    page = [l for l in layers if l["id"].endswith("-paper")]
+    caps = [l for l in layers if "-cap" in l["id"]]
+    rest = [l for l in layers if l not in page and l not in caps]
+    stage = {"id": f"{sid}-stage", "kind": "comp", "layers": rest,
+             "transform": {"position": STAGE_TO, "anchor": STAGE_FROM, "scale": STAGE_SCALE}}
     s = {"op": "add_scene", "id": sid, "start": start, "end": end, "background": PAPER, "step_fps": step,
-         "camera": camera or {"zoom": keys((start, 1.0), (end, 1.035), ease="linear")}, "layers": layers}
+         "camera": camera or {"zoom": keys((start, 1.0), (end, 1.03), ease="linear")}, "layers": page + [stage] + caps}
     if sid in TRANSITIONS:
         s["transition"] = {"type": TRANSITIONS[sid], "dur": "12f", "direction": "up"}
     if lights:
@@ -296,6 +342,7 @@ def hook():
     years = win(text("years", "50 YEARS", 150, [W / 2, 520], INK, BLACK, transform=tr([W / 2, 520], scale=tween(fifty, 0.7, 1, "6f", "land"), opacity=fade_in(fifty, "2f"))), fifty, why - 0.2)
     later = win(text("later", "of research", 56, [W / 2, 660], "#55555c", SERIF_I, transform=tr([W / 2, 660], opacity=fade_in(fifty + 0.3, "3f"))), fifty, why - 0.2)
     L_ += [years, later]
+    L_.insert(1, moire_lines("coins-moire", [W / 2, 1060], [820, 560], "#b8862b", billions - 0.9, why - 0.2, 0.22))
     for k, (x, n) in enumerate([(300, 6), (540, 9), (780, 7)]):
         coin = {"id": f"coin{k}", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 92, "height": 22, "bevel": 5},
                 "material": {"preset": "metal", "color": "#e8b84a", "roughness": 0.28}, "parts": {"side": {"color": "#c9952e"}},
@@ -307,7 +354,8 @@ def hook():
     L_.append(win({"id": "nocure", "kind": "shape", "shape": "rect", "size": [620, 120], "radius": 10, "fill": RED,
                    "transform": tr([W / 2, 820], rotation=4, scale=tween(cure, 1.6, 1, "5f", "land"), opacity=fade_in(cure, "2f"))}, cure, why - 0.2))
     L_.append(win(text("nocure-tx", "NO CURE", 92, [W / 2, 820], CREAM, BLACK, transform=tr([W / 2, 822], rotation=4, scale=tween(cure, 1.6, 1, "5f", "land"), opacity=fade_in(cure, "2f"))), cure, why - 0.2))
-    # Why?
+    # Why? Over live moiré rings.
+    L_.append(moire_rings("why-moire", [W / 2, 870], 520, RED, why - 0.1, end, 0.32))
     L_.append(win(text("why", "Why?", 380, [W / 2, 860], INK, SERIF_BI, transform=tr([W / 2, 860], scale=tween(why, 0.5, 1, "8f", "pop"), opacity=fade_in(why, "2f"))), why, None))
     L_.append(win(highlight("why-hl", why + 0.25, [W / 2 + 10, 1010], 620, 34, "6f", RED), why + 0.2, None))
     L_ += captions(sid, end)
@@ -320,13 +368,14 @@ def many():
     start, end = scene_window(sid)
     two = at_word(4, "two hundred", -0.1)
     L_ = [paper(sid)] + chapter(sid, "1 · NOT ONE DISEASE", start)
+    L_.append(moire_lines("cancer-moire", [W / 2, 860], [820, 380], INK, start + 0.2, at_word(4, "two hundred", 0.1), 0.2))
     # One label, "CANCER", that turns out to be many.
     one = win(text("one", "CANCER", 150, [W / 2, 860], INK, BLACK, transform=tr([W / 2, 860], scale=tween(T(3), 0.8, 1, "6f", "land"), opacity=inout(T(3) - 0.1, two - 0.1, "3f"))), start, two + 0.1)
     one_hl = win(highlight("one-hl", T(3) + 0.4, [W / 2, 866], 600, 120), start, two + 0.1)
     L_ += [one_hl, one]
     dot = {"id": "type", "kind": "shape", "shape": "circle", "size": 44, "fill": "#999999",
            "transform": tr([0, 0], scale=tween(two, 0, 1, "6f", "pop"))}
-    grid = {"id": "types", "kind": "instancer", "layout": {"type": "grid", "columns": 14, "rows": 15, "spacing": [64, 52], "hex": True},
+    grid = {"id": "types", "kind": "instancer", "layout": {"type": "grid", "columns": 13, "rows": 15, "spacing": [66, 54], "hex": True},
             "palette": MUTED + [CORAL, "#b07aa1"], "palette_order": "random", "stagger": {"total": 1.0, "order": "random", "seed": 4},
             "random": {"seed": 9, "scale": [0.7, 1.15]}, "transform": tr([W / 2, 900]), "layers": [dot]}
     L_.append(win(grid, two - 0.1, None))
@@ -371,6 +420,7 @@ def self_():
     hit = at_word(6, "hit", -0.1)
     you = at_word(6, "hitting you", -0.05)
     L_ = [paper(sid)] + chapter(sid, "2 · IT'S MADE OF YOU", start)
+    L_.append(moire_rings("virus-moire", [W / 2, 860], 380, "#c0392b", start + 0.2, own - 0.3, 0.26, 13, 40))
     # A virus: a foreign invader, easy to tell apart.
     spike = {"id": "spike", "kind": "mesh", "mesh": {"type": "capsule", "radius": 10, "height": 70}, "material": {"preset": "glossy", "color": "#d9534f"},
              "transform": tr([0, 0], position=[0, -40])}
@@ -415,7 +465,7 @@ def helix(at, end):
     """A DNA double helix: two strands of beads with base-pair rungs (3D)."""
     layers = [{"id": "dna", "kind": "shape", "shape": "circle", "size": 1, "three_d": True,
                "transform": tr([W / 2, 760], rotation=-12, rotation_x=keys((at, 0), (end, 220), ease="linear"))}]
-    n, length, amp = 22, 920, 110
+    n, length, amp = 21, 820, 104
     pairs = [("#f2c14e", "#e76f51"), ("#2a9d8f", "#3a6ea5")]
     for i in range(n):
         x = -length / 2 + length * i / (n - 1)
@@ -469,7 +519,8 @@ def typo():
     L_.append(win({"id": "sw-knob", "kind": "shape", "shape": "circle", "size": 56, "fill": CREAM,
                    "transform": tr([sx + 210, sy], position=keys((fail - 0.05, [sx + 210, sy]), (fail + 0.2, [sx + 130, sy]), ease="snap"), opacity=fade_in(typos + 1.2, "3f"))}, typos + 1.1, one - 0.1))
     L_.append(win(text("sw-off", "OFF", 40, [sx + 300, sy], RED, BLACK, transform=tr([sx + 300, sy - 70], opacity=fade_in(fail + 0.2, "2f"))), fail, one - 0.1))
-    # One becomes two, four... billions.
+    # One becomes two, four... billions, over a moiré that starts to boil.
+    L_.append(moire_lines("div-moire", [W / 2, 860], [860, 760], RED, one - 0.15, billions + 0.2, 0.2, 12, 14))
     def ball(id, pos_keys, at, until, r=80, grow=True):
         scale = pop(at, "8f") if grow else 1
         return smooth(win({"id": id, "kind": "mesh", "mesh": {"type": "sphere", "radius": r}, "material": {"preset": "coated", "color": RED},
@@ -506,6 +557,7 @@ def crowd():
     resist = at_word(12, "resist", -0.2)
     back = at_word(12, "grow back", -0.2)
     L_ = [paper(sid)] + chapter(sid, "4 · A CROWD THAT EVOLVES", start)
+    L_.append(moire_rings("drug-moire", [W / 2, 900], 470, INK, drug - 0.1, back - 0.1, 0.16, 14, 60))
     tumor_reds = [RED, CORAL, "#9d0208", "#f4a261", "#b5179e", "#d62828"]
     cellm = {"id": "tc", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"preset": "glossy", "color": "#ffffff"},
              "transform": tr([0, 0], scale=tween(T(10, 0.2), 0, 1, "8f", "pop"))}
@@ -569,23 +621,24 @@ def spread():
         {"id": "torso", "kind": "shape", "shape": "rect", "size": [330, 520], "radius": 120, **ink, "transform": tr([cx, 820])},
         {"id": "armL", "kind": "shape", "shape": "capsule", "size": [80, 440], **ink, "transform": tr([cx - 245, 820], rotation=8)},
         {"id": "armR", "kind": "shape", "shape": "capsule", "size": [80, 440], **ink, "transform": tr([cx + 245, 820], rotation=-8)},
-        {"id": "legL", "kind": "shape", "shape": "capsule", "size": [100, 480], **ink, "transform": tr([cx - 85, 1310])},
-        {"id": "legR", "kind": "shape", "shape": "capsule", "size": [100, 480], **ink, "transform": tr([cx + 85, 1310])},
+        {"id": "legL", "kind": "shape", "shape": "capsule", "size": [100, 380], **ink, "transform": tr([cx - 85, 1255])},
+        {"id": "legR", "kind": "shape", "shape": "capsule", "size": [100, 380], **ink, "transform": tr([cx + 85, 1255])},
         {"id": "brain", "kind": "shape", "shape": "circle", "size": [110, 90], "fill": "#f3c4cf", "transform": tr([cx, 415])},
         {"id": "lungL", "kind": "shape", "shape": "capsule", "size": [95, 200], "fill": "#f3c4cf", "transform": tr([cx - 70, 700])},
         {"id": "lungR", "kind": "shape", "shape": "capsule", "size": [95, 200], "fill": "#f3c4cf", "transform": tr([cx + 70, 700])},
         {"id": "liver", "kind": "shape", "shape": "circle", "size": [190, 110], "fill": "#d9a38b", "transform": tr([cx + 40, 900])},
-        {"id": "bone", "kind": "shape", "shape": "capsule", "size": [34, 300], "fill": "#e9e1cf", "transform": tr([cx - 85, 1320])},
+        {"id": "bone", "kind": "shape", "shape": "capsule", "size": [34, 240], "fill": "#e9e1cf", "transform": tr([cx - 85, 1265])},
     ]
     for k, l in enumerate(body):
         l["transform"]["opacity"] = fade_in(start + 0.1 + k * 0.04, "3f")
         L_.append(l)
-    # The first tumour, in a lung.
+    # The first tumour, in a lung, sending out moiré ripples.
+    L_.insert(1, moire_rings("spread-moire", [cx - 80, 690], 330, RED, T(13, 0.0), end, 0.3, 12, 30))
     L_.append({"id": "primary", "kind": "shape", "shape": "circle", "size": 46, "fill": RED, "transform": tr([cx - 80, 690], scale=pop(T(13, 0.1), "8f"))})
     routes = [
         ("toLiver", f"M {cx - 80} 690 C {cx - 160} 780 {cx - 30} 880 {cx + 40} 900", move + 0.2),
         ("toBrain", f"M {cx - 80} 690 C {cx - 150} 600 {cx - 40} 480 {cx} 420", move + 0.5),
-        ("toBone", f"M {cx - 80} 690 C {cx - 160} 900 {cx - 120} 1150 {cx - 85} 1320", blood - 0.2),
+        ("toBone", f"M {cx - 80} 690 C {cx - 160} 900 {cx - 120} 1120 {cx - 85} 1265", blood - 0.2),
     ]
     for k, (rid, d, t0) in enumerate(routes):
         L_.append({"id": rid, "kind": "shape", "shape": "path", "d": d, "stroke": {"color": "#c1121f", "width": 7, "dash": [14, 10]},
@@ -594,14 +647,14 @@ def spread():
             ta = t0 + 0.2 + j * 0.25
             L_.append(win({"id": f"{rid}-c{j}", "kind": "shape", "shape": "circle", "size": 26, "fill": RED,
                            "follow": {"layer": rid, "at": tween(ta, 0, 1, "24f", "glide")}}, ta, ta + 1.0))
-        dest = {"toLiver": [cx + 40, 900], "toBrain": [cx, 420], "toBone": [cx - 85, 1320]}[rid]
+        dest = {"toLiver": [cx + 40, 900], "toBrain": [cx, 420], "toBone": [cx - 85, 1265]}[rid]
         ta = t0 + 0.2 + 0.8
         L_.append(win({"id": f"{rid}-met", "kind": "shape", "shape": "circle", "size": 40, "fill": RED, "transform": tr(dest, scale=pop(ta, "8f"))}, ta, None))
         L_.append(win({"id": f"{rid}-ring", "kind": "shape", "shape": "ring", "size": 60, "thickness": 6, "fill": RED,
                        "transform": tr(dest, scale=tween(ta, 0.6, 3.5, "14f", "settle"), opacity=tween(ta, 1, 0, "14f", "glide"))}, ta, ta + 0.6))
-    L_.append(win(card("deadly-card", [760, 150], [W / 2, 1520 - 240], deaths, -2, "#ffffff"), deaths, None))
-    L_.append(win(text("deadly", "The deadliest step", 66, [W / 2, 1280], INK, SERIF_BI, transform=tr([W / 2, 1280], rotation=-2, opacity=fade_in(deaths + 0.1, "3f"))), deaths, None))
-    L_.append(win(highlight("deadly-hl", deaths + 0.3, [W / 2 + 120, 1288], 300, 56), deaths + 0.2, None))
+    L_.append(win(card("deadly-card", [760, 150], [W / 2, 1190], deaths, -2, "#ffffff"), deaths, None))
+    L_.append(win(text("deadly", "The deadliest step", 66, [W / 2, 1190], INK, SERIF_BI, transform=tr([W / 2, 1190], rotation=-2, opacity=fade_in(deaths + 0.1, "3f"))), deaths, None))
+    L_.append(win(highlight("deadly-hl", deaths + 0.3, [W / 2 + 120, 1198], 300, 56), deaths + 0.2, None))
     L_ += captions(sid, end)
     sfx = [("pop", T(13, 0.1), -8)] + [("whoosh", t0 + 0.2, -14) for _, _, t0 in routes] + [("pop", t0 + 1.0, -10) for _, _, t0 in routes] + [("thud", deaths, -6)]
     return scene(sid, L_), sfx
@@ -618,8 +671,9 @@ def hope():
     L_.append(win({"id": "trend", "kind": "shape", "shape": "path", "d": "M 140 1050 C 340 1000 420 900 560 860 S 820 640 940 560",
                    "stroke": {"color": TEAL, "width": 14, "cap": "round"}, "trim": tween(T(15, 0.1), [0, 0], [0, 1], "20f", "glide")}, start, T(16, -0.2)))
     L_.append(win(text("notlosing", "not a war we're losing", 64, [W / 2, 460], INK, SERIF_BI, transform=tr([W / 2, 460], opacity=fade_in(losing, "3f"))), start, T(16, -0.2)))
-    # Survival: 49% then 69%.
+    # Survival: 49% then 69%, over a soft moiré.
     base = 1240
+    L_.append(moire_lines("chart-moire", [W / 2, 900], [900, 820], TEAL, T(16, -0.2), end, 0.16, 14, 10))
     L_.append(win(text("chart-t", "5-YEAR SURVIVAL, ALL CANCERS (US)", 34, [W / 2, 300], INK, SEMI, tracking=60, transform=tr([W / 2, 300], opacity=fade_in(T(16), "3f"))), T(16, -0.1), None))
     L_.append(win({"id": "axis", "kind": "shape", "shape": "line", "size": [820, 0], "thickness": 6, "fill": INK, "trim": tween(T(16), [0, 0], [0, 1], "8f", "glide"), "transform": tr([W / 2, base])}, T(16, -0.1), None))
     for k, (x, pct, label, color, t) in enumerate([(330, 49, "1975–77", "#9a958c", s49), (750, 69, "2013–19", TEAL, s69)]):
@@ -644,11 +698,12 @@ def finale():
     L_.append(win(text("onecure", "ONE CURE", 150, [W / 2, 520], INK, BLACK, transform=tr([W / 2, 520], opacity=fade_in(one, "2f"))), one, None))
     L_.append(win({"id": "strike", "kind": "shape", "shape": "line", "size": [760, 0], "thickness": 18, "fill": RED,
                    "trim": tween(at_word(17, "won't", 0.1), [0, 0], [0, 1], "5f", "glide"), "transform": tr([W / 2, 525], rotation=-6)}, one, None))
+    L_.append(moire_rings("end-moire", [W / 2, 1020], 560, "#c9952e", many_t - 0.2, end, 0.3, 16, 50))
     tiles = [("targeted\ndrugs", "target"), ("immuno-\ntherapy", "shield"), ("early\ndetection", "lens"), ("surgery &\nradiation", "plus")]
     for k, (label, icon) in enumerate(tiles):
-        x, y = 300 + (k % 2) * 480, 860 + (k // 2) * 330
+        x, y = 320 + (k % 2) * 440, 860 + (k // 2) * 330
         t = many_t + k * 0.12
-        L_.append(win(card(f"tile{k}", [420, 280], [x, y], t, (-3, 2, 2, -2)[k], "#ffffff"), t, None))
+        L_.append(win(card(f"tile{k}", [390, 280], [x, y], t, (-3, 2, 2, -2)[k], "#ffffff"), t, None))
         ic = [x, y - 50]
         if icon == "target":
             for j, s in enumerate([110, 70, 30]):
@@ -662,8 +717,8 @@ def finale():
             L_.append(win({"id": f"ic{k}a", "kind": "shape", "shape": "rect", "size": [100, 32], "radius": 6, "fill": PURPLE, "transform": tr(ic, scale=pop(t + 0.05, "8f"))}, t, None))
             L_.append(win({"id": f"ic{k}b", "kind": "shape", "shape": "rect", "size": [32, 100], "radius": 6, "fill": PURPLE, "transform": tr(ic, scale=pop(t + 0.05, "8f"))}, t, None))
         L_.append(win(text(f"tile{k}tx", label, 40, [x, y + 70], INK, SERIF_B, line_height=1.0, transform=tr([x, y + 70], opacity=fade_in(t + 0.1, "3f"))), t, None))
-    L_.append(win(text("many-word", "MANY", 150, [W / 2, 1425], INK, BLACK, transform=tr([W / 2, 1425], scale=tween(many_t + 0.6, 0.5, 1, "8f", "pop"), opacity=fade_in(many_t + 0.6, "2f"))), many_t + 0.55, None))
-    L_.append(win(highlight("many-hl", many_t + 0.8, [W / 2, 1432], 500, 120), many_t + 0.75, None))
+    L_.append(win(text("many-word", "MANY", 150, [W / 2, 1395], INK, BLACK, transform=tr([W / 2, 1395], scale=tween(many_t + 0.6, 0.5, 1, "8f", "pop"), opacity=fade_in(many_t + 0.6, "2f"))), many_t + 0.55, None))
+    L_.append(win(highlight("many-hl", many_t + 0.8, [W / 2, 1402], 500, 120), many_t + 0.75, None))
     title_t = E(17, 0.6)
     L_.append(win(text("title", "WHY CANCER IS\nSO HARD TO CURE", 62, [W / 2, 1620], INK, BLACK, line_height=1.05, transform=tr([W / 2, 1620], opacity=fade_in(title_t, "4f"))), title_t, None))
     L_.append(win(text("credit", "Sources: American Cancer Society; Cancer Research UK\nMade with the Lahza motion engine", 24, [W / 2, 1745], "#6a6a70", SERIF_I, transform=tr([W / 2, 1745], opacity=fade_in(title_t + 0.3, "4f"))), title_t, None))
