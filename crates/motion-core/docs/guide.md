@@ -38,6 +38,25 @@ looks), the worst stretches with a sheet of them, a timeline graph and a
 side-by-side video (ours | reference | difference). With `at: [...]` it
 shows only those moments.
 
+## Measuring a reference's motion
+
+Don't eyeball frames or write scripts to measure a reference: use the tools.
+
+- `track {video, color: "#ff3355", tolerance}` follows a coloured object
+  (`region` limits the search); `point: [x, y]` follows the colour blob
+  under a point; `box: [x, y, w, h]` follows a textured patch (position
+  only). Per frame you get x/y, bbox, area, angle and mean colour in the
+  reference's pixels; `from`/`to` limit the range.
+- To copy a move frame for frame (a hand-held drift, a wobble), ask for
+  `keys: {scale, offset, at, layer}`: canvas = reference × scale + offset,
+  scale from the area, rotation from the angle, and `ops` to pass to
+  `edit_apply`.
+- To rebuild a designed move, give its samples to `fit_curve` (e.g.
+  `[[t, [x, y]], …]` from track): it returns the ease (a preset when one
+  fits), start, duration, from/to and a `key` to drop into the property's
+  keys. Prefer this over per-frame keys: one eased key stays editable and
+  snaps to beats.
+
 ## Footage and 3D
 
 - Footage: `media_import` a clip or image sequence, then add a

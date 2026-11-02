@@ -207,6 +207,29 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: false,
         },
         ToolDef {
+            name: "track",
+            description: "Follow a target through a video (a reference) and measure it per frame: t, frame, x/y (centroid), bbox [x, y, w, h], area, angle (principal axis from image moments, degrees clockwise) and mean colour, in source pixels. Target: `color` \"#rrggbb\" ± `tolerance` (RGB distance, default 40; `region` [x, y, w, h] limits the search), or `point` [x, y] (the colour blob under it in the first frame, followed as the connected region nearest its last position), or `box` [x, y, w, h] (that picture matched frame to frame within `search` px; translation only, angle 0). With `keys` it also returns transform keys (position, scale from the area, rotation from the angle, one per frame) and, given keys.layer, edit_apply ops that set them. Use it instead of measuring frames by hand; feed a move's samples to fit_curve to get one eased key instead of per-frame keys.",
+            schema: obj(json!({
+                "video": {"type": "string", "description": "video file (absolute, or relative to the working folder or project)"},
+                "color": {"type": "string"}, "tolerance": {"type": "number", "default": 40},
+                "region": {"type": "array", "items": {"type": "number"}, "description": "[x, y, w, h] in source pixels"},
+                "point": {"type": "array", "items": {"type": "number"}, "description": "[x, y] in source pixels on the first frame"},
+                "box": {"type": "array", "items": {"type": "number"}, "description": "[x, y, w, h] in source pixels on the first frame"},
+                "search": {"type": "number", "description": "box: pixels to search per frame (default the box size)"},
+                "from": {"type": "number", "default": 0}, "to": {"type": "number"},
+                "width": {"type": "integer", "description": "processing width (default source, at most 960)"},
+                "keys": {"type": "object", "description": "{scale: canvas px per source px (default 1), offset: [x, y], at: timeline seconds of `from` (default 0), base_scale: 1, rotate: true, layer: id} → keys and ops"}}), &["video"]),
+            read_only: true,
+        },
+        ToolDef {
+            name: "fit_curve",
+            description: "Fit the engine's eases to a measured move: `samples` [[t, value], …] with a number or [x, y] per sample (positions are fitted along the line of the move; e.g. track's x/y). Tries linear, power in/out/in-out (n), exp (tau), spring (zeta, hz), bezier, bounce and every named preset, searching start, duration and the ease's parameters; from/to by least squares. Returns `best` with ease, start, end, duration, from, to, rms_error, relative_error (of the travel) and `key` — {at, anchor: \"start\", dur, from, v, ease}, ready for a key op — plus the runners-up. A named preset or simpler ease wins when it fits about as well.",
+            schema: obj(json!({
+                "samples": {"type": "array", "items": {"type": "array"}, "description": "[[t, value], …], value a number or [x, y]"},
+                "fps": {"type": "number", "description": "frame rate for frame-based eases (default the project's, else 30)"}}), &["samples"]),
+            read_only: true,
+        },
+        ToolDef {
             name: "audio_analyze",
             description: "Analyse music into marker tracks: tempo (a tempo map when it changes), meter (3/4 or 4/4), first downbeat, beat/bar/half/sixteenth/triplet grids, onsets per band, hit, stop (silence→hit, or the music cutting to a reverb tail or ringing hit), drop (bass dropout before a downbeat), music.start/end. Reports the feel (straight, or triplet for a shuffle or compound swing) with feel_confidence, and tempo_confidence with the alternatives: other groupings of the same pulse (3:4, 2:3; e.g. 133 BPM in triplets vs 100 BPM in sixteenths) when the onsets cannot tell them apart. Defaults to the project's music.",
             schema: obj(json!({"path": {"type": "string", "description": "audio file; registered as the music when the project has none"}, "offset": {"type": "number", "description": "timeline time of the file's start"}}), &[]),
@@ -316,6 +339,8 @@ impl Toolbox {
             "audio_analyze" => self.audio_analyze(&args),
             "media_import" => self.media_import(&args),
             "blender_run" => self.blender_run(&args),
+            "track" => self.track(&args),
+            "fit_curve" => self.fit_curve(&args),
             other => Err(format!("unknown tool '{other}'")),
         }
     }
@@ -1920,6 +1945,64 @@ impl Toolbox {
             walk(&scene.layers, &compiled, &mut out, &window);
         }
         Value::Object(out)
+    }
+
+    /// A file named by the agent: absolute, or relative to the working
+    /// folder or (failing that) the current project.
+    fn input_file(&self, p: &str) -> PathBuf {
+        let abs = self.path(p);
+        match &self.current {
+            Some(dir) if !abs.exists() && dir.join(p).exists() => dir.join(p),
+            _ => abs,
+        }
+    }
+
+    fn track(&mut self, args: &Value) -> ToolResult {
+        let video = self.input_file(get_str(args, "video").ok_or("track needs \"video\"")?);
+        let target = crate::measure::Target::from_json(args)?;
+        let from = get_f64(args, "from").unwrap_or(0.0);
+        let width = args.get("width").and_then(Value::as_u64).map(|w| w as u32);
+        let (info, samples) = crate::measure::track(&video, &target, from, get_f64(args, "to"), width)?;
+        let found = samples.iter().filter(|s| s.found).count();
+        let mut out = json!({
+            "video": video.display().to_string(), "size": [info.width, info.height], "fps": round(info.fps),
+            "frames": samples.len(), "found": found,
+            "track": samples.iter().map(|s| s.to_json()).collect::<Vec<_>>(),
+        });
+        if let Some(k) = args.get("keys").filter(|k| k.is_object()) {
+            let offset = k.get("offset").and_then(Value::as_array).map(|a| [a.first().and_then(Value::as_f64).unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]).unwrap_or([0.0, 0.0]);
+            let rotate = k.get("rotate").and_then(Value::as_bool).unwrap_or(!matches!(target, crate::measure::Target::Box { .. }));
+            let keys = crate::measure::keys(&samples, from, get_f64(k, "at").unwrap_or(0.0), get_f64(k, "scale").unwrap_or(1.0), offset, get_f64(k, "base_scale").unwrap_or(1.0), rotate);
+            if let (Some(layer), Some(map)) = (get_str(k, "layer"), keys.as_object()) {
+                out["ops"] = json!(map.iter().map(|(path, v)| json!({"op": "set", "target": format!("{layer}.{path}"), "value": v})).collect::<Vec<_>>());
+            }
+            out["keys"] = keys;
+        }
+        Ok(Output::json(out))
+    }
+
+    fn fit_curve(&mut self, args: &Value) -> ToolResult {
+        let list = args.get("samples").and_then(Value::as_array).ok_or("fit_curve needs \"samples\": [[t, value], …]")?;
+        let mut samples = Vec::with_capacity(list.len());
+        for s in list {
+            let pair = s.as_array().filter(|a| a.len() == 2).ok_or("each sample is [t, value]")?;
+            let t = pair[0].as_f64().ok_or("sample times are numbers")?;
+            let v: Vec<f64> = match &pair[1] {
+                Value::Number(n) => vec![n.as_f64().unwrap_or(0.0)],
+                Value::Array(a) => a.iter().map(|x| x.as_f64().ok_or("sample values are numbers or [x, y]")).collect::<Result<_, _>>()?,
+                _ => return Err("sample values are numbers or [x, y]".into()),
+            };
+            samples.push((t, v));
+        }
+        let project_fps = match (get_str(args, "project"), &self.current) {
+            (None, None) => None,
+            _ => self.dir(args).ok().map(|dir| self.state(&dir).project.settings.fps),
+        };
+        let fps = match get_f64(args, "fps") {
+            Some(f) => Fps::from_f64(f).map_err(|e| e.to_string())?,
+            None => project_fps.unwrap_or(Fps::whole(30)),
+        };
+        crate::measure::fit_curve(&samples, fps).map(Output::json)
     }
 }
 
