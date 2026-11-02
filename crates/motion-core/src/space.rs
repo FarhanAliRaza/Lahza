@@ -181,6 +181,25 @@ impl Mat4 {
         std::array::from_fn(|r| m[r * 4] * x + m[r * 4 + 1] * y + m[r * 4 + 2] * z + m[r * 4 + 3])
     }
 
+    /// Inverse of the upper 3×3 transposed (normals' transform), or None
+    /// when it is singular.
+    pub fn normal_matrix(self) -> Option<[[f64; 3]; 3]> {
+        let m = self.0;
+        let a = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
+        let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        if det.abs() < 1e-18 || !det.is_finite() {
+            return None;
+        }
+        // Cofactor matrix / det = (A⁻¹)ᵀ.
+        let c = |r0: usize, r1: usize, c0: usize, c1: usize| a[r0][c0] * a[r1][c1] - a[r0][c1] * a[r1][c0];
+        let k = 1.0 / det;
+        Some([
+            [c(1, 2, 1, 2) * k, -c(1, 2, 0, 2) * k, c(1, 2, 0, 1) * k],
+            [-c(0, 2, 1, 2) * k, c(0, 2, 0, 2) * k, -c(0, 2, 0, 1) * k],
+            [c(0, 1, 1, 2) * k, -c(0, 1, 0, 2) * k, c(0, 1, 0, 1) * k],
+        ])
+    }
+
     /// The homography of the local z = 0 plane: columns x, y, w; rows x, y, w.
     pub fn plane(self) -> Proj {
         let m = self.0;
@@ -189,12 +208,15 @@ impl Mat4 {
 }
 
 /// A 3D camera looking at `poi` from `distance` along +z (before orbit).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera3 {
     /// World → camera space (camera at the origin, looking down +z).
     pub view: Mat4,
     /// World → screen homogeneous (X, Y, Z, W), point = (X/W, Y/W).
     pub project: Mat4,
+    /// Camera space → screen: x = focal·x/z + centre.x (same for y).
+    pub focal: f64,
+    pub centre: (f64, f64),
 }
 
 impl Camera3 {
@@ -211,7 +233,7 @@ impl Camera3 {
             .then(Mat4::translate(-poi.0, -poi.1, 0.0));
         let k = zoom * f;
         let intrinsics = Mat4([k, 0.0, width / 2.0, 0.0, 0.0, k, height / 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        Camera3 { view, project: intrinsics.then(view) }
+        Camera3 { view, project: intrinsics.then(view), focal: k, centre: (width / 2.0, height / 2.0) }
     }
 }
 

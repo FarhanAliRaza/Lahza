@@ -417,6 +417,7 @@ pub fn bounds(layer: &LayerState, measure: Option<Measure>) -> Option<[f64; 4]> 
             None => return None,
         },
         Content::Text(_) => return measure.and_then(|m| m(layer)),
+        Content::Mesh(m) => return m.screen_bounds(),
     };
     let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)].map(|(x, y)| layer.matrix.apply(x, y));
     Some([

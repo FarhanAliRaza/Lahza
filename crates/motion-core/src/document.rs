@@ -187,6 +187,12 @@ pub struct Scene {
     pub transition: Option<Transition>,
     #[serde(default, skip_serializing_if = "Camera::is_default")]
     pub camera: Camera,
+    /// Lights for `mesh` layers (default: a key, a rim and a little fill).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lights: Vec<Light>,
+    /// What glossy meshes reflect (default: the studio environment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion_blur: Option<MotionBlur>,
     /// Stepped clock for every layer of the scene (the camera stays smooth).
@@ -209,6 +215,8 @@ impl Scene {
             background: None,
             transition: None,
             camera: Camera::default(),
+            lights: Vec::new(),
+            environment: None,
             motion_blur: None,
             step_fps: None,
             layers: Vec::new(),
@@ -330,6 +338,9 @@ pub struct Transform {
     pub rotation_x: Property<f64>,
     #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
     pub rotation_y: Property<f64>,
+    /// 3D layers: depth scale (meshes default to `scale`'s x, planes to 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_z: Option<Property<f64>>,
 }
 
 impl Default for Transform {
@@ -343,6 +354,7 @@ impl Default for Transform {
             z: zero_prop(),
             rotation_x: zero_prop(),
             rotation_y: zero_prop(),
+            scale_z: None,
         }
     }
 }
@@ -763,6 +775,7 @@ pub enum LayerKind {
     Video(VideoLayer),
     Comp(CompLayer),
     Instancer(InstancerLayer),
+    Mesh(MeshLayer),
 }
 
 impl LayerKind {
@@ -774,6 +787,7 @@ impl LayerKind {
             LayerKind::Video(_) => "video",
             LayerKind::Comp(_) => "comp",
             LayerKind::Instancer(_) => "instancer",
+            LayerKind::Mesh(_) => "mesh",
         }
     }
 }
@@ -824,7 +838,7 @@ impl Layer {
         let common: Common = serde_json::from_value(serde_json::Value::Object(common))
             .map_err(|e| format!("layer '{id}': {e}"))?;
         if !map.contains_key("kind") {
-            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image, video, comp or instancer"));
+            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image, video, comp, instancer or mesh"));
         }
         let kind: LayerKind =
             serde_json::from_value(serde_json::Value::Object(map)).map_err(|e| format!("layer '{id}': {e}"))?;
@@ -1910,4 +1924,337 @@ mod tests {
 
 fn zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+// ------------------------------------------------------------------ 3D
+
+/// A lit 3D object, rendered in the engine with the scene's camera,
+/// `lights` and `environment`. Always 3D: it sorts by depth with other
+/// 3D layers, and meshes next to each other share one depth buffer (they
+/// intersect correctly).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshLayer {
+    pub mesh: MeshDef,
+    #[serde(default, skip_serializing_if = "Material::is_empty")]
+    pub material: Material,
+    /// Materials for parts of the mesh (front, back, side, bevel, caps),
+    /// over `material`.
+    #[serde(default, skip_serializing_if = "Parts::is_empty")]
+    pub parts: Parts,
+    /// Split rings, revolves and sweeps into this many pieces.
+    #[serde(default = "one_u32", skip_serializing_if = "is_one_u32")]
+    pub segments: u32,
+    /// Between pieces: degrees (rings, revolves) or a fraction of the
+    /// length (sweeps).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub gap: Property<f64>,
+    /// One colour per piece, in turn (parts with their own colour keep it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub colors: Vec<Property<Color>>,
+    /// Tessellation (1 = smooth at the drawn size; 2 = twice as fine).
+    #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")]
+    pub detail: f64,
+}
+
+fn one_u32() -> u32 {
+    1
+}
+fn is_one_u32(v: &u32) -> bool {
+    *v == 1
+}
+
+/// Mesh geometry. Space is the layer's: x right, y down, z away from the
+/// viewer; the mesh is centred on the layer origin.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum MeshDef {
+    Sphere {
+        #[serde(default = "hundred_f")]
+        radius: Property<f64>,
+    },
+    /// A box `size` [w, h] by `depth`, edges rounded by `bevel`.
+    Box {
+        #[serde(default = "hundred")]
+        size: Property<Vec2>,
+        #[serde(default = "hundred_f")]
+        depth: Property<f64>,
+        #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+        bevel: Property<f64>,
+    },
+    /// Standing along y; `top` gives a cone or frustum.
+    Cylinder {
+        #[serde(default = "fifty_f")]
+        radius: Property<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top: Option<Property<f64>>,
+        #[serde(default = "hundred_f")]
+        height: Property<f64>,
+        #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+        bevel: Property<f64>,
+    },
+    /// Standing along y, `height` end to end.
+    Capsule {
+        #[serde(default = "fifty_f")]
+        radius: Property<f64>,
+        #[serde(default = "two_hundred")]
+        height: Property<f64>,
+    },
+    /// A ring facing the camera: `radius` to the tube's centre, `tube` its
+    /// radius, `angles` [from, to] like an arc (0 = up, clockwise).
+    Torus {
+        #[serde(default = "hundred_f")]
+        radius: Property<f64>,
+        #[serde(default = "twenty_f")]
+        tube: Property<f64>,
+        #[serde(default = "full_turn_vec", skip_serializing_if = "is_full_turn_vec")]
+        angles: Property<Vec2>,
+        #[serde(default, skip_serializing_if = "is_default")]
+        caps: MeshCaps,
+    },
+    /// An outline (`d`: SVG path data, a primitive, or morph keys) pushed
+    /// back `depth`, its edges rounded by `bevel`. Holes are kept.
+    Extrude {
+        d: PathData,
+        #[serde(default = "forty_f")]
+        depth: Property<f64>,
+        #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+        bevel: Property<f64>,
+    },
+    /// `profile` (x = distance from the axis, y = position along it) turned
+    /// about the `axis` ("y": standing up, "z": facing the camera).
+    Revolve {
+        profile: PathData,
+        #[serde(default = "full_turn_vec", skip_serializing_if = "is_full_turn_vec")]
+        angles: Property<Vec2>,
+        #[serde(default)]
+        axis: RevolveAxis,
+    },
+    /// A tube along `d` in the layer plane, drawn on by `trim` [from, to],
+    /// with an optional ball (`head` radius) leading it.
+    Sweep {
+        d: PathData,
+        #[serde(default = "ten")]
+        radius: Property<f64>,
+        #[serde(default, skip_serializing_if = "is_default")]
+        profile: SweepShape,
+        /// Ribbon: width across the path (standing out of the plane).
+        #[serde(default = "forty_f", skip_serializing_if = "is_forty")]
+        width: Property<f64>,
+        #[serde(default = "full_trim", skip_serializing_if = "is_full_trim")]
+        trim: Property<Vec2>,
+        #[serde(default = "round_caps", skip_serializing_if = "is_round_caps")]
+        caps: MeshCaps,
+        #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+        head: Property<f64>,
+    },
+}
+
+fn fifty_f() -> Property<f64> {
+    Property::Constant(50.0)
+}
+fn forty_f() -> Property<f64> {
+    Property::Constant(40.0)
+}
+fn is_forty(p: &Property<f64>) -> bool {
+    *p == forty_f()
+}
+fn twenty_f() -> Property<f64> {
+    Property::Constant(20.0)
+}
+fn full_turn_vec() -> Property<Vec2> {
+    Property::Constant(Vec2::new(0.0, 360.0))
+}
+fn is_full_turn_vec(p: &Property<Vec2>) -> bool {
+    *p == full_turn_vec()
+}
+fn round_caps() -> MeshCaps {
+    MeshCaps::Round
+}
+fn is_round_caps(c: &MeshCaps) -> bool {
+    *c == MeshCaps::Round
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshCaps {
+    #[default]
+    Flat,
+    Round,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SweepShape {
+    #[default]
+    Circle,
+    Square,
+    Ribbon,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RevolveAxis {
+    #[default]
+    Y,
+    Z,
+}
+
+/// Surface look. Unset fields come from `preset` (default "glossy").
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Material {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<MaterialPreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Property<Color>>,
+    /// 0 dielectric (plastic, paint) … 1 metal (reflections take the colour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metallic: Option<Property<f64>>,
+    /// 0 mirror-sharp highlights … 1 fully diffuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<Property<f64>>,
+    /// A clear lacquer layer over the base (car paint, coated plastic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearcoat: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearcoat_roughness: Option<Property<f64>>,
+    /// Light the surface gives off (not lit, not shaded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive: Option<Property<Color>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive_strength: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Property<f64>>,
+    /// Glass: the body lets this much of what is behind through; edges
+    /// reflect more (fresnel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transmission: Option<Property<f64>>,
+    /// Ignore lights: the flat colour (flat-shaded idents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlit: Option<bool>,
+    /// Faceted: one normal per triangle (low-poly look).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faceted: Option<bool>,
+}
+
+impl Material {
+    pub fn is_empty(&self) -> bool {
+        *self == Material::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaterialPreset {
+    Matte,
+    Plastic,
+    #[default]
+    Glossy,
+    /// Base colour under a clear lacquer: crisp reflections over colour.
+    Coated,
+    Metal,
+    Chrome,
+    Glass,
+    Emissive,
+    /// Unlit flat colour.
+    Flat,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Parts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub front: Option<Material>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back: Option<Material>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<Material>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bevel: Option<Material>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<Material>,
+}
+
+impl Parts {
+    pub fn is_empty(&self) -> bool {
+        *self == Parts::default()
+    }
+    /// In `mesh::PART_*` order.
+    pub fn list(&self) -> [Option<&Material>; 5] {
+        [self.front.as_ref(), self.back.as_ref(), self.side.as_ref(), self.bevel.as_ref(), self.caps.as_ref()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LightKind {
+    /// Parallel light arriving from direction `from`.
+    #[default]
+    Directional,
+    /// A light at `position` (world px, like a 3D layer's position and z).
+    Point,
+    /// Even light from everywhere.
+    Ambient,
+}
+
+/// A light for mesh layers. Directions are in the scene's space (x right,
+/// y down, z away): `from: [-1, -1, -1]` is a key from the upper left,
+/// in front of the subject; `[1, -0.5, 1]` a rim from behind on the right.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Light {
+    #[serde(rename = "type", default)]
+    pub kind: LightKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<[f64; 3]>,
+    #[serde(default = "white_prop")]
+    pub color: Property<Color>,
+    #[serde(default = "one_prop", skip_serializing_if = "is_one")]
+    pub intensity: Property<f64>,
+}
+
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvironmentPreset {
+    /// Neutral studio: a soft top light, two strip boxes, dark floor.
+    #[default]
+    Studio,
+    /// Bright and even (product shots on white).
+    Soft,
+    /// Warm low sun, cool sky.
+    Sunset,
+    /// Dark with thin bright strips (premium, glossy idents).
+    Night,
+    /// No reflections or ambient from the environment.
+    None,
+}
+
+/// What glossy surfaces reflect and how much ambient light comes from it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    #[serde(default)]
+    pub preset: EnvironmentPreset,
+    #[serde(default = "one_prop", skip_serializing_if = "is_one")]
+    pub intensity: Property<f64>,
+    /// Turns the environment about the vertical axis (degrees).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub rotation: Property<f64>,
+    /// Override the preset's colours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sky: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ground: Option<Color>,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self { preset: EnvironmentPreset::Studio, intensity: one_prop(), rotation: zero_prop(), sky: None, horizon: None, ground: None }
+    }
 }

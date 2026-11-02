@@ -15,7 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 mod instancer;
+mod meshes;
 use instancer::CInstancer;
+pub use meshes::{srgb_to_linear, EnvState, LightState, Lighting, Lobe, MaterialState, MeshState};
+use meshes::{CLighting, CMesh};
 
 /// 2D affine transform: (x, y) → (a·x + c·y + e, b·x + d·y + f).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,6 +175,8 @@ pub enum Content {
     /// A comp drawn as one picture (AE precomp): children carry absolute
     /// matrices; the group's opacity, blend, effects and matte apply once.
     Group(Vec<LayerState>),
+    /// A lit 3D object.
+    Mesh(Box<MeshState>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -380,6 +385,7 @@ pub struct CScene {
     camera_dolly: Prop<f64>,
     camera_focus: Option<CFocus>,
     camera_aperture: Prop<f64>,
+    lighting: CLighting,
     transition: Option<CTransition>,
     pub layers: Vec<CLayer>,
 }
@@ -435,6 +441,7 @@ pub struct CLayer {
     z: Prop<f64>,
     rotation_x: Prop<f64>,
     rotation_y: Prop<f64>,
+    scale_z: Option<Prop<f64>>,
     three_d: bool,
     blend: Blend,
     effects: Vec<CEffect>,
@@ -495,6 +502,7 @@ enum CKind {
     Video(CVideo),
     Comp(Vec<CLayer>),
     Instancer(Box<CInstancer>),
+    Mesh(Box<CMesh>),
 }
 
 struct CVideo {
@@ -847,6 +855,7 @@ impl<'a> Compiler<'a> {
         let z = self.prop(&t.z, id, "transform.z", start, step, shift);
         let rotation_x = self.prop(&t.rotation_x, id, "transform.rotation_x", start, step, shift);
         let rotation_y = self.prop(&t.rotation_y, id, "transform.rotation_y", start, step, shift);
+        let scale_z = t.scale_z.as_ref().map(|p| self.prop(p, id, "transform.scale_z", start, step, shift));
         let mut effects = Vec::new();
         for (i, e) in c.effects.iter().enumerate() {
             let what = |f: &str| format!("effects.{i}.{f}");
@@ -1054,7 +1063,10 @@ impl<'a> Compiler<'a> {
             }),
             LayerKind::Comp(comp) => CKind::Comp(self.layers(&comp.layers, step, shift - offset)),
             LayerKind::Instancer(n) => CKind::Instancer(Box::new(self.instancer(n, id, start, step, shift, siblings))),
+            LayerKind::Mesh(m) => CKind::Mesh(Box::new(self.mesh(m, id, start, step, shift))),
         };
+        // Meshes are always placed in 3D.
+        let three_d = c.three_d || matches!(kind, CKind::Mesh(_));
         CLayer {
             id: id.into(),
             start,
@@ -1069,7 +1081,8 @@ impl<'a> Compiler<'a> {
             z,
             rotation_x,
             rotation_y,
-            three_d: c.three_d,
+            scale_z,
+            three_d,
             blend: c.blend,
             effects,
             matte,
@@ -1303,6 +1316,7 @@ impl Compiled {
                 },
             };
             let layers = c.layers(&scene.layers, step, pre_roll);
+            let lighting = c.lighting(scene, pre_roll, start);
             let transition = scene.transition.as_ref().map(|t| CTransition {
                 kind: t.kind,
                 dur: t.dur.seconds(&c.windows.base).unwrap_or(0.0).max(0.0),
@@ -1324,6 +1338,7 @@ impl Compiled {
                 camera_dolly,
                 camera_focus,
                 camera_aperture,
+                lighting,
                 transition,
                 layers,
             });
@@ -1463,7 +1478,12 @@ impl Compiled {
 
     fn scene_layers(&self, scene: &CScene, t: f64, out: &mut Vec<LayerState>) {
         let tc = t + scene.pre_roll;
+        let first = out.len();
         emit(&scene.layers, tc, None, &self.camera(scene, tc), 1.0, out);
+        if has_meshes(&out[first..]) {
+            let lighting = Arc::new(scene.lighting.at(tc));
+            meshes::light_meshes(&mut out[first..], &lighting);
+        }
     }
 
     /// A whole scene as one group with its background, for transitions.
@@ -1531,6 +1551,14 @@ impl Compiled {
             }
         }
     }
+}
+
+fn has_meshes(layers: &[LayerState]) -> bool {
+    layers.iter().any(|l| match &l.content {
+        Content::Mesh(_) => true,
+        Content::Group(c) => has_meshes(c),
+        _ => false,
+    } || l.matte.as_ref().and_then(|m| m.source.as_ref()).is_some_and(|s| has_meshes(std::slice::from_ref(s))))
 }
 
 /// A solid rectangle covering w × h, centred on the canvas.
@@ -1604,12 +1632,18 @@ fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, s
     let t = clock(l.step.or(inherited), tc);
     let s = l.scale.at(t);
     let a = l.anchor.at(t);
+    // Depth scale: meshes scale uniformly with x unless told otherwise.
+    let sz = match &l.scale_z {
+        Some(p) => p.at(t),
+        None if matches!(l.kind, CKind::Mesh(_)) => s.x(),
+        None => 1.0,
+    };
     let local = |origin: Mat4| {
         origin
             .then(Mat4::rotate_y(l.rotation_y.at(t)))
             .then(Mat4::rotate_x(l.rotation_x.at(t)))
             .then(Mat4::rotate_z(l.rotation.at(t)))
-            .then(Mat4::scale(s.x(), s.y(), 1.0))
+            .then(Mat4::scale(s.x(), s.y(), sz))
             .then(Mat4::translate(-a.x(), -a.y(), 0.0))
     };
     let m = match &l.follow {
@@ -1883,6 +1917,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             }),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
+        CKind::Mesh(m) => Content::Mesh(Box::new(m.state(t, world, space.cam))),
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
         CKind::Video(v) => Content::Video(VideoState {
             src: v.src.clone(),
