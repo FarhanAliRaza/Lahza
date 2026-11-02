@@ -228,7 +228,14 @@ fn gpu_matches_cpu_fields_strokes_and_focus() {
     assert_gpu_matches_cpu(&p, &[0.5]);
 }
 
-fn assert_gpu_matches_cpu(p: &Project, times: &[f64]) {
+pub(crate) fn assert_gpu_matches_cpu(p: &Project, times: &[f64]) {
+    assert_gpu_matches_cpu_within(p, times, 0.0);
+}
+
+/// `outliers`: fraction of pixels allowed to differ by more than 3 levels
+/// (mesh edges: a sample on a triangle edge can fall either way when the
+/// GPU fuses multiply-adds).
+pub(crate) fn assert_gpu_matches_cpu_within(p: &Project, times: &[f64], outliers: f64) {
     let c = Compiled::new(p);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
@@ -243,13 +250,22 @@ fn assert_gpu_matches_cpu(p: &Project, times: &[f64]) {
         let b = cpu.render(&c, t);
         let mut max = 0u8;
         let mut total = 0u64;
+        let mut over = 0usize;
         for (pa, pb) in a.pixels().zip(b.pixels()) {
+            let mut m = 0u8;
             for k in 0..4 {
                 let d = pa.0[k].abs_diff(pb.0[k]);
-                max = max.max(d);
+                m = m.max(d);
                 total += d as u64;
             }
+            if m > 3 {
+                over += 1;
+            } else {
+                max = max.max(m);
+            }
         }
+        let allowed = (outliers * (a.width() * a.height()) as f64) as usize;
+        assert!(over <= allowed, "t={t}: {over} pixels differ by more than 3 levels (allowed {allowed})");
         let mean = total as f64 / (a.len() as f64);
         if let Ok(dir) = std::env::var("LAHZA_MOTION_DUMP") {
             a.save(format!("{dir}/gpu-{t}.png")).unwrap();
@@ -892,7 +908,7 @@ fn instancer_2000_copies_at_1080p() {
         let started = Instant::now();
         let f = c.frame(times(n));
         let evaluated = Instant::now();
-        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, scale: 1.0 }.build(&f);
+        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, meshes: &mut Default::default(), scale: 1.0 }.build(&f);
         build += evaluated.elapsed().as_secs_f64() * 1000.0;
         eval += (evaluated - started).as_secs_f64() * 1000.0;
         assert_eq!(list.prims.len(), 2000);

@@ -17,6 +17,7 @@ pub mod footage;
 pub mod gpu;
 pub mod images;
 pub mod list;
+pub mod mesh3d;
 pub mod raster;
 pub mod sheet;
 
@@ -80,6 +81,7 @@ pub struct Renderer {
     pub fonts: Fonts,
     pub images: Images,
     pub footage: footage::Footage,
+    pub meshes: mesh3d::MeshCache,
     gpu: Option<gpu::Gpu>,
     gpu_error: Option<String>,
     options: RenderOptions,
@@ -102,6 +104,7 @@ impl Renderer {
             fonts: Fonts::new(root),
             images: Images::new(root),
             footage: footage::Footage::new(root),
+            meshes: mesh3d::MeshCache::default(),
             gpu,
             gpu_error,
             options,
@@ -140,6 +143,7 @@ impl Renderer {
         let mut w = self.fonts.warnings.clone();
         w.extend(self.images.warnings.iter().cloned());
         w.extend(self.footage.warnings.iter().cloned());
+        w.extend(self.meshes.warnings.iter().cloned());
         w.sort();
         w.dedup();
         w
@@ -173,7 +177,7 @@ impl Renderer {
         self.footage.begin_frame();
         let lists: Vec<DisplayList> = states
             .iter()
-            .map(|s| Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, scale }.build(s))
+            .map(|s| Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, meshes: &mut self.meshes, scale }.build(s))
             .collect();
         let mut key = Vec::new();
         for l in &lists {
@@ -255,3 +259,6 @@ pub fn encode_png(image: &RgbaImage) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod mesh_tests;

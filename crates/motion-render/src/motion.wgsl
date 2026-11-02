@@ -47,6 +47,8 @@ var<storage, read> b_groups: array<vec4<f32>>;
 var<storage, read> b_segs: array<vec4<f32>>;
 var<storage, read> b_footage: array<u32>;
 var<storage, read> b_ops: array<vec4<f32>>;
+var<storage, read> b_mesh: array<vec4<f32>>;
+var<storage, read> b_bins: array<u32>;
 var<storage, read_write> b_target: array<vec4<f32>>;
 
 var<uniform> u_blur: BlurPass;
@@ -688,6 +690,288 @@ fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(rgb * a, a);
 }
 
+// ------------------------------------------------------------------ meshes
+// Mirrors mesh3d.rs: nearest triangle at 8 samples, each distinct winner
+// shaded once at the centroid of its samples (GGX, clear coat, fresnel,
+// procedural environment, linear light encoded to sRGB).
+
+const SAMPLE_X = array<f32, 8>(1.0, -1.0, 5.0, -3.0, -5.0, -7.0, 3.0, 7.0);
+const SAMPLE_Y = array<f32, 8>(-3.0, 3.0, 1.0, -5.0, 5.0, -1.0, 7.0, -7.0);
+const NO_TRI: u32 = 0xffffffffu;
+
+fn env_light(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
+    let up = -d.y;
+    let sky = b_mesh[lb + 4u].xyz;
+    let horizon = b_mesh[lb + 5u].xyz;
+    let ground = b_mesh[lb + 6u].xyz;
+    var c: vec3<f32>;
+    if up >= 0.0 {
+        c = mix(horizon, sky, smoothstep(0.0, 0.6 + r, up));
+    } else {
+        c = mix(horizon, ground, smoothstep(0.0, 0.2 + r, -up));
+    }
+    let lights = u32(b_mesh[lb].x);
+    let lobes = u32(b_mesh[lb].y);
+    let first = lb + 7u + lights * 2u;
+    for (var i = 0u; i < lobes; i++) {
+        let l = b_mesh[first + i * 2u];
+        let s2 = l.w * l.w;
+        let w2 = s2 + r * r * 1.2;
+        let k = exp((dot(d, l.xyz) - 1.0) / w2) * s2 / w2;
+        c = c + b_mesh[first + i * 2u + 1u].xyz * k;
+    }
+    return c;
+}
+
+fn to_world(lb: u32, v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(b_mesh[lb + 1u].xyz, v), dot(b_mesh[lb + 2u].xyz, v), dot(b_mesh[lb + 3u].xyz, v));
+}
+
+fn ggx(n_h: f32, a: f32) -> f32 {
+    let a2 = a * a;
+    let d = n_h * n_h * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-12);
+}
+
+fn smith(n_v: f32, n_l: f32, r: f32) -> f32 {
+    let k = (r + 1.0) * (r + 1.0) / 8.0;
+    return n_v / (n_v * (1.0 - k) + k) * (n_l / (n_l * (1.0 - k) + k));
+}
+
+fn env_brdf(r: f32, n_v: f32) -> vec2<f32> {
+    let rr = r * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let a004 = min(rr.x * rr.x, exp2(-9.28 * n_v)) * rr.x + rr.y;
+    return vec2<f32>(-1.04 * a004 + rr.z, 1.04 * a004 + rr.w);
+}
+
+fn shoulder(x: f32) -> f32 {
+    if x < 0.8 { return x; }
+    return 0.8 + 0.2 * (1.0 - exp(-(x - 0.8) / 0.2));
+}
+
+fn encode(x_in: f32) -> f32 {
+    let x = clamp(x_in, 0.0, 1.0);
+    if x <= 0.0031308 { return x * 12.92; }
+    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+fn pow5(x: f32) -> f32 {
+    let x2 = x * x;
+    return x2 * x2 * x;
+}
+
+// Edge function of a→b at q with the endpoints in a fixed order, so two
+// triangles sharing an edge compute it identically (watertight).
+fn edge_fn(a: vec2<f32>, b: vec2<f32>, q: vec2<f32>) -> f32 {
+    if a.x < b.x || (a.x == b.x && a.y < b.y) {
+        return (b.x - a.x) * (q.y - a.y) - (b.y - a.y) * (q.x - a.x);
+    }
+    return -((a.x - b.x) * (q.y - b.y) - (a.y - b.y) * (q.x - b.x));
+}
+
+fn owns(d: vec2<f32>) -> bool {
+    return d.y > 0.0 || (d.y == 0.0 && d.x < 0.0);
+}
+
+struct Cover {
+    e: vec3<f32>,
+    inside: bool,
+}
+
+fn cover(r0: vec4<f32>, r1: vec4<f32>, q: vec2<f32>) -> Cover {
+    var p = array<vec2<f32>, 3>(r0.xy, r0.zw, r1.xy);
+    let sign = r1.z;
+    var e = array<f32, 3>(0.0, 0.0, 0.0);
+    var inside = true;
+    for (var k = 0u; k < 3u; k++) {
+        let a = p[(k + 1u) % 3u];
+        let b = p[(k + 2u) % 3u];
+        e[k] = edge_fn(a, b, q) * sign;
+        if e[k] < 0.0 || (e[k] == 0.0 && !owns((b - a) * sign)) {
+            inside = false;
+        }
+    }
+    return Cover(vec3<f32>(e[0], e[1], e[2]), inside);
+}
+
+fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
+    let tb = bitcast<u32>(prim.geom2.x) + tri * 4u;
+    let vb = bitcast<u32>(prim.geom2.y);
+    let mb = bitcast<u32>(prim.geom2.z);
+    let lb = bitcast<u32>(prim.geom2.w);
+    let cv = cover(b_mesh[tb], b_mesh[tb + 1u], q);
+    let ev = array<f32, 3>(cv.e.x, cv.e.y, cv.e.z);
+    let ids = b_mesh[tb + 2u];
+    let idv = array<u32, 3>(bitcast<u32>(ids.x), bitcast<u32>(ids.y), bitcast<u32>(ids.z));
+    var w: array<f32, 3>;
+    var pos: array<vec3<f32>, 3>;
+    var nrm: array<vec3<f32>, 3>;
+    for (var k = 0u; k < 3u; k++) {
+        let v = idv[k];
+        let a = b_mesh[vb + v * 2u];
+        pos[k] = a.xyz;
+        nrm[k] = b_mesh[vb + v * 2u + 1u].xyz;
+        w[k] = max(ev[k], 0.0) * a.w;
+    }
+    let s = max(w[0] + w[1] + w[2], 1e-30);
+    let b = vec3<f32>(w[0] / s, w[1] / s, w[2] / s);
+    let p = pos[0] * b.x + pos[1] * b.y + pos[2] * b.z;
+    let navg = nrm[0] * b.x + nrm[1] * b.y + nrm[2] * b.z;
+    let mat = bitcast<u32>(b_mesh[tb + 1u].w);
+    let m0 = b_mesh[mb + mat * 4u];
+    let m1 = b_mesh[mb + mat * 4u + 1u];
+    let m2 = b_mesh[mb + mat * 4u + 2u];
+    let m3 = b_mesh[mb + mat * 4u + 3u];
+    let flags = u32(m2.w);
+    var n = navg / max(sqrt(dot(navg, navg)), 1e-20);
+    if (flags & 2u) != 0u {
+        let gc = cross(pos[1] - pos[0], pos[2] - pos[0]);
+        var g = gc / max(sqrt(dot(gc, gc)), 1e-20);
+        if dot(g, navg) < 0.0 { g = -g; }
+        n = g;
+    }
+    let vv = -p;
+    let v = vv / max(sqrt(dot(vv, vv)), 1e-20);
+    if dot(n, v) < 0.0 { n = -n; }
+    let base = m0.xyz;
+    let opacity = m0.w;
+    let emissive = m2.xyz;
+    if (flags & 1u) != 0u {
+        let c = base + emissive;
+        return vec4<f32>(encode(c.x) * opacity, encode(c.y) * opacity, encode(c.z) * opacity, opacity);
+    }
+    let metal = m1.x;
+    let rough = max(m1.y, 0.03);
+    let cc = m1.z;
+    let ccr = max(m1.w, 0.03);
+    let trans = m3.x;
+    let f0 = mix(vec3<f32>(0.04), base, metal);
+    let diffuse = base * ((1.0 - metal) * (1.0 - trans));
+    let n_v = max(dot(n, v), 1e-4);
+    let fc_v = 0.04 + 0.96 * pow5(1.0 - n_v);
+    let coat = 1.0 - cc * fc_v;
+    var d_light = vec3<f32>(0.0);
+    var s_light = vec3<f32>(0.0);
+    let lights = u32(b_mesh[lb].x);
+    for (var i = 0u; i < lights; i++) {
+        let row = b_mesh[lb + 7u + i * 2u];
+        let col = b_mesh[lb + 7u + i * 2u + 1u].xyz;
+        let kind = u32(row.w);
+        if kind == 2u {
+            d_light = d_light + diffuse * col;
+            continue;
+        }
+        var l = row.xyz;
+        if kind == 1u {
+            let dl = row.xyz - p;
+            l = dl / max(sqrt(dot(dl, dl)), 1e-20);
+        }
+        let n_l = dot(n, l);
+        if n_l <= 0.0 { continue; }
+        let hh = l + v;
+        let h = hh / max(sqrt(dot(hh, hh)), 1e-20);
+        let n_h = max(dot(n, h), 0.0);
+        let v_h = max(dot(v, h), 0.0);
+        let fw = pow5(1.0 - v_h);
+        let f = f0 + (vec3<f32>(1.0) - f0) * fw;
+        let spec = ggx(n_h, rough * rough) * smith(n_v, n_l, rough) / max(4.0 * n_v * n_l, 1e-4) * PI;
+        let kd = vec3<f32>(1.0) - f;
+        d_light = d_light + (kd * diffuse) * (col * (n_l * coat));
+        s_light = s_light + (f * (spec * n_l * coat)) * col;
+        if cc > 0.0 {
+            let fc = 0.04 + 0.96 * fw;
+            let sc = ggx(n_h, ccr * ccr) * smith(n_v, n_l, ccr) / max(4.0 * n_v * n_l, 1e-4) * PI;
+            s_light = s_light + col * (sc * fc * cc * n_l);
+        }
+    }
+    let nw = to_world(lb, n);
+    let r_view = n * (2.0 * dot(n, v)) - v;
+    let rw = to_world(lb, r_view);
+    d_light = d_light + (diffuse * env_light(lb, nw, 1.0)) * coat;
+    let ab = env_brdf(rough, n_v);
+    let spec_env = env_light(lb, rw, rough) * (f0 * ab.x + vec3<f32>(ab.y));
+    s_light = s_light + spec_env * coat;
+    if cc > 0.0 {
+        s_light = s_light + env_light(lb, rw, ccr) * (fc_v * cc);
+    }
+    let body = opacity * (1.0 - trans * (1.0 - fc_v));
+    let sl = s_light * opacity;
+    let lit = (d_light + emissive) * body + sl;
+    let peak = min(max(max(sl.x, sl.y), sl.z), 1.0);
+    let a = clamp(body + (1.0 - body) * peak, 0.0, 1.0);
+    if a <= 0.0 { return vec4<f32>(0.0); }
+    let c = vec3<f32>(encode(shoulder(lit.x / a)), encode(shoulder(lit.y / a)), encode(shoulder(lit.z / a)));
+    return vec4<f32>(c * a, a);
+}
+
+fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
+    let tx = u32(p.x) / 16u;
+    let ty = u32(p.y) / 16u;
+    let tx0 = bitcast<u32>(prim.geom.y);
+    let ty0 = bitcast<u32>(prim.geom.z);
+    let tw = bitcast<u32>(prim.geom.w);
+    if tx < tx0 || ty < ty0 || tx - tx0 >= tw { return vec4<f32>(0.0); }
+    let base = bitcast<u32>(prim.geom.x);
+    let k = (ty - ty0) * tw + (tx - tx0);
+    let start = base + b_bins[base + k * 2u];
+    let count = b_bins[base + k * 2u + 1u];
+    let tb = bitcast<u32>(prim.geom2.x);
+    var best: array<u32, 8>;
+    var depth: array<f32, 8>;
+    for (var s = 0u; s < 8u; s++) {
+        best[s] = NO_TRI;
+        depth[s] = 0.0;
+    }
+    for (var j = 0u; j < count; j++) {
+        let tri = b_bins[start + j];
+        let r = tb + tri * 4u;
+        let r0 = b_mesh[r];
+        let r1 = b_mesh[r + 1u];
+        let d = b_mesh[r + 3u];
+        let c = cover(r0, r1, p);
+        let ca = array<f32, 3>(c.e.x, c.e.y, c.e.z);
+        var pts = array<vec2<f32>, 3>(r0.xy, r0.zw, r1.xy);
+        var reject = false;
+        for (var k = 0u; k < 3u; k++) {
+            let ea = pts[(k + 1u) % 3u];
+            let eb = pts[(k + 2u) % 3u];
+            if ca[k] < -(abs(eb.x - ea.x) + abs(eb.y - ea.y)) * 0.4375 - 1e-3 { reject = true; }
+        }
+        if reject { continue; }
+        for (var s = 0u; s < 8u; s++) {
+            let q = vec2<f32>(p.x + SAMPLE_X[s] / 16.0, p.y + SAMPLE_Y[s] / 16.0);
+            if cover(r0, r1, q).inside {
+                let z = d.x * q.x + d.y * q.y + d.z;
+                if z > depth[s] {
+                    depth[s] = z;
+                    best[s] = tri;
+                }
+            }
+        }
+    }
+    var out = vec4<f32>(0.0);
+    for (var s = 0u; s < 8u; s++) {
+        let tri = best[s];
+        if tri == NO_TRI { continue; }
+        var seen = false;
+        for (var j = 0u; j < s; j++) {
+            if best[j] == tri { seen = true; }
+        }
+        if seen { continue; }
+        var n = 0.0;
+        var q = vec2<f32>(0.0);
+        for (var j = s; j < 8u; j++) {
+            if best[j] == tri {
+                n += 1.0;
+                q = q + vec2<f32>(SAMPLE_X[j], SAMPLE_Y[j]);
+            }
+        }
+        let centroid = vec2<f32>(p.x + q.x / (16.0 * n), p.y + q.y / (16.0 * n));
+        out = out + shade_tri(prim, tri, centroid) * (n / 8.0);
+    }
+    return out * prim.inv_y.w;
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn raster(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let size = u_pass.size;
@@ -701,7 +985,8 @@ fn raster(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li
     var c = u_pass.background;
     for (var k = 0u; k < count; k++) {
         let prim = b_prims[b_indices[start + k]];
-        let s = shade(prim, p);
+        var s: vec4<f32>;
+        if prim.kind.x == 4u { s = shade_mesh(prim, p); } else { s = shade(prim, p); }
         if s.w > 0.0 {
             c = blend(c, s, prim.kind.z);
         }

@@ -29,6 +29,10 @@ pub const SOURCE_GROUP: u32 = 1;
 pub const SOURCE_FOOTAGE: u32 = 2;
 /// Group A masked by group B (same size): geom2 = [A offset, B offset, mode].
 pub const PRIM_MATTE: u32 = 3;
+/// Mesh batch (see `mesh3d`): geom = [bins base, first tile x, first tile
+/// y, tiles across] (bits), geom2 = [triangles, vertices, materials,
+/// lights] row offsets into `mesh` (bits).
+pub const PRIM_MESH: u32 = 4;
 
 pub const SHAPE_ELLIPSE: u32 = 0;
 pub const SHAPE_RECT: u32 = 1;
@@ -142,6 +146,11 @@ pub struct DisplayList {
     pub segments: Vec<[f32; 4]>,
     /// Post programs of composited groups (see `raster::OP_*`).
     pub ops: Vec<[f32; 4]>,
+    /// Mesh batches: triangles, vertices, materials and lights.
+    pub mesh: Vec<[f32; 4]>,
+    /// Mesh tile bins: per tile [start (relative to the batch's base),
+    /// count], then triangle indices.
+    pub bins: Vec<u32>,
 }
 
 impl DisplayList {
@@ -161,6 +170,8 @@ impl DisplayList {
         out.extend_from_slice(bytemuck::cast_slice(&self.stops));
         out.extend_from_slice(bytemuck::cast_slice(&self.segments));
         out.extend_from_slice(bytemuck::cast_slice(&self.ops));
+        out.extend_from_slice(bytemuck::cast_slice(&self.mesh));
+        out.extend_from_slice(bytemuck::cast_slice(&self.bins));
         out
     }
 }
@@ -268,6 +279,7 @@ pub struct Builder<'a> {
     pub fonts: &'a mut Fonts,
     pub images: &'a mut Images,
     pub footage: &'a mut crate::footage::Footage,
+    pub meshes: &'a mut crate::mesh3d::MeshCache,
     /// Output scale (0.5 for half-resolution previews).
     pub scale: f64,
 }
@@ -278,6 +290,7 @@ impl Builder<'_> {
         let h = ((frame.height as f64 * self.scale).round() as u32).max(1);
         let root = Proj::from(Affine::scale(self.scale, self.scale));
         let mut list = DisplayList::default();
+        self.meshes.begin();
         let mut pending: Vec<Pending> = Vec::new();
         let mut main_items: Vec<Item> = Vec::new();
         for layer in &frame.layers {
@@ -291,6 +304,9 @@ impl Builder<'_> {
             let prims: Vec<(Prim, [f64; 4])> = items
                 .iter()
                 .filter_map(|it| {
+                    if it.prim.kind[0] == PRIM_MESH {
+                        return self.place_mesh(&mut list, it, &group.target, origin, factor);
+                    }
                     let p = retarget(it, origin, factor)?;
                     let b = canvas_bounds(it);
                     Some((p, [(b[0] - origin[0]) / factor[0], (b[1] - origin[1]) / factor[1], (b[2] - origin[0]) / factor[0], (b[3] - origin[1]) / factor[1]]))
@@ -301,7 +317,10 @@ impl Builder<'_> {
             list.groups.push(group);
         }
         let main = Target::new(w, h, range_base, background);
-        let prims: Vec<(Prim, [f64; 4])> = main_items.iter().map(|it| (it.prim, canvas_bounds(it))).collect();
+        let prims: Vec<(Prim, [f64; 4])> = main_items
+            .iter()
+            .filter_map(|it| if it.prim.kind[0] == PRIM_MESH { self.place_mesh(&mut list, it, &main, [0.0, 0.0], [1.0, 1.0]) } else { Some((it.prim, canvas_bounds(it))) })
+            .collect();
         bin(&mut list, &main, prims);
         list.main = Some(main);
         list
@@ -389,7 +408,43 @@ impl Builder<'_> {
         (start as u32, (list.ops.len() - start) as u32)
     }
 
+    fn place_mesh(&mut self, list: &mut DisplayList, item: &Item, target: &Target, origin: [f64; 2], factor: [f64; 2]) -> Option<(Prim, [f64; 4])> {
+        let batch = self.meshes.batches.get(item.prim.kind[1] as usize)?;
+        batch.place(&mut list.mesh, &mut list.bins, target, origin, factor, item.prim.kind[2])
+    }
+
+    /// A mesh item: a new batch, or `m` added to the batch of the item just
+    /// before it (meshes next to each other share one depth buffer).
+    fn mesh_item(&mut self, layer: &LayerState, m: &lahza_motion_core::compile::MeshState, root: Proj, prev: Option<&mut Item>) -> Option<Item> {
+        let blend = blend_code(layer.blend);
+        if let Some(prev) = prev {
+            let i = prev.prim.kind[1] as usize;
+            if prev.prim.kind[0] == PRIM_MESH && prev.prim.kind[2] == blend && blend == blend_code(Blend::Normal) && self.meshes.batches[i].can_join(m) {
+                let mut batch = std::mem::replace(&mut self.meshes.batches[i], crate::mesh3d::Batch::new(m)?);
+                batch.add(self.meshes, m, root, layer.opacity);
+                prev.bounds = batch.bounds;
+                self.meshes.batches[i] = batch;
+                return None;
+            }
+        }
+        let mut batch = crate::mesh3d::Batch::new(m)?;
+        batch.add(self.meshes, m, root, layer.opacity);
+        let bounds = batch.bounds;
+        if !(bounds[2] >= bounds[0]) {
+            return None;
+        }
+        self.meshes.batches.push(batch);
+        let prim = Prim { kind: [PRIM_MESH, (self.meshes.batches.len() - 1) as u32, blend, 0], ..Default::default() };
+        Some(Item { prim, forward: Proj::IDENTITY, bounds })
+    }
+
     fn emit(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
+        if let (false, Content::Mesh(m)) = (layer.is_isolated(), &layer.content) {
+            if let Some(item) = self.mesh_item(layer, m, root, out.last_mut()) {
+                out.push(item);
+            }
+            return;
+        }
         if !layer.is_isolated() {
             out.extend(self.layer_items(layer, root, &mut list.stops, &mut list.segments));
             return;
@@ -573,6 +628,7 @@ impl Builder<'_> {
         let mut items = Vec::new();
         match &layer.content {
             Content::Group(_) => {}
+            Content::Mesh(m) => items.extend(self.mesh_item(layer, m, root, None)),
             Content::Shape(s) if s.shape == ShapeKind::Path => {
                 items.extend(path_items(s, matrix, layer.opacity, blend, stops, segments));
             }

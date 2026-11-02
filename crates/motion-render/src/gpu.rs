@@ -49,6 +49,8 @@ struct RasterData {
     b_segs: gpu::BufferPiece,
     b_footage: gpu::BufferPiece,
     b_ops: gpu::BufferPiece,
+    b_mesh: gpu::BufferPiece,
+    b_bins: gpu::BufferPiece,
     b_target: gpu::BufferPiece,
 }
 
@@ -130,6 +132,8 @@ pub struct Gpu {
     segs: Buffer,
     footage: Buffer,
     ops: Buffer,
+    mesh: Buffer,
+    bins: Buffer,
     atlas: Buffer,
     images: Buffer,
     groups: Buffer,
@@ -155,6 +159,8 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let texel_base = out.group_texels;
         let seg_base = out.segments.len() as u32;
         let ops_base = out.ops.len() as u32;
+        let mesh_base = out.mesh.len() as u32;
+        let bins_base = out.bins.len() as u32;
         for p in &list.prims {
             let mut p: Prim = *p;
             let rebase = |v: f32, by: u32| f32::from_bits(v.to_bits() + by);
@@ -165,6 +171,10 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
                 }
             }
             match p.kind[0] {
+                crate::list::PRIM_MESH => {
+                    p.geom[0] = rebase(p.geom[0], bins_base);
+                    p.geom2 = p.geom2.map(|v| rebase(v, mesh_base));
+                }
                 crate::list::PRIM_IMAGE if p.kind[1] == 1 => p.geom2[0] = rebase(p.geom2[0], texel_base),
                 crate::list::PRIM_MATTE => {
                     p.geom2[0] = rebase(p.geom2[0], texel_base);
@@ -180,6 +190,8 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         }
         out.segments.extend_from_slice(&list.segments);
         out.ops.extend_from_slice(&list.ops);
+        out.mesh.extend_from_slice(&list.mesh);
+        out.bins.extend_from_slice(&list.bins);
         out.indices.extend(list.indices.iter().map(|i| i + prim_base));
         for pair in list.ranges.chunks_exact(2) {
             out.ranges.push(pair[0] + index_base);
@@ -243,6 +255,8 @@ impl Gpu {
             segs: Buffer::new(&context, "motion segments", 1 << 12, true),
             footage: Buffer::new(&context, "motion footage", 1 << 12, true),
             ops: Buffer::new(&context, "motion post ops", 1 << 12, true),
+            mesh: Buffer::new(&context, "motion mesh", 1 << 12, true),
+            bins: Buffer::new(&context, "motion mesh bins", 1 << 12, true),
             atlas: Buffer::new(&context, "motion atlas", (ATLAS_SIZE * ATLAS_SIZE) as usize, true),
             images: Buffer::new(&context, "motion images", 1 << 12, true),
             groups: Buffer::new(&context, "motion groups", 1 << 12, false),
@@ -280,6 +294,8 @@ impl Gpu {
         // Footage frames change every frame and upload every time.
         self.footage.upload(ctx, &mut self.encoder, bytemuck::cast_slice(footage))?;
         self.ops.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ops))?;
+        self.mesh.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.mesh))?;
+        self.bins.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.bins))?;
         if self.atlas_generation != fonts.generation {
             self.atlas.upload(ctx, &mut self.encoder, &fonts.atlas)?;
             self.atlas_generation = fonts.generation;
@@ -305,6 +321,8 @@ impl Gpu {
             b_segs: s.segs.device.into(),
             b_footage: s.footage.device.into(),
             b_ops: s.ops.device.into(),
+            b_mesh: s.mesh.device.into(),
+            b_bins: s.bins.device.into(),
             b_target: target.into(),
         };
         for (i, (main, groups)) in targets.iter().enumerate() {
@@ -398,6 +416,8 @@ impl Drop for Gpu {
             &mut self.segs,
             &mut self.footage,
             &mut self.ops,
+            &mut self.mesh,
+            &mut self.bins,
             &mut self.atlas,
             &mut self.images,
             &mut self.groups,
