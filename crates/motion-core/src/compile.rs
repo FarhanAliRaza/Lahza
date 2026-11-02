@@ -14,6 +14,9 @@ use crate::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+mod instancer;
+use instancer::CInstancer;
+
 /// 2D affine transform: (x, y) → (a·x + c·y + e, b·x + d·y + f).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Affine(pub [f64; 6]);
@@ -382,6 +385,7 @@ impl CLayer {
     pub fn children(&self) -> &[CLayer] {
         match &self.kind {
             CKind::Comp(children) => children,
+            CKind::Instancer(n) => &n.layers,
             _ => &[],
         }
     }
@@ -410,6 +414,7 @@ enum CKind {
     Image { src: Arc<str>, size: Option<Prop<Vec2>> },
     Video(CVideo),
     Comp(Vec<CLayer>),
+    Instancer(Box<CInstancer>),
 }
 
 struct CVideo {
@@ -697,6 +702,17 @@ impl<'a> Compiler<'a> {
                 out[i].follow = None;
             }
         }
+        // Instancers laid out along a path need a path layer.
+        for i in 0..out.len() {
+            let CKind::Instancer(n) = &out[i].kind else { continue };
+            let Some(target) = n.path_target() else { continue };
+            if !matches!(&out[target].kind, CKind::Shape(s) if s.path.is_some()) {
+                self.errors.push(format!("{}.layout.layer: '{}' is not a path layer (shape \"path\" with \"d\")", out[i].id, out[target].id));
+                if let CKind::Instancer(n) = &mut out[i].kind {
+                    n.clear_path_target();
+                }
+            }
+        }
         out
     }
 
@@ -911,6 +927,7 @@ impl<'a> Compiler<'a> {
                 mute: v.mute,
             }),
             LayerKind::Comp(comp) => CKind::Comp(self.layers(&comp.layers, step, shift - offset)),
+            LayerKind::Instancer(n) => CKind::Instancer(Box::new(self.instancer(n, id, start, step, shift, siblings))),
         };
         CLayer {
             id: id.into(),
@@ -1602,15 +1619,23 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
         Box::new(MatteState { mode, source: src.pop() })
     });
     let content = match &l.kind {
-        CKind::Comp(children) => {
-            let ct = tc - l.offset;
-            let group = isolate || !effects.is_empty() || matte.is_some() || l.blend != Blend::Normal || own_opacity < 1.0 && children.len() > 1;
+        CKind::Comp(_) | CKind::Instancer(_) => {
+            // Children (or copies) paint straight into `out` unless the
+            // layer must be drawn as one picture.
+            let pieces = match &l.kind {
+                CKind::Instancer(n) => n.count() * n.layers.len(),
+                _ => l.children().len(),
+            };
+            let group = isolate || !effects.is_empty() || matte.is_some() || l.blend != Blend::Normal || own_opacity < 1.0 && pieces > 1;
+            let mut kids = Vec::new();
+            let (target, opacity) = if group { (&mut kids, 1.0) } else { (&mut *out, parent_opacity * own_opacity) };
+            match &l.kind {
+                CKind::Instancer(n) => instancer::emit_copies(n, layers, i, tc, t, step, inherited, space, &inner, opacity, cache, target),
+                _ => emit(l.children(), tc - l.offset, step, &inner, opacity, target),
+            }
             if !group {
-                emit(children, ct, step, &inner, parent_opacity * own_opacity, out);
                 return;
             }
-            let mut kids = Vec::new();
-            emit(children, ct, step, &inner, 1.0, &mut kids);
             let inner = kids;
             out.push(LayerState {
                 id: l.id.clone(),

@@ -789,3 +789,95 @@ fn three_d_layers_perspective_and_depth() {
     let behind = cpu().render(&Compiled::new(&p), 0.0);
     assert!(behind.pixels().all(|q| q.0[0] < 10), "nothing behind the camera is drawn");
 }
+
+#[test]
+fn instancer_halftone_ripple() {
+    // 16 × 9 dots 20 px apart (centres at 10 + 20k), radius 3, growing to
+    // radius 9 at the crest of a ring that leaves the centre at 0.5 s.
+    let p = project(json!([{"id": "dots", "kind": "instancer", "transform": {"position": [160, 90]},
+        "layout": {"type": "grid", "columns": 16, "rows": 9, "spacing": 20},
+        "fields": [{"type": "wave", "center": [0, 0], "at": 0.5, "speed": 200, "wavelength": 60, "scale": 2}],
+        "palette": ["#ffffff", "#ff0000"],
+        "layers": [{"id": "dot", "kind": "shape", "shape": "circle", "size": 6, "fill": "#000000"}]}]));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let mut r = cpu();
+    // Before the wave every dot is small: 6 px right of a centre is dark.
+    let before = r.render(&c, 0.4);
+    // Copy 69 (row 4, column 5) takes the palette's second colour.
+    assert_eq!(px(&before, 110, 90), [255, 0, 0, 255], "a dot centre in its palette colour");
+    assert_eq!(px(&before, 116, 90), [0, 0, 0, 255]);
+    assert_eq!(px(&before, 130, 90), [255, 255, 255, 255], "the next dot takes the next palette colour");
+    // At 0.9 s the crest is 50 px out: the dot there is three times larger,
+    // while a far corner dot is not reached yet.
+    let crest = r.render(&c, 0.9);
+    assert_eq!(px(&crest, 116, 90), [255, 0, 0, 255]);
+    assert_eq!(px(&crest, 16, 10), [0, 0, 0, 255]);
+    assert_eq!(px(&crest, 10, 10), [255, 255, 255, 255]);
+}
+
+/// 2,000 copies (a 50 × 40 dot grid with a wave, noise twinkle, staggered
+/// entrances and a palette) at 1080p: evaluating and building a frame stays
+/// well inside a 60 fps frame. Prints the full frame time on the GPU when
+/// one is available (`--nocapture`).
+#[test]
+fn instancer_2000_copies_at_1080p() {
+    let p = {
+        let mut p = Project::new(1920, 1080, Fps::whole(60), 6.0);
+        p.scenes.push(serde_json::from_value(json!({"id": "s", "layers": [{"id": "field", "kind": "instancer", "transform": {"position": [960, 540]},
+            "layout": {"type": "grid", "columns": 50, "rows": 40, "spacing": [38, 26], "hex": true},
+            "stagger": {"total": 1.0, "order": "center"},
+            "random": {"seed": 4, "scale": [0.7, 1.0]},
+            "palette": ["#ffffff", "#ff3d7f", "#d7ff3a"], "palette_order": "random",
+            "fields": [
+                {"type": "wave", "at": 1.0, "speed": 900, "wavelength": 260, "scale": 1.4, "ease": "gesture"},
+                {"type": "noise", "size": 180, "speed": 0.8, "scale": 0.25, "opacity": -0.3}
+            ],
+            "layers": [{"id": "dot", "kind": "shape", "shape": "circle", "size": 14, "fill": "#ffffff",
+                "transform": {"scale": {"keys": [{"at": 0, "from": 0, "v": 1, "ease": "pop", "anchor": "start"}]}}}]}]}))
+        .unwrap());
+        p
+    };
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.frame(2.0).layers.len(), 2000);
+    let frames = 30;
+    let times = |n: usize| 1.5 + n as f64 / 60.0;
+    let mut eval = 0.0;
+    let mut build = 0.0;
+    let (mut fonts, mut images, mut footage) = (font::Fonts::new(None), images::Images::new(None), footage::Footage::new(None));
+    for n in 0..frames {
+        let started = Instant::now();
+        let f = c.frame(times(n));
+        let evaluated = Instant::now();
+        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, scale: 1.0 }.build(&f);
+        build += evaluated.elapsed().as_secs_f64() * 1000.0;
+        eval += (evaluated - started).as_secs_f64() * 1000.0;
+        assert_eq!(list.prims.len(), 2000);
+    }
+    let (eval, build) = (eval / frames as f64, build / frames as f64);
+    eprintln!("2000 copies at 1080p: evaluate {eval:.2} ms, display list {build:.2} ms per frame");
+    // Generous for slow CI machines; locally both are a small fraction of this.
+    assert!(eval + build < 16.0, "evaluate {eval:.2} ms + build {build:.2} ms");
+
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mut gpu = Renderer::new(None, RenderOptions { backend: Backend::Gpu, motion_blur: false, allow_software_gpu: allow, ..Default::default() });
+    if !gpu.is_gpu() {
+        eprintln!("no GPU for the frame time: {}", gpu.backend_label());
+        return;
+    }
+    for r in [&mut gpu, &mut cpu()] {
+        r.render(&c, 1.0);
+        r.stats = Stats::default();
+        let started = Instant::now();
+        for n in 0..frames {
+            r.render(&c, times(n));
+        }
+        let per = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!("{}: {per:.2} ms per frame ({:.0} fps), raster+readback {:.2} ms", r.backend_label(), 1000.0 / per, r.stats.raster_ms / frames as f64);
+    }
+    // The GPU draws the same picture as the CPU.
+    let (a, b) = (gpu.render(&c, 2.2), cpu().render(&c, 2.2));
+    let max = a.pixels().zip(b.pixels()).flat_map(|(x, y)| (0..4).map(move |k| x.0[k].abs_diff(y.0[k]))).max().unwrap_or(0);
+    assert!(max <= 3, "GPU and CPU differ by {max}");
+}

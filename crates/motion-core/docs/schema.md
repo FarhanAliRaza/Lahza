@@ -54,7 +54,8 @@ Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 `glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `follow`, `hidden`.
 
 Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
-`star`, `line`, `path` with SVG `d`), `text`, `image`, `comp`.
+`star`, `line`, `path` with SVG `d`), `text`, `image`, `video`, `comp`,
+`instancer`.
 
 ```json
 {"id": "route", "kind": "shape", "shape": "path", "d": "M -300 0 C -100 -200 100 200 300 0",
@@ -87,6 +88,59 @@ point, along the path's direction frame when rotating. The follower's
 {"id": "pen", "kind": "shape", "shape": "ring", "size": 36, "thickness": 8, "fill": "#ffffff",
  "follow": {"layer": "route", "at": "head", "rotate": false, "offset": [0, 0]}}
 ```
+
+An `instancer` (a cloner) draws its `layers`, the template, once per
+point of its `layout`, each copy centred on its point in the instancer's
+own space (its `position` is the layout's centre). Copies are cheap: use
+one instancer, not hundreds of layers with their own keys.
+
+```json
+{"id": "dots", "kind": "instancer", "transform": {"position": [960, 540]},
+ "layout": {"type": "grid", "columns": 48, "rows": 27, "spacing": [40, 40], "hex": true},
+ "stagger": {"total": "20f", "order": "center"},
+ "random": {"seed": 3, "scale": [0.6, 1.0]},
+ "palette": ["#ffffff", "#ff3d7f"], "palette_order": "random",
+ "fields": [{"type": "wave", "center": [0, 0], "at": 3.82, "speed": 900, "wavelength": 240, "scale": 1.5}],
+ "layers": [{"id": "dot", "kind": "shape", "shape": "circle", "size": 12, "fill": "#ffffff"}]}
+```
+
+Layouts (`type`): `grid` (`columns`, `rows`, `spacing`, `hex`), `radial`
+(`count`, `radius`, `start` and `sweep` in degrees from up, clockwise;
+`align` turns each copy so its up points outward), `line` (`count`,
+`from`, `to`, `align`), `random` (`count`, `size`, `area`: `box` or
+`circle`, `seed`) and `path` (`count` spread along a sibling path layer
+as drawn, `offset` slides them along it, `align`). `spacing`, `radius`,
+`start`, `sweep`, `from`, `to`, `size` and `offset` are animatable.
+
+Per copy:
+
+- `stagger`: copy k sees time `t − delay`, its rank in `order`
+  (`forward`, `reverse`, `center`: rings out from the middle, `edges`,
+  `random`) times `each`, or the ranks spread over `total`; the template's
+  keys and window start that much later.
+- `random` (`seed`): `[min, max]` ranges for `scale` and `opacity`
+  (multipliers), `rotation` (degrees) and `time` (extra delay, s);
+  `position` a ± jitter in px; `color` a random mix of two colours.
+- `palette` with `palette_order` (`cycle` or `random`) replaces the
+  template's solid fill, stroke and text colours, keeping their alpha.
+
+`fields` are effectors applied in order. Each gives every copy a value
+0..1 at its layout point, then adds value × delta: `position` ([x, y]
+px), `scale` (added to the copy's scale: 1 doubles it), `rotation`
+(degrees), `opacity` (added: −1 hides) and `color` (mixed in). `ease`
+reshapes the value (any curve), `invert` flips it, `amount` weights it.
+
+| `type` | value | parameters |
+|---|---|---|
+| `radial` | 1 within `radius − falloff` of `center`, 0 from `radius` | `center`, `radius` (200), `falloff` (px, default the radius) |
+| `linear` | ramps 0 → 1 over `range` px along `angle`, ½ at `center` | `center`, `angle` (degrees, 0 = +x), `range` (200) |
+| `noise` | smooth noise | `size` (feature px, 200), `speed` (per second, 0.5), `seed` |
+| `wave` | a ring leaving `center` at time `at` | `at` (default the layer start), `speed` (px/s, 600), `wavelength` (crest width px, 200), `cycles` (crests, 1; 0 = endless ripples), `decay` (px) |
+
+Every field parameter and delta is animatable except `at`, `seed`,
+`cycles` and `decay`. Copies whose opacity or scale reaches 0 are not
+drawn. With opacity below 1, a blend mode, effects or a matte, the
+instancer is drawn as one picture (like a comp).
 
 Scenes may arrive with a transition centred on their cut:
 `"transition": {"type": "whip", "dur": "8f", "direction": "left"}`

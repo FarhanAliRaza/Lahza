@@ -78,6 +78,54 @@ video timeline:
    frame like an inserted clip. Call again to move it; `remove: true` takes
    it off. The person sees it live and can open it in the editor.
 
+## Repeaters: many copies of one thing
+
+Dot fields, rings of petals or shards, rows of bars: build one `instancer`
+(see the schema), never hundreds of layers with their own keys. Animate
+the template once; `stagger` cascades it across the copies, `random`
+breaks the regularity and `fields` move, grow, fade or tint copies by
+where they are. Thousands of copies render in real time.
+
+**Halftone ripple.** A dot grid pops on from the centre, then a ring
+leaves the centre at 3.82 s and swells the dots as it passes, with a
+slow noise twinkle throughout:
+
+```json
+{"id": "halftone", "kind": "instancer", "transform": {"position": [960, 540]},
+ "layout": {"type": "grid", "columns": 49, "rows": 28, "spacing": [40, 40], "hex": true},
+ "stagger": {"total": "18f", "order": "center"},
+ "fields": [
+   {"type": "wave", "center": [0, 0], "at": 3.82, "speed": 1100, "wavelength": 320, "scale": 2.2, "ease": "gesture"},
+   {"type": "noise", "size": 220, "speed": 0.6, "seed": 7, "scale": 0.25, "opacity": -0.35}
+ ],
+ "layers": [{"id": "halftone-dot", "kind": "shape", "shape": "circle", "size": 10, "fill": "#f4f1ea",
+   "transform": {"scale": {"keys": [{"at": "#halftone.start", "from": 0, "v": 1, "ease": "pop", "anchor": "start"}]}}}]}
+```
+
+**Burst ring of petals.** Twelve petals shoot out from a small ring one
+frame apart, each pointing outward (`align`), coloured from a palette,
+then fade:
+
+```json
+{"id": "burst", "kind": "instancer", "transform": {"position": [960, 540]},
+ "layout": {"type": "radial", "count": 12, "radius": 40, "align": true},
+ "stagger": {"each": "1f"},
+ "random": {"seed": 4, "scale": [0.8, 1.1], "rotation": [-6, 6]},
+ "palette": ["#ff3d7f", "#ffd23f", "#7b61ff"],
+ "layers": [{"id": "petal", "kind": "shape", "shape": "capsule", "size": [26, 90], "fill": "#ffffff",
+   "transform": {"anchor": [0, 45],
+     "position": {"keys": [{"at": "#burst.start", "from": [0, 0], "v": [0, -260], "ease": "snap", "anchor": "start"}]},
+     "scale": {"keys": [{"at": "#burst.start", "from": 0, "v": 1, "ease": "pop", "anchor": "start"}]},
+     "opacity": {"keys": [{"at": "#burst.start + 0.5", "v": 1}, {"at": "#burst.start + 0.9", "v": 0}]}}}]}
+```
+
+Tips: key the template relative to the instancer (`#burst.start`), since
+each copy replays those keys `delay` later. With `align`, the template's
+up is outward (radial) or its x axis runs along the line or path, so a
+template moving toward −y flies outward. A field's `amount` keyed 0 → 1
+fades an effect in; `invert` on a `radial` field affects everything
+outside the radius instead.
+
 ## Timing rules that make it look professional
 
 - **Sync the peak, not the start.** Put `"anchor": "peak"` on transitions

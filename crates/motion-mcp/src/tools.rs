@@ -695,6 +695,10 @@ impl Toolbox {
                             lahza_motion_core::document::LayerKind::Image(i) => out["src"] = json!(i.src),
                             lahza_motion_core::document::LayerKind::Video(v) => out["src"] = json!(v.src),
                             lahza_motion_core::document::LayerKind::Comp(_) => out["layers"] = json!(layers(l.children(), compiled)),
+                            lahza_motion_core::document::LayerKind::Instancer(n) => {
+                                out["layout"] = json!(n.layout);
+                                out["layers"] = json!(layers(l.children(), compiled));
+                            }
                         }
                         if !animated.is_empty() {
                             out["animated"] = json!(animated);

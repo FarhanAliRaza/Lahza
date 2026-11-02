@@ -211,7 +211,28 @@ pub fn catalog_json() -> Value {
                 "loop": "restart at trim when the source ends (default: hold the last frame)", "time_remap": "animatable source seconds (freeze, ramps, reverse); overrides trim/speed",
                 "fps": "image sequences: frames per second (default the project's)", "volume_db": "sound level in the mix", "mute": "bool"
             },
-            "comp": {"layers": "nested layers; transform and stepping apply to all children; with opacity < 1, a blend mode, effects or a matte the comp is drawn as one picture"}
+            "comp": {"layers": "nested layers; transform and stepping apply to all children; with opacity < 1, a blend mode, effects or a matte the comp is drawn as one picture"},
+            "instancer": {
+                "note": "a cloner: draws its layers (the template, like a comp) once per layout point, centred on it; use it instead of many hand-placed layers (dot fields, rings of petals, rows of bars). Copies share the template's ids. Max 50000 copies",
+                "layers": "the template (any layers, comps included); its own transform and keys apply inside each copy",
+                "layout": [
+                    {"type": "grid", "columns": "count", "rows": "count", "spacing": "[x, y] px or number (default 50, animatable)", "hex": "bool: odd rows shift half a cell"},
+                    {"type": "radial", "count": "copies", "radius": "px (default 200, animatable)", "start": "degrees, 0 = up, clockwise (animatable)", "sweep": "degrees (default 360; less includes both ends)", "align": "bool: turn each copy to its angle (its up points outward)"},
+                    {"type": "line", "count": "copies", "from": "[x, y] (default [-500, 0])", "to": "[x, y] (default [500, 0])", "align": "bool: x axis along the line"},
+                    {"type": "random", "count": "copies", "size": "[w, h] (default [1000, 1000])", "area": "box | circle", "seed": 0},
+                    {"type": "path", "count": "copies", "layer": "sibling shape \"path\" layer (its morph and transform)", "offset": "fraction moved along the path (animatable; closed paths wrap)", "align": "bool: turn along the path"}
+                ],
+                "layout_space": "the instancer's own space: its position is the layout's centre",
+                "stagger": {"each": "delay per rank (duration)", "total": "or spread all ranks over this duration", "order": "forward | reverse | center (rings out from the middle) | edges | random", "seed": 0, "note": "copy k sees time t − delay: its keys and window start later"},
+                "random": {"seed": 0, "scale": "[min, max] multiplier", "rotation": "[min, max] degrees", "opacity": "[min, max] multiplier", "position": "[x, y] ± jitter px", "time": "[min, max] extra delay seconds", "color": "[colour, colour]: a random mix (replaces the palette)"},
+                "palette": "[colour, …] replacing the template's solid fill, stroke and text colours (alpha kept)", "palette_order": "cycle | random",
+                "fields": [{
+                    "type": "radial (center, radius, falloff px: default the radius) | linear (center, angle degrees, range px: ramps 0→1 along angle) | noise (size px, speed per second, seed) | wave (center, at time, speed px/s, wavelength px, cycles: crests (default 1, 0 = endless), decay px)",
+                    "deltas": {"position": "[x, y] px", "scale": "added to the copy's scale (1 doubles it)", "rotation": "degrees", "opacity": "added (−1 hides)", "color": "mixed in"},
+                    "shaping": {"ease": "curve applied to the 0..1 value", "invert": "bool", "amount": "weight 0..1 (default 1)"},
+                    "note": "each field gives every copy a 0..1 value at its layout point and adds value × delta; fields apply in list order; every parameter and delta is animatable (keys) except at, seed, cycles and decay"
+                }]
+            }
         },
         "scene": {
             "id": "stable id", "start": "time (cuts on markers lead −1 f by default)", "lead": "frames",

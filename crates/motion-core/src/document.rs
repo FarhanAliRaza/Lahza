@@ -727,6 +727,7 @@ pub enum LayerKind {
     Image(ImageLayer),
     Video(VideoLayer),
     Comp(CompLayer),
+    Instancer(InstancerLayer),
 }
 
 impl LayerKind {
@@ -737,6 +738,7 @@ impl LayerKind {
             LayerKind::Image(_) => "image",
             LayerKind::Video(_) => "video",
             LayerKind::Comp(_) => "comp",
+            LayerKind::Instancer(_) => "instancer",
         }
     }
 }
@@ -787,7 +789,7 @@ impl Layer {
         let common: Common = serde_json::from_value(serde_json::Value::Object(common))
             .map_err(|e| format!("layer '{id}': {e}"))?;
         if !map.contains_key("kind") {
-            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image or comp"));
+            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image, video, comp or instancer"));
         }
         let kind: LayerKind =
             serde_json::from_value(serde_json::Value::Object(map)).map_err(|e| format!("layer '{id}': {e}"))?;
@@ -797,12 +799,14 @@ impl Layer {
     pub fn children(&self) -> &[Layer] {
         match &self.kind {
             LayerKind::Comp(c) => &c.layers,
+            LayerKind::Instancer(i) => &i.layers,
             _ => &[],
         }
     }
     pub fn children_mut(&mut self) -> Option<&mut Vec<Layer>> {
         match &mut self.kind {
             LayerKind::Comp(c) => Some(&mut c.layers),
+            LayerKind::Instancer(i) => Some(&mut i.layers),
             _ => None,
         }
     }
@@ -1376,6 +1380,230 @@ fn is_one_f64(v: &f64) -> bool {
 pub struct CompLayer {
     #[serde(default)]
     pub layers: Vec<Layer>,
+}
+
+/// Repeats its `layers` (drawn like a comp) once per point of `layout`;
+/// each copy can start later (`stagger`), vary at random (`random`), take
+/// a colour from `palette` and be shaped by `fields`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstancerLayer {
+    pub layout: Layout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagger: Option<Stagger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random: Option<Spread>,
+    /// Colours given to the copies in turn (`palette_order`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub palette: Vec<Color>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub palette_order: PaletteOrder,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<Field>,
+    /// The template, drawn once per copy centred on its point.
+    #[serde(default)]
+    pub layers: Vec<Layer>,
+}
+
+/// Where the copies sit, in the instancer's own space (centred on its
+/// origin, like shapes).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Layout {
+    /// `columns` × `rows` cells `spacing` apart; `hex` shifts odd rows by
+    /// half a cell.
+    Grid {
+        columns: u32,
+        rows: u32,
+        #[serde(default = "fifty_vec")]
+        spacing: Property<Vec2>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hex: bool,
+    },
+    /// `count` copies on a circle from `start` over `sweep` degrees (0 =
+    /// up, clockwise). `align` turns each copy to its angle (up points out).
+    Radial {
+        count: u32,
+        #[serde(default = "two_hundred")]
+        radius: Property<f64>,
+        #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+        start: Property<f64>,
+        #[serde(default = "full_turn")]
+        sweep: Property<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        align: bool,
+    },
+    /// `count` copies from `from` to `to`, ends included; `align` turns
+    /// their x axis along the line.
+    Line {
+        count: u32,
+        #[serde(default = "line_from")]
+        from: Property<Vec2>,
+        #[serde(default = "line_to")]
+        to: Property<Vec2>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        align: bool,
+    },
+    /// `count` copies scattered over a `size` box (or the ellipse in it).
+    Random {
+        count: u32,
+        #[serde(default = "thousand_vec")]
+        size: Property<Vec2>,
+        #[serde(default, skip_serializing_if = "is_default")]
+        area: Area,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// `count` copies spread evenly along a sibling path layer as drawn
+    /// (morph and transform), moved along it by `offset` (a fraction of its
+    /// length; closed paths wrap). `align` turns them along the path.
+    Path {
+        count: u32,
+        layer: String,
+        #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+        offset: Property<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        align: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Area {
+    #[default]
+    Box,
+    Circle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaletteOrder {
+    #[default]
+    Cycle,
+    Random,
+}
+
+fn fifty_vec() -> Property<Vec2> {
+    Property::Constant(Vec2::new(50.0, 50.0))
+}
+fn two_hundred() -> Property<f64> {
+    Property::Constant(200.0)
+}
+fn full_turn() -> Property<f64> {
+    Property::Constant(360.0)
+}
+fn line_from() -> Property<Vec2> {
+    Property::Constant(Vec2::new(-500.0, 0.0))
+}
+fn line_to() -> Property<Vec2> {
+    Property::Constant(Vec2::new(500.0, 0.0))
+}
+fn thousand_vec() -> Property<Vec2> {
+    Property::Constant(Vec2::new(1000.0, 1000.0))
+}
+
+/// Copies start one after another: copy k sees time `t − delay(k)`, its
+/// rank in `order` times `each`, or the ranks spread over `total`.
+/// `order` center starts in the layout's middle and moves out in rings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stagger {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub each: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<Duration>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub order: Order,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub seed: u32,
+}
+
+/// Seeded per-copy variation: [min, max] ranges (`scale` multiplies,
+/// `rotation` degrees, `opacity` multiplies, `time` extra delay in
+/// seconds), `position` a ± jitter in px, `color` a mix between two colours.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spread {
+    #[serde(default)]
+    pub seed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Vec2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[Color; 2]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldKind {
+    /// 1 within `radius` − `falloff` of `center`, fading to 0 at `radius`.
+    Radial,
+    /// Ramps 0 → 1 over `range` px along `angle` (degrees), centred on `center`.
+    Linear,
+    /// Smooth noise with features `size` px across, evolving `speed` per second.
+    Noise,
+    /// A ring leaving `center` at time `at` at `speed` px/s; each of its
+    /// `cycles` crests is `wavelength` px wide (0 cycles: endless ripples);
+    /// `decay` px fades it with distance.
+    Wave,
+}
+
+/// A field effector: a 0..1 value per copy (shaped by `ease`, flipped by
+/// `invert`, weighted by `amount`) that scales deltas added to the copy's
+/// `position`, `scale`, `rotation` and `opacity` and mixes in `color`.
+/// Fields apply in list order; their parameters are animatable.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Field {
+    #[serde(rename = "type")]
+    pub kind: FieldKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center: Option<Property<Vec2>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub falloff: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<TimeRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wavelength: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycles: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decay: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ease: Option<Ease>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invert: bool,
+    #[serde(default = "one_prop", skip_serializing_if = "is_one")]
+    pub amount: Property<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Property<Vec2>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Property<Color>>,
 }
 
 /// Depth-first walk over a layer tree.
