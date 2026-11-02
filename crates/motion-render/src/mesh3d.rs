@@ -28,17 +28,104 @@ pub struct MeshCache {
     frame: u64,
     /// Batches of the display list being built.
     pub(crate) batches: Vec<Batch>,
+    /// The layer lists being emitted (innermost last).
+    runs: Vec<Run>,
+    serial: u64,
     pub warnings: Vec<String>,
+}
+
+/// A mesh layer of a layer list, for the other batches of that list.
+struct RunMesh {
+    index: usize,
+    state: MeshState,
+    root: Proj,
+    /// Opaque, normal blend: it hides what is behind it.
+    occludes: bool,
+    bounds: [f64; 4],
+}
+
+/// The mesh layers of one layer list: batches made from the list hide
+/// what the list's other meshes cover.
+struct Run {
+    serial: u64,
+    meshes: Vec<RunMesh>,
+    current: usize,
+}
+
+/// A mesh layer that lets what is behind it show (opacity, glass, a
+/// blend mode): drawn after the opaque meshes, never hiding them.
+pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> bool {
+    use lahza_motion_core::compile::Content;
+    let Content::Mesh(m) = &layer.content else { return false };
+    layer.opacity < 1.0
+        || layer.blend != lahza_motion_core::document::Blend::Normal
+        || m.materials.iter().any(|x| x.opacity < 1.0 || x.transmission > 0.0 || x.color.0[3] < 1.0)
+        || m.colors.iter().any(|c| c.0[3] < 1.0)
 }
 
 impl MeshCache {
     pub(crate) fn begin(&mut self) {
         self.frame += 1;
         self.batches.clear();
+        self.runs.clear();
         if self.meshes.len() > 96 {
             let keep = self.frame.saturating_sub(4);
             self.meshes.retain(|_, (_, used)| *used >= keep);
         }
+    }
+
+    /// Starts emitting a layer list drawn through `root`.
+    pub(crate) fn open_run(&mut self, layers: &[lahza_motion_core::compile::LayerState], root: Proj) {
+        use lahza_motion_core::compile::Content;
+        self.serial += 1;
+        let meshes = layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, l)| {
+                let Content::Mesh(m) = &l.content else { return None };
+                let b = m.screen_bounds()?;
+                let pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])].map(|(x, y)| root.apply(x, y));
+                let bounds = [
+                    pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                    pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                    pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+                    pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+                ];
+                Some(RunMesh { index, state: (**m).clone(), root, occludes: !see_through(l), bounds })
+            })
+            .collect();
+        self.runs.push(Run { serial: self.serial, meshes, current: 0 });
+    }
+
+    /// The layer of the current list about to be emitted.
+    pub(crate) fn set_current(&mut self, index: usize) {
+        if let Some(r) = self.runs.last_mut() {
+            r.current = index;
+        }
+    }
+
+    /// The current list and layer (for a new or joined batch).
+    pub(crate) fn member(&self) -> (u64, usize) {
+        self.runs.last().map(|r| (r.serial, r.current)).unwrap_or((0, 0))
+    }
+
+    /// Ends the current list: each of its batches gets the list's other
+    /// opaque meshes over it as occluders.
+    pub(crate) fn close_run(&mut self) {
+        let Some(run) = self.runs.pop() else { return };
+        if run.meshes.len() < 2 {
+            return;
+        }
+        let mut batches = std::mem::take(&mut self.batches);
+        for b in batches.iter_mut().filter(|b| b.list == run.serial) {
+            for rm in &run.meshes {
+                let overlaps = rm.bounds[2] >= b.bounds[0] && rm.bounds[0] <= b.bounds[2] && rm.bounds[3] >= b.bounds[1] && rm.bounds[1] <= b.bounds[3];
+                if rm.occludes && overlaps && !b.members.contains(&rm.index) {
+                    b.add_occluder(self, &rm.state, rm.root);
+                }
+            }
+        }
+        self.batches = batches;
     }
 
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
@@ -80,15 +167,26 @@ pub(crate) struct Batch {
     light_rows: Vec<[f32; 4]>,
     pub(crate) bounds: [f64; 4],
     layers: usize,
+    /// The material standing for other meshes' surfaces: they win the
+    /// depth test but draw nothing (their own batch draws them).
+    occluder: Option<u32>,
+    /// The layer list this batch was made in and its layers' places in it.
+    pub(crate) list: u64,
+    pub(crate) members: Vec<usize>,
+    pub(crate) see_through: bool,
 }
 
 impl Batch {
     pub(crate) fn can_join(&self, m: &MeshState) -> bool {
-        m.lighting.as_ref().is_some_and(|l| Arc::ptr_eq(l, &self.lighting) || **l == *self.lighting)
+        !self.see_through && m.lighting.as_ref().is_some_and(|l| Arc::ptr_eq(l, &self.lighting) || **l == *self.lighting)
     }
 }
 
 const NEAR: f64 = 1.0;
+/// Material flags (row 2, w): unlit, faceted, depth-only occluder.
+pub const FLAG_UNLIT: u32 = 1;
+pub const FLAG_FACETED: u32 = 2;
+pub const FLAG_OCCLUDER: u32 = 4;
 /// Most triangles one batch may hold (beyond this, meshes are skipped).
 const MAX_TRIS: usize = 4_000_000;
 
@@ -160,11 +258,29 @@ impl Batch {
             light_rows,
             bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
             layers: 0,
+            occluder: None,
+            list: 0,
+            members: Vec::new(),
+            see_through: false,
         })
     }
 
     /// Adds one mesh layer drawn through `root` (canvas → output pixels).
     pub(crate) fn add(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64) {
+        self.add_mesh(cache, m, root, opacity, false);
+    }
+
+    /// Adds another layer's mesh as depth only: where it is nearer, this
+    /// batch shows nothing.
+    pub(crate) fn add_occluder(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj) {
+        if self.occluder.is_none() {
+            self.occluder = Some((self.materials.len() / 4) as u32);
+            self.materials.extend_from_slice(&[[0.0; 4], [0.0; 4], [0.0, 0.0, 0.0, FLAG_OCCLUDER as f32], [0.0; 4]]);
+        }
+        self.add_mesh(cache, m, root, 1.0, true);
+    }
+
+    fn add_mesh(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
         let Some(mesh) = cache.get(m) else { return };
         self.layers += 1;
         if self.tris.len() + mesh.tris.len() > MAX_TRIS {
@@ -196,7 +312,9 @@ impl Batch {
         let mut slot: Vec<u32> = vec![u32::MAX; cam.len()];
         let push = |verts: &mut Vec<Vert>, bounds: &mut [f64; 4], p: [f64; 3], n: [f64; 3]| -> u32 {
             let s = project(p);
-            *bounds = [bounds[0].min(s[0]), bounds[1].min(s[1]), bounds[2].max(s[0]), bounds[3].max(s[1])];
+            if !occluder {
+                *bounds = [bounds[0].min(s[0]), bounds[1].min(s[1]), bounds[2].max(s[0]), bounds[3].max(s[1])];
+            }
             verts.push(Vert { screen: s, pos: [p[0] as f32, p[1] as f32, p[2] as f32], normal: [n[0] as f32, n[1] as f32, n[2] as f32] });
             (verts.len() - 1) as u32
         };
@@ -218,13 +336,18 @@ impl Batch {
             if tag & TWO_SIDED == 0 && dot(g, v[0].0) >= 0.0 {
                 continue;
             }
-            let colors = if m.colors.is_empty() || m.own_color[part] { 1 } else { m.colors.len() as u32 };
-            let mslot = &mut slots[part * colors_n + (segment % colors) as usize];
-            if *mslot == u32::MAX {
-                *mslot = (self.materials.len() / 4) as u32;
-                self.materials.extend_from_slice(&material_rows(m, part, segment, opacity));
-            }
-            let material = *mslot;
+            let material = match (occluder, self.occluder) {
+                (true, Some(o)) => o,
+                _ => {
+                    let colors = if m.colors.is_empty() || m.own_color[part] { 1 } else { m.colors.len() as u32 };
+                    let mslot = &mut slots[part * colors_n + (segment % colors) as usize];
+                    if *mslot == u32::MAX {
+                        *mslot = (self.materials.len() / 4) as u32;
+                        self.materials.extend_from_slice(&material_rows(m, part, segment, opacity));
+                    }
+                    *mslot
+                }
+            };
             let behind = v.iter().filter(|q| q.0[2] < NEAR).count();
             if behind == 3 {
                 continue;
@@ -322,17 +445,26 @@ impl Batch {
                 all
             })
         };
+        // The drawn triangles set the covered area; occluders only matter
+        // inside it.
+        let is_occluder = |t: &Tri| Some(t.rows[1][3].to_bits()) == self.occluder;
         let mut used = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-        for t in &tris {
+        for t in tris.iter().filter(|t| !is_occluder(t)) {
             let bbox = t.bbox.map(|v| v as f64);
             used = [used[0].min(bbox[0]), used[1].min(bbox[1]), used[2].max(bbox[2]), used[3].max(bbox[3])];
         }
-        if tris.is_empty() {
+        if !(used[2] >= used[0]) {
             return None;
+        }
+        let mut tris = tris;
+        if self.occluder.is_some() {
+            tris.retain(|t| !is_occluder(t) || (t.bbox[2] as f64 >= used[0] && t.bbox[0] as f64 <= used[2] && t.bbox[3] as f64 >= used[1] && t.bbox[1] as f64 <= used[3]));
         }
         let clamp_x = |v: f64| (v.max(0.0).min(tw_px - 1.0) as u32 / TILE).min(target.tiles_x - 1);
         let clamp_y = |v: f64| (v.max(0.0).min(th_px - 1.0) as u32 / TILE).min(target.tiles_y - 1);
         let (tx0, ty0, tx1, ty1) = (clamp_x(used[0]), clamp_y(used[1]), clamp_x(used[2]), clamp_y(used[3]));
+        let clamp_x = move |v: f64| clamp_x(v).clamp(tx0, tx1);
+        let clamp_y = move |v: f64| clamp_y(v).clamp(ty0, ty1);
         let (tw, th) = (tx1 - tx0 + 1, ty1 - ty0 + 1);
         // Two passes (count, then fill) into one flat list.
         let tiles = (tw * th) as usize;
@@ -609,6 +741,10 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
     let vb = prim.geom2[1].to_bits() as usize;
     let mb = prim.geom2[2].to_bits() as usize;
     let lb = prim.geom2[3].to_bits() as usize;
+    if m[mb + m[tb + 1][3].to_bits() as usize * 4 + 2][3] as u32 & FLAG_OCCLUDER != 0 {
+        // Another batch draws this surface.
+        return [0.0; 4];
+    }
     let (e, _) = cover(m[tb], m[tb + 1], q);
     let ids = m[tb + 2];
     let mut w = [0.0f32; 3];

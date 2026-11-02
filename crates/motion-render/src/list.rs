@@ -293,9 +293,7 @@ impl Builder<'_> {
         self.meshes.begin();
         let mut pending: Vec<Pending> = Vec::new();
         let mut main_items: Vec<Item> = Vec::new();
-        for layer in &frame.layers {
-            self.emit(layer, root, (w, h), &mut list, &mut pending, &mut main_items);
-        }
+        self.emit_list(&frame.layers, root, (w, h), &mut list, &mut pending, &mut main_items);
         let background = premul(frame.background, 1.0);
         // Groups first (inner before outer), then the main target.
         let mut range_base = 0;
@@ -417,17 +415,23 @@ impl Builder<'_> {
     /// before it (meshes next to each other share one depth buffer).
     fn mesh_item(&mut self, layer: &LayerState, m: &lahza_motion_core::compile::MeshState, root: Proj, prev: Option<&mut Item>) -> Option<Item> {
         let blend = blend_code(layer.blend);
-        if let Some(prev) = prev {
+        let see_through = crate::mesh3d::see_through(layer);
+        let (list_serial, index) = self.meshes.member();
+        if let (Some(prev), false) = (prev, see_through) {
             let i = prev.prim.kind[1] as usize;
-            if prev.prim.kind[0] == PRIM_MESH && prev.prim.kind[2] == blend && blend == blend_code(Blend::Normal) && self.meshes.batches[i].can_join(m) {
+            if prev.prim.kind[0] == PRIM_MESH && prev.prim.kind[2] == blend && blend == blend_code(Blend::Normal) && self.meshes.batches[i].can_join(m) && self.meshes.batches[i].list == list_serial {
                 let mut batch = std::mem::replace(&mut self.meshes.batches[i], crate::mesh3d::Batch::new(m)?);
                 batch.add(self.meshes, m, root, layer.opacity);
+                batch.members.push(index);
                 prev.bounds = batch.bounds;
                 self.meshes.batches[i] = batch;
                 return None;
             }
         }
         let mut batch = crate::mesh3d::Batch::new(m)?;
+        batch.list = list_serial;
+        batch.members.push(index);
+        batch.see_through = see_through;
         batch.add(self.meshes, m, root, layer.opacity);
         let bounds = batch.bounds;
         if !(bounds[2] >= bounds[0]) {
@@ -436,6 +440,35 @@ impl Builder<'_> {
         self.meshes.batches.push(batch);
         let prim = Prim { kind: [PRIM_MESH, (self.meshes.batches.len() - 1) as u32, blend, 0], ..Default::default() };
         Some(Item { prim, forward: Proj::IDENTITY, bounds })
+    }
+
+    /// Emits a layer list in order. Meshes that let what is behind them
+    /// show (opacity, glass, blend modes) are drawn after the opaque meshes
+    /// next to them, and every mesh batch hides where the list's other
+    /// opaque meshes are nearer (shared depth across effects, blends and
+    /// depth of field).
+    fn emit_list(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
+        self.meshes.open_run(layers, root);
+        let mut deferred: Vec<usize> = Vec::new();
+        for (i, layer) in layers.iter().enumerate() {
+            if crate::mesh3d::see_through(layer) {
+                deferred.push(i);
+                continue;
+            }
+            if !matches!(layer.content, Content::Mesh(_)) {
+                for j in deferred.drain(..) {
+                    self.meshes.set_current(j);
+                    self.emit(&layers[j], root, canvas, list, pending, out);
+                }
+            }
+            self.meshes.set_current(i);
+            self.emit(layer, root, canvas, list, pending, out);
+        }
+        for j in deferred {
+            self.meshes.set_current(j);
+            self.emit(&layers[j], root, canvas, list, pending, out);
+        }
+        self.meshes.close_run();
     }
 
     fn emit(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
@@ -455,9 +488,7 @@ impl Builder<'_> {
         let group_opacity = match &layer.content {
             Content::Group(children) => {
                 let inner = root.then(layer.matrix);
-                for c in children {
-                    self.emit(c, inner, canvas, list, pending, &mut items);
-                }
+                self.emit_list(children, inner, canvas, list, pending, &mut items);
                 layer.opacity
             }
             _ => {

@@ -279,3 +279,53 @@ fn benchmark_meshes_1080p() {
         eprintln!("{label}: {tris} triangles, {ms:.1} ms/frame (build {:.1} ms, raster {:.1} ms)", r.stats.build_ms / n as f64, r.stats.raster_ms / n as f64);
     }
 }
+
+#[test]
+fn meshes_drawn_on_their_own_still_share_depth() {
+    // The X of slabs again, with the red slab drawn on its own (an effect,
+    // a blend mode, depth of field) and the blue one see-through.
+    let slab = |id: &str, color: &str, turn: f64, extra: serde_json::Value| {
+        let mut l = json!({"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [200, 100], "depth": 4}, "material": {"preset": "flat", "color": color},
+            "transform": {"position": [160, 120], "rotation_y": turn}});
+        for (k, v) in extra.as_object().unwrap() {
+            l[k] = v.clone();
+        }
+        l
+    };
+    let variants = [
+        json!({"effects": [{"type": "brightness_contrast", "brightness": 0}]}),
+        json!({"effects": [{"type": "blur", "radius": 0.2}]}),
+    ];
+    for extra in variants {
+        for order in [0, 1] {
+            let red = slab("a", "#ff0000", 30.0, extra.clone());
+            let blue = slab("b", "#0000ff", -30.0, json!({}));
+            let layers = if order == 0 { json!([red, blue]) } else { json!([blue, red]) };
+            let img = render(&scene(320, 240, json!({"layers": layers})), 0.0);
+            let (l, r) = (px(&img, 110, 120), px(&img, 210, 120));
+            assert!(l[0] > 240 && l[2] < 15, "{extra} order {order}: left {l:?}");
+            assert!(r[2] > 240 && r[0] < 15, "{extra} order {order}: right {r:?}");
+        }
+    }
+    // A blend mode blends a mesh in front over the meshes behind it, and
+    // hides nothing in front of it.
+    for order in [0, 1] {
+        let red = slab("a", "#ff0000", 30.0, json!({"blend": "lighten"}));
+        let blue = slab("b", "#0000ff", -30.0, json!({}));
+        let layers = if order == 0 { json!([red, blue]) } else { json!([blue, red]) };
+        let img = render(&scene(320, 240, json!({"layers": layers})), 0.0);
+        assert_eq!(px(&img, 110, 120), [255, 0, 255, 255], "order {order}");
+        assert_eq!(px(&img, 210, 120), [0, 0, 255, 255], "order {order}");
+    }
+    // A half-transparent blue slab: in front (right) it tints the red
+    // behind it; behind (left) the opaque red hides it.
+    for order in [0, 1] {
+        let red = slab("a", "#ff0000", 30.0, json!({}));
+        let blue = slab("b", "#0000ff", -30.0, json!({"transform": {"position": [160, 120], "rotation_y": -30, "opacity": 0.5}}));
+        let layers = if order == 0 { json!([red, blue]) } else { json!([blue, red]) };
+        let img = render(&scene(320, 240, json!({"layers": layers})), 0.0);
+        assert_eq!(px(&img, 110, 120), [255, 0, 0, 255], "order {order}");
+        let r = px(&img, 210, 120);
+        assert!((r[0] as i32 - 128).abs() <= 3 && (r[2] as i32 - 128).abs() <= 3, "order {order}: {r:?}");
+    }
+}

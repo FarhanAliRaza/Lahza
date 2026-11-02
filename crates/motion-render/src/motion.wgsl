@@ -799,6 +799,10 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let vb = bitcast<u32>(prim.geom2.y);
     let mb = bitcast<u32>(prim.geom2.z);
     let lb = bitcast<u32>(prim.geom2.w);
+    if (u32(b_mesh[mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u + 2u].w) & 4u) != 0u {
+        // A depth-only occluder: another batch draws this surface.
+        return vec4<f32>(0.0);
+    }
     let cv = cover(b_mesh[tb], b_mesh[tb + 1u], q);
     let ev = array<f32, 3>(cv.e.x, cv.e.y, cv.e.z);
     let ids = b_mesh[tb + 2u];
