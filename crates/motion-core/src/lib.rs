@@ -15,6 +15,7 @@ pub mod document;
 pub mod edit;
 pub mod io;
 pub mod markers;
+pub mod mesh;
 pub mod path;
 pub mod property;
 pub mod recording;

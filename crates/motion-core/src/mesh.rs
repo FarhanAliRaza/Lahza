@@ -1,0 +1,1299 @@
+//! 3D meshes for `mesh` layers: primitives (sphere, box, cylinder,
+//! capsule, torus), extruded and bevelled outlines, profiles revolved
+//! around an axis, and tubes swept along a path.
+//!
+//! Space is the layer's (x right, y down, z away from the viewer), so a
+//! mesh with no rotation faces the camera the way a shape layer does: a
+//! torus lies in the screen plane like a `ring`, an extruded outline shows
+//! its front face, and angles run from up, clockwise, like `arc`.
+//!
+//! Every triangle carries a tag: the part it belongs to (front, back,
+//! side, bevel, caps — each can take its own material) and the segment
+//! (rings and revolves split into `segments` pieces take per-segment
+//! colours). Generation depends only on the parameters, so a mesh is
+//! cached by them and identical on every machine.
+
+use crate::compile::PathMorph;
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
+
+pub const PART_FRONT: u32 = 0;
+pub const PART_BACK: u32 = 1;
+pub const PART_SIDE: u32 = 2;
+pub const PART_BEVEL: u32 = 3;
+pub const PART_CAPS: u32 = 4;
+pub const PARTS: usize = 5;
+pub const PART_NAMES: [&str; PARTS] = ["front", "back", "side", "bevel", "caps"];
+/// Tag bit: the surface is open (seen from both sides).
+pub const TWO_SIDED: u32 = 1 << 31;
+
+/// A triangle mesh in layer units.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Mesh {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub tris: Vec<[u32; 3]>,
+    /// Per triangle: part (bits 0..8), segment (bits 8..24), `TWO_SIDED`.
+    pub tags: Vec<u32>,
+}
+
+pub fn tag(part: u32, segment: u32) -> u32 {
+    part | (segment.min(0xffff) << 8)
+}
+pub fn tag_part(tag: u32) -> u32 {
+    tag & 0xff
+}
+pub fn tag_segment(tag: u32) -> u32 {
+    (tag >> 8) & 0xffff
+}
+
+type V3 = [f64; 3];
+
+fn add(a: V3, b: V3) -> V3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+fn sub(a: V3, b: V3) -> V3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn mul(a: V3, k: f64) -> V3 {
+    [a[0] * k, a[1] * k, a[2] * k]
+}
+fn dot(a: V3, b: V3) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn norm(a: V3) -> V3 {
+    let l = dot(a, a).sqrt();
+    if l > 1e-12 {
+        mul(a, 1.0 / l)
+    } else {
+        a
+    }
+}
+
+impl Mesh {
+    fn vertex(&mut self, p: V3, n: V3) -> u32 {
+        self.positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+        let n = norm(n);
+        self.normals.push([n[0] as f32, n[1] as f32, n[2] as f32]);
+        (self.positions.len() - 1) as u32
+    }
+    fn tri(&mut self, a: u32, b: u32, c: u32, tag: u32) {
+        self.tris.push([a, b, c]);
+        self.tags.push(tag);
+    }
+    fn quad(&mut self, a: u32, b: u32, c: u32, d: u32, tag: u32) {
+        self.tri(a, b, c, tag);
+        self.tri(a, c, d, tag);
+    }
+    pub fn append(&mut self, other: &Mesh) {
+        let base = self.positions.len() as u32;
+        self.positions.extend_from_slice(&other.positions);
+        self.normals.extend_from_slice(&other.normals);
+        self.tris.extend(other.tris.iter().map(|t| t.map(|i| i + base)));
+        self.tags.extend_from_slice(&other.tags);
+    }
+    /// Local bounds [min, max].
+    pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for p in &self.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        (lo, hi)
+    }
+}
+
+// ------------------------------------------------------------ parameters
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Caps {
+    Flat,
+    Round,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SweepProfile {
+    Circle,
+    Square,
+    /// A flat band `width` wide, standing out of the layer plane (along z).
+    Ribbon,
+}
+
+/// A mesh's evaluated parameters (layer units, degrees).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MeshShape {
+    Sphere { radius: f64 },
+    /// `size` [w, h, d]; `bevel` rounds every edge.
+    Box { size: V3, bevel: f64 },
+    /// Axis along y; `top` radius makes a cone or frustum.
+    Cylinder { radius: f64, top: f64, height: f64, bevel: f64 },
+    Capsule { radius: f64, height: f64 },
+    /// Facing the camera (axis z); `angles` like an arc (0 = up, clockwise).
+    Torus { radius: f64, tube: f64, angles: [f64; 2], caps: Caps },
+    /// A closed outline pushed back `depth`, its edges rounded by `bevel`.
+    Extrude { path: PathMorph, depth: f64, bevel: f64 },
+    /// An outline in (x = distance from the axis, y = along the axis)
+    /// turned about the axis (`axis_y`: the layer's y, else z).
+    Revolve { profile: PathMorph, angles: [f64; 2], axis_y: bool },
+    /// A tube along a path in the layer plane, drawn on by `trim`.
+    Sweep { path: PathMorph, radius: f64, width: f64, profile: SweepProfile, trim: [f64; 2], caps: Caps, head: f64 },
+}
+
+/// Shape plus the splitting and tessellation settings every kind shares.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshParams {
+    pub shape: MeshShape,
+    /// Pieces around the angle range (rings, revolves) or along the path
+    /// (sweeps); each takes the next of the layer's `colors`.
+    pub segments: u32,
+    /// Degrees between pieces (rings, revolves) or fraction of the length
+    /// between pieces (sweeps).
+    pub gap: f64,
+    /// Tessellation multiplier (1 = smooth at the size drawn).
+    pub detail: f64,
+}
+
+impl MeshParams {
+    /// Bytes identifying the generated mesh (cache key).
+    pub fn key(&self) -> Vec<u8> {
+        let mut k = Vec::with_capacity(96);
+        let mut f = |v: f64| k.extend_from_slice(&v.to_bits().to_le_bytes());
+        f(self.segments as f64);
+        f(self.gap);
+        f(self.detail);
+        let mut text = String::new();
+        let mut path = |m: &PathMorph, f: &mut dyn FnMut(f64)| {
+            f(m.t);
+            text.push_str(&m.from);
+            text.push('|');
+            text.push_str(m.to.as_deref().unwrap_or(""));
+            text.push('|');
+        };
+        match &self.shape {
+            MeshShape::Sphere { radius } => {
+                f(1.0);
+                f(*radius);
+            }
+            MeshShape::Box { size, bevel } => {
+                f(2.0);
+                size.iter().for_each(|v| f(*v));
+                f(*bevel);
+            }
+            MeshShape::Cylinder { radius, top, height, bevel } => {
+                f(3.0);
+                [*radius, *top, *height, *bevel].iter().for_each(|v| f(*v));
+            }
+            MeshShape::Capsule { radius, height } => {
+                f(4.0);
+                f(*radius);
+                f(*height);
+            }
+            MeshShape::Torus { radius, tube, angles, caps } => {
+                f(5.0);
+                [*radius, *tube, angles[0], angles[1], *caps as u8 as f64].iter().for_each(|v| f(*v));
+            }
+            MeshShape::Extrude { path: p, depth, bevel } => {
+                f(6.0);
+                f(*depth);
+                f(*bevel);
+                path(p, &mut f);
+            }
+            MeshShape::Revolve { profile, angles, axis_y } => {
+                f(7.0);
+                [angles[0], angles[1], *axis_y as u8 as f64].iter().for_each(|v| f(*v));
+                path(profile, &mut f);
+            }
+            MeshShape::Sweep { path: p, radius, width, profile, trim, caps, head } => {
+                f(8.0);
+                [*radius, *width, *profile as u8 as f64, trim[0], trim[1], *caps as u8 as f64, *head].iter().for_each(|v| f(*v));
+                path(p, &mut f);
+            }
+        }
+        k.extend_from_slice(text.as_bytes());
+        k
+    }
+}
+
+/// Segments for a circle of radius `r` (one every ~9 px, scaled by detail).
+fn circle_steps(r: f64, detail: f64, span: f64) -> usize {
+    let n = (r.abs() * span / 9.0 * detail).ceil();
+    let min = (24.0 * span / TAU).ceil().max(3.0);
+    n.clamp(min, 320.0 * span / TAU + 4.0) as usize
+}
+
+/// The pieces of an angle range: `count` spans with `gap` degrees between
+/// them (between neighbours only, unless the range is a full turn).
+fn pieces(a0: f64, a1: f64, count: u32, gap: f64) -> Vec<(f64, f64)> {
+    let count = count.max(1) as usize;
+    let span = a1 - a0;
+    let full = span.abs() >= 360.0 - 1e-9;
+    let gaps = if full { count } else { count - 1 };
+    let gap = gap.max(0.0).min(span.abs() / gaps.max(1) as f64 * 0.95) * span.signum();
+    let each = (span - gap * gaps as f64) / count as f64;
+    (0..count)
+        .map(|i| {
+            let s = a0 + (each + gap) * i as f64 + if full { gap / 2.0 } else { 0.0 };
+            (s, s + each)
+        })
+        .collect()
+}
+
+pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
+    let detail = if params.detail.is_finite() && params.detail > 0.0 { params.detail.clamp(0.1, 8.0) } else { 1.0 };
+    let mut mesh = Mesh::default();
+    match &params.shape {
+        MeshShape::Sphere { radius } => {
+            let r = radius.max(0.0);
+            let profile = Profile::arc((0.0, 0.0), r, -FRAC_PI_2, FRAC_PI_2, circle_steps(r, detail, PI), PART_SIDE);
+            revolve_pieces(&mut mesh, &[profile], (0.0, 360.0), 1, 0.0, true, circle_steps(r, detail, TAU), false);
+        }
+        MeshShape::Box { size, bevel } => rounded_box(&mut mesh, *size, *bevel, detail),
+        MeshShape::Cylinder { radius, top, height, bevel } => {
+            let lines = cylinder_profile(radius.max(0.0), top.max(0.0), height.max(0.0), *bevel, detail);
+            let steps = circle_steps(radius.max(*top), detail, TAU);
+            revolve_pieces(&mut mesh, &lines, (0.0, 360.0), params.segments, params.gap, true, steps, true);
+        }
+        MeshShape::Capsule { radius, height } => {
+            let r = radius.max(0.0);
+            let half = (height / 2.0 - r).max(0.0);
+            let n = circle_steps(r, detail, FRAC_PI_2);
+            let mut p = Profile::arc((0.0, -half), r, -FRAC_PI_2, 0.0, n, PART_SIDE);
+            p.extend(Profile::arc((0.0, half), r, 0.0, FRAC_PI_2, n, PART_SIDE));
+            revolve_pieces(&mut mesh, &[p], (0.0, 360.0), params.segments, params.gap, true, circle_steps(r, detail, TAU), true);
+        }
+        MeshShape::Torus { radius, tube, angles, caps } => {
+            let (r, t) = (radius.max(0.0), tube.max(0.0).min(radius.max(0.0)));
+            let ring = Profile::arc((r, 0.0), t, -PI, PI, circle_steps(t, detail, TAU), PART_SIDE);
+            let steps = circle_steps(r + t, detail, TAU);
+            let n = params.segments.max(1);
+            for (k, (a0, a1)) in pieces(angles[0], angles[1], n, params.gap).into_iter().enumerate() {
+                let piece = revolve(&ring_profile(&ring), a0.to_radians(), a1.to_radians(), steps, k as u32, false, false);
+                mesh.append(&piece);
+                if (a1 - a0).abs() < 360.0 - 1e-9 {
+                    for (a, dir) in [(a0, -1.0), (a1, 1.0)] {
+                        let sign = dir * (a1 - a0).signum();
+                        match caps {
+                            Caps::Flat => disc_cap(&mut mesh, r, t, a.to_radians(), sign, steps_for(t, detail), k as u32),
+                            Caps::Round => round_cap(&mut mesh, r, t, a.to_radians(), sign, steps_for(t, detail), k as u32),
+                        }
+                    }
+                }
+            }
+        }
+        MeshShape::Extrude { path, depth, bevel } => extrude(&mut mesh, path, *depth, *bevel, detail)?,
+        MeshShape::Revolve { profile, angles, axis_y } => {
+            let subpaths = crate::path::morph(profile, 0.3 / detail)?;
+            if subpaths.is_empty() {
+                return Err("revolve: the profile is empty".into());
+            }
+            let mut lines = Vec::new();
+            let mut closed_all = true;
+            let mut reach = 0.0f64;
+            for (pts, closed) in &subpaths {
+                closed_all &= *closed;
+                reach = pts.iter().fold(reach, |m, p| m.max(p.0.abs()));
+                lines.extend(Profile::from_polyline(pts, *closed, PART_SIDE));
+            }
+            let steps = circle_steps(reach, detail, TAU);
+            revolve_pieces(&mut mesh, &lines, (angles[0], angles[1]), params.segments, params.gap, closed_all, steps, *axis_y);
+            if !closed_all {
+                for t in &mut mesh.tags {
+                    *t |= TWO_SIDED;
+                }
+            }
+            if closed_all && (angles[1] - angles[0]).abs() < 360.0 - 1e-9 || params.segments > 1 {
+                for (k, (a0, a1)) in pieces(angles[0], angles[1], params.segments, params.gap).into_iter().enumerate() {
+                    if (a1 - a0).abs() >= 360.0 - 1e-9 {
+                        continue;
+                    }
+                    for (pts, closed) in &subpaths {
+                        let pts: Vec<(f64, f64)> = if *closed { pts.clone() } else { close_on_axis(pts) };
+                        for (a, s) in [(a0, -1.0), (a1, 1.0)] {
+                            profile_cap(&mut mesh, &pts, a.to_radians(), s * (a1 - a0).signum(), *axis_y, k as u32);
+                        }
+                    }
+                }
+            }
+        }
+        MeshShape::Sweep { path, radius, width, profile, trim, caps, head } => {
+            sweep(&mut mesh, path, *radius, *width, *profile, *trim, *caps, *head, params.segments, params.gap, detail)?
+        }
+    }
+    Ok(mesh)
+}
+
+fn steps_for(r: f64, detail: f64) -> usize {
+    circle_steps(r, detail, TAU)
+}
+
+// ------------------------------------------------------------- profiles
+
+/// A profile point: (distance from the axis, position along it) and the
+/// outward normal in that plane.
+#[derive(Clone, Copy, Debug)]
+struct PV {
+    r: f64,
+    h: f64,
+    nr: f64,
+    nh: f64,
+}
+
+/// A smooth run of profile points (corners start a new run).
+#[derive(Clone, Debug)]
+struct Profile {
+    pts: Vec<PV>,
+    part: u32,
+}
+
+impl Profile {
+    /// Circular arc about `c` of radius `r` from angle `a0` to `a1`
+    /// (radians; 0 points away from the axis, positive turns toward +h).
+    fn arc(c: (f64, f64), r: f64, a0: f64, a1: f64, n: usize, part: u32) -> Profile {
+        let n = n.max(1);
+        let pts = (0..=n)
+            .map(|i| {
+                let a = a0 + (a1 - a0) * i as f64 / n as f64;
+                let (s, co) = a.sin_cos();
+                PV { r: c.0 + r * co, h: c.1 + r * s, nr: co, nh: s }
+            })
+            .collect();
+        Profile { pts, part }
+    }
+    fn extend(&mut self, other: Profile) {
+        let skip = usize::from(matches!((self.pts.last(), other.pts.first()), (Some(a), Some(b)) if (a.r - b.r).abs() < 1e-9 && (a.h - b.h).abs() < 1e-9));
+        self.pts.extend(other.pts.into_iter().skip(skip));
+    }
+    /// A straight run from `a` to `b` with its normal on the right of the
+    /// direction of travel when `right`, else on the left.
+    fn line(a: (f64, f64), b: (f64, f64), outward: (f64, f64), part: u32) -> Profile {
+        let l = outward.0.hypot(outward.1).max(1e-12);
+        let (nr, nh) = (outward.0 / l, outward.1 / l);
+        Profile { pts: vec![PV { r: a.0, h: a.1, nr, nh }, PV { r: b.0, h: b.1, nr, nh }], part }
+    }
+    /// A polyline split into smooth runs at corners sharper than ~35°.
+    /// Normals point to the right of the direction of travel (for a closed
+    /// outline drawn clockwise on screen, outward).
+    fn from_polyline(pts: &[(f64, f64)], closed: bool, part: u32) -> Vec<Profile> {
+        let mut p: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
+        for &q in pts {
+            if p.last().is_none_or(|l: &(f64, f64)| (l.0 - q.0).hypot(l.1 - q.1) > 1e-6) {
+                p.push(q);
+            }
+        }
+        if closed && p.len() > 2 && (p[0].0 - p[p.len() - 1].0).hypot(p[0].1 - p[p.len() - 1].1) <= 1e-6 {
+            p.pop();
+        }
+        if p.len() < 2 {
+            return Vec::new();
+        }
+        // Profiles turn about the axis with h along the axis: the right of
+        // travel in (r, h) is (dh, −dr) — outward for a clockwise
+        // (screen) outline; flip so the outline's outside is outward.
+        let area: f64 = (0..p.len()).map(|i| {
+            let (a, b) = (p[i], p[(i + 1) % p.len()]);
+            a.0 * b.1 - b.0 * a.1
+        }).sum();
+        let flip = if closed && area < 0.0 { -1.0 } else { 1.0 };
+        let n = p.len();
+        let edges = if closed { n } else { n - 1 };
+        let edge_normal = |i: usize| {
+            let (a, b) = (p[i % n], p[(i + 1) % n]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let l = dx.hypot(dy).max(1e-12);
+            (dy / l * flip, -dx / l * flip)
+        };
+        let sharp = |i: usize| -> bool {
+            // Corner at vertex i between edge i−1 and edge i.
+            let (a, b) = (edge_normal((i + edges - 1) % edges), edge_normal(i % edges));
+            a.0 * b.0 + a.1 * b.1 < 0.82
+        };
+        let mut out = Vec::new();
+        let mut cur: Vec<PV> = Vec::new();
+        let vertex = |i: usize, n0: (f64, f64)| PV { r: p[i % n].0, h: p[i % n].1, nr: n0.0, nh: n0.1 };
+        // Start at a corner when there is one, so closed outlines split cleanly.
+        let start = if closed { (0..n).find(|&i| sharp(i)).unwrap_or(0) } else { 0 };
+        let count = if closed { n + 1 } else { n };
+        for k in 0..count {
+            let i = start + k;
+            let at_end = !closed && (k == 0 || k == n - 1);
+            let (ein, eout) = ((i + edges - 1) % edges, i % edges);
+            if at_end {
+                let e = if k == 0 { edge_normal(eout) } else { edge_normal(ein) };
+                cur.push(vertex(i, e));
+                continue;
+            }
+            if sharp(i % n) && closed || (!closed && sharp(i)) {
+                if !cur.is_empty() {
+                    cur.push(vertex(i, edge_normal(ein)));
+                    out.push(Profile { pts: std::mem::take(&mut cur), part });
+                }
+                if k < count - 1 {
+                    cur.push(vertex(i, edge_normal(eout)));
+                }
+            } else {
+                let (a, b) = (edge_normal(ein), edge_normal(eout));
+                let m = (a.0 + b.0, a.1 + b.1);
+                let l = m.0.hypot(m.1).max(1e-12);
+                cur.push(vertex(i, (m.0 / l, m.1 / l)));
+            }
+        }
+        if cur.len() >= 2 {
+            out.push(Profile { pts: cur, part });
+        }
+        out
+    }
+}
+
+/// The torus tube's profile as a single smooth loop.
+fn ring_profile(ring: &Profile) -> Vec<Profile> {
+    vec![ring.clone()]
+}
+
+fn cylinder_profile(rb: f64, rt: f64, height: f64, bevel: f64, detail: f64) -> Vec<Profile> {
+    let hh = height / 2.0;
+    let b = bevel.max(0.0).min(hh).min(rb.max(rt) * 0.999);
+    let n = circle_steps(b, detail, FRAC_PI_2).min(16);
+    // Side slope: from bottom (rb, +hh) to top (rt, −hh); y is down.
+    let side_n = (2.0 * hh, rt - rb);
+    let mut lines = Vec::new();
+    if b <= 1e-9 {
+        lines.push(Profile::line((0.0, hh), (rb, hh), (0.0, 1.0), PART_CAPS));
+        lines.push(Profile::line((rb, hh), (rt, -hh), side_n, PART_SIDE));
+        lines.push(Profile::line((rt, -hh), (0.0, -hh), (0.0, -1.0), PART_CAPS));
+    } else {
+        lines.push(Profile::line((0.0, hh), ((rb - b).max(0.0), hh), (0.0, 1.0), PART_CAPS));
+        lines.push(Profile::arc(((rb - b).max(0.0), hh - b), b, FRAC_PI_2, 0.0, n, PART_BEVEL));
+        lines.push(Profile::line((rb, hh - b), (rt, -hh + b), side_n, PART_SIDE));
+        lines.push(Profile::arc(((rt - b).max(0.0), -hh + b), b, 0.0, -FRAC_PI_2, n, PART_BEVEL));
+        lines.push(Profile::line(((rt - b).max(0.0), -hh), (0.0, -hh), (0.0, -1.0), PART_CAPS));
+    }
+    lines
+}
+
+/// The point at angle `a` (radians, 0 = up, clockwise on screen) and
+/// distance `r` from the axis, `h` along it. Axis z faces the camera;
+/// axis y stands up (h down the screen), angle 0 toward the viewer.
+fn around(axis_y: bool, a: f64, r: f64, h: f64) -> V3 {
+    let (s, c) = a.sin_cos();
+    if axis_y {
+        [r * s, h, -r * c]
+    } else {
+        [r * s, -r * c, h]
+    }
+}
+
+fn around_dir(axis_y: bool, a: f64, nr: f64, nh: f64) -> V3 {
+    around(axis_y, a, nr, nh)
+}
+
+/// d(around)/da direction at angle `a` (unit, for caps).
+fn tangent_dir(axis_y: bool, a: f64) -> V3 {
+    let (s, c) = a.sin_cos();
+    if axis_y {
+        [c, 0.0, s]
+    } else {
+        [c, s, 0.0]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn revolve_pieces(mesh: &mut Mesh, lines: &[Profile], angles: (f64, f64), segments: u32, gap: f64, _closed: bool, steps: usize, axis_y: bool) {
+    for (k, (a0, a1)) in pieces(angles.0, angles.1, segments, gap).into_iter().enumerate() {
+        let piece = revolve(lines, a0.to_radians(), a1.to_radians(), steps, k as u32, axis_y, true);
+        mesh.append(&piece);
+    }
+}
+
+/// Turns profile runs from `a0` to `a1` radians in `steps` per full turn.
+fn revolve(lines: &[Profile], a0: f64, a1: f64, steps: usize, segment: u32, axis_y: bool, _caps_hint: bool) -> Mesh {
+    let mut m = Mesh::default();
+    let n = ((steps as f64 * (a1 - a0).abs() / TAU).ceil() as usize).max(1);
+    for line in lines {
+        let t = tag(line.part, segment);
+        let mut prev: Option<Vec<u32>> = None;
+        for i in 0..=n {
+            let a = a0 + (a1 - a0) * i as f64 / n as f64;
+            let ring: Vec<u32> = line.pts.iter().map(|p| m.vertex(around(axis_y, a, p.r, p.h), around_dir(axis_y, a, p.nr, p.nh))).collect();
+            if let Some(prev) = &prev {
+                for j in 0..ring.len() - 1 {
+                    // Skip quads collapsed on the axis.
+                    let (p, q) = (line.pts[j], line.pts[j + 1]);
+                    if p.r.abs() < 1e-9 && q.r.abs() < 1e-9 {
+                        continue;
+                    }
+                    if p.r.abs() < 1e-9 {
+                        m.tri(prev[j], ring[j + 1], prev[j + 1], t);
+                    } else if q.r.abs() < 1e-9 {
+                        m.tri(prev[j], ring[j], prev[j + 1], t);
+                    } else {
+                        m.quad(prev[j], ring[j], ring[j + 1], prev[j + 1], t);
+                    }
+                }
+            }
+            prev = Some(ring);
+        }
+    }
+    m
+}
+
+/// Flat cap closing a torus tube at angle `a`; `dir` −1 faces back along
+/// the turn (start), +1 forward (end).
+fn disc_cap(mesh: &mut Mesh, r: f64, t: f64, a: f64, dir: f64, steps: usize, segment: u32) {
+    let normal = mul(tangent_dir(false, a), dir);
+    let c = mesh.vertex(around(false, a, r, 0.0), normal);
+    let ring: Vec<u32> = (0..=steps)
+        .map(|i| {
+            let b = TAU * i as f64 / steps as f64;
+            mesh.vertex(around(false, a, r + t * b.cos(), t * b.sin()), normal)
+        })
+        .collect();
+    for w in ring.windows(2) {
+        mesh.tri(c, w[0], w[1], tag(PART_CAPS, segment));
+    }
+}
+
+/// A half sphere closing a torus tube at angle `a`.
+fn round_cap(mesh: &mut Mesh, r: f64, t: f64, a: f64, dir: f64, steps: usize, segment: u32) {
+    let centre = around(false, a, r, 0.0);
+    let out = mul(tangent_dir(false, a), dir);
+    let radial = around(false, a, 1.0, 0.0);
+    let axis = [0.0, 0.0, 1.0];
+    let lat = (steps / 4).max(3);
+    let mut prev: Option<Vec<u32>> = None;
+    for j in 0..=lat {
+        let phi = FRAC_PI_2 * j as f64 / lat as f64;
+        let ring: Vec<u32> = (0..=steps)
+            .map(|i| {
+                let b = TAU * i as f64 / steps as f64;
+                let rim = add(mul(radial, b.cos()), mul(axis, b.sin()));
+                let n = add(mul(rim, phi.cos()), mul(out, phi.sin()));
+                mesh.vertex(add(centre, mul(n, t)), n)
+            })
+            .collect();
+        if let Some(prev) = &prev {
+            for i in 0..steps {
+                if j == lat {
+                    mesh.tri(prev[i], prev[i + 1], ring[i], tag(PART_CAPS, segment));
+                } else {
+                    mesh.quad(prev[i], prev[i + 1], ring[i + 1], ring[i], tag(PART_CAPS, segment));
+                }
+            }
+        }
+        prev = Some(ring);
+    }
+}
+
+/// An open profile closed along the axis (its ends dropped onto r = 0).
+fn close_on_axis(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out = pts.to_vec();
+    if let (Some(&first), Some(&last)) = (pts.first(), pts.last()) {
+        if last.0.abs() > 1e-9 {
+            out.push((0.0, last.1));
+        }
+        if first.0.abs() > 1e-9 {
+            out.push((0.0, first.1));
+        }
+    }
+    out
+}
+
+/// A flat cap: the profile polygon at angle `a`.
+fn profile_cap(mesh: &mut Mesh, pts: &[(f64, f64)], a: f64, dir: f64, axis_y: bool, segment: u32) {
+    let tris = triangulate(&[pts.to_vec()]);
+    let normal = mul(tangent_dir(axis_y, a), dir);
+    let base = mesh.positions.len() as u32;
+    for p in pts {
+        mesh.vertex(around(axis_y, a, p.0, p.1), normal);
+    }
+    for t in tris {
+        mesh.tri(base + t[0] as u32, base + t[1] as u32, base + t[2] as u32, tag(PART_CAPS, segment));
+    }
+}
+
+// ------------------------------------------------------------------ box
+
+fn rounded_box(mesh: &mut Mesh, size: V3, bevel: f64, detail: f64) {
+    let h = size.map(|v| v.abs() / 2.0);
+    let r = bevel.max(0.0).min(h[0]).min(h[1]).min(h[2]);
+    let n = if r > 1e-9 { circle_steps(r, detail, FRAC_PI_2).clamp(2, 16) } else { 0 };
+    // Coordinates along an axis: the bevel band spread by angle.
+    let coords = |half: f64| -> Vec<(f64, bool)> {
+        let mut c = Vec::new();
+        if n == 0 {
+            return vec![(-half, false), (half, false)];
+        }
+        for k in 0..=n {
+            let t = (FRAC_PI_4 * (n - k) as f64 / n as f64).tan();
+            c.push((-(half - r) - r * t, k < n));
+        }
+        for k in 0..=n {
+            let t = (FRAC_PI_4 * k as f64 / n as f64).tan();
+            c.push(((half - r) + r * t, k > 0));
+        }
+        c
+    };
+    let inner = h.map(|v| v - r);
+    // (normal axis, sign, u axis, v axis, part)
+    let faces = [(2, -1.0, 0, 1, PART_FRONT), (2, 1.0, 0, 1, PART_BACK), (0, -1.0, 1, 2, PART_SIDE), (0, 1.0, 1, 2, PART_SIDE), (1, -1.0, 0, 2, PART_SIDE), (1, 1.0, 0, 2, PART_SIDE)];
+    for (axis, sign, u, v, part) in faces {
+        let (cu, cv) = (coords(h[u]), coords(h[v]));
+        let base = mesh.positions.len() as u32;
+        for &(y, _) in &cv {
+            for &(x, _) in &cu {
+                let mut p = [0.0; 3];
+                p[axis] = sign * h[axis];
+                p[u] = x;
+                p[v] = y;
+                let mut face_n = [0.0; 3];
+                face_n[axis] = sign;
+                if r <= 1e-9 {
+                    mesh.vertex(p, face_n);
+                } else {
+                    let q = [p[0].clamp(-inner[0], inner[0]), p[1].clamp(-inner[1], inner[1]), p[2].clamp(-inner[2], inner[2])];
+                    let d = norm(sub(p, q));
+                    mesh.vertex(add(q, mul(d, r)), d);
+                }
+            }
+        }
+        let w = cu.len() as u32;
+        for j in 0..cv.len() - 1 {
+            for i in 0..cu.len() - 1 {
+                // Every cell but the middle one lies on the rounded edges.
+                let band = n > 0 && (i != n || j != n);
+                let flat_cell = (cu[i + 1].0 - cu[i].0).abs() < 1e-12 || (cv[j + 1].0 - cv[j].0).abs() < 1e-12;
+                if flat_cell {
+                    continue;
+                }
+                let t = tag(if band { PART_BEVEL } else { part }, 0);
+                let a = base + j as u32 * w + i as u32;
+                mesh.quad(a, a + 1, a + w + 1, a + w, t);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------- extrude
+
+fn signed_area(p: &[(f64, f64)]) -> f64 {
+    (0..p.len())
+        .map(|i| {
+            let (a, b) = (p[i], p[(i + 1) % p.len()]);
+            a.0 * b.1 - b.0 * a.1
+        })
+        .sum::<f64>()
+        / 2.0
+}
+
+fn point_in(poly: &[(f64, f64)], q: (f64, f64)) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[(i + n - 1) % n]);
+        if (a.1 > q.1) != (b.1 > q.1) && q.0 < (b.0 - a.0) * (q.1 - a.1) / (b.1 - a.1) + a.0 {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn clean(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut p: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
+    for &q in pts {
+        if p.last().is_none_or(|l: &(f64, f64)| (l.0 - q.0).hypot(l.1 - q.1) > 1e-6) {
+            p.push(q);
+        }
+    }
+    while p.len() > 2 && (p[0].0 - p[p.len() - 1].0).hypot(p[0].1 - p[p.len() - 1].1) <= 1e-6 {
+        p.pop();
+    }
+    // Drop collinear points.
+    let mut i = 0;
+    while p.len() > 3 && i < p.len() {
+        let n = p.len();
+        let (a, b, c) = (p[(i + n - 1) % n], p[i], p[(i + 1) % n]);
+        let cr = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
+        let l = (b.0 - a.0).hypot(b.1 - a.1) * (c.0 - b.0).hypot(c.1 - b.1);
+        if cr.abs() <= 1e-9 * l.max(1e-12) && (b.0 - a.0) * (c.0 - b.0) + (b.1 - a.1) * (c.1 - b.1) > 0.0 {
+            p.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    p
+}
+
+/// Outer outlines with their holes: outers have positive area, holes
+/// negative (nesting by even/odd depth).
+fn regions(contours: Vec<Vec<(f64, f64)>>) -> Vec<Vec<Vec<(f64, f64)>>> {
+    let contours: Vec<Vec<(f64, f64)>> = contours.into_iter().map(|c| clean(&c)).filter(|c| c.len() >= 3 && signed_area(c).abs() > 1e-6).collect();
+    let depth: Vec<usize> = contours
+        .iter()
+        .enumerate()
+        .map(|(i, c)| contours.iter().enumerate().filter(|(j, o)| *j != i && signed_area(o).abs() > signed_area(c).abs() && point_in(o, c[0])).count())
+        .collect();
+    let mut out: Vec<(usize, Vec<Vec<(f64, f64)>>)> = Vec::new();
+    for (i, c) in contours.iter().enumerate() {
+        if depth[i] % 2 == 0 {
+            let mut c = c.clone();
+            if signed_area(&c) < 0.0 {
+                c.reverse();
+            }
+            out.push((i, vec![c]));
+        }
+    }
+    for (i, c) in contours.iter().enumerate() {
+        if depth[i] % 2 == 1 {
+            // The smallest enclosing outer.
+            let owner = out
+                .iter_mut()
+                .filter(|(_, r)| point_in(&r[0], c[0]))
+                .min_by(|a, b| signed_area(&a.1[0]).total_cmp(&signed_area(&b.1[0])));
+            if let Some((_, r)) = owner {
+                let mut c = c.clone();
+                if signed_area(&c) > 0.0 {
+                    c.reverse();
+                }
+                r.push(c);
+            }
+        }
+    }
+    out.into_iter().map(|(_, r)| r).collect()
+}
+
+fn cross2(o: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+}
+
+fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    let (d1, d2, d3, d4) = (cross2(c, d, a), cross2(c, d, b), cross2(a, b, c), cross2(a, b, d));
+    ((d1 > 1e-12 && d2 < -1e-12) || (d1 < -1e-12 && d2 > 1e-12)) && ((d3 > 1e-12 && d4 < -1e-12) || (d3 < -1e-12 && d4 > 1e-12))
+}
+
+/// Triangulates an outer outline (positive area) with holes (negative)
+/// by ear clipping after bridging each hole to the outline. Indices run
+/// over the contours' points concatenated in order.
+pub fn triangulate(contours: &[Vec<(f64, f64)>]) -> Vec<[usize; 3]> {
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    let mut rings: Vec<Vec<usize>> = Vec::new();
+    for c in contours {
+        let base = pts.len();
+        pts.extend_from_slice(c);
+        rings.push((base..base + c.len()).collect());
+    }
+    if rings.is_empty() || rings[0].len() < 3 {
+        return Vec::new();
+    }
+    let mut outer = rings[0].clone();
+    if signed_area(&outer.iter().map(|&i| pts[i]).collect::<Vec<_>>()) < 0.0 {
+        outer.reverse();
+    }
+    let mut holes: Vec<Vec<usize>> = rings[1..].to_vec();
+    for h in &mut holes {
+        if signed_area(&h.iter().map(|&i| pts[i]).collect::<Vec<_>>()) > 0.0 {
+            h.reverse();
+        }
+    }
+    // Bridge holes rightmost first.
+    holes.sort_by(|a, b| {
+        let mx = |h: &Vec<usize>| h.iter().map(|&i| pts[i].0).fold(f64::NEG_INFINITY, f64::max);
+        mx(b).total_cmp(&mx(a))
+    });
+    for (hi, hole) in holes.iter().enumerate() {
+        let (mi, _) = hole.iter().enumerate().max_by(|a, b| pts[*a.1].0.total_cmp(&pts[*b.1].0)).unwrap();
+        let m = pts[hole[mi]];
+        // The nearest outline vertex the bridge can reach without crossing
+        // any edge.
+        let edges: Vec<(usize, usize)> = std::iter::once(&outer)
+            .chain(holes[hi..].iter())
+            .flat_map(|r| (0..r.len()).map(move |k| (r[k], r[(k + 1) % r.len()])))
+            .collect();
+        let mut best: Option<(f64, usize)> = None;
+        for (k, &oi) in outer.iter().enumerate() {
+            let p = pts[oi];
+            let d = (p.0 - m.0).powi(2) + (p.1 - m.1).powi(2);
+            if best.is_some_and(|(bd, _)| d >= bd) {
+                continue;
+            }
+            if edges.iter().any(|&(a, b)| a != oi && b != oi && a != hole[mi] && b != hole[mi] && segments_cross(m, p, pts[a], pts[b])) {
+                continue;
+            }
+            best = Some((d, k));
+        }
+        let Some((_, k)) = best else { continue };
+        let mut spliced = Vec::with_capacity(outer.len() + hole.len() + 2);
+        spliced.extend_from_slice(&outer[..=k]);
+        for j in 0..=hole.len() {
+            spliced.push(hole[(mi + j) % hole.len()]);
+        }
+        spliced.push(outer[k]);
+        spliced.extend_from_slice(&outer[k + 1..]);
+        outer = spliced;
+    }
+    ear_clip(&pts, outer)
+}
+
+fn ear_clip(pts: &[(f64, f64)], mut poly: Vec<usize>) -> Vec<[usize; 3]> {
+    let mut out = Vec::with_capacity(poly.len());
+    let mut guard = 0;
+    let mut i = 0;
+    while poly.len() > 3 && guard < poly.len() * 3 + 16 {
+        let n = poly.len();
+        let (ia, ib, ic) = (poly[(i + n - 1) % n], poly[i % n], poly[(i + 1) % n]);
+        let (a, b, c) = (pts[ia], pts[ib], pts[ic]);
+        let convex = cross2(a, b, c) > 1e-12;
+        let ear = convex
+            && !poly.iter().any(|&j| {
+                if j == ia || j == ib || j == ic {
+                    return false;
+                }
+                let p = pts[j];
+                if p == a || p == b || p == c {
+                    return false;
+                }
+                cross2(a, b, p) >= -1e-12 && cross2(b, c, p) >= -1e-12 && cross2(c, a, p) >= -1e-12
+            });
+        if ear {
+            out.push([ia, ib, ic]);
+            poly.remove(i % n);
+            guard = 0;
+            if i > 0 {
+                i -= 1;
+            }
+        } else {
+            i = (i + 1) % n;
+            guard += 1;
+        }
+    }
+    if poly.len() == 3 && cross2(pts[poly[0]], pts[poly[1]], pts[poly[2]]).abs() > 1e-12 {
+        out.push([poly[0], poly[1], poly[2]]);
+    } else if poly.len() > 3 {
+        // Degenerate leftovers (self-touching outlines): fan them.
+        for k in 1..poly.len() - 1 {
+            out.push([poly[0], poly[k], poly[k + 1]]);
+        }
+    }
+    out
+}
+
+/// Per-vertex wall data of a closed contour: the miter offset (outward,
+/// unit edge distance) and the shading normals (one, or two at corners).
+struct Wall {
+    p: (f64, f64),
+    miter: (f64, f64),
+    normals: Vec<(f64, f64)>,
+}
+
+fn walls(c: &[(f64, f64)]) -> Vec<Wall> {
+    let n = c.len();
+    let en = |i: usize| {
+        let (a, b) = (c[i % n], c[(i + 1) % n]);
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l = dx.hypot(dy).max(1e-12);
+        (dy / l, -dx / l)
+    };
+    (0..n)
+        .map(|i| {
+            let (a, b) = (en(i + n - 1), en(i));
+            let m = (a.0 + b.0, a.1 + b.1);
+            let ml = m.0.hypot(m.1);
+            let cos = a.0 * b.0 + a.1 * b.1;
+            let mu = if ml > 1e-9 { (m.0 / ml, m.1 / ml) } else { b };
+            // Miter length 1/cos(half angle), limited.
+            let half_cos = (mu.0 * b.0 + mu.1 * b.1).max(0.4);
+            let miter = (mu.0 / half_cos, mu.1 / half_cos);
+            let normals = if cos < 0.82 { vec![a, b] } else { vec![mu] };
+            Wall { p: c[i], miter, normals }
+        })
+        .collect()
+}
+
+fn extrude(mesh: &mut Mesh, path: &PathMorph, depth: f64, bevel: f64, detail: f64) -> Result<(), String> {
+    let subpaths = crate::path::morph(path, 0.3 / detail)?;
+    let regions = regions(subpaths.into_iter().map(|(p, _)| p).collect());
+    if regions.is_empty() {
+        return Err("extrude: the outline has no closed area".into());
+    }
+    let d = depth.max(0.0) / 2.0;
+    // The bevel can't exceed the half depth or eat the outline.
+    let mut b = bevel.max(0.0).min(d);
+    for r in &regions {
+        for c in r {
+            let (mut lo, mut hi) = ((f64::INFINITY, f64::INFINITY), (f64::NEG_INFINITY, f64::NEG_INFINITY));
+            for p in c {
+                lo = (lo.0.min(p.0), lo.1.min(p.1));
+                hi = (hi.0.max(p.0), hi.1.max(p.1));
+            }
+            b = b.min((hi.0 - lo.0).min(hi.1 - lo.1) * 0.3);
+        }
+    }
+    let segs = if b > 1e-9 { circle_steps(b, detail, FRAC_PI_2).clamp(2, 12) } else { 0 };
+    for region in &regions {
+        let tris = triangulate(region);
+        let all_walls: Vec<Vec<Wall>> = region.iter().map(|c| walls(c)).collect();
+        // Caps (inset by the bevel): front at −d (toward the viewer), back at +d.
+        for (z, nz, part) in [(-d, -1.0, PART_FRONT), (d, 1.0, PART_BACK)] {
+            let base = mesh.positions.len() as u32;
+            for w in all_walls.iter().flatten() {
+                let p = (w.p.0 - w.miter.0 * b, w.p.1 - w.miter.1 * b);
+                mesh.vertex([p.0, p.1, z], [0.0, 0.0, nz]);
+            }
+            for t in &tris {
+                mesh.tri(base + t[0] as u32, base + t[1] as u32, base + t[2] as u32, tag(part, 0));
+            }
+        }
+        // Walls: rings from the front face, round the bevel, down the side
+        // and round the back bevel. Each ring: (inset, z, normal xy scale,
+        // normal z, part).
+        let mut rings: Vec<(f64, f64, f64, f64, u32)> = Vec::new();
+        for k in 0..=segs {
+            let phi = FRAC_PI_2 * k as f64 / segs.max(1) as f64;
+            if segs == 0 {
+                break;
+            }
+            rings.push((b * (1.0 - phi.sin()), -d + b - b * phi.cos(), phi.sin(), -phi.cos(), PART_BEVEL));
+        }
+        rings.push((0.0, -d + b, 1.0, 0.0, PART_SIDE));
+        rings.push((0.0, d - b, 1.0, 0.0, PART_SIDE));
+        for k in 0..=segs {
+            if segs == 0 {
+                break;
+            }
+            let phi = FRAC_PI_2 * k as f64 / segs as f64;
+            rings.push((b * (1.0 - phi.cos()), d - b + b * phi.sin(), phi.cos(), phi.sin(), PART_BEVEL));
+        }
+        for wl in &all_walls {
+            // Columns: one per shading normal; corners have two at one point.
+            let cols: Vec<(usize, (f64, f64))> = wl.iter().enumerate().flat_map(|(i, w)| w.normals.iter().map(move |n| (i, *n))).collect();
+            let nc = cols.len();
+            let mut grid: Vec<Vec<u32>> = Vec::new();
+            for &(inset, z, nxy, nz, _) in &rings {
+                let row = cols
+                    .iter()
+                    .map(|&(i, n)| {
+                        let w = &wl[i];
+                        mesh.vertex([w.p.0 - w.miter.0 * inset, w.p.1 - w.miter.1 * inset, z], [n.0 * nxy, n.1 * nxy, nz])
+                    })
+                    .collect();
+                grid.push(row);
+            }
+            for r in 0..rings.len() - 1 {
+                let part = if rings[r].4 == PART_SIDE && rings[r + 1].4 == PART_SIDE { PART_SIDE } else { PART_BEVEL };
+                if (rings[r].1 - rings[r + 1].1).abs() < 1e-12 && (rings[r].0 - rings[r + 1].0).abs() < 1e-12 {
+                    continue;
+                }
+                for k in 0..nc {
+                    let k2 = (k + 1) % nc;
+                    // The two columns of one corner share a point: no quad.
+                    if cols[k].0 == cols[k2].0 {
+                        continue;
+                    }
+                    mesh.quad(grid[r][k], grid[r][k2], grid[r + 1][k2], grid[r + 1][k], tag(part, 0));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------- sweep
+
+#[allow(clippy::too_many_arguments)]
+fn sweep(mesh: &mut Mesh, path: &PathMorph, radius: f64, width: f64, profile: SweepProfile, trim: [f64; 2], caps: Caps, head: f64, segments: u32, gap: f64, detail: f64) -> Result<(), String> {
+    let subpaths = crate::path::morph(path, 0.25 / detail)?;
+    let (t0, t1) = (trim[0].clamp(0.0, 1.0), trim[1].clamp(0.0, 1.0));
+    if t1 <= t0 {
+        return Ok(());
+    }
+    let r = radius.max(0.0);
+    let count = segments.max(1);
+    let span = t1 - t0;
+    let gap = gap.max(0.0).min(span / count as f64 * 0.9);
+    let each = (span - gap * (count - 1) as f64) / count as f64;
+    for k in 0..count {
+        let a = t0 + (each + gap) * k as f64;
+        let lines = crate::path::trim(&subpaths, a, a + each);
+        for line in lines {
+            tube(mesh, &line, r, width, profile, caps, k, detail);
+        }
+    }
+    if head > 0.0 {
+        if let Some((p, _)) = crate::path::point_at(&subpaths, t1) {
+            let n = circle_steps(head, detail, TAU);
+            let profile = Profile::arc((0.0, 0.0), head, -FRAC_PI_2, FRAC_PI_2, n / 2, PART_CAPS);
+            let mut ball = revolve(&[profile], 0.0, TAU, n, count - 1, true, true);
+            for q in &mut ball.positions {
+                q[0] += p.0 as f32;
+                q[1] += p.1 as f32;
+            }
+            mesh.append(&ball);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tube(mesh: &mut Mesh, line: &[(f64, f64)], r: f64, width: f64, profile: SweepProfile, caps: Caps, segment: u32, detail: f64) {
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(line.len());
+    for &q in line {
+        if pts.last().is_none_or(|l: &(f64, f64)| (l.0 - q.0).hypot(l.1 - q.1) > 1e-6) {
+            pts.push(q);
+        }
+    }
+    if pts.len() < 2 {
+        return;
+    }
+    let n = pts.len();
+    let dir = |i: usize, j: usize| {
+        let (dx, dy) = (pts[j].0 - pts[i].0, pts[j].1 - pts[i].1);
+        let l = dx.hypot(dy).max(1e-12);
+        (dx / l, dy / l)
+    };
+    let tangents: Vec<(f64, f64)> = (0..n)
+        .map(|i| {
+            let a = if i > 0 { dir(i - 1, i) } else { dir(0, 1) };
+            let b = if i + 1 < n { dir(i, i + 1) } else { dir(n - 2, n - 1) };
+            let m = (a.0 + b.0, a.1 + b.1);
+            let l = m.0.hypot(m.1);
+            if l > 1e-9 {
+                (m.0 / l, m.1 / l)
+            } else {
+                b
+            }
+        })
+        .collect();
+    // Cross-section in (N, B) = (in-plane normal, z), with normals.
+    let section: Vec<((f64, f64), (f64, f64))> = match profile {
+        SweepProfile::Circle => {
+            let s = circle_steps(r, detail, TAU).min(64);
+            (0..=s)
+                .map(|i| {
+                    let a = TAU * i as f64 / s as f64;
+                    let (sn, c) = a.sin_cos();
+                    ((r * c, r * sn), (c, sn))
+                })
+                .collect()
+        }
+        SweepProfile::Square => {
+            let mut v = Vec::new();
+            let corners = [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)];
+            let normals = [(0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (1.0, 0.0)];
+            for k in 0..4 {
+                let (a, b) = (corners[k], corners[(k + 1) % 4]);
+                v.push(((a.0 * r, a.1 * r), normals[k]));
+                v.push(((b.0 * r, b.1 * r), normals[k]));
+            }
+            v
+        }
+        SweepProfile::Ribbon => {
+            let hw = width.max(0.0) / 2.0;
+            vec![((0.0, -hw), (1.0, 0.0)), ((0.0, hw), (1.0, 0.0))]
+        }
+    };
+    let two = if profile == SweepProfile::Ribbon { TWO_SIDED } else { 0 };
+    let t = tag(PART_SIDE, segment) | two;
+    let mut prev: Option<Vec<u32>> = None;
+    for i in 0..n {
+        let (tx, ty) = tangents[i];
+        let nn = [-ty, tx, 0.0];
+        let bb = [0.0, 0.0, 1.0];
+        let c = [pts[i].0, pts[i].1, 0.0];
+        let ring: Vec<u32> = section.iter().map(|&((u, v), (nu, nv))| mesh.vertex(add(c, add(mul(nn, u), mul(bb, v))), add(mul(nn, nu), mul(bb, nv)))).collect();
+        if let Some(prev) = &prev {
+            let step = if profile == SweepProfile::Square { 2 } else { 1 };
+            let mut j = 0;
+            while j + 1 < ring.len() {
+                mesh.quad(prev[j], ring[j], ring[j + 1], prev[j + 1], t);
+                j += step;
+            }
+        }
+        prev = Some(ring);
+    }
+    if profile == SweepProfile::Ribbon {
+        return;
+    }
+    for (end, sign) in [(0usize, -1.0), (n - 1, 1.0)] {
+        let (tx, ty) = tangents[end];
+        let out = [tx * sign, ty * sign, 0.0];
+        let nn = [-ty, tx, 0.0];
+        let c = [pts[end].0, pts[end].1, 0.0];
+        match (caps, profile) {
+            (Caps::Round, SweepProfile::Circle) => {
+                let s = section.len() - 1;
+                let lat = (s / 4).max(3);
+                let mut prev: Option<Vec<u32>> = None;
+                for j in 0..=lat {
+                    let phi = FRAC_PI_2 * j as f64 / lat as f64;
+                    let ring: Vec<u32> = section
+                        .iter()
+                        .map(|&(_, (nu, nv))| {
+                            let rim = add(mul(nn, nu), mul([0.0, 0.0, 1.0], nv));
+                            let d = add(mul(rim, phi.cos()), mul(out, phi.sin()));
+                            mesh.vertex(add(c, mul(d, r)), d)
+                        })
+                        .collect();
+                    if let Some(prev) = &prev {
+                        for i in 0..s {
+                            mesh.quad(prev[i], prev[i + 1], ring[i + 1], ring[i], tag(PART_CAPS, segment));
+                        }
+                    }
+                    prev = Some(ring);
+                }
+            }
+            _ => {
+                let centre = mesh.vertex(c, out);
+                let ring: Vec<u32> = section.iter().map(|&((u, v), _)| mesh.vertex(add(c, add(mul(nn, u), mul([0.0, 0.0, 1.0], v))), out)).collect();
+                for w in ring.windows(2) {
+                    mesh.tri(centre, w[0], w[1], tag(PART_CAPS, segment));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(shape: MeshShape) -> MeshParams {
+        MeshParams { shape, segments: 1, gap: 0.0, detail: 1.0 }
+    }
+
+    fn path(d: &str) -> PathMorph {
+        PathMorph { from: d.into(), to: None, t: 0.0 }
+    }
+
+    /// Normals point away from the centroid for convex closed meshes and
+    /// every vertex lies where the shape says.
+    fn check_outward(m: &Mesh, centre: V3) {
+        assert!(!m.tris.is_empty());
+        let mut agree = 0usize;
+        for (t, _) in m.tris.iter().zip(&m.tags) {
+            let p = t.map(|i| m.positions[i as usize].map(|v| v as f64));
+            let c = mul(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
+            let n = t.iter().fold([0.0; 3], |acc, &i| add(acc, m.normals[i as usize].map(|v| v as f64)));
+            if dot(n, sub(c, centre)) >= -1e-6 {
+                agree += 1;
+            }
+        }
+        assert_eq!(agree, m.tris.len(), "every normal points outward");
+    }
+
+    #[test]
+    fn primitives_are_closed_and_outward() {
+        let s = generate(&params(MeshShape::Sphere { radius: 100.0 })).unwrap();
+        check_outward(&s, [0.0; 3]);
+        for p in &s.positions {
+            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            assert!((r - 100.0).abs() < 1e-3);
+        }
+        let b = generate(&params(MeshShape::Box { size: [200.0, 100.0, 60.0], bevel: 12.0 })).unwrap();
+        check_outward(&b, [0.0; 3]);
+        let (lo, hi) = b.bounds();
+        assert!((lo[0] + 100.0).abs() < 1e-3 && (hi[2] - 30.0).abs() < 1e-3);
+        assert!(b.tags.iter().any(|t| tag_part(*t) == PART_BEVEL) && b.tags.iter().any(|t| tag_part(*t) == PART_FRONT));
+        let c = generate(&params(MeshShape::Cylinder { radius: 80.0, top: 80.0, height: 120.0, bevel: 8.0 })).unwrap();
+        check_outward(&c, [0.0; 3]);
+        let cap = generate(&params(MeshShape::Capsule { radius: 40.0, height: 200.0 })).unwrap();
+        check_outward(&cap, [0.0; 3]);
+        let (lo, hi) = cap.bounds();
+        assert!((lo[1] + 100.0).abs() < 1e-3 && (hi[1] - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn torus_faces_the_camera_and_splits_into_coloured_segments() {
+        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 4, gap: 10.0, detail: 1.0 }).unwrap();
+        let (lo, hi) = t.bounds();
+        assert!(hi[0] > 225.0 && hi[0] < 230.01 && (lo[2] + 30.0).abs() < 0.5 && (hi[2] - 30.0).abs() < 0.5, "{lo:?} {hi:?}");
+        let segs: std::collections::BTreeSet<u32> = t.tags.iter().map(|x| tag_segment(*x)).collect();
+        assert_eq!(segs.into_iter().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        // Gaps: no vertex sits at the very top (0°), which falls in a gap.
+        assert!(t.positions.iter().all(|p| !(p[0].abs() < 1.0 && p[1] < -150.0)));
+        assert!(t.tags.iter().any(|x| tag_part(*x) == PART_CAPS));
+        // Each tube cross-section's normals point away from the tube centre.
+        for (p, n) in t.positions.iter().zip(&t.normals) {
+            if t.tags.is_empty() {
+                break;
+            }
+            let rr = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            let c = [p[0] / rr * 200.0, p[1] / rr * 200.0, 0.0];
+            let d = [p[0] - c[0], p[1] - c[1], p[2]];
+            let dd = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+            assert!(dd > -1e-3 || rr < 1.0);
+        }
+        // An arc from up to the right, clockwise: x ≥ 0, y ≤ 0 (plus the tube).
+        let arc = generate(&params(MeshShape::Torus { radius: 200.0, tube: 20.0, angles: [0.0, 90.0], caps: Caps::Round })).unwrap();
+        let (lo, hi) = arc.bounds();
+        assert!(lo[0] > -21.0 && hi[1] < 21.0, "{lo:?} {hi:?}");
+    }
+
+    #[test]
+    fn extrude_handles_holes_and_bevels() {
+        // A square with a square hole.
+        let m = generate(&params(MeshShape::Extrude { path: path("M -100 -100 L 100 -100 L 100 100 L -100 100 Z M -40 -40 L -40 40 L 40 40 L 40 -40 Z"), depth: 40.0, bevel: 6.0 })).unwrap();
+        let front: Vec<_> = m.tris.iter().zip(&m.tags).filter(|(_, t)| tag_part(**t) == PART_FRONT).collect();
+        // Front area = 200² − 80² minus the bevel inset.
+        let area: f64 = front
+            .iter()
+            .map(|(t, _)| {
+                let p = t.map(|i| m.positions[i as usize]);
+                (((p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0])) as f64).abs() / 2.0
+            })
+            .sum();
+        let expect = 188.0f64.powi(2) - 92.0f64.powi(2);
+        assert!((area - expect).abs() < 1.0, "front area {area} vs {expect}");
+        assert!(m.positions.iter().all(|p| (p[2].abs() - 20.0) < 1e-3));
+        assert!(m.tags.iter().any(|t| tag_part(*t) == PART_BEVEL) && m.tags.iter().any(|t| tag_part(*t) == PART_SIDE));
+        // Side normals point out of the material: away from the hole at the hole wall.
+        for (p, n) in m.positions.iter().zip(&m.normals) {
+            if n[2].abs() < 1e-3 && p[0].abs() < 41.0 && p[1].abs() < 41.0 {
+                assert!(p[0] * n[0] + p[1] * n[1] < 0.0, "hole wall normal points into the hole");
+            }
+        }
+        // A circle extrudes into a disc.
+        let disc = generate(&params(MeshShape::Extrude { path: path("M 0 -50 A 50 50 0 1 1 0 50 A 50 50 0 1 1 0 -50 Z"), depth: 10.0, bevel: 0.0 })).unwrap();
+        check_outward(&disc, [0.0; 3]);
+    }
+
+    #[test]
+    fn revolve_and_sweep() {
+        // A vase-like open profile turned about y: two-sided.
+        let v = generate(&params(MeshShape::Revolve { profile: path("M 0 100 L 60 100 L 40 -100"), angles: [0.0, 360.0], axis_y: true })).unwrap();
+        assert!(v.tags.iter().all(|t| t & TWO_SIDED != 0));
+        let (lo, hi) = v.bounds();
+        assert!((hi[0] - 60.0).abs() < 0.5 && (lo[1] + 100.0).abs() < 1e-3);
+        // A closed profile (a circle at x = 150) about z, half a turn: capped.
+        let r = generate(&params(MeshShape::Revolve { profile: path("M 150 -20 A 20 20 0 1 1 150 20 A 20 20 0 1 1 150 -20 Z"), angles: [0.0, 180.0], axis_y: false })).unwrap();
+        assert!(r.tags.iter().any(|t| tag_part(*t) == PART_CAPS));
+        // A tube drawn on halfway.
+        let full = generate(&params(MeshShape::Sweep { path: path("M -200 0 L 200 0"), radius: 10.0, width: 0.0, profile: SweepProfile::Circle, trim: [0.0, 1.0], caps: Caps::Round, head: 0.0 })).unwrap();
+        let half = generate(&params(MeshShape::Sweep { path: path("M -200 0 L 200 0"), radius: 10.0, width: 0.0, profile: SweepProfile::Circle, trim: [0.0, 0.5], caps: Caps::Round, head: 18.0 })).unwrap();
+        let (lo, hi) = full.bounds();
+        assert!((lo[0] + 210.0).abs() < 0.5 && (hi[0] - 210.0).abs() < 0.5);
+        let (_, hi) = half.bounds();
+        assert!((hi[0] - 18.0).abs() < 0.5, "head ball at the trim end: {hi:?}");
+        check_outward(&generate(&params(MeshShape::Sweep { path: path("M -200 0 L 200 0"), radius: 10.0, width: 0.0, profile: SweepProfile::Circle, trim: [0.0, 1.0], caps: Caps::Flat, head: 0.0 })).unwrap(), [0.0; 3]);
+    }
+
+    #[test]
+    fn triangulation_covers_the_area() {
+        let outer: Vec<(f64, f64)> = (0..40).map(|i| {
+            let a = TAU * i as f64 / 40.0;
+            let r = if i % 2 == 0 { 100.0 } else { 60.0 };
+            (r * a.cos(), r * a.sin())
+        }).collect();
+        let tris = triangulate(&[outer.clone()]);
+        let area: f64 = tris.iter().map(|t| cross2(outer[t[0]], outer[t[1]], outer[t[2]]).abs() / 2.0).sum();
+        assert!((area - signed_area(&outer).abs()).abs() < 1e-6);
+        assert_eq!(tris.len(), 38);
+    }
+
+    #[test]
+    fn keys_differ_by_parameters() {
+        let a = params(MeshShape::Sphere { radius: 10.0 }).key();
+        let b = params(MeshShape::Sphere { radius: 11.0 }).key();
+        assert_ne!(a, b);
+        assert_eq!(a, params(MeshShape::Sphere { radius: 10.0 }).key());
+    }
+}
