@@ -18,11 +18,21 @@ use std::time::Duration;
 /// Waveform buckets per second.
 const BUCKETS_PER_SECOND: f64 = 100.0;
 
+/// A sound of the project placed on its timeline.
+#[derive(Clone, Debug)]
+pub(crate) struct Placed {
+    /// Sound id for edits ("music", "vo", an effect's id); None for the
+    /// sound of a footage layer (edited on the layer).
+    pub id: Option<String>,
+    pub path: PathBuf,
+    pub clip: AudioClip,
+}
+
 /// Where each sound of the project plays, with its file probed.
-pub(crate) fn clips(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<(PathBuf, AudioClip)> {
+pub(crate) fn placed(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<Placed> {
     let end = project.settings.duration;
     let mut out = Vec::new();
-    let mut push = |path: PathBuf, at: f64, trim: f64, gain_db: f64, length: Option<f64>, name: &str| {
+    let mut push = |id: Option<String>, path: PathBuf, at: f64, trim: f64, gain_db: f64, length: Option<f64>, name: &str| {
         let Ok((source_duration, has_audio)) = lahza_motion_render::footage::probe_sound(&path) else { return };
         if !has_audio {
             return;
@@ -37,33 +47,39 @@ pub(crate) fn clips(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<(
         if duration <= 0.01 {
             return;
         }
-        out.push((
-            path.clone(),
-            AudioClip {
-                id: uuid::Uuid::new_v4(),
-                file: path,
-                name: name.to_string(),
-                start,
-                source_start,
-                duration,
-                volume: 10f64.powf(gain_db / 20.0).min(2.0),
-                fade_in: 0.0,
-                fade_out: 0.0,
-                source_duration,
-            },
-        ));
+        let clip = AudioClip {
+            id: uuid::Uuid::new_v4(),
+            file: path.clone(),
+            name: name.to_string(),
+            start,
+            source_start,
+            duration,
+            volume: 10f64.powf(gain_db / 20.0).min(2.0),
+            fade_in: 0.0,
+            fade_out: 0.0,
+            source_duration,
+        };
+        out.push(Placed { id, path, clip });
     };
-    for clip in project.audio.clips() {
+    let slots = [("music", project.audio.music.as_ref()), ("vo", project.audio.vo.as_ref())];
+    let named = slots.into_iter().filter_map(|(slot, c)| c.map(|c| (c.id.clone().unwrap_or_else(|| slot.into()), c)));
+    for (id, clip) in named.chain(project.audio.sfx.iter().map(|c| (c.id.clone().unwrap_or_default(), c))) {
         let at = compiled.resolve(&project.markers, &clip.at).unwrap_or(0.0);
-        let name = clip.name.clone().or(clip.id.clone()).unwrap_or_else(|| clip.path.clone());
-        push(dir.join(&clip.path), at, clip.trim, clip.gain_db, clip.length, &name);
+        let file = clip.path.rsplit('/').next().unwrap_or(&clip.path).to_string();
+        let name = clip.name.clone().unwrap_or_else(|| if id.is_empty() { file } else { id.clone() });
+        push((!id.is_empty()).then_some(id), dir.join(&clip.path), at, clip.trim, clip.gain_db, clip.length, &name);
     }
     for footage in compiled.footage_audio() {
         if (footage.speed - 1.0).abs() < 1e-3 {
-            push(dir.join(&*footage.src), footage.start, footage.trim, footage.gain_db, Some(footage.end - footage.start), &footage.src);
+            push(None, dir.join(&*footage.src), footage.start, footage.trim, footage.gain_db, Some(footage.end - footage.start), &footage.src);
         }
     }
     out
+}
+
+/// Every sound as studio audio clips (path, clip), for playback.
+pub(crate) fn clips(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<(PathBuf, AudioClip)> {
+    placed(project, compiled, dir).into_iter().map(|p| (p.path, p.clip)).collect()
 }
 
 /// Plays the project's sound on its own thread while the editor plays.
@@ -114,7 +130,10 @@ impl Drop for Player {
 /// Peak levels of one sound, placed on the timeline.
 #[derive(Clone, Debug)]
 pub(crate) struct Wave {
+    pub id: Option<String>,
+    pub name: String,
     pub start: f64,
+    pub duration: f64,
     /// 0..1 peaks, `BUCKETS_PER_SECOND` per second.
     pub peaks: Vec<f32>,
 }
@@ -128,27 +147,41 @@ impl Wave {
     }
 }
 
-/// Decodes every sound and measures its peaks, normalised so the loudest
-/// moment of the project reaches 1.
-pub(crate) fn waves(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<Wave> {
+/// Peaks of whole files, decoded once: moving or cutting a sound only
+/// re-slices them.
+pub(crate) type PeakCache = Arc<Mutex<std::collections::HashMap<PathBuf, Arc<Vec<f32>>>>>;
+
+fn file_peaks(cache: &PeakCache, path: &Path) -> Option<Arc<Vec<f32>>> {
+    if let Some(p) = cache.lock().unwrap().get(path) {
+        return Some(p.clone());
+    }
+    let samples = lahza_motion_audio::decode(path).ok()?;
     let rate = lahza_motion_audio::SAMPLE_RATE as f64;
+    // Bucket edges from exact times, so long sounds don't drift.
+    let per = rate / BUCKETS_PER_SECOND;
+    let count = (samples.len() as f64 / per).ceil() as usize;
+    let peaks: Vec<f32> = (0..count)
+        .map(|i| {
+            let (a, b) = ((i as f64 * per) as usize, (((i + 1) as f64 * per) as usize).min(samples.len()));
+            samples.get(a..b).map(|r| r.iter().fold(0.0f32, |m, s| m.max(s.abs()))).unwrap_or(0.0)
+        })
+        .collect();
+    let peaks = Arc::new(peaks);
+    cache.lock().unwrap().insert(path.to_path_buf(), peaks.clone());
+    Some(peaks)
+}
+
+/// Every sound's peaks, normalised so the loudest moment of the project
+/// reaches 1.
+pub(crate) fn waves(project: &Project, compiled: &Compiled, dir: &Path, cache: &PeakCache) -> Vec<Wave> {
     let mut waves = Vec::new();
-    for (path, clip) in clips(project, compiled, dir) {
-        let Ok(samples) = lahza_motion_audio::decode(&path) else { continue };
-        let first = (clip.source_start * rate) as usize;
-        let last = (((clip.source_start + clip.duration) * rate) as usize).min(samples.len());
-        let Some(range) = samples.get(first..last) else { continue };
-        // Bucket edges from exact times, so long sounds don't drift.
-        let per = rate / BUCKETS_PER_SECOND;
-        let count = (range.len() as f64 / per).round() as usize;
-        let gain = clip.volume as f32;
-        let peaks = (0..count)
-            .map(|i| {
-                let (a, b) = ((i as f64 * per) as usize, (((i + 1) as f64 * per) as usize).min(range.len()));
-                range[a..b].iter().fold(0.0f32, |m, s| m.max(s.abs())) * gain
-            })
-            .collect();
-        waves.push(Wave { start: clip.start, peaks });
+    for p in placed(project, compiled, dir) {
+        let Some(file) = file_peaks(cache, &p.path) else { continue };
+        let first = (p.clip.source_start * BUCKETS_PER_SECOND).round() as usize;
+        let count = (p.clip.duration * BUCKETS_PER_SECOND).round() as usize;
+        let gain = p.clip.volume as f32;
+        let peaks = (first..first + count).map(|i| file.get(i).copied().unwrap_or(0.0) * gain).collect();
+        waves.push(Wave { id: p.id, name: p.clip.name, start: p.clip.start, duration: p.clip.duration, peaks });
     }
     let loudest = waves.iter().flat_map(|w| w.peaks.iter().copied()).fold(0.0f32, f32::max);
     if loudest > 0.0 {
@@ -165,6 +198,10 @@ pub(crate) fn waves(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<W
 /// when the audio placement changes.
 pub(crate) fn signature(project: &Project, compiled: &Compiled) -> String {
     let mut s = serde_json::to_string(&project.audio).unwrap_or_default();
+    // Anchored sounds move with their layers.
+    for clip in project.audio.clips() {
+        s.push_str(&format!("|{:.4}", compiled.resolve(&project.markers, &clip.at).unwrap_or(0.0)));
+    }
     for f in compiled.footage_audio() {
         s.push_str(&format!("|{}@{:.4}+{:.4}x{:.3}", f.src, f.start, f.trim, f.speed));
     }
@@ -211,7 +248,7 @@ mod tests {
         // Cut at the project end: 2 s − 0.5 s.
         assert!((clip.duration - 1.5).abs() < 0.01, "{}", clip.duration);
         assert!((clip.volume - 0.501).abs() < 0.01, "{}", clip.volume);
-        let waves = waves(&project, &compiled, &project_dir);
+        let waves = waves(&project, &compiled, &project_dir, &PeakCache::default());
         assert_eq!(waves.len(), 1);
         assert!(waves[0].peak(0.0, 0.4) == 0.0, "silent before the music starts");
         assert!(waves[0].peak(1.0, 1.2) > 0.9, "full level mid-tone");
