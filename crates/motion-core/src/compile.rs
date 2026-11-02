@@ -242,9 +242,66 @@ pub struct TextState {
     pub line_height: f64,
     pub align: Align,
     /// Per character (`text.chars()`), empty when no animator is active.
+    /// Position-ordered animators are not in it: see `sweeps`.
     pub glyphs: Vec<GlyphState>,
     /// Which unit each character's pivot belongs to, per character.
     pub pivots: Arc<[u32]>,
+    /// Faux bold, px the edges move outward.
+    pub weight: f64,
+    /// Outline colour, width (px) and placement.
+    pub stroke: Option<(Color, f64, StrokeAlign)>,
+    /// Rim light colour, width (px) and light angle (degrees, 0 = above).
+    pub edge: Option<(Color, f64, f64)>,
+    /// Position-ordered animators; the renderer applies them from the
+    /// laid-out unit positions.
+    pub sweeps: Vec<Sweep>,
+    /// Per character: glyph, word and line unit (u32::MAX = none).
+    pub units: Arc<[[u32; 3]]>,
+}
+
+/// A text animator ordered by position, evaluated at one time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sweep {
+    /// 0 glyph, 1 word, 2 line (index into `TextState::units`).
+    pub unit: usize,
+    /// Animated units [lo, hi) (0-based).
+    pub range: (usize, usize),
+    pub order: SpatialOrder,
+    /// Seconds since the first unit started.
+    pub elapsed: f64,
+    /// Delay of the last unit (position 1): stagger × (units − 1).
+    pub span: f64,
+    pub dur: f64,
+    pub curve: Curve,
+    pub from: [f64; 5],
+    pub to: [f64; 5],
+}
+
+impl Sweep {
+    /// The unit at normalised position `s` (0…1 along the sweep).
+    pub fn values(&self, s: f64) -> [f64; 5] {
+        let p = self.curve.progress(self.elapsed - s * self.span, self.dur);
+        std::array::from_fn(|k| self.from[k] + (self.to[k] - self.from[k]) * p)
+    }
+    /// Feathered sweeps: where the opacity wipe's middle is (0…1 along
+    /// the text extent); it travels from −feather/2 to 1 + feather/2 over
+    /// the whole animation (span + dur), eased.
+    pub fn front(&self) -> f64 {
+        let f = self.order.feather;
+        -f / 2.0 + (1.0 + f) * self.curve.progress(self.elapsed, self.span + self.dur)
+    }
+}
+
+/// Adds one animator's values to a character's state; `opacity: false`
+/// leaves opacity to a feathered wipe.
+pub fn apply_unit(g: &mut GlyphState, v: [f64; 5], opacity: bool) {
+    g.x += v[0];
+    g.y += v[1];
+    g.scale *= v[2];
+    g.rotation += v[3];
+    if opacity {
+        g.opacity *= v[4].clamp(0.0, 1.0);
+    }
 }
 
 /// Offsets applied to one character, about its unit's centre.
@@ -457,14 +514,19 @@ struct CText {
     tracking: Prop<f64>,
     line_height: f64,
     align: Align,
+    weight: Prop<f64>,
+    stroke: Option<(Prop<Color>, Prop<f64>, StrokeAlign)>,
+    edge: Option<(Prop<Color>, Prop<f64>, Prop<f64>)>,
     animators: Vec<CAnim>,
     /// Per character: unit index for glyph, word and line (u32::MAX = none).
-    units: Vec<[u32; 3]>,
+    units: Arc<[[u32; 3]]>,
     pivots: Arc<[u32]>,
 }
 
 struct CAnim {
     unit: usize,
+    /// Position-driven order (applied by the renderer).
+    spatial: Option<SpatialOrder>,
     /// Per unit: its rank in the animation order.
     ranks: Vec<f64>,
     start: f64,
@@ -1012,6 +1074,18 @@ impl<'a> Compiler<'a> {
                 None => (0, n),
             };
             let span = hi.saturating_sub(lo);
+            let (index_order, spatial) = match a.order {
+                UnitOrder::Index(o) => (o, None),
+                UnitOrder::Spatial(s) => {
+                    if s.axis.is_some() && s.radial.is_some() {
+                        self.errors.push(format!("{id}.{what}.order: give either axis or radial, not both"));
+                    }
+                    if !(s.feather >= 0.0) {
+                        self.errors.push(format!("{id}.{what}.order.feather: must be ≥ 0"));
+                    }
+                    (Order::Forward, Some(SpatialOrder { feather: s.feather.max(0.0), ..s }))
+                }
+            };
             let order: Vec<f64> = (0..n)
                 .map(|u| {
                     if u < lo || u >= hi {
@@ -1019,7 +1093,7 @@ impl<'a> Compiler<'a> {
                     }
                     let k = (u - lo) as f64;
                     let last = span.saturating_sub(1) as f64;
-                    match a.order {
+                    match index_order {
                         Order::Forward => k,
                         Order::Reverse => last - k,
                         Order::Center => (k - last / 2.0).abs().floor(),
@@ -1028,7 +1102,7 @@ impl<'a> Compiler<'a> {
                     }
                 })
                 .collect();
-            let ranks = if a.order == Order::Random {
+            let ranks = if index_order == Order::Random {
                 let mut idx: Vec<usize> = (lo..hi).collect();
                 let mut state = (a.seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
                 for i in (1..idx.len()).rev() {
@@ -1060,6 +1134,7 @@ impl<'a> Compiler<'a> {
             }
             animators.push(CAnim {
                 unit,
+                spatial,
                 ranks,
                 start: first,
                 stagger,
@@ -1079,8 +1154,23 @@ impl<'a> Compiler<'a> {
             tracking: self.prop(&tx.tracking, id, "tracking", start, step, shift),
             line_height: tx.line_height,
             align: tx.align,
+            weight: self.prop(&tx.weight, id, "weight", start, step, shift),
+            stroke: tx.stroke.as_ref().map(|s| {
+                (
+                    self.prop(&s.color, id, "stroke.color", start, step, shift),
+                    self.prop(&s.width, id, "stroke.width", start, step, shift),
+                    s.align,
+                )
+            }),
+            edge: tx.edge.as_ref().map(|e| {
+                (
+                    self.prop(&e.color, id, "edge.color", start, step, shift),
+                    self.prop(&e.width, id, "edge.width", start, step, shift),
+                    self.prop(&e.angle, id, "edge.angle", start, step, shift),
+                )
+            }),
             animators,
-            units,
+            units: units.into(),
             pivots,
         }
     }
@@ -1688,9 +1778,24 @@ fn clamp_color(c: Color) -> Color {
 
 fn text_state(tx: &CText, t: f64) -> TextState {
     let mut glyphs = Vec::new();
+    let mut sweeps = Vec::new();
     if !tx.animators.is_empty() {
         glyphs = vec![GlyphState::IDENTITY; tx.units.len()];
         for a in &tx.animators {
+            if let Some(order) = a.spatial {
+                sweeps.push(Sweep {
+                    unit: a.unit,
+                    range: a.range,
+                    order,
+                    elapsed: t - a.start,
+                    span: a.stagger * a.range.1.saturating_sub(a.range.0).saturating_sub(1) as f64,
+                    dur: a.dur,
+                    curve: a.curve.clone(),
+                    from: a.from,
+                    to: a.to,
+                });
+                continue;
+            }
             for (ci, units) in tx.units.iter().enumerate() {
                 let u = units[a.unit];
                 if u == u32::MAX {
@@ -1703,16 +1808,16 @@ fn text_state(tx: &CText, t: f64) -> TextState {
                 let start = a.start + a.ranks[u] * a.stagger;
                 let p = a.curve.progress(t - start, a.dur);
                 let v: [f64; 5] = std::array::from_fn(|k| a.from[k] + (a.to[k] - a.from[k]) * p);
-                let g = &mut glyphs[ci];
-                g.x += v[0];
-                g.y += v[1];
-                g.scale *= v[2];
-                g.rotation += v[3];
-                g.opacity *= v[4].clamp(0.0, 1.0);
+                apply_unit(&mut glyphs[ci], v, true);
             }
         }
     }
     TextState {
+        weight: tx.weight.at(t),
+        stroke: tx.stroke.as_ref().map(|(c, w, align)| (clamp_color(c.at(t)), w.at(t).max(0.0), *align)),
+        edge: tx.edge.as_ref().map(|(c, w, a)| (clamp_color(c.at(t)), w.at(t).max(0.0), a.at(t))),
+        sweeps,
+        units: tx.units.clone(),
         text: tx.text.clone(),
         font: tx.font.clone(),
         size: tx.size.at(t).max(0.0),
@@ -1784,6 +1889,53 @@ mod tests {
         assert!(tx.glyphs.iter().all(|g| g.opacity == 1.0 && g.y == 0.0));
         // Space has no glyph unit and stays identity.
         assert_eq!(tx.pivots[2], u32::MAX);
+    }
+
+    #[test]
+    fn spatial_order_becomes_a_sweep() {
+        let mut p = Project::new(320, 180, Fps::whole(30), 2.0);
+        let scene: Scene = serde_json::from_value(serde_json::json!({"id": "s", "layers": [
+            {"id": "t", "kind": "text", "text": "AB CD", "weight": 2, "stroke": {"color": "#f00", "width": 3, "align": "center"},
+             "edge": {"angle": 45},
+             "animators": [
+                {"at": 0.5, "order": {"axis": "y", "from": "end", "feather": 0.25}, "stagger": "2f", "dur": "4f", "from": {"opacity": 0}},
+                {"at": 0, "order": "reverse", "from": {"y": 10}, "dur": "4f"}]},
+            {"id": "bad", "kind": "text", "text": "X", "animators": [{"at": 0, "order": {"axis": "x", "radial": [0.5, 0.5]}}]}
+        ]}))
+        .unwrap();
+        p.scenes.push(scene);
+        let c = Compiled::new(&p);
+        assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
+        assert!(c.errors[0].contains("bad.animators.0.order"), "{:?}", c.errors);
+        let f = c.frame(0.6);
+        let Content::Text(tx) = &f.layers[0].content else { panic!() };
+        assert_eq!(tx.weight, 2.0);
+        assert_eq!(tx.stroke, Some((Color::parse("#f00").unwrap(), 3.0, StrokeAlign::Center)));
+        assert_eq!(tx.edge, Some((Color::WHITE, 3.0, 45.0)));
+        // The spatial animator is handed to the renderer, not applied here.
+        assert_eq!(tx.sweeps.len(), 1);
+        let sw = &tx.sweeps[0];
+        assert_eq!(sw.order.axis, Some(Axis::Named(AxisName::Y)));
+        assert_eq!(sw.order.from, SweepFrom::End);
+        assert!((sw.elapsed - 0.1).abs() < 1e-9);
+        // Four glyphs: the last starts 3 × 2 f after the first.
+        assert!((sw.span - 0.2).abs() < 1e-9, "{}", sw.span);
+        assert!(tx.glyphs.iter().all(|g| g.opacity == 1.0));
+        assert_eq!(tx.units.len(), 5);
+        // Linear timing per position: position 0 is 3 of 4 frames in at
+        // 0.6 s; position 1 hasn't started.
+        let lin = Sweep { curve: Curve::Linear, ..sw.clone() };
+        assert!((lin.values(0.0)[4] - 0.75).abs() < 1e-9);
+        assert_eq!(lin.values(1.0)[4], 0.0);
+        assert!((lin.values(0.25)[4] - 0.375).abs() < 1e-9);
+        // The wipe front travels from −f/2 to 1 + f/2 over span + dur.
+        let at = |elapsed: f64| Sweep { elapsed, ..lin.clone() }.front();
+        assert!((at(0.0) + 0.125).abs() < 1e-9);
+        assert!((at(0.2 + 4.0 / 30.0) - 1.125).abs() < 1e-9);
+        // The index-ordered animator still applies per glyph.
+        let f = c.frame(0.0);
+        let Content::Text(tx) = &f.layers[0].content else { panic!() };
+        assert_eq!(tx.glyphs[4].y, 10.0);
     }
 
     #[test]

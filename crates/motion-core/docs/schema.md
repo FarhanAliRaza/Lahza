@@ -156,6 +156,39 @@ Shapes and text are centred on their origin: `position` places their centre.
                 "from": {"y": 80, "opacity": 0}}]}
 ```
 
+Text styling comes from the glyphs' distance field, so it stays crisp at
+any size and per-glyph animators still apply. `stroke` (`color`, `width`
+px, `align`: `outside` (default, drawn under every fill so touching
+letters share one outline), `center` or `inside`) outlines the glyphs;
+a transparent `color` with a stroke gives outline-only type. `weight` (px)
+moves the edges outward for a faux bold (negative thins). `edge` (`color`,
+`width` px, `angle`: where the light comes from, 0 = above, clockwise)
+lays a rim light inside the edges that face the light. All of these are
+animatable; weight plus an outside stroke reach at most ~0.11 em past the
+outline.
+
+```json
+{"id": "logo", "kind": "text", "text": "LAHZA", "size": 180, "color": "#1d2a6b", "weight": 2,
+ "stroke": {"color": "#ffffff", "width": 4},
+ "edge": {"color": "#ffe9a0", "width": 6, "angle": -40}}
+```
+
+An animator's `order` can also come from position: `{"axis": "x"}`
+(`"y"`, or the sweep direction in degrees, 0 = rightward, clockwise; with
+`"from": "start" | "end" | "center"`) or `{"radial": [0.5, 0.5]}` (a centre
+in fractions of the text block). Each unit's delay is its position across
+the text (0 for the first, 1 for the last) times `stagger × (units − 1)`.
+`"feather": 0.3` turns the opacity change into a soft wipe 30% of the
+text wide that travels through the glyphs over the whole animation;
+position, scale and rotation still move per unit. One feathered animator
+per text layer.
+
+```json
+{"id": "reveal", "kind": "text", "text": "SWEEP", "size": 140,
+ "animators": [{"at": "beat:1", "order": {"axis": "x", "feather": 0.25},
+                "stagger": "2f", "dur": "10f", "from": {"opacity": 0, "y": 20}}]}
+```
+
 ```json
 {"id": "dot", "kind": "shape", "shape": "circle", "size": 120, "fill": "#d7ff3a",
  "transform": {"scale": {"keys": [{"at": "beat:5", "from": 0, "v": 1, "ease": "pop", "anchor": "start"}],

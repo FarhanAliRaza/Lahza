@@ -170,6 +170,14 @@ fn gpu_matches_cpu() {
         {"id": "s", "kind": "shape", "shape": "polygon", "sides": 6, "size": 70, "radius": 6, "fill": "#33ddaa", "stroke": {"color": "#ffffff", "width": 3}, "transform": {"position": [230, 70], "scale": [1.3, 0.8]}},
         {"id": "t", "kind": "text", "text": "Sync the peak", "size": 28, "color": "#ffffff", "transform": {"position": [160, 150], "rotation": -4},
          "animators": [{"at": 0, "from": {"y": 30, "opacity": 0, "scale": 0.5}, "dur": "10f"}]},
+        {"id": "rim", "kind": "text", "text": "RIM", "size": 44, "color": "#2a3a8a", "weight": 1.5,
+         "stroke": {"color": "#ffffff", "width": 2.5}, "edge": {"color": "#ffe9a0", "width": 4, "angle": -30},
+         "transform": {"position": [70, 140], "rotation": 8},
+         "animators": [{"at": 0, "order": {"radial": [0.3, 0.5], "feather": 0.4}, "from": {"opacity": 0, "y": 12, "rotation": 20}, "stagger": "2f", "dur": "6f"}]},
+        {"id": "wipe", "kind": "text", "text": "WIPE\nIN", "size": 26, "color": "#ffd23f",
+         "stroke": {"color": "#ff3355", "width": 3, "align": "center"}, "transform": {"position": [270, 150]},
+         "animators": [{"at": 0, "order": {"axis": 30, "from": "center", "feather": 0.3}, "from": {"opacity": 0}, "stagger": "1f", "dur": "6f"},
+                       {"at": 0, "unit": "word", "order": {"axis": "y", "from": "end"}, "from": {"scale": 0.6}, "stagger": "3f", "dur": "8f"}]},
         {"id": "b", "kind": "shape", "shape": "capsule", "size": [80, 24], "fill": "#ffd23f", "effects": [{"type": "blur", "radius": 9}], "transform": {"position": [240, 130]}},
         {"id": "fx", "kind": "shape", "shape": "rect", "size": [120, 60], "fill": {"gradient": "linear", "from": [-60, 0], "to": [60, 0], "stops": [[0, "#ff0000"], [1, "#00ffff"]]},
          "blend": "soft_light", "transform": {"position": [230, 40]},
@@ -288,7 +296,7 @@ fn text_is_shaped_with_kerning() {
         let t = lahza_motion_core::compile::TextState {
             text: s.into(), font: "Inter SemiBold".into(), size: 100.0, color: lahza_motion_core::value::Color::WHITE,
             tracking: 0.0, line_height: 1.2, align: lahza_motion_core::document::Align::Left, glyphs: Vec::new(),
-            pivots: vec![u32::MAX; s.chars().count()].into(),
+            pivots: vec![u32::MAX; s.chars().count()].into(), weight: 0.0, stroke: None, edge: None, sweeps: Vec::new(), units: Vec::new().into(),
         };
         let l = fonts.layout(&t);
         l.bounds[2] - l.bounds[0]
@@ -880,4 +888,178 @@ fn instancer_2000_copies_at_1080p() {
     let (a, b) = (gpu.render(&c, 2.2), cpu().render(&c, 2.2));
     let max = a.pixels().zip(b.pixels()).flat_map(|(x, y)| (0..4).map(move |k| x.0[k].abs_diff(y.0[k]))).max().unwrap_or(0);
     assert!(max <= 3, "GPU and CPU differ by {max}");
+}
+
+/// One text layer at the canvas centre, with `extra` fields merged in.
+fn text_layer(text: &str, size: f64, color: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut layer = json!({"id": "t", "kind": "text", "text": text, "size": size, "color": color, "transform": {"position": [160, 90]}});
+    for (k, v) in extra.as_object().unwrap() {
+        layer[k] = v.clone();
+    }
+    layer
+}
+
+fn render_text(layer: serde_json::Value, t: f64) -> image::RgbaImage {
+    let c = Compiled::new(&project(json!([layer])));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    cpu().render(&c, t)
+}
+
+#[test]
+fn text_stroke_and_weight_move_the_outline() {
+    // "I" is a plain stem: its row 90 span measures the outline exactly.
+    let i = |extra: serde_json::Value| render_text(text_layer("I", 120.0, "#ffffff", extra), 0.0);
+    let plain = i(json!({}));
+    let (x0, x1) = lit_span(&plain, 90, 1);
+    assert!(x1 - x0 > 8, "{x0}..{x1}");
+    let near = |a: u32, b: i64| (a as i64 - b).abs() <= 1;
+    // Outside (default): the fill is untouched, the outline adds 6 px a side.
+    let out = i(json!({"stroke": {"color": "#ff0000", "width": 6}}));
+    let (g0, g1) = lit_span(&out, 90, 1);
+    let (r0, r1) = lit_span(&out, 90, 0);
+    assert!(near(g0, x0 as i64) && near(g1, x1 as i64), "fill {g0}..{g1} vs {x0}..{x1}");
+    assert!(near(r0, x0 as i64 - 6) && near(r1, x1 as i64 + 6), "outline {r0}..{r1} vs {x0}..{x1}");
+    assert_eq!(px(&out, x0 - 3, 90), [255, 0, 0, 255]);
+    assert_eq!(px(&out, (x0 + x1) / 2, 90), [255, 255, 255, 255]);
+    // Centred: half outside, half over the fill.
+    let mid = i(json!({"stroke": {"color": "#ff0000", "width": 6, "align": "center"}}));
+    let (r0, r1) = lit_span(&mid, 90, 0);
+    let (g0, g1) = lit_span(&mid, 90, 1);
+    assert!(near(r0, x0 as i64 - 3) && near(r1, x1 as i64 + 3), "{r0}..{r1}");
+    assert!(near(g0, x0 as i64 + 3) && near(g1, x1 as i64 - 3), "{g0}..{g1}");
+    // Inside: the silhouette keeps its size.
+    let inside = i(json!({"stroke": {"color": "#ff0000", "width": 4, "align": "inside"}}));
+    let (r0, r1) = lit_span(&inside, 90, 0);
+    assert!(near(r0, x0 as i64) && near(r1, x1 as i64), "{r0}..{r1}");
+    assert_eq!(px(&inside, x0 + 2, 90), [255, 0, 0, 255]);
+    // Weight moves the edge itself; negative thins.
+    let bold = i(json!({"weight": 3}));
+    let (b0, b1) = lit_span(&bold, 90, 1);
+    assert!(near(b0, x0 as i64 - 3) && near(b1, x1 as i64 + 3), "bold {b0}..{b1} vs {x0}..{x1}");
+    let thin = i(json!({"weight": -2}));
+    let (t0, t1) = lit_span(&thin, 90, 1);
+    assert!(near(t0, x0 as i64 + 2) && near(t1, x1 as i64 - 2), "thin {t0}..{t1} vs {x0}..{x1}");
+    // A stroke follows the weighted edge.
+    let both = i(json!({"weight": 3, "stroke": {"color": "#ff0000", "width": 4}}));
+    let (r0, _) = lit_span(&both, 90, 0);
+    assert!(near(r0, x0 as i64 - 7), "{r0} vs {x0}");
+    // Animatable: the outline grows over time.
+    let grow = Compiled::new(&project(json!([text_layer("I", 120.0, "#ffffff",
+        json!({"stroke": {"color": "#ff0000", "width": {"keys": [{"at": 0, "v": 0}, {"at": 1, "v": 8}]}}}))])));
+    let mut r = cpu();
+    let w0 = lit_span(&r.render(&grow, 0.0), 90, 0);
+    let w1 = lit_span(&r.render(&grow, 1.0), 90, 0);
+    assert!(near(w0.0, x0 as i64) && near(w1.0, x0 as i64 - 8), "{w0:?} {w1:?}");
+}
+
+#[test]
+fn edge_light_lights_the_side_facing_the_light() {
+    let dark = "#202020";
+    let lit = |angle: f64| render_text(text_layer("I", 120.0, dark, json!({"edge": {"color": "#ffffff", "width": 6, "angle": angle}})), 0.0);
+    let plain = render_text(text_layer("I", 120.0, dark, json!({})), 0.0);
+    let ink = |img: &image::RgbaImage, x: u32, y: u32| px(img, x, y)[0] >= 30;
+    let col: Vec<u32> = (0..180).filter(|y| ink(&plain, 160, *y)).collect();
+    let (top, bottom) = (*col.first().unwrap(), *col.last().unwrap());
+    let left = (0..320).find(|x| ink(&plain, *x, 90)).unwrap();
+    let from_above = lit(0.0);
+    assert!(px(&from_above, 160, top + 1)[0] > 150, "{:?}", px(&from_above, 160, top + 1));
+    assert!(px(&from_above, 160, bottom - 1)[0] < 50, "{:?}", px(&from_above, 160, bottom - 1));
+    // The middle of the stem and its sides (parallel to the light) stay dark.
+    assert!(px(&from_above, 160, 90)[0] < 40);
+    assert!(px(&from_above, left + 1, 90)[0] < 50, "{:?}", px(&from_above, left + 1, 90));
+    // Light from below lights the bottom; from the left, the left side.
+    let from_below = lit(180.0);
+    assert!(px(&from_below, 160, bottom - 1)[0] > 150 && px(&from_below, 160, top + 1)[0] < 50);
+    let from_left = lit(-90.0);
+    assert!(px(&from_left, left + 1, 90)[0] > 150, "{:?}", px(&from_left, left + 1, 90));
+    // The silhouette is unchanged: the rim lies inside the edge.
+    let width = |img: &image::RgbaImage| (0..320).filter(|x| px(img, *x, 90)[0] > 0).count();
+    assert_eq!(width(&from_left), width(&plain));
+}
+
+/// Per-char (opacity, y) of a text layer at `t`, with the renderer's
+/// position-ordered animators applied.
+fn swept(text: &str, animator: serde_json::Value, t: f64) -> Vec<(f64, f64)> {
+    let c = Compiled::new(&project(json!([text_layer(text, 40.0, "#ffffff", json!({"animators": [animator]}))])));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let f = c.frame(t);
+    let lahza_motion_core::compile::Content::Text(tx) = &f.layers[0].content else { panic!() };
+    let mut fonts = font::Fonts::new(None);
+    let layout = fonts.layout(tx);
+    let (glyphs, _) = font::sweep(&layout, tx);
+    glyphs.iter().map(|g| (g.opacity, g.y)).collect()
+}
+
+#[test]
+fn spatial_order_delays_units_by_position() {
+    // Linear 4-frame fades, 2 f stagger: 4 glyphs span 6 f.
+    let anim = |order: serde_json::Value| json!({"at": 0, "order": order, "stagger": "2f", "dur": "4f", "ease": "linear", "from": {"opacity": 0}});
+    let f = 1.0 / 30.0;
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    // Left to right: the first glyph is 2 of 4 frames in, the last hasn't
+    // started. Equal advances put the glyphs at 0, 1/3, 2/3, 1: the last
+    // starts at exactly 6 f, as in index order.
+    let x = swept("HHHH", anim(json!({"axis": "x"})), 2.0 * f);
+    assert!(near(x[0].0, 0.5) && x[1].0 == 0.0 && x[3].0 == 0.0, "{x:?}");
+    let mid = swept("HHHH", anim(json!({"axis": "x"})), 4.0 * f);
+    assert!(near(mid[0].0, 1.0) && near(mid[1].0, 0.5) && near(mid[2].0, 0.0), "{mid:?}");
+    let late = swept("HHHH", anim(json!({"axis": "x"})), 8.0 * f);
+    assert!(near(late[3].0, 0.5) && late[0].0 == 1.0, "{late:?}");
+    // From the end: mirrored; an angle of 180° sweeps right to left too.
+    for order in [json!({"axis": "x", "from": "end"}), json!({"axis": 180})] {
+        let end = swept("HHHH", anim(order), 2.0 * f);
+        assert!(near(end[3].0, 0.5) && end[0].0 == 0.0, "{end:?}");
+    }
+    // From the centre outward: the middle pair together, the ends last.
+    let centre = swept("HHHH", anim(json!({"axis": "x", "from": "center"})), 2.0 * f);
+    assert!(near(centre[1].0, 0.5) && near(centre[2].0, 0.5) && centre[0].0 == 0.0 && centre[3].0 == 0.0, "{centre:?}");
+    // Vertical: lines top to bottom.
+    let lines = swept("AB\nC", json!({"at": 0, "unit": "line", "order": {"axis": "y"}, "stagger": "4f", "dur": "4f", "ease": "linear", "from": {"opacity": 0}}), 2.0 * f);
+    assert!(near(lines[0].0, 0.5) && near(lines[1].0, 0.5) && lines[3].0 == 0.0, "{lines:?}");
+    // Radial from the middle: the centre glyph first, then symmetric pairs.
+    let radial = swept("HHHHH", anim(json!({"radial": [0.5, 0.5]})), 5.0 * f);
+    // Span 8 f: the neighbours sit at 0.5 (start at 4 f), the ends at 1.
+    assert!(near(radial[2].0, 1.0), "{radial:?}");
+    assert!(near(radial[1].0, radial[3].0) && near(radial[0].0, radial[4].0), "{radial:?}");
+    // (Close to 0.25: the centre is the block's, a little off the cap middle.)
+    assert!((radial[1].0 - 0.25).abs() < 0.01 && radial[0].0 == 0.0, "{radial:?}");
+    // Other channels follow the same delays.
+    let y = swept("HHHH", json!({"at": 0, "order": {"axis": "x"}, "stagger": "2f", "dur": "4f", "ease": "linear", "from": {"y": 40}}), 2.0 * f);
+    assert!(near(y[0].1, 20.0) && y[3].1 == 40.0, "{y:?}");
+}
+
+#[test]
+fn feathered_reveal_is_a_soft_wipe_across_glyphs() {
+    let layer = text_layer("HHHH", 60.0, "#ffffff", json!({"animators": [
+        {"at": 0, "order": {"axis": "x", "feather": 0.3}, "stagger": "4f", "dur": "6f", "ease": "linear", "from": {"opacity": 0}}]}));
+    let c = Compiled::new(&project(json!([layer])));
+    let mut r = cpu();
+    let column = |img: &image::RgbaImage, x: u32| (0..180).map(|y| px(img, x, y)[0]).max().unwrap();
+    let full = r.render(&c, 1.5);
+    let (x0, x1) = lit_span(&full, 90, 0);
+    assert!(r.render(&c, 0.0).pixels().all(|p| p.0[0] == 0), "nothing shows at the start");
+    // Halfway (span 12 f + dur 6 f = 18 f): left lit, right dark, and a
+    // ramp between that runs through glyphs (not whole-glyph steps).
+    let half = r.render(&c, 9.0 / 30.0);
+    let cols: Vec<u8> = (x0..=x1).map(|x| column(&half, x)).collect();
+    let ink: Vec<u8> = (x0..=x1).map(|x| column(&full, x)).collect();
+    assert!(cols[1] > 240 && *cols.last().unwrap() < 10, "{cols:?}");
+    let partial = cols.iter().zip(&ink).filter(|(c, i)| **i > 250 && **c > 20 && **c < 235).count();
+    assert!(partial > 10, "{partial}: {cols:?}");
+    // Monotone where there is ink: the wipe never brightens to the right.
+    let mut last = 255u8;
+    for (c, i) in cols.iter().zip(&ink) {
+        if *i > 250 {
+            assert!(*c <= last.saturating_add(2), "{cols:?}");
+            last = *c;
+        }
+    }
+    // A radial wipe from the middle: centre lit before the ends.
+    let radial = Compiled::new(&project(json!([text_layer("HHHH", 60.0, "#ffffff", json!({"animators": [
+        {"at": 0, "order": {"radial": [0.5, 0.5], "feather": 0.3}, "stagger": "4f", "dur": "6f", "ease": "linear", "from": {"opacity": 0}}]}))])));
+    let img = r.render(&radial, 9.0 / 30.0);
+    // The inked column nearest the middle (the middle itself is a gap).
+    let m = (x0..=x1).filter(|x| ink[(x - x0) as usize] > 250).min_by_key(|x| (*x as i64 - (x0 + x1) as i64 / 2).abs()).unwrap();
+    let cols = [column(&img, m), column(&img, x0 + 1), column(&img, x1 - 1)];
+    assert!(cols[0] > 200 && cols[1] < 30 && cols[2] < 30, "{cols:?}");
 }
