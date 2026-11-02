@@ -262,11 +262,107 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
         }
     }
 
+    tracing(project, compiled, &mut issues);
+
     issues.sort_by(|a, b| b.severity.cmp(&a.severity));
     let errors = issues.iter().filter(|i| i.severity == Severity::Error).count();
     let warnings = issues.iter().filter(|i| i.severity == Severity::Warning).count();
     let max_drift_frames = syncs.iter().map(|s| s.drift_frames.abs()).fold(0.0, f64::max);
     Report { ok: errors == 0, errors, warnings, issues, syncs, max_drift_frames }
+}
+
+/// A scene with at least this many short-lived traced-looking path layers
+/// warns (a flipbook of polygons).
+pub const TRACE_FLASH_LAYERS: usize = 12;
+/// "Short-lived": on screen for at most this many frames.
+pub const TRACE_FLASH_FRAMES: f64 = 2.0;
+/// A path whose `d` has at least this many keys, with a median gap of at
+/// most [`TRACE_DENSE_GAP`] frames, is keyed on (nearly) every frame.
+pub const TRACE_DENSE_KEYS: usize = 12;
+pub const TRACE_DENSE_GAP: f64 = 1.5;
+/// A scene warns with this many per-frame-keyed paths, or this many
+/// per-frame keys among them.
+pub const TRACE_DENSE_LAYERS: usize = 3;
+pub const TRACE_DENSE_TOTAL_KEYS: usize = 48;
+
+/// Geometry traced from a reference rather than built: many SVG path layers
+/// that each live ≤ 2 frames (per-frame polygons), or path layers whose `d`
+/// is keyed on (nearly) every frame (rotoscoped outlines). Paths made from
+/// primitives (`{"shape": …}`), paths of fewer than 3 points (spark
+/// streaks), instancer templates and ordinary morphs with a few keys don't
+/// count.
+fn tracing(project: &Project, compiled: &Compiled, issues: &mut Vec<Issue>) {
+    use crate::document::{PathData, PathValue, ShapeKind};
+    let fps = compiled.fps();
+    let f = fps.as_f64();
+    // A path drawn from SVG data with at least 3 points.
+    let traced = |v: &PathValue| match v {
+        PathValue::Svg(d) => {
+            let d = d.replace('-', " -");
+            let numbers = d.split(|c: char| c.is_whitespace() || c == ',' || (c.is_ascii_alphabetic() && c != 'e')).filter(|s| s.parse::<f64>().is_ok()).count();
+            numbers >= 6
+        }
+        PathValue::Shape(_) => false,
+    };
+    fn paths<'a>(layers: &'a [crate::document::Layer], out: &mut Vec<&'a crate::document::Layer>) {
+        for l in layers {
+            match &l.kind {
+                LayerKind::Shape(s) if s.shape == ShapeKind::Path => out.push(l),
+                LayerKind::Comp(c) => paths(&c.layers, out),
+                _ => {}
+            }
+        }
+    }
+    for scene in &project.scenes {
+        let mut layers = Vec::new();
+        paths(&scene.layers, &mut layers);
+        let mut flashes: Vec<&str> = Vec::new();
+        let mut dense: Vec<(&str, usize)> = Vec::new();
+        for l in layers {
+            let LayerKind::Shape(s) = &l.kind else { continue };
+            match &s.d {
+                Some(PathData::Static(v)) if traced(v) => {
+                    if compiled.element_window(&l.id).is_some_and(|(a, b)| (b - a) * f <= TRACE_FLASH_FRAMES + 1e-6) {
+                        flashes.push(&l.id);
+                    }
+                }
+                Some(PathData::Keys(keys)) if keys.iter().any(|k| traced(&k.v)) => {
+                    if compiled.element_window(&l.id).is_some_and(|(a, b)| (b - a) * f <= TRACE_FLASH_FRAMES + 1e-6) {
+                        flashes.push(&l.id);
+                    }
+                    if keys.len() < TRACE_DENSE_KEYS {
+                        continue;
+                    }
+                    let mut times: Vec<f64> = keys.iter().filter_map(|k| compiled.resolve(&project.markers, &k.at).ok()).collect();
+                    times.sort_by(f64::total_cmp);
+                    let mut gaps: Vec<f64> = times.windows(2).map(|w| (w[1] - w[0]) * f).collect();
+                    if gaps.len() + 1 < TRACE_DENSE_KEYS {
+                        continue;
+                    }
+                    gaps.sort_by(f64::total_cmp);
+                    if gaps[gaps.len() / 2] <= TRACE_DENSE_GAP + 1e-6 {
+                        dense.push((&l.id, keys.len()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let examples = |ids: &mut dyn Iterator<Item = &str>| ids.take(3).map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+        const BUILD: &str = "build the geometry from engine shapes, 3D meshes or Blender and use measurements of the reference only for timing, positions, colours, sizes and camera";
+        if flashes.len() >= TRACE_FLASH_LAYERS {
+            issues.push(issue(Severity::Warning, "tracing", Some(&scene.id), None, format!(
+                "{} path layers in scene '{}' are each on screen for {} frames or less (e.g. {}): this looks like per-frame polygons traced from a reference; {BUILD}",
+                flashes.len(), scene.id, TRACE_FLASH_FRAMES, examples(&mut flashes.iter().copied())
+            )));
+        }
+        let dense_keys: usize = dense.iter().map(|d| d.1).sum();
+        if dense.len() >= TRACE_DENSE_LAYERS || dense_keys >= TRACE_DENSE_TOTAL_KEYS {
+            issues.push(issue(Severity::Warning, "tracing", Some(&scene.id), None, format!(
+                "{} path layer(s) in scene '{}' key their shape on (nearly) every frame ({} keys, e.g. {}): this looks like outlines rotoscoped from a reference; {BUILD}. A morph needs a few eased keys",
+                dense.len(), scene.id, dense_keys, examples(&mut dense.iter().map(|d| d.0))
+            )));
+        }
+    }
 }
 
 fn round(v: f64) -> f64 {
@@ -386,5 +482,73 @@ mod tests {
         let c = Compiled::new(&p);
         let r = check(&p, &c, &Options::default());
         assert!(r.issues.iter().any(|i| i.message.contains("holds still")), "{r:#?}");
+    }
+
+    fn tracing_issues(layers: Vec<serde_json::Value>) -> Vec<Issue> {
+        let mut p = Project::new(640, 360, Fps::whole(30), 4.0);
+        p.scenes.push(serde_json::from_value(serde_json::json!({"id": "s1", "layers": layers})).unwrap());
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        check(&p, &c, &Options::default()).issues.into_iter().filter(|i| i.kind == "tracing").collect()
+    }
+
+    /// A quad roughly where frame `i` saw a blob in the reference.
+    fn polygon(i: usize) -> String {
+        let x = 100.0 + i as f64 * 7.0;
+        format!("M {x} 100 L {} 96 L {} 160 L {} 171 Z", x + 52.0, x + 61.0, x - 4.0)
+    }
+
+    #[test]
+    fn per_frame_polygons_warn_as_tracing() {
+        // 14 polygons, each on screen for 2 frames: a flipbook traced from a reference.
+        let flipbook = (0..14)
+            .map(|i| serde_json::json!({"id": format!("blob-{i}"), "kind": "shape", "shape": "path", "d": polygon(i), "fill": "#e0a040",
+                "time": {"start": i as f64 * 2.0 / 30.0, "end": (i as f64 * 2.0 + 2.0) / 30.0}}))
+            .collect();
+        let issues = tracing_issues(flipbook);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert!(issues[0].severity == Severity::Warning && issues[0].message.contains("14 path layers"), "{issues:#?}");
+        // Three outlines whose shape is keyed on every frame.
+        let rotoscoped = (0..3)
+            .map(|k| serde_json::json!({"id": format!("outline-{k}"), "kind": "shape", "shape": "path", "fill": "#3060c0",
+                "d": {"keys": (0..20).map(|i| serde_json::json!({"at": i as f64 / 30.0, "v": polygon(i + k)})).collect::<Vec<_>>()}}))
+            .collect();
+        let issues = tracing_issues(rotoscoped);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert!(issues[0].message.contains("every frame") && issues[0].message.contains("60 keys"), "{issues:#?}");
+        // One outline keyed every frame for two seconds is enough.
+        let one = vec![serde_json::json!({"id": "outline", "kind": "shape", "shape": "path", "fill": "#3060c0",
+            "d": {"keys": (0..60).map(|i| serde_json::json!({"at": i as f64 / 30.0, "v": polygon(i)})).collect::<Vec<_>>()}})];
+        assert_eq!(tracing_issues(one).len(), 1);
+    }
+
+    #[test]
+    fn morphs_sparks_and_built_shapes_do_not_warn_as_tracing() {
+        let mut layers = Vec::new();
+        // An ordinary morph: three eased keys.
+        layers.push(serde_json::json!({"id": "morph", "kind": "shape", "shape": "path", "fill": "#ffffff", "d": {"keys": [
+            {"at": 0.5, "v": polygon(0)}, {"at": 1.0, "v": {"shape": "star", "size": 200}, "ease": "gesture"}, {"at": 1.6, "v": polygon(3), "ease": "glide"}]}}));
+        // A 1-frame stagger of short-lived sparks built from primitives:
+        // circles, primitive paths and two-point streaks, 2 frames each.
+        for i in 0..16 {
+            let time = serde_json::json!({"start": 2.0 + i as f64 / 30.0, "end": 2.0 + (i as f64 + 2.0) / 30.0});
+            layers.push(serde_json::json!({"id": format!("spark-{i}"), "kind": "shape", "shape": "circle", "size": 8, "fill": "#ffd23f", "time": time}));
+            layers.push(serde_json::json!({"id": format!("star-{i}"), "kind": "shape", "shape": "path", "d": {"shape": "star", "size": 30}, "fill": "#ffd23f", "time": time}));
+            layers.push(serde_json::json!({"id": format!("streak-{i}"), "kind": "shape", "shape": "path", "d": "M 0 0 L 40 0", "stroke": {"color": "#ffffff", "width": 3}, "time": time}));
+        }
+        // Many hand-drawn polygons that stay on screen.
+        for i in 0..20 {
+            layers.push(serde_json::json!({"id": format!("shard-{i}"), "kind": "shape", "shape": "path", "d": polygon(i), "fill": "#ff3d7f", "time": {"start": i as f64 / 30.0}}));
+        }
+        // A few short-lived polygons, below the threshold.
+        for i in 0..TRACE_FLASH_LAYERS - 1 {
+            layers.push(serde_json::json!({"id": format!("flash-{i}"), "kind": "shape", "shape": "path", "d": polygon(i), "fill": "#ffffff",
+                "time": {"start": 3.0 + i as f64 / 30.0, "end": 3.0 + (i as f64 + 1.0) / 30.0}}));
+        }
+        // A boil: a drawing redrawn on threes (12 keys, 3 frames apart).
+        layers.push(serde_json::json!({"id": "boil", "kind": "shape", "shape": "path", "stroke": {"color": "#ffffff", "width": 4},
+            "d": {"keys": (0..12).map(|i| serde_json::json!({"at": i as f64 * 3.0 / 30.0, "v": polygon(i % 3)})).collect::<Vec<_>>()}}));
+        let issues = tracing_issues(layers);
+        assert!(issues.is_empty(), "{issues:#?}");
     }
 }

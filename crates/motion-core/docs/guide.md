@@ -24,9 +24,11 @@
    - `free`: only stop→hit moments bind; cut every 1.5–2 beats.
    - `words`: anchor to narration (explainers).
 4. **Build** with `edit_apply`, one scene at a time. Batches are atomic and
-   undoable (`history`).
-5. **Review**: `check` (no errors, sync drift ≤ ±1 f) and `snapshot` with
-   `sheet: true` at the scene's sync points. Look at the frames; fix; repeat.
+   undoable (`history`). Geometry is built, never traced from a reference
+   (see [No tracing](#no-tracing-as-content)).
+5. **Review**: `check` (no errors, sync drift ≤ ±1 f, no `tracing`
+   warnings) and `snapshot` with `sheet: true` at the scene's sync points.
+   Look at the frames; fix; repeat.
 6. **Render** a draft (`quality: "draft"`), then the final.
 
 ## Comparing with a reference
@@ -61,9 +63,34 @@ flagged (`shading_ratio` is null when the reference is flat). A flat
 verdict means the shot needs lighting (3D materials, gradients,
 highlights), not a better match of pixels.
 
+### No tracing as content
+
+A low difference is not the goal; a shot built the way the reference was
+made is. Measurements of a reference (`track`, `fit_curve`, sampled
+pixels) may set **parameters**: timing, positions of objects, colours,
+sizes, the camera. The final **geometry** is built from engine shapes and
+text, 3D meshes or Blender, never from traced or rotoscoped reference
+pixels: no per-frame polygons cut from the reference, no tracked colour
+blobs drawn as shapes, no outlines keyed to the reference frame by frame.
+
+`check` warns (`kind: "tracing"`) when a scene looks traced:
+
+- 12 or more path layers drawn from SVG data (3+ points) that are each on
+  screen for 2 frames or less (a flipbook of polygons), or
+- path layers whose `d` is keyed on (nearly) every frame (12+ keys, median
+  gap ≤ 1.5 frames): 3 such layers, or 48 such keys in the scene.
+
+Ordinary morphs (a few eased keys), paths made from primitives
+(`{"shape": …}`), short spark streaks, instancer copies and long-lived
+hand-drawn paths don't count. Fix the warning by rebuilding the element
+from engine shapes, meshes or Blender, not by spreading the same tracing over more frames.
+
 ## Measuring a reference's motion
 
 Don't eyeball frames or write scripts to measure a reference: use the tools.
+What they measure sets parameters (timing, positions, colours, sizes,
+camera), never the geometry itself (see
+[No tracing](#no-tracing-as-content)).
 
 - `track {video, color: "#ff3355", tolerance}` follows a coloured object
   (`region` limits the search); `point: [x, y]` follows the colour blob
@@ -231,7 +258,8 @@ outside the radius instead.
 
 ## Review checklist
 
-- `check` has no errors; every anchored key's drift is within ±1 frame.
+- `check` has no errors; every anchored key's drift is within ±1 frame;
+  no `tracing` warnings.
 - Against a reference, no scene says "ours is flatter" or "ours lacks
   detail".
 - No still picture longer than the style's hold limit.
