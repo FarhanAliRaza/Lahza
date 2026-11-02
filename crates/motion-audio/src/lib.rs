@@ -1,13 +1,14 @@
 //! Music analysis into marker tracks (design section 4.2):
 //! tempo and first downbeat, straight and triplet grids, per-band onsets,
-//! `hit` (strongest onsets), `stop` (silence → hit) and `drop` (bass
-//! dropout before a downbeat), plus `music.start` / `music.end`.
+//! `hit` (strongest onsets), `stop` (silence → hit, or a cut to a tail) and
+//! `drop` (bass dropout before a downbeat), plus `music.start` / `music.end`.
 //!
 //! Audio is decoded by ffmpeg to mono 22.05 kHz floats. Onsets come from
 //! log-compressed spectral flux in three bands; the tempo from the
 //! autocorrelation of the onset envelope with a log-normal prior around
-//! 120 BPM, refined by a comb search over period and phase; bars from the
-//! beat phase with the strongest low-band (kick) onsets.
+//! 120 BPM, refined by a comb search over period and phase, then checked
+//! against other groupings of the same pulse (3:4, 2:3); bars from the beat
+//! phase with the strongest low-band (kick) onsets.
 
 pub mod sfx;
 
@@ -34,16 +35,51 @@ pub struct Analysis {
     pub beats_per_bar: u32,
     /// True when beats follow a changing tempo instead of a fixed grid.
     pub tempo_varies: bool,
-    /// "straight" or "triplet".
+    /// "straight" (beats split in halves and quarters) or "triplet" (in
+    /// thirds: a shuffle or compound feel).
     pub feel: String,
+    /// How clearly the onsets prefer that split (0..1).
+    pub feel_confidence: f64,
     /// Mean onset strength at beat fractions 0, 1/3, 1/2, 2/3.
     pub phase_strength: [f64; 4],
     /// How well onsets fit the grid (0..1).
     pub grid_confidence: f64,
+    /// How clearly this tempo beats its metrical alternatives (0..1); low
+    /// when another reading (see `alternatives`) fits the onsets as well.
+    pub tempo_confidence: f64,
+    /// Other groupings of the same pulse (3:4, 4:3, 2:3 or 3:2 of this
+    /// tempo) and how accented their beats are.
+    pub alternatives: Vec<Alternative>,
     pub music_start: f64,
     pub music_end: f64,
     #[serde(skip)]
     pub tracks: Vec<MarkerTrack>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Alternative {
+    pub bpm: f64,
+    pub feel: String,
+    /// How much its beats stand out from the pulse (0 = not at all).
+    pub accent: f64,
+}
+
+/// Onset strength at beat fractions 0, 1/4, 1/3, 1/2, 2/3, 3/4.
+fn feel_profile(at: impl Fn(f64) -> f64) -> [f64; 6] {
+    [0.0, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75].map(at)
+}
+
+/// Triplet feel when the thirds of the beat carry clearly more onsets than
+/// its halves and quarters (a shuffle needs only one of the thirds).
+/// Strengths are taken above the envelope's floor. Returns the verdict and
+/// its confidence (0..1).
+fn triplet_feel(p: &[f64; 6], floor: f64) -> (bool, f64) {
+    let above = |v: f64| (v - floor).max(0.0);
+    let thirds = above(p[2]).max(above(p[4]));
+    let duple = above(p[3]).max(0.5 * (above(p[1]) + above(p[5])));
+    let triplet = thirds > 1.5 * duple && thirds > 0.15 * above(p[0]);
+    let confidence = ((thirds - duple).abs() / (thirds + duple).max(1e-9)).clamp(0.0, 1.0);
+    (triplet, confidence)
 }
 
 impl Analysis {
@@ -258,7 +294,126 @@ fn comb(env: &[f32], period: f64, phase: f64) -> f64 {
     }
 }
 
-fn tempo(env: &[f32], dt: f64, start: usize, end: usize) -> (f64, f64, f64) {
+/// Log-normal tempo preference around 120 BPM (one octave wide).
+fn tempo_prior(bpm: f64) -> f64 {
+    (-0.5 * (bpm / 120.0).log2().powi(2)).exp()
+}
+
+/// Best comb period (within ±3% of `lag`) and phase from `start`, in
+/// frames: (mean envelope at the beats, period, phase).
+fn fine_comb(env: &[f32], lag: f64, start: usize) -> (f64, f64, f64) {
+    let mut top = (f64::MIN, lag, 0.0);
+    let steps = 120;
+    for k in 0..=steps {
+        let period = lag * (0.97 + 0.06 * k as f64 / steps as f64);
+        let phases = (period * 4.0).ceil() as usize;
+        for p in 0..phases {
+            let phase = start as f64 + p as f64 * 0.25;
+            let s = comb(env, period, phase);
+            if s > top.0 {
+                top = (s, period, phase);
+            }
+        }
+    }
+    top
+}
+
+/// The beat: a period and phase in frames.
+#[derive(Clone, Copy, Debug)]
+struct Reading {
+    period: f64,
+    phase: f64,
+    /// Mean onset envelope at the beats.
+    fit: f64,
+}
+
+/// A grouping of the tatum (the fastest regular pulse) into beats.
+#[derive(Clone, Copy, Debug)]
+struct Grouping {
+    /// Tatums per beat: 2 or 4 (straight), 3 (triplet).
+    tatums: usize,
+    bpm: f64,
+    /// How much its beats stand out from the other tatums, relative to the
+    /// tatum level (0 = not at all).
+    accent: f64,
+}
+
+/// Below this accent no grouping is audible in the onsets (an even stream
+/// of tatums) and the tempo prior decides.
+const EVEN_STREAM: f64 = 0.2;
+
+/// The beat among metrical alternatives of the autocorrelation period
+/// `lag`. Its subdivision gives the tatum (a third of the beat for a
+/// triplet feel, a quarter or half otherwise); the alternatives group the
+/// same tatum differently: 3 against 4 (133 BPM in triplets or 100 BPM in
+/// sixteenths share a 150 ms pulse) and 3 against 2 (compound vs simple).
+/// Each grouping is judged by how accented its beats are in a 12-tatum
+/// cycle of the onset envelope (medians, so a once-a-bar kick counts for
+/// neither); when none is accented the one nearest the preferred tempo
+/// wins. Returns the beat, its grouping and the alternatives.
+fn choose_reading(env: &[f32], onset: &[f32], dt: f64, lag: f64, start: usize, end: usize) -> (Reading, Grouping, Vec<Grouping>) {
+    let (fit, period, phase) = fine_comb(env, lag, start);
+    let base = Reading { period, phase, fit };
+    let onset_floor = median(&onset[start..end]) as f64;
+    let p = feel_profile(|f| comb(onset, period, phase + f * period));
+    let above = |v: f64| (v - onset_floor).max(0.0);
+    let tatums = if triplet_feel(&p, onset_floor).0 {
+        3
+    } else if 0.5 * (above(p[1]) + above(p[5])) > 0.5 * above(p[3]) {
+        4
+    } else {
+        2
+    };
+    let tatum = period / tatums as f64;
+    // Mean envelope at each tatum of a 12-tatum cycle (12 = lcm of 2, 3, 4).
+    let mut sums = [0.0f64; 12];
+    let mut counts = [0usize; 12];
+    let mut k = 0usize;
+    loop {
+        let x = phase + k as f64 * tatum;
+        if x >= end as f64 {
+            break;
+        }
+        sums[k % 12] += sample(env, x).max(sample(env, x - 1.0)).max(sample(env, x + 1.0)) as f64;
+        counts[k % 12] += 1;
+        k += 1;
+    }
+    let profile: Vec<f64> = sums.iter().zip(counts).map(|(s, c)| s / c.max(1) as f64).collect();
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    };
+    let all = med(&mut profile.clone());
+    let level = (profile.iter().sum::<f64>() / 12.0 - median(&env[start..end]) as f64).max(1e-9);
+    let grouping = |g: usize| -> Grouping {
+        let accent = (0..g).map(|o| med(&mut (o..12).step_by(g).map(|i| profile[i]).collect()) - all).fold(f64::MIN, f64::max);
+        Grouping { tatums: g, bpm: 60.0 / (g as f64 * tatum * dt), accent: (accent / level).max(0.0) }
+    };
+    let alternatives: &[usize] = match tatums {
+        3 => &[4, 2],
+        _ => &[3],
+    };
+    let mut groups: Vec<Grouping> = std::iter::once(tatums)
+        .chain(alternatives.iter().copied())
+        .map(grouping)
+        .filter(|g| g.tatums == tatums || (55.0..=210.0).contains(&g.bpm))
+        .collect();
+    let even = groups.iter().all(|g| g.accent < EVEN_STREAM);
+    groups.sort_by(|a, b| if even { tempo_prior(b.bpm).total_cmp(&tempo_prior(a.bpm)) } else { b.accent.total_cmp(&a.accent) });
+    let chosen = groups.remove(0);
+    let reading = if chosen.tatums == tatums {
+        base
+    } else {
+        let (fit, period, phase) = fine_comb(env, tatum * chosen.tatums as f64, start);
+        Reading { period, phase, fit }
+    };
+    (reading, chosen, groups)
+}
+
+/// The autocorrelation period of the onset envelope in frames, weighted by
+/// the tempo prior and by its double and quadruple.
+fn tempo_lag(env: &[f32], dt: f64, start: usize, end: usize) -> f64 {
     let seg: Vec<f32> = env[start..end.max(start + 1)].to_vec();
     let mean = seg.iter().sum::<f32>() / seg.len().max(1) as f32;
     let raw: Vec<f32> = seg.iter().map(|v| (v - mean).max(0.0)).collect();
@@ -290,8 +445,7 @@ fn tempo(env: &[f32], dt: f64, start: usize, end: usize) -> (f64, f64, f64) {
         if lag >= x.len() {
             break;
         }
-        let bpm = 60.0 / (lag as f64 * dt);
-        let prior = (-0.5 * ((bpm / 120.0).log2() / 1.0).powi(2)).exp();
+        let prior = tempo_prior(60.0 / (lag as f64 * dt));
         // Reward periods whose double and quadruple (a 4/4 bar) also
         // correlate: accents repeat per bar, which settles triplet and
         // half/double ambiguities.
@@ -301,25 +455,7 @@ fn tempo(env: &[f32], dt: f64, start: usize, end: usize) -> (f64, f64, f64) {
             best = (score, lag);
         }
     }
-    let lag = best.1.max(1) as f64;
-    // Fine search of period and phase with the comb.
-    let mut top = (f64::MIN, lag, 0.0);
-    let steps = 120;
-    for k in 0..=steps {
-        let period = lag * (0.97 + 0.06 * k as f64 / steps as f64);
-        let phases = (period * 4.0).ceil() as usize;
-        for p in 0..phases {
-            let phase = start as f64 + p as f64 * 0.25;
-            let s = comb(env, period, phase);
-            if s > top.0 {
-                top = (s, period, phase);
-            }
-        }
-    }
-    let (score, period, phase) = top;
-    let baseline = env[start..end.max(start + 1)].iter().map(|v| *v as f64).sum::<f64>() / (end - start).max(1) as f64;
-    let confidence = (1.0 - baseline / score.max(1e-9)).clamp(0.0, 1.0);
-    (period * dt, phase, confidence)
+    best.1.max(1) as f64
 }
 
 pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
@@ -334,18 +470,38 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
     let music_start = (first as f64 * env.dt).max(0.0);
     let music_end = ((last * HOP + WINDOW) as f64 / sr as f64).min(duration);
 
-    let (beat, mut phase_frames, grid_confidence) = tempo(&env.beat_env, env.dt, first, last.max(first + 1));
-    let period_frames = beat / env.dt;
-    // On-beat or off-beat? Kicks and snares sit on the beat.
-    let (low_on, low_off) = (comb(&env.bands[0], period_frames, phase_frames), comb(&env.bands[0], period_frames, phase_frames + period_frames / 2.0));
-    let off_beat = if (low_on - low_off).abs() > 0.2 * low_on.max(low_off) {
-        low_off > low_on
-    } else {
-        comb(&env.beat_env, period_frames, phase_frames + period_frames / 2.0) > comb(&env.beat_env, period_frames, phase_frames)
+    let end = last.max(first + 1);
+    let lag = tempo_lag(&env.beat_env, env.dt, first, end);
+    let (reading, grouping, others) = choose_reading(&env.beat_env, &env.onset, env.dt, lag, first, end);
+    let beat = reading.period * env.dt;
+    let period_frames = reading.period;
+    let baseline = env.beat_env[first..end].iter().map(|v| *v as f64).sum::<f64>() / (end - first) as f64;
+    let grid_confidence = (1.0 - baseline / reading.fit.max(1e-9)).clamp(0.0, 1.0);
+    let onset_floor = median(&env.onset[first..end]) as f64;
+    // Which pulse of the beat is the beat itself? Kicks and snares sit on
+    // it; a triplet feel has three candidates, a straight one two. When
+    // neither the kicks nor the onsets decide, the music starts on a beat.
+    let profile_at = |phase: f64| feel_profile(|f| comb(&env.onset, period_frames, phase + f * period_frames));
+    let (triplet_reading, _) = triplet_feel(&profile_at(reading.phase), onset_floor);
+    let shifts: &[f64] = if triplet_reading { &[0.0, 1.0 / 3.0, 2.0 / 3.0] } else { &[0.0, 0.5] };
+    let candidates: Vec<f64> = shifts.iter().map(|s| reading.phase + s * period_frames).collect();
+    let decisive = |band: &[f32], margin: f64| -> Option<f64> {
+        let mut scored: Vec<(f64, f64)> = candidates.iter().map(|p| (comb(band, period_frames, *p), *p)).collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        (scored[0].0 > (1.0 + margin) * scored[1].0).then_some(scored[0].1)
     };
-    if off_beat {
-        phase_frames += period_frames / 2.0;
-    }
+    let beat_max_raw = env.beat_env.iter().copied().fold(0.0f32, f32::max);
+    let first_strong = env.beat_env[first..end].iter().position(|v| *v >= 0.5 * beat_max_raw).map(|i| (i + first) as f64).unwrap_or(first as f64);
+    let starts_on_beat = || -> f64 {
+        *candidates
+            .iter()
+            .min_by(|a, b| {
+                let off = |p: f64| ((first_strong - p) / period_frames).rem_euclid(1.0).min(1.0 - ((first_strong - p) / period_frames).rem_euclid(1.0));
+                off(**a).total_cmp(&off(**b))
+            })
+            .unwrap_or(&reading.phase)
+    };
+    let phase_frames = decisive(&env.bands[0], 0.2).or_else(|| decisive(&env.beat_env, 0.05)).unwrap_or_else(starts_on_beat);
     // Beat grid covering the music.
     let mut phase = env.t0 + phase_frames * env.dt;
     while phase - beat >= music_start - beat * 0.25 {
@@ -447,9 +603,18 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
             .collect();
         vals.iter().sum::<f64>() / vals.len().max(1) as f64
     };
-    let phase_strength = [frac(0.0), frac(1.0 / 3.0), frac(0.5), frac(2.0 / 3.0)];
-    let triplet = (phase_strength[1] + phase_strength[3]) / 2.0;
-    let feel = if triplet > 1.6 * phase_strength[2] && triplet > 0.35 * phase_strength[0] { "triplet" } else { "straight" };
+    let profile = feel_profile(frac);
+    let phase_strength = [profile[0], profile[2], profile[3], profile[4]];
+    let (triplet, feel_confidence) = triplet_feel(&profile, onset_floor);
+    let feel = if triplet { "triplet" } else { "straight" };
+    // Below 0.5 another grouping's beats are more accented (it lost to the
+    // tempo prior in an even stream).
+    let best_other = others.iter().map(|g| g.accent).fold(0.0, f64::max);
+    let tempo_confidence = (0.5 + (grouping.accent - best_other) / (2.0 * EVEN_STREAM)).clamp(0.0, 1.0);
+    let alternatives: Vec<Alternative> = others
+        .iter()
+        .map(|g| Alternative { bpm: round3(g.bpm), feel: if g.tatums == 3 { "triplet" } else { "straight" }.into(), accent: round3(g.accent) })
+        .collect();
 
     let shift = |t: f64| t + offset;
     let track = |name: &str, times: Vec<f64>| MarkerTrack::from_times(name, times.into_iter().map(shift));
@@ -477,7 +642,8 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
     // Onsets per band and combined.
     let spacing = 0.05;
     let refine_all = |p: Vec<(f64, f32)>| -> Vec<(f64, f32)> { p.into_iter().map(|(t, v)| (refine(samples, sr, t), v)).collect() };
-    let mut all = refine_all(peaks(&env.onset, env.dt, env.t0, spacing, 1.4));
+    let raw_onsets = peaks(&env.onset, env.dt, env.t0, spacing, 1.4);
+    let mut all = refine_all(raw_onsets.clone());
     for (name, band) in ["onset.low", "onset.mid", "onset.high"].iter().zip(env.bands.iter()) {
         let p = refine_all(peaks(band, env.dt, env.t0, spacing, 1.5));
         tracks.push(MarkerTrack {
@@ -545,6 +711,64 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
         }
         i += 1;
     }
+    // Cuts: the music stops dead on a hit and only a tail follows (reverb,
+    // the hit ringing out). While the music plays, the grid's pulses (beats
+    // and their thirds or halves) carry onsets; after a cut none rises
+    // above the envelope's local floor by a third of what the music's
+    // pulses did, for at least max(1.2 s, 2.5 beats), though sound goes on.
+    let hold = (2.5 * beat).max(1.2);
+    let step = beat / if triplet { 3.0 } else { 2.0 };
+    let mut pulses: Vec<f64> = sub(if triplet { 3 } else { 2 });
+    if let Some(&end_pulse) = pulses.last() {
+        pulses.extend((1..).map(|k| end_pulse + k as f64 * step).take_while(|t| *t < duration));
+    }
+    let floor_near = |t: f64| -> f64 {
+        let a = ((t - 0.5 * beat - env.t0) / env.dt).max(0.0) as usize;
+        let b = (((t + 0.5 * beat - env.t0) / env.dt).max(0.0) as usize).min(env.onset.len());
+        median(&env.onset[a.min(b)..b]) as f64
+    };
+    let rms_at = |t: f64| env.rms_db.get(((t - env.t0) / env.dt).round().max(0.0) as usize).copied().unwrap_or(-120.0);
+    // The log flux hears a fading reverb as texture: weigh each pulse by
+    // its loudness against the music's (RMS windows centred within ±20 ms).
+    let loudness = |t: f64| {
+        let c = ((t - WINDOW as f64 / 2.0 / sr as f64) / env.dt).round() as i64;
+        let db = (c - 3..=c + 3).filter_map(|j| env.rms_db.get(j.max(0) as usize)).copied().fold(f32::MIN, f32::max);
+        10f64.powf(((db - level) as f64 / 20.0).min(0.0))
+    };
+    let strength: Vec<f64> = pulses.iter().map(|t| (window_max(&env.onset, *t) - floor_near(*t)).max(0.0) * loudness(*t)).collect();
+    let pauses: Vec<f64> = stops.iter().map(|m| m.t - offset).collect();
+    let mut cut_until = f64::MIN;
+    for (i, &t) in pulses.iter().enumerate() {
+        if t < cut_until || t < music_start || t + hold > duration {
+            continue;
+        }
+        let mut before: Vec<f64> = pulses[..i].iter().zip(&strength).rev().take_while(|(p, _)| **p >= t - 2.0).map(|(_, s)| *s).collect();
+        if before.len() < 4 {
+            continue;
+        }
+        before.sort_by(f64::total_cmp);
+        let typical = before[before.len() * 3 / 4];
+        let quiet = pulses[i + 1..].iter().zip(&strength[i + 1..]).take_while(|(p, _)| **p <= t + hold).all(|(_, s)| *s < typical / 3.0);
+        // A pause before another hit is a silence stop, found above.
+        let pause = pauses.iter().any(|p| *p > t && *p <= t + hold + 0.1);
+        if strength[i] < 0.5 * typical || !quiet || pause || rms_at(t + 0.5) < level - 30.0 {
+            continue;
+        }
+        // On the envelope's own peak: refining onto the sharpest transient
+        // can jump to the crack inside a ringing hit.
+        let at = raw_onsets.iter().map(|o| o.0).filter(|o| (o - t).abs() <= 0.06).min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs())).unwrap_or(t);
+        // The tail lasts until the sound is 40 dB under the music.
+        let from = ((at - env.t0) / env.dt).max(0.0) as usize;
+        let tail = (from..env.rms_db.len()).find(|&j| env.rms_db[j] < level - 40.0).map_or(duration, |j| env.t0 + j as f64 * env.dt) - at;
+        stops.push(Marker {
+            t: shift(at),
+            value: Some(round3(tail)),
+            label: Some(format!("the music cuts; {tail:.1} s tail")),
+            ..Default::default()
+        });
+        cut_until = t + hold;
+    }
+    stops.sort_by(|a, b| a.t.total_cmp(&b.t));
     tracks.push(MarkerTrack { name: "stop".into(), source: None, markers: stops });
     // Drops: the bass falls under a quarter of its running level for at
     // least half a beat and comes back on (or near) a downbeat.
@@ -594,8 +818,11 @@ pub fn analyze(samples: &[f32], sr: u32, offset: f64) -> Analysis {
         beats_per_bar,
         tempo_varies: tempo_map,
         feel: feel.into(),
+        feel_confidence: round3(feel_confidence),
         phase_strength: phase_strength.map(round3),
         grid_confidence: round3(grid_confidence),
+        tempo_confidence: round3(tempo_confidence),
+        alternatives,
         music_start: shift(music_start),
         music_end: shift(music_end),
         tracks,

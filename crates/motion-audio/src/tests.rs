@@ -256,3 +256,179 @@ fn waltz_has_three_beats_per_bar() {
     let bars = track(&a, "bar");
     assert!((bars.markers[1].t - (0.4 + 3.0 * beat)).abs() < 0.03);
 }
+
+impl Synth {
+    fn snare(&mut self, t: f64, amp: f32) {
+        let start = (t * SR as f64) as usize;
+        for i in 0..(0.2 * SR as f64) as usize {
+            let n = self.noise();
+            let s = i as f32 / SR as f32;
+            if let Some(v) = self.buf.get_mut(start + i) {
+                *v += amp * (0.7 * n * (-s * 25.0).exp() + 0.5 * (std::f32::consts::TAU * 190.0 * s).sin() * (-s * 30.0).exp());
+            }
+        }
+    }
+    fn pluck(&mut self, t: f64, hz: f32, amp: f32) {
+        let start = (t * SR as f64) as usize;
+        for i in 0..(0.12 * SR as f64) as usize {
+            let s = i as f32 / SR as f32;
+            if let Some(v) = self.buf.get_mut(start + i) {
+                *v += amp * (std::f32::consts::TAU * hz * s).sin() * (-s * 40.0).exp();
+            }
+        }
+    }
+    /// Decaying noise from `t`: a reverb tail or a ringing hit.
+    fn tail(&mut self, t: f64, seconds: f64, amp: f32, db_per_s: f32) {
+        let start = (t * SR as f64) as usize;
+        let k = db_per_s / 8.686;
+        let mut low = 0.0f32;
+        for i in 0..(seconds * SR as f64) as usize {
+            let n = self.noise();
+            low += 0.05 * (n - low);
+            let s = i as f32 / SR as f32;
+            if let Some(v) = self.buf.get_mut(start + i) {
+                *v += amp * (0.5 * n + 2.0 * low) * (-s * k).exp();
+            }
+        }
+    }
+    fn cut(&mut self, t: f64) {
+        let a = ((t * SR as f64) as usize).min(self.buf.len());
+        for v in &mut self.buf[a..] {
+            *v = 0.0;
+        }
+    }
+}
+
+/// The reference opener's music: an even stream of triplet eighths
+/// (150 ms) with a soft kick every fourth one. Grouped in 3 it is 133.3 BPM
+/// in triplets, in 4 it is 100 BPM in sixteenths; neither grouping is
+/// accented, so the tempo nearer the preferred one wins, with low
+/// confidence and the other reading listed.
+#[test]
+fn even_triplet_stream_reads_as_133_triplet() {
+    let (first, tatum) = (0.25, 0.45006 / 3.0);
+    let mut s = Synth::new(16.0);
+    let notes = [440.0, 554.0, 659.0, 880.0];
+    for k in 0..100 {
+        let t = first + k as f64 * tatum;
+        s.hat(t, 0.4);
+        s.pluck(t, notes[k % 4], 0.25);
+        if k % 4 == 0 {
+            s.kick(t, 0.3);
+        }
+    }
+    let a = analyze(&s.buf, SR, 0.0);
+    assert!((a.bpm - 133.3).abs() < 0.6, "{:?}", a.summary());
+    assert_eq!(a.feel, "triplet", "{:?}", a.summary());
+    assert!(a.tempo_confidence < 0.5, "{:?}", a.summary());
+    assert!(a.alternatives.iter().any(|alt| (alt.bpm - 100.0).abs() < 1.0 && alt.feel == "straight"), "{:?}", a.summary());
+    let err = grid_error(track(&a, "beat"), (0..30).map(|k| first + k as f64 * 3.0 * tatum));
+    assert!(err < 0.02, "beat grid error {err}");
+    let err = grid_error(track(&a, "triplet"), (0..90).map(|k| first + k as f64 * tatum));
+    assert!(err < 0.02, "triplet grid error {err}");
+}
+
+/// The same 150 ms pulse played as straight sixteenths at 100 BPM: kick on
+/// 1 and 3, snare on 2 and 4, hats accented on the eighths. The beats are
+/// accented, so it stays 100 BPM straight.
+#[test]
+fn straight_sixteenths_with_a_backbeat_stay_straight() {
+    let (first, beat) = (0.3, 0.6);
+    let mut s = Synth::new(16.0);
+    for k in 0..25 {
+        let t = first + k as f64 * beat;
+        if k % 2 == 0 { s.kick(t, 0.8) } else { s.snare(t, 0.5) }
+        for q in 0..4 {
+            s.hat(t + q as f64 * beat / 4.0, if q % 2 == 0 { 0.35 } else { 0.2 });
+        }
+    }
+    let a = analyze(&s.buf, SR, 0.0);
+    assert!((a.bpm - 100.0).abs() < 0.5, "{:?}", a.summary());
+    assert_eq!(a.feel, "straight", "{:?}", a.summary());
+    assert!(a.tempo_confidence > 0.5, "{:?}", a.summary());
+    assert!((a.first_downbeat - first).abs() < 0.04, "{}", a.first_downbeat);
+}
+
+/// A shuffle (the Lahza opener's groove): kick on 1 and 3, snare on 2 and
+/// 4, hats on the beat and its last third only. One third is enough for a
+/// triplet feel.
+#[test]
+fn shuffle_is_a_triplet_feel() {
+    let (first, beat) = (0.217, 0.4503);
+    let mut s = Synth::new(16.0);
+    for k in 0..32 {
+        let t = first + k as f64 * beat;
+        if k % 2 == 0 { s.kick(t, 0.9) } else { s.snare(t, 0.5) }
+        s.hat(t, 0.35);
+        s.hat(t + 2.0 * beat / 3.0, 0.3);
+    }
+    let a = analyze(&s.buf, SR, 0.0);
+    assert!((a.bpm - 133.3).abs() < 0.6, "{:?}", a.summary());
+    assert_eq!(a.feel, "triplet", "{:?}", a.summary());
+    assert!(a.feel_confidence > 0.3, "{:?}", a.summary());
+    assert!((a.first_downbeat - first).abs() < 0.034, "{}", a.first_downbeat);
+}
+
+/// Hard stops: the music cuts on a hit and only a tail follows, a quiet
+/// reverb fading out or a loud hit ringing on. Either is a `stop` at the
+/// cut, though the tail never falls silent.
+#[test]
+fn hard_stop_with_a_tail() {
+    let beat = 0.5;
+    for (name, amp, db_per_s) in [("reverb", 0.25, 30.0), ("ring-out", 0.9, 4.0)] {
+        let mut s = Synth::new(12.0);
+        let cut = 0.4 + 16.0 * beat + beat / 2.0;
+        for k in 0..20 {
+            let t = 0.4 + k as f64 * beat;
+            if k % 2 == 0 { s.kick(t, 0.8) } else { s.snare(t, 0.5) }
+            s.hat(t + beat / 2.0, 0.3);
+            s.tone(t, t + beat, 110.0, 0.1);
+        }
+        s.cut(cut);
+        s.kick(cut, 0.9);
+        s.tail(cut, 3.0, amp, db_per_s);
+        let a = analyze(&s.buf, SR, 0.0);
+        let stop = track(&a, "stop");
+        assert_eq!(stop.markers.len(), 1, "{name}: {stop:?}");
+        assert!((stop.markers[0].t - cut).abs() < 0.03, "{name}: {stop:?}");
+        assert!(stop.markers[0].label.as_deref().unwrap_or("").contains("cuts"), "{name}: {stop:?}");
+    }
+}
+
+/// The two opener tracks, when they are on this machine: the reference
+/// opener's music and the Lahza opener's own track (133.3 BPM triplet feel,
+/// a hard stop with a reverb tail at 17.02 s).
+#[test]
+#[ignore]
+fn reference_openers() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cases = [
+        (format!("{home}/Videos/replica/ref-audio.wav"), 0.2546, 0.45006, None),
+        (format!("{home}/Videos/lahza-opener/track.wav"), 0.217, 0.4503, Some(7.421)),
+    ];
+    let mut failures = Vec::new();
+    for (path, first, beat, drop) in cases {
+        let path = Path::new(&path);
+        if !path.exists() {
+            continue;
+        }
+        let a = analyze_file(path, 0.0).unwrap();
+        let mut s = a.summary();
+        s["tracks"] = serde_json::Value::Null;
+        eprintln!("{}: {s}", path.display());
+        for name in ["beat", "bar", "stop", "drop", "hit"] {
+            eprintln!("  {name}: {:?}", track(&a, name).markers.iter().take(12).map(|m| (m.t * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+        }
+        let name = path.display();
+        let err = grid_error(track(&a, "beat"), (0..30).map(|k| first + k as f64 * beat));
+        let checks = [
+            ((a.beat - beat).abs() < 0.003, format!("{name}: beat {} vs {beat}", a.beat)),
+            (a.feel == "triplet", format!("{name}: feel {}", a.feel)),
+            (err < 0.02, format!("{name}: beat grid error {err}")),
+            (track(&a, "stop").markers.iter().any(|m| (m.t - 17.02).abs() < 0.04), format!("{name}: no stop at 17.02")),
+            (drop.is_none_or(|d| track(&a, "drop").markers.iter().any(|m| (m.t - d).abs() < 0.03)), format!("{name}: no drop at {drop:?}")),
+        ];
+        failures.extend(checks.into_iter().filter(|c| !c.0).map(|c| c.1));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
