@@ -54,7 +54,22 @@ struct RunMesh {
 struct Run {
     serial: u64,
     meshes: Vec<RunMesh>,
+    /// Flat 3D layers drawn as cards in the list's batches.
+    cards: Vec<Card>,
     current: usize,
+}
+
+/// A flat 3D layer in the mesh depth buffer: its picture (a group, in
+/// output pixels) on a quad at its place in 3D. Samples where the picture
+/// is under half opaque let what is behind show.
+#[derive(Clone, Debug)]
+pub(crate) struct Card {
+    pub index: usize,
+    /// Quad corners in camera space and in output pixels.
+    pub view: [[f64; 3]; 4],
+    pub screen: [[f64; 2]; 4],
+    pub picture: Backdrop,
+    pub bounds: [f64; 4],
 }
 
 /// A mesh layer that lets what is behind it show (opacity, glass, a
@@ -102,13 +117,25 @@ impl MeshCache {
                 Some(RunMesh { index, state: (**m).clone(), root, occludes: !see_through(l), bounds })
             })
             .collect();
-        self.runs.push(Run { serial: self.serial, meshes, current: 0 });
+        self.runs.push(Run { serial: self.serial, meshes, cards: Vec::new(), current: 0 });
     }
 
     /// The layer of the current list about to be emitted.
     pub(crate) fn set_current(&mut self, index: usize) {
         if let Some(r) = self.runs.last_mut() {
             r.current = index;
+        }
+    }
+
+    /// A mesh of the current list (its lighting and camera start batches
+    /// that open with a card).
+    pub(crate) fn run_mesh(&self) -> Option<MeshState> {
+        self.runs.last()?.meshes.first().map(|m| m.state.clone())
+    }
+
+    pub(crate) fn add_card(&mut self, card: Card) {
+        if let Some(r) = self.runs.last_mut() {
+            r.cards.push(card);
         }
     }
 
@@ -121,7 +148,7 @@ impl MeshCache {
     /// opaque meshes over it as occluders.
     pub(crate) fn close_run(&mut self) {
         let Some(run) = self.runs.pop() else { return };
-        if run.meshes.is_empty() {
+        if run.meshes.is_empty() && run.cards.len() < 2 {
             return;
         }
         // Shadows: every mesh of the list casts onto every other.
@@ -130,7 +157,7 @@ impl MeshCache {
         for b in batches.iter_mut().filter(|b| b.list == run.serial) {
             b.shadows = shadows.clone();
         }
-        if run.meshes.len() < 2 {
+        if run.meshes.len() + run.cards.len() < 2 {
             self.batches = batches;
             return;
         }
@@ -139,6 +166,12 @@ impl MeshCache {
                 let overlaps = rm.bounds[2] >= b.bounds[0] && rm.bounds[0] <= b.bounds[2] && rm.bounds[3] >= b.bounds[1] && rm.bounds[1] <= b.bounds[3];
                 if rm.occludes && overlaps && !b.members.contains(&rm.index) {
                     b.add_occluder(self, &rm.state, rm.root);
+                }
+            }
+            for card in &run.cards {
+                let overlaps = card.bounds[2] >= b.bounds[0] && card.bounds[0] <= b.bounds[2] && card.bounds[3] >= b.bounds[1] && card.bounds[1] <= b.bounds[3];
+                if overlaps && !b.members.contains(&card.index) {
+                    b.add_card(card, true);
                 }
             }
         }
@@ -270,6 +303,8 @@ pub(crate) struct Batch {
     pub(crate) backdrop: Option<Backdrop>,
     /// Camera focal length in output pixels (refraction offsets).
     focal: f64,
+    /// Holds only cards (no meshes, no lighting).
+    pub(crate) cards_only: bool,
 }
 
 /// A group over output-pixel rect `origin + factor·(x, y)`.
@@ -499,6 +534,9 @@ pub const FLAG_UNLIT: u32 = 1;
 pub const FLAG_FACETED: u32 = 2;
 pub const FLAG_OCCLUDER: u32 = 4;
 pub const FLAG_SHADOW_CATCHER: u32 = 8;
+/// A card: rows 0–1 hold its picture (canvas → texel map, texel offset
+/// relative to the primitive's texel base, size).
+pub const FLAG_CARD: u32 = 16;
 
 /// Shadow filter taps (a Poisson disk on the unit circle).
 pub const SHADOW_TAPS: [[f32; 2]; 8] = [[-0.613, 0.617], [0.170, -0.040], [-0.299, -0.792], [0.645, 0.493], [-0.651, -0.075], [0.421, -0.718], [-0.084, 0.290], [0.874, -0.130]];
@@ -562,6 +600,31 @@ fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
 }
 
 impl Batch {
+    /// A batch of cards only (flat 3D layers, no meshes): no lights.
+    pub(crate) fn cards_only() -> Batch {
+        let mut rows = vec![[0.0f32; 4]; 7];
+        rows[1][0] = 1.0;
+        rows[2][1] = 1.0;
+        rows[3][2] = 1.0;
+        Batch {
+            verts: Vec::new(),
+            tris: Vec::new(),
+            materials: Vec::new(),
+            lighting: Arc::new(Lighting { lights: Vec::new(), env: lahza_motion_core::compile::EnvState { sky: [0.0; 3], horizon: [0.0; 3], ground: [0.0; 3], lobes: Vec::new() } }),
+            light_rows: rows,
+            bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+            layers: 0,
+            occluder: None,
+            list: 0,
+            members: Vec::new(),
+            see_through: false,
+            shadows: Arc::default(),
+            backdrop: None,
+            focal: 1.0,
+            cards_only: true,
+        }
+    }
+
     pub(crate) fn new(m: &MeshState) -> Option<Batch> {
         let lighting = m.lighting.clone()?;
         let light_rows = light_rows(&lighting, m);
@@ -580,6 +643,7 @@ impl Batch {
             shadows: Arc::default(),
             backdrop: None,
             focal: m.camera.focal,
+            cards_only: false,
         })
     }
 
@@ -596,6 +660,33 @@ impl Batch {
             self.materials.extend_from_slice(&[[0.0; 4], [0.0; 4], [0.0, 0.0, 0.0, FLAG_OCCLUDER as f32], [0.0; 4]]);
         }
         self.add_mesh(cache, m, root, 1.0, true);
+    }
+
+    /// Adds a card (a flat 3D layer's picture on its quad); as an occluder
+    /// it hides this batch where its picture is, drawing nothing.
+    pub(crate) fn add_card(&mut self, card: &Card, occluder: bool) {
+        let b = |v: u32| f32::from_bits(v);
+        let p = card.picture;
+        let flags = FLAG_CARD | if occluder { FLAG_OCCLUDER } else { 0 };
+        let material = (self.materials.len() / 4) as u32;
+        self.materials.extend_from_slice(&[
+            [p.origin[0] as f32, p.origin[1] as f32, p.factor[0] as f32, p.factor[1] as f32],
+            [b(p.offset), b(p.size.0), b(p.size.1), 0.0],
+            [0.0, 0.0, 0.0, flags as f32],
+            [0.0; 4],
+        ]);
+        let n = cross(sub(card.view[1], card.view[0]), sub(card.view[3], card.view[0]));
+        let n = unit3(n);
+        let base = self.verts.len() as u32;
+        for k in 0..4 {
+            let (s, q) = (card.screen[k], card.view[k]);
+            self.verts.push(Vert { screen: s, pos: q.map(|v| v as f32), normal: n.map(|v| v as f32) });
+            if !occluder {
+                self.bounds = [self.bounds[0].min(s[0]), self.bounds[1].min(s[1]), self.bounds[2].max(s[0]), self.bounds[3].max(s[1])];
+            }
+        }
+        self.tris.push(([base, base + 1, base + 2], material));
+        self.tris.push(([base, base + 2, base + 3], material));
     }
 
     fn add_mesh(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
@@ -748,7 +839,7 @@ impl Batch {
             let rows = [
                 [f(p[0][0]), f(p[0][1]), f(p[1][0]), f(p[1][1])],
                 [f(p[2][0]), f(p[2][1]), sign, f32::from_bits(*material)],
-                [f32::from_bits(ids[0]), f32::from_bits(ids[1]), f32::from_bits(ids[2]), 0.0],
+                [f32::from_bits(ids[0]), f32::from_bits(ids[1]), f32::from_bits(ids[2]), if self.materials[*material as usize * 4 + 2][3] as u32 & FLAG_CARD != 0 { 1.0 } else { 0.0 }],
                 [f(depth[0]), f(depth[1]), f(depth[2]), 0.0],
             ];
             Some(Tri { rows, bbox: bbox.map(|v| v as f32) })
@@ -770,7 +861,7 @@ impl Batch {
         };
         // The drawn triangles set the covered area; occluders only matter
         // inside it.
-        let is_occluder = |t: &Tri| Some(t.rows[1][3].to_bits()) == self.occluder;
+        let is_occluder = |t: &Tri| self.materials[t.rows[1][3].to_bits() as usize * 4 + 2][3] as u32 & FLAG_OCCLUDER != 0;
         let mut used = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for t in tris.iter().filter(|t| !is_occluder(t)) {
             let bbox = t.bbox.map(|v| v as f64);
@@ -908,11 +999,15 @@ impl Batch {
             ),
             None => ([0.0; 4], [0.0; 4], [0.0; 4]),
         };
+        let mut stroke = stroke;
+        stroke[2] = b(0);
         let prim = Prim {
             kind: [PRIM_MESH, 0, blend, 0],
             paint,
             paint2,
             stroke,
+            // Target pixel → output pixel (cards look their pictures up there).
+            fill: [target_origin[0] as f32, target_origin[1] as f32, factor[0] as f32, factor[1] as f32],
             inv_x: [1.0, 0.0, 0.0, 1.0],
             inv_y: [0.0, 1.0, 0.0, 1.0],
             inv_w: [0.0, 0.0, 1.0, 1.0],
@@ -990,6 +1085,9 @@ fn cross(a: V3, b: V3) -> V3 {
 }
 
 // ------------------------------------------------------------ CPU shading
+
+/// Relative depth within which the later surface wins (coplanar layers).
+pub const TIE: f32 = 2e-5;
 
 /// Sample offsets within a pixel (the standard 8× pattern, in 1/16 px).
 pub const SAMPLES: [[f32; 2]; 8] = [[1.0, -3.0], [-1.0, 3.0], [5.0, 1.0], [-3.0, -5.0], [-5.0, 5.0], [-7.0, -1.0], [3.0, 7.0], [7.0, -7.0]];
@@ -1188,14 +1286,37 @@ fn sample_group(groups: &[[f32; 4]], prim: &Prim, g: [f32; 2]) -> [f32; 4] {
     })
 }
 
+/// A card's picture at target point `q` (transparent outside it).
+fn card_sample(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], material: usize, q: [f32; 2]) -> [f32; 4] {
+    let (r0, r1) = (m[material], m[material + 1]);
+    let c = [prim.fill[0] + prim.fill[2] * q[0], prim.fill[1] + prim.fill[3] * q[1]];
+    let g = [(c[0] - r0[0]) / r0[2] - 0.5, (c[1] - r0[1]) / r0[3] - 0.5];
+    let off = prim.stroke[2].to_bits() as i64 + r1[0].to_bits() as i64;
+    let (w, h) = (r1[1].to_bits() as i64, r1[2].to_bits() as i64);
+    let (x0, y0) = (g[0].floor(), g[1].floor());
+    let (fx, fy) = (g[0] - x0, g[1] - y0);
+    let at = |x: i64, y: i64| if x < 0 || y < 0 || x >= w || y >= h { [0.0; 4] } else { groups[(off + y * w + x) as usize] };
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let (a, b, cc, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    std::array::from_fn(|i| {
+        let top = a[i] + (b[i] - a[i]) * fx;
+        let bottom = cc[i] + (d[i] - cc[i]) * fx;
+        top + (bottom - top) * fy
+    })
+}
+
 fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
     let tb = prim.geom2[0].to_bits() as usize + tri as usize * 4;
     let vb = prim.geom2[1].to_bits() as usize;
     let mb = prim.geom2[2].to_bits() as usize;
     let lb = prim.geom2[3].to_bits() as usize;
-    if m[mb + m[tb + 1][3].to_bits() as usize * 4 + 2][3] as u32 & FLAG_OCCLUDER != 0 {
+    let mat_flags = m[mb + m[tb + 1][3].to_bits() as usize * 4 + 2][3] as u32;
+    if mat_flags & FLAG_OCCLUDER != 0 {
         // Another batch draws this surface.
         return [0.0; 4];
+    }
+    if mat_flags & FLAG_CARD != 0 {
+        return card_sample(prim, m, groups, mb + m[tb + 1][3].to_bits() as usize * 4, q);
     }
     let (e, _) = cover(m[tb], m[tb + 1], q);
     let ids = m[tb + 2];
@@ -1377,7 +1498,9 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
             let q = [p[0] + SAMPLES[s][0] / 16.0, p[1] + SAMPLES[s][1] / 16.0];
             if cover(r0, r1, q).1 {
                 let z = d[0] * q[0] + d[1] * q[1] + d[2];
-                if z > depth[s] {
+                // Cards only stand where their picture is (alpha test).
+                // Later surfaces win ties: coplanar layers keep their order.
+                if z >= depth[s] * (1.0 - TIE) && (m[r + 2][3] < 0.5 || card_sample(prim, m, groups, prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * 4, q)[3] >= 0.5) {
                     depth[s] = z;
                     best[s] = tri;
                 }

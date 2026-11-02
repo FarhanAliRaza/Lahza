@@ -437,3 +437,68 @@ fn glass_refracts_what_is_behind() {
 fn gpu_matches_cpu_glass() {
     crate::tests::assert_gpu_matches_cpu_within(&glass_scene(json!({"preset": "glass", "color": "#e8f4ff", "ior": 1.6, "thickness": 90})), &[0.0], 0.0005);
 }
+
+#[test]
+fn flat_3d_layers_share_the_mesh_depth_buffer() {
+    // A red 3D rectangle and a blue slab crossing like an X: each is in
+    // front on its own side, whatever the layer order.
+    for order in [0, 1] {
+        let card = json!({"id": "card", "kind": "shape", "shape": "rect", "size": [200, 100], "fill": "#ff0000", "three_d": true,
+            "transform": {"position": [160, 120], "rotation_y": 30}});
+        let slab = json!({"id": "slab", "kind": "mesh", "mesh": {"type": "box", "size": [200, 100], "depth": 4}, "material": {"preset": "flat", "color": "#0000ff"},
+            "transform": {"position": [160, 120], "rotation_y": -30}});
+        let layers = if order == 0 { json!([card, slab]) } else { json!([slab, card]) };
+        let img = render(&scene(320, 240, json!({"layers": layers})), 0.0);
+        assert_eq!(px(&img, 110, 120), [255, 0, 0, 255], "order {order}: left");
+        assert_eq!(px(&img, 210, 120), [0, 0, 255, 255], "order {order}: right");
+    }
+    // A card only stands where its picture is: between two bars of a
+    // 3D layer in front, the mesh behind shows.
+    let bars = json!({"id": "bars", "kind": "shape", "shape": "path", "d": "M -100 -50 L -40 -50 L -40 50 L -100 50 Z M 40 -50 L 100 -50 L 100 50 L 40 50 Z",
+        "fill": "#ff0000", "three_d": true, "transform": {"position": [160, 120], "z": -40}});
+    let wall = json!({"id": "wall", "kind": "mesh", "mesh": {"type": "box", "size": [260, 160], "depth": 10}, "material": {"preset": "flat", "color": "#0000ff"},
+        "transform": {"position": [160, 120], "z": 40}});
+    let img = render(&scene(320, 240, json!({"layers": [wall, bars]})), 0.0);
+    assert_eq!(px(&img, 160, 120), [0, 0, 255, 255], "the gap shows the mesh");
+    assert_eq!(px(&img, 160 - 75, 120)[0], 255, "the bar in front");
+    // A mesh with an effect (drawn on its own) is still hidden by a card.
+    let mut blurred = json!({"id": "slab", "kind": "mesh", "mesh": {"type": "box", "size": [200, 100], "depth": 4}, "material": {"preset": "flat", "color": "#0000ff"},
+        "effects": [{"type": "brightness_contrast", "brightness": 0}], "transform": {"position": [160, 120], "rotation_y": -30}});
+    blurred["id"] = json!("slab2");
+    let card = json!({"id": "card", "kind": "shape", "shape": "rect", "size": [200, 100], "fill": "#ff0000", "three_d": true,
+        "transform": {"position": [160, 120], "rotation_y": 30}});
+    let img = render(&scene(320, 240, json!({"layers": [card, blurred]})), 0.0);
+    assert_eq!(px(&img, 110, 120), [255, 0, 0, 255]);
+    assert_eq!(px(&img, 210, 120), [0, 0, 255, 255]);
+}
+
+#[test]
+fn tilted_3d_layers_cut_through_each_other() {
+    // Two flat 3D rectangles crossing like an X, no meshes at all.
+    for order in [0, 1] {
+        let a = json!({"id": "a", "kind": "shape", "shape": "rect", "size": [200, 100], "fill": "#ff0000", "three_d": true, "transform": {"position": [160, 120], "rotation_y": 30}});
+        let b = json!({"id": "b", "kind": "shape", "shape": "rect", "size": [200, 100], "fill": "#0000ff", "three_d": true, "transform": {"position": [160, 120], "rotation_y": -30}});
+        let layers = if order == 0 { json!([a, b]) } else { json!([b, a]) };
+        let img = render(&scene(320, 240, json!({"layers": layers})), 0.0);
+        assert_eq!(px(&img, 110, 120), [255, 0, 0, 255], "order {order}");
+        assert_eq!(px(&img, 210, 120), [0, 0, 255, 255], "order {order}");
+    }
+    // Text on a card in the same tilted plane stays on top (paint order
+    // breaks the tie).
+    let card = json!({"id": "card", "kind": "shape", "shape": "rect", "size": [220, 120], "fill": "#202020", "three_d": true, "transform": {"position": [160, 120], "rotation_y": 35}});
+    let text = json!({"id": "label", "kind": "shape", "shape": "rect", "size": [120, 40], "fill": "#ffffff", "three_d": true, "transform": {"position": [160, 120], "rotation_y": 35}});
+    let img = render(&scene(320, 240, json!({"layers": [card, text]})), 0.0);
+    assert_eq!(px(&img, 160, 120), [255, 255, 255, 255]);
+}
+
+#[test]
+fn gpu_matches_cpu_cards() {
+    let p = scene(320, 240, json!({"layers": [
+        {"id": "wall", "kind": "mesh", "mesh": {"type": "box", "size": [260, 160], "depth": 10}, "material": {"preset": "glossy", "color": "#3355ff"}, "transform": {"position": [160, 120], "z": 40, "rotation_y": 20}},
+        {"id": "card", "kind": "shape", "shape": "rect", "size": [200, 100], "radius": 12, "fill": "#ff3355", "three_d": true, "transform": {"position": [160, 120], "rotation_y": -25}},
+        {"id": "word", "kind": "text", "text": "DEPTH", "size": 40, "color": "#ffffff", "three_d": true, "transform": {"position": [160, 120], "rotation_y": -25}},
+        {"id": "glow", "kind": "mesh", "mesh": {"type": "torus", "radius": 70, "tube": 14}, "material": {"preset": "coated", "color": "#ffd23f"},
+         "effects": [{"type": "glow", "radius": 4}], "transform": {"position": [160, 120], "rotation_x": 70}}
+    ]}));
+    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.001);
+}

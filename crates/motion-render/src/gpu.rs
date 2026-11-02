@@ -186,6 +186,8 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
                     if p.paint[3] > 0.5 {
                         p.paint[0] = rebase(p.paint[0], texel_base);
                     }
+                    // Cards' pictures are relative to this base.
+                    p.stroke[2] = rebase(p.stroke[2], texel_base);
                 }
                 crate::list::PRIM_IMAGE if p.kind[1] == 1 => p.geom2[0] = rebase(p.geom2[0], texel_base),
                 crate::list::PRIM_MATTE => {

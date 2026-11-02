@@ -105,6 +105,9 @@ pub struct LayerState {
     pub effects: Vec<EffectState>,
     pub matte: Option<Box<MatteState>>,
     pub content: Content,
+    /// 3D layers: layer space → camera space (x right, y down, z forward),
+    /// for depth against meshes. `None` for flat layers.
+    pub view: Option<Mat4>,
 }
 
 impl LayerState {
@@ -1492,7 +1495,7 @@ impl Compiled {
         let (w, h) = (self.settings.width as f64, self.settings.height as f64);
         let mut layers = vec![canvas_rect(&format!("{}-background", scene.id), w, h, scene.background)];
         self.scene_layers(scene, t, &mut layers);
-        LayerState { id: scene.id.clone(), matrix, opacity, blend: Blend::Normal, effects: Vec::new(), matte: None, content: Content::Group(layers) }
+        LayerState { id: scene.id.clone(), matrix, opacity, blend: Blend::Normal, effects: Vec::new(), matte: None, content: Content::Group(layers), view: None }
     }
 
     fn transition(&self, a: &CScene, b: &CScene, tr: &CTransition, p: f64, ta: f64, tb: f64) -> Vec<LayerState> {
@@ -1586,6 +1589,7 @@ fn canvas_rect(id: &str, w: f64, h: f64, color: Color) -> LayerState {
             path: None,
             field: None,
         }),
+        view: None,
     }
 }
 
@@ -1889,6 +1893,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                 effects,
                 matte,
                 content: Content::Group(inner),
+                view: None,
             });
             return;
         }
@@ -1931,7 +1936,8 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             fps: v.fps,
         }),
     };
-    out.push(LayerState { id: l.id.clone(), matrix, opacity: parent_opacity * own_opacity, blend: l.blend, effects, matte, content });
+    let view = three_d.then(|| space.cam.view.then(world));
+    out.push(LayerState { id: l.id.clone(), matrix, opacity: parent_opacity * own_opacity, blend: l.blend, effects, matte, content, view });
 }
 
 fn clamp_color(c: Color) -> Color {

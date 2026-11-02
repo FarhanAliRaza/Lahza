@@ -907,14 +907,49 @@ fn sample_group(prim: Prim, g: vec2<f32>) -> vec4<f32> {
     return top + (bottom - top) * fy;
 }
 
+const TIE: f32 = 2e-5;
+
+fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
+    if x < 0 || y < 0 || x >= w || y >= h { return vec4<f32>(0.0); }
+    return b_groups[u32(off + y * w + x)];
+}
+
+// Mirrors `card_sample` in mesh3d.rs: a card's picture at target point q.
+fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
+    let r0 = b_mesh[material];
+    let r1 = b_mesh[material + 1u];
+    let c = vec2<f32>(prim.fill.x + prim.fill.z * q.x, prim.fill.y + prim.fill.w * q.y);
+    let g = vec2<f32>((c.x - r0.x) / r0.z - 0.5, (c.y - r0.y) / r0.w - 0.5);
+    let off = i32(bitcast<u32>(prim.stroke.z) + bitcast<u32>(r1.x));
+    let w = i32(bitcast<u32>(r1.y));
+    let h = i32(bitcast<u32>(r1.z));
+    let x0 = floor(g.x);
+    let y0 = floor(g.y);
+    let fx = g.x - x0;
+    let fy = g.y - y0;
+    let xi = i32(x0);
+    let yi = i32(y0);
+    let a = card_at(off, w, h, xi, yi);
+    let b = card_at(off, w, h, xi + 1, yi);
+    let cc = card_at(off, w, h, xi, yi + 1);
+    let d = card_at(off, w, h, xi + 1, yi + 1);
+    let top = a + (b - a) * fx;
+    let bottom = cc + (d - cc) * fx;
+    return top + (bottom - top) * fy;
+}
+
 fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let tb = bitcast<u32>(prim.geom2.x) + tri * 4u;
     let vb = bitcast<u32>(prim.geom2.y);
     let mb = bitcast<u32>(prim.geom2.z);
     let lb = bitcast<u32>(prim.geom2.w);
-    if (u32(b_mesh[mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u + 2u].w) & 4u) != 0u {
+    let mat_flags = u32(b_mesh[mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u + 2u].w);
+    if (mat_flags & 4u) != 0u {
         // A depth-only occluder: another batch draws this surface.
         return vec4<f32>(0.0);
+    }
+    if (mat_flags & 16u) != 0u {
+        return card_sample(prim, mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u, q);
     }
     let cv = cover(b_mesh[tb], b_mesh[tb + 1u], q);
     let ev = array<f32, 3>(cv.e.x, cv.e.y, cv.e.z);
@@ -1104,9 +1139,16 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
             let q = vec2<f32>(p.x + SAMPLE_X[s] / 16.0, p.y + SAMPLE_Y[s] / 16.0);
             if cover(r0, r1, q).inside {
                 let z = d.x * q.x + d.y * q.y + d.z;
-                if z > depth[s] {
-                    depth[s] = z;
-                    best[s] = tri;
+                // Later surfaces win ties; cards only where their picture is.
+                if z >= depth[s] * (1.0 - TIE) {
+                    var stands = true;
+                    if b_mesh[r + 2u].w >= 0.5 {
+                        stands = card_sample(prim, bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * 4u, q).w >= 0.5;
+                    }
+                    if stands {
+                        depth[s] = z;
+                        best[s] = tri;
+                    }
                 }
             }
         }

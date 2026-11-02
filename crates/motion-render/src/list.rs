@@ -450,11 +450,22 @@ impl Builder<'_> {
     /// depth of field).
     fn emit_list(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         self.meshes.open_run(layers, root);
+        // With meshes in the list, flat 3D layers join their depth buffer;
+        // so do tilted 3D layers that could cut through each other.
+        let cards = layers.iter().filter(|l| card_candidate(l)).count();
+        let has_mesh = layers.iter().any(|l| matches!(l.content, Content::Mesh(_)))
+            || cards >= 2 && layers.iter().any(|l| card_candidate(l) && !l.matrix.is_affine());
         let mut deferred: Vec<usize> = Vec::new();
         for (i, layer) in layers.iter().enumerate() {
             if crate::mesh3d::see_through(layer) {
                 deferred.push(i);
                 continue;
+            }
+            if has_mesh && card_candidate(layer) {
+                self.meshes.set_current(i);
+                if self.card_item(layer, root, canvas, list, pending, out) {
+                    continue;
+                }
             }
             if !matches!(layer.content, Content::Mesh(_)) {
                 for j in deferred.drain(..) {
@@ -470,6 +481,73 @@ impl Builder<'_> {
             self.emit(&layers[j], root, canvas, list, pending, out);
         }
         self.meshes.close_run();
+    }
+
+    /// Draws a flat 3D layer as a card in the mesh depth buffer: its
+    /// picture into a group, its quad into the current batch. False when it
+    /// can't be (it crosses the camera): it is then drawn as usual.
+    fn card_item(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) -> bool {
+        let Some(view) = layer.view else { return false };
+        let lighting = self.meshes.run_mesh();
+        let Some(inverse) = root.then(layer.matrix).inverse() else { return false };
+        let items = self.layer_items(layer, root, &mut list.stops, &mut list.segments);
+        if items.is_empty() {
+            return true;
+        }
+        let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for it in &items {
+            let b = canvas_bounds(it);
+            bb = [bb[0].min(b[0]), bb[1].min(b[1]), bb[2].max(b[2]), bb[3].max(b[3])];
+        }
+        let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
+        let rect = [bb[0].floor().max(0.0), bb[1].floor().max(0.0), bb[2].ceil().min(cw), bb[3].ceil().min(ch)];
+        if !rect.iter().all(|v| v.is_finite()) || rect[2] <= rect[0] || rect[3] <= rect[1] {
+            return bb.iter().all(|v| v.is_finite());
+        }
+        // The quad: the picture's rect, found back on the layer's plane.
+        let screen = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[2], rect[3]], [rect[0], rect[3]]];
+        let mut corners = [[0.0; 3]; 4];
+        for (k, s) in screen.iter().enumerate() {
+            let (x, y) = inverse.apply(s[0], s[1]);
+            let q = view.apply(x, y, 0.0);
+            if !(x.is_finite() && y.is_finite()) || q[2] < 1.0 {
+                return false;
+            }
+            corners[k] = [q[0], q[1], q[2]];
+        }
+        let (offset, origin, factor, size) = self.reserve(list, pending, items, rect, 0.0, 1.0, false);
+        let (serial, index) = self.meshes.member();
+        let card = crate::mesh3d::Card { index, view: corners, screen, picture: crate::mesh3d::Backdrop { offset, size, origin, factor }, bounds: rect };
+        self.meshes.add_card(card.clone());
+        if let Some(prev) = out.last_mut().filter(|p| p.prim.kind[0] == PRIM_MESH) {
+            let i = prev.prim.kind[1] as usize;
+            let joins = match &lighting {
+                Some(m) => self.meshes.batches[i].can_join(m),
+                None => self.meshes.batches[i].cards_only,
+            };
+            if prev.prim.kind[0] == PRIM_MESH && prev.prim.kind[2] == blend_code(Blend::Normal) && self.meshes.batches[i].list == serial && joins {
+                let batch = &mut self.meshes.batches[i];
+                batch.add_card(&card, false);
+                batch.members.push(index);
+                prev.bounds = batch.bounds;
+                return true;
+            }
+        }
+        let mut batch = match &lighting {
+            Some(m) => match crate::mesh3d::Batch::new(m) {
+                Some(b) => b,
+                None => return false,
+            },
+            None => crate::mesh3d::Batch::cards_only(),
+        };
+        batch.list = serial;
+        batch.members.push(index);
+        batch.add_card(&card, false);
+        let bounds = batch.bounds;
+        self.meshes.batches.push(batch);
+        let prim = Prim { kind: [PRIM_MESH, (self.meshes.batches.len() - 1) as u32, blend_code(Blend::Normal), 0], ..Default::default() };
+        out.push(Item { prim, forward: Proj::IDENTITY, bounds });
+        true
     }
 
     /// Glass refracts what is drawn before it: those items, drawn again
@@ -906,6 +984,15 @@ impl Builder<'_> {
         }
         items
     }
+}
+
+/// A flat 3D layer that can stand in the mesh depth buffer as a card.
+fn card_candidate(layer: &LayerState) -> bool {
+    layer.view.is_some()
+        && !matches!(layer.content, Content::Mesh(_) | Content::Group(_))
+        && !layer.is_isolated()
+        && layer.blend == Blend::Normal
+        && layer.opacity >= 0.999
 }
 
 /// Canvas bounds without the anti-aliasing margins.

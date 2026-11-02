@@ -38,6 +38,7 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
             effects: Vec::new(),
             matte: None,
             content: Content::Image { src: name.as_str().into(), size: Some(Vec2::new(tw, th)) },
+            view: None,
         });
         let text: Arc<str> = label.as_str().into();
         let count = text.chars().count();
@@ -64,6 +65,7 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
                 sweeps: Vec::new(),
                 units: Vec::new().into(),
             }),
+            view: None,
         });
     }
     let state = FrameState { t: 0.0, scene: None, background: Color::parse("#18181c").unwrap(), width, height, layers };
