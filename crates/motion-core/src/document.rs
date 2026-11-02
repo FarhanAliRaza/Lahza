@@ -237,6 +237,41 @@ pub struct Camera {
     /// 3D layers: move toward the point of interest (px).
     #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
     pub dolly: Property<f64>,
+    /// Depth of field: the sharp plane, as a depth like a layer's `z`
+    /// (0 = the point of interest's plane) or a layer id to keep sharp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<Focus>,
+    /// Depth of field: blur radius (px) per 100 px of depth away from the
+    /// focus plane; 0 turns it off. 3D layers only.
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub aperture: Property<f64>,
+}
+
+/// Where the camera focuses: a depth (animatable, for rack focus) or a
+/// layer whose depth it follows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Focus {
+    Depth(Property<f64>),
+    Layer(String),
+}
+
+impl Serialize for Focus {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Focus::Depth(p) => p.serialize(s),
+            Focus::Layer(id) => id.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Focus {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(id) => Ok(Focus::Layer(id)),
+            value => serde_json::from_value(value).map(Focus::Depth).map_err(|e| D::Error::custom(format!("focus: a depth or a layer id: {e}"))),
+        }
+    }
 }
 
 fn default_fov() -> Property<f64> {
@@ -248,7 +283,7 @@ fn is_default_fov(p: &Property<f64>) -> bool {
 
 impl Default for Camera {
     fn default() -> Self {
-        Self { position: None, zoom: one_prop(), rotation: zero_prop(), fov: default_fov(), orbit: zero_vec(), dolly: zero_prop() }
+        Self { position: None, zoom: one_prop(), rotation: zero_prop(), fov: default_fov(), orbit: zero_vec(), dolly: zero_prop(), focus: None, aperture: zero_prop() }
     }
 }
 
@@ -840,6 +875,9 @@ pub enum ShapeKind {
     /// Bézier path from SVG path data `d` (layer space; fill uses non-zero
     /// winding, `stroke` draws the outline, `trim` draws it on).
     Path,
+    /// A `size` box filled with a smooth blend of coloured `points`
+    /// (mesh/blob gradient backgrounds); `radius` rounds the corners.
+    Field,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -871,6 +909,41 @@ pub struct ShapeLayer {
     pub fill: Option<Paint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stroke: Option<Stroke>,
+    /// Field: the coloured points blended across the box.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<FieldPoint>,
+    /// Field: how far colours blend into each other (default 1; 0.25 is
+    /// crisp, 2 very soft).
+    #[serde(default = "one_prop", skip_serializing_if = "is_one")]
+    pub softness: Property<f64>,
+    /// Field: noise displacement of the blend in px (organic edges).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub warp: Property<f64>,
+    /// Field: the warp noise's feature size in px.
+    #[serde(default = "warp_scale", skip_serializing_if = "is_warp_scale")]
+    pub warp_scale: Property<f64>,
+}
+
+/// One coloured point of a field shape (layer space, like `d`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldPoint {
+    pub position: Property<Vec2>,
+    pub color: Property<Color>,
+    /// Reach of the colour in px: inside it the colour holds, beyond it it
+    /// gives way to the other points.
+    #[serde(default = "two_hundred")]
+    pub radius: Property<f64>,
+}
+
+fn two_hundred() -> Property<f64> {
+    Property::Constant(200.0)
+}
+fn warp_scale() -> Property<f64> {
+    Property::Constant(300.0)
+}
+fn is_warp_scale(p: &Property<f64>) -> bool {
+    *p == warp_scale()
 }
 
 fn hundred() -> Property<Vec2> {
@@ -1058,11 +1131,16 @@ pub struct Gradient {
     /// "linear" or "radial".
     #[serde(rename = "gradient")]
     pub kind: GradientKind,
-    /// Layer-space points: linear from→to; radial centre→edge.
+    /// Points: linear from→to; radial centre→edge. In `units`.
     pub from: Vec2,
     pub to: Vec2,
     /// [[offset, "#colour"], …], offsets in 0..1.
     pub stops: Vec<(f64, Color)>,
+    /// "layer" (default): `from`/`to` in layer px. "box": fractions of the
+    /// shape's box, [0, 0] top-left to [1, 1] bottom-right, so the gradient
+    /// stretches with an animated `size` (radials become ellipses).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub units: GradientUnits,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1070,6 +1148,14 @@ pub struct Gradient {
 pub enum GradientKind {
     Linear,
     Radial,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GradientUnits {
+    #[default]
+    Layer,
+    Box,
 }
 
 impl Serialize for Paint {
@@ -1099,6 +1185,8 @@ impl<'de> Deserialize<'de> for Paint {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stroke {
+    /// Ignored when `gradient` is set.
+    #[serde(default = "white_prop")]
     pub color: Property<Color>,
     #[serde(default = "four")]
     pub width: Property<f64>,
@@ -1124,6 +1212,33 @@ pub struct Stroke {
     /// Fade over this many px at the stroke's start (a fading tail).
     #[serde(default, skip_serializing_if = "is_default")]
     pub feather_start: f64,
+    /// Path strokes: colour along the stroke instead of `color`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient: Option<StrokeGradient>,
+}
+
+/// A stroke colour that changes along the path: offset 0 is the path's
+/// start, 1 its end, over the full path (trim reveals it; the colours do
+/// not slide while it draws on).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrokeGradient {
+    /// [[offset, "#colour"], …], offsets in 0..1.
+    pub stops: Vec<(f64, Color)>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub along: Along,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Along {
+    /// Arc length of the full path.
+    #[default]
+    Length,
+}
+
+fn white_prop() -> Property<Color> {
+    Property::Constant(Color::WHITE)
 }
 
 /// How a path stroke is outlined, when it is not the default round caps
@@ -1603,9 +1718,6 @@ pub enum PaletteOrder {
 fn fifty_vec() -> Property<Vec2> {
     Property::Constant(Vec2::new(50.0, 50.0))
 }
-fn two_hundred() -> Property<f64> {
-    Property::Constant(200.0)
-}
 fn full_turn() -> Property<f64> {
     Property::Constant(360.0)
 }
@@ -1765,6 +1877,34 @@ mod tests {
         .unwrap();
         let LayerKind::Shape(s) = &grad.kind else { panic!() };
         assert!(matches!(s.fill, Some(Paint::Gradient(_))));
+    }
+
+    #[test]
+    fn fields_stroke_gradients_box_units_and_focus_round_trip() {
+        let round_trip = |json: serde_json::Value| {
+            let layer = Layer::from_json(json).unwrap();
+            assert_eq!(Layer::from_json(serde_json::to_value(&layer).unwrap()).unwrap(), layer);
+            layer
+        };
+        let field = round_trip(serde_json::json!({
+            "id": "bg", "kind": "shape", "shape": "field", "size": [1920, 1080], "softness": 0.6, "warp": 20,
+            "points": [{"position": [0, 0], "color": "#ff3355"}, {"position": {"keys": [{"at": 0, "v": [100, 0]}]}, "color": "#2d5bff", "radius": 400}]
+        }));
+        let LayerKind::Shape(s) = &field.kind else { panic!() };
+        assert_eq!((s.shape, s.points.len(), s.points[0].radius.clone()), (ShapeKind::Field, 2, Property::Constant(200.0)));
+        let stroke = round_trip(serde_json::json!({
+            "id": "p", "kind": "shape", "shape": "path", "d": "M 0 0 H 100",
+            "stroke": {"width": 6, "gradient": {"stops": [[0, "#f00"], [1, "#00f"]], "along": "length"}},
+            "fill": {"gradient": "radial", "units": "box", "from": [0.5, 0.5], "to": [1, 0.5], "stops": [[0, "#fff"]]}
+        }));
+        let LayerKind::Shape(s) = &stroke.kind else { panic!() };
+        assert_eq!(s.stroke.as_ref().unwrap().color, Property::Constant(Color::WHITE), "colour may be left out");
+        assert!(matches!(&s.fill, Some(Paint::Gradient(g)) if g.units == GradientUnits::Box));
+        for (focus, expected) in [(serde_json::json!("hero"), Focus::Layer("hero".into())), (serde_json::json!(250), Focus::Depth(Property::Constant(250.0)))] {
+            let cam: Camera = serde_json::from_value(serde_json::json!({"focus": focus, "aperture": 2})).unwrap();
+            assert_eq!(cam.focus, Some(expected));
+            assert_eq!(serde_json::from_value::<Camera>(serde_json::to_value(&cam).unwrap()).unwrap(), cam);
+        }
     }
 }
 

@@ -139,14 +139,82 @@ fn mix4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
 
-fn gradient(prim: &Prim, l: V2, stops: &[[f32; 4]]) -> [f32; 4] {
+/// Fraction of the full path's length at the centreline point nearest `l`.
+fn along(prim: &Prim, l: V2, segments: &[[f32; 4]]) -> f32 {
+    let first = prim.paint2[0].to_bits() as usize;
+    let count = prim.paint2[1].to_bits() as usize;
+    let mut best = f32::MAX;
+    let mut u = 0.0;
+    for i in 0..count {
+        let s = segments[first + i];
+        let e = [s[2] - s[0], s[3] - s[1]];
+        let w = [l[0] - s[0], l[1] - s[1]];
+        let t = clamp01((w[0] * e[0] + w[1] * e[1]) / (e[0] * e[0] + e[1] * e[1]).max(1e-12));
+        let dx = w[0] - e[0] * t;
+        let dy = w[1] - e[1] * t;
+        let d = dx * dx + dy * dy;
+        if d < best {
+            best = d;
+            let m = segments[first + count + i];
+            u = m[0] + (m[1] - m[0]) * t;
+        }
+    }
+    u
+}
+
+/// Smooth colour field: points weighted by (1 + d²/r²)^−power, relative
+/// to the strongest so far-away pixels never underflow.
+fn field(prim: &Prim, l: V2, stops: &[[f32; 4]]) -> [f32; 4] {
+    let [warp, scale, power, _] = prim.paint2;
+    let mut p = l;
+    if warp != 0.0 {
+        let s = scale.max(1e-3);
+        let (qx, qy) = (l[0] / s, l[1] / s);
+        p = [l[0] + warp * value_noise(qx, qy, 7), l[1] + warp * value_noise(qx + 31.7, qy + 17.3, 13)];
+    }
+    let base = prim.paint[2] as usize * 2;
+    let count = prim.paint[3] as usize;
+    // One pass: weights are relative to the nearest point so far, and the
+    // sums rescale when a nearer one turns up.
+    let mut lo = 0.0f32;
+    let mut acc = [0.0f32; 4];
+    let mut sum = 0.0f32;
+    for i in 0..count {
+        let pt = stops[base + i * 2];
+        let (dx, dy) = (p[0] - pt[0], p[1] - pt[1]);
+        let x = (1.0 + (dx * dx + dy * dy) * pt[2]).log2();
+        if i == 0 {
+            lo = x;
+        } else if x < lo {
+            let k = (-power * (lo - x)).exp2();
+            acc = acc.map(|v| v * k);
+            sum *= k;
+            lo = x;
+        }
+        let w = (-power * (x - lo)).exp2();
+        let c = stops[base + i * 2 + 1];
+        for k in 0..4 {
+            acc[k] += c[k] * w;
+        }
+        sum += w;
+    }
+    acc.map(|v| v / sum.max(1e-30))
+}
+
+/// Colour of a non-solid paint (`PAINT_*`) at local point `l`.
+fn gradient(prim: &Prim, l: V2, stops: &[[f32; 4]], segments: &[[f32; 4]]) -> [f32; 4] {
+    let kind = prim.paint[1] as u32;
+    if kind == PAINT_FIELD {
+        return field(prim, l, stops);
+    }
     let [fx, fy, tx, ty] = prim.paint2;
     let d = [tx - fx, ty - fy];
     let dd = (d[0] * d[0] + d[1] * d[1]).max(1e-9);
-    let t = if prim.paint[1] < 1.5 {
-        ((l[0] - fx) * d[0] + (l[1] - fy) * d[1]) / dd
-    } else {
-        len([l[0] - fx, l[1] - fy]) / dd.sqrt()
+    let t = match kind {
+        PAINT_ALONG => along(prim, l, segments),
+        PAINT_ELLIPSE => len([(l[0] - fx) / tx.max(1e-6), (l[1] - fy) / ty.max(1e-6)]),
+        PAINT_LINEAR => ((l[0] - fx) * d[0] + (l[1] - fy) * d[1]) / dd,
+        _ => len([l[0] - fx, l[1] - fy]) / dd.sqrt(),
     };
     let base = prim.paint[2] as usize * 2;
     let count = prim.paint[3] as usize;
@@ -293,14 +361,15 @@ pub fn shade(prim: &Prim, p: V2, stops: &[[f32; 4]], segments: &[[f32; 4]], src:
             if prim.kind[3] & FLAG_FILL != 0 {
                 let cov = clamp01(0.5 - d / aa);
                 if cov > 0.0 {
-                    let c = if prim.paint[1] > 0.5 { gradient(prim, l, stops) } else { prim.fill };
+                    let c = if prim.paint[1] > 0.5 { gradient(prim, l, stops, segments) } else { prim.fill };
                     out = c.map(|v| v * cov);
                 }
             }
             if prim.kind[3] & FLAG_STROKE != 0 {
                 let cov = clamp01(0.5 - (d.abs() - prim.paint[0] * 0.5) / aa);
                 if cov > 0.0 {
-                    let s = prim.stroke.map(|v| v * cov);
+                    let c = if prim.paint[1] as u32 == PAINT_ALONG { gradient(prim, l, stops, segments) } else { prim.stroke };
+                    let s = c.map(|v| v * cov);
                     out = std::array::from_fn(|i| s[i] + out[i] * (1.0 - s[3]));
                 }
             }

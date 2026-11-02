@@ -196,7 +196,41 @@ fn gpu_matches_cpu() {
                 {"id": "g3", "kind": "shape", "shape": "path", "d": "M -30 0 Q 0 -40 30 0", "stroke": {"color": "#ff8800", "width": 5}, "trim": [0.1, 0.8], "transform": {"position": [60, 45]}}]}]}
     ]));
     p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 4 });
-    let c = Compiled::new(&p);
+    assert_gpu_matches_cpu(&p, &[0.0, 0.1, 0.5]);
+}
+
+/// The newer paints and depth of field: box gradients, a warped field,
+/// gradient strokes (plain, dashed, feathered and trimmed) and rack focus.
+#[test]
+fn gpu_matches_cpu_fields_strokes_and_focus() {
+    let mut p = project(json!([
+        {"id": "f", "kind": "shape", "shape": "field", "size": [320, 180], "warp": 12, "warp_scale": 40, "softness": 0.8,
+         "points": [{"position": {"keys": [{"at": 0, "v": [-100, -40]}, {"at": 1, "v": [60, 30]}]}, "color": "#ff3355", "radius": 50},
+                    {"position": [90, 30], "color": "#3355ff", "radius": 70}, {"position": [0, 60], "color": "#ffd23f80", "radius": 30}],
+         "transform": {"position": [160, 90]}},
+        {"id": "bx", "kind": "shape", "shape": "rect", "size": {"keys": [{"at": 0, "v": [60, 40]}, {"at": 1, "v": [120, 40]}]},
+         "fill": {"gradient": "linear", "units": "box", "from": [0, 0], "to": [1, 1], "stops": [[0, "#000000"], [1, "#00ff88"]]}, "transform": {"position": [80, 40]}},
+        {"id": "br", "kind": "shape", "shape": "circle", "size": [90, 50],
+         "fill": {"gradient": "radial", "units": "box", "from": [0.5, 0.5], "to": [1, 0.5], "stops": [[0, "#ffffff"], [1, "#ff000000"]]}, "transform": {"position": [240, 40]}},
+        {"id": "st1", "kind": "shape", "shape": "path", "d": "M 20 120 C 80 60 140 180 200 120 S 280 100 300 150",
+         "stroke": {"width": 9, "gradient": {"stops": [[0, "#ff0000"], [0.5, "#00ff00"], [1, "#0000ff"]]}}, "trim": [0.1, 0.9]},
+        {"id": "s2", "kind": "shape", "shape": "path", "d": {"shape": "star", "size": 90, "sides": 5},
+         "stroke": {"width": 6, "cap": "butt", "join": "miter", "dash": [14, 6], "feather": 40, "gradient": {"stops": [[0, "#ffff00"], [1, "#ff00ff"]]}},
+         "trim": {"keys": [{"at": 0, "v": [0, 0.3]}, {"at": 1, "v": [0, 1]}]}, "transform": {"position": [250, 120]}},
+        {"id": "near", "kind": "shape", "shape": "rect", "size": [60, 60], "fill": "#ffffff", "three_d": true, "transform": {"position": [100, 120], "z": -50}},
+        {"id": "far", "kind": "text", "text": "DOF", "size": 40, "color": "#00ffff", "three_d": true, "transform": {"position": [150, 150], "z": 300}}
+    ]));
+    p.scenes[0].camera.aperture = lahza_motion_core::property::Property::Constant(2.0);
+    p.scenes[0].camera.focus = Some(serde_json::from_value(json!({"keys": [{"at": 0, "v": -50}, {"at": 1, "v": 300}]})).unwrap());
+    assert_gpu_matches_cpu(&p, &[0.0, 0.4, 1.0]);
+    // Motion-blur samples merge several lists (segments and stops rebased).
+    p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 3 });
+    assert_gpu_matches_cpu(&p, &[0.5]);
+}
+
+fn assert_gpu_matches_cpu(p: &Project, times: &[f64]) {
+    let c = Compiled::new(p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
     let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
     let mut gpu = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
     if !gpu.is_gpu() {
@@ -204,7 +238,7 @@ fn gpu_matches_cpu() {
         return;
     }
     let mut cpu = cpu();
-    for t in [0.0, 0.1, 0.5] {
+    for &t in times {
         let a = gpu.render(&c, t);
         let b = cpu.render(&c, t);
         let mut max = 0u8;
@@ -1062,4 +1096,194 @@ fn feathered_reveal_is_a_soft_wipe_across_glyphs() {
     let m = (x0..=x1).filter(|x| ink[(x - x0) as usize] > 250).min_by_key(|x| (*x as i64 - (x0 + x1) as i64 / 2).abs()).unwrap();
     let cols = [column(&img, m), column(&img, x0 + 1), column(&img, x1 - 1)];
     assert!(cols[0] > 200 && cols[1] < 30 && cols[2] < 30, "{cols:?}");
+}
+
+#[test]
+fn box_gradients_follow_an_animated_size() {
+    let p = project(json!([{"id": "g", "kind": "shape", "shape": "rect", "transform": {"position": [160, 90]},
+        "size": {"keys": [{"at": 0, "v": [100, 40]}, {"at": 1, "v": [240, 40]}]},
+        "fill": {"gradient": "linear", "units": "box", "from": [0, 0.5], "to": [1, 0.5], "stops": [[0, "#000000"], [1, "#ffffff"]]}}]));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let mut r = cpu();
+    for (t, hw) in [(0.0, 50u32), (1.0, 120u32)] {
+        let img = r.render(&c, t);
+        let (left, mid, right) = (px(&img, 160 - hw + 2, 90)[0], px(&img, 160, 90)[0], px(&img, 160 + hw - 2, 90)[0]);
+        assert!(left < 12 && right > 243 && (mid as i32 - 128).abs() < 6, "t={t}: {left} {mid} {right}");
+    }
+    // A radial gradient in box units is an ellipse filling the box.
+    let p = project(json!([{"id": "e", "kind": "shape", "shape": "rect", "size": [200, 60], "transform": {"position": [160, 90]},
+        "fill": {"gradient": "radial", "units": "box", "from": [0.5, 0.5], "to": [1, 0.5], "stops": [[0, "#ffffff"], [1, "#000000"]]}}]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    let (x, y) = (px(&img, 160 + 70, 90)[0], px(&img, 160, 90 + 21)[0]);
+    assert!((x as i32 - y as i32).abs() <= 4 && (x as i32 - 77).abs() < 8, "70% out along x {x}, along y {y}");
+}
+
+#[test]
+fn stroke_gradient_runs_along_the_path() {
+    let stroke = |extra: serde_json::Value| {
+        let mut s = json!({"width": 20, "gradient": {"stops": [[0, "#ff0000"], [1, "#0000ff"]], "along": "length"}});
+        s.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        s
+    };
+    let render = |d: &str, s: serde_json::Value, trim: serde_json::Value| {
+        let p = project(json!([{"id": "p", "kind": "shape", "shape": "path", "d": d, "stroke": s, "trim": trim}]));
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        cpu().render(&c, 0.0)
+    };
+    // A U turn: a linear gradient could not make both arms' starts differ.
+    let u = "M 40 40 H 280 V 140 H 40";
+    let img = render(u, stroke(json!({})), json!([0, 1]));
+    let (a, b) = (px(&img, 50, 40), px(&img, 50, 140));
+    assert!(a[0] > 230 && a[2] < 25 && b[2] > 230 && b[0] < 25, "start {a:?} end {b:?}");
+    let corner = px(&img, 280, 90);
+    assert!((corner[0] as i32 - corner[2] as i32).abs() < 12, "halfway is half and half: {corner:?}");
+    // Trim reveals the colours without sliding them.
+    let trimmed = render(u, stroke(json!({})), json!([0, 0.6]));
+    assert_eq!(px(&trimmed, 200, 40), px(&img, 200, 40));
+    assert_eq!(px(&trimmed, 280, 90), corner);
+    assert_eq!(px(&trimmed, 100, 140), [0, 0, 0, 255], "background past the trim");
+    // Dashes and butt caps keep the same colours; feathers fade the head.
+    let dashed = render(u, stroke(json!({"cap": "butt", "dash": [30, 10]})), json!([0, 1]));
+    assert_eq!(px(&dashed, 55, 40), px(&img, 55, 40));
+    assert_eq!(px(&dashed, 75, 40), [0, 0, 0, 255], "a gap");
+    let feathered = render(u, stroke(json!({"feather": 120})), json!([0, 0.6]));
+    let (body, head) = (px(&feathered, 150, 40), px(&feathered, 280, 130));
+    assert_eq!(body, px(&img, 150, 40), "before the feather");
+    assert!((head[0] as u32 + head[2] as u32) < 80, "18 px from the end of a 120 px feather: {head:?}");
+    // No seams around a closed curve: neighbouring samples change gently.
+    let ring = render("M 160 30 A 60 60 0 1 1 159.99 30", json!({"width": 12, "gradient": {"stops": [[0, "#ff0000"], [0.5, "#00ff00"], [1, "#0000ff"]]}}), json!([0, 1]));
+    let mut prev: Option<[u8; 4]> = None;
+    for i in 10..350 {
+        let a = (i as f64).to_radians();
+        let q = px(&ring, (160.0 + 60.0 * a.sin()).round() as u32, (90.0 - 60.0 * a.cos()).round() as u32);
+        if let Some(p) = prev {
+            let d = (0..3).map(|k| p[k].abs_diff(q[k])).max().unwrap();
+            assert!(d <= 12, "jump at {i}°: {p:?} → {q:?}");
+        }
+        prev = Some(q);
+    }
+}
+
+/// Pixels between the dark background and a white edge along row `y`.
+fn soft_edge(img: &image::RgbaImage, y: u32, from: u32, to: u32) -> usize {
+    (from..to).filter(|x| (20..235).contains(&px(img, *x, y)[0])).count()
+}
+
+#[test]
+fn depth_of_field_blurs_by_distance_from_focus() {
+    let layers = json!([
+        {"id": "near", "kind": "shape", "shape": "rect", "size": [60, 60], "fill": "#ffffff", "three_d": true, "transform": {"position": [80, 90]}},
+        {"id": "far", "kind": "shape", "shape": "rect", "size": [60, 60], "fill": "#ffffff", "three_d": true, "transform": {"position": [240, 90], "z": 400}},
+        {"id": "hud", "kind": "shape", "shape": "rect", "size": [20, 20], "fill": "#ffffff", "transform": {"position": [160, 20]}}
+    ]);
+    let render = |focus: serde_json::Value, t: f64| {
+        let mut p = project(layers.clone());
+        p.scenes[0].camera.aperture = lahza_motion_core::property::Property::Constant(2.0);
+        p.scenes[0].camera.focus = Some(serde_json::from_value(focus).unwrap());
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        cpu().render(&c, t)
+    };
+    // Focused on the near plane: it stays crisp, the far one blurs.
+    let a = render(json!(0), 0.0);
+    let (near, far) = (soft_edge(&a, 90, 30, 80), soft_edge(&a, 90, 180, 240));
+    assert!(near <= 2 && far >= 8, "near {near} far {far}");
+    // Rack focus to the far plane over a second, or focus on its layer.
+    let rack = json!({"keys": [{"at": 0, "v": 0}, {"at": 1, "v": 400}]});
+    for b in [render(rack, 1.0), render(json!("far"), 0.0)] {
+        let (near, far) = (soft_edge(&b, 90, 30, 80), soft_edge(&b, 90, 180, 240));
+        assert!(near >= 8 && far <= 2, "near {near} far {far}");
+        // 2D layers are never blurred.
+        assert_eq!(soft_edge(&b, 20, 140, 160), 0);
+    }
+    // An unknown focus layer is an error.
+    let mut p = project(layers.clone());
+    p.scenes[0].camera.focus = Some(serde_json::from_value(json!("nope")).unwrap());
+    assert!(Compiled::new(&p).errors.iter().any(|e| e.contains("camera.focus")));
+}
+
+#[test]
+fn field_blends_points_smoothly() {
+    let layers = |warp: f64| json!([{"id": "f", "kind": "shape", "shape": "field", "size": [320, 180], "transform": {"position": [160, 90]}, "warp": warp,
+        "points": [{"position": {"keys": [{"at": 0, "v": [-110, 0]}, {"at": 1, "v": [-60, 0]}]}, "color": "#ff0000", "radius": 50},
+                   {"position": [110, 0], "color": "#0000ff", "radius": 50}]}]);
+    let c = Compiled::new(&project(layers(0.0)));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let mut r = cpu();
+    let img = r.render(&c, 0.0);
+    let (red, blue, mid) = (px(&img, 50, 90), px(&img, 270, 90), px(&img, 160, 90));
+    assert!(red[0] > 235 && red[2] < 20 && blue[2] > 235 && blue[0] < 20, "{red:?} {blue:?}");
+    assert!((mid[0] as i32 - mid[2] as i32).abs() < 6 && mid[0] > 100, "an even blend between them: {mid:?}");
+    // Smooth everywhere, and it fills the whole box (no gaps far away).
+    for y in [0, 90, 179] {
+        for x in 1..320 {
+            let (a, b) = (px(&img, x - 1, y), px(&img, x, y));
+            assert!((0..3).all(|k| a[k].abs_diff(b[k]) <= 4) && b[3] == 255, "({x}, {y}): {a:?} {b:?}");
+        }
+    }
+    // The red point moves right with its keys: the blend moves with it.
+    let later = r.render(&c, 1.0);
+    assert!(px(&later, 160, 90)[0] > mid[0] + 30, "{:?}", px(&later, 160, 90));
+    // Warp makes the boundary organic.
+    let warped = cpu().render(&Compiled::new(&project(layers(30.0))), 0.0);
+    assert!((0..180).any(|y| px(&warped, 160, y) != px(&img, 160, y)));
+}
+
+/// A 1080p frame with a 6-point warped field and depth of field on five 3D
+/// cards (rack focus), against the same cards on a flat background in
+/// focus. `cargo test -p lahza-motion-render --release -- --ignored --nocapture benchmark_field`
+#[test]
+#[ignore]
+fn benchmark_field_and_depth_of_field_1080p() {
+    let colours = ["#ff3355", "#7b61ff", "#00d4a6", "#ffd23f", "#2d5bff", "#ff8800"];
+    let points: Vec<serde_json::Value> = (0..6)
+        .map(|i| json!({"position": {"keys": [{"at": 0, "v": [-700 + i * 280, -300 + (i % 3) * 300]}, {"at": 4, "v": [-500 + i * 200, 300 - (i % 3) * 300]}]},
+            "color": colours[i as usize], "radius": 300}))
+        .collect();
+    let build = |field: bool, dof: bool| {
+        let mut layers = vec![if field {
+            json!({"id": "bg", "kind": "shape", "shape": "field", "size": [1920, 1080], "warp": 40, "transform": {"position": [960, 540]}, "points": points})
+        } else {
+            json!({"id": "bg", "kind": "shape", "shape": "rect", "size": [1920, 1080], "fill": "#203040", "transform": {"position": [960, 540]}})
+        }];
+        for i in 0..5 {
+            layers.push(json!({"id": format!("card{i}"), "kind": "shape", "shape": "rect", "size": [360, 220], "radius": 24, "fill": "#ffffff", "three_d": true,
+                "transform": {"position": [300 + i * 330, 540], "z": i * 250 - 250, "rotation_y": {"keys": [{"at": 0, "v": 10}, {"at": 4, "v": 30}]}}}));
+        }
+        let mut p = Project::new(1920, 1080, Fps::whole(60), 4.0);
+        let mut scene: Scene = serde_json::from_value(json!({"id": "s", "layers": layers})).unwrap();
+        if dof {
+            scene.camera.aperture = lahza_motion_core::property::Property::Constant(3.0);
+            scene.camera.focus = Some(serde_json::from_value(json!({"keys": [{"at": 0, "v": -250}, {"at": 4, "v": 750}]})).unwrap());
+        }
+        p.scenes.push(scene);
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        c
+    };
+    for backend in [Backend::Gpu, Backend::Cpu] {
+        for (label, field, dof) in [("flat, in focus", false, false), ("field", true, false), ("DOF", false, true), ("field + DOF", true, true)] {
+            let c = build(field, dof);
+            let mut r = Renderer::new(None, RenderOptions { backend, motion_blur: false, ..Default::default() });
+            if backend == Backend::Gpu && !r.is_gpu() {
+                eprintln!("no GPU: {}", r.backend_label());
+                break;
+            }
+            r.render(&c, 0.0);
+            let frames = if backend == Backend::Gpu { 120 } else { 6 };
+            let started = Instant::now();
+            for n in 0..frames {
+                r.render(&c, 0.5 + n as f64 / 60.0);
+            }
+            let per = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            eprintln!(
+                "{} {label}: {per:.2} ms/frame; build {:.2} ms, raster+readback {:.2} ms",
+                r.backend_label(),
+                r.stats.build_ms / r.stats.frames as f64,
+                r.stats.raster_ms / r.stats.frames as f64
+            );
+        }
+    }
 }

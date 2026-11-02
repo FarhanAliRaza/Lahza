@@ -214,8 +214,23 @@ pub struct ShapeState {
     /// Caps, joins, dashes and feather for path strokes; `None` is the
     /// default round caps and joins.
     pub stroke_style: Option<Arc<crate::document::StrokeStyle>>,
+    /// Path strokes: colour stops along the full path's length (0 = start).
+    pub stroke_gradient: Option<Arc<Vec<(f64, Color)>>>,
     /// Path for `ShapeKind::Path`, possibly mid-morph.
     pub path: Option<PathMorph>,
+    /// `ShapeKind::Field`: its points this frame.
+    pub field: Option<FieldState>,
+}
+
+/// A field shape's evaluated points (layer space) and blend.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldState {
+    /// (position, colour, radius px).
+    pub points: Vec<(Vec2, Color, f64)>,
+    pub softness: f64,
+    /// Noise displacement amplitude and feature size, px.
+    pub warp: f64,
+    pub warp_scale: f64,
 }
 
 /// `from` morphing toward `to` by `t` (0…1; springs may overshoot).
@@ -363,8 +378,16 @@ pub struct CScene {
     camera_fov: Prop<f64>,
     camera_orbit: Prop<Vec2>,
     camera_dolly: Prop<f64>,
+    camera_focus: Option<CFocus>,
+    camera_aperture: Prop<f64>,
     transition: Option<CTransition>,
     pub layers: Vec<CLayer>,
+}
+
+enum CFocus {
+    Depth(Prop<f64>),
+    /// A top-level layer of the scene.
+    Layer(usize),
 }
 
 struct CTransition {
@@ -498,7 +521,16 @@ struct CShape {
     fill: Option<CPaint>,
     stroke: Option<(Prop<Color>, Prop<f64>)>,
     stroke_style: Option<Arc<crate::document::StrokeStyle>>,
+    stroke_gradient: Option<Arc<Vec<(f64, Color)>>>,
     path: Option<(Vec<Arc<str>>, Prop<f64>)>,
+    field: Option<CField>,
+}
+
+struct CField {
+    points: Vec<(Prop<Vec2>, Prop<Color>, Prop<f64>)>,
+    softness: Prop<f64>,
+    warp: Prop<f64>,
+    warp_scale: Prop<f64>,
 }
 
 enum CPaint {
@@ -937,6 +969,38 @@ impl<'a> Compiler<'a> {
                     fill,
                     stroke,
                     stroke_style: s.stroke.as_ref().and_then(|st| st.style()).map(Arc::new),
+                    stroke_gradient: s.stroke.as_ref().and_then(|st| st.gradient.as_ref()).and_then(|g| {
+                        if g.stops.is_empty() {
+                            self.errors.push(format!("{id}.stroke.gradient: needs at least one stop"));
+                            return None;
+                        }
+                        let mut stops = g.stops.clone();
+                        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        Some(Arc::new(stops))
+                    }),
+                    field: (s.shape == ShapeKind::Field).then(|| {
+                        if s.points.is_empty() {
+                            self.errors.push(format!("{id}: shape \"field\" needs \"points\""));
+                        }
+                        CField {
+                            points: s
+                                .points
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| {
+                                    let what = |f: &str| format!("points[{i}].{f}");
+                                    (
+                                        self.prop(&p.position, id, &what("position"), start, step, shift),
+                                        self.prop(&p.color, id, &what("color"), start, step, shift),
+                                        self.prop(&p.radius, id, &what("radius"), start, step, shift),
+                                    )
+                                })
+                                .collect(),
+                            softness: self.prop(&s.softness, id, "softness", start, step, shift),
+                            warp: self.prop(&s.warp, id, "warp", start, step, shift),
+                            warp_scale: self.prop(&s.warp_scale, id, "warp_scale", start, step, shift),
+                        }
+                    }),
                     path: match (s.shape, &s.d) {
                         (ShapeKind::Path, Some(PathData::Static(v))) => Some((vec![v.svg().into()], Prop::constant(0.0))),
                         (ShapeKind::Path, Some(PathData::Keys(keys))) => {
@@ -1226,6 +1290,18 @@ impl Compiled {
             let camera_fov = c.prop(&scene.camera.fov, id, "camera.fov", start, None, pre_roll);
             let camera_orbit = c.prop(&scene.camera.orbit, id, "camera.orbit", start, None, pre_roll);
             let camera_dolly = c.prop(&scene.camera.dolly, id, "camera.dolly", start, None, pre_roll);
+            let camera_aperture = c.prop(&scene.camera.aperture, id, "camera.aperture", start, None, pre_roll);
+            let camera_focus = match &scene.camera.focus {
+                None => None,
+                Some(Focus::Depth(p)) => Some(CFocus::Depth(c.prop(p, id, "camera.focus", start, None, pre_roll))),
+                Some(Focus::Layer(layer)) => match scene.layers.iter().position(|l| l.id == *layer) {
+                    Some(i) => Some(CFocus::Layer(i)),
+                    None => {
+                        c.errors.push(format!("{id}.camera.focus: no top-level layer '{layer}' in the scene"));
+                        None
+                    }
+                },
+            };
             let layers = c.layers(&scene.layers, step, pre_roll);
             let transition = scene.transition.as_ref().map(|t| CTransition {
                 kind: t.kind,
@@ -1246,6 +1322,8 @@ impl Compiled {
                 camera_fov,
                 camera_orbit,
                 camera_dolly,
+                camera_focus,
+                camera_aperture,
                 transition,
                 layers,
             });
@@ -1362,8 +1440,25 @@ impl Compiled {
             .then(Affine::rotate(-roll))
             .then(Affine::translate(-center.x(), -center.y()));
         let orbit = scene.camera_orbit.at(tc);
-        let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, scene.camera_fov.at(tc), (orbit.x(), orbit.y()), scene.camera_dolly.at(tc));
-        Space { world: Mat4::IDENTITY, flat, cam, three_d: false }
+        let (fov, dolly) = (scene.camera_fov.at(tc), scene.camera_dolly.at(tc));
+        let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, fov, (orbit.x(), orbit.y()), dolly);
+        let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None };
+        let aperture = scene.camera_aperture.at(tc);
+        if aperture > 0.0 {
+            // Depths are view-space z; the point of interest sits at the
+            // camera's distance, so a focus depth reads like a layer's z.
+            let plane = match &scene.camera_focus {
+                None => Some(crate::space::focal(h, fov) - dolly),
+                Some(CFocus::Depth(p)) => Some(crate::space::focal(h, fov) - dolly + p.at(tc)),
+                Some(CFocus::Layer(i)) => {
+                    let mut cache = vec![None; scene.layers.len()];
+                    let world = layer_matrix(&scene.layers, *i, tc, None, &space, &mut cache);
+                    Some(view_depth(&space, world))
+                }
+            };
+            space.dof = plane.map(|plane| Dof { plane, per_px: aperture / 100.0 });
+        }
+        space
     }
 
     fn scene_layers(&self, scene: &CScene, t: f64, out: &mut Vec<LayerState>) {
@@ -1459,7 +1554,9 @@ fn canvas_rect(id: &str, w: f64, h: f64, color: Color) -> LayerState {
             fill: Some(PaintState::Solid(color)),
             stroke: None,
             stroke_style: None,
+            stroke_gradient: None,
             path: None,
+            field: None,
         }),
     }
 }
@@ -1473,6 +1570,20 @@ struct Space {
     cam: Camera3,
     /// Inside a 3D comp: everything is on its plane, projected.
     three_d: bool,
+    /// Depth of field for 3D layers.
+    dof: Option<Dof>,
+}
+
+/// Depth of field: blur sigma = `per_px` × |view depth − `plane`| canvas px.
+#[derive(Clone, Copy)]
+struct Dof {
+    plane: f64,
+    per_px: f64,
+}
+
+/// View-space depth of a layer's origin.
+fn view_depth(space: &Space, world: Mat4) -> f64 {
+    space.cam.view.then(world).apply(0.0, 0.0, 0.0)[2]
 }
 
 impl Space {
@@ -1613,7 +1724,7 @@ fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, space: &Space, pare
             .iter()
             .map(|&k| {
                 let world = space.world.then(layer_matrix(layers, k, tc, inherited, space, &mut cache));
-                (space.cam.view.then(world).apply(0.0, 0.0, 0.0)[2], k)
+                (view_depth(space, world), k)
             })
             .collect();
         // Stable: equal depths keep list order.
@@ -1703,6 +1814,15 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             }
         })
         .collect();
+    let mut effects = effects;
+    // Depth of field blurs each 3D layer by its distance from the focus
+    // plane (comps pass it on to their children instead).
+    if let (true, Some(dof), false) = (three_d, space.dof, matches!(l.kind, CKind::Comp(_))) {
+        let sigma = dof.per_px * (view_depth(space, world) - dof.plane).abs();
+        if sigma > 0.05 {
+            effects.insert(0, EffectState::Blur { sigma, repeat_edges: false });
+        }
+    }
     let matte = l.matte.map(|(mi, mode)| {
         let mut src = Vec::new();
         layer(layers, mi, tc, inherited, space, 1.0, cache, true, &mut src);
@@ -1753,7 +1873,14 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             }),
             stroke: s.stroke.as_ref().map(|(c, w)| (clamp_color(c.at(t)), w.at(t).max(0.0))),
             stroke_style: s.stroke_style.clone(),
+            stroke_gradient: s.stroke_gradient.clone(),
             path: s.path.as_ref().map(|(paths, index)| path_morph(paths, index.at(t))),
+            field: s.field.as_ref().map(|f| FieldState {
+                points: f.points.iter().map(|(p, c, r)| (p.at(t), clamp_color(c.at(t)), r.at(t).max(1e-3))).collect(),
+                softness: f.softness.at(t).clamp(0.05, 10.0),
+                warp: f.warp.at(t),
+                warp_scale: f.warp_scale.at(t).max(1e-3),
+            }),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },

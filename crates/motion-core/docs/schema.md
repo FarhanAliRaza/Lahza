@@ -54,7 +54,7 @@ Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 `glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `follow`, `hidden`.
 
 Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
-`star`, `line`, `path` with SVG `d`), `text`, `image`, `video`, `comp`,
+`star`, `line`, `path` with SVG `d`, `field`), `text`, `image`, `video`, `comp`,
 `instancer`.
 
 ```json
@@ -72,6 +72,45 @@ fading tail):
 ```json
 {"id": "guide", "kind": "shape", "shape": "path", "d": "M 0 450 H 1080",
  "stroke": {"color": "#3b35b0", "width": 3, "cap": "butt", "dash": [14, 12]}}
+```
+
+A path stroke's colour can run along its length: `gradient` replaces
+`color`; offset 0 is the path's start and 1 its end, measured over the
+full path, so `trim` reveals the colours without sliding them while it
+draws on. It works with caps, joins, dashes and feathers (`along` is
+`"length"`, the default). Other shapes: use a path primitive
+(`"d": {"shape": "circle", "size": 200}`):
+
+```json
+{"id": "route", "kind": "shape", "shape": "path", "d": "M -300 0 C -100 -200 100 200 300 0",
+ "stroke": {"width": 8, "gradient": {"stops": [[0, "#ff3d7f"], [1, "#ffd23f"]], "along": "length"}},
+ "trim": {"keys": [{"at": 0, "v": [0, 0]}, {"at": 1, "v": [0, 1]}]}}
+```
+
+Gradient fills take `"units": "box"` to place `from`/`to` as fractions of
+the shape's box ([0, 0] top-left, [1, 1] bottom-right; a path's box is its
+bounds), so the gradient stretches with an animated `size`; radial ones
+become ellipses. The default `"layer"` units are layer px:
+
+```json
+{"id": "bar", "kind": "shape", "shape": "rect", "size": {"keys": [{"at": 0, "v": [10, 40]}, {"at": 1, "v": [600, 40]}]},
+ "fill": {"gradient": "linear", "units": "box", "from": [0, 0.5], "to": [1, 0.5], "stops": [[0, "#2d5bff"], [1, "#00d4a6"]]}}
+```
+
+`shape: "field"` fills its `size` box (corners rounded by `radius`) with a
+smooth blend of coloured `points` (mesh / blob gradient backgrounds, one
+GPU primitive). Each point has an animatable `position` (layer space,
+centred like `d`), `color` and `radius` (px it holds its colour, default
+200). `softness` (default 1; 0.25 crisp, 2 very soft) sets how far
+colours blend; `warp` (px) and `warp_scale` (feature px, default 300) bend
+the blend with noise:
+
+```json
+{"id": "bg", "kind": "shape", "shape": "field", "size": [1920, 1080], "transform": {"position": [960, 540]},
+ "softness": 1, "warp": 40,
+ "points": [{"position": {"keys": [{"at": 0, "v": [-600, -200]}, {"at": 6, "v": [-200, 100]}]}, "color": "#ff3355", "radius": 350},
+            {"position": [500, 200], "color": "#7b61ff", "radius": 400},
+            {"position": {"base": [0, 0], "add": [{"type": "wiggle", "hz": 0.2, "amp": [200, 120]}]}, "color": "#00d4a6"}]}
 ```
 
 `follow` places a layer on a sibling path layer, evaluated at every
@@ -145,6 +184,17 @@ instancer is drawn as one picture (like a comp).
 Scenes may arrive with a transition centred on their cut:
 `"transition": {"type": "whip", "dur": "8f", "direction": "left"}`
 (`fade`, `push`, `slide`, `zoom`, `wipe`, `whip`).
+
+Depth of field (2.5D): the scene `camera` takes `aperture`, the blur
+radius in px per 100 px of depth away from the focus plane (0 = off), and
+`focus`, the sharp plane as a depth read like a layer's `z` (0 = the point
+of interest's plane, the default; animatable for a rack focus) or the id of
+a top-level layer to keep sharp. Every 3D layer (and each child of a 3D
+comp) blurs by its distance from that plane; 2D layers are unaffected:
+
+```json
+"camera": {"aperture": 2, "focus": {"keys": [{"at": "bar:3", "v": 0}, {"at": "bar:4", "v": 600, "ease": "glide"}]}}
+```
 
 Shapes and text are centred on their origin: `position` places their centre.
 

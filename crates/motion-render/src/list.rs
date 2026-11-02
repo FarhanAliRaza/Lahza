@@ -12,10 +12,10 @@
 use crate::font::{self, Fonts};
 use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
-use lahza_motion_core::path::{self, morph, trim};
+use lahza_motion_core::path::{self, morph, trim_measured};
 use lahza_motion_core::space::Proj;
-use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PostKind, ShapeState, TextState};
-use lahza_motion_core::document::{Blend, Gradient, GradientKind, LineCap, LineJoin, MatteMode, ShapeKind, StrokeAlign, StrokeStyle};
+use lahza_motion_core::compile::{Affine, Content, EffectState, FieldState, FrameState, LayerState, PaintState, PostKind, ShapeState, TextState};
+use lahza_motion_core::document::{Blend, Gradient, GradientKind, GradientUnits, LineCap, LineJoin, MatteMode, ShapeKind, StrokeAlign, StrokeStyle};
 use lahza_motion_core::value::{Color, Vec2};
 
 pub const TILE: u32 = 16;
@@ -38,6 +38,22 @@ pub const SHAPE_LINE: u32 = 4;
 pub const SHAPE_STAR: u32 = 5;
 /// Flattened Bézier path: geom2 = [first segment, count, open (1) / filled (0)].
 pub const SHAPE_PATH: u32 = 6;
+
+/// Paint kinds (paint.y): where a fill's colour comes from.
+pub const PAINT_SOLID: u32 = 0;
+/// paint2 = [from, to].
+pub const PAINT_LINEAR: u32 = 1;
+/// paint2 = [centre, edge point].
+pub const PAINT_RADIAL: u32 = 2;
+/// Axis-aligned ellipse: paint2 = [centre, radii].
+pub const PAINT_ELLIPSE: u32 = 3;
+/// Along a path: paint2 = [first centreline segment, count] (bits); the
+/// count segments after them hold each one's [u0, u1] (fractions of the
+/// full path's length).
+pub const PAINT_ALONG: u32 = 4;
+/// Field: per point a stop pair [x, y, 1/r², 0] + premultiplied colour;
+/// paint2 = [warp px, warp scale px, falloff power, 0].
+pub const PAINT_FIELD: u32 = 5;
 
 pub const FLAG_FILL: u32 = 1;
 pub const FLAG_STROKE: u32 = 2;
@@ -71,10 +87,10 @@ pub struct Prim {
     pub fill: [f32; 4],
     /// Premultiplied stroke colour.
     pub stroke: [f32; 4],
-    /// x: stroke width, y: gradient kind (0 none, 1 linear, 2 radial),
-    /// z: first stop, w: stop count.
+    /// x: stroke width, y: paint kind (`PAINT_*`), z: first stop, w: stop
+    /// count.
     pub paint: [f32; 4],
-    /// Gradient from.xy, to.xy in local units.
+    /// Paint geometry in local units (see `PAINT_*`).
     pub paint2: [f32; 4],
 }
 
@@ -565,6 +581,7 @@ impl Builder<'_> {
                 let (hw, hh) = (s.size.x() / 2.0, s.size.y() / 2.0);
                 let half_t = s.thickness / 2.0;
                 let bounds_half;
+                let mut box_half = None;
                 match s.shape {
                     ShapeKind::Circle => {
                         prim.kind[1] = SHAPE_ELLIPSE;
@@ -606,8 +623,14 @@ impl Builder<'_> {
                         let len = s.size.x();
                         prim.geom = [(-len / 2.0 + len * t0) as f32, (-len / 2.0 + len * t1) as f32, half_t as f32, 0.0];
                         bounds_half = (hw + half_t, half_t);
+                        box_half = Some((hw, half_t));
                     }
                     ShapeKind::Path => unreachable!("paths are handled above"),
+                    ShapeKind::Field => {
+                        prim.kind[1] = SHAPE_RECT;
+                        prim.geom = [hw as f32, hh as f32, s.radius.min(hw.min(hh)) as f32, 0.0];
+                        bounds_half = (hw, hh);
+                    }
                     ShapeKind::Polygon | ShapeKind::Star => {
                         prim.kind[1] = SHAPE_STAR;
                         let n = s.sides.max(3) as f64;
@@ -617,29 +640,19 @@ impl Builder<'_> {
                     }
                 }
                 let stroke_w = s.stroke.map(|(_, w)| w).unwrap_or(0.0);
-                match &s.fill {
-                    Some(PaintState::Solid(c)) => {
-                        prim.kind[3] |= FLAG_FILL;
-                        prim.fill = premul(*c, 1.0);
-                    }
-                    Some(PaintState::Gradient(g)) => {
-                        prim.kind[3] |= FLAG_FILL;
-                        prim.fill = [1.0; 4];
-                        prim.paint[1] = match g.kind {
-                            GradientKind::Linear => 1.0,
-                            GradientKind::Radial => 2.0,
-                        };
-                        prim.paint[2] = (stops.len() / 2) as f32;
-                        prim.paint[3] = g.stops.len() as f32;
-                        let mut sorted = g.stops.clone();
-                        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-                        for (offset, color) in sorted {
-                            stops.push([offset as f32, 0.0, 0.0, 0.0]);
-                            stops.push(premul(color, 1.0));
+                let (bx, by) = box_half.unwrap_or(bounds_half);
+                match (&s.field, &s.fill) {
+                    (Some(field), _) => {
+                        if !field.points.is_empty() {
+                            prim.kind[3] |= FLAG_FILL;
+                            set_field(&mut prim, field, stops);
                         }
-                        prim.paint2 = [g.from.x() as f32, g.from.y() as f32, g.to.x() as f32, g.to.y() as f32];
                     }
-                    None => {}
+                    (None, Some(fill)) => {
+                        prim.kind[3] |= FLAG_FILL;
+                        set_fill(&mut prim, fill, stops, [-bx, -by, bx, by]);
+                    }
+                    (None, None) => {}
                 }
                 if let Some((c, w)) = s.stroke {
                     if w > 0.0 && c.0[3] > 0.0 {
@@ -869,42 +882,122 @@ fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mu
         let lines: Vec<Vec<(f64, f64)>> = subpaths.iter().map(|(p, _)| p.clone()).collect();
         let (first, count, b) = push_segments(&lines, true, segments);
         let mut prim = Prim { kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_FILL], geom2: [f32::from_bits(first), f32::from_bits(count), 0.0, 0.0], ..Default::default() };
-        set_fill(&mut prim, fill, stops);
+        set_fill(&mut prim, fill, stops, b);
         add(prim, b, 0.0);
     }
     if let Some((color, width)) = s.stroke {
         let (t0, t1) = (s.trim.x().clamp(0.0, 1.0), s.trim.y().clamp(0.0, 1.0));
-        if width > 0.0 && color.0[3] > 0.0 && t1 > t0 {
-            let lines = trim(&subpaths, t0, t1);
+        let along = s.stroke_gradient.as_deref();
+        if width > 0.0 && (color.0[3] > 0.0 || along.is_some()) && t1 > t0 {
+            let measured = trim_measured(&subpaths, t0, t1);
+            let lines: Vec<Vec<(f64, f64)>> = measured.iter().map(|l| l.iter().map(|(p, _)| *p).collect()).collect();
+            // Colour along the length: stops (feathers folded in) looked
+            // up by the nearest point of the visible centreline.
+            let along_stops = along.map(|g| along_stops(g, s.stroke_style.as_deref(), (t0, t1), path::length(&subpaths)));
             if let Some(style) = &s.stroke_style {
                 // Caps, joins, dashes and feather: outline the stroke and fill it.
+                let centreline = along_stops.as_ref().map(|_| {
+                    let (first, count, _) = push_segments(&lines, false, segments);
+                    push_params(&measured, segments);
+                    (first, count)
+                });
                 let outline = stroke_outline(&lines, width, style, tolerance);
                 let (first, count, b) = push_segments(&outline, true, segments);
                 if count > 0 {
                     let mut prim = Prim { kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_FILL], geom2: [f32::from_bits(first), f32::from_bits(count), 0.0, 0.0], ..Default::default() };
-                    let paint = match feather_gradient(&lines, style, color) {
-                        Some(g) => PaintState::Gradient(std::sync::Arc::new(g)),
-                        None => PaintState::Solid(color),
-                    };
-                    set_fill(&mut prim, &paint, stops);
+                    match (centreline, &along_stops) {
+                        (Some(c), Some(a)) => set_along(&mut prim, c, a, stops),
+                        _ => {
+                            let paint = match feather_gradient(&lines, style, color) {
+                                Some(g) => PaintState::Gradient(std::sync::Arc::new(g)),
+                                None => PaintState::Solid(color),
+                            };
+                            set_fill(&mut prim, &paint, stops, b);
+                        }
+                    }
                     add(prim, b, 0.0);
                 }
                 return items;
             }
             let (first, count, b) = push_segments(&lines, false, segments);
             if count > 0 {
-                let prim = Prim {
+                let mut prim = Prim {
                     kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_STROKE],
                     geom2: [f32::from_bits(first), f32::from_bits(count), 1.0, 0.0],
                     stroke: premul(color, 1.0),
                     paint: [width as f32, 0.0, 0.0, 0.0],
                     ..Default::default()
                 };
+                if let Some(a) = &along_stops {
+                    // The stroke's own segments are its centreline.
+                    push_params(&measured, segments);
+                    set_along(&mut prim, (first, count), a, stops);
+                }
                 add(prim, b, width / 2.0);
             }
         }
     }
     items
+}
+
+/// Appends [u0, u1, 0, 0] for each segment of `measured`, in the order
+/// `push_segments(…, false, …)` pushed them.
+fn push_params(measured: &[Vec<((f64, f64), f64)>], segments: &mut Vec<[f32; 4]>) {
+    for line in measured {
+        for w in line.windows(2) {
+            segments.push([w[0].1 as f32, w[1].1 as f32, 0.0, 0.0]);
+        }
+    }
+}
+
+fn set_along(prim: &mut Prim, (first, count): (u32, u32), along: &[(f32, [f32; 4])], stops: &mut Vec<[f32; 4]>) {
+    push_stops(prim, along, stops);
+    prim.paint[1] = PAINT_ALONG as f32;
+    prim.paint2 = [f32::from_bits(first), f32::from_bits(count), 0.0, 0.0];
+}
+
+/// A stroke gradient's stops (premultiplied) over the full path's length,
+/// times the feathers' opacity ramps at the ends of the visible part
+/// `trim`. Ramps are sampled finely, so the product stays smooth.
+fn along_stops(gradient: &[(f64, Color)], style: Option<&StrokeStyle>, trim: (f64, f64), length: f64) -> Vec<(f32, [f32; 4])> {
+    let colours: Vec<(f64, [f32; 4])> = gradient.iter().map(|(o, c)| (*o, premul(*c, 1.0))).collect();
+    let colour = |u: f64| -> [f32; 4] {
+        let (first, last) = (colours[0], colours[colours.len() - 1]);
+        if u <= first.0 {
+            return first.1;
+        }
+        for w in colours.windows(2) {
+            if u <= w[1].0 {
+                let k = ((u - w[0].0) / (w[1].0 - w[0].0).max(1e-6)).clamp(0.0, 1.0) as f32;
+                return std::array::from_fn(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * k);
+            }
+        }
+        last.1
+    };
+    let (tail, head) = match (style, length > 0.0) {
+        (Some(st), true) => (st.feather_start / length, st.feather / length),
+        _ => (0.0, 0.0),
+    };
+    let alpha = |u: f64| {
+        let a = if tail > 0.0 { ((u - trim.0) / tail).clamp(0.0, 1.0) } else { 1.0 };
+        let b = if head > 0.0 { ((trim.1 - u) / head).clamp(0.0, 1.0) } else { 1.0 };
+        a * b
+    };
+    let mut at: Vec<f64> = colours.iter().map(|(o, _)| *o).collect();
+    const STEPS: usize = 8;
+    for (from, to) in [(trim.0, trim.0 + tail), (trim.1 - head, trim.1)] {
+        if to > from {
+            at.extend((0..=STEPS).map(|i| from + (to - from) * i as f64 / STEPS as f64));
+        }
+    }
+    at.sort_by(|a, b| a.total_cmp(b));
+    at.dedup_by(|a, b| (*a - *b).abs() < 1e-7);
+    at.into_iter()
+        .map(|u| {
+            let (c, a) = (colour(u), alpha(u) as f32);
+            (u as f32, c.map(|v| v * a))
+        })
+        .collect()
 }
 
 /// The filled outline of a stroke along `lines` (layer space), flattened.
@@ -972,7 +1065,7 @@ fn feather_gradient(lines: &[Vec<(f64, f64)>], style: &StrokeStyle, color: Color
     let first = lines.first()?;
     let last = lines.last()?;
     let (start, end) = (*first.first()?, *last.last()?);
-    let linear = |from: (f64, f64), to: (f64, f64), stops| Gradient { kind: GradientKind::Linear, from: Vec2::new(from.0, from.1), to: Vec2::new(to.0, to.1), stops };
+    let linear = |from: (f64, f64), to: (f64, f64), stops| Gradient { kind: GradientKind::Linear, from: Vec2::new(from.0, from.1), to: Vec2::new(to.0, to.1), stops, units: GradientUnits::Layer };
     match (style.feather_start > 0.0, style.feather > 0.0) {
         (false, false) => None,
         (false, true) => {
@@ -995,24 +1088,71 @@ fn feather_gradient(lines: &[Vec<(f64, f64)>], style: &StrokeStyle, color: Color
     }
 }
 
-fn set_fill(prim: &mut Prim, fill: &PaintState, stops: &mut Vec<[f32; 4]>) {
+/// Sets a solid or gradient fill; `bbox` (local [x0, y0, x1, y1]) is the
+/// shape's box for gradients in box units.
+fn set_fill(prim: &mut Prim, fill: &PaintState, stops: &mut Vec<[f32; 4]>, bbox: [f64; 4]) {
     match fill {
         PaintState::Solid(c) => prim.fill = premul(*c, 1.0),
         PaintState::Gradient(g) => {
             prim.fill = [1.0; 4];
-            prim.paint[1] = match g.kind {
-                GradientKind::Linear => 1.0,
-                GradientKind::Radial => 2.0,
-            };
-            prim.paint[2] = (stops.len() / 2) as f32;
-            prim.paint[3] = g.stops.len() as f32;
             let mut sorted = g.stops.clone();
             sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-            for (offset, color) in sorted {
-                stops.push([offset as f32, 0.0, 0.0, 0.0]);
-                stops.push(premul(color, 1.0));
-            }
-            prim.paint2 = [g.from.x() as f32, g.from.y() as f32, g.to.x() as f32, g.to.y() as f32];
+            let sorted: Vec<(f32, [f32; 4])> = sorted.into_iter().map(|(o, c)| (o as f32, premul(c, 1.0))).collect();
+            push_stops(prim, &sorted, stops);
+            let (kind, geometry) = gradient_geometry(g, bbox);
+            prim.paint[1] = kind as f32;
+            prim.paint2 = geometry.map(|v| v as f32);
         }
     }
+}
+
+fn push_stops(prim: &mut Prim, sorted: &[(f32, [f32; 4])], stops: &mut Vec<[f32; 4]>) {
+    prim.paint[2] = (stops.len() / 2) as f32;
+    prim.paint[3] = sorted.len() as f32;
+    for (offset, color) in sorted {
+        stops.push([*offset, 0.0, 0.0, 0.0]);
+        stops.push(*color);
+    }
+}
+
+/// Paint kind and geometry of a gradient in local units. Box units map
+/// [0, 0]..[1, 1] onto `bbox`: a linear gradient stays linear (its
+/// equivalent local from/to), a radial one becomes an ellipse.
+fn gradient_geometry(g: &Gradient, bbox: [f64; 4]) -> (u32, [f64; 4]) {
+    let (f, t) = ([g.from.x(), g.from.y()], [g.to.x(), g.to.y()]);
+    let (m, s) = ([bbox[0], bbox[1]], [bbox[2] - bbox[0], bbox[3] - bbox[1]]);
+    match (g.units, g.kind) {
+        (GradientUnits::Layer, GradientKind::Linear) => (PAINT_LINEAR, [f[0], f[1], t[0], t[1]]),
+        (GradientUnits::Layer, GradientKind::Radial) => (PAINT_RADIAL, [f[0], f[1], t[0], t[1]]),
+        (GradientUnits::Box, GradientKind::Radial) => {
+            let r = (t[0] - f[0]).hypot(t[1] - f[1]);
+            (PAINT_ELLIPSE, [m[0] + f[0] * s[0], m[1] + f[1] * s[1], r * s[0].abs(), r * s[1].abs()])
+        }
+        (GradientUnits::Box, GradientKind::Linear) => {
+            // t(l) = (((l − m) / s) − f)·d / |d|² = a·l + b.
+            let d = [t[0] - f[0], t[1] - f[1]];
+            let dd = d[0] * d[0] + d[1] * d[1];
+            if dd < 1e-18 || s[0].abs() < 1e-9 || s[1].abs() < 1e-9 {
+                return (PAINT_LINEAR, [0.0; 4]);
+            }
+            let a = [d[0] / (s[0] * dd), d[1] / (s[1] * dd)];
+            let b = -(m[0] * a[0] + m[1] * a[1]) - (f[0] * d[0] + f[1] * d[1]) / dd;
+            let aa = a[0] * a[0] + a[1] * a[1];
+            let from = [-b * a[0] / aa, -b * a[1] / aa];
+            (PAINT_LINEAR, [from[0], from[1], from[0] + a[0] / aa, from[1] + a[1] / aa])
+        }
+    }
+}
+
+/// A field's points as stop pairs (see `PAINT_FIELD`).
+fn set_field(prim: &mut Prim, field: &FieldState, stops: &mut Vec<[f32; 4]>) {
+    prim.fill = [1.0; 4];
+    prim.paint[1] = PAINT_FIELD as f32;
+    prim.paint[2] = (stops.len() / 2) as f32;
+    prim.paint[3] = field.points.len() as f32;
+    for (p, c, r) in &field.points {
+        stops.push([p.x() as f32, p.y() as f32, (1.0 / (r * r)) as f32, 0.0]);
+        stops.push(premul(*c, 1.0));
+    }
+    prim.paint2 = [field.warp as f32, field.warp_scale as f32, (2.0 / field.softness) as f32, 0.0];
 }

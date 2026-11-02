@@ -175,12 +175,75 @@ fn shape_distance(prim: Prim, l: vec2<f32>) -> f32 {
     }
 }
 
+fn along(prim: Prim, l: vec2<f32>) -> f32 {
+    let first = bitcast<u32>(prim.paint2.x);
+    let count = bitcast<u32>(prim.paint2.y);
+    var best = 3.0e38;
+    var u = 0.0;
+    for (var i = 0u; i < count; i++) {
+        let s = b_segs[first + i];
+        let e = s.zw - s.xy;
+        let w = l - s.xy;
+        let t = clamp01(dot(w, e) / max(dot(e, e), 1e-12));
+        let q = w - e * t;
+        let d = dot(q, q);
+        if d < best {
+            best = d;
+            let m = b_segs[first + count + i];
+            u = m.x + (m.y - m.x) * t;
+        }
+    }
+    return u;
+}
+
+fn field_lx(p: vec2<f32>, pt: vec4<f32>) -> f32 {
+    let d = p - pt.xy;
+    return log2(1.0 + dot(d, d) * pt.z);
+}
+
+fn field(prim: Prim, l: vec2<f32>) -> vec4<f32> {
+    let warp = prim.paint2.x;
+    let power = prim.paint2.z;
+    var p = l;
+    if warp != 0.0 {
+        let s = max(prim.paint2.y, 1e-3);
+        let q = l / s;
+        p = l + warp * vec2<f32>(value_noise(q.x, q.y, 7u), value_noise(q.x + 31.7, q.y + 17.3, 13u));
+    }
+    let base = u32(prim.paint.z) * 2u;
+    let count = u32(prim.paint.w);
+    var lo = 0.0;
+    var acc = vec4<f32>(0.0);
+    var sum = 0.0;
+    for (var i = 0u; i < count; i++) {
+        let x = field_lx(p, b_stops[base + i * 2u]);
+        if i == 0u {
+            lo = x;
+        } else if x < lo {
+            let k = exp2(-power * (lo - x));
+            acc *= k;
+            sum *= k;
+            lo = x;
+        }
+        let w = exp2(-power * (x - lo));
+        acc += b_stops[base + i * 2u + 1u] * w;
+        sum += w;
+    }
+    return acc / max(sum, 1e-30);
+}
+
 fn gradient(prim: Prim, l: vec2<f32>) -> vec4<f32> {
+    let kind = u32(prim.paint.y);
+    if kind == 5u { return field(prim, l); }
     let origin = prim.paint2.xy;
     let d = prim.paint2.zw - origin;
     let dd = max(dot(d, d), 1e-9);
     var t: f32;
-    if prim.paint.y < 1.5 {
+    if kind == 4u {
+        t = along(prim, l);
+    } else if kind == 3u {
+        t = length((l - origin) / max(prim.paint2.zw, vec2<f32>(1e-6)));
+    } else if kind == 1u {
         t = dot(l - origin, d) / dd;
     } else {
         t = length(l - origin) / sqrt(dd);
@@ -316,7 +379,9 @@ fn shade(prim_in: Prim, p: vec2<f32>) -> vec4<f32> {
         if (prim.kind.w & 2u) != 0u {
             let cov = clamp01(0.5 - (abs(d) - prim.paint.x * 0.5) / aa);
             if cov > 0.0 {
-                let s = prim.stroke * cov;
+                var sc = prim.stroke;
+                if u32(prim.paint.y) == 4u { sc = gradient(prim, l); }
+                let s = sc * cov;
                 out = s + out * (1.0 - s.w);
             }
         }

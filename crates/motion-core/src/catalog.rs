@@ -183,15 +183,18 @@ pub fn catalog_json() -> Value {
         },
         "layer_kinds": {
             "shape": {
-                "shape": "circle | rect | capsule | ring | arc | polygon | star | line | path",
+                "shape": "circle | rect | capsule | ring | arc | polygon | star | line | path | field",
                 "d": "path only: SVG path data in layer space (M L H V C S Q T A Z, absolute or relative), or a primitive {\"shape\": \"circle|rect|capsule|polygon|star\", \"size\", \"radius\", \"sides\", \"inner\"}, or keys that MORPH: {\"keys\": [{\"at\", \"v\": path or primitive, \"ease\", \"anchor\", \"lead\", \"dur\"}]} (outlines are resampled and aligned, so any two shapes morph); fill uses non-zero winding; trim draws the stroke on",
                 "size": "[w, h] (default [100, 100]); circle/ring/arc/polygon/star use size[0] as diameter",
                 "radius": "corner rounding (rect, polygon, star)", "thickness": "ring, arc and line width (default 10)",
                 "sides": "polygon sides / star points (default 5)", "inner": "star inner radius ratio (default 0.5)",
                 "angles": "arc [from, to] degrees, 0 = up, clockwise (default [0, 270])",
                 "trim": "line, ring, arc draw-on [from, to] in 0..1",
-                "fill": "colour (animatable) or {gradient: linear|radial, from, to, stops: [[0, colour], ...]}",
-                "stroke": {"color": "colour", "width": "px", "cap": "round | butt | square (default round)", "join": "round | miter | bevel (default round)", "miter_limit": "default 4", "dash": "[dash, gap, …] px", "dash_offset": "px", "feather": "px faded at the far end (the head while trim draws it on)", "feather_start": "px faded at the start (a fading tail)", "note": "cap, join, dash and feathers apply to path strokes"}
+                "fill": "colour (animatable) or {gradient: linear|radial, from, to, stops: [[0, colour], ...], units: layer|box}; units \"box\": from/to as fractions of the shape's box ([0,0] top-left, [1,1] bottom-right; a path's bounds) so the gradient follows an animated size (radials become ellipses); default \"layer\" px",
+                "points": "field only: [{\"position\": [x, y] layer space (animatable), \"color\": colour (animatable), \"radius\": px the colour holds (animatable, default 200)}, …] blended smoothly across the size box (mesh/blob gradient background)",
+                "softness": "field: how far colours blend (default 1; 0.25 crisp, 2 very soft; animatable)",
+                "warp": "field: noise displacement px of the blend (default 0; animatable)", "warp_scale": "field: warp noise feature size px (default 300)",
+                "stroke": {"color": "colour (default white)", "width": "px", "gradient": "path strokes: {\"stops\": [[0, colour], [1, colour]], \"along\": \"length\"} colour along the full path's length (0 = start, 1 = end; trim reveals it without sliding), replaces color; works with caps, joins, dashes, feathers", "cap": "round | butt | square (default round)", "join": "round | miter | bevel (default round)", "miter_limit": "default 4", "dash": "[dash, gap, …] px", "dash_offset": "px", "feather": "px faded at the far end (the head while trim draws it on)", "feather_start": "px faded at the start (a fading tail)", "note": "cap, join, dash and feathers apply to path strokes"}
             },
             "text": {
                 "text": "string; \\n breaks lines", "font": "Inter | Inter Medium | Inter SemiBold | project-relative .ttf/.otf",
@@ -245,7 +248,7 @@ pub fn catalog_json() -> Value {
             "end": "time (default next scene's start or the project end)", "duration": "duration",
             "pre_roll": "open this far into the animation", "background": "colour",
             "transition": {"type": "fade | push | slide | zoom | wipe | whip", "dur": "default \"10f\", centred on the cut", "ease": "default gesture (peak speed on the cut)", "direction": "left | right | up | down"},
-            "camera": {"position": "[x, y] point of interest shown at the canvas centre", "zoom": "number", "rotation": "degrees (roll)", "fov": "3D: vertical degrees (39.6 keeps z = 0 at 1:1)", "orbit": "3D: [yaw, pitch] degrees around the point of interest", "dolly": "3D: px toward the point of interest"},
+            "camera": {"position": "[x, y] point of interest shown at the canvas centre", "zoom": "number", "rotation": "degrees (roll)", "fov": "3D: vertical degrees (39.6 keeps z = 0 at 1:1)", "orbit": "3D: [yaw, pitch] degrees around the point of interest", "dolly": "3D: px toward the point of interest", "aperture": "3D depth of field: blur radius px per 100 px of depth from the focus plane (0 = off; animatable)", "focus": "3D depth of field: sharp plane as a depth like a layer's z (0 = point of interest, default; animatable for rack focus) or a top-level layer id to keep sharp"},
             "motion_blur": {"shutter": "degrees (180 film-like)", "samples": 8},
             "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first"
         },
