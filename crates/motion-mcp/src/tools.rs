@@ -156,7 +156,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "compare",
-            description: "Compare the project with a reference video. Without `at` it compares every frame from first to last: per frame the difference and how much each side moves, a per-scene summary with a verdict, the worst stretches (with a sheet of them), a timeline graph, and a side-by-side video (ours | reference | difference) of the whole piece. With `at` it returns those moments side by side. The reference time is ours + offset.",
+            description: "Compare the project with a reference video. Without `at` it compares every frame from first to last: per frame the difference and how much each side moves, a per-scene summary with a verdict (motion, look, missing/extra detail, and interior shading: shading_ratio is ours ÷ reference, \"ours is flatter\" when below 0.5 against a reference that has real shading), the worst stretches (with a sheet of them), a timeline graph, and a side-by-side video (ours | reference | difference) of the whole piece. With `at` it returns those moments side by side. The reference time is ours + offset.",
             schema: obj(json!({"against": {"type": "string", "description": "reference video or image"}, "at": {"type": "array", "items": time, "description": "only these moments (default: every frame)"},
                 "from": {"type": "number"}, "to": {"type": "number"},
                 "offset": {"type": "number", "description": "reference seconds = ours + offset (default 0)"},
@@ -1023,9 +1023,16 @@ impl Toolbox {
             let (diff, mean) = difference(&ours, &reference);
             let luma = |img: &image::RgbaImage| img.pixels().map(|p| 0.2126 * p.0[0] as f64 + 0.7152 * p.0[1] as f64 + 0.0722 * p.0[2] as f64).sum::<f64>() / (w as f64 * h as f64);
             let (missing, extra) = detail(&ours, &reference);
-            rows.push(json!({"at": label, "t": round(ft), "reference_t": round(rt), "mean_difference": round(mean),
+            let (so, sr) = (crate::measure::shading(&ours), crate::measure::shading(&reference));
+            let ratio = crate::measure::shading_ratio(so, sr);
+            let mut row = json!({"at": label, "t": round(ft), "reference_t": round(rt), "mean_difference": round(mean),
                              "missing_detail": round(missing), "extra_detail": round(extra),
-                             "brightness_ours": round(luma(&ours)), "brightness_reference": round(luma(&reference))}));
+                             "shading_ours": so.map(round), "shading_reference": sr.map(round), "shading_ratio": ratio.map(round),
+                             "brightness_ours": round(luma(&ours)), "brightness_reference": round(luma(&reference))});
+            if let Some(v) = crate::measure::flatness_verdict(ratio) {
+                row["shading_verdict"] = json!(v);
+            }
+            rows.push(row);
             cells.push((format!("ours {label} · {ft:.2}s"), ours));
             cells.push((format!("reference {rt:.2}s"), reference));
             cells.push((format!("difference {mean:.1}"), diff));
@@ -1089,6 +1096,8 @@ impl Toolbox {
         let mut ended_at = None;
         // [difference, motion ours, motion reference, missing detail, extra detail]
         let mut series: Vec<[f64; 5]> = Vec::new();
+        // Interior shading (ours, reference); `None` where a frame has no interior.
+        let mut shades: Vec<(Option<f64>, Option<f64>)> = Vec::new();
         let (mut prev_ours, mut prev_ref): (Option<image::RgbaImage>, Option<image::RgbaImage>) = (None, None);
         let black = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
         // The last decoded reference frame and its index.
@@ -1114,6 +1123,7 @@ impl Toolbox {
             let motion = |prev: &Option<image::RgbaImage>, cur: &image::RgbaImage| prev.as_ref().map(|p| difference(p, cur).1).unwrap_or(0.0);
             let (missing, extra) = detail(&ours, &reference);
             series.push([mean, motion(&prev_ours, &ours), motion(&prev_ref, &reference), missing, extra]);
+            shades.push((crate::measure::shading(&ours), crate::measure::shading(&reference)));
             let mut frame = image::RgbaImage::from_pixel(vw, vh, image::Rgba([20, 20, 26, 255]));
             for (i, img) in [&ours, &reference, &diff].into_iter().enumerate() {
                 image::imageops::replace(&mut frame, img, (i as u32 * (w + 4)) as i64, 0);
@@ -1137,6 +1147,32 @@ impl Toolbox {
             }).collect()
         };
         let (mo, mr, miss, extra) = (smooth(1), smooth(2), smooth(3), smooth(4));
+        // Shading over the same 5 frames; a frame without interior counts as flat.
+        let smooth_shade = |pick: fn(&(Option<f64>, Option<f64>)) -> Option<f64>| -> Vec<f64> {
+            (0..shades.len()).map(|i| {
+                let (a, b) = (i.saturating_sub(2), (i + 3).min(shades.len()));
+                shades[a..b].iter().map(|s| pick(s).unwrap_or(0.0)).sum::<f64>() / (b - a) as f64
+            }).collect()
+        };
+        let (so, sr) = (smooth_shade(|s| s.0), smooth_shade(|s| s.1));
+        let flat = |i: usize| crate::measure::flatness_verdict(crate::measure::shading_ratio(Some(so[i]), Some(sr[i]))).is_some();
+        // Shading over a set of frames: ours ÷ reference over the frames
+        // where the reference has an interior to measure.
+        let shading_of = |idx: &mut dyn Iterator<Item = usize>| -> (Option<f64>, Option<f64>, Option<f64>) {
+            let (mut o, mut r, mut n) = (0.0, 0.0, 0usize);
+            for i in idx {
+                if let Some(rs) = shades[i].1 {
+                    o += shades[i].0.unwrap_or(0.0);
+                    r += rs;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return (None, None, None);
+            }
+            let (o, r) = (o / n as f64, r / n as f64);
+            (Some(o), Some(r), crate::measure::shading_ratio(Some(o), Some(r)))
+        };
         // Fixed scales, not relative to this video: motion is the mean
         // per-pixel change between frames, difference the mean per-pixel gap.
         let moves = |o: f64, r: f64| -> &'static str {
@@ -1168,9 +1204,10 @@ impl Toolbox {
                 _ => String::new(),
             }
         };
-        let verdict = |o: f64, r: f64, d: f64, m: f64| -> &'static str {
+        let verdict = |o: f64, r: f64, d: f64, m: f64, flat: bool| -> &'static str {
             match moves(o, r) {
                 "motion similar" if m > MISSING => "ours lacks detail",
+                "motion similar" if flat => "ours is flatter",
                 "motion similar" if d >= 25.0 => "looks different",
                 "motion similar" => "close",
                 m => m,
@@ -1180,7 +1217,7 @@ impl Toolbox {
         // Stretches where a verdict other than "close" holds (gaps ≤ 3 f bridged).
         let mut segments: Vec<(usize, usize, &'static str)> = Vec::new();
         for i in 0..series.len() {
-            let v = verdict(mo[i], mr[i], series[i][0], miss[i]);
+            let v = verdict(mo[i], mr[i], series[i][0], miss[i], flat(i));
             if v == "close" {
                 continue;
             }
@@ -1199,7 +1236,8 @@ impl Toolbox {
                    "mean_difference": round((s.0..=s.1).map(|i| series[i][0]).sum::<f64>() / n),
                    "motion_ours": round((s.0..=s.1).map(|i| mo[i]).sum::<f64>() / n),
                    "motion_reference": round((s.0..=s.1).map(|i| mr[i]).sum::<f64>() / n),
-                   "missing_detail": round((s.0..=s.1).map(|i| miss[i]).sum::<f64>() / n)})
+                   "missing_detail": round((s.0..=s.1).map(|i| miss[i]).sum::<f64>() / n),
+                   "shading_ratio": shading_of(&mut (s.0..=s.1)).2.map(round)})
         }).collect();
         let scenes: Vec<Value> = compiled.scenes.iter().filter_map(|sc| {
             let idx: Vec<usize> = (0..series.len()).filter(|&i| time(i) >= sc.start && time(i) < sc.end).collect();
@@ -1210,9 +1248,12 @@ impl Toolbox {
             let avg = |v: &dyn Fn(usize) -> f64| idx.iter().map(|&i| v(i)).sum::<f64>() / n;
             let (d, o, r) = (avg(&|i| series[i][0]), avg(&|i| mo[i]), avg(&|i| mr[i]));
             let (m, x) = (avg(&|i| miss[i]), avg(&|i| extra[i]));
+            let (shade_o, shade_r, ratio) = shading_of(&mut idx.iter().copied());
+            let flatter = crate::measure::flatness_verdict(ratio).map(|v| format!("; {v}")).unwrap_or_default();
             Some(json!({"scene": sc.id.as_ref(), "from": round(sc.start), "to": round(sc.end), "mean_difference": round(d),
                         "motion_ours": round(o), "motion_reference": round(r), "missing_detail": round(m), "extra_detail": round(x),
-                        "verdict": format!("{}; {}{}", moves(o, r), looks(d), details(m, x))}))
+                        "shading_ours": shade_o.map(round), "shading_reference": shade_r.map(round), "shading_ratio": ratio.map(round),
+                        "verdict": format!("{}; {}{}{}", moves(o, r), looks(d), details(m, x), flatter)}))
         }).collect();
 
         // Timeline graph: difference (white), motion ours (orange), reference (cyan).
@@ -2081,28 +2122,12 @@ fn reference_frame(path: &Path, t: f64, w: u32, h: u32) -> Result<image::RgbaIma
     image::RgbaImage::from_raw(w, h, out.stdout[..expected].to_vec()).ok_or_else(|| "bad reference frame".into())
 }
 
-/// Edge (Sobel) magnitude of the luminance, 0–~1000.
-fn edges(img: &image::RgbaImage) -> (Vec<f32>, u32, u32) {
-    let (w, h) = img.dimensions();
-    let l: Vec<f32> = img.pixels().map(|p| 0.2126 * p.0[0] as f32 + 0.7152 * p.0[1] as f32 + 0.0722 * p.0[2] as f32).collect();
-    let at = |x: u32, y: u32| l[(y * w + x) as usize];
-    let mut e = vec![0f32; (w * h) as usize];
-    for y in 1..h.saturating_sub(1) {
-        for x in 1..w.saturating_sub(1) {
-            let gx = at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1);
-            let gy = at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1);
-            e[(y * w + x) as usize] = (gx * gx + gy * gy).sqrt();
-        }
-    }
-    (e, w, h)
-}
-
 /// Fractions of the reference's edge pixels with no edge of ours within
 /// 1 px (missing detail), and of ours with none of the reference's (extra).
 pub(crate) fn detail(ours: &image::RgbaImage, reference: &image::RgbaImage) -> (f64, f64) {
     const EDGE: f32 = 60.0;
-    let (a, w, h) = edges(ours);
-    let (b, _, _) = edges(reference);
+    let (a, w, h) = crate::measure::edges(ours);
+    let (b, _, _) = crate::measure::edges(reference);
     let near = |e: &[f32], x: u32, y: u32| -> bool {
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {

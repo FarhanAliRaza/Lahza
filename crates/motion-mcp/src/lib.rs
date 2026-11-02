@@ -182,21 +182,24 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 println!("{p}");
             }
             let r = &out.json;
+            // Shading ratio (ours ÷ reference) as a percentage; "–" when the reference is flat.
+            let pct = |v: &Value| v.as_f64().map(|r| format!("{:.0}%", r * 100.0)).unwrap_or_else(|| "–".into());
             for row in r["rows"].as_array().into_iter().flatten() {
-                println!("  {:<14} ours {:>6}s  reference {:>6}s  difference {:>5}  missing detail {:>5}  extra {:>5}", row["at"].as_str().unwrap_or(""), row["t"], row["reference_t"], row["mean_difference"], row["missing_detail"], row["extra_detail"]);
+                println!("  {:<14} ours {:>6}s  reference {:>6}s  difference {:>5}  missing detail {:>5}  extra {:>5}  shading {:>5}{}", row["at"].as_str().unwrap_or(""), row["t"], row["reference_t"], row["mean_difference"], row["missing_detail"], row["extra_detail"],
+                         pct(&row["shading_ratio"]), row["shading_verdict"].as_str().map(|v| format!("  {v}")).unwrap_or_default());
             }
             if r.get("scenes").is_some() {
                 println!("{} frames {}–{}s, mean difference {}{}", r["frames"], r["from"], r["to"], r["mean_difference"],
                          r["video"].as_str().map(|v| format!(", video {v}")).unwrap_or_default());
-                println!("  {:<16} {:>7} {:>7} {:>6} {:>7} {:>7}  verdict", "scene", "from", "to", "diff", "motion", "ref");
+                println!("  {:<16} {:>7} {:>7} {:>6} {:>7} {:>7} {:>7}  verdict", "scene", "from", "to", "diff", "motion", "ref", "shading");
                 for sc in r["scenes"].as_array().into_iter().flatten() {
-                    println!("  {:<16} {:>7} {:>7} {:>6} {:>7} {:>7}  {}", sc["scene"].as_str().unwrap_or(""), sc["from"], sc["to"], sc["mean_difference"],
-                             sc["motion_ours"], sc["motion_reference"], sc["verdict"].as_str().unwrap_or(""));
+                    println!("  {:<16} {:>7} {:>7} {:>6} {:>7} {:>7} {:>7}  {}", sc["scene"].as_str().unwrap_or(""), sc["from"], sc["to"], sc["mean_difference"],
+                             sc["motion_ours"], sc["motion_reference"], pct(&sc["shading_ratio"]), sc["verdict"].as_str().unwrap_or(""));
                 }
                 println!("  worst stretches:");
                 for w in r["worst"].as_array().into_iter().flatten() {
-                    println!("    {:>6}–{:<6}s  {:<36} diff {:>5}  motion ours {:>5} ref {:>5}  missing detail {:>5}", w["from"], w["to"], w["verdict"].as_str().unwrap_or(""),
-                             w["mean_difference"], w["motion_ours"], w["motion_reference"], w["missing_detail"]);
+                    println!("    {:>6}–{:<6}s  {:<36} diff {:>5}  motion ours {:>5} ref {:>5}  missing detail {:>5}  shading {:>5}", w["from"], w["to"], w["verdict"].as_str().unwrap_or(""),
+                             w["mean_difference"], w["motion_ours"], w["motion_reference"], w["missing_detail"], pct(&w["shading_ratio"]));
                 }
                 if let Some(t) = r["reference_ended_at"].as_f64() {
                     println!("  the reference ends at {t}s");

@@ -316,3 +316,54 @@ fn detail_score_notices_missing_thin_lines() {
     }
     assert!(crate::tools::detail(&shifted, &reference).0 < 0.1);
 }
+
+#[test]
+fn compare_says_when_ours_is_flatter_than_a_lit_reference() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("compare-flat");
+    tb.call("project_create", json!({"path": "flat", "duration": 1, "fps": 10, "width": 320, "height": 180, "background": "#000000"})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "scene": "s1", "layer": {"id": "ball", "kind": "shape", "shape": "circle", "size": 130, "fill": "#eb8c46", "transform": {"position": [160, 90]}}}
+    ]})).unwrap();
+    // The reference: the same ball, lit from the top left.
+    let mut lit = image::RgbaImage::from_pixel(320, 180, image::Rgba([0, 0, 0, 255]));
+    let l = [-0.5f64, -0.6, 0.62];
+    for y in 0..180 {
+        for x in 0..320 {
+            let (nx, ny) = ((x as f64 + 0.5 - 160.0) / 65.0, (y as f64 + 0.5 - 90.0) / 65.0);
+            if nx * nx + ny * ny <= 1.0 {
+                let nz = (1.0 - nx * nx - ny * ny).sqrt();
+                let d = (nx * l[0] + ny * l[1] + nz * l[2]).max(0.0);
+                let c = [235.0, 140.0, 70.0].map(|c: f64| (c * (0.15 + 0.85 * d)).min(255.0) as u8);
+                lit.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
+            }
+        }
+    }
+    lit.save(dir.join("lit.png")).unwrap();
+    let at = tb.call("compare", json!({"against": "lit.png", "at": [0.5]})).unwrap().json;
+    let row = &at["rows"][0];
+    assert!(row["shading_ratio"].as_f64().unwrap() < 0.2, "{at:#}");
+    assert!(row["shading_verdict"].as_str().unwrap().starts_with("ours is flatter"), "{at:#}");
+    // Every frame, against a compressed video of it.
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-loop", "1", "-i", "lit.png", "-t", "1", "-r", "10", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "lit.mp4"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let run = tb.call("compare", json!({"against": "lit.mp4"})).unwrap().json;
+    let scene = &run["scenes"][0];
+    assert!(scene["verdict"].as_str().unwrap().contains("ours is flatter than the reference (shading"), "{run:#}");
+    assert!(run["worst"].as_array().unwrap().iter().any(|w| w["verdict"] == "ours is flatter"), "{run:#}");
+    // Against our own (flat) render nothing is flagged, and a flat
+    // reference has no ratio.
+    tb.call("render", json!({"output": "ours.mp4", "wait": true, "audio": false})).unwrap();
+    let same = tb.call("compare", json!({"against": "ours.mp4"})).unwrap().json;
+    assert!(!same["scenes"][0]["verdict"].as_str().unwrap().contains("flatter"), "{same:#}");
+    assert!(same["scenes"][0]["shading_ratio"].is_null(), "{same:#}");
+    std::fs::remove_dir_all(&dir).ok();
+}

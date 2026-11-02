@@ -45,6 +45,22 @@ in one picture with nothing near them in the other); a verdict saying
 "ours lacks detail" means something visible is missing, whatever the
 difference says.
 
+Each frame and scene also reports `shading_ours`, `shading_reference` and
+`shading_ratio` (ours ÷ reference): how much light lives *inside* shapes.
+It is the mean luminance slope, in levels per 1% of the frame width, over
+interior pixels: pixels away from drawn edges (Sobel above 60, a step of
+15+ levels, widened by the slope's reach) and not the background (the
+most common colour ± 24); slopes under 0.5 count as flat. A lit 3D object
+reads several units; flat fills, posterised polygons and line art read
+about 0; gradient fills, glows and soft backgrounds count as shading too.
+When the reference has real shading (≥ 1.0) and the ratio is under 0.5,
+the verdict says "ours is flatter than the reference (shading 34% of the
+reference's)" and those stretches show up as "ours is flatter". Flat 2D
+graphics against flat graphics, or line art against line art, are never
+flagged (`shading_ratio` is null when the reference is flat). A flat
+verdict means the shot needs lighting (3D materials, gradients,
+highlights), not a better match of pixels.
+
 ## Measuring a reference's motion
 
 Don't eyeball frames or write scripts to measure a reference: use the tools.
@@ -216,6 +232,8 @@ outside the radius instead.
 ## Review checklist
 
 - `check` has no errors; every anchored key's drift is within ±1 frame.
+- Against a reference, no scene says "ours is flatter" or "ours lacks
+  detail".
 - No still picture longer than the style's hold limit.
 - Text inside title-safe, readable contrast, no overlapping labels.
 - Every asset has a source and a licence.

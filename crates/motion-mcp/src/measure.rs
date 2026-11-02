@@ -1,6 +1,8 @@
 //! Measuring a reference: `track` follows a target through a video and
 //! `fit_curve` turns sampled motion into one of the engine's eases, so a
 //! move seen in a reference becomes keys without ad-hoc scripts.
+//! `shading` measures how much lighting lives inside shapes, so `compare`
+//! can tell a flat replica of a lit shot.
 
 use lahza_motion_core::curve::{Curve, Ease, PowerMode, Preset, PRESETS};
 use lahza_motion_core::time::{Duration, Fps, TimeBase};
@@ -646,6 +648,156 @@ pub fn fit_curve(samples: &[(f64, Vec<f64>)], fps: Fps) -> Result<Value, String>
             "ease": serde_json::to_value(f.family.ease(&f.params)).unwrap_or_default()})).collect::<Vec<_>>(),
         "samples": samples.len(),
     }))
+}
+
+// -------------------------------------------------------------- shading
+
+/// Sobel magnitude of the luminance, 0–~1000 (a 255 step reads ~1020; a
+/// step of 15 levels reads 60).
+pub(crate) fn edges(img: &image::RgbaImage) -> (Vec<f32>, u32, u32) {
+    let (w, h) = img.dimensions();
+    let l = luma(img);
+    let at = |x: u32, y: u32| l[(y * w + x) as usize];
+    let mut e = vec![0f32; (w * h) as usize];
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let gx = at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1);
+            let gy = at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1);
+            e[(y * w + x) as usize] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+    (e, w, h)
+}
+
+fn luma(img: &image::RgbaImage) -> Vec<f32> {
+    img.pixels().map(|p| 0.2126 * p.0[0] as f32 + 0.7152 * p.0[1] as f32 + 0.0722 * p.0[2] as f32).collect()
+}
+
+/// A Sobel magnitude above this is a drawn edge (a luminance step of 15+
+/// levels): shape outlines, posterisation bands, lines. Its surroundings are
+/// left out of the shading measure.
+pub const SHADING_EDGE: f32 = 60.0;
+/// Per-pixel slopes below this (luminance levels per 1% of the frame width)
+/// count as flat: compression noise, banding and faint vignettes.
+pub const SHADING_FLOOR: f64 = 0.5;
+/// A reference whose interior shading is below this is flat itself (2D
+/// graphics, line art): no flatness verdict either way.
+pub const SHADING_MEANINGFUL: f64 = 1.0;
+/// Ours ÷ reference below this is "flatter than the reference".
+pub const SHADING_FLAT_RATIO: f64 = 0.5;
+/// Fewer interior pixels than this share of the frame: nothing to measure
+/// (line art, thin type).
+pub const SHADING_MIN_INTERIOR: f64 = 0.02;
+
+/// How much shading lives *inside* shapes: the mean low-to-mid-frequency
+/// luminance slope (levels per 1% of the frame width) over interior pixels,
+/// those away from drawn edges and not the background. A lit 3D object
+/// (gradients across its faces, soft highlights) reads several units; flat
+/// fills, posterised polygons and line art read about 0. `None` when the
+/// frame has almost no interior to measure.
+///
+/// Edges: Sobel above [`SHADING_EDGE`], dilated by the reach of the slope
+/// (2b + 1 px, b = width / 135, at least 1) so a shape's own outline never
+/// leaks in. Background: pixels within 24 levels (per channel) of the most
+/// common colour. Slope: central difference over ±b px of the luminance
+/// box-blurred by b px; slopes under [`SHADING_FLOOR`] count as 0.
+pub fn shading(img: &image::RgbaImage) -> Option<f64> {
+    let (w, h) = img.dimensions();
+    let (wu, hu) = (w as usize, h as usize);
+    if w < 16 || h < 16 {
+        return None;
+    }
+    let b = ((w as f64 / 135.0).round() as usize).max(1);
+    let reach = 2 * b + 1;
+    let (e, _, _) = edges(img);
+    // Edge mask dilated by `reach` (separable max via running counts).
+    let edge: Vec<bool> = e.iter().map(|&v| v > SHADING_EDGE).collect();
+    let dilate = |src: &[bool], horizontal: bool| -> Vec<bool> {
+        let mut out = vec![false; wu * hu];
+        let (lines, len) = if horizontal { (hu, wu) } else { (wu, hu) };
+        let idx = |line: usize, i: usize| if horizontal { line * wu + i } else { i * wu + line };
+        for line in 0..lines {
+            let mut prefix = vec![0u32; len + 1];
+            for i in 0..len {
+                prefix[i + 1] = prefix[i] + src[idx(line, i)] as u32;
+            }
+            for i in 0..len {
+                let (a, z) = (i.saturating_sub(reach), (i + reach + 1).min(len));
+                out[idx(line, i)] = prefix[z] > prefix[a];
+            }
+        }
+        out
+    };
+    let near_edge = dilate(&dilate(&edge, true), false);
+    // Background: the most common colour (4 bits per channel).
+    let mut bins = vec![(0u32, [0u64; 3]); 4096];
+    for p in img.pixels() {
+        let k = ((p.0[0] as usize >> 4) << 8) | ((p.0[1] as usize >> 4) << 4) | (p.0[2] as usize >> 4);
+        bins[k].0 += 1;
+        for c in 0..3 {
+            bins[k].1[c] += p.0[c] as u64;
+        }
+    }
+    let (count, sum) = bins.iter().max_by_key(|b| b.0).copied().unwrap_or_default();
+    let bg = sum.map(|s| s as f64 / count.max(1) as f64);
+    let background = |p: &image::Rgba<u8>| (0..3).all(|c| (p.0[c] as f64 - bg[c]).abs() <= 24.0);
+    // Luminance box-blurred by b (separable, clamped at the borders).
+    let l = luma(img);
+    let blur = |src: &[f32], horizontal: bool| -> Vec<f32> {
+        let mut out = vec![0f32; wu * hu];
+        for y in 0..hu {
+            for x in 0..wu {
+                let mut s = 0.0;
+                for k in -(b as i64)..=b as i64 {
+                    let (sx, sy) = if horizontal {
+                        ((x as i64 + k).clamp(0, wu as i64 - 1) as usize, y)
+                    } else {
+                        (x, (y as i64 + k).clamp(0, hu as i64 - 1) as usize)
+                    };
+                    s += src[sy * wu + sx];
+                }
+                out[y * wu + x] = s / (2 * b + 1) as f32;
+            }
+        }
+        out
+    };
+    let smooth = blur(&blur(&l, true), false);
+    let per_percent = w as f64 / 100.0;
+    let (mut total, mut interior) = (0.0f64, 0usize);
+    for y in reach..hu.saturating_sub(reach) {
+        for x in reach..wu.saturating_sub(reach) {
+            let i = y * wu + x;
+            if near_edge[i] || background(img.get_pixel(x as u32, y as u32)) {
+                continue;
+            }
+            interior += 1;
+            let gx = (smooth[i + b] - smooth[i - b]) as f64 / (2 * b) as f64;
+            let gy = (smooth[i + b * wu] - smooth[i - b * wu]) as f64 / (2 * b) as f64;
+            let g = (gx * gx + gy * gy).sqrt() * per_percent;
+            if g >= SHADING_FLOOR {
+                total += g;
+            }
+        }
+    }
+    if (interior as f64) < SHADING_MIN_INTERIOR * (wu * hu) as f64 {
+        return None;
+    }
+    Some(total / interior as f64)
+}
+
+/// Ours ÷ reference interior shading, or `None` when the reference has no
+/// meaningful shading (both flat 2D graphics: nothing to flag). Ours with
+/// no interior at all counts as flat.
+pub fn shading_ratio(ours: Option<f64>, reference: Option<f64>) -> Option<f64> {
+    let r = reference?;
+    (r >= SHADING_MEANINGFUL).then(|| ours.unwrap_or(0.0) / r)
+}
+
+/// "ours is flatter than the reference (shading 34% of the reference's)"
+/// when the ratio is below [`SHADING_FLAT_RATIO`].
+pub fn flatness_verdict(ratio: Option<f64>) -> Option<String> {
+    let r = ratio?;
+    (r < SHADING_FLAT_RATIO).then(|| format!("ours is flatter than the reference (shading {:.0}% of the reference's)", r * 100.0))
 }
 
 #[cfg(test)]
