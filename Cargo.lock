@@ -3237,6 +3237,7 @@ dependencies = [
  "gstreamer",
  "image",
  "lahza-annotations",
+ "lahza-motion-audio",
  "lahza-motion-core",
  "lahza-motion-mcp",
  "lahza-motion-render",

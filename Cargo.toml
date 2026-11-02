@@ -51,6 +51,7 @@ x11rb = { version = "=0.13.2", features = ["randr", "shape"] }
 [dependencies]
 lahza-annotations = { workspace = true }
 lahza-recording = { path = "crates/recording" }
+lahza-motion-audio = { path = "crates/motion-audio" }
 lahza-motion-core = { path = "crates/motion-core" }
 lahza-motion-mcp = { path = "crates/motion-mcp" }
 lahza-motion-render = { path = "crates/motion-render" }

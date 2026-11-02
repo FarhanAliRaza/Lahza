@@ -11,6 +11,7 @@
 //! with motion blur. GPU images are released with `Window::drop_image`.
 
 use crate::controls::{icon_button, ButtonKind, ButtonSize};
+use crate::motion_sound::{self, Player, Wave};
 use crate::theme::{self, TextRoles};
 use gpui::{
     canvas, div, img, prelude::*, px, size, App, Bounds, Context, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -193,6 +194,14 @@ pub(crate) struct MotionEditor {
     fonts: Fonts,
     status: String,
     poll_ticks: u32,
+    /// Playhead in seconds (`f64::to_bits`), read by the sound thread.
+    clock: Arc<AtomicU64>,
+    /// Plays the project's sound while the editor plays.
+    player: Option<Player>,
+    sound_error: Arc<Mutex<Option<String>>>,
+    waves: Arc<Vec<Wave>>,
+    wave_signature: String,
+    wave_inbox: Arc<Mutex<Option<(String, Vec<Wave>)>>>,
 }
 
 fn stamp(dir: &Path) -> SystemTime {
@@ -346,7 +355,15 @@ impl MotionEditor {
             focus: cx.focus_handle(),
             status: String::new(),
             poll_ticks: 0,
+            clock: Arc::default(),
+            player: None,
+            sound_error: Arc::default(),
+            waves: Arc::default(),
+            wave_signature: String::new(),
+            wave_inbox: Arc::default(),
         };
+        let mut editor = editor;
+        editor.refresh_waves();
         Ok(editor)
     }
 
@@ -376,6 +393,18 @@ impl MotionEditor {
             self.follow_playhead();
             self.dirty = true;
             changed = true;
+        }
+        self.clock.store(self.time.to_bits(), Ordering::SeqCst);
+        if let Some(message) = self.sound_error.lock().unwrap().take() {
+            self.status = message;
+            self.player = None;
+            changed = true;
+        }
+        if let Some((signature, waves)) = self.wave_inbox.lock().unwrap().take() {
+            if signature == self.wave_signature {
+                self.waves = Arc::new(waves);
+                changed = true;
+            }
         }
         self.poll_ticks += 1;
         if self.poll_ticks % 30 == 0 && self.drag.is_none() && stamp(&self.dir) > self.stamp {
@@ -419,6 +448,10 @@ impl MotionEditor {
                 self.rows = layer_rows(&self.project, &self.compiled);
                 self.stamp = stamp(&self.dir);
                 self.dirty = true;
+                self.refresh_waves();
+                if self.player.is_some() {
+                    self.start_sound();
+                }
                 if let Some(id) = &self.selected {
                     if find_layer(&self.project, id).is_none() {
                         self.selected = None;
@@ -470,7 +503,29 @@ impl MotionEditor {
         let fps = self.project.settings.fps;
         let n = fps.nearest_frame(t.clamp(0.0, self.project.settings.duration)).clamp(0, self.compiled.frame_count().saturating_sub(1) as i64);
         self.time = fps.time_of(n);
+        self.clock.store(self.time.to_bits(), Ordering::SeqCst);
         self.dirty = true;
+    }
+
+    /// (Re)starts the sound from the saved project at the playhead.
+    fn start_sound(&mut self) {
+        self.clock.store(self.time.to_bits(), Ordering::SeqCst);
+        self.player = Some(Player::start(self.project.clone(), self.compiled.clone(), self.dir.clone(), self.clock.clone(), self.sound_error.clone()));
+    }
+
+    /// Recomputes the waveform lane off the UI thread when the sound's
+    /// placement changed.
+    fn refresh_waves(&mut self) {
+        let signature = motion_sound::signature(&self.project, &self.compiled);
+        if signature == self.wave_signature {
+            return;
+        }
+        self.wave_signature = signature.clone();
+        let (project, compiled, dir, inbox) = (self.project.clone(), self.compiled.clone(), self.dir.clone(), self.wave_inbox.clone());
+        std::thread::spawn(move || {
+            let waves = motion_sound::waves(&project, &compiled, &dir);
+            *inbox.lock().unwrap() = Some((signature, waves));
+        });
     }
 
     fn step(&mut self, frames: i64) {
@@ -618,6 +673,11 @@ impl MotionEditor {
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
         self.playing = !self.playing;
         self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.playing {
+            self.start_sound();
+        } else {
+            self.player = None;
+        }
         self.dirty = true;
         cx.notify();
     }
@@ -962,6 +1022,31 @@ impl MotionEditor {
                 }
             }
         }
+        // Sound: peaks of every clip, two pixels per bar.
+        let (waves, zoom, scroll, colour) = (self.waves.clone(), self.zoom, self.scroll, theme::lane_audio());
+        let sound = div().relative().flex_1().h(px(30.0)).overflow_hidden().child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                    let mut x = 0.0f32;
+                    while x < w {
+                        let t0 = scroll + f64::from(x) / zoom;
+                        let peak = waves.iter().map(|wave| wave.peak(t0, t0 + 2.0 / zoom)).fold(0.0, f32::max);
+                        if peak > 0.0 {
+                            let bar = (peak * (h - 6.0)).max(1.0);
+                            window.paint_quad(gpui::fill(
+                                Bounds::new(gpui::point(bounds.origin.x + px(x), bounds.origin.y + px((h - bar) / 2.0)), size(px(1.5), px(bar))),
+                                colour,
+                            ));
+                        }
+                        x += 2.0;
+                    }
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
         // Scenes.
         let mut scenes = div().relative().flex_1().h(px(ROW)).overflow_hidden();
         for s in &self.compiled.scenes {
@@ -1083,6 +1168,7 @@ impl MotionEditor {
             }))
             .child(lane("Time".into(), ruler.into_any_element()))
             .child(lane("Markers".into(), markers.into_any_element()))
+            .children((!self.waves.is_empty()).then(|| lane("Sound".into(), sound.into_any_element())))
             .child(lane("Scenes".into(), scenes.into_any_element()))
             .child(rows)
             .child(div().absolute().top_0().bottom_0().left(px(playhead)).w(px(2.0)).bg(theme::brand()))

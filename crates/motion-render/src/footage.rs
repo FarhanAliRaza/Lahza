@@ -39,6 +39,23 @@ pub struct MediaInfo {
 }
 
 /// Probes a video file with ffprobe.
+/// Duration and whether there is sound, for any audio or video file
+/// (`probe` needs a video stream).
+pub fn probe_sound(path: &Path) -> Result<(f64, bool), String> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=codec_type:format=duration", "-of", "json"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("cannot run ffprobe (install ffmpeg): {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    let has_audio = v["streams"].as_array().is_some_and(|s| s.iter().any(|s| s["codec_type"] == "audio"));
+    let duration = v["format"]["duration"].as_str().and_then(|d| d.parse::<f64>().ok()).unwrap_or(0.0);
+    Ok((duration, has_audio))
+}
+
 pub fn probe(path: &Path) -> Result<MediaInfo, String> {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-show_streams", "-show_format", "-of", "json"])

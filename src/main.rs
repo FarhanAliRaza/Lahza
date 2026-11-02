@@ -33,6 +33,7 @@ mod library;
 mod models;
 mod motion_ui;
 mod motion_editor;
+mod motion_sound;
 mod motion_overview_ui;
 mod animation_ui;
 mod notifications;
