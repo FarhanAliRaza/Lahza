@@ -98,6 +98,17 @@ video timeline:
   field: `"follow": {"layer": "<path id>"}` on the handle (`"rotate": true`
   for arrows). Animate only the path's `trim`; never key the handle's
   position frame by frame.
+- **A stroke that changes colour as it draws** is `stroke.gradient`
+  (`{"stops": […], "along": "length"}`) on a path; the colours stay on the
+  path while `trim` reveals it.
+- **Gradients on growing shapes** use `"units": "box"` so they stretch
+  with an animated `size` instead of staying pinned.
+- **Soft colour-blob backgrounds** are one `shape: "field"` layer with a
+  few moving `points` (wiggle their positions), never dozens of blurred
+  layers.
+- **Rack focus** in 2.5D: give the camera an `aperture` (2–4) and key its
+  `focus` from one layer's depth to another's (or set `focus` to a layer
+  id); spread 3D layers in `z` so depth reads.
 
 ## Review checklist
 

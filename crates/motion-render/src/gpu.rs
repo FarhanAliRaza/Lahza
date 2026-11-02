@@ -157,10 +157,13 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let ops_base = out.ops.len() as u32;
         for p in &list.prims {
             let mut p: Prim = *p;
-            if p.paint[1] > 0.5 {
-                p.paint[2] += stop_base;
-            }
             let rebase = |v: f32, by: u32| f32::from_bits(v.to_bits() + by);
+            if p.kind[0] == crate::list::PRIM_SHAPE && p.paint[1] > 0.5 {
+                p.paint[2] += stop_base;
+                if p.paint[1] as u32 == crate::list::PAINT_ALONG {
+                    p.paint2[0] = rebase(p.paint2[0], seg_base);
+                }
+            }
             match p.kind[0] {
                 crate::list::PRIM_IMAGE if p.kind[1] == 1 => p.geom2[0] = rebase(p.geom2[0], texel_base),
                 crate::list::PRIM_MATTE => {

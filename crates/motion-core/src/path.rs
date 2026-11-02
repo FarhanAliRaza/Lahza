@@ -61,15 +61,26 @@ fn total_length(lines: &[Vec<Pt>]) -> f64 {
     lines.iter().flat_map(|l| l.windows(2).map(|w| seg_len(w[0], w[1]))).sum()
 }
 
+/// Full length of the subpaths (closed ones include their closing edge).
+pub fn length(subpaths: &[Poly]) -> f64 {
+    total_length(&polylines(subpaths))
+}
+
 /// The part of the polylines between fractions [t0, t1] of total length.
 pub fn trim(subpaths: &[Poly], t0: f64, t1: f64) -> Vec<Vec<Pt>> {
+    trim_measured(subpaths, t0, t1).into_iter().map(|line| line.into_iter().map(|(p, _)| p).collect()).collect()
+}
+
+/// `trim`, with each vertex's fraction of the full (untrimmed) length.
+pub fn trim_measured(subpaths: &[Poly], t0: f64, t1: f64) -> Vec<Vec<(Pt, f64)>> {
     let lines = polylines(subpaths);
     let total = total_length(&lines);
     let (from, to) = (t0 * total, t1 * total);
+    let u = |x: f64| if total > 0.0 { x / total } else { 0.0 };
     let mut out = Vec::new();
     let mut acc = 0.0;
     for line in &lines {
-        let mut cur: Vec<Pt> = Vec::new();
+        let mut cur: Vec<(Pt, f64)> = Vec::new();
         for w in line.windows(2) {
             let l = seg_len(w[0], w[1]);
             let (a, b) = (acc, acc + l);
@@ -82,7 +93,7 @@ pub fn trim(subpaths: &[Poly], t0: f64, t1: f64) -> Vec<Vec<Pt>> {
             }
             let lerp = |x: f64| {
                 let k = ((x - a) / l).clamp(0.0, 1.0);
-                (w[0].0 + (w[1].0 - w[0].0) * k, w[0].1 + (w[1].1 - w[0].1) * k)
+                ((w[0].0 + (w[1].0 - w[0].0) * k, w[0].1 + (w[1].1 - w[0].1) * k), u(a + l * k))
             };
             if cur.is_empty() {
                 cur.push(lerp(from.max(a)));
