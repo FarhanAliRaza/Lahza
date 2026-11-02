@@ -159,6 +159,10 @@ pub struct MeshParams {
     pub detail: f64,
     /// Relative sizes of the pieces, in turn (empty: all equal).
     pub spans: Vec<f64>,
+    /// Screen pixels per layer unit where the mesh is drawn (in half-octave
+    /// steps): tessellation follows the drawn size, so small profiles
+    /// scaled up and far meshes both get the segments they need.
+    pub screen: f64,
 }
 
 impl MeshParams {
@@ -169,6 +173,7 @@ impl MeshParams {
         f(self.segments as f64);
         f(self.gap);
         f(self.detail);
+        f(self.screen);
         f(self.spans.len() as f64);
         for s in &self.spans {
             f(*s);
@@ -366,6 +371,8 @@ fn piece_weights(count: usize, spans: &[f64]) -> Vec<f64> {
 
 pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
     let detail = if params.detail.is_finite() && params.detail > 0.0 { params.detail.clamp(0.1, 8.0) } else { 1.0 };
+    let screen = if params.screen.is_finite() && params.screen > 0.0 { params.screen.clamp(1.0 / 16.0, 32.0) } else { 1.0 };
+    let detail = detail * screen;
     let mut mesh = Mesh::default();
     match &params.shape {
         MeshShape::Sphere { radius } => {
@@ -1330,7 +1337,7 @@ mod tests {
     use super::*;
 
     fn params(shape: MeshShape) -> MeshParams {
-        MeshParams { shape, segments: 1, gap: 0.0, detail: 1.0, spans: Vec::new() }
+        MeshParams { shape, segments: 1, gap: 0.0, detail: 1.0, spans: Vec::new(), screen: 1.0 }
     }
 
     fn path(d: &str) -> PathMorph {
@@ -1376,7 +1383,7 @@ mod tests {
 
     #[test]
     fn torus_faces_the_camera_and_splits_into_coloured_segments() {
-        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 4, gap: 10.0, detail: 1.0, spans: Vec::new() }).unwrap();
+        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 4, gap: 10.0, detail: 1.0, spans: Vec::new(), screen: 1.0 }).unwrap();
         let (lo, hi) = t.bounds();
         assert!(hi[0] > 225.0 && hi[0] < 230.01 && (lo[2] + 30.0).abs() < 0.5 && (hi[2] - 30.0).abs() < 0.5, "{lo:?} {hi:?}");
         let segs: std::collections::BTreeSet<u32> = t.tags.iter().map(|x| tag_segment(*x)).collect();
@@ -1486,7 +1493,7 @@ mod tests {
 
     #[test]
     fn rings_tag_faces_and_size_pieces() {
-        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 2, gap: 0.0, detail: 1.0, spans: vec![1.0, 3.0] }).unwrap();
+        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 2, gap: 0.0, detail: 1.0, spans: vec![1.0, 3.0], screen: 1.0 }).unwrap();
         let parts: std::collections::BTreeSet<u32> = t.tags.iter().map(|x| tag_part(*x)).collect();
         assert!([PART_FRONT, PART_BACK, PART_SIDE, PART_INSIDE].iter().all(|p| parts.contains(p)), "{parts:?}");
         // Front faces face the camera (−z), inside faces the axis.

@@ -495,8 +495,22 @@ impl CLighting {
     }
 }
 
+/// Screen pixels per layer unit at the mesh's origin (largest axis), in
+/// half-octave steps.
+fn screen_scale(world: Mat4, camera: &Camera3) -> f64 {
+    let mv = camera.view.then(world);
+    let m = mv.0;
+    let z = m[11];
+    let axis = |c: usize| (m[c] * m[c] + m[4 + c] * m[4 + c] + m[8 + c] * m[8 + c]).sqrt();
+    let k = camera.focal / z.max(1.0) * axis(0).max(axis(1)).max(axis(2));
+    if !(k.is_finite() && k > 0.0) {
+        return 1.0;
+    }
+    (k.log2() * 2.0).round().exp2().sqrt().clamp(1.0 / 16.0, 32.0)
+}
+
 impl CMesh {
-    pub(super) fn params_at(&self, t: f64) -> Arc<MeshParams> {
+    pub(super) fn params_at(&self, t: f64, screen: f64) -> Arc<MeshParams> {
         let path = |(paths, index): &(Vec<Arc<str>>, Prop<f64>)| path_morph(paths, index.at(t));
         let shape = match &self.shape {
             CMeshShape::Sphere(r) => MeshShape::Sphere { radius: r.at(t) },
@@ -527,7 +541,7 @@ impl CMesh {
                 MeshShape::Sweep { path: path(p), radius: radius.at(t), width: width.at(t), profile: *profile, trim: [tr.x(), tr.y()], caps: *caps, head: head.at(t) }
             }
         };
-        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone() };
+        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone(), screen };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         match &*last {
             Some(p) if **p == params => p.clone(),
@@ -541,7 +555,7 @@ impl CMesh {
 
     pub(super) fn state(&self, t: f64, world: Mat4, camera: Camera3) -> MeshState {
         MeshState {
-            params: self.params_at(t),
+            params: self.params_at(t, screen_scale(world, &camera)),
             world,
             camera,
             materials: std::array::from_fn(|i| self.materials[i].at(t)),
@@ -653,5 +667,29 @@ mod more_tests {
         assert_eq!(mesh.len(), 2, "{mesh:?}");
         assert!(mesh.iter().any(|i| i.element.as_deref() == Some("b") && i.message.contains("bevel 35.0 is too big and is drawn as 20.0")));
         assert!(mesh.iter().any(|i| i.element.as_deref() == Some("x") && i.message.contains("narrowest")));
+    }
+}
+
+#[cfg(test)]
+mod tessellation_tests {
+    use super::tests::compiled;
+    use crate::compile::Content;
+
+    #[test]
+    fn tessellation_follows_the_drawn_size() {
+        // The same small revolve drawn at 1× and scaled 16×.
+        let c = compiled(serde_json::json!({"layers": [
+            {"id": "small", "kind": "mesh", "mesh": {"type": "revolve", "profile": "M 0 -10 C 12 -8 12 8 0 10", "axis": "z"}},
+            {"id": "big", "kind": "mesh", "mesh": {"type": "revolve", "profile": "M 0 -10 C 12 -8 12 8 0 10", "axis": "z"}, "transform": {"scale": 16}}]}));
+        let tris = |id: &str| {
+            let f = c.frame(0.0);
+            let m = f.layers.iter().find_map(|l| match &l.content { Content::Mesh(m) if &*l.id == id => Some(m.clone()), _ => None }).unwrap();
+            (m.params.screen, crate::mesh::generate(&m.params).unwrap().tris.len())
+        };
+        let ((s1, n1), (s16, n16)) = (tris("small"), tris("big"));
+        assert!((s1 - 1.0).abs() < 1e-9 && (s16 - 16.0).abs() < 1e-9, "{s1} {s16}");
+        // Drawn 16× bigger, the circle around the axis has ~16× the steps
+        // (one every ~9 px on screen), not the same 24.
+        assert!(n16 > n1 * 8, "{n1} → {n16}");
     }
 }
