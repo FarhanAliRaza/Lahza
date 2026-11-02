@@ -334,6 +334,54 @@ impl Studio {
         .detach();
     }
 
+    /// Adds a built-in sound effect at the playhead on the Music / SFX
+    /// lane. The sound is generated once into the recording's media folder.
+    pub(crate) fn add_sound_effect_to_video(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        let Some(session) = self.video_project.as_ref() else { return };
+        let file = std::path::PathBuf::from("media").join(format!("sfx-{name}.wav"));
+        if let Err(e) = lahza_motion_audio::sfx::ensure(name, &session.directory.join(&file)) {
+            self.toast = Some(crate::Notification::error(format!("Could not add the sound: {e}")));
+            cx.notify();
+            return;
+        }
+        let seconds = lahza_motion_audio::sfx::SOUNDS.iter().find(|s| s.0 == name).map_or(0.5, |s| s.1 as f64);
+        let duration = seconds.min((self.video_timeline_duration() - self.video_position).max(0.05));
+        let clip = media::AudioClip {
+            id: uuid::Uuid::new_v4(),
+            file,
+            name: name.to_string(),
+            start: self.video_position,
+            source_start: 0.0,
+            duration,
+            volume: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            source_duration: seconds,
+        };
+        self.video_undo_stack.push(VideoEditSnapshot::Audio(self.video_audio_clips.clone()));
+        self.video_redo_stack.clear();
+        self.video_audio_clips.push(clip);
+        self.save_audio_clips(cx);
+        cx.notify();
+    }
+
+    /// Picks up sounds an agent added to the edit document while the
+    /// recording is open (undoable like any audio edit).
+    pub(crate) fn reload_external_audio_clips(&mut self) -> bool {
+        if self.video_audio_drag.is_some() {
+            return false;
+        }
+        let Some(session) = self.video_project.as_ref() else { return false };
+        let Ok(Some(clips)) = session.read_edit_field::<Vec<media::AudioClip>>("audioClips") else { return false };
+        let clips: Vec<_> = clips.into_iter().filter(|c| c.validate().is_ok() && media::asset_path(session, &c.file).is_ok()).collect();
+        if clips == self.video_audio_clips {
+            return false;
+        }
+        self.video_undo_stack.push(VideoEditSnapshot::Audio(std::mem::replace(&mut self.video_audio_clips, clips)));
+        self.video_redo_stack.clear();
+        true
+    }
+
     pub(crate) fn save_audio_clips(&mut self, cx: &mut Context<Self>) {
         self.pause_video_playback();
         if let Some(session) = &self.video_project {

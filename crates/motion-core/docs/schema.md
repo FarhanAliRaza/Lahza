@@ -102,6 +102,29 @@ ends takes over from the current value, so motion stays continuous.
 Values: numbers; `[x, y]` vectors (scale also takes one number); colours
 `"#rgb"`, `"#rrggbb"`, `"#rrggbbaa"`.
 
+## Sounds
+
+`audio` holds the `music`, the narration (`vo`) and sound effects (`sfx`):
+
+```json
+"audio": {
+  "music": {"path": "assets/track.wav", "at": 0, "gain_db": -2},
+  "sfx": [
+    {"id": "whoosh1", "path": "assets/sfx/whoosh.wav", "at": "#card.start - 3f", "gain_db": -6},
+    {"id": "pop1", "path": "assets/sfx/pop.wav", "at": "beat:9", "length": 0.1}
+  ]
+}
+```
+
+Fields: `path`, `at` (any time reference: an effect anchored to a layer,
+`#card.start`, moves when the layer moves), `trim` (seconds skipped in the
+file), `gain_db`, `length` (seconds to play), `name`, `id`. Add one with
+`{"op": "add_sound", "path": …, "at": …}` (`"kind": "music"` or `"vo"` for
+those); then `set` and `remove` work on its id (`whoosh1.at`), and music and
+narration answer to `music` and `vo`. Built-in effects (`sfx_add`):
+whoosh, whoosh-out, swipe, pop, click, tick, type, thud, hit, boom, riser,
+ding, sparkle, glitch.
+
 ## Markers
 
 `markers/<track>.json`:

@@ -72,13 +72,18 @@ impl Studio {
                     if this.motion_pieces_loop != token {
                         return false;
                     }
+                    let dragging = this.motion_piece_drag.is_some();
                     let Some(pieces) = this.motion_pieces.as_mut() else { return false };
                     let mut changed = pieces.frames_ready();
-                    if tick % 30 == 0 && this.motion_piece_drag.is_none() && pieces.poll() {
+                    if tick % 30 == 0 && !dragging && pieces.poll() {
                         changed = true;
-                        if this.selected_motion_piece.as_ref().is_some_and(|id| pieces.get(id).is_none()) {
+                        let missing = this.selected_motion_piece.as_ref().is_some_and(|id| pieces.get(id).is_none());
+                        if missing {
                             this.selected_motion_piece = None;
                         }
+                        // The edit document changed on disk: an agent may
+                        // have added sounds to the video too.
+                        this.reload_external_audio_clips();
                     }
                     if changed {
                         cx.notify();

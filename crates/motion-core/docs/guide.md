@@ -32,6 +32,23 @@
   a video layer, so 3D objects composite with type, shapes and effects.
   Match `frames` to the scene's span; use `fps` of the project.
 
+## Sound effects
+
+Sound sells motion. Give arrivals and big moves a sound with `sfx_add`,
+anchored to the animation so it follows it (built-ins need no files):
+
+- a layer flying in: `whoosh` at `"#card.start - 3f"` (air leads the move);
+  leaving: `whoosh-out` at its exit;
+- appearing or scaling up: `pop`; a card settling: `thud`; a title slam or
+  a cut on a downbeat: `hit`; the drop: `boom`;
+- a reveal: `riser` ending on it (`"#reveal.start - 1.6"`), then `ding` or
+  `sparkle`; typing: `type` per word or glyph; clicks: `click`;
+- keep effects under the music: `gain_db` -6 to -10, and fewer is better:
+  one sound per idea, not per layer.
+
+On a screen recording's own timeline use `recording_sound_add`;
+`recording_info` lists its clicks, keystrokes and zooms.
+
 ## Motion inside a screen recording
 
 A person editing a Lahza screen recording (`*.lahzarec`) can ask for a

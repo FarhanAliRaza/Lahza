@@ -26,7 +26,8 @@ dependencies. Pass `--cpu` to force the CPU renderer.
 Tools: `project_create`, `project_open`, `project_info`, `timeline_get`,
 `markers_query`, `markers_import`, `edit_apply`, `check`, `snapshot`,
 `render`, `render_status`, `history`, `audio_analyze`, `media_import`,
-`blender_run`, `recording_info`, `recording_place`.
+`blender_run`, `recording_info`, `recording_place`, `sfx_add`,
+`recording_sound_add`.
 Resources: `lahza://guide` (the production loop and timing rules),
 `lahza://schema` (the project format), `lahza://catalog` (presets with
 their measured numbers, curves, anchors, references, layer kinds, ops),
@@ -86,6 +87,27 @@ frame evaluation 0.16 ms and display-list build 0.8 ms per frame; raster on a
 4-core container is 47 ms (llvmpipe Vulkan) / 69 ms (CPU path). Hardware GPU
 numbers (the RTX 3060 target) still need measuring on that machine. The full
 20 s promo exported at 0.85× real time on the 4-core CPU path.
+
+## Sound effects
+
+Sound effects are clips with ids, placed by any time reference, so an
+effect anchored to an animation (`"#card.start - 3f"`) moves when the
+animation moves; `set` and `remove` work on them by id, with undo. Fourteen
+effects are built in, synthesised at 48 kHz with nothing to source or
+license: whoosh, whoosh-out, swipe, pop, click, tick, type, thud, hit, boom,
+riser, ding, sparkle and glitch (`lahza://catalog` lists what each is for).
+
+- **Motion editor:** one row per sound with its waveform. **Add sound**
+  places an effect at the playhead (on a selected layer's start it anchors
+  to that layer). Drag a sound to retime it: it snaps to a layer's start or
+  end and then follows that layer, or to a key; Shift snaps to beats.
+  Selecting one shows its time, gain (±3 dB) and Delete.
+- **Video timeline:** **+ Media → Sound effect…** adds one at the playhead
+  on the Music / SFX lane, where it can be moved, trimmed and faded like any
+  audio clip.
+- **Agents:** `sfx_add` in a motion project; `recording_sound_add` on a
+  recording, whose `recording_info` lists the clicks, keystrokes and zooms
+  in edited-video seconds. The studio shows an agent's sounds live.
 
 ## Motion inside screen recordings
 
