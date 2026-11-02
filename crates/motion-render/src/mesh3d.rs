@@ -81,6 +81,7 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
         || layer.blend != lahza_motion_core::document::Blend::Normal
         || m.materials.iter().any(|x| x.opacity < 1.0 || x.transmission > 0.0 || x.color.0[3] < 1.0)
         || m.colors.iter().any(|c| c.0[3] < 1.0)
+        || m.materials.iter().any(|x| x.wireframe > 0.0 && x.wire_fill.is_none())
 }
 
 impl MeshCache {
@@ -190,6 +191,9 @@ impl MeshCache {
         // triangle's outward side (+1/−1 on its winding), 0 when open.
         let mut caster = Caster::default();
         for rm in &run.meshes {
+            if rm.state.materials.iter().all(|x| x.wireframe > 0.0 && x.wire_fill.is_none()) {
+                continue;
+            }
             let Some(mesh) = self.get(&rm.state) else { continue };
             let mv = rm.state.camera.view.then(rm.state.world);
             let m3 = mv.0;
@@ -282,7 +286,7 @@ pub(crate) struct Vert {
 pub(crate) struct Batch {
     verts: Vec<Vert>,
     /// Vertex indices and material index.
-    tris: Vec<([u32; 3], u32)>,
+    tris: Vec<([u32; 3], u32, u8)>,
     /// 4 rows per material (see `material_rows`).
     materials: Vec<[f32; 4]>,
     lighting: Arc<Lighting>,
@@ -537,6 +541,9 @@ pub const FLAG_SHADOW_CATCHER: u32 = 8;
 /// A card: rows 0–1 hold its picture (canvas → texel map, texel offset
 /// relative to the primitive's texel base, size).
 pub const FLAG_CARD: u32 = 16;
+/// A wireframe: edges `row 3.w` px wide in row 0's colour; faces in row 1's
+/// colour, or see-through when its alpha is 0.
+pub const FLAG_WIRE: u32 = 32;
 
 /// Shadow filter taps (a Poisson disk on the unit circle).
 pub const SHADOW_TAPS: [[f32; 2]; 8] = [[-0.613, 0.617], [0.170, -0.040], [-0.299, -0.792], [0.645, 0.493], [-0.651, -0.075], [0.421, -0.718], [-0.084, 0.290], [0.874, -0.130]];
@@ -572,9 +579,21 @@ fn piece_colors(m: &MeshState, part: usize) -> usize {
 /// Rows of one material: [rgb linear, opacity], [metallic, roughness,
 /// clear coat, its roughness], [emissive rgb, flags (1 unlit, 2 faceted)],
 /// [transmission, 0, 0, 0].
-fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64) -> [[f32; 4]; 4] {
+fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64) -> [[f32; 4]; 4] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
+    if mat.wireframe > 0.0 {
+        // Wires: [colour, opacity], [fill colour, fill opacity (0: see-through)],
+        // [_, flags], [_, _, _, width in output px].
+        let lin = |c: lahza_motion_core::value::Color| [srgb_to_linear(c.0[0]) as f32, srgb_to_linear(c.0[1]) as f32, srgb_to_linear(c.0[2]) as f32];
+        let (w, f) = (lin(color), mat.wire_fill.map(|c| (lin(c), c.0[3] * mat.opacity * opacity)).unwrap_or(([0.0; 3], 0.0)));
+        return [
+            [w[0], w[1], w[2], (color.0[3] * mat.opacity * opacity) as f32],
+            [f.0[0], f.0[1], f.0[2], f.1 as f32],
+            [0.0, 0.0, 0.0, (FLAG_WIRE | FLAG_UNLIT) as f32],
+            [0.0, 0.0, 0.0, (mat.wireframe * scale) as f32],
+        ];
+    }
     let flags = (mat.unlit as u32) * FLAG_UNLIT | (mat.faceted as u32) * FLAG_FACETED | (mat.shadow_catcher as u32) * FLAG_SHADOW_CATCHER;
     [
         [srgb_to_linear(color.0[0]) as f32, srgb_to_linear(color.0[1]) as f32, srgb_to_linear(color.0[2]) as f32, (color.0[3] * mat.opacity * opacity) as f32],
@@ -706,8 +725,8 @@ impl Batch {
                 self.bounds = [self.bounds[0].min(s[0]), self.bounds[1].min(s[1]), self.bounds[2].max(s[0]), self.bounds[3].max(s[1])];
             }
         }
-        self.tris.push(([base, base + 1, base + 2], material));
-        self.tris.push(([base, base + 2, base + 3], material));
+        self.tris.push(([base, base + 1, base + 2], material, 7));
+        self.tris.push(([base, base + 2, base + 3], material, 7));
     }
 
     fn add_mesh(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
@@ -754,7 +773,8 @@ impl Batch {
         // Material slots by (part, colour), filled on first use.
         let colors_n = (0..PARTS).map(|p| piece_colors(m, p)).max().unwrap_or(1);
         let mut slots = vec![u32::MAX; PARTS * colors_n];
-        for (t, &tag) in mesh.tris.iter().zip(&mesh.tags) {
+        let wire_scale = root.max_scale();
+        for ((t, &tag), &edges) in mesh.tris.iter().zip(&mesh.tags).zip(&mesh.edges) {
             let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
             let segment = mesh::tag_segment(tag);
             let v = t.map(|i| cam[i as usize]);
@@ -766,7 +786,9 @@ impl Batch {
             if dot(g, navg) < 0.0 {
                 g = [-g[0], -g[1], -g[2]];
             }
-            if tag & TWO_SIDED == 0 && dot(g, v[0].0) >= 0.0 {
+            // See-through wireframes show their back edges too.
+            let xray = m.materials[part].wireframe > 0.0 && m.materials[part].wire_fill.is_none();
+            if tag & TWO_SIDED == 0 && !xray && dot(g, v[0].0) >= 0.0 {
                 continue;
             }
             let material = match (occluder, self.occluder) {
@@ -776,7 +798,7 @@ impl Batch {
                     let mslot = &mut slots[part * colors_n + (segment % colors) as usize];
                     if *mslot == u32::MAX {
                         *mslot = (self.materials.len() / 4) as u32;
-                        self.materials.extend_from_slice(&material_rows(m, part, segment, opacity));
+                        self.materials.extend_from_slice(&material_rows(m, part, segment, opacity, wire_scale));
                     }
                     *mslot
                 }
@@ -793,7 +815,7 @@ impl Batch {
                     }
                     *s
                 });
-                self.tris.push((ids, material));
+                self.tris.push((ids, material, edges));
                 continue;
             }
             // Clip against the near plane (Sutherland–Hodgman).
@@ -811,7 +833,7 @@ impl Batch {
             }
             let ids: Vec<u32> = poly.iter().map(|(p, n)| push(&mut self.verts, &mut self.bounds, *p, *n)).collect();
             for k in 1..ids.len().saturating_sub(1) {
-                self.tris.push(([ids[0], ids[k], ids[k + 1]], material));
+                self.tris.push(([ids[0], ids[k], ids[k + 1]], material, 7));
             }
         }
     }
@@ -829,7 +851,7 @@ impl Batch {
             rows: [[f32; 4]; 4],
             bbox: [f32; 4],
         }
-        let setup = |(ids, material): &([u32; 3], u32)| -> Option<Tri> {
+        let setup = |(ids, material, edges): &([u32; 3], u32, u8)| -> Option<Tri> {
             // Positions as the rasteriser sees them (f32), so the edge
             // tests and these planes agree.
             let p = ids.map(|i| to_target(self.verts[i as usize].screen).map(|v| v as f32 as f64));
@@ -860,7 +882,11 @@ impl Batch {
             let rows = [
                 [f(p[0][0]), f(p[0][1]), f(p[1][0]), f(p[1][1])],
                 [f(p[2][0]), f(p[2][1]), sign, f32::from_bits(*material)],
-                [f32::from_bits(ids[0]), f32::from_bits(ids[1]), f32::from_bits(ids[2]), if self.materials[*material as usize * 4 + 2][3] as u32 & FLAG_CARD != 0 { 1.0 } else { 0.0 }],
+                [f32::from_bits(ids[0]), f32::from_bits(ids[1]), f32::from_bits(ids[2]), {
+                    // Bits: card, wireframe, then the real-edge mask.
+                    let flags = self.materials[*material as usize * 4 + 2][3] as u32;
+                    ((flags & FLAG_CARD != 0) as u32 | ((flags & FLAG_WIRE != 0) as u32) << 1 | (*edges as u32) << 2) as f32
+                }],
                 [f(depth[0]), f(depth[1]), f(depth[2]), 0.0],
             ];
             Some(Tri { rows, bbox: bbox.map(|v| v as f32) })
@@ -1307,6 +1333,31 @@ fn sample_group(groups: &[[f32; 4]], prim: &Prim, g: [f32; 2]) -> [f32; 4] {
     })
 }
 
+/// Distance in px from `q` to the triangle's nearest real edge (`mask`
+/// bits: edges opposite each vertex), given its positive-inside edge values.
+fn wire_distance(r0: [f32; 4], r1: [f32; 4], e: [f32; 3], mask: u32) -> f32 {
+    let p = [[r0[0], r0[1]], [r0[2], r0[3]], [r1[0], r1[1]]];
+    let mut d = f32::MAX;
+    for k in 0..3 {
+        if mask & (1 << k) != 0 {
+            let (a, b) = (p[(k + 1) % 3], p[(k + 2) % 3]);
+            let len = ((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1])).sqrt().max(1e-6);
+            d = d.min(e[k] / len);
+        }
+    }
+    d
+}
+
+/// Whether a sample stands on a wireframe triangle: on a wire, or on its
+/// face when the wireframe is filled.
+fn wire_stands(m: &[[f32; 4]], material: usize, r0: [f32; 4], r1: [f32; 4], tri_flags: u32, q: [f32; 2]) -> bool {
+    if m[material + 1][3] > 0.0 {
+        return true;
+    }
+    let (e, _) = cover(r0, r1, q);
+    wire_distance(r0, r1, e, tri_flags >> 2) <= m[material + 3][3] * 0.5
+}
+
 /// A card's picture at target point `q` (transparent outside it).
 fn card_sample(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], material: usize, q: [f32; 2]) -> [f32; 4] {
     let (r0, r1) = (m[material], m[material + 1]);
@@ -1338,6 +1389,14 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     }
     if mat_flags & FLAG_CARD != 0 {
         return card_sample(prim, m, groups, mb + m[tb + 1][3].to_bits() as usize * 4, q);
+    }
+    if mat_flags & FLAG_WIRE != 0 {
+        let row = mb + m[tb + 1][3].to_bits() as usize * 4;
+        let (e, _) = cover(m[tb], m[tb + 1], q);
+        let on_wire = wire_distance(m[tb], m[tb + 1], e, m[tb + 2][3] as u32 >> 2) <= m[row + 3][3] * 0.5;
+        let c = if on_wire { m[row] } else { m[row + 1] };
+        let a = c[3];
+        return [encode(c[0]) * a, encode(c[1]) * a, encode(c[2]) * a, a];
     }
     let (e, _) = cover(m[tb], m[tb + 1], q);
     let ids = m[tb + 2];
@@ -1521,7 +1580,16 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
                 let z = d[0] * q[0] + d[1] * q[1] + d[2];
                 // Cards only stand where their picture is (alpha test).
                 // Later surfaces win ties: coplanar layers keep their order.
-                if z >= depth[s] * (1.0 - TIE) && (m[r + 2][3] < 0.5 || card_sample(prim, m, groups, prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * 4, q)[3] >= 0.5) {
+                let tf = m[r + 2][3] as u32;
+                let material = prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * 4;
+                let stands = if tf & 1 != 0 {
+                    card_sample(prim, m, groups, material, q)[3] >= 0.5
+                } else if tf & 2 != 0 {
+                    wire_stands(m, material, r0, r1, tf, q)
+                } else {
+                    true
+                };
+                if z >= depth[s] * (1.0 - TIE) && stands {
                     depth[s] = z;
                     best[s] = tri;
                 }

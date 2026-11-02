@@ -271,11 +271,12 @@ y down, z away from the viewer, centred on the layer origin.
 |---|---|
 | `mesh` | geometry, by `type` (below) |
 | `material` | surface (below); default preset `glossy`, white |
-| `parts` | `front`, `back`, `side`, `bevel`, `caps`: a material over `material` for that part |
+| `parts` | `front`, `back`, `side`, `bevel`, `caps`, `inside`: a material over `material` for that part |
 | `segments` | split rings, revolves and sweeps into this many pieces (default 1) |
+| `spans` | relative sizes of the pieces, in turn (`[1, 3]`: a quarter and three quarters); default equal |
 | `gap` | between pieces: degrees (sweeps: a fraction of the length); animatable |
 | `colors` | one colour per piece, in turn (animatable); parts with their own colour keep it |
-| `detail` | tessellation multiplier (default 1: smooth at the drawn size) |
+| `detail` | tessellation multiplier (default 1: smooth at the drawn size; meshes are tessellated for their on-screen size, so small profiles scaled up stay smooth) |
 
 Geometry (numbers animatable unless noted):
 
@@ -292,6 +293,12 @@ Geometry (numbers animatable unless noted):
 | `sweep` | `d` path in the layer plane, `radius` (10), `profile`: `circle` \| `square` \| `ribbon`, `width` (ribbon, 40), `trim` [from, to] (0..1), `caps`: `round` (default) \| `flat`, `head` (radius of a leading ball) |
 
 A torus faces the camera like a `ring` shape; tilt it with `rotation_x`.
+Rings and revolves name their faces by the way they face: `front`
+(toward −axis: the camera for rings, the top for standing revolves),
+`back`, `side` (away from the axis) and `inside` (toward it); flat ends
+are `caps`. Any part's material can take its own `colors` (one per piece,
+in turn), e.g. a ring whose fronts cycle colours while its sides stay one
+colour.
 Depth scales with `scale` (times `transform.scale_z`, default 1).
 
 Material: `preset` (`matte`, `plastic`, `glossy`, `coated`, `metal`,
@@ -300,8 +307,17 @@ Material: `preset` (`matte`, `plastic`, `glossy`, `coated`, `metal`,
 `clearcoat_roughness`, `emissive` (colour), `emissive_strength`, `opacity`,
 `transmission` (0..1, glass), `ior` (glass: 1 no bending, 1.45 default,
 2.4 diamond), `thickness` (glass: px the light travels inside, default 60),
-`unlit` (bool), `faceted` (bool: one normal per triangle). Colours and
-numbers are animatable.
+`unlit` (bool), `faceted` (bool: one normal per triangle), `colors` (per
+piece, in turn), `wireframe` (px: draw the edges instead of the surface,
+unlit, in `color`; quad diagonals and cap fills are skipped) and `fill`
+(wireframe face colour: hidden-line; without it the wires are see-through
+and show the back edges). Preset `wireframe` is 1.5 px light grey wires.
+Colours and numbers are animatable.
+
+```json
+{"id": "cage", "kind": "mesh", "mesh": {"type": "torus", "radius": 200, "tube": 60},
+ "material": {"preset": "wireframe", "color": "#ffb020", "fill": "#24262b"}}
+```
 
 Glass (`transmission` > 0) refracts what is drawn before it: the layers
 behind are seen bent through it (by `ior` and `thickness`), tinted by its
@@ -338,7 +354,8 @@ Scenes light meshes with `lights` and `environment`:
 
 `from` points toward a directional light (y down, z away: `[-1, -1, -1]`
 is upper left, in front); `position` places a point light in world px.
-Colours and intensities are animatable. Without `lights` a scene has a key
+`from`, `position`, colours and intensities are animatable (keys of
+`[x, y, z]`), so lights can move. Without `lights` a scene has a key
 from the upper left front and a rim from behind on the right. Lights cast
 soft shadows from every mesh onto every other mesh of the layer list:
 `shadow` (bool; default true for the first directional or point light,

@@ -40,6 +40,10 @@ pub struct MaterialState {
     pub faceted: bool,
     /// Shows only the shadows falling on it.
     pub shadow_catcher: bool,
+    /// Edge width in px (0: a surface).
+    pub wireframe: f64,
+    /// Wireframe face colour (hidden-line); `None`: see-through wires.
+    pub wire_fill: Option<Color>,
 }
 
 impl MaterialState {
@@ -58,6 +62,8 @@ impl MaterialState {
             unlit: false,
             faceted: false,
             shadow_catcher: false,
+            wireframe: 0.0,
+            wire_fill: None,
         };
         match p {
             MaterialPreset::Matte => MaterialState { roughness: 0.85, ..base },
@@ -70,6 +76,7 @@ impl MaterialState {
             MaterialPreset::Emissive => MaterialState { roughness: 0.5, ..base },
             MaterialPreset::Flat => MaterialState { unlit: true, ..base },
             MaterialPreset::Shadow => MaterialState { color: Color::BLACK, opacity: 0.55, shadow_catcher: true, ..base },
+            MaterialPreset::Wireframe => MaterialState { color: Color([0.86, 0.89, 0.94, 1.0]), unlit: true, wireframe: 1.5, ..base },
         }
     }
 }
@@ -148,6 +155,8 @@ pub(super) struct CMaterial {
     thickness: Option<Prop<f64>>,
     unlit: Option<bool>,
     faceted: Option<bool>,
+    wireframe: Option<Prop<f64>>,
+    fill: Option<Prop<Color>>,
 }
 
 impl CMaterial {
@@ -173,6 +182,10 @@ impl CMaterial {
         };
         if let Some(e) = emissive {
             m.emissive = [e.0[0] * e.0[3] * strength, e.0[1] * e.0[3] * strength, e.0[2] * e.0[3] * strength];
+        }
+        m.wireframe = f(&self.wireframe, m.wireframe, 0.0, 200.0);
+        if let Some(fill) = &self.fill {
+            m.wire_fill = Some(clamp_color(fill.at(t)));
         }
         m.unlit = self.unlit.unwrap_or(m.unlit);
         m.faceted = self.faceted.unwrap_or(m.faceted);
@@ -227,6 +240,8 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         emissive: o.emissive.clone().or_else(|| base.emissive.clone()),
         emissive_strength: o.emissive_strength.clone().or_else(|| base.emissive_strength.clone()),
         colors: if o.colors.is_empty() { base.colors.clone() } else { o.colors.clone() },
+        wireframe: o.wireframe.clone().or_else(|| base.wireframe.clone()),
+        fill: o.fill.clone().or_else(|| base.fill.clone()),
         opacity: o.opacity.clone().or_else(|| base.opacity.clone()),
         transmission: o.transmission.clone().or_else(|| base.transmission.clone()),
         ior: o.ior.clone().or_else(|| base.ior.clone()),
@@ -284,6 +299,8 @@ impl Compiler<'_> {
             thickness: m.thickness.as_ref().map(|p| self.prop(p, id, &w("thickness"), start, step, shift)),
             unlit: m.unlit,
             faceted: m.faceted,
+            wireframe: m.wireframe.as_ref().map(|p| self.prop(p, id, &w("wireframe"), start, step, shift)),
+            fill: m.fill.as_ref().map(|p| self.prop(p, id, &w("fill"), start, step, shift)),
         }
     }
 

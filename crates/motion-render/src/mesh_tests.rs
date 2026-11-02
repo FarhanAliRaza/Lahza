@@ -520,3 +520,44 @@ fn two_tone_rings_colour_parts_per_segment() {
         "transform": {"position": [160, 120], "rotation_x": 75}})), 0.0);
     assert!(tilted.pixels().filter(|p| p.0 == [0, 0, 255, 255]).count() > 300);
 }
+
+fn wire_scene() -> Project {
+    scene(640, 360, json!({"background": "#2a2c31", "camera": {"orbit": [20, 15]}, "layers": [
+        {"id": "box", "kind": "mesh", "mesh": {"type": "box", "size": [140, 140], "depth": 140, "bevel": 20}, "material": {"preset": "wireframe"},
+         "transform": {"position": [150, 180], "rotation_y": 25}},
+        {"id": "torus", "kind": "mesh", "mesh": {"type": "torus", "radius": 90, "tube": 30}, "material": {"preset": "wireframe", "color": "#ffb020", "fill": "#3a3d44"},
+         "transform": {"position": [340, 180], "rotation_x": 60}},
+        {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 80}, "material": {"preset": "glossy", "color": "#5fd4ff"}, "transform": {"position": [530, 180]}},
+        {"id": "cage", "kind": "mesh", "mesh": {"type": "sphere", "radius": 95}, "material": {"preset": "wireframe", "wireframe": 1}, "transform": {"position": [530, 180]}}
+    ]}))
+}
+
+#[test]
+#[ignore]
+fn dump_wireframe() {
+    let out = std::env::var("LAHZA_MESH_OUT").unwrap_or_else(|_| "/tmp".into());
+    render(&wire_scene(), 0.0).save(format!("{out}/wire.png")).unwrap();
+}
+
+#[test]
+fn wireframes_draw_edges() {
+    let img = render(&wire_scene(), 0.0);
+    // The see-through box: thin light lines with the background between.
+    let grey = img.pixels().filter(|p| p.0[0] > 200 && p.0[1] > 200 && p.0[2] > 200).count();
+    assert!(grey > 1500, "wires drawn: {grey}");
+    assert_eq!(px(&img, 150, 180), [0x2a, 0x2c, 0x31, 255], "inside the x-ray box is background");
+    // The hidden-line torus: its fill shows between the orange wires.
+    let fill = img.pixels().filter(|p| p.0 == [0x3a, 0x3d, 0x44, 255]).count();
+    let orange = img.pixels().filter(|p| p.0[0] > 240 && p.0[1] > 160 && p.0[1] < 190 && p.0[2] < 60).count();
+    assert!(fill > 3000 && orange > 1500, "fill {fill}, wires {orange}");
+    // Quad diagonals are not drawn: a flat-shaded box face has only its outline.
+    let face = render(&one(json!({"id": "b", "kind": "mesh", "mesh": {"type": "box", "size": [160, 160], "depth": 160}, "material": {"preset": "wireframe", "wireframe": 2, "fill": "#000000"}, "transform": {"position": [160, 120]}})), 0.0);
+    let lit = |x0: u32, x1: u32, y: u32| (x0..x1).filter(|&x| face.get_pixel(x, y).0[0] > 100).count();
+    assert_eq!(lit(100, 220, 120), 0, "no diagonal across the face");
+    assert!(lit(30, 100, 120) >= 1, "the left edge");
+}
+
+#[test]
+fn gpu_matches_cpu_wireframes() {
+    crate::tests::assert_gpu_matches_cpu_within(&wire_scene(), &[0.0], 0.001);
+}

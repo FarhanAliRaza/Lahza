@@ -2153,6 +2153,15 @@ pub struct Material {
     /// what is behind shifts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thickness: Option<Property<f64>>,
+    /// Wireframe: draw the mesh's edges this many px wide instead of its
+    /// surface (in `color`, unlit). Without `fill` the wires show through
+    /// (the back edges too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireframe: Option<Property<f64>>,
+    /// Wireframe: fill the faces with this colour and hide the edges
+    /// behind them (hidden-line viewport look).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Property<Color>>,
     /// One colour per piece, in turn, for this part (over the layer's
     /// `colors`): two-tone segmented rings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2189,6 +2198,8 @@ pub enum MaterialPreset {
     /// Invisible except for the shadows falling on it (`color` tints them,
     /// `opacity` is their strength): drops meshes' shadows onto 2D layers.
     Shadow,
+    /// Edges only (1.5 px, light grey, see-through): a 3D viewport look.
+    Wireframe,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

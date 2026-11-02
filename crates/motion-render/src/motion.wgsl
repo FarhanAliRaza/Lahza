@@ -909,6 +909,28 @@ fn sample_group(prim: Prim, g: vec2<f32>) -> vec4<f32> {
 
 const TIE: f32 = 2e-5;
 
+// Mirrors `wire_distance` in mesh3d.rs.
+fn wire_distance(r0: vec4<f32>, r1: vec4<f32>, e: vec3<f32>, mask: u32) -> f32 {
+    var p = array<vec2<f32>, 3>(r0.xy, r0.zw, r1.xy);
+    let ev = array<f32, 3>(e.x, e.y, e.z);
+    var d = 3.4e38;
+    for (var k = 0u; k < 3u; k++) {
+        if (mask & (1u << k)) != 0u {
+            let a = p[(k + 1u) % 3u];
+            let b = p[(k + 2u) % 3u];
+            let len = max(sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y)), 1e-6);
+            d = min(d, ev[k] / len);
+        }
+    }
+    return d;
+}
+
+fn wire_stands(material: u32, r0: vec4<f32>, r1: vec4<f32>, tf: u32, q: vec2<f32>) -> bool {
+    if b_mesh[material + 1u].w > 0.0 { return true; }
+    let c = cover(r0, r1, q);
+    return wire_distance(r0, r1, c.e, tf >> 2u) <= b_mesh[material + 3u].w * 0.5;
+}
+
 fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
     if x < 0 || y < 0 || x >= w || y >= h { return vec4<f32>(0.0); }
     return b_groups[u32(off + y * w + x)];
@@ -950,6 +972,14 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     }
     if (mat_flags & 16u) != 0u {
         return card_sample(prim, mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u, q);
+    }
+    if (mat_flags & 32u) != 0u {
+        let row = mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u;
+        let wc = cover(b_mesh[tb], b_mesh[tb + 1u], q);
+        let on_wire = wire_distance(b_mesh[tb], b_mesh[tb + 1u], wc.e, u32(b_mesh[tb + 2u].w) >> 2u) <= b_mesh[row + 3u].w * 0.5;
+        var c = b_mesh[row + 1u];
+        if on_wire { c = b_mesh[row]; }
+        return vec4<f32>(encode(c.x) * c.w, encode(c.y) * c.w, encode(c.z) * c.w, c.w);
     }
     let cv = cover(b_mesh[tb], b_mesh[tb + 1u], q);
     let ev = array<f32, 3>(cv.e.x, cv.e.y, cv.e.z);
@@ -1142,8 +1172,12 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
                 // Later surfaces win ties; cards only where their picture is.
                 if z >= depth[s] * (1.0 - TIE) {
                     var stands = true;
-                    if b_mesh[r + 2u].w >= 0.5 {
-                        stands = card_sample(prim, bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * 4u, q).w >= 0.5;
+                    let tf = u32(b_mesh[r + 2u].w);
+                    let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * 4u;
+                    if (tf & 1u) != 0u {
+                        stands = card_sample(prim, material, q).w >= 0.5;
+                    } else if (tf & 2u) != 0u {
+                        stands = wire_stands(material, r0, r1, tf, q);
                     }
                     if stands {
                         depth[s] = z;

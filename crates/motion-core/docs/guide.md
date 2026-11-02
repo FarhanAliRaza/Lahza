@@ -194,6 +194,9 @@ reference.
   with thin streaks mean the `night` environment.
 - **Camera**: the scene camera's `fov`, `orbit`, `dolly`, depth of field
   (`aperture`, `focus`) and motion blur all apply.
+- **Viewport looks**: `preset: wireframe` draws a mesh's edges (`fill`
+  for hidden-line); a wire cage over a glossy copy of the same mesh reads
+  as a 3D app's viewport.
 - Blender (`blender_run`) is for what meshes can't do: fluids, cloth,
   sculpted or imported models, caustics and global illumination.
 

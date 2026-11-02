@@ -36,6 +36,9 @@ pub struct Mesh {
     pub tris: Vec<[u32; 3]>,
     /// Per triangle: part (bits 0..8), segment (bits 8..24), `TWO_SIDED`.
     pub tags: Vec<u32>,
+    /// Per triangle: which edges are real (bit k: the edge opposite vertex
+    /// k), for wireframes; quad diagonals and cap fills are not.
+    pub edges: Vec<u8>,
 }
 
 pub fn tag(part: u32, segment: u32) -> u32 {
@@ -79,12 +82,44 @@ impl Mesh {
         (self.positions.len() - 1) as u32
     }
     fn tri(&mut self, a: u32, b: u32, c: u32, tag: u32) {
+        self.tri_edges(a, b, c, tag, 7);
+    }
+    fn tri_edges(&mut self, a: u32, b: u32, c: u32, tag: u32, edges: u8) {
         self.tris.push([a, b, c]);
         self.tags.push(tag);
+        self.edges.push(edges);
     }
     fn quad(&mut self, a: u32, b: u32, c: u32, d: u32, tag: u32) {
-        self.tri(a, b, c, tag);
-        self.tri(a, c, d, tag);
+        // The diagonal a–c is not an edge of the quad.
+        self.tri_edges(a, b, c, tag, 0b101);
+        self.tri_edges(a, c, d, tag, 0b011);
+    }
+    /// Triangles filling outlines: only edges along an outline (between
+    /// neighbouring points of one contour) are real.
+    fn fill(&mut self, base: u32, tris: &[[usize; 3]], contours: &[usize], tag: u32) {
+        let contour_of = |i: usize| {
+            let mut start = 0;
+            for &n in contours {
+                if i < start + n {
+                    return (start, n);
+                }
+                start += n;
+            }
+            (start, 1)
+        };
+        let outline = |i: usize, j: usize| {
+            let ((si, ni), (sj, _)) = (contour_of(i), contour_of(j));
+            si == sj && ((i - si + 1) % ni == j - si || (j - si + 1) % ni == i - si)
+        };
+        for t in tris {
+            let mut mask = 0u8;
+            for k in 0..3 {
+                if outline(t[(k + 1) % 3], t[(k + 2) % 3]) {
+                    mask |= 1 << k;
+                }
+            }
+            self.tri_edges(base + t[0] as u32, base + t[1] as u32, base + t[2] as u32, tag, mask);
+        }
     }
     pub fn append(&mut self, other: &Mesh) {
         let base = self.positions.len() as u32;
@@ -92,6 +127,7 @@ impl Mesh {
         self.normals.extend_from_slice(&other.normals);
         self.tris.extend(other.tris.iter().map(|t| t.map(|i| i + base)));
         self.tags.extend_from_slice(&other.tags);
+        self.edges.extend_from_slice(&other.edges);
     }
     /// Local bounds [min, max].
     pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
@@ -726,7 +762,7 @@ fn disc_cap(mesh: &mut Mesh, r: f64, t: f64, a: f64, dir: f64, steps: usize, seg
         })
         .collect();
     for w in ring.windows(2) {
-        mesh.tri(c, w[0], w[1], tag(PART_CAPS, segment));
+        mesh.tri_edges(c, w[0], w[1], tag(PART_CAPS, segment), 0b001);
     }
 }
 
@@ -783,9 +819,7 @@ fn profile_cap(mesh: &mut Mesh, pts: &[(f64, f64)], a: f64, dir: f64, axis_y: bo
     for p in pts {
         mesh.vertex(around(axis_y, a, p.0, p.1), normal);
     }
-    for t in tris {
-        mesh.tri(base + t[0] as u32, base + t[1] as u32, base + t[2] as u32, tag(PART_CAPS, segment));
-    }
+    mesh.fill(base, &tris, &[pts.len()], tag(PART_CAPS, segment));
 }
 
 // ------------------------------------------------------------------ box
@@ -1115,9 +1149,8 @@ fn extrude(mesh: &mut Mesh, path: &PathMorph, depth: f64, bevel: f64, detail: f6
                 let p = (w.p.0 - w.miter.0 * b, w.p.1 - w.miter.1 * b);
                 mesh.vertex([p.0, p.1, z], [0.0, 0.0, nz]);
             }
-            for t in &tris {
-                mesh.tri(base + t[0] as u32, base + t[1] as u32, base + t[2] as u32, tag(part, 0));
-            }
+            let sizes: Vec<usize> = all_walls.iter().map(Vec::len).collect();
+            mesh.fill(base, &tris, &sizes, tag(part, 0));
         }
         // Walls: rings from the front face, round the bevel, down the side
         // and round the back bevel. Each ring: (inset, z, normal xy scale,
@@ -1325,7 +1358,7 @@ fn tube(mesh: &mut Mesh, line: &[(f64, f64)], r: f64, width: f64, profile: Sweep
                 let centre = mesh.vertex(c, out);
                 let ring: Vec<u32> = section.iter().map(|&((u, v), _)| mesh.vertex(add(c, add(mul(nn, u), mul([0.0, 0.0, 1.0], v))), out)).collect();
                 for w in ring.windows(2) {
-                    mesh.tri(centre, w[0], w[1], tag(PART_CAPS, segment));
+                    mesh.tri_edges(centre, w[0], w[1], tag(PART_CAPS, segment), 0b001);
                 }
             }
         }
@@ -1517,6 +1550,30 @@ mod tests {
         };
         assert!((angle(0) - 90.0).abs() < 1.0, "{}", angle(0));
         assert!(angle(1) > 260.0);
+    }
+
+    #[test]
+    fn wire_edges_skip_diagonals_and_fills() {
+        for shape in [
+            MeshShape::Box { size: [100.0, 100.0, 100.0], bevel: 0.0 },
+            MeshShape::Extrude { path: path("M -50 -50 L 50 -50 L 50 50 L -50 50 Z"), depth: 20.0, bevel: 0.0 },
+            MeshShape::Torus { radius: 100.0, tube: 20.0, angles: [0.0, 180.0], caps: Caps::Flat },
+        ] {
+            let m = generate(&params(shape.clone())).unwrap();
+            assert_eq!(m.edges.len(), m.tris.len());
+            // Real edges are never interior to a flat face: count edges on
+            // the box/extrude front (z = −half): its 4 outline edges only.
+            if !matches!(shape, MeshShape::Torus { .. }) {
+                let mut front = 0;
+                for ((t, tag), mask) in m.tris.iter().zip(&m.tags).zip(&m.edges) {
+                    if tag_part(*tag) == PART_FRONT {
+                        front += mask.count_ones();
+                        let _ = t;
+                    }
+                }
+                assert_eq!(front, 4, "{shape:?}");
+            }
+        }
     }
 
     #[test]
