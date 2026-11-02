@@ -183,6 +183,9 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
                 crate::list::PRIM_MESH => {
                     p.geom[0] = rebase(p.geom[0], bins_base);
                     p.geom2 = p.geom2.map(|v| rebase(v, mesh_base));
+                    if p.paint[3] > 0.5 {
+                        p.paint[0] = rebase(p.paint[0], texel_base);
+                    }
                 }
                 crate::list::PRIM_IMAGE if p.kind[1] == 1 => p.geom2[0] = rebase(p.geom2[0], texel_base),
                 crate::list::PRIM_MATTE => {

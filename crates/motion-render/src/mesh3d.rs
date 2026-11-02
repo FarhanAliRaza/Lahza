@@ -266,6 +266,24 @@ pub(crate) struct Batch {
     pub(crate) see_through: bool,
     /// Per light of the lighting: its shadow map, if it casts shadows.
     shadows: Arc<Vec<Option<Arc<ShadowMap>>>>,
+    /// Glass: a group holding everything behind, to refract.
+    pub(crate) backdrop: Option<Backdrop>,
+    /// Camera focal length in output pixels (refraction offsets).
+    focal: f64,
+}
+
+/// A group over output-pixel rect `origin + factor·(x, y)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Backdrop {
+    pub offset: u32,
+    pub size: (u32, u32),
+    pub origin: [f64; 2],
+    pub factor: [f64; 2],
+}
+
+/// Whether a mesh layer refracts (some part is glass).
+pub(crate) fn refracts(m: &MeshState) -> bool {
+    m.materials.iter().any(|x| x.transmission > 0.0 && !x.unlit && !x.shadow_catcher)
 }
 
 /// A light-space depth map: how close to the light the nearest surface is
@@ -503,7 +521,7 @@ fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64) -> [[f3
         [srgb_to_linear(color.0[0]) as f32, srgb_to_linear(color.0[1]) as f32, srgb_to_linear(color.0[2]) as f32, (color.0[3] * mat.opacity * opacity) as f32],
         [mat.metallic as f32, mat.roughness as f32, mat.clearcoat as f32, mat.clearcoat_roughness as f32],
         [mat.emissive[0] as f32, mat.emissive[1] as f32, mat.emissive[2] as f32, flags as f32],
-        [mat.transmission as f32, 0.0, 0.0, 0.0],
+        [mat.transmission as f32, mat.ior as f32, mat.thickness as f32, 0.0],
     ]
 }
 
@@ -560,6 +578,8 @@ impl Batch {
             members: Vec::new(),
             see_through: false,
             shadows: Arc::default(),
+            backdrop: None,
+            focal: m.camera.focal,
         })
     }
 
@@ -588,6 +608,9 @@ impl Batch {
         let mv = m.camera.view.then(m.world);
         let Some(nm) = mv.normal_matrix() else { return };
         let (focal, (cx, cy)) = (m.camera.focal, m.camera.centre);
+        if !occluder {
+            self.focal = focal * root.max_scale();
+        }
         let project = |p: [f64; 3]| -> [f64; 2] {
             let sx = focal * p[0] / p[2] + cx;
             let sy = focal * p[1] / p[2] + cy;
@@ -687,6 +710,7 @@ impl Batch {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn place(&self, mesh_rows: &mut Vec<[f32; 4]>, bins: &mut Vec<u32>, placed: &mut HashMap<usize, u32>, target: &Target, origin: [f64; 2], factor: [f64; 2], blend: u32) -> Option<(Prim, [f64; 4])> {
         let (tw_px, th_px) = (target.width as f64, target.height as f64);
+        let target_origin = origin;
         let to_target = |s: [f64; 2]| [(s[0] - origin[0]) / factor[0], (s[1] - origin[1]) / factor[1]];
         // Triangles on the target with their edge and depth planes.
         struct Tri {
@@ -869,8 +893,26 @@ impl Batch {
             mesh_rows[row][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
         }
         let b = |v: u32| f32::from_bits(v);
+        // Glass: target pixel p → backdrop texel a + b·p, and output px per
+        // unit of x/z for refraction offsets.
+        let (paint, paint2, stroke) = match self.backdrop {
+            Some(bd) => (
+                [b(bd.offset), b(bd.size.0), b(bd.size.1), 1.0],
+                [
+                    ((target_origin[0] - bd.origin[0]) / bd.factor[0]) as f32,
+                    ((target_origin[1] - bd.origin[1]) / bd.factor[1]) as f32,
+                    (factor[0] / bd.factor[0]) as f32,
+                    (factor[1] / bd.factor[1]) as f32,
+                ],
+                [(self.focal / factor[0]) as f32, (self.focal / factor[1]) as f32, 0.0, 0.0],
+            ),
+            None => ([0.0; 4], [0.0; 4], [0.0; 4]),
+        };
         let prim = Prim {
             kind: [PRIM_MESH, 0, blend, 0],
+            paint,
+            paint2,
+            stroke,
             inv_x: [1.0, 0.0, 0.0, 1.0],
             inv_y: [0.0, 1.0, 0.0, 1.0],
             inv_w: [0.0, 0.0, 1.0, 1.0],
@@ -1120,7 +1162,33 @@ fn encode(x: f32) -> f32 {
 }
 
 /// Premultiplied sRGB colour of triangle `tri` at target point `q`.
-fn shade_tri(prim: &Prim, m: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
+fn srgb_decode(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Bilinear sample of the glass backdrop group at texel position `g`.
+fn sample_group(groups: &[[f32; 4]], prim: &Prim, g: [f32; 2]) -> [f32; 4] {
+    let off = prim.paint[0].to_bits() as i64;
+    let (w, h) = (prim.paint[1].to_bits() as i64, prim.paint[2].to_bits() as i64);
+    let s = [g[0] - 0.5, g[1] - 0.5];
+    let (x0, y0) = (s[0].floor(), s[1].floor());
+    let (fx, fy) = (s[0] - x0, s[1] - y0);
+    let at = |x: i64, y: i64| groups[(off + y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize];
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    std::array::from_fn(|i| {
+        let top = a[i] + (b[i] - a[i]) * fx;
+        let bottom = c[i] + (d[i] - c[i]) * fx;
+        top + (bottom - top) * fy
+    })
+}
+
+fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
     let tb = prim.geom2[0].to_bits() as usize + tri as usize * 4;
     let vb = prim.geom2[1].to_bits() as usize;
     let mb = prim.geom2[2].to_bits() as usize;
@@ -1233,6 +1301,34 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
     if cc > 0.0 {
         s_light = fadd(s_light, fmul(env(m, lb, rw, ccr), fc_v * cc));
     }
+    if trans > 0.0 && prim.paint[3] > 0.5 {
+        // Refraction: what is behind, seen through the glass where the
+        // bent ray leaves it, tinted by the colour.
+        let ior = m3[1].max(1.0);
+        let i = fmul(v, -1.0);
+        let eta = 1.0 / ior;
+        let cosi = fdot(n, v).clamp(0.0, 1.0);
+        let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+        let t = if k < 0.0 { fsub(i, fmul(n, 2.0 * fdot(n, i))) } else { fadd(fmul(i, eta), fmul(n, eta * cosi - k.sqrt())) };
+        let exit = fadd(p, fmul(t, m3[2]));
+        let z = exit[2].max(1.0);
+        let d = [prim.stroke[0] * (exit[0] / z - p[0] / p[2]), prim.stroke[1] * (exit[1] / z - p[1] / p[2])];
+        let g = [prim.paint2[0] + prim.paint2[2] * (q[0] + d[0]), prim.paint2[1] + prim.paint2[3] * (q[1] + d[1])];
+        let behind = sample_group(groups, prim, g);
+        let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
+        let fr = f0 + (1.0 - f0) * (1.0 - n_v).powi(5);
+        let seen = if behind[3] > 0.0 { [0, 1, 2].map(|c| srgb_decode(behind[c] / behind[3]) * base[c]) } else { [0.0; 3] };
+        let through = trans * (1.0 - fr) * behind[3];
+        let lit = fadd(fadd(fmul(seen, through), fadd(d_light, emissive)), s_light);
+        let peak = s_light[0].max(s_light[1]).max(s_light[2]).min(1.0);
+        let a = (through + (1.0 - trans) + (1.0 - through - (1.0 - trans)).max(0.0) * peak).clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return [0.0; 4];
+        }
+        let c = lit.map(|x| encode(shoulder(x / a)));
+        let a = a * opacity;
+        return [c[0] * a, c[1] * a, c[2] * a, a];
+    }
     // Glass: the body lets the background through except where it reflects.
     let body = opacity * (1.0 - trans * (1.0 - fc_v));
     let s_light = fmul(s_light, opacity);
@@ -1247,7 +1343,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
 }
 
 /// Premultiplied colour of a mesh primitive at target pixel centre `p`.
-pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32]) -> [f32; 4] {
+pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups: &[[f32; 4]]) -> [f32; 4] {
     let tx = (p[0] as u32) / TILE;
     let ty = (p[1] as u32) / TILE;
     let (tx0, ty0, tw) = (prim.geom[1].to_bits(), prim.geom[2].to_bits(), prim.geom[3].to_bits());
@@ -1303,7 +1399,7 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32]) -> [f3
             }
         }
         let centroid = [p[0] + q[0] / (16.0 * n), p[1] + q[1] / (16.0 * n)];
-        let c = shade_tri(prim, m, tri, centroid);
+        let c = shade_tri(prim, m, groups, tri, centroid);
         for i in 0..4 {
             out[i] += c[i] * n / 8.0;
         }

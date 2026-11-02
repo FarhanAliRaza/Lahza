@@ -390,3 +390,50 @@ fn gpu_matches_cpu_shadows_and_occluders() {
         "transform": {"position": [540, 300], "rotation_x": 90}})).unwrap());
     crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0005);
 }
+
+/// Glass over stripes: real refraction bends them (and frosts with roughness).
+fn glass_scene(material: serde_json::Value) -> Project {
+    let mut layers = vec![json!({"id": "bg", "kind": "shape", "shape": "rect", "size": [640, 400], "fill": "#f4f1ea", "transform": {"position": [320, 200]}})];
+    for i in 0..16 {
+        let fill = ["#ff3b5c", "#2d5bff", "#111111", "#ffd23f"][i % 4];
+        layers.push(json!({"id": format!("stripe{i}"), "kind": "shape", "shape": "rect", "size": [18, 400], "fill": fill, "transform": {"position": [20 + i * 40, 200]}}));
+    }
+    layers.push(json!({"id": "t", "kind": "text", "text": "GLASS", "size": 90, "color": "#111111", "transform": {"position": [320, 340]}}));
+    layers.push(json!({"id": "g", "kind": "mesh", "mesh": {"type": "sphere", "radius": 120}, "material": material, "transform": {"position": [220, 190]}}));
+    layers.push(json!({"id": "c", "kind": "mesh", "mesh": {"type": "capsule", "radius": 50, "height": 260}, "material": {"preset": "glass", "roughness": 0.45}, "transform": {"position": [480, 190], "rotation": 30}}));
+    scene(640, 400, json!({"layers": layers}))
+}
+
+#[test]
+#[ignore]
+fn dump_glass() {
+    let out = std::env::var("LAHZA_MESH_OUT").unwrap_or_else(|_| "/tmp".into());
+    let img = render(&glass_scene(json!({"preset": "glass"})), 0.0);
+    img.save(format!("{out}/glass.png")).unwrap();
+}
+
+#[test]
+fn glass_refracts_what_is_behind() {
+    let clear = render(&glass_scene(json!({"preset": "glass"})), 0.0);
+    let mut none = glass_scene(json!({"preset": "glass"}));
+    none.scenes[0].layers.retain(|l| l.id != "g" && l.id != "c");
+    let plain = render(&none, 0.0);
+    // Through the sphere the stripes are bent: the row across it differs
+    // from the plain stripes much more than tint and gloss alone would.
+    let row = |img: &image::RgbaImage| (120..320).map(|x| px(img, x, 190)).collect::<Vec<_>>();
+    let (a, b) = (row(&clear), row(&plain));
+    let moved = a.iter().zip(&b).filter(|(p, q)| (0..3).map(|k| p[k].abs_diff(q[k]) as u32).sum::<u32>() > 120).count();
+    assert!(moved > 40, "only {moved} pixels changed: no refraction");
+    // Colours stay what is behind (red stays red, not grey).
+    assert!(a.iter().any(|p| p[0] > 200 && p[1] < 120 && p[2] < 140), "the red stripes show through");
+    // Frosted glass (the capsule) blurs: neighbouring pixels differ less
+    // than the crisp stripes do.
+    let contrast = |img: &image::RgbaImage, y: u32, x0: u32, x1: u32| (x0..x1).map(|x| luma(px(img, x + 1, y)) - luma(px(img, x, y))).map(f64::abs).sum::<f64>();
+    let frosted = render(&glass_scene(json!({"preset": "glass"})), 0.0);
+    assert!(contrast(&frosted, 190, 450, 510) < 0.35 * contrast(&plain, 190, 450, 510), "frosted glass blurs");
+}
+
+#[test]
+fn gpu_matches_cpu_glass() {
+    crate::tests::assert_gpu_matches_cpu_within(&glass_scene(json!({"preset": "glass", "color": "#e8f4ff", "ior": 1.6, "thickness": 90})), &[0.0], 0.0005);
+}

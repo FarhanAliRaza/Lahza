@@ -2136,6 +2136,13 @@ pub struct Material {
     /// reflect more (fresnel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transmission: Option<Property<f64>>,
+    /// Glass: index of refraction (1 = no bending, 1.5 glass, 2.4 diamond).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ior: Option<Property<f64>>,
+    /// Glass: how far light travels inside before leaving, px (how much
+    /// what is behind shifts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thickness: Option<Property<f64>>,
     /// Ignore lights: the flat colour (flat-shaded idents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlit: Option<bool>,

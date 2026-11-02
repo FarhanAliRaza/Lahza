@@ -876,6 +876,37 @@ fn cover(r0: vec4<f32>, r1: vec4<f32>, q: vec2<f32>) -> Cover {
     return Cover(vec3<f32>(e[0], e[1], e[2]), inside);
 }
 
+fn srgb_decode(x_in: f32) -> f32 {
+    let x = clamp(x_in, 0.0, 1.0);
+    if x <= 0.04045 { return x / 12.92; }
+    return pow((x + 0.055) / 1.055, 2.4);
+}
+
+fn group_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
+    return b_groups[u32(off + clamp(y, 0, h - 1) * w + clamp(x, 0, w - 1))];
+}
+
+// Mirrors `sample_group` in mesh3d.rs.
+fn sample_group(prim: Prim, g: vec2<f32>) -> vec4<f32> {
+    let off = i32(bitcast<u32>(prim.paint.x));
+    let w = i32(bitcast<u32>(prim.paint.y));
+    let h = i32(bitcast<u32>(prim.paint.z));
+    let s = g - vec2<f32>(0.5);
+    let x0 = floor(s.x);
+    let y0 = floor(s.y);
+    let fx = s.x - x0;
+    let fy = s.y - y0;
+    let xi = i32(x0);
+    let yi = i32(y0);
+    let a = group_at(off, w, h, xi, yi);
+    let b = group_at(off, w, h, xi + 1, yi);
+    let c = group_at(off, w, h, xi, yi + 1);
+    let d = group_at(off, w, h, xi + 1, yi + 1);
+    let top = a + (b - a) * fx;
+    let bottom = c + (d - c) * fx;
+    return top + (bottom - top) * fy;
+}
+
 fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let tb = bitcast<u32>(prim.geom2.x) + tri * 4u;
     let vb = bitcast<u32>(prim.geom2.y);
@@ -996,6 +1027,34 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     s_light = s_light + spec_env * coat;
     if cc > 0.0 {
         s_light = s_light + env_light(lb, rw, ccr) * (fc_v * cc);
+    }
+    if trans > 0.0 && prim.paint.w > 0.5 {
+        let ior = max(m3.y, 1.0);
+        let i = -v;
+        let eta = 1.0 / ior;
+        let cosi = clamp(dot(n, v), 0.0, 1.0);
+        let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+        var t: vec3<f32>;
+        if k < 0.0 { t = i - n * (2.0 * dot(n, i)); } else { t = i * eta + n * (eta * cosi - sqrt(k)); }
+        let exit = p + t * m3.z;
+        let z = max(exit.z, 1.0);
+        let d = vec2<f32>(prim.stroke.x * (exit.x / z - p.x / p.z), prim.stroke.y * (exit.y / z - p.y / p.z));
+        let g = vec2<f32>(prim.paint2.x + prim.paint2.z * (q.x + d.x), prim.paint2.y + prim.paint2.w * (q.y + d.y));
+        let behind = sample_group(prim, g);
+        let gf0 = ((ior - 1.0) / (ior + 1.0)) * ((ior - 1.0) / (ior + 1.0));
+        let fr = gf0 + (1.0 - gf0) * pow5(1.0 - n_v);
+        var seen = vec3<f32>(0.0);
+        if behind.w > 0.0 {
+            seen = vec3<f32>(srgb_decode(behind.x / behind.w) * base.x, srgb_decode(behind.y / behind.w) * base.y, srgb_decode(behind.z / behind.w) * base.z);
+        }
+        let through = trans * (1.0 - fr) * behind.w;
+        let glit = seen * through + (d_light + emissive) + s_light;
+        let gpeak = min(max(max(s_light.x, s_light.y), s_light.z), 1.0);
+        let ga = clamp(through + (1.0 - trans) + max(1.0 - through - (1.0 - trans), 0.0) * gpeak, 0.0, 1.0);
+        if ga <= 0.0 { return vec4<f32>(0.0); }
+        let gc = vec3<f32>(encode(shoulder(glit.x / ga)), encode(shoulder(glit.y / ga)), encode(shoulder(glit.z / ga)));
+        let gao = ga * opacity;
+        return vec4<f32>(gc * gao, gao);
     }
     let body = opacity * (1.0 - trans * (1.0 - fc_v));
     let sl = s_light * opacity;

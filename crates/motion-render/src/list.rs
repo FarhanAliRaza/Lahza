@@ -472,9 +472,35 @@ impl Builder<'_> {
         self.meshes.close_run();
     }
 
+    /// Glass refracts what is drawn before it: those items, drawn again
+    /// into a group around the glass (blurred by its roughness: frosted).
+    fn glass_backdrop(&mut self, m: &lahza_motion_core::compile::MeshState, item: &Item, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &[Item]) {
+        let glass = m.materials.iter().filter(|x| x.transmission > 0.0);
+        let (mut reach, mut rough) = (0.0f64, 0.0f64);
+        for x in glass {
+            reach = reach.max(x.thickness);
+            rough = rough.max(x.roughness);
+        }
+        let sigma = rough * rough * 60.0 * self.scale;
+        let pad = reach * self.scale + 3.0 * sigma + 8.0;
+        let b = item.bounds;
+        let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
+        let rect = [(b[0] - pad).floor().max(0.0), (b[1] - pad).floor().max(0.0), (b[2] + pad).ceil().min(cw), (b[3] + pad).ceil().min(ch)];
+        if rect[2] <= rect[0] || rect[3] <= rect[1] {
+            return;
+        }
+        let factor = if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
+        let (offset, origin, f, size) = self.reserve(list, pending, out.to_vec(), rect, if sigma > 0.3 { sigma } else { 0.0 }, factor, false);
+        let i = item.prim.kind[1] as usize;
+        self.meshes.batches[i].backdrop = Some(crate::mesh3d::Backdrop { offset, size, origin, factor: f });
+    }
+
     fn emit(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         if let (false, Content::Mesh(m)) = (layer.is_isolated(), &layer.content) {
             if let Some(item) = self.mesh_item(layer, m, root, out.last_mut()) {
+                if crate::mesh3d::refracts(m) && !out.is_empty() {
+                    self.glass_backdrop(m, &item, canvas, list, pending, out);
+                }
                 out.push(item);
             }
             return;

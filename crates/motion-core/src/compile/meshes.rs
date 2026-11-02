@@ -32,6 +32,8 @@ pub struct MaterialState {
     pub emissive: [f64; 3],
     pub opacity: f64,
     pub transmission: f64,
+    pub ior: f64,
+    pub thickness: f64,
     pub unlit: bool,
     pub faceted: bool,
     /// Shows only the shadows falling on it.
@@ -49,6 +51,8 @@ impl MaterialState {
             emissive: [0.0; 3],
             opacity: 1.0,
             transmission: 0.0,
+            ior: 1.45,
+            thickness: 60.0,
             unlit: false,
             faceted: false,
             shadow_catcher: false,
@@ -138,6 +142,8 @@ pub(super) struct CMaterial {
     emissive_strength: Option<Prop<f64>>,
     opacity: Option<Prop<f64>>,
     transmission: Option<Prop<f64>>,
+    ior: Option<Prop<f64>>,
+    thickness: Option<Prop<f64>>,
     unlit: Option<bool>,
     faceted: Option<bool>,
 }
@@ -155,6 +161,8 @@ impl CMaterial {
         m.clearcoat_roughness = f(&self.clearcoat_roughness, m.clearcoat_roughness, 0.02, 1.0);
         m.opacity = f(&self.opacity, m.opacity, 0.0, 1.0);
         m.transmission = f(&self.transmission, m.transmission, 0.0, 1.0);
+        m.ior = f(&self.ior, m.ior, 1.0, 3.0);
+        m.thickness = f(&self.thickness, m.thickness, 0.0, 10_000.0);
         let strength = f(&self.emissive_strength, 1.0, 0.0, 100.0);
         let emissive = match (&self.emissive, self.preset) {
             (Some(c), _) => Some(clamp_color(c.at(t))),
@@ -216,6 +224,8 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         emissive_strength: o.emissive_strength.clone().or_else(|| base.emissive_strength.clone()),
         opacity: o.opacity.clone().or_else(|| base.opacity.clone()),
         transmission: o.transmission.clone().or_else(|| base.transmission.clone()),
+        ior: o.ior.clone().or_else(|| base.ior.clone()),
+        thickness: o.thickness.clone().or_else(|| base.thickness.clone()),
         unlit: o.unlit.or(base.unlit),
         faceted: o.faceted.or(base.faceted),
     }
@@ -265,6 +275,8 @@ impl Compiler<'_> {
             emissive_strength: m.emissive_strength.as_ref().map(|p| self.prop(p, id, &w("emissive_strength"), start, step, shift)),
             opacity: m.opacity.as_ref().map(|p| self.prop(p, id, &w("opacity"), start, step, shift)),
             transmission: m.transmission.as_ref().map(|p| self.prop(p, id, &w("transmission"), start, step, shift)),
+            ior: m.ior.as_ref().map(|p| self.prop(p, id, &w("ior"), start, step, shift)),
+            thickness: m.thickness.as_ref().map(|p| self.prop(p, id, &w("thickness"), start, step, shift)),
             unlit: m.unlit,
             faceted: m.faceted,
         }
