@@ -10,7 +10,13 @@
    `triplet`, `onset.*`, `hit`, `stop`, `drop`, `music.start`,
    `music.end`). Import word timestamps for narration (`markers_import`).
    Read the result with `markers_query`; structure comes from the audio's
-   shape (stops, drops, the biggest hit), not from BPM alone.
+   shape (stops, drops, the biggest hit), not from BPM alone. Check
+   `feel`: with `triplet` (a shuffle or 12/8 swing) cut and key on
+   `triplet` markers, not `half`/`sixteenth`. A low `tempo_confidence`
+   means another grouping of the same pulse (listed in `alternatives`,
+   e.g. 100 BPM straight for 133 BPM triplets) fits the onsets as well:
+   pick the one the reference cuts on. A `stop` labelled "the music cuts"
+   is a hard stop with a tail ringing on; land the final title on it.
 3. **Scene plan.** One scene per section; cut on bars or hits. Choose a
    sync mode per section:
    - `grid`: snap events to beat subdivisions (promos).
@@ -40,6 +46,16 @@ shows only those moments.
   a transparent PNG sequence into `assets/blender/<name>/` that you place as
   a video layer, so 3D objects composite with type, shapes and effects.
   Match `frames` to the scene's span; use `fps` of the project.
+  - Sync 3D keys to the timeline from `LAHZA`: `LAHZA["markers"]["beat"]`
+    (`"seconds"`, `"frames"`, and `"labels"` for words), and
+    `LAHZA["elements"]["title"]` (`start_frame`, `end_frame`) for scenes and
+    layers; `frame_of(seconds)` converts any time. Frames count from
+    `frame_start` at project time `at`: place the footage layer at `at`.
+  - Iterate with `quality: "preview"` (EEVEE, half size, no motion blur, a
+    sheet of `preview_frames` frames in seconds), then render
+    `quality: "final"` once (every frame, `samples`, denoised, motion blur).
+    It renders on the GPU (OptiX/CUDA) when there is one; `seconds_per_frame`
+    in the report tells you what a longer range will cost.
 
 ## Sound effects
 
