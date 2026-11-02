@@ -38,6 +38,13 @@ looks), the worst stretches with a sheet of them, a timeline graph and a
 side-by-side video (ours | reference | difference). With `at: [...]` it
 shows only those moments.
 
+The mean difference is dominated by large areas: thin lines, cages and
+outlines barely move it, and leaving them out can even lower it. Each
+scene also reports `missing_detail` and `extra_detail` (the share of edges
+in one picture with nothing near them in the other); a verdict saying
+"ours lacks detail" means something visible is missing, whatever the
+difference says.
+
 ## Measuring a reference's motion
 
 Don't eyeball frames or write scripts to measure a reference: use the tools.

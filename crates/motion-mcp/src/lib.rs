@@ -183,7 +183,7 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             }
             let r = &out.json;
             for row in r["rows"].as_array().into_iter().flatten() {
-                println!("  {:<14} ours {:>6}s  reference {:>6}s  difference {:>5}", row["at"].as_str().unwrap_or(""), row["t"], row["reference_t"], row["mean_difference"]);
+                println!("  {:<14} ours {:>6}s  reference {:>6}s  difference {:>5}  missing detail {:>5}  extra {:>5}", row["at"].as_str().unwrap_or(""), row["t"], row["reference_t"], row["mean_difference"], row["missing_detail"], row["extra_detail"]);
             }
             if r.get("scenes").is_some() {
                 println!("{} frames {}–{}s, mean difference {}{}", r["frames"], r["from"], r["to"], r["mean_difference"],
@@ -195,8 +195,8 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 }
                 println!("  worst stretches:");
                 for w in r["worst"].as_array().into_iter().flatten() {
-                    println!("    {:>6}–{:<6}s  {:<36} diff {:>5}  motion ours {:>5} ref {:>5}", w["from"], w["to"], w["verdict"].as_str().unwrap_or(""),
-                             w["mean_difference"], w["motion_ours"], w["motion_reference"]);
+                    println!("    {:>6}–{:<6}s  {:<36} diff {:>5}  motion ours {:>5} ref {:>5}  missing detail {:>5}", w["from"], w["to"], w["verdict"].as_str().unwrap_or(""),
+                             w["mean_difference"], w["motion_ours"], w["motion_reference"], w["missing_detail"]);
                 }
                 if let Some(t) = r["reference_ended_at"].as_f64() {
                     println!("  the reference ends at {t}s");

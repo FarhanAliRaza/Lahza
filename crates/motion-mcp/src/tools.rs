@@ -1022,7 +1022,9 @@ impl Toolbox {
             let reference = reference_frame(&against, rt, w, h)?;
             let (diff, mean) = difference(&ours, &reference);
             let luma = |img: &image::RgbaImage| img.pixels().map(|p| 0.2126 * p.0[0] as f64 + 0.7152 * p.0[1] as f64 + 0.0722 * p.0[2] as f64).sum::<f64>() / (w as f64 * h as f64);
+            let (missing, extra) = detail(&ours, &reference);
             rows.push(json!({"at": label, "t": round(ft), "reference_t": round(rt), "mean_difference": round(mean),
+                             "missing_detail": round(missing), "extra_detail": round(extra),
                              "brightness_ours": round(luma(&ours)), "brightness_reference": round(luma(&reference))}));
             cells.push((format!("ours {label} · {ft:.2}s"), ours));
             cells.push((format!("reference {rt:.2}s"), reference));
@@ -1085,7 +1087,8 @@ impl Toolbox {
         let mut sink = writer.stdin.take().ok_or("ffmpeg gave no input")?;
         let frame_bytes = (w * h * 4) as usize;
         let mut ended_at = None;
-        let mut series: Vec<[f64; 3]> = Vec::new(); // [difference, motion ours, motion reference]
+        // [difference, motion ours, motion reference, missing detail, extra detail]
+        let mut series: Vec<[f64; 5]> = Vec::new();
         let (mut prev_ours, mut prev_ref): (Option<image::RgbaImage>, Option<image::RgbaImage>) = (None, None);
         let black = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
         // The last decoded reference frame and its index.
@@ -1109,7 +1112,8 @@ impl Toolbox {
             let reference = held.clone().unwrap_or_else(|| black.clone());
             let (diff, mean) = difference(&ours, &reference);
             let motion = |prev: &Option<image::RgbaImage>, cur: &image::RgbaImage| prev.as_ref().map(|p| difference(p, cur).1).unwrap_or(0.0);
-            series.push([mean, motion(&prev_ours, &ours), motion(&prev_ref, &reference)]);
+            let (missing, extra) = detail(&ours, &reference);
+            series.push([mean, motion(&prev_ours, &ours), motion(&prev_ref, &reference), missing, extra]);
             let mut frame = image::RgbaImage::from_pixel(vw, vh, image::Rgba([20, 20, 26, 255]));
             for (i, img) in [&ours, &reference, &diff].into_iter().enumerate() {
                 image::imageops::replace(&mut frame, img, (i as u32 * (w + 4)) as i64, 0);
@@ -1132,7 +1136,7 @@ impl Toolbox {
                 series[a..b].iter().map(|v| v[k]).sum::<f64>() / (b - a) as f64
             }).collect()
         };
-        let (mo, mr) = (smooth(1), smooth(2));
+        let (mo, mr, miss, extra) = (smooth(1), smooth(2), smooth(3), smooth(4));
         // Fixed scales, not relative to this video: motion is the mean
         // per-pixel change between frames, difference the mean per-pixel gap.
         let moves = |o: f64, r: f64| -> &'static str {
@@ -1153,8 +1157,20 @@ impl Toolbox {
                 "looks different"
             }
         };
-        let verdict = |o: f64, r: f64, d: f64| -> &'static str {
+        // Detail: edges in one picture with no edge near them in the other.
+        // The mean difference barely notices thin lines; this does.
+        const MISSING: f64 = 0.4;
+        let details = |m: f64, x: f64| -> String {
+            match (m > MISSING, x > MISSING) {
+                (true, true) => format!("; different detail (missing {:.0}%, extra {:.0}%)", m * 100.0, x * 100.0),
+                (true, false) => format!("; ours lacks detail the reference has ({:.0}% of its edges)", m * 100.0),
+                (false, true) => format!("; ours has detail the reference lacks ({:.0}% of our edges)", x * 100.0),
+                _ => String::new(),
+            }
+        };
+        let verdict = |o: f64, r: f64, d: f64, m: f64| -> &'static str {
             match moves(o, r) {
+                "motion similar" if m > MISSING => "ours lacks detail",
                 "motion similar" if d >= 25.0 => "looks different",
                 "motion similar" => "close",
                 m => m,
@@ -1164,7 +1180,7 @@ impl Toolbox {
         // Stretches where a verdict other than "close" holds (gaps ≤ 3 f bridged).
         let mut segments: Vec<(usize, usize, &'static str)> = Vec::new();
         for i in 0..series.len() {
-            let v = verdict(mo[i], mr[i], series[i][0]);
+            let v = verdict(mo[i], mr[i], series[i][0], miss[i]);
             if v == "close" {
                 continue;
             }
@@ -1182,7 +1198,8 @@ impl Toolbox {
             json!({"from": round(time(s.0)), "to": round(time(s.1)), "frames": s.1 - s.0 + 1, "verdict": s.2,
                    "mean_difference": round((s.0..=s.1).map(|i| series[i][0]).sum::<f64>() / n),
                    "motion_ours": round((s.0..=s.1).map(|i| mo[i]).sum::<f64>() / n),
-                   "motion_reference": round((s.0..=s.1).map(|i| mr[i]).sum::<f64>() / n)})
+                   "motion_reference": round((s.0..=s.1).map(|i| mr[i]).sum::<f64>() / n),
+                   "missing_detail": round((s.0..=s.1).map(|i| miss[i]).sum::<f64>() / n)})
         }).collect();
         let scenes: Vec<Value> = compiled.scenes.iter().filter_map(|sc| {
             let idx: Vec<usize> = (0..series.len()).filter(|&i| time(i) >= sc.start && time(i) < sc.end).collect();
@@ -1190,9 +1207,12 @@ impl Toolbox {
                 return None;
             }
             let n = idx.len() as f64;
-            let (d, o, r) = (idx.iter().map(|&i| series[i][0]).sum::<f64>() / n, idx.iter().map(|&i| mo[i]).sum::<f64>() / n, idx.iter().map(|&i| mr[i]).sum::<f64>() / n);
+            let avg = |v: &dyn Fn(usize) -> f64| idx.iter().map(|&i| v(i)).sum::<f64>() / n;
+            let (d, o, r) = (avg(&|i| series[i][0]), avg(&|i| mo[i]), avg(&|i| mr[i]));
+            let (m, x) = (avg(&|i| miss[i]), avg(&|i| extra[i]));
             Some(json!({"scene": sc.id.as_ref(), "from": round(sc.start), "to": round(sc.end), "mean_difference": round(d),
-                        "motion_ours": round(o), "motion_reference": round(r), "verdict": format!("{}; {}", moves(o, r), looks(d))}))
+                        "motion_ours": round(o), "motion_reference": round(r), "missing_detail": round(m), "extra_detail": round(x),
+                        "verdict": format!("{}; {}{}", moves(o, r), looks(d), details(m, x))}))
         }).collect();
 
         // Timeline graph: difference (white), motion ours (orange), reference (cyan).
@@ -2059,6 +2079,56 @@ fn reference_frame(path: &Path, t: f64, w: u32, h: u32) -> Result<image::RgbaIma
         return Err(format!("no reference frame at {t:.2}s in {}: {}", path.display(), String::from_utf8_lossy(&out.stderr).trim()));
     }
     image::RgbaImage::from_raw(w, h, out.stdout[..expected].to_vec()).ok_or_else(|| "bad reference frame".into())
+}
+
+/// Edge (Sobel) magnitude of the luminance, 0–~1000.
+fn edges(img: &image::RgbaImage) -> (Vec<f32>, u32, u32) {
+    let (w, h) = img.dimensions();
+    let l: Vec<f32> = img.pixels().map(|p| 0.2126 * p.0[0] as f32 + 0.7152 * p.0[1] as f32 + 0.0722 * p.0[2] as f32).collect();
+    let at = |x: u32, y: u32| l[(y * w + x) as usize];
+    let mut e = vec![0f32; (w * h) as usize];
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let gx = at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1);
+            let gy = at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1);
+            e[(y * w + x) as usize] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+    (e, w, h)
+}
+
+/// Fractions of the reference's edge pixels with no edge of ours within
+/// 1 px (missing detail), and of ours with none of the reference's (extra).
+pub(crate) fn detail(ours: &image::RgbaImage, reference: &image::RgbaImage) -> (f64, f64) {
+    const EDGE: f32 = 60.0;
+    let (a, w, h) = edges(ours);
+    let (b, _, _) = edges(reference);
+    let near = |e: &[f32], x: u32, y: u32| -> bool {
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx >= 0 && ny >= 0 && (nx as u32) < w && (ny as u32) < h && e[(ny as u32 * w + nx as u32) as usize] > EDGE * 0.5 {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    let unmatched = |src: &[f32], other: &[f32]| -> f64 {
+        let (mut total, mut lost) = (0u32, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                if src[(y * w + x) as usize] > EDGE {
+                    total += 1;
+                    if !near(other, x, y) {
+                        lost += 1;
+                    }
+                }
+            }
+        }
+        if total < 20 { 0.0 } else { lost as f64 / total as f64 }
+    };
+    (unmatched(&b, &a), unmatched(&a, &b))
 }
 
 /// Per-pixel |ours − reference| (amplified 3× so small differences show)

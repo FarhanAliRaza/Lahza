@@ -293,3 +293,26 @@ fn compare_runs_every_frame_and_names_motion_gaps() {
     let still = tb.call("compare", json!({"against": "ref.mp4", "width": 160})).unwrap().json;
     assert!(still["scenes"][0]["verdict"].as_str().unwrap().starts_with("the reference moves more"), "{still:#}");
 }
+
+#[test]
+fn detail_score_notices_missing_thin_lines() {
+    // A reference with a few thin lines on grey; ours is the same grey without them.
+    let grey = image::Rgba([70, 70, 74, 255]);
+    let mut reference = image::RgbaImage::from_pixel(200, 200, grey);
+    for i in 20..180 {
+        reference.put_pixel(i, 60, image::Rgba([220, 220, 225, 255]));
+        reference.put_pixel(100, i, image::Rgba([220, 220, 225, 255]));
+    }
+    let blank = image::RgbaImage::from_pixel(200, 200, grey);
+    let (missing, extra) = crate::tools::detail(&blank, &reference);
+    assert!(missing > 0.95 && extra == 0.0, "missing {missing}, extra {extra}");
+    let (missing, extra) = crate::tools::detail(&reference, &reference);
+    assert!(missing < 0.01 && extra < 0.01, "identical: {missing} {extra}");
+    // A one-pixel shift still counts as matched.
+    let mut shifted = image::RgbaImage::from_pixel(200, 200, grey);
+    for i in 20..180 {
+        shifted.put_pixel(i, 61, image::Rgba([220, 220, 225, 255]));
+        shifted.put_pixel(101, i, image::Rgba([220, 220, 225, 255]));
+    }
+    assert!(crate::tools::detail(&shifted, &reference).0 < 0.1);
+}
