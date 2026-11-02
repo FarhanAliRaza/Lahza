@@ -65,6 +65,14 @@ fn mcp_server_lists_tools_reads_resources_and_runs_tools() {
     assert!(guide["result"]["contents"][0]["text"].as_str().unwrap().contains("Sync the peak"));
     let prompts = c.request("prompts/get", json!({"name": "make_promo", "arguments": {"brief": "a launch"}}));
     assert!(prompts["result"]["messages"][0]["content"]["text"].as_str().unwrap().contains("promo.kinetic"));
+    // The per-shot breakdown: a prompt and a section of the guide.
+    let listed = c.request("prompts/list", json!({}));
+    assert!(listed["result"]["prompts"].as_array().unwrap().iter().any(|p| p["name"] == "breakdown"), "{listed}");
+    let breakdown = c.request("prompts/get", json!({"name": "breakdown", "arguments": {"shot": "the ring sting at 3.8 s"}}));
+    let text = breakdown["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("the ring sting at 3.8 s") && text.contains("material:") && text.contains("build:"), "{text}");
+    let section = c.request("resources/read", json!({"uri": "lahza://guide/breakdown"}));
+    assert!(section["result"]["contents"][0]["text"].as_str().unwrap().starts_with("## Breakdown"), "{section}");
 
     let created = c.request("tools/call", json!({"name": "project_create", "arguments": {"path": "demo", "width": 640, "height": 360, "duration": 2, "style": "promo.kinetic"}}));
     assert_eq!(created["result"]["isError"], false, "{created}");

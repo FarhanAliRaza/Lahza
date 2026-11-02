@@ -10,7 +10,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-const INSTRUCTIONS: &str = "Lahza motion engine. Loop: project_create (or project_open) → audio_analyze (music) / markers_import (narration words) → markers_query → edit_apply (scenes, layers, keys anchored to markers) → check (sync drift ≤ ±1 f, no errors) → snapshot (contact sheet at sync points) → fix → render. Read lahza://guide first, lahza://schema for the format and lahza://catalog for presets, layer kinds and time references.";
+const INSTRUCTIONS: &str = "Lahza motion engine. Loop: project_create (or project_open) → audio_analyze (music) / markers_import (narration words) → markers_query → edit_apply (scenes, layers, keys anchored to markers) → check (sync drift ≤ ±1 f, no errors) → snapshot (contact sheet at sync points) → fix → render. Before building each shot, write its breakdown (prompt `breakdown`, or lahza://guide/breakdown): every element's kind, structure, material, lighting, motion and how it will be built. Build geometry from engine shapes, 3D meshes or Blender; measurements of a reference set parameters only, never traced shapes. Read lahza://guide first, lahza://schema for the format and lahza://catalog for presets, layer kinds and time references.";
 
 #[derive(Clone)]
 pub struct Server {
@@ -32,6 +32,7 @@ struct Doc {
 
 const DOCS: &[Doc] = &[
     Doc { uri: "lahza://guide", name: "guide", description: "The production loop, timing rules and review checklist", mime: "text/markdown" },
+    Doc { uri: "lahza://guide/breakdown", name: "breakdown", description: "The per-shot breakdown template (kind, structure, material, lighting, motion, build) with an example; write one before building a shot", mime: "text/markdown" },
     Doc { uri: "lahza://schema", name: "schema", description: "Project folder and JSON format", mime: "text/markdown" },
     Doc { uri: "lahza://catalog", name: "catalog", description: "Presets with measured numbers, raw curves, anchors, time references, layer kinds, ops", mime: "application/json" },
     Doc { uri: "lahza://styles", name: "styles", description: "Style packs with palettes, defaults and rules", mime: "application/json" },
@@ -40,6 +41,7 @@ const DOCS: &[Doc] = &[
 fn read_doc(uri: &str) -> Option<(String, &'static str)> {
     Some(match uri {
         "lahza://guide" => (catalog::GUIDE.to_string(), "text/markdown"),
+        "lahza://guide/breakdown" => (breakdown_section().to_string(), "text/markdown"),
         "lahza://schema" => (catalog::SCHEMA.to_string(), "text/markdown"),
         "lahza://catalog" => {
             let mut c = catalog::catalog_json();
@@ -55,6 +57,26 @@ fn read_doc(uri: &str) -> Option<(String, &'static str)> {
             (serde_json::to_string_pretty(&pack).ok()?, "application/json")
         }
     })
+}
+
+/// The guide's "Breakdown" section (its heading to the next `## `).
+pub fn breakdown_section() -> &'static str {
+    let guide = catalog::GUIDE;
+    let start = guide.find("## Breakdown").unwrap_or(0);
+    let end = guide[start + 2..].find("\n## ").map(|i| start + 2 + i).unwrap_or(guide.len());
+    guide[start..end].trim()
+}
+
+/// The `breakdown` prompt: the template for one shot.
+pub fn breakdown_prompt(shot: &str) -> String {
+    format!(
+        "Write the breakdown for this shot before building anything for it.\n\nShot: {shot}\n\n\
+        Fill one block per element (kind, structure, material, lighting, motion, build) as in the template and example below; a few words each, \
+        concrete numbers where you have them (counts, colours, key direction, sync anchors). If there is a reference, measure it with track / fit_curve \
+        for timing, positions, colours and sizes, but choose the build from what the element is (a lit 3D object is a 3D mesh or Blender, not traced \
+        shapes). Then build the shot as the breakdown says and check it with check and compare.\n\n{}",
+        breakdown_section()
+    )
 }
 
 struct PromptDef {
@@ -75,7 +97,7 @@ fn prompt_text(p: &PromptDef, brief: &str) -> String {
     format!(
         "Make a video with the Lahza motion tools.\n\nBrief: {brief}\n\nStyle pack: {style} (read lahza://styles/{style}). {shape}\n\n\
         First write a visual script as a table — one row per line or musical section: words | visual | sync anchor (e.g. bar:5, word:canal, hit:2) | style notes — and get it approved. \
-        Then follow lahza://guide: create the project with the style, analyse the music, query markers, build scene by scene with edit_apply, run check after each scene \
+        Then follow lahza://guide: create the project with the style, analyse the music, query markers, write each shot's breakdown (lahza://guide/breakdown) before building it, build scene by scene with edit_apply, run check after each scene \
         (no errors, drift ≤ ±1 frame), review a snapshot contact sheet at its sync points, and render a draft before the final.",
         style = p.style,
         shape = p.shape
@@ -145,14 +167,23 @@ impl ServerHandler for Server {
     }
 
     async fn list_prompts(&self, _: Option<PaginatedRequestParams>, _: RequestContext<RoleServer>) -> Result<ListPromptsResult, McpError> {
-        let prompts = PROMPTS
+        let mut prompts: Vec<Prompt> = PROMPTS
             .iter()
             .map(|p| Prompt::new(p.name, Some(p.description), Some(vec![PromptArgument::new("brief").with_description("what the video is about, audience, length, assets").with_required(true)])))
             .collect();
+        prompts.push(Prompt::new(
+            "breakdown",
+            Some("Break a shot down before building it: each element's kind, structure, material, lighting, motion and build method"),
+            Some(vec![PromptArgument::new("shot").with_description("the shot: its time range, sync points and what it shows (or the reference's moment)").with_required(true)]),
+        ));
         Ok(ListPromptsResult::with_all_items(prompts))
     }
 
     async fn get_prompt(&self, request: GetPromptRequestParams, _: RequestContext<RoleServer>) -> Result<GetPromptResponse, McpError> {
+        if request.name == "breakdown" {
+            let shot = request.arguments.as_ref().and_then(|a| a.get("shot")).and_then(Value::as_str).unwrap_or("(ask which shot)");
+            return Ok(GetPromptResult::new(vec![PromptMessage::new_text(Role::User, breakdown_prompt(shot))]).with_description("Per-shot breakdown before building").into());
+        }
         let p = PROMPTS.iter().find(|p| p.name == request.name).ok_or_else(|| McpError::invalid_params(format!("no prompt {}", request.name), None))?;
         let brief = request.arguments.as_ref().and_then(|a| a.get("brief")).and_then(Value::as_str).unwrap_or("(ask the person for the brief)");
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(Role::User, prompt_text(p, brief))]).with_description(p.description).into())
@@ -167,4 +198,25 @@ pub fn serve(toolbox: Toolbox) -> Result<(), String> {
         service.waiting().await.map_err(|e| e.to_string())?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn breakdown_is_a_guide_section_a_resource_and_a_prompt() {
+        let section = breakdown_section();
+        assert!(section.starts_with("## Breakdown"), "{section}");
+        assert!(!section.contains("\n## "), "only one section: {section}");
+        for field in ["kind", "structure", "material", "lighting", "motion", "build", "torus split into 4"] {
+            assert!(section.contains(field), "missing {field}");
+        }
+        let (text, mime) = read_doc("lahza://guide/breakdown").unwrap();
+        assert_eq!((text.as_str(), mime), (section, "text/markdown"));
+        assert!(DOCS.iter().any(|d| d.uri == "lahza://guide/breakdown"));
+        let prompt = breakdown_prompt("shot 3, 4.2–6.0 s");
+        assert!(prompt.contains("shot 3, 4.2–6.0 s") && prompt.contains(section));
+        assert!(INSTRUCTIONS.contains("breakdown"));
+    }
 }

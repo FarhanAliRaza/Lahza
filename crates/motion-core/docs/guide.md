@@ -23,13 +23,55 @@
    - `hits`: snap to onsets, no grid.
    - `free`: only stop→hit moments bind; cut every 1.5–2 beats.
    - `words`: anchor to narration (explainers).
-4. **Build** with `edit_apply`, one scene at a time. Batches are atomic and
-   undoable (`history`). Geometry is built, never traced from a reference
-   (see [No tracing](#no-tracing-as-content)).
-5. **Review**: `check` (no errors, sync drift ≤ ±1 f, no `tracing`
+4. **Breakdown** (required, per shot, before building it): what each
+   element is, how it is lit and moves, and how you will build it. See
+   [Breakdown](#breakdown-before-building-a-shot) below, or the MCP prompt
+   `breakdown`.
+5. **Build** with `edit_apply`, one scene at a time, as the breakdown
+   says. Batches are atomic and undoable (`history`). Geometry is built,
+   never traced from a reference (see [No tracing](#no-tracing-as-content)).
+6. **Review**: `check` (no errors, sync drift ≤ ±1 f, no `tracing`
    warnings) and `snapshot` with `sheet: true` at the scene's sync points.
    Look at the frames; fix; repeat.
-6. **Render** a draft (`quality: "draft"`), then the final.
+7. **Render** a draft (`quality: "draft"`), then the final.
+
+## Breakdown (before building a shot)
+
+Write this for every shot before the first `edit_apply` for it, and keep
+it next to the visual script. One block per element; a few words each:
+
+```
+shot <n> (<from>–<to>, sync: <anchors>)
+- <element>: kind (2D shape | 3D object | text | footage | particles)
+  structure: counts, segments, faces, thickness
+  material: flat | glossy | coated | glass | emissive (+ colours)
+  lighting: key direction, rim, highlights, shadows
+  motion: what moves, eases, sync points
+  build: engine 2D | engine 3D mesh | Blender (+ the layer kinds/tools)
+```
+
+Example, a logo sting:
+
+```
+shot 2 (3.82–5.10 s, sync: hit:2 lands, bar:3 out)
+- ring: 3D object
+  structure: torus split into 4 equal arc segments (90° each), thick tube
+  material: glossy coated plastic, segments #ff3d7f, #ffd23f, #2d5bff, #00d4a6
+  lighting: warm key from the top left, cool rim from behind right,
+    one soft specular streak per segment, contact shadow below
+  motion: segments fly in from 4 directions ("snap"), meet on hit:2
+    (anchor: land), ring turns 20° on its y axis with a drift; out on bar:3
+  build: Blender (blender_run, bevelled torus, 4 materials, keys from
+    LAHZA markers), placed as a video layer; title as engine text above
+- title: text, "LAHZA", 1 line, heavy weight
+  material: flat white; lighting: none (edge light from the ring's key side)
+  motion: per-glyph enter, 1 f stagger, starting at hit:2 + 2f
+  build: engine 2D (text, animators)
+```
+
+Measurements of a reference (`track`, `fit_curve`, sampled colours) fill in
+the numbers: when things move, where they sit, colours, sizes, the camera.
+They never replace the build line.
 
 ## Comparing with a reference
 
@@ -83,7 +125,7 @@ blobs drawn as shapes, no outlines keyed to the reference frame by frame.
 Ordinary morphs (a few eased keys), paths made from primitives
 (`{"shape": …}`), short spark streaks, instancer copies and long-lived
 hand-drawn paths don't count. Fix the warning by rebuilding the element
-from engine shapes, meshes or Blender, not by spreading the same tracing over more frames.
+as the breakdown says, not by spreading the same tracing over more frames.
 
 ## Measuring a reference's motion
 
@@ -260,8 +302,8 @@ outside the radius instead.
 
 - `check` has no errors; every anchored key's drift is within ±1 frame;
   no `tracing` warnings.
-- Against a reference, no scene says "ours is flatter" or "ours lacks
-  detail".
+- Every shot was built from its breakdown; against a reference, no scene
+  says "ours is flatter" or "ours lacks detail".
 - No still picture longer than the style's hold limit.
 - Text inside title-safe, readable contrast, no overlapping labels.
 - Every asset has a source and a licence.
