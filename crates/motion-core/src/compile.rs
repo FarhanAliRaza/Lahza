@@ -208,6 +208,9 @@ pub struct ShapeState {
     pub trim: Vec2,
     pub fill: Option<PaintState>,
     pub stroke: Option<(Color, f64)>,
+    /// Caps, joins, dashes and feather for path strokes; `None` is the
+    /// default round caps and joins.
+    pub stroke_style: Option<Arc<crate::document::StrokeStyle>>,
     /// Path for `ShapeKind::Path`, possibly mid-morph.
     pub path: Option<PathMorph>,
 }
@@ -356,8 +359,23 @@ pub struct CLayer {
     /// Used as another layer's matte: not drawn by itself.
     is_matte: bool,
     parent: Option<usize>,
+    follow: Option<CFollow>,
     hidden: bool,
     kind: CKind,
+}
+
+/// `follow`: placed on sibling `target`'s path.
+struct CFollow {
+    target: usize,
+    at: CFollowAt,
+    rotate: bool,
+    offset: Prop<Vec2>,
+}
+
+enum CFollowAt {
+    Head,
+    Tail,
+    Fraction(Prop<f64>),
 }
 
 impl CLayer {
@@ -417,6 +435,7 @@ struct CShape {
     trim: Prop<Vec2>,
     fill: Option<CPaint>,
     stroke: Option<(Prop<Color>, Prop<f64>)>,
+    stroke_style: Option<Arc<crate::document::StrokeStyle>>,
     path: Option<(Vec<Arc<str>>, Prop<f64>)>,
 }
 
@@ -661,6 +680,23 @@ impl<'a> Compiler<'a> {
                 cur = out[c].parent;
             }
         }
+        // A follower needs a path target whose placement does not depend
+        // on the follower itself (through parents and follows).
+        for i in 0..out.len() {
+            let Some(target) = out[i].follow.as_ref().map(|f| f.target) else { continue };
+            let is_path = matches!(&out[target].kind, CKind::Shape(s) if s.path.is_some());
+            let error = if !is_path {
+                Some(format!("{}.follow: '{}' is not a path layer (shape \"path\" with \"d\")", out[i].id, out[target].id))
+            } else if depends_on(&out, target, i) {
+                Some(format!("{}.follow: '{}' depends on '{}' through parent or follow (a cycle)", out[i].id, out[target].id, out[i].id))
+            } else {
+                None
+            };
+            if let Some(e) = error {
+                self.errors.push(e);
+                out[i].follow = None;
+            }
+        }
         out
     }
 
@@ -771,10 +807,31 @@ impl<'a> Compiler<'a> {
                 None
             }
         });
-        let parent = c.parent.as_ref().and_then(|p| match siblings.get(p.as_str()) {
+        let mut parent = c.parent.as_ref().and_then(|p| match siblings.get(p.as_str()) {
             Some(i) => Some(*i),
             None => {
                 self.errors.push(format!("{id}.parent: no sibling layer '{p}'"));
+                None
+            }
+        });
+        let follow = c.follow.as_ref().and_then(|f| match siblings.get(f.layer.as_str()) {
+            Some(&target) if f.layer != id => {
+                if parent.take().is_some() {
+                    self.errors.push(format!("{id}: follow places the layer, so it can't also have a parent"));
+                }
+                Some(CFollow {
+                    target,
+                    at: match &f.at {
+                        FollowAt::Head => CFollowAt::Head,
+                        FollowAt::Tail => CFollowAt::Tail,
+                        FollowAt::Fraction(p) => CFollowAt::Fraction(self.prop(p, id, "follow.at", start, step, shift)),
+                    },
+                    rotate: f.rotate,
+                    offset: self.prop(&f.offset, id, "follow.offset", start, step, shift),
+                })
+            }
+            _ => {
+                self.errors.push(format!("{id}.follow: no sibling layer '{}'", f.layer));
                 None
             }
         });
@@ -801,6 +858,7 @@ impl<'a> Compiler<'a> {
                     trim: self.prop(&s.trim, id, "trim", start, step, shift),
                     fill,
                     stroke,
+                    stroke_style: s.stroke.as_ref().and_then(|st| st.style()).map(Arc::new),
                     path: match (s.shape, &s.d) {
                         (ShapeKind::Path, Some(PathData::Static(v))) => Some((vec![v.svg().into()], Prop::constant(0.0))),
                         (ShapeKind::Path, Some(PathData::Keys(keys))) => {
@@ -874,6 +932,7 @@ impl<'a> Compiler<'a> {
             matte,
             is_matte: false,
             parent,
+            follow,
             hidden: c.hidden,
             kind,
         }
@@ -1292,6 +1351,7 @@ fn canvas_rect(id: &str, w: f64, h: f64, color: Color) -> LayerState {
             trim: Vec2::new(0.0, 1.0),
             fill: Some(PaintState::Solid(color)),
             stroke: None,
+            stroke_style: None,
             path: None,
         }),
     }
@@ -1318,27 +1378,107 @@ impl Space {
     }
 }
 
-fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, cache: &mut [Option<Mat4>]) -> Mat4 {
+fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &Space, cache: &mut [Option<Mat4>]) -> Mat4 {
     if let Some(m) = cache[i] {
         return m;
     }
     let l = &layers[i];
     let t = clock(l.step.or(inherited), tc);
-    let p = l.position.at(t);
     let s = l.scale.at(t);
     let a = l.anchor.at(t);
-    let local = Mat4::translate(p.x(), p.y(), l.z.at(t))
-        .then(Mat4::rotate_y(l.rotation_y.at(t)))
-        .then(Mat4::rotate_x(l.rotation_x.at(t)))
-        .then(Mat4::rotate_z(l.rotation.at(t)))
-        .then(Mat4::scale(s.x(), s.y(), 1.0))
-        .then(Mat4::translate(-a.x(), -a.y(), 0.0));
-    let m = match l.parent {
-        Some(pi) => layer_matrix(layers, pi, tc, inherited, cache).then(local),
-        None => local,
+    let local = |origin: Mat4| {
+        origin
+            .then(Mat4::rotate_y(l.rotation_y.at(t)))
+            .then(Mat4::rotate_x(l.rotation_x.at(t)))
+            .then(Mat4::rotate_z(l.rotation.at(t)))
+            .then(Mat4::scale(s.x(), s.y(), 1.0))
+            .then(Mat4::translate(-a.x(), -a.y(), 0.0))
+    };
+    let m = match &l.follow {
+        Some(f) => local(follow_origin(layers, f, t, tc, inherited, space, cache)),
+        None => {
+            let p = l.position.at(t);
+            let local = local(Mat4::translate(p.x(), p.y(), l.z.at(t)));
+            match l.parent {
+                Some(pi) => layer_matrix(layers, pi, tc, inherited, space, cache).then(local),
+                None => local,
+            }
+        }
     };
     cache[i] = Some(m);
     m
+}
+
+/// Where a follower sits: the point on its target's path (as drawn at
+/// this moment: morph, trim and full transform), turned along the path
+/// when `rotate`, then moved by `offset`. `t` is the follower's clock.
+#[allow(clippy::too_many_arguments)]
+fn follow_origin(layers: &[CLayer], f: &CFollow, t: f64, tc: f64, inherited: Option<Step>, space: &Space, cache: &mut [Option<Mat4>]) -> Mat4 {
+    let target = &layers[f.target];
+    let tm = layer_matrix(layers, f.target, tc, inherited, space, cache);
+    let tt = clock(target.step.or(inherited), tc);
+    let mut point = ((0.0, 0.0), (1.0, 0.0));
+    if let CKind::Shape(CShape { path: Some((paths, index)), trim, .. }) = &target.kind {
+        let trim = trim.at(tt);
+        let fraction = match &f.at {
+            CFollowAt::Head => trim.y(),
+            CFollowAt::Tail => trim.x(),
+            CFollowAt::Fraction(p) => p.at(t),
+        };
+        // Flattened exactly as the renderer flattens the target, so the
+        // point lies on the drawn stroke.
+        let screen = space.screen(space.world.then(tm), space.three_d || target.three_d);
+        let tolerance = crate::path::tolerance(screen.max_scale());
+        if let Ok(subpaths) = crate::path::morph(&path_morph(paths, index.at(tt)), tolerance) {
+            point = crate::path::point_at(&subpaths, fraction).unwrap_or(point);
+        }
+    }
+    let ((x, y), (dx, dy)) = point;
+    let p = tm.apply(x, y, 0.0);
+    let mut m = Mat4::translate(p[0], p[1], p[2]);
+    if f.rotate {
+        let q = tm.apply(x + dx, y + dy, 0.0);
+        m = m.then(Mat4::rotate_z((q[1] - p[1]).atan2(q[0] - p[0]).to_degrees()));
+    }
+    let o = f.offset.at(t);
+    m.then(Mat4::translate(o.x(), o.y(), 0.0))
+}
+
+/// Whether layer `from`'s placement depends on layer `on` (through parents
+/// and follow targets), or is it.
+fn depends_on(layers: &[CLayer], from: usize, on: usize) -> bool {
+    let mut stack = vec![from];
+    let mut seen = HashSet::new();
+    while let Some(c) = stack.pop() {
+        if c == on {
+            return true;
+        }
+        if seen.insert(c) {
+            stack.extend(layers[c].parent);
+            stack.extend(layers[c].follow.as_ref().map(|f| f.target));
+        }
+    }
+    false
+}
+
+/// Path keys `paths` at morph index `x` (springs may overshoot the last).
+fn path_morph(paths: &[Arc<str>], x: f64) -> PathMorph {
+    let last = paths.len() - 1;
+    let i = (x.floor().max(0.0) as usize).min(last.saturating_sub(1));
+    if last == 0 {
+        PathMorph { from: paths[0].clone(), to: None, t: 0.0 }
+    } else {
+        // Overshooting springs extrapolate past the last path.
+        let t = if x >= last as f64 { x - (last - 1) as f64 } else { x - i as f64 };
+        let i = if x >= last as f64 { last - 1 } else { i };
+        if t.abs() < 1e-9 {
+            PathMorph { from: paths[i].clone(), to: None, t: 0.0 }
+        } else if (t - 1.0).abs() < 1e-9 {
+            PathMorph { from: paths[i + 1].clone(), to: None, t: 0.0 }
+        } else {
+            PathMorph { from: paths[i].clone(), to: Some(paths[i + 1].clone()), t }
+        }
+    }
 }
 
 fn clock(step: Option<Step>, t: f64) -> f64 {
@@ -1365,7 +1505,7 @@ fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, space: &Space, pare
         let mut depth: Vec<(f64, usize)> = order[start..i]
             .iter()
             .map(|&k| {
-                let world = space.world.then(layer_matrix(layers, k, tc, inherited, &mut cache));
+                let world = space.world.then(layer_matrix(layers, k, tc, inherited, space, &mut cache));
                 (space.cam.view.then(world).apply(0.0, 0.0, 0.0)[2], k)
             })
             .collect();
@@ -1400,7 +1540,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
     if own_opacity * parent_opacity <= 0.0 {
         return;
     }
-    let world = space.world.then(layer_matrix(layers, i, tc, inherited, cache));
+    let world = space.world.then(layer_matrix(layers, i, tc, inherited, space, cache));
     let three_d = space.three_d || l.three_d;
     let matrix = space.screen(world, three_d);
     let scale = matrix.max_scale();
@@ -1497,25 +1637,8 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                 CPaint::Gradient(g) => PaintState::Gradient(g.clone()),
             }),
             stroke: s.stroke.as_ref().map(|(c, w)| (clamp_color(c.at(t)), w.at(t).max(0.0))),
-            path: s.path.as_ref().map(|(paths, index)| {
-                let x = index.at(t);
-                let last = paths.len() - 1;
-                let i = (x.floor().max(0.0) as usize).min(last.saturating_sub(1));
-                if last == 0 {
-                    PathMorph { from: paths[0].clone(), to: None, t: 0.0 }
-                } else {
-                    // Overshooting springs extrapolate past the last path.
-                    let t = if x >= last as f64 { x - (last - 1) as f64 } else { x - i as f64 };
-                    let i = if x >= last as f64 { last - 1 } else { i };
-                    if t.abs() < 1e-9 {
-                        PathMorph { from: paths[i].clone(), to: None, t: 0.0 }
-                    } else if (t - 1.0).abs() < 1e-9 {
-                        PathMorph { from: paths[i + 1].clone(), to: None, t: 0.0 }
-                    } else {
-                        PathMorph { from: paths[i].clone(), to: Some(paths[i + 1].clone()), t }
-                    }
-                }
-            }),
+            stroke_style: s.stroke_style.clone(),
+            path: s.path.as_ref().map(|(paths, index)| path_morph(paths, index.at(t))),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
@@ -1655,6 +1778,103 @@ mod tests {
         p.scenes[0].layers[0].common.time.start = Some("hit:2".into());
         let c = Compiled::new(&p);
         assert!(c.errors.iter().any(|e| e.contains("box") && e.contains("hit")), "{:?}", c.errors);
+    }
+
+    fn follow_project(layers: serde_json::Value) -> Project {
+        let mut p = Project::new(1000, 1000, Fps::whole(30), 4.0);
+        p.scenes.push(serde_json::from_value(serde_json::json!({"id": "s", "start": 0, "layers": layers})).unwrap());
+        p
+    }
+
+    /// Where layer `id`'s origin lands on the canvas, and its x axis there.
+    fn placed(c: &Compiled, t: f64, id: &str) -> ((f64, f64), (f64, f64)) {
+        let f = c.frame(t);
+        let m = f.layers.iter().find(|l| &*l.id == id).unwrap().matrix;
+        let (o, x) = (m.apply(0.0, 0.0), m.apply(1.0, 0.0));
+        (o, (x.0 - o.0, x.1 - o.1))
+    }
+
+    fn near(a: (f64, f64), b: (f64, f64)) -> bool {
+        (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
+    }
+
+    #[test]
+    fn follow_rides_head_tail_and_fractions() {
+        let c = Compiled::new(&follow_project(serde_json::json!([
+            {"id": "line", "kind": "shape", "shape": "path", "d": "M 0 0 L 400 0", "stroke": {"color": "#fff", "width": 4},
+             "transform": {"position": [100, 500]}, "trim": {"keys": [{"at": 0, "v": [0, 0]}, {"at": 2, "v": [0, 1]}]}},
+            {"id": "band", "kind": "shape", "shape": "path", "d": "M 0 0 L 400 0", "stroke": {"color": "#fff", "width": 4},
+             "transform": {"position": [100, 700]}, "trim": [0.25, 0.75]},
+            {"id": "head", "kind": "shape", "shape": "ring", "size": 20, "fill": "#fff", "transform": {"position": [999, 999]}, "follow": {"layer": "line"}},
+            {"id": "tail", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff", "follow": {"layer": "band", "at": "tail"}},
+            {"id": "head2", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff", "follow": {"layer": "band", "at": "head", "offset": [0, -30]}},
+            {"id": "frac", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff",
+             "follow": {"layer": "line", "at": {"keys": [{"at": 0, "v": 0}, {"at": 2, "v": 1}]}}}
+        ])));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        for (t, x) in [(0.0, 100.0), (0.5, 200.0), (1.0, 300.0), (1.5, 400.0), (2.0, 500.0), (3.0, 500.0)] {
+            assert!(near(placed(&c, t, "head").0, (x, 500.0)), "head at {t}: {:?}", placed(&c, t, "head"));
+            assert!(near(placed(&c, t, "frac").0, (x, 500.0)), "fraction at {t}");
+        }
+        assert!(near(placed(&c, 1.0, "tail").0, (200.0, 700.0)));
+        assert!(near(placed(&c, 1.0, "head2").0, (400.0, 670.0)), "offset in canvas axes without rotate");
+    }
+
+    #[test]
+    fn follow_uses_the_targets_full_transform_and_turns_with_it() {
+        // Parent turned 90° clockwise; the path scaled 2× about its anchor.
+        let c = Compiled::new(&follow_project(serde_json::json!([
+            {"id": "p", "kind": "shape", "shape": "circle", "size": 1, "fill": "#00000000", "transform": {"position": [500, 500], "rotation": 90}},
+            {"id": "path", "kind": "shape", "shape": "path", "d": "M 0 0 L 100 0", "stroke": {"color": "#fff", "width": 4}, "parent": "p",
+             "transform": {"position": [10, 0], "scale": 2, "anchor": [50, 0]}, "trim": [0, 0.75]},
+            {"id": "arrow", "kind": "shape", "shape": "polygon", "sides": 3, "size": 20, "fill": "#fff",
+             "transform": {"rotation": 10}, "follow": {"layer": "path", "rotate": true, "offset": [0, -20]}}
+        ])));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        // Head (75, 0) → ((75 − 50)·2 + 10, 0) = (60, 0) → turned: (0, 60) → (500, 560);
+        // the offset turns with the path: (0, −20) → (20, 0).
+        let (o, x) = placed(&c, 0.0, "arrow");
+        assert!(near(o, (520.0, 560.0)), "{o:?}");
+        // Path direction (down) plus its own 10°.
+        let (s, k) = 100f64.to_radians().sin_cos();
+        assert!(near(x, (k, s)), "{x:?}");
+    }
+
+    #[test]
+    fn follow_tracks_a_morphing_path_and_stepped_time() {
+        let c = Compiled::new(&follow_project(serde_json::json!([
+            {"id": "m", "kind": "shape", "shape": "path", "stroke": {"color": "#fff", "width": 4},
+             "d": {"keys": [{"at": 0, "v": "M 0 0 L 100 0"}, {"at": 2, "v": "M 0 100 L 100 100"}]}},
+            {"id": "a", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff", "follow": {"layer": "m", "at": 0.5}},
+            {"id": "stepped", "kind": "shape", "shape": "path", "d": "M 0 0 L 300 0", "stroke": {"color": "#fff", "width": 4},
+             "time": {"step_fps": 10}, "trim": {"keys": [{"at": 0, "v": [0, 0]}, {"at": 3, "v": [0, 1]}]}},
+            {"id": "b", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff", "follow": {"layer": "stepped"}}
+        ])));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert!(near(placed(&c, 1.0, "a").0, (50.0, 50.0)), "{:?}", placed(&c, 1.0, "a"));
+        // The stepped stroke holds 0.3 s → its head (and the follower) hold too.
+        assert!(near(placed(&c, 0.31, "b").0, (30.0, 0.0)));
+        assert!(near(placed(&c, 0.39, "b").0, (30.0, 0.0)));
+        assert!(near(placed(&c, 0.41, "b").0, (40.0, 0.0)));
+    }
+
+    #[test]
+    fn follow_errors_name_the_problem() {
+        let errors = |layers| Compiled::new(&follow_project(layers)).errors;
+        let e = errors(serde_json::json!([{"id": "a", "kind": "shape", "shape": "circle", "follow": {"layer": "nope"}}]));
+        assert!(e.iter().any(|e| e.contains("a.follow: no sibling layer 'nope'")), "{e:?}");
+        let e = errors(serde_json::json!([
+            {"id": "dot", "kind": "shape", "shape": "circle"},
+            {"id": "a", "kind": "shape", "shape": "circle", "follow": {"layer": "dot"}}
+        ]));
+        assert!(e.iter().any(|e| e.contains("a.follow: 'dot' is not a path layer")), "{e:?}");
+        let e = errors(serde_json::json!([
+            {"id": "path", "kind": "shape", "shape": "path", "d": "M 0 0 L 10 0", "parent": "a"},
+            {"id": "a", "kind": "shape", "shape": "circle", "follow": {"layer": "path"}}
+        ]));
+        assert!(e.iter().any(|e| e.contains("a.follow") && e.contains("cycle")), "{e:?}");
+        let bad: std::result::Result<Layer, _> = Layer::from_json(serde_json::json!({"id": "a", "kind": "shape", "shape": "circle", "follow": {"layer": "p", "at": "middle"}}));
+        assert!(bad.unwrap_err().contains("\"head\", \"tail\" or a fraction"));
     }
 
     #[test]

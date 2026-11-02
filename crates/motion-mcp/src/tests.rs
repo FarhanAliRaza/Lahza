@@ -235,3 +235,61 @@ fn sound_trim_and_fades_shape_the_render() {
     assert!(level(2.55, 3.0) < 0.01, "cut after its length: {}", level(2.55, 3.0));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn compare_lines_frames_up_against_a_reference() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("compare");
+    tb.call("project_create", json!({"path": "look", "duration": 2, "width": 320, "height": 180, "background": "#000000"})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "scene": "s1", "layer": {"id": "dot", "kind": "shape", "shape": "circle", "size": 80, "fill": "#ff8800", "transform": {"position": [160, 90]}}}
+    ]})).unwrap();
+    // Our own frame as the reference: almost no difference.
+    tb.call("snapshot", json!({"at": [0.5], "width": 320, "save": "same.png"})).unwrap();
+    let same = tb.call("compare", json!({"against": "same.png", "at": [0.5], "width": 320})).unwrap();
+    assert_eq!(same.images.len(), 1);
+    let d = same.json["rows"][0]["mean_difference"].as_f64().unwrap();
+    assert!(d < 2.0, "identical frames differ by {d}");
+    // A reference with the dot elsewhere: a clear difference.
+    let mut moved = image::RgbaImage::from_pixel(320, 180, image::Rgba([0, 0, 0, 255]));
+    for y in 50..130 {
+        for x in 20..100 {
+            moved.put_pixel(x, y, image::Rgba([255, 136, 0, 255]));
+        }
+    }
+    moved.save(dir.join("moved.png")).unwrap();
+    let other = tb.call("compare", json!({"against": "moved.png", "at": [0.5], "width": 320})).unwrap().json;
+    assert!(other["rows"][0]["mean_difference"].as_f64().unwrap() > 10.0, "{other:#}");
+    assert!(tb.call("compare", json!({"against": "missing.mp4", "at": [0.5]})).is_err());
+}
+
+#[test]
+fn compare_runs_every_frame_and_names_motion_gaps() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("compare-run");
+    tb.call("project_create", json!({"path": "run", "duration": 1, "fps": 10, "width": 160, "height": 90, "background": "#000000"})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "scene": "s1", "layer": {"id": "dot", "kind": "shape", "shape": "circle", "size": 30, "fill": "#ffffff",
+            "transform": {"position": {"keys": [{"at": 0, "v": [20, 45]}, {"at": 0.9, "v": [140, 45]}]}}}}
+    ]})).unwrap();
+    let job = tb.call("render", json!({"output": "ref.mp4", "wait": true, "audio": false})).unwrap().json;
+    assert!(dir.join("ref.mp4").is_file(), "{job:#}");
+    // Against its own render: every frame compared, close.
+    let same = tb.call("compare", json!({"against": "ref.mp4", "width": 160})).unwrap();
+    assert_eq!(same.json["frames"], 10);
+    assert!(same.json["mean_difference"].as_f64().unwrap() < 5.0, "{:#}", same.json);
+    assert!(same.json["scenes"][0]["verdict"].as_str().unwrap().starts_with("motion similar"), "{:#}", same.json);
+    assert!(same.json["video"].as_str().is_some_and(|v| std::path::Path::new(v).is_file()));
+    // Hold the dot still: the reference now moves more.
+    tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "dot.transform.position", "value": [20, 45]}]})).unwrap();
+    let still = tb.call("compare", json!({"against": "ref.mp4", "width": 160})).unwrap().json;
+    assert!(still["scenes"][0]["verdict"].as_str().unwrap().starts_with("the reference moves more"), "{still:#}");
+}

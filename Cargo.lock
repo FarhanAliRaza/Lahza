@@ -3545,6 +3545,7 @@ dependencies = [
 name = "lahza-motion-core"
 version = "0.1.0"
 dependencies = [
+ "kurbo",
  "serde",
  "serde_json",
 ]

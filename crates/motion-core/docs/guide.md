@@ -23,6 +23,15 @@
    `sheet: true` at the scene's sync points. Look at the frames; fix; repeat.
 6. **Render** a draft (`quality: "draft"`), then the final.
 
+## Comparing with a reference
+
+`compare {against: "ref.mp4"}` checks every frame from first to last
+(`offset` = reference seconds minus ours; `from`/`to` limit the range). It
+returns a per-scene summary (how much each side moves, how different it
+looks), the worst stretches with a sheet of them, a timeline graph and a
+side-by-side video (ours | reference | difference). With `at: [...]` it
+shows only those moments.
+
 ## Footage and 3D
 
 - Footage: `media_import` a clip or image sequence, then add a
@@ -85,6 +94,10 @@ video timeline:
 - **Stop-motion is stepped time**, not jitter: `"time": {"step_fps": 12}`.
   The camera keeps its own smooth clock.
 - **Zooms over large ratios** use `zoom` (log space).
+- **A handle on a stroke's drawing head** (pen tip, ring, arrowhead) is one
+  field: `"follow": {"layer": "<path id>"}` on the handle (`"rotate": true`
+  for arrows). Animate only the path's `trim`; never key the handle's
+  position frame by frame.
 
 ## Review checklist
 

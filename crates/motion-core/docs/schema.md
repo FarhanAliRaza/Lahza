@@ -51,7 +51,7 @@ start, else the project end. A cut on a marker leads it by one frame unless
 Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 `scale`, `rotation`, `opacity`), `time` (`start`, `end`, `duration`,
 `step_fps`, `step_phase`, `offset`), `blend`, `effects` (`blur`, `shadow`,
-`glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `hidden`.
+`glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `follow`, `hidden`.
 
 Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
 `star`, `line`, `path` with SVG `d`), `text`, `image`, `comp`.
@@ -60,6 +60,32 @@ Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
 {"id": "route", "kind": "shape", "shape": "path", "d": "M -300 0 C -100 -200 100 200 300 0",
  "stroke": {"color": "#ffd23f", "width": 8},
  "trim": {"keys": [{"at": "word:route", "from": [0, 0], "v": [0, 1], "ease": "glide", "dur": "20f", "anchor": "start"}]}}
+```
+
+Path strokes take `cap` (`round`, `butt`, `square`), `join` (`round`,
+`miter`, `bevel`), `miter_limit`, `dash` (`[dash, gap, …]` px),
+`dash_offset`, `feather` (px faded at the far end, so a stroke drawn on
+with `trim` has a soft head) and `feather_start` (px faded at the start, a
+fading tail):
+
+```json
+{"id": "guide", "kind": "shape", "shape": "path", "d": "M 0 450 H 1080",
+ "stroke": {"color": "#3b35b0", "width": 3, "cap": "butt", "dash": [14, 12]}}
+```
+
+`follow` places a layer on a sibling path layer, evaluated at every
+moment (motion-blur samples and stepped time included), from the path as
+drawn: its morph, trim and full transform (parents and comps too). `at`
+is `"head"` (the trim end, the default: a handle riding a stroke as it
+draws on), `"tail"` (the trim start) or a fraction of the full length
+(animatable, `{"keys": …}`). `rotate: true` also turns the layer along the
+path's direction (added to its `rotation`); `offset` (px) moves it off the
+point, along the path's direction frame when rotating. The follower's
+`position` and `z` are not used, and it can't also have a `parent`:
+
+```json
+{"id": "pen", "kind": "shape", "shape": "ring", "size": 36, "thickness": 8, "fill": "#ffffff",
+ "follow": {"layer": "route", "at": "head", "rotate": false, "offset": [0, 0]}}
 ```
 
 Scenes may arrive with a transition centred on their cut:

@@ -12,10 +12,11 @@
 use crate::font::Fonts;
 use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
+use lahza_motion_core::path::{self, morph, trim};
 use lahza_motion_core::space::Proj;
-use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PathMorph, PostKind, ShapeState};
-use lahza_motion_core::document::{Blend, GradientKind, MatteMode, ShapeKind};
-use lahza_motion_core::value::Color;
+use lahza_motion_core::compile::{Affine, Content, EffectState, FrameState, LayerState, PaintState, PostKind, ShapeState};
+use lahza_motion_core::document::{Blend, Gradient, GradientKind, LineCap, LineJoin, MatteMode, ShapeKind, StrokeStyle};
+use lahza_motion_core::value::{Color, Vec2};
 
 pub const TILE: u32 = 16;
 
@@ -149,6 +150,15 @@ fn premul(c: Color, opacity: f64) -> [f32; 4] {
 
 fn blend_code(b: Blend) -> u32 {
     b.code()
+}
+
+fn matte_code(mode: MatteMode) -> f32 {
+    match mode {
+        MatteMode::Alpha => 0.0,
+        MatteMode::AlphaInverted => 1.0,
+        MatteMode::Luma => 2.0,
+        MatteMode::LumaInverted => 3.0,
+    }
 }
 
 #[derive(Clone)]
@@ -382,6 +392,32 @@ impl Builder<'_> {
         let wide = |reach: f64| [(bb[0] - reach).floor().max(0.0), (bb[1] - reach).floor().max(0.0), (bb[2] + reach).ceil().min(cw), (bb[3] + reach).ceil().min(ch)];
         let factor_for = |sigma: f64| if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
         let blend = blend_code(layer.blend);
+        let matte = layer.matte.as_ref().and_then(|m| m.source.as_ref().map(|src| (m.mode, src)));
+        let matte_items = matte.map(|(_, src)| {
+            let mut mi = Vec::new();
+            self.emit(src, root, canvas, list, pending, &mut mi);
+            mi
+        });
+        // Shadows and glows follow what the layer shows: with a matte they
+        // are made from the matted picture, not from the whole layer.
+        let has_outer = layer.effects.iter().any(|e| matches!(e, EffectState::Shadow { .. } | EffectState::Glow { .. }));
+        let effect_src = match (matte, &matte_items) {
+            (Some((mode, _)), Some(mi)) if has_outer && rect[2] > rect[0] && rect[3] > rect[1] => {
+                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), rect, 0.0, 1.0, false);
+                let (moff, ..) = self.reserve(list, pending, mi.clone(), rect, 0.0, 1.0, false);
+                let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1])));
+                let prim = Prim {
+                    kind: [PRIM_MATTE, 1, 0, 0],
+                    geom: [gw as f32, gh as f32, 1.0, 0.0],
+                    geom2: [f32::from_bits(off), f32::from_bits(moff), matte_code(mode), 0.0],
+                    ..Default::default()
+                };
+                with_inverse(prim, forward, 1.0)
+                    .map(|(prim, _)| vec![Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] }])
+                    .unwrap_or_default()
+            }
+            _ => items.clone(),
+        };
         // Effects below the layer.
         for e in &layer.effects {
             if let EffectState::Shadow { color, offset, sigma } = e {
@@ -390,7 +426,7 @@ impl Builder<'_> {
                 if r[2] <= r[0] || r[3] <= r[1] {
                     continue;
                 }
-                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), r, sigma, factor_for(sigma), false);
+                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, effect_src.clone(), r, sigma, factor_for(sigma), false);
                 let forward = Proj::from(Affine::translate(offset.x() * scale, offset.y() * scale).then(Affine::translate(origin[0], origin[1])).then(Affine::scale(f[0], f[1])));
                 let prim = Prim {
                     kind: [PRIM_IMAGE, 1, 0, FLAG_TINT_ALPHA],
@@ -406,12 +442,6 @@ impl Builder<'_> {
         }
         if rect[2] > rect[0] && rect[3] > rect[1] {
             let factor = factor_for(blur);
-            let matte = layer.matte.as_ref().and_then(|m| m.source.as_ref().map(|src| (m.mode, src)));
-            let matte_items = matte.map(|(_, src)| {
-                let mut mi = Vec::new();
-                self.emit(src, root, canvas, list, pending, &mut mi);
-                mi
-            });
             // Repeat-edge blur needs the content's exact rectangle: an
             // anti-aliasing margin would make the repeated edge transparent.
             let rect = if clamp {
@@ -429,16 +459,10 @@ impl Builder<'_> {
             let prim = match (matte, matte_items) {
                 (Some((mode, _)), Some(mi)) => {
                     let (moff, ..) = self.reserve(list, pending, mi, rect, 0.0, factor, false);
-                    let mode = match mode {
-                        MatteMode::Alpha => 0.0,
-                        MatteMode::AlphaInverted => 1.0,
-                        MatteMode::Luma => 2.0,
-                        MatteMode::LumaInverted => 3.0,
-                    };
                     Prim {
                         kind: [PRIM_MATTE, 1, blend, 0],
                         geom: [gw as f32, gh as f32, 1.0, 0.0],
-                        geom2: [f32::from_bits(off), f32::from_bits(moff), mode, 0.0],
+                        geom2: [f32::from_bits(off), f32::from_bits(moff), matte_code(mode), 0.0],
                         ..Default::default()
                     }
                 }
@@ -467,7 +491,7 @@ impl Builder<'_> {
                 if r[2] <= r[0] || r[3] <= r[1] || *intensity <= 0.0 {
                     continue;
                 }
-                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items.clone(), r, sigma, factor_for(sigma), false);
+                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, effect_src.clone(), r, sigma, factor_for(sigma), false);
                 let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1])));
                 let k = *intensity as f32;
                 let prim = Prim {
@@ -724,73 +748,6 @@ fn bin(list: &mut DisplayList, target: &Target, prims: Vec<(Prim, [f64; 4])>) {
     }
 }
 
-/// Flattened subpaths of SVG path data, in layer units (each a polyline,
-/// with whether it was closed).
-pub fn flatten(d: &str, tolerance: f64) -> Result<Vec<(Vec<(f64, f64)>, bool)>, String> {
-    let path = kurbo::BezPath::from_svg(d).map_err(|e| format!("bad path data: {e}"))?;
-    let mut out: Vec<(Vec<(f64, f64)>, bool)> = Vec::new();
-    kurbo::flatten(&path, tolerance.max(1e-4), |el| match el {
-        kurbo::PathEl::MoveTo(p) => out.push((vec![(p.x, p.y)], false)),
-        kurbo::PathEl::LineTo(p) => {
-            if let Some(last) = out.last_mut() {
-                last.0.push((p.x, p.y));
-            }
-        }
-        kurbo::PathEl::ClosePath => {
-            if let Some(last) = out.last_mut() {
-                last.1 = true;
-            }
-        }
-        _ => {}
-    });
-    Ok(out.into_iter().filter(|(pts, _)| pts.len() >= 2).collect())
-}
-
-/// The part of the polylines between fractions [t0, t1] of total length.
-fn trim(subpaths: &[(Vec<(f64, f64)>, bool)], t0: f64, t1: f64) -> Vec<Vec<(f64, f64)>> {
-    let lines: Vec<Vec<(f64, f64)>> = subpaths
-        .iter()
-        .map(|(pts, closed)| {
-            let mut p = pts.clone();
-            if *closed && p.first() != p.last() {
-                p.push(p[0]);
-            }
-            p
-        })
-        .collect();
-    let seg_len = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
-    let total: f64 = lines.iter().flat_map(|l| l.windows(2).map(|w| seg_len(w[0], w[1]))).sum();
-    let (from, to) = (t0 * total, t1 * total);
-    let mut out = Vec::new();
-    let mut acc = 0.0;
-    for line in &lines {
-        let mut cur: Vec<(f64, f64)> = Vec::new();
-        for w in line.windows(2) {
-            let l = seg_len(w[0], w[1]);
-            let (a, b) = (acc, acc + l);
-            acc = b;
-            if b < from || a > to || l <= 0.0 {
-                if !cur.is_empty() && a > to {
-                    break;
-                }
-                continue;
-            }
-            let lerp = |x: f64| {
-                let k = ((x - a) / l).clamp(0.0, 1.0);
-                (w[0].0 + (w[1].0 - w[0].0) * k, w[0].1 + (w[1].1 - w[0].1) * k)
-            };
-            if cur.is_empty() {
-                cur.push(lerp(from.max(a)));
-            }
-            cur.push(lerp(to.min(b)));
-        }
-        if cur.len() >= 2 {
-            out.push(cur);
-        }
-    }
-    out
-}
-
 fn push_segments(lines: &[Vec<(f64, f64)>], close: bool, segments: &mut Vec<[f32; 4]>) -> (u32, u32, [f64; 4]) {
     let first = segments.len() as u32;
     let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
@@ -812,8 +769,7 @@ fn push_segments(lines: &[Vec<(f64, f64)>], close: bool, segments: &mut Vec<[f32
 fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
     let mut items = Vec::new();
     let Some(m) = &s.path else { return items };
-    // Flatten finely enough for the on-screen size (¼ px).
-    let tolerance = 0.25 / matrix.max_scale().max(1e-6);
+    let tolerance = path::tolerance(matrix.max_scale());
     let Ok(subpaths) = morph(m, tolerance) else { return items };
     let mut add = |prim: Prim, bounds: [f64; 4], pad: f64| {
         if let Some((prim, _)) = with_inverse(prim, matrix, opacity) {
@@ -832,6 +788,21 @@ fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mu
         let (t0, t1) = (s.trim.x().clamp(0.0, 1.0), s.trim.y().clamp(0.0, 1.0));
         if width > 0.0 && color.0[3] > 0.0 && t1 > t0 {
             let lines = trim(&subpaths, t0, t1);
+            if let Some(style) = &s.stroke_style {
+                // Caps, joins, dashes and feather: outline the stroke and fill it.
+                let outline = stroke_outline(&lines, width, style, tolerance);
+                let (first, count, b) = push_segments(&outline, true, segments);
+                if count > 0 {
+                    let mut prim = Prim { kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_FILL], geom2: [f32::from_bits(first), f32::from_bits(count), 0.0, 0.0], ..Default::default() };
+                    let paint = match feather_gradient(&lines, style, color) {
+                        Some(g) => PaintState::Gradient(std::sync::Arc::new(g)),
+                        None => PaintState::Solid(color),
+                    };
+                    set_fill(&mut prim, &paint, stops);
+                    add(prim, b, 0.0);
+                }
+                return items;
+            }
             let (first, count, b) = push_segments(&lines, false, segments);
             if count > 0 {
                 let prim = Prim {
@@ -846,6 +817,94 @@ fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mu
         }
     }
     items
+}
+
+/// The filled outline of a stroke along `lines` (layer space), flattened.
+fn stroke_outline(lines: &[Vec<(f64, f64)>], width: f64, style: &StrokeStyle, tolerance: f64) -> Vec<Vec<(f64, f64)>> {
+    let mut path = kurbo::BezPath::new();
+    for line in lines {
+        for (i, p) in line.iter().enumerate() {
+            if i == 0 {
+                path.move_to(*p);
+            } else {
+                path.line_to(*p);
+            }
+        }
+    }
+    let cap = match style.cap {
+        LineCap::Round => kurbo::Cap::Round,
+        LineCap::Butt => kurbo::Cap::Butt,
+        LineCap::Square => kurbo::Cap::Square,
+    };
+    let join = match style.join {
+        LineJoin::Round => kurbo::Join::Round,
+        LineJoin::Miter => kurbo::Join::Miter,
+        LineJoin::Bevel => kurbo::Join::Bevel,
+    };
+    let mut k = kurbo::Stroke::new(width).with_caps(cap).with_join(join).with_miter_limit(style.miter_limit);
+    if !style.dash.is_empty() {
+        k = k.with_dashes(style.dash_offset, style.dash.iter().copied());
+    }
+    let outline = kurbo::stroke(path, &k, &kurbo::StrokeOpts::default(), tolerance);
+    let mut polys: Vec<Vec<(f64, f64)>> = Vec::new();
+    kurbo::flatten(&outline, tolerance, |el| match el {
+        kurbo::PathEl::MoveTo(p) => polys.push(vec![(p.x, p.y)]),
+        kurbo::PathEl::LineTo(p) => {
+            if let Some(poly) = polys.last_mut() {
+                poly.push((p.x, p.y));
+            }
+        }
+        kurbo::PathEl::ClosePath => {}
+        _ => {}
+    });
+    polys.retain(|p| p.len() >= 3);
+    polys
+}
+
+/// The point `distance` px back from the end of `pts` (or its start when
+/// the line is shorter).
+fn back_along(pts: &[(f64, f64)], distance: f64) -> (f64, f64) {
+    let mut left = distance;
+    for w in pts.windows(2).rev() {
+        let l = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+        if l >= left && l > 0.0 {
+            let k = left / l;
+            return (w[1].0 + (w[0].0 - w[1].0) * k, w[1].1 + (w[0].1 - w[1].1) * k);
+        }
+        left -= l;
+    }
+    pts[0]
+}
+
+/// Opacity ramps for `feather` (far end) and `feather_start` (start) as a
+/// linear gradient. One ramp follows the stroke's direction where it fades;
+/// both together ramp along the line from start to end.
+fn feather_gradient(lines: &[Vec<(f64, f64)>], style: &StrokeStyle, color: Color) -> Option<Gradient> {
+    let clear = Color([color.0[0], color.0[1], color.0[2], 0.0]);
+    let first = lines.first()?;
+    let last = lines.last()?;
+    let (start, end) = (*first.first()?, *last.last()?);
+    let linear = |from: (f64, f64), to: (f64, f64), stops| Gradient { kind: GradientKind::Linear, from: Vec2::new(from.0, from.1), to: Vec2::new(to.0, to.1), stops };
+    match (style.feather_start > 0.0, style.feather > 0.0) {
+        (false, false) => None,
+        (false, true) => {
+            let from = back_along(last, style.feather);
+            (from != end).then(|| linear(from, end, vec![(0.0, color), (1.0, clear)]))
+        }
+        (true, false) => {
+            let reversed: Vec<(f64, f64)> = first.iter().rev().copied().collect();
+            let to = back_along(&reversed, style.feather_start);
+            (to != start).then(|| linear(start, to, vec![(0.0, clear), (1.0, color)]))
+        }
+        (true, true) => {
+            let length = ((end.0 - start.0).powi(2) + (end.1 - start.1).powi(2)).sqrt();
+            (length > 0.0).then(|| {
+                let a = (style.feather_start / length).min(0.5);
+                let b = (1.0 - style.feather / length).max(a);
+                linear(start, end, vec![(0.0, clear), (a, color), (b, color), (1.0, clear)])
+            })
+        }
+    }
 }
 
 fn set_fill(prim: &mut Prim, fill: &PaintState, stops: &mut Vec<[f32; 4]>) {
@@ -868,93 +927,4 @@ fn set_fill(prim: &mut Prim, fill: &PaintState, stops: &mut Vec<[f32; 4]>) {
             prim.paint2 = [g.from.x() as f32, g.from.y() as f32, g.to.x() as f32, g.to.y() as f32];
         }
     }
-}
-
-type Poly = (Vec<(f64, f64)>, bool);
-
-/// `n` points evenly spaced along a polyline (closed: around the loop).
-fn resample(pts: &[(f64, f64)], closed: bool, n: usize) -> Vec<(f64, f64)> {
-    let mut p = pts.to_vec();
-    if closed && p.first() != p.last() {
-        p.push(p[0]);
-    }
-    let lens: Vec<f64> = p.windows(2).map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt()).collect();
-    let total: f64 = lens.iter().sum();
-    if total <= 0.0 || p.len() < 2 {
-        return vec![p[0]; n];
-    }
-    let steps = if closed { n } else { n - 1 };
-    let mut out = Vec::with_capacity(n);
-    let (mut seg, mut acc) = (0usize, 0.0f64);
-    for i in 0..n {
-        let target = total * i as f64 / steps.max(1) as f64;
-        while seg + 1 < lens.len() && acc + lens[seg] < target {
-            acc += lens[seg];
-            seg += 1;
-        }
-        let k = if lens[seg] > 0.0 { ((target - acc) / lens[seg]).clamp(0.0, 1.0) } else { 0.0 };
-        out.push((p[seg].0 + (p[seg + 1].0 - p[seg].0) * k, p[seg].1 + (p[seg + 1].1 - p[seg].1) * k));
-    }
-    out
-}
-
-fn centroid(pts: &[(f64, f64)]) -> (f64, f64) {
-    let n = pts.len().max(1) as f64;
-    (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n)
-}
-
-/// Point correspondence for closed outlines: the rotation (and direction)
-/// of `b` that sits closest to `a`.
-fn align(a: &[(f64, f64)], b: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let n = a.len();
-    let stride = (n / 64).max(1);
-    let cost = |c: &[(f64, f64)], off: usize| -> f64 {
-        (0..n).step_by(stride).map(|i| {
-            let q = c[(i + off) % n];
-            (q.0 - a[i].0).powi(2) + (q.1 - a[i].1).powi(2)
-        }).sum()
-    };
-    let reversed: Vec<(f64, f64)> = b.iter().rev().copied().collect();
-    let mut best = (f64::INFINITY, 0usize, false);
-    for (rev, c) in [(false, b), (true, reversed.as_slice())] {
-        for off in 0..n {
-            let v = cost(c, off);
-            if v < best.0 {
-                best = (v, off, rev);
-            }
-        }
-    }
-    let c = if best.2 { &reversed } else { b };
-    (0..n).map(|i| c[(i + best.1) % n]).collect()
-}
-
-/// Outlines of a path, interpolated when it is mid-morph.
-pub fn morph(m: &PathMorph, tolerance: f64) -> Result<Vec<Poly>, String> {
-    let a = flatten(&m.from, tolerance)?;
-    let Some(to) = &m.to else { return Ok(a) };
-    let b = flatten(to, tolerance)?;
-    let t = m.t;
-    let count = a.len().max(b.len());
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        // A subpath without a partner grows from (or shrinks to) a point.
-        let (pa, ca) = a.get(i).cloned().unwrap_or_else(|| {
-            let c = centroid(&b[i].0);
-            (vec![c, c], b[i].1)
-        });
-        let (pb, cb) = b.get(i).cloned().unwrap_or_else(|| {
-            let c = centroid(&a[i].0);
-            (vec![c, c], a[i].1)
-        });
-        let closed = ca || cb;
-        let n = pa.len().max(pb.len()).clamp(32, 4096);
-        let ra = resample(&pa, closed, n);
-        let mut rb = resample(&pb, closed, n);
-        if closed {
-            rb = align(&ra, &rb);
-        }
-        let pts = ra.iter().zip(&rb).map(|(p, q)| (p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t)).collect();
-        out.push((pts, closed));
-    }
-    Ok(out)
 }

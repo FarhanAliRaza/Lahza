@@ -178,6 +178,7 @@ pub fn catalog_json() -> Value {
             "three_d": "bool: place the layer in 3D (uses transform.z, rotation_x, rotation_y and the scene camera's fov/orbit/dolly); 3D layers sort back to front among their neighbours; children of a 3D comp lie on its plane",
             "transform_3d": {"z": "depth, + is away from the viewer", "rotation_x": "degrees, + tilts the top away", "rotation_y": "degrees, + turns the right side away"},
             "parent": "transform parent: sibling layer id",
+            "follow": {"layer": "sibling shape \"path\" layer to ride (replaces position, z and parent)", "at": "head (trim end, default) | tail (trim start) | fraction 0..1 of the full length (animatable)", "rotate": "bool: also turn along the path (added to rotation)", "offset": "[x, y] px from the point (along the path frame when rotate)"},
             "hidden": "bool"
         },
         "layer_kinds": {
@@ -190,7 +191,7 @@ pub fn catalog_json() -> Value {
                 "angles": "arc [from, to] degrees, 0 = up, clockwise (default [0, 270])",
                 "trim": "line, ring, arc draw-on [from, to] in 0..1",
                 "fill": "colour (animatable) or {gradient: linear|radial, from, to, stops: [[0, colour], ...]}",
-                "stroke": {"color": "colour", "width": "px"}
+                "stroke": {"color": "colour", "width": "px", "cap": "round | butt | square (default round)", "join": "round | miter | bevel (default round)", "miter_limit": "default 4", "dash": "[dash, gap, …] px", "dash_offset": "px", "feather": "px faded at the far end (the head while trim draws it on)", "feather_start": "px faded at the start (a fading tail)", "note": "cap, join, dash and feathers apply to path strokes"}
             },
             "text": {
                 "text": "string; \\n breaks lines", "font": "Inter | Inter Medium | Inter SemiBold | project-relative .ttf/.otf",

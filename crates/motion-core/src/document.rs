@@ -563,6 +563,62 @@ pub struct Matte {
     pub mode: MatteMode,
 }
 
+/// Rides a sibling path layer: the layer is placed on the path's drawn
+/// geometry (its morph, trim and full transform) at every evaluated time,
+/// replacing its own `position` (and `parent`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Follow {
+    /// A sibling `shape: "path"` layer.
+    pub layer: String,
+    #[serde(default)]
+    pub at: FollowAt,
+    /// Also turn along the path's direction (added to `rotation`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rotate: bool,
+    /// Added to the point, in the path's direction frame when `rotate`.
+    #[serde(default = "zero_vec", skip_serializing_if = "is_zero_vec")]
+    pub offset: Property<Vec2>,
+}
+
+/// Where on the path: the drawn head (`trim[1]`), its tail (`trim[0]`),
+/// or a fraction of the full length (animatable).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FollowAt {
+    Head,
+    Tail,
+    Fraction(Property<f64>),
+}
+
+impl Default for FollowAt {
+    fn default() -> Self {
+        FollowAt::Head
+    }
+}
+
+impl Serialize for FollowAt {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            FollowAt::Head => s.serialize_str("head"),
+            FollowAt::Tail => s.serialize_str("tail"),
+            FollowAt::Fraction(p) => p.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FollowAt {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(d)?;
+        match value.as_str() {
+            Some("head") => Ok(FollowAt::Head),
+            Some("tail") => Ok(FollowAt::Tail),
+            Some(other) => Err(D::Error::custom(format!("follow.at: \"head\", \"tail\" or a fraction 0..1, not \"{other}\""))),
+            None => serde_json::from_value(value).map(FollowAt::Fraction).map_err(|e| D::Error::custom(format!("follow.at: {e}"))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatteMode {
@@ -647,6 +703,8 @@ pub struct Common {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matte: Option<Matte>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<Follow>,
     /// Place the layer in 3D (z, rotation_x/y, the scene's 3D camera);
     /// 3D layers sort by depth among their neighbours.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -659,7 +717,7 @@ fn is_normal(b: &Blend) -> bool {
     *b == Blend::Normal
 }
 
-const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "three_d", "hidden"];
+const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "follow", "three_d", "hidden"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -1040,10 +1098,92 @@ pub struct Stroke {
     pub color: Property<Color>,
     #[serde(default = "four")]
     pub width: Property<f64>,
+    /// Ends of open strokes and dashes.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub cap: LineCap,
+    /// Corners between segments.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub join: LineJoin,
+    /// Miter joins longer than this many half-widths are bevelled.
+    #[serde(default = "four_f64", skip_serializing_if = "is_four")]
+    pub miter_limit: f64,
+    /// Alternating dash and gap lengths in px.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dash: Vec<f64>,
+    /// Shift of the dash pattern along the stroke, px.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub dash_offset: f64,
+    /// Fade over this many px at the stroke's far end (the drawing head
+    /// while `trim` draws it on).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub feather: f64,
+    /// Fade over this many px at the stroke's start (a fading tail).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub feather_start: f64,
+}
+
+/// How a path stroke is outlined, when it is not the default round caps
+/// and joins with no dashes or feather.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrokeStyle {
+    pub cap: LineCap,
+    pub join: LineJoin,
+    pub miter_limit: f64,
+    pub dash: Vec<f64>,
+    pub dash_offset: f64,
+    pub feather: f64,
+    pub feather_start: f64,
+}
+
+impl Stroke {
+    pub fn style(&self) -> Option<StrokeStyle> {
+        let dash: Vec<f64> = self.dash.iter().map(|d| d.max(0.0)).collect();
+        let dashed = dash.iter().sum::<f64>() > 0.0;
+        let plain = self.cap == LineCap::Round && self.join == LineJoin::Round && !dashed && self.feather <= 0.0 && self.feather_start <= 0.0;
+        (!plain).then(|| StrokeStyle {
+            cap: self.cap,
+            join: self.join,
+            miter_limit: self.miter_limit.max(1.0),
+            dash: if dashed { dash } else { Vec::new() },
+            dash_offset: self.dash_offset,
+            feather: self.feather.max(0.0),
+            feather_start: self.feather_start.max(0.0),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineCap {
+    #[default]
+    Round,
+    Butt,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineJoin {
+    #[default]
+    Round,
+    Miter,
+    Bevel,
 }
 
 fn four() -> Property<f64> {
     Property::Constant(4.0)
+}
+
+fn four_f64() -> f64 {
+    4.0
+}
+
+fn is_four(v: &f64) -> bool {
+    *v == 4.0
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

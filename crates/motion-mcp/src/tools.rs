@@ -155,6 +155,17 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: true,
         },
         ToolDef {
+            name: "compare",
+            description: "Compare the project with a reference video. Without `at` it compares every frame from first to last: per frame the difference and how much each side moves, a per-scene summary with a verdict, the worst stretches (with a sheet of them), a timeline graph, and a side-by-side video (ours | reference | difference) of the whole piece. With `at` it returns those moments side by side. The reference time is ours + offset.",
+            schema: obj(json!({"against": {"type": "string", "description": "reference video or image"}, "at": {"type": "array", "items": time, "description": "only these moments (default: every frame)"},
+                "from": {"type": "number"}, "to": {"type": "number"},
+                "offset": {"type": "number", "description": "reference seconds = ours + offset (default 0)"},
+                "width": {"type": "integer", "description": "px per frame (default 360 for moments, 270 for a full run)"},
+                "video": {"type": "string", "description": "full run: side-by-side video path (default renders/compare.mp4)"},
+                "save": {"type": "string", "description": "also write the first PNG here"}}), &["against"]),
+            read_only: true,
+        },
+        ToolDef {
             name: "render",
             description: "Export video (mp4, webm or gif by extension) in the background; poll render_status. quality=draft renders half size without motion blur.",
             schema: obj(json!({"output": {"type": "string", "description": "default renders/<name>.mp4 in the project"}, "quality": {"type": "string", "enum": ["draft", "final"], "default": "final"},
@@ -294,6 +305,7 @@ impl Toolbox {
             "edit_apply" => self.edit_apply(&args),
             "check" => self.check(&args),
             "snapshot" => self.snapshot(&args),
+            "compare" => self.compare(&args),
             "render" => self.render(&args),
             "render_status" => self.render_status(&args),
             "history" => self.history(&args),
@@ -943,6 +955,282 @@ impl Toolbox {
         Ok(Output { json: json!({"frames": listed, "renderer": backend}), images })
     }
 
+    fn compare(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let against = self.path(get_str(args, "against").ok_or("compare needs \"against\" (a reference video)")?);
+        if !against.exists() {
+            return Err(format!("{} does not exist", against.display()));
+        }
+        let offset = get_f64(args, "offset").unwrap_or(0.0);
+        let Some(at) = args.get("at").and_then(Value::as_array) else {
+            return self.compare_run(&dir, &against, offset, args);
+        };
+        let mut times = Vec::new();
+        for v in at {
+            times.push(self.resolve_time(&dir, v)?);
+        }
+        if times.is_empty() || times.len() > 16 {
+            return Err("compare takes 1 to 16 times".into());
+        }
+        let width = args.get("width").and_then(Value::as_u64).unwrap_or(360).clamp(64, 1280) as f64;
+        let compiled = self.compiled(&dir);
+        let fps = compiled.fps();
+        let scale = (width * 2.0 / compiled.settings.width as f64).clamp(0.05, 1.0);
+        let renderer = self.renderer(&dir);
+        renderer.set_scale(scale);
+        let mut cells = Vec::new();
+        let mut rows = Vec::new();
+        for (label, t) in &times {
+            let n = fps.nearest_frame(*t).clamp(0, compiled.frame_count().saturating_sub(1) as i64);
+            let ft = fps.time_of(n);
+            let ours = renderer.render(&compiled, ft);
+            let (w, h) = ours.dimensions();
+            let rt = (ft + offset).max(0.0);
+            let reference = reference_frame(&against, rt, w, h)?;
+            let (diff, mean) = difference(&ours, &reference);
+            let luma = |img: &image::RgbaImage| img.pixels().map(|p| 0.2126 * p.0[0] as f64 + 0.7152 * p.0[1] as f64 + 0.0722 * p.0[2] as f64).sum::<f64>() / (w as f64 * h as f64);
+            rows.push(json!({"at": label, "t": round(ft), "reference_t": round(rt), "mean_difference": round(mean),
+                             "brightness_ours": round(luma(&ours)), "brightness_reference": round(luma(&reference))}));
+            cells.push((format!("ours {label} · {ft:.2}s"), ours));
+            cells.push((format!("reference {rt:.2}s"), reference));
+            cells.push((format!("difference {mean:.1}"), diff));
+        }
+        renderer.set_scale(1.0);
+        let png = lahza_motion_render::encode_png(&sheet::contact_sheet(&cells, 3, width as u32));
+        if let Some(save) = get_str(args, "save") {
+            let path = self.path(save);
+            std::fs::write(&path, &png).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(Output { json: json!({"rows": rows, "against": against.display().to_string(), "offset": offset}), images: vec![png] })
+    }
+
+    /// Every frame from first to last against the reference.
+    fn compare_run(&mut self, dir: &Path, against: &Path, offset: f64, args: &Value) -> ToolResult {
+        let ffmpeg = which("ffmpeg").ok_or("compare needs ffmpeg")?;
+        let compiled = self.compiled(dir);
+        let fps = compiled.fps();
+        let last = compiled.frame_count().saturating_sub(1) as i64;
+        let first_n = get_f64(args, "from").map(|t| fps.nearest_frame(t)).unwrap_or(0).clamp(0, last);
+        let last_n = get_f64(args, "to").map(|t| fps.nearest_frame(t)).unwrap_or(last).clamp(first_n, last);
+        let width = args.get("width").and_then(Value::as_u64).unwrap_or(270).clamp(64, 960) as f64;
+        let scale = (width / compiled.settings.width as f64).clamp(0.02, 1.0);
+        let video = match get_str(args, "video") {
+            Some(v) => self.path(v),
+            None => dir.join("renders").join("compare.mp4"),
+        };
+        let save = get_str(args, "save").map(|p| self.path(p));
+        let renderer = self.renderer(dir);
+        renderer.set_scale(scale);
+        let probe = renderer.render(&compiled, fps.time_of(first_n));
+        let (w, h) = probe.dimensions();
+        // Pair frames by index, not by resampled timestamps: our frame n
+        // shows the reference frame on screen at n/fps + offset.
+        let timing = ref_timing(against);
+        let ref_index = |t: f64| timing.map(|(s, r)| ((t - s) * r + 1e-6).floor().max(0.0) as i64).unwrap_or(0);
+        let first_ref = ref_index(fps.time_of(first_n) + offset);
+        let filter = format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black");
+        let mut reader = std::process::Command::new(&ffmpeg)
+            .args(["-v", "error", "-ss", &format!("{:.6}", seek_before(timing, first_ref)), "-i"])
+            .arg(against)
+            .args(["-vf", &filter, "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("ffmpeg: {e}"))?;
+        let mut ref_out = reader.stdout.take().ok_or("ffmpeg gave no output")?;
+        // Side-by-side video: ours | reference | difference, even height.
+        if let Some(parent) = video.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let (vw, vh) = (w * 3 + 8, h + (h % 2));
+        let mut writer = std::process::Command::new(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{vw}x{vh}"), "-r", &format!("{}", fps.as_f64()), "-i", "-",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"])
+            .arg(&video)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("ffmpeg: {e}"))?;
+        let mut sink = writer.stdin.take().ok_or("ffmpeg gave no input")?;
+        let frame_bytes = (w * h * 4) as usize;
+        let mut ended_at = None;
+        let mut series: Vec<[f64; 3]> = Vec::new(); // [difference, motion ours, motion reference]
+        let (mut prev_ours, mut prev_ref): (Option<image::RgbaImage>, Option<image::RgbaImage>) = (None, None);
+        let black = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+        // The last decoded reference frame and its index.
+        let (mut held, mut held_index): (Option<image::RgbaImage>, i64) = (None, first_ref - 1);
+        for n in first_n..=last_n {
+            let ours = renderer.render(&compiled, fps.time_of(n));
+            let want = ref_index(fps.time_of(n) + offset);
+            while held_index < want && ended_at.is_none() {
+                let mut buf = vec![0u8; frame_bytes];
+                match std::io::Read::read_exact(&mut ref_out, &mut buf) {
+                    Ok(()) => {
+                        held = image::RgbaImage::from_raw(w, h, buf);
+                        held_index += 1;
+                    }
+                    Err(_) => {
+                        ended_at = Some(fps.time_of(n) + offset);
+                        held = None;
+                    }
+                }
+            }
+            let reference = held.clone().unwrap_or_else(|| black.clone());
+            let (diff, mean) = difference(&ours, &reference);
+            let motion = |prev: &Option<image::RgbaImage>, cur: &image::RgbaImage| prev.as_ref().map(|p| difference(p, cur).1).unwrap_or(0.0);
+            series.push([mean, motion(&prev_ours, &ours), motion(&prev_ref, &reference)]);
+            let mut frame = image::RgbaImage::from_pixel(vw, vh, image::Rgba([20, 20, 26, 255]));
+            for (i, img) in [&ours, &reference, &diff].into_iter().enumerate() {
+                image::imageops::replace(&mut frame, img, (i as u32 * (w + 4)) as i64, 0);
+            }
+            if std::io::Write::write_all(&mut sink, frame.as_raw()).is_err() {
+                break;
+            }
+            prev_ours = Some(ours);
+            prev_ref = Some(reference);
+        }
+        drop(sink);
+        let _ = reader.kill();
+        let _ = reader.wait();
+        let written = writer.wait().map(|s| s.success()).unwrap_or(false);
+
+        // Motion is smoothed over 5 frames so single-frame cuts don't dominate.
+        let smooth = |k: usize| -> Vec<f64> {
+            (0..series.len()).map(|i| {
+                let (a, b) = (i.saturating_sub(2), (i + 3).min(series.len()));
+                series[a..b].iter().map(|v| v[k]).sum::<f64>() / (b - a) as f64
+            }).collect()
+        };
+        let (mo, mr) = (smooth(1), smooth(2));
+        // Fixed scales, not relative to this video: motion is the mean
+        // per-pixel change between frames, difference the mean per-pixel gap.
+        let moves = |o: f64, r: f64| -> &'static str {
+            if r > 0.8 && o < 0.5 * r {
+                "the reference moves more"
+            } else if o > 0.8 && r < 0.5 * o {
+                "ours moves more"
+            } else {
+                "motion similar"
+            }
+        };
+        let looks = |d: f64| -> &'static str {
+            if d < 12.0 {
+                "looks close"
+            } else if d < 25.0 {
+                "looks somewhat different"
+            } else {
+                "looks different"
+            }
+        };
+        let verdict = |o: f64, r: f64, d: f64| -> &'static str {
+            match moves(o, r) {
+                "motion similar" if d >= 25.0 => "looks different",
+                "motion similar" => "close",
+                m => m,
+            }
+        };
+        let time = |i: usize| fps.time_of(first_n + i as i64);
+        // Stretches where a verdict other than "close" holds (gaps ≤ 3 f bridged).
+        let mut segments: Vec<(usize, usize, &'static str)> = Vec::new();
+        for i in 0..series.len() {
+            let v = verdict(mo[i], mr[i], series[i][0]);
+            if v == "close" {
+                continue;
+            }
+            match segments.last_mut() {
+                Some(last) if last.2 == v && i - last.1 <= 4 => last.1 = i,
+                _ => segments.push((i, i, v)),
+            }
+        }
+        segments.retain(|s| s.1 - s.0 + 1 >= 4);
+        let severity = |s: &(usize, usize, &str)| (s.0..=s.1).map(|i| series[i][0] + (mr[i] - mo[i]).abs() * 4.0).sum::<f64>();
+        segments.sort_by(|a, b| severity(b).total_cmp(&severity(a)));
+        segments.truncate(10);
+        let seg_json: Vec<Value> = segments.iter().map(|s| {
+            let n = (s.1 - s.0 + 1) as f64;
+            json!({"from": round(time(s.0)), "to": round(time(s.1)), "frames": s.1 - s.0 + 1, "verdict": s.2,
+                   "mean_difference": round((s.0..=s.1).map(|i| series[i][0]).sum::<f64>() / n),
+                   "motion_ours": round((s.0..=s.1).map(|i| mo[i]).sum::<f64>() / n),
+                   "motion_reference": round((s.0..=s.1).map(|i| mr[i]).sum::<f64>() / n)})
+        }).collect();
+        let scenes: Vec<Value> = compiled.scenes.iter().filter_map(|sc| {
+            let idx: Vec<usize> = (0..series.len()).filter(|&i| time(i) >= sc.start && time(i) < sc.end).collect();
+            if idx.is_empty() {
+                return None;
+            }
+            let n = idx.len() as f64;
+            let (d, o, r) = (idx.iter().map(|&i| series[i][0]).sum::<f64>() / n, idx.iter().map(|&i| mo[i]).sum::<f64>() / n, idx.iter().map(|&i| mr[i]).sum::<f64>() / n);
+            Some(json!({"scene": sc.id.as_ref(), "from": round(sc.start), "to": round(sc.end), "mean_difference": round(d),
+                        "motion_ours": round(o), "motion_reference": round(r), "verdict": format!("{}; {}", moves(o, r), looks(d))}))
+        }).collect();
+
+        // Timeline graph: difference (white), motion ours (orange), reference (cyan).
+        let gw = (series.len() as u32 * 2).clamp(600, 1800);
+        let gh = 260u32;
+        let mut graph = image::RgbaImage::from_pixel(gw, gh, image::Rgba([14, 14, 20, 255]));
+        let x_of = |i: usize| ((i as f64 + 0.5) / series.len() as f64 * gw as f64) as u32;
+        for sc in &compiled.scenes {
+            let i = (0..series.len()).find(|&i| time(i) >= sc.start);
+            if let Some(i) = i {
+                for y in 0..gh {
+                    graph.put_pixel(x_of(i).min(gw - 1), y, image::Rgba([60, 60, 72, 255]));
+                }
+            }
+        }
+        let dmax = series.iter().map(|v| v[0]).fold(1.0f64, f64::max);
+        let mmax = mo.iter().chain(mr.iter()).copied().fold(0.5f64, f64::max);
+        let plot = |g: &mut image::RgbaImage, values: &[f64], max: f64, color: [u8; 4]| {
+            let y_of = |v: f64| (gh as f64 - 6.0 - (v / max).clamp(0.0, 1.0) * (gh as f64 - 12.0)) as i64;
+            for i in 1..values.len() {
+                let (x0, x1) = (x_of(i - 1) as i64, x_of(i) as i64);
+                let (y0, y1) = (y_of(values[i - 1]), y_of(values[i]));
+                let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
+                for k in 0..=steps {
+                    let x = x0 + (x1 - x0) * k / steps;
+                    let y = y0 + (y1 - y0) * k / steps;
+                    for dy in 0..2 {
+                        if x >= 0 && (x as u32) < gw && y + dy >= 0 && ((y + dy) as u32) < gh {
+                            g.put_pixel(x as u32, (y + dy) as u32, image::Rgba(color));
+                        }
+                    }
+                }
+            }
+        };
+        let diffs: Vec<f64> = series.iter().map(|v| v[0]).collect();
+        plot(&mut graph, &diffs, dmax, [235, 235, 240, 255]);
+        plot(&mut graph, &mr, mmax, [80, 210, 255, 255]);
+        plot(&mut graph, &mo, mmax, [255, 150, 40, 255]);
+        let caption = format!("{:.2}–{:.2}s · difference (white, max {dmax:.0}) · motion: reference (cyan), ours (orange) · grey = cuts", time(0), time(series.len() - 1));
+        let graph_png = lahza_motion_render::encode_png(&sheet::contact_sheet(&[(caption, graph)], 1, gw));
+        // The worst stretches, at their middle frame.
+        let mut cells = Vec::new();
+        for s in &segments {
+            let t = time((s.0 + s.1) / 2);
+            let ours = renderer.render(&compiled, t);
+            let reference = reference_frame(against, t + offset, w, h).unwrap_or_else(|_| image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255])));
+            let (diff, _) = difference(&ours, &reference);
+            cells.push((format!("ours {:.2}–{:.2}s", time(s.0), time(s.1)), ours));
+            cells.push((format!("reference · {}", s.2), reference));
+            cells.push(("difference".to_string(), diff));
+        }
+        renderer.set_scale(1.0);
+        let mut images = vec![graph_png];
+        if !cells.is_empty() {
+            images.push(lahza_motion_render::encode_png(&sheet::contact_sheet(&cells, 3, 240)));
+        }
+        if let Some(path) = save {
+            std::fs::write(&path, &images[0]).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(Output {
+            json: json!({
+                "frames": series.len(), "from": round(time(0)), "to": round(time(series.len() - 1)), "offset": offset,
+                "mean_difference": round(diffs.iter().sum::<f64>() / diffs.len().max(1) as f64),
+                "scenes": scenes, "worst": seg_json,
+                "reference_ended_at": ended_at.map(round),
+                "video": if written { Some(video.display().to_string()) } else { None },
+            }),
+            images,
+        })
+    }
+
     fn render(&mut self, args: &Value) -> ToolResult {
         let dir = self.dir(args)?;
         let project = self.state(&dir).project.clone();
@@ -1465,6 +1753,75 @@ impl Toolbox {
         }
         self.render_status(&json!({"job": id}))
     }
+}
+
+/// One frame of a reference video (or an image) at `t`, fitted into w×h
+/// on black so it lines up with our frame.
+/// A video's first frame time and frame rate (None for stills or when
+/// ffprobe can't tell).
+fn ref_timing(path: &Path) -> Option<(f64, f64)> {
+    let still = path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp"));
+    if still {
+        return None;
+    }
+    let out = std::process::Command::new(which("ffprobe")?)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate,r_frame_rate,start_time", "-of", "json"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let stream = v["streams"].get(0)?;
+    let ratio = |s: &str| -> Option<f64> {
+        let (a, b) = s.split_once('/')?;
+        let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
+        (a > 0.0 && b > 0.0).then_some(a / b)
+    };
+    let rate = stream["avg_frame_rate"].as_str().and_then(ratio).or_else(|| stream["r_frame_rate"].as_str().and_then(ratio))?;
+    let start = stream["start_time"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    Some((start, rate))
+}
+
+/// A seek time that lands exactly on reference frame `index` (a quarter
+/// frame before its timestamp, so float rounding can't skip it).
+fn seek_before(timing: Option<(f64, f64)>, index: i64) -> f64 {
+    timing.map(|(s, r)| (s + index as f64 / r - 0.25 / r).max(0.0)).unwrap_or(0.0)
+}
+
+fn reference_frame(path: &Path, t: f64, w: u32, h: u32) -> Result<image::RgbaImage, String> {
+    let ffmpeg = which("ffmpeg").ok_or("compare needs ffmpeg")?;
+    let filter = format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black");
+    // The frame on screen at t; a still reference is the same at every time.
+    let timing = ref_timing(path);
+    let seek = seek_before(timing, timing.map(|(s, r)| ((t - s) * r + 1e-6).floor().max(0.0) as i64).unwrap_or(0));
+    let out = std::process::Command::new(ffmpeg)
+        .args(["-v", "error", "-ss", &format!("{seek:.6}"), "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-vf", &filter, "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .output()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    let expected = (w * h * 4) as usize;
+    if !out.status.success() || out.stdout.len() < expected {
+        return Err(format!("no reference frame at {t:.2}s in {}: {}", path.display(), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    image::RgbaImage::from_raw(w, h, out.stdout[..expected].to_vec()).ok_or_else(|| "bad reference frame".into())
+}
+
+/// Per-pixel |ours − reference| (amplified 3× so small differences show)
+/// and the mean absolute channel difference, 0–255.
+fn difference(a: &image::RgbaImage, b: &image::RgbaImage) -> (image::RgbaImage, f64) {
+    let (w, h) = a.dimensions();
+    let mut out = image::RgbaImage::new(w, h);
+    let mut total = 0u64;
+    for ((pa, pb), po) in a.pixels().zip(b.pixels()).zip(out.pixels_mut()) {
+        let mut c = [0u8, 0, 0, 255];
+        for k in 0..3 {
+            let d = (pa.0[k] as i32 - pb.0[k] as i32).unsigned_abs();
+            total += d as u64;
+            c[k] = (d * 3).min(255) as u8;
+        }
+        po.0 = c;
+    }
+    (out, total as f64 / (w as f64 * h as f64 * 3.0))
 }
 
 fn which(program: &str) -> Option<PathBuf> {

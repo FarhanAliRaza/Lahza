@@ -332,6 +332,55 @@ fn track_mattes() {
 }
 
 #[test]
+fn stroke_caps_joins_dashes_and_feather() {
+    let path = |d: &str, extra: serde_json::Value| {
+        let mut stroke = json!({"color": "#ffffff", "width": 20});
+        stroke.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let p = project(json!([{"id": "p", "kind": "shape", "shape": "path", "d": d, "stroke": stroke}]));
+        cpu().render(&Compiled::new(&p), 0.0)
+    };
+    // Caps: 5 px past the end of a horizontal stroke.
+    assert_eq!(px(&path("M 60 40 H 260", json!({})), 55, 40)[0], 255, "round cap (default) covers past the end");
+    assert_eq!(px(&path("M 60 40 H 260", json!({"cap": "butt"})), 55, 40)[0], 0, "butt cap stops at the end");
+    assert_eq!(px(&path("M 60 40 H 260", json!({"cap": "square"})), 55, 40)[0], 255, "square cap extends half a width");
+    // Joins: just outside the round corner of a right angle, inside a miter.
+    let corner = "M 100 60 V 140 H 200";
+    assert_eq!(px(&path(corner, json!({})), 92, 148)[0], 0, "round join is rounded");
+    assert_eq!(px(&path(corner, json!({"join": "miter"})), 92, 148)[0], 255, "miter join is square");
+    // Dashes: 20 on, 20 off from x = 20.
+    let dashed = path("M 20 90 H 300", json!({"cap": "butt", "dash": [20, 20]}));
+    assert_eq!(px(&dashed, 30, 90)[0], 255, "inside a dash");
+    assert_eq!(px(&dashed, 50, 90)[0], 0, "inside a gap");
+    // Feather: the last 100 px fade out toward the end.
+    let feathered = path("M 20 90 H 300", json!({"cap": "butt", "feather": 100}));
+    assert_eq!(px(&feathered, 100, 90)[0], 255, "before the feather");
+    let (mid, end) = (px(&feathered, 250, 90)[0], px(&feathered, 296, 90)[0]);
+    assert!(mid > 60 && mid < 200 && end < 30, "fades toward the end: {mid} then {end}");
+    // A fading tail: the first 100 px fade in from the start.
+    let tail = path("M 20 90 H 300", json!({"cap": "butt", "feather_start": 100}));
+    assert!(px(&tail, 24, 90)[0] < 30 && px(&tail, 200, 90)[0] == 255, "tail {:?} body {:?}", px(&tail, 24, 90), px(&tail, 200, 90));
+}
+
+#[test]
+fn glow_and_shadow_follow_the_matte() {
+    // A wide rect matted to a small circle, with a glow and a drop shadow:
+    // both must come from the circle the viewer sees, not from the rect.
+    let p = project(json!([
+        {"id": "m", "kind": "shape", "shape": "circle", "size": 40, "fill": "#ffffff", "transform": {"position": [160, 90]}},
+        {"id": "r", "kind": "shape", "shape": "rect", "size": [240, 120], "fill": "#ff0000", "transform": {"position": [160, 90]},
+         "matte": {"layer": "m", "mode": "alpha"},
+         "effects": [{"type": "glow", "color": "#ffffff", "radius": 6, "intensity": 1},
+                     {"type": "shadow", "color": "#ffffff", "offset": [0, 0], "radius": 3}]}
+    ]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    // Inside the rect but far outside the circle and the glow's reach.
+    assert_eq!(px(&img, 60, 50), [0, 0, 0, 255], "the glow drew the unmatted rect");
+    assert_eq!(px(&img, 260, 130), [0, 0, 0, 255], "the shadow drew the unmatted rect");
+    // Just outside the circle the glow still shows.
+    assert!(px(&img, 160, 66)[0] > 10, "no glow around the matted circle: {:?}", px(&img, 160, 66));
+}
+
+#[test]
 fn shadow_and_glow() {
     let p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [80, 40], "fill": "#808080", "transform": {"position": [160, 90]},
         "effects": [{"type": "shadow", "color": "#000000", "offset": [0, 30], "radius": 4}, {"type": "glow", "color": "#ffffff", "radius": 8, "intensity": 1}]}]));
@@ -361,6 +410,29 @@ fn bezier_paths_fill_and_trim() {
     // Left half of the curve is drawn, the right half is trimmed away.
     assert_eq!(px(&img, 180, 110)[0], 255);
     assert_eq!(px(&img, 300, 110)[0], 0);
+}
+
+#[test]
+fn follower_sits_on_the_drawn_head() {
+    // A dot riding the head of a curve drawn on with trim keys.
+    let p = project(json!([
+        {"id": "curve", "kind": "shape", "shape": "path", "d": "M -120 0 C -60 -90 60 90 120 0", "stroke": {"color": "#ffffff", "width": 10, "cap": "butt"},
+         "transform": {"position": [160, 90]}, "trim": {"keys": [{"at": 0, "v": [0, 0]}, {"at": 1, "v": [0, 1]}]}},
+        {"id": "dot", "kind": "shape", "shape": "circle", "size": 6, "fill": "#ff0000", "follow": {"layer": "curve"}}
+    ]));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let path = lahza_motion_core::path::flatten("M -120 0 C -60 -90 60 90 120 0", lahza_motion_core::path::tolerance(1.0)).unwrap();
+    let mut r = cpu();
+    for t in [0.3, 0.5, 0.8] {
+        let img = r.render(&c, t);
+        let ((x, y), (dx, dy)) = lahza_motion_core::path::point_at(&path, t).unwrap();
+        let (x, y) = (x + 160.0, y + 90.0);
+        assert_eq!(px(&img, x as u32, y as u32), [255, 0, 0, 255], "dot on the head at {t}");
+        // Just behind the dot: the stroke; just ahead: nothing drawn yet.
+        assert_eq!(px(&img, (x - dx * 6.0) as u32, (y - dy * 6.0) as u32), [255, 255, 255, 255], "stroke behind at {t}");
+        assert_eq!(px(&img, (x + dx * 6.0) as u32, (y + dy * 6.0) as u32), [0, 0, 0, 255], "nothing ahead at {t}");
+    }
 }
 
 #[test]
