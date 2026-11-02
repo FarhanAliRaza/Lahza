@@ -10,7 +10,6 @@
 use crate::recording::media::{AudioClip, AudioPlayback};
 use lahza_motion_core::compile::Compiled;
 use lahza_motion_core::document::Project;
-use lahza_motion_core::timeref::NoElements;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,8 +54,9 @@ pub(crate) fn clips(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<(
         ));
     };
     for clip in project.audio.clips() {
-        let at = clip.at.resolve(&project.markers, &compiled.base, &mut NoElements).unwrap_or(0.0);
-        push(dir.join(&clip.path), at, clip.trim, clip.gain_db, None, &clip.path);
+        let at = compiled.resolve(&project.markers, &clip.at).unwrap_or(0.0);
+        let name = clip.name.clone().or(clip.id.clone()).unwrap_or_else(|| clip.path.clone());
+        push(dir.join(&clip.path), at, clip.trim, clip.gain_db, clip.length, &name);
     }
     for footage in compiled.footage_audio() {
         if (footage.speed - 1.0).abs() < 1e-3 {

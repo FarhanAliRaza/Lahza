@@ -142,13 +142,13 @@ fn audio_inputs(project: &Project, compiled: &Compiled, dir: &Path, start: f64) 
         if !path.is_file() {
             return None;
         }
-        let at = clip
-            .at
-            .resolve(&project.markers, &compiled.base, &mut lahza_motion_core::timeref::NoElements)
-            .unwrap_or(0.0)
-            - start;
+        let at = compiled.resolve(&project.markers, &clip.at).unwrap_or(0.0) - start;
         let skip = clip.trim + (-at).max(0.0);
-        args.extend(["-ss".into(), format!("{skip:.6}"), "-i".into(), path.to_string_lossy().into_owned()]);
+        args.extend(["-ss".into(), format!("{skip:.6}")]);
+        if let Some(length) = clip.length {
+            args.extend(["-t".into(), format!("{:.6}", (length - (-at).max(0.0)).max(0.001))]);
+        }
+        args.extend(["-i".into(), path.to_string_lossy().into_owned()]);
         let delay = (at.max(0.0) * 1000.0).round() as u64;
         let name = format!("{label}{index}");
         parts.push(format!("[{index}:a]aresample=48000,adelay={delay}:all=1,volume={:.3}dB[{name}]", clip.gain_db));

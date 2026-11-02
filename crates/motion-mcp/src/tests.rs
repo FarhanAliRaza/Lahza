@@ -142,3 +142,67 @@ fn a_motion_piece_lives_inside_a_recording_and_shares_its_files() {
     assert!(removed["pieces"].as_array().unwrap().is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn sound_effects_follow_their_animation_into_the_render() {
+    let (mut tb, dir) = toolbox("sfx");
+    tb.call("project_create", json!({"path": "p", "duration": 2, "width": 320, "height": 180})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "id": "card", "kind": "shape", "shape": "rect", "time": {"start": 1.0}}
+    ]})).unwrap();
+    let out = tb.call("sfx_add", json!({"sound": "pop", "at": ["#card.start", 0.25], "gain_db": -3})).unwrap().json;
+    assert_eq!(out["created"], json!(["pop1", "pop2"]));
+    assert_eq!(out["path"], "assets/sfx/pop.wav");
+    assert!(dir.join("p.lahza/assets/sfx/pop.wav").is_file());
+    // Moving the animation moves its sound; the sound can be retimed by id.
+    tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "card.time.start", "value": 1.2}, {"op": "remove", "id": "pop2"}]})).unwrap();
+    let info = tb.call("project_info", json!({})).unwrap().json;
+    assert_eq!(info["audio"]["sfx"].as_array().unwrap().len(), 1);
+    assert!(tb.call("sfx_add", json!({"sound": "kazoo", "at": 1})).is_err());
+
+    // The render's sound: silent, then the pop at 1.2 s.
+    let mp4 = dir.join("out.mp4");
+    tb.call("render", json!({"output": mp4, "quality": "draft", "wait": true})).unwrap();
+    let pcm = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"]).arg(&mp4)
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "f32le", "-"])
+        .output().unwrap().stdout;
+    let samples: Vec<f32> = pcm.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let at = |t: f64| ((t * 8000.0) as usize).min(samples.len());
+    let loud = |a: f64, b: f64| samples[at(a)..at(b)].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(loud(0.0, 1.1) < 0.01, "silent before: {}", loud(0.0, 1.1));
+    assert!(loud(1.18, 1.3) > 0.3, "the pop: {}", loud(1.18, 1.3));
+    assert!(loud(1.4, 2.0) < 0.01, "and it ends");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sounds_on_a_recordings_own_timeline() {
+    let (mut tb, dir) = toolbox("recsound");
+    let rec = dir.join("demo.lahzarec");
+    std::fs::create_dir_all(&rec).unwrap();
+    std::fs::write(rec.join("edit.json"), json!({"formatVersion": 6, "clips": [
+        {"id": "a", "sourceStart": 0.0, "sourceEnd": 2.0, "speed": 1.0},
+        {"id": "b", "sourceStart": 4.0, "sourceEnd": 6.0, "speed": 1.0}
+    ], "zoomCues": [{"id": "z", "start": 4.5, "end": 5.5}]}).to_string()).unwrap();
+    std::fs::write(rec.join("input.json"), json!({"presses": [
+        {"time": 1.0, "phase": "down"}, {"time": 1.1, "phase": "up"}, {"time": 3.0, "phase": "down"}, {"time": 5.0, "phase": "down"}
+    ], "keystrokes": [{"time": 4.2}]}).to_string()).unwrap();
+    let info = tb.call("recording_info", json!({"recording": "demo.lahzarec"})).unwrap().json;
+    // The click at 3 s was cut; 5 s plays at 3 s on the edited video.
+    assert_eq!(info["clicks"], json!([1.0, 3.0]));
+    assert_eq!(info["keystrokes"], json!([2.2]));
+    assert_eq!(info["zooms"][0]["start"], 2.5);
+    let out = tb.call("recording_sound_add", json!({"recording": "demo.lahzarec", "sound": "click", "at": [1.0, 3.0], "gain_db": -6})).unwrap().json;
+    assert_eq!(out["added"], 2);
+    assert_eq!(out["sounds"].as_array().unwrap().len(), 2);
+    let draft: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rec.join("edit.draft.json")).unwrap()).unwrap();
+    let clip = &draft["audioClips"][1];
+    assert_eq!(clip["file"], "media/sfx-click.wav");
+    assert_eq!(clip["start"], 3.0);
+    assert!((clip["volume"].as_f64().unwrap() - 0.501).abs() < 0.01);
+    assert!(rec.join("media/sfx-click.wav").is_file());
+    assert_eq!(draft["clips"].as_array().unwrap().len(), 2, "other keys survive");
+    std::fs::remove_dir_all(&dir).ok();
+}

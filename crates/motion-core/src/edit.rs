@@ -17,6 +17,9 @@
 //! {"op": "anchor", "target": "title.transform.opacity", "key": 1, "at": "beat:4", "anchor": "peak", "lead": -1}
 //! {"op": "group", "ids": ["a", "b"], "id": "pair"}
 //! {"op": "ungroup", "id": "pair"}
+//! {"op": "add_sound", "id": "whoosh1", "path": "assets/sfx/whoosh.wav", "at": "#title.start - 4f", "gain_db": -6}
+//! {"op": "set", "target": "whoosh1.at", "value": "beat:9"}
+//! {"op": "remove", "id": "whoosh1"}
 //! ```
 
 use crate::document::{valid_id, Project};
@@ -54,6 +57,7 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
             "anchor" => op_anchor(&mut doc, op),
             "group" => op_group(&mut doc, op, &mut created),
             "ungroup" => op_ungroup(&mut doc, op),
+            "add_sound" => op_add_sound(&mut doc, op, &mut created),
             "" => Err("op needs an \"op\" field".into()),
             other => Err(format!(
                 "unknown op '{other}': use add, add_scene, set, remove, move, key, anchor, group, ungroup"
@@ -90,7 +94,92 @@ fn find(doc: &Value, id: &str) -> Option<(String, String, usize)> {
             return Some(found);
         }
     }
-    None
+    find_sound(doc, id)
+}
+
+/// Sounds: effects by id, music and narration by id or as "music"/"vo".
+fn find_sound(doc: &Value, id: &str) -> Option<(String, String, usize)> {
+    let audio = doc.get("audio")?;
+    for slot in ["music", "vo"] {
+        if let Some(clip) = audio.get(slot).filter(|c| c.is_object()) {
+            if id == slot || clip.get("id").and_then(Value::as_str) == Some(id) {
+                return Some((format!("/audio/{slot}"), "/audio".into(), 0));
+            }
+        }
+    }
+    let sfx = audio.get("sfx")?.as_array()?;
+    let i = sfx.iter().position(|c| c.get("id").and_then(Value::as_str) == Some(id))?;
+    Some((format!("/audio/sfx/{i}"), "/audio/sfx".into(), i))
+}
+
+/// Adds a sound: an effect (default), the music or the narration.
+fn op_add_sound(doc: &mut Value, op: &Value, created: &mut Vec<String>) -> OpResult {
+    let kind = op.get("kind").and_then(Value::as_str).unwrap_or("sfx");
+    let mut clip = match op.get("sound") {
+        Some(s) => s.clone(),
+        None => {
+            let mut m = Map::new();
+            for (k, v) in op.as_object().unwrap() {
+                if !["op", "kind", "index", "sound"].contains(&k.as_str()) {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+            Value::Object(m)
+        }
+    };
+    if clip.get("path").and_then(Value::as_str).is_none() {
+        bail!("add_sound needs \"path\" (an audio file in the project)");
+    }
+    let audio = doc.as_object_mut().unwrap().entry("audio").or_insert_with(|| json!({}));
+    if !audio.is_object() {
+        *audio = json!({});
+    }
+    match kind {
+        "music" | "vo" => {
+            if audio.get(kind).is_some_and(|v| !v.is_null()) {
+                bail!("the project already has {kind}: remove \"{kind}\" first, or set its fields");
+            }
+            let id = clip.get("id").and_then(Value::as_str).unwrap_or(kind).to_string();
+            audio[kind] = clip;
+            let audio_clip: Result<crate::document::AudioClip> = serde_json::from_value(audio[kind].clone()).map_err(|e| e.to_string().into());
+            if let Err(e) = audio_clip {
+                audio.as_object_mut().unwrap().remove(kind);
+                bail!("add_sound: {e}");
+            }
+            created.push(id.clone());
+            Ok((vec![json!({"op": "remove", "id": id})], vec![id], format!("added {kind}")))
+        }
+        "sfx" => {
+            let id = match clip.get("id").and_then(Value::as_str) {
+                Some(id) => {
+                    if !valid_id(id) {
+                        bail!("sound id '{id}': letters, digits, '-' and '_' only");
+                    }
+                    id.to_string()
+                }
+                None => {
+                    let stem = clip["path"].as_str().unwrap().rsplit('/').next().unwrap_or("sfx").split('.').next().unwrap_or("sfx").to_string();
+                    let stem: String = stem.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+                    let stem = if stem.is_empty() { "sfx".to_string() } else { stem };
+                    let doc_ref: &Value = doc;
+                    (1..).map(|n| format!("{stem}{n}")).find(|c| !exists(doc_ref, c)).unwrap()
+                }
+            };
+            if exists(doc, &id) {
+                bail!("id '{id}' is already used");
+            }
+            clip["id"] = json!(id);
+            serde_json::from_value::<crate::document::AudioClip>(clip.clone()).map_err(|e| format!("add_sound: {e}"))?;
+            let audio = doc.as_object_mut().unwrap().get_mut("audio").unwrap();
+            let sfx = audio.as_object_mut().unwrap().entry("sfx").or_insert_with(|| json!([]));
+            let list = sfx.as_array_mut().ok_or("audio.sfx is not a list")?;
+            let index = op.get("index").and_then(Value::as_u64).map(|i| (i as usize).min(list.len())).unwrap_or(list.len());
+            list.insert(index, clip);
+            created.push(id.clone());
+            Ok((vec![json!({"op": "remove", "id": id})], vec![id.clone()], format!("added sound {id}")))
+        }
+        other => bail!("add_sound kind '{other}': sfx, music or vo"),
+    }
 }
 
 fn find_layer(node: &Value, path: &str, id: &str) -> Option<(String, String, usize)> {
@@ -345,7 +434,17 @@ fn op_remove(doc: &mut Value, op: &Value) -> OpResult {
     if id == "project" {
         bail!("cannot remove the project");
     }
-    let (_, container, index) = find(doc, id).ok_or_else(|| format!("no layer or scene with id '{id}'"))?;
+    let (pointer, container, index) = find(doc, id).ok_or_else(|| format!("no layer or scene with id '{id}'"))?;
+    if container == "/audio" {
+        // Music or narration.
+        let slot = pointer.trim_start_matches("/audio/").to_string();
+        let removed = doc["audio"].as_object_mut().unwrap().remove(&slot).unwrap_or(Value::Null);
+        return Ok((vec![json!({"op": "add_sound", "kind": slot, "sound": removed})], vec![id.into()], format!("removed {slot}")));
+    }
+    if container == "/audio/sfx" {
+        let removed = doc["audio"]["sfx"].as_array_mut().unwrap().remove(index);
+        return Ok((vec![json!({"op": "add_sound", "kind": "sfx", "index": index, "sound": removed})], vec![id.into()], format!("removed sound {id}")));
+    }
     let target = container_target(doc, &container);
     let list = doc.pointer_mut(&container).and_then(Value::as_array_mut).unwrap();
     let removed = list.remove(index);
@@ -599,6 +698,36 @@ mod tests {
         let mut p = Project::new(1920, 1080, Fps::whole(30), 10.0);
         p.scenes.push(crate::document::Scene::new("s1"));
         p
+    }
+
+    #[test]
+    fn sounds_are_added_retimed_and_removed_with_undo() {
+        let p = base();
+        let p = apply(&p, &[json!({"op": "add", "scene": "s1", "id": "card", "kind": "shape", "shape": "rect", "time": {"start": 2.0}})]).unwrap().project;
+        let a = apply(&p, &[
+            json!({"op": "add_sound", "path": "assets/sfx/whoosh.wav", "at": "#card.start - 4f", "gain_db": -6}),
+            json!({"op": "add_sound", "path": "assets/sfx/whoosh.wav", "at": "beat:3"}),
+            json!({"op": "add_sound", "kind": "music", "path": "assets/track.wav"}),
+        ]).unwrap();
+        assert_eq!(a.created, vec!["whoosh1", "whoosh2", "music"]);
+        assert_eq!(a.project.audio.sfx.len(), 2);
+        assert_eq!(a.project.audio.sfx[0].gain_db, -6.0);
+        assert!(a.project.audio.music.is_some());
+        // Retime and cut an effect through the generic set op.
+        let b = apply(&a.project, &[json!({"op": "set", "target": "whoosh2.at", "value": 1.5}), json!({"op": "set", "target": "whoosh2.length", "value": 0.4})]).unwrap();
+        assert_eq!(b.project.audio.sfx[1].length, Some(0.4));
+        // Undo restores the previous timing.
+        let undone = apply(&b.project, &b.inverse.iter().rev().cloned().collect::<Vec<_>>()).unwrap();
+        assert_eq!(undone.project.audio.sfx[1], a.project.audio.sfx[1]);
+        // Remove, then undo puts it back at the same place.
+        let c = apply(&a.project, &[json!({"op": "remove", "id": "whoosh1"}), json!({"op": "remove", "id": "music"})]).unwrap();
+        assert_eq!(c.project.audio.sfx.len(), 1);
+        assert!(c.project.audio.music.is_none());
+        let back = apply(&c.project, &c.inverse.iter().rev().cloned().collect::<Vec<_>>()).unwrap();
+        assert_eq!(back.project.audio, a.project.audio);
+        // Ids stay unique across layers and sounds.
+        assert!(apply(&a.project, &[json!({"op": "add_sound", "id": "card", "path": "x.wav"})]).is_err());
+        assert!(apply(&a.project, &[json!({"op": "add_sound", "kind": "music", "path": "x.wav"})]).is_err());
     }
 
     #[test]

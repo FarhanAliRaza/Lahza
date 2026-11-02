@@ -80,6 +80,17 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
     if project.scenes.is_empty() {
         issues.push(issue(Severity::Warning, "structure", None, None, "the project has no scenes".into()));
     }
+    // Sounds: their times must resolve (an anchored effect follows its layer).
+    for clip in project.audio.clips() {
+        let id = clip.id.clone().unwrap_or_else(|| clip.path.clone());
+        match compiled.resolve(&project.markers, &clip.at) {
+            Err(e) => issues.push(issue(Severity::Error, "sound", Some(&id), None, format!("sound '{id}' at: {e}"))),
+            Ok(t) if t >= compiled.settings.duration => {
+                issues.push(issue(Severity::Warning, "sound", Some(&id), Some(t), format!("sound '{id}' starts after the end ({t:.3} s)")))
+            }
+            Ok(_) => {}
+        }
+    }
     let fps = compiled.fps();
     let f = fps.as_f64();
     // Uncovered timeline.

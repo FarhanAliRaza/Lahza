@@ -9,6 +9,8 @@
 //! 120 BPM, refined by a comb search over period and phase; bars from the
 //! beat phase with the strongest low-band (kick) onsets.
 
+pub mod sfx;
+
 use lahza_motion_core::markers::{Marker, MarkerTrack};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use serde::Serialize;

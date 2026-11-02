@@ -41,7 +41,13 @@ fn read_doc(uri: &str) -> Option<(String, &'static str)> {
     Some(match uri {
         "lahza://guide" => (catalog::GUIDE.to_string(), "text/markdown"),
         "lahza://schema" => (catalog::SCHEMA.to_string(), "text/markdown"),
-        "lahza://catalog" => (serde_json::to_string_pretty(&catalog::catalog_json()).ok()?, "application/json"),
+        "lahza://catalog" => {
+            let mut c = catalog::catalog_json();
+            c["sounds"] = serde_json::Value::Array(
+                lahza_motion_audio::sfx::SOUNDS.iter().map(|(name, seconds, use_for)| serde_json::json!({"name": name, "seconds": seconds, "use_for": use_for})).collect(),
+            );
+            (serde_json::to_string_pretty(&c).ok()?, "application/json")
+        }
         "lahza://styles" => (serde_json::to_string_pretty(&catalog::styles_json()).ok()?, "application/json"),
         other => {
             let name = other.strip_prefix("lahza://styles/")?;

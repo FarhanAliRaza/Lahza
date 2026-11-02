@@ -370,6 +370,15 @@ impl CLayer {
 }
 
 /// Element references against compiled windows (for times given to tools).
+impl Compiled {
+    /// Resolves a time reference against this project's markers and
+    /// element times (`#card.start`), e.g. where a sound plays.
+    pub fn resolve(&self, markers: &crate::markers::Markers, at: &crate::timeref::TimeRef) -> Result<f64> {
+        let mut me = self;
+        at.resolve(markers, &self.base, &mut me)
+    }
+}
+
 impl ElementTimes for &Compiled {
     fn element_time(&mut self, id: &str, edge: Edge) -> Result<f64> {
         let (s, e) = self.element_window(id).ok_or_else(|| crate::Error(format!("no layer or scene with id '{id}'")))?;

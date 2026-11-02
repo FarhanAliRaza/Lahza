@@ -74,6 +74,28 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: false,
         },
         ToolDef {
+            name: "sfx_add",
+            description: "Add a sound effect at one or more times. `sound` is a built-in effect (whoosh, whoosh-out, swipe, pop, click, tick, type, thud, hit, boom, riser, ding, sparkle, glitch; see \"sounds\" in lahza://catalog) or an audio file. Anchor it to the animation it belongs to so it moves with it: \"#card.start - 3f\" (a whoosh leads its move), \"#title.end\", \"beat:9\", \"hit:2\". A riser should end where the reveal lands: at = \"#reveal.start - 1.6\". Each placement is a sound with an id (whoosh1, whoosh2…).",
+            schema: obj(json!({
+                "sound": {"type": "string"},
+                "at": {"description": "a time, or a list of times", "type": ["number", "string", "array"]},
+                "gain_db": {"type": "number", "default": 0},
+                "length": {"type": "number", "description": "seconds to play"},
+                "name": {"type": "string"}}), &["sound", "at"]),
+            read_only: false,
+        },
+        ToolDef {
+            name: "recording_sound_add",
+            description: "Add sounds to a Lahza screen recording's own video timeline (its Music / SFX lane): a built-in effect or an audio file at seconds on the edited video. recording_info lists clicks, keystrokes and zooms in those seconds, e.g. a click on every click or a whoosh on every zoom. The person sees them live and can move, trim or delete them.",
+            schema: obj(json!({
+                "recording": {"type": "string"},
+                "sound": {"type": "string"},
+                "at": {"description": "seconds on the edited video, or a list", "type": ["number", "array"]},
+                "gain_db": {"type": "number", "default": 0},
+                "length": {"type": "number"}}), &["recording", "sound", "at"]),
+            read_only: false,
+        },
+        ToolDef {
             name: "recording_info",
             description: "A Lahza screen recording (*.lahzarec): its size, the edited video's duration, transcript availability, shared media files (as paths usable from a piece inside it) and the motion pieces placed on its timeline.",
             schema: obj(json!({"recording": {"type": "string"}}), &["recording"]),
@@ -113,7 +135,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "edit_apply",
-            description: "Apply a batch of edit ops atomically as one undoable step: add, add_scene, set, remove, move, key, anchor, group, ungroup (see lahza://schema and lahza://catalog). Returns created ids, the change summary and compile errors.",
+            description: "Apply a batch of edit ops atomically as one undoable step: add, add_scene, set, remove, move, key, anchor, group, ungroup, add_sound (see lahza://schema and lahza://catalog). Sounds have ids too: set \"whoosh1.at\", remove \"whoosh1\". Returns created ids, the change summary and compile errors.",
             schema: obj(json!({"ops": {"type": "array", "items": {"type": "object"}}, "author": {"type": "string", "default": "agent"}}), &["ops"]),
             read_only: false,
         },
@@ -261,6 +283,8 @@ impl Toolbox {
             }
             "project_info" => self.project_info(&args),
             "recording_info" => self.recording_info(&args),
+            "sfx_add" => self.sfx_add(&args),
+            "recording_sound_add" => self.recording_sound_add(&args),
             "recording_place" => self.recording_place(&args),
             "timeline_get" => self.timeline_get(&args),
             "markers_query" => self.markers_query(&args),
@@ -387,7 +411,7 @@ impl Toolbox {
         std::fs::create_dir_all(path.join("assets")).map_err(|e| e.to_string())?;
         if let Some(music) = get_str(args, "music") {
             let rel = import_asset(&path, &self.path(music))?;
-            project.audio.music = Some(AudioClip { path: rel.clone(), at: TimeRef::Seconds(0.0), trim: 0.0, gain_db: 0.0, duck_db: None });
+            project.audio.music = Some(AudioClip { id: None, name: None, path: rel.clone(), at: TimeRef::Seconds(0.0), trim: 0.0, gain_db: 0.0, length: None, duck_db: None });
             project.assets.push(Asset { path: rel, source: "user".into(), licence: get_str(args, "licence").unwrap_or("user-supplied").into(), credit: None });
         }
         io::save(&path, &project).map_err(|e| e.to_string())?;
@@ -448,15 +472,131 @@ impl Toolbox {
             })
             .collect();
         let words = doc["transcript"]["words"].as_array().map(|w| w.len()).unwrap_or(0);
+        // Moments worth a sound, in seconds on the edited video.
+        let input: Value = std::fs::read_to_string(rec.join("input.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let on_video = |t: f64| recording::source_to_editor(&doc, t).map(round);
+        let clicks: Vec<f64> = input["presses"].as_array().into_iter().flatten()
+            .filter(|p| p["phase"] == "down").filter_map(|p| p["time"].as_f64()).filter_map(on_video).collect();
+        let keys: Vec<f64> = input["keystrokes"].as_array().into_iter().flatten().filter_map(|k| k["time"].as_f64()).filter_map(on_video).collect();
+        let zooms: Vec<Value> = doc["zoomCues"].as_array().into_iter().flatten()
+            .filter(|z| z["isEnabled"].as_bool().unwrap_or(true))
+            .filter_map(|z| Some(json!({"start": on_video(z["start"].as_f64()?)?, "end": z["end"].as_f64().and_then(on_video)})))
+            .collect();
+        let sounds: Vec<Value> = doc["audioClips"].as_array().into_iter().flatten()
+            .map(|c| json!({"name": c["name"], "start": c["start"], "duration": c["duration"]})).collect();
         Ok(Output::json(json!({
             "recording": rec,
             "size": recording_size(&rec),
             "duration": edited_duration(&rec, &doc),
             "transcript_words": words,
+            "clicks": clicks,
+            "keystrokes": keys,
+            "zooms": zooms,
+            "sounds": sounds,
             "shared": {"recording": "../../screen.mkv", "media": media},
             "pieces": pieces,
             "next": "project_create {path: name, recording} → edit_apply → recording_place {start, placement}",
         })))
+    }
+
+    fn sfx_add(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let sound = get_str(args, "sound").ok_or("sfx_add needs \"sound\"")?;
+        let rec = recording::recording_of(&dir);
+        let path = if lahza_motion_audio::sfx::SOUNDS.iter().any(|s| s.0 == sound) {
+            // Built-ins are generated once; inside a recording they are shared.
+            match &rec {
+                Some(rec) => {
+                    let file = rec.join("media").join(format!("sfx-{sound}.wav"));
+                    lahza_motion_audio::sfx::ensure(sound, &file)?;
+                    recording::shared_path(&dir, rec, &file).ok_or("bad path")?
+                }
+                None => {
+                    lahza_motion_audio::sfx::ensure(sound, &dir.join("assets/sfx").join(format!("{sound}.wav")))?;
+                    format!("assets/sfx/{sound}.wav")
+                }
+            }
+        } else {
+            let abs = self.path(sound);
+            match (abs.strip_prefix(&dir), &rec) {
+                (Ok(r), _) => r.to_string_lossy().into_owned(),
+                (Err(_), Some(rec)) if abs.starts_with(rec) => recording::shared_path(&dir, rec, &abs).ok_or("bad path")?,
+                (Err(_), Some(rec)) => {
+                    let dest = unique_file(&rec.join("media"), &abs)?;
+                    std::fs::copy(&abs, &dest).map_err(|e| format!("copying {}: {e}", abs.display()))?;
+                    recording::shared_path(&dir, rec, &dest).ok_or("bad path")?
+                }
+                (Err(_), None) => import_asset(&dir, &abs)?,
+            }
+        };
+        let times: Vec<Value> = match args.get("at") {
+            Some(Value::Array(a)) if !a.is_empty() => a.clone(),
+            Some(v) if !v.is_array() && !v.is_null() => vec![v.clone()],
+            _ => return Err("sfx_add needs \"at\": a time or a list of times".into()),
+        };
+        let ops: Vec<Value> = times
+            .into_iter()
+            .map(|at| {
+                let mut op = json!({"op": "add_sound", "path": path, "at": at});
+                for k in ["gain_db", "length", "name"] {
+                    if let Some(v) = args.get(k) {
+                        op[k] = v.clone();
+                    }
+                }
+                op
+            })
+            .collect();
+        let mut out = self.edit_apply(&json!({"project": dir, "ops": ops}))?;
+        out.json["path"] = json!(path);
+        Ok(out)
+    }
+
+    fn recording_sound_add(&mut self, args: &Value) -> ToolResult {
+        let rec = self.path(get_str(args, "recording").ok_or("recording_sound_add needs \"recording\"")?);
+        if !recording::is_recording(&rec) {
+            return Err(format!("{} is not a Lahza recording (*.lahzarec folder)", rec.display()));
+        }
+        let sound = get_str(args, "sound").ok_or("recording_sound_add needs \"sound\"")?;
+        let (file, name) = if lahza_motion_audio::sfx::SOUNDS.iter().any(|s| s.0 == sound) {
+            let file = rec.join("media").join(format!("sfx-{sound}.wav"));
+            lahza_motion_audio::sfx::ensure(sound, &file)?;
+            (file, sound.to_string())
+        } else {
+            let abs = self.path(sound);
+            let file = if abs.starts_with(&rec) { abs.clone() } else {
+                let dest = unique_file(&rec.join("media"), &abs)?;
+                std::fs::copy(&abs, &dest).map_err(|e| format!("copying {}: {e}", abs.display()))?;
+                dest
+            };
+            (file, abs.file_stem().and_then(|s| s.to_str()).unwrap_or("sound").to_string())
+        };
+        let (source_duration, has_audio) = lahza_motion_render::footage::probe_sound(&file)?;
+        if !has_audio || source_duration <= 0.0 {
+            return Err(format!("{} has no sound", file.display()));
+        }
+        let times: Vec<f64> = match args.get("at") {
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_f64).collect(),
+            Some(v) => v.as_f64().into_iter().collect(),
+            None => Vec::new(),
+        };
+        if times.is_empty() || times.iter().any(|t| !(t.is_finite() && *t >= 0.0)) {
+            return Err("at: seconds ≥ 0 on the edited video, or a list of them".into());
+        }
+        let duration = get_f64(args, "length").map_or(source_duration, |l| l.min(source_duration)).max(0.05);
+        let volume = 10f64.powf(get_f64(args, "gain_db").unwrap_or(0.0) / 20.0).clamp(0.0, 2.0);
+        let rel = file.strip_prefix(&rec).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+        let mut clips = recording::read_edit(&rec)["audioClips"].as_array().cloned().unwrap_or_default();
+        for t in &times {
+            clips.push(json!({
+                "id": uuid::Uuid::new_v4().to_string(), "file": rel, "name": name,
+                "start": t, "sourceStart": 0.0, "duration": duration, "volume": volume,
+                "fadeIn": 0.0, "fadeOut": 0.0, "sourceDuration": source_duration,
+            }));
+        }
+        recording::write_key(&rec, "audioClips", Value::Array(clips))?;
+        let mut info = self.recording_info(&json!({"recording": rec}))?;
+        info.json["added"] = json!(times.len());
+        Ok(info)
     }
 
     fn recording_place(&mut self, args: &Value) -> ToolResult {
@@ -962,7 +1102,7 @@ impl Toolbox {
             next.markers.insert(t);
         }
         if register {
-            next.audio.music = Some(AudioClip { path: rel.clone(), at: TimeRef::Seconds(offset), trim: 0.0, gain_db: 0.0, duck_db: None });
+            next.audio.music = Some(AudioClip { id: None, name: None, path: rel.clone(), at: TimeRef::Seconds(offset), trim: 0.0, gain_db: 0.0, length: None, duck_db: None });
             if !next.assets.iter().any(|a| a.path == rel) {
                 next.assets.push(Asset { path: rel.clone(), source: "user".into(), licence: "user-supplied".into(), credit: None });
             }

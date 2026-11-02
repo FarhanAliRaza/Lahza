@@ -108,15 +108,42 @@ pub fn read_pieces(recording: &Path) -> Vec<MotionPiece> {
 
 /// Replaces `motionPieces` in the draft, keeping every other key.
 pub fn write_pieces(recording: &Path, pieces: &[MotionPiece]) -> Result<(), String> {
+    write_key(recording, PIECES_KEY, serde_json::to_value(pieces).map_err(|e| e.to_string())?)
+}
+
+/// Replaces one top-level key of the edit document in the draft, keeping
+/// every other key (the studio's `write_edit_field`).
+pub fn write_key(recording: &Path, key: &str, value: Value) -> Result<(), String> {
     let mut doc = read_edit(recording);
     let object = doc.as_object_mut().ok_or("edit document is not an object")?;
     let version = object.get("formatVersion").and_then(Value::as_u64).unwrap_or(0).max(5);
     object.insert("formatVersion".into(), json!(version));
-    object.insert(PIECES_KEY.into(), serde_json::to_value(pieces).map_err(|e| e.to_string())?);
+    object.insert(key.into(), value);
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     let tmp = recording.join(format!("{DRAFT_FILE}.tmp"));
     fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
     fs::rename(&tmp, recording.join(DRAFT_FILE)).map_err(|e| e.to_string())
+}
+
+/// Editor time (on the edited video) of source time `t`, through the
+/// edit's clips in order; None when that moment was cut. Without clips
+/// the two are the same.
+pub fn source_to_editor(doc: &Value, t: f64) -> Option<f64> {
+    let Some(clips) = doc.get("clips").and_then(Value::as_array).filter(|c| !c.is_empty()) else {
+        return Some(t);
+    };
+    let mut offset = 0.0;
+    for c in clips {
+        let a = c["sourceStart"].as_f64().or(c["start"].as_f64()).unwrap_or(0.0);
+        let b = c["sourceEnd"].as_f64().or(c["end"].as_f64()).unwrap_or(a);
+        let speed = c["speed"].as_f64().filter(|s| *s > 0.0).unwrap_or(1.0);
+        offset += c["gapBefore"].as_f64().unwrap_or(0.0);
+        if t >= a && t < b {
+            return Some(offset + (t - a) / speed);
+        }
+        offset += (b - a).max(0.0) / speed;
+    }
+    None
 }
 
 /// `path` as seen from a motion project inside `recording`
@@ -164,6 +191,11 @@ mod tests {
         assert_eq!(recording_of(&project), Some(rec.clone()));
         assert_eq!(shared_path(&project, &rec, &rec.join("media/shot.png")).as_deref(), Some("../../media/shot.png"));
         assert_eq!(shared_path(&project, &rec, Path::new("/elsewhere/x.png")), None);
+        let doc = json!({"clips": [{"sourceStart": 0.0, "sourceEnd": 2.0}, {"sourceStart": 5.0, "sourceEnd": 7.0, "speed": 2.0, "gapBefore": 0.5}]});
+        assert_eq!(source_to_editor(&doc, 1.0), Some(1.0));
+        assert_eq!(source_to_editor(&doc, 3.0), None, "cut");
+        assert_eq!(source_to_editor(&doc, 6.0), Some(2.0 + 0.5 + 0.5));
+        assert_eq!(source_to_editor(&json!({}), 4.0), Some(4.0));
         fs::remove_dir_all(&rec).ok();
     }
 }

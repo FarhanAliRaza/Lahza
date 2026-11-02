@@ -120,6 +120,13 @@ impl Audio {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AudioClip {
+    /// Stable id for edits (`whoosh1.at`); music and narration answer to
+    /// "music" and "vo" when they have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Shown in editors; defaults to the file name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Relative to the project folder.
     pub path: String,
     /// Timeline time where the clip starts.
@@ -130,6 +137,9 @@ pub struct AudioClip {
     pub trim: f64,
     #[serde(default)]
     pub gain_db: f64,
+    /// Seconds to play; the rest of the file is cut. None plays it all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<f64>,
     /// Music only: lower by this much under narration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duck_db: Option<f64>,
