@@ -728,6 +728,7 @@ impl Toolbox {
                                 out["layout"] = json!(n.layout);
                                 out["layers"] = json!(layers(l.children(), compiled));
                             }
+                            lahza_motion_core::document::LayerKind::Mesh(m) => out["mesh"] = json!(m.mesh)["type"].clone(),
                         }
                         if !animated.is_empty() {
                             out["animated"] = json!(animated);

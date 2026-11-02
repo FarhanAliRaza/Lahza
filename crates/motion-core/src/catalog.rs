@@ -242,6 +242,27 @@ pub fn catalog_json() -> Value {
                     "note": "each field gives every copy a 0..1 value at its layout point and adds value × delta; fields apply in list order; every parameter and delta is animatable (keys) except at, seed, cycles and decay"
                 }]
             }
+            ,
+            "mesh": {
+                "note": "a lit 3D object rendered in the engine (no Blender): always 3D, sorts by depth with 3D layers; meshes next to each other in the layer list share a depth buffer and intersect correctly. Space: x right, y down, z away; centred on the layer origin; transform rotation_x/rotation_y/rotation/z/scale (+ scale_z, default scale.x) place it. Build real objects this way instead of faking 3D with flat shapes",
+                "mesh": [
+                    {"type": "sphere", "radius": "px (default 100)"},
+                    {"type": "box", "size": "[w, h] (default [100, 100])", "depth": "px (default 100)", "bevel": "edge radius px"},
+                    {"type": "cylinder", "radius": "px (default 50)", "top": "top radius (cone/frustum; default = radius)", "height": "along y (default 100)", "bevel": "rim radius px"},
+                    {"type": "capsule", "radius": "px (default 50)", "height": "end to end along y (default 200)"},
+                    {"type": "torus", "radius": "to the tube centre (default 100)", "tube": "tube radius (default 20)", "angles": "[from, to] degrees like an arc: 0 = up, clockwise (default [0, 360]); animate for a ring that draws on", "caps": "flat (default) | round: ends of an open arc"},
+                    {"type": "extrude", "d": "SVG path, {\"shape\": …} primitive or morph keys: closed outline (holes kept)", "depth": "px (default 40)", "bevel": "rounded edge px"},
+                    {"type": "revolve", "profile": "path in (x = distance from axis, y = along it)", "angles": "[from, to] degrees", "axis": "y (standing, default) | z (facing the camera)"},
+                    {"type": "sweep", "d": "path in the layer plane", "radius": "tube radius (default 10)", "profile": "circle (default) | square | ribbon", "width": "ribbon width (default 40)", "trim": "[from, to] 0..1 drawn part (animatable: tubes that grow)", "caps": "round (default) | flat", "head": "radius of a ball leading the tube (0 = none)"}
+                ],
+                "segments": "split rings, revolves and sweeps into this many pieces (default 1)", "gap": "degrees between pieces (sweeps: fraction of the length)",
+                "colors": "[colour, …] one per piece in turn (animatable)",
+                "material": {"preset": "matte | plastic | glossy (default) | coated (lacquer: crisp reflections over colour) | metal | chrome | glass | emissive | flat (unlit flat colour)",
+                    "color": "base colour (animatable)", "metallic": "0..1", "roughness": "0 mirror … 1 diffuse", "clearcoat": "0..1 lacquer layer", "clearcoat_roughness": "0..1",
+                    "emissive": "colour it glows with", "emissive_strength": "multiplier", "opacity": "0..1", "transmission": "0..1 glass (background shows through, edges reflect)", "unlit": "bool", "faceted": "bool: low-poly normals"},
+                "parts": {"front": "material over `material` for the part", "back": "…", "side": "…", "bevel": "…", "caps": "…"},
+                "detail": "tessellation multiplier (default 1)"
+            }
         },
         "scene": {
             "id": "stable id", "start": "time (cuts on markers lead −1 f by default)", "lead": "frames",
@@ -249,6 +270,8 @@ pub fn catalog_json() -> Value {
             "pre_roll": "open this far into the animation", "background": "colour",
             "transition": {"type": "fade | push | slide | zoom | wipe | whip", "dur": "default \"10f\", centred on the cut", "ease": "default gesture (peak speed on the cut)", "direction": "left | right | up | down"},
             "camera": {"position": "[x, y] point of interest shown at the canvas centre", "zoom": "number", "rotation": "degrees (roll)", "fov": "3D: vertical degrees (39.6 keeps z = 0 at 1:1)", "orbit": "3D: [yaw, pitch] degrees around the point of interest", "dolly": "3D: px toward the point of interest", "aperture": "3D depth of field: blur radius px per 100 px of depth from the focus plane (0 = off; animatable)", "focus": "3D depth of field: sharp plane as a depth like a layer's z (0 = point of interest, default; animatable for rack focus) or a top-level layer id to keep sharp"},
+            "lights": [{"type": "directional (default) | point | ambient", "from": "directional: [x, y, z] toward the light (y down, z away: [-1, -1, -1] = upper left, in front)", "position": "point: [x, y, z] world px", "color": "colour (animatable)", "intensity": "animatable (default 1)", "note": "for mesh layers; default rig: key from the upper left front + rim from behind right"}],
+            "environment": {"preset": "studio (default) | soft | sunset | night | none", "intensity": "animatable", "rotation": "degrees about the vertical axis", "sky": "colour", "horizon": "colour", "ground": "colour", "note": "what glossy meshes reflect and their ambient light"},
             "motion_blur": {"shutter": "degrees (180 film-like)", "samples": 8},
             "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first"
         },

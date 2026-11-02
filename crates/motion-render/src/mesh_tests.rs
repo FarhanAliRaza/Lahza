@@ -237,3 +237,45 @@ fn meshes_crossing_the_camera_are_clipped() {
     // without panics or garbage.
     assert!(img.pixels().all(|p| p.0[3] == 255));
 }
+
+/// 1080p, 40 glossy meshes of a few thousand triangles each, 3 lights.
+/// `cargo test -p lahza-motion-render --release -- --ignored --nocapture benchmark_meshes`
+#[test]
+#[ignore]
+fn benchmark_meshes_1080p() {
+    let mut layers = Vec::new();
+    for i in 0..40 {
+        let (x, y) = (160.0 + (i % 8) as f64 * 230.0, 140.0 + (i / 8) as f64 * 200.0);
+        let mesh = match i % 4 {
+            0 => json!({"type": "torus", "radius": 70, "tube": 22}),
+            1 => json!({"type": "sphere", "radius": 75}),
+            2 => json!({"type": "box", "size": [110, 110], "depth": 110, "bevel": 18}),
+            _ => json!({"type": "extrude", "d": {"shape": "star", "size": 160, "sides": 5}, "depth": 40, "bevel": 6}),
+        };
+        layers.push(json!({"id": format!("m{i}"), "kind": "mesh", "mesh": mesh, "segments": if i % 4 == 0 { 4 } else { 1 },
+            "colors": ["#ff3b5c", "#ffb020", "#2ec4ff", "#7b61ff"], "material": {"preset": "coated", "color": "#e0e0e0"},
+            "transform": {"position": [x, y], "rotation_x": {"keys": [{"at": 0, "v": 0}, {"at": 2, "v": 360}]}, "rotation_y": 25 + i}}));
+    }
+    let mut p = scene(1920, 1080, json!({"layers": layers, "lights": [
+        {"from": [-1, -1, -1]}, {"from": [1, -0.4, 1], "intensity": 0.7}, {"type": "point", "position": [960, 200, -400], "intensity": 0.5}]}));
+    p.settings.duration = 2.0;
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let tris: usize = c.frame(0.0).layers.iter().filter_map(|l| match &l.content {
+        Content::Mesh(m) => Some(lahza_motion_core::mesh::generate(&m.params).unwrap().tris.len()),
+        _ => None,
+    }).sum();
+    for backend in [Backend::Gpu, Backend::Cpu] {
+        let mut r = Renderer::new(None, RenderOptions { backend, allow_software_gpu: true, motion_blur: false, ..Default::default() });
+        let label = r.backend_label();
+        r.render(&c, 0.0);
+        r.stats = Stats::default();
+        let n = 10;
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            r.render(&c, 0.05 + i as f64 * 0.1);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("{label}: {tris} triangles, {ms:.1} ms/frame (build {:.1} ms, raster {:.1} ms)", r.stats.build_ms / n as f64, r.stats.raster_ms / n as f64);
+    }
+}

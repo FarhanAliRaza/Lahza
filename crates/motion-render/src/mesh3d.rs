@@ -75,7 +75,6 @@ pub(crate) struct Batch {
     tris: Vec<([u32; 3], u32)>,
     /// 4 rows per material (see `material_rows`).
     materials: Vec<[f32; 4]>,
-    material_index: HashMap<(usize, u32, u32), u32>,
     lighting: Arc<Lighting>,
     /// Rows of the light block.
     light_rows: Vec<[f32; 4]>,
@@ -157,7 +156,6 @@ impl Batch {
             verts: Vec::new(),
             tris: Vec::new(),
             materials: Vec::new(),
-            material_index: HashMap::new(),
             lighting,
             light_rows,
             bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
@@ -168,7 +166,6 @@ impl Batch {
     /// Adds one mesh layer drawn through `root` (canvas → output pixels).
     pub(crate) fn add(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64) {
         let Some(mesh) = cache.get(m) else { return };
-        let layer = self.layers;
         self.layers += 1;
         if self.tris.len() + mesh.tris.len() > MAX_TRIS {
             cache.warnings.push("too many mesh triangles in one frame; some meshes were skipped".into());
@@ -203,6 +200,9 @@ impl Batch {
             verts.push(Vert { screen: s, pos: [p[0] as f32, p[1] as f32, p[2] as f32], normal: [n[0] as f32, n[1] as f32, n[2] as f32] });
             (verts.len() - 1) as u32
         };
+        // Material slots by (part, colour), filled on first use.
+        let colors_n = m.colors.len().max(1);
+        let mut slots = vec![u32::MAX; PARTS * colors_n];
         for (t, &tag) in mesh.tris.iter().zip(&mesh.tags) {
             let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
             let segment = mesh::tag_segment(tag);
@@ -219,16 +219,12 @@ impl Batch {
                 continue;
             }
             let colors = if m.colors.is_empty() || m.own_color[part] { 1 } else { m.colors.len() as u32 };
-            let key = (layer, part as u32, segment % colors);
-            let material = match self.material_index.get(&key) {
-                Some(&i) => i,
-                None => {
-                    let i = (self.materials.len() / 4) as u32;
-                    self.materials.extend_from_slice(&material_rows(m, part, segment, opacity));
-                    self.material_index.insert(key, i);
-                    i
-                }
-            };
+            let mslot = &mut slots[part * colors_n + (segment % colors) as usize];
+            if *mslot == u32::MAX {
+                *mslot = (self.materials.len() / 4) as u32;
+                self.materials.extend_from_slice(&material_rows(m, part, segment, opacity));
+            }
+            let material = *mslot;
             let behind = v.iter().filter(|q| q.0[2] < NEAR).count();
             if behind == 3 {
                 continue;
@@ -273,13 +269,9 @@ impl Batch {
         // Triangles on the target with their edge and depth planes.
         struct Tri {
             rows: [[f32; 4]; 4],
-            /// Edge planes (f64), for binning.
-            planes: [[f64; 3]; 3],
-            bbox: [f64; 4],
+            bbox: [f32; 4],
         }
-        let mut tris: Vec<Tri> = Vec::with_capacity(self.tris.len());
-        let mut used = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-        for (ids, material) in &self.tris {
+        let setup = |(ids, material): &([u32; 3], u32)| -> Option<Tri> {
             // Positions as the rasteriser sees them (f32), so the edge
             // tests and these planes agree.
             let p = ids.map(|i| to_target(self.verts[i as usize].screen).map(|v| v as f32 as f64));
@@ -290,11 +282,11 @@ impl Batch {
                 p[0][1].max(p[1][1]).max(p[2][1]) + 0.5,
             ];
             if bbox[2] < 0.0 || bbox[3] < 0.0 || bbox[0] >= tw_px || bbox[1] >= th_px || !bbox.iter().all(|v| v.is_finite()) {
-                continue;
+                return None;
             }
             let area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
             if area.abs() < 1e-9 {
-                continue;
+                return None;
             }
             // Barycentric weight of vertex k: edge function of the opposite
             // edge over twice the area (sign-free).
@@ -313,7 +305,26 @@ impl Batch {
                 [f32::from_bits(ids[0]), f32::from_bits(ids[1]), f32::from_bits(ids[2]), 0.0],
                 [f(depth[0]), f(depth[1]), f(depth[2]), 0.0],
             ];
-            tris.push(Tri { rows, planes: e, bbox });
+            Some(Tri { rows, bbox: bbox.map(|v| v as f32) })
+        };
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+        let tris: Vec<Tri> = if self.tris.len() < 8192 || threads < 2 {
+            self.tris.iter().filter_map(setup).collect()
+        } else {
+            let chunk = self.tris.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = self.tris.chunks(chunk).map(|c| scope.spawn(move || c.iter().filter_map(setup).collect::<Vec<Tri>>())).collect();
+                let parts: Vec<Vec<Tri>> = jobs.into_iter().map(|j| j.join().expect("triangle setup")).collect();
+                let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+                for p in parts {
+                    all.extend(p);
+                }
+                all
+            })
+        };
+        let mut used = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for t in &tris {
+            let bbox = t.bbox.map(|v| v as f64);
             used = [used[0].min(bbox[0]), used[1].min(bbox[1]), used[2].max(bbox[2]), used[3].max(bbox[3])];
         }
         if tris.is_empty() {
@@ -323,31 +334,83 @@ impl Batch {
         let clamp_y = |v: f64| (v.max(0.0).min(th_px - 1.0) as u32 / TILE).min(target.tiles_y - 1);
         let (tx0, ty0, tx1, ty1) = (clamp_x(used[0]), clamp_y(used[1]), clamp_x(used[2]), clamp_y(used[3]));
         let (tw, th) = (tx1 - tx0 + 1, ty1 - ty0 + 1);
-        let mut per_tile: Vec<Vec<u32>> = vec![Vec::new(); (tw * th) as usize];
-        for (i, t) in tris.iter().enumerate() {
-            let (ax, ay, bx, by) = (clamp_x(t.bbox[0]), clamp_y(t.bbox[1]), clamp_x(t.bbox[2]), clamp_y(t.bbox[3]));
+        // Two passes (count, then fill) into one flat list.
+        let tiles = (tw * th) as usize;
+        fn visit(t: &Tri, clamp_x: &dyn Fn(f64) -> u32, clamp_y: &dyn Fn(f64) -> u32, origin: (u32, u32), tw: u32, mut f: impl FnMut(usize)) {
+            let b = t.bbox.map(|v| v as f64);
+            let (ax, ay, bx, by) = (clamp_x(b[0]), clamp_y(b[1]), clamp_x(b[2]), clamp_y(b[3]));
+            if ax == bx && ay == by {
+                f(((ay - origin.1) * tw + (ax - origin.0)) as usize);
+                return;
+            }
             for ty in ay..=by {
                 for tx in ax..=bx {
                     // Skip tiles the triangle misses (big thin triangles).
-                    if !touches(&t.planes, tx, ty) {
-                        continue;
+                    if touches(&t.rows, tx, ty) {
+                        f(((ty - origin.1) * tw + (tx - origin.0)) as usize);
                     }
-                    per_tile[((ty - ty0) * tw + (tx - tx0)) as usize].push(i as u32);
                 }
             }
         }
-        let bins_base = bins.len() as u32;
-        let mut rel = (tw * th * 2) as u32;
-        let mut pairs = Vec::with_capacity((tw * th * 2) as usize);
-        for t in &per_tile {
-            pairs.push(rel);
-            pairs.push(t.len() as u32);
-            rel += t.len() as u32;
+        let origin = (tx0, ty0);
+        // Each thread counts its chunk's triangles per tile, then fills its
+        // own slots: tiles list triangles in batch order, as serially.
+        let chunk = if tris.len() < 8192 || threads < 2 { tris.len().max(1) } else { tris.len().div_ceil(threads) };
+        let chunks: Vec<&[Tri]> = tris.chunks(chunk).collect();
+        let counts: Vec<Vec<u32>> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = chunks
+                .iter()
+                .map(|c| {
+                    let (clamp_x, clamp_y) = (&clamp_x, &clamp_y);
+                    scope.spawn(move || {
+                        let mut counts = vec![0u32; tiles];
+                        for t in c.iter() {
+                            visit(t, clamp_x, clamp_y, origin, tw, |k| counts[k] += 1);
+                        }
+                        counts
+                    })
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().expect("binning")).collect()
+        });
+        let bins_base = bins.len();
+        let header = tiles * 2;
+        let total: usize = counts.iter().flatten().map(|c| *c as usize).sum();
+        bins.resize(bins_base + header + total, 0);
+        // Start of each (chunk, tile) run.
+        let mut starts: Vec<Vec<u32>> = vec![vec![0; tiles]; chunks.len()];
+        let mut rel = header as u32;
+        for k in 0..tiles {
+            bins[bins_base + k * 2] = rel;
+            let mut n = 0;
+            for (c, cs) in counts.iter().enumerate() {
+                starts[c][k] = rel + n;
+                n += cs[k];
+            }
+            bins[bins_base + k * 2 + 1] = n;
+            rel += n;
         }
-        bins.extend_from_slice(&pairs);
-        for t in per_tile {
-            bins.extend(t);
+        {
+            let out = &mut bins[bins_base..];
+            let addr = out.as_mut_ptr() as usize;
+            std::thread::scope(|scope| {
+                for (c, (ts, mut next)) in chunks.iter().zip(starts).enumerate() {
+                    let (clamp_x, clamp_y) = (&clamp_x, &clamp_y);
+                    let first = c * chunk;
+                    scope.spawn(move || {
+                        let out = addr as *mut u32;
+                        for (i, t) in ts.iter().enumerate() {
+                            visit(t, clamp_x, clamp_y, origin, tw, |k| {
+                                // SAFETY: (chunk, tile) runs are disjoint and inside `out`.
+                                unsafe { *out.add(next[k] as usize) = (first + i) as u32 };
+                                next[k] += 1;
+                            });
+                        }
+                    });
+                }
+            });
         }
+        let bins_base = bins_base as u32;
         let tri_base = mesh_rows.len() as u32;
         for t in &tris {
             mesh_rows.extend_from_slice(&t.rows);
@@ -377,13 +440,18 @@ impl Batch {
 }
 
 /// Whether a triangle (edge rows) can cover any sample of tile (tx, ty).
-fn touches(planes: &[[f64; 3]; 3], tx: u32, ty: u32) -> bool {
-    let (x0, y0) = ((tx * TILE) as f64, (ty * TILE) as f64);
-    let (x1, y1) = (x0 + TILE as f64, y0 + TILE as f64);
-    planes.iter().all(|e| {
-        // The edge function's largest value over the tile's corners.
-        let m = (e[0] * x0).max(e[0] * x1) + (e[1] * y0).max(e[1] * y1) + e[2];
-        m >= -1e-3
+fn touches(rows: &[[f32; 4]; 4], tx: u32, ty: u32) -> bool {
+    let (x0, y0) = ((tx * TILE) as f32, (ty * TILE) as f32);
+    let (x1, y1) = (x0 + TILE as f32, y0 + TILE as f32);
+    let p = [[rows[0][0], rows[0][1]], [rows[0][2], rows[0][3]], [rows[1][0], rows[1][1]]];
+    let sign = rows[1][2];
+    (0..3).all(|k| {
+        // Inside is where sign·cross(b − a, q − a) ≥ 0; its largest value
+        // over the tile's corners.
+        let (a, b) = (p[(k + 1) % 3], p[(k + 2) % 3]);
+        let (ex, ey) = ((b[0] - a[0]) * sign, (b[1] - a[1]) * sign);
+        let at = |x: f32, y: f32| ex * (y - a[1]) - ey * (x - a[0]);
+        at(x0, y0).max(at(x1, y0)).max(at(x0, y1)).max(at(x1, y1)) >= -1e-2
     })
 }
 
@@ -705,3 +773,4 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32]) -> [f3
     let opacity = prim.inv_y[3];
     out.map(|v| v * opacity)
 }
+

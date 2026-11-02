@@ -73,16 +73,26 @@ struct Buffer {
     device: gpu::Buffer,
     host: Option<gpu::Buffer>,
     capacity: usize,
+    host_memory: Option<gpu::Memory>,
     name: &'static str,
 }
 
 impl Buffer {
     fn new(context: &gpu::Context, name: &'static str, size: usize, staged: bool) -> Self {
+        Self::with_host(context, name, size, staged.then_some(gpu::Memory::Upload))
+    }
+    /// A buffer read back by the CPU: its twin is host-cached memory
+    /// (reading write-combined upload memory costs tens of ms per frame).
+    fn readback(context: &gpu::Context, name: &'static str, size: usize) -> Self {
+        Self::with_host(context, name, size, Some(gpu::Memory::Shared))
+    }
+    fn with_host(context: &gpu::Context, name: &'static str, size: usize, host: Option<gpu::Memory>) -> Self {
         let capacity = size.max(256);
         Self {
             device: context.create_buffer(gpu::BufferDesc { name, size: capacity as u64, memory: gpu::Memory::Device }),
-            host: staged.then(|| context.create_buffer(gpu::BufferDesc { name, size: capacity as u64, memory: gpu::Memory::Upload })),
+            host: host.map(|memory| context.create_buffer(gpu::BufferDesc { name, size: capacity as u64, memory })),
             capacity,
+            host_memory: host,
             name,
         }
     }
@@ -91,8 +101,7 @@ impl Buffer {
             return Err(format!("{} needs {size} bytes, over the GPU buffer limit", self.name));
         }
         if size > self.capacity {
-            let staged = self.host.is_some();
-            let next = Self::new(context, self.name, size.next_power_of_two(), staged);
+            let next = Self::with_host(context, self.name, size.next_power_of_two(), self.host_memory);
             self.destroy(context);
             *self = next;
         }
@@ -262,7 +271,7 @@ impl Gpu {
             groups: Buffer::new(&context, "motion groups", 1 << 12, false),
             groups_tmp: Buffer::new(&context, "motion groups tmp", 1 << 12, false),
             accum: Buffer::new(&context, "motion accum", 1 << 12, false),
-            output: Buffer::new(&context, "motion output", 1 << 12, true),
+            output: Buffer::readback(&context, "motion output", 1 << 12),
             atlas_generation: 0,
             images_generation: 0,
             pending: None,
