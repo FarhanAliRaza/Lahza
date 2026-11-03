@@ -97,7 +97,21 @@ fn parse(b: &[u8]) -> Option<MapData> {
         let code = r.str()?;
         let name = r.str()?;
         let label = (r.f32()? as f64, r.f32()? as f64);
-        countries.push(Country { code, name, label, rings: r.rings()? });
+        let rings = r.rings()?;
+        // Dependencies can share their country's code (Australia's
+        // territories are AUS too): one country, named and labelled after
+        // its largest part, so every child id stays unique.
+        let points = |rs: &Vec<Vec<(f64, f64)>>| rs.iter().map(Vec::len).sum::<usize>();
+        match countries.iter_mut().find(|c: &&mut Country| c.code == code) {
+            Some(c) => {
+                if points(&rings) > points(&c.rings) {
+                    c.name = name;
+                    c.label = label;
+                }
+                c.rings.extend(rings);
+            }
+            None => countries.push(Country { code, name, label, rings }),
+        }
     }
     let mut lakes = Vec::new();
     for _ in 0..r.u32()? {
@@ -438,6 +452,12 @@ mod tests {
     fn data_loads_and_finds_places() {
         let d = data();
         assert!(d.countries.len() > 200);
+        let mut codes: Vec<&str> = d.countries.iter().map(|c| c.code.as_str()).collect();
+        codes.sort();
+        let n = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), n, "country codes are unique (child ids)");
+        assert_eq!(d.countries.iter().find(|c| c.code == "AUS").unwrap().name, "Australia");
         let iran = d.countries.iter().find(|c| c.code == "IRN").unwrap();
         assert_eq!(iran.name, "Iran");
         assert!(iran.rings.iter().map(Vec::len).sum::<usize>() > 300);
