@@ -1066,11 +1066,26 @@ impl Toolbox {
             report.syncs.sort_by(|a, b| b.drift_frames.abs().total_cmp(&a.drift_frames.abs()));
             report.syncs.truncate(40);
         }
+        // What the renderer would drop is an error, not a footnote: a font
+        // that is not found, a frame whose images cannot all be held.
+        for w in &warnings {
+            report.add(check::Severity::Error, "structure", None, None, w.clone());
+        }
+        if let Some((t, need)) = image_overflow(&compiled, &dir) {
+            report.add(
+                check::Severity::Error,
+                "structure",
+                None,
+                Some(t),
+                format!(
+                    "the images on screen at {t:.2} s need {:.0} M texels; the image pool holds {:.0} M, so some would not be drawn (use smaller images)",
+                    need as f64 / 1e6,
+                    lahza_motion_render::images::MAX_TEXELS as f64 / 1e6
+                ),
+            );
+        }
         let mut v = serde_json::to_value(&report).unwrap_or_default();
         v["sync_count"] = json!(sync_count);
-        if !warnings.is_empty() {
-            v["font_warnings"] = json!(warnings);
-        }
         Ok(Output::json(v))
     }
 
@@ -1133,6 +1148,7 @@ impl Toolbox {
             frames.push((format!("{label} · {ft:.2}s · f{n}"), image));
         }
         let backend = renderer.backend_label();
+        let dropped = renderer.dropped();
         renderer.set_scale(1.0);
         let images: Vec<Vec<u8>> = if sheet {
             let columns = (frames.len() as f64).sqrt().ceil().max(1.0) as u32;
@@ -1144,7 +1160,13 @@ impl Toolbox {
             let path = self.path(save);
             std::fs::write(&path, &images[0]).map_err(|e| format!("{}: {e}", path.display()))?;
         }
-        Ok(Output { json: json!({"frames": listed, "renderer": backend}), images })
+        let mut out = json!({"frames": listed, "renderer": backend});
+        if !dropped.is_empty() {
+            // Not drawn as asked: the frames are wrong.
+            out["ok"] = json!(false);
+            out["errors"] = json!(dropped);
+        }
+        Ok(Output { json: out, images })
     }
 
     fn compare(&mut self, args: &Value) -> ToolResult {
@@ -1552,6 +1574,11 @@ impl Toolbox {
                 Some(Ok(report)) => {
                     v["state"] = json!("done");
                     v["report"] = report.clone();
+                    if let Some(d) = report.get("dropped").filter(|d| d.as_array().is_some_and(|a| !a.is_empty())) {
+                        // Rendered, but not as asked.
+                        v["ok"] = json!(false);
+                        v["errors"] = d.clone();
+                    }
                 }
                 Some(Err(e)) => {
                     v["state"] = json!("failed");
@@ -1771,6 +1798,48 @@ fn animated_paths(v: &Value, prefix: &str, out: &mut Vec<String>) {
             animated_paths(child, &format!("{prefix}.{k}"), out);
         }
     }
+}
+
+/// Frames (sampled every half second) whose images together exceed the
+/// image pool, with the texels they need. Reported once, at the first.
+fn image_overflow(compiled: &Compiled, dir: &Path) -> Option<(f64, usize)> {
+    use lahza_motion_core::compile::{Content, LayerState};
+    let mut sizes: HashMap<String, usize> = HashMap::new();
+    fn walk(layers: &[LayerState], out: &mut Vec<String>) {
+        for l in layers {
+            match &l.content {
+                Content::Image { src, .. } => out.push(src.to_string()),
+                Content::Group(c) => walk(c, out),
+                _ => {}
+            }
+        }
+    }
+    let max_side = lahza_motion_render::images::MAX_SIDE as f64;
+    let mut t = 0.0;
+    while t < compiled.settings.duration {
+        let frame = compiled.frame(t);
+        let mut srcs = Vec::new();
+        walk(&frame.layers, &mut srcs);
+        srcs.sort();
+        srcs.dedup();
+        let need: usize = srcs
+            .iter()
+            .map(|s| {
+                *sizes.entry(s.clone()).or_insert_with(|| {
+                    image::image_dimensions(dir.join(s)).map(|(w, h)| {
+                        let k = (max_side / w.max(h) as f64).min(1.0);
+                        // With its mip chain: about a third more.
+                        ((w as f64 * k) * (h as f64 * k) * 4.0 / 3.0) as usize
+                    }).unwrap_or(0)
+                })
+            })
+            .sum();
+        if need > lahza_motion_render::images::MAX_TEXELS {
+            return Some((t, need));
+        }
+        t += 0.5;
+    }
+    None
 }
 
 /// The reference to use for marker `i` of `track`: by name where that

@@ -64,6 +64,9 @@ pub struct ExportReport {
     pub encoder: String,
     pub cached_frames: u64,
     pub warnings: Vec<String>,
+    /// Assets that were not drawn (see `Renderer::dropped`): errors.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,5 +367,6 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
         encoder: encoder_label,
         cached_frames: renderer.stats.cached,
         warnings: renderer.warnings(),
+        dropped: renderer.dropped(),
     })
 }

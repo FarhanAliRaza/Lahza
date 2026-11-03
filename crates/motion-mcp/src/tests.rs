@@ -481,3 +481,34 @@ fn imports_are_content_addressed_and_idempotent() {
     assert_eq!(third["src"].as_str().unwrap(), b);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn dropped_assets_are_errors_and_check_summarises_causes() {
+    let (mut tb, dir) = toolbox("dropped");
+    tb.call("project_create", json!({"path": "p", "duration": 1, "width": 320, "height": 180})).unwrap();
+    assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=32x32", "-frames:v", "1"]).arg(dir.join("p.lahza/assets/pic.png")).status().unwrap().success());
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "id": "pic", "kind": "image", "src": "assets/pic.png"},
+        {"op": "add", "id": "t1", "kind": "text", "text": "Hi", "font": "fonts/Missing.ttf", "transform": {"position": [160, 90]}},
+        {"op": "add", "id": "a", "kind": "text", "text": "A", "color": "#16181c", "transform": {"position": [60, 90]}},
+        {"op": "add", "id": "b", "kind": "text", "text": "B", "color": "#16181c", "transform": {"position": [260, 90]}},
+        // White on white, but outlined: readable.
+        {"op": "add", "id": "cap", "kind": "text", "text": "Caption", "color": "#ffffff", "size": 40, "stroke": {"color": "#000000", "width": 6}, "transform": {"position": [160, 150]}}
+    ]})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "s1.background", "value": "#000000"}]})).unwrap();
+    let r = tb.call("check", json!({})).unwrap().json;
+    let msgs: Vec<String> = r["issues"].as_array().unwrap().iter().map(|i| format!("{} {}", i["severity"], i["message"])).collect();
+    assert!(msgs.iter().any(|m| m.contains("error") && m.contains("Missing.ttf")), "a missing font file is an error: {msgs:?}");
+    assert!(!msgs.iter().any(|m| m.contains("contrast") && m.contains("cap")), "{msgs:?}");
+    // Two texts with the same problem: one cause, counted twice.
+    let low = r["causes"].as_array().unwrap().iter().find(|c| c["what"].as_str().unwrap().contains("contrast")).expect("contrast cause").clone();
+    assert_eq!(low["count"], 2, "{low}");
+    // A deleted image: an error in check and in the snapshot.
+    std::fs::remove_file(dir.join("p.lahza/assets/pic.png")).unwrap();
+    let r = tb.call("check", json!({})).unwrap().json;
+    assert!(r["issues"].as_array().unwrap().iter().any(|i| i["severity"] == "error" && i["message"].as_str().unwrap().contains("pic.png")), "{r:#}");
+    let snap = tb.call("snapshot", json!({"at": [0.5]})).unwrap().json;
+    assert_eq!(snap["ok"], false, "{snap:#}");
+    std::fs::remove_dir_all(&dir).ok();
+}

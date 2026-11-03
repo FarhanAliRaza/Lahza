@@ -166,6 +166,18 @@ impl Renderer {
         w
     }
 
+    /// What could not be drawn as asked: images or LUTs that failed to load
+    /// or did not fit the image pool, fonts that were substituted, footage
+    /// that could not be read. These are errors: the picture is wrong.
+    pub fn dropped(&self) -> Vec<String> {
+        let mut d: Vec<String> = self.images.warnings.iter().cloned().collect();
+        d.extend(self.fonts.warnings.iter().cloned());
+        d.extend(self.footage.warnings.iter().cloned());
+        d.sort();
+        d.dedup();
+        d
+    }
+
     /// The frame at timeline time `t`, with motion blur when the scene asks.
     pub fn render(&mut self, compiled: &Compiled, t: f64) -> RgbaImage {
         let mut states = Vec::new();

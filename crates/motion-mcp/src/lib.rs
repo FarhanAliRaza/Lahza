@@ -126,13 +126,24 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                     r["sync_count"],
                     r["max_drift_frames"]
                 );
-                for i in r["issues"].as_array().into_iter().flatten() {
+                // One line per cause; one issue per cause shown in full.
+                for c in r["causes"].as_array().into_iter().flatten() {
+                    let elements: Vec<&str> = c["elements"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                    let what = r["issues"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|i| i["severity"] == c["severity"] && i["kind"] == c["kind"] && elements.first().is_none_or(|e| i["element"] == *e))
+                        .and_then(|i| i["message"].as_str())
+                        .unwrap_or_else(|| c["what"].as_str().unwrap_or(""));
+                    let count = c["count"].as_u64().unwrap_or(1);
                     println!(
-                        "  {:<7} {:<9} {}{}",
-                        i["severity"].as_str().unwrap_or(""),
-                        i["kind"].as_str().unwrap_or(""),
-                        i["element"].as_str().map(|e| format!("[{e}] ")).unwrap_or_default(),
-                        i["message"].as_str().unwrap_or("")
+                        "  {:<7} {:<9} {}{}{}",
+                        c["severity"].as_str().unwrap_or(""),
+                        c["kind"].as_str().unwrap_or(""),
+                        elements.first().map(|e| format!("[{e}] ")).unwrap_or_default(),
+                        what,
+                        if count > 1 { format!("  (×{count}: {})", elements.join(", ")) } else { String::new() }
                     );
                 }
             }
@@ -159,6 +170,9 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 println!("{path}");
             }
             eprintln!("{}", serde_json::to_string(&out.json).unwrap_or_default());
+            if out.json["ok"] == false {
+                return Err(format!("not drawn as asked: {}", out.json["errors"]));
+            }
         }
         "compare" => {
             let against = flag(args, "--against").ok_or("compare needs --against REF.mp4")?;
@@ -233,6 +247,9 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                     Some("done") => {
                         eprintln!();
                         print(&s["report"]);
+                        if s["ok"] == false {
+                            return Err(format!("rendered, but not as asked: {}", s["errors"]));
+                        }
                         break;
                     }
                     _ => {

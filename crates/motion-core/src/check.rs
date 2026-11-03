@@ -52,6 +52,98 @@ pub struct Report {
     pub syncs: Vec<SyncResult>,
     /// Largest |drift| in frames.
     pub max_drift_frames: f64,
+    /// Issues grouped by cause (the same message for different elements).
+    pub causes: Vec<Cause>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Cause {
+    pub severity: Severity,
+    pub kind: &'static str,
+    /// The message with numbers and quoted names generalised.
+    pub what: String,
+    pub count: usize,
+    /// Up to five elements it applies to.
+    pub elements: Vec<String>,
+}
+
+impl Report {
+    /// Adds an issue found outside `check` (the renderer's fonts and
+    /// images) and recounts.
+    pub fn add(&mut self, severity: Severity, kind: &'static str, element: Option<&str>, at: Option<f64>, message: String) {
+        self.issues.push(issue(severity, kind, element, at, message));
+        self.issues.sort_by(|a, b| b.severity.cmp(&a.severity));
+        self.errors = self.issues.iter().filter(|i| i.severity == Severity::Error).count();
+        self.warnings = self.issues.iter().filter(|i| i.severity == Severity::Warning).count();
+        self.ok = self.errors == 0;
+        self.causes = causes(&self.issues);
+    }
+}
+
+fn causes(issues: &[Issue]) -> Vec<Cause> {
+    let general = |m: &str| -> String {
+        let mut out = String::new();
+        let mut quoted = false;
+        let mut last_digit = false;
+        for c in m.chars() {
+            if c == '\'' {
+                if !quoted {
+                    out.push_str("'…'");
+                }
+                quoted = !quoted;
+                continue;
+            }
+            if quoted {
+                continue;
+            }
+            let digit = c.is_ascii_digit() || (last_digit && c == '.');
+            if digit {
+                if !last_digit {
+                    out.push('#');
+                }
+            } else {
+                out.push(c);
+            }
+            last_digit = digit;
+        }
+        out
+    };
+    let mut out: Vec<Cause> = Vec::new();
+    for i in issues {
+        let what = general(&i.message);
+        match out.iter_mut().find(|c| c.severity == i.severity && c.kind == i.kind && c.what == what) {
+            Some(c) => {
+                c.count += 1;
+                if let Some(e) = &i.element {
+                    if c.elements.len() < 5 && !c.elements.contains(e) {
+                        c.elements.push(e.clone());
+                    }
+                }
+            }
+            None => out.push(Cause { severity: i.severity, kind: i.kind, what, count: 1, elements: i.element.iter().cloned().collect() }),
+        }
+    }
+    out.sort_by(|a, b| b.severity.cmp(&a.severity).then(b.count.cmp(&a.count)));
+    out
+}
+
+/// Frame layers with comps opened: children carry their parents'
+/// transforms and opacity, in drawing order.
+fn flatten(layers: &[LayerState]) -> Vec<LayerState> {
+    let mut out = Vec::new();
+    for l in layers {
+        match &l.content {
+            Content::Group(children) => {
+                let kids: Vec<LayerState> = children
+                    .iter()
+                    .map(|c| LayerState { matrix: l.matrix.then(c.matrix), opacity: c.opacity * l.opacity, ..c.clone() })
+                    .collect();
+                out.extend(flatten(&kids));
+            }
+            _ => out.push(l.clone()),
+        }
+    }
+    out
 }
 
 /// Measures a layer's on-canvas bounds [x0, y0, x1, y1]; the renderer
@@ -204,7 +296,10 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
         }
         if n % layout_every == 0 {
             let mut text_boxes: Vec<(&str, [f64; 4])> = Vec::new();
-            for (i, layer) in frame.layers.iter().enumerate() {
+            // Every layer where it is on screen: children of comps with
+            // their parents' transforms and opacity.
+            let flat = flatten(&frame.layers);
+            for (i, layer) in flat.iter().enumerate() {
                 if let Content::Mesh(m) = &layer.content {
                     for message in m.params.adjustments() {
                         if mesh_reported.insert(format!("{}:{message}", layer.id)) {
@@ -235,14 +330,27 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
                         // Measured against what is right behind the text:
                         // a button or card under it, else the background.
                         let centre = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
-                        let below = &frame.layers[..i];
+                        let below = &flat[..i];
                         let behind = match backdrop(below, centre, options.measure) {
                             Hit::Color(c) => Some((c, "the shape behind it")),
                             Hit::Miss => Some((frame.background, "the background")),
                             Hit::Unknown => None,
                         };
                         if let Some((under, what)) = behind {
-                            let ratio = contrast(tx.color.luminance(), under.luminance());
+                            let mut ratio = contrast(tx.color.luminance(), under.luminance());
+                            // An outline or a solid shadow carries the text too.
+                            if let Some((sc, sw, _)) = tx.stroke {
+                                if sw >= tx.size * 0.03 && sc.0[3] >= 0.5 {
+                                    ratio = ratio.max(contrast(tx.color.luminance(), sc.luminance()));
+                                }
+                            }
+                            for e in &layer.effects {
+                                if let crate::compile::EffectState::Shadow { color, sigma, .. } = e {
+                                    if color.0[3] >= 0.5 && *sigma <= tx.size * 0.3 {
+                                        ratio = ratio.max(contrast(tx.color.luminance(), color.luminance()));
+                                    }
+                                }
+                            }
                             if ratio < 3.0 && contrast_reported.insert(layer.id.to_string()) {
                                 issues.push(issue(Severity::Warning, "layout", Some(&layer.id), Some(t), format!("text contrast against {what} is {ratio:.1}:1 (aim for at least 3:1)")));
                             }
@@ -281,6 +389,21 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
     for clip in project.audio.clips() {
         used.push(("audio".into(), clip.path.clone()));
     }
+    // Font files (bundled fonts are names: "Inter SemiBold") and LUTs.
+    for scene in &project.scenes {
+        walk_layers(&scene.layers, &mut |l| {
+            if let LayerKind::Text(t) = &l.kind {
+                if t.font.contains('.') || t.font.contains('/') {
+                    used.push((l.id.clone(), t.font.clone()));
+                }
+            }
+            for e in &l.common.effects {
+                if let crate::document::Effect::Lut { path, .. } = e {
+                    used.push((l.id.clone(), path.clone()));
+                }
+            }
+        });
+    }
     for (element, path) in used {
         if let Some(dir) = options.dir {
             if !dir.join(&path).exists() {
@@ -302,7 +425,8 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
     let errors = issues.iter().filter(|i| i.severity == Severity::Error).count();
     let warnings = issues.iter().filter(|i| i.severity == Severity::Warning).count();
     let max_drift_frames = syncs.iter().map(|s| s.drift_frames.abs()).fold(0.0, f64::max);
-    Report { ok: errors == 0, errors, warnings, issues, syncs, max_drift_frames }
+    let causes = causes(&issues);
+    Report { ok: errors == 0, errors, warnings, issues, syncs, max_drift_frames, causes }
 }
 
 /// A scene with at least this many short-lived traced-looking path layers
@@ -658,5 +782,27 @@ mod tests {
         let contrast: Vec<_> = r.issues.iter().filter(|i| i.message.contains("contrast")).collect();
         assert!(!contrast.iter().any(|i| i.element.as_deref() == Some("cta")), "dark text on a yellow button reads fine: {contrast:?}");
         assert!(contrast.iter().any(|i| i.element.as_deref() == Some("lost") && i.message.contains("the background")), "{contrast:?}");
+    }
+
+    #[test]
+    fn title_safe_uses_where_text_is_on_screen() {
+        let mut p = Project::new(640, 360, Fps::whole(30), 2.0);
+        // A label in a comp that a camera push brings in from off-frame,
+        // and one that ends up hugging the edge.
+        p.scenes.push(serde_json::from_value(serde_json::json!({"id": "s1", "layers": [
+            {"id": "world", "kind": "comp", "transform": {"position": {"keys": [{"at": 0, "v": [900, 0]}, {"at": 1, "v": [0, 0]}]}}, "layers": [
+                {"id": "label", "kind": "text", "text": "IRAN", "transform": {"position": [320, 180]}},
+                {"id": "edge", "kind": "text", "text": "OMAN", "transform": {"position": [612, 180]}}]}
+        ]}))
+        .unwrap());
+        let c = Compiled::new(&p);
+        let measure = |l: &LayerState| {
+            let (x, y) = l.matrix.apply(0.0, 0.0);
+            Some([x - 20.0, y - 10.0, x + 20.0, y + 10.0])
+        };
+        let r = check(&p, &c, &Options { measure: Some(&measure), ..Default::default() });
+        let safe: Vec<_> = r.issues.iter().filter(|i| i.message.contains("title-safe")).collect();
+        assert!(!safe.iter().any(|i| i.element.as_deref() == Some("label")), "{safe:?}");
+        assert!(safe.iter().any(|i| i.element.as_deref() == Some("edge")), "nested text is checked where it lands: {safe:?}");
     }
 }
