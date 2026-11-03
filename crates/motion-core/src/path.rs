@@ -221,11 +221,40 @@ fn align(a: &[(f64, f64)], b: &[(f64, f64)]) -> Vec<(f64, f64)> {
     (0..n).map(|i| c[(i + best.1) % n]).collect()
 }
 
+/// `flatten`, remembered per path text and tolerance (rounded down to a
+/// power of two, so a zoom keeps hitting the cache): parsing a map's
+/// countries every frame cost more than drawing them. The cache holds the
+/// text itself, so an entry's address cannot be reused by another path.
+pub fn flatten_cached(d: &std::sync::Arc<str>, tolerance: f64) -> Result<std::sync::Arc<Vec<Poly>>, String> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    type Cache = HashMap<(usize, usize, i32), (Arc<str>, Arc<Vec<Poly>>)>;
+    thread_local! {
+        static CACHE: RefCell<Cache> = RefCell::new(HashMap::new());
+    }
+    let bucket = tolerance.max(1e-9).log2().floor() as i32;
+    let key = (Arc::as_ptr(d) as *const u8 as usize, d.len(), bucket);
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).map(|e| e.1.clone())) {
+        return Ok(hit);
+    }
+    let polys = Arc::new(flatten(d, 2f64.powi(bucket))?);
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 8192 {
+            c.clear();
+        }
+        c.insert(key, (d.clone(), polys.clone()));
+    });
+    Ok(polys)
+}
+
 /// Outlines of a path, interpolated when it is mid-morph.
 pub fn morph(m: &PathMorph, tolerance: f64) -> Result<Vec<Poly>, String> {
-    let a = flatten(&m.from, tolerance)?;
-    let Some(to) = &m.to else { return Ok(a) };
-    let b = flatten(to, tolerance)?;
+    let a = flatten_cached(&m.from, tolerance)?;
+    let Some(to) = &m.to else { return Ok((*a).clone()) };
+    let a = (*a).clone();
+    let b = (*flatten_cached(to, tolerance)?).clone();
     let t = m.t;
     let count = a.len().max(b.len());
     let mut out = Vec::with_capacity(count);

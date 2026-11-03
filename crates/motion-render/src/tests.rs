@@ -265,6 +265,10 @@ pub(crate) fn assert_gpu_matches_cpu_within(p: &Project, times: &[f64], outliers
             }
         }
         let allowed = (outliers * (a.width() * a.height()) as f64) as usize;
+        if let Ok(dir) = std::env::var("LAHZA_MOTION_DUMP") {
+            a.save(format!("{dir}/gpu-{t}.png")).unwrap();
+            b.save(format!("{dir}/cpu-{t}.png")).unwrap();
+        }
         assert!(over <= allowed, "t={t}: {over} pixels differ by more than 3 levels (allowed {allowed})");
         let mean = total as f64 / (a.len() as f64);
         if let Ok(dir) = std::env::var("LAHZA_MOTION_DUMP") {
@@ -1426,4 +1430,41 @@ fn benchmark_big_path_1080x1920() {
         r.render(&c, 0.0);
     }
     eprintln!("big path: {:.1} ms/frame", t.elapsed().as_secs_f64() * 200.0);
+}
+
+/// Split paths (per-tile copies with a row backdrop) on the GPU.
+#[test]
+fn gpu_matches_cpu_big_paths() {
+    let n = 900;
+    let d: String = (0..n)
+        .map(|i| {
+            let a = i as f64 / n as f64 * std::f64::consts::TAU;
+            let r = 70.0 + 12.0 * (a * 23.0).sin();
+            format!("{} {:.3} {:.3}", if i == 0 { "M" } else { "L" }, r * a.cos(), 0.9 * r * a.sin())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " Z M -20 -10 L 20 -10 L 20 10 L -20 10 Z";
+    let p = project(json!([
+        {"id": "land", "kind": "shape", "shape": "path", "d": d, "fill": "#d8cfb8", "stroke": {"color": "#222222", "width": 2},
+         "transform": {"position": {"keys": [{"at": 0, "v": [160, 90]}, {"at": 1, "v": [150, 95]}]}, "scale": {"keys": [{"at": 0, "v": [1, 1]}, {"at": 1, "v": [1.6, 1.6]}]}}}
+    ]));
+    assert_gpu_matches_cpu(&p, &[0.0, 0.5, 1.0]);
+}
+
+#[test]
+fn motion_blurred_cpu_frames_are_not_black() {
+    // A group with an effect: its offscreen picture comes before the main
+    // target in each sample's list.
+    let mut p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [100, 60], "fill": "#ff0000",
+        "transform": {"position": {"keys": [{"at": 0, "v": [150, 90]}, {"at": 1, "v": [170, 90]}]}}},
+        {"id": "g", "kind": "comp", "effects": [{"type": "blur", "radius": {"keys": [{"at": 0, "v": 1}, {"at": 1, "v": 6}]}}], "layers": [
+            {"id": "d", "kind": "shape", "shape": "circle", "size": 30, "fill": "#00ff00", "transform": {"position": [40, 40]}}]}]));
+    p.settings.background = lahza_motion_core::value::Color::parse("#203040").unwrap();
+    for samples in [1u32, 4] {
+        p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples });
+        let img = cpu().render(&Compiled::new(&p), 0.5);
+        assert_eq!(px(&img, 160, 90), [255, 0, 0, 255], "samples {samples}");
+        assert_eq!(px(&img, 5, 5), [32, 48, 64, 255], "samples {samples}");
+    }
 }

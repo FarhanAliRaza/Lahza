@@ -95,11 +95,19 @@ fn sd_star(p: V2, g: [f32; 4]) -> f32 {
 /// Distance to a flattened path; negative inside (non-zero winding) for
 /// filled paths.
 fn sd_path(prim: &Prim, l: V2, segments: &[[f32; 4]]) -> f32 {
-    let first = prim.geom2[0].to_bits() as usize;
+    let mut first = prim.geom2[0].to_bits() as usize;
     let count = prim.geom2[1].to_bits() as usize;
     let open = prim.geom2[2] > 0.5;
     let mut best = f32::MAX;
     let mut winding = 0i32;
+    if prim.geom2[3] > 0.5 {
+        // A tile of a split path: its row's winding from the segments
+        // wholly to its right (see `list::split_path`).
+        let h = segments[first];
+        let r = ((l[1] - h[0]) / h[1]).round().clamp(0.0, 15.0) as usize;
+        winding = segments[first + 1 + r / 4][r % 4] as i32;
+        first += 5;
+    }
     for s in &segments[first..first + count] {
         let e = [s[2] - s[0], s[3] - s[1]];
         let w = [l[0] - s[0], l[1] - s[1]];

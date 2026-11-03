@@ -32,6 +32,23 @@ pub struct Kind {
 
 pub const KINDS: &[Kind] = &[
     Kind {
+        name: "map",
+        summary: "A vector map from Natural Earth 1:50m (bundled, public domain), Web Mercator, filling `size` (default the canvas; place the component at [0, 0]). Children: water, zoom and pan (the camera), one path per country by ISO A3 code (IRN, IRQ, …: address map/IRN.fill, map/IRN.stroke.width), lakes, <code>-label, p-<place> and p-<place>-label, arc1…. Borders, labels and dots keep their size on screen while the camera zooms.",
+        params: &[
+            ("camera", "{center: [lon, lat] or a place name, zoom} or {keys: [{at, center, zoom, ease, dur, anchor}, …]}; zoom 0 shows the whole world across the width, each +1 doubles", "{center: [0, 20], zoom: 0}"),
+            ("size", "[w, h]", "the canvas"),
+            ("land, water", "colours", "#e4ddcc, #b9cfd9"),
+            ("border", "{color, width (px on screen)}", "{#8c8270, 1.5}"),
+            ("fills", "{ISO: colour} per country", "{}"),
+            ("labels", "ISO codes to label at their label points", "[]"),
+            ("label", "{size, color, font, uppercase}", "{h/48, #3a352c, Inter SemiBold, true}"),
+            ("places", "names from Natural Earth's populated places, or {name, lon, lat, at, color, size, label}", "[]"),
+            ("arcs", "[{from, to (place or [lon, lat]), at, dur, color, width, lift}] great-circle arcs drawn on", "[]"),
+            ("lakes", "draw lakes", "true"),
+            ("detail", "simplification, px at the deepest zoom", "0.35"),
+        ],
+    },
+    Kind {
         name: "captions",
         summary: "Word-synced captions from a word track (narration): chunks by length, sentence ends and pauses; each chunk enters, each word lights up as it is spoken. Canvas coordinates. Children c1, c2, … (and c1-box with style boxed).",
         params: &[
@@ -113,6 +130,7 @@ pub fn generate(component: &str, params: &Value, ctx: &Ctx) -> Result<Vec<Value>
         "callout" => callout(&p),
         "counter" => counter(&p, ctx),
         "chart" => chart(&p),
+        "map" => crate::map::generate(params, ctx.width, ctx.height),
         other => Err(format!("unknown component '{other}': {}", KINDS.iter().map(|k| k.name).collect::<Vec<_>>().join(", "))),
     }
 }
@@ -775,5 +793,26 @@ mod tests {
         let lit: Vec<bool> = t.glyphs.iter().map(|g| g.color.is_some_and(|c| (c.0[2] - 0.0).abs() < 0.05)).collect();
         assert!(lit[5..9].iter().all(|x| *x), "'Iran' is yellow: {lit:?}");
         assert!(!lit[0], "'Over' is not");
+    }
+
+    #[test]
+    fn a_map_override_survives_a_zoom_change_and_detaches() {
+        use crate::edit::apply;
+        let p = project();
+        let p = apply(&p, &[json!({"op": "add", "scene": "s1", "id": "map", "kind": "component", "component": "map",
+            "params": {"camera": {"center": [53, 28], "zoom": 3}, "labels": ["IRN"]}})]).unwrap().project;
+        let a = apply(&p, &[json!({"op": "key", "target": "map/IRN.fill", "at": 1.0, "from": "#e4ddcc", "v": "#c8102e", "dur": "12f"})]).unwrap();
+        let b = apply(&a.project, &[json!({"op": "set", "target": "map.params.camera", "value": {"center": "Tehran", "zoom": 5}})]).unwrap();
+        let c = crate::compile::Compiled::new(&b.project);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let ex = expand_project(&b.project, &mut Vec::new()).unwrap();
+        let iran = ex.scenes[0].layers[0].children().iter().find(|l| l.id == "map/IRN").expect("Iran in view");
+        assert!(serde_json::to_value(iran).unwrap()["fill"]["keys"].is_array(), "the keyed fill survived the zoom change");
+        let d = apply(&b.project, &[json!({"op": "detach", "id": "map"})]).unwrap();
+        let v = serde_json::to_value(&d.project).unwrap();
+        let kids = v["scenes"][0]["layers"][0]["layers"].as_array().unwrap();
+        assert!(kids.iter().any(|k| k["id"] == "map-IRN" && k["fill"]["keys"].is_array()));
+        assert!(kids.iter().any(|k| k["id"] == "map-pan" && k["parent"] == "map-zoom"));
+        assert!(crate::compile::Compiled::new(&d.project).errors.is_empty());
     }
 }

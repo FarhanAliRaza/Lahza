@@ -1204,11 +1204,14 @@ fn bin(list: &mut DisplayList, target: &Target, prims: Vec<(Prim, [f64; 4])>) {
 const SPLIT_SEGMENTS: u32 = 48;
 
 /// A big path (a country, a coastline) costs every one of its segments at
-/// every pixel. Per tile only some matter: the winding ray runs to local
-/// +x, so a pixel needs the segments that cross its row to its right, plus
-/// those near enough to shade its edge. With a flat transform (no rotation
-/// or perspective) each tile gets its own copy of the primitive pointing
-/// at just those segments; tiles it does not touch get nothing.
+/// every pixel. Per tile only some matter. With a flat transform (no
+/// rotation or perspective) each tile gets its own copy of the primitive
+/// holding just the segments that reach it (within the shading margin).
+/// For fills, the crossings of segments entirely to its right (the winding
+/// ray runs to local +x) are the same for every pixel of a pixel row, so
+/// they are summed once per row into a header the shader starts from
+/// (`geom2.w` = 1): a header entry [local y of row 0, local y step, 0, 0],
+/// then 16 row windings in 4 entries, then the segments.
 fn split_path(list: &mut DisplayList, target: &Target, prim: &Prim, b: [f64; 4]) -> Option<Vec<(usize, Prim)>> {
     let count = prim.geom2[1].to_bits();
     if prim.kind[0] != PRIM_SHAPE || prim.kind[1] != SHAPE_PATH || count < SPLIT_SEGMENTS {
@@ -1218,62 +1221,87 @@ fn split_path(list: &mut DisplayList, target: &Target, prim: &Prim, b: [f64; 4])
     if prim.inv_x[1] != 0.0 || prim.inv_y[0] != 0.0 || prim.inv_w[0] != 0.0 || prim.inv_w[1] != 0.0 || a == 0.0 || d == 0.0 || w <= 0.0 {
         return None;
     }
+    let fill = prim.geom2[2] < 0.5;
     let first = prim.geom2[0].to_bits() as usize;
-    // Segments in target pixels.
-    let to_px = |x: f32, y: f32| ((x * w - c) / a, (y * w - f) / d);
     let segs: Vec<[f32; 4]> = list.segments[first..first + count as usize].to_vec();
-    let px: Vec<[f32; 4]> = segs
-        .iter()
-        .map(|s| {
-            let (x0, y0) = to_px(s[0], s[1]);
-            let (x1, y1) = to_px(s[2], s[3]);
-            [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
-        })
-        .collect();
-    // Edge shading reach in pixels: anti-aliasing, plus half a stroke.
-    let aa = prim.inv_x[3].abs() / a.abs().max(1e-12) * w;
-    let stroke = if prim.kind[3] & FLAG_STROKE != 0 { prim.paint[0] * w / a.abs().max(1e-12) * 0.5 } else { 0.0 };
-    let margin = 2.0 * aa.max(1.0) + stroke;
+    // Local x and y of a pixel coordinate, and back.
+    let lx = |px: f32| (a * px + c) / w;
+    let ly = |py: f32| (d * py + f) / w;
+    let py_of = |y: f32| (y * w - f) / d;
+    // Shading reach: anti-aliasing, plus half a stroke, in local units.
+    let aa = prim.inv_x[3].abs();
+    let stroke = if prim.kind[3] & FLAG_STROKE != 0 { prim.paint[0] * 0.5 } else { 0.0 };
+    let m = 2.0 * aa.max((a / w).abs()) + stroke;
     let (tw, th) = (target.tiles_x, target.tiles_y);
     let ty0 = ((b[1].max(0.0) as u32) / TILE).min(th - 1);
     let ty1 = (((b[3].min(target.height as f64 - 1.0)).max(0.0) as u32) / TILE).min(th - 1);
     let tx0 = ((b[0].max(0.0) as u32) / TILE).min(tw - 1);
     let tx1 = (((b[2].min(target.width as f64 - 1.0)).max(0.0) as u32) / TILE).min(tw - 1);
-    // Bucket by tile row, then pick per tile by x.
+    // Segment bounds in local units, and the pixel rows they span.
+    let lb: Vec<[f32; 4]> = segs.iter().map(|s| [s[0].min(s[2]), s[1].min(s[3]), s[0].max(s[2]), s[1].max(s[3])]).collect();
     let mut rows: Vec<Vec<u32>> = vec![Vec::new(); (ty1 - ty0 + 1) as usize];
-    for (i, s) in px.iter().enumerate() {
-        let r0 = (((s[1] - margin).max(0.0) as u32) / TILE).max(ty0);
-        let r1 = ((((s[3] + margin).max(0.0)) as u32) / TILE).min(ty1);
+    for (i, s) in lb.iter().enumerate() {
+        let (p0, p1) = (py_of(s[1] - m), py_of(s[3] + m));
+        let r0 = ((p0.min(p1).max(0.0) as u32) / TILE).max(ty0);
+        let r1 = ((p0.max(p1).max(0.0) as u32) / TILE).min(ty1);
         for r in r0..=r1 {
-            if r >= ty0 && r <= ty1 {
-                rows[(r - ty0) as usize].push(i as u32);
-            }
+            rows[(r - ty0) as usize].push(i as u32);
         }
     }
     let mut out = Vec::new();
     for ty in ty0..=ty1 {
-        let row = &rows[(ty - ty0) as usize];
-        if row.is_empty() {
+        let band = &rows[(ty - ty0) as usize];
+        if band.is_empty() {
             continue;
         }
-        for tx in tx0..=tx1 {
-            let x0 = (tx * TILE) as f32 - margin;
-            let x1 = ((tx + 1) * TILE) as f32 + margin;
-            let start = list.segments.len() as u32;
-            for &i in row {
-                let s = &px[i as usize];
-                // Right of (or near) the tile: crossings or the edge.
-                if s[2] >= x0 && (s[0] <= x1 || prim.kind[3] & FLAG_FILL != 0) {
-                    list.segments.push(segs[i as usize]);
+        // Row centres in local y, and each band segment's crossing there.
+        let y_rows: [f32; 16] = std::array::from_fn(|r| ly((ty * TILE + r as u32) as f32 + 0.5));
+        let mut order: Vec<u32> = band.clone();
+        order.sort_by(|&i, &j| lb[i as usize][0].total_cmp(&lb[j as usize][0]));
+        // suffix[k][r]: winding at row r from order[k..].
+        let mut suffix = vec![[0i32; 16]; order.len() + 1];
+        if fill {
+            for k in (0..order.len()).rev() {
+                let s = &segs[order[k] as usize];
+                let mut acc = suffix[k + 1];
+                for (r, y) in y_rows.iter().enumerate() {
+                    if (s[1] <= *y) != (s[3] <= *y) {
+                        acc[r] += if s[3] > s[1] { 1 } else { -1 };
+                    }
                 }
+                suffix[k] = acc;
             }
-            let n = list.segments.len() as u32 - start;
-            if n == 0 {
+        }
+        let xmins: Vec<f32> = order.iter().map(|&i| lb[i as usize][0]).collect();
+        for tx in tx0..=tx1 {
+            let (xa, xb) = (lx((tx * TILE) as f32), lx(((tx + 1) * TILE) as f32));
+            let (x0, x1) = (xa.min(xb) - m, xa.max(xb) + m);
+            // Wholly right of the tile in local x (the ray's way): summed.
+            let far = if a / w > 0.0 { xmins.partition_point(|&x| x <= x1) } else { order.len() };
+            let near: Vec<u32> = order[..far].iter().copied().filter(|&i| lb[i as usize][2] >= x0).collect();
+            let backdrop = if fill && a / w > 0.0 { suffix[far] } else { [0; 16] };
+            if near.is_empty() && backdrop.iter().all(|v| *v == 0) {
                 continue;
             }
+            let start = list.segments.len() as u32;
             let mut part = *prim;
+            if fill && a / w > 0.0 {
+                list.segments.push([y_rows[0], d / w, 0.0, 0.0]);
+                for q in 0..4 {
+                    list.segments.push(std::array::from_fn(|k| backdrop[q * 4 + k] as f32));
+                }
+                part.geom2[3] = 1.0;
+            } else if fill {
+                // Mirrored: no backdrop, every segment right of the tile.
+                list.segments.extend(order[..].iter().filter(|&&i| lb[i as usize][2] >= x0).map(|&i| segs[i as usize]));
+                part.geom2[0] = f32::from_bits(start);
+                part.geom2[1] = f32::from_bits(list.segments.len() as u32 - start);
+                out.push(((ty * tw + tx) as usize, part));
+                continue;
+            }
+            list.segments.extend(near.iter().map(|&i| segs[i as usize]));
             part.geom2[0] = f32::from_bits(start);
-            part.geom2[1] = f32::from_bits(n);
+            part.geom2[1] = f32::from_bits(near.len() as u32);
             out.push(((ty * tw + tx) as usize, part));
         }
     }

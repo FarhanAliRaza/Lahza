@@ -15,6 +15,7 @@ pub mod curve;
 pub mod document;
 pub mod edit;
 pub mod io;
+pub mod map;
 pub mod markers;
 pub mod mesh;
 pub mod narration;

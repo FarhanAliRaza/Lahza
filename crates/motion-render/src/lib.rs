@@ -253,7 +253,8 @@ impl Renderer {
             }
             let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups, footage: &self.footage.dynamic, ops: &list.ops };
             let write = if lists.len() == 1 { raster::Write::Replace } else { raster::Write::Accumulate(weight) };
-            raster::raster(list, &main, &src, accum, write, self.threads);
+            // Each list has its own main target (its tile ranges sit after its groups).
+            raster::raster(list, &list.main(), &src, accum, write, self.threads);
         }
         let mut out = vec![0u8; w * h * 4];
         raster::resolve(accum, &mut out, self.threads);

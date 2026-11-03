@@ -136,11 +136,19 @@ fn sd_star(p: vec2<f32>, g: vec4<f32>) -> f32 {
 }
 
 fn sd_path(prim: Prim, l: vec2<f32>) -> f32 {
-    let first = bitcast<u32>(prim.geom2.x);
+    var first = bitcast<u32>(prim.geom2.x);
     let count = bitcast<u32>(prim.geom2.y);
     let open = prim.geom2.z > 0.5;
     var best = 3.0e38;
     var winding = 0;
+    if prim.geom2.w > 0.5 {
+        // A tile of a split path: its row's winding from the segments
+        // wholly to its right (see list.rs split_path).
+        let h = b_segs[first];
+        let r = u32(clamp(round((l.y - h.x) / h.y), 0.0, 15.0));
+        winding = i32(b_segs[first + 1u + r / 4u][r % 4u]);
+        first += 5u;
+    }
     for (var i = 0u; i < count; i++) {
         let s = b_segs[first + i];
         let e = s.zw - s.xy;
