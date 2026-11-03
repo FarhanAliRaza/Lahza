@@ -8,7 +8,8 @@
 2. **Audio first.** Put the music (and voiceover) in `assets/`, register it
    with `audio_analyze` (writes `beat`, `bar`, `half`, `sixteenth`,
    `triplet`, `onset.*`, `hit`, `stop`, `drop`, `music.start`,
-   `music.end`). Import word timestamps for narration (`markers_import`).
+   `music.end`). Narration comes in as a manifest (`narration_import`, see
+   [Narration](#narration)).
    Read the result with `markers_query`; structure comes from the audio's
    shape (stops, drops, the biggest hit), not from BPM alone. Check
    `feel`: with `triplet` (a shuffle or 12/8 swing) cut and key on
@@ -367,3 +368,29 @@ outside the radius instead.
 - Text inside title-safe, readable contrast, no overlapping labels.
 - Every asset has a source and a licence.
 - Contact sheet at the sync points reads as the visual script intends.
+
+## Narration
+
+Narrate before building scenes, and time everything from the narration.
+
+1. **Script with cues.** One line per clip (id it: `hook`, `s03`). Mark
+   the moments visuals hit with `[cue]` markup: `One bomb. Over
+   [strike]Iran.` gives `cue:strike` (the cued word: start and `.end`);
+   `[map]Over Iran[/map]` spans words. Write numbers and names as they
+   should be shown ("81", "U.S."); the voice may say them differently.
+2. **Voice with timings.** Any provider, through an adapter in
+   `tools/narration` that writes a manifest: each clip's audio, script text
+   and the provider's `words` or `chars` timings. Kokoro needs a model
+   export with a duration output; ElevenLabs `with-timestamps` gives
+   characters; voices without timings need an external aligner.
+3. **`narration_import`** places the clips (one after another unless `at`
+   is given), builds `line`, `sentence`, `word` and `cue` tracks, and
+   reports timing problems — words with no time, out of order, outside
+   their clip or in silence. These are errors in `check`; fix the
+   timings, not the references.
+4. **Time with references, never seconds.** Scene starts on `line:s03`,
+   a reveal on `cue:strike`, a caption until `sentence#4.end`, a sound
+   effect on `word:'81'` (quote numbers: `word:81` is the 81st word).
+   Indices (`word#42`) shift when the script changes; cues and line ids
+   do not. Re-narrating — a new hook line, a reworded sentence — then
+   moves every scene with no other edits; unchanged lines are reused.

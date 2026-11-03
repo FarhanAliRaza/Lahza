@@ -28,6 +28,9 @@ pub struct Project {
     /// Marker tracks; stored as `markers/<track>.json` on disk.
     #[serde(skip)]
     pub markers: Markers,
+    /// Narration lines and their word timings; `narration.json` on disk.
+    #[serde(skip)]
+    pub narration: Option<crate::narration::Narration>,
 }
 
 fn version() -> u32 {
@@ -43,6 +46,7 @@ impl Project {
             assets: Vec::new(),
             scenes: Vec::new(),
             markers: Markers::default(),
+            narration: None,
         }
     }
 }
@@ -104,16 +108,24 @@ pub struct Audio {
     pub music: Option<AudioClip>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vo: Option<AudioClip>,
+    /// Narration lines from `narration_import` (one clip per line, owned by
+    /// `narration.json`: re-importing replaces them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub narration: Vec<AudioClip>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sfx: Vec<AudioClip>,
 }
 
 impl Audio {
     pub fn is_empty(&self) -> bool {
-        self.music.is_none() && self.vo.is_none() && self.sfx.is_empty()
+        self.music.is_none() && self.vo.is_none() && self.narration.is_empty() && self.sfx.is_empty()
     }
     pub fn clips(&self) -> impl Iterator<Item = &AudioClip> {
-        self.music.iter().chain(self.vo.iter()).chain(self.sfx.iter())
+        self.music.iter().chain(self.vo.iter()).chain(self.narration.iter()).chain(self.sfx.iter())
+    }
+    /// The voice: the single `vo` clip and the narration lines.
+    pub fn voice(&self) -> impl Iterator<Item = &AudioClip> {
+        self.vo.iter().chain(self.narration.iter())
     }
 }
 

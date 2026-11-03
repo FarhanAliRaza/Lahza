@@ -144,7 +144,8 @@ Every project carries named marker tracks the agent can query and anchor to:
 
 | Track | Source |
 |---|---|
-| `word`, `sentence` | VO transcription (whisper.cpp) |
+| `line`, `sentence`, `word`, `cue` | narration manifest (`narration_import`): the voice provider's own word or character timings, aligned to the script |
+| `word`, `sentence` (recordings) | transcription (whisper.cpp), for recordings that have no script |
 | `beat`, `bar`, `half`, `sixteenth`, `triplet` | music analysis: BPM, offset, swing/triplet feel |
 | `onset.low`, `onset.mid`, `onset.high` | per-band onset detection |
 | `hit` | strongest onsets; impact-style sounds |
@@ -154,12 +155,27 @@ Every project carries named marker tracks the agent can query and anchor to:
 | `ocr` | text boxes found in recordings, images and PDFs, with times |
 | `user` | markers placed by hand |
 
+Narration is made outside the engine by any voice (Kokoro, ElevenLabs,
+Azure, OpenAI, a recording). The engine never transcribes it: small
+adapters (`tools/narration`) turn each provider's timings into one manifest
+format — one clip per line with its audio, script text and `words` or
+`chars` timings — and the engine validates them without listening (order,
+inside the clip, every script word timed, no word in silence). Script text
+is what is shown ("81"); timings may be what was spoken ("eighty-one").
+`[cue]` markup in the script names moments (`cue:strike`) that survive
+script edits. Clips are hashed: re-importing after an edit re-imports only
+changed lines, and everything anchored to the narration moves with it.
+Transcription (whisper.cpp) remains an import source for recordings with
+no script.
+
 ### 4.3 Anchoring
 Any time field accepts a reference instead of a number:
 
 ```
-"word:borders"            first occurrence of the word
-"word#42"                 by index
+"cue:strike", "cue:strike.end"   a cue in the narration script
+"line:hook"               a narration line by id
+"word:borders"            first occurrence of the word (or its spoken form)
+"word#42"                 by index (breaks when the script changes)
 "sentence#3.end"
 "beat:17", "bar:5", "triplet:12"
 "hit:3", "stop:2", "click:4", "ocr:'Deploy'"

@@ -254,6 +254,15 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
         prev = Some(frame);
     }
 
+    // Narration timings: wrong word times put every reference on them off.
+    if let Some(narration) = &project.narration {
+        for (clip, word, message) in narration.validate() {
+            let at = narration.clips.iter().find(|c| c.id == clip).map(|c| c.at);
+            let what = word.map(|w| format!("'{w}' ")).unwrap_or_default();
+            issues.push(issue(Severity::Error, "narration", Some(&clip), at, format!("line {clip}: {what}{message}")));
+        }
+    }
+
     // Assets and licences.
     let mut used: Vec<(String, String)> = Vec::new();
     for scene in &project.scenes {

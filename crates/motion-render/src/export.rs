@@ -171,7 +171,18 @@ fn audio_inputs(project: &Project, compiled: &Compiled, dir: &Path, start: f64) 
         Some(name)
     };
     let music = project.audio.music.as_ref().and_then(|c| add(c, "m", &mut args, &mut parts).map(|n| (n, c.duck_db)));
-    let vo = project.audio.vo.as_ref().and_then(|c| add(c, "v", &mut args, &mut parts));
+    // The voice: the single `vo` clip and/or the narration lines, as one
+    // bus (it drives the music's ducking).
+    let voices: Vec<String> = project.audio.voice().filter_map(|c| add(c, "v", &mut args, &mut parts)).collect();
+    let vo = match voices.len() {
+        0 => None,
+        1 => voices.into_iter().next(),
+        n => {
+            let inputs: String = voices.iter().map(|l| format!("[{l}]")).collect();
+            parts.push(format!("{inputs}amix=inputs={n}:normalize=0:dropout_transition=0[vbus]"));
+            Some("vbus".to_string())
+        }
+    };
     for clip in &project.audio.sfx {
         if let Some(n) = add(clip, "s", &mut args, &mut parts) {
             labels.push(n);

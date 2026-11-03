@@ -418,5 +418,13 @@ ding, sparkle, glitch.
  "markers": [{"t": 1.093}, {"t": 1.760, "value": 0.8}]}
 ```
 
-Marker fields: `t`, optional `end`, `label` (words, OCR text), `value`
+Narration (`narration.json`, written by `narration_import`; not edited by
+hand): clips with `id`, `path`, `text` (script with `[cue]` markup), `at`,
+`duration` and aligned `words` (`text` as shown, `spoken` when it differs,
+`start`/`end` in the clip, `loud` dB under the speech level). Its clips
+appear in `audio.narration`; it derives the `line`, `sentence`, `word` and
+`cue` tracks.
+
+Marker fields: `t`, optional `end`, `label` (words, OCR text), `id` (a name it
+also answers to: `line:hook`), `alt` (a word's spoken form), `value`
 (strength), `bbox` ([x, y, w, h]).

@@ -136,6 +136,12 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: false,
         },
         ToolDef {
+            name: "narration_import",
+            description: "Import narration from a manifest: one clip per line, each {id, audio, text, at?, pause?, words: [{text, start, end}] | chars: [{char, start, end}]} with the voice provider's timings (seconds from the clip's start). Script text is as shown (\"81\", \"U.S.\") and may carry [cue] markup (\"Over [strike]Iran.\", \"[map]a span[/map]\"). Builds the narration audio and the line (line:<id>), sentence, word (word:iran, also matched by its spoken form) and cue (cue:strike, cue:strike.end) marker tracks. Clips without `at` follow the previous one after `pause` (default 0.35 s; the first starts at `lead`, default 0.5 s). Unchanged clips (same audio, text and timings) are reused; re-importing after a script change moves everything referenced to the narration's markers. Reports timing problems (also errors in check): words with no time, out of order, outside the clip, or in silence. Time narrated pieces with cue:/word:/line: references, never literal seconds.",
+            schema: obj(json!({"manifest": {"type": "string", "description": "manifest JSON file"}}), &["manifest"]),
+            read_only: false,
+        },
+        ToolDef {
             name: "edit_apply",
             description: "Apply a batch of edit ops atomically as one undoable step: add, add_scene, set, remove, move, key, anchor, group, ungroup, add_sound (see lahza://schema and lahza://catalog). Sounds have ids too: set \"whoosh1.at\", remove \"whoosh1\". Returns created ids, the change summary and compile errors.",
             schema: obj(json!({"ops": {"type": "array", "items": {"type": "object"}}, "author": {"type": "string", "default": "agent"}}), &["ops"]),
@@ -329,6 +335,7 @@ impl Toolbox {
             "timeline_get" => self.timeline_get(&args),
             "markers_query" => self.markers_query(&args),
             "markers_import" => self.markers_import(&args),
+            "narration_import" => self.narration_import(&args),
             "edit_apply" => self.edit_apply(&args),
             "check" => self.check(&args),
             "snapshot" => self.snapshot(&args),
@@ -388,9 +395,14 @@ impl Toolbox {
         open.compiled.clone().unwrap()
     }
 
-    fn save(&mut self, dir: &Path, project: Project) -> Result<(), String> {
+    fn save(&mut self, dir: &Path, mut project: Project) -> Result<(), String> {
         io::save(dir, &project).map_err(|e| e.to_string())?;
         let open = self.state(dir);
+        // The narration lives in narration.json, owned by narration_import:
+        // edits made from project JSON do not carry it.
+        if project.narration.is_none() {
+            project.narration = open.project.narration.take();
+        }
         open.project = project;
         open.compiled = None;
         open.stamp = stamp(dir);
@@ -782,7 +794,13 @@ impl Toolbox {
                 .filter(|(_, m)| text.as_ref().is_none_or(|q| lahza_motion_core::markers::normalize(m.label.as_deref().unwrap_or("")).contains(q.as_str())))
                 .take(limit)
                 .map(|(i, m)| {
-                    let mut v = json!({"ref": format!("{name}:{}", i + 1), "t": round(m.t)});
+                    let mut v = json!({"ref": marker_ref(track, i), "t": round(m.t)});
+                    if let Some(id) = &m.id {
+                        v["id"] = json!(id);
+                    }
+                    if let Some(a) = &m.alt {
+                        v["alt"] = json!(a);
+                    }
                     if let Some(e) = m.end {
                         v["end"] = json!(round(e));
                     }
@@ -801,6 +819,115 @@ impl Toolbox {
             out.insert(name, Value::Array(list));
         }
         Ok(Output::json(Value::Object(out)))
+    }
+
+    fn narration_import(&mut self, args: &Value) -> ToolResult {
+        use lahza_motion_core::narration::{self as nar, Manifest, Narration, NarrationClip};
+        let dir = self.dir(args)?;
+        let file = self.file_in(&dir, get_str(args, "manifest").ok_or("narration_import needs \"manifest\"")?)?;
+        let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+        let base = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        let old = self.state(&dir).project.narration.clone().unwrap_or_default();
+        let project = self.state(&dir).project.clone();
+        let mut clips: Vec<NarrationClip> = Vec::new();
+        let (mut imported, mut reused) = (Vec::new(), Vec::new());
+        let mut cursor: Option<f64> = None;
+        for (n, mc) in manifest.clips.iter().enumerate() {
+            let id = mc.id.clone().unwrap_or_else(|| format!("line{}", n + 1));
+            if !lahza_motion_core::document::valid_id(&id) {
+                return Err(format!("clip id '{id}': letters, digits, '-' and '_' only"));
+            }
+            if clips.iter().any(|c| c.id == id) {
+                return Err(format!("clip id '{id}' is used twice"));
+            }
+            let audio = if Path::new(&mc.audio).is_absolute() { PathBuf::from(&mc.audio) } else { base.join(&mc.audio) };
+            let bytes = std::fs::read(&audio).map_err(|e| format!("line {id}: {}: {e}", audio.display()))?;
+            let audio_hash = sha_hex(&bytes);
+            let timed = match (&mc.words, &mc.chars) {
+                (Some(w), _) => w.clone(),
+                (None, Some(c)) => nar::chars_to_words(c),
+                (None, None) => {
+                    return Err(format!(
+                        "line {id} has no timings: give \"words\" or \"chars\" from the voice provider (tools/narration has adapters; a voice without timings needs an external aligner)"
+                    ))
+                }
+            };
+            let hash = sha_hex(format!("{audio_hash}\n{}\n{}", mc.text, serde_json::to_string(&timed).unwrap_or_default()).as_bytes());
+            let at = mc.at.unwrap_or_else(|| match cursor {
+                None => manifest.lead.unwrap_or(0.5),
+                Some(end) => end + mc.pause.or(manifest.pause).unwrap_or(0.35),
+            });
+            let gain_db = mc.gain_db.unwrap_or(0.0);
+            let clip = match old.clips.iter().find(|c| c.id == id && c.hash == hash && dir.join(&c.path).is_file()) {
+                Some(prev) => {
+                    reused.push(id.clone());
+                    NarrationClip { at, gain_db, ..prev.clone() }
+                }
+                None => {
+                    let ext = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav");
+                    let rel = format!("assets/narration/{id}-{}.{ext}", &audio_hash[..12]);
+                    let dest = dir.join(&rel);
+                    if !dest.is_file() {
+                        std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
+                        std::fs::write(&dest, &bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+                    }
+                    let (mut words, cues) = nar::build_clip(&mc.text, &timed).map_err(|e| format!("line {id}: {e}"))?;
+                    let samples = lahza_motion_audio::decode(&dest).map_err(|e| format!("line {id}: {e}"))?;
+                    let rate = lahza_motion_audio::SAMPLE_RATE as f64;
+                    word_loudness(&samples, rate, &mut words);
+                    imported.push(id.clone());
+                    NarrationClip { id: id.clone(), path: rel, text: mc.text.clone(), at, duration: samples.len() as f64 / rate, gain_db, words, cues, audio_hash, hash }
+                }
+            };
+            cursor = Some(clip.at + clip.duration);
+            clips.push(clip);
+        }
+        let narration = Narration { clips };
+        // Earlier takes of changed lines are no longer used.
+        let keep: Vec<&str> = narration.clips.iter().map(|c| c.path.as_str()).collect();
+        if let Ok(entries) = std::fs::read_dir(dir.join("assets/narration")) {
+            for e in entries.flatten() {
+                let rel = format!("assets/narration/{}", e.file_name().to_string_lossy());
+                if !keep.contains(&rel.as_str()) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        io::save_narration(&dir, &narration).map_err(|e| e.to_string())?;
+        let tracks = narration.tracks();
+        for t in &tracks {
+            io::save_track(&dir, t).map_err(|e| e.to_string())?;
+        }
+        let mut project = project;
+        project.audio.narration = narration
+            .clips
+            .iter()
+            .map(|c| AudioClip { id: Some(c.id.clone()), name: None, path: c.path.clone(), at: TimeRef::Seconds(c.at), trim: 0.0, gain_db: c.gain_db, length: None, fade_in: 0.0, fade_out: 0.0, duck_db: None })
+            .collect();
+        project.assets.retain(|a| !a.path.starts_with("assets/narration/") || keep.contains(&a.path.as_str()));
+        for c in &narration.clips {
+            if !project.assets.iter().any(|a| a.path == c.path) {
+                project.assets.push(Asset { path: c.path.clone(), source: "narration".into(), licence: "user-supplied".into(), credit: None });
+            }
+        }
+        for t in tracks.clone() {
+            project.markers.insert(t);
+        }
+        let issues: Vec<Value> = narration.validate().into_iter().map(|(clip, word, message)| json!({"line": clip, "word": word, "message": message})).collect();
+        let end = narration.clips.last().map(|c| c.at + c.duration).unwrap_or(0.0);
+        let summary = json!({
+            "lines": narration.clips.len(),
+            "imported": imported, "reused": reused,
+            "words": narration.clips.iter().map(|c| c.words.len()).sum::<usize>(),
+            "cues": tracks.iter().find(|t| t.name == "cue").map(|t| t.markers.iter().filter_map(|m| m.label.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+            "narration_ends": (end * 1000.0).round() / 1000.0,
+            "project_duration": project.settings.duration,
+            "issues": issues,
+        });
+        project.narration = Some(narration);
+        self.save(&dir, project)?;
+        Ok(Output::json(summary))
     }
 
     fn markers_import(&mut self, args: &Value) -> ToolResult {
@@ -1595,6 +1722,58 @@ fn animated_paths(v: &Value, prefix: &str, out: &mut Vec<String>) {
                 continue;
             }
             animated_paths(child, &format!("{prefix}.{k}"), out);
+        }
+    }
+}
+
+/// The reference to use for marker `i` of `track`: by name where that
+/// survives edits (`line:hook`, `cue:strike`, `word:iran@2`), else by index.
+fn marker_ref(track: &MarkerTrack, i: usize) -> String {
+    let name = &track.name;
+    let m = &track.markers[i];
+    if let Some(id) = &m.id {
+        return format!("{name}:{id}");
+    }
+    if matches!(name.as_str(), "cue" | "word") {
+        if let Some(label) = &m.label {
+            let key = lahza_motion_core::markers::normalize(label);
+            if !key.is_empty() && !key.contains(' ') && key.chars().all(|c| c.is_alphanumeric()) && !key.chars().all(|c| c.is_ascii_digit()) {
+                let n = track.markers[..=i].iter().filter(|o| o.label.as_deref().map(lahza_motion_core::markers::normalize).as_deref() == Some(key.as_str())).count();
+                return if n == 1 { format!("{name}:{key}") } else { format!("{name}:{key}@{n}") };
+            }
+        }
+    }
+    format!("{name}#{}", i + 1)
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Each word's loudest 10 ms, dB relative to the clip's speech level (the
+/// 90th percentile of its 10 ms frames).
+fn word_loudness(samples: &[f32], rate: f64, words: &mut [lahza_motion_core::narration::Word]) {
+    let hop = (rate * 0.01).round().max(1.0) as usize;
+    let db: Vec<f64> = samples
+        .chunks(hop)
+        .map(|c| {
+            let rms = (c.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / c.len() as f64).sqrt();
+            20.0 * rms.max(1e-6).log10()
+        })
+        .collect();
+    if db.is_empty() {
+        return;
+    }
+    let mut sorted = db.clone();
+    sorted.sort_by(f64::total_cmp);
+    let speech = sorted[(sorted.len() * 9 / 10).min(sorted.len() - 1)];
+    for w in words {
+        if let (Some(s), Some(e)) = (w.start, w.end) {
+            let a = ((s / 0.01).floor().max(0.0) as usize).min(db.len() - 1);
+            let b = ((e / 0.01).ceil() as usize).clamp(a + 1, db.len());
+            let peak = db[a..b].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            w.loud = Some(((peak - speech) * 10.0).round() / 10.0);
         }
     }
 }

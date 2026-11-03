@@ -133,7 +133,7 @@ pub fn catalog_json() -> Value {
         "time_references": [
             "2.5 (seconds)", "\"48f\"", "\"beat:17\"", "\"bar:5\"", "\"triplet:12\"", "\"half:3\"", "\"sixteenth:9\"",
             "\"hit:3\"", "\"stop:2\"", "\"drop:1\"", "\"onset.low:4\"", "\"music.start:1\"",
-            "\"word:borders\"", "\"word:borders@2\"", "\"word#42\"", "\"sentence#3.end\"",
+            "\"cue:strike\"", "\"cue:strike.end\"", "\"line:hook\"", "\"word:borders\"", "\"word:borders@2\"", "\"word:'81'\"", "\"word#42\"", "\"sentence#3.end\"",
             "\"#title.end + 0.25\"", "\"bar:5 - 2f\"", "\"beat:9 + 0.5b\""
         ],
         "durations": "number = seconds; strings: \"8f\" frames, \"0.25s\", \"120ms\", \"1b\" beats, \"1bar\"; lead: bare numbers are frames",

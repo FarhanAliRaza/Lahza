@@ -64,7 +64,8 @@ pub(crate) fn placed(project: &Project, compiled: &Compiled, dir: &Path) -> Vec<
     };
     let slots = [("music", project.audio.music.as_ref()), ("vo", project.audio.vo.as_ref())];
     let named = slots.into_iter().filter_map(|(slot, c)| c.map(|c| (c.id.clone().unwrap_or_else(|| slot.into()), c)));
-    for (id, clip) in named.chain(project.audio.sfx.iter().map(|c| (c.id.clone().unwrap_or_default(), c))) {
+    let lines = project.audio.narration.iter().map(|c| (c.id.clone().unwrap_or_default(), c));
+    for (id, clip) in named.chain(lines).chain(project.audio.sfx.iter().map(|c| (c.id.clone().unwrap_or_default(), c))) {
         let at = compiled.resolve(&project.markers, &clip.at).unwrap_or(0.0);
         let file = clip.path.rsplit('/').next().unwrap_or(&clip.path).to_string();
         let name = clip.name.clone().unwrap_or_else(|| if id.is_empty() { file } else { id.clone() });

@@ -58,7 +58,15 @@ pub fn load(dir: &Path) -> Result<Project> {
     }
     let mut project: Project = serde_json::from_value(doc).map_err(|e| err(&file, e))?;
     project.markers = load_markers(dir)?;
+    let narration = dir.join("narration.json");
+    if narration.is_file() {
+        project.narration = Some(serde_json::from_value(read_json(&narration)?).map_err(|e| err(&narration, e))?);
+    }
     Ok(project)
+}
+
+pub fn save_narration(dir: &Path, narration: &crate::narration::Narration) -> Result<()> {
+    write_json(&dir.join("narration.json"), narration)
 }
 
 pub fn load_markers(dir: &Path) -> Result<Markers> {

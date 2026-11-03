@@ -33,7 +33,7 @@ fn words_from_a_recording_anchor_layers() {
     let out = tb.call("markers_import", json!({"kind": "transcript", "path": "talk.lahzarec", "offset": 1.0})).unwrap();
     assert_eq!(out.json["imported"][0]["count"], 4);
     let words = tb.call("markers_query", json!({"track": "word", "text": "canal"})).unwrap().json;
-    assert_eq!(words["word"][0]["ref"], "word:2");
+    assert_eq!(words["word"][0]["ref"], "word:canal", "words are referred to by text, which survives edits");
     assert_eq!(words["word"][0]["t"], 1.7);
     let sentences = tb.call("markers_query", json!({"track": "sentence"})).unwrap().json;
     assert_eq!(sentences["sentence"].as_array().unwrap().len(), 2);
@@ -386,5 +386,71 @@ fn audio_files_import_as_sounds_and_paths_resolve_inside_the_project() {
     assert_eq!(out["path"], "input/whoosh.wav");
     let err = tb.call("sfx_add", json!({"sound": "input/missing.wav", "at": 0.5})).unwrap_err();
     assert!(err.contains("not a built-in sound") && err.contains("project"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn narration_manifest_times_everything_and_survives_a_new_hook() {
+    let (mut tb, dir) = toolbox("narration");
+    tb.call("project_create", json!({"path": "p", "duration": 10, "width": 320, "height": 180})).unwrap();
+    // "Speech": a tone where each word is, silence between words.
+    let tone = |name: &str, spans: &[(f64, f64)], total: f64| {
+        let expr = spans.iter().map(|(a, b)| format!("between(t,{a},{b})")).collect::<Vec<_>>().join("+");
+        let path = dir.join(name);
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("aevalsrc='0.5*sin(2*PI*220*t)*({expr})':s=22050:d={total}")])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    };
+    tone("a.wav", &[(0.1, 0.4), (0.5, 0.9), (1.2, 1.5), (1.6, 2.1)], 2.3);
+    tone("b.wav", &[(0.1, 0.5), (0.6, 1.4), (1.5, 1.9)], 2.0);
+    let words_a = json!([{"text": "One", "start": 0.1, "end": 0.4}, {"text": "bomb.", "start": 0.5, "end": 0.9},
+        {"text": "Over", "start": 1.2, "end": 1.5}, {"text": "Iran.", "start": 1.6, "end": 2.1}]);
+    let words_b = json!([{"text": "It", "start": 0.1, "end": 0.5}, {"text": "eighty-one", "start": 0.6, "end": 1.4}, {"text": "cities", "start": 1.5, "end": 1.9}]);
+    let manifest = |clips: serde_json::Value| {
+        std::fs::write(dir.join("narration.json"), json!({"lead": 0.5, "pause": 0.4, "clips": clips}).to_string()).unwrap();
+    };
+    let a = json!({"id": "s01", "audio": "a.wav", "text": "One bomb. Over [strike]Iran.", "words": words_a});
+    let b = json!({"id": "s02", "audio": "b.wav", "text": "It hits 81 cities.", "words": words_b});
+    manifest(json!([a, b]));
+    let out = tb.call("narration_import", json!({"manifest": "narration.json"})).unwrap().json;
+    assert_eq!(out["lines"], 2, "{out:#}");
+    // "hits" was never spoken: an error, with the line and the word.
+    assert_eq!(out["issues"].as_array().unwrap().len(), 1, "{out:#}");
+    assert!(out["issues"][0]["word"].as_str().unwrap().contains("hits"), "{out:#}");
+    let markers = |tb: &mut crate::tools::Toolbox, track: &str| tb.call("markers_query", json!({"track": track})).unwrap().json;
+    let cue = markers(&mut tb, "cue");
+    assert_eq!(cue["cue"][0]["t"], 2.1, "line s01 starts at 0.5; Iran at 1.6: {cue:#}");
+    let words = markers(&mut tb, "word");
+    let w81 = words["word"].as_array().unwrap().iter().find(|m| m["label"] == "81").unwrap().clone();
+    assert_eq!(w81["alt"], "eighty-one");
+    // s02 follows s01 (ends 0.5 + 2.3) after the 0.4 s pause.
+    assert_eq!(w81["t"], 3.8, "{w81:#}");
+    // A word in silence is caught without listening.
+    let mut late = words_a.clone();
+    late[1]["start"] = json!(0.95);
+    late[1]["end"] = json!(1.15);
+    manifest(json!([{"id": "s01", "audio": "a.wav", "text": "One bomb. Over [strike]Iran.", "words": late}, b]));
+    let out = tb.call("narration_import", json!({"manifest": "narration.json"})).unwrap().json;
+    assert_eq!(out["reused"], json!(["s02"]), "unchanged lines are reused: {out:#}");
+    assert!(out["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().unwrap().contains("silence")), "{out:#}");
+    let report = tb.call("check", json!({})).unwrap().json;
+    assert!(report["errors"].as_u64().unwrap() >= 2, "narration problems are errors in check: {report:#}");
+    // A layer timed to the cue; then a hook line goes in front.
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}, {"op": "add", "id": "flash", "kind": "shape", "shape": "rect", "time": {"start": "cue:strike", "end": "cue:strike.end + 0.5"}}]})).unwrap();
+    tone("h.wav", &[(0.1, 0.5), (0.6, 1.0)], 1.2);
+    let hook = json!({"id": "hook", "audio": "h.wav", "text": "What if?", "words": [{"text": "What", "start": 0.1, "end": 0.5}, {"text": "if", "start": 0.6, "end": 1.0}]});
+    manifest(json!([hook, a, b]));
+    let out = tb.call("narration_import", json!({"manifest": "narration.json"})).unwrap().json;
+    // The hook is new and s01 went back to its first timings; s02 is reused.
+    assert_eq!(out["imported"], json!(["hook", "s01"]), "{out:#}");
+    assert_eq!(out["reused"], json!(["s02"]), "{out:#}");
+    let cue = markers(&mut tb, "cue");
+    // hook 0.5–1.7, pause 0.4: s01 at 2.1, Iran at 2.1 + 1.6.
+    assert_eq!(cue["cue"][0]["t"], 3.7, "{cue:#}");
+    assert_eq!(markers(&mut tb, "line")["line"][0]["id"], "hook");
     std::fs::remove_dir_all(&dir).ok();
 }

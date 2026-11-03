@@ -19,6 +19,12 @@ pub struct Marker {
     /// Box in pixels [x, y, w, h] (OCR, clicks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bbox: Option<[f64; 4]>,
+    /// A name it also answers to (`line:hook` for the line with id "hook").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Another form of the label: a word as spoken ("eighty-one" for "81").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -97,11 +103,17 @@ impl Markers {
                     .iter()
                     .map(|m| normalize(m.label.as_deref().unwrap_or("")))
                     .collect();
+                // Spoken forms compare without spaces or hyphens.
+                let compact = |s: &str| crate::narration::normal(s);
+                let wanted_compact = compact(text);
                 let mut found = 0;
                 for i in 0..t.markers.len() {
+                    let m = &t.markers[i];
                     // A label may hold a whole phrase (OCR) or one word; a
                     // multi-word query also matches consecutive word markers.
                     let matched = labels[i] == wanted
+                        || m.id.as_deref() == Some(text.as_str())
+                        || m.alt.as_deref().is_some_and(|a| !wanted_compact.is_empty() && compact(a) == wanted_compact)
                         || words > 1
                             && labels[i].contains(&wanted)
                         || words > 1
