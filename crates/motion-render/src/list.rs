@@ -16,7 +16,7 @@ use lahza_motion_core::path::{self, morph, trim_measured};
 use lahza_motion_core::space::Proj;
 use lahza_motion_core::compile::{Affine, Content, EffectState, FieldState, FrameState, LayerState, PaintState, PostKind, ShapeState, TextState};
 use lahza_motion_core::document::{Blend, Gradient, GradientKind, GradientUnits, LineCap, LineJoin, MatteMode, ShapeKind, StrokeAlign, StrokeStyle};
-use lahza_motion_core::value::{Color, Vec2};
+use lahza_motion_core::value::Color;
 
 pub const TILE: u32 = 16;
 
@@ -1407,7 +1407,11 @@ fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mu
     }
     if let Some((color, width)) = s.stroke {
         let (t0, t1) = (s.trim.x().clamp(0.0, 1.0), s.trim.y().clamp(0.0, 1.0));
-        let along = s.stroke_gradient.as_deref();
+        // Feathers fade along the path's length (every subpath, any curve):
+        // a solid stroke with feathers is a one-colour gradient along it.
+        let feathered = s.stroke_style.as_deref().is_some_and(|st| st.feather > 0.0 || st.feather_start > 0.0);
+        let solid = [(0.0, color), (1.0, color)];
+        let along = s.stroke_gradient.as_deref().map(|g| g.as_slice()).or(feathered.then_some(&solid[..]));
         if width > 0.0 && (color.0[3] > 0.0 || along.is_some()) && t1 > t0 {
             let measured = trim_measured(&subpaths, t0, t1);
             let lines: Vec<Vec<(f64, f64)>> = measured.iter().map(|l| l.iter().map(|(p, _)| *p).collect()).collect();
@@ -1427,13 +1431,7 @@ fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mu
                     let mut prim = Prim { kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_FILL], geom2: [f32::from_bits(first), f32::from_bits(count), 0.0, 0.0], ..Default::default() };
                     match (centreline, &along_stops) {
                         (Some(c), Some(a)) => set_along(&mut prim, c, a, stops),
-                        _ => {
-                            let paint = match feather_gradient(&lines, style, color) {
-                                Some(g) => PaintState::Gradient(std::sync::Arc::new(g)),
-                                None => PaintState::Solid(color),
-                            };
-                            set_fill(&mut prim, &paint, stops, b);
-                        }
+                        _ => set_fill(&mut prim, &PaintState::Solid(color), stops, b),
                     }
                     add(prim, b, 0.0);
                 }
@@ -1560,52 +1558,6 @@ fn stroke_outline(lines: &[Vec<(f64, f64)>], width: f64, style: &StrokeStyle, to
     });
     polys.retain(|p| p.len() >= 3);
     polys
-}
-
-/// The point `distance` px back from the end of `pts` (or its start when
-/// the line is shorter).
-fn back_along(pts: &[(f64, f64)], distance: f64) -> (f64, f64) {
-    let mut left = distance;
-    for w in pts.windows(2).rev() {
-        let l = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
-        if l >= left && l > 0.0 {
-            let k = left / l;
-            return (w[1].0 + (w[0].0 - w[1].0) * k, w[1].1 + (w[0].1 - w[1].1) * k);
-        }
-        left -= l;
-    }
-    pts[0]
-}
-
-/// Opacity ramps for `feather` (far end) and `feather_start` (start) as a
-/// linear gradient. One ramp follows the stroke's direction where it fades;
-/// both together ramp along the line from start to end.
-fn feather_gradient(lines: &[Vec<(f64, f64)>], style: &StrokeStyle, color: Color) -> Option<Gradient> {
-    let clear = Color([color.0[0], color.0[1], color.0[2], 0.0]);
-    let first = lines.first()?;
-    let last = lines.last()?;
-    let (start, end) = (*first.first()?, *last.last()?);
-    let linear = |from: (f64, f64), to: (f64, f64), stops| Gradient { kind: GradientKind::Linear, from: Vec2::new(from.0, from.1), to: Vec2::new(to.0, to.1), stops, units: GradientUnits::Layer };
-    match (style.feather_start > 0.0, style.feather > 0.0) {
-        (false, false) => None,
-        (false, true) => {
-            let from = back_along(last, style.feather);
-            (from != end).then(|| linear(from, end, vec![(0.0, color), (1.0, clear)]))
-        }
-        (true, false) => {
-            let reversed: Vec<(f64, f64)> = first.iter().rev().copied().collect();
-            let to = back_along(&reversed, style.feather_start);
-            (to != start).then(|| linear(start, to, vec![(0.0, clear), (1.0, color)]))
-        }
-        (true, true) => {
-            let length = ((end.0 - start.0).powi(2) + (end.1 - start.1).powi(2)).sqrt();
-            (length > 0.0).then(|| {
-                let a = (style.feather_start / length).min(0.5);
-                let b = (1.0 - style.feather / length).max(a);
-                linear(start, end, vec![(0.0, clear), (a, color), (b, color), (1.0, clear)])
-            })
-        }
-    }
 }
 
 /// Sets a solid or gradient fill; `bbox` (local [x0, y0, x1, y1]) is the

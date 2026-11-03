@@ -1527,7 +1527,7 @@ fn benchmark_feathered_trimmed_path() {
         .join(" ");
     let mut p = Project::new(1080, 1920, Fps::whole(30), 1.0);
     p.scenes.push(serde_json::from_value(json!({"id": "s", "layers": [
-        {"id": "route", "kind": "shape", "shape": "path", "d": d, "stroke": {"color": "#ff4040", "width": 8, "feather": 120, "gradient": {"stops": [[0, "#ff4040"], [1, "#40a0ff"]], "along": "length"}},
+        {"id": "route", "kind": "shape", "shape": "path", "d": d, "stroke": {"color": "#ff4040", "width": 8, "feather": 120, "feather_start": 40},
          "trim": [0, 0.85], "transform": {"position": [540, 960]}}]})).unwrap());
     let c = Compiled::new(&p);
     let mut r = cpu();
@@ -1594,5 +1594,18 @@ fn defocused_cards_keep_their_depth() {
     let sum = |img: &image::RgbaImage| (60..110).flat_map(|y| (110..210).map(move |x| (x, y))).map(|(x, y)| px(img, x, y)[0] as u64).sum::<u64>();
     let (a, b) = (sum(&sharp), sum(&soft));
     assert!(b as f64 > 0.8 * a as f64, "defocused word lost to the floor: {b} vs {a}");
+    assert_gpu_matches_cpu(&p, &[0.0]);
+}
+
+/// A feather fades along the path's length: on a path of two lines only the
+/// end of the second fades, not whatever lies past a straight ramp.
+#[test]
+fn feathers_fade_along_every_subpath() {
+    let p = project(json!([{"id": "p", "kind": "shape", "shape": "path", "d": "M 20 60 H 300 M 300 120 H 20",
+                            "stroke": {"color": "#ffffff", "width": 16, "cap": "butt", "feather": 60}}]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    assert_eq!(px(&img, 40, 60)[0], 255, "the first line is whole");
+    assert_eq!(px(&img, 200, 120)[0], 255, "the second line before its feather");
+    assert!(px(&img, 24, 120)[0] < 40, "the end of the second line fades: {:?}", px(&img, 24, 120));
     assert_gpu_matches_cpu(&p, &[0.0]);
 }
