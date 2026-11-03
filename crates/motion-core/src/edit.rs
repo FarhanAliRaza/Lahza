@@ -20,6 +20,8 @@
 //! {"op": "add_sound", "id": "whoosh1", "path": "assets/sfx/whoosh.wav", "at": "#title.start - 4f", "gain_db": -6}
 //! {"op": "set", "target": "whoosh1.at", "value": "beat:9"}
 //! {"op": "remove", "id": "whoosh1"}
+//! {"op": "insert_time", "at": 0, "duration": 5}
+//! {"op": "shift", "ids": ["s07", "map"], "by": "12f"}
 //! ```
 
 use crate::document::{valid_id, Project};
@@ -29,6 +31,8 @@ use serde_json::{json, Map, Value};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Applied {
     pub project: Project,
+    /// `insert_time` moved markers or the narration: save them too.
+    pub markers_changed: bool,
     /// Ops that undo this batch, in order.
     pub inverse: Vec<Value>,
     /// Ids created by `add`, `add_scene` and `group`, in op order.
@@ -41,6 +45,9 @@ pub struct Applied {
 
 pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
     let mut doc = serde_json::to_value(project).map_err(|e| e.to_string())?;
+    let base = time_base(project);
+    // Time inserted (at, duration), applied to markers and narration below.
+    let mut ripples: Vec<(f64, f64)> = Vec::new();
     let mut inverse = Vec::new();
     let mut created = Vec::new();
     let mut changed = Vec::new();
@@ -58,9 +65,11 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
             "group" => op_group(&mut doc, op, &mut created),
             "ungroup" => op_ungroup(&mut doc, op),
             "add_sound" => op_add_sound(&mut doc, op, &mut created),
+            "insert_time" => op_insert_time(&mut doc, op, &base, &mut ripples),
+            "shift" => op_shift(&mut doc, op, &base),
             "" => Err("op needs an \"op\" field".into()),
             other => Err(format!(
-                "unknown op '{other}': use add, add_scene, set, remove, move, key, anchor, group, ungroup"
+                "unknown op '{other}': use add, add_scene, set, remove, move, key, anchor, group, ungroup, add_sound, insert_time, shift"
             )
             .into()),
         };
@@ -71,9 +80,14 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
     }
     let mut next: Project = serde_json::from_value(doc).map_err(|e| format!("result is not a valid project: {e}"))?;
     next.markers = project.markers.clone();
+    next.narration = project.narration.clone();
+    let markers_changed = !ripples.is_empty();
+    for (at, d) in ripples {
+        ripple_markers(&mut next, project, at, d);
+    }
     changed.sort();
     changed.dedup();
-    Ok(Applied { project: next, inverse, created, changed, summary })
+    Ok(Applied { project: next, markers_changed, inverse, created, changed, summary })
 }
 
 type OpResult = Result<(Vec<Value>, Vec<String>, String)>;
@@ -784,5 +798,346 @@ mod tests {
         assert_eq!(b.project.scenes[0].layers.len(), 1);
         let back = apply(&b.project, &b.inverse).unwrap();
         assert_eq!(back.project, a.project);
+    }
+}
+
+// ------------------------------------------------------------ time edits
+
+fn time_base(project: &Project) -> crate::time::TimeBase {
+    let mut base = crate::time::TimeBase::new(project.settings.fps);
+    base.beat = project.markers.get("beat").and_then(|t| t.median_interval());
+    base.bar = project.markers.get("bar").and_then(|t| t.median_interval());
+    base
+}
+
+fn seconds_arg(op: &Value, key: &str, base: &crate::time::TimeBase) -> Result<f64> {
+    let v = op.get(key).ok_or_else(|| format!("needs \"{key}\""))?;
+    let d = match v {
+        Value::Number(n) => crate::time::Duration::Seconds(n.as_f64().unwrap_or(0.0)),
+        Value::String(s) => crate::time::Duration::parse(s)?,
+        _ => bail!("\"{key}\" is a time in seconds or \"12f\""),
+    };
+    d.seconds(base)
+}
+
+/// A literal time in the document: seconds, or "48f"/"2s" (frames are
+/// kept as frames when the shift is whole frames). References (markers,
+/// `#id`, beats) are None: they resolve on their own.
+fn literal_time(v: &Value, base: &crate::time::TimeBase) -> Option<(f64, bool)> {
+    match v {
+        Value::Number(n) => Some((n.as_f64()?, false)),
+        Value::String(s) => match crate::timeref::parse(s).ok()? {
+            crate::timeref::Parsed { base: crate::timeref::Base::Seconds(t), offsets } if offsets.is_empty() => Some((t, false)),
+            crate::timeref::Parsed { base: crate::timeref::Base::Duration(d), offsets } if offsets.is_empty() => match d {
+                crate::time::Duration::Frames(_) => Some((d.seconds(base).ok()?, true)),
+                crate::time::Duration::Seconds(t) => Some((t, false)),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn write_time(v: &mut Value, t: f64, frames: bool, base: &crate::time::TimeBase) {
+    let f = t / base.fps.frame();
+    *v = if frames && (f - f.round()).abs() < 1e-6 {
+        json!(format!("{}f", f.round()))
+    } else {
+        json!((t * 1e6).round() / 1e6)
+    };
+}
+
+/// Moves the time in `v` by `d` when `keep(t)`; returns whether it moved.
+fn move_time(v: &mut Value, d: f64, base: &crate::time::TimeBase, keep: &dyn Fn(f64) -> bool) -> bool {
+    match literal_time(v, base) {
+        Some((t, frames)) if keep(t) => {
+            write_time(v, t + d, frames, base);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Seconds a `time.offset` / `pre_roll` duration stands for (0 when absent).
+fn duration_secs(v: Option<&Value>, base: &crate::time::TimeBase) -> Result<f64> {
+    let Some(v) = v else { return Ok(0.0) };
+    let d = match v {
+        Value::Number(n) => crate::time::Duration::Seconds(n.as_f64().unwrap_or(0.0)),
+        Value::String(s) => crate::time::Duration::parse(s)?,
+        Value::Null => return Ok(0.0),
+        _ => bail!("bad duration {v}"),
+    };
+    d.seconds(base)
+}
+
+/// Every literal time in a layer list. `k`: local time = timeline + k (a
+/// scene's pre-roll, minus the offsets of enclosing comps). `when(t)` is
+/// asked with the timeline time.
+fn layers_times(layers: &mut Value, k: f64, d: f64, base: &crate::time::TimeBase, when: &dyn Fn(f64) -> bool, n: &mut usize) -> Result<()> {
+    let Some(list) = layers.as_array_mut() else { return Ok(()) };
+    for layer in list {
+        layer_times(layer, k, d, base, when, n)?;
+    }
+    Ok(())
+}
+
+fn layer_times(layer: &mut Value, k: f64, d: f64, base: &crate::time::TimeBase, when: &dyn Fn(f64) -> bool, n: &mut usize) -> Result<()> {
+    let at_local = |t: f64| when(t - k);
+    if let Some(time) = layer.get_mut("time").and_then(Value::as_object_mut) {
+        for f in ["start", "end"] {
+            if let Some(v) = time.get_mut(f) {
+                *n += move_time(v, d, base, &at_local) as usize;
+            }
+        }
+    }
+    let offset = duration_secs(layer.get("time").and_then(|t| t.get("offset")), base)?;
+    if let Some(obj) = layer.as_object_mut() {
+        for (key, v) in obj.iter_mut() {
+            match key.as_str() {
+                "layers" => layers_times(v, k - offset, d, base, when, n)?,
+                "time" | "follow" | "id" => {}
+                _ => any_times(v, k, d, base, when, n),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `at` fields anywhere below (keys, animators, effects).
+fn any_times(v: &mut Value, k: f64, d: f64, base: &crate::time::TimeBase, when: &dyn Fn(f64) -> bool, n: &mut usize) {
+    match v {
+        Value::Object(o) => {
+            for (key, child) in o.iter_mut() {
+                if key == "at" || key == "t" {
+                    *n += move_time(child, d, base, &|t| when(t - k)) as usize;
+                } else if key != "follow" && key != "layers" {
+                    any_times(child, k, d, base, when, n);
+                }
+            }
+        }
+        Value::Array(a) => {
+            for child in a {
+                any_times(child, k, d, base, when, n);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scene_times(scene: &mut Value, d: f64, base: &crate::time::TimeBase, when: &dyn Fn(f64) -> bool, n: &mut usize) -> Result<()> {
+    for f in ["start", "end"] {
+        if let Some(v) = scene.get_mut(f) {
+            *n += move_time(v, d, base, when) as usize;
+        }
+    }
+    let pre_roll = duration_secs(scene.get("pre_roll"), base)?;
+    if let Some(cam) = scene.get_mut("camera") {
+        any_times(cam, pre_roll, d, base, when, n);
+    }
+    if let Some(layers) = scene.get_mut("layers") {
+        layers_times(layers, pre_roll, d, base, when, n)?;
+    }
+    Ok(())
+}
+
+fn sounds_times(doc: &mut Value, d: f64, base: &crate::time::TimeBase, when: &dyn Fn(f64) -> bool, n: &mut usize) {
+    let Some(audio) = doc.get_mut("audio").and_then(Value::as_object_mut) else { return };
+    for (key, v) in audio.iter_mut() {
+        let clips: Vec<&mut Value> = match (key.as_str(), v) {
+            ("music" | "vo", v @ Value::Object(_)) => vec![v],
+            (_, Value::Array(list)) => list.iter_mut().collect(),
+            _ => Vec::new(),
+        };
+        for clip in clips {
+            if let Some(at) = clip.get_mut("at") {
+                *n += move_time(at, d, base, when) as usize;
+            }
+        }
+    }
+}
+
+/// Inserts `duration` of time at `at`: everything timed at or after `at`
+/// (by a literal time: seconds or frames) moves later. Scenes, layers,
+/// keys, animators, effects, sounds, the project length, marker tracks
+/// and the narration ripple; references resolve on their own.
+fn op_insert_time(doc: &mut Value, op: &Value, base: &crate::time::TimeBase, ripples: &mut Vec<(f64, f64)>) -> OpResult {
+    let at = seconds_arg(op, "at", base)?;
+    let d = seconds_arg(op, "duration", base)?;
+    // Negative durations are the undo of an insert (exact there); asked
+    // for directly they would fold later times onto earlier ones.
+    if d <= 0.0 && op.get("undo").and_then(Value::as_bool) != Some(true) {
+        bail!("insert_time needs a positive \"duration\"");
+    }
+    let when = |t: f64| t >= at - 1e-9;
+    let mut n = 0;
+    if let Some(scenes) = doc.get_mut("scenes").and_then(Value::as_array_mut) {
+        for scene in scenes {
+            scene_times(scene, d, base, &when, &mut n)?;
+        }
+    }
+    sounds_times(doc, d, base, &when, &mut n);
+    if let Some(dur) = doc.pointer_mut("/settings/duration") {
+        if let Some(v) = dur.as_f64() {
+            if v > at {
+                *dur = json!(((v + d).max(at) * 1e6).round() / 1e6);
+            }
+        }
+    }
+    ripples.push((at, d));
+    let inverse = vec![json!({"op": "insert_time", "at": at + d, "duration": -d, "undo": true})];
+    Ok((inverse, Vec::new(), format!("inserted {d:.3} s at {at:.3} s ({n} times moved)")))
+}
+
+/// Moves elements in time by `by`: scenes (with their layers), layers
+/// (with their keys and children) and sounds, by id.
+fn op_shift(doc: &mut Value, op: &Value, base: &crate::time::TimeBase) -> OpResult {
+    let by = seconds_arg(op, "by", base)?;
+    let ids: Vec<String> = match op.get("ids") {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => bail!("shift needs \"ids\": a list of scene, layer or sound ids"),
+    };
+    let all = |_: f64| true;
+    let mut n = 0;
+    for id in &ids {
+        let (ptr, _, _) = find(doc, id).ok_or_else(|| format!("no element '{id}'"))?;
+        let el = doc.pointer_mut(&ptr).ok_or_else(|| format!("no element '{id}'"))?;
+        if ptr.starts_with("/audio") {
+            if let Some(at) = el.get_mut("at") {
+                n += move_time(at, by, base, &all) as usize;
+            }
+        } else if ptr.matches("/layers/").count() == 0 && ptr.starts_with("/scenes/") {
+            scene_times(el, by, base, &all, &mut n)?;
+        } else {
+            layer_times(el, 0.0, by, base, &all, &mut n)?;
+        }
+    }
+    let inverse = vec![json!({"op": "shift", "ids": ids, "by": -by})];
+    Ok((inverse, ids.clone(), format!("shifted {} by {by:.3} s ({n} times moved)", ids.join(", "))))
+}
+
+/// Marker tracks and the narration follow inserted time. Music analysis
+/// tracks move only with the music; the narration is re-derived.
+fn ripple_markers(next: &mut Project, before: &Project, at: f64, d: f64) {
+    const MUSIC: [&str; 9] = ["beat", "bar", "half", "sixteenth", "triplet", "hit", "stop", "drop", "music.start"];
+    let music_moved = before.audio.music.as_ref().is_some_and(|m| matches!(m.at, crate::timeref::TimeRef::Seconds(t) if t >= at - 1e-9));
+    let narration_tracks = ["line", "sentence", "word", "cue"];
+    let has_narration = next.narration.is_some();
+    for track in next.markers.tracks.values_mut() {
+        let music = MUSIC.contains(&track.name.as_str()) || track.name.starts_with("onset") || track.name == "music.end";
+        if music && !music_moved || has_narration && narration_tracks.contains(&track.name.as_str()) {
+            continue;
+        }
+        for m in &mut track.markers {
+            if music || m.t >= at - 1e-9 {
+                m.t += d;
+                if let Some(e) = &mut m.end {
+                    *e += d;
+                }
+            } else if let Some(e) = &mut m.end {
+                // A marker spanning the insert grows.
+                if *e >= at - 1e-9 {
+                    *e += d;
+                }
+            }
+        }
+    }
+    if let Some(narration) = &mut next.narration {
+        for clip in &mut narration.clips {
+            if clip.at >= at - 1e-9 {
+                clip.at += d;
+            }
+        }
+        for t in narration.tracks() {
+            next.markers.insert(t);
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+    use crate::time::Fps;
+
+    fn base() -> Project {
+        let mut p = Project::new(1920, 1080, Fps::whole(30), 10.0);
+        p.scenes.push(crate::document::Scene::new("s1"));
+        p
+    }
+
+    #[test]
+    fn insert_time_ripples_literal_times_and_undoes_exactly() {
+        let mut p = Project::new(1920, 1080, Fps::whole(30), 20.0);
+        p.markers.insert(crate::markers::MarkerTrack::from_times("beat", (0..40).map(|i| i as f64 * 0.5)));
+        p.markers.insert(crate::markers::MarkerTrack { name: "user".into(), source: Some("user".into()), markers: vec![
+            crate::markers::Marker { t: 1.0, ..Default::default() }, crate::markers::Marker { t: 6.0, ..Default::default() }] });
+        let doc = json!({"scenes": [
+            {"id": "a", "start": 0, "layers": [
+                {"id": "early", "kind": "shape", "shape": "rect", "time": {"start": 0.5, "end": 3.0},
+                 "transform": {"opacity": {"keys": [{"at": 0.5, "v": 0}, {"at": "60f", "v": 1}, {"at": "beat:3", "v": 0.5}]}}}]},
+            {"id": "b", "start": 4.0, "pre_roll": 0.5, "layers": [
+                {"id": "late", "kind": "shape", "shape": "rect", "time": {"start": "#early.end + 0.25"},
+                 "transform": {"position": {"keys": [{"at": 4.6, "v": [0, 0]}, {"at": 6.0, "v": [100, 0]}]}}},
+                {"id": "box", "kind": "comp", "time": {"start": 5.0, "offset": 3.0}, "layers": [
+                    {"id": "inner", "kind": "shape", "shape": "circle", "transform": {"scale": {"keys": [{"at": 1.0, "v": [1, 1]}, {"at": 3.0, "v": [2, 2]}]}}}]},
+                {"id": "path", "kind": "shape", "shape": "path", "d": "M 0 0 L 100 0"},
+                {"id": "rider", "kind": "shape", "shape": "circle", "follow": {"layer": "path", "at": 0.5}}]}]});
+        let mut p2: Project = serde_json::from_value(json!({"settings": serde_json::to_value(&p.settings).unwrap(), "scenes": doc["scenes"]})).unwrap();
+        p2.markers = p.markers.clone();
+        let p = apply(&p2, &[
+            json!({"op": "add_sound", "path": "a.wav", "id": "boom", "at": 4.5}),
+            json!({"op": "add_sound", "path": "b.wav", "id": "tick", "at": 1.0}),
+            json!({"op": "add_sound", "kind": "music", "path": "m.wav"}),
+        ]).unwrap().project;
+        let a = apply(&p, &[json!({"op": "insert_time", "at": 2.0, "duration": 5})]).unwrap();
+        let q = &a.project;
+        let v = serde_json::to_value(q).unwrap();
+        let early = &v["scenes"][0]["layers"][0];
+        assert_eq!(early["time"]["start"], 0.5, "before the insert: stays");
+        assert_eq!(early["time"]["end"], 8.0, "a layer spanning the insert grows");
+        assert_eq!(early["transform"]["opacity"]["keys"][1]["at"], "210f", "frames stay frames: 60f + 150f");
+        assert_eq!(early["transform"]["opacity"]["keys"][2]["at"], "beat:3", "references are left alone");
+        assert_eq!(v["scenes"][1]["start"], 9.0);
+        let late = &v["scenes"][1]["layers"][0];
+        // Scene b's layers run 0.5 s ahead (pre-roll): 4.6 is timeline 4.1.
+        assert_eq!(late["transform"]["position"]["keys"][0]["at"], 9.6);
+        let inner = &v["scenes"][1]["layers"][1]["layers"][0];
+        // Inside the comp (offset 3, pre-roll 0.5): local 1.0 is timeline 3.5.
+        assert_eq!(inner["transform"]["scale"]["keys"][0]["at"], 6.0);
+        assert_eq!(v["scenes"][1]["layers"][1]["time"]["start"], 10.0);
+        assert_eq!(v["scenes"][1]["layers"][3]["follow"]["at"], 0.5, "a follow position is not a time");
+        assert_eq!(q.audio.sfx[0].at, crate::timeref::TimeRef::Seconds(9.5));
+        assert_eq!(q.audio.sfx[1].at, crate::timeref::TimeRef::Seconds(1.0));
+        assert_eq!(q.settings.duration, 25.0);
+        // The music starts at 0 and does not move, nor does its beat grid;
+        // the user's marker after the insert does.
+        assert_eq!(q.markers.get("beat").unwrap().markers[3].t, 1.5);
+        assert_eq!(q.markers.get("user").unwrap().markers.iter().map(|m| m.t).collect::<Vec<_>>(), vec![1.0, 11.0]);
+        assert!(a.markers_changed);
+        // Undo is exact.
+        let undone = apply(q, &a.inverse).unwrap().project;
+        assert_eq!(serde_json::to_value(&undone).unwrap(), serde_json::to_value(&p).unwrap());
+        assert_eq!(undone.markers, p.markers);
+        assert!(apply(&p, &[json!({"op": "insert_time", "at": 2.0, "duration": -1})]).is_err());
+    }
+
+    #[test]
+    fn shift_moves_elements_with_everything_in_them() {
+        let p = base();
+        let p = apply(&p, &[
+            json!({"op": "add", "scene": "s1", "id": "card", "kind": "shape", "shape": "rect", "time": {"start": 2.0, "end": 4.0},
+                   "transform": {"opacity": {"keys": [{"at": 2.0, "v": 0}, {"at": 2.5, "v": 1}]}}}),
+            json!({"op": "add_sound", "path": "a.wav", "id": "pop", "at": 2.0}),
+        ]).unwrap().project;
+        let a = apply(&p, &[json!({"op": "shift", "ids": ["card", "pop"], "by": "15f"})]).unwrap();
+        let v = serde_json::to_value(&a.project).unwrap();
+        let card = &v["scenes"][0]["layers"][0];
+        assert_eq!(card["time"]["start"], 2.5);
+        assert_eq!(card["transform"]["opacity"]["keys"][1]["at"], 3.0);
+        assert_eq!(a.project.audio.sfx[0].at, crate::timeref::TimeRef::Seconds(2.5));
+        let undone = apply(&a.project, &a.inverse).unwrap().project;
+        assert_eq!(serde_json::to_value(&undone).unwrap(), serde_json::to_value(&p).unwrap());
     }
 }

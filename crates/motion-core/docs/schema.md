@@ -409,6 +409,24 @@ narration answer to `music` and `vo`. Built-in effects (`sfx_add`):
 whoosh, whoosh-out, swipe, pop, click, tick, type, thud, hit, boom, riser,
 ding, sparkle, glitch.
 
+## Time edits
+
+`{"op": "insert_time", "at": 0, "duration": 5}` makes room at `at`:
+every literal time at or after it (seconds or `"48f"`) moves later. That
+covers:
+- scene starts and ends, and layer `time.start` and `time.end`;
+- keys, text animators and effects, read in each scene's and comp's own
+  time (`pre_roll`, `time.offset`);
+- sounds, the project length, user and transcript markers, and the
+  narration;
+- music analysis tracks, but only when the music itself moves.
+
+References (`word:…`, `#id.end`, `beat:…`) are not rewritten: they move with
+what they point at. A layer spanning `at` grows. The op undoes exactly.
+
+`{"op": "shift", "ids": ["s07", "pop1"], "by": "-6f"}` moves scenes, layers
+or sounds, with every literal time inside them, by `by`.
+
 ## Markers
 
 `markers/<track>.json`:

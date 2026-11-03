@@ -143,7 +143,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "edit_apply",
-            description: "Apply a batch of edit ops atomically as one undoable step: add, add_scene, set, remove, move, key, anchor, group, ungroup, add_sound (see lahza://schema and lahza://catalog). Sounds have ids too: set \"whoosh1.at\", remove \"whoosh1\". Returns created ids, the change summary and compile errors.",
+            description: "Apply a batch of edit ops atomically as one undoable step: add, add_scene, set, remove, move, key, anchor, group, ungroup, add_sound, insert_time {at, duration} (ripples every literal time at or after `at`: scenes, layers, keys, animators, sounds, markers, narration; references move on their own), shift {ids, by} (moves scenes, layers or sounds with everything in them) (see lahza://schema and lahza://catalog). Sounds have ids too: set \"whoosh1.at\", remove \"whoosh1\". Returns created ids, the change summary and compile errors.",
             schema: obj(json!({"ops": {"type": "array", "items": {"type": "object"}}, "author": {"type": "string", "default": "agent"}}), &["ops"]),
             read_only: false,
         },
@@ -406,6 +406,21 @@ impl Toolbox {
         open.project = project;
         open.compiled = None;
         open.stamp = stamp(dir);
+        Ok(())
+    }
+
+    /// Marker tracks and the narration, when an edit moved them
+    /// (`insert_time`).
+    fn save_markers(&mut self, dir: &Path, applied: &edit::Applied) -> Result<(), String> {
+        if !applied.markers_changed {
+            return Ok(());
+        }
+        for track in applied.project.markers.tracks.values() {
+            io::save_track(dir, track).map_err(|e| e.to_string())?;
+        }
+        if let Some(n) = &applied.project.narration {
+            io::save_narration(dir, n).map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
@@ -987,6 +1002,7 @@ impl Toolbox {
         let author = get_str(args, "author").unwrap_or("agent").to_string();
         let applied = edit::apply(&self.state(&dir).project, &ops).map_err(|e| e.to_string())?;
         let n = io::next_history_number(&dir).map_err(|e| e.to_string())?;
+        self.save_markers(&dir, &applied)?;
         self.save(&dir, applied.project)?;
         io::write_history(&dir, &HistoryEntry {
             n,
@@ -1544,6 +1560,7 @@ impl Toolbox {
             // Redo = revert the most recent undo that is still in effect.
             let undo = entries.iter().rev().find(|e| !e.undoes.is_empty() && !e.undone).ok_or("nothing to redo")?;
             let applied = edit::apply(&self.state(&dir).project, &undo.inverse).map_err(|e| format!("redo failed (the project changed in a conflicting way): {e}"))?;
+            self.save_markers(&dir, &applied)?;
             self.save(&dir, applied.project)?;
             let mut u = undo.clone();
             u.undone = true;
@@ -1568,6 +1585,7 @@ impl Toolbox {
             let ops: Vec<Value> = targets.iter().flat_map(|e| e.inverse.iter().cloned()).collect();
             let applied = edit::apply(&self.state(&dir).project, &ops).map_err(|e| format!("undo failed (the project changed in a conflicting way): {e}"))?;
             let n = io::next_history_number(&dir).map_err(|e| e.to_string())?;
+            self.save_markers(&dir, &applied)?;
             self.save(&dir, applied.project)?;
             for e in &targets {
                 let mut e = (*e).clone();
