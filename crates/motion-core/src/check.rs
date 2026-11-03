@@ -730,8 +730,11 @@ pub fn sync_check(project: &Project, compiled: &Compiled, options: &SyncOptions)
             continue;
         }
         // The piece's start is not a sync point; layers appearing with a
-        // cut are part of it.
-        if e.reference.is_none() && (e.t < half || e.kind == EventKind::Appear && cuts.iter().any(|c| (c - e.t).abs() < half)) {
+        // cut are part of it, and a component's generated children
+        // (`counter/v12`, one per displayed value) appearing is the
+        // component working, not an event of its own.
+        let generated = e.kind == EventKind::Appear && e.element.contains('/');
+        if e.reference.is_none() && (generated || e.t < half || e.kind == EventKind::Appear && cuts.iter().any(|c| (c - e.t).abs() < half)) {
             continue;
         }
         // The authored point, measured as `check` measures it.
@@ -806,6 +809,8 @@ mod tests {
                 // Authored against hit 2 (a stepped clock is aligned to it).
                 {"id": "stepped", "kind": "shape", "shape": "rect", "fill": "#fff", "time": {"step_fps": 2},
                  "transform": {"scale": {"keys": [{"at": 0, "v": [1, 1]}, {"at": "hit:2", "v": [2, 2], "dur": "6f", "anchor": "land"}]}}},
+                // A counter: its values appearing are not events.
+                {"id": "count", "kind": "component", "component": "counter", "params": {"from": 0, "to": 30, "at": 1.0, "dur": 1.0}},
                 // Appears on hit 2; a colour jump (hold) at 3 s.
                 {"id": "pop", "kind": "shape", "shape": "rect", "time": {"start": "hit:2"},
                  "fill": {"keys": [{"at": 2.2, "v": "#ff0000"}, {"at": 3.0, "v": "#00ff00", "ease": "hold"}]}}
@@ -828,6 +833,7 @@ mod tests {
         assert_eq!((pop.reference.as_deref(), pop.flag, pop.drift_frames), (Some("hit:2"), None, Some(0.0)));
         let jump = find("pop", EventKind::Jump);
         assert_eq!((jump.t, jump.flag), (3.0, Some("unsynced")));
+        assert!(!r.events.iter().any(|e| e.element.starts_with("count/") && e.kind == EventKind::Appear), "{r:#?}");
         // Layers starting with the scene are part of its cut.
         assert!(!r.events.iter().any(|e| e.element == "on" && e.kind == EventKind::Appear));
         assert_eq!((r.drift, r.unsynced), (0, 2), "{:#?}", r.events.iter().filter(|e| e.flag.is_some()).collect::<Vec<_>>());
