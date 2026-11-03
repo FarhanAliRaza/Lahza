@@ -394,42 +394,50 @@ fn read_video(v: &mut Video, index: i64) -> Option<(Arc<image::RgbaImage>, bool)
     image::RgbaImage::from_raw(v.w, v.h, buf).map(|i| (Arc::new(i), seeked))
 }
 
-/// Premultiplies `img` into `pool` with a 2×2 box mip chain.
+/// Premultiplies `img` into `pool` with a 2×2 box mip chain. Runs once
+/// per decoded frame, so it stays in 8-bit integers (opaque video, the
+/// common case, is copied as is).
 fn place(pool: &mut Vec<u32>, img: &image::RgbaImage) -> Texture {
     let (w, h) = img.dimensions();
     let offset = pool.len() as u32;
-    let mut level: Vec<[f32; 4]> = img
-        .pixels()
-        .map(|p| {
-            let a = p.0[3] as f32 / 255.0;
-            [p.0[0] as f32 * a, p.0[1] as f32 * a, p.0[2] as f32 * a, p.0[3] as f32]
-        })
-        .collect();
-    let (mut lw, mut lh) = (w, h);
-    let mut levels = 0;
-    loop {
-        pool.extend(level.iter().map(|c| pack(c.map(|v| (v + 0.5).clamp(0.0, 255.0) as u8))));
-        levels += 1;
-        if lw == 1 && lh == 1 || levels == 12 {
-            break;
+    pool.reserve((w as usize * h as usize) * 4 / 3 + 16);
+    let mut start = pool.len();
+    pool.extend(img.as_raw().chunks_exact(4).map(|p| {
+        let a = p[3] as u32;
+        if a == 255 {
+            pack([p[0], p[1], p[2], 255])
+        } else {
+            let m = |v: u8| ((v as u32 * a + 127) / 255) as u8;
+            pack([m(p[0]), m(p[1]), m(p[2]), a as u8])
         }
+    }));
+    let (mut lw, mut lh) = (w, h);
+    let mut levels = 1;
+    let mut next = Vec::new();
+    while !(lw == 1 && lh == 1) && levels < 12 {
         let (nw, nh) = ((lw / 2).max(1), (lh / 2).max(1));
-        let mut next = vec![[0.0f32; 4]; (nw * nh) as usize];
+        next.clear();
+        next.reserve((nw * nh) as usize);
+        let level = &pool[start..start + (lw * lh) as usize];
         for y in 0..nh {
+            let (r0, r1) = ((y * 2).min(lh - 1) * lw, (y * 2 + 1).min(lh - 1) * lw);
             for x in 0..nw {
-                let mut acc = [0.0; 4];
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let p = level[((y * 2 + dy).min(lh - 1) * lw + (x * 2 + dx).min(lw - 1)) as usize];
-                    for k in 0..4 {
-                        acc[k] += p[k] * 0.25;
-                    }
+                let (c0, c1) = ((x * 2).min(lw - 1), (x * 2 + 1).min(lw - 1));
+                let q = [level[(r0 + c0) as usize], level[(r0 + c1) as usize], level[(r1 + c0) as usize], level[(r1 + c1) as usize]];
+                let mut out = 0u32;
+                for k in 0..4 {
+                    let sh = k * 8;
+                    let sum: u32 = q.iter().map(|v| (v >> sh) & 255).sum();
+                    out |= ((sum + 2) >> 2) << sh;
                 }
-                next[(y * nw + x) as usize] = acc;
+                next.push(out);
             }
         }
-        level = next;
+        start = pool.len();
+        pool.extend_from_slice(&next);
         lw = nw;
         lh = nh;
+        levels += 1;
     }
     Texture { offset, width: w, height: h, levels }
 }

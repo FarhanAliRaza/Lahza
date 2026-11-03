@@ -1495,11 +1495,24 @@ impl Compiled {
 
     /// A whole scene as one group with its background, for transitions.
     fn scene_group(&self, scene: &CScene, t: f64, matrix: Affine, opacity: f64) -> LayerState {
+        self.scene_group_bg(scene, t, matrix, opacity, 1.0)
+    }
+
+    /// `bg` scales the scene's background about the canvas centre, so a
+    /// scene drawn smaller than the canvas still fills the frame with its
+    /// own background colour.
+    fn scene_group_bg(&self, scene: &CScene, t: f64, matrix: Affine, opacity: f64, bg: f64) -> LayerState {
         let matrix = Proj::from(matrix);
         let (w, h) = (self.settings.width as f64, self.settings.height as f64);
-        let mut layers = vec![canvas_rect(&format!("{}-background", scene.id), w, h, scene.background)];
+        let mut background = canvas_rect(&format!("{}-background", scene.id), (w * bg).ceil(), (h * bg).ceil(), scene.background);
+        background.matrix = Affine::translate(w / 2.0, h / 2.0).into();
+        let mut layers = vec![background];
         self.scene_layers(scene, t, &mut layers);
         LayerState { id: scene.id.clone(), matrix, opacity, blend: Blend::Normal, effects: Vec::new(), matte: None, content: Content::Group(layers), view: None }
+    }
+
+    fn scene_group_layers(&self, id: &str, layers: Vec<LayerState>) -> LayerState {
+        LayerState { id: id.into(), matrix: Proj::from(Affine::IDENTITY), opacity: 1.0, blend: Blend::Normal, effects: Vec::new(), matte: None, content: Content::Group(layers), view: None }
     }
 
     fn transition(&self, a: &CScene, b: &CScene, tr: &CTransition, p: f64, ta: f64, tb: f64) -> Vec<LayerState> {
@@ -1528,19 +1541,41 @@ impl Compiled {
                 self.scene_group(a, ta, id, 1.0),
                 self.scene_group(b, tb, shift(p - 1.0), 1.0),
             ],
-            TransitionKind::Zoom => vec![
-                self.scene_group(a, ta, about_centre(4f64.powf(p)), (1.0 - p).clamp(0.0, 1.0)),
-                self.scene_group(b, tb, about_centre(0.5f64.powf(1.0 - p)), p.clamp(0.0, 1.0)),
-            ],
+            TransitionKind::Zoom => {
+                // The incoming scene grows from half size; its background
+                // is drawn large enough to fill the frame the whole time,
+                // so no hard-edged box or border shows around it.
+                let k = 0.5f64.powf(1.0 - p);
+                vec![
+                    self.scene_group(a, ta, about_centre(4f64.powf(p)), (1.0 - p).clamp(0.0, 1.0)),
+                    self.scene_group_bg(b, tb, about_centre(k), p.clamp(0.0, 1.0), 1.0 / k + 0.02),
+                ]
+            }
             TransitionKind::Whip => {
+                // One blur over both scenes together, like a camera whip:
+                // the edge where they meet smears instead of staying sharp.
                 let sigma = 120.0 * p * (1.0 - p) * (w / 1920.0);
-                let mut ga = self.scene_group(a, ta, shift(p), 1.0);
-                let mut gb = self.scene_group(b, tb, behind(p), 1.0);
                 if sigma > 0.3 {
-                    ga.effects.push(EffectState::Blur { sigma, repeat_edges: true });
-                    gb.effects.push(EffectState::Blur { sigma, repeat_edges: true });
+                    // The renderer blurs at reduced resolution (a texel is
+                    // `q` canvas px; see `factor_for` in motion-render's
+                    // list.rs). Snapping the offset to that grid puts the
+                    // seam on a texel edge, so no partly covered texel lets
+                    // a covered background bleed into the smear.
+                    let factor = if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
+                    let len = if dx != 0.0 { w } else { h };
+                    let q = len / (len / factor).ceil();
+                    let at = |k: f64| ((dx * k / q).round() * q, (dy * k / q).round() * q);
+                    let (sx, sy) = at(p);
+                    let pair = vec![
+                        self.scene_group(a, ta, Affine::translate(sx, sy), 1.0),
+                        self.scene_group(b, tb, Affine::translate(sx - dx, sy - dy), 1.0),
+                    ];
+                    let mut g = self.scene_group_layers(&format!("{}-whip", b.id), pair);
+                    g.effects.push(EffectState::Blur { sigma, repeat_edges: true });
+                    vec![g]
+                } else {
+                    vec![self.scene_group(a, ta, shift(p), 1.0), self.scene_group(b, tb, behind(p), 1.0)]
                 }
-                vec![ga, gb]
             }
             TransitionKind::Wipe => {
                 // The revealed part grows from the edge opposite `direction`.

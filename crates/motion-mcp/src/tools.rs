@@ -560,7 +560,7 @@ impl Toolbox {
                 }
             }
         } else {
-            let abs = self.path(sound);
+            let abs = self.file_in(&dir, sound).map_err(|e| format!("sfx_add: '{sound}' is not a built-in sound (see lahza://sfx) and {e}"))?;
             match (abs.strip_prefix(&dir), &rec) {
                 (Ok(r), _) => r.to_string_lossy().into_owned(),
                 (Err(_), Some(rec)) if abs.starts_with(rec) => recording::shared_path(&dir, rec, &abs).ok_or("bad path")?,
@@ -1754,7 +1754,7 @@ impl Toolbox {
         let dir = self.dir(args)?;
         let path = get_str(args, "path").ok_or("media_import needs \"path\"")?;
         let copy = args.get("copy").and_then(Value::as_bool).unwrap_or(true);
-        let abs = self.path(path);
+        let abs = if path.contains('#') { self.path(path) } else { self.file_in(&dir, path)? };
         // Sequences: "shot_####.png" or a folder of frames.
         let (rel, probe_src) = if path.contains('#') || abs.is_dir() {
             let folder = if abs.is_dir() { abs.clone() } else { abs.parent().map(Path::to_path_buf).unwrap_or_default() };
@@ -1788,21 +1788,43 @@ impl Toolbox {
             (rel.clone(), rel)
         };
         let mut footage = lahza_motion_render::footage::Footage::new(Some(&dir));
-        let info = footage.info(&probe_src).ok_or_else(|| format!("cannot read '{probe_src}' as footage: {}", footage.warnings.join("; ")))?;
-        let mut project = self.state(&dir).project.clone();
-        if !project.assets.iter().any(|a| a.path == rel) {
-            project.assets.push(Asset {
-                path: rel.clone(),
-                source: get_str(args, "source").unwrap_or("user").into(),
-                licence: get_str(args, "licence").unwrap_or("user-supplied").into(),
-                credit: None,
-            });
-            self.save(&dir, project)?;
-        }
+        let audio_ext = Path::new(&probe_src)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "aiff", "aif"].contains(&e.to_ascii_lowercase().as_str()));
+        let info = if audio_ext { None } else { footage.info(&probe_src) };
+        let Some(info) = info else {
+            // Audio-only files are sounds, not layers.
+            let samples = lahza_motion_audio::decode(&dir.join(&probe_src))
+                .map_err(|e| format!("cannot read '{probe_src}' as footage ({}) or as audio ({e})", footage.warnings.join("; ")))?;
+            self.register_asset(&dir, &rel, args)?;
+            let duration = samples.len() as f64 / lahza_motion_audio::SAMPLE_RATE as f64;
+            return Ok(Output::json(json!({
+                "src": rel, "kind": "audio", "info": {"duration": (duration * 1000.0).round() / 1000.0},
+                "use": format!("audio is a sound, not a layer: sfx_add {{\"sound\": \"{rel}\", \"at\": …}}, or the add_sound / set_music edit ops with \"path\": \"{rel}\""),
+                "op": {"op": "add_sound", "path": rel, "at": 0},
+            })));
+        };
+        self.register_asset(&dir, &rel, args)?;
         Ok(Output::json(json!({
             "src": rel, "info": info,
             "layer": {"kind": "video", "src": rel, "transform": {"position": [self.state(&dir).project.settings.width / 2, self.state(&dir).project.settings.height / 2]}},
         })))
+    }
+
+    /// Records an imported file in the project's asset list (once).
+    fn register_asset(&mut self, dir: &Path, rel: &str, args: &Value) -> Result<(), String> {
+        let mut project = self.state(dir).project.clone();
+        if !project.assets.iter().any(|a| a.path == rel) {
+            project.assets.push(Asset {
+                path: rel.to_string(),
+                source: get_str(args, "source").unwrap_or("user").into(),
+                licence: get_str(args, "licence").unwrap_or("user-supplied").into(),
+                credit: None,
+            });
+            self.save(dir, project)?;
+        }
+        Ok(())
     }
 
     fn blender_run(&mut self, args: &Value) -> ToolResult {
@@ -2025,6 +2047,20 @@ impl Toolbox {
             Some(dir) if !abs.exists() && dir.join(p).exists() => dir.join(p),
             _ => abs,
         }
+    }
+
+    /// A file named for project `dir`: absolute, relative to the working
+    /// folder, or (when that does not exist) relative to the project.
+    fn file_in(&self, dir: &Path, p: &str) -> Result<PathBuf, String> {
+        let abs = self.path(p);
+        if abs.exists() {
+            return Ok(abs);
+        }
+        let inside = dir.join(p);
+        if inside.exists() {
+            return Ok(inside.canonicalize().unwrap_or(inside));
+        }
+        Err(format!("no file '{p}': looked in {} and in the project {}", self.cwd.display(), dir.display()))
     }
 
     fn track(&mut self, args: &Value) -> ToolResult {

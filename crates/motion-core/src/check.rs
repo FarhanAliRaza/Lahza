@@ -204,7 +204,7 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
         }
         if n % layout_every == 0 {
             let mut text_boxes: Vec<(&str, [f64; 4])> = Vec::new();
-            for layer in &frame.layers {
+            for (i, layer) in frame.layers.iter().enumerate() {
                 if let Content::Mesh(m) = &layer.content {
                     for message in m.params.adjustments() {
                         if mesh_reported.insert(format!("{}:{message}", layer.id)) {
@@ -232,9 +232,20 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
                     }
                     text_boxes.push((&layer.id, b));
                     if let Content::Text(tx) = &layer.content {
-                        let ratio = contrast(tx.color.luminance(), frame.background.luminance());
-                        if ratio < 3.0 && contrast_reported.insert(layer.id.to_string()) {
-                            issues.push(issue(Severity::Warning, "layout", Some(&layer.id), Some(t), format!("text contrast against the background is {ratio:.1}:1 (aim for at least 3:1)")));
+                        // Measured against what is right behind the text:
+                        // a button or card under it, else the background.
+                        let centre = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+                        let below = &frame.layers[..i];
+                        let behind = match backdrop(below, centre, options.measure) {
+                            Hit::Color(c) => Some((c, "the shape behind it")),
+                            Hit::Miss => Some((frame.background, "the background")),
+                            Hit::Unknown => None,
+                        };
+                        if let Some((under, what)) = behind {
+                            let ratio = contrast(tx.color.luminance(), under.luminance());
+                            if ratio < 3.0 && contrast_reported.insert(layer.id.to_string()) {
+                                issues.push(issue(Severity::Warning, "layout", Some(&layer.id), Some(t), format!("text contrast against {what} is {ratio:.1}:1 (aim for at least 3:1)")));
+                            }
                         }
                     }
                 }
@@ -399,6 +410,53 @@ fn same_picture(a: &FrameState, b: &FrameState) -> bool {
 
 /// Canvas bounds of shapes and images from their geometry; text through
 /// the measure callback.
+enum Hit {
+    /// Nothing there: the background shows.
+    Miss,
+    /// A solid shape.
+    Color(crate::value::Color),
+    /// Footage, an image, a gradient… no single colour to measure against.
+    Unknown,
+}
+
+/// What is painted at point `p` by the topmost of `layers` covering it.
+fn backdrop(layers: &[LayerState], p: (f64, f64), measure: Option<Measure>) -> Hit {
+    for layer in layers.iter().rev() {
+        if layer.opacity < 0.5 {
+            continue;
+        }
+        if let Content::Group(children) = &layer.content {
+            let kids: Vec<LayerState> = children
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.matrix = layer.matrix.then(c.matrix);
+                    c.opacity *= layer.opacity;
+                    c
+                })
+                .collect();
+            match backdrop(&kids, p, measure) {
+                Hit::Miss => continue,
+                hit => return hit,
+            }
+        }
+        let Some(b) = bounds(layer, measure) else { continue };
+        if !(b[0] <= p.0 && p.0 <= b[2] && b[1] <= p.1 && p.1 <= b[3]) {
+            continue;
+        }
+        return match &layer.content {
+            Content::Shape(s) => match &s.fill {
+                Some(crate::compile::PaintState::Solid(c)) if c.0[3] >= 0.5 => Hit::Color(*c),
+                Some(crate::compile::PaintState::Solid(_)) | None => continue,
+                Some(_) => Hit::Unknown,
+            },
+            // Text behind text, footage, images, meshes: unknown colour.
+            _ => Hit::Unknown,
+        };
+    }
+    Hit::Miss
+}
+
 pub fn bounds(layer: &LayerState, measure: Option<Measure>) -> Option<[f64; 4]> {
     let (hw, hh) = match &layer.content {
         Content::Group(children) => {
@@ -569,5 +627,27 @@ mod tests {
             "d": {"keys": (0..12).map(|i| serde_json::json!({"at": i as f64 * 3.0 / 30.0, "v": polygon(i % 3)})).collect::<Vec<_>>()}}));
         let issues = tracing_issues(layers);
         assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn text_contrast_is_measured_against_the_shape_behind_it() {
+        let mut p = Project::new(640, 360, Fps::whole(30), 1.0);
+        p.settings.background = crate::value::Color::parse("#15171c").unwrap();
+        p.scenes.push(serde_json::from_value(serde_json::json!({"id": "s1", "background": "#15171c", "layers": [
+            {"id": "button", "kind": "shape", "shape": "capsule", "size": [300, 80], "fill": "#ffd400", "transform": {"position": [320, 120]}},
+            {"id": "cta", "kind": "text", "text": "Try free", "color": "#15171c", "transform": {"position": [320, 120]}},
+            {"id": "lost", "kind": "text", "text": "dark on dark", "color": "#202228", "transform": {"position": [320, 260]}}
+        ]}))
+        .unwrap());
+        let c = Compiled::new(&p);
+        // Text boxes: 200 × 40 around each text's position.
+        let measure = |l: &LayerState| {
+            let (x, y) = l.matrix.apply(0.0, 0.0);
+            Some([x - 100.0, y - 20.0, x + 100.0, y + 20.0])
+        };
+        let r = check(&p, &c, &Options { measure: Some(&measure), ..Default::default() });
+        let contrast: Vec<_> = r.issues.iter().filter(|i| i.message.contains("contrast")).collect();
+        assert!(!contrast.iter().any(|i| i.element.as_deref() == Some("cta")), "dark text on a yellow button reads fine: {contrast:?}");
+        assert!(contrast.iter().any(|i| i.element.as_deref() == Some("lost") && i.message.contains("the background")), "{contrast:?}");
     }
 }

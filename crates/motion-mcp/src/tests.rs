@@ -367,3 +367,24 @@ fn compare_says_when_ours_is_flatter_than_a_lit_reference() {
     assert!(same["scenes"][0]["shading_ratio"].is_null(), "{same:#}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn audio_files_import_as_sounds_and_paths_resolve_inside_the_project() {
+    let (mut tb, dir) = toolbox("audio-import");
+    tb.call("project_create", json!({"path": "p", "duration": 2, "width": 320, "height": 180})).unwrap();
+    // A sound that lives inside the project, named relative to it (the
+    // server's working folder is elsewhere).
+    std::fs::create_dir_all(dir.join("p.lahza/input")).unwrap();
+    let wav = dir.join("p.lahza/input/whoosh.wav");
+    assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=0.5"]).arg(&wav).status().unwrap().success());
+    let imported = tb.call("media_import", json!({"path": "input/whoosh.wav"})).unwrap().json;
+    assert_eq!(imported["kind"], "audio");
+    assert_eq!(imported["src"], "input/whoosh.wav");
+    assert!((imported["info"]["duration"].as_f64().unwrap() - 0.5).abs() < 0.02, "{imported}");
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
+    let out = tb.call("sfx_add", json!({"sound": "input/whoosh.wav", "at": 0.5})).unwrap().json;
+    assert_eq!(out["path"], "input/whoosh.wav");
+    let err = tb.call("sfx_add", json!({"sound": "input/missing.wav", "at": 0.5})).unwrap_err();
+    assert!(err.contains("not a built-in sound") && err.contains("project"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}

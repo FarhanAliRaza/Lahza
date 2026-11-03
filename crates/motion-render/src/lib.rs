@@ -88,6 +88,16 @@ pub struct Renderer {
     last: Option<(Vec<u8>, RgbaImage)>,
     pub stats: Stats,
     threads: usize,
+    /// CPU frame buffers, kept between frames: a fresh 33 MB buffer per
+    /// 1080p frame costs more in page faults than drawing into it.
+    scratch: Scratch,
+}
+
+#[derive(Default)]
+struct Scratch {
+    accum: Vec<[f32; 4]>,
+    groups: Vec<[f32; 4]>,
+    target: Vec<[f32; 4]>,
 }
 
 impl Renderer {
@@ -111,6 +121,7 @@ impl Renderer {
             last: None,
             stats: Stats::default(),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            scratch: Scratch::default(),
         }
     }
 
@@ -215,24 +226,31 @@ impl Renderer {
         let main = lists[0].main();
         let (w, h) = (main.width as usize, main.height as usize);
         let weight = 1.0 / lists.len() as f32;
-        let mut accum = vec![[0.0f32; 4]; w * h];
+        let Scratch { accum, groups, target } = &mut self.scratch;
+        // One sample writes every pixel; several add up into a cleared sum.
+        accum.resize(w * h, [0.0; 4]);
+        if lists.len() > 1 {
+            accum.fill([0.0; 4]);
+        }
         for list in lists {
-            let mut groups = vec![[0.0f32; 4]; list.group_texels as usize];
+            // Every group is drawn in full before it is read.
+            groups.resize(list.group_texels as usize, [0.0; 4]);
             for g in &list.groups {
                 let n = (g.target.width * g.target.height) as usize;
                 // Outer groups sample inner ones, so draw into a scratch
                 // buffer and copy it in place.
-                let mut target = vec![[0.0f32; 4]; n];
-                let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic, ops: &list.ops };
-                raster::raster(list, &g.target, &src, &mut target, raster::Write::Replace, self.threads);
-                groups[g.offset as usize..g.offset as usize + n].copy_from_slice(&target);
-                raster::blur(&mut groups, g.offset as usize, g.target.width as usize, g.target.height as usize, g.sigma, g.clamp, self.threads);
+                target.resize(n, [0.0; 4]);
+                let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups, footage: &self.footage.dynamic, ops: &list.ops };
+                raster::raster(list, &g.target, &src, &mut target[..n], raster::Write::Replace, self.threads);
+                groups[g.offset as usize..g.offset as usize + n].copy_from_slice(&target[..n]);
+                raster::blur(groups, g.offset as usize, g.target.width as usize, g.target.height as usize, g.sigma, g.clamp, self.threads);
             }
-            let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups: &groups, footage: &self.footage.dynamic, ops: &list.ops };
-            raster::raster(list, &list.main(), &src, &mut accum, raster::Write::Accumulate(weight), self.threads);
+            let src = raster::Sources { atlas: &self.fonts.atlas, images: &self.images.texels, groups, footage: &self.footage.dynamic, ops: &list.ops };
+            let write = if lists.len() == 1 { raster::Write::Replace } else { raster::Write::Accumulate(weight) };
+            raster::raster(list, &main, &src, accum, write, self.threads);
         }
         let mut out = vec![0u8; w * h * 4];
-        raster::resolve(&accum, &mut out);
+        raster::resolve(accum, &mut out, self.threads);
         out
     }
 

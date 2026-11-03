@@ -291,37 +291,51 @@ fn unpack(v: u32) -> [f32; 4] {
     [(v & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, ((v >> 16) & 255) as f32 / 255.0, ((v >> 24) & 255) as f32 / 255.0]
 }
 
-fn image_texel(src: &Sources, source: u32, offset: u32, w: i32, h: i32, x: i32, y: i32) -> [f32; 4] {
-    let i = (offset as i32 + y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize;
-    match source {
-        1 => src.groups[i],
-        2 => unpack(src.footage[i]),
-        _ => unpack(src.images[i]),
-    }
+/// `x.floor()` without a libm call (the baseline x86-64 target has no
+/// rounding instruction, so `floorf` is a function call per use).
+#[inline(always)]
+fn floor_fast(x: f32) -> f32 {
+    let t = x as i32 as f32;
+    if t > x { t - 1.0 } else { t }
 }
 
+#[inline(always)]
 fn sample_image(src: &Sources, prim: &Prim, l: V2) -> [f32; 4] {
     let source = prim.kind[1];
     let mut offset = prim.geom2[0].to_bits();
     let (mut w, mut h) = (prim.geom[0] as i32, prim.geom[1] as i32);
     let levels = prim.geom[2] as i32;
-    let aa = prim.inv_x[3];
-    let lod = (aa.max(1.0).log2().floor() as i32).clamp(0, levels - 1);
-    for _ in 0..lod {
-        offset += (w * h) as u32;
-        w = (w / 2).max(1);
-        h = (h / 2).max(1);
+    // Mip level: only images have more than one (groups and footage are
+    // drawn near their own size).
+    let mut k = 1.0;
+    if levels > 1 {
+        let aa = prim.inv_x[3];
+        let lod = (aa.max(1.0).log2().floor() as i32).clamp(0, levels - 1);
+        for _ in 0..lod {
+            offset += (w * h) as u32;
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        k = (1u32 << lod) as f32;
     }
-    let k = (1u32 << lod) as f32;
     let s = [l[0] / k - 0.5, l[1] / k - 0.5];
-    let x0 = s[0].floor();
-    let y0 = s[1].floor();
+    let x0 = floor_fast(s[0]);
+    let y0 = floor_fast(s[1]);
     let (fx, fy) = (s[0] - x0, s[1] - y0);
     let (x0, y0) = (x0 as i32, y0 as i32);
-    let a = image_texel(src, source, offset, w, h, x0, y0);
-    let b = image_texel(src, source, offset, w, h, x0 + 1, y0);
-    let c = image_texel(src, source, offset, w, h, x0, y0 + 1);
-    let d = image_texel(src, source, offset, w, h, x0 + 1, y0 + 1);
+    // Clamped rows and columns, then one fetch per texel.
+    let (xa, xb) = (x0.clamp(0, w - 1), (x0 + 1).clamp(0, w - 1));
+    let (ya, yb) = (y0.clamp(0, h - 1) * w, (y0 + 1).clamp(0, h - 1) * w);
+    let base = offset as usize;
+    let at = |i: i32| -> [f32; 4] {
+        let i = base + i as usize;
+        match source {
+            1 => src.groups[i],
+            2 => unpack(src.footage[i]),
+            _ => unpack(src.images[i]),
+        }
+    };
+    let (a, b, c, d) = (at(ya + xa), at(ya + xb), at(yb + xa), at(yb + xb));
     mix4(mix4(a, b, fx), mix4(c, d, fx), fy)
 }
 
@@ -797,26 +811,62 @@ pub fn raster(list: &DisplayList, target: &Target, src: &Sources, out: &mut [[f3
 fn raster_band(list: &DisplayList, target: &Target, src: &Sources, ty: u32, band: &mut [[f32; 4]], write: Write) {
     let w = target.width;
     let rows = (band.len() as u32) / w;
+    // One tile at a time, one primitive at a time across the tile: the
+    // primitive's data stays hot and flat images take a tight loop.
+    let mut tile = [[0.0f32; 4]; (TILE * TILE) as usize];
     for tx in 0..target.tiles_x {
-        let tile = target.range_base + ty * target.tiles_x + tx;
-        let start = list.ranges[tile as usize * 2] as usize;
-        let count = list.ranges[tile as usize * 2 + 1] as usize;
+        let t = target.range_base + ty * target.tiles_x + tx;
+        let start = list.ranges[t as usize * 2] as usize;
+        let count = list.ranges[t as usize * 2 + 1] as usize;
         let indices = &list.indices[start..start + count];
-        for y in 0..rows {
-            for x in tx * TILE..((tx + 1) * TILE).min(w) {
-                let p = [x as f32 + 0.5, (ty * TILE + y) as f32 + 0.5];
-                let mut c = target.background;
-                for &i in indices {
-                    let prim = &list.prims[i as usize];
-                    let s = if prim.kind[0] == PRIM_MESH { crate::mesh3d::shade_mesh(prim, p, &list.mesh, &list.bins, src.groups) } else { shade(prim, p, &list.stops, &list.segments, src) };
-                    if s[3] > 0.0 {
-                        c = blend(c, s, prim.kind[2]);
+        let x0 = tx * TILE;
+        let cols = TILE.min(w - x0);
+        let y0 = ty * TILE;
+        let n = (rows * TILE) as usize;
+        // Only normal blending: composite front to back and stop once the
+        // whole tile is opaque, so what is hidden (backgrounds under a
+        // window, shadows under the card that casts them) costs nothing.
+        let front = indices.iter().all(|&i| list.prims[i as usize].kind[2] == 0);
+        tile[..n].fill(if front { [0.0; 4] } else { target.background });
+        let order: &mut dyn Iterator<Item = &u32> = if front { &mut indices.iter().rev() } else { &mut indices.iter() };
+        for &i in order {
+            let prim = &list.prims[i as usize];
+            let done = ((prim.kind[0] == PRIM_IMAGE || prim.kind[0] == PRIM_MATTE) && image_tile(prim, src, &mut tile, x0, y0, cols, rows, front))
+                || (prim.kind[0] == PRIM_SHAPE && solid_tile(prim, &list.segments, &mut tile, x0, y0, cols, rows, front));
+            if !done {
+                for y in 0..rows {
+                    for x in 0..cols {
+                        let p = [(x0 + x) as f32 + 0.5, (y0 + y) as f32 + 0.5];
+                        let c = &mut tile[(y * TILE + x) as usize];
+                        if front && c[3] >= OPAQUE {
+                            continue;
+                        }
+                        let s = if prim.kind[0] == PRIM_MESH { crate::mesh3d::shade_mesh(prim, p, &list.mesh, &list.bins, src.groups) } else { shade(prim, p, &list.stops, &list.segments, src) };
+                        if s[3] > 0.0 {
+                            *c = if front { under(*c, s) } else { blend(*c, s, prim.kind[2]) };
+                        }
                     }
                 }
-                let o = &mut band[(y * w + x) as usize];
-                match write {
-                    Write::Replace => *o = c,
-                    Write::Accumulate(k) => {
+            }
+            if front && (0..rows).all(|y| tile[(y * TILE) as usize..(y * TILE + cols) as usize].iter().all(|c| c[3] >= OPAQUE)) {
+                break;
+            }
+        }
+        if front {
+            let bg = target.background;
+            for y in 0..rows {
+                for c in &mut tile[(y * TILE) as usize..(y * TILE + cols) as usize] {
+                    *c = under(*c, bg);
+                }
+            }
+        }
+        for y in 0..rows {
+            let row = &mut band[(y * w + x0) as usize..(y * w + x0 + cols) as usize];
+            let from = &tile[(y * TILE) as usize..(y * TILE + cols) as usize];
+            match write {
+                Write::Replace => row.copy_from_slice(from),
+                Write::Accumulate(k) => {
+                    for (o, c) in row.iter_mut().zip(from) {
                         for i in 0..4 {
                             o[i] += c[i] * k;
                         }
@@ -825,6 +875,191 @@ fn raster_band(list: &DisplayList, target: &Target, src: &Sources, ty: u32, band
             }
         }
     }
+}
+
+/// A flat (affine) image primitive over one tile: the same pixels as
+/// `shade`, with the transform stepped per pixel and the mip level, source
+/// and tint resolved once. Returns false for what it does not handle
+/// (perspective, post programs), which then goes through `shade`.
+fn image_tile(prim: &Prim, src: &Sources, tile: &mut [[f32; 4]], x0: u32, y0: u32, cols: u32, rows: u32, front: bool) -> bool {
+    if prim.inv_w[0] != 0.0 || prim.inv_w[1] != 0.0 || prim.paint[3].to_bits() > 0 || prim.inv_w[2] <= 0.0 {
+        return false;
+    }
+    let iw = 1.0 / prim.inv_w[2];
+    let (ax, bx, cx) = (prim.inv_x[0] * iw, prim.inv_x[1] * iw, prim.inv_x[2] * iw);
+    let (ay, by, cy) = (prim.inv_y[0] * iw, prim.inv_y[1] * iw, prim.inv_y[2] * iw);
+    let aa = prim.inv_x[3].max(1e-6);
+    let (gw, gh) = (prim.geom[0], prim.geom[1]);
+    // Mip level, as in `sample_image`.
+    let source = prim.kind[1];
+    let mut offset = prim.geom2[0].to_bits() as usize;
+    let (mut w, mut h) = (gw as i32, gh as i32);
+    let levels = prim.geom[2] as i32;
+    let mut k = 1.0f32;
+    if levels > 1 {
+        let lod = (prim.inv_x[3].max(1.0).log2().floor() as i32).clamp(0, levels - 1);
+        for _ in 0..lod {
+            offset += (w * h) as usize;
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        k = (1u32 << lod) as f32;
+    }
+    // A matte's two textures share size and placement (one level each).
+    let matte = (prim.kind[0] == PRIM_MATTE).then(|| (prim.geom2[1].to_bits() as usize, prim.geom2[2] as u32));
+    let geo = ImageGeo { a: [ax, bx, cx], b: [ay, by, cy], aa, size: [gw, gh], offset, w, h, k, matte };
+    match source {
+        1 => image_span(prim, &geo, |i| src.groups[i], tile, x0, y0, cols, rows, front),
+        2 => image_span(prim, &geo, |i| unpack(src.footage[i]), tile, x0, y0, cols, rows, front),
+        _ => image_span(prim, &geo, |i| unpack(src.images[i]), tile, x0, y0, cols, rows, front),
+    }
+    true
+}
+
+struct ImageGeo {
+    /// local x = a·(px, py, 1); local y = b·(px, py, 1).
+    a: [f32; 3],
+    b: [f32; 3],
+    aa: f32,
+    size: [f32; 2],
+    /// Texels of the chosen mip level and their scale.
+    offset: usize,
+    w: i32,
+    h: i32,
+    k: f32,
+    /// A matte: the matte texture's offset (same size and level) and mode.
+    matte: Option<(usize, u32)>,
+}
+
+#[inline(always)]
+fn image_span<F: Fn(usize) -> [f32; 4]>(prim: &Prim, g: &ImageGeo, fetch: F, tile: &mut [[f32; 4]], x0: u32, y0: u32, cols: u32, rows: u32, front: bool) {
+    let flags = prim.kind[3];
+    let mode = prim.kind[2];
+    let opacity = prim.inv_y[3];
+    let [ax, bx, cx] = g.a;
+    let [ay, by, cy] = g.b;
+    let [gw, gh] = g.size;
+    let (w, h, k, offset) = (g.w, g.h, g.k, g.offset);
+    // Drawn 1:1 on whole pixels (offscreen groups at full resolution): one
+    // texel per pixel, no filtering.
+    // (Inverting the placement leaves float noise: within 1/1000 of a
+    // texel is the same texel.)
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+    let (ox, oy) = (x0 as f32 + cx, y0 as f32 + cy);
+    let aligned = k == 1.0 && near(ax, 1.0) && near(bx, 0.0) && near(ay, 0.0) && near(by, 1.0) && near(ox, ox.round()) && near(oy, oy.round());
+    let (ox, oy) = (ox.round(), oy.round());
+    for y in 0..rows {
+        let py = (y0 + y) as f32 + 0.5;
+        let px0 = x0 as f32 + 0.5;
+        let mut lx = ax * px0 + bx * py + cx;
+        let mut ly = ay * px0 + by * py + cy;
+        for x in 0..cols {
+            let (l0, l1) = (lx, ly);
+            lx += ax;
+            ly += ay;
+            let o = &mut tile[(y * TILE + x) as usize];
+            if front && o[3] >= OPAQUE {
+                continue;
+            }
+            let edge = (-l0).max(l0 - gw).max(-l1).max(l1 - gh);
+            let cov = clamp01(0.5 - edge / g.aa);
+            if cov <= 0.0 {
+                continue;
+            }
+            let sample = |offset: usize| -> [f32; 4] {
+                if aligned {
+                    let xi = ((ox as i32) + x as i32).clamp(0, w - 1) as usize;
+                    let yi = ((oy as i32) + y as i32).clamp(0, h - 1) as usize;
+                    fetch(offset + yi * w as usize + xi)
+                } else {
+                    let sx = l0 / k - 0.5;
+                    let sy = l1 / k - 0.5;
+                    let fx0 = floor_fast(sx);
+                    let fy0 = floor_fast(sy);
+                    let (fx, fy) = (sx - fx0, sy - fy0);
+                    let (xi, yi) = (fx0 as i32, fy0 as i32);
+                    let (xa, xb) = (xi.clamp(0, w - 1) as usize, (xi + 1).clamp(0, w - 1) as usize);
+                    let (ya, yb) = (yi.clamp(0, h - 1) as usize * w as usize, (yi + 1).clamp(0, h - 1) as usize * w as usize);
+                    let (a, b, c, d) = (fetch(offset + ya + xa), fetch(offset + ya + xb), fetch(offset + yb + xa), fetch(offset + yb + xb));
+                    mix4(mix4(a, b, fx), mix4(c, d, fx), fy)
+                }
+            };
+            let mut s = sample(offset);
+            if let Some((matte_offset, matte_mode)) = g.matte {
+                let m = sample(matte_offset);
+                let k = match matte_mode {
+                    0 => m[3],
+                    1 => 1.0 - m[3],
+                    2 => luma(m),
+                    _ => 1.0 - luma(m),
+                };
+                s = s.map(|v| v * clamp01(k));
+            } else if flags & FLAG_TINT_ALPHA != 0 {
+                s = prim.fill.map(|f| f * s[3]);
+            } else if flags & FLAG_TINT_MUL != 0 {
+                s = std::array::from_fn(|i| s[i] * prim.fill[i]);
+            }
+            let m = cov * opacity;
+            let s = s.map(|v| v * m);
+            if s[3] > 0.0 {
+                *o = if front {
+                    under(*o, s)
+                } else if mode == 0 {
+                    std::array::from_fn(|i| s[i] + o[i] * (1.0 - s[3]))
+                } else {
+                    blend(*o, s, mode)
+                };
+            }
+        }
+    }
+}
+
+/// A solid-filled convex shape (rectangle, rounded rectangle, capsule)
+/// that covers the whole tile: one colour composited over every pixel.
+/// The shape is convex, so its inner offset is too: if the four corner
+/// pixels are fully inside, every pixel between them is.
+fn solid_tile(prim: &Prim, segments: &[[f32; 4]], tile: &mut [[f32; 4]], x0: u32, y0: u32, cols: u32, rows: u32, front: bool) -> bool {
+    if !(prim.kind[1] == SHAPE_RECT || prim.kind[1] == SHAPE_CAPSULE)
+        || prim.kind[3] != FLAG_FILL
+        || prim.paint[1] > 0.5
+        || prim.kind[2] != 0
+        || prim.inv_w[0] != 0.0
+        || prim.inv_w[1] != 0.0
+        || prim.inv_w[2] <= 0.0
+    {
+        return false;
+    }
+    let iw = 1.0 / prim.inv_w[2];
+    let local = |px: f32, py: f32| [(prim.inv_x[0] * px + prim.inv_x[1] * py + prim.inv_x[2]) * iw, (prim.inv_y[0] * px + prim.inv_y[1] * py + prim.inv_y[2]) * iw];
+    let (xa, xb) = (x0 as f32 + 0.5, (x0 + cols) as f32 - 0.5);
+    let (ya, yb) = (y0 as f32 + 0.5, (y0 + rows) as f32 - 0.5);
+    let limit = -0.5 * prim.inv_x[3];
+    for (px, py) in [(xa, ya), (xb, ya), (xa, yb), (xb, yb)] {
+        if shape_distance(prim, local(px, py), segments) > limit {
+            return false;
+        }
+    }
+    let s = prim.fill.map(|v| v * prim.inv_y[3]);
+    if s[3] <= 0.0 {
+        return true;
+    }
+    let keep = 1.0 - s[3];
+    for y in 0..rows {
+        for o in &mut tile[(y * TILE) as usize..(y * TILE + cols) as usize] {
+            *o = if front { under(*o, s) } else { std::array::from_fn(|i| s[i] + o[i] * keep) };
+        }
+    }
+    true
+}
+
+/// Alpha this close to 1 hides whatever is behind (< 0.13 of a level).
+const OPAQUE: f32 = 0.9995;
+
+/// `s` composited under `d` (front-to-back "over").
+#[inline(always)]
+fn under(d: [f32; 4], s: [f32; 4]) -> [f32; 4] {
+    let k = 1.0 - d[3];
+    std::array::from_fn(|i| d[i] + s[i] * k)
 }
 
 /// Separable Gaussian blur of one group in place (zero outside).
@@ -877,8 +1112,25 @@ pub fn blur(buf: &mut [[f32; 4]], offset: usize, w: usize, h: usize, sigma: f32,
 }
 
 /// Premultiplied float → straight RGBA8.
-pub fn resolve(src: &[[f32; 4]], out: &mut [u8]) {
+pub fn resolve(src: &[[f32; 4]], out: &mut [u8], threads: usize) {
+    let per = src.len().div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|scope| {
+        for (src, out) in src.chunks(per).zip(out.chunks_mut(per * 4)) {
+            scope.spawn(move || resolve_part(src, out));
+        }
+    });
+}
+
+fn resolve_part(src: &[[f32; 4]], out: &mut [u8]) {
     for (c, o) in src.iter().zip(out.chunks_exact_mut(4)) {
+        if c[3] >= 1.0 {
+            // Opaque (most of a frame): no un-premultiplying.
+            o[0] = (c[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            o[1] = (c[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            o[2] = (c[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            o[3] = 255;
+            continue;
+        }
         let a = c[3].clamp(0.0, 1.0);
         let k = if a > 0.0 { 1.0 / a } else { 0.0 };
         o[0] = ((c[0] * k).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;

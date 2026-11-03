@@ -573,6 +573,122 @@ impl Builder<'_> {
         self.meshes.batches[i].backdrop = Some(crate::mesh3d::Backdrop { offset, size, origin, factor: f });
     }
 
+    /// A plain group drawn straight into its parent, without an offscreen
+    /// picture, when that gives exactly the same pixels: no effects, matte
+    /// or blend mode on the group or (for its children's blending) on any
+    /// child, nothing 3D, and either full opacity or children that do not
+    /// overlap (a faded grid of dots: each dot takes the group's opacity).
+    /// Rendering a group offscreen costs a raster of its whole area plus a
+    /// resampled composite, so this is the common case worth skipping.
+    fn flat_group(&mut self, layer: &LayerState, children: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>) -> Option<Vec<Item>> {
+        fn has_3d(layers: &[LayerState]) -> bool {
+            layers.iter().any(|l| {
+                l.view.is_some() || !l.matrix.is_affine() || matches!(l.content, Content::Mesh(_)) || matches!(&l.content, Content::Group(c) if has_3d(c))
+            })
+        }
+        if !layer.effects.is_empty() || layer.matte.is_some() || layer.blend != Blend::Normal || !layer.matrix.is_affine() || layer.view.is_some() {
+            return None;
+        }
+        if children.iter().any(|c| c.blend != Blend::Normal) || has_3d(children) {
+            return None;
+        }
+        let inner = root.then(layer.matrix);
+        if layer.opacity >= 0.999 {
+            let mut items = Vec::new();
+            self.emit_list(children, inner, canvas, list, pending, &mut items);
+            return Some(items);
+        }
+        if layer.opacity <= 0.0 {
+            return Some(Vec::new());
+        }
+        if children.iter().any(LayerState::is_isolated) {
+            return None;
+        }
+        let mut items = Vec::new();
+        let mut boxes: Vec<[f64; 4]> = Vec::with_capacity(children.len());
+        for child in children {
+            let faded = LayerState { opacity: child.opacity * layer.opacity, ..child.clone() };
+            let its = self.layer_items(&faded, inner, &mut list.stops, &mut list.segments);
+            let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+            for it in &its {
+                let c = canvas_bounds(it);
+                b = [b[0].min(c[0]), b[1].min(c[1]), b[2].max(c[2]), b[3].max(c[3])];
+            }
+            // One child drawn as several overlapping items (glyphs, path
+            // pieces) would double-fade where they overlap.
+            if its.len() > 1 {
+                return None;
+            }
+            if b[0] < b[2] {
+                boxes.push(b);
+            }
+            items.extend(its);
+        }
+        // Sweep in x: any two boxes overlapping (anti-aliased edges
+        // included) need the offscreen group.
+        boxes.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                if boxes[j][0] >= boxes[i][2] {
+                    break;
+                }
+                if boxes[j][1] < boxes[i][3] && boxes[i][1] < boxes[j][3] {
+                    return None;
+                }
+            }
+        }
+        Some(items)
+    }
+
+    /// A gradient field is smooth (its features are its point radii and
+    /// warp scale, hundreds of px), yet costs a sum over its points and a
+    /// noise lookup per pixel. Drawn into a group at up to ¼ resolution
+    /// and stretched back (bilinear, edges clamped), it costs ~1/16 as much
+    /// and looks the same. Only for plain, axis-aligned rectangle fields.
+    fn field_proxy(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>) -> Option<Item> {
+        let Content::Shape(s) = &layer.content else { return None };
+        let field = s.field.as_ref()?;
+        if s.shape != ShapeKind::Field || field.points.is_empty() || s.stroke.is_some() || s.radius > 0.0 || layer.blend != Blend::Normal {
+            return None;
+        }
+        let m = root.then(layer.matrix);
+        if !m.is_affine() {
+            return None;
+        }
+        let o = m.apply(0.0, 0.0);
+        let (ax, ay) = (m.apply(1.0, 0.0), m.apply(0.0, 1.0));
+        let (ux, uy) = ((ax.0 - o.0, ax.1 - o.1), (ay.0 - o.0, ay.1 - o.1));
+        if ux.1.abs() > 1e-6 || uy.0.abs() > 1e-6 {
+            return None; // rotated or skewed
+        }
+        let px = ux.0.abs().min(uy.1.abs()) * self.scale;
+        let smallest = field.points.iter().map(|p| p.2).fold(f64::INFINITY, f64::min).min(if field.warp > 0.0 { field.warp_scale } else { f64::INFINITY });
+        let factor = (smallest * px / 48.0).floor().clamp(1.0, 4.0);
+        if factor < 2.0 {
+            return None;
+        }
+        let items = self.layer_items(layer, root, &mut list.stops, &mut list.segments);
+        let mut t = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for it in &items {
+            let b = tight_bounds(it);
+            t = [t[0].min(b[0]), t[1].min(b[1]), t[2].max(b[2]), t[3].max(b[3])];
+        }
+        let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
+        let rect = [t[0].round().max(0.0), t[1].round().max(0.0), t[2].round().min(cw), t[3].round().min(ch)];
+        if rect[2] <= rect[0] || rect[3] <= rect[1] {
+            return None;
+        }
+        let (off, origin, f, (gw, gh)) = self.reserve(list, pending, items, rect, 0.0, factor, false);
+        let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1])));
+        let prim = Prim {
+            kind: [PRIM_IMAGE, 1, blend_code(Blend::Normal), 0],
+            geom: [gw as f32, gh as f32, 1.0, 0.0],
+            geom2: [f32::from_bits(off), 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        with_inverse(prim, forward, 1.0).map(|(prim, _)| Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] })
+    }
+
     fn emit(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         if let (false, Content::Mesh(m)) = (layer.is_isolated(), &layer.content) {
             if let Some(item) = self.mesh_item(layer, m, root, out.last_mut()) {
@@ -584,8 +700,18 @@ impl Builder<'_> {
             return;
         }
         if !layer.is_isolated() {
+            if let Some(item) = self.field_proxy(layer, root, canvas, list, pending) {
+                out.push(item);
+                return;
+            }
             out.extend(self.layer_items(layer, root, &mut list.stops, &mut list.segments));
             return;
+        }
+        if let Content::Group(children) = &layer.content {
+            if let Some(items) = self.flat_group(layer, children, root, canvas, list, pending) {
+                out.extend(items);
+                return;
+            }
         }
         let scale = self.scale;
         // The layer's own picture, in canvas space.
@@ -690,7 +816,20 @@ impl Builder<'_> {
                 }
             }
         }
-        if rect[2] > rect[0] && rect[3] > rect[1] {
+        // Shadows and glows only: the layer itself is drawn as it is, with
+        // no offscreen picture (that would cost a raster of its area and a
+        // resampled composite for the same pixels).
+        let plain = matte.is_none()
+            && blur == 0.0
+            && layer.effects.iter().all(|e| matches!(e, EffectState::Shadow { .. } | EffectState::Glow { .. }))
+            && layer.blend == Blend::Normal
+            && match &layer.content {
+                Content::Group(children) => group_opacity >= 0.999 && children.iter().all(|c| c.blend == Blend::Normal),
+                _ => true,
+            };
+        if plain {
+            out.extend(items);
+        } else if rect[2] > rect[0] && rect[3] > rect[1] {
             let factor = factor_for(blur);
             // Repeat-edge blur needs the content's exact rectangle: an
             // anti-aliasing margin would make the repeated edge transparent.

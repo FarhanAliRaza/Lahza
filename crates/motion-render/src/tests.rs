@@ -1303,3 +1303,56 @@ fn benchmark_field_and_depth_of_field_1080p() {
         }
     }
 }
+
+
+#[test]
+fn whip_smears_the_edge_between_scenes() {
+    let mut p = Project::new(320, 180, Fps::whole(30), 4.0);
+    p.scenes.push(serde_json::from_value(json!({"id": "a", "background": "#ff0000"})).unwrap());
+    p.scenes.push(serde_json::from_value(json!({"id": "b", "start": 2, "background": "#0000ff",
+        "transition": {"type": "whip", "dur": 1, "ease": "linear", "direction": "up"}})).unwrap());
+    let img = cpu().render(&Compiled::new(&p), 2.0);
+    // Halfway: the scenes meet at y = 90. Each row may only change a little
+    // from the next (a smear), not jump from red to blue (a seam).
+    let worst = (60..120).map(|y| (px(&img, 160, y)[0] as i32 - px(&img, 160, y + 1)[0] as i32).abs()).max().unwrap();
+    assert!(worst < 40, "largest red step between rows near the seam: {worst}");
+    assert!(px(&img, 160, 40)[0] > 200 && px(&img, 160, 140)[2] > 200, "far from the seam: the scenes' own colours");
+}
+
+#[test]
+fn zoom_never_shows_a_box_or_border() {
+    let mut p = Project::new(320, 180, Fps::whole(30), 4.0);
+    p.scenes.push(serde_json::from_value(json!({"id": "a", "background": "#ff0000"})).unwrap());
+    p.scenes.push(serde_json::from_value(json!({"id": "b", "start": 2, "background": "#0000ff",
+        "transition": {"type": "zoom", "dur": 1, "ease": "linear"}})).unwrap());
+    let c = Compiled::new(&p);
+    for t in [1.6, 2.0, 2.4] {
+        let img = cpu().render(&c, t);
+        // Both backgrounds fill the frame: corners match the centre.
+        let mid = px(&img, 160, 90);
+        for (x, y) in [(0, 0), (319, 0), (0, 179), (319, 179), (40, 90)] {
+            let c = px(&img, x, y);
+            assert!((0..3).all(|i| (c[i] as i32 - mid[i] as i32).abs() <= 2), "t={t}: ({x},{y}) {c:?} vs centre {mid:?}");
+        }
+    }
+}
+
+#[test]
+fn faded_groups_fade_as_one_picture() {
+    // Two overlapping white squares in a 50 % group: where they overlap
+    // the group is still 50 % (one picture), not 75 % (two layers).
+    let p = project(json!([
+        {"id": "g", "kind": "comp", "transform": {"opacity": 0.5}, "layers": [
+            {"id": "a", "kind": "shape", "shape": "rect", "size": [80, 80], "fill": "#ffffff", "transform": {"position": [120, 90]}},
+            {"id": "b", "kind": "shape", "shape": "rect", "size": [80, 80], "fill": "#ffffff", "transform": {"position": [160, 90]}}]},
+        // Apart: each square takes the group's opacity (drawn directly).
+        {"id": "h", "kind": "comp", "transform": {"opacity": 0.5}, "layers": [
+            {"id": "c", "kind": "shape", "shape": "rect", "size": [20, 20], "fill": "#ffffff", "transform": {"position": [40, 20]}},
+            {"id": "d", "kind": "shape", "shape": "rect", "size": [20, 20], "fill": "#ffffff", "transform": {"position": [280, 20]}}]}
+    ]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    let grey = |c: [u8; 4]| (c[0] as i32 - 128).abs() <= 2;
+    assert!(grey(px(&img, 140, 90)), "overlap: {:?}", px(&img, 140, 90));
+    assert!(grey(px(&img, 100, 90)) && grey(px(&img, 180, 90)));
+    assert!(grey(px(&img, 40, 20)) && grey(px(&img, 280, 20)), "{:?} {:?}", px(&img, 40, 20), px(&img, 280, 20));
+}
