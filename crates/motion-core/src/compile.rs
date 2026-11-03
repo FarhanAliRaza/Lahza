@@ -335,10 +335,12 @@ pub struct GlyphState {
     pub scale: f64,
     pub rotation: f64,
     pub opacity: f64,
+    /// Fill colour from a colour animator; None is the text's colour.
+    pub color: Option<Color>,
 }
 
 impl GlyphState {
-    pub const IDENTITY: GlyphState = GlyphState { x: 0.0, y: 0.0, scale: 1.0, rotation: 0.0, opacity: 1.0 };
+    pub const IDENTITY: GlyphState = GlyphState { x: 0.0, y: 0.0, scale: 1.0, rotation: 0.0, opacity: 1.0, color: None };
 }
 
 // --------------------------------------------------------- compiled form
@@ -579,6 +581,8 @@ struct CAnim {
     curve: Curve,
     from: [f64; 5],
     to: [f64; 5],
+    /// Colour from → to (None: the text's colour); only when either is set.
+    colors: Option<(Option<Color>, Option<Color>)>,
     range: (usize, usize),
 }
 
@@ -1068,6 +1072,8 @@ impl<'a> Compiler<'a> {
             LayerKind::Comp(comp) => CKind::Comp(self.layers(&comp.layers, step, shift - offset)),
             LayerKind::Instancer(n) => CKind::Instancer(Box::new(self.instancer(n, id, start, step, shift, siblings))),
             LayerKind::Mesh(m) => CKind::Mesh(Box::new(self.mesh(m, id, start, step, shift))),
+            // Expanded before compiling (`components::expand_project`).
+            LayerKind::Component(_) => CKind::Comp(Vec::new()),
         };
         // Meshes are always placed in 3D.
         let three_d = c.three_d || matches!(kind, CKind::Mesh(_));
@@ -1223,6 +1229,7 @@ impl<'a> Compiler<'a> {
                 curve: ease_curve,
                 from: state(&a.from),
                 to: state(&a.to),
+                colors: (a.from.color.is_some() || a.to.color.is_some()).then_some((a.from.color, a.to.color)),
                 range: (lo, hi),
             });
         }
@@ -1259,10 +1266,15 @@ impl<'a> Compiler<'a> {
 
 impl Compiled {
     pub fn new(project: &Project) -> Compiled {
+        // Components become comps of their generated layers first, so every
+        // child is an ordinary layer from here on.
+        let mut expand_errors = Vec::new();
+        let expanded = crate::components::expand_project(project, &mut expand_errors);
+        let project = expanded.as_ref().unwrap_or(project);
         let mut base = TimeBase::new(project.settings.fps);
         base.beat = project.markers.get("beat").and_then(|t| t.median_interval());
         base.bar = project.markers.get("bar").and_then(|t| t.median_interval());
-        let mut errors = Vec::new();
+        let mut errors = expand_errors;
         if project.settings.width == 0 || project.settings.height == 0 || project.settings.width > 8192 || project.settings.height > 8192 {
             errors.push("settings: width and height must be 1..8192".into());
         }
@@ -1982,6 +1994,7 @@ fn clamp_color(c: Color) -> Color {
 }
 
 fn text_state(tx: &CText, t: f64) -> TextState {
+    let text_color = clamp_color(tx.color.at(t));
     let mut glyphs = Vec::new();
     let mut sweeps = Vec::new();
     if !tx.animators.is_empty() {
@@ -2014,6 +2027,13 @@ fn text_state(tx: &CText, t: f64) -> TextState {
                 let p = a.curve.progress(t - start, a.dur);
                 let v: [f64; 5] = std::array::from_fn(|k| a.from[k] + (a.to[k] - a.from[k]) * p);
                 apply_unit(&mut glyphs[ci], v, true);
+                if let Some((c0, c1)) = a.colors {
+                    if t >= start {
+                        let base = glyphs[ci].color.unwrap_or(text_color);
+                        let (c0, c1) = (c0.unwrap_or(base), c1.unwrap_or(base));
+                        glyphs[ci].color = Some(Color(std::array::from_fn(|k| c0.0[k] + (c1.0[k] - c0.0[k]) * p)));
+                    }
+                }
             }
         }
     }

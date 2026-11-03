@@ -125,6 +125,12 @@ impl Renderer {
         }
     }
 
+    /// Forgets the last frame, so the next one is drawn (benchmarks).
+    #[cfg(test)]
+    pub fn last_invalidate(&mut self) {
+        self.last = None;
+    }
+
     pub fn options(&self) -> RenderOptions {
         self.options
     }

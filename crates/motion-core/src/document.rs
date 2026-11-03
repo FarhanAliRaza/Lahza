@@ -794,6 +794,23 @@ pub enum LayerKind {
     Comp(CompLayer),
     Instancer(InstancerLayer),
     Mesh(MeshLayer),
+    Component(ComponentLayer),
+}
+
+/// A component (`crate::components`): its generator expands `params` to
+/// children at compile time; `overrides` patches children by id.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentLayer {
+    pub component: String,
+    #[serde(default = "empty_object")]
+    pub params: serde_json::Value,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub overrides: serde_json::Map<String, serde_json::Value>,
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 impl LayerKind {
@@ -806,6 +823,7 @@ impl LayerKind {
             LayerKind::Comp(_) => "comp",
             LayerKind::Instancer(_) => "instancer",
             LayerKind::Mesh(_) => "mesh",
+            LayerKind::Component(_) => "component",
         }
     }
 }
@@ -856,7 +874,7 @@ impl Layer {
         let common: Common = serde_json::from_value(serde_json::Value::Object(common))
             .map_err(|e| format!("layer '{id}': {e}"))?;
         if !map.contains_key("kind") {
-            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image, video, comp, instancer or mesh"));
+            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image, video, comp, instancer, mesh or component"));
         }
         let kind: LayerKind =
             serde_json::from_value(serde_json::Value::Object(map)).map_err(|e| format!("layer '{id}': {e}"))?;
@@ -1544,6 +1562,11 @@ pub struct UnitState {
     pub rotation: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f64>,
+    /// Fill colour; missing is the text's own. A colour applies once the
+    /// unit's move has started (a word lights up when it is spoken, and a
+    /// later animator takes it back).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
 }
 
 /// Animates glyphs, words or lines from `from` to `to`, one unit after

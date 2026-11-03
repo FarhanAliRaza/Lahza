@@ -103,6 +103,13 @@ pub fn styles_json() -> Value {
 }
 
 pub fn catalog_json() -> Value {
+    let components: Vec<Value> = crate::components::KINDS
+        .iter()
+        .map(|k| {
+            let params: Vec<Value> = k.params.iter().map(|(n, what, d)| json!({"name": n, "what": what, "default": d})).collect();
+            json!({"component": k.name, "summary": k.summary, "params": params})
+        })
+        .collect();
     let presets: Vec<Value> = PRESETS
         .iter()
         .map(|p| {
@@ -113,7 +120,7 @@ pub fn catalog_json() -> Value {
             })
         })
         .collect();
-    json!({
+    let mut catalog = json!({
         "presets": presets,
         "raw_curves": [
             {"type": "linear"}, {"type": "hold", "note": "jump at the end of the move"},
@@ -282,5 +289,8 @@ pub fn catalog_json() -> Value {
         "text_shaping": "HarfBuzz shaping (kerning, ligatures, marks) with bidi runs; use a project font for scripts Inter lacks (Arabic, Urdu, Devanagari…)",
         "edit_ops": ["add", "add_scene", "set", "remove", "move", "key", "anchor", "group", "ungroup"],
         "style_packs": styles_json(),
-    })
+    });
+    catalog["components"] = Value::from(components);
+    catalog["component_layer"] = json!("{\"kind\": \"component\", \"component\": <name>, \"params\": {…}} plus the usual transform/time/effects. It expands to ordinary layers, addressed as <id>/<child> (timeline_get lists them): set/key/anchor/remove on a child (\"map/IRN.fill\", \"caps/c3.text\") is kept in `overrides` and survives changes to params; {\"op\": \"detach\", \"id\": <id>} turns it into a comp of plain layers.");
+    catalog
 }

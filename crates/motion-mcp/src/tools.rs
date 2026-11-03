@@ -734,7 +734,7 @@ impl Toolbox {
                 scenes.push(serde_json::to_value(s).unwrap_or_default());
                 continue;
             }
-            fn layers(list: &[lahza_motion_core::document::Layer], compiled: &Compiled) -> Vec<Value> {
+            fn layers(list: &[lahza_motion_core::document::Layer], compiled: &Compiled, project: &Project) -> Vec<Value> {
                 list.iter()
                     .map(|l| {
                         let (start, end) = compiled.element_window(&l.id).unwrap_or((0.0, 0.0));
@@ -750,10 +750,27 @@ impl Toolbox {
                             lahza_motion_core::document::LayerKind::Shape(s) => out["shape"] = json!(s.shape),
                             lahza_motion_core::document::LayerKind::Image(i) => out["src"] = json!(i.src),
                             lahza_motion_core::document::LayerKind::Video(v) => out["src"] = json!(v.src),
-                            lahza_motion_core::document::LayerKind::Comp(_) => out["layers"] = json!(layers(l.children(), compiled)),
+                            lahza_motion_core::document::LayerKind::Comp(_) => out["layers"] = json!(layers(l.children(), compiled, project)),
                             lahza_motion_core::document::LayerKind::Instancer(n) => {
                                 out["layout"] = json!(n.layout);
-                                out["layers"] = json!(layers(l.children(), compiled));
+                                out["layers"] = json!(layers(l.children(), compiled, project));
+                            }
+                            lahza_motion_core::document::LayerKind::Component(c) => {
+                                // Its generated children, addressed as <id>/<child>.
+                                out["component"] = json!(c.component);
+                                if !c.overrides.is_empty() {
+                                    out["overridden"] = json!(c.overrides.keys().collect::<Vec<_>>());
+                                }
+                                let ctx = lahza_motion_core::components::Ctx {
+                                    width: project.settings.width as f64,
+                                    height: project.settings.height as f64,
+                                    fps: project.settings.fps,
+                                    markers: &project.markers,
+                                };
+                                match lahza_motion_core::components::build_children(&l.id, c, &ctx) {
+                                    Ok(children) => out["layers"] = json!(layers(&children, compiled, project)),
+                                    Err(e) => out["error"] = json!(e),
+                                }
                             }
                             lahza_motion_core::document::LayerKind::Mesh(m) => out["mesh"] = json!(m.mesh)["type"].clone(),
                         }
@@ -769,7 +786,7 @@ impl Toolbox {
                     })
                     .collect()
             }
-            scenes.push(json!({"id": s.id, "start": round(c.start), "end": round(c.end), "pre_roll": s.pre_roll, "camera_animated": !s.camera.is_default(), "layers": layers(&s.layers, &compiled)}));
+            scenes.push(json!({"id": s.id, "start": round(c.start), "end": round(c.end), "pre_roll": s.pre_roll, "camera_animated": !s.camera.is_default(), "layers": layers(&s.layers, &compiled, p)}));
         }
         Ok(Output::json(json!({"duration": p.settings.duration, "fps": p.settings.fps, "scenes": scenes})))
     }

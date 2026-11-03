@@ -10,6 +10,7 @@
 pub mod catalog;
 pub mod check;
 pub mod compile;
+pub mod components;
 pub mod curve;
 pub mod document;
 pub mod edit;

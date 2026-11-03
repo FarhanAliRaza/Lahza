@@ -1356,3 +1356,74 @@ fn faded_groups_fade_as_one_picture() {
     assert!(grey(px(&img, 100, 90)) && grey(px(&img, 180, 90)));
     assert!(grey(px(&img, 40, 20)) && grey(px(&img, 280, 20)), "{:?} {:?}", px(&img, 40, 20), px(&img, 280, 20));
 }
+
+#[test]
+fn big_paths_split_per_tile_draw_the_same() {
+    // A 600-segment circle against the analytic circle: same pixels.
+    let n = 600;
+    let d: String = (0..n)
+        .map(|i| {
+            let a = i as f64 / n as f64 * std::f64::consts::TAU;
+            format!("{} {:.4} {:.4}", if i == 0 { "M" } else { "L" }, 70.0 * a.cos(), 70.0 * a.sin())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " Z";
+    let p = project(json!([
+        {"id": "poly", "kind": "shape", "shape": "path", "d": d, "fill": "#ffffff", "stroke": {"color": "#ff0000", "width": 4}, "transform": {"position": [85, 90]}},
+        {"id": "disc", "kind": "shape", "shape": "circle", "size": 140, "fill": "#ffffff", "stroke": {"color": "#ff0000", "width": 4}, "transform": {"position": [235, 90]}}
+    ]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    let mut worst = 0;
+    for y in 0..180 {
+        for x in 8..160 {
+            let a = px(&img, x, y);
+            let b = px(&img, x + 150, y);
+            worst = worst.max((0..3).map(|i| (a[i] as i32 - b[i] as i32).abs()).max().unwrap());
+        }
+    }
+    if worst > 40 {
+        img.save(std::env::temp_dir().join("split.png")).ok();
+        let mut where_ = Vec::new();
+        for y in 0..180 {
+            for x in 8..160 {
+                let a = px(&img, x, y);
+                let b = px(&img, x + 150, y);
+                if (0..3).any(|i| (a[i] as i32 - b[i] as i32).abs() > 40) {
+                    where_.push((x, y, a, b));
+                }
+            }
+        }
+        panic!("split path differs from the circle at {} px, e.g. {:?}", where_.len(), &where_[..where_.len().min(6)]);
+    }
+    assert_eq!(px(&img, 85, 90), [255, 255, 255, 255], "inside");
+    assert_eq!(px(&img, 85, 10), [0, 0, 0, 255], "outside");
+}
+
+#[test]
+#[ignore]
+fn benchmark_big_path_1080x1920() {
+    // A jagged 4000-segment coastline filling most of a vertical frame.
+    let n = 4000;
+    let d: String = (0..n)
+        .map(|i| {
+            let a = i as f64 / n as f64 * std::f64::consts::TAU;
+            let r = 480.0 + 60.0 * (a * 37.0).sin() + 25.0 * (a * 211.0).sin();
+            format!("{} {:.2} {:.2}", if i == 0 { "M" } else { "L" }, r * a.cos(), 1.8 * r * a.sin())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " Z";
+    let mut p = Project::new(1080, 1920, Fps::whole(30), 1.0);
+    p.scenes.push(serde_json::from_value(json!({"id": "s", "layers": [
+        {"id": "land", "kind": "shape", "shape": "path", "d": d, "fill": "#d8cfb8", "stroke": {"color": "#222222", "width": 3}, "transform": {"position": [540, 960]}}]})).unwrap());
+    let c = Compiled::new(&p);
+    let mut r = cpu();
+    r.render(&c, 0.0);
+    let t = std::time::Instant::now();
+    for _ in 0..5 {
+        r.last_invalidate();
+        r.render(&c, 0.0);
+    }
+    eprintln!("big path: {:.1} ms/frame", t.elapsed().as_secs_f64() * 200.0);
+}

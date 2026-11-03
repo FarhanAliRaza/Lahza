@@ -409,6 +409,22 @@ narration answer to `music` and `vo`. Built-in effects (`sfx_add`):
 whoosh, whoosh-out, swipe, pop, click, tick, type, thud, hit, boom, riser,
 ding, sparkle, glitch.
 
+## Components
+
+`{"id": "caps", "kind": "component", "component": "captions", "params": {…}}`
+generates ordinary layers from parameters: `captions`, `card`, `callout`,
+`counter`, `chart` and `map`. The catalog (`lahza://catalog` →
+`components`) lists each one's params.
+
+- **Children are addressed as `<id>/<child>`** (`caps/c3`, `map/IRN`);
+  `timeline_get` lists them.
+- **`set`, `key`, `anchor` and `remove` on a child** are stored in
+  `overrides` as a merge patch for that child, keyframes included. They are
+  re-applied every time the component regenerates, for example after its
+  params change.
+- **`{"op": "detach", "id": "caps"}`** replaces the component with a comp of
+  plain layers (`caps-c3`), with the overrides applied.
+
 ## Time edits
 
 `{"op": "insert_time", "at": 0, "duration": 5}` makes room at `at`:

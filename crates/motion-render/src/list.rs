@@ -1023,10 +1023,14 @@ impl Builder<'_> {
                     let forward = matrix.then(glyph_xf);
                     let r = g.atlas.rect;
                     let bounds = [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64];
+                    let fill = match glyphs.get(g.char_index).and_then(|s| s.color) {
+                        Some(c) => premul(c, 1.0),
+                        None => color,
+                    };
                     let mut prim = Prim {
                         kind: [PRIM_GLYPH, 0, blend, FLAG_FILL],
                         geom: [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32],
-                        fill: color,
+                        fill,
                         paint: [style.weight, 0.0, 0.0, 0.0],
                         ..Default::default()
                     };
@@ -1170,6 +1174,13 @@ fn bin(list: &mut DisplayList, target: &Target, prims: Vec<(Prim, [f64; 4])>) {
         if !(b[2] > 0.0 && b[3] > 0.0 && b[0] < target.width as f64 && b[1] < target.height as f64) {
             continue;
         }
+        if let Some(parts) = split_path(list, target, &prim, b) {
+            for (tile, part) in parts {
+                per_tile[tile].push(list.prims.len() as u32);
+                list.prims.push(part);
+            }
+            continue;
+        }
         let index = list.prims.len() as u32;
         list.prims.push(prim);
         let tx0 = (b[0].max(0.0) as u32) / TILE;
@@ -1187,6 +1198,86 @@ fn bin(list: &mut DisplayList, target: &Target, prims: Vec<(Prim, [f64; 4])>) {
         list.ranges.push(tile.len() as u32);
         list.indices.extend(tile);
     }
+}
+
+/// Segments a path needs before it is split per tile.
+const SPLIT_SEGMENTS: u32 = 48;
+
+/// A big path (a country, a coastline) costs every one of its segments at
+/// every pixel. Per tile only some matter: the winding ray runs to local
+/// +x, so a pixel needs the segments that cross its row to its right, plus
+/// those near enough to shade its edge. With a flat transform (no rotation
+/// or perspective) each tile gets its own copy of the primitive pointing
+/// at just those segments; tiles it does not touch get nothing.
+fn split_path(list: &mut DisplayList, target: &Target, prim: &Prim, b: [f64; 4]) -> Option<Vec<(usize, Prim)>> {
+    let count = prim.geom2[1].to_bits();
+    if prim.kind[0] != PRIM_SHAPE || prim.kind[1] != SHAPE_PATH || count < SPLIT_SEGMENTS {
+        return None;
+    }
+    let (a, c, d, f, w) = (prim.inv_x[0], prim.inv_x[2], prim.inv_y[1], prim.inv_y[2], prim.inv_w[2]);
+    if prim.inv_x[1] != 0.0 || prim.inv_y[0] != 0.0 || prim.inv_w[0] != 0.0 || prim.inv_w[1] != 0.0 || a == 0.0 || d == 0.0 || w <= 0.0 {
+        return None;
+    }
+    let first = prim.geom2[0].to_bits() as usize;
+    // Segments in target pixels.
+    let to_px = |x: f32, y: f32| ((x * w - c) / a, (y * w - f) / d);
+    let segs: Vec<[f32; 4]> = list.segments[first..first + count as usize].to_vec();
+    let px: Vec<[f32; 4]> = segs
+        .iter()
+        .map(|s| {
+            let (x0, y0) = to_px(s[0], s[1]);
+            let (x1, y1) = to_px(s[2], s[3]);
+            [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
+        })
+        .collect();
+    // Edge shading reach in pixels: anti-aliasing, plus half a stroke.
+    let aa = prim.inv_x[3].abs() / a.abs().max(1e-12) * w;
+    let stroke = if prim.kind[3] & FLAG_STROKE != 0 { prim.paint[0] * w / a.abs().max(1e-12) * 0.5 } else { 0.0 };
+    let margin = 2.0 * aa.max(1.0) + stroke;
+    let (tw, th) = (target.tiles_x, target.tiles_y);
+    let ty0 = ((b[1].max(0.0) as u32) / TILE).min(th - 1);
+    let ty1 = (((b[3].min(target.height as f64 - 1.0)).max(0.0) as u32) / TILE).min(th - 1);
+    let tx0 = ((b[0].max(0.0) as u32) / TILE).min(tw - 1);
+    let tx1 = (((b[2].min(target.width as f64 - 1.0)).max(0.0) as u32) / TILE).min(tw - 1);
+    // Bucket by tile row, then pick per tile by x.
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); (ty1 - ty0 + 1) as usize];
+    for (i, s) in px.iter().enumerate() {
+        let r0 = (((s[1] - margin).max(0.0) as u32) / TILE).max(ty0);
+        let r1 = ((((s[3] + margin).max(0.0)) as u32) / TILE).min(ty1);
+        for r in r0..=r1 {
+            if r >= ty0 && r <= ty1 {
+                rows[(r - ty0) as usize].push(i as u32);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for ty in ty0..=ty1 {
+        let row = &rows[(ty - ty0) as usize];
+        if row.is_empty() {
+            continue;
+        }
+        for tx in tx0..=tx1 {
+            let x0 = (tx * TILE) as f32 - margin;
+            let x1 = ((tx + 1) * TILE) as f32 + margin;
+            let start = list.segments.len() as u32;
+            for &i in row {
+                let s = &px[i as usize];
+                // Right of (or near) the tile: crossings or the edge.
+                if s[2] >= x0 && (s[0] <= x1 || prim.kind[3] & FLAG_FILL != 0) {
+                    list.segments.push(segs[i as usize]);
+                }
+            }
+            let n = list.segments.len() as u32 - start;
+            if n == 0 {
+                continue;
+            }
+            let mut part = *prim;
+            part.geom2[0] = f32::from_bits(start);
+            part.geom2[1] = f32::from_bits(n);
+            out.push(((ty * tw + tx) as usize, part));
+        }
+    }
+    Some(out)
 }
 
 fn push_segments(lines: &[Vec<(f64, f64)>], close: bool, segments: &mut Vec<[f32; 4]>) -> (u32, u32, [f64; 4]) {

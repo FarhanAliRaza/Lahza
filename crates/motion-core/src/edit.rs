@@ -54,24 +54,9 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
     let mut summary = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         let name = op.get("op").and_then(Value::as_str).unwrap_or("");
-        let result = match name {
-            "add" => op_add(&mut doc, op, &mut created),
-            "add_scene" => op_add_scene(&mut doc, op, &mut created),
-            "set" => op_set(&mut doc, op),
-            "remove" => op_remove(&mut doc, op),
-            "move" => op_move(&mut doc, op),
-            "key" => op_key(&mut doc, op),
-            "anchor" => op_anchor(&mut doc, op),
-            "group" => op_group(&mut doc, op, &mut created),
-            "ungroup" => op_ungroup(&mut doc, op),
-            "add_sound" => op_add_sound(&mut doc, op, &mut created),
-            "insert_time" => op_insert_time(&mut doc, op, &base, &mut ripples),
-            "shift" => op_shift(&mut doc, op, &base),
-            "" => Err("op needs an \"op\" field".into()),
-            other => Err(format!(
-                "unknown op '{other}': use add, add_scene, set, remove, move, key, anchor, group, ungroup, add_sound, insert_time, shift"
-            )
-            .into()),
+        let result = match child_target(op) {
+            Some((component, child)) => op_child(&mut doc, op, &component, &child, project, &base, &mut ripples, &mut created),
+            None => dispatch(&mut doc, op, &base, &mut ripples, &mut created),
         };
         let (inv, ids, line) = result.map_err(|e| format!("op {} ({name}): {e}", i + 1))?;
         inverse.splice(0..0, inv);
@@ -91,6 +76,158 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
 }
 
 type OpResult = Result<(Vec<Value>, Vec<String>, String)>;
+
+fn dispatch(doc: &mut Value, op: &Value, base: &crate::time::TimeBase, ripples: &mut Vec<(f64, f64)>, created: &mut Vec<String>) -> OpResult {
+    match op.get("op").and_then(Value::as_str).unwrap_or("") {
+        "add" => op_add(doc, op, created),
+        "add_scene" => op_add_scene(doc, op, created),
+        "set" => op_set(doc, op),
+        "remove" => op_remove(doc, op),
+        "move" => op_move(doc, op),
+        "key" => op_key(doc, op),
+        "anchor" => op_anchor(doc, op),
+        "group" => op_group(doc, op, created),
+        "ungroup" => op_ungroup(doc, op),
+        "add_sound" => op_add_sound(doc, op, created),
+        "insert_time" => op_insert_time(doc, op, base, ripples),
+        "shift" => op_shift(doc, op, base),
+        "detach" => op_detach(doc, op),
+        "set_override" => op_set_override(doc, op),
+        "replace_layer" => op_replace_layer(doc, op),
+        "" => Err("op needs an \"op\" field".into()),
+        other => Err(format!(
+            "unknown op '{other}': use add, add_scene, set, remove, move, key, anchor, group, ungroup, add_sound, insert_time, shift, detach"
+        )
+        .into()),
+    }
+}
+
+// ------------------------------------------------------------ components
+
+/// `map/IRN.fill` (or `"id": "map/IRN"`): the component and child an op
+/// targets.
+fn child_target(op: &Value) -> Option<(String, String)> {
+    let target = op.get("target").and_then(Value::as_str).map(|t| t.split('.').next().unwrap_or(t)).or_else(|| op.get("id").and_then(Value::as_str))?;
+    let (component, child) = target.split_once('/')?;
+    Some((component.to_string(), child.to_string()))
+}
+
+fn component_ctx(project: &Project) -> crate::components::Ctx<'_> {
+    crate::components::Ctx { width: project.settings.width as f64, height: project.settings.height as f64, fps: project.settings.fps, markers: &project.markers }
+}
+
+/// An op on a generated child: done on the child as generated (with its
+/// current override), and the difference kept as the child's override,
+/// so it survives regeneration.
+#[allow(clippy::too_many_arguments)]
+fn op_child(doc: &mut Value, op: &Value, component: &str, child: &str, project: &Project, base: &crate::time::TimeBase, ripples: &mut Vec<(f64, f64)>, created: &mut Vec<String>) -> OpResult {
+    let name = op.get("op").and_then(Value::as_str).unwrap_or("");
+    if !["set", "key", "anchor", "remove"].contains(&name) {
+        bail!("'{name}' does not apply to a component's child ({component}/{child}): use set, key, anchor or remove, or detach the component first");
+    }
+    let (ptr, _, _) = find(doc, component).ok_or_else(|| format!("no component '{component}'"))?;
+    let layer = doc.pointer(&ptr).cloned().unwrap_or_default();
+    if layer.get("kind").and_then(Value::as_str) != Some("component") {
+        bail!("'{component}' is not a component");
+    }
+    let kind = layer["component"].as_str().unwrap_or("").to_string();
+    let params = layer.get("params").cloned().unwrap_or_else(|| json!({}));
+    let generated = crate::components::generate(&kind, &params, &component_ctx(project))?;
+    let base_child = generated.into_iter().find(|c| c["id"] == child).ok_or_else(|| format!("{component} has no child '{child}'"))?;
+    let old = layer.pointer(&format!("/overrides/{child}")).cloned();
+    let mut current = base_child.clone();
+    match &old {
+        Some(Value::Null) => bail!("{component}/{child} was removed; set {component}.overrides to bring it back"),
+        Some(patch) => crate::components::merge_patch(&mut current, patch),
+        None => {}
+    }
+    let new_patch = if name == "remove" {
+        Some(Value::Null)
+    } else {
+        // The op, on a scratch document holding just this child.
+        let mut scratch = json!({"settings": doc["settings"].clone(), "scenes": [{"id": "__component", "layers": [current]}]});
+        let mut local = op.clone();
+        if let Some(t) = op.get("target").and_then(Value::as_str) {
+            local["target"] = json!(t.split_once('/').map(|(_, rest)| rest).unwrap_or(t));
+        }
+        dispatch(&mut scratch, &local, base, ripples, created)?;
+        crate::components::diff_patch(&base_child, &scratch["scenes"][0]["layers"][0])
+    };
+    let overrides = doc.pointer_mut(&ptr).unwrap().as_object_mut().unwrap().entry("overrides").or_insert_with(|| json!({}));
+    let map = overrides.as_object_mut().ok_or("overrides is not an object")?;
+    match &new_patch {
+        Some(p) => {
+            map.insert(child.into(), p.clone());
+        }
+        None => {
+            map.remove(child);
+        }
+    }
+    let inverse = vec![json!({"op": "set_override", "id": component, "child": child, "value": old.clone().unwrap_or(json!("__none"))})];
+    Ok((inverse, vec![format!("{component}/{child}")], format!("{name} on {component}/{child} (kept as an override)")))
+}
+
+fn op_set_override(doc: &mut Value, op: &Value) -> OpResult {
+    let id = op.get("id").and_then(Value::as_str).ok_or("set_override needs \"id\"")?;
+    let child = op.get("child").and_then(Value::as_str).ok_or("set_override needs \"child\"")?;
+    let (ptr, _, _) = find(doc, id).ok_or_else(|| format!("no component '{id}'"))?;
+    let layer = doc.pointer_mut(&ptr).unwrap().as_object_mut().ok_or("bad layer")?;
+    let overrides = layer.entry("overrides").or_insert_with(|| json!({}));
+    let old = overrides.get(child).cloned();
+    let map = overrides.as_object_mut().ok_or("overrides is not an object")?;
+    match op.get("value") {
+        Some(Value::String(s)) if s == "__none" => {
+            map.remove(child);
+        }
+        Some(v) => {
+            map.insert(child.into(), v.clone());
+        }
+        None => bail!("set_override needs \"value\""),
+    }
+    if map.is_empty() {
+        layer.remove("overrides");
+    }
+    Ok((vec![json!({"op": "set_override", "id": id, "child": child, "value": old.unwrap_or(json!("__none"))})], vec![id.to_string()], format!("override of {id}/{child}")))
+}
+
+/// Turns a component into a comp of its children as plain layers (ids
+/// `<component>-<child>`), overrides applied.
+fn op_detach(doc: &mut Value, op: &Value) -> OpResult {
+    let id = op.get("id").and_then(Value::as_str).ok_or("detach needs \"id\"")?;
+    let (ptr, _, _) = find(doc, id).ok_or_else(|| format!("no component '{id}'"))?;
+    let layer = doc.pointer(&ptr).cloned().unwrap_or_default();
+    if layer.get("kind").and_then(Value::as_str) != Some("component") {
+        bail!("'{id}' is not a component");
+    }
+    let project: Project = serde_json::from_value(doc.clone()).map_err(|e| e.to_string())?;
+    let kind = layer["component"].as_str().unwrap_or("");
+    let overrides = layer.get("overrides").and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut children = crate::components::children(kind, layer.get("params").unwrap_or(&json!({})), &overrides, &component_ctx(&project))?;
+    crate::components::rename(&mut children, &format!("{id}-"), true);
+    for c in &children {
+        let cid = c["id"].as_str().unwrap_or("");
+        if exists(doc, cid) {
+            bail!("detaching {id} would make a second '{cid}'");
+        }
+    }
+    let mut comp = layer.clone();
+    let obj = comp.as_object_mut().unwrap();
+    for k in ["component", "params", "overrides"] {
+        obj.remove(k);
+    }
+    obj.insert("kind".into(), json!("comp"));
+    obj.insert("layers".into(), Value::Array(children));
+    *doc.pointer_mut(&ptr).unwrap() = comp;
+    Ok((vec![json!({"op": "replace_layer", "id": id, "layer": layer})], vec![id.to_string()], format!("detached {id} into plain layers")))
+}
+
+fn op_replace_layer(doc: &mut Value, op: &Value) -> OpResult {
+    let id = op.get("id").and_then(Value::as_str).ok_or("replace_layer needs \"id\"")?;
+    let new = op.get("layer").cloned().ok_or("replace_layer needs \"layer\"")?;
+    let (ptr, _, _) = find(doc, id).ok_or_else(|| format!("no layer '{id}'"))?;
+    let old = std::mem::replace(doc.pointer_mut(&ptr).unwrap(), new);
+    Ok((vec![json!({"op": "replace_layer", "id": id, "layer": old})], vec![id.to_string()], format!("replaced {id}")))
+}
 
 // ------------------------------------------------------------ locating
 
