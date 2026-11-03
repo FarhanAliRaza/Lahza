@@ -46,6 +46,7 @@ lahza motion create promo --style promo.kinetic --duration 20 --music track.wav
 lahza motion analyze promo.lahza
 lahza motion apply promo.lahza ops.json
 lahza motion check promo.lahza
+lahza motion sync-check promo.lahza --tracks beat    # events off the beat; --all lists every event
 lahza motion snapshot promo.lahza --sheet -o sheet.png
 lahza motion render promo.lahza -o promo.mp4          # --draft, --from/--to, --no-audio
 ```

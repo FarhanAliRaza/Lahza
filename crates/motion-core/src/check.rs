@@ -5,7 +5,7 @@
 //! from the requested numbers.
 
 use crate::catalog::style_pack;
-use crate::compile::{Compiled, Content, FrameState, LayerState, SyncKind};
+use crate::compile::{Compiled, Content, EventKind, FrameState, LayerState, SyncKind, SyncRecord};
 use crate::document::{walk_layers, LayerKind, Project};
 use crate::timeref::Anchor;
 use serde::Serialize;
@@ -164,6 +164,36 @@ impl Default for Options<'_> {
     }
 }
 
+/// Where a requested sync point lands on the frame grid (timeline seconds).
+fn achieved(compiled: &Compiled, s: &SyncRecord) -> f64 {
+    let fps = compiled.fps();
+    let f = fps.as_f64();
+    match &s.kind {
+        SyncKind::Edge => ((s.requested * f - 1e-6).ceil()) / f,
+        SyncKind::Move { curve, start, dur, step, shift } => {
+            let p = |k: i64| {
+                let tc = fps.time_of(k) + shift;
+                let tl = step.map(|st| st.quantize(tc)).unwrap_or(tc);
+                curve.progress(tl - start, *dur)
+            };
+            let lo = ((start - shift) * f).floor() as i64 - 2;
+            let hi = ((start - shift + dur) * f).ceil() as i64 + 2;
+            let k = match s.anchor {
+                Anchor::Start => (lo..=hi).find(|&k| p(k) > 1e-6).map(|k| k - 1),
+                Anchor::Peak => (lo..=hi).max_by(|a, b| {
+                    let va = (p(a + 1) - p(a - 1)).abs();
+                    let vb = (p(b + 1) - p(b - 1)).abs();
+                    // Earliest of equals.
+                    va.total_cmp(&vb).then(b.cmp(a))
+                }),
+                Anchor::Land => (lo..=hi).find(|&k| p(k) >= 0.98),
+                Anchor::End => (lo..=hi).find(|&k| p(k) >= 1.0 - 1e-9),
+            };
+            k.map(|k| fps.time_of(k)).unwrap_or(s.requested)
+        }
+    }
+}
+
 pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Report {
     let mut issues = Vec::new();
     for e in &compiled.errors {
@@ -202,30 +232,7 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
     // Sync drift.
     let mut syncs = Vec::new();
     for s in &compiled.syncs {
-        let achieved = match &s.kind {
-            SyncKind::Edge => ((s.requested * f - 1e-6).ceil()) / f,
-            SyncKind::Move { curve, start, dur, step, shift } => {
-                let p = |k: i64| {
-                    let tc = fps.time_of(k) + shift;
-                    let tl = step.map(|st| st.quantize(tc)).unwrap_or(tc);
-                    curve.progress(tl - start, *dur)
-                };
-                let lo = ((start - shift) * f).floor() as i64 - 2;
-                let hi = ((start - shift + dur) * f).ceil() as i64 + 2;
-                let k = match s.anchor {
-                    Anchor::Start => (lo..=hi).find(|&k| p(k) > 1e-6).map(|k| k - 1),
-                    Anchor::Peak => (lo..=hi).max_by(|a, b| {
-                        let va = (p(a + 1) - p(a - 1)).abs();
-                        let vb = (p(b + 1) - p(b - 1)).abs();
-                        // Earliest of equals.
-                        va.total_cmp(&vb).then(b.cmp(a))
-                    }),
-                    Anchor::Land => (lo..=hi).find(|&k| p(k) >= 0.98),
-                    Anchor::End => (lo..=hi).find(|&k| p(k) >= 1.0 - 1e-9),
-                };
-                k.map(|k| fps.time_of(k)).unwrap_or(s.requested)
-            }
-        };
+        let achieved = achieved(compiled, s);
         let drift = (achieved - s.requested) * f;
         // A stepped layer only changes on its steps: it can't land closer
         // than one step, so that is its tolerance.
@@ -633,6 +640,132 @@ pub fn bounds(layer: &LayerState, measure: Option<Measure>) -> Option<[f64; 4]> 
     ])
 }
 
+/// What `sync_check` looks at.
+pub struct SyncOptions<'a> {
+    /// Flag events further than this from their reference or any marker.
+    pub frames: f64,
+    /// Marker tracks to measure against (`sound` for sound effects); all
+    /// when `None`.
+    pub tracks: Option<&'a [String]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SyncEvent {
+    pub t: f64,
+    pub frame: i64,
+    pub kind: EventKind,
+    pub element: String,
+    pub what: String,
+    /// The marker it was authored against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// For authored events: achieved − requested, in frames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_frames: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearest: Option<Nearest>,
+    /// `drift` (more than N frames off its reference) or `unsynced` (no
+    /// marker within N frames).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flag: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Nearest {
+    /// `track:n` (1-based), or `sound:<id>`.
+    pub marker: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub t: f64,
+    /// Event − marker, in frames.
+    pub frames: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SyncCheck {
+    pub frames: f64,
+    pub markers: usize,
+    pub drift: usize,
+    pub unsynced: usize,
+    pub events: Vec<SyncEvent>,
+}
+
+/// Every visual event (cuts, layers appearing, keys landing, values
+/// jumping) with the nearest marker. Events authored against a marker are
+/// measured on the frame grid like `check` does and flagged `drift` when
+/// more than `frames` off; the rest are flagged `unsynced` when no marker
+/// (or sound effect) is within `frames`.
+pub fn sync_check(project: &Project, compiled: &Compiled, options: &SyncOptions) -> SyncCheck {
+    let f = compiled.fps().as_f64();
+    let wanted = |track: &str| options.tracks.is_none_or(|ts| ts.iter().any(|t| t == track));
+    let mut marks: Vec<(f64, String, Option<String>)> = Vec::new();
+    for (name, track) in &project.markers.tracks {
+        if wanted(name) {
+            marks.extend(track.markers.iter().enumerate().map(|(i, m)| (m.t, format!("{name}:{}", i + 1), m.id.clone().or_else(|| m.label.clone()))));
+        }
+    }
+    if wanted("sound") {
+        for clip in &project.audio.sfx {
+            if let Ok(t) = compiled.resolve(&project.markers, &clip.at) {
+                let id = clip.id.clone().unwrap_or_else(|| clip.path.clone());
+                marks.push((t, format!("sound:{id}"), None));
+            }
+        }
+    }
+    marks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let nearest = |t: f64| -> Option<Nearest> {
+        let i = marks.partition_point(|m| m.0 < t);
+        [i.checked_sub(1), Some(i)]
+            .into_iter()
+            .flatten()
+            .filter_map(|i| marks.get(i))
+            .min_by(|a, b| (a.0 - t).abs().total_cmp(&(b.0 - t).abs()))
+            .map(|(mt, name, label)| Nearest { marker: name.clone(), label: label.clone(), t: round(*mt), frames: ((t - mt) * f * 100.0).round() / 100.0 })
+    };
+    let cuts: Vec<f64> = compiled.events.iter().filter(|e| e.kind == EventKind::Cut).map(|e| e.t).collect();
+    let half = 0.5 / f;
+    let mut out = SyncCheck { frames: options.frames, markers: marks.len(), ..Default::default() };
+    for e in &compiled.events {
+        if e.t < -half || e.t > compiled.settings.duration + half {
+            continue;
+        }
+        // The piece's start is not a sync point; layers appearing with a
+        // cut are part of it.
+        if e.reference.is_none() && (e.t < half || e.kind == EventKind::Appear && cuts.iter().any(|c| (c - e.t).abs() < half)) {
+            continue;
+        }
+        // The authored point, measured as `check` measures it.
+        let drift = e.reference.as_ref().and_then(|r| {
+            let record = compiled.syncs.iter().find(|s| s.element == e.element && &s.reference == r && (s.what == e.what || e.kind == EventKind::Appear && s.what == "time.start" || e.kind == EventKind::Cut && s.what == "cut"))?;
+            Some(((achieved(compiled, record) - record.requested) * f * 100.0).round() / 100.0)
+        });
+        let near = nearest(e.t);
+        let flag = match drift {
+            Some(d) if d.abs() > options.frames + 1e-6 => Some("drift"),
+            Some(_) => None,
+            None if e.reference.is_some() => None,
+            None => (!marks.is_empty() && near.as_ref().is_none_or(|n| n.frames.abs() > options.frames + 1e-6)).then_some("unsynced"),
+        };
+        match flag {
+            Some("drift") => out.drift += 1,
+            Some(_) => out.unsynced += 1,
+            None => {}
+        }
+        out.events.push(SyncEvent {
+            t: round(e.t),
+            frame: (e.t * f).round() as i64,
+            kind: e.kind,
+            element: e.element.clone(),
+            what: e.what.clone(),
+            reference: e.reference.clone(),
+            drift_frames: drift,
+            nearest: near,
+            flag,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,6 +789,59 @@ mod tests {
         p.scenes.push(serde_json::from_value(serde_json::json!({"id": "s1", "start": "beat:1", "layers": [layer]})).unwrap());
         p.scenes[0].start = crate::timeref::TimeRef::Seconds(0.0);
         p
+    }
+
+    #[test]
+    fn sync_check_lists_events_with_their_nearest_marker() {
+        let mut p = Project::new(640, 360, Fps::whole(30), 4.0);
+        p.markers.insert(MarkerTrack::from_times("hit", [1.0, 2.2]));
+        p.scenes.push(
+            serde_json::from_value(serde_json::json!({"id": "s1", "layers": [
+                // Lands on hit 1 by hand: synced to it.
+                {"id": "on", "kind": "shape", "shape": "rect", "fill": "#fff",
+                 "transform": {"opacity": {"keys": [{"at": 0.5, "v": 0}, {"at": 1.0, "v": 1}]}}},
+                // Lands 0.3 s after hit 2: nothing near.
+                {"id": "late", "kind": "shape", "shape": "rect", "fill": "#fff",
+                 "transform": {"position": {"keys": [{"at": 2.0, "v": [0, 0]}, {"at": 2.5, "v": [100, 0]}]}}},
+                // Authored against hit 2 (a stepped clock is aligned to it).
+                {"id": "stepped", "kind": "shape", "shape": "rect", "fill": "#fff", "time": {"step_fps": 2},
+                 "transform": {"scale": {"keys": [{"at": 0, "v": [1, 1]}, {"at": "hit:2", "v": [2, 2], "dur": "6f", "anchor": "land"}]}}},
+                // Appears on hit 2; a colour jump (hold) at 3 s.
+                {"id": "pop", "kind": "shape", "shape": "rect", "time": {"start": "hit:2"},
+                 "fill": {"keys": [{"at": 2.2, "v": "#ff0000"}, {"at": 3.0, "v": "#00ff00", "ease": "hold"}]}}
+            ]}))
+            .unwrap(),
+        );
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let r = sync_check(&p, &c, &SyncOptions { frames: 2.0, tracks: None });
+        let find = |el: &str, kind: EventKind| r.events.iter().find(|e| e.element == el && e.kind == kind).unwrap_or_else(|| panic!("{el} {kind:?}: {r:#?}"));
+        let on = find("on", EventKind::Land);
+        assert_eq!((on.flag, on.nearest.as_ref().map(|n| n.marker.as_str())), (None, Some("hit:1")));
+        let late = find("late", EventKind::Land);
+        assert_eq!(late.flag, Some("unsynced"));
+        assert_eq!(late.nearest.as_ref().unwrap().frames, 9.0);
+        let stepped = find("stepped", EventKind::Land);
+        assert_eq!(stepped.reference.as_deref(), Some("hit:2"));
+        assert_eq!((stepped.drift_frames, stepped.flag), (Some(0.0), None));
+        let pop = find("pop", EventKind::Appear);
+        assert_eq!((pop.reference.as_deref(), pop.flag, pop.drift_frames), (Some("hit:2"), None, Some(0.0)));
+        let jump = find("pop", EventKind::Jump);
+        assert_eq!((jump.t, jump.flag), (3.0, Some("unsynced")));
+        // Layers starting with the scene are part of its cut.
+        assert!(!r.events.iter().any(|e| e.element == "on" && e.kind == EventKind::Appear));
+        assert_eq!((r.drift, r.unsynced), (0, 2), "{:#?}", r.events.iter().filter(|e| e.flag.is_some()).collect::<Vec<_>>());
+        // A peak on an 8 fps clock lands between frames: drift beyond a
+        // tight tolerance.
+        let p = project(Some(8.0));
+        let c = Compiled::new(&p);
+        let r = sync_check(&p, &c, &SyncOptions { frames: 0.25, tracks: None });
+        let dot = r.events.iter().find(|e| e.element == "dot" && e.reference.is_some()).unwrap();
+        assert!(dot.drift_frames.unwrap().abs() > 0.25 && dot.flag == Some("drift"), "{dot:?}");
+        assert_eq!(r.drift, 1);
+        // Only the tracks asked for count.
+        let none = sync_check(&p, &c, &SyncOptions { frames: 2.0, tracks: Some(&["none".to_string()]) });
+        assert_eq!((none.markers, none.unsynced), (0, 0));
     }
 
     #[test]

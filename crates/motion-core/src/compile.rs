@@ -351,6 +351,8 @@ pub struct Compiled {
     pub scenes: Vec<CScene>,
     /// Every requested sync point, for `check`.
     pub syncs: Vec<SyncRecord>,
+    /// Cuts, layers appearing and keys landing, for `sync_check`.
+    pub events: Vec<VisualEvent>,
     /// Problems found while compiling; a project with errors still
     /// evaluates (bad properties keep their initial value).
     pub errors: Vec<String>,
@@ -365,6 +367,27 @@ pub struct SyncRecord {
     /// Requested timeline time (reference + lead).
     pub requested: f64,
     pub kind: SyncKind,
+}
+
+/// A visual event: a cut, a layer appearing, a key landing or a value
+/// jumping (a hold or a change within a frame), at timeline time `t`.
+#[derive(Clone, Debug)]
+pub struct VisualEvent {
+    pub element: String,
+    pub what: String,
+    pub kind: EventKind,
+    pub t: f64,
+    /// The marker reference the key or edge was authored against.
+    pub reference: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventKind {
+    Cut,
+    Appear,
+    Land,
+    Jump,
 }
 
 #[derive(Clone, Debug)]
@@ -719,6 +742,7 @@ struct Compiler<'a> {
     windows: Windows<'a>,
     errors: Vec<String>,
     syncs: Vec<SyncRecord>,
+    events: Vec<VisualEvent>,
 }
 
 impl<'a> Compiler<'a> {
@@ -739,6 +763,20 @@ impl<'a> Compiler<'a> {
                             kind: SyncKind::Move { curve: seg.curve.clone(), start: *start, dur: *dur, step: prop.step.or(step), shift },
                         });
                     }
+                }
+                let frame = 1.0 / base.fps.as_f64();
+                for seg in &prop.segments {
+                    if seg.from == seg.to {
+                        continue;
+                    }
+                    let jump = seg.curve == Curve::Hold || seg.dur < 1.5 * frame;
+                    self.events.push(VisualEvent {
+                        element: element.into(),
+                        what: what.into(),
+                        kind: if jump { EventKind::Jump } else { EventKind::Land },
+                        t: seg.end() - shift,
+                        reference: seg.sync.as_ref().map(|s| s.reference.clone()),
+                    });
                 }
                 prop
             }
@@ -841,6 +879,10 @@ impl<'a> Compiler<'a> {
             self.errors.push(format!("{id}.time.end: {e}"));
             f64::INFINITY
         });
+        if start.is_finite() {
+            let reference = c.time.start.as_ref().filter(|r| r.is_marker()).map(|r| r.text());
+            self.events.push(VisualEvent { element: id.into(), what: "appear".into(), kind: EventKind::Appear, t: start - shift, reference });
+        }
         if let Some(r) = &c.time.start {
             if r.is_marker() {
                 self.syncs.push(SyncRecord {
@@ -1294,7 +1336,7 @@ impl Compiled {
             errors.push("settings.duration must be positive".into());
         }
         let windows = Windows::new(project, base, &mut errors);
-        let mut c = Compiler { windows, errors, syncs: Vec::new() };
+        let mut c = Compiler { windows, errors, syncs: Vec::new(), events: Vec::new() };
         let mut scenes = Vec::new();
         for scene in &project.scenes {
             let id = scene.id.as_str();
@@ -1312,6 +1354,8 @@ impl Compiled {
             if end <= start {
                 c.errors.push(format!("{id}: scene ends ({end:.3}s) before it starts ({start:.3}s)"));
             }
+            let reference = scene.start.is_marker().then(|| scene.start.text());
+            c.events.push(VisualEvent { element: id.into(), what: "cut".into(), kind: EventKind::Cut, t: start, reference });
             if scene.start.is_marker() {
                 c.syncs.push(SyncRecord {
                     element: id.into(),
@@ -1373,8 +1417,9 @@ impl Compiled {
                 layers,
             });
         }
-        let Compiler { errors, syncs, .. } = c;
-        Compiled { settings: project.settings.clone(), base, scenes, syncs, errors }
+        let Compiler { errors, syncs, mut events, .. } = c;
+        events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        Compiled { settings: project.settings.clone(), base, scenes, syncs, events, errors }
     }
 
     pub fn fps(&self) -> Fps {

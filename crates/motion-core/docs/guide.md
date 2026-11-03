@@ -32,7 +32,11 @@
    says. Batches are atomic and undoable (`history`). Geometry is built,
    never traced from a reference (see [No tracing](#no-tracing-as-content)).
 6. **Review**: `check` (no errors, sync drift ≤ ±1 f, no `tracing`
-   warnings) and `snapshot` with `sheet: true` at the scene's sync points.
+   warnings), `sync_check {flagged: true}` (every cut, entrance, key
+   landing and jump against its nearest word, cue, beat or sound effect:
+   `drift` means it misses the marker it was keyed to, `unsynced` means a
+   hit with nothing to hit; key it to the marker instead of nudging
+   seconds) and `snapshot` with `sheet: true` at the scene's sync points.
    Look at the frames; fix; repeat.
 7. **Render** a draft (`quality: "draft"`), then the final.
 
@@ -362,6 +366,8 @@ outside the radius instead.
 
 - `check` has no errors; every anchored key's drift is within ±1 frame;
   no `tracing` warnings.
+- `sync_check {flagged: true}` lists nothing you did not mean (ambient
+  motion may land between markers on purpose).
 - Every shot was built from its breakdown; against a reference, no scene
   says "ours is flatter" or "ours lacks detail".
 - No still picture longer than the style's hold limit.

@@ -17,6 +17,7 @@ Usage:
   lahza motion analyze <project> [--audio FILE] [--offset SECONDS]
   lahza motion apply <project> <ops.json>
   lahza motion check <project> [--json]
+  lahza motion sync-check <project> [--frames N] [--tracks a,b] [--all] [--json]
   lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [-o out.png]
   lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [-o compare.png]
                                           (no --at: every frame, first to last, plus a side-by-side video)
@@ -149,6 +150,41 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             }
             if out.json["ok"] != true {
                 return Err("check found errors".into());
+            }
+        }
+        "sync-check" => {
+            let mut a = json!({"project": need()?, "flagged": !has(args, "--all") && !has(args, "--json"), "limit": 100000});
+            if let Some(n) = flag(args, "--frames") {
+                a["frames"] = json!(n.parse::<f64>().map_err(|e| e.to_string())?);
+            }
+            if let Some(t) = flag(args, "--tracks") {
+                a["tracks"] = json!(t.split(',').map(str::trim).collect::<Vec<_>>());
+            }
+            let r = tb.call("sync_check", a)?.json;
+            if has(args, "--json") {
+                print(&r);
+            } else {
+                println!("{} drift, {} unsynced (within {} f of {} markers)", r["drift"], r["unsynced"], r["frames"], r["markers"]);
+                if let Some(note) = r["note"].as_str() {
+                    println!("  {note}");
+                }
+                for e in r["events"].as_array().into_iter().flatten() {
+                    let near = &e["nearest"];
+                    println!(
+                        "  {:>8.3} s  f{:<5} {:<7} {:<8} {}.{}{}  nearest {}",
+                        e["t"].as_f64().unwrap_or(0.0),
+                        e["frame"],
+                        e["kind"].as_str().unwrap_or(""),
+                        e["flag"].as_str().unwrap_or("ok"),
+                        e["element"].as_str().unwrap_or(""),
+                        e["what"].as_str().unwrap_or(""),
+                        e["reference"].as_str().map(|r| format!(" on {r} ({:+} f)", e["drift_frames"])).unwrap_or_default(),
+                        if near.is_null() { "none".to_string() } else { format!("{} {:+} f", near["marker"].as_str().unwrap_or(""), near["frames"]) }
+                    );
+                }
+            }
+            if r["drift"].as_u64().unwrap_or(0) > 0 {
+                return Err("events drift from their markers".into());
             }
         }
         "snapshot" => {

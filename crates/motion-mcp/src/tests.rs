@@ -512,3 +512,39 @@ fn dropped_assets_are_errors_and_check_summarises_causes() {
     assert_eq!(snap["ok"], false, "{snap:#}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn sync_check_flags_hits_with_nothing_to_hit() {
+    let (mut tb, dir) = toolbox("synccheck");
+    let rec = dir.join("talk.lahzarec");
+    std::fs::create_dir_all(&rec).unwrap();
+    std::fs::write(
+        rec.join("edit.json"),
+        json!({"formatVersion": 5, "transcript": {"words": [
+            {"text": " The", "start": 0.4, "end": 0.6},
+            {"text": " canal", "start": 0.7, "end": 1.1},
+            {"text": " closed.", "start": 1.15, "end": 1.6}
+        ], "cues": [], "language": "en"}})
+        .to_string(),
+    )
+    .unwrap();
+    tb.call("project_create", json!({"path": "sync", "duration": 4, "width": 640, "height": 360})).unwrap();
+    tb.call("markers_import", json!({"kind": "transcript", "path": "talk.lahzarec", "offset": 1.0})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "id": "label", "kind": "text", "text": "Canal", "size": 48, "color": "#ffffff",
+         "transform": {"position": [320, 180], "opacity": {"keys": [{"at": "word:canal", "from": 0, "v": 1, "dur": "6f", "anchor": "start"}]}}},
+        {"op": "add", "id": "pop", "kind": "shape", "shape": "circle", "size": 40, "fill": "#ff0000",
+         "transform": {"position": [100, 100], "scale": {"keys": [{"at": 2.4, "v": [0, 0]}, {"at": 2.6, "v": [1, 1]}]}}}
+    ]}))
+    .unwrap();
+    let r = tb.call("sync_check", json!({"flagged": true})).unwrap().json;
+    let flagged: Vec<&str> = r["events"].as_array().unwrap().iter().map(|e| e["element"].as_str().unwrap()).collect();
+    assert_eq!(flagged, ["pop"], "{r:#}");
+    assert_eq!(r["events"][0]["flag"], "unsynced");
+    assert_eq!(r["events"][0]["nearest"]["marker"], "word:3", "{r:#}");
+    let all = tb.call("sync_check", json!({"element": "label"})).unwrap().json;
+    let label = &all["events"].as_array().unwrap().iter().find(|e| e["reference"] == "word:canal").unwrap();
+    assert_eq!(label["drift_frames"], 0.0, "{all:#}");
+    std::fs::remove_dir_all(&dir).ok();
+}

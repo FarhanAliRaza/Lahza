@@ -154,6 +154,17 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: true,
         },
         ToolDef {
+            name: "sync_check",
+            description: "Visual events (cuts, layers appearing, keys landing, fill/opacity/value jumps) on the frame grid, each with its nearest marker or sound effect. Flags `drift`: authored against a marker (word:, cue:, beat:, …) but lands more than `frames` off it; `unsynced`: no marker within `frames` (a hit with nothing to hit). Use it instead of eyeballing audio loudness to confirm a narrated or beat-cut piece lands; fix flags by keying to the marker (\"at\": \"word:iran\") rather than nudging seconds.",
+            schema: obj(json!({"frames": {"type": "number", "default": 2, "description": "allowed distance in frames"},
+                "tracks": {"type": "array", "items": {"type": "string"}, "description": "marker tracks to measure against (\"sound\" = sound effects); default all"},
+                "element": {"type": "string", "description": "only this layer or scene id (and its children, <id>/…)"},
+                "from": {"type": "number"}, "to": {"type": "number"},
+                "flagged": {"type": "boolean", "description": "only flagged events (default false)"},
+                "limit": {"type": "integer", "default": 200}}), &[]),
+            read_only: true,
+        },
+        ToolDef {
             name: "snapshot",
             description: "Render frames as images: at given times/references, at a track's markers, or (default) at the project's sync points. sheet=true returns one labelled contact sheet.",
             schema: obj(json!({"at": {"type": "array", "items": time}, "track": {"type": "string"}, "from": {"type": "number"}, "to": {"type": "number"},
@@ -338,6 +349,7 @@ impl Toolbox {
             "narration_import" => self.narration_import(&args),
             "edit_apply" => self.edit_apply(&args),
             "check" => self.check(&args),
+            "sync_check" => self.sync_check(&args),
             "snapshot" => self.snapshot(&args),
             "compare" => self.compare(&args),
             "render" => self.render(&args),
@@ -1086,6 +1098,36 @@ impl Toolbox {
         }
         let mut v = serde_json::to_value(&report).unwrap_or_default();
         v["sync_count"] = json!(sync_count);
+        Ok(Output::json(v))
+    }
+
+    fn sync_check(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let compiled = self.compiled(&dir);
+        let project = &self.state(&dir).project;
+        let tracks: Option<Vec<String>> = args.get("tracks").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect());
+        let options = check::SyncOptions { frames: get_f64(args, "frames").unwrap_or(2.0), tracks: tracks.as_deref() };
+        let mut r = check::sync_check(project, &compiled, &options);
+        let from = get_f64(args, "from").unwrap_or(f64::NEG_INFINITY);
+        let to = get_f64(args, "to").unwrap_or(f64::INFINITY);
+        let element = get_str(args, "element");
+        let flagged = args.get("flagged").and_then(Value::as_bool).unwrap_or(false);
+        r.events.retain(|e| {
+            e.t >= from && e.t <= to && (!flagged || e.flag.is_some()) && element.is_none_or(|id| e.element == id || e.element.starts_with(&format!("{id}/")))
+        });
+        let shown = r.events.len();
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+        if shown > limit {
+            // Flagged first, then in time order.
+            r.events.sort_by(|a, b| a.flag.is_none().cmp(&b.flag.is_none()).then(a.t.total_cmp(&b.t)));
+            r.events.truncate(limit);
+            r.events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        }
+        let mut v = serde_json::to_value(&r).unwrap_or_default();
+        v["matching"] = json!(shown);
+        if r.markers == 0 {
+            v["note"] = json!("no markers to measure against: import narration, analyse the music or add markers first");
+        }
         Ok(Output::json(v))
     }
 
