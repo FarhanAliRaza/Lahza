@@ -449,6 +449,8 @@ pub struct CLayer {
     rotation_y: Prop<f64>,
     scale_z: Option<Prop<f64>>,
     three_d: bool,
+    /// Placed on the canvas, outside the scene camera (`space: "screen"`).
+    screen: bool,
     blend: Blend,
     effects: Vec<CEffect>,
     matte: Option<(usize, MatteMode)>,
@@ -535,6 +537,8 @@ struct CShape {
     fill: Option<CPaint>,
     stroke: Option<(Prop<Color>, Prop<f64>)>,
     stroke_style: Option<Arc<crate::document::StrokeStyle>>,
+    /// Animated dash offset (the style holds it when constant).
+    dash_offset: Option<Prop<f64>>,
     stroke_gradient: Option<Arc<Vec<(f64, Color)>>>,
     path: Option<(Vec<Arc<str>>, Prop<f64>)>,
     field: Option<CField>,
@@ -985,7 +989,13 @@ impl<'a> Compiler<'a> {
                     trim: self.prop(&s.trim, id, "trim", start, step, shift),
                     fill,
                     stroke,
-                    stroke_style: s.stroke.as_ref().and_then(|st| st.style()).map(Arc::new),
+                    stroke_style: s.stroke.as_ref().and_then(|st| st.style()).map(|mut style| {
+                        if let Some(Property::Constant(v)) = s.stroke.as_ref().map(|st| &st.dash_offset) {
+                            style.dash_offset = *v;
+                        }
+                        Arc::new(style)
+                    }),
+                    dash_offset: s.stroke.as_ref().filter(|st| st.dash_offset.is_animated()).map(|st| self.prop(&st.dash_offset, id, "stroke.dash_offset", start, step, shift)),
                     stroke_gradient: s.stroke.as_ref().and_then(|st| st.gradient.as_ref()).and_then(|g| {
                         if g.stops.is_empty() {
                             self.errors.push(format!("{id}.stroke.gradient: needs at least one stop"));
@@ -1076,7 +1086,8 @@ impl<'a> Compiler<'a> {
             LayerKind::Component(_) => CKind::Comp(Vec::new()),
         };
         // Meshes are always placed in 3D.
-        let three_d = c.three_d || matches!(kind, CKind::Mesh(_));
+        let screen = c.space == crate::document::LayerSpace::Screen;
+        let three_d = !screen && (c.three_d || matches!(kind, CKind::Mesh(_)));
         CLayer {
             id: id.into(),
             start,
@@ -1093,6 +1104,7 @@ impl<'a> Compiler<'a> {
             rotation_y,
             scale_z,
             three_d,
+            screen,
             blend: c.blend,
             effects,
             matte,
@@ -1799,12 +1811,13 @@ fn emit(layers: &[CLayer], tc: f64, inherited: Option<Step>, space: &Space, pare
     let mut order: Vec<usize> = (0..layers.len()).collect();
     let mut i = 0;
     while i < order.len() {
-        if !(layers[order[i]].three_d || space.three_d) {
+        let sorted = |l: &CLayer| !l.screen && (l.three_d || space.three_d);
+        if !sorted(&layers[order[i]]) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < order.len() && (layers[order[i]].three_d || space.three_d) {
+        while i < order.len() && sorted(&layers[order[i]]) {
             i += 1;
         }
         let mut depth: Vec<(f64, usize)> = order[start..i]
@@ -1846,10 +1859,11 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
         return;
     }
     let world = space.world.then(layer_matrix(layers, i, tc, inherited, space, cache));
-    let three_d = space.three_d || l.three_d;
-    let matrix = space.screen(world, three_d);
+    // Screen layers (and what is inside them) skip the camera.
+    let (three_d, flat) = if l.screen { (false, Affine::IDENTITY) } else { (space.three_d || l.three_d, space.flat) };
+    let matrix = if l.screen { Proj::from(world.to_affine()) } else { space.screen(world, three_d) };
     let scale = matrix.max_scale();
-    let inner = Space { world, three_d, ..*space };
+    let inner = Space { world, three_d, flat, ..*space };
     let effects: Vec<EffectState> = l
         .effects
         .iter()
@@ -1960,7 +1974,10 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                 CPaint::Gradient(g) => PaintState::Gradient(g.clone()),
             }),
             stroke: s.stroke.as_ref().map(|(c, w)| (clamp_color(c.at(t)), w.at(t).max(0.0))),
-            stroke_style: s.stroke_style.clone(),
+            stroke_style: match (&s.stroke_style, &s.dash_offset) {
+                (Some(style), Some(offset)) => Some(Arc::new(crate::document::StrokeStyle { dash_offset: offset.at(t), ..(**style).clone() })),
+                (style, _) => style.clone(),
+            },
             stroke_gradient: s.stroke_gradient.clone(),
             path: s.path.as_ref().map(|(paths, index)| path_morph(paths, index.at(t))),
             field: s.field.as_ref().map(|f| FieldState {
@@ -2285,5 +2302,25 @@ mod tests {
         p.scenes[0].start = "beat:2".into();
         let c = Compiled::new(&p);
         assert!((c.scenes[0].start - (1.0 - 1.0 / 30.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn screen_layers_ignore_the_camera() {
+        let mut p = Project::new(640, 360, Fps::whole(30), 2.0);
+        p.scenes.push(serde_json::from_value(serde_json::json!({"id": "s1",
+            "camera": {"zoom": {"keys": [{"at": 0, "v": 1}, {"at": 2, "v": 1.6}]}, "orbit": {"keys": [{"at": 0, "v": [0, 0]}, {"at": 2, "v": [25, 10]}]},
+                       "dolly": {"keys": [{"at": 0, "v": 0}, {"at": 2, "v": 200}]}},
+            "layers": [
+                {"id": "card", "kind": "shape", "shape": "rect", "fill": "#fff", "three_d": true, "transform": {"position": [320, 180]}},
+                {"id": "flat", "kind": "shape", "shape": "rect", "fill": "#fff", "transform": {"position": [100, 60]}},
+                {"id": "title", "kind": "shape", "shape": "rect", "fill": "#fff", "space": "screen", "transform": {"position": [100, 60]}}]}))
+        .unwrap());
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let at = |t: f64, id: &str| c.frame(t).layers.iter().find(|l| l.id.as_ref() == id).map(|l| l.matrix.apply(0.0, 0.0)).unwrap();
+        // The world layers move with the camera; the screen layer stays put.
+        assert!((at(0.0, "flat").0 - at(1.9, "flat").0).abs() > 10.0);
+        assert_eq!(at(0.0, "title"), (100.0, 60.0));
+        assert_eq!(at(1.9, "title"), (100.0, 60.0));
     }
 }

@@ -182,6 +182,7 @@ pub fn catalog_json() -> Value {
             "effects_order": "shadow (below), then the layer through displace → directional_blur → rgb_split → colour effects in list order → vignette → grain, then glow (above); blur applies to the layer's picture first",
             "effects_note": "effects apply to the layer as one picture; on a comp they apply to the flattened comp (like an AE precomp)",
             "matte": {"layer": "sibling layer id used as a track matte (not drawn itself)", "mode": "alpha | alpha_inverted | luma | luma_inverted"},
+            "space": "world (default) | screen: screen ignores the scene camera's zoom/orbit/dolly and stays put on screen, drawn in layer order (titles, captions and finishing layers over a moving 3D camera)",
             "three_d": "bool: place the layer in 3D (uses transform.z, rotation_x, rotation_y and the scene camera's fov/orbit/dolly); 3D layers sort back to front among their neighbours; children of a 3D comp lie on its plane",
             "transform_3d": {"z": "depth, + is away from the viewer", "rotation_x": "degrees, + tilts the top away", "rotation_y": "degrees, + turns the right side away"},
             "parent": "transform parent: sibling layer id",
@@ -201,7 +202,7 @@ pub fn catalog_json() -> Value {
                 "points": "field only: [{\"position\": [x, y] layer space (animatable), \"color\": colour (animatable), \"radius\": px the colour holds (animatable, default 200)}, …] blended smoothly across the size box (mesh/blob gradient background)",
                 "softness": "field: how far colours blend (default 1; 0.25 crisp, 2 very soft; animatable)",
                 "warp": "field: noise displacement px of the blend (default 0; animatable)", "warp_scale": "field: warp noise feature size px (default 300)",
-                "stroke": {"color": "colour (default white)", "width": "px", "gradient": "path strokes: {\"stops\": [[0, colour], [1, colour]], \"along\": \"length\"} colour along the full path's length (0 = start, 1 = end; trim reveals it without sliding), replaces color; works with caps, joins, dashes, feathers", "cap": "round | butt | square (default round)", "join": "round | miter | bevel (default round)", "miter_limit": "default 4", "dash": "[dash, gap, …] px", "dash_offset": "px", "feather": "px faded at the far end (the head while trim draws it on)", "feather_start": "px faded at the start (a fading tail)", "note": "cap, join, dash and feathers apply to path strokes"}
+                "stroke": {"color": "colour (default white)", "width": "px", "gradient": "path strokes: {\"stops\": [[0, colour], [1, colour]], \"along\": \"length\"} colour along the full path's length (0 = start, 1 = end; trim reveals it without sliding), replaces color; works with caps, joins, dashes, feathers", "cap": "round | butt | square (default round)", "join": "round | miter | bevel (default round)", "miter_limit": "default 4", "dash": "[dash, gap, …] px", "dash_offset": "px, animatable (marching ants)", "feather": "px faded at the far end (the head while trim draws it on)", "feather_start": "px faded at the start (a fading tail)", "note": "cap, join, dash and feathers apply to path strokes"}
             },
             "text": {
                 "text": "string; \\n breaks lines", "font": "Inter | Inter Medium | Inter SemiBold | project-relative .ttf/.otf",

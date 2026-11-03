@@ -51,7 +51,11 @@ start, else the project end. A cut on a marker leads it by one frame unless
 Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 `scale`, `rotation`, `opacity`), `time` (`start`, `end`, `duration`,
 `step_fps`, `step_phase`, `offset`), `blend`, `effects` (`blur`, `shadow`,
-`glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `follow`, `hidden`.
+`glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `follow`, `hidden`,
+`space` (`"world"`, the default, or `"screen"`: the layer ignores the scene
+camera's zoom, orbit and dolly and stays where its transform puts it on
+screen, drawn in layer order above a moving 3D camera; use it for titles,
+captions and finishing layers in 3D scenes).
 
 3D layers (`three_d`, and every `mesh`) also take `transform.z`,
 `rotation_x`, `rotation_y` and `scale_z`. Space is x right, y down, z away
@@ -80,7 +84,7 @@ Kinds: `shape` (`circle`, `rect`, `capsule`, `ring`, `arc`, `polygon`,
 
 Path strokes take `cap` (`round`, `butt`, `square`), `join` (`round`,
 `miter`, `bevel`), `miter_limit`, `dash` (`[dash, gap, …]` px),
-`dash_offset`, `feather` (px faded at the far end, so a stroke drawn on
+`dash_offset` (animatable: key it linearly for marching ants), `feather` (px faded at the far end, so a stroke drawn on
 with `trim` has a soft head) and `feather_start` (px faded at the start, a
 fading tail):
 

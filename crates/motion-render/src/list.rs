@@ -1224,6 +1224,10 @@ fn split_path(list: &mut DisplayList, target: &Target, prim: &Prim, b: [f64; 4])
     let fill = prim.geom2[2] < 0.5;
     let first = prim.geom2[0].to_bits() as usize;
     let segs: Vec<[f32; 4]> = list.segments[first..first + count as usize].to_vec();
+    let centreline = (prim.paint[1] as u32 == PAINT_ALONG).then(|| {
+        let (cf, cn) = (prim.paint2[0].to_bits() as usize, prim.paint2[1].to_bits() as usize);
+        Centreline { segs: list.segments[cf..cf + cn].to_vec(), params: list.segments[cf + cn..cf + 2 * cn].to_vec() }
+    });
     // Local x and y of a pixel coordinate, and back.
     let lx = |px: f32| (a * px + c) / w;
     let ly = |py: f32| (d * py + f) / w;
@@ -1273,6 +1277,7 @@ fn split_path(list: &mut DisplayList, target: &Target, prim: &Prim, b: [f64; 4])
             }
         }
         let xmins: Vec<f32> = order.iter().map(|&i| lb[i as usize][0]).collect();
+        let (ya, yb) = (ly((ty * TILE) as f32), ly(((ty + 1) * TILE) as f32));
         for tx in tx0..=tx1 {
             let (xa, xb) = (lx((tx * TILE) as f32), lx(((tx + 1) * TILE) as f32));
             let (x0, x1) = (xa.min(xb) - m, xa.max(xb) + m);
@@ -1296,16 +1301,61 @@ fn split_path(list: &mut DisplayList, target: &Target, prim: &Prim, b: [f64; 4])
                 list.segments.extend(order[..].iter().filter(|&&i| lb[i as usize][2] >= x0).map(|&i| segs[i as usize]));
                 part.geom2[0] = f32::from_bits(start);
                 part.geom2[1] = f32::from_bits(list.segments.len() as u32 - start);
+                if let Some(c) = &centreline {
+                    cull_along(list, &mut part, c, [xa.min(xb), ya.min(yb), xa.max(xb), ya.max(yb)]);
+                }
                 out.push(((ty * tw + tx) as usize, part));
                 continue;
             }
             list.segments.extend(near.iter().map(|&i| segs[i as usize]));
             part.geom2[0] = f32::from_bits(start);
             part.geom2[1] = f32::from_bits(near.len() as u32);
+            if let Some(c) = &centreline {
+                cull_along(list, &mut part, c, [xa.min(xb), ya.min(yb), xa.max(xb), ya.max(yb)]);
+            }
             out.push(((ty * tw + tx) as usize, part));
         }
     }
     Some(out)
+}
+
+/// A colour-along-length prim's centreline: segments and their [u0, u1]
+/// params.
+struct Centreline {
+    segs: Vec<[f32; 4]>,
+    params: Vec<[f32; 4]>,
+}
+
+/// Points `part` at the centreline segments that can be nearest to some
+/// pixel of the tile `rect` (local units), so the per-pixel lookup scans
+/// those instead of the whole line. A segment further from the tile
+/// centre than the nearest one plus the tile's diagonal is never the
+/// nearest to any pixel in it, so shading is unchanged.
+fn cull_along(list: &mut DisplayList, part: &mut Prim, c: &Centreline, rect: [f32; 4]) {
+    let centre = [(rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5];
+    // Half the diagonal, plus a pixel's worth of slack for sample offsets.
+    let half = 0.5 * (rect[2] - rect[0]).hypot(rect[3] - rect[1]) * 1.1;
+    let dist = |s: &[f32; 4]| {
+        let e = [s[2] - s[0], s[3] - s[1]];
+        let w = [centre[0] - s[0], centre[1] - s[1]];
+        let t = clamp01((w[0] * e[0] + w[1] * e[1]) / (e[0] * e[0] + e[1] * e[1]).max(1e-12));
+        (w[0] - e[0] * t).hypot(w[1] - e[1] * t)
+    };
+    let d: Vec<f32> = c.segs.iter().map(dist).collect();
+    let nearest = d.iter().copied().fold(f32::MAX, f32::min);
+    let keep: Vec<usize> = (0..d.len()).filter(|&i| d[i] <= nearest + 2.0 * half).collect();
+    if keep.len() == d.len() {
+        return;
+    }
+    let start = list.segments.len() as u32;
+    list.segments.extend(keep.iter().map(|&i| c.segs[i]));
+    list.segments.extend(keep.iter().map(|&i| c.params[i]));
+    part.paint2[0] = f32::from_bits(start);
+    part.paint2[1] = f32::from_bits(keep.len() as u32);
+}
+
+fn clamp01(v: f32) -> f32 {
+    v.clamp(0.0, 1.0)
 }
 
 fn push_segments(lines: &[Vec<(f64, f64)>], close: bool, segments: &mut Vec<[f32; 4]>) -> (u32, u32, [f64; 4]) {

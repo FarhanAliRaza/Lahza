@@ -1468,3 +1468,108 @@ fn motion_blurred_cpu_frames_are_not_black() {
         assert_eq!(px(&img, 5, 5), [32, 48, 64, 255], "samples {samples}");
     }
 }
+
+#[test]
+fn dash_offset_animates() {
+    let p = project(json!([{"id": "ants", "kind": "shape", "shape": "path", "d": "M 20 90 L 300 90",
+        "stroke": {"color": "#ffffff", "width": 8, "cap": "butt", "dash": [20, 20], "dash_offset": {"keys": [{"at": 0, "v": 0}, {"at": 1, "v": 20, "ease": "linear"}]}}}]));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let a = cpu().render(&c, 0.0);
+    let b = cpu().render(&c, 1.0);
+    // Shifted by one dash: lit and dark swap along the line.
+    let lit = |img: &image::RgbaImage, x| px(img, x, 90)[0] > 128;
+    assert!((30..270).step_by(10).all(|x| lit(&a, x) != lit(&b, x)), "the dashes moved");
+}
+
+#[test]
+fn a_gradient_rect_works_as_a_matte() {
+    for (mode, stops) in [("alpha", json!([[0, "#ffffffff"], [1, "#ffffff00"]])), ("luma", json!([[0, "#ffffff"], [1, "#000000"]]))] {
+        let p = project(json!([
+            {"id": "m", "kind": "shape", "shape": "rect", "size": [300, 160],
+             "fill": {"gradient": "linear", "from": [-150, 0], "to": [150, 0], "stops": stops}, "transform": {"position": [160, 90]}},
+            {"id": "red", "kind": "shape", "shape": "rect", "size": [300, 160], "fill": "#ff0000", "transform": {"position": [160, 90]},
+             "matte": {"layer": "m", "mode": mode}}
+        ]));
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let img = cpu().render(&c, 0.0);
+        let (l, m, r) = (px(&img, 30, 90)[0], px(&img, 160, 90)[0], px(&img, 290, 90)[0]);
+        assert!(l > 220 && (100..160).contains(&m) && r < 40, "{mode}: red should fade left to right, got {l} {m} {r}");
+    }
+}
+
+
+/// Gradient-filled mattes (alpha, luma, box units, on a comp) on the GPU.
+#[test]
+fn gpu_matches_cpu_gradient_mattes() {
+    let p = project(json!([
+        {"id": "m1", "kind": "shape", "shape": "rect", "size": [140, 160], "fill": {"gradient": "linear", "from": [-70, 0], "to": [70, 0], "stops": [[0, "#ffffffff"], [1, "#ffffff00"]]}, "transform": {"position": [80, 90]}},
+        {"id": "a", "kind": "shape", "shape": "rect", "size": [140, 160], "fill": "#ff0000", "transform": {"position": [80, 90]}, "matte": {"layer": "m1", "mode": "alpha"}},
+        {"id": "m2", "kind": "shape", "shape": "rect", "size": [140, 160], "fill": {"gradient": "radial", "units": "box", "from": [0.5, 0.5], "to": [1, 0.5], "stops": [[0, "#ffffff"], [1, "#000000"]]}, "transform": {"position": [240, 90]}},
+        {"id": "g", "kind": "comp", "matte": {"layer": "m2", "mode": "luma"}, "layers": [
+            {"id": "b", "kind": "shape", "shape": "rect", "size": [140, 160], "fill": "#00ff00", "transform": {"position": [240, 90]}}]}
+    ]));
+    assert_gpu_matches_cpu(&p, &[0.0]);
+}
+
+#[test]
+#[ignore]
+fn benchmark_feathered_trimmed_path() {
+    // A long wavy route drawn on with trim and a soft head.
+    let n = 3000;
+    let d: String = (0..n)
+        .map(|i| {
+            let u = i as f64 / n as f64;
+            format!("{} {:.2} {:.2}", if i == 0 { "M" } else { "L" }, -450.0 + 900.0 * u, 600.0 * (u * 9.0).sin() + 40.0 * (u * 97.0).sin())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut p = Project::new(1080, 1920, Fps::whole(30), 1.0);
+    p.scenes.push(serde_json::from_value(json!({"id": "s", "layers": [
+        {"id": "route", "kind": "shape", "shape": "path", "d": d, "stroke": {"color": "#ff4040", "width": 8, "feather": 120, "gradient": {"stops": [[0, "#ff4040"], [1, "#40a0ff"]], "along": "length"}},
+         "trim": [0, 0.85], "transform": {"position": [540, 960]}}]})).unwrap());
+    let c = Compiled::new(&p);
+    let mut r = cpu();
+    r.render(&c, 0.0);
+    let t = std::time::Instant::now();
+    for _ in 0..5 {
+        r.last_invalidate();
+        r.render(&c, 0.0);
+    }
+    eprintln!("feathered path: {:.1} ms/frame", t.elapsed().as_secs_f64() * 200.0);
+}
+
+/// Colour along a long feathered line: split per tile (each tile scans
+/// only its nearby centreline) against the same line rotated a quarter
+/// turn, which is never split.
+#[test]
+fn along_paint_split_per_tile_draws_the_same() {
+    let n = 400;
+    let pts: Vec<(f64, f64)> = (0..n)
+        .map(|i| {
+            let u = i as f64 / (n - 1) as f64;
+            (-65.0 + 130.0 * u, 55.0 * (u * 11.0).sin())
+        })
+        .collect();
+    let path = |f: &dyn Fn((f64, f64)) -> (f64, f64)| {
+        pts.iter().enumerate().map(|(i, p)| { let q = f(*p); format!("{} {:.4} {:.4}", if i == 0 { "M" } else { "L" }, q.0, q.1) }).collect::<Vec<_>>().join(" ")
+    };
+    let stroke = json!({"width": 9, "feather": 40, "feather_start": 15, "gradient": {"stops": [[0, "#ff2020"], [0.5, "#20ff20"], [1, "#4040ff"]], "along": "length"}});
+    let p = project(json!([
+        {"id": "split", "kind": "shape", "shape": "path", "d": path(&|p| p), "stroke": stroke, "trim": [0.05, 0.9], "transform": {"position": [85, 90]}},
+        {"id": "whole", "kind": "shape", "shape": "path", "d": path(&|(x, y)| (y, -x)), "stroke": stroke, "trim": [0.05, 0.9], "transform": {"position": [235, 90], "rotation": 90}}
+    ]));
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    let mut worst = 0;
+    for y in 0..180 {
+        for x in 8..160 {
+            let (a, b) = (px(&img, x, y), px(&img, x + 150, y));
+            worst = worst.max((0..3).map(|i| (a[i] as i32 - b[i] as i32).abs()).max().unwrap());
+        }
+    }
+    let lit = (0..180).flat_map(|y| (8..160).map(move |x| (x, y))).filter(|&(x, y)| px(&img, x, y)[..3].iter().any(|v| *v > 40)).count();
+    assert!(lit > 800, "the line drew ({lit} px)");
+    assert!(worst <= 24, "split along paint differs by {worst}");
+    assert_gpu_matches_cpu(&p, &[0.0]);
+}

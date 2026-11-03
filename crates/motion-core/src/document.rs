@@ -321,6 +321,9 @@ impl Camera {
 fn one_prop() -> Property<f64> {
     Property::Constant(1.0)
 }
+fn is_zero_prop(p: &Property<f64>) -> bool {
+    *p == zero_prop()
+}
 fn zero_prop() -> Property<f64> {
     Property::Constant(0.0)
 }
@@ -776,13 +779,32 @@ pub struct Common {
     pub three_d: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// "screen": placed in canvas coordinates, untouched by the scene's
+    /// camera (2D moves, orbit, dolly, perspective) — titles and finishing
+    /// layers over a moving 3D shot. Default "world".
+    #[serde(default, skip_serializing_if = "LayerSpace::is_world")]
+    pub space: LayerSpace,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerSpace {
+    #[default]
+    World,
+    Screen,
+}
+
+impl LayerSpace {
+    pub fn is_world(&self) -> bool {
+        *self == LayerSpace::World
+    }
 }
 
 fn is_normal(b: &Blend) -> bool {
     *b == Blend::Normal
 }
 
-const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "follow", "three_d", "hidden"];
+const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "follow", "three_d", "hidden", "space"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -1252,9 +1274,10 @@ pub struct Stroke {
     /// Alternating dash and gap lengths in px.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dash: Vec<f64>,
-    /// Shift of the dash pattern along the stroke, px.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub dash_offset: f64,
+    /// Shift of the dash pattern along the stroke, px (animatable: marching
+    /// ants, a dash running along a route).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero_prop")]
+    pub dash_offset: Property<f64>,
     /// Fade over this many px at the stroke's far end (the drawing head
     /// while `trim` draws it on).
     #[serde(default, skip_serializing_if = "is_default")]
@@ -1314,7 +1337,8 @@ impl Stroke {
             join: self.join,
             miter_limit: self.miter_limit.max(1.0),
             dash: if dashed { dash } else { Vec::new() },
-            dash_offset: self.dash_offset,
+            // The current value is set per frame (see compile).
+            dash_offset: 0.0,
             feather: self.feather.max(0.0),
             feather_start: self.feather_start.max(0.0),
         })
