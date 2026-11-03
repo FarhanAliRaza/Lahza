@@ -454,3 +454,30 @@ fn narration_manifest_times_everything_and_survives_a_new_hook() {
     assert_eq!(markers(&mut tb, "line")["line"][0]["id"], "hook");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn imports_are_content_addressed_and_idempotent() {
+    let (mut tb, dir) = toolbox("assets-cas");
+    tb.call("project_create", json!({"path": "p", "duration": 2, "width": 320, "height": 180})).unwrap();
+    let ff = |name: &str, color: &str| {
+        assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("color=c={color}:s=16x16"), "-frames:v", "1"]).arg(dir.join(name)).status().unwrap().success());
+    };
+    std::fs::create_dir_all(dir.join("g1")).unwrap();
+    std::fs::create_dir_all(dir.join("g2")).unwrap();
+    ff("g1/map.png", "red");
+    ff("g2/map.png", "blue");
+    let a = tb.call("media_import", json!({"path": "g1/map.png"})).unwrap().json;
+    let again = tb.call("media_import", json!({"path": "g1/map.png"})).unwrap().json;
+    let b = tb.call("media_import", json!({"path": "g2/map.png"})).unwrap().json;
+    assert_eq!(a["src"], "assets/map.png");
+    assert_eq!(again["src"], "assets/map.png", "the same file twice is a no-op");
+    let b = b["src"].as_str().unwrap();
+    assert!(b.starts_with("assets/map-") && b.ends_with(".png"), "same name, other bytes: a distinct path, not an error ({b})");
+    // Both files are intact.
+    let red = image::open(dir.join("p.lahza").join("assets/map.png")).unwrap().to_rgba8();
+    let blue = image::open(dir.join("p.lahza").join(b)).unwrap().to_rgba8();
+    assert!(red.get_pixel(0, 0)[0] > 200 && blue.get_pixel(0, 0)[2] > 200);
+    let third = tb.call("media_import", json!({"path": "g2/map.png"})).unwrap().json;
+    assert_eq!(third["src"].as_str().unwrap(), b);
+    std::fs::remove_dir_all(&dir).ok();
+}

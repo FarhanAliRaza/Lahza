@@ -592,8 +592,7 @@ impl Toolbox {
                 (Ok(r), _) => r.to_string_lossy().into_owned(),
                 (Err(_), Some(rec)) if abs.starts_with(rec) => recording::shared_path(&dir, rec, &abs).ok_or("bad path")?,
                 (Err(_), Some(rec)) => {
-                    let dest = unique_file(&rec.join("media"), &abs)?;
-                    std::fs::copy(&abs, &dest).map_err(|e| format!("copying {}: {e}", abs.display()))?;
+                    let dest = store_file(&rec.join("media"), &abs)?;
                     recording::shared_path(&dir, rec, &dest).ok_or("bad path")?
                 }
                 (Err(_), None) => import_asset(&dir, &abs)?,
@@ -646,8 +645,7 @@ impl Toolbox {
         } else {
             let abs = self.path(sound);
             let file = if abs.starts_with(&rec) { abs.clone() } else {
-                let dest = unique_file(&rec.join("media"), &abs)?;
-                std::fs::copy(&abs, &dest).map_err(|e| format!("copying {}: {e}", abs.display()))?;
+                let dest = store_file(&rec.join("media"), &abs)?;
                 dest
             };
             (file, abs.file_stem().and_then(|s| s.to_str()).unwrap_or("sound").to_string())
@@ -1687,17 +1685,37 @@ impl Toolbox {
 
 /// Copies a file into `<project>/assets/` and returns its relative path.
 /// A free name for `file` in `folder` (`shot.png`, `shot-2.png`, …).
-fn unique_file(folder: &Path, file: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+/// Copies `file` into `folder`, content-addressed and idempotent: it keeps
+/// its name when that is free or already holds the same bytes (importing
+/// twice is a no-op); a different file with the same name becomes
+/// `<stem>-<hash>.<ext>`. Written through a temporary file and a rename,
+/// so agents importing at once never see a half-written or clobbered file.
+fn store_file(folder: &Path, file: &Path) -> Result<PathBuf, String> {
     if !file.is_file() {
         return Err(format!("{} does not exist", file.display()));
     }
+    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    if file.parent().and_then(|p| p.canonicalize().ok()) == folder.canonicalize().ok() {
+        return Ok(file.to_path_buf());
+    }
+    let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let hash = sha_hex(&bytes);
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("media");
     let ext = file.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
-    (1..1000)
-        .map(|i| folder.join(if i == 1 { format!("{stem}{ext}") } else { format!("{stem}-{i}{ext}") }))
-        .find(|p| !p.exists())
-        .ok_or_else(|| "no free file name".to_string())
+    for name in [format!("{stem}{ext}"), format!("{stem}-{}{ext}", &hash[..12])] {
+        let dest = folder.join(&name);
+        match std::fs::read(&dest) {
+            Ok(existing) if existing == bytes => return Ok(dest),
+            Ok(_) => continue,
+            Err(_) => {
+                let tmp = folder.join(format!(".{name}.{}.{}", std::process::id(), &hash[..8]));
+                std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+                std::fs::rename(&tmp, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+                return Ok(dest);
+            }
+        }
+    }
+    Err(format!("{}: could not store a copy", file.display()))
 }
 
 /// Pixel size of a recording's screen video.
@@ -1733,15 +1751,9 @@ fn edited_duration(rec: &Path, doc: &Value) -> Option<f64> {
 }
 
 fn import_asset(dir: &Path, file: &Path) -> Result<String, String> {
-    if !file.is_file() {
-        return Err(format!("{} does not exist", file.display()));
-    }
-    let name = file.file_name().ok_or("bad file name")?.to_string_lossy().into_owned();
-    let dest = dir.join("assets").join(&name);
-    std::fs::create_dir_all(dir.join("assets")).map_err(|e| e.to_string())?;
-    if dest != file {
-        std::fs::copy(file, &dest).map_err(|e| format!("copying {}: {e}", file.display()))?;
-    }
+    let assets = dir.join("assets");
+    let dest = store_file(&assets, file)?;
+    let name = dest.file_name().ok_or("bad file name")?.to_string_lossy().into_owned();
     Ok(format!("assets/{name}"))
 }
 
@@ -1976,9 +1988,9 @@ impl Toolbox {
                 Ok(r) => r.to_string_lossy().into_owned(),
                 Err(_) if copy => {
                     let name = folder.file_name().ok_or("bad folder")?.to_string_lossy().into_owned();
-                    let dest = dir.join("assets").join(&name);
-                    copy_dir(&folder, &dest)?;
-                    format!("assets/{name}")
+                    std::fs::create_dir_all(dir.join("assets")).map_err(|e| e.to_string())?;
+                    let dest = copy_dir(&folder, &dir.join("assets").join(&name))?;
+                    format!("assets/{}", dest.file_name().unwrap_or_default().to_string_lossy())
                 }
                 Err(_) => return Err("sequences outside the project must be copied (copy: true)".into()),
             };
@@ -1992,8 +2004,7 @@ impl Toolbox {
                 (Err(_), Some(rec)) if abs.starts_with(rec) => recording::shared_path(&dir, rec, &abs).ok_or("bad path")?,
                 // Other files go to the recording's shared media folder.
                 (Err(_), Some(rec)) if copy => {
-                    let dest = unique_file(&rec.join("media"), &abs)?;
-                    std::fs::copy(&abs, &dest).map_err(|e| format!("copying {}: {e}", abs.display()))?;
+                    let dest = store_file(&rec.join("media"), &abs)?;
                     recording::shared_path(&dir, rec, &dest).ok_or("bad path")?
                 }
                 (Err(_), _) if copy => import_asset(&dir, &abs)?,
@@ -2436,12 +2447,39 @@ fn which(program: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")?.to_str()?.split(':').map(|d| Path::new(d).join(program)).find(|p| p.is_file())
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+/// Copies a folder of frames; like `store_file`, an existing folder of the
+/// same name is reused when it holds the same files, else the copy gets
+/// `<name>-<hash>`. Returns the folder used.
+fn copy_dir(from: &Path, to: &Path) -> Result<PathBuf, String> {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for e in std::fs::read_dir(from).map_err(|e| e.to_string())?.flatten() {
         if e.path().is_file() {
-            std::fs::copy(e.path(), to.join(e.file_name())).map_err(|e| e.to_string())?;
+            files.push((e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).map_err(|e| e.to_string())?));
         }
     }
-    Ok(())
+    files.sort();
+    let mut all = Vec::new();
+    for (n, b) in &files {
+        all.extend_from_slice(n.as_bytes());
+        all.extend_from_slice(&sha_hex(b).into_bytes());
+    }
+    let hash = sha_hex(&all);
+    let same = |dir: &Path| files.iter().all(|(n, b)| std::fs::read(dir.join(n)).is_ok_and(|e| &e == b));
+    let alt = to.with_file_name(format!("{}-{}", to.file_name().and_then(|n| n.to_str()).unwrap_or("frames"), &hash[..12]));
+    for dest in [to.to_path_buf(), alt] {
+        if dest.exists() {
+            if same(&dest) {
+                return Ok(dest);
+            }
+            continue;
+        }
+        let tmp = dest.with_file_name(format!(".{}.{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("frames"), std::process::id()));
+        std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+        for (n, b) in &files {
+            std::fs::write(tmp.join(n), b).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&tmp, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        return Ok(dest);
+    }
+    Err(format!("{}: could not store a copy", from.display()))
 }
