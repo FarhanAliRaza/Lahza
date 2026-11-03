@@ -491,6 +491,8 @@ impl Builder<'_> {
         let lighting = self.meshes.run_mesh();
         let Some(inverse) = root.then(layer.matrix).inverse() else { return false };
         let items = self.layer_items(layer, root, &mut list.stops, &mut list.segments);
+        let blur = card_blur(layer, self.scale);
+        let pad = if blur > 0.3 { 3.0 * blur + 2.0 } else { 0.0 };
         if items.is_empty() {
             return true;
         }
@@ -500,7 +502,7 @@ impl Builder<'_> {
             bb = [bb[0].min(b[0]), bb[1].min(b[1]), bb[2].max(b[2]), bb[3].max(b[3])];
         }
         let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
-        let rect = [bb[0].floor().max(0.0), bb[1].floor().max(0.0), bb[2].ceil().min(cw), bb[3].ceil().min(ch)];
+        let rect = [(bb[0] - pad).floor().max(0.0), (bb[1] - pad).floor().max(0.0), (bb[2] + pad).ceil().min(cw), (bb[3] + pad).ceil().min(ch)];
         if !rect.iter().all(|v| v.is_finite()) || rect[2] <= rect[0] || rect[3] <= rect[1] {
             return bb.iter().all(|v| v.is_finite());
         }
@@ -515,7 +517,8 @@ impl Builder<'_> {
             }
             corners[k] = [q[0], q[1], q[2]];
         }
-        let (offset, origin, factor, size) = self.reserve(list, pending, items, rect, 0.0, 1.0, false);
+        let (sigma, factor) = if blur > 0.3 { (blur, if blur <= 4.0 { 1.0 } else { 2f64.powf((blur / 4.0).log2().ceil()).min(16.0) }) } else { (0.0, 1.0) };
+        let (offset, origin, factor, size) = self.reserve(list, pending, items, rect, sigma, factor, false);
         let (serial, index) = self.meshes.member();
         let card = crate::mesh3d::Card { index, view: corners, screen, picture: crate::mesh3d::Backdrop { offset, size, origin, factor }, bounds: rect };
         self.meshes.add_card(card.clone());
@@ -1129,13 +1132,21 @@ impl Builder<'_> {
     }
 }
 
-/// A flat 3D layer that can stand in the mesh depth buffer as a card.
+/// A flat 3D layer that can stand in the mesh depth buffer as a card. A
+/// blur (depth of field adds one) is drawn into the card's picture.
 fn card_candidate(layer: &LayerState) -> bool {
     layer.view.is_some()
         && !matches!(layer.content, Content::Mesh(_) | Content::Group(_))
-        && !layer.is_isolated()
+        && layer.matte.is_none()
+        && layer.effects.iter().all(|e| matches!(e, EffectState::Blur { repeat_edges: false, .. }))
         && layer.blend == Blend::Normal
         && layer.opacity >= 0.999
+}
+
+/// The combined blur of a card's effects, in canvas px.
+fn card_blur(layer: &LayerState, scale: f64) -> f64 {
+    let sum: f64 = layer.effects.iter().map(|e| if let EffectState::Blur { sigma, .. } = e { sigma * sigma } else { 0.0 }).sum();
+    sum.sqrt() * scale
 }
 
 /// Canvas bounds without the anti-aliasing margins.

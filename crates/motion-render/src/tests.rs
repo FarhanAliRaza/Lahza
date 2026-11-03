@@ -1573,3 +1573,26 @@ fn along_paint_split_per_tile_draws_the_same() {
     assert!(worst <= 24, "split along paint differs by {worst}");
     assert_gpu_matches_cpu(&p, &[0.0]);
 }
+
+/// Depth of field blurs a 3D layer; blurred, it must still stand in the
+/// mesh depth buffer as a card, not be painted over by a floor behind it.
+#[test]
+fn defocused_cards_keep_their_depth() {
+    let build = |aperture: f64| {
+        let mut p = project(json!([
+            {"id": "word", "kind": "text", "text": "HI", "size": 70, "color": "#ffffff", "three_d": true, "transform": {"position": [160, 80], "z": 300}},
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#404040"},
+             "transform": {"position": [160, 150], "rotation_x": 90}}
+        ]));
+        p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12], "aperture": aperture, "focus": 0})).unwrap();
+        p
+    };
+    let sharp = cpu().render(&Compiled::new(&build(0.0)), 0.0);
+    let p = build(0.5);
+    let soft = cpu().render(&Compiled::new(&p), 0.0);
+    // The word's lower half: as bright (summed) blurred as sharp, not covered by the floor.
+    let sum = |img: &image::RgbaImage| (60..110).flat_map(|y| (110..210).map(move |x| (x, y))).map(|(x, y)| px(img, x, y)[0] as u64).sum::<u64>();
+    let (a, b) = (sum(&sharp), sum(&soft));
+    assert!(b as f64 > 0.8 * a as f64, "defocused word lost to the floor: {b} vs {a}");
+    assert_gpu_matches_cpu(&p, &[0.0]);
+}
