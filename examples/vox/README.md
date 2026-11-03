@@ -1,8 +1,9 @@
 # Why is cancer so hard to cure? (Vox-style short)
 
 A 68-second vertical (1080×1920) explainer, built entirely with the Lahza
-motion engine through its MCP tools: collage on paper, taped cut-out
-cards, highlighter swipes, 12 fps stepped animation, captions that light
+motion engine through its MCP tools: collage on textured, grainy paper,
+taped cut-out cards, drifting moiré rings and gratings behind the key
+objects, highlighter swipes, 12 fps stepped animation, captions that light
 up word by word with the narration, generated microscope slides, and real
 3D where things are objects (gold coins, glass cells, a DNA double helix,
 a tumour, a pill), with soft shadows on the paper.
