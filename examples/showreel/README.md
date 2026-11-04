@@ -11,7 +11,17 @@ python3 "$REPO/examples/showreel/build.py"             # writes reel.lahza/
 lahza motion check reel.lahza
 lahza motion sync-check reel.lahza --tracks beat,hit,tick --frames 1
 lahza motion render reel.lahza -o lahza-showreel.mp4
+
+# 9:16 for Shorts / Reels / TikTok: the same film, laid out for a tall frame
+python3 "$REPO/examples/showreel/build.py" --vertical      # writes reel-vertical.lahza/
+lahza motion render reel-vertical.lahza -o lahza-showreel-vertical.mp4
 ```
+
+The vertical cut is not a crop: the title's facts, the type specimen and the
+data stack instead of sitting in columns, the 3D still life clusters in depth,
+the dot field turns, statements break onto two lines, the map opens wider so
+every arc fits, and the HUD sits inside title-safe and clear of the apps'
+top and bottom chrome.
 
 Needs Python 3 with numpy, scipy and Pillow, and the Debian/Ubuntu font
 packages `fonts-inter` and `fonts-jetbrains-mono` (both SIL OFL; the build

@@ -33,6 +33,16 @@ SYSTEM_FONTS = {  # Debian/Ubuntu: fonts-inter, fonts-jetbrains-mono
 W, H, FPS = 1920, 1080, 30
 DURATION = 51.0
 M = 96  # margin
+V = False  # vertical (9:16) layout
+
+
+def configure(vertical):
+    """Sets the frame: 1920x1080 (96 px margins) or 1080x1920 (72 px)."""
+    global W, H, M, V, COL, OUT
+    V = vertical
+    W, H, M = (1080, 1920, 72) if vertical else (1920, 1080, 96)
+    COL = (W - 2 * M - 11 * 24) / 12
+    OUT = os.path.join(HERE, "reel-vertical.lahza" if vertical else "reel.lahza")
 
 INK = "#0e0e0d"
 INK2 = "#1b1b1a"
@@ -148,14 +158,15 @@ def hud(scene_id, start, end, tone="dark", index=None):
     dim = 0.55 if tone != "light" else 0.62
     out = []
     p = scene_id
-    y_top = M - 30
+    # Vertical: clear of title-safe (5% of 1920 is 96 px) and of phone apps' top UI.
+    y_top = M - 30 if not V else 110
     out.append(text(f"{p}-hud-mark", "LAHZA", M, y_top, 17, F_MONO, c, "left", 260, opacity=dim, space="screen"))
     out.append(text(f"{p}-hud-mark2", "MOTION ENGINE", M + 104, y_top, 17, F_MONO, c, "left", 260, opacity=dim * 0.6, space="screen"))
     if index is not None:
         n, label = index
         out.append(text(f"{p}-hud-sec", f"{n:02d} / 10   {label}", W - M, y_top, 17, F_MONO, c, "right", 260, opacity=dim, space="screen"))
     # Timeline: hairline across the bottom, ticks at section starts, red playhead.
-    y = H - M + 34
+    y = H - M + 34 if not V else H - 130
     x0, x1 = M, W - M
     out.append({"id": f"{p}-hud-line", "kind": "shape", "shape": "line", "size": [x1 - x0, 0], "thickness": 1,
                 "fill": c, "transform": {"position": [(x0 + x1) / 2, y], "opacity": dim * 0.55}, "space": "screen"})
@@ -182,7 +193,7 @@ def hud(scene_id, start, end, tone="dark", index=None):
                     "time": window(lo / FPS, hi / FPS if hi < f1 else None),
                     "transform": {"position": [M + cw / 2, y - 26], "opacity": dim}, "space": "screen"})
         lo = hi
-    out.append(text(f"{p}-hud-spec", "1920×1080 · 30 FPS · 120 BPM", W - M, y - 26, 17, F_MONO, c, "right", 160, opacity=dim * 0.8, space="screen"))
+    out.append(text(f"{p}-hud-spec", f"{W}×{H} · 30 FPS · 120 BPM", W - M, y - 26, 17, F_MONO, c, "right", 160, opacity=dim * 0.8, space="screen"))
     return out
 
 
@@ -261,7 +272,8 @@ def s02():
     hit = "hit:1"  # 4.0 s
     cx, cy = W / 2, H / 2 - 40
     L = []
-    title_w = text_width("LAHZA", F_BLACK, 300, -30)
+    ts = 230 if V else 300  # title size
+    title_w = text_width("LAHZA", F_BLACK, ts, -30)
     # Hairline 12-column grid, drawn on after the hit, very faint.
     col = (W - 2 * M - 11 * 24) / 12
     for i in range(13):
@@ -271,12 +283,12 @@ def s02():
                                 "opacity": keys(k(4.0 + i * f(1), 0.13, **{"from": 0, "ease": "glide", "dur": "12f", "anchor": "start"}))},
                   "trim": keys(k(4.0 + i * f(1), [0, 1], **{"from": [0.5, 0.5], "ease": "glide", "dur": "18f", "anchor": "start"}))})
     # The title.
-    L.append(text("title", "LAHZA", cx, cy, 300, F_BLACK, PAPER, tracking=-30,
+    L.append(text("title", "LAHZA", cx, cy, ts, F_BLACK, PAPER, tracking=-30,
                   animators=[{"at": hit, "unit": "glyph", "order": "center", "stagger": "1f", "dur": "6f", "ease": "slam",
                               "anchor": "end", "from": {"scale": 2.6, "opacity": 0}}],
                   scale=keys(k(4.0, 1), add=[{"type": "drift", "rate": 0.0006, "per": "frame", "mode": "mul"}])))
     # Viewfinder brackets (from the wordmark) frame the title, snapping in from outside.
-    bw, bh = title_w + 150, 360
+    bw, bh = title_w + (110 if V else 150), ts * 1.2
     corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
     for i, (sx, sy) in enumerate(corners):
         d = f"M {sx*0} {sy*0} L {-sx*52} 0 L {-sx*52} {sy*0+sy*14} L {-sx*0+sx*0} {sy*14} Z"
@@ -288,24 +300,27 @@ def s02():
                                 "opacity": fade_in(4.0, "4f")}})
     # Rule and kicker.
     L.append({"id": "rule", "kind": "shape", "shape": "line", "size": [title_w, 0], "thickness": 2, "fill": PAPER,
-              "transform": {"position": [cx, cy + 150]},
+              "transform": {"position": [cx, cy + ts / 2]},
               "trim": keys(k(4.25, [0, 1], **{"from": [0.5, 0.5], "ease": "glide", "dur": "16f", "anchor": "start"}))})
-    L.append(text("kicker", "MOTION ENGINE", cx, cy + 196, 26, F_MONO, PAPER, tracking=520,
+    L.append(text("kicker", "MOTION ENGINE", cx, cy + ts / 2 + 46, 26, F_MONO, PAPER, tracking=520,
                   animators=[{"at": 4.5, "unit": "glyph", "order": "center", "stagger": "1f", "dur": "10f", "ease": "glide",
                               "from": {"opacity": 0, "y": 12}}]))
     # Three facts on the grid, bar 4.
     facts = [("01", "LANGUAGE", "Rust"), ("02", "RENDER", "GPU + CPU"), ("03", "TIMING", "Frame-accurate")]
-    colx = [M + 3 * (col + 24), M + 6 * (col + 24), M + 9 * (col + 24)]
-    fy = H - M - 130
+    # Landscape: three columns along the bottom. Vertical: three rows under the title.
+    rule_w = col * 2 + 24 if not V else col * 8 + 7 * 24
     for i, (n, lab, val) in enumerate(facts):
         t0 = 6.0 + i * f(3)
+        x_i = (M + (3 + 3 * i) * (col + 24)) if not V else M + 2 * (col + 24)
+        fy = (H - M - 130) if not V else cy + 360 + i * 150
+        colx = {i: x_i}
         L.append(text(f"fact{i}-n", f"{n}  {lab}", colx[i], fy, 15, F_MONO, PAPER, "left", 300,
                       opacity=keys(k(t0, 0.7, **{"from": 0, "ease": "glide", "dur": "10f", "anchor": "start"}))))
         L.append(text(f"fact{i}-v", val, colx[i], fy + 40, 34, F_MED, PAPER, "left", -10,
                       animators=[{"at": t0 + f(2), "unit": "glyph", "stagger": "0.5f", "dur": "10f", "ease": "glide",
                                   "from": {"opacity": 0, "y": 18}}]))
-        L.append({"id": f"fact{i}-rule", "kind": "shape", "shape": "line", "size": [col * 2 + 24, 0], "thickness": 1, "fill": PAPER,
-                  "transform": {"position": [colx[i] + col + 12, fy - 26], "opacity": 0.5},
+        L.append({"id": f"fact{i}-rule", "kind": "shape", "shape": "line", "size": [rule_w, 0], "thickness": 1, "fill": PAPER,
+                  "transform": {"position": [colx[i] + rule_w / 2, fy - 26], "opacity": 0.5},
                   "trim": keys(k(t0, [0, 1], **{"from": [0, 0], "ease": "glide", "dur": "14f", "anchor": "start"}))})
     # Exit: the title and facts lift away on beat 16 (7.5 s), peak speed on the beat.
     for l in L:
@@ -350,12 +365,12 @@ def s03():
     sid, start, end = "s03", 8.0, 14.0
     L = []
     # Column rule.
-    L.append({"id": "t-rule", "kind": "shape", "shape": "line", "size": [0, H - 2 * M - 120], "thickness": 1, "fill": INK,
-              "transform": {"position": [colx(6) - 12.5, H / 2], "opacity": 0.25},
+    L.append({"id": "t-rule", "kind": "shape", "shape": "line", "size": [0, H - 2 * M - 120] if not V else [W - 2 * M, 0], "thickness": 1, "fill": INK,
+              "transform": {"position": [colx(6) - 12.5, H / 2] if not V else [W / 2, 930], "opacity": 0.25},
               "trim": keys(k(8.0, [0, 1], **{"from": [0, 0], "ease": "glide", "dur": "24f", "anchor": "start"}))})
     # The specimen: Aa, rising in, then thin, bold, outline, red.
-    ax, ay = colx(0) + (6 * COL + 5 * 24) / 2, H / 2 - 10
-    L.append(text("aa", "Aa", ax, ay, 520, F_BLACK, INK, tracking=-40,
+    ax, ay = (colx(0) + (6 * COL + 5 * 24) / 2, H / 2 - 10) if not V else (W / 2, 520)
+    L.append(text("aa", "Aa", ax, ay, 520 if not V else 470, F_BLACK, INK, tracking=-40,
                   animators=[{"at": 8.0, "unit": "glyph", "stagger": "3f", "dur": "16f", "ease": "glide",
                               "from": {"y": 220, "opacity": 0}}],
                   weight=keys(k(9.0, -9, ease="glide", dur="14f", anchor="start"), k(10.0, 5, ease="land", anchor="start"),
@@ -368,7 +383,7 @@ def s03():
     caps = [(8.0, "INTER DISPLAY BLACK · 520 PX"), (9.0, "WEIGHT  −9 PX"), (10.0, "WEIGHT  +5 PX · SPRING"),
             (11.0, "OUTLINE · STROKE 4 PX"), (12.0, "FILL  #D03734"), (13.0, "")]
     for i, (t, c) in enumerate(caps[:-1]):
-        L.append(text(f"aa-cap{i}", c, colx(0), H - M - 120, 15, F_MONO, INK, "left", 220, time=window(t, caps[i + 1][0]),
+        L.append(text(f"aa-cap{i}", c, colx(0), H - M - 120 if not V else 860, 15, F_MONO, INK, "left", 220, time=window(t, caps[i + 1][0]),
                       animators=[{"at": t, "unit": "glyph", "stagger": "0.5f", "dur": "3f", "from": {"opacity": 0}}], opacity=0.75))
     # Right column: one animator per line, on the beat.
     lines = [
@@ -378,9 +393,9 @@ def s03():
         (11.5, "From the centre", "RADIAL · SCALE · POP", {"unit": "glyph", "order": {"radial": [0.5, 0.5]}, "stagger": "1f", "dur": "10f", "ease": "pop", "from": {"scale": 0, "opacity": 0}}),
         (12.5, "In any order", "RANDOM · SEED 4", {"unit": "glyph", "order": "random", "seed": 4, "stagger": "0.7f", "dur": "8f", "ease": "snap", "from": {"opacity": 0, "y": -30}}),
     ]
-    x = colx(6) + 24
+    x = colx(6) + 24 if not V else M
     for i, (t, s_, lab, anim) in enumerate(lines):
-        y = 236 + i * 142
+        y = 236 + i * 142 if not V else 1060 + i * 142
         an = dict(anim)
         an["at"] = beat(int(t / BEAT) + 1)
         L += label(f"l{i}-lab", lab, x, y - 50, INK, beat(int(t / BEAT) + 1), opacity=0.7)
@@ -427,7 +442,7 @@ def s04():
               "transform": {"position": [cx, cy], "rotation": spin, "scale": collapse}})
     # Labels, bottom-left, one per idea.
     for i, (t, s_) in enumerate([(14.0, "PATH MORPH · ANY OUTLINE TO ANY OUTLINE"), (14.5, "INSTANCER · 24 COPIES · STAGGER 1F"), (15.0, "STROKE · GRADIENT ALONG LENGTH · FEATHER")]):
-        L += label(f"sh-lab{i}", s_, M, H - M - 150 + i * 30, PAPER, t, opacity=keys(k(t, 0.7), k(15.5, 0, ease="snap", dur="4f", anchor="end")))
+        L += label(f"sh-lab{i}", s_, M, low(3, 30) + i * 30 if V else H - M - 150 + i * 30, PAPER, t, opacity=keys(k(t, 0.7), k(15.5, 0, ease="snap", dur="4f", anchor="end")))
     # The dot, alone in the silent beat before the drop.
     L.append({"id": "s4-dot", "kind": "shape", "shape": "circle", "size": 44, "fill": RED, "time": window(15.5),
               "transform": {"position": [cx, cy], "scale": keys(k(15.5, 1, **{"from": 0, "ease": "pop", "anchor": "start"}), k(16.0, 0.0, ease="slam", dur="5f", anchor="end"))}})
@@ -435,6 +450,12 @@ def s04():
     return {"id": sid, "start": start, "end": end, "background": INK, "layers": L,
             "motion_blur": {"shutter": 180, "samples": 16}, "transition": {"type": "push", "direction": "left", "dur": "8f"}}
 
+
+
+def low(lines, step=34):
+    """Top y of a block of `lines` label rows ending clear of the HUD."""
+    bottom = H - M - 96 if not V else H - 230
+    return bottom - (lines - 1) * step
 
 
 def spec_list(prefix, items, x, y0, color, step=34):
@@ -454,16 +475,16 @@ def spec_list(prefix, items, x, y0, color, step=34):
 def s05():
     """LIGHT: a glass lens bends the wordmark behind it; chrome rings and the red dot orbit it."""
     sid, start, end = "s05", 16.0, 21.0
-    cx, cy = W / 2, H / 2 - 20
+    cx, cy = W / 2, H / 2 - (20 if not V else 120)
     L = []
     # Warm light behind everything.
     L.append({"id": "l-bg", "kind": "shape", "shape": "field", "size": [W + 40, H + 40], "transform": {"position": [W / 2, H / 2]},
               "softness": 1.4, "space": "screen",
-              "points": [{"position": [0, 60], "color": "#30231f", "radius": 520}, {"position": [-900, 500], "color": "#0a0a09", "radius": 500},
-                         {"position": [900, -500], "color": "#0a0a09", "radius": 500}, {"position": [900, 500], "color": "#0c0c0b", "radius": 400},
-                         {"position": [-900, -500], "color": "#0c0c0b", "radius": 400}]})
+              "points": [{"position": [0, 60], "color": "#30231f", "radius": 520}] + [
+                  {"position": [sx * W / 2.1, sy * H / 2.1], "color": "#0a0a09" if sx != sy else "#0c0c0b", "radius": 500 if sx != sy else 400}
+                  for sx, sy in ((-1, 1), (1, -1), (1, 1), (-1, -1))]})
     # The word behind the lens (3D, far back so the camera's orbit gives parallax).
-    L.append(text("l-word", "LAHZA", cx, cy - 40, 420, F_BLACK, PAPER, tracking=-30, three_d=True,
+    L.append(text("l-word", "LAHZA", cx, cy - 40, 420 if not V else 250, F_BLACK, PAPER, tracking=-30, three_d=True,
                   opacity=keys(k(16.0, 1, **{"from": 0, "ease": "glide", "dur": "10f", "anchor": "start"}))))
     L[-1]["transform"]["z"] = 760
     # Floor.
@@ -494,10 +515,10 @@ def s05():
     # Spec list, screen space, on the beat.
     L += spec_list("l-spec", [(16.5, "GLASS", "IOR 1.50 · REFRACTION"), (17.0, "CHROME", "PBR · METALLIC 1.0"),
                               (17.5, "SHADOWS", "SOFT · PCF"), (18.0, "DEPTH OF FIELD", "APERTURE 0.9"),
-                              (18.5, "CAMERA", "ORBIT · DOLLY")], M, H - M - 230, PAPER)
+                              (18.5, "CAMERA", "ORBIT · DOLLY")], M, low(5) if V else H - M - 230, PAPER)
     L += hud(sid, start, end, "dark", (5, "LIGHT"))
     camera = {"fov": 39.6,
-              "orbit": keys(k(16.0, [-26, 7]), k(21.0, [20, 13], ease="linear")),
+              "orbit": keys(k(16.0, [-26 if not V else -12, 7]), k(21.0, [20 if not V else 12, 13], ease="linear")),
               "dolly": keys(k(16.0, -60), k(20.0, 120, ease="linear"), k(21.0, 620, ease="zoom", dur="16f", anchor="end")),
               "aperture": 0.9, "focus": "l-glass"}
     lights = [{"type": "directional", "from": [-0.7, -1.0, -0.8], "color": "#fff1e2", "intensity": 1.5, "shadow": True, "softness": 0.55},
@@ -511,7 +532,8 @@ def s05():
 def s06():
     """FORM: Bauhaus primitives land on the beat and cast soft shadows on paper."""
     sid, start, end = "s06", 21.0, 26.0
-    cx, floor = W / 2, H / 2 + 170
+    cx, floor = W / 2, H / 2 + (170 if not V else 120)
+    sx = 1.0 if not V else 0.58  # horizontal spread
     L = []
     L.append({"id": "f-catcher", "kind": "mesh", "mesh": {"type": "plane", "size": [9000, 9000]},
               "material": {"preset": "shadow", "color": "#2a2620", "opacity": 0.55},
@@ -527,27 +549,29 @@ def s06():
     # Box (extrude family: a bevelled box), ink.
     L.append({"id": "f-box", "kind": "mesh", "time": falls(43), "mesh": {"type": "box", "size": [230, 230], "depth": 230, "bevel": 12},
               "material": {"preset": "plastic", "color": INK2, "roughness": 0.55},
-              "transform": {"position": drop(beat(43), [cx - 560, floor - 115]), "z": 60, "rotation_y": -28}})
+              "transform": {"position": drop(beat(43), [cx - 560 * sx, floor - 115]), "z": 60 if not V else 160, "rotation_y": -28}})
     # The dot, now a big red ball.
     L.append({"id": "f-ball", "kind": "mesh", "time": falls(44), "mesh": {"type": "sphere", "radius": 128},
               "material": {"preset": "coated", "color": RED, "roughness": 0.25},
-              "transform": {"position": drop(beat(44), [cx - 230, floor - 128]), "z": -60}})
+              "transform": {"position": drop(beat(44), [cx - 230 * sx, floor - 128]), "z": -60 if not V else -140}})
     # A revolved vessel, paper white (revolve from a profile path).
     L.append({"id": "f-vase", "kind": "mesh", "time": falls(45),
               "mesh": {"type": "revolve", "profile": "M 0 -150 L 46 -150 C 40 -110 34 -80 64 -30 C 100 30 104 90 82 150 L 0 150"},
               "material": {"preset": "glossy", "color": "#f7f4ee", "roughness": 0.3},
-              "transform": {"position": drop(beat(45), [cx + 90, floor - 150]), "z": 80}})
+              "transform": {"position": drop(beat(45), [cx + 90 * sx, floor - 150]), "z": 80 if not V else 220}})
     # A standing ring, ink, split into two colours.
     L.append({"id": "f-ring", "kind": "mesh", "time": falls(46), "mesh": {"type": "torus", "radius": 112, "tube": 36}, "segments": 2, "spans": [3, 1],
               "colors": [INK2, RED], "material": {"preset": "plastic", "roughness": 0.45},
-              "transform": {"position": drop(beat(46), [cx + 420, floor - 148]), "z": -40, "rotation_y": 24}})
+              "transform": {"position": drop(beat(46), [cx + 420 * sx, floor - 148]), "z": -40 if not V else -60, "rotation_y": 24}})
     # An extruded viewfinder corner (from the wordmark), lying flat in front.
     corner = "M 0 0 L 160 0 L 160 46 L 46 46 L 46 160 L 0 160 Z"
     L.append({"id": "f-corner", "kind": "mesh", "time": falls(47), "mesh": {"type": "extrude", "d": corner, "depth": 40, "bevel": 6},
               "material": {"preset": "coated", "color": RED, "roughness": 0.3},
-              "transform": {"position": drop(beat(47), [cx + 650, floor - 20]), "z": -260, "rotation_x": 90, "rotation": 25}})
+              "transform": {"position": drop(beat(47), [cx + (650 if not V else 250), floor - 20]), "z": -260 if not V else -420, "rotation_x": 90, "rotation": 25}})
     # A swept tube drawing a line between them on the floor, its head a red ball.
     route = "M -760 160 C -520 300 -380 -40 -160 120 S 120 320 300 100 S 640 -60 820 140"
+    if V:
+        route = "M -420 240 C -300 380 -220 -40 -90 160 S 70 400 170 140 S 360 -20 440 200"
     L.append({"id": "f-sweep", "kind": "mesh", "mesh": {"type": "sweep", "d": route, "radius": 7, "head": 15,
                                                          "trim": keys(k(beat(48), [0, 0]), k(25.2, [0, 1], ease="glide", dur="44f", anchor="start"))},
               "material": {"preset": "plastic", "color": INK2, "roughness": 0.4},
@@ -555,10 +579,10 @@ def s06():
     L += spec_list("f-spec", [(21.0, "BOX", "BEVEL 12 · PLASTIC"), (21.5, "SPHERE", "COATED · CLEARCOAT"),
                               (22.0, "REVOLVE", "FROM A PROFILE PATH"), (22.5, "TORUS", "2 SEGMENTS · SPANS 3:1"),
                               (23.0, "EXTRUDE", "ANY OUTLINE · BEVEL 6"), (23.5, "SWEEP", "TRIM 0 → 1 · HEAD")], M, M + 60, INK)
-    L.append(text("f-note", "SPRINGS: BOUNCE, ANCHORED TO THE BEAT", W - M, M + 60, 15, F_MONO, INK, "right", 220, space="screen", opacity=0.55,
+    L.append(text("f-note", "SPRINGS: BOUNCE, ANCHORED TO THE BEAT", W - M if not V else M, M + 60 if not V else M + 290, 15, F_MONO, INK, "right" if not V else "left", 220, space="screen", opacity=0.55,
                   animators=[{"at": 21.0, "unit": "glyph", "stagger": "0.4f", "dur": "3f", "from": {"opacity": 0}}]))
     L += hud(sid, start, end, "light", (6, "FORM"))
-    camera = {"fov": 30, "orbit": keys(k(21.0, [-14, 16]), k(26.0, [12, 22], ease="linear")),
+    camera = {"fov": 30 if not V else 39.6, "orbit": keys(k(21.0, [-14, 16 if not V else 26]), k(26.0, [12, 22 if not V else 32], ease="linear")),
               "dolly": keys(k(21.0, -220), k(26.0, 40, ease="linear"))}
     lights = [{"type": "directional", "from": [-0.8, -1.1, -0.6], "color": "#fff6ea", "intensity": 1.5, "shadow": True, "softness": 0.6},
               {"type": "directional", "from": [1.0, -0.4, 0.6], "color": "#e6eeff", "intensity": 0.6},
@@ -575,17 +599,17 @@ def s07():
     cities = [("London", 27.5), ("New York", 28.0), ("Tokyo", 28.5), ("Sydney", 29.0), ("Lagos", 29.25), ("San Francisco", 29.5)]
     L.append({"id": "map", "kind": "component", "component": "map", "transform": {"position": [0, 0]},
               "params": {
-                  "camera": {"keys": [{"at": 26.0, "center": [40, 18], "zoom": 0.35},
-                                      {"at": 27.2, "center": karachi, "zoom": 2.4, "ease": "zoom", "dur": "34f"},
-                                      {"at": 29.6, "center": [10, 22], "zoom": 0.55, "ease": "glide", "dur": "50f"}]},
+                  "camera": {"keys": [{"at": 26.0, "center": [40, 18], "zoom": 0.35 if not V else 0.9},
+                                      {"at": 27.2, "center": karachi, "zoom": 2.4 if not V else 2.6, "ease": "zoom", "dur": "34f"},
+                                      {"at": 29.6, "center": [10, 22] if not V else [15, 18], "zoom": 0.55 if not V else 0.05, "ease": "glide", "dur": "50f"}]},
                   "land": "#232321", "water": "#0d0d0c", "border": {"color": "#3a3936", "width": 1},
                   "fills": {"PAK": "#3a2a28"},
                   "label": {"size": 17, "color": PAPER, "font": F_MONO, "uppercase": True},
                   "places": [{"name": "Karachi", "color": RED, "size": 12, "at": 26.5}] + [{"name": n, "color": PAPER, "size": 6, "at": t + 0.35} for n, t in cities],
                   "arcs": [{"from": "Karachi", "to": n, "at": t, "dur": "16f", "color": RED, "width": 4, "lift": 0.25} for n, t in cities],
                   "detail": 0.35}})
-    L += spec_list("m-spec", [(26.5, "MAP", "NATURAL EARTH 1:50M · NATIVE"), (27.2, "CAMERA", "ZOOM 0.35 → 2.4 → 0.55"),
-                              (27.5, "ARCS", "GREAT CIRCLES · DRAWN ON THE BEAT")], M, H - M - 160, PAPER)
+    L += spec_list("m-spec", [(26.5, "MAP", "NATURAL EARTH 1:50M · NATIVE"), (27.2, "CAMERA", "ZOOM 0.35 → 2.4 → 0.55" if not V else "ZOOM 0.9 → 2.6 → 0.05"),
+                              (27.5, "ARCS", "GREAT CIRCLES · DRAWN ON THE BEAT")], M, low(3) if V else H - M - 160, PAPER)
     L.append(text("m-title", "Karachi, to everywhere.", M, M + 70, 46, F_LIGHT, PAPER, "left", -10, space="screen",
                   animators=[{"at": 26.5, "unit": "glyph", "order": {"axis": "x", "feather": 0.3}, "stagger": "1f", "dur": "14f", "from": {"opacity": 0}}]))
     L += hud(sid, start, end, "dark", (7, "DATA"))
@@ -607,30 +631,34 @@ def s07b():
     sid, start, end = "s07b", 30.0, 34.0
     L = []
     loud = loudness(os.path.join(HERE, "track.wav"))[: int(49.0 / BEAT)]  # to the last tick; the tail is a fade
-    L.append(text("d-k1", "FRAMES IN THIS FILM", colx(0), 300, 15, F_MONO, PAPER, "left", 300, opacity=0.6,
+    top = 300 if not V else 330
+    L.append(text("d-k1", "FRAMES IN THIS FILM", colx(0), top, 15, F_MONO, PAPER, "left", 300, opacity=0.6,
                   animators=[{"at": 30.0, "unit": "glyph", "stagger": "0.4f", "dur": "3f", "from": {"opacity": 0}}]))
     L.append({"id": "d-count", "kind": "component", "component": "counter",
               "params": {"from": 0, "to": int(DURATION * FPS), "at": 30.0, "dur": "40f", "ease": "glide", "separator": ",",
                          "size": 210, "font": F_BLACK, "color": PAPER},
-              "transform": {"position": [colx(0) + 300, 420]}})
+              "transform": {"position": [colx(0) + 300, top + 120]}})
     rows = [("DURATION", "51.0 S · 25 BARS · 120 BPM"), ("RENDERER", "ONE ENGINE · NO PLUG-INS"), ("SOURCE", "ONE JSON PROJECT")]
     for i, (a, b_) in enumerate(rows):
         t = 31.0 + i * 0.5
-        y = 600 + i * 46
-        L.append({"id": f"d-r{i}", "kind": "shape", "shape": "line", "size": [5 * COL + 4 * 24, 0], "thickness": 1, "fill": PAPER,
-                  "transform": {"position": [colx(0) + (5 * COL + 4 * 24) / 2, y - 22], "opacity": 0.3},
+        y = top + 300 + i * 46
+        rw = 5 * COL + 4 * 24 if not V else W - 2 * M
+        L.append({"id": f"d-r{i}", "kind": "shape", "shape": "line", "size": [rw, 0], "thickness": 1, "fill": PAPER,
+                  "transform": {"position": [colx(0) + rw / 2, y - 22], "opacity": 0.3},
                   "trim": keys(k(t, [0, 1], **{"from": [0, 0], "ease": "glide", "dur": "12f", "anchor": "start"}))})
         L.append(text(f"d-r{i}a", a, colx(0), y, 15, F_MONO, RED, "left", 260,
                       animators=[{"at": t, "unit": "glyph", "stagger": "0.4f", "dur": "3f", "from": {"opacity": 0}}]))
-        L.append(text(f"d-r{i}b", b_, colx(2), y, 15, F_MONO, PAPER, "left", 220,
+        L.append(text(f"d-r{i}b", b_, colx(2) if not V else M + 220, y, 15, F_MONO, PAPER, "left", 220,
                       animators=[{"at": t + f(3), "unit": "glyph", "stagger": "0.4f", "dur": "3f", "from": {"opacity": 0}}]))
     # The soundtrack as a line chart, drawn on through the breakdown.
-    L.append(text("d-k2", "THE SOUNDTRACK · LOUDNESS PER BEAT · DB", colx(6) + 24, 300, 15, F_MONO, PAPER, "left", 300, opacity=0.6,
+    cx2, ky = (colx(6) + 24, 300) if not V else (M, 1000)
+    cw2 = 6 * COL + 5 * 24 - 160 if not V else W - 2 * M - 120
+    L.append(text("d-k2", "THE SOUNDTRACK · LOUDNESS PER BEAT · DB", cx2, ky, 15, F_MONO, PAPER, "left", 300, opacity=0.6,
                   animators=[{"at": 30.5, "unit": "glyph", "stagger": "0.4f", "dur": "3f", "from": {"opacity": 0}}]))
     L.append({"id": "d-chart", "kind": "component", "component": "chart",
-              "params": {"type": "line", "data": loud, "size": [6 * COL + 5 * 24 - 160, 420], "min": -40, "max": -8,
+              "params": {"type": "line", "data": loud, "size": [cw2, 420], "min": -40, "max": -8,
                          "at": 30.5, "dur": "2.6s", "color": RED, "axis_color": "#f2eee640", "text_color": PAPER, "value_format": " dB"},
-              "transform": {"position": [colx(6) + 24 + (6 * COL + 5 * 24 - 160) / 2, 560]}})
+              "transform": {"position": [cx2 + cw2 / 2, ky + 260]}})
     L += hud(sid, start, end, "dark", (7, "DATA"))
     return {"id": sid, "start": start, "end": end, "background": INK, "layers": L, "transition": {"type": "slide", "direction": "left", "dur": "10f"}}
 
@@ -640,13 +668,15 @@ def s08():
     sid, start, end = "s08", 34.0, 40.0
     L = []
     centres = [[0, 0], [-520, -200], [520, 200], [0, 0], [-520, 200], [520, -200]]
+    if V:
+        centres = [[y, x] for x, y in centres]
     fields = [{"type": "noise", "size": 260, "speed": 0.4, "seed": 3, "opacity": 0.35, "amount": 0.8}]
     for i in range(12):
         t = 34.0 + i * 0.5
         fields.append({"type": "wave", "center": centres[(i // 2) % len(centres)], "at": t, "speed": 1500, "wavelength": 260,
                        "scale": 1.8, "color": RED, "opacity": 0.6})
     L.append({"id": "y-field", "kind": "instancer", "transform": {"position": [W / 2, H / 2]},
-              "layout": {"type": "grid", "columns": 45, "rows": 25, "spacing": [44, 44], "hex": True},
+              "layout": {"type": "grid", "columns": 45 if not V else 25, "rows": 25 if not V else 45, "spacing": [44, 44], "hex": True},
               "stagger": {"total": "16f", "order": "center"},
               "fields": fields,
               "layers": [{"id": "y-dot", "kind": "shape", "shape": "circle", "size": 6, "fill": PAPER,
@@ -654,17 +684,22 @@ def s08():
                                         "scale": keys(k(34.0, 1, **{"from": 0, "ease": "pop", "anchor": "start"}))}}]})
     # One word per beat, slammed in, centred as a line.
     words = ["Locked", "to", "the", "beat."]
-    full = "Locked to the beat."
     size = 150
-    total = text_width(full, F_BLACK, size, -30)
-    x = W / 2 - total / 2
-    for i, w_ in enumerate(words):
-        piece = (" " if i else "") + w_
-        wx = x + text_width(" ".join(words[:i]) + (" " if i else ""), F_BLACK, size, -30)
-        L.append(text(f"y-w{i}", w_, wx, H / 2 - 10, size, F_BLACK, PAPER if i < 3 else RED, "left", -30,
+    # One line landscape; two lines ("Locked to" / "the beat.") vertical.
+    lines = [words] if not V else [words[:2], words[2:]]
+    placed = []
+    for li, line in enumerate(lines):
+        total = text_width(" ".join(line), F_BLACK, size, -30)
+        y_line = H / 2 - 10 + (li - (len(lines) - 1) / 2) * size * 1.05
+        for j, w_ in enumerate(line):
+            wx = W / 2 - total / 2 + text_width(" ".join(line[:j]) + (" " if j else ""), F_BLACK, size, -30)
+            placed.append((w_, wx, y_line))
+    for i, (w_, wx, y_line) in enumerate(placed):
+        L.append(text(f"y-w{i}", w_, wx, y_line, size, F_BLACK, PAPER if i < 3 else RED, "left", -30,
                       animators=[{"at": beat(69 + i), "unit": "glyph", "stagger": "0.5f", "dur": "6f", "ease": "slam", "anchor": "end",
                                   "from": {"scale": 1.8, "opacity": 0}}]))
-    L.append(text("y-sub", "MARKERS FROM THE MUSIC · KEYS ANCHORED TO THEM · CHECKED ON THE FRAME GRID", W / 2, H / 2 + 110, 15, F_MONO, PAPER,
+    sub = "MARKERS FROM THE MUSIC · KEYS ANCHORED TO THEM · CHECKED ON THE FRAME GRID" if not V else "MARKERS FROM THE MUSIC\nKEYS ANCHORED TO THEM\nCHECKED ON THE FRAME GRID"
+    L.append(text("y-sub", sub, W / 2, H / 2 + (110 if not V else 260), 15, F_MONO, PAPER, line_height=1.9,
                   tracking=260, opacity=0.6, animators=[{"at": 36.0, "unit": "glyph", "stagger": "0.25f", "dur": "3f", "from": {"opacity": 0}}]))
     L += hud(sid, start, end, "dark", (8, "SYNC"))
     return {"id": sid, "start": start, "end": end, "background": INK, "layers": L, "transition": {"type": "zoom", "dur": "8f"}}
@@ -693,13 +728,13 @@ def montage():
         if word == "GLITCH":
             effects = [{"type": "rgb_split", "amount": keys(k(t0, 4, **{"from": 46, "ease": "snap", "dur": "8f", "anchor": "start"})), "angle": 0},
                        {"type": "displace", "amount": keys(k(t0, 0, **{"from": 40, "ease": "snap", "dur": "8f", "anchor": "start"})), "scale": 30, "speed": 6}]
-        L.append(text(f"{sid}-w", word, W / 2, H / 2 - 30, 330, F_BLACK, ink, tracking=-35,
+        L.append(text(f"{sid}-w", word, W / 2, H / 2 - 30, 330 if not V else 230, F_BLACK, ink, tracking=-35,
                       animators=[{"at": t0, "unit": "glyph", "order": "center", "stagger": "0.5f", "dur": "6f", "ease": "snap",
                                   "from": {"scale": 1.25, "opacity": 0}}],
                       effects=effects or None))
         if not effects:
             del L[-1]["effects"]
-        L.append(text(f"{sid}-c", cap, W / 2, H / 2 + 170, 17, F_MONO, ink, tracking=320,
+        L.append(text(f"{sid}-c", cap, W / 2, H / 2 + (170 if not V else 130), 17, F_MONO, ink, tracking=320,
                       opacity=keys(k(t0 + f(1), 0.7, **{"from": 0, "ease": "snap", "dur": "3f", "anchor": "start"}))))
         L += hud(sid, t0, t0 + 0.5, "light" if bg == PAPER else "dark", (9, "MOTION"))
         out.append({"id": sid, "start": beat(81 + i), "end": beat(82 + i), "background": bg, "layers": L, "transition": tr,
@@ -716,7 +751,7 @@ def s10():
     """END: the Urdu wordmark assembles: the dot lands, the viewfinder closes, the letters draw on."""
     sid, start, end = "s10", 44.0, DURATION
     cx, cy = W / 2, H / 2 - 60
-    letters, brackets, (dx, dy, dr) = wordmark(1000)
+    letters, brackets, (dx, dy, dr) = wordmark(1000 if not V else 860)
     L = []
     # Letters: stroke draws on (feathered head), then the fill arrives and the stroke goes.
     L.append({"id": "e-ink", "kind": "shape", "shape": "path", "d": letters,
@@ -741,7 +776,10 @@ def s10():
                   animators=[{"at": 46.0, "unit": "glyph", "order": "center", "stagger": "1f", "dur": "12f", "ease": "glide", "from": {"opacity": 0, "y": 10}}]))
     L.append(text("e-tag", "Every moment, engineered.", cx, cy + 320, 44, F_LIGHT, INK, tracking=-10,
                   animators=[{"at": 46.5, "unit": "glyph", "order": {"axis": "x", "feather": 0.35}, "stagger": "1f", "dur": "16f", "from": {"opacity": 0}}]))
-    L.append(text("e-meta", "MOTION ENGINE  ·  RUST  ·  GPU + CPU  ·  THIS FILM WAS RENDERED BY IT", cx, cy + 400, 15, F_MONO, INK, tracking=260, opacity=0.6,
+    meta = "MOTION ENGINE  ·  RUST  ·  GPU + CPU  ·  THIS FILM WAS RENDERED BY IT"
+    if V:
+        meta = "MOTION ENGINE  ·  RUST  ·  GPU + CPU\nTHIS FILM WAS RENDERED BY IT"
+    L.append(text("e-meta", meta, cx, cy + (400 if not V else 420), 15, F_MONO, INK, tracking=260, opacity=0.6, line_height=1.9,
                   animators=[{"at": 47.5, "unit": "glyph", "stagger": "0.2f", "dur": "3f", "from": {"opacity": 0}}]))
     L += hud(sid, start, end, "light", (10, "LAHZA"))
     return {"id": sid, "start": start, "end": end, "background": PAPER, "layers": L,
@@ -790,4 +828,6 @@ def build(only=None):
 
 
 if __name__ == "__main__":
-    build(sys.argv[1:] or None)
+    args = sys.argv[1:]
+    configure("--vertical" in args)
+    build([a for a in args if not a.startswith("--")] or None)
