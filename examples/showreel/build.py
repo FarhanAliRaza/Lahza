@@ -168,12 +168,20 @@ def hud(scene_id, start, end, tone="dark", index=None):
     out.append({"id": f"{p}-hud-head", "kind": "shape", "shape": "circle", "size": 9, "fill": RED, "space": "screen",
                 "transform": {"position": keys(k(start, [xs, y]), k(end, [xe, y], ease="linear"))}})
     # Frame counter, left, above the line; resolution, right.
+    # Frame counter, left-aligned: a counter is centred, so one counter per
+    # digit count, each placed for its width (no half-digit jumps at 100).
     f0, f1 = round(start * FPS), round(end * FPS)
-    cw = text_width("F 0000", F_MONO, 17, 260)
-    out.append({"id": f"{p}-hud-frame", "kind": "component", "component": "counter",
-                "params": {"from": f0, "to": f1, "at": start, "dur": end - start, "ease": "linear", "decimals": 0,
-                           "separator": "", "prefix": "F ", "size": 17, "font": F_MONO, "color": c},
-                "transform": {"position": [M + cw / 2, y - 26], "opacity": dim}, "space": "screen"})
+    lo = f0
+    while lo < f1:
+        digits = len(str(lo))
+        hi = min(f1, 10 ** digits)
+        cw = text_width("F " + "0" * digits, F_MONO, 17)  # counters are not tracked
+        out.append({"id": f"{p}-hud-frame{digits}", "kind": "component", "component": "counter",
+                    "params": {"from": lo, "to": hi, "at": lo / FPS, "dur": (hi - lo) / FPS, "ease": "linear", "decimals": 0,
+                               "separator": "", "prefix": "F ", "size": 17, "font": F_MONO, "color": c},
+                    "time": window(lo / FPS, hi / FPS if hi < f1 else None),
+                    "transform": {"position": [M + cw / 2, y - 26], "opacity": dim}, "space": "screen"})
+        lo = hi
     out.append(text(f"{p}-hud-spec", "1920×1080 · 30 FPS · 120 BPM", W - M, y - 26, 17, F_MONO, c, "right", 160, opacity=dim * 0.8, space="screen"))
     return out
 
@@ -377,13 +385,6 @@ def s03():
         an["at"] = beat(int(t / BEAT) + 1)
         L += label(f"l{i}-lab", lab, x, y - 50, INK, beat(int(t / BEAT) + 1), opacity=0.7)
         L.append(text(f"l{i}", s_, x, y, 74, F_MED, INK, "left", -25, animators=[an]))
-    # Exit: the sheet slides up out of frame on beat 28 (13.5 s), peak on the beat.
-    for l in L:
-        if l["id"].startswith(("t-", "aa", "l")):
-            tr = l.setdefault("transform", {})
-            pos = tr.get("position")
-            if isinstance(pos, list):
-                tr["position"] = keys(k(8.0, pos), k(13.82, [pos[0], pos[1] - 1100], ease="gesture", dur="12f", anchor="peak"))
     L += hud(sid, start, end, "light", (3, "TYPE"))
     return {"id": sid, "start": start, "end": end, "background": PAPER, "layers": L,
             "transition": {"type": "wipe", "direction": "up", "dur": "10f"}}
@@ -605,7 +606,7 @@ def s07b():
     """DATA II: this film, counted and charted: its own soundtrack, beat by beat."""
     sid, start, end = "s07b", 30.0, 34.0
     L = []
-    loud = loudness(os.path.join(HERE, "track.wav"))
+    loud = loudness(os.path.join(HERE, "track.wav"))[: int(49.0 / BEAT)]  # to the last tick; the tail is a fade
     L.append(text("d-k1", "FRAMES IN THIS FILM", colx(0), 300, 15, F_MONO, PAPER, "left", 300, opacity=0.6,
                   animators=[{"at": 30.0, "unit": "glyph", "stagger": "0.4f", "dur": "3f", "from": {"opacity": 0}}]))
     L.append({"id": "d-count", "kind": "component", "component": "counter",
@@ -698,8 +699,8 @@ def montage():
                       effects=effects or None))
         if not effects:
             del L[-1]["effects"]
-        L.append(text(f"{sid}-c", cap, W / 2, H / 2 + 170, 17, F_MONO, ink, tracking=320, opacity=0.7,
-                      animators=[{"at": t0 + f(2), "unit": "glyph", "stagger": "0.2f", "dur": "2f", "from": {"opacity": 0}}]))
+        L.append(text(f"{sid}-c", cap, W / 2, H / 2 + 170, 17, F_MONO, ink, tracking=320,
+                      opacity=keys(k(t0 + f(1), 0.7, **{"from": 0, "ease": "snap", "dur": "3f", "anchor": "start"}))))
         L += hud(sid, t0, t0 + 0.5, "light" if bg == PAPER else "dark", (9, "MOTION"))
         out.append({"id": sid, "start": beat(81 + i), "end": beat(82 + i), "background": bg, "layers": L, "transition": tr,
                     "motion_blur": {"shutter": 180, "samples": 16}})
