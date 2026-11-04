@@ -7,8 +7,11 @@ from PIL import Image, ImageDraw, ImageFont
 video, out = sys.argv[1], sys.argv[2]
 times = [float(t) for t in sys.argv[3].split(",")]
 cols = int(sys.argv[4]) if len(sys.argv) > 4 else 4
-w = 480
-h = w * 9 // 16
+probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", video],
+                       capture_output=True, text=True).stdout.strip().split(",")
+vw, vh = int(probe[0]), int(probe[1])
+w = 480 if vw >= vh else 240  # keeps the video's own aspect (16:9 or 9:16)
+h = round(w * vh / vw)
 font = ImageFont.truetype("/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Medium.ttf", 14)
 rows = (len(times) + cols - 1) // cols
 sheet = Image.new("RGB", (cols * (w + 8) + 8, rows * (h + 30) + 8), "#18181a")
