@@ -398,13 +398,20 @@ pub fn generate(p: &Value, width: f64, height: f64) -> Result<Vec<Value>, String
         let color = place.get("color").cloned().unwrap_or(json!("#c8102e"));
         let mut d = json!({"id": id, "kind": "shape", "shape": "circle", "size": dot, "fill": color, "stroke": {"color": "#ffffff", "width": dot * 0.18},
             "parent": "pan", "transform": {"position": [at.0, at.1], "scale": counter}});
-        if let Some(t) = place.get("at") {
-            d["transform"]["opacity"] = json!({"keys": [{"at": t, "from": 0, "v": 1, "ease": "pop", "dur": "6f", "anchor": "start"}]});
+        // A place with `at` appears then: its dot and its label (a parent
+        // passes on its transform, not its opacity).
+        let entrance = place.get("at").map(|t| json!({"keys": [{"at": t, "from": 0, "v": 1, "ease": "pop", "dur": "6f", "anchor": "start"}]}));
+        if let Some(e) = &entrance {
+            d["transform"]["opacity"] = e.clone();
         }
         out.push(d);
         if place.get("label").and_then(Value::as_bool).unwrap_or(true) {
-            out.push(json!({"id": format!("{id}-label"), "kind": "text", "text": name, "font": lfont, "size": lsize * 0.9, "color": lcolor, "align": "left",
-                "parent": id, "transform": {"position": [dot * 0.9, 0]}}));
+            let mut label = json!({"id": format!("{id}-label"), "kind": "text", "text": name, "font": lfont, "size": lsize * 0.9, "color": lcolor, "align": "left",
+                "parent": id, "transform": {"position": [dot * 0.9, 0]}});
+            if let Some(e) = entrance {
+                label["transform"]["opacity"] = e;
+            }
+            out.push(label);
         }
     }
     for (i, arc) in get("arcs").and_then(Value::as_array).cloned().unwrap_or_default().iter().enumerate() {

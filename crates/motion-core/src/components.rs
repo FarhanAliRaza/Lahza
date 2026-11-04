@@ -796,6 +796,21 @@ mod tests {
     }
 
     #[test]
+    fn a_map_place_with_a_time_brings_its_label_with_it() {
+        use crate::edit::apply;
+        let p = apply(&project(), &[json!({"op": "add", "scene": "s1", "id": "map", "kind": "component", "component": "map",
+            "params": {"places": [{"name": "Karachi", "at": 1.0}]}})]).unwrap().project;
+        let c = crate::compile::Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let shown = |t: f64, id: &str| c.frame(t).layers.iter().flat_map(|l| match &l.content {
+            crate::compile::Content::Group(kids) => kids.clone(),
+            _ => vec![l.clone()],
+        }).find(|l| l.id.as_ref() == id).map(|l| l.opacity).unwrap_or(0.0);
+        assert!(shown(0.5, "map/p-karachi-label") < 0.01, "the label waits for its place");
+        assert!(shown(1.5, "map/p-karachi-label") > 0.99);
+    }
+
+    #[test]
     fn a_map_override_survives_a_zoom_change_and_detaches() {
         use crate::edit::apply;
         let p = project();
