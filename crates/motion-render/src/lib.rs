@@ -273,18 +273,10 @@ impl Renderer {
         out
     }
 
-    /// Canvas bounds of a text layer (unanimated layout), for `check`.
+    /// Canvas bounds of the ink a text layer shows now, for `check`.
     pub fn measure(&mut self, layer: &LayerState) -> Option<[f64; 4]> {
         let Content::Text(text) = &layer.content else { return None };
-        let layout = self.fonts.layout(text);
-        let [x0, y0, x1, y1] = layout.bounds;
-        let pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| layer.matrix.apply(x, y));
-        Some([
-            pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
-            pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
-            pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
-            pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
-        ])
+        self.fonts.ink_bounds(text, layer.matrix)
     }
 }
 

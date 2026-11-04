@@ -302,10 +302,19 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
             reported_hold = true;
         }
         if n % layout_every == 0 {
-            let mut text_boxes: Vec<(&str, [f64; 4])> = Vec::new();
+            let mut text_boxes: Vec<(&str, [f64; 4], usize)> = Vec::new();
             // Every layer where it is on screen: children of comps with
             // their parents' transforms and opacity.
             let flat = flatten(&frame.layers);
+            // In a transition the frame is two scene pictures moving over
+            // each other: text is compared within its own scene, and nothing
+            // is judged against the title-safe area mid-move.
+            let crossing = frame.layers.len() > 1 && frame.layers.iter().all(|l| matches!(l.content, Content::Group(_)) && compiled.scenes.iter().any(|s| s.id == l.id));
+            let scene_of: Vec<usize> = if crossing {
+                frame.layers.iter().enumerate().flat_map(|(k, l)| std::iter::repeat_n(k, flatten(std::slice::from_ref(l)).len())).collect()
+            } else {
+                vec![0; flat.len()]
+            };
             for (i, layer) in flat.iter().enumerate() {
                 if let Content::Mesh(m) = &layer.content {
                     for message in m.params.adjustments() {
@@ -321,18 +330,21 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
                 }
                 let is_text = matches!(layer.content, Content::Text(_));
                 let fully_on = b[0] >= 0.0 && b[1] >= 0.0 && b[2] <= w && b[3] <= h;
-                if is_text && fully_on && (b[0] < safe[0] || b[1] < safe[1] || b[2] > safe[2] || b[3] > safe[3]) && safe_reported.insert(layer.id.to_string()) {
+                if is_text && !crossing && fully_on && (b[0] < safe[0] || b[1] < safe[1] || b[2] > safe[2] || b[3] > safe[3]) && safe_reported.insert(layer.id.to_string()) {
                     issues.push(issue(Severity::Warning, "layout", Some(&layer.id), Some(t), "text sits outside the title-safe area (5% margin)".into()));
                 }
                 if is_text {
-                    for (other, ob) in &text_boxes {
+                    for (other, ob, scene) in &text_boxes {
+                        if *scene != scene_of[i] {
+                            continue;
+                        }
                         let overlap = b[0] < ob[2] && ob[0] < b[2] && b[1] < ob[3] && ob[1] < b[3];
                         let key = format!("{other}+{}", layer.id);
                         if overlap && overlap_reported.insert(key) {
                             issues.push(issue(Severity::Info, "layout", Some(&layer.id), Some(t), format!("text overlaps '{other}'")));
                         }
                     }
-                    text_boxes.push((&layer.id, b));
+                    text_boxes.push((&layer.id, b, scene_of[i]));
                     if let Content::Text(tx) = &layer.content {
                         // Measured against what is right behind the text:
                         // a button or card under it, else the background.
@@ -996,5 +1008,23 @@ mod tests {
         let safe: Vec<_> = r.issues.iter().filter(|i| i.message.contains("title-safe")).collect();
         assert!(!safe.iter().any(|i| i.element.as_deref() == Some("label")), "{safe:?}");
         assert!(safe.iter().any(|i| i.element.as_deref() == Some("edge")), "nested text is checked where it lands: {safe:?}");
+    }
+
+    #[test]
+    fn scenes_crossing_in_a_transition_are_not_compared() {
+        let mut p = Project::new(640, 360, Fps::whole(30), 2.0);
+        let scene = |id: &str, start: f64, word: &str| {
+            serde_json::from_value::<crate::document::Scene>(serde_json::json!({"id": id, "start": start, "transition": {"type": "fade", "dur": "10f"},
+                "layers": [{"id": word, "kind": "text", "text": word, "transform": {"position": [320, 180]}}]})).unwrap()
+        };
+        p.scenes.push(scene("a", 0.0, "ONE"));
+        p.scenes.push(scene("b", 1.0, "TWO"));
+        let c = Compiled::new(&p);
+        let measure = |l: &LayerState| {
+            let (x, y) = l.matrix.apply(0.0, 0.0);
+            Some([x - 40.0, y - 10.0, x + 40.0, y + 10.0])
+        };
+        let r = check(&p, &c, &Options { measure: Some(&measure), ..Default::default() });
+        assert!(!r.issues.iter().any(|i| i.message.contains("overlaps")), "{:?}", r.issues);
     }
 }

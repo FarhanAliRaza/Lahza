@@ -319,6 +319,32 @@ impl Fonts {
         layout
     }
 
+    /// Canvas bounds of what a text layer shows now: the ink of every glyph
+    /// at least half visible, through its animator, without the distance
+    /// field's margin. `None` when no glyph is visible.
+    pub fn ink_bounds(&mut self, text: &TextState, matrix: lahza_motion_core::space::Proj) -> Option<[f64; 4]> {
+        let layout = self.layout(text);
+        let mut b = EMPTY_BOX;
+        for g in &layout.glyphs {
+            let (m, opacity) = Self::glyph_transform(&layout, text, &text.glyphs, g);
+            if opacity < 0.5 {
+                continue;
+            }
+            let r = g.atlas.rect.map(|v| v as f64);
+            let s = SPREAD as f64;
+            let (x0, y0, x1, y1) = (r[0] + s, r[1] + s, r[2] - s, r[3] - s);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+                let (lx, ly) = m.apply(x, y);
+                let (cx, cy) = matrix.apply(lx, ly);
+                b = union(b, [cx, cy, cx, cy]);
+            }
+        }
+        b.iter().all(|v| v.is_finite()).then_some(b)
+    }
+
     /// Atlas texel → layer space transform of one glyph, with its unit's
     /// animation applied about the unit's centre.
     pub fn glyph_transform(layout: &Layout, text: &TextState, glyphs: &[GlyphState], g: &PlacedGlyph) -> (Affine, f64) {

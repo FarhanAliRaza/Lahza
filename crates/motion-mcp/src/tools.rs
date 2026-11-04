@@ -1059,15 +1059,7 @@ impl Toolbox {
         let fonts = std::cell::RefCell::new(open.fonts.take().unwrap_or_else(|| Fonts::new(Some(&dir))));
         let measure = |layer: &lahza_motion_core::compile::LayerState| -> Option<[f64; 4]> {
             let lahza_motion_core::compile::Content::Text(text) = &layer.content else { return None };
-            let layout = fonts.borrow_mut().layout(text);
-            let [x0, y0, x1, y1] = layout.bounds;
-            let pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| layer.matrix.apply(x, y));
-            Some([
-                pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
-                pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
-                pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
-                pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
-            ])
+            fonts.borrow_mut().ink_bounds(text, layer.matrix)
         };
         let options = CheckOptions { dir: Some(&dir), measure: Some(&measure), tolerance_frames: get_f64(args, "tolerance_frames").unwrap_or(1.0) };
         let mut report = check::check(&open.project, &compiled, &options);

@@ -1609,3 +1609,18 @@ fn feathers_fade_along_every_subpath() {
     assert!(px(&img, 24, 120)[0] < 40, "the end of the second line fades: {:?}", px(&img, 24, 120));
     assert_gpu_matches_cpu(&p, &[0.0]);
 }
+
+/// `check` measures the ink a text shows: nothing before an animator
+/// reveals it, then the caps' height, not the line box.
+#[test]
+fn text_is_measured_by_its_visible_ink() {
+    let p = project(json!([{"id": "t", "kind": "text", "text": "HI", "size": 100, "transform": {"position": [160, 90]},
+                            "animators": [{"at": 1.0, "dur": "4f", "from": {"opacity": 0}}]}]));
+    let c = Compiled::new(&p);
+    let mut r = cpu();
+    let at = |t: f64| c.frame(t).layers.into_iter().find(|l| l.id.as_ref() == "t").unwrap();
+    assert_eq!(r.measure(&at(0.5)), None, "not shown yet");
+    let b = r.measure(&at(1.5)).unwrap();
+    let height = b[3] - b[1];
+    assert!(height > 60.0 && height < 80.0, "cap height of 100 px Inter, not the line box: {b:?}");
+}
