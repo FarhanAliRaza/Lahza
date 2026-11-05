@@ -455,6 +455,12 @@ impl Builder<'_> {
         let cards = layers.iter().filter(|l| card_candidate(l)).count();
         let has_mesh = layers.iter().any(|l| matches!(l.content, Content::Mesh(_)))
             || cards >= 2 && layers.iter().any(|l| card_candidate(l) && !l.matrix.is_affine());
+        // Cards (flat 3D layers among meshes) are drawn after the opaque
+        // meshes next to them and blend by their picture's alpha, so their
+        // soft and anti-aliased parts show the mesh behind them, not the
+        // background; a nearer opaque mesh hides them. See-through meshes
+        // come last (glass refracts the cards too).
+        let mut cards: Vec<usize> = Vec::new();
         let mut deferred: Vec<usize> = Vec::new();
         for (i, layer) in layers.iter().enumerate() {
             if crate::mesh3d::see_through(layer) {
@@ -462,25 +468,32 @@ impl Builder<'_> {
                 continue;
             }
             if has_mesh && card_candidate(layer) {
-                self.meshes.set_current(i);
-                if self.card_item(layer, root, canvas, list, pending, out) {
-                    continue;
-                }
+                cards.push(i);
+                continue;
             }
             if !matches!(layer.content, Content::Mesh(_)) {
-                for j in deferred.drain(..) {
-                    self.meshes.set_current(j);
-                    self.emit(&layers[j], root, canvas, list, pending, out);
-                }
+                self.flush_deferred(layers, &mut cards, &mut deferred, root, canvas, list, pending, out);
             }
             self.meshes.set_current(i);
             self.emit(layer, root, canvas, list, pending, out);
         }
-        for j in deferred {
+        self.flush_deferred(layers, &mut cards, &mut deferred, root, canvas, list, pending, out);
+        self.meshes.close_run();
+    }
+
+    /// Draws the cards and see-through meshes held back by `emit_list`.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_deferred(&mut self, layers: &[LayerState], cards: &mut Vec<usize>, deferred: &mut Vec<usize>, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
+        for j in cards.drain(..) {
+            self.meshes.set_current(j);
+            if !self.card_item(&layers[j], root, canvas, list, pending, out) {
+                self.emit(&layers[j], root, canvas, list, pending, out);
+            }
+        }
+        for j in deferred.drain(..) {
             self.meshes.set_current(j);
             self.emit(&layers[j], root, canvas, list, pending, out);
         }
-        self.meshes.close_run();
     }
 
     /// Draws a flat 3D layer as a card in the mesh depth buffer: its
@@ -488,7 +501,6 @@ impl Builder<'_> {
     /// can't be (it crosses the camera): it is then drawn as usual.
     fn card_item(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) -> bool {
         let Some(view) = layer.view else { return false };
-        let lighting = self.meshes.run_mesh();
         let Some(inverse) = root.then(layer.matrix).inverse() else { return false };
         let items = self.layer_items(layer, root, &mut list.stops, &mut list.segments);
         let blur = card_blur(layer, self.scale);
@@ -502,7 +514,10 @@ impl Builder<'_> {
             bb = [bb[0].min(b[0]), bb[1].min(b[1]), bb[2].max(b[2]), bb[3].max(b[3])];
         }
         let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
-        let rect = [(bb[0] - pad).floor().max(0.0), (bb[1] - pad).floor().max(0.0), (bb[2] + pad).ceil().min(cw), (bb[3] + pad).ceil().min(ch)];
+        // A blurred picture reaches past the canvas by the blur's reach, so
+        // content just outside the frame blurs in instead of fading the
+        // edges to transparent.
+        let rect = [(bb[0] - pad).floor().max(-pad), (bb[1] - pad).floor().max(-pad), (bb[2] + pad).ceil().min(cw + pad), (bb[3] + pad).ceil().min(ch + pad)];
         if !rect.iter().all(|v| v.is_finite()) || rect[2] <= rect[0] || rect[3] <= rect[1] {
             return bb.iter().all(|v| v.is_finite());
         }
@@ -522,13 +537,11 @@ impl Builder<'_> {
         let (serial, index) = self.meshes.member();
         let card = crate::mesh3d::Card { index, view: corners, screen, picture: crate::mesh3d::Backdrop { offset, size, origin, factor }, bounds: rect };
         self.meshes.add_card(card.clone());
+        // Cards share a batch with each other (they cut through each
+        // other), never with opaque meshes (drawn before them).
         if let Some(prev) = out.last_mut().filter(|p| p.prim.kind[0] == PRIM_MESH) {
             let i = prev.prim.kind[1] as usize;
-            let joins = match &lighting {
-                Some(m) => self.meshes.batches[i].can_join(m),
-                None => self.meshes.batches[i].cards_only,
-            };
-            if prev.prim.kind[0] == PRIM_MESH && prev.prim.kind[2] == blend_code(Blend::Normal) && self.meshes.batches[i].list == serial && joins {
+            if prev.prim.kind[2] == blend_code(Blend::Normal) && self.meshes.batches[i].list == serial && self.meshes.batches[i].cards_only {
                 let batch = &mut self.meshes.batches[i];
                 batch.add_card(&card, false);
                 batch.members.push(index);
@@ -536,13 +549,7 @@ impl Builder<'_> {
                 return true;
             }
         }
-        let mut batch = match &lighting {
-            Some(m) => match crate::mesh3d::Batch::new(m) {
-                Some(b) => b,
-                None => return false,
-            },
-            None => crate::mesh3d::Batch::cards_only(),
-        };
+        let mut batch = crate::mesh3d::Batch::cards_only();
         batch.list = serial;
         batch.members.push(index);
         batch.add_card(&card, false);

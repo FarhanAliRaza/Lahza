@@ -1183,7 +1183,7 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
                     let tf = u32(b_mesh[r + 2u].w);
                     let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * 4u;
                     if (tf & 1u) != 0u {
-                        stands = card_sample(prim, material, q).w >= 0.5;
+                        stands = card_sample(prim, material, q).w >= 1.0 / 512.0; // CARD_STANDS
                     } else if (tf & 2u) != 0u {
                         stands = wire_stands(material, r0, r1, tf, q);
                     }

@@ -209,7 +209,9 @@ radius in px per 100 px of depth away from the focus plane (0 = off), and
 `focus`, the sharp plane as a depth read like a layer's `z` (0 = the point
 of interest's plane, the default; animatable for a rack focus) or the id of
 a top-level layer to keep sharp. Every 3D layer (and each child of a 3D
-comp) blurs by its distance from that plane; 2D layers are unaffected:
+comp) blurs by its distance from that plane, up to an eighth of the frame's
+longer side (beyond that a layer is a soft wash of its colour); 2D layers
+are unaffected:
 
 ```json
 "camera": {"aperture": 2, "focus": {"keys": [{"at": "bar:3", "v": 0}, {"at": "bar:4", "v": 600, "ease": "glide"}]}}
@@ -335,9 +337,11 @@ also when one has effects, a matte or depth of field. Meshes that let
 what is behind show (opacity < 1, glass, a blend mode) are drawn after the
 opaque ones and never hide them. Flat 3D layers (`three_d` shapes, text,
 images, footage) in a list with meshes join the same depth test as cards
-(their picture on a quad; where the picture is under half opaque it hides
-nothing), and lists of two or more tilted 3D layers do too, so planes cut
-through each other and through meshes. Coplanar layers keep their layer
+(their picture on a quad), and lists of two or more tilted 3D layers do
+too, so planes cut through each other and through meshes. Cards are drawn
+after the opaque meshes and blend by their picture's alpha, so their soft,
+defocused and anti-aliased parts show the mesh behind them; a nearer
+opaque mesh hides them. Coplanar layers keep their layer
 order.
 
 ```json

@@ -1624,3 +1624,55 @@ fn text_is_measured_by_its_visible_ink() {
     let height = b[3] - b[1];
     assert!(height > 60.0 && height < 80.0, "cap height of 100 px Inter, not the line box: {b:?}");
 }
+
+/// A defocused flat 3D layer in front of a mesh blends over the mesh: its
+/// soft edge mixes with the box behind it, not with the background (which
+/// showed as background-coloured holes around blurred or anti-aliased
+/// cards).
+#[test]
+fn defocused_cards_blend_over_the_meshes_behind_them() {
+    let mut p = project(json!([
+        {"id": "box", "kind": "mesh", "mesh": {"type": "box", "size": [300, 170], "depth": 40},
+         "material": {"preset": "flat", "color": "#808080"}, "transform": {"position": [160, 90]}},
+        {"id": "card", "kind": "shape", "shape": "rect", "size": [60, 60], "fill": "#ffffff", "three_d": true,
+         "transform": {"position": [160, 90], "z": -120}}
+    ]));
+    p.scenes[0].camera = serde_json::from_value(json!({"aperture": 4, "focus": 0})).unwrap();
+    let img = cpu().render(&Compiled::new(&p), 0.0);
+    let grey = px(&img, 30, 90)[0] as i32;
+    assert!(grey > 100 && grey < 160, "the box is mid grey: {grey}");
+    // Across the card's soft edge, over the box: between grey and white, and
+    // a whole blur: as many pixels in its outer half (under half the card)
+    // as in its inner half; cut at half opacity, the outer half was missing.
+    let row: Vec<i32> = (160..300).map(|x| px(&img, x, 90)[0] as i32).collect();
+    assert!(row.iter().all(|v| *v >= grey - 3), "the soft edge darkens toward the background: {row:?}");
+    let mid = (255 + grey) / 2;
+    let inner = row.iter().filter(|v| **v > mid && **v < 253).count();
+    let outer = row.iter().filter(|v| **v <= mid && **v > grey + 2).count();
+    assert!(outer * 10 >= inner * 7, "the blur's outer half is cut off: {inner} inner, {outer} outer px: {row:?}");
+    assert!(px(&img, 160, 90)[0] > grey as u8 + 40, "the card shows in front");
+    assert_gpu_matches_cpu(&p, &[0.0]);
+}
+
+/// Depth of field caps its blur (an eighth of the frame), so a far layer
+/// is a soft wash instead of a picture too large to blur.
+#[test]
+fn depth_of_field_blur_is_capped() {
+    let mut p = project(json!([
+        {"id": "sky", "kind": "shape", "shape": "rect", "size": [400000, 200000], "fill": "#88aacc", "three_d": true,
+         "transform": {"position": [160, 90], "z": 150000}},
+        {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 40}, "transform": {"position": [160, 90]}}
+    ]));
+    p.scenes[0].camera = serde_json::from_value(json!({"aperture": 3, "focus": "ball"})).unwrap();
+    let c = Compiled::new(&p);
+    let sky = c.frame(0.0).layers.into_iter().find(|l| l.id.as_ref() == "sky").unwrap();
+    let sigma = sky.effects.iter().find_map(|e| match e {
+        lahza_motion_core::compile::EffectState::Blur { sigma, .. } => Some(*sigma),
+        _ => None,
+    });
+    assert_eq!(sigma, Some(320.0 / 8.0), "capped at an eighth of the frame");
+    let img = cpu().render(&c, 0.0);
+    let corner = px(&img, 5, 5);
+    assert!(corner[2] > 150 && corner[0] < 160, "the sky is a wash of its colour: {corner:?}");
+}
+

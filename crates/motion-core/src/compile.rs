@@ -1547,7 +1547,8 @@ impl Compiled {
                     Some(view_depth(&space, world))
                 }
             };
-            space.dof = plane.map(|plane| Dof { plane, per_px: aperture / 100.0 });
+            let max = self.settings.width.max(self.settings.height) as f64 / 8.0;
+            space.dof = plane.map(|plane| Dof { plane, per_px: aperture / 100.0, max });
         }
         space
     }
@@ -1719,6 +1720,9 @@ struct Space {
 struct Dof {
     plane: f64,
     per_px: f64,
+    /// Largest blur (px): past about an eighth of the frame a defocused
+    /// layer is a smooth wash, and more blur only costs memory.
+    max: f64,
 }
 
 /// View-space depth of a layer's origin.
@@ -1964,7 +1968,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
     // Depth of field blurs each 3D layer by its distance from the focus
     // plane (comps pass it on to their children instead).
     if let (true, Some(dof), false) = (three_d, space.dof, matches!(l.kind, CKind::Comp(_))) {
-        let sigma = dof.per_px * (view_depth(space, world) - dof.plane).abs();
+        let sigma = (dof.per_px * (view_depth(space, world) - dof.plane).abs()).min(dof.max);
         if sigma > 0.05 {
             effects.insert(0, EffectState::Blur { sigma, repeat_edges: false });
         }

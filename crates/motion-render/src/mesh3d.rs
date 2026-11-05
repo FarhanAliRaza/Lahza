@@ -130,10 +130,6 @@ impl MeshCache {
 
     /// A mesh of the current list (its lighting and camera start batches
     /// that open with a card).
-    pub(crate) fn run_mesh(&self) -> Option<MeshState> {
-        self.runs.last()?.meshes.first().map(|m| m.state.clone())
-    }
-
     pub(crate) fn add_card(&mut self, card: Card) {
         if let Some(r) = self.runs.last_mut() {
             r.cards.push(card);
@@ -155,7 +151,8 @@ impl MeshCache {
         // Shadows: every mesh of the list casts onto every other.
         let shadows = self.shadow_maps(&run);
         let mut batches = std::mem::take(&mut self.batches);
-        for b in batches.iter_mut().filter(|b| b.list == run.serial) {
+        // Cards are unlit pictures: no light rows to hang shadow maps on.
+        for b in batches.iter_mut().filter(|b| b.list == run.serial && !b.cards_only) {
             b.shadows = shadows.clone();
         }
         if run.meshes.len() + run.cards.len() < 2 {
@@ -168,6 +165,11 @@ impl MeshCache {
                 if rm.occludes && overlaps && !b.members.contains(&rm.index) {
                     b.add_occluder(self, &rm.state, rm.root);
                 }
+            }
+            // Cards are drawn after the opaque meshes and blend over them,
+            // so they hide only other cards (in another cards' batch).
+            if !b.cards_only {
+                continue;
             }
             for card in &run.cards {
                 let overlaps = card.bounds[2] >= b.bounds[0] && card.bounds[0] <= b.bounds[2] && card.bounds[3] >= b.bounds[1] && card.bounds[1] <= b.bounds[3];
@@ -541,6 +543,10 @@ pub const FLAG_SHADOW_CATCHER: u32 = 8;
 /// A card: rows 0–1 hold its picture (canvas → texel map, texel offset
 /// relative to the primitive's texel base, size).
 pub const FLAG_CARD: u32 = 16;
+/// A card stands (wins its sample) wherever its picture shows at all; its
+/// colour then blends over what was drawn before it (cards come after the
+/// opaque meshes), so soft and anti-aliased edges keep what is behind.
+pub const CARD_STANDS: f32 = 1.0 / 512.0;
 /// A wireframe: edges `row 3.w` px wide in row 0's colour; faces in row 1's
 /// colour, or see-through when its alpha is 0.
 pub const FLAG_WIRE: u32 = 32;
@@ -1583,7 +1589,7 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
                 let tf = m[r + 2][3] as u32;
                 let material = prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * 4;
                 let stands = if tf & 1 != 0 {
-                    card_sample(prim, m, groups, material, q)[3] >= 0.5
+                    card_sample(prim, m, groups, material, q)[3] >= CARD_STANDS
                 } else if tf & 2 != 0 {
                     wire_stands(m, material, r0, r1, tf, q)
                 } else {
