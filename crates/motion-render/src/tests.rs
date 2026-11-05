@@ -1676,3 +1676,30 @@ fn depth_of_field_blur_is_capped() {
     assert!(corner[2] > 150 && corner[0] < 160, "the sky is a wash of its colour: {corner:?}");
 }
 
+
+/// A lost GPU device is replaced and the frame tried again; if that fails
+/// too the CPU takes over. Either way it is reported, never silent.
+#[test]
+fn a_lost_gpu_is_retried_then_reported() {
+    let p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [100, 60], "fill": "#ff0000", "transform": {"position": [160, 90]}}]));
+    let c = Compiled::new(&p);
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
+    if !r.is_gpu() {
+        eprintln!("skipping: {}", r.backend_label());
+        return;
+    }
+    let want = cpu().render(&c, 0.0);
+    // One failure: a new device renders the frame.
+    r.fail_gpu = 1;
+    assert_eq!(r.render(&c, 0.0), want);
+    assert!(r.is_gpu(), "still on the GPU");
+    assert!(r.warnings().iter().any(|w| w.contains("a new device rendered it")), "{:?}", r.warnings());
+    // Two in a row: the CPU takes over, and says so.
+    r.last_invalidate();
+    r.fail_gpu = 2;
+    assert_eq!(r.render(&c, 0.5), want);
+    assert!(!r.is_gpu());
+    assert!(r.backend_label().starts_with("CPU (GPU failed"), "{}", r.backend_label());
+    assert!(r.warnings().iter().any(|w| w.contains("rendered on the CPU")), "{:?}", r.warnings());
+}

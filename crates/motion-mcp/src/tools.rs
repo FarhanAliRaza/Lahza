@@ -1183,6 +1183,7 @@ impl Toolbox {
         }
         let backend = renderer.backend_label();
         let dropped = renderer.dropped();
+        let fell_back: Vec<String> = renderer.warnings().into_iter().filter(|w| w.starts_with("GPU failed")).collect();
         renderer.set_scale(1.0);
         let images: Vec<Vec<u8>> = if sheet {
             let columns = (frames.len() as f64).sqrt().ceil().max(1.0) as u32;
@@ -1195,6 +1196,10 @@ impl Toolbox {
             std::fs::write(&path, &images[0]).map_err(|e| format!("{}: {e}", path.display()))?;
         }
         let mut out = json!({"frames": listed, "renderer": backend});
+        // A GPU failure mid-snapshot is reported, not silent.
+        if !fell_back.is_empty() {
+            out["warnings"] = json!(fell_back);
+        }
         if !dropped.is_empty() {
             // Not drawn as asked: the frames are wrong.
             out["ok"] = json!(false);

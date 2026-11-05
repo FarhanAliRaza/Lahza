@@ -84,6 +84,11 @@ pub struct Renderer {
     pub meshes: mesh3d::MeshCache,
     gpu: Option<gpu::Gpu>,
     gpu_error: Option<String>,
+    /// GPU failures recovered or fallen back from (reported as warnings).
+    fallbacks: Vec<String>,
+    /// Tests: GPU renders to fail as a lost device would.
+    #[cfg(test)]
+    pub(crate) fail_gpu: u32,
     options: RenderOptions,
     last: Option<(Vec<u8>, RgbaImage)>,
     pub stats: Stats,
@@ -105,7 +110,7 @@ impl Renderer {
     pub fn new(root: Option<&Path>, options: RenderOptions) -> Self {
         let (gpu, gpu_error) = match options.backend {
             Backend::Cpu => (None, None),
-            _ => match gpu::Gpu::new(options.allow_software_gpu) {
+            _ => match gpu_with_retry(options.allow_software_gpu) {
                 Ok(g) => (Some(g), None),
                 Err(e) => (None, Some(e)),
             },
@@ -117,12 +122,23 @@ impl Renderer {
             meshes: mesh3d::MeshCache::default(),
             gpu,
             gpu_error,
+            fallbacks: Vec::new(),
+            #[cfg(test)]
+            fail_gpu: 0,
             options,
             last: None,
             stats: Stats::default(),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             scratch: Scratch::default(),
         }
+    }
+
+    /// Tests: whether this GPU render should fail as a lost device would.
+    #[cfg(test)]
+    fn take_failure(&mut self) -> bool {
+        let fail = self.fail_gpu > 0;
+        self.fail_gpu = self.fail_gpu.saturating_sub(1);
+        fail
     }
 
     /// Forgets the last frame, so the next one is drawn (benchmarks).
@@ -161,6 +177,7 @@ impl Renderer {
         w.extend(self.images.warnings.iter().cloned());
         w.extend(self.footage.warnings.iter().cloned());
         w.extend(self.meshes.warnings.iter().cloned());
+        w.extend(self.fallbacks.iter().cloned());
         w.sort();
         w.dedup();
         w
@@ -224,13 +241,38 @@ impl Renderer {
             }
         }
         let main = lists[0].main();
-        let bytes = match self.gpu.as_mut().map(|g| g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic)) {
+        #[cfg(test)]
+        let fail = self.take_failure();
+        #[cfg(not(test))]
+        let fail = false;
+        let result = self.gpu.as_mut().map(|g| if fail { Err("ERROR_DEVICE_LOST (test)".to_string()) } else { g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic) });
+        let bytes = match result {
             Some(Ok(bytes)) => bytes,
             Some(Err(e)) => {
-                // Sticky fallback: the same lists render on the CPU.
-                self.gpu = None;
-                self.gpu_error = Some(format!("GPU failed: {e}"));
-                self.cpu(&lists)
+                // A lost device (contention, a driver reset) usually comes
+                // back: make a new one and try the frame again before
+                // falling back to the CPU for good, and say so either way.
+                #[cfg(test)]
+                let fail_again = self.take_failure();
+                #[cfg(not(test))]
+                let fail_again = false;
+                let retried = gpu_with_retry(self.options.allow_software_gpu).ok().and_then(|mut g| {
+                    let r = if fail_again { None } else { g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic).ok() };
+                    self.gpu = Some(g);
+                    r
+                });
+                match retried {
+                    Some(bytes) => {
+                        self.fallbacks.push(format!("GPU failed at frame {} ({e}); a new device rendered it", self.stats.frames));
+                        bytes
+                    }
+                    None => {
+                        self.gpu = None;
+                        self.gpu_error = Some(format!("GPU failed: {e}"));
+                        self.fallbacks.push(format!("GPU failed at frame {} ({e}); this and later frames rendered on the CPU", self.stats.frames));
+                        self.cpu(&lists)
+                    }
+                }
             }
             None => self.cpu(&lists),
         };
@@ -278,6 +320,22 @@ impl Renderer {
         let Content::Text(text) = &layer.content else { return None };
         self.fonts.ink_bounds(text, layer.matrix)
     }
+}
+
+/// Makes the GPU renderer, trying again on transient failures (a device
+/// busy or lost under contention); a missing or software-only device is not
+/// retried.
+fn gpu_with_retry(allow_software: bool) -> Result<gpu::Gpu, String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        match gpu::Gpu::new(allow_software) {
+            Ok(g) => return Ok(g),
+            Err(e) if e.starts_with("only a software") || e.starts_with("no Vulkan device") && !e.contains("DEVICE_LOST") => return Err(e),
+            Err(e) => last = e,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
+    }
+    Err(last)
 }
 
 pub fn encode_png(image: &RgbaImage) -> Vec<u8> {
