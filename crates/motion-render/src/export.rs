@@ -4,9 +4,10 @@
 //! as `crates/export-encoder`), else libx264. Audio clips are mixed in, with
 //! music ducked under narration when `duck_db` is set.
 
+use crate::pt::TraceOptions;
 use crate::{RenderOptions, Renderer};
 use lahza_motion_core::compile::Compiled;
-use lahza_motion_core::document::{AudioClip, Project};
+use lahza_motion_core::document::{AudioClip, Project, RendererKind, Settings};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -29,6 +30,22 @@ pub struct ExportOptions {
     pub range: Option<(f64, f64)>,
     pub audio: bool,
     pub render: RenderOptions,
+    /// Overrides the project's `renderer` setting (`render --pt`).
+    pub renderer: Option<RendererKind>,
+    /// Overrides the project's `samples` (paths per pixel).
+    pub samples: Option<u32>,
+}
+
+/// The path tracer's options for an export, or None to rasterise: the
+/// override, else the project's `renderer`; draft quality traces a quarter
+/// of the samples (at least 4).
+pub fn trace_options(settings: &Settings, quality: Quality, renderer: Option<RendererKind>, samples: Option<u32>) -> Option<TraceOptions> {
+    if renderer.or(settings.renderer) != Some(RendererKind::Path) {
+        return None;
+    }
+    let spp = samples.or(settings.samples).unwrap_or(TraceOptions::default().spp).max(1);
+    let spp = if quality == Quality::Draft { (spp / 4).max(4).min(spp) } else { spp };
+    Some(TraceOptions { spp, ..Default::default() })
 }
 
 #[derive(Default)]
@@ -256,6 +273,7 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
         return Err(format!("the project has errors; run check: {}", compiled.errors.join("; ")));
     }
     let mut render = options.render;
+    render.path = render.path.filter(|_| options.renderer != Some(RendererKind::Raster)).or_else(|| trace_options(&compiled.settings, options.quality, options.renderer, options.samples));
     if options.quality == Quality::Draft {
         render.scale *= 0.5;
         render.motion_blur = false;

@@ -7,7 +7,7 @@ use base64::Engine as _;
 use lahza_motion_core::catalog::style_pack;
 use lahza_motion_core::check::{self, Options as CheckOptions};
 use lahza_motion_core::compile::Compiled;
-use lahza_motion_core::document::{Asset, AudioClip, Project};
+use lahza_motion_core::document::{Asset, AudioClip, Project, RendererKind};
 use lahza_motion_core::edit;
 use lahza_motion_core::io::{self, HistoryEntry};
 use lahza_motion_core::markers::{Marker, MarkerTrack, Markers};
@@ -168,7 +168,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
             name: "snapshot",
             description: "Render frames as images: at given times/references, at a track's markers, or (default) at the project's sync points. sheet=true returns one labelled contact sheet.",
             schema: obj(json!({"at": {"type": "array", "items": time}, "track": {"type": "string"}, "from": {"type": "number"}, "to": {"type": "number"},
-                "sheet": {"type": "boolean"}, "width": {"type": "integer", "description": "px per frame (default 960, 360 in sheets)"}, "save": {"type": "string", "description": "also write the PNG here"}}), &[]),
+                "sheet": {"type": "boolean"}, "width": {"type": "integer", "description": "px per frame (default 960, 360 in sheets)"}, "save": {"type": "string", "description": "also write the PNG here"},
+                "pt": {"type": "boolean", "description": "path-trace meshes, as a path-traced export draws them (default false: the preview's raster)"}, "samples": {"type": "integer", "description": "with pt: paths per pixel (default the project's samples, else 64)"}}), &[]),
             read_only: true,
         },
         ToolDef {
@@ -184,9 +185,10 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "render",
-            description: "Export video (mp4, webm or gif by extension) in the background; poll render_status. quality=draft renders half size without motion blur.",
+            description: "Export video (mp4, webm or gif by extension) in the background; poll render_status. quality=draft renders half size without motion blur. pt=true (or settings.renderer \"path\") path-traces meshes on a GPU with ray queries (else rasterised, with a warning).",
             schema: obj(json!({"output": {"type": "string", "description": "default renders/<name>.mp4 in the project"}, "quality": {"type": "string", "enum": ["draft", "final"], "default": "final"},
-                "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"}}), &[]),
+                "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
+                "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"}}), &[]),
             read_only: false,
         },
         ToolDef { name: "render_status", description: "Progress and result of render jobs.", schema: json!({"type": "object", "properties": {"job": {"type": "string"}}}), read_only: true },
@@ -312,6 +314,28 @@ fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn get_f64(args: &Value, key: &str) -> Option<f64> {
     args.get(key).and_then(Value::as_f64)
+}
+
+/// `pt`: true path-traces meshes, false rasterises them, absent follows
+/// the project.
+fn renderer_arg(args: &Value) -> Result<Option<RendererKind>, String> {
+    match args.get("pt") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(true)) => Ok(Some(RendererKind::Path)),
+        Some(Value::Bool(false)) => Ok(Some(RendererKind::Raster)),
+        Some(v) => Err(format!("pt: expected true or false, got {v}")),
+    }
+}
+
+/// `samples`: paths per pixel for the path tracer.
+fn samples_arg(args: &Value) -> Result<Option<u32>, String> {
+    match args.get("samples") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=65536).contains(&n) => Ok(Some(n as u32)),
+            _ => Err(format!("samples: expected a whole number 1..65536, got {v}")),
+        },
+    }
 }
 
 fn round(v: f64) -> f64 {
@@ -1169,8 +1193,14 @@ impl Toolbox {
         let pw = compiled.settings.width as f64;
         // Render at the size we return (sheets render at 2× thumbnail size).
         let scale = ((if sheet { width * 2.0 } else { width }) / pw).clamp(0.05, 1.0);
+        let path = match renderer_arg(args)? {
+            Some(RendererKind::Path) => export::trace_options(&compiled.settings, Quality::Final, Some(RendererKind::Path), samples_arg(args)?),
+            _ => None,
+        };
         let renderer = self.renderer(&dir);
         renderer.set_scale(scale);
+        renderer.set_path(path);
+        renderer.clear_fallbacks();
         let mut frames = Vec::new();
         let mut listed = Vec::new();
         for (label, t) in &times {
@@ -1183,8 +1213,9 @@ impl Toolbox {
         }
         let backend = renderer.backend_label();
         let dropped = renderer.dropped();
-        let fell_back: Vec<String> = renderer.warnings().into_iter().filter(|w| w.starts_with("GPU failed")).collect();
+        let fell_back: Vec<String> = renderer.warnings().into_iter().filter(|w| w.starts_with("GPU failed") || w.starts_with("path tracing needs")).collect();
         renderer.set_scale(1.0);
+        renderer.set_path(None);
         let images: Vec<Vec<u8>> = if sheet {
             let columns = (frames.len() as f64).sqrt().ceil().max(1.0) as u32;
             vec![lahza_motion_render::encode_png(&sheet::contact_sheet(&frames, columns.min(4).max(1), width as u32))]
@@ -1568,6 +1599,8 @@ impl Toolbox {
             range,
             audio: args.get("audio").and_then(Value::as_bool).unwrap_or(true),
             render: RenderOptions { backend: self.backend, ..Default::default() },
+            renderer: renderer_arg(args)?,
+            samples: samples_arg(args)?,
         };
         let progress = Arc::new(Progress::default());
         let p2 = progress.clone();

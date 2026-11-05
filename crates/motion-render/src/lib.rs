@@ -18,6 +18,7 @@ pub mod gpu;
 pub mod images;
 pub mod list;
 pub mod mesh3d;
+pub mod pt;
 pub mod raster;
 pub mod sheet;
 
@@ -56,6 +57,10 @@ pub struct RenderOptions {
     pub backend: Backend,
     /// Accept llvmpipe-style software Vulkan (tests).
     pub allow_software_gpu: bool,
+    /// Path-trace meshes (export); `None` rasterises them (the preview).
+    /// Needs a GPU with ray queries, else the frame is rasterised and a
+    /// warning says so.
+    pub path: Option<pt::TraceOptions>,
 }
 
 impl Default for RenderOptions {
@@ -65,6 +70,7 @@ impl Default for RenderOptions {
             motion_blur: true,
             backend: Backend::Auto,
             allow_software_gpu: std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some(),
+            path: None,
         }
     }
 }
@@ -159,10 +165,28 @@ impl Renderer {
         self.options.motion_blur = on;
     }
 
-    /// "GPU · <device>" or "CPU (<why>)".
+    /// Forgets the fall-back warnings (GPU failures, no path tracing), so
+    /// `warnings` reports those of the frames rendered from now on.
+    pub fn clear_fallbacks(&mut self) {
+        self.fallbacks.clear();
+    }
+
+    /// Path-trace meshes from the next frame (`None`: rasterise them).
+    pub fn set_path(&mut self, path: Option<pt::TraceOptions>) {
+        if self.options.path != path {
+            self.options.path = path;
+            self.last = None;
+        }
+    }
+
+    /// "GPU · <device>" (plus "· path traced, N spp" when tracing) or
+    /// "CPU (<why>)".
     pub fn backend_label(&self) -> String {
         match (&self.gpu, &self.gpu_error) {
-            (Some(g), _) => g.label.clone(),
+            (Some(g), _) => match self.options.path {
+                Some(o) if g.can_trace() => format!("{} · path traced, {} spp", g.label, o.spp),
+                _ => g.label.clone(),
+            },
             (None, Some(e)) => format!("CPU ({e})"),
             (None, None) => "CPU".into(),
         }
@@ -170,6 +194,11 @@ impl Renderer {
 
     pub fn is_gpu(&self) -> bool {
         self.gpu.is_some()
+    }
+
+    /// Whether `path` options will path-trace (a GPU with ray queries).
+    pub fn can_trace(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.can_trace())
     }
 
     pub fn warnings(&self) -> Vec<String> {
@@ -219,12 +248,20 @@ impl Renderer {
     /// Renders equally weighted sub-samples of one output frame.
     pub fn render_states(&mut self, states: &[FrameState]) -> RgbaImage {
         let started = Instant::now();
-        let scale = self.options.scale;
         self.footage.begin_frame();
-        let lists: Vec<DisplayList> = states
-            .iter()
-            .map(|s| Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, meshes: &mut self.meshes, scale }.build(s))
-            .collect();
+        let trace = match (self.options.path, self.gpu.as_ref()) {
+            (Some(p), Some(g)) if g.can_trace() => Some(p),
+            (Some(_), g) => {
+                let why = g.and_then(|g| g.trace_error.clone()).or_else(|| self.gpu_error.clone()).unwrap_or_else(|| "no GPU".into());
+                let w = format!("path tracing needs a GPU with ray queries ({why}): rendered with the rasteriser");
+                if !self.fallbacks.contains(&w) {
+                    self.fallbacks.push(w);
+                }
+                None
+            }
+            (None, _) => None,
+        };
+        let lists = self.build_lists(states, trace);
         let mut key = Vec::new();
         for l in &lists {
             key.extend(l.signature());
@@ -270,7 +307,13 @@ impl Renderer {
                         self.gpu = None;
                         self.gpu_error = Some(format!("GPU failed: {e}"));
                         self.fallbacks.push(format!("GPU failed at frame {} ({e}); this and later frames rendered on the CPU", self.stats.frames));
-                        self.cpu(&lists)
+                        // The CPU cannot trace: rasterise the frame instead.
+                        if trace.is_some() {
+                            let raster = self.build_lists(states, None);
+                            self.cpu(&raster)
+                        } else {
+                            self.cpu(&lists)
+                        }
                     }
                 }
             }
@@ -280,6 +323,18 @@ impl Renderer {
         let image = RgbaImage::from_raw(main.width, main.height, bytes).expect("frame size");
         self.last = Some((key, image.clone()));
         image
+    }
+
+    fn build_lists(&mut self, states: &[FrameState], trace: Option<pt::TraceOptions>) -> Vec<DisplayList> {
+        let scale = self.options.scale;
+        states
+            .iter()
+            .map(|s| {
+                // Seeded by the frame's time: the same frame traces the same.
+                let seed = ((s.t * 1000.0).round() as i64 as u64).wrapping_mul(0x9E37_79B9) as u32;
+                Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, meshes: &mut self.meshes, scale, trace, seed }.build(s)
+            })
+            .collect()
     }
 
     fn cpu(&mut self, lists: &[DisplayList]) -> Vec<u8> {

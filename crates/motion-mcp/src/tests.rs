@@ -548,3 +548,23 @@ fn sync_check_flags_hits_with_nothing_to_hit() {
     assert_eq!(label["drift_frames"], 0.0, "{all:#}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `snapshot pt=true` without ray queries draws the raster and says so.
+#[test]
+fn a_path_traced_snapshot_without_ray_queries_warns() {
+    let (mut tb, dir) = toolbox("pt");
+    tb.call("project_create", json!({"path": "still", "duration": 1, "width": 320, "height": 180})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "scene": "s1", "layer": {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 40}, "transform": {"position": [160, 90]}}}
+    ]})).unwrap();
+    let raster = tb.call("snapshot", json!({"at": [0.5], "width": 320})).unwrap();
+    assert!(raster.json.get("warnings").is_none(), "{}", raster.json);
+    let traced = tb.call("snapshot", json!({"at": [0.5], "width": 320, "pt": true, "samples": 4})).unwrap();
+    assert!(traced.json["warnings"].to_string().contains("path tracing needs a GPU with ray queries"), "{}", traced.json);
+    assert_eq!(traced.images, raster.images);
+    let again = tb.call("snapshot", json!({"at": [0.5], "width": 320})).unwrap();
+    assert!(again.json.get("warnings").is_none(), "the warning was about the traced snapshot: {}", again.json);
+    assert!(tb.call("snapshot", json!({"at": [0.5], "pt": "yes"})).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

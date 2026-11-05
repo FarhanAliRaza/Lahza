@@ -273,7 +273,8 @@ pub fn catalog_json() -> Value {
                     "emissive": "colour it glows with", "emissive_strength": "multiplier", "opacity": "0..1", "transmission": "0..1 glass (background shows through, edges reflect)", "unlit": "bool", "faceted": "bool: low-poly normals"},
                 "parts": {"front": "material over `material` for the part (rings/revolves: facing −axis)", "back": "…", "side": "… (rings/revolves: facing away from the axis)", "bevel": "…", "caps": "…", "inside": "rings/revolves: facing the axis"},
                 "detail": "tessellation multiplier (default 1)",
-                "depth": "meshes and flat 3D layers in the same layer list share one depth test (planes cut through meshes, any order); see-through meshes (opacity, glass, blend) draw after the opaque ones"
+                "depth": "meshes and flat 3D layers in the same layer list share one depth test (planes cut through meshes, any order); see-through meshes (opacity, glass, blend) draw after the opaque ones",
+                "path_tracing": "export only: project settings.renderer \"path\" (samples: paths per pixel, default 64, drafts a quarter) or render --pt / snapshot --pt (--spp N): ray-traced shadows, bounced light, reflections of the scene, refraction of meshes behind glass; same camera, so meshes stand where the raster draws them. Needs a GPU with ray queries, else rasterised with a warning; lists with wireframes, effects (depth of field too), mattes or blend modes on 3D layers are rasterised"
             }
         },
         "scene": {

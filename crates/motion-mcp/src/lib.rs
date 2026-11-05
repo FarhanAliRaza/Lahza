@@ -18,13 +18,14 @@ Usage:
   lahza motion apply <project> <ops.json>
   lahza motion check <project> [--json]
   lahza motion sync-check <project> [--frames N] [--tracks a,b] [--all] [--json]
-  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [-o out.png]
+  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N]] [-o out.png]
   lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [-o compare.png]
                                           (no --at: every frame, first to last, plus a side-by-side video)
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
   lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
+                    [--pt|--raster] [--spp N]   path-trace meshes (default: the project's settings.renderer)
 
 Times and references: 2.5, \"48f\", beat:17, bar:5, word:canal, hit:2, \"#title.end + 0.25\".";
 
@@ -64,6 +65,19 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// `--pt` / `--raster` and `--spp N` as the tools' `pt` and `samples`.
+fn renderer_flags(args: &[String], a: &mut Value) -> Result<(), String> {
+    if has(args, "--pt") {
+        a["pt"] = json!(true);
+    } else if has(args, "--raster") {
+        a["pt"] = json!(false);
+    }
+    if let Some(n) = flag(args, "--spp") {
+        a["samples"] = json!(n.parse::<u32>().map_err(|e| format!("--spp: {e}"))?);
+    }
+    Ok(())
 }
 
 fn print(v: &Value) {
@@ -198,6 +212,7 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             if let Some(w) = flag(args, "--width") {
                 a["width"] = json!(w.parse::<u32>().map_err(|e| e.to_string())?);
             }
+            renderer_flags(args, &mut a)?;
             let out = tb.call("snapshot", a)?;
             let base = flag(args, "-o").unwrap_or_else(|| "snapshot.png".into());
             for (i, png) in out.images.iter().enumerate() {
@@ -267,6 +282,7 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             if has(args, "--no-audio") {
                 a["audio"] = json!(false);
             }
+            renderer_flags(args, &mut a)?;
             for f in ["from", "to"] {
                 if let Some(v) = flag(args, &format!("--{f}")) {
                     a[f] = json!(v.parse::<f64>().map_err(|e| e.to_string())?);

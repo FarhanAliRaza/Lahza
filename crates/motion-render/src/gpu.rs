@@ -153,6 +153,9 @@ pub struct Gpu {
     images_generation: u64,
     pending: Option<gpu::SyncPoint>,
     pub label: String,
+    /// The path tracer, where the device has ray queries.
+    tracer: Option<crate::pt::Tracer>,
+    pub(crate) trace_error: Option<String>,
 }
 
 /// Concatenates sub-sample display lists into one upload. Returns the
@@ -170,6 +173,14 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let ops_base = out.ops.len() as u32;
         let mesh_base = out.mesh.len() as u32;
         let bins_base = out.bins.len() as u32;
+        let trace_base = out.traces.len() as u32;
+        out.traces.extend(list.traces.iter().map(|t| {
+            let mut t = t.clone();
+            for c in &mut t.cards {
+                c.picture.offset += texel_base;
+            }
+            t
+        }));
         for p in &list.prims {
             let mut p: Prim = *p;
             let rebase = |v: f32, by: u32| f32::from_bits(v.to_bits() + by);
@@ -222,6 +233,7 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
                 let mut g = *g;
                 g.target.range_base += range_base;
                 g.offset += texel_base;
+                g.trace = g.trace.map(|i| i + trace_base);
                 g
             })
             .collect();
@@ -261,6 +273,14 @@ impl Gpu {
         });
         let encoder = context.create_command_encoder(gpu::CommandEncoderDesc { name: "motion", buffer_count: 1 });
         let label = format!("GPU · {}", info.device_name);
+        let (tracer, trace_error) = if !crate::pt::supported(&context) {
+            (None, Some(format!("{} has no ray queries", info.device_name)))
+        } else {
+            match crate::pt::Tracer::new(&context) {
+                Ok(t) => (Some(t), None),
+                Err(e) => (None, Some(format!("path tracer: {e}"))),
+            }
+        };
         Ok(Self {
             prims: Buffer::new(&context, "motion prims", 1 << 16, true),
             ranges: Buffer::new(&context, "motion ranges", 1 << 16, true),
@@ -286,7 +306,14 @@ impl Gpu {
             blur,
             resolve,
             label,
+            tracer,
+            trace_error,
         })
+    }
+
+    /// Whether this GPU can path-trace.
+    pub fn can_trace(&self) -> bool {
+        self.tracer.is_some()
     }
 
     /// Renders weighted sub-samples (weights sum to 1) to straight RGBA8.
@@ -299,6 +326,9 @@ impl Gpu {
         let (list, targets) = merge(samples);
         let weight = 1.0 / samples.len() as f32;
         let ctx = &self.context;
+        if let Some(t) = self.tracer.as_mut() {
+            t.begin_frame(&self.context);
+        }
         self.encoder.start();
         self.prims.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.prims))?;
         self.ranges.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ranges))?;
@@ -342,6 +372,11 @@ impl Gpu {
         for (i, (main, groups)) in targets.iter().enumerate() {
             for g in groups {
                 let t = g.target;
+                if let Some(ti) = g.trace {
+                    let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
+                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device);
+                    continue;
+                }
                 let data = raster_data(
                     Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, 0, 0], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
                     self.groups.device,
@@ -421,6 +456,9 @@ impl Drop for Gpu {
     fn drop(&mut self) {
         if let Some(sync) = self.pending.take() {
             let _ = self.context.wait_for(&sync, 5000);
+        }
+        if let Some(mut t) = self.tracer.take() {
+            t.destroy(&self.context);
         }
         for b in [
             &mut self.prims,

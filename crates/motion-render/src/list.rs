@@ -128,6 +128,8 @@ pub struct Group {
     pub sigma: f32,
     /// Blur clamps to edge pixels instead of transparent.
     pub clamp: bool,
+    /// Traced instead of rasterised: index into `DisplayList::traces`.
+    pub trace: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -151,6 +153,8 @@ pub struct DisplayList {
     /// Mesh tile bins: per tile [start (relative to the batch's base),
     /// count], then triangle indices.
     pub bins: Vec<u32>,
+    /// Layer lists the path tracer renders (export), by group.
+    pub traces: Vec<crate::pt::Trace>,
 }
 
 impl DisplayList {
@@ -172,6 +176,9 @@ impl DisplayList {
         out.extend_from_slice(bytemuck::cast_slice(&self.ops));
         out.extend_from_slice(bytemuck::cast_slice(&self.mesh));
         out.extend_from_slice(bytemuck::cast_slice(&self.bins));
+        for t in &self.traces {
+            t.signature(&mut out);
+        }
         out
     }
 }
@@ -282,6 +289,11 @@ pub struct Builder<'a> {
     pub meshes: &'a mut crate::mesh3d::MeshCache,
     /// Output scale (0.5 for half-resolution previews).
     pub scale: f64,
+    /// Path-trace layer lists with meshes instead of rasterising them.
+    pub trace: Option<crate::pt::TraceOptions>,
+    /// Seeds the tracer's samples (the frame's time), so a frame renders
+    /// the same every time.
+    pub seed: u32,
 }
 
 impl Builder<'_> {
@@ -335,7 +347,7 @@ impl Builder<'_> {
         let gw = (w / factor).ceil().max(1.0) as u32;
         let gh = (h / factor).ceil().max(1.0) as u32;
         let f = [w / gw as f64, h / gh as f64];
-        let group = Group { target: Target::new(gw, gh, 0, [0.0; 4]), offset: list.group_texels, sigma: (sigma / ((f[0] + f[1]) / 2.0)) as f32, clamp };
+        let group = Group { target: Target::new(gw, gh, 0, [0.0; 4]), offset: list.group_texels, sigma: (sigma / ((f[0] + f[1]) / 2.0)) as f32, clamp, trace: None };
         list.group_texels += gw * gh;
         let origin = [rect[0], rect[1]];
         pending.push(Pending { group, items, origin, factor: f });
@@ -449,6 +461,12 @@ impl Builder<'_> {
     /// opaque meshes are nearer (shared depth across effects, blends and
     /// depth of field).
     fn emit_list(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
+        if let Some(options) = self.trace {
+            if layers.iter().any(|l| matches!(l.content, Content::Mesh(_))) && traceable(layers) {
+                self.trace_list(layers, root, canvas, list, pending, out, options);
+                return;
+            }
+        }
         self.meshes.open_run(layers, root);
         // With meshes in the list, flat 3D layers join their depth buffer;
         // so do tilted 3D layers that could cut through each other.
@@ -481,6 +499,70 @@ impl Builder<'_> {
         self.meshes.close_run();
     }
 
+    /// Path tracing (export): the list's meshes and flat 3D layers become
+    /// one traced picture, composited where the first of them is; its 2D
+    /// layers draw around it as usual.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_list(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>, options: crate::pt::TraceOptions) {
+        let mut at: Option<usize> = None;
+        let mut instances = Vec::new();
+        let mut cards = Vec::new();
+        let mut first: Option<lahza_motion_core::compile::MeshState> = None;
+        for layer in layers {
+            let card = trace_card_candidate(layer);
+            if !matches!(layer.content, Content::Mesh(_)) && !card {
+                self.emit(layer, root, canvas, list, pending, out);
+                continue;
+            }
+            at.get_or_insert(out.len());
+            if let Content::Mesh(m) = &layer.content {
+                if let Some(i) = self.meshes.trace_instance(m, layer.opacity, root.max_scale()) {
+                    instances.push(i);
+                }
+                first.get_or_insert_with(|| (**m).clone());
+                continue;
+            }
+            match self.card_picture(layer, root, canvas, list, pending, false) {
+                Ok(Some((view, _, picture, _))) => cards.push(crate::pt::TraceCard { view: view.map(|v| v.map(|x| x as f32)), picture }),
+                Ok(None) => {}
+                Err(()) => self.emit(layer, root, canvas, list, pending, out),
+            }
+        }
+        let (Some(at), Some(m)) = (at, first) else { return };
+        let mut lights = m.lighting.as_ref().map(|l| crate::mesh3d::light_rows(l, &m)).unwrap_or_default();
+        if let Some(l) = &m.lighting {
+            // Which lights cast shadows (the raster links its maps here).
+            for (i, light) in l.lights.iter().enumerate() {
+                lights[7 + i * 2 + 1][3] = if light.shadow { 1.0 } else { 0.0 };
+            }
+        }
+        let inv = root.inverse().unwrap_or(root);
+        let rect = [0.0, 0.0, canvas.0 as f64, canvas.1 as f64];
+        let (offset, origin, factor, (gw, gh)) = self.reserve(list, pending, Vec::new(), rect, 0.0, 1.0, false);
+        if let Some(p) = pending.last_mut() {
+            p.group.trace = Some(list.traces.len() as u32);
+        }
+        let f = |v: [f64; 9]| v.map(|x| x as f32);
+        list.traces.push(crate::pt::Trace {
+            instances,
+            cards,
+            lights,
+            focal: m.camera.focal as f32,
+            centre: [m.camera.centre.0 as f32, m.camera.centre.1 as f32],
+            root: f(root.0),
+            inv_root: f(inv.0),
+            origin: [origin[0] as f32, origin[1] as f32],
+            factor: [factor[0] as f32, factor[1] as f32],
+            options,
+            seed: self.seed,
+        });
+        let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(factor[0], factor[1])));
+        let prim = Prim { kind: [PRIM_IMAGE, 1, blend_code(Blend::Normal), 0], geom: [gw as f32, gh as f32, 1.0, 0.0], geom2: [f32::from_bits(offset), 0.0, 0.0, 0.0], ..Default::default() };
+        if let Some((prim, _)) = with_inverse(prim, forward, 1.0) {
+            out.insert(at, Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
+        }
+    }
+
     /// Draws the cards and see-through meshes held back by `emit_list`.
     #[allow(clippy::too_many_arguments)]
     fn flush_deferred(&mut self, layers: &[LayerState], cards: &mut Vec<usize>, deferred: &mut Vec<usize>, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
@@ -499,14 +581,20 @@ impl Builder<'_> {
     /// Draws a flat 3D layer as a card in the mesh depth buffer: its
     /// picture into a group, its quad into the current batch. False when it
     /// can't be (it crosses the camera): it is then drawn as usual.
-    fn card_item(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) -> bool {
-        let Some(view) = layer.view else { return false };
-        let Some(inverse) = root.then(layer.matrix).inverse() else { return false };
-        let items = self.layer_items(layer, root, &mut list.stops, &mut list.segments);
-        let blur = card_blur(layer, self.scale);
+    /// A flat 3D layer's picture (an offscreen group, blurred by its own
+    /// blur when `blurred`) and the quad it lies on in camera space.
+    /// Err: it can't be a card (it crosses the camera); Ok(None): nothing
+    /// to draw.
+    #[allow(clippy::type_complexity)]
+    fn card_picture(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, blurred: bool) -> Result<Option<([[f64; 3]; 4], [[f64; 2]; 4], crate::mesh3d::Backdrop, [f64; 4])>, ()> {
+        let Some(view) = layer.view else { return Err(()) };
+        let Some(inverse) = root.then(layer.matrix).inverse() else { return Err(()) };
+        let bare = LayerState { effects: Vec::new(), ..layer.clone() };
+        let items = self.layer_items(&bare, root, &mut list.stops, &mut list.segments);
+        let blur = if blurred { card_blur(layer, self.scale) } else { 0.0 };
         let pad = if blur > 0.3 { 3.0 * blur + 2.0 } else { 0.0 };
         if items.is_empty() {
-            return true;
+            return Ok(None);
         }
         let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for it in &items {
@@ -519,7 +607,7 @@ impl Builder<'_> {
         // edges to transparent.
         let rect = [(bb[0] - pad).floor().max(-pad), (bb[1] - pad).floor().max(-pad), (bb[2] + pad).ceil().min(cw + pad), (bb[3] + pad).ceil().min(ch + pad)];
         if !rect.iter().all(|v| v.is_finite()) || rect[2] <= rect[0] || rect[3] <= rect[1] {
-            return bb.iter().all(|v| v.is_finite());
+            return if bb.iter().all(|v| v.is_finite()) { Ok(None) } else { Err(()) };
         }
         // The quad: the picture's rect, found back on the layer's plane.
         let screen = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[2], rect[3]], [rect[0], rect[3]]];
@@ -528,15 +616,25 @@ impl Builder<'_> {
             let (x, y) = inverse.apply(s[0], s[1]);
             let q = view.apply(x, y, 0.0);
             if !(x.is_finite() && y.is_finite()) || q[2] < 1.0 {
-                return false;
+                return Err(());
             }
             corners[k] = [q[0], q[1], q[2]];
         }
         let (sigma, factor) = if blur > 0.3 { (blur, if blur <= 4.0 { 1.0 } else { 2f64.powf((blur / 4.0).log2().ceil()).min(16.0) }) } else { (0.0, 1.0) };
         let (offset, origin, factor, size) = self.reserve(list, pending, items, rect, sigma, factor, false);
+        Ok(Some((corners, screen, crate::mesh3d::Backdrop { offset, size, origin, factor }, rect)))
+    }
+
+    fn card_item(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) -> bool {
+        let (corners, screen, picture, rect) = match self.card_picture(layer, root, canvas, list, pending, true) {
+            Err(()) => return false,
+            Ok(None) => return true,
+            Ok(Some(c)) => c,
+        };
         let (serial, index) = self.meshes.member();
-        let card = crate::mesh3d::Card { index, view: corners, screen, picture: crate::mesh3d::Backdrop { offset, size, origin, factor }, bounds: rect };
+        let card = crate::mesh3d::Card { index, view: corners, screen, picture, bounds: rect };
         self.meshes.add_card(card.clone());
+
         // Cards share a batch with each other (they cut through each
         // other), never with opaque meshes (drawn before them).
         if let Some(prev) = out.last_mut().filter(|p| p.prim.kind[0] == PRIM_MESH) {
@@ -1137,6 +1235,29 @@ impl Builder<'_> {
         }
         items
     }
+}
+
+/// A flat 3D layer the path tracer can place in its scene as a card.
+fn trace_card_candidate(layer: &LayerState) -> bool {
+    layer.view.is_some() && !matches!(layer.content, Content::Mesh(_) | Content::Group(_)) && plain(layer)
+}
+
+/// No effects (depth of field is one), matte or blend mode.
+fn plain(layer: &LayerState) -> bool {
+    layer.matte.is_none() && layer.effects.is_empty() && layer.blend == Blend::Normal
+}
+
+/// Whether the path tracer draws everything 3D in this list as the raster
+/// would: plain meshes without wireframes and plain flat 3D layers. Other
+/// lists are rasterised (the tracer has no effects, mattes, blend modes or
+/// wires yet, and a 3D layer drawn flat beside the traced picture would
+/// lose its depth).
+fn traceable(layers: &[LayerState]) -> bool {
+    layers.iter().all(|l| match &l.content {
+        Content::Mesh(m) => plain(l) && m.materials.iter().all(|x| x.wireframe <= 0.0),
+        Content::Group(_) => true,
+        _ => l.view.is_none() || trace_card_candidate(l),
+    })
 }
 
 /// A flat 3D layer that can stand in the mesh depth buffer as a card. A

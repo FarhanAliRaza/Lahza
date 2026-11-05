@@ -29,6 +29,10 @@ All times are **timeline seconds** unless written as a reference string
 ```
 
 `fps` is a number or a ratio string (`"30000/1001"`).
+`renderer` picks how exports draw meshes: `raster` (default; what the
+preview shows) or `path` (path traced, see Path tracing under mesh);
+`samples` is the path tracer's paths per pixel (default 64; drafts trace a
+quarter).
 
 ## scenes/<id>.json
 
@@ -348,6 +352,30 @@ order.
 {"id": "coin", "kind": "mesh", "mesh": {"type": "extrude", "d": {"shape": "circle", "size": 300}, "depth": 30, "bevel": 6},
  "material": {"preset": "metal", "color": "#ffc030"}, "parts": {"side": {"color": "#b07a10", "roughness": 0.5}},
  "transform": {"position": [960, 540], "rotation_y": {"keys": [{"at": 0, "v": 0}, {"at": 2, "v": 360, "ease": "glide"}]}}}
+```
+
+#### Path tracing
+
+Exports can path-trace meshes instead of rasterising them: project
+`settings.renderer: "path"`, or `lahza motion render --pt` (`--raster`
+overrides the project; `--spp N` sets the samples). `lahza motion snapshot
+--pt` previews a frame the same way (MCP: `pt` and `samples` on `render`
+and `snapshot`). Each layer list with meshes becomes one traced picture
+composited in the list's place, so 2D layers, effects on the list and
+transitions around it are drawn as usual. The tracer shoots rays through
+the same camera, so meshes stand exactly where the raster draws them, and
+adds what rasterising cannot: shadows from every shadow-casting light by
+ray, light bounced between surfaces, reflections of the scene, and glass
+that refracts the meshes behind it. Flat 3D layers in the list are cards in
+the traced scene. It needs a GPU with ray queries (Vulkan
+`VK_KHR_ray_query`); elsewhere the frame is rasterised and a warning says
+so. The same frame traces the same picture (samples are seeded by time).
+Lists with what the tracer does not draw yet (wireframes, effects
+including depth of field, mattes, blend modes on their 3D layers) are
+rasterised.
+
+```json
+"settings": {"width": 1920, "height": 1080, "fps": 30, "duration": 20, "renderer": "path", "samples": 128}
 ```
 
 Scenes light meshes with `lights` and `environment`:

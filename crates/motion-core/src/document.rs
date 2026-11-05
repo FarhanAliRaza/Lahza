@@ -66,6 +66,24 @@ pub struct Settings {
     /// Off unless set; scenes may override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion_blur: Option<MotionBlur>,
+    /// How exports draw meshes: the preview's rasteriser (default) or the
+    /// path tracer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<RendererKind>,
+    /// Path tracing: paths per pixel (default 64; draft exports use a
+    /// quarter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub samples: Option<u32>,
+}
+
+/// The export renderer for meshes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RendererKind {
+    /// Depth-buffered raster, as the preview draws.
+    Raster,
+    /// Path traced on the GPU (ray queries), rasterised where unsupported.
+    Path,
 }
 
 fn black() -> Color {
@@ -82,6 +100,8 @@ impl Default for Settings {
             background: Color::BLACK,
             style: None,
             motion_blur: None,
+            renderer: None,
+            samples: None,
         }
     }
 }

@@ -4,11 +4,11 @@ use lahza_motion_core::markers::MarkerTrack;
 use lahza_motion_core::time::Fps;
 use serde_json::json;
 
-fn cpu() -> Renderer {
+pub(crate) fn cpu() -> Renderer {
     Renderer::new(None, RenderOptions { backend: Backend::Cpu, ..Default::default() })
 }
 
-fn project(layers: serde_json::Value) -> Project {
+pub(crate) fn project(layers: serde_json::Value) -> Project {
     let mut p = Project::new(320, 180, Fps::whole(30), 2.0);
     p.settings.background = lahza_motion_core::value::Color::parse("#000000").unwrap();
     let scene: Scene = serde_json::from_value(json!({"id": "s1", "layers": layers})).unwrap();
@@ -651,7 +651,7 @@ fn export_mixes_footage_audio() {
     assert_eq!(clips.len(), 1);
     assert_eq!((clips[0].start, clips[0].trim, clips[0].speed), (0.5, 0.5, 1.5));
     let out = dir.join("out.mp4");
-    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() } };
+    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None };
     let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
     assert_eq!(report.frames, 60);
     let info = crate::footage::probe(&out).unwrap();
@@ -912,7 +912,7 @@ fn instancer_2000_copies_at_1080p() {
         let started = Instant::now();
         let f = c.frame(times(n));
         let evaluated = Instant::now();
-        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, meshes: &mut Default::default(), scale: 1.0 }.build(&f);
+        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, meshes: &mut Default::default(), scale: 1.0, trace: None, seed: 0 }.build(&f);
         build += evaluated.elapsed().as_secs_f64() * 1000.0;
         eval += (evaluated - started).as_secs_f64() * 1000.0;
         assert_eq!(list.prims.len(), 2000);
@@ -1702,4 +1702,22 @@ fn a_lost_gpu_is_retried_then_reported() {
     assert!(!r.is_gpu());
     assert!(r.backend_label().starts_with("CPU (GPU failed"), "{}", r.backend_label());
     assert!(r.warnings().iter().any(|w| w.contains("rendered on the CPU")), "{:?}", r.warnings());
+}
+
+/// Exports path-trace when the project says `"renderer": "path"` or the
+/// command says `--pt`; `--raster` and the default rasterise; drafts trace
+/// a quarter of the samples.
+#[test]
+fn the_export_renderer_follows_the_project_and_the_flag() {
+    use export::{trace_options, Quality};
+    use lahza_motion_core::document::{RendererKind, Settings};
+    let plain: Settings = serde_json::from_value(json!({"width": 320, "height": 180, "fps": 30, "duration": 1})).unwrap();
+    let traced: Settings = serde_json::from_value(json!({"width": 320, "height": 180, "fps": 30, "duration": 1, "renderer": "path", "samples": 128})).unwrap();
+    assert_eq!(trace_options(&plain, Quality::Final, None, None), None);
+    assert_eq!(trace_options(&plain, Quality::Final, Some(RendererKind::Path), None).map(|o| o.spp), Some(64));
+    assert_eq!(trace_options(&traced, Quality::Final, None, None).map(|o| o.spp), Some(128));
+    assert_eq!(trace_options(&traced, Quality::Draft, None, None).map(|o| o.spp), Some(32));
+    assert_eq!(trace_options(&traced, Quality::Final, None, Some(16)).map(|o| o.spp), Some(16));
+    assert_eq!(trace_options(&traced, Quality::Final, Some(RendererKind::Raster), None), None);
+    assert!(serde_json::from_value::<Settings>(json!({"width": 1, "height": 1, "fps": 30, "duration": 1, "renderer": "ray"})).is_err());
 }

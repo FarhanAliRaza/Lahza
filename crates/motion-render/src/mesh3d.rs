@@ -257,6 +257,24 @@ impl MeshCache {
         Arc::new(maps)
     }
 
+    /// A mesh layer as an instance for the path tracer: its geometry, its
+    /// object → camera transform and its materials by part and segment.
+    pub(crate) fn trace_instance(&mut self, m: &MeshState, opacity: f64, scale: f64) -> Option<crate::pt::TraceInstance> {
+        let mesh = self.get(m)?;
+        let mv = m.camera.view.then(m.world).0;
+        let transform = [0, 1, 2].map(|r| [mv[r * 4] as f32, mv[r * 4 + 1] as f32, mv[r * 4 + 2] as f32, mv[r * 4 + 3] as f32]);
+        let mut materials = Vec::new();
+        let mut parts = [(0u32, 1u32); PARTS];
+        for (part, slot) in parts.iter_mut().enumerate() {
+            let colors = piece_colors(m, part);
+            *slot = ((materials.len() / 4) as u32, colors as u32);
+            for segment in 0..colors as u32 {
+                materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale));
+            }
+        }
+        Some(crate::pt::TraceInstance { mesh, key: m.params.key(), transform, materials, parts })
+    }
+
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
         let key = m.params.key();
         if let Some((mesh, used)) = self.meshes.get_mut(&key) {
@@ -314,8 +332,8 @@ pub(crate) struct Batch {
 }
 
 /// A group over output-pixel rect `origin + factor·(x, y)`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Backdrop {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Backdrop {
     pub offset: u32,
     pub size: (u32, u32),
     pub origin: [f64; 2],
@@ -572,7 +590,7 @@ fn piece_color(m: &MeshState, part: usize, segment: u32) -> lahza_motion_core::v
 }
 
 /// How many distinct colours a part cycles through.
-fn piece_colors(m: &MeshState, part: usize) -> usize {
+pub(crate) fn piece_colors(m: &MeshState, part: usize) -> usize {
     if !m.part_colors[part].is_empty() {
         m.part_colors[part].len()
     } else if !m.colors.is_empty() && !m.own_color[part] {
@@ -585,7 +603,7 @@ fn piece_colors(m: &MeshState, part: usize) -> usize {
 /// Rows of one material: [rgb linear, opacity], [metallic, roughness,
 /// clear coat, its roughness], [emissive rgb, flags (1 unlit, 2 faceted)],
 /// [transmission, 0, 0, 0].
-fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64) -> [[f32; 4]; 4] {
+pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64) -> [[f32; 4]; 4] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
     if mat.wireframe > 0.0 {
@@ -613,7 +631,7 @@ fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: 
 /// rows), sky, horizon, ground, then per light [vector, kind] [colour]
 /// and per lobe [direction, size] [colour]. Light vectors are in camera
 /// space; lobes in world space.
-fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
+pub(crate) fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
     let v = m.camera.view.0;
     // World → camera rotation R (rows of the view matrix); camera → world is Rᵀ.
     let r = [[v[0], v[1], v[2]], [v[4], v[5], v[6]], [v[8], v[9], v[10]]];
