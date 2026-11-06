@@ -849,7 +849,7 @@ fn raster_band(list: &DisplayList, target: &Target, src: &Sources, ty: u32, band
                         if front && c[3] >= OPAQUE {
                             continue;
                         }
-                        let s = if prim.kind[0] == PRIM_MESH { crate::mesh3d::shade_mesh(prim, p, &list.mesh, &list.bins, src.groups) } else { shade(prim, p, &list.stops, &list.segments, src) };
+                        let s = if prim.kind[0] == PRIM_MESH { crate::mesh3d::shade_mesh(prim, p, &list.mesh, &list.bins, src.groups, src.images) } else { shade(prim, p, &list.stops, &list.segments, src) };
                         if s[3] > 0.0 {
                             *c = if front { under(*c, s) } else { blend(*c, s, prim.kind[2]) };
                         }

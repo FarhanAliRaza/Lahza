@@ -54,7 +54,7 @@ var<storage, read_write> b_next: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 9u;
+const MAT_ROWS: u32 = 17u;
 // Rows per instance (pt.rs INST_ROWS).
 const INST_ROWS: u32 = 7u;
 // Rows per light (mesh3d::LROWS).

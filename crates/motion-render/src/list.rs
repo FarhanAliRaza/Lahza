@@ -426,7 +426,20 @@ impl Builder<'_> {
 
     /// A mesh item: a new batch, or `m` added to the batch of the item just
     /// before it (meshes next to each other share one depth buffer).
+    /// Loads a mesh's image maps into the pool (once) for its material rows.
+    fn mesh_textures(&mut self, m: &lahza_motion_core::compile::MeshState) {
+        for mat in &m.materials {
+            for path in [&mat.map, &mat.normal_map, &mat.bump_map].into_iter().flatten() {
+                if !self.meshes.textures.contains_key(path) {
+                    let t = self.images.get(path);
+                    self.meshes.textures.insert(path.clone(), t);
+                }
+            }
+        }
+    }
+
     fn mesh_item(&mut self, layer: &LayerState, m: &lahza_motion_core::compile::MeshState, root: Proj, prev: Option<&mut Item>) -> Option<Item> {
+        self.mesh_textures(m);
         let blend = blend_code(layer.blend);
         let see_through = crate::mesh3d::see_through(layer);
         let (list_serial, index) = self.meshes.member();
@@ -516,6 +529,7 @@ impl Builder<'_> {
             }
             at.get_or_insert(out.len());
             if let Content::Mesh(m) = &layer.content {
+                self.mesh_textures(m);
                 if let Some(i) = self.meshes.trace_instance(layer.id.clone(), m, layer.opacity, root.max_scale()) {
                     instances.push(i);
                 }

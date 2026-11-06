@@ -43,6 +43,8 @@ pub struct MeshCache {
     envs: HashMap<Arc<str>, Option<Arc<crate::envmap::EnvMap>>>,
     /// Environment images that could not be loaded (not drawn as asked).
     pub dropped: Vec<String>,
+    /// Image maps of the meshes being added (resolved by the list builder).
+    pub(crate) textures: HashMap<Arc<str>, Option<crate::images::Texture>>,
 }
 
 /// A mesh layer of a layer list, for the other batches of that list.
@@ -101,6 +103,7 @@ impl MeshCache {
         self.batches.clear();
         self.runs.clear();
         self.placed.clear();
+        self.textures.clear();
         if self.meshes.len() > 96 {
             let keep = self.frame.saturating_sub(4);
             self.meshes.retain(|_, (_, used)| *used >= keep);
@@ -286,7 +289,7 @@ impl MeshCache {
             let colors = piece_colors(m, part);
             *slot = ((materials.len() / MAT_ROWS) as u32, colors as u32);
             for segment in 0..colors as u32 {
-                materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale));
+                materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale, &self.textures));
             }
         }
         Some(crate::pt::TraceInstance { id, mesh, key: m.params.key(), transform, materials, parts })
@@ -339,7 +342,13 @@ pub(crate) struct Vert {
     screen: [f64; 2],
     pos: [f32; 3],
     normal: [f32; 3],
+    /// Noise-space position (object or world) and UV.
+    aux: [f32; 5],
 }
+
+/// Rows per vertex: [camera position, 1/z], [normal, u], [noise-space
+/// position, v].
+pub(crate) const VROWS: usize = 3;
 
 pub(crate) struct Batch {
     verts: Vec<Vert>,
@@ -645,15 +654,20 @@ pub(crate) fn piece_colors(m: &MeshState, part: usize) -> usize {
 }
 
 /// Rows per material (GPU raster, CPU raster and path tracer agree).
-pub(crate) const MAT_ROWS: usize = 9;
+pub(crate) const MAT_ROWS: usize = 17;
 
 /// Rows of one material:
 /// 0 [base rgb linear, opacity], 1 [metallic, roughness, clear coat, its
 /// roughness], 2 [emissive rgb, flags], 3 [transmission, ior, thickness,
 /// dielectric F0], 4 [specular tint rgb, anisotropy], 5 [sheen rgb (colour ×
 /// amount), sheen roughness], 6 [clear coat colour rgb, dispersion], 7 [grain
-/// axis (camera space), grain rotation], 8 [mesh centre (camera space), 0].
-pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64) -> [[f32; 4]; MAT_ROWS] {
+/// axis (camera space), grain rotation], 8 [mesh centre (camera space), 0],
+/// surface detail: 9 [noise kind + 1 (0: none), 1 / scale, octaves, seed
+/// bits], 10 [noise colour rgb, amount], 11 [noise roughness ±, noise bump
+/// px, 0, 0], 12 [colour map offset, w, h (bits), 1 if set], 13 [normal map
+/// the same], 14 [bump map offset, w, h, height px], 15 [uv scale x, y,
+/// offset x, y], 16 [uv rotation, 0, 0, 0].
+pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64, textures: &HashMap<Arc<str>, Option<crate::images::Texture>>) -> [[f32; 4]; MAT_ROWS] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
     let lin = |c: lahza_motion_core::value::Color| [srgb_to_linear(c.0[0]) as f32, srgb_to_linear(c.0[1]) as f32, srgb_to_linear(c.0[2]) as f32];
@@ -691,6 +705,32 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
     let a = unit3(a);
     rows[7] = [a[0] as f32, a[1] as f32, a[2] as f32, mat.anisotropy_rotation as f32];
     rows[8] = [mv[3] as f32, mv[7] as f32, mv[11] as f32, 0.0];
+    let b = |v: u32| f32::from_bits(v);
+    if let Some(n) = &mat.noise {
+        rows[9] = [(n.field.kind.code() + 1) as f32, (1.0 / n.field.scale) as f32, n.field.octaves as f32, b(n.field.seed)];
+        let (c, amount) = n.color.map(|c| (lin(c), n.amount)).unwrap_or(([0.0; 3], 0.0));
+        rows[10] = [c[0], c[1], c[2], amount as f32];
+        rows[11] = [n.roughness as f32, n.bump as f32, 0.0, 0.0];
+    }
+    let texture = |path: &Option<Arc<str>>| path.as_ref().and_then(|p| textures.get(p).copied().flatten());
+    if let Some(t) = texture(&mat.map) {
+        rows[12] = [b(t.offset), b(t.width), b(t.height), 1.0];
+    }
+    if let Some(t) = texture(&mat.normal_map) {
+        rows[13] = [b(t.offset), b(t.width), b(t.height), 1.0];
+    }
+    if let Some(t) = texture(&mat.bump_map) {
+        rows[14] = [b(t.offset), b(t.width), b(t.height), mat.bump as f32];
+    }
+    rows[15] = [mat.uv[0] as f32, mat.uv[1] as f32, mat.uv[2] as f32, mat.uv[3] as f32];
+    // Which UVs wrap around (1: u, 2: v), so a triangle across the seam
+    // joins its corners.
+    let wraps = match &m.params.shape {
+        mesh::MeshShape::Sphere { .. } | mesh::MeshShape::Cylinder { .. } | mesh::MeshShape::Capsule { .. } | mesh::MeshShape::Revolve { .. } => 1.0,
+        mesh::MeshShape::Torus { .. } => 3.0,
+        _ => 0.0,
+    };
+    rows[16] = [mat.uv[4] as f32, wraps, 0.0, 0.0];
     rows
 }
 
@@ -832,7 +872,7 @@ impl Batch {
         let base = self.verts.len() as u32;
         for k in 0..4 {
             let (s, q) = (card.screen[k], card.view[k]);
-            self.verts.push(Vert { screen: s, pos: q.map(|v| v as f32), normal: n.map(|v| v as f32) });
+            self.verts.push(Vert { screen: s, pos: q.map(|v| v as f32), normal: n.map(|v| v as f32), aux: [0.0; 5] });
             if !occluder {
                 self.bounds = [self.bounds[0].min(s[0]), self.bounds[1].min(s[1]), self.bounds[2].max(s[0]), self.bounds[3].max(s[1])];
             }
@@ -875,14 +915,27 @@ impl Batch {
                 ([q[0], q[1], q[2]], [nn[0] / l, nn[1] / l, nn[2] / l])
             })
             .collect();
+        // Surface detail inputs: noise-space position (object, or world when
+        // a part's noise asks) and UV.
+        let world_noise = m.materials.iter().any(|x| x.noise.is_some_and(|n| n.world));
+        let aux: Vec<[f64; 5]> = mesh
+            .positions
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let q = if world_noise { let w = m.world.apply(p[0] as f64, p[1] as f64, p[2] as f64); [w[0], w[1], w[2]] } else { [p[0] as f64, p[1] as f64, p[2] as f64] };
+                let uv = mesh.uvs.get(i).copied().unwrap_or([0.0; 2]);
+                [q[0], q[1], q[2], uv[0] as f64, uv[1] as f64]
+            })
+            .collect();
         // Vertex slots: mesh vertices in front of the near plane, placed on demand.
         let mut slot: Vec<u32> = vec![u32::MAX; cam.len()];
-        let push = |verts: &mut Vec<Vert>, bounds: &mut [f64; 4], p: [f64; 3], n: [f64; 3]| -> u32 {
+        let push = |verts: &mut Vec<Vert>, bounds: &mut [f64; 4], p: [f64; 3], n: [f64; 3], a: [f64; 5]| -> u32 {
             let s = project(p);
             if !occluder {
                 *bounds = [bounds[0].min(s[0]), bounds[1].min(s[1]), bounds[2].max(s[0]), bounds[3].max(s[1])];
             }
-            verts.push(Vert { screen: s, pos: [p[0] as f32, p[1] as f32, p[2] as f32], normal: [n[0] as f32, n[1] as f32, n[2] as f32] });
+            verts.push(Vert { screen: s, pos: [p[0] as f32, p[1] as f32, p[2] as f32], normal: [n[0] as f32, n[1] as f32, n[2] as f32], aux: a.map(|v| v as f32) });
             (verts.len() - 1) as u32
         };
         // Material slots by (part, colour), filled on first use.
@@ -913,7 +966,7 @@ impl Batch {
                     let mslot = &mut slots[part * colors_n + (segment % colors) as usize];
                     if *mslot == u32::MAX {
                         *mslot = (self.materials.len() / MAT_ROWS) as u32;
-                        self.materials.extend_from_slice(&material_rows(m, part, segment, opacity, wire_scale));
+                        self.materials.extend_from_slice(&material_rows(m, part, segment, opacity, wire_scale, &cache.textures));
                     }
                     *mslot
                 }
@@ -926,7 +979,7 @@ impl Batch {
                 let ids = t.map(|i| {
                     let s = &mut slot[i as usize];
                     if *s == u32::MAX {
-                        *s = push(&mut self.verts, &mut self.bounds, cam[i as usize].0, cam[i as usize].1);
+                        *s = push(&mut self.verts, &mut self.bounds, cam[i as usize].0, cam[i as usize].1, aux[i as usize]);
                     }
                     *s
                 });
@@ -934,19 +987,22 @@ impl Batch {
                 continue;
             }
             // Clip against the near plane (Sutherland–Hodgman).
-            let mut poly: Vec<([f64; 3], [f64; 3])> = Vec::with_capacity(4);
+            let va = t.map(|i| aux[i as usize]);
+            let mut poly: Vec<([f64; 3], [f64; 3], [f64; 5])> = Vec::with_capacity(4);
             for k in 0..3 {
                 let (a, b) = (v[k], v[(k + 1) % 3]);
+                let (aa, ab) = (va[k], va[(k + 1) % 3]);
                 if a.0[2] >= NEAR {
-                    poly.push(a);
+                    poly.push((a.0, a.1, aa));
                 }
                 if (a.0[2] >= NEAR) != (b.0[2] >= NEAR) {
                     let s = (NEAR - a.0[2]) / (b.0[2] - a.0[2]);
                     let lerp = |x: [f64; 3], y: [f64; 3]| [x[0] + (y[0] - x[0]) * s, x[1] + (y[1] - x[1]) * s, x[2] + (y[2] - x[2]) * s];
-                    poly.push((lerp(a.0, b.0), lerp(a.1, b.1)));
+                    let lerp5: [f64; 5] = std::array::from_fn(|c| aa[c] + (ab[c] - aa[c]) * s);
+                    poly.push((lerp(a.0, b.0), lerp(a.1, b.1), lerp5));
                 }
             }
-            let ids: Vec<u32> = poly.iter().map(|(p, n)| push(&mut self.verts, &mut self.bounds, *p, *n)).collect();
+            let ids: Vec<u32> = poly.iter().map(|(p, n, a)| push(&mut self.verts, &mut self.bounds, *p, *n, *a)).collect();
             for k in 1..ids.len().saturating_sub(1) {
                 self.tris.push(([ids[0], ids[k], ids[k + 1]], material, 7));
             }
@@ -1126,7 +1182,8 @@ impl Batch {
         let vert_base = mesh_rows.len() as u32;
         for v in &self.verts {
             mesh_rows.push([v.pos[0], v.pos[1], v.pos[2], 1.0 / v.pos[2]]);
-            mesh_rows.push([v.normal[0], v.normal[1], v.normal[2], 0.0]);
+            mesh_rows.push([v.normal[0], v.normal[1], v.normal[2], v.aux[3]]);
+            mesh_rows.push([v.aux[0], v.aux[1], v.aux[2], v.aux[4]]);
         }
         let mat_base = mesh_rows.len() as u32;
         mesh_rows.extend_from_slice(&self.materials);
@@ -1546,6 +1603,131 @@ fn area_light(m: &[[f32; 4]], row: usize, p: F3, n: F3, v: F3, alpha: f32) -> Op
     Some(AreaSample { l, ls: fnorm(fsub(qs, p)), sa: (alpha + (area / pi).sqrt() / (3.0 * dist)).min(1.0), e })
 }
 
+/// A mesh map texel (wrapping), raw 0..1 (mirrors `map_texel`).
+fn map_texel(images: &[u32], r: [f32; 4], x: i32, y: i32) -> [f32; 4] {
+    let (w, h) = (r[1].to_bits() as i32, r[2].to_bits() as i32);
+    let (xx, yy) = (((x % w) + w) % w, ((y % h) + h) % h);
+    let v = images.get(r[0].to_bits() as usize + (yy * w + xx) as usize).copied().unwrap_or(0);
+    [(v & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, ((v >> 16) & 255) as f32 / 255.0, ((v >> 24) & 255) as f32 / 255.0]
+}
+
+fn map_sample(images: &[u32], r: [f32; 4], t: [f32; 2]) -> [f32; 4] {
+    let s = [t[0] * r[1].to_bits() as f32 - 0.5, t[1] * r[2].to_bits() as f32 - 0.5];
+    let (f0, f1) = (s[0].floor(), s[1].floor());
+    let (fx, fy) = (s[0] - f0, s[1] - f1);
+    let (x, y) = (f0 as i32, f1 as i32);
+    let m = |a: [f32; 4], b: [f32; 4], t: f32| -> [f32; 4] { std::array::from_fn(|c| a[c] * (1.0 - t) + b[c] * t) };
+    m(m(map_texel(images, r, x, y), map_texel(images, r, x + 1, y), fx), m(map_texel(images, r, x, y + 1), map_texel(images, r, x + 1, y + 1), fx), fy)
+}
+
+fn map_height(images: &[u32], r: [f32; 4], t: [f32; 2]) -> f32 {
+    let c = map_sample(images, r, t);
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+/// A material's surface detail (mirrors `surface_detail` in motion.wgsl):
+/// colour, roughness change, bent normal.
+#[allow(clippy::too_many_arguments)]
+fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps: [F3; 3], uvs_in: [[f32; 2]; 3], b: F3, n_in: F3, base_in: F3) -> (F3, f32, F3) {
+    let (r9, r12, r13, r14) = (m[row + 9], m[row + 12], m[row + 13], m[row + 14]);
+    let mut base = base_in;
+    let mut rough = 0.0f32;
+    if r9[0] < 0.5 && r12[3] < 0.5 && r13[3] < 0.5 && r14[3] == 0.0 {
+        return (base, rough, n_in);
+    }
+    let e1 = fsub(pos[1], pos[0]);
+    let e2 = fsub(pos[2], pos[0]);
+    let mut n = n_in;
+    if r12[3] > 0.5 || r13[3] > 0.5 || r14[3] != 0.0 {
+        let mut uvs = uvs_in;
+        let wraps = m[row + 16][1] as u32;
+        for c in 0..2 {
+            if wraps & (1 << c) == 0 {
+                continue;
+            }
+            for k in 1..3 {
+                if uvs[k][c] - uvs[0][c] > 0.5 {
+                    uvs[k][c] -= 1.0;
+                }
+                if uvs[k][c] - uvs[0][c] < -0.5 {
+                    uvs[k][c] += 1.0;
+                }
+            }
+        }
+        let r15 = m[row + 15];
+        let ang = m[row + 16][0];
+        let (cs, sn) = (ang.cos(), ang.sin());
+        for uv in &mut uvs {
+            let c = [uv[0] - 0.5, uv[1] - 0.5];
+            *uv = [(c[0] * cs - c[1] * sn) * r15[0] + 0.5 + r15[2], (c[0] * sn + c[1] * cs) * r15[1] + 0.5 + r15[3]];
+        }
+        let t = [uvs[0][0] * b[0] + uvs[1][0] * b[1] + uvs[2][0] * b[2], uvs[0][1] * b[0] + uvs[1][1] * b[1] + uvs[2][1] * b[2]];
+        let d1 = [uvs[1][0] - uvs[0][0], uvs[1][1] - uvs[0][1]];
+        let d2 = [uvs[2][0] - uvs[0][0], uvs[2][1] - uvs[0][1]];
+        let det = d1[0] * d2[1] - d2[0] * d1[1];
+        let (mut dpdu, mut dpdv) = ([0.0f32; 3], [0.0f32; 3]);
+        if det.abs() > 1e-12 {
+            dpdu = fmul(fsub(fmul(e1, d2[1]), fmul(e2, d1[1])), 1.0 / det);
+            dpdv = fmul(fsub(fmul(e2, d1[0]), fmul(e1, d2[0])), 1.0 / det);
+        }
+        if r12[3] > 0.5 {
+            let c = map_sample(images, r12, t);
+            let straight = if c[3] > 0.0 { [c[0] / c[3], c[1] / c[3], c[2] / c[3]] } else { [0.0; 3] };
+            base = fmul3(base, straight.map(srgb_decode));
+        }
+        let (lu, lv) = (fdot(dpdu, dpdu).sqrt(), fdot(dpdv, dpdv).sqrt());
+        if lu > 1e-9 && lv > 1e-9 {
+            let tu = fnorm(fsub(dpdu, fmul(n, fdot(n, dpdu))));
+            let tv = fnorm(fsub(fsub(dpdv, fmul(n, fdot(n, dpdv))), fmul(tu, fdot(tu, dpdv))));
+            if r13[3] > 0.5 {
+                let c = map_sample(images, r13, t);
+                let mm = [c[0] * 2.0 - 1.0, c[1] * 2.0 - 1.0, c[2] * 2.0 - 1.0];
+                n = fnorm(fadd(fsub(fmul(tu, mm[0]), fmul(tv, mm[1])), fmul(n, mm[2].max(0.05))));
+            }
+            if r14[3] != 0.0 {
+                let (su, sv) = (1.0 / r14[1].to_bits() as f32, 1.0 / r14[2].to_bits() as f32);
+                let dhdu = (map_height(images, r14, [t[0] + su, t[1]]) - map_height(images, r14, [t[0] - su, t[1]])) / (2.0 * su);
+                let dhdv = (map_height(images, r14, [t[0], t[1] + sv]) - map_height(images, r14, [t[0], t[1] - sv])) / (2.0 * sv);
+                n = fnorm(fsub(n, fmul(fadd(fmul(tu, dhdu / lu), fmul(tv, dhdv / lv)), r14[3])));
+            }
+        }
+    }
+    if r9[0] > 0.5 {
+        use lahza_motion_core::noise::sample;
+        let kind = (r9[0] + 0.5) as u32;
+        // Core codes: 0 value, 1 fbm, 2 cellular; the rows store code + 1.
+        let code = kind - 1;
+        let (inv, octaves, seed) = (r9[1], r9[2] as u32, r9[3].to_bits());
+        let q = fmul(fadd(fadd(fmul(nps[0], b[0]), fmul(nps[1], b[1])), fmul(nps[2], b[2])), inv);
+        let v = sample(code, q, octaves, seed);
+        let (r10, r11) = (m[row + 10], m[row + 11]);
+        base = std::array::from_fn(|c| base[c] * (1.0 - r10[3] * v) + r10[c] * (r10[3] * v));
+        rough = r11[0] * (2.0 * v - 1.0);
+        if r11[1] != 0.0 {
+            let f1 = fsub(nps[1], nps[0]);
+            let f2 = fsub(nps[2], nps[0]);
+            let (g11, g12, g22) = (fdot(e1, e1), fdot(e1, e2), fdot(e2, e2));
+            let gd = g11 * g22 - g12 * g12;
+            if gd.abs() > 1e-12 {
+                let t1 = fnorm(fsub(e1, fmul(n_in, fdot(n_in, e1))));
+                let t2 = fcross(n_in, t1);
+                let h = 0.15 / inv.max(1e-6);
+                let mut grad = [0.0f32; 3];
+                for tk in [t1, t2] {
+                    let (c1, c2) = (fdot(e1, tk), fdot(e2, tk));
+                    let a = (c1 * g22 - c2 * g12) / gd;
+                    let bb = (c2 * g11 - c1 * g12) / gd;
+                    let step = fmul(fadd(fmul(f1, a), fmul(f2, bb)), h * inv);
+                    let dv = (sample(code, fadd(q, step), octaves, seed) - v) / h;
+                    grad = fadd(grad, fmul(tk, dv));
+                }
+                n = fnorm(fsub(n, fmul(grad, r11[1])));
+            }
+        }
+    }
+    (base, rough, n)
+}
+
 /// A point light's fade to its range (0: none). Mirrors motion.wgsl.
 pub(crate) fn range_window(dist: f32, range: f32) -> f32 {
     if range <= 0.0 {
@@ -1701,7 +1883,7 @@ fn card_sample(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], material: usize
     })
 }
 
-fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32; 2]) -> [f32; 4] {
+fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], tri: u32, q: [f32; 2]) -> [f32; 4] {
     let tb = prim.geom2[0].to_bits() as usize + tri as usize * 4;
     let vb = prim.geom2[1].to_bits() as usize;
     let mb = prim.geom2[2].to_bits() as usize;
@@ -1729,9 +1911,9 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     let mut nrm = [[0.0f32; 3]; 3];
     for k in 0..3 {
         let v = ids[k].to_bits() as usize;
-        let a = m[vb + v * 2];
+        let a = m[vb + v * VROWS];
         pos[k] = f3(a);
-        nrm[k] = f3(m[vb + v * 2 + 1]);
+        nrm[k] = f3(m[vb + v * VROWS + 1]);
         w[k] = e[k].max(0.0) * a[3];
     }
     let s = (w[0] + w[1] + w[2]).max(1e-30);
@@ -1753,7 +1935,11 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     if fdot(n, v) < 0.0 {
         n = fmul(n, -1.0);
     }
-    let base = f3(m0);
+    let vid = |k: usize| ids[k].to_bits() as usize;
+    let uvs = [0, 1, 2].map(|k| [m[vb + vid(k) * VROWS + 1][3], m[vb + vid(k) * VROWS + 2][3]]);
+    let nps = [0, 1, 2].map(|k| f3(m[vb + vid(k) * VROWS + 2]));
+    let (base, rough_d, nd) = surface_detail(m, images, mb + mat * MAT_ROWS, pos, nps, uvs, b, n, f3(m0));
+    n = nd;
     let opacity = m0[3];
     let emissive = f3(m2);
     if flags & FLAG_SHADOW_CATCHER != 0 {
@@ -1774,7 +1960,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
         let c = fadd(base, emissive).map(|x| encode(x));
         return [c[0] * opacity, c[1] * opacity, c[2] * opacity, opacity];
     }
-    let (metal, rough, cc, ccr) = (m1[0], m1[1].max(0.03), m1[2], m1[3].max(0.03));
+    let (metal, rough, cc, ccr) = (m1[0], (m1[1] + rough_d).clamp(0.03, 1.0), m1[2], m1[3].max(0.03));
     let trans = m3[0];
     let row = |k: usize| m[mb + mat * MAT_ROWS + k];
     let (m4, m5, m6, m7, m8) = (row(4), row(5), row(6), row(7), row(8));
@@ -1935,7 +2121,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
 }
 
 /// Premultiplied colour of a mesh primitive at target pixel centre `p`.
-pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups: &[[f32; 4]]) -> [f32; 4] {
+pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups: &[[f32; 4]], images: &[u32]) -> [f32; 4] {
     let tx = (p[0] as u32) / TILE;
     let ty = (p[1] as u32) / TILE;
     let (tx0, ty0, tw) = (prim.geom[1].to_bits(), prim.geom[2].to_bits(), prim.geom[3].to_bits());
@@ -2002,7 +2188,7 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
             }
         }
         let centroid = [p[0] + q[0] / (16.0 * n), p[1] + q[1] / (16.0 * n)];
-        let c = shade_tri(prim, m, groups, tri, centroid);
+        let c = shade_tri(prim, m, groups, images, tri, centroid);
         for i in 0..4 {
             out[i] += c[i] * n / 8.0;
         }

@@ -776,3 +776,118 @@ fn environment_images_light_and_reflect() {
     assert!(r.dropped().iter().any(|d| d.contains("environment image")), "{:?}", r.dropped());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Writes a w × h checker (cells px, colours a and b) for map tests.
+fn checker_png(path: &std::path::Path, w: u32, h: u32, cell: u32, a: [u8; 4], b: [u8; 4]) {
+    image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(if (x / cell + y / cell) % 2 == 0 { a } else { b })).save(path).unwrap();
+}
+
+fn detail_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("lahza-detail-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Noise varies a surface's colour (seeded: the same seed, the same
+/// pattern; another seed, another), and a colour map tiles across UVs.
+#[test]
+fn noise_and_maps_colour_surfaces() {
+    let lights = json!([{"type": "ambient", "intensity": 1}]);
+    let env = json!({"preset": "none"});
+    let noisy = |seed: u32| render(&sphere_in(json!({"preset": "flat", "color": "#ffffff", "noise": {"type": "fbm", "scale": 30, "seed": seed, "color": "#ff0000"}}), lights.clone(), env.clone()), 0.0);
+    let (a, a2, b) = (noisy(1), noisy(1), noisy(2));
+    assert_eq!(a, a2, "seeded");
+    assert_ne!(a, b, "another seed, another pattern");
+    let greens: Vec<u8> = (60..180u32).map(|x| px(&a, x, 120)[1]).collect();
+    let (lo, hi) = (*greens.iter().min().unwrap(), *greens.iter().max().unwrap());
+    assert!(hi - lo > 60, "the noise moves the colour toward red: green {lo}..{hi}");
+    // A checker map on a plane facing the camera: 4 cells across at uv
+    // scale 1, 8 at scale 2.
+    let dir = detail_dir("map");
+    let tex = dir.join("check.png");
+    checker_png(&tex, 64, 64, 16, [255, 255, 255, 255], [0, 0, 0, 255]);
+    let plane = |scale: f64| {
+        render(&scene(320, 240, json!({"layers": [{"id": "p", "kind": "mesh", "mesh": {"type": "plane", "size": [200, 200]},
+            "material": {"preset": "flat", "color": "#ffffff", "map": tex.to_str().unwrap(), "uv": {"scale": [scale, scale]}},
+            "transform": {"position": [160, 120]}}]})), 0.0)
+    };
+    let changes = |img: &image::RgbaImage| (62..258u32).filter(|&x| (px(img, x, 121)[0] > 128) != (px(img, x + 1, 121)[0] > 128)).count();
+    let (one, two) = (changes(&plane(1.0)), changes(&plane(2.0)));
+    assert_eq!(one, 3, "four cells across");
+    assert_eq!(two, 7, "eight at twice the tiling");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bump (a striped height map, or noise) bends the light on a flat wall
+/// lit from the side; without it the wall is even.
+#[test]
+fn bumps_bend_the_light() {
+    let dir = detail_dir("bump");
+    let stripes = dir.join("stripes.png");
+    image::RgbaImage::from_fn(64, 64, |x, _| {
+        let v = (128.0 + 127.0 * (x as f64 / 64.0 * std::f64::consts::TAU * 4.0).sin()) as u8;
+        image::Rgba([v, v, v, 255])
+    })
+    .save(&stripes)
+    .unwrap();
+    let wall = |material: serde_json::Value| {
+        render(&scene(320, 240, json!({"layers": [{"id": "w", "kind": "mesh", "mesh": {"type": "plane", "size": [300, 220]}, "material": material, "transform": {"position": [160, 120]}}],
+            "lights": [{"type": "directional", "from": [-1, 0, -0.4], "shadow": false}], "environment": {"preset": "none"}})), 0.0)
+    };
+    let spread = |img: &image::RgbaImage| {
+        let v: Vec<f64> = (40..280u32).map(|x| luma(px(img, x, 120))).collect();
+        v.iter().cloned().fold(0.0, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min)
+    };
+    let flat = spread(&wall(json!({"preset": "matte", "color": "#c0c0c0"})));
+    let bumped = spread(&wall(json!({"preset": "matte", "color": "#c0c0c0", "bump_map": stripes.to_str().unwrap(), "bump": 20})));
+    let noisy = spread(&wall(json!({"preset": "matte", "color": "#c0c0c0", "noise": {"scale": 20, "bump": 6}})));
+    assert!(flat < 6.0, "even: {flat}");
+    assert!(bumped > 40.0, "striped light: {bumped}");
+    assert!(noisy > 20.0, "noisy light: {noisy}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Displacement reaches the silhouette: a displaced ball's outline is no
+/// longer round.
+#[test]
+fn displacement_changes_the_silhouette() {
+    let ball = |displace: serde_json::Value| {
+        let mut l = json!({"id": "b", "kind": "mesh", "mesh": {"type": "sphere", "radius": 80}, "material": {"preset": "flat", "color": "#ffffff"}, "transform": {"position": [160, 120]}});
+        if !displace.is_null() {
+            l["displace"] = displace;
+        }
+        render(&scene(320, 240, json!({"layers": [l]})), 0.0)
+    };
+    let radii = |img: &image::RgbaImage| -> Vec<f64> {
+        (0..36).map(|k| {
+            let a = k as f64 * std::f64::consts::TAU / 36.0;
+            (0..120).map(|r| r as f64).take_while(|r| {
+                let (x, y) = ((160.0 + r * a.cos()) as u32, (120.0 + r * a.sin()) as u32);
+                px(img, x, y)[0] > 128
+            }).count() as f64
+        }).collect()
+    };
+    let spread = |v: &[f64]| v.iter().cloned().fold(0.0, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min);
+    let (round, rock) = (radii(&ball(serde_json::Value::Null)), radii(&ball(json!({"type": "fbm", "scale": 40, "amount": 12, "seed": 3}))));
+    assert!(spread(&round) <= 3.0, "round: {round:?}");
+    assert!(spread(&rock) >= 8.0, "rocky: {rock:?}");
+}
+
+#[test]
+fn gpu_matches_cpu_surface_detail() {
+    let dir = detail_dir("parity");
+    let (tex, nrm) = (dir.join("check.png"), dir.join("normal.png"));
+    checker_png(&tex, 32, 32, 8, [255, 200, 120, 255], [40, 60, 200, 255]);
+    image::RgbaImage::from_fn(32, 32, |x, y| image::Rgba([(128.0 + 90.0 * ((x as f64) * 0.6).sin()) as u8, (128.0 + 90.0 * ((y as f64) * 0.6).cos()) as u8, 220, 255])).save(&nrm).unwrap();
+    let p = scene(640, 240, json!({"layers": [
+        {"id": "rock", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "displace": {"type": "cellular", "scale": 30, "amount": 8},
+         "material": {"preset": "matte", "color": "#a08060", "noise": {"type": "fbm", "scale": 15, "color": "#403020", "roughness": 0.3, "bump": 3}}, "transform": {"position": [90, 120]}},
+        {"id": "tile", "kind": "mesh", "mesh": {"type": "box", "size": [110, 110], "depth": 110}, "material": {"preset": "plastic", "map": tex.to_str().unwrap(), "normal_map": nrm.to_str().unwrap(), "uv": {"scale": [2, 2], "rotation": 15}},
+         "transform": {"position": [260, 120], "rotation_y": 30, "rotation_x": 20}},
+        {"id": "can", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 50, "height": 120}, "material": {"preset": "metal", "color": "#d0d0d0", "bump_map": tex.to_str().unwrap(), "bump": 4, "noise": {"type": "value", "scale": 25, "space": "world", "roughness": 0.2}},
+         "transform": {"position": [440, 120], "rotation_x": 20}},
+        {"id": "ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 50, "tube": 16}, "material": {"preset": "glossy", "color": "#ffffff", "map": tex.to_str().unwrap()}, "transform": {"position": [580, 120], "rotation_x": 50}}
+    ]}));
+    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0005);
+    let _ = std::fs::remove_dir_all(&dir);
+}

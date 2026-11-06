@@ -818,6 +818,227 @@ fn env_diffuse(lb: u32, n: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
+// ------------------------------------------------------------ surface detail
+// Seeded noise (noise.rs, exactly): PCG lattice hash, quintic value noise,
+// fbm octaves, cellular F1.
+
+fn n_pcg(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn n_hash(x: i32, y: i32, z: i32, seed: u32) -> f32 {
+    let h = n_pcg((bitcast<u32>(x) * 73856093u) ^ (bitcast<u32>(y) * 19349663u) ^ (bitcast<u32>(z) * 83492791u) ^ n_pcg(seed));
+    return f32(h >> 8u) / 16777216.0;
+}
+
+fn n_fade(t: f32) -> f32 {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+fn n_value(q: vec3<f32>, seed: u32) -> f32 {
+    let f = floor(q);
+    let x = i32(f.x);
+    let y = i32(f.y);
+    let z = i32(f.z);
+    let tx = n_fade(q.x - f.x);
+    let ty = n_fade(q.y - f.y);
+    let tz = n_fade(q.z - f.z);
+    let a = mix(mix(n_hash(x, y, z, seed), n_hash(x + 1, y, z, seed), tx), mix(n_hash(x, y + 1, z, seed), n_hash(x + 1, y + 1, z, seed), tx), ty);
+    let b = mix(mix(n_hash(x, y, z + 1, seed), n_hash(x + 1, y, z + 1, seed), tx), mix(n_hash(x, y + 1, z + 1, seed), n_hash(x + 1, y + 1, z + 1, seed), tx), ty);
+    return mix(a, b, tz);
+}
+
+fn n_fbm(q: vec3<f32>, octaves: u32, seed: u32) -> f32 {
+    var sum = 0.0;
+    var amp = 1.0;
+    var total = 0.0;
+    var f = 1.0;
+    for (var o = 0u; o < clamp(octaves, 1u, 8u); o++) {
+        sum += amp * n_value(q * f, seed + o * 1013u);
+        total += amp;
+        amp *= 0.5;
+        f *= 2.0;
+    }
+    return sum / total;
+}
+
+fn n_cellular(q: vec3<f32>, seed: u32) -> f32 {
+    let f = floor(q);
+    var best = 4.0;
+    for (var dz = -1; dz <= 1; dz++) {
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let x = i32(f.x) + dx;
+                let y = i32(f.y) + dy;
+                let z = i32(f.z) + dz;
+                let p = vec3<f32>(f32(x) + n_hash(x, y, z, seed), f32(y) + n_hash(x, y, z, seed ^ 0x9e37u), f32(z) + n_hash(x, y, z, seed ^ 0x7f4au));
+                let d = p - q;
+                best = min(best, dot(d, d));
+            }
+        }
+    }
+    return min(sqrt(best), 1.0);
+}
+
+// kind: 1 value, 2 fbm, 3 cellular (material row 9.x).
+fn n_sample(kind: u32, q: vec3<f32>, octaves: u32, seed: u32) -> f32 {
+    if kind == 1u { return n_value(q, seed); }
+    if kind == 3u { return n_cellular(q, seed); }
+    return n_fbm(q, octaves, seed);
+}
+
+// An image map texel (wrapping: maps tile), bilinear, level 0. Raw
+// values (premultiplied sRGB for colour, data for normal and bump maps).
+fn map_texel(r: vec4<f32>, x: i32, y: i32) -> vec4<f32> {
+    let w = i32(bitcast<u32>(r.y));
+    let h = i32(bitcast<u32>(r.z));
+    let xx = ((x % w) + w) % w;
+    let yy = ((y % h) + h) % h;
+    return unpack(b_images[bitcast<u32>(r.x) + u32(yy * w + xx)]);
+}
+
+fn map_sample(r: vec4<f32>, t: vec2<f32>) -> vec4<f32> {
+    let s = t * vec2<f32>(f32(bitcast<u32>(r.y)), f32(bitcast<u32>(r.z))) - vec2<f32>(0.5);
+    let f = floor(s);
+    let fx = s.x - f.x;
+    let fy = s.y - f.y;
+    let x = i32(f.x);
+    let y = i32(f.y);
+    return mix(mix(map_texel(r, x, y), map_texel(r, x + 1, y), fx), mix(map_texel(r, x, y + 1), map_texel(r, x + 1, y + 1), fx), fy);
+}
+
+fn map_height(r: vec4<f32>, t: vec2<f32>) -> f32 {
+    let c = map_sample(r, t);
+    return dot(c.xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+struct Detail {
+    base: vec3<f32>,
+    rough: f32,
+    n: vec3<f32>,
+}
+
+// A material's surface detail at barycentric b of a triangle (camera-space
+// positions pos, noise-space positions nps, UVs uvs), shading normal n:
+// its colour, roughness change and bent normal.
+fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, uvs_in: array<vec2<f32>, 3>, b: vec3<f32>, n_in: vec3<f32>, base_in: vec3<f32>) -> Detail {
+    var d: Detail;
+    d.base = base_in;
+    d.rough = 0.0;
+    d.n = n_in;
+    let r9 = b_mesh[row + 9u];
+    let r12 = b_mesh[row + 12u];
+    let r13 = b_mesh[row + 13u];
+    let r14 = b_mesh[row + 14u];
+    if r9.x < 0.5 && r12.w < 0.5 && r13.w < 0.5 && r14.w == 0.0 { return d; }
+    let e1 = pos[1] - pos[0];
+    let e2 = pos[2] - pos[0];
+    var n = n_in;
+    if r12.w > 0.5 || r13.w > 0.5 || r14.w != 0.0 {
+        // UVs: across a wrap seam, bring the corners together; then tile,
+        // offset and turn (about the middle).
+        var uvs = uvs_in;
+        let wraps = u32(b_mesh[row + 16u].y);
+        for (var k = 1u; k < 3u; k++) {
+            if (wraps & 1u) != 0u {
+                if uvs[k].x - uvs[0].x > 0.5 { uvs[k].x -= 1.0; }
+                if uvs[k].x - uvs[0].x < -0.5 { uvs[k].x += 1.0; }
+            }
+            if (wraps & 2u) != 0u {
+                if uvs[k].y - uvs[0].y > 0.5 { uvs[k].y -= 1.0; }
+                if uvs[k].y - uvs[0].y < -0.5 { uvs[k].y += 1.0; }
+            }
+        }
+        let r15 = b_mesh[row + 15u];
+        let ang = b_mesh[row + 16u].x;
+        let cs = cos(ang);
+        let sn = sin(ang);
+        for (var k = 0u; k < 3u; k++) {
+            let c = uvs[k] - vec2<f32>(0.5);
+            uvs[k] = vec2<f32>(c.x * cs - c.y * sn, c.x * sn + c.y * cs) * r15.xy + vec2<f32>(0.5) + r15.zw;
+        }
+        let t = uvs[0] * b.x + uvs[1] * b.y + uvs[2] * b.z;
+        // How the surface runs along u and v.
+        let d1 = uvs[1] - uvs[0];
+        let d2 = uvs[2] - uvs[0];
+        let det = d1.x * d2.y - d2.x * d1.y;
+        var dpdu = vec3<f32>(0.0);
+        var dpdv = vec3<f32>(0.0);
+        if abs(det) > 1e-12 {
+            dpdu = (e1 * d2.y - e2 * d1.y) / det;
+            dpdv = (e2 * d1.x - e1 * d2.x) / det;
+        }
+        if r12.w > 0.5 {
+            let c = map_sample(r12, t);
+            var straight = vec3<f32>(0.0);
+            if c.w > 0.0 { straight = c.xyz / c.w; }
+            d.base = d.base * vec3<f32>(srgb_decode(straight.x), srgb_decode(straight.y), srgb_decode(straight.z));
+        }
+        let lu = length(dpdu);
+        let lv = length(dpdv);
+        if lu > 1e-9 && lv > 1e-9 {
+            let tu = normalize(dpdu - n * dot(n, dpdu));
+            let tv = normalize(dpdv - n * dot(n, dpdv) - tu * dot(tu, dpdv));
+            if r13.w > 0.5 {
+                // Tangent space, green up (against v, which runs down the image).
+                let m = map_sample(r13, t).xyz * 2.0 - vec3<f32>(1.0);
+                n = normalize(tu * m.x - tv * m.y + n * max(m.z, 0.05));
+            }
+            if r14.w != 0.0 {
+                let su = 1.0 / f32(bitcast<u32>(r14.y));
+                let sv = 1.0 / f32(bitcast<u32>(r14.z));
+                let dhdu = (map_height(r14, t + vec2<f32>(su, 0.0)) - map_height(r14, t - vec2<f32>(su, 0.0))) / (2.0 * su);
+                let dhdv = (map_height(r14, t + vec2<f32>(0.0, sv)) - map_height(r14, t - vec2<f32>(0.0, sv))) / (2.0 * sv);
+                n = normalize(n - r14.w * (tu * (dhdu / lu) + tv * (dhdv / lv)));
+            }
+        }
+    }
+    if r9.x > 0.5 {
+        let kind = u32(r9.x + 0.5);
+        let inv = r9.y;
+        let octaves = u32(r9.z);
+        let seed = bitcast<u32>(r9.w);
+        let q = (nps[0] * b.x + nps[1] * b.y + nps[2] * b.z) * inv;
+        let v = n_sample(kind, q, octaves, seed);
+        let r10 = b_mesh[row + 10u];
+        let r11 = b_mesh[row + 11u];
+        d.base = mix(d.base, r10.xyz, r10.w * v);
+        d.rough = r11.x * (2.0 * v - 1.0);
+        if r11.y != 0.0 {
+            // Bump: the noise's slope along the surface (two directions in
+            // the triangle, carried into noise space by its Jacobian).
+            let f1 = nps[1] - nps[0];
+            let f2 = nps[2] - nps[0];
+            let g11 = dot(e1, e1);
+            let g12 = dot(e1, e2);
+            let g22 = dot(e2, e2);
+            let gd = g11 * g22 - g12 * g12;
+            if abs(gd) > 1e-12 {
+                let t1 = normalize(e1 - n_in * dot(n_in, e1));
+                let t2 = cross(n_in, t1);
+                let h = 0.15 / max(inv, 1e-6);
+                var grad = vec3<f32>(0.0);
+                for (var k = 0u; k < 2u; k++) {
+                    var tk = t1;
+                    if k == 1u { tk = t2; }
+                    let c1 = dot(e1, tk);
+                    let c2 = dot(e2, tk);
+                    let a = (c1 * g22 - c2 * g12) / gd;
+                    let bb = (c2 * g11 - c1 * g12) / gd;
+                    let step = (f1 * a + f2 * bb) * (h * inv);
+                    let dv = (n_sample(kind, q + step, octaves, seed) - v) / h;
+                    grad += tk * dv;
+                }
+                n = normalize(n - r11.y * grad);
+            }
+        }
+    }
+    d.n = n;
+    return d;
+}
+
 const SHADOW_TAP_X = array<f32, 8>(-0.613, 0.170, -0.299, 0.645, -0.651, 0.421, -0.084, 0.874);
 const SHADOW_TAP_Y = array<f32, 8>(0.617, -0.040, -0.792, 0.493, -0.075, -0.718, 0.290, -0.130);
 const NO_SURFACE: f32 = -1.0e30;
@@ -1153,9 +1374,11 @@ fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
 }
 
 // Rows per mesh material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 9u;
+const MAT_ROWS: u32 = 17u;
 // Rows per light (mesh3d::LROWS).
 const LROWS: u32 = 5u;
+// Rows per vertex (mesh3d::VROWS).
+const VROWS: u32 = 3u;
 
 // Mirrors `card_sample` in mesh3d.rs: a card's picture at target point q.
 fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
@@ -1211,9 +1434,9 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     var nrm: array<vec3<f32>, 3>;
     for (var k = 0u; k < 3u; k++) {
         let v = idv[k];
-        let a = b_mesh[vb + v * 2u];
+        let a = b_mesh[vb + v * VROWS];
         pos[k] = a.xyz;
-        nrm[k] = b_mesh[vb + v * 2u + 1u].xyz;
+        nrm[k] = b_mesh[vb + v * VROWS + 1u].xyz;
         w[k] = max(ev[k], 0.0) * a.w;
     }
     let s = max(w[0] + w[1] + w[2], 1e-30);
@@ -1236,7 +1459,17 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let vv = -p;
     let v = vv / max(sqrt(dot(vv, vv)), 1e-20);
     if dot(n, v) < 0.0 { n = -n; }
-    let base = m0.xyz;
+    var uvs: array<vec2<f32>, 3>;
+    var nps: array<vec3<f32>, 3>;
+    for (var k = 0u; k < 3u; k++) {
+        let r1 = b_mesh[vb + idv[k] * VROWS + 1u];
+        let r2 = b_mesh[vb + idv[k] * VROWS + 2u];
+        uvs[k] = vec2<f32>(r1.w, r2.w);
+        nps[k] = r2.xyz;
+    }
+    let det = surface_detail(mb + mat * MAT_ROWS, pos, nps, uvs, b, n, m0.xyz);
+    n = det.n;
+    let base = det.base;
     let opacity = m0.w;
     let emissive = m2.xyz;
     if (flags & 8u) != 0u {
@@ -1259,7 +1492,7 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
         return vec4<f32>(encode(c.x) * opacity, encode(c.y) * opacity, encode(c.z) * opacity, opacity);
     }
     let metal = m1.x;
-    let rough = max(m1.y, 0.03);
+    let rough = clamp(m1.y + det.rough, 0.03, 1.0);
     let cc = m1.z;
     let ccr = max(m1.w, 0.03);
     let trans = m3.x;

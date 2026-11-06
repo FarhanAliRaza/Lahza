@@ -66,8 +66,9 @@ fn fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
+/// As WGSL's mix (so the shaders' copies agree exactly).
 fn mix(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
+    a * (1.0 - t) + b * t
 }
 
 /// Value noise at q (lattice units), 0..1.
