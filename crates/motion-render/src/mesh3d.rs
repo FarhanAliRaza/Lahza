@@ -1265,6 +1265,35 @@ fn env(m: &[[f32; 4]], lb: usize, d: F3, r: f32) -> F3 {
     c
 }
 
+/// Irradiance / π from the environment on a matte surface facing world
+/// direction n (mirrors `env_diffuse` in motion.wgsl).
+fn env_diffuse(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
+    let up = -n[1];
+    let (sky, horizon, ground) = (f3(m[lb + 4]), f3(m[lb + 5]), f3(m[lb + 6]));
+    let mut c = if up >= 0.0 { fmix(horizon, sky, smoothstep(0.0, 1.6, up)) } else { fmix(horizon, ground, smoothstep(0.0, 1.2, -up)) };
+    let lights = m[lb][0] as usize;
+    let lobes = m[lb][1] as usize;
+    let first = lb + 7 + lights * LROWS;
+    for i in 0..lobes {
+        let l = m[first + i * 2];
+        let lam = 1.0 / (l[3] * l[3]).max(1e-6);
+        let mu = fdot(n, f3(l));
+        let eml = (-lam).exp();
+        let em2l = eml * eml;
+        let rl = 1.0 / lam;
+        let scale = 1.0 + 2.0 * em2l - rl;
+        let bias = (eml - em2l) * rl - em2l;
+        let x = (1.0 - scale).max(0.0).sqrt();
+        let x0 = 0.36 * mu;
+        let x1 = x / (4.0 * 0.36);
+        let nn = x0 + x1;
+        let y = if x0.abs() <= x1 { nn * nn / x.max(1e-6) } else { mu.clamp(0.0, 1.0) };
+        let e = (scale * y + bias).max(0.0);
+        c = fadd(c, fmul(f3(m[first + i * 2 + 1]), e * 2.0 * rl * (1.0 - em2l)));
+    }
+    c
+}
+
 /// Whether a texel's surface leaves a point at closeness `c` lit.
 fn shadow_lit(s: f32, c: f32, bias: f32, point: bool) -> f32 {
     if s <= NO_SURFACE * 0.5 {
@@ -1744,11 +1773,12 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     };
     let r_view = fsub(fmul(rn, 2.0 * fdot(rn, v)), v);
     let rw = to_world(m, lb, r_view);
-    d_light = fadd(d_light, fmul(fmul3(diffuse, env(m, lb, nw, 1.0)), coat));
+    let env_d = env_diffuse(m, lb, nw);
+    d_light = fadd(d_light, fmul(fmul3(diffuse, env_d), coat));
     let spec_env = fmul3(fmul3(env(m, lb, rw, rough), fadd(fmul(f0, ab[0]), fmul(f82, f90 * ab[1]))), comp);
     s_light = fadd(s_light, fmul(spec_env, coat));
     if e_sheen > 0.0 {
-        s_light = fadd(s_light, fmul(fmul3(sheen, env(m, lb, nw, 1.0)), sheen_albedo(n_v, sheen_r) * coat));
+        s_light = fadd(s_light, fmul(fmul3(sheen, env_d), sheen_albedo(n_v, sheen_r) * coat));
     }
     if cc > 0.0 {
         let cr = fsub(fmul(n, 2.0 * fdot(n, v)), v);

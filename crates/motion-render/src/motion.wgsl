@@ -731,6 +731,45 @@ fn env_light(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
     return c;
 }
 
+// What a matte surface facing world direction n gets from the
+// environment (irradiance / π): the sky/horizon/ground blurred, and each
+// lobe (a spherical Gaussian) by Hill's fitted cosine convolution, so
+// small bright lobes (the sun) light as much as they do traced.
+fn env_diffuse(lb: u32, n: vec3<f32>) -> vec3<f32> {
+    let up = -n.y;
+    let sky = b_mesh[lb + 4u].xyz;
+    let horizon = b_mesh[lb + 5u].xyz;
+    let ground = b_mesh[lb + 6u].xyz;
+    var c: vec3<f32>;
+    if up >= 0.0 {
+        c = mix(horizon, sky, smoothstep(0.0, 1.6, up));
+    } else {
+        c = mix(horizon, ground, smoothstep(0.0, 1.2, -up));
+    }
+    let lights = u32(b_mesh[lb].x);
+    let lobes = u32(b_mesh[lb].y);
+    let first = lb + 7u + lights * LROWS;
+    for (var i = 0u; i < lobes; i++) {
+        let l = b_mesh[first + i * 2u];
+        let lam = 1.0 / max(l.w * l.w, 1e-6);
+        let mu = dot(n, l.xyz);
+        let eml = exp(-lam);
+        let em2l = eml * eml;
+        let rl = 1.0 / lam;
+        let scale = 1.0 + 2.0 * em2l - rl;
+        let bias = (eml - em2l) * rl - em2l;
+        let x = sqrt(max(1.0 - scale, 0.0));
+        let x0 = 0.36 * mu;
+        let x1 = x / (4.0 * 0.36);
+        let nn = x0 + x1;
+        var y = clamp(mu, 0.0, 1.0);
+        if abs(x0) <= x1 { y = nn * nn / max(x, 1e-6); }
+        let e = max(scale * y + bias, 0.0);
+        c = c + b_mesh[first + i * 2u + 1u].xyz * (e * 2.0 * rl * (1.0 - em2l));
+    }
+    return c;
+}
+
 const SHADOW_TAP_X = array<f32, 8>(-0.613, 0.170, -0.299, 0.645, -0.651, 0.421, -0.084, 0.874);
 const SHADOW_TAP_Y = array<f32, 8>(0.617, -0.040, -0.792, 0.493, -0.075, -0.718, 0.290, -0.130);
 const NO_SURFACE: f32 = -1.0e30;
@@ -1292,11 +1331,12 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     }
     let r_view = rn * (2.0 * dot(rn, v)) - v;
     let rw = to_world(lb, r_view);
-    d_light = d_light + (diffuse * env_light(lb, nw, 1.0)) * coat;
+    let env_d = env_diffuse(lb, nw);
+    d_light = d_light + (diffuse * env_d) * coat;
     let spec_env = env_light(lb, rw, rough) * (f0 * ab.x + f82 * (f90 * ab.y)) * comp;
     s_light = s_light + spec_env * coat;
     if e_sheen > 0.0 {
-        s_light = s_light + sheen * env_light(lb, nw, 1.0) * (sheen_albedo(n_v, sheen_r) * coat);
+        s_light = s_light + sheen * env_d * (sheen_albedo(n_v, sheen_r) * coat);
     }
     if cc > 0.0 {
         let cr = n * (2.0 * dot(n, v)) - v;

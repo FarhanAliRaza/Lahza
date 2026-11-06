@@ -105,9 +105,10 @@ fn to_world(v: vec3<f32>) -> vec3<f32> {
 }
 
 // Environment radiance seen along camera-space direction `d` (sharp):
-// sky/horizon/ground by height, plus the lobes, plus ambient lights (a
-// uniform environment).
-fn env(d: vec3<f32>) -> vec3<f32> {
+// the smooth part (sky/horizon/ground by height, plus ambient lights, a
+// uniform environment) and the lobes (softboxes, the sun), which are
+// also sampled directly (see env_lobe_*).
+fn env_smooth(d: vec3<f32>) -> vec3<f32> {
     let w = to_world(d);
     let up = -w.y;
     let sky = b_light[4].xyz;
@@ -116,6 +117,16 @@ fn env(d: vec3<f32>) -> vec3<f32> {
     var c: vec3<f32>;
     if up >= 0.0 { c = mix(horizon, sky, smoothstep(0.0, 0.6, up)); } else { c = mix(horizon, ground, smoothstep(0.0, 0.2, -up)); }
     let lights = u32(b_light[0].x);
+    for (var i = 0u; i < lights; i++) {
+        if u32(b_light[7u + i * LROWS].w) == 2u { c += b_light[7u + i * LROWS + 1u].xyz; }
+    }
+    return c;
+}
+
+fn env_lobes(d: vec3<f32>) -> vec3<f32> {
+    let w = to_world(d);
+    var c = vec3<f32>(0.0);
+    let lights = u32(b_light[0].x);
     let lobes = u32(b_light[0].y);
     let first = 7u + lights * LROWS;
     for (var i = 0u; i < lobes; i++) {
@@ -123,10 +134,68 @@ fn env(d: vec3<f32>) -> vec3<f32> {
         let s2 = max(l.w * l.w, 1e-6);
         c += b_light[first + i * 2u + 1u].xyz * exp((dot(w, l.xyz) - 1.0) / s2);
     }
-    for (var i = 0u; i < lights; i++) {
-        if u32(b_light[7u + i * LROWS].w) == 2u { c += b_light[7u + i * LROWS + 1u].xyz; }
-    }
     return c;
+}
+
+fn env(d: vec3<f32>) -> vec3<f32> {
+    return env_smooth(d) + env_lobes(d);
+}
+
+// A lobe exp((cos − 1) / s²) is a von Mises–Fisher lobe with κ = 1 / s²:
+// sampled exactly. Lobes are picked by their power (colour × s²).
+fn lobe_weight(i: u32) -> f32 {
+    let first = 7u + u32(b_light[0].x) * LROWS;
+    let l = b_light[first + i * 2u];
+    return luminance(b_light[first + i * 2u + 1u].xyz) * max(l.w * l.w, 1e-6);
+}
+
+fn vmf_pdf(cos_t: f32, k: f32) -> f32 {
+    return k * exp(k * (cos_t - 1.0)) / (2.0 * PI * (1.0 - exp(-2.0 * k)));
+}
+
+// The pdf of env_lobe_sample choosing camera-space direction d.
+fn env_lobe_pdf(d: vec3<f32>) -> f32 {
+    let lobes = u32(b_light[0].y);
+    if lobes == 0u { return 0.0; }
+    let w = to_world(d);
+    let first = 7u + u32(b_light[0].x) * LROWS;
+    var total = 0.0;
+    var pdf = 0.0;
+    for (var i = 0u; i < lobes; i++) {
+        let lw = lobe_weight(i);
+        total += lw;
+        let l = b_light[first + i * 2u];
+        pdf += lw * vmf_pdf(dot(w, l.xyz), 1.0 / max(l.w * l.w, 1e-6));
+    }
+    if total <= 0.0 { return 0.0; }
+    return pdf / total;
+}
+
+// A camera-space direction toward the lobes (w: 0 when there are none).
+fn env_lobe_sample(rng: ptr<function, Rng>) -> vec4<f32> {
+    let lobes = u32(b_light[0].y);
+    if lobes == 0u { return vec4<f32>(0.0); }
+    var total = 0.0;
+    for (var i = 0u; i < lobes; i++) { total += lobe_weight(i); }
+    if total <= 0.0 { return vec4<f32>(0.0); }
+    var pick = rnd(rng) * total;
+    var chosen = lobes - 1u;
+    for (var i = 0u; i < lobes; i++) {
+        pick -= lobe_weight(i);
+        if pick <= 0.0 { chosen = i; break; }
+    }
+    let first = 7u + u32(b_light[0].x) * LROWS;
+    let l = b_light[first + chosen * 2u];
+    let k = 1.0 / max(l.w * l.w, 1e-6);
+    let u1 = rnd(rng);
+    let u2 = rnd(rng);
+    let c = clamp(1.0 + log(u1 + (1.0 - u1) * exp(-2.0 * k)) / k, -1.0, 1.0);
+    let sn = sqrt(max(1.0 - c * c, 0.0));
+    let f = basis(normalize(l.xyz));
+    let ww = normalize(f[0] * (sn * cos(2.0 * PI * u2)) + f[1] * (sn * sin(2.0 * PI * u2)) + f[2] * c);
+    // World → camera: the rows of camera→world are its columns.
+    let d = normalize(b_light[1].xyz * ww.x + b_light[2].xyz * ww.y + b_light[3].xyz * ww.z);
+    return vec4<f32>(d, 1.0);
 }
 
 // ---------------------------------------------------------------- scene
@@ -740,6 +809,15 @@ fn direct(s: Surface, h: Hit, v: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32
         if ls.shadow && occluded(offset(h, ls.l), ls.l, ls.dist * 0.999, rng) { continue; }
         out += bsdf_cos(s, v, ls.l) * PI * ls.col;
     }
+    // The environment's lobes, sampled directly (MIS with the BSDF).
+    let e = env_lobe_sample(rng);
+    if e.w > 0.0 && dot(h.n, e.xyz) > 0.0 {
+        let pdf = env_lobe_pdf(e.xyz);
+        if pdf > 0.0 && !occluded(offset(h, e.xyz), e.xyz, 1e30, rng) {
+            let w = pdf / (pdf + bsdf_pdf(s, v, e.xyz));
+            out += bsdf_cos(s, v, e.xyz) * env_lobes(e.xyz) * (w / pdf);
+        }
+    }
     return out;
 }
 
@@ -812,7 +890,14 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         }
         if !h.found {
             if !through {
-                out.color += throughput * env(d);
+                // Lobes were also sampled directly at the last surface:
+                // weigh this sample against that (MIS).
+                var w = 1.0;
+                if last_pdf > 0.0 {
+                    let lp = env_lobe_pdf(d);
+                    w = last_pdf / (last_pdf + lp);
+                }
+                out.color += throughput * (env_smooth(d) + env_lobes(d) * w);
                 out.alpha = 1.0;
             }
             return out;

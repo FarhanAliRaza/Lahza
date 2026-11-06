@@ -589,27 +589,29 @@ impl CLighting {
         let k = self.intensity.at(tc).max(0.0);
         let rot = self.rotation.at(tc).to_radians();
         let g = |v: f64| Color([v, v, v, 1.0]);
-        // (sky, horizon, ground, lobes: direction, angular radius, colour × strength)
+        // (sky, horizon, ground, lobes: direction, angular radius, colour × strength).
+        // Lobe sizes are set so their exact fill light (as traced) matches
+        // the look the presets were designed with.
         type L = ([f64; 3], f64, Color, f64);
         let (sky, horizon, ground, lobes): (Color, Color, Color, Vec<L>) = match self.preset {
             EnvironmentPreset::Studio => (
                 g(0.42),
                 g(0.30),
                 g(0.06),
-                vec![([0.0, -1.0, -0.25], 0.42, g(1.0), 2.4), ([-1.0, -0.25, -0.35], 0.22, g(1.0), 1.8), ([1.0, -0.15, 0.25], 0.18, g(1.0), 1.5)],
+                vec![([0.0, -1.0, -0.25], 0.262, g(1.0), 2.4), ([-1.0, -0.25, -0.35], 0.141, g(1.0), 1.8), ([1.0, -0.15, 0.25], 0.115, g(1.0), 1.5)],
             ),
-            EnvironmentPreset::Soft => (g(0.85), g(0.75), g(0.5), vec![([0.0, -1.0, -0.4], 0.7, g(1.0), 1.4)]),
+            EnvironmentPreset::Soft => (g(0.85), g(0.75), g(0.5), vec![([0.0, -1.0, -0.4], 0.419, g(1.0), 1.4)]),
             EnvironmentPreset::Sunset => (
                 Color([0.30, 0.38, 0.62, 1.0]),
                 Color([1.0, 0.58, 0.32, 1.0]),
                 Color([0.14, 0.09, 0.07, 1.0]),
-                vec![([-0.85, -0.12, 0.5], 0.1, Color([1.0, 0.72, 0.45, 1.0]), 6.0)],
+                vec![([-0.85, -0.12, 0.5], 0.064, Color([1.0, 0.72, 0.45, 1.0]), 6.0)],
             ),
             EnvironmentPreset::Night => (
                 g(0.03),
                 g(0.05),
                 g(0.0),
-                vec![([-1.0, -0.2, -0.1], 0.08, g(1.0), 4.0), ([1.0, -0.35, 0.45], 0.07, g(1.0), 3.5), ([0.0, -1.0, 0.1], 0.2, g(1.0), 1.4)],
+                vec![([-1.0, -0.2, -0.1], 0.052, g(1.0), 4.0), ([1.0, -0.35, 0.45], 0.045, g(1.0), 3.5), ([0.0, -1.0, 0.1], 0.128, g(1.0), 1.4)],
             ),
             EnvironmentPreset::None => (g(0.0), g(0.0), g(0.0), Vec::new()),
         };

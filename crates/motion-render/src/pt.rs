@@ -914,6 +914,30 @@ mod physics_tests {
         assert!(rim[1] < 60, "its edge mirrors the dark: {rim:?}");
     }
 
+    /// The environment's bright lobes (softboxes, the sun) are sampled
+    /// directly: a matte wall lit only by a small one is clean at a few
+    /// samples per pixel, and as bright as the raster has it.
+    #[test]
+    fn environment_lobes_are_sampled_directly() {
+        let Some(mut r) = tracer(16) else { return };
+        let mut p = project(json!([{"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [2000, 2000]}, "material": {"preset": "matte", "color": "#ffffff", "specular": 0}, "transform": {"position": [160, 120]}}]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.scenes[0].lights = serde_json::from_value(json!([{"type": "ambient", "intensity": 0}])).unwrap();
+        // Sunset: a small warm sun low on one side, over a dark sky.
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "sunset", "rotation": 180, "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+        let c = Compiled::new(&p);
+        let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+        let patch: Vec<f64> = (100..140u32).flat_map(|y| (140..180u32).map(move |x| (x, y))).map(|(x, y)| a.get_pixel(x, y).0[0] as f64).collect();
+        let mean = patch.iter().sum::<f64>() / patch.len() as f64;
+        let sd = (patch.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / patch.len() as f64).sqrt();
+        let raster = b.get_pixel(160, 120).0[0] as f64;
+        eprintln!("traced mean {mean:.1} sd {sd:.1}, raster {raster}");
+        assert!(mean > 20.0, "lit by the sun: {mean:.1}");
+        assert!(sd < 0.08 * mean, "clean: sd {sd:.1} of {mean:.1}");
+        assert!((mean - raster).abs() < 0.12 * raster.max(20.0), "as bright as the raster: {mean:.1} vs {raster}");
+    }
+
     /// Lists with what the tracer can't draw yet (wires, effects such as
     /// depth of field, mattes, blend modes) keep the raster's picture.
     #[test]
