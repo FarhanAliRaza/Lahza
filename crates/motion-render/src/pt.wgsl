@@ -60,7 +60,7 @@ fn unpack(v: u32) -> vec4<f32> {
 
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 17u;
+const MAT_ROWS: u32 = 18u;
 // Rows per instance (pt.rs INST_ROWS).
 const INST_ROWS: u32 = 13u;
 // Rows per light (mesh3d::LROWS).
@@ -712,7 +712,7 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
         let inv = r9.y;
         let octaves = u32(r9.z);
         let seed = bitcast<u32>(r9.w);
-        let q = (nps[0] * b.x + nps[1] * b.y + nps[2] * b.z) * inv;
+        let q = (nps[0] * b.x + nps[1] * b.y + nps[2] * b.z + b_mat[row + 17u].xyz) * inv;
         let v = n_sample(kind, q, octaves, seed);
         let r10 = b_mat[row + 10u];
         let r11 = b_mat[row + 11u];

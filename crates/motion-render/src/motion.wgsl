@@ -1005,7 +1005,7 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
         let inv = r9.y;
         let octaves = u32(r9.z);
         let seed = bitcast<u32>(r9.w);
-        let q = (nps[0] * b.x + nps[1] * b.y + nps[2] * b.z) * inv;
+        let q = (nps[0] * b.x + nps[1] * b.y + nps[2] * b.z + b_mesh[row + 17u].xyz) * inv;
         let v = n_sample(kind, q, octaves, seed);
         let r10 = b_mesh[row + 10u];
         let r11 = b_mesh[row + 11u];
@@ -1414,7 +1414,7 @@ fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
 }
 
 // Rows per mesh material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 17u;
+const MAT_ROWS: u32 = 18u;
 // Rows per light (mesh3d::LROWS).
 const LROWS: u32 = 5u;
 // Rows per vertex (mesh3d::VROWS).

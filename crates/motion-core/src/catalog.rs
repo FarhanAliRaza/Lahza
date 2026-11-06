@@ -120,12 +120,20 @@ pub fn catalog_json() -> Value {
             })
         })
         .collect();
-    let material = json!({"preset": "matte | plastic | glossy (default) | coated (lacquer: crisp reflections over colour) | metal | chrome | brushed (spun metal) | velvet (fabric sheen) | glass (refracts what is behind) | emissive | flat (unlit flat colour) | shadow (invisible except shadows: drops shadows onto 2D layers) | wireframe (edges only: 3D viewport look)",
+    let layouts = json!([
+                    {"type": "grid", "columns": "count", "rows": "count", "spacing": "[x, y] px or number (default 50, animatable)", "hex": "bool: odd rows shift half a cell"},
+                    {"type": "radial", "count": "copies", "radius": "px (default 200, animatable)", "start": "degrees, 0 = up, clockwise (animatable)", "sweep": "degrees (default 360; less includes both ends)", "align": "bool: turn each copy to its angle (its up points outward)"},
+                    {"type": "line", "count": "copies", "from": "[x, y] (default [-500, 0])", "to": "[x, y] (default [500, 0])", "align": "bool: x axis along the line"},
+                    {"type": "random", "count": "copies", "size": "[w, h] (default [1000, 1000])", "area": "box | circle", "seed": 0},
+                    {"type": "path", "count": "copies", "layer": "sibling shape \"path\" layer (its morph and transform)", "offset": "fraction moved along the path (animatable; closed paths wrap)", "align": "bool: turn along the path"},
+                    {"type": "emitter", "rate": "particles/s", "lifetime": "s (2)", "lifetime_jitter": "0.3", "size": "[w, h] birth box (point)", "area": "box | circle", "direction": "degrees, 0 = up", "spread": "cone degrees (30)", "speed": "px/s (200)", "speed_jitter": "0.3", "gravity": "[x, y] px/s² ([0, 300])", "drag": "fraction/s", "spin": "°/s", "size_over_life": "[[life 0..1, scale]]", "opacity_over_life": "[[life, opacity]]", "color_over_life": "[[life, colour]]", "start": "s", "stop": "s", "prewarm": "bool", "seed": 0, "note": "particles: stateless per frame (scrub freely); the template's animation plays from each particle's birth"}
+                ]);
+    let material = json!({"preset": "matte | plastic | glossy (default) | coated (lacquer: crisp reflections over colour) | metal | chrome | brushed (spun metal) | velvet (fabric sheen) | liquid (water: clear, rippling; give noise a drift) | glass (refracts what is behind) | emissive | flat (unlit flat colour) | shadow (invisible except shadows: drops shadows onto 2D layers) | wireframe (edges only: 3D viewport look)",
                     "specular": "0..1 dielectric reflection (0.5 default = 4% head-on; 0 none)", "specular_tint": "colour: tints a dielectric's reflection and a metal's edges (Blender F82 tint)",
                     "anisotropy": "0..1 brushed/spun metal: grain around the mesh's axis, highlights stretch across it", "anisotropy_rotation": "degrees the grain turns",
                     "sheen": "0..1 soft grazing light (velvet, fabric)", "sheen_color": "colour (default white)", "sheen_roughness": "0..1 (default 0.5)",
                     "clearcoat_color": "colour the coat tints what is under it (candy paint)",
-                    "noise": "{type: fbm|value|cellular, scale px, octaves, seed, space: object|world, color, amount, roughness ±, bump px}: procedural surface detail, no UVs", "map": "image over the UVs (multiplies color)", "normal_map": "tangent-space normal image (green up)", "bump_map": "height image", "bump": "bump_map height px (2)", "uv": "{scale: [x, y], offset: [x, y], rotation: deg}", "dispersion": "glass, path tracing: 1/Abbe (0.02 glass, 0.05 flint, more: stylised rainbows)",
+                    "noise": "{type: fbm|value|cellular, scale px, octaves, seed, space: object|world, drift: [x,y,z] px/s (flowing), color, amount, roughness ±, bump px}: procedural surface detail, no UVs", "map": "image over the UVs (multiplies color)", "normal_map": "tangent-space normal image (green up)", "bump_map": "height image", "bump": "bump_map height px (2)", "uv": "{scale: [x, y], offset: [x, y], rotation: deg}", "dispersion": "glass, path tracing: 1/Abbe (0.02 glass, 0.05 flint, more: stylised rainbows)",
                     "ior": "glass: index of refraction (default 1.45)", "thickness": "glass: px light travels inside (default 60)",
                     "colors": "[colour, …] per piece, in turn, for this part (over the layer's colors)", "wireframe": "px: draw edges instead of the surface (preset wireframe)", "fill": "wireframe face colour (hidden-line; omit for see-through wires)",
                     "color": "base colour (animatable)", "metallic": "0..1", "roughness": "0 mirror … 1 diffuse", "clearcoat": "0..1 lacquer layer", "clearcoat_roughness": "0..1",
@@ -242,14 +250,7 @@ pub fn catalog_json() -> Value {
             "instancer": {
                 "note": "a cloner: draws its layers (the template, like a comp) once per layout point, centred on it; use it instead of many hand-placed layers (dot fields, rings of petals, rows of bars). Copies share the template's ids. Max 50000 copies",
                 "layers": "the template (any layers, comps included); its own transform and keys apply inside each copy",
-                "layout": [
-                    {"type": "grid", "columns": "count", "rows": "count", "spacing": "[x, y] px or number (default 50, animatable)", "hex": "bool: odd rows shift half a cell"},
-                    {"type": "radial", "count": "copies", "radius": "px (default 200, animatable)", "start": "degrees, 0 = up, clockwise (animatable)", "sweep": "degrees (default 360; less includes both ends)", "align": "bool: turn each copy to its angle (its up points outward)"},
-                    {"type": "line", "count": "copies", "from": "[x, y] (default [-500, 0])", "to": "[x, y] (default [500, 0])", "align": "bool: x axis along the line"},
-                    {"type": "random", "count": "copies", "size": "[w, h] (default [1000, 1000])", "area": "box | circle", "seed": 0},
-                    {"type": "path", "count": "copies", "layer": "sibling shape \"path\" layer (its morph and transform)", "offset": "fraction moved along the path (animatable; closed paths wrap)", "align": "bool: turn along the path"},
-                    {"type": "emitter", "rate": "particles/s", "lifetime": "s (2)", "lifetime_jitter": "0.3", "size": "[w, h] birth box (point)", "area": "box | circle", "direction": "degrees, 0 = up", "spread": "cone degrees (30)", "speed": "px/s (200)", "speed_jitter": "0.3", "gravity": "[x, y] px/s² ([0, 300])", "drag": "fraction/s", "spin": "°/s", "size_over_life": "[[life 0..1, scale]]", "opacity_over_life": "[[life, opacity]]", "color_over_life": "[[life, colour]]", "start": "s", "stop": "s", "prewarm": "bool", "seed": 0, "note": "particles: stateless per frame (scrub freely); the template's animation plays from each particle's birth"}
-                ],
+                "layout": layouts,
                 "layout_space": "the instancer's own space: its position is the layout's centre",
                 "stagger": {"each": "delay per rank (duration)", "total": "or spread all ranks over this duration", "order": "forward | reverse | center (rings out from the middle) | edges | random", "seed": 0, "note": "copy k sees time t − delay: its keys and window start later"},
                 "random": {"seed": 0, "scale": "[min, max] multiplier", "rotation": "[min, max] degrees", "opacity": "[min, max] multiplier", "position": "[x, y] ± jitter px", "time": "[min, max] extra delay seconds", "color": "[colour, colour]: a random mix (replaces the palette)"},
@@ -279,7 +280,7 @@ pub fn catalog_json() -> Value {
                 "colors": "[colour, …] one per piece in turn (animatable)",
                 "material": material,
                 "parts": {"front": "material over `material` for the part (rings/revolves: facing −axis)", "back": "…", "side": "… (rings/revolves: facing away from the axis)", "bevel": "…", "caps": "…", "inside": "rings/revolves: facing the axis"},
-                "detail": "tessellation multiplier (default 1)", "displace": "{type, scale px, octaves, seed, amount px}: pushes the surface out and in by noise (real silhouette; subdivided, stays closed)",
+                "detail": "tessellation multiplier (default 1)", "displace": "{type, scale px, octaves, seed, amount px, drift: [x,y,z] px/s}: pushes the surface out and in by noise (real silhouette; subdivided, stays closed; drift makes waves)",
                 "depth": "meshes and flat 3D layers in the same layer list share one depth test (planes cut through meshes, any order); see-through meshes (opacity, glass, blend) draw after the opaque ones",
                 "path_tracing": "export only: project settings.renderer \"path\" (samples: paths per pixel, default 64, drafts a quarter) or render --pt / snapshot --pt (--spp N): ray-traced shadows, bounced light, reflections of the scene, refraction of meshes behind glass; same camera, so meshes stand where the raster draws them. Needs a GPU with ray queries, else rasterised with a warning; depth of field is a traced thin lens, motion blur splits the samples across the shutter; a denoiser cleans few-sample frames (--no-denoise to skip) and exports accumulate frame to frame along the motion; lists with wireframes, effects, mattes or blend modes on 3D layers are rasterised"
             }

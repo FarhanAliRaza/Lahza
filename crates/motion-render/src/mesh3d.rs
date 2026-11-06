@@ -656,7 +656,7 @@ pub(crate) fn piece_colors(m: &MeshState, part: usize) -> usize {
 }
 
 /// Rows per material (GPU raster, CPU raster and path tracer agree).
-pub(crate) const MAT_ROWS: usize = 17;
+pub(crate) const MAT_ROWS: usize = 18;
 
 /// Rows of one material:
 /// 0 [base rgb linear, opacity], 1 [metallic, roughness, clear coat, its
@@ -668,7 +668,7 @@ pub(crate) const MAT_ROWS: usize = 17;
 /// bits], 10 [noise colour rgb, amount], 11 [noise roughness ±, noise bump
 /// px, 0, 0], 12 [colour map offset, w, h (bits), 1 if set], 13 [normal map
 /// the same], 14 [bump map offset, w, h, height px], 15 [uv scale x, y,
-/// offset x, y], 16 [uv rotation, 0, 0, 0].
+/// offset x, y], 16 [uv rotation, wraps, 0, 0], 17 [noise drift offset xyz, 0].
 pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64, textures: &HashMap<Arc<str>, Option<crate::images::Texture>>) -> [[f32; 4]; MAT_ROWS] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
@@ -713,6 +713,7 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
         let (c, amount) = n.color.map(|c| (lin(c), n.amount)).unwrap_or(([0.0; 3], 0.0));
         rows[10] = [c[0], c[1], c[2], amount as f32];
         rows[11] = [n.roughness as f32, n.bump as f32, if n.world { 1.0 } else { 0.0 }, 0.0];
+        rows[17] = [n.field.offset[0] as f32, n.field.offset[1] as f32, n.field.offset[2] as f32, 0.0];
     }
     let texture = |path: &Option<Arc<str>>| path.as_ref().and_then(|p| textures.get(p).copied().flatten());
     if let Some(t) = texture(&mat.map) {
@@ -1703,7 +1704,7 @@ fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps:
         // Core codes: 0 value, 1 fbm, 2 cellular; the rows store code + 1.
         let code = kind - 1;
         let (inv, octaves, seed) = (r9[1], r9[2] as u32, r9[3].to_bits());
-        let q = fmul(fadd(fadd(fmul(nps[0], b[0]), fmul(nps[1], b[1])), fmul(nps[2], b[2])), inv);
+        let q = fmul(fadd(fadd(fadd(fmul(nps[0], b[0]), fmul(nps[1], b[1])), fmul(nps[2], b[2])), f3(m[row + 17])), inv);
         let v = sample(code, q, octaves, seed);
         let (r10, r11) = (m[row + 10], m[row + 11]);
         base = std::array::from_fn(|c| base[c] * (1.0 - r10[3] * v) + r10[c] * (r10[3] * v));

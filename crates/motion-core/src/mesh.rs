@@ -278,7 +278,7 @@ impl MeshParams {
             }
         }
         if let Some((field, amount)) = &self.displace {
-            [10.0, field.kind.code() as f64, field.scale, field.octaves as f64, field.seed as f64, *amount].iter().for_each(|v| f(*v));
+            [10.0, field.kind.code() as f64, field.scale, field.octaves as f64, field.seed as f64, *amount, field.offset[0], field.offset[1], field.offset[2]].iter().for_each(|v| f(*v));
         }
         k.extend_from_slice(text.as_bytes());
         k
@@ -1599,7 +1599,7 @@ mod tests {
     /// facing out; the same parameters give the same rock.
     #[test]
     fn displacement_roughens_without_cracks() {
-        let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 30.0, octaves: 4, seed: 7 };
+        let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 30.0, octaves: 4, seed: 7, offset: [0.0; 3] };
         let mut p = params(MeshShape::Sphere { radius: 100.0 });
         p.displace = Some((field, 12.0));
         let m = generate(&p).unwrap();

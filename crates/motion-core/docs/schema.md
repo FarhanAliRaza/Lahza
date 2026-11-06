@@ -331,7 +331,7 @@ colour.
 Depth scales with `scale` (times `transform.scale_z`, default 1).
 
 Material: `preset` (`matte`, `plastic`, `glossy`, `coated`, `metal`,
-`chrome`, `brushed`, `velvet`, `glass`, `emissive`, `flat`, `shadow`) then any of `color`,
+`chrome`, `brushed`, `velvet`, `liquid`, `glass`, `emissive`, `flat`, `shadow`) then any of `color`,
 `metallic` (0..1), `roughness` (0 mirror … 1 diffuse), `clearcoat` (0..1),
 `clearcoat_roughness`, `emissive` (colour), `emissive_strength`, `opacity`,
 `transmission` (0..1, glass), `ior` (glass: 1 no bending, 1.45 default,
@@ -359,7 +359,7 @@ Surface detail (raster and path tracer alike):
 
 | field | meaning |
 |---|---|
-| `noise` | procedural noise on the surface, no UVs needed: `{"type": "fbm" (default) \| "value" \| "cellular", "scale": px feature size (40), "octaves": 4, "seed": 0, "space": "object" (moves with the mesh) \| "world", "color": colour where the noise is high, "amount": 0..1 toward it (1), "roughness": ± roughness, "bump": px of apparent height}` (scale, colour, amount, roughness and bump animatable) |
+| `noise` | procedural noise on the surface, no UVs needed: `{"type": "fbm" (default) \| "value" \| "cellular", "scale": px feature size (40), "octaves": 4, "seed": 0, "space": "object" (moves with the mesh) \| "world", "drift": [x, y, z] px/s the noise flows (ripples, boiling), "color": colour where the noise is high, "amount": 0..1 toward it (1), "roughness": ± roughness, "bump": px of apparent height}` (scale, colour, amount, roughness and bump animatable) |
 | `map` | an image (project path) over the UVs, multiplying `color` |
 | `normal_map` | a tangent-space normal map (green up) |
 | `bump_map`, `bump` | a height image (bright = raised) and its height in px (2) |
@@ -369,9 +369,19 @@ UVs run 0..1 across each flat face of planes, boxes and extrusions,
 around (u) and along (v) cylinders, capsules and revolves (caps planar),
 over spheres equirectangularly, and around and across a ring's tube.
 A mesh's `displace` pushes its surface out and in for real (the
-silhouette changes): `{"type", "scale", "octaves", "seed", "amount": px}`;
+silhouette changes): `{"type", "scale", "octaves", "seed", "amount": px, "drift": [x, y, z] px/s}`;
 the mesh is subdivided to the noise's scale (up to 200k triangles) and
 stays closed.
+
+A liquid is a clear surface whose ripples flow: preset `liquid` (ior
+1.33, a gentle ripple bump) with a drifting `noise` (and, for waves that
+break the silhouette, a drifting `displace`):
+
+```json
+{"id": "acid", "kind": "mesh", "mesh": {"type": "plane", "size": [1600, 900]}, "transform": {"position": [960, 700], "rotation_x": 75},
+ "material": {"preset": "liquid", "color": "#c8ffb0", "noise": {"scale": 60, "bump": 3, "drift": [30, 0, 25]}},
+ "displace": {"scale": 140, "amount": 6, "drift": [0, 40, 0]}}
+```
 
 ```json
 {"id": "rock", "kind": "mesh", "mesh": {"type": "sphere", "radius": 120},

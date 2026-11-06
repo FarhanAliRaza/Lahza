@@ -2480,6 +2480,10 @@ pub struct SurfaceNoise {
     pub seed: u32,
     #[serde(default)]
     pub space: NoiseSpace,
+    /// px/s the noise moves through the surface ([x, y, z]): ripples,
+    /// flowing liquid, boiling crust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<crate::value::Vec3>,
     /// The colour the surface turns to where the noise is high.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<Property<Color>>,
@@ -2531,6 +2535,9 @@ pub struct Displace {
     pub seed: u32,
     /// px out (and in) at the noise's extremes.
     pub amount: Property<f64>,
+    /// px/s the noise moves (the surface ripples; regenerated each frame).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<crate::value::Vec3>,
 }
 
 impl Material {
@@ -2554,6 +2561,9 @@ pub enum MaterialPreset {
     Brushed,
     /// Fabric: matte with a soft sheen at the edges.
     Velvet,
+    /// Water: clear, ior 1.33, with a gentle ripple bump (give its noise a
+    /// `drift` to make it move).
+    Liquid,
     Glass,
     Emissive,
     /// Unlit flat colour.

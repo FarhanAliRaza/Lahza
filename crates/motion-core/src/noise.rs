@@ -31,20 +31,22 @@ impl NoiseKind {
 }
 
 /// A noise field: `kind` at feature size `scale` (px), `octaves` (fbm),
-/// `seed`.
+/// `seed`, moved by `offset` (px: drifting noise animates).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Field {
     pub kind: NoiseKind,
     pub scale: f64,
     pub octaves: u32,
     pub seed: u32,
+    pub offset: [f64; 3],
 }
 
 impl Field {
     /// The value at point p (px), 0..1.
     pub fn at(&self, p: [f64; 3]) -> f64 {
         let s = 1.0 / self.scale.max(1e-3) as f32;
-        let q = [p[0] as f32 * s, p[1] as f32 * s, p[2] as f32 * s];
+        let p = [(p[0] + self.offset[0]) as f32, (p[1] + self.offset[1]) as f32, (p[2] + self.offset[2]) as f32];
+        let q = [p[0] * s, p[1] * s, p[2] * s];
         sample(self.kind.code(), q, self.octaves, self.seed) as f64
     }
 }

@@ -124,6 +124,22 @@ impl MaterialState {
             MaterialPreset::Chrome => MaterialState { metallic: 1.0, roughness: 0.06, ..base },
             MaterialPreset::Brushed => MaterialState { metallic: 1.0, roughness: 0.3, anisotropy: 0.8, ..base },
             MaterialPreset::Velvet => MaterialState { roughness: 0.9, specular: 0.2, sheen: 1.0, sheen_roughness: 0.4, ..base },
+            MaterialPreset::Liquid => MaterialState {
+                roughness: 0.02,
+                transmission: 1.0,
+                ior: 1.33,
+                thickness: 400.0,
+                color: Color([0.92, 0.97, 1.0, 1.0]),
+                noise: Some(NoiseState {
+                    field: crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 80.0, octaves: 3, seed: 0, offset: [0.0; 3] },
+                    world: false,
+                    color: None,
+                    amount: 0.0,
+                    roughness: 0.0,
+                    bump: 2.0,
+                }),
+                ..base
+            },
             MaterialPreset::Glass => MaterialState { roughness: 0.04, transmission: 0.92, ..base },
             MaterialPreset::Emissive => MaterialState { roughness: 0.5, ..base },
             MaterialPreset::Flat => MaterialState { unlit: true, ..base },
@@ -247,6 +263,7 @@ pub(super) struct CMaterial {
 }
 
 pub(super) struct CNoise {
+    drift: Option<[f64; 3]>,
     kind: crate::noise::NoiseKind,
     scale: Prop<f64>,
     octaves: u32,
@@ -298,14 +315,17 @@ impl CMaterial {
         m.specular_tint = colour(&self.specular_tint, m.specular_tint);
         m.sheen_color = colour(&self.sheen_color, m.sheen_color);
         m.clearcoat_color = colour(&self.clearcoat_color, m.clearcoat_color);
-        m.noise = self.noise.as_ref().map(|n| NoiseState {
-            field: crate::noise::Field { kind: n.kind, scale: n.scale.at(t).max(0.1), octaves: n.octaves.clamp(1, 8), seed: n.seed },
+        // A material's own noise replaces its preset's (the liquid ripple).
+        if let Some(n) = self.noise.as_ref().map(|n| NoiseState {
+            field: crate::noise::Field { kind: n.kind, scale: n.scale.at(t).max(0.1), octaves: n.octaves.clamp(1, 8), seed: n.seed, offset: n.drift.map(|d| [d[0] * t, d[1] * t, d[2] * t]).unwrap_or([0.0; 3]) },
             world: n.world,
             color: n.color.as_ref().map(|c| clamp_color(c.at(t))),
             amount: n.amount.at(t).clamp(0.0, 1.0),
             roughness: n.roughness.as_ref().map(|r| r.at(t)).unwrap_or(0.0).clamp(-1.0, 1.0),
             bump: n.bump.as_ref().map(|b| b.at(t)).unwrap_or(0.0).clamp(-1000.0, 1000.0),
-        });
+        }) {
+            m.noise = Some(n);
+        }
         m.map = self.map.clone();
         m.normal_map = self.normal_map.clone();
         m.bump_map = self.bump_map.clone();
@@ -340,7 +360,7 @@ pub(super) struct CMesh {
     segments: u32,
     gap: Prop<f64>,
     detail: f64,
-    displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>)>,
+    displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>, [f64; 3])>,
     /// Last parameters, so unchanged frames share one `Arc` (and one
     /// cached mesh in the renderer).
     last: std::sync::Mutex<Option<Arc<MeshParams>>>,
@@ -452,6 +472,7 @@ impl Compiler<'_> {
             clearcoat_color: m.clearcoat_color.as_ref().map(|p| self.prop(p, id, &w("clearcoat_color"), start, step, shift)),
             dispersion: m.dispersion.as_ref().map(|p| self.prop(p, id, &w("dispersion"), start, step, shift)),
             noise: m.noise.as_ref().map(|n| CNoise {
+                drift: n.drift.map(|d| d.0),
                 kind: n.kind,
                 scale: self.prop(&n.scale, id, &w("noise.scale"), start, step, shift),
                 octaves: n.octaves,
@@ -531,7 +552,7 @@ impl Compiler<'_> {
             self.errors.push(format!("{id}.segments: must be at least 1"));
         }
         let displace = m.displace.as_ref().map(|d| {
-            (d.kind, self.prop(&d.scale, id, "displace.scale", start, step, shift), d.octaves, d.seed, self.prop(&d.amount, id, "displace.amount", start, step, shift))
+            (d.kind, self.prop(&d.scale, id, "displace.scale", start, step, shift), d.octaves, d.seed, self.prop(&d.amount, id, "displace.amount", start, step, shift), d.drift.map(|v| v.0).unwrap_or([0.0; 3]))
         });
         CMesh {
             displace,
@@ -796,8 +817,8 @@ impl CMesh {
                 MeshShape::Sweep { path: path(p), radius: radius.at(t), width: width.at(t), profile: *profile, trim: [tr.x(), tr.y()], caps: *caps, head: head.at(t) }
             }
         };
-        let displace = self.displace.as_ref().map(|(kind, scale, octaves, seed, amount)| {
-            (crate::noise::Field { kind: *kind, scale: scale.at(t).max(0.5), octaves: (*octaves).clamp(1, 8), seed: *seed }, amount.at(t))
+        let displace = self.displace.as_ref().map(|(kind, scale, octaves, seed, amount, drift)| {
+            (crate::noise::Field { kind: *kind, scale: scale.at(t).max(0.5), octaves: (*octaves).clamp(1, 8), seed: *seed, offset: [drift[0] * t, drift[1] * t, drift[2] * t] }, amount.at(t))
         });
         let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone(), screen, displace };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());

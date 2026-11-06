@@ -923,3 +923,27 @@ fn looks_tone_map_and_bloom() {
         crate::tests::assert_gpu_matches_cpu_within(&shot(look), &[0.0], 0.0005);
     }
 }
+
+/// Liquids: drifting noise makes ripples move (frames differ) and a
+/// drifting displacement moves the surface; the `liquid` preset ripples.
+#[test]
+fn drifting_noise_ripples() {
+    let water = |t: f64, displace: bool| {
+        let mut l = json!({"id": "w", "kind": "mesh", "mesh": {"type": "plane", "size": [300, 220]}, "material": {"preset": "liquid", "color": "#80c0ff", "noise": {"scale": 30, "bump": 4, "drift": [40, 0, 20]}},
+            "transform": {"position": [160, 120], "rotation_x": 60}});
+        if displace {
+            l["displace"] = json!({"scale": 60, "amount": 10, "drift": [0, 30, 0]});
+        }
+        let mut p = scene(320, 240, json!({"layers": [l], "lights": [{"from": [-1, -1, -1]}], "environment": {"preset": "studio"}}));
+        p.settings.duration = 4.0;
+        render(&p, t)
+    };
+    assert_ne!(water(0.0, false), water(1.0, false), "the ripples move");
+    assert_eq!(water(1.0, false), water(1.0, false), "deterministic");
+    assert_ne!(water(0.0, true), water(1.0, true));
+    let mut still = scene(320, 240, json!({"layers": [{"id": "w", "kind": "mesh", "mesh": {"type": "plane", "size": [300, 220]}, "material": {"preset": "liquid"}, "transform": {"position": [160, 120], "rotation_x": 60}}], "lights": [{"from": [-1, -1, -1]}]}));
+    still.settings.duration = 4.0;
+    let c = Compiled::new(&still);
+    let lahza_motion_core::compile::Content::Mesh(m) = &c.frame(0.0).layers[0].content else { panic!() };
+    assert!(m.materials[0].noise.is_some_and(|n| n.bump > 0.0), "the liquid preset ripples");
+}
