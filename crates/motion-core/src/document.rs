@@ -1856,6 +1856,88 @@ pub enum Layout {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         align: bool,
     },
+    /// Particles: the template is a particle, born `rate` per second over
+    /// the `area` and flying off (see `Emitter`).
+    Emitter(Box<Emitter>),
+}
+
+/// A particle emitter: copies are particles born at a steady rate, flying
+/// from their birth point with gravity and drag, living `lifetime` s;
+/// their size, opacity and colour follow curves over their life (0..1).
+/// Stateless: any frame is worked out on its own (scrub freely), and the
+/// same seed gives the same particles. The template's own animation plays
+/// from each particle's birth.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Emitter {
+    /// Particles per second.
+    pub rate: f64,
+    /// Seconds each lives (default 2), ± `lifetime_jitter` of it (0.3).
+    #[serde(default = "two_f64")]
+    pub lifetime: f64,
+    #[serde(default = "point_three")]
+    pub lifetime_jitter: f64,
+    /// Where they are born: a `size` box (default a point) or the ellipse in it.
+    #[serde(default = "zero_vec2")]
+    pub size: Vec2,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub area: Area,
+    /// Launch: degrees (0 = up, clockwise), cone width, speed px/s ±
+    /// `speed_jitter` of it.
+    #[serde(default)]
+    pub direction: f64,
+    #[serde(default = "thirty")]
+    pub spread: f64,
+    #[serde(default = "two_hundred_f64")]
+    pub speed: f64,
+    #[serde(default = "point_three")]
+    pub speed_jitter: f64,
+    /// px/s² (y down: [0, 300] falls).
+    #[serde(default = "gravity_default")]
+    pub gravity: Vec2,
+    /// Air resistance: speed lost per second as a fraction (0: none).
+    #[serde(default)]
+    pub drag: f64,
+    /// Degrees per second, each particle a random amount up to this either way.
+    #[serde(default)]
+    pub spin: f64,
+    /// Over life (0 born … 1 gone): [[life, scale]], [[life, opacity]],
+    /// [[life, colour]] (the colour tints the template).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub size_over_life: Vec<(f64, f64)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opacity_over_life: Vec<(f64, f64)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub color_over_life: Vec<(f64, Color)>,
+    /// Emitting from `start` (s, the layer's time) until `stop`.
+    #[serde(default)]
+    pub start: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<f64>,
+    /// Begin already full (as if it had been emitting for a lifetime).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prewarm: bool,
+    #[serde(default)]
+    pub seed: u32,
+}
+
+fn two_f64() -> f64 {
+    2.0
+}
+fn point_three() -> f64 {
+    0.3
+}
+fn thirty() -> f64 {
+    30.0
+}
+fn two_hundred_f64() -> f64 {
+    200.0
+}
+fn zero_vec2() -> Vec2 {
+    Vec2([0.0, 0.0])
+}
+fn gravity_default() -> Vec2 {
+    Vec2([0.0, 300.0])
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

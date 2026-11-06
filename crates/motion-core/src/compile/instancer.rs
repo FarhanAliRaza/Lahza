@@ -37,6 +37,7 @@ enum CLayout {
     /// Unit positions in [-0.5, 0.5]², scaled by `size`.
     Random { unit: Vec<(f64, f64)>, size: Prop<Vec2> },
     Path { target: Option<usize>, offset: Prop<f64>, align: bool },
+    Emitter(Box<crate::document::Emitter>),
 }
 
 struct CField {
@@ -139,6 +140,14 @@ impl Compiler<'_> {
                     })
                     .collect();
                 (CLayout::Random { unit, size: self.prop(size, id, "layout.size", start, step, shift) }, *count as u64)
+            }
+            Layout::Emitter(e) => {
+                if !(e.rate > 0.0 && e.lifetime > 0.0) {
+                    self.errors.push(format!("{id}.layout: an emitter needs a positive rate and lifetime"));
+                }
+                // Slots: the most particles alive at once.
+                let slots = (e.rate.max(0.0) * e.lifetime.max(0.0) * (1.0 + e.lifetime_jitter.clamp(0.0, 1.0))).ceil();
+                (CLayout::Emitter(e.clone()), slots as u64)
             }
             Layout::Path { count, layer, offset, align } => {
                 let target = match siblings.get(layer.as_str()) {
@@ -533,7 +542,101 @@ fn points(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, inherite
                 .collect()
         }
         CLayout::Path { target: None, .. } => Vec::new(),
+        // Particles are placed by `emit_particles`.
+        CLayout::Emitter(_) => Vec::new(),
     }
+}
+
+/// The value of a curve over life (pairs sorted by life) at `f`; `d` with
+/// none.
+fn over_life(curve: &[(f64, f64)], f: f64, d: f64) -> f64 {
+    let Some(first) = curve.first() else { return d };
+    if f <= first.0 {
+        return first.1;
+    }
+    for w in curve.windows(2) {
+        if f <= w[1].0 {
+            let k = (f - w[0].0) / (w[1].0 - w[0].0).max(1e-9);
+            return w[0].1 + (w[1].1 - w[0].1) * k;
+        }
+    }
+    curve.last().map(|c| c.1).unwrap_or(d)
+}
+
+fn colour_over_life(curve: &[(f64, Color)], f: f64) -> Option<Color> {
+    let first = curve.first()?;
+    if f <= first.0 {
+        return Some(first.1);
+    }
+    for w in curve.windows(2) {
+        if f <= w[1].0 {
+            let k = ((f - w[0].0) / (w[1].0 - w[0].0).max(1e-9)) as f32 as f64;
+            return Some(Color(std::array::from_fn(|c| w[0].1 .0[c] + (w[1].1 .0[c] - w[0].1 .0[c]) * k)));
+        }
+    }
+    curve.last().map(|c| c.1)
+}
+
+/// A particle at emitter time `tau`, in slot `j` of `slots`: its place,
+/// rotation, scale, opacity, colour and age, or None when the slot is empty.
+pub(super) fn particle(e: &crate::document::Emitter, slots: usize, j: usize, tau: f64) -> Option<(f64, f64, f64, f64, f64, Option<Color>, f64)> {
+    if slots == 0 || e.rate <= 0.0 {
+        return None;
+    }
+    let tau = if e.prewarm { tau + e.lifetime * (1.0 + e.lifetime_jitter.clamp(0.0, 1.0)) } else { tau };
+    if tau < 0.0 {
+        return None;
+    }
+    // The newest particle of this slot already born (and before `stop`).
+    let n = slots as i64;
+    let born = (tau * e.rate).floor() as i64;
+    let mut i = j as i64 + n * ((born - j as i64).div_euclid(n));
+    if i > born {
+        i -= n;
+    }
+    if let Some(stop) = e.stop {
+        let shift = if e.prewarm { e.lifetime * (1.0 + e.lifetime_jitter.clamp(0.0, 1.0)) } else { 0.0 };
+        while i >= 0 && i as f64 / e.rate > stop - e.start + shift {
+            i -= n;
+        }
+    }
+    if i < 0 {
+        return None;
+    }
+    let k = i as usize;
+    let r = |c: u32| rand(e.seed, k, 100 + c);
+    let age = tau - i as f64 / e.rate;
+    let life = e.lifetime * (1.0 + e.lifetime_jitter.clamp(0.0, 1.0) * (2.0 * r(0) - 1.0));
+    if age < 0.0 || age >= life {
+        return None;
+    }
+    let (u, v) = (r(1), r(2));
+    let (x0, y0) = match e.area {
+        Area::Box => ((u - 0.5) * e.size.x(), (v - 0.5) * e.size.y()),
+        Area::Circle => {
+            let (rr, a) = (u.sqrt() / 2.0, v * std::f64::consts::TAU);
+            (rr * a.cos() * e.size.x(), rr * a.sin() * e.size.y())
+        }
+    };
+    let a = (e.direction + e.spread * (r(3) - 0.5)).to_radians();
+    let speed = e.speed * (1.0 + e.speed_jitter.clamp(0.0, 1.0) * (2.0 * r(4) - 1.0));
+    let (vx, vy) = (speed * a.sin(), -speed * a.cos());
+    let (gx, gy) = (e.gravity.x(), e.gravity.y());
+    // Ballistic flight with linear drag k: x = v(1 − e^(−kt))/k + g(t/k − (1 − e^(−kt))/k²).
+    let k = e.drag.max(0.0);
+    let (fv, fg) = if k > 1e-6 {
+        let d = (1.0 - (-k * age).exp()) / k;
+        (d, (age - d) / k)
+    } else {
+        (age, age * age / 2.0)
+    };
+    let x = x0 + vx * fv + gx * fg;
+    let y = y0 + vy * fv + gy * fg;
+    let f = age / life;
+    let rotation = e.spin * (2.0 * r(5) - 1.0) * age;
+    let scale = over_life(&e.size_over_life, f, 1.0);
+    let opacity = over_life(&e.opacity_over_life, f, 1.0);
+    Some((x, y, rotation, scale, opacity, colour_over_life(&e.color_over_life, f), age))
 }
 
 /// Emits every visible copy of instancer `i`'s template. `inner` is the
@@ -541,6 +644,25 @@ fn points(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, inherite
 /// copies are delayed from.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, step: Option<Step>, inherited: Option<Step>, space: &Space, inner: &Space, opacity: f64, cache: &mut [Option<Mat4>], out: &mut Vec<LayerState>) {
+    if let CLayout::Emitter(e) = &n.layout {
+        // Particles: each slot's newest live particle; the template plays
+        // from its birth.
+        for j in 0..n.copies.len() {
+            let Some((x, y, rotation, scale, alpha, colour, age)) = particle(e, n.copies.len(), j, t - e.start) else { continue };
+            let alpha = alpha.clamp(0.0, 1.0);
+            if alpha <= 0.0 || scale <= 0.0 {
+                continue;
+            }
+            let m = Mat4::translate(x, y, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, scale.abs()));
+            let copy = Space { world: inner.world.then(m), ..*inner };
+            let first = out.len();
+            emit(&n.layers, age, step, &copy, opacity * alpha, out);
+            if let Some(c) = colour {
+                out[first..].iter_mut().for_each(|s| tint(s, c, 1.0));
+            }
+        }
+        return;
+    }
     let points = points(n, layers, i, tc, t, inherited, space, cache);
     let fields: Vec<FieldNow> = n.fields.iter().map(|f| f.now(t)).collect();
     for (base, &(px, py, angle)) in n.copies.iter().zip(&points) {
@@ -633,6 +755,40 @@ mod tests {
 
     fn near(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    /// Particles: as many alive as rate × life, deterministic, falling
+    /// under gravity as they age, shrinking and colouring over life; a
+    /// prewarmed emitter starts full and a stopped one empties.
+    #[test]
+    fn emitters_make_particles() {
+        let emitter = |extra: serde_json::Value| {
+            let mut e = json!({"type": "emitter", "rate": 40, "lifetime": 1, "lifetime_jitter": 0, "speed": 100, "speed_jitter": 0, "spread": 0, "gravity": [0, 400], "seed": 5,
+                "size_over_life": [[0, 1], [1, 0.25]], "color_over_life": [[0, "#ffffff"], [1, "#ff0000"]]});
+            for (k, v) in extra.as_object().unwrap() {
+                e[k] = v.clone();
+            }
+            e
+        };
+        let c = compiled(json!([dots(emitter(json!({})), json!({}))]));
+        let f = c.frame(1.5);
+        let p = copies(&f, "dot");
+        assert!((38..=41).contains(&p.len()), "alive: {}", p.len());
+        assert_eq!(copies(&c.frame(1.5), "dot"), p, "deterministic");
+        // Launched up at 100 px/s, gravity 400: the oldest have turned and fall.
+        let (young, old): (Vec<_>, Vec<_>) = p.iter().partition(|q| q.2 > 0.7);
+        let mean_y = |v: &[&(f64, f64, f64, f64)]| v.iter().map(|q| q.1).sum::<f64>() / v.len() as f64;
+        assert!(!young.is_empty() && !old.is_empty());
+        assert!(mean_y(&old) > mean_y(&young), "older particles are lower: {} vs {}", mean_y(&old), mean_y(&young));
+        // Older is smaller and redder.
+        let reds: Vec<_> = f.layers.iter().filter(|l| &*l.id == "dot").map(|l| fill(l)).collect();
+        assert!(reds.iter().any(|c| c[1] < 0.5) && reds.iter().any(|c| c[1] > 0.8), "white to red over life");
+        // Nothing before the start; prewarm starts full; stop empties.
+        assert!(copies(&compiled(json!([dots(emitter(json!({"start": 1})), json!({}))])).frame(0.5), "dot").is_empty());
+        assert!(copies(&compiled(json!([dots(emitter(json!({"prewarm": true})), json!({}))])).frame(0.0), "dot").len() >= 38);
+        let stopped = compiled(json!([dots(emitter(json!({"stop": 1})), json!({}))]));
+        assert!(!copies(&stopped.frame(1.5), "dot").is_empty());
+        assert!(copies(&stopped.frame(2.1), "dot").is_empty(), "all gone a lifetime after stop");
     }
 
     #[test]

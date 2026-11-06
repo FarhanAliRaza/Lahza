@@ -174,6 +174,25 @@ Layouts (`type`): `grid` (`columns`, `rows`, `spacing`, `hex`), `radial`
 as drawn, `offset` slides them along it, `align`). `spacing`, `radius`,
 `start`, `sweep`, `from`, `to`, `size` and `offset` are animatable.
 
+`emitter` makes the template a particle: born `rate` per second over a
+`size` box (or `area: "circle"`), launched `direction` (degrees, 0 = up)
+± `spread`/2 at `speed` px/s (± `speed_jitter`), falling with `gravity`
+[x, y] px/s² (default [0, 300]) and slowed by `drag` (fraction per s),
+spinning up to `spin` °/s, living `lifetime` s (± `lifetime_jitter`).
+`size_over_life`, `opacity_over_life` ([[life 0..1, value]]) and
+`color_over_life` ([[life, colour]], tints the template) shape each
+particle's life; the template's own animation plays from its birth.
+Emission runs from `start` (layer time) to `stop`; `prewarm` starts full.
+It is worked out per frame from the seed (scrub freely, frames repeat).
+
+```json
+{"id": "bubbles", "kind": "instancer", "transform": {"position": [960, 1000]},
+ "layout": {"type": "emitter", "rate": 30, "lifetime": 3, "size": [600, 0], "speed": 180, "spread": 20,
+            "gravity": [0, -60], "drag": 0.5, "size_over_life": [[0, 0.3], [0.2, 1], [1, 1.2]],
+            "opacity_over_life": [[0, 0], [0.1, 0.9], [1, 0]]},
+ "layers": [{"id": "bubble", "kind": "shape", "shape": "circle", "size": 18, "stroke": {"color": "#ffffff", "width": 2}}]}
+```
+
 Per copy:
 
 - `stagger`: copy k sees time `t − delay`, its rank in `order`
