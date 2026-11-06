@@ -25,7 +25,7 @@ pub struct MeshState {
     pub lens: Option<[f64; 2]>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MaterialState {
     pub color: Color,
     pub metallic: f64,
@@ -58,6 +58,27 @@ pub struct MaterialState {
     pub clearcoat_color: Color,
     /// 1 / Abbe number.
     pub dispersion: f64,
+    pub noise: Option<NoiseState>,
+    /// Image maps (project paths).
+    pub map: Option<Arc<str>>,
+    pub normal_map: Option<Arc<str>>,
+    pub bump_map: Option<Arc<str>>,
+    /// bump_map's height, px.
+    pub bump: f64,
+    /// UV scale x, y, offset x, y, rotation (radians).
+    pub uv: [f64; 5],
+}
+
+/// Surface noise at a moment (see `document::SurfaceNoise`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoiseState {
+    pub field: crate::noise::Field,
+    pub world: bool,
+    /// The colour at the noise's peaks and how far toward it.
+    pub color: Option<Color>,
+    pub amount: f64,
+    pub roughness: f64,
+    pub bump: f64,
 }
 
 impl MaterialState {
@@ -87,6 +108,12 @@ impl MaterialState {
             sheen_roughness: 0.5,
             clearcoat_color: Color::WHITE,
             dispersion: 0.0,
+            noise: None,
+            map: None,
+            normal_map: None,
+            bump_map: None,
+            bump: 2.0,
+            uv: [1.0, 1.0, 0.0, 0.0, 0.0],
         };
         match p {
             MaterialPreset::Matte => MaterialState { roughness: 0.85, ..base },
@@ -207,6 +234,24 @@ pub(super) struct CMaterial {
     sheen_roughness: Option<Prop<f64>>,
     clearcoat_color: Option<Prop<Color>>,
     dispersion: Option<Prop<f64>>,
+    noise: Option<CNoise>,
+    map: Option<Arc<str>>,
+    normal_map: Option<Arc<str>>,
+    bump_map: Option<Arc<str>>,
+    bump: Option<Prop<f64>>,
+    uv: Option<(Prop<crate::value::Vec2>, Prop<crate::value::Vec2>, Prop<f64>)>,
+}
+
+pub(super) struct CNoise {
+    kind: crate::noise::NoiseKind,
+    scale: Prop<f64>,
+    octaves: u32,
+    seed: u32,
+    world: bool,
+    color: Option<Prop<Color>>,
+    amount: Prop<f64>,
+    roughness: Option<Prop<f64>>,
+    bump: Option<Prop<f64>>,
 }
 
 impl CMaterial {
@@ -249,6 +294,22 @@ impl CMaterial {
         m.specular_tint = colour(&self.specular_tint, m.specular_tint);
         m.sheen_color = colour(&self.sheen_color, m.sheen_color);
         m.clearcoat_color = colour(&self.clearcoat_color, m.clearcoat_color);
+        m.noise = self.noise.as_ref().map(|n| NoiseState {
+            field: crate::noise::Field { kind: n.kind, scale: n.scale.at(t).max(0.1), octaves: n.octaves.clamp(1, 8), seed: n.seed },
+            world: n.world,
+            color: n.color.as_ref().map(|c| clamp_color(c.at(t))),
+            amount: n.amount.at(t).clamp(0.0, 1.0),
+            roughness: n.roughness.as_ref().map(|r| r.at(t)).unwrap_or(0.0).clamp(-1.0, 1.0),
+            bump: n.bump.as_ref().map(|b| b.at(t)).unwrap_or(0.0).clamp(-1000.0, 1000.0),
+        });
+        m.map = self.map.clone();
+        m.normal_map = self.normal_map.clone();
+        m.bump_map = self.bump_map.clone();
+        m.bump = f(&self.bump, m.bump, -1000.0, 1000.0);
+        if let Some((sc, off, rot)) = &self.uv {
+            let (sc, off) = (sc.at(t), off.at(t));
+            m.uv = [sc.x(), sc.y(), off.x(), off.y(), rot.at(t).to_radians()];
+        }
         m
     }
 }
@@ -275,6 +336,7 @@ pub(super) struct CMesh {
     segments: u32,
     gap: Prop<f64>,
     detail: f64,
+    displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>)>,
     /// Last parameters, so unchanged frames share one `Arc` (and one
     /// cached mesh in the renderer).
     last: std::sync::Mutex<Option<Arc<MeshParams>>>,
@@ -317,6 +379,12 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         sheen_roughness: o.sheen_roughness.clone().or_else(|| base.sheen_roughness.clone()),
         clearcoat_color: o.clearcoat_color.clone().or_else(|| base.clearcoat_color.clone()),
         dispersion: o.dispersion.clone().or_else(|| base.dispersion.clone()),
+        noise: o.noise.clone().or_else(|| base.noise.clone()),
+        map: o.map.clone().or_else(|| base.map.clone()),
+        normal_map: o.normal_map.clone().or_else(|| base.normal_map.clone()),
+        bump_map: o.bump_map.clone().or_else(|| base.bump_map.clone()),
+        bump: o.bump.clone().or_else(|| base.bump.clone()),
+        uv: o.uv.clone().or_else(|| base.uv.clone()),
     }
 }
 
@@ -379,6 +447,22 @@ impl Compiler<'_> {
             sheen_roughness: m.sheen_roughness.as_ref().map(|p| self.prop(p, id, &w("sheen_roughness"), start, step, shift)),
             clearcoat_color: m.clearcoat_color.as_ref().map(|p| self.prop(p, id, &w("clearcoat_color"), start, step, shift)),
             dispersion: m.dispersion.as_ref().map(|p| self.prop(p, id, &w("dispersion"), start, step, shift)),
+            noise: m.noise.as_ref().map(|n| CNoise {
+                kind: n.kind,
+                scale: self.prop(&n.scale, id, &w("noise.scale"), start, step, shift),
+                octaves: n.octaves,
+                seed: n.seed,
+                world: n.space == crate::document::NoiseSpace::World,
+                color: n.color.as_ref().map(|p| self.prop(p, id, &w("noise.color"), start, step, shift)),
+                amount: self.prop(&n.amount, id, &w("noise.amount"), start, step, shift),
+                roughness: n.roughness.as_ref().map(|p| self.prop(p, id, &w("noise.roughness"), start, step, shift)),
+                bump: n.bump.as_ref().map(|p| self.prop(p, id, &w("noise.bump"), start, step, shift)),
+            }),
+            map: m.map.as_deref().map(Arc::from),
+            normal_map: m.normal_map.as_deref().map(Arc::from),
+            bump_map: m.bump_map.as_deref().map(Arc::from),
+            bump: m.bump.as_ref().map(|p| self.prop(p, id, &w("bump"), start, step, shift)),
+            uv: m.uv.as_ref().map(|u| (self.prop(&u.scale, id, &w("uv.scale"), start, step, shift), self.prop(&u.offset, id, &w("uv.offset"), start, step, shift), self.prop(&u.rotation, id, &w("uv.rotation"), start, step, shift))),
         }
     }
 
@@ -442,7 +526,11 @@ impl Compiler<'_> {
         if m.segments == 0 {
             self.errors.push(format!("{id}.segments: must be at least 1"));
         }
+        let displace = m.displace.as_ref().map(|d| {
+            (d.kind, self.prop(&d.scale, id, "displace.scale", start, step, shift), d.octaves, d.seed, self.prop(&d.amount, id, "displace.amount", start, step, shift))
+        });
         CMesh {
+            displace,
             shape,
             materials,
             own_color,
@@ -692,7 +780,10 @@ impl CMesh {
                 MeshShape::Sweep { path: path(p), radius: radius.at(t), width: width.at(t), profile: *profile, trim: [tr.x(), tr.y()], caps: *caps, head: head.at(t) }
             }
         };
-        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone(), screen };
+        let displace = self.displace.as_ref().map(|(kind, scale, octaves, seed, amount)| {
+            (crate::noise::Field { kind: *kind, scale: scale.at(t).max(0.5), octaves: (*octaves).clamp(1, 8), seed: *seed }, amount.at(t))
+        });
+        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone(), screen, displace };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         match &*last {
             Some(p) if **p == params => p.clone(),

@@ -2045,6 +2045,9 @@ pub struct MeshLayer {
     /// Tessellation (1 = smooth at the drawn size; 2 = twice as fine).
     #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")]
     pub detail: f64,
+    /// Pushes the surface out and in by noise (real bumps on the silhouette).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displace: Option<Displace>,
 }
 
 fn one_u32() -> u32 {
@@ -2275,12 +2278,118 @@ pub struct Material {
     /// flint; more for a stylised prism). Path tracing only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispersion: Option<Property<f64>>,
+    /// Procedural noise on the surface (no UVs needed): colour variation,
+    /// roughness variation and bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise: Option<SurfaceNoise>,
+    /// An image (project path) over the surface's UVs, multiplying its
+    /// colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<String>,
+    /// A tangent-space normal map (project path; OpenGL convention, green up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_map: Option<String>,
+    /// A height image (project path): bright is raised, by `bump` px.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bump_map: Option<String>,
+    /// Height of `bump_map`'s white, px (default 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bump: Option<Property<f64>>,
+    /// How the maps lie on the UVs: tiling, offset, rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv: Option<UvTransform>,
     /// Ignore lights: the flat colour (flat-shaded idents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlit: Option<bool>,
     /// Faceted: one normal per triangle (low-poly look).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub faceted: Option<bool>,
+}
+
+/// Where surface noise is measured: the mesh's own space (it moves with
+/// the mesh) or the world (the mesh moves through it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoiseSpace {
+    #[default]
+    Object,
+    World,
+}
+
+fn noise_scale() -> Property<f64> {
+    Property::Constant(40.0)
+}
+fn four_u32() -> u32 {
+    4
+}
+
+/// Procedural noise on a mesh's surface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceNoise {
+    #[serde(rename = "type", default)]
+    pub kind: crate::noise::NoiseKind,
+    /// Feature size, px (default 40).
+    #[serde(default = "noise_scale")]
+    pub scale: Property<f64>,
+    /// fbm: octaves (default 4).
+    #[serde(default = "four_u32")]
+    pub octaves: u32,
+    #[serde(default)]
+    pub seed: u32,
+    #[serde(default)]
+    pub space: NoiseSpace,
+    /// The colour the surface turns to where the noise is high.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Property<Color>>,
+    /// How far toward `color` at the noise's peaks (0..1, default 1).
+    #[serde(default = "one_prop", skip_serializing_if = "is_one")]
+    pub amount: Property<f64>,
+    /// Roughness varies by ± this with the noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<Property<f64>>,
+    /// Bump: the surface seems raised by up to this many px where the
+    /// noise is high (its normal follows the noise's slope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bump: Option<Property<f64>>,
+}
+
+/// How image maps lie on a surface's UVs (0..1 across a face or around).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UvTransform {
+    /// Repeats across the UVs (default [1, 1]).
+    #[serde(default = "uv_one")]
+    pub scale: Property<crate::value::Vec2>,
+    #[serde(default = "uv_zero")]
+    pub offset: Property<crate::value::Vec2>,
+    /// Degrees.
+    #[serde(default = "zero_prop")]
+    pub rotation: Property<f64>,
+}
+
+fn uv_one() -> Property<crate::value::Vec2> {
+    Property::Constant(crate::value::Vec2([1.0, 1.0]))
+}
+fn uv_zero() -> Property<crate::value::Vec2> {
+    Property::Constant(crate::value::Vec2([0.0, 0.0]))
+}
+
+/// Displacement: the mesh's surface pushed out and in along its normals by
+/// noise (rocks, crusts), finely tessellated for it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Displace {
+    #[serde(rename = "type", default)]
+    pub kind: crate::noise::NoiseKind,
+    #[serde(default = "noise_scale")]
+    pub scale: Property<f64>,
+    #[serde(default = "four_u32")]
+    pub octaves: u32,
+    #[serde(default)]
+    pub seed: u32,
+    /// px out (and in) at the noise's extremes.
+    pub amount: Property<f64>,
 }
 
 impl Material {

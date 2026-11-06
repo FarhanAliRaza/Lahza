@@ -39,6 +39,9 @@ pub struct Mesh {
     /// Per triangle: which edges are real (bit k: the edge opposite vertex
     /// k), for wireframes; quad diagonals and cap fills are not.
     pub edges: Vec<u8>,
+    /// Per vertex: texture coordinates (0..1 across a face, around a
+    /// revolved surface, over a sphere); set at the end of `generate`.
+    pub uvs: Vec<[f32; 2]>,
 }
 
 pub fn tag(part: u32, segment: u32) -> u32 {
@@ -123,6 +126,11 @@ impl Mesh {
     }
     pub fn append(&mut self, other: &Mesh) {
         let base = self.positions.len() as u32;
+        if !other.uvs.is_empty() || !self.uvs.is_empty() {
+            self.uvs.resize(self.positions.len(), [0.0; 2]);
+            self.uvs.extend_from_slice(&other.uvs);
+            self.uvs.resize(self.positions.len() + other.positions.len(), [0.0; 2]);
+        }
         self.positions.extend_from_slice(&other.positions);
         self.normals.extend_from_slice(&other.normals);
         self.tris.extend(other.tris.iter().map(|t| t.map(|i| i + base)));
@@ -199,6 +207,8 @@ pub struct MeshParams {
     /// steps): tessellation follows the drawn size, so small profiles
     /// scaled up and far meshes both get the segments they need.
     pub screen: f64,
+    /// Displacement by noise along the normals: the field and its reach (px).
+    pub displace: Option<(crate::noise::Field, f64)>,
 }
 
 impl MeshParams {
@@ -267,6 +277,9 @@ impl MeshParams {
                 path(p, &mut f);
             }
         }
+        if let Some((field, amount)) = &self.displace {
+            [10.0, field.kind.code() as f64, field.scale, field.octaves as f64, field.seed as f64, *amount].iter().for_each(|v| f(*v));
+        }
         k.extend_from_slice(text.as_bytes());
         k
     }
@@ -321,6 +334,12 @@ impl MeshParams {
     /// Local bounds [min, max] without generating the mesh (a slightly
     /// loose box: arcs count as full rings).
     pub fn local_bounds(&self) -> Option<([f64; 3], [f64; 3])> {
+        // Displacement reaches this far out.
+        let pad = self.displace.map(|(_, a)| a.abs()).unwrap_or(0.0);
+        self.shape_bounds().map(|(lo, hi)| (lo.map(|v| v - pad), hi.map(|v| v + pad)))
+    }
+
+    fn shape_bounds(&self) -> Option<([f64; 3], [f64; 3])> {
         let sym = |x: f64, y: f64, z: f64| Some(([-x, -y, -z], [x, y, z]));
         let path_box = |m: &PathMorph| -> Option<[f64; 4]> {
             let subpaths = crate::path::morph(m, 1.0).ok()?;
@@ -507,7 +526,161 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
             sweep(&mut mesh, path, *radius, *width, *profile, *trim, *caps, *head, params.segments, params.gap, &params.spans, detail)?
         }
     }
+    set_uvs(&mut mesh, &params.shape);
+    if let Some((field, amount)) = params.displace {
+        if amount != 0.0 {
+            displace(&mut mesh, &field, amount);
+        }
+    }
     Ok(mesh)
+}
+
+/// Texture coordinates by the shape's kind: spheres equirectangular,
+/// revolved surfaces around their axis (caps planar), rings around and
+/// across the tube, flat faces planar by the axis they face.
+fn set_uvs(mesh: &mut Mesh, shape: &MeshShape) {
+    let (lo, hi) = mesh.bounds();
+    let span = |k: usize| ((hi[k] - lo[k]) as f64).max(1e-6);
+    let unit = |v: f64, k: usize| ((v - lo[k] as f64) / span(k)) as f32;
+    let around = |a: f64, b: f64| (0.5 + a.atan2(b) / TAU) as f32;
+    let planar = |p: [f64; 3], n: [f64; 3]| -> [f32; 2] {
+        let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
+        if az >= ax && az >= ay {
+            [unit(p[0], 0), unit(p[1], 1)]
+        } else if ax >= ay {
+            [unit(p[2], 2), unit(p[1], 1)]
+        } else {
+            [unit(p[0], 0), unit(p[2], 2)]
+        }
+    };
+    mesh.uvs = mesh
+        .positions
+        .iter()
+        .zip(&mesh.normals)
+        .map(|(p, n)| {
+            let p = [p[0] as f64, p[1] as f64, p[2] as f64];
+            let n = [n[0] as f64, n[1] as f64, n[2] as f64];
+            match shape {
+                MeshShape::Sphere { .. } => {
+                    let d = norm(p);
+                    [around(d[0], -d[2]), ((-d[1]).clamp(-1.0, 1.0).acos() / PI) as f32]
+                }
+                MeshShape::Cylinder { .. } | MeshShape::Capsule { .. } | MeshShape::Revolve { axis_y: true, .. } => {
+                    if n[1].abs() > 0.7 && !matches!(shape, MeshShape::Capsule { .. }) {
+                        [unit(p[0], 0), unit(p[2], 2)]
+                    } else {
+                        [around(p[0], -p[2]), unit(p[1], 1)]
+                    }
+                }
+                MeshShape::Revolve { axis_y: false, .. } => {
+                    if n[2].abs() > 0.7 {
+                        [unit(p[0], 0), unit(p[1], 1)]
+                    } else {
+                        [around(p[0], -p[1]), unit(p[2], 2)]
+                    }
+                }
+                MeshShape::Torus { radius, .. } => {
+                    let rho = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                    [around(p[0], -p[1]), around(p[2], rho - radius)]
+                }
+                MeshShape::Plane { .. } => [unit(p[0], 0), unit(p[1], 1)],
+                _ => planar(p, n),
+            }
+        })
+        .collect();
+}
+
+/// Most triangles a displaced mesh is subdivided to.
+const DISPLACE_MAX_TRIS: usize = 200_000;
+
+/// Pushes the surface along its normals by `amount` × (2·noise − 1),
+/// subdividing first until edges are a third of the noise's features.
+/// Copies of one point (hard edges) move together, so nothing cracks.
+fn displace(mesh: &mut Mesh, field: &crate::noise::Field, amount: f64) {
+    let target = (field.scale / 3.0).max(0.5);
+    loop {
+        let longest = mesh.tris.iter().map(|t| {
+            let p = t.map(|i| mesh.positions[i as usize]);
+            let d = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() as f64;
+            d(p[0], p[1]).max(d(p[1], p[2])).max(d(p[2], p[0]))
+        }).fold(0.0, f64::max);
+        if longest <= target || mesh.tris.len() * 4 > DISPLACE_MAX_TRIS {
+            break;
+        }
+        subdivide(mesh);
+    }
+    // One direction per point (welded), the average of its copies' normals.
+    let key = |p: [f32; 3]| [(p[0] * 64.0).round() as i64, (p[1] * 64.0).round() as i64, (p[2] * 64.0).round() as i64];
+    let mut dirs: std::collections::HashMap<[i64; 3], [f64; 3]> = std::collections::HashMap::new();
+    for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
+        let e = dirs.entry(key(*p)).or_insert([0.0; 3]);
+        *e = add(*e, [n[0] as f64, n[1] as f64, n[2] as f64]);
+    }
+    let moved: Vec<[f32; 3]> = mesh
+        .positions
+        .iter()
+        .map(|p| {
+            let q = [p[0] as f64, p[1] as f64, p[2] as f64];
+            let d = norm(dirs[&key(*p)]);
+            let h = amount * (2.0 * field.at(q) - 1.0);
+            [(q[0] + d[0] * h) as f32, (q[1] + d[1] * h) as f32, (q[2] + d[2] * h) as f32]
+        })
+        .collect();
+    mesh.positions = moved;
+    // Normals again, from the displaced faces (keeping each side's sense).
+    let mut acc = vec![[0.0f64; 3]; mesh.positions.len()];
+    for t in &mesh.tris {
+        let p = t.map(|i| {
+            let v = mesh.positions[i as usize];
+            [v[0] as f64, v[1] as f64, v[2] as f64]
+        });
+        let a = sub(p[1], p[0]);
+        let b = sub(p[2], p[0]);
+        let n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        for i in t {
+            acc[*i as usize] = add(acc[*i as usize], n);
+        }
+    }
+    for (n, a) in mesh.normals.iter_mut().zip(acc) {
+        let mut d = norm(a);
+        if dot(d, [n[0] as f64, n[1] as f64, n[2] as f64]) < 0.0 {
+            d = mul(d, -1.0);
+        }
+        *n = [d[0] as f32, d[1] as f32, d[2] as f32];
+    }
+}
+
+/// Splits every triangle into four at its edges' midpoints (shared, so the
+/// mesh stays watertight).
+fn subdivide(mesh: &mut Mesh) {
+    let mut mid: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    let mut point = |mesh: &mut Mesh, a: u32, b: u32| -> u32 {
+        let k = (a.min(b), a.max(b));
+        if let Some(&i) = mid.get(&k) {
+            return i;
+        }
+        let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+        let (na, nb) = (mesh.normals[a as usize], mesh.normals[b as usize]);
+        let (ua, ub) = (mesh.uvs[a as usize], mesh.uvs[b as usize]);
+        let n = norm([(na[0] + nb[0]) as f64, (na[1] + nb[1]) as f64, (na[2] + nb[2]) as f64]);
+        mesh.positions.push([(pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0, (pa[2] + pb[2]) / 2.0]);
+        mesh.normals.push([n[0] as f32, n[1] as f32, n[2] as f32]);
+        mesh.uvs.push([(ua[0] + ub[0]) / 2.0, (ua[1] + ub[1]) / 2.0]);
+        let i = (mesh.positions.len() - 1) as u32;
+        mid.insert(k, i);
+        i
+    };
+    let (tris, tags, edges) = (std::mem::take(&mut mesh.tris), std::mem::take(&mut mesh.tags), std::mem::take(&mut mesh.edges));
+    for ((t, tag), e) in tris.into_iter().zip(tags).zip(edges) {
+        let [a, b, c] = t;
+        let (ab, bc, ca) = (point(mesh, a, b), point(mesh, b, c), point(mesh, c, a));
+        // Edge k is opposite vertex k: c–a is bit 1, a–b bit 2, b–c bit 0.
+        let (e_bc, e_ca, e_ab) = (e & 1, (e >> 1) & 1, (e >> 2) & 1);
+        mesh.tri_edges(a, ab, ca, tag, (e_ca << 1) | (e_ab << 2));
+        mesh.tri_edges(ab, b, bc, tag, e_bc | (e_ab << 2));
+        mesh.tri_edges(ca, bc, c, tag, e_bc | (e_ca << 1));
+        mesh.tri_edges(ab, bc, ca, tag, 0);
+    }
 }
 
 fn steps_for(r: f64, detail: f64) -> usize {
@@ -1370,7 +1543,7 @@ mod tests {
     use super::*;
 
     fn params(shape: MeshShape) -> MeshParams {
-        MeshParams { shape, segments: 1, gap: 0.0, detail: 1.0, spans: Vec::new(), screen: 1.0 }
+        MeshParams { shape, segments: 1, gap: 0.0, detail: 1.0, spans: Vec::new(), screen: 1.0, displace: None }
     }
 
     fn path(d: &str) -> PathMorph {
@@ -1391,6 +1564,65 @@ mod tests {
             }
         }
         assert_eq!(agree, m.tris.len(), "every normal points outward");
+    }
+
+    /// Every primitive gets UVs in 0..1, one per vertex.
+    #[test]
+    fn primitives_have_uvs() {
+        let shapes = [
+            MeshShape::Sphere { radius: 100.0 },
+            MeshShape::Plane { size: [300.0, 200.0] },
+            MeshShape::Box { size: [200.0, 100.0, 60.0], bevel: 12.0 },
+            MeshShape::Cylinder { radius: 80.0, top: 80.0, height: 120.0, bevel: 8.0 },
+            MeshShape::Capsule { radius: 40.0, height: 200.0 },
+            MeshShape::Torus { radius: 100.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat },
+            MeshShape::Extrude { path: path("M -50 -50 L 50 -50 L 50 50 L -50 50 Z"), depth: 40.0, bevel: 6.0 },
+        ];
+        for shape in shapes {
+            let m = generate(&params(shape.clone())).unwrap();
+            assert_eq!(m.uvs.len(), m.positions.len(), "{shape:?}");
+            assert!(m.uvs.iter().all(|uv| (-1e-3..=1.001).contains(&uv[0]) && (-1e-3..=1.001).contains(&uv[1])), "{shape:?}");
+            let spread = m.uvs.iter().fold((1.0f32, 0.0f32), |(lo, hi), uv| (lo.min(uv[0]), hi.max(uv[0])));
+            assert!(spread.1 - spread.0 > 0.5, "{shape:?}: UVs span the surface");
+        }
+        // A box's front face: x and y across it.
+        let b = generate(&params(MeshShape::Box { size: [200.0, 100.0, 60.0], bevel: 0.0 })).unwrap();
+        for ((p, n), uv) in b.positions.iter().zip(&b.normals).zip(&b.uvs) {
+            if n[2] < -0.99 {
+                assert!((uv[0] - (p[0] + 100.0) / 200.0).abs() < 1e-3 && (uv[1] - (p[1] + 50.0) / 100.0).abs() < 1e-3);
+            }
+        }
+    }
+
+    /// Displacement: a sphere becomes a rock (radii vary by about the
+    /// amount), finely tessellated, still closed (no cracks at its seams) and
+    /// facing out; the same parameters give the same rock.
+    #[test]
+    fn displacement_roughens_without_cracks() {
+        let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 30.0, octaves: 4, seed: 7 };
+        let mut p = params(MeshShape::Sphere { radius: 100.0 });
+        p.displace = Some((field, 12.0));
+        let m = generate(&p).unwrap();
+        let plain = generate(&params(MeshShape::Sphere { radius: 100.0 })).unwrap();
+        assert!(m.tris.len() > plain.tris.len() * 3, "subdivided: {} vs {}", m.tris.len(), plain.tris.len());
+        let radii: Vec<f32> = m.positions.iter().map(|q| (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt()).collect();
+        let (lo, hi) = radii.iter().fold((f32::MAX, 0.0f32), |(a, b), r| (a.min(*r), b.max(*r)));
+        assert!(hi - lo > 8.0 && lo > 85.0 && hi < 115.0, "radii {lo}..{hi}");
+        check_outward(&m, [0.0; 3]);
+        // Watertight: every edge (by position) is shared by two triangles.
+        let key = |v: [f32; 3]| [(v[0] * 64.0).round() as i64, (v[1] * 64.0).round() as i64, (v[2] * 64.0).round() as i64];
+        let mut count: std::collections::HashMap<([i64; 3], [i64; 3]), u32> = std::collections::HashMap::new();
+        for t in &m.tris {
+            for k in 0..3 {
+                let (a, b) = (key(m.positions[t[k] as usize]), key(m.positions[t[(k + 1) % 3] as usize]));
+                if a != b {
+                    *count.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
+            }
+        }
+        assert!(count.values().all(|c| *c == 2), "{} open edges", count.values().filter(|c| **c != 2).count());
+        assert_eq!(generate(&p).unwrap(), m);
+        assert_ne!(p.key(), params(MeshShape::Sphere { radius: 100.0 }).key());
     }
 
     #[test]
@@ -1416,7 +1648,7 @@ mod tests {
 
     #[test]
     fn torus_faces_the_camera_and_splits_into_coloured_segments() {
-        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 4, gap: 10.0, detail: 1.0, spans: Vec::new(), screen: 1.0 }).unwrap();
+        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 4, gap: 10.0, detail: 1.0, spans: Vec::new(), screen: 1.0, displace: None }).unwrap();
         let (lo, hi) = t.bounds();
         assert!(hi[0] > 225.0 && hi[0] < 230.01 && (lo[2] + 30.0).abs() < 0.5 && (hi[2] - 30.0).abs() < 0.5, "{lo:?} {hi:?}");
         let segs: std::collections::BTreeSet<u32> = t.tags.iter().map(|x| tag_segment(*x)).collect();
@@ -1526,7 +1758,7 @@ mod tests {
 
     #[test]
     fn rings_tag_faces_and_size_pieces() {
-        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 2, gap: 0.0, detail: 1.0, spans: vec![1.0, 3.0], screen: 1.0 }).unwrap();
+        let t = generate(&MeshParams { shape: MeshShape::Torus { radius: 200.0, tube: 30.0, angles: [0.0, 360.0], caps: Caps::Flat }, segments: 2, gap: 0.0, detail: 1.0, spans: vec![1.0, 3.0], screen: 1.0, displace: None }).unwrap();
         let parts: std::collections::BTreeSet<u32> = t.tags.iter().map(|x| tag_part(*x)).collect();
         assert!([PART_FRONT, PART_BACK, PART_SIDE, PART_INSIDE].iter().all(|p| parts.contains(p)), "{parts:?}");
         // Front faces face the camera (−z), inside faces the axis.

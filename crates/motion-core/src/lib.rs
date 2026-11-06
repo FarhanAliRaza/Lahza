@@ -19,6 +19,7 @@ pub mod map;
 pub mod markers;
 pub mod mesh;
 pub mod narration;
+pub mod noise;
 pub mod path;
 pub mod property;
 pub mod recording;
