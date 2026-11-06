@@ -215,9 +215,6 @@ pub struct Tracer {
     frame: u64,
     /// Scratch addresses must be aligned to this for builds.
     alignment: u64,
-    /// Record hits by hand (see `cast_ray` in pt.wgsl): software Vulkan
-    /// (Mesa lavapipe) reports committed hits with the wrong instance.
-    manual_commit: bool,
     /// The environment image's rows on the GPU, by the map's address.
     env: Option<(usize, Arc<crate::envmap::EnvMap>, gpu::Buffer)>,
     /// Each mesh layer's object → camera transform on the last frame.
@@ -247,8 +244,7 @@ impl Tracer {
         let temporal = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace temporal", data_layouts: &[&TraceData::layout()], compute: shader.at("temporal") });
         let atrous = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace denoise", data_layouts: &[&TraceData::layout()], compute: shader.at("atrous") });
         let resolve = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace resolve", data_layouts: &[&TraceData::layout()], compute: shader.at("resolve") });
-        let manual_commit = context.device_information().is_software_emulated;
-        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, manual_commit, env: None })
+        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None })
     }
 
     /// Frees the last frame's transient buffers and structures; call when
@@ -509,7 +505,7 @@ impl Tracer {
             u: Uniforms {
                 size: [size.0, size.1, offset, t.options.spp.max(1)],
                 opts: [t.options.bounces.max(1), t.seed, CARD_INSTANCE, t.cards.len() as u32],
-                cam: [t.focal, t.centre[0], t.centre[1], if self.manual_commit { 1.0 } else { 0.0 }],
+                cam: [t.focal, t.centre[0], t.centre[1], 0.0],
                 place: [t.origin[0], t.origin[1], t.factor[0], t.factor[1]],
                 root: r(&t.root),
                 inv_root: r(&t.inv_root),
@@ -630,6 +626,18 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
             return None;
         }
         Some(context)
+    }
+
+    /// The tracer never reads a committed intersection. naga 25's SPIR-V
+    /// writer shares one helper between candidate and committed reads, so
+    /// with both in the shader the committed read returns the candidate: on
+    /// hardware ray tracing (NVIDIA) every miss became a hit at t = 0 and
+    /// every lit frame came out black. Software Vulkan (CI) can't show it,
+    /// so this guards the source.
+    #[test]
+    fn the_tracer_reads_candidates_only() {
+        assert!(SHADER.contains("rayQueryGetCandidateIntersection"));
+        assert!(!SHADER.contains("rayQueryGetCommittedIntersection"), "see cast_ray: naga 25 miscompiles committed reads next to candidate reads");
     }
 
     /// One triangle, traced: rays inside it hit at the right distance,
@@ -1398,6 +1406,8 @@ mod physics_tests {
             let c = Compiled::new(&project(json!([layer])));
             assert!(c.errors.is_empty(), "{:?}", c.errors);
             assert_eq!(r.render(&c, 0.0), raster.render(&c, 0.0), "{layer}");
+            let id = layer["id"].as_str().unwrap();
+            assert!(r.warnings().iter().any(|w| w.contains("rasterised") && w.contains(id)), "the report names '{id}': {:?}", r.warnings());
         }
     }
 

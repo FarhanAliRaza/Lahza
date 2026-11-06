@@ -12,7 +12,7 @@
 struct Uniforms {
     size: vec4<u32>,      // group w, h, texel offset, spp
     opts: vec4<u32>,      // bounces, seed, card instance id, cards
-    cam: vec4<f32>,       // focal, centre x, centre y, manual commit (1: see cast_ray)
+    cam: vec4<f32>,       // focal, centre x, centre y, unused
     place: vec4<f32>,     // group origin x, y, factor x, y (target px)
     root0: vec4<f32>,
     root1: vec4<f32>,
@@ -395,16 +395,19 @@ fn card_picture(card: u32, p: vec3<f32>) -> vec4<f32> {
 
 fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> Hit {
     var rq: ray_query;
-    // Manual commit: some drivers (Mesa lavapipe) report the committed hit
-    // with the instance of the last box the ray entered, not of the
-    // triangle it hit. There every triangle is a candidate, and the hit is
-    // the last confirmed candidate, recorded here.
-    let manual = u.cam.w > 0.5;
-    var ray_flags = RAY_FLAG_NONE;
-    if manual { ray_flags = RAY_FLAG_FORCE_NO_OPAQUE; }
-    rayQueryInitialize(&rq, acc, RayDesc(ray_flags, 0xFFu, 0.0, tmax, o, d));
-    // What the hit needs, recorded field by field: on lavapipe, reading the
-    // committed intersection (or a whole copied candidate) crashes the JIT.
+    // Every hit is recorded by hand from the candidates, on every device:
+    // every triangle is a candidate (no opaque fast path) and the hit is the
+    // last confirmed one (confirming shortens the ray, so it is the nearest).
+    // The committed intersection is never read:
+    // - naga 25's SPIR-V writer makes one helper for both intersection
+    //   reads, so after a candidate read the committed one returns the
+    //   candidate: on NVIDIA every miss came back as a triangle at t = 0
+    //   (black frames, everything shadowed);
+    // - Mesa lavapipe reports the committed hit with the instance of the
+    //   last box the ray entered;
+    // - on lavapipe, reading the committed intersection (or a whole copied
+    //   candidate) crashes the JIT, so the fields are copied one by one.
+    rayQueryInitialize(&rq, acc, RayDesc(RAY_FLAG_FORCE_NO_OPAQUE, 0xFFu, 0.0, tmax, o, d));
     var kind = RAY_QUERY_INTERSECTION_NONE;
     var hit_t = 0.0;
     var custom = 0u;
@@ -423,24 +426,13 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
         }
         if take {
             rayQueryConfirmIntersection(&rq);
-            if manual {
-                kind = c.kind;
-                hit_t = c.t;
-                custom = c.instance_custom_data;
-                prim = c.primitive_index;
-                bary = c.barycentrics;
-                w2o = c.world_to_object;
-            }
+            kind = c.kind;
+            hit_t = c.t;
+            custom = c.instance_custom_data;
+            prim = c.primitive_index;
+            bary = c.barycentrics;
+            w2o = c.world_to_object;
         }
-    }
-    if !manual {
-        let h = rayQueryGetCommittedIntersection(&rq);
-        kind = h.kind;
-        hit_t = h.t;
-        custom = h.instance_custom_data;
-        prim = h.primitive_index;
-        bary = h.barycentrics;
-        w2o = h.world_to_object;
     }
     var hit: Hit;
     hit.found = kind != RAY_QUERY_INTERSECTION_NONE;

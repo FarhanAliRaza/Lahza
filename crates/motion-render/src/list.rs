@@ -475,9 +475,20 @@ impl Builder<'_> {
     /// depth of field).
     fn emit_list(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         if let Some(options) = self.trace {
-            if layers.iter().any(|l| matches!(l.content, Content::Mesh(_))) && traceable(layers) {
-                self.trace_list(layers, root, canvas, list, pending, out, options);
-                return;
+            if layers.iter().any(|l| matches!(l.content, Content::Mesh(_))) {
+                match untraceable(layers) {
+                    None => {
+                        self.trace_list(layers, root, canvas, list, pending, out, options);
+                        return;
+                    }
+                    Some((id, why)) => {
+                        // Say so: a silently rasterised list looks traced in the report.
+                        let w = format!("path tracing: the layer list with '{id}' was rasterised ({why})");
+                        if !self.meshes.warnings.contains(&w) {
+                            self.meshes.warnings.push(w);
+                        }
+                    }
+                }
             }
         }
         self.meshes.open_run(layers, root);
@@ -1293,19 +1304,37 @@ fn trace_card_candidate(layer: &LayerState) -> bool {
 /// No effects (but depth of field's blur, which the tracer's lens makes),
 /// matte or blend mode.
 fn plain(layer: &LayerState) -> bool {
-    layer.matte.is_none() && layer.effects.iter().all(|e| matches!(e, EffectState::Blur { lens: true, .. })) && layer.blend == Blend::Normal
+    not_plain(layer).is_none()
 }
 
-/// Whether the path tracer draws everything 3D in this list as the raster
-/// would: plain meshes without wireframes and plain flat 3D layers. Other
-/// lists are rasterised (the tracer has no effects, mattes, blend modes or
-/// wires yet, and a 3D layer drawn flat beside the traced picture would
-/// lose its depth). Depth of field is traced through a lens.
-fn traceable(layers: &[LayerState]) -> bool {
-    layers.iter().all(|l| match &l.content {
-        Content::Mesh(m) => plain(l) && m.materials.iter().all(|x| x.wireframe <= 0.0),
-        Content::Group(_) => true,
-        _ => l.view.is_none() || trace_card_candidate(l),
+/// What keeps a layer from being traced: effects, a matte or a blend mode.
+fn not_plain(layer: &LayerState) -> Option<&'static str> {
+    if layer.matte.is_some() {
+        Some("a matte")
+    } else if !layer.effects.iter().all(|e| matches!(e, EffectState::Blur { lens: true, .. })) {
+        Some("effects; use the camera's aperture for depth of field")
+    } else if layer.blend != Blend::Normal {
+        Some("a blend mode")
+    } else {
+        None
+    }
+}
+
+/// The first layer that keeps the path tracer from drawing this list as the
+/// raster would, and why; `None` when it can: plain meshes without
+/// wireframes and plain flat 3D layers. Other lists are rasterised (the
+/// tracer has no effects, mattes, blend modes or wires yet, and a 3D layer
+/// drawn flat beside the traced picture would lose its depth). Depth of
+/// field is traced through a lens.
+fn untraceable(layers: &[LayerState]) -> Option<(std::sync::Arc<str>, &'static str)> {
+    layers.iter().find_map(|l| {
+        let why = match &l.content {
+            Content::Mesh(m) => not_plain(l).or_else(|| m.materials.iter().any(|x| x.wireframe > 0.0).then_some("a wireframe")),
+            Content::Group(_) => None,
+            _ if l.view.is_none() || trace_card_candidate(l) => None,
+            _ => Some(not_plain(l).unwrap_or("a flat 3D layer the tracer can't place")),
+        };
+        why.map(|w| (l.id.clone(), w))
     })
 }
 

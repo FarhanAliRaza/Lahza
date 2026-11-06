@@ -470,7 +470,8 @@ export each frame also builds on the previous ones, reprojected along
 each surface's motion (camera and objects), and rejects history that no
 longer matches, so animation does not boil or ghost. Lists with what the tracer does not
 draw yet (wireframes, effects, mattes, blend modes on their 3D layers)
-are rasterised.
+are rasterised, and the render's warnings name the list's layer and why
+(for depth of field, use the camera's `aperture`, not a blur effect).
 
 ```json
 "settings": {"width": 1920, "height": 1080, "fps": 30, "duration": 20, "renderer": "path", "samples": 128}
