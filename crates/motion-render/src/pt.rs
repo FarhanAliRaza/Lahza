@@ -1341,6 +1341,22 @@ mod physics_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The scene's look (AgX, exposure) applies to the traced picture as to
+    /// the raster.
+    #[test]
+    fn traced_pictures_take_the_look() {
+        let Some(mut r) = tracer(32) else { return };
+        let mut p = sphere_in(json!({"preset": "matte", "color": "#ff8040", "specular": 0}), json!([{"type": "directional", "from": [0, 0, -1], "intensity": 3, "shadow": false}]),
+            json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"}));
+        p.scenes[0].look = Some(serde_json::from_value(json!({"tone": "agx", "exposure": 0.5})).unwrap());
+        let c = Compiled::new(&p);
+        let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+        let (ma, mb) = (disc(&a, 160.0, 120.0, 0.0, 70.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 70.0, |_, _| true));
+        for k in 0..3 {
+            assert!((ma[k] - mb[k]).abs() < 8.0, "traced {ma:?}, raster {mb:?}");
+        }
+    }
+
     /// Lists with what the tracer can't draw yet (wires, effects such as
     /// depth of field, mattes, blend modes) keep the raster's picture.
     #[test]

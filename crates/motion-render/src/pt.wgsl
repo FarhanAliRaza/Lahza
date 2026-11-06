@@ -102,6 +102,35 @@ fn decode(x_in: f32) -> f32 {
     return pow((x + 0.055) / 1.055, 2.4);
 }
 
+// Lit colour → display: exposure, then the scene's curve (0 the standard
+// shoulder, 1 Hable filmic, 2 AgX). The light block's rotation rows carry
+// exposure (row 1 w) and the curve (row 2 w).
+fn hable(v: f32) -> f32 {
+    return ((v * (0.15 * v + 0.05) + 0.004) / (v * (0.15 * v + 0.5) + 0.06)) - 0.02 / 0.3;
+}
+
+fn agx(c: vec3<f32>) -> vec3<f32> {
+    let inset = mat3x3<f32>(0.84247906, 0.04232824, 0.042375654, 0.0784336, 0.8784686, 0.0784336, 0.079223745, 0.07916613, 0.87914297);
+    let outset = mat3x3<f32>(1.196879, -0.05289685, -0.052971635, -0.09802088, 1.1519031, -0.09804345, -0.09902974, -0.09896118, 1.1510737);
+    let lo = -12.47393;
+    let hi = 4.026069;
+    var v = inset * c;
+    v = (clamp(log2(max(v, vec3<f32>(1e-10))), vec3<f32>(lo), vec3<f32>(hi)) - vec3<f32>(lo)) / (hi - lo);
+    let x2 = v * v;
+    let x4 = x2 * x2;
+    v = 15.5 * x4 * x2 - 40.14 * x4 * v + 31.96 * x4 - 6.868 * x2 * v + 0.4298 * x2 + 0.1191 * v - vec3<f32>(0.00232);
+    return min(pow(max(outset * v, vec3<f32>(0.0)), vec3<f32>(2.2)), vec3<f32>(1.0));
+}
+
+fn tone_curve(x: vec3<f32>, kind: u32) -> vec3<f32> {
+    if kind == 1u {
+        let white = hable(11.2);
+        return clamp(vec3<f32>(hable(max(x.x, 0.0) * 2.0), hable(max(x.y, 0.0) * 2.0), hable(max(x.z, 0.0) * 2.0)) / white, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    if kind == 2u { return agx(x); }
+    return vec3<f32>(shoulder(x.x), shoulder(x.y), shoulder(x.z));
+}
+
 fn shoulder(x: f32) -> f32 {
     if x < 0.8 { return x; }
     return 0.8 + 0.2 * (1.0 - exp(-(x - 0.8) / 0.2));
@@ -1627,7 +1656,10 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     var out = vec4<f32>(0.0);
     if a > 0.0 {
         let straight = color / a;
-        out = vec4<f32>(encode(shoulder(straight.x)) * a, encode(shoulder(straight.y)) * a, encode(shoulder(straight.z)) * a, a);
+        var e = b_light[1].w;
+        if e <= 0.0 { e = 1.0; }
+        let tm = tone_curve(straight * e, u32(b_light[2].w));
+        out = vec4<f32>(encode(tm.x) * a, encode(tm.y) * a, encode(tm.z) * a, a);
     }
     b_groups[u.size.z + i] = out;
 }

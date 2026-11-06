@@ -66,6 +66,9 @@ pub struct Settings {
     /// Off unless set; scenes may override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion_blur: Option<MotionBlur>,
+    /// The look of lit 3D content for every scene (scenes may override).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<Look>,
     /// How exports draw meshes: the preview's rasteriser (default) or the
     /// path tracer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,10 +103,62 @@ impl Default for Settings {
             background: Color::BLACK,
             style: None,
             motion_blur: None,
+            look: None,
             renderer: None,
             samples: None,
         }
     }
+}
+
+/// How lit 3D content becomes the picture.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Look {
+    #[serde(default)]
+    pub tone: ToneMap,
+    /// Stops brighter (+) or darker (−) before tone mapping (animatable).
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub exposure: Property<f64>,
+    /// Light bleeding around bright parts (emissive, hot highlights).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bloom: Option<Bloom>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToneMap {
+    /// The renderer's soft shoulder: colours as given, highlights rolled off.
+    #[default]
+    Standard,
+    /// A filmic curve (Hable): toe and long shoulder, more contrast.
+    Filmic,
+    /// AgX (Blender's default since 4.0): hues hold and bright colours
+    /// desaturate toward white like film.
+    Agx,
+}
+
+fn bloom_threshold() -> Property<f64> {
+    Property::Constant(0.8)
+}
+fn bloom_radius() -> Property<f64> {
+    Property::Constant(24.0)
+}
+fn bloom_intensity() -> Property<f64> {
+    Property::Constant(0.8)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bloom {
+    /// Brightness (0..1, display) above which light blooms (default 0.8).
+    #[serde(default = "bloom_threshold")]
+    pub threshold: Property<f64>,
+    /// px (default 24).
+    #[serde(default = "bloom_radius")]
+    pub radius: Property<f64>,
+    /// default 0.8.
+    #[serde(default = "bloom_intensity")]
+    pub intensity: Property<f64>,
 }
 
 /// Shutter-angle motion blur: `samples` sub-frames spread over
@@ -226,6 +281,9 @@ pub struct Scene {
     /// What glossy meshes reflect (default: the studio environment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<Environment>,
+    /// Tone mapping, exposure and bloom (default: the project's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<Look>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion_blur: Option<MotionBlur>,
     /// Stepped clock for every layer of the scene (the camera stays smooth).
@@ -250,6 +308,7 @@ impl Scene {
             camera: Camera::default(),
             lights: Vec::new(),
             environment: None,
+            look: None,
             motion_blur: None,
             step_fps: None,
             layers: Vec::new(),

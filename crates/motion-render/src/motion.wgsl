@@ -603,6 +603,11 @@ fn apply_color(i: u32, c: vec3<f32>, l: vec2<f32>, size: vec2<f32>) -> vec3<f32>
         return mix(c, g, h.z);
     }
     if op == 7.0 { return mix(c, vec3<f32>(1.0) - c, h.z); }
+    if op == 10.0 {
+        // Bloom's threshold: only what is brighter than h.z, ramping up.
+        let y = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+        return c * clamp((y - h.z) / max(1.0 - h.z, 1e-3), 0.0, 1.0);
+    }
     if op == 9.0 { return mix(c, b_ops[i + 1u].xyz, h.z); }
     if op == 8.0 {
         let n = u32(h.w);
@@ -1263,6 +1268,41 @@ fn sheen_albedo(n_v: f32, r: f32) -> f32 {
     return mix(a, b, fy);
 }
 
+// Lit colour → display: exposure, then the scene's curve (0 the standard
+// shoulder, 1 Hable filmic, 2 AgX). The light block's rotation rows carry
+// exposure (row 1 w) and the curve (row 2 w).
+fn hable(v: f32) -> f32 {
+    return ((v * (0.15 * v + 0.05) + 0.004) / (v * (0.15 * v + 0.5) + 0.06)) - 0.02 / 0.3;
+}
+
+fn agx(c: vec3<f32>) -> vec3<f32> {
+    let inset = mat3x3<f32>(0.84247906, 0.04232824, 0.042375654, 0.0784336, 0.8784686, 0.0784336, 0.079223745, 0.07916613, 0.87914297);
+    let outset = mat3x3<f32>(1.196879, -0.05289685, -0.052971635, -0.09802088, 1.1519031, -0.09804345, -0.09902974, -0.09896118, 1.1510737);
+    let lo = -12.47393;
+    let hi = 4.026069;
+    var v = inset * c;
+    v = (clamp(log2(max(v, vec3<f32>(1e-10))), vec3<f32>(lo), vec3<f32>(hi)) - vec3<f32>(lo)) / (hi - lo);
+    let x2 = v * v;
+    let x4 = x2 * x2;
+    v = 15.5 * x4 * x2 - 40.14 * x4 * v + 31.96 * x4 - 6.868 * x2 * v + 0.4298 * x2 + 0.1191 * v - vec3<f32>(0.00232);
+    return min(pow(max(outset * v, vec3<f32>(0.0)), vec3<f32>(2.2)), vec3<f32>(1.0));
+}
+
+fn tone_curve(x: vec3<f32>, kind: u32) -> vec3<f32> {
+    if kind == 1u {
+        let white = hable(11.2);
+        return clamp(vec3<f32>(hable(max(x.x, 0.0) * 2.0), hable(max(x.y, 0.0) * 2.0), hable(max(x.z, 0.0) * 2.0)) / white, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    if kind == 2u { return agx(x); }
+    return vec3<f32>(shoulder(x.x), shoulder(x.y), shoulder(x.z));
+}
+
+fn tone_map(lb: u32, c: vec3<f32>) -> vec3<f32> {
+    var e = b_mesh[lb + 1u].w;
+    if e <= 0.0 { e = 1.0; }
+    return tone_curve(c * e, u32(b_mesh[lb + 2u].w));
+}
+
 fn shoulder(x: f32) -> f32 {
     if x < 0.8 { return x; }
     return 0.8 + 0.2 * (1.0 - exp(-(x - 0.8) / 0.2));
@@ -1650,7 +1690,8 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
         let gpeak = min(max(max(s_light.x, s_light.y), s_light.z), 1.0);
         let ga = clamp(through + (1.0 - trans) + max(1.0 - through - (1.0 - trans), 0.0) * gpeak, 0.0, 1.0);
         if ga <= 0.0 { return vec4<f32>(0.0); }
-        let gc = vec3<f32>(encode(shoulder(glit.x / ga)), encode(shoulder(glit.y / ga)), encode(shoulder(glit.z / ga)));
+        let gt = tone_map(lb, glit / ga);
+        let gc = vec3<f32>(encode(gt.x), encode(gt.y), encode(gt.z));
         let gao = ga * opacity;
         return vec4<f32>(gc * gao, gao);
     }
@@ -1660,7 +1701,8 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let peak = min(max(max(sl.x, sl.y), sl.z), 1.0);
     let a = clamp(body + (1.0 - body) * peak, 0.0, 1.0);
     if a <= 0.0 { return vec4<f32>(0.0); }
-    let c = vec3<f32>(encode(shoulder(lit.x / a)), encode(shoulder(lit.y / a)), encode(shoulder(lit.z / a)));
+    let lt = tone_map(lb, lit / a);
+    let c = vec3<f32>(encode(lt.x), encode(lt.y), encode(lt.z));
     return vec4<f32>(c * a, a);
 }
 

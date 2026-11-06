@@ -138,6 +138,10 @@ impl MaterialState {
 pub struct Lighting {
     pub lights: Vec<LightState>,
     pub env: EnvState,
+    /// Tone mapping of lit content: 0 standard, 1 filmic, 2 AgX.
+    pub tone: u32,
+    /// Exposure as a multiplier (2^stops).
+    pub exposure: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -593,6 +597,7 @@ impl Compiler<'_> {
                 .collect()
         };
         let env = scene.environment.clone().unwrap_or_default();
+        let look = scene.look.clone().or_else(|| self.windows.project.settings.look.clone());
         CLighting {
             lights,
             preset: env.preset,
@@ -602,6 +607,15 @@ impl Compiler<'_> {
             horizon: env.horizon.as_ref().map(|p| self.prop(p, id, "environment.horizon", start, None, pre_roll)),
             ground: env.ground.as_ref().map(|p| self.prop(p, id, "environment.ground", start, None, pre_roll)),
             image: env.image.as_deref().map(std::sync::Arc::from),
+            tone: match look.as_ref().map(|l| l.tone).unwrap_or_default() {
+                crate::document::ToneMap::Standard => 0,
+                crate::document::ToneMap::Filmic => 1,
+                crate::document::ToneMap::Agx => 2,
+            },
+            exposure: match look.as_ref() {
+                Some(l) => self.prop(&l.exposure, id, "look.exposure", start, None, pre_roll),
+                None => Prop::constant(0.0),
+            },
         }
     }
 }
@@ -646,6 +660,8 @@ pub(super) struct CLighting {
     horizon: Option<Prop<Color>>,
     ground: Option<Prop<Color>>,
     image: Option<std::sync::Arc<str>>,
+    tone: u32,
+    exposure: Prop<f64>,
 }
 
 impl CLighting {
@@ -730,7 +746,7 @@ impl CLighting {
                 image_rotation: 0.0,
             }
         };
-        Lighting { lights, env }
+        Lighting { lights, env, tone: self.tone, exposure: self.exposure.at(tc).clamp(-16.0, 16.0).exp2() }
     }
 }
 

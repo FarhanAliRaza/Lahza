@@ -880,7 +880,7 @@ impl Builder<'_> {
                     clamp |= *repeat_edges;
                 }
                 EffectState::Shadow { offset, sigma, .. } => reach = reach.max(3.0 * sigma + offset.x().abs().max(offset.y().abs())),
-                EffectState::Glow { sigma, .. } => reach = reach.max(3.0 * sigma),
+                EffectState::Glow { sigma, .. } | EffectState::Bloom { sigma, .. } => reach = reach.max(3.0 * sigma),
                 EffectState::Post(p) => match p.kind {
                     PostKind::Displace => post_pad += p.v[0].abs(),
                     PostKind::DirectionalBlur | PostKind::RgbSplit => post_pad += p.v[0].hypot(p.v[1]),
@@ -1022,6 +1022,30 @@ impl Builder<'_> {
                     fill: [color.0[0] as f32 * k, color.0[1] as f32 * k, color.0[2] as f32 * k, color.0[3] as f32 * k],
                     ..Default::default()
                 };
+                if let Some((prim, _)) = with_inverse(prim, forward, group_opacity) {
+                    out.push(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
+                }
+            }
+            if let EffectState::Bloom { threshold, sigma, intensity } = e {
+                // What is brighter than the threshold, blurred, added on top.
+                let sigma = sigma * scale;
+                let r = wide(3.0 * sigma + 2.0);
+                if r[2] <= r[0] || r[3] <= r[1] || *intensity <= 0.0 {
+                    continue;
+                }
+                let factor = factor_for(sigma).min(4.0);
+                let (aoff, aorigin, af, (aw, ah)) = self.reserve(list, pending, effect_src.clone(), r, 0.0, factor, false);
+                let start = list.ops.len() as u32;
+                list.ops.push([crate::raster::OP_THRESHOLD, 1.0, *threshold as f32, 0.0]);
+                let aforward = Proj::from(Affine::translate(aorigin[0], aorigin[1]).then(Affine::scale(af[0], af[1])));
+                let mut bright = Prim { kind: [PRIM_IMAGE, 1, 0, 0], geom: [aw as f32, ah as f32, 1.0, 0.0], geom2: [f32::from_bits(aoff), 0.0, 0.0, 0.0], ..Default::default() };
+                bright.paint[2] = f32::from_bits(start);
+                bright.paint[3] = f32::from_bits(1);
+                let Some((bright, _)) = with_inverse(bright, aforward, 1.0) else { continue };
+                let (off, origin, f, (gw, gh)) = self.reserve(list, pending, vec![Item { prim: bright, forward: aforward, bounds: [0.0, 0.0, aw as f64, ah as f64] }], r, sigma, factor_for(sigma), false);
+                let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(f[0], f[1])));
+                let k = *intensity as f32;
+                let prim = Prim { kind: [PRIM_IMAGE, 1, 1, FLAG_TINT_MUL], geom: [gw as f32, gh as f32, 1.0, 0.0], geom2: [f32::from_bits(off), 0.0, 0.0, 0.0], fill: [k, k, k, k], ..Default::default() };
                 if let Some((prim, _)) = with_inverse(prim, forward, group_opacity) {
                     out.push(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] });
                 }

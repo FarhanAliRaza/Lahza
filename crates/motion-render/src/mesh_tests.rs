@@ -891,3 +891,35 @@ fn gpu_matches_cpu_surface_detail() {
     crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0005);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Tone mapping and exposure: AgX and filmic roll a hot light off into
+/// a smooth falloff instead of the standard clip, exposure brightens; GPU
+/// and CPU agree. Bloom spreads what is bright beyond its edge.
+#[test]
+fn looks_tone_map_and_bloom() {
+    let shot = |look: serde_json::Value| {
+        let mut s = json!({"layers": [{"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 80}, "material": {"preset": "matte", "color": "#ff8040"}, "transform": {"position": [160, 120]}}],
+            "lights": [{"type": "directional", "from": [0, 0, -1], "intensity": 3, "shadow": false}], "environment": {"preset": "none"}});
+        if !look.is_null() {
+            s["look"] = look;
+        }
+        scene(320, 240, s)
+    };
+    let (standard, agx, filmic) = (render(&shot(serde_json::Value::Null), 0.0), render(&shot(json!({"tone": "agx"})), 0.0), render(&shot(json!({"tone": "filmic"})), 0.0));
+    let c = |img: &image::RgbaImage| px(img, 160, 120);
+    assert_ne!(c(&standard), c(&agx));
+    assert_ne!(c(&standard), c(&filmic));
+    // AgX desaturates the hot centre toward white more than standard.
+    let sat = |p: [u8; 4]| p[0] as f64 - p[2] as f64;
+    assert!(sat(c(&agx)) < sat(c(&standard)), "AgX {:?} vs standard {:?}", c(&agx), c(&standard));
+    // Exposure: −2 stops is darker.
+    let dark = render(&shot(json!({"exposure": -2})), 0.0);
+    assert!(luma(c(&dark)) < luma(c(&standard)) - 30.0);
+    // Bloom: light beyond the ball's edge.
+    let bloom = render(&shot(json!({"bloom": {"threshold": 0.5, "radius": 30, "intensity": 1}})), 0.0);
+    let outside = |img: &image::RgbaImage| luma(px(img, 160 + 90, 120));
+    assert!(outside(&bloom) > outside(&standard) + 10.0, "bloom spreads: {} vs {}", outside(&bloom), outside(&standard));
+    for look in [json!({"tone": "agx", "exposure": 0.5}), json!({"tone": "filmic"}), json!({"bloom": {"threshold": 0.6}})] {
+        crate::tests::assert_gpu_matches_cpu_within(&shot(look), &[0.0], 0.0005);
+    }
+}

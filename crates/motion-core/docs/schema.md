@@ -430,6 +430,16 @@ are rasterised.
 "settings": {"width": 1920, "height": 1080, "fps": 30, "duration": 20, "renderer": "path", "samples": 128}
 ```
 
+A scene's (or the project's, `settings.look`) `look` sets how lit 3D
+content becomes the picture: `{"tone": "standard" (default soft shoulder)
+| "filmic" (Hable: toe, long shoulder) | "agx" (Blender's default: bright
+colours desaturate toward white like film), "exposure": stops (animatable),
+"bloom": {"threshold": 0.8 (display brightness), "radius": 24 px,
+"intensity": 0.8}}` (bloom values animatable). Tone mapping applies to
+lit meshes (raster and path tracer alike); flat 2D layers and unlit
+materials keep their exact colours. Bloom blurs what is brighter than the
+threshold across the whole scene (2D layers too) and adds it on top.
+
 Scenes light meshes with `lights` and `environment`:
 
 ```json

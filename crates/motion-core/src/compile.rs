@@ -121,6 +121,8 @@ impl LayerState {
 pub enum EffectState {
     /// `lens`: depth of field's blur (a path tracer's lens makes it instead).
     Blur { sigma: f64, repeat_edges: bool, lens: bool },
+    /// What is brighter than `threshold` (display 0..1), blurred and added.
+    Bloom { threshold: f64, sigma: f64, intensity: f64 },
     Shadow { color: Color, offset: Vec2, sigma: f64 },
     Glow { color: Color, sigma: f64, intensity: f64 },
     /// Per-pixel post effects applied when the layer is composited.
@@ -417,6 +419,8 @@ pub struct CScene {
     camera_focus: Option<CFocus>,
     camera_aperture: Prop<f64>,
     lighting: CLighting,
+    /// Bloom over the scene: threshold, radius px, intensity.
+    bloom: Option<(Prop<f64>, Prop<f64>, Prop<f64>)>,
     transition: Option<CTransition>,
     pub layers: Vec<CLayer>,
 }
@@ -1396,6 +1400,9 @@ impl Compiled {
             };
             let layers = c.layers(&scene.layers, step, pre_roll);
             let lighting = c.lighting(scene, pre_roll, start);
+            let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
+                (c.prop(&b.threshold, id, "look.bloom.threshold", start, None, pre_roll), c.prop(&b.radius, id, "look.bloom.radius", start, None, pre_roll), c.prop(&b.intensity, id, "look.bloom.intensity", start, None, pre_roll))
+            });
             let transition = scene.transition.as_ref().map(|t| CTransition {
                 kind: t.kind,
                 dur: t.dur.seconds(&c.windows.base).unwrap_or(0.0).max(0.0),
@@ -1419,6 +1426,7 @@ impl Compiled {
                 camera_focus,
                 camera_aperture,
                 lighting,
+                bloom,
                 transition,
                 layers,
             });
@@ -1566,6 +1574,16 @@ impl Compiled {
         if has_meshes(&out[first..]) {
             let lighting = Arc::new(scene.lighting.at(tc));
             meshes::light_meshes(&mut out[first..], &lighting);
+        }
+        // Bloom: the scene's layers as one group that blooms.
+        if let Some((threshold, radius, intensity)) = &scene.bloom {
+            let (threshold, sigma, intensity) = (threshold.at(tc).clamp(0.0, 0.999), radius.at(tc).max(0.0) / 2.0, intensity.at(tc).max(0.0));
+            if sigma > 0.0 && intensity > 0.0 && out.len() > first {
+                let layers: Vec<LayerState> = out.drain(first..).collect();
+                let mut g = self.scene_group_layers(&format!("{}-bloom", scene.id), layers);
+                g.effects.push(EffectState::Bloom { threshold, sigma, intensity });
+                out.push(g);
+            }
         }
     }
 

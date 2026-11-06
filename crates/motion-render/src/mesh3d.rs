@@ -755,8 +755,11 @@ pub(crate) fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
     // offset from this block (set where the image is placed).
     let image = l.env.image.is_some();
     let mut rows = vec![[l.lights.len() as f32, l.env.lobes.len() as f32, if image { 1.0 } else { 0.0 }, l.env.image_intensity as f32]];
+    // The rotation's rows' w: exposure (multiplier), tone mapping (0
+    // standard, 1 filmic, 2 AgX), 0.
+    let w = [l.exposure as f32, l.tone as f32, 0.0];
     for c in 0..3 {
-        rows.push([r[0][c] as f32, r[1][c] as f32, r[2][c] as f32, 0.0]);
+        rows.push([r[0][c] as f32, r[1][c] as f32, r[2][c] as f32, w[c]]);
     }
     rows.push(f(l.env.sky, l.env.image_rotation));
     rows.push(f(l.env.horizon, 0.0));
@@ -801,7 +804,7 @@ impl Batch {
             verts: Vec::new(),
             tris: Vec::new(),
             materials: Vec::new(),
-            lighting: Arc::new(Lighting { lights: Vec::new(), env: lahza_motion_core::compile::EnvState { sky: [0.0; 3], horizon: [0.0; 3], ground: [0.0; 3], lobes: Vec::new(), image: None, image_intensity: 0.0, image_rotation: 0.0 } }),
+            lighting: Arc::new(Lighting { lights: Vec::new(), env: lahza_motion_core::compile::EnvState { sky: [0.0; 3], horizon: [0.0; 3], ground: [0.0; 3], lobes: Vec::new(), image: None, image_intensity: 0.0, image_rotation: 0.0 }, tone: 0, exposure: 1.0 }),
             light_rows: rows,
             bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
             layers: 0,
@@ -1730,6 +1733,38 @@ fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps:
     (base, rough, n)
 }
 
+/// Lit colour → display (mirrors `tone_map` in motion.wgsl): exposure,
+/// then the scene's curve (standard shoulder, Hable filmic or AgX).
+fn tone_map(m: &[[f32; 4]], lb: usize, c: F3) -> F3 {
+    let e = if m[lb + 1][3] > 0.0 { m[lb + 1][3] } else { 1.0 };
+    let x = fmul(c, e);
+    match m[lb + 2][3] as u32 {
+        1 => {
+            let hable = |v: f32| ((v * (0.15 * v + 0.05) + 0.004) / (v * (0.15 * v + 0.5) + 0.06)) - 0.02 / 0.3;
+            let white = hable(11.2);
+            x.map(|v| (hable(v.max(0.0) * 2.0) / white).clamp(0.0, 1.0))
+        }
+        2 => agx(x),
+        _ => x.map(shoulder),
+    }
+}
+
+/// AgX (Sobotka; the polynomial fit by Wrensch): inset, log2 encoding,
+/// sigmoid, outset; back to linear for the sRGB encode.
+fn agx(c: F3) -> F3 {
+    // Column-major, as the WGSL mat3x3 constructors.
+    let inset = [[0.842_479_06, 0.042_328_24, 0.042_375_654], [0.078_433_6, 0.878_468_6, 0.078_433_6], [0.079_223_745, 0.079_166_13, 0.879_142_97]];
+    let outset = [[1.196_879, -0.052_896_85, -0.052_971_635], [-0.098_020_88, 1.151_903_1, -0.098_043_45], [-0.099_029_74, -0.098_961_18, 1.151_073_7]];
+    let mul = |m: [[f32; 3]; 3], v: F3| -> F3 { std::array::from_fn(|i| m[0][i] * v[0] + m[1][i] * v[1] + m[2][i] * v[2]) };
+    let (lo, hi) = (-12.473_93f32, 4.026_069f32);
+    let v = mul(inset, c).map(|x| ((x.max(1e-10).log2()).clamp(lo, hi) - lo) / (hi - lo));
+    let v = v.map(|x| {
+        let (x2, x4) = (x * x, x * x * x * x);
+        15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232
+    });
+    mul(outset, v).map(|x| x.max(0.0).powf(2.2).min(1.0))
+}
+
 /// A point light's fade to its range (0: none). Mirrors motion.wgsl.
 pub(crate) fn range_window(dist: f32, range: f32) -> f32 {
     if range <= 0.0 {
@@ -2105,7 +2140,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         if a <= 0.0 {
             return [0.0; 4];
         }
-        let c = lit.map(|x| encode(shoulder(x / a)));
+        let c = tone_map(m, lb, fmul(lit, 1.0 / a)).map(encode);
         let a = a * opacity;
         return [c[0] * a, c[1] * a, c[2] * a, a];
     }
@@ -2118,7 +2153,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     if a <= 0.0 {
         return [0.0; 4];
     }
-    let c = lit.map(|x| encode(shoulder(x / a)));
+    let c = tone_map(m, lb, fmul(lit, 1.0 / a)).map(encode);
     [c[0] * a, c[1] * a, c[2] * a, a]
 }
 

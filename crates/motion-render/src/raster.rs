@@ -592,6 +592,7 @@ pub const OP_GRADIENT_MAP: f32 = 6.0;
 pub const OP_INVERT: f32 = 7.0;
 pub const OP_LUT: f32 = 8.0;
 pub const OP_FILL: f32 = 9.0;
+pub const OP_THRESHOLD: f32 = 10.0;
 pub const OP_DISPLACE: f32 = 20.0;
 pub const OP_DIRECTIONAL_BLUR: f32 = 21.0;
 pub const OP_RGB_SPLIT: f32 = 22.0;
@@ -679,6 +680,11 @@ fn apply_color(op: &[[f32; 4]], c: V3, l: V2, size: V2) -> V3 {
             mix3(c, g, h[2])
         }
         OP_INVERT => mix3(c, c.map(|v| 1.0 - v), h[2]),
+        OP_THRESHOLD => {
+            let y = luma3(c);
+            let k = ((y - h[2]) / (1.0 - h[2]).max(1e-3)).clamp(0.0, 1.0);
+            c.map(|v| v * k)
+        }
         OP_FILL => mix3(c, [op[1][0], op[1][1], op[1][2]], h[2]),
         OP_LUT => {
             let n = h[3] as usize;
