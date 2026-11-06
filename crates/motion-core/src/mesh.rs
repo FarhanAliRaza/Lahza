@@ -529,7 +529,7 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
     set_uvs(&mut mesh, &params.shape);
     if let Some((field, amount)) = params.displace {
         if amount != 0.0 {
-            displace(&mut mesh, &field, amount);
+            displace(&mut mesh, &field, amount, screen);
         }
     }
     Ok(mesh)
@@ -593,18 +593,28 @@ fn set_uvs(mesh: &mut Mesh, shape: &MeshShape) {
 /// Most triangles a displaced mesh is subdivided to.
 const DISPLACE_MAX_TRIS: usize = 200_000;
 
+/// Displacement subdivides no finer than this many screen pixels per edge:
+/// smaller triangles add no visible silhouette (bump shades finer detail),
+/// and 18 close-up displaced rods at the cap filled the path tracer's GPU.
+const DISPLACE_MIN_EDGE_PX: f64 = 6.0;
+
 /// Pushes the surface along its normals by `amount` × (2·noise − 1),
-/// subdividing first until edges are a third of the noise's features.
-/// Copies of one point (hard edges) move together, so nothing cracks.
-fn displace(mesh: &mut Mesh, field: &crate::noise::Field, amount: f64) {
-    let target = (field.scale / 3.0).max(0.5);
+/// subdividing first until edges average a third of the noise's features,
+/// or `DISPLACE_MIN_EDGE_PX` on screen (`screen`: screen px per layer unit),
+/// whichever is longer. Copies of one point (hard edges) move together, so
+/// nothing cracks.
+fn displace(mesh: &mut Mesh, field: &crate::noise::Field, amount: f64, screen: f64) {
+    let target = (field.scale / 3.0).max(DISPLACE_MIN_EDGE_PX / screen).max(0.5);
     loop {
-        let longest = mesh.tris.iter().map(|t| {
+        // The mean edge, not the longest: a few long seam or equator edges
+        // would force another 4x subdivision of the whole mesh.
+        let d = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() as f64;
+        let total: f64 = mesh.tris.iter().map(|t| {
             let p = t.map(|i| mesh.positions[i as usize]);
-            let d = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() as f64;
-            d(p[0], p[1]).max(d(p[1], p[2])).max(d(p[2], p[0]))
-        }).fold(0.0, f64::max);
-        if longest <= target || mesh.tris.len() * 4 > DISPLACE_MAX_TRIS {
+            d(p[0], p[1]) + d(p[1], p[2]) + d(p[2], p[0])
+        }).sum();
+        let mean = total / (3 * mesh.tris.len().max(1)) as f64;
+        if mean <= target || mesh.tris.len() * 4 > DISPLACE_MAX_TRIS {
             break;
         }
         subdivide(mesh);
@@ -1595,11 +1605,12 @@ mod tests {
     }
 
     /// Displacement: a sphere becomes a rock (radii vary by about the
-    /// amount), finely tessellated, still closed (no cracks at its seams) and
-    /// facing out; the same parameters give the same rock.
+    /// amount), subdivided where the noise is finer than its triangles,
+    /// still closed (no cracks at its seams) and facing out; the same
+    /// parameters give the same rock.
     #[test]
     fn displacement_roughens_without_cracks() {
-        let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 30.0, octaves: 4, seed: 7, offset: [0.0; 3] };
+        let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 12.0, octaves: 4, seed: 7, offset: [0.0; 3] };
         let mut p = params(MeshShape::Sphere { radius: 100.0 });
         p.displace = Some((field, 12.0));
         let m = generate(&p).unwrap();
@@ -1623,6 +1634,24 @@ mod tests {
         assert!(count.values().all(|c| *c == 2), "{} open edges", count.values().filter(|c| **c != 2).count());
         assert_eq!(generate(&p).unwrap(), m);
         assert_ne!(p.key(), params(MeshShape::Sphere { radius: 100.0 }).key());
+    }
+
+    /// Displacement subdivides for the drawn size: fine noise on a 300 px
+    /// rock stops once edges are about DISPLACE_MIN_EDGE_PX on screen (one
+    /// subdivision; it ran on to 16x the plain mesh, near the 200 000 cap),
+    /// and the same rock far away, a quarter the pixels, gets far fewer.
+    #[test]
+    fn displacement_follows_the_drawn_size() {
+        let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 3.0, octaves: 3, seed: 3, offset: [0.0; 3] };
+        let rock = |screen: f64, displace: bool| {
+            let mut p = params(MeshShape::Sphere { radius: 150.0 });
+            p.displace = displace.then_some((field, 4.0));
+            p.screen = screen;
+            generate(&p).unwrap()
+        };
+        let (plain, near, far) = (rock(1.0, false), rock(1.0, true), rock(0.25, true));
+        assert!(near.tris.len() <= plain.tris.len() * 4, "{} triangles for a {}-triangle rock: subdivided below {DISPLACE_MIN_EDGE_PX} px edges", near.tris.len(), plain.tris.len());
+        assert!(far.tris.len() * 4 <= near.tris.len(), "far {} vs near {}", far.tris.len(), near.tris.len());
     }
 
     #[test]
