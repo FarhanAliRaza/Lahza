@@ -479,9 +479,9 @@ impl Compiler<'_> {
             preset: env.preset,
             intensity: self.prop(&env.intensity, id, "environment.intensity", start, None, pre_roll),
             rotation: self.prop(&env.rotation, id, "environment.rotation", start, None, pre_roll),
-            sky: env.sky,
-            horizon: env.horizon,
-            ground: env.ground,
+            sky: env.sky.as_ref().map(|p| self.prop(p, id, "environment.sky", start, None, pre_roll)),
+            horizon: env.horizon.as_ref().map(|p| self.prop(p, id, "environment.horizon", start, None, pre_roll)),
+            ground: env.ground.as_ref().map(|p| self.prop(p, id, "environment.ground", start, None, pre_roll)),
         }
     }
 }
@@ -514,9 +514,9 @@ pub(super) struct CLighting {
     preset: EnvironmentPreset,
     intensity: Prop<f64>,
     rotation: Prop<f64>,
-    sky: Option<Color>,
-    horizon: Option<Color>,
-    ground: Option<Color>,
+    sky: Option<Prop<Color>>,
+    horizon: Option<Prop<Color>>,
+    ground: Option<Prop<Color>>,
 }
 
 impl CLighting {
@@ -563,9 +563,9 @@ impl CLighting {
             unit([d[0] * c - d[2] * s, d[1], d[0] * s + d[2] * c])
         };
         let env = EnvState {
-            sky: linear(self.sky.unwrap_or(sky), k),
-            horizon: linear(self.horizon.unwrap_or(horizon), k),
-            ground: linear(self.ground.unwrap_or(ground), k),
+            sky: linear(self.sky.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(sky), k),
+            horizon: linear(self.horizon.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(horizon), k),
+            ground: linear(self.ground.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(ground), k),
             lobes: lobes.into_iter().map(|(d, size, c, s)| Lobe { dir: turn(d), size, color: linear(c, s * k) }).collect(),
         };
         Lighting { lights, env }

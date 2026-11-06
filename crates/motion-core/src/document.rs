@@ -212,8 +212,9 @@ pub struct Scene {
     /// The shot opens this far into its animation (content time = t + pre_roll).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_roll: Option<Duration>,
+    /// Animatable (keys fade the backdrop from one colour to another).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background: Option<Color>,
+    pub background: Option<Property<Color>>,
     /// How this scene arrives from the previous one (default: a cut).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition: Option<Transition>,
@@ -2412,13 +2413,13 @@ pub struct Environment {
     /// Turns the environment about the vertical axis (degrees).
     #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
     pub rotation: Property<f64>,
-    /// Override the preset's colours.
+    /// Override the preset's colours (animatable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sky: Option<Color>,
+    pub sky: Option<Property<Color>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub horizon: Option<Color>,
+    pub horizon: Option<Property<Color>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ground: Option<Color>,
+    pub ground: Option<Property<Color>>,
 }
 
 impl Default for Environment {

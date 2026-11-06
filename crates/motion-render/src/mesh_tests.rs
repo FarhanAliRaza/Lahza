@@ -700,3 +700,18 @@ fn dump_principled() {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     cpu().render(&c, 0.0).save(std::env::var("LAHZA_MESH_OUT").unwrap_or_else(|_| "/tmp/principled.png".into())).unwrap();
 }
+
+/// Scene `background` and environment colours take keys: the backdrop
+/// fades, and what the meshes reflect changes with it.
+#[test]
+fn background_and_environment_colours_animate() {
+    let keys = |a: &str, b: &str| json!({"keys": [{"at": 0, "v": a}, {"at": 1, "v": b}]});
+    let mut p = sphere_in(json!({"preset": "chrome", "color": "#ffffff"}), json!([{"type": "ambient", "intensity": 0}]),
+        json!({"preset": "none", "sky": keys("#ff0000", "#0000ff"), "horizon": keys("#ff0000", "#0000ff"), "ground": keys("#ff0000", "#0000ff")}));
+    p.scenes[0].background = Some(serde_json::from_value(keys("#000000", "#ffffff")).unwrap());
+    let (a, b) = (render(&p, 0.0), render(&p, 1.0));
+    assert_eq!(px(&a, 5, 5), [0, 0, 0, 255], "the backdrop starts black");
+    assert_eq!(px(&b, 5, 5), [255, 255, 255, 255], "and ends white");
+    let (ca, cb) = (px(&a, 160, 120), px(&b, 160, 120));
+    assert!(ca[0] > 150 && ca[2] < 40 && cb[2] > 150 && cb[0] < 40, "the chrome reflects red, then blue: {ca:?} → {cb:?}");
+}

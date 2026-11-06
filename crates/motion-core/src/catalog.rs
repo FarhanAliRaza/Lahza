@@ -285,11 +285,11 @@ pub fn catalog_json() -> Value {
         "scene": {
             "id": "stable id", "start": "time (cuts on markers lead −1 f by default)", "lead": "frames",
             "end": "time (default next scene's start or the project end)", "duration": "duration",
-            "pre_roll": "open this far into the animation", "background": "colour",
+            "pre_roll": "open this far into the animation", "background": "colour (animatable)",
             "transition": {"type": "fade | push | slide | zoom | wipe | whip", "dur": "default \"10f\", centred on the cut", "ease": "default gesture (peak speed on the cut)", "direction": "left | right | up | down"},
             "camera": {"position": "[x, y] point of interest shown at the canvas centre", "zoom": "number", "rotation": "degrees (roll)", "fov": "3D: vertical degrees (39.6 keeps z = 0 at 1:1)", "orbit": "3D: [yaw, pitch] degrees around the point of interest", "dolly": "3D: px toward the point of interest", "shift": "3D lens shift [x, y] px: moves the 3D picture without turning the camera (verticals stay parallel)", "aperture": "3D depth of field: blur radius px per 100 px of depth from the focus plane (0 = off; animatable)", "focus": "3D depth of field: sharp plane as a depth like a layer's z (0 = point of interest, default; animatable for rack focus) or a top-level layer id to keep sharp"},
             "lights": [{"type": "directional (default) | point | ambient", "from": "directional: [x, y, z] toward the light (y down, z away: [-1, -1, -1] = upper left, in front)", "position": "point: [x, y, z] world px (animatable; from is too)", "color": "colour (animatable)", "intensity": "animatable (default 1)", "shadow": "bool: cast soft shadows (default: the first directional/point light only)", "softness": "0 sharp … 1 very soft (default 0.35, animatable)", "note": "for mesh layers; default rig: key from the upper left front (casts shadows) + rim from behind right"}],
-            "environment": {"preset": "studio (default) | soft | sunset | night | none", "intensity": "animatable", "rotation": "degrees about the vertical axis", "sky": "colour", "horizon": "colour", "ground": "colour", "note": "what glossy meshes reflect and their ambient light"},
+            "environment": {"preset": "studio (default) | soft | sunset | night | none", "intensity": "animatable", "rotation": "degrees about the vertical axis", "sky": "colour (animatable)", "horizon": "colour (animatable)", "ground": "colour (animatable)", "note": "what glossy meshes reflect and their ambient light"},
             "motion_blur": {"shutter": "degrees (180 film-like)", "samples": 8},
             "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first"
         },

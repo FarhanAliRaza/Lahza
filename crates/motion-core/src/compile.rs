@@ -403,7 +403,8 @@ pub struct CScene {
     pub start: f64,
     pub end: f64,
     pub pre_roll: f64,
-    pub background: Color,
+    /// At scene content time (t + pre_roll).
+    pub background: Prop<Color>,
     pub motion_blur: Option<MotionBlur>,
     camera_position: Option<Prop<Vec2>>,
     camera_zoom: Prop<f64>,
@@ -1377,6 +1378,10 @@ impl Compiled {
             let camera_dolly = c.prop(&scene.camera.dolly, id, "camera.dolly", start, None, pre_roll);
             let camera_shift = c.prop(&scene.camera.shift, id, "camera.shift", start, None, pre_roll);
             let camera_aperture = c.prop(&scene.camera.aperture, id, "camera.aperture", start, None, pre_roll);
+            let background = match &scene.background {
+                Some(b) => c.prop(b, id, "background", start, None, pre_roll),
+                None => Prop::constant(project.settings.background),
+            };
             let camera_focus = match &scene.camera.focus {
                 None => None,
                 Some(Focus::Depth(p)) => Some(CFocus::Depth(c.prop(p, id, "camera.focus", start, None, pre_roll))),
@@ -1401,7 +1406,7 @@ impl Compiled {
                 start,
                 end,
                 pre_roll,
-                background: scene.background.unwrap_or(project.settings.background),
+                background,
                 motion_blur: scene.motion_blur.or(project.settings.motion_blur),
                 camera_position,
                 camera_zoom,
@@ -1509,13 +1514,13 @@ impl Compiled {
             let ta = t.min(a.end - 1e-6).max(a.start);
             let tb = t.max(b.start);
             frame.scene = Some(b.id.clone());
-            frame.background = a.background;
+            frame.background = a.background.at(ta + a.pre_roll);
             frame.layers = self.transition(a, b, tr, p, ta, tb);
             return frame;
         }
         let Some(scene) = self.scene_at(t) else { return frame };
         frame.scene = Some(scene.id.clone());
-        frame.background = scene.background;
+        frame.background = scene.background.at(t + scene.pre_roll);
         self.scene_layers(scene, t, &mut frame.layers);
         frame
     }
@@ -1574,7 +1579,7 @@ impl Compiled {
     fn scene_group_bg(&self, scene: &CScene, t: f64, matrix: Affine, opacity: f64, bg: f64) -> LayerState {
         let matrix = Proj::from(matrix);
         let (w, h) = (self.settings.width as f64, self.settings.height as f64);
-        let mut background = canvas_rect(&format!("{}-background", scene.id), (w * bg).ceil(), (h * bg).ceil(), scene.background);
+        let mut background = canvas_rect(&format!("{}-background", scene.id), (w * bg).ceil(), (h * bg).ceil(), scene.background.at(t + scene.pre_roll));
         background.matrix = Affine::translate(w / 2.0, h / 2.0).into();
         let mut layers = vec![background];
         self.scene_layers(scene, t, &mut layers);

@@ -417,8 +417,9 @@ soft shadows from every mesh onto every other mesh of the layer list:
 false for the rest) and `softness` (0 sharp … 1 very soft, default 0.35;
 animatable). The
 environment (`studio` default, `soft`, `sunset`, `night`, `none`; `sky`,
-`horizon`, `ground` override its colours) is what glossy surfaces reflect
-and gives soft ambient light.
+`horizon`, `ground` override its colours; all three are animatable) is
+what glossy surfaces reflect and gives soft ambient light. A scene's
+`background` is animatable too.
 
 ## Properties
 
