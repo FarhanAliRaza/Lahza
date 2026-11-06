@@ -597,6 +597,77 @@ fn range_window(dist: f32, range: f32) -> f32 {
     return w * w;
 }
 
+// Area lights (rows: [centre, 3], [colour, shadow], [range, ..],
+// [u half extent, disc], [v half extent, area]); they shine along u × v.
+fn area_point(row: u32, u1: f32, u2: f32) -> vec3<f32> {
+    let c = b_light[row].xyz;
+    let u = b_light[row + 3u];
+    let w = b_light[row + 4u];
+    if u.w > 0.5 {
+        let r = sqrt(u1);
+        let phi = 2.0 * PI * u2;
+        return c + u.xyz * (r * cos(phi)) + w.xyz * (r * sin(phi));
+    }
+    return c + u.xyz * (2.0 * u1 - 1.0) + w.xyz * (2.0 * u2 - 1.0);
+}
+
+// Radiance per unit colour: a light of intensity 1 gives a surface facing
+// it 1000 px away the irradiance of a directional light of intensity 1
+// (π × colour, as light colours are irradiance / π), whatever its size.
+fn area_radiance(row: u32) -> f32 {
+    return PI * 1e6 / max(b_light[row + 4u].w, 1.0);
+}
+
+// Solid-angle pdf of sampling the panel uniformly, toward l at dist.
+fn area_pdf(row: u32, p: vec3<f32>, l: vec3<f32>, dist: f32) -> f32 {
+    let nl = normalize(cross(b_light[row + 3u].xyz, b_light[row + 4u].xyz));
+    let cos_l = -dot(l, nl);
+    if cos_l <= 1e-6 { return 0.0; }
+    return dist * dist / (cos_l * max(b_light[row + 4u].w, 1.0));
+}
+
+// Where a ray from o along d meets the front of the panel (t, or −1).
+fn area_hit(row: u32, o: vec3<f32>, d: vec3<f32>) -> f32 {
+    let c = b_light[row].xyz;
+    let u = b_light[row + 3u];
+    let w = b_light[row + 4u];
+    let nl = normalize(cross(u.xyz, w.xyz));
+    let den = dot(d, nl);
+    if den >= -1e-6 { return -1.0; }
+    let t = dot(c - o, nl) / den;
+    if t <= 0.0 { return -1.0; }
+    let rel = o + d * t - c;
+    let x = dot(rel, u.xyz) / max(dot(u.xyz, u.xyz), 1e-6);
+    let y = dot(rel, w.xyz) / max(dot(w.xyz, w.xyz), 1e-6);
+    if u.w > 0.5 {
+        if x * x + y * y > 1.0 { return -1.0; }
+    } else if abs(x) > 1.0 || abs(y) > 1.0 {
+        return -1.0;
+    }
+    return t;
+}
+
+// Light from the area panels a ray (o, d) meets before tmax, found by
+// sampling a surface with pdf `pdf` (0: a mirror bounce, no MIS).
+fn area_emission(o: vec3<f32>, d: vec3<f32>, tmax: f32, pdf: f32) -> vec3<f32> {
+    var out = vec3<f32>(0.0);
+    let lights = u32(b_light[0].x);
+    for (var i = 0u; i < lights; i++) {
+        let row = 7u + i * LROWS;
+        if u32(b_light[row].w) != 3u { continue; }
+        let t = area_hit(row, o, d);
+        if t <= 0.0 || t >= tmax { continue; }
+        var w = 1.0;
+        if pdf > 0.0 {
+            let lp = area_pdf(row, o, d, t);
+            w = pdf / (pdf + lp);
+        }
+        let col = b_light[row + 1u].xyz * range_window(length(b_light[row].xyz - o), b_light[row + 2u].x);
+        out += col * area_radiance(row) * w;
+    }
+    return out;
+}
+
 struct LightSample {
     l: vec3<f32>,      // toward the light
     dist: f32,         // to it (1e30: directional)
@@ -620,7 +691,13 @@ fn sample_light(i: u32, p: vec3<f32>, rng: ptr<function, Rng>) -> LightSample {
     let r = sqrt(u1);
     let phi = 2.0 * PI * u2;
     let disc = vec2<f32>(r * cos(phi), r * sin(phi));
-    if u32(row.w) == 1u {
+    if u32(row.w) == 3u {
+        let q = area_point(7u + i * LROWS, u1, u2);
+        let tt = q - p;
+        ls.dist = length(tt);
+        ls.l = tt / max(ls.dist, 1e-6);
+        ls.col *= range_window(length(row.xyz - p), extra.x);
+    } else if u32(row.w) == 1u {
         let to = row.xyz - p;
         let d = length(to);
         let c = to / max(d, 1e-6);
@@ -649,6 +726,17 @@ fn direct(s: Surface, h: Hit, v: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32
         if kind == 2u { continue; }
         let ls = sample_light(i, h.p, rng);
         if dot(h.n, ls.l) <= 0.0 || dot(ls.col, ls.col) <= 0.0 { continue; }
+        if kind == 3u {
+            // A point on the panel: radiance / pdf, weighted against
+            // finding it by sampling the surface (MIS, balance).
+            let row = 7u + i * LROWS;
+            let pdf = area_pdf(row, h.p, ls.l, ls.dist);
+            if pdf <= 0.0 { continue; }
+            if ls.shadow && occluded(offset(h, ls.l), ls.l, ls.dist * 0.999, rng) { continue; }
+            let w = pdf / (pdf + bsdf_pdf(s, v, ls.l));
+            out += bsdf_cos(s, v, ls.l) * area_radiance(row) * ls.col * (w / pdf);
+            continue;
+        }
         if ls.shadow && occluded(offset(h, ls.l), ls.l, ls.dist * 0.999, rng) { continue; }
         out += bsdf_cos(s, v, ls.l) * PI * ls.col;
     }
@@ -711,8 +799,17 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     // Scattering off surfaces counts against `bounces`; passing through
     // glass and see-through layers has its own, larger allowance.
     var bounce = 0u;
+    // The pdf of the last bounce (0: a mirror-like event), for MIS on the
+    // area lights it reaches.
+    var last_pdf = 0.0;
     for (var step = 0u; step < bounces + 16u; step++) {
         let h = cast_ray(o, d, 1e30, rng);
+        if !through {
+            // Area lights are seen in reflections, not by the camera.
+            var tmax = 1e30;
+            if h.found { tmax = h.t; }
+            out.color += throughput * area_emission(o, d, tmax, last_pdf);
+        }
         if !h.found {
             if !through {
                 out.color += throughput * env(d);
@@ -808,6 +905,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
                 throughput *= 1.0 / (1.0 + smith_lambda(lw, glass_a, glass_a));
             }
             d = s.t * ll.x + s.b * ll.y + s.n * ll.z;
+            last_pdf = 0.0;
             if refracted {
                 if h.two_sided {
                     // A thin pane: straight through, tinted once.
@@ -831,6 +929,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         if smp.w <= 0.0 { return out; }
         let l = smp.xyz;
         throughput *= bsdf_cos(s, v, l) / smp.w;
+        last_pdf = smp.w;
         // Russian roulette after a few bounces.
         if bounce >= 3u {
             let q = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);

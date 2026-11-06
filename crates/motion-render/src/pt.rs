@@ -549,8 +549,12 @@ mod scene_tests {
     pub(crate) fn tracer(spp: u32) -> Option<Renderer> {
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
         let r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp, bounces: 4 }), ..Default::default() });
+        // Asked for the GPU and it (or the tracer's shader) failed: a bug.
+        assert!(!allow || r.is_gpu(), "no GPU: {}", r.backend_label());
+        let trace_error = r.gpu.as_ref().and_then(|g| g.trace_error.clone());
+        assert!(!allow || trace_error.as_deref().is_none_or(|e| !e.starts_with("path tracer:")), "the tracer failed: {trace_error:?}");
         if !r.is_gpu() || !r.can_trace() {
-            eprintln!("skipping: no path tracer ({}; {:?})", r.backend_label(), r.gpu.as_ref().and_then(|g| g.trace_error.clone()));
+            eprintln!("skipping: no path tracer ({}; {:?})", r.backend_label(), trace_error);
             return None;
         }
         Some(r)
@@ -856,6 +860,58 @@ mod physics_tests {
             let (ta, tb) = (a.get_pixel(x, 120).0[1] as i32, b.get_pixel(x, 120).0[1] as i32);
             assert!((ta - tb).abs() <= 8, "x {x}: traced {ta}, raster {tb}");
         }
+    }
+
+    /// An area light: traced and rasterised light the same; its size
+    /// softens shadows without changing how bright it is; mirrors show
+    /// it, the camera does not.
+    #[test]
+    fn area_lights_light_soften_and_reflect() {
+        let Some(mut r) = tracer(64) else { return };
+        let dark = json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"});
+        let setup = |layers: serde_json::Value, light: serde_json::Value| {
+            let mut p = project(layers);
+            p.settings.width = 320;
+            p.settings.height = 240;
+            p.scenes[0].lights = serde_json::from_value(json!([light])).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(dark.clone()).unwrap());
+            Compiled::new(&p)
+        };
+        // Agreement on lit spheres, matte and glossy.
+        for material in [json!({"preset": "matte", "color": "#d0d0d0"}), json!({"preset": "plastic", "color": "#c03030", "roughness": 0.4})] {
+            let c = setup(json!([{"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 90}, "material": material, "transform": {"position": [160, 120]}}]),
+                json!({"type": "area", "position": [-200, -100, -600], "size": [300, 200], "intensity": 1.5, "shadow": false}));
+            assert!(c.errors.is_empty(), "{:?}", c.errors);
+            let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+            let (ma, mb) = (disc(&a, 160.0, 120.0, 0.0, 85.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 85.0, |_, _| true));
+            let worst = (0..3).map(|k| (ma[k] - mb[k]).abs()).fold(0.0, f64::max);
+            assert!(worst < 8.0, "{material}: traced {ma:?}, raster {mb:?}");
+        }
+        // Size: same light on the floor, wider shadow edge.
+        let shadow = |size: f64, r: &mut crate::Renderer| {
+            let c = setup(json!([
+                {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#ffffff"}, "transform": {"position": [160, 120]}},
+                {"id": "block", "kind": "mesh", "mesh": {"type": "box", "size": [60, 2000], "depth": 20}, "material": {"preset": "matte", "color": "#000000", "specular": 0}, "transform": {"position": [80, 120], "z": -150}}
+            ]), json!({"type": "area", "position": [-600, 120, -600], "aim": [160, 120, 0], "size": [size, size], "shape": "disc", "shadow": true}));
+            r.render(&c, 0.0)
+        };
+        let (small, big) = (shadow(10.0, &mut r), shadow(300.0, &mut r));
+        let lit = |img: &image::RgbaImage| img.get_pixel(20, 40).0[1] as f64;
+        assert!((lit(&small) - lit(&big)).abs() < 10.0, "brightness keeps with size: {} vs {}", lit(&small), lit(&big));
+        let edge = |img: &image::RgbaImage| {
+            let row: Vec<f64> = (115..320u32).map(|x| img.get_pixel(x, 120).0[1] as f64).collect();
+            let top = row.iter().cloned().fold(0.0, f64::max);
+            row.iter().filter(|v| **v > 0.1 * top && **v < 0.9 * top).count()
+        };
+        assert!(edge(&big) >= edge(&small) + 8, "shadow edge: {} px big, {} px small", edge(&big), edge(&small));
+        // A mirror ball shows the panel; the camera does not.
+        let c = setup(json!([{"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": {"preset": "metal", "color": "#ffffff", "roughness": 0}, "transform": {"position": [160, 120]}}]),
+            json!({"type": "area", "position": [160, 120, -400], "aim": [160, 120, 0], "size": [200, 200], "intensity": 0.2, "shadow": false}));
+        let img = r.render(&c, 0.0);
+        let centre = img.get_pixel(160, 120).0;
+        assert!(centre[1] > 200, "the ball's centre mirrors the panel: {centre:?}");
+        let rim = img.get_pixel(160, 175).0;
+        assert!(rim[1] < 60, "its edge mirrors the dark: {rim:?}");
     }
 
     /// Lists with what the tracer can't draw yet (wires, effects such as

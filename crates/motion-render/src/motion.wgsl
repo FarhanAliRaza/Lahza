@@ -834,6 +834,60 @@ fn env_brdf(r: f32, n_v: f32) -> vec2<f32> {
     return vec2<f32>(-1.04 * a004 + rr.z, 1.04 * a004 + rr.w);
 }
 
+// An area light (rows from `row`: [centre, 3], [colour], [range, ..],
+// [u half extent, disc], [v half extent, area]) seen from p: the
+// direction to its centre for diffuse, the point nearest the reflection
+// ray for specular (Karis' representative point) with GGX alpha widened
+// by its size, and the irradiance factor (radiance × solid angle).
+struct AreaSample {
+    ok: u32,
+    l: vec3<f32>,
+    ls: vec3<f32>,
+    sa: f32,
+    e: f32,
+}
+
+fn area_light(row: u32, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, alpha: f32) -> AreaSample {
+    var out: AreaSample;
+    let c = b_mesh[row].xyz;
+    let u = b_mesh[row + 3u];
+    let w = b_mesh[row + 4u];
+    let nl = normalize(cross(u.xyz, w.xyz));
+    let area = max(w.w, 1.0);
+    let dl = c - p;
+    let d2 = max(dot(dl, dl), 1e-6);
+    let dist = sqrt(d2);
+    out.l = dl / dist;
+    let cos_l = dot(-out.l, nl);
+    // Behind the panel: nothing (unless the point is within its plane).
+    if cos_l <= 0.0 && dot(p - c, nl) <= 0.0 { return out; }
+    out.ok = 1u;
+    // Irradiance facing it: radiance (1000² / area per unit intensity) ×
+    // solid angle, kept finite up close.
+    out.e = 1e6 * max(cos_l, 0.0) / (d2 + area / PI) * range_window(dist, b_mesh[row + 2u].x);
+    let r = n * (2.0 * dot(n, v)) - v;
+    let den = dot(r, nl);
+    var q = c;
+    if den < -1e-4 {
+        let t = dot(c - p, nl) / den;
+        if t > 0.0 { q = p + r * t; }
+    }
+    let rel = q - c;
+    var x = dot(rel, u.xyz) / max(dot(u.xyz, u.xyz), 1e-6);
+    var y = dot(rel, w.xyz) / max(dot(w.xyz, w.xyz), 1e-6);
+    if u.w > 0.5 {
+        let rr = sqrt(x * x + y * y);
+        if rr > 1.0 { x = x / rr; y = y / rr; }
+    } else {
+        x = clamp(x, -1.0, 1.0);
+        y = clamp(y, -1.0, 1.0);
+    }
+    let qs = c + u.xyz * x + w.xyz * y;
+    out.ls = normalize(qs - p);
+    out.sa = min(alpha + sqrt(area / PI) / (3.0 * dist), 1.0);
+    return out;
+}
+
 // A point light's fade to its range (0: none): smooth, reaching zero there.
 fn range_window(dist: f32, range: f32) -> f32 {
     if range <= 0.0 { return 1.0; }
@@ -1179,34 +1233,53 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
             continue;
         }
         var l = row.xyz;
+        // Specular: toward ls, with GGX alpha sa (× spec_norm to keep energy).
+        var ls = l;
+        var sa = alpha;
+        var spec_norm = 1.0;
         if kind == 1u {
             let dl = row.xyz - p;
             let dist = sqrt(dot(dl, dl));
             l = dl / max(dist, 1e-20);
+            ls = l;
             col = col * range_window(dist, extra.x);
+        } else if kind == 3u {
+            let ar = area_light(lb + 7u + i * LROWS, p, n, v, alpha);
+            if ar.ok == 0u { continue; }
+            l = ar.l;
+            ls = ar.ls;
+            sa = ar.sa;
+            spec_norm = (alpha / sa) * (alpha / sa);
+            col = col * ar.e;
         }
         let n_l = dot(n, l);
-        if n_l <= 0.0 { continue; }
+        let n_ls = dot(n, ls);
+        if n_l <= 0.0 && n_ls <= 0.0 { continue; }
         let soff = shadow_of(lb, i);
         if soff != 0 { col = col * shadow(u32(i32(lb) + soff), p, n); }
-        let hh = l + v;
+        if n_l > 0.0 {
+            d_light = d_light + diffuse * (col * (n_l * coat));
+            if e_sheen > 0.0 {
+                let hd = normalize(l + v);
+                s_light = s_light + sheen * col * (charlie(max(dot(n, hd), 0.0), sheen_r * sheen_r) * neubelt(n_v, n_l) * n_l * PI * coat);
+            }
+        }
+        if n_ls <= 0.0 { continue; }
+        let hh = ls + v;
         let h = hh / max(sqrt(dot(hh, hh)), 1e-20);
         let n_h = max(dot(n, h), 0.0);
         let v_h = max(dot(v, h), 0.0);
         let fw = pow5(1.0 - v_h);
         let f = fresnel_f82(f0, f82, f90, v_h);
-        var d = ggx(n_h, alpha);
-        if aniso > 0.0 { d = ggx_aniso(dot(h, tg), dot(h, bt), n_h, at, ab_); }
-        let spec = d * smith(n_v, n_l, rough) / max(4.0 * n_v * n_l, 1e-4) * PI;
-        d_light = d_light + diffuse * (col * (n_l * coat));
-        s_light = s_light + (f * comp * (spec * n_l * coat)) * col;
-        if e_sheen > 0.0 {
-            s_light = s_light + sheen * col * (charlie(n_h, sheen_r * sheen_r) * neubelt(n_v, n_l) * n_l * PI * coat);
-        }
+        var d = ggx(n_h, sa) * spec_norm;
+        if aniso > 0.0 { d = ggx_aniso(dot(h, tg), dot(h, bt), n_h, at * sa / alpha, ab_ * sa / alpha) * spec_norm; }
+        let spec = d * smith(n_v, n_ls, rough) / max(4.0 * n_v * n_ls, 1e-4) * PI;
+        s_light = s_light + (f * comp * (spec * n_ls * coat)) * col;
         if cc > 0.0 {
             let fc = 0.04 + 0.96 * fw;
-            let sc = ggx(n_h, ccr * ccr) * smith(n_v, n_l, ccr) / max(4.0 * n_v * n_l, 1e-4) * PI;
-            c_light = c_light + col * (sc * fc * cc * n_l);
+            let ca = max(ccr * ccr, sa - alpha + ccr * ccr);
+            let sc = ggx(n_h, ca) * ((ccr * ccr) / ca) * ((ccr * ccr) / ca) * smith(n_v, n_ls, ccr) / max(4.0 * n_v * n_ls, 1e-4) * PI;
+            c_light = c_light + col * (sc * fc * cc * n_ls);
         }
     }
     let nw = to_world(lb, n);

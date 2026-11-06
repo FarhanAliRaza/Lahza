@@ -418,7 +418,22 @@ false for the rest) and `softness` (0 sharp … 1 very soft, default 0.35;
 animatable; the path tracer makes it the light's size: a sun up to 0.1 rad
 across, a ball up to 40 px in radius). A point light's `range` (px,
 animatable) fades it smoothly to nothing at that distance; without one it
-lights near and far alike. The
+lights near and far alike.
+
+Area lights are glowing panels: `{"type": "area", "position": [x, y, z],
+"aim": [x, y, z], "size": [w, h], "shape": "rect" | "disc"}` (`aim`
+defaults to the canvas centre at z 0; position, aim and size animatable).
+Their light is soft and their shadows soften with their size; `intensity`
+1 lights a surface facing it 1000 px away like a directional light of
+intensity 1, whatever its size, so resizing a softbox changes its shadows,
+not its brightness. Glossy surfaces show the panel's shape (the path
+tracer exactly, the raster approximately); the camera does not see it.
+`range` fades it like a point light.
+
+```json
+"lights": [{"type": "area", "position": [400, 100, -600], "size": [600, 300], "intensity": 1.2},
+           {"type": "area", "position": [1600, 500, -300], "aim": [960, 540, 0], "size": [200, 200], "shape": "disc", "color": "#a0c8ff"}]
+``` The
 environment (`studio` default, `soft`, `sunset`, `night`, `none`; `sky`,
 `horizon`, `ground` override its colours; all three are animatable) is
 what glossy surfaces reflect and gives soft ambient light. A scene's

@@ -241,6 +241,9 @@ pub(crate) fn assert_gpu_matches_cpu_within(p: &Project, times: &[f64], outliers
     let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
     let mut gpu = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
     if !gpu.is_gpu() {
+        // Asked for the GPU (LAHZA_MOTION_SOFTWARE_GPU) and none came up:
+        // a shader that does not compile, not a machine without one.
+        assert!(!allow, "no GPU: {}", gpu.backend_label());
         eprintln!("skipping gpu_matches_cpu: {}", gpu.backend_label());
         return;
     }

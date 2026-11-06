@@ -734,3 +734,16 @@ fn point_lights_fade_out_at_their_range() {
     assert!(luma(px(&ranged, near.0, near.1)) > 0.8 * luma(px(&open, near.0, near.1)), "in range: as before");
     assert!(luma(px(&ranged, far.0, far.1)) < 3.0, "beyond range: dark ({:?})", px(&ranged, far.0, far.1));
 }
+
+#[test]
+fn gpu_matches_cpu_area_lights() {
+    let p = scene(480, 240, json!({"layers": [
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [2000, 2000]}, "material": {"preset": "matte", "color": "#d8d0c0"}, "transform": {"position": [240, 200], "rotation_x": 90}},
+        {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": {"preset": "plastic", "color": "#c03030", "roughness": 0.3}, "transform": {"position": [150, 140]}},
+        {"id": "cube", "kind": "mesh", "mesh": {"type": "box", "size": [80, 80], "depth": 80}, "material": {"preset": "brushed", "color": "#d0d4da"}, "transform": {"position": [330, 160], "rotation_y": 30}}
+    ], "lights": [
+        {"type": "area", "position": [0, -200, -300], "size": [400, 150], "intensity": 1.2},
+        {"type": "area", "position": [500, 0, -200], "aim": [300, 160, 0], "size": [120, 120], "shape": "disc", "color": "#a0c8ff", "range": 900}
+    ], "environment": {"preset": "night"}}));
+    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0002);
+}

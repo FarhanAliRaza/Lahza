@@ -249,6 +249,12 @@ impl MeshCache {
                         let p = view.apply(l.vector[0], l.vector[1], l.vector[2]);
                         ShadowMap::point(&tris, [p[0], p[1], p[2]], size, l.softness)
                     }
+                    LightKind::Area => {
+                        // From its centre, softened by its size.
+                        let p = view.apply(l.vector[0], l.vector[1], l.vector[2]);
+                        let soft = ((len3(l.u) + len3(l.v)) / 150.0).clamp(0.1, 1.0).max(l.softness);
+                        ShadowMap::point(&tris, [p[0], p[1], p[2]], size, soft)
+                    }
                     LightKind::Ambient => None,
                 }
                 .map(Arc::new)
@@ -355,6 +361,10 @@ pub(crate) struct ShadowMap {
 }
 
 const NO_SURFACE: f32 = -1.0e30;
+
+fn len3(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
 
 fn unit3(v: [f64; 3]) -> [f64; 3] {
     let l = dot(v, v).sqrt().max(1e-12);
@@ -679,12 +689,19 @@ pub(crate) fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
                 ([p[0], p[1], p[2]], 1.0)
             }
             LightKind::Ambient => ([0.0; 3], 2.0),
+            LightKind::Area => {
+                let p = m.camera.view.apply(light.vector[0], light.vector[1], light.vector[2]);
+                ([p[0], p[1], p[2]], 3.0)
+            }
         };
         rows.push(f(vector, kind));
         rows.push(f(light.color, 0.0));
         rows.push([light.range as f32, light.softness as f32, 0.0, 0.0]);
-        rows.push([0.0; 4]);
-        rows.push([0.0; 4]);
+        // Area lights: half extents (camera space), shape, area.
+        let (hu, hv) = (len3(light.u), len3(light.v));
+        let area = if light.disc { std::f64::consts::PI * hu * hv } else { 4.0 * hu * hv };
+        rows.push(f(rot(light.u), if light.disc { 1.0 } else { 0.0 }));
+        rows.push(f(rot(light.v), area));
     }
     for lobe in &l.env.lobes {
         rows.push(f(lobe.dir, lobe.size));
@@ -1344,6 +1361,55 @@ fn env_brdf(r: f32, n_v: f32) -> [f32; 2] {
     [-1.04 * a004 + rr[2], 1.04 * a004 + rr[3]]
 }
 
+/// An area light seen from p (mirrors `area_light` in motion.wgsl).
+struct AreaSample {
+    l: F3,
+    ls: F3,
+    sa: f32,
+    e: f32,
+}
+
+fn area_light(m: &[[f32; 4]], row: usize, p: F3, n: F3, v: F3, alpha: f32) -> Option<AreaSample> {
+    let c = f3(m[row]);
+    let (u, w) = (m[row + 3], m[row + 4]);
+    let nl = fnorm(fcross(f3(u), f3(w)));
+    let area = w[3].max(1.0);
+    let dl = fsub(c, p);
+    let d2 = fdot(dl, dl).max(1e-6);
+    let dist = d2.sqrt();
+    let l = fmul(dl, 1.0 / dist);
+    let cos_l = -fdot(l, nl);
+    if cos_l <= 0.0 && fdot(fsub(p, c), nl) <= 0.0 {
+        return None;
+    }
+    let pi = std::f32::consts::PI;
+    let e = 1e6 * cos_l.max(0.0) / (d2 + area / pi) * range_window(dist, m[row + 2][0]);
+    let r = fsub(fmul(n, 2.0 * fdot(n, v)), v);
+    let den = fdot(r, nl);
+    let mut q = c;
+    if den < -1e-4 {
+        let t = fdot(fsub(c, p), nl) / den;
+        if t > 0.0 {
+            q = fadd(p, fmul(r, t));
+        }
+    }
+    let rel = fsub(q, c);
+    let mut x = fdot(rel, f3(u)) / fdot(f3(u), f3(u)).max(1e-6);
+    let mut y = fdot(rel, f3(w)) / fdot(f3(w), f3(w)).max(1e-6);
+    if u[3] > 0.5 {
+        let rr = (x * x + y * y).sqrt();
+        if rr > 1.0 {
+            x /= rr;
+            y /= rr;
+        }
+    } else {
+        x = x.clamp(-1.0, 1.0);
+        y = y.clamp(-1.0, 1.0);
+    }
+    let qs = fadd(fadd(c, fmul(f3(u), x)), fmul(f3(w), y));
+    Some(AreaSample { l, ls: fnorm(fsub(qs, p)), sa: (alpha + (area / pi).sqrt() / (3.0 * dist)).min(1.0), e })
+}
+
 /// A point light's fade to its range (0: none). Mirrors motion.wgsl.
 pub(crate) fn range_window(dist: f32, range: f32) -> f32 {
     if range <= 0.0 {
@@ -1622,37 +1688,51 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
             d_light = fadd(d_light, fmul3(diffuse, col));
             continue;
         }
-        let (l, col) = if kind == 1 {
+        // Specular: toward ls with GGX alpha sa (× spec_norm keeps energy).
+        let (l, ls, sa, col) = if kind == 1 {
             let dl = fsub(f3(row), p);
             let dist = fdot(dl, dl).sqrt();
-            (fmul(dl, 1.0 / dist.max(1e-20)), fmul(col, range_window(dist, extra[0])))
+            let l = fmul(dl, 1.0 / dist.max(1e-20));
+            (l, l, alpha, fmul(col, range_window(dist, extra[0])))
+        } else if kind == 3 {
+            let Some(ar) = area_light(m, lb + 7 + i * LROWS, p, n, v, alpha) else { continue };
+            (ar.l, ar.ls, ar.sa, fmul(col, ar.e))
         } else {
-            (f3(row), col)
+            (f3(row), f3(row), alpha, col)
         };
+        let spec_norm = (alpha / sa) * (alpha / sa);
         let n_l = fdot(n, l);
-        if n_l <= 0.0 {
+        let n_ls = fdot(n, ls);
+        if n_l <= 0.0 && n_ls <= 0.0 {
             continue;
         }
         let col = match shadow_of(m, lb, i) {
             Some(sm) => fmul(col, shadow(m, sm, p, n)),
             None => col,
         };
-        let h = fnorm(fadd(l, v));
+        if n_l > 0.0 {
+            d_light = fadd(d_light, fmul3(diffuse, fmul(col, n_l * coat)));
+            if e_sheen > 0.0 {
+                let hd = fnorm(fadd(l, v));
+                s_light = fadd(s_light, fmul(fmul3(sheen, col), charlie(fdot(n, hd).max(0.0), sheen_r * sheen_r) * neubelt(n_v, n_l) * n_l * std::f32::consts::PI * coat));
+            }
+        }
+        if n_ls <= 0.0 {
+            continue;
+        }
+        let h = fnorm(fadd(ls, v));
         let n_h = fdot(n, h).max(0.0);
         let v_h = fdot(v, h).max(0.0);
         let fw = (1.0 - v_h).powi(5);
         let f = fresnel_f82(f0, f82, f90, v_h);
-        let d = if aniso > 0.0 { ggx_aniso(fdot(h, tg), fdot(h, bt), n_h, at, ab_) } else { ggx(n_h, alpha) };
-        let spec = d * smith(n_v, n_l, rough) / (4.0 * n_v * n_l).max(1e-4) * std::f32::consts::PI;
-        d_light = fadd(d_light, fmul3(diffuse, fmul(col, n_l * coat)));
-        s_light = fadd(s_light, fmul3(fmul(fmul3(f, comp), spec * n_l * coat), col));
-        if e_sheen > 0.0 {
-            s_light = fadd(s_light, fmul(fmul3(sheen, col), charlie(n_h, sheen_r * sheen_r) * neubelt(n_v, n_l) * n_l * std::f32::consts::PI * coat));
-        }
+        let d = if aniso > 0.0 { ggx_aniso(fdot(h, tg), fdot(h, bt), n_h, at * sa / alpha, ab_ * sa / alpha) * spec_norm } else { ggx(n_h, sa) * spec_norm };
+        let spec = d * smith(n_v, n_ls, rough) / (4.0 * n_v * n_ls).max(1e-4) * std::f32::consts::PI;
+        s_light = fadd(s_light, fmul3(fmul(fmul3(f, comp), spec * n_ls * coat), col));
         if cc > 0.0 {
             let fc = 0.04 + 0.96 * fw;
-            let sc = ggx(n_h, ccr * ccr) * smith(n_v, n_l, ccr) / (4.0 * n_v * n_l).max(1e-4) * std::f32::consts::PI;
-            c_light = fadd(c_light, fmul(col, sc * fc * cc * n_l));
+            let ca = (ccr * ccr).max(sa - alpha + ccr * ccr);
+            let sc = ggx(n_h, ca) * ((ccr * ccr) / ca) * ((ccr * ccr) / ca) * smith(n_v, n_ls, ccr) / (4.0 * n_v * n_ls).max(1e-4) * std::f32::consts::PI;
+            c_light = fadd(c_light, fmul(col, sc * fc * cc * n_ls));
         }
     }
     let nw = to_world(m, lb, n);

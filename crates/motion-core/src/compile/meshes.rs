@@ -123,6 +123,11 @@ pub struct LightState {
     pub softness: f64,
     /// Point lights: px where the light has faded out (0: no falloff).
     pub range: f64,
+    /// Area lights: half extents across the panel (world px); u × v
+    /// points the way it shines.
+    pub u: [f64; 3],
+    pub v: [f64; 3],
+    pub disc: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +159,10 @@ pub fn srgb_to_linear(v: f64) -> f64 {
 
 fn linear(c: Color, k: f64) -> [f64; 3] {
     [srgb_to_linear(c.0[0]) * k, srgb_to_linear(c.0[1]) * k, srgb_to_linear(c.0[2]) * k]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
 fn unit(v: [f64; 3]) -> [f64; 3] {
@@ -454,16 +463,19 @@ impl Compiler<'_> {
                 .enumerate()
                 .map(|(i, l)| {
                     let (what, fallback) = match l.kind {
-                        LightKind::Point => (("position", &l.position), [0.0, 0.0, -500.0]),
+                        LightKind::Point | LightKind::Area => (("position", &l.position), [0.0, 0.0, -500.0]),
                         _ => (("from", &l.from), [-1.0, -1.0, -1.0]),
                     };
                     let vector = match what.1 {
                         Some(p) => self.prop(p, id, &format!("lights.{i}.{}", what.0), start, None, pre_roll),
                         None => Prop::constant(crate::value::Vec3(fallback)),
                     };
-                    if l.kind == LightKind::Point && l.position.is_none() {
-                        self.errors.push(format!("{id}.lights.{i}: a point light needs \"position\""));
+                    if matches!(l.kind, LightKind::Point | LightKind::Area) && l.position.is_none() {
+                        let kind = if l.kind == LightKind::Area { "an area" } else { "a point" };
+                        self.errors.push(format!("{id}.lights.{i}: {kind} light needs \"position\""));
                     }
+                    let settings = &self.windows.project.settings;
+                    let centre = crate::value::Vec3([settings.width as f64 / 2.0, settings.height as f64 / 2.0, 0.0]);
                     CLight {
                         kind: l.kind,
                         vector,
@@ -472,6 +484,15 @@ impl Compiler<'_> {
                         shadow: l.shadow.unwrap_or(Some(i) == key) && l.kind != LightKind::Ambient,
                         softness: self.prop(&l.softness, id, &format!("lights.{i}.softness"), start, None, pre_roll),
                         range: l.range.as_ref().map(|r| self.prop(r, id, &format!("lights.{i}.range"), start, None, pre_roll)),
+                        aim: match &l.aim {
+                            Some(a) => self.prop(a, id, &format!("lights.{i}.aim"), start, None, pre_roll),
+                            None => Prop::constant(centre),
+                        },
+                        size: match &l.size {
+                            Some(a) => self.prop(a, id, &format!("lights.{i}.size"), start, None, pre_roll),
+                            None => Prop::constant(crate::value::Vec2([300.0, 300.0])),
+                        },
+                        disc: l.shape == Some(crate::document::AreaShape::Disc),
                     }
                 })
                 .collect()
@@ -498,6 +519,9 @@ fn default_rig() -> Vec<CLight> {
         shadow,
         softness: Prop::constant(0.35),
         range: None,
+        aim: Prop::constant(crate::value::Vec3([0.0; 3])),
+        size: Prop::constant(crate::value::Vec2([0.0; 2])),
+        disc: false,
     };
     // The key casts shadows; the rim only outlines.
     vec![light([-0.55, -0.8, -0.7], 1.0, true), light([0.75, -0.35, 0.8], 0.7, false)]
@@ -512,6 +536,9 @@ pub(super) struct CLight {
     shadow: bool,
     softness: Prop<f64>,
     range: Option<Prop<f64>>,
+    aim: Prop<crate::value::Vec3>,
+    size: Prop<crate::value::Vec2>,
+    disc: bool,
 }
 
 pub(super) struct CLighting {
@@ -532,7 +559,20 @@ impl CLighting {
             .map(|l| {
                 let c = clamp_color(l.color.at(tc));
                 let v = l.vector.at(tc).0;
-                let vector = if l.kind == LightKind::Point { v } else { unit(v) };
+                let vector = if matches!(l.kind, LightKind::Point | LightKind::Area) { v } else { unit(v) };
+                let (mut u, mut w) = ([0.0; 3], [0.0; 3]);
+                if l.kind == LightKind::Area {
+                    // Half extents across the panel; u × w faces the aim.
+                    let a = l.aim.at(tc).0;
+                    let n = unit([a[0] - v[0], a[1] - v[1], a[2] - v[2]]);
+                    let up = if n[1].abs() > 0.99 { [0.0, 0.0, 1.0] } else { [0.0, -1.0, 0.0] };
+                    let ud = unit(cross(n, up));
+                    let wd = cross(n, ud);
+                    let size = l.size.at(tc).0;
+                    let (hw, hh) = (size[0].max(1.0) / 2.0, size[1].max(1.0) / 2.0);
+                    u = [ud[0] * hw, ud[1] * hw, ud[2] * hw];
+                    w = [wd[0] * hh, wd[1] * hh, wd[2] * hh];
+                }
                 LightState {
                     kind: l.kind,
                     vector,
@@ -540,6 +580,9 @@ impl CLighting {
                     shadow: l.shadow,
                     softness: l.softness.at(tc).clamp(0.0, 1.0),
                     range: l.range.as_ref().map(|r| r.at(tc).max(1.0)).unwrap_or(0.0),
+                    u,
+                    v: w,
+                    disc: l.disc,
                 }
             })
             .collect();

@@ -2353,6 +2353,17 @@ pub enum LightKind {
     Point,
     /// Even light from everywhere.
     Ambient,
+    /// A glowing panel (rect or disc) at `position` facing `aim`: soft
+    /// light whose shadows soften with its `size`.
+    Area,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AreaShape {
+    #[default]
+    Rect,
+    Disc,
 }
 
 /// A light for mesh layers. Directions are in the scene's space (x right,
@@ -2381,6 +2392,15 @@ pub struct Light {
     /// default none: it lights everything evenly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Property<f64>>,
+    /// Area lights: the world point the panel faces (default the canvas
+    /// centre at z 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aim: Option<Property<crate::value::Vec3>>,
+    /// Area lights: [w, h] px (disc: its diameters); default [300, 300].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Property<crate::value::Vec2>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<AreaShape>,
 }
 
 fn shadow_softness() -> Property<f64> {
