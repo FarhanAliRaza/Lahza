@@ -283,6 +283,8 @@ impl MeshCache {
         let mesh = self.get(m)?;
         let mv = m.camera.view.then(m.world).0;
         let transform = [0, 1, 2].map(|r| [mv[r * 4] as f32, mv[r * 4 + 1] as f32, mv[r * 4 + 2] as f32, mv[r * 4 + 3] as f32]);
+        let w = m.world.0;
+        let world = [0, 1, 2].map(|r| [w[r * 4] as f32, w[r * 4 + 1] as f32, w[r * 4 + 2] as f32, w[r * 4 + 3] as f32]);
         let mut materials = Vec::new();
         let mut parts = [(0u32, 1u32); PARTS];
         for (part, slot) in parts.iter_mut().enumerate() {
@@ -292,7 +294,7 @@ impl MeshCache {
                 materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale, &self.textures));
             }
         }
-        Some(crate::pt::TraceInstance { id, mesh, key: m.params.key(), transform, materials, parts })
+        Some(crate::pt::TraceInstance { id, mesh, key: m.params.key(), transform, world, materials, parts })
     }
 
     /// The environment image of these lights, loaded once.
@@ -710,7 +712,7 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
         rows[9] = [(n.field.kind.code() + 1) as f32, (1.0 / n.field.scale) as f32, n.field.octaves as f32, b(n.field.seed)];
         let (c, amount) = n.color.map(|c| (lin(c), n.amount)).unwrap_or(([0.0; 3], 0.0));
         rows[10] = [c[0], c[1], c[2], amount as f32];
-        rows[11] = [n.roughness as f32, n.bump as f32, 0.0, 0.0];
+        rows[11] = [n.roughness as f32, n.bump as f32, if n.world { 1.0 } else { 0.0 }, 0.0];
     }
     let texture = |path: &Option<Arc<str>>| path.as_ref().and_then(|p| textures.get(p).copied().flatten());
     if let Some(t) = texture(&mat.map) {

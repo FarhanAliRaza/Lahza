@@ -336,6 +336,30 @@ The model follows Blender's Principled BSDF, so materials carry over:
 | `clearcoat_color` | the coat's tint: what is under it is seen through this colour (candy paint) |
 | `dispersion` | glass: rainbow fringes as 1 / Abbe number (0.02 window glass, 0.05 flint, more for a stylised prism); path tracing only |
 
+Surface detail (raster and path tracer alike):
+
+| field | meaning |
+|---|---|
+| `noise` | procedural noise on the surface, no UVs needed: `{"type": "fbm" (default) \| "value" \| "cellular", "scale": px feature size (40), "octaves": 4, "seed": 0, "space": "object" (moves with the mesh) \| "world", "color": colour where the noise is high, "amount": 0..1 toward it (1), "roughness": ± roughness, "bump": px of apparent height}` (scale, colour, amount, roughness and bump animatable) |
+| `map` | an image (project path) over the UVs, multiplying `color` |
+| `normal_map` | a tangent-space normal map (green up) |
+| `bump_map`, `bump` | a height image (bright = raised) and its height in px (2) |
+| `uv` | `{"scale": [x, y] repeats (1, 1), "offset": [x, y], "rotation": degrees}` (animatable) |
+
+UVs run 0..1 across each flat face of planes, boxes and extrusions,
+around (u) and along (v) cylinders, capsules and revolves (caps planar),
+over spheres equirectangularly, and around and across a ring's tube.
+A mesh's `displace` pushes its surface out and in for real (the
+silhouette changes): `{"type", "scale", "octaves", "seed", "amount": px}`;
+the mesh is subdivided to the noise's scale (up to 200k triangles) and
+stays closed.
+
+```json
+{"id": "rock", "kind": "mesh", "mesh": {"type": "sphere", "radius": 120},
+ "displace": {"type": "fbm", "scale": 60, "amount": 18},
+ "material": {"preset": "matte", "color": "#8a7a68", "noise": {"type": "cellular", "scale": 20, "color": "#4a4038", "bump": 4}}}
+```
+
 Reflection keeps its energy at every roughness (rough metals stay bright,
 as with multiple scattering), and the diffuse under a lobe gets only the
 light that lobe leaves. Presets `brushed` (spun metal, anisotropy 0.8) and

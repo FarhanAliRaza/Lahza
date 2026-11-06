@@ -425,6 +425,15 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
                     used.push((l.id.clone(), path.clone()));
                 }
             }
+            // Mesh image maps.
+            if let LayerKind::Mesh(m) = &l.kind {
+                let parts = m.parts.list();
+                for mat in std::iter::once(&m.material).chain(parts.into_iter().flatten()) {
+                    for path in [&mat.map, &mat.normal_map, &mat.bump_map].into_iter().flatten() {
+                        used.push((l.id.clone(), path.clone()));
+                    }
+                }
+            }
         });
     }
     for (element, path) in used {

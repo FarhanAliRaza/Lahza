@@ -374,7 +374,7 @@ impl Gpu {
                 let t = g.target;
                 if let Some(ti) = g.trace {
                     let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
-                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device);
+                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device, self.images.device);
                     continue;
                 }
                 let data = raster_data(

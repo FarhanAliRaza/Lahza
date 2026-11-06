@@ -124,7 +124,8 @@ pub fn catalog_json() -> Value {
                     "specular": "0..1 dielectric reflection (0.5 default = 4% head-on; 0 none)", "specular_tint": "colour: tints a dielectric's reflection and a metal's edges (Blender F82 tint)",
                     "anisotropy": "0..1 brushed/spun metal: grain around the mesh's axis, highlights stretch across it", "anisotropy_rotation": "degrees the grain turns",
                     "sheen": "0..1 soft grazing light (velvet, fabric)", "sheen_color": "colour (default white)", "sheen_roughness": "0..1 (default 0.5)",
-                    "clearcoat_color": "colour the coat tints what is under it (candy paint)", "dispersion": "glass, path tracing: 1/Abbe (0.02 glass, 0.05 flint, more: stylised rainbows)",
+                    "clearcoat_color": "colour the coat tints what is under it (candy paint)",
+                    "noise": "{type: fbm|value|cellular, scale px, octaves, seed, space: object|world, color, amount, roughness ±, bump px}: procedural surface detail, no UVs", "map": "image over the UVs (multiplies color)", "normal_map": "tangent-space normal image (green up)", "bump_map": "height image", "bump": "bump_map height px (2)", "uv": "{scale: [x, y], offset: [x, y], rotation: deg}", "dispersion": "glass, path tracing: 1/Abbe (0.02 glass, 0.05 flint, more: stylised rainbows)",
                     "ior": "glass: index of refraction (default 1.45)", "thickness": "glass: px light travels inside (default 60)",
                     "colors": "[colour, …] per piece, in turn, for this part (over the layer's colors)", "wireframe": "px: draw edges instead of the surface (preset wireframe)", "fill": "wireframe face colour (hidden-line; omit for see-through wires)",
                     "color": "base colour (animatable)", "metallic": "0..1", "roughness": "0 mirror … 1 diffuse", "clearcoat": "0..1 lacquer layer", "clearcoat_roughness": "0..1",
@@ -277,7 +278,7 @@ pub fn catalog_json() -> Value {
                 "colors": "[colour, …] one per piece in turn (animatable)",
                 "material": material,
                 "parts": {"front": "material over `material` for the part (rings/revolves: facing −axis)", "back": "…", "side": "… (rings/revolves: facing away from the axis)", "bevel": "…", "caps": "…", "inside": "rings/revolves: facing the axis"},
-                "detail": "tessellation multiplier (default 1)",
+                "detail": "tessellation multiplier (default 1)", "displace": "{type, scale px, octaves, seed, amount px}: pushes the surface out and in by noise (real silhouette; subdivided, stays closed)",
                 "depth": "meshes and flat 3D layers in the same layer list share one depth test (planes cut through meshes, any order); see-through meshes (opacity, glass, blend) draw after the opaque ones",
                 "path_tracing": "export only: project settings.renderer \"path\" (samples: paths per pixel, default 64, drafts a quarter) or render --pt / snapshot --pt (--spp N): ray-traced shadows, bounced light, reflections of the scene, refraction of meshes behind glass; same camera, so meshes stand where the raster draws them. Needs a GPU with ray queries, else rasterised with a warning; depth of field is a traced thin lens, motion blur splits the samples across the shutter; a denoiser cleans few-sample frames (--no-denoise to skip) and exports accumulate frame to frame along the motion; lists with wireframes, effects, mattes or blend modes on 3D layers are rasterised"
             }

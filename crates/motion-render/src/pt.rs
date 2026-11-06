@@ -53,6 +53,8 @@ pub struct TraceInstance {
     pub key: Vec<u8>,
     /// Object → camera space, row-major 3 × 4.
     pub transform: [[f32; 4]; 3],
+    /// Object → world (world-space surface noise).
+    pub world: [[f32; 4]; 3],
     /// Material rows (`mesh3d::MAT_ROWS` per material, see `mesh3d::material_rows`).
     pub materials: Vec<[f32; 4]>,
     /// Per part: (first material, count): a triangle of part p and segment
@@ -129,8 +131,9 @@ pub fn supported(context: &gpu::Context) -> bool {
 const SHADER: &str = include_str!("pt.wgsl");
 
 /// Rows per instance: [attribute, index, tag bases], part materials (3),
-/// the previous frame's object → camera transform (3).
-const INST_ROWS: usize = 7;
+/// the previous frame's object → camera transform (3), this frame's (3),
+/// object → world (3).
+const INST_ROWS: usize = 13;
 
 /// The custom index marking the cards' instance.
 const CARD_INSTANCE: u32 = 0x00FF_FFFF;
@@ -177,6 +180,7 @@ struct TraceData {
     b_tmp: gpu::BufferPiece,
     b_hist: gpu::BufferPiece,
     b_next: gpu::BufferPiece,
+    b_images: gpu::BufferPiece,
 }
 
 /// A mesh's bottom-level structure and where its attributes live.
@@ -322,9 +326,10 @@ impl Tracer {
         let scratch = self.scratch(context, sizes.scratch);
         encoder.acceleration_structure("trace blas").build_bottom_level(blas, std::slice::from_ref(&m), scratch.into());
         let attr_base = (self.attrs.len() / 2) as u32;
-        for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
-            self.attrs.push([p[0], p[1], p[2], 0.0]);
-            self.attrs.push([n[0], n[1], n[2], 0.0]);
+        for (i, (p, n)) in mesh.positions.iter().zip(&mesh.normals).enumerate() {
+            let uv = mesh.uvs.get(i).copied().unwrap_or([0.0; 2]);
+            self.attrs.push([p[0], p[1], p[2], uv[0]]);
+            self.attrs.push([n[0], n[1], n[2], uv[1]]);
         }
         let idx_base = self.idx.len() as u32;
         self.idx.extend_from_slice(&indices);
@@ -357,7 +362,7 @@ impl Tracer {
 
     /// Records the trace of `t` into group texels at `offset` (w × h).
     #[allow(clippy::too_many_arguments)]
-    pub fn trace(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, t: &Trace, offset: u32, size: (u32, u32), groups: gpu::Buffer) {
+    pub fn trace(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, t: &Trace, offset: u32, size: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer) {
         let mut instances = Vec::new();
         let mut blases = Vec::new();
         let mut inst_rows: Vec<[f32; 4]> = Vec::new();
@@ -380,6 +385,8 @@ impl Tracer {
             // Where it was on the previous frame (object → camera then).
             let prev = self.prev_transforms.get(&inst.id).copied().unwrap_or(inst.transform);
             inst_rows.extend_from_slice(&prev);
+            inst_rows.extend_from_slice(&inst.transform);
+            inst_rows.extend_from_slice(&inst.world);
             next_transforms.insert(inst.id.clone(), inst.transform);
             instances.push(gpu::AccelerationStructureInstance { acceleration_structure_index: blases.len() as u32, transform: inst.transform.into(), mask: 0xFF, custom_index: custom });
             blases.push(g.blas);
@@ -527,6 +534,7 @@ impl Tracer {
             b_tmp: write.into(),
             b_hist: hist_read.into(),
             b_next: hist_write.into(),
+            b_images: images.into(),
         };
         let groups_x = [size.0.div_ceil(8), size.1.div_ceil(8), 1];
         {
@@ -1299,6 +1307,38 @@ mod physics_tests {
         // is floor again, not a red trail.
         let old = frames[9].get_pixel(80, 120).0;
         assert!((old[0] as i32 - old[1] as i32).abs() < 25, "no ghost: {old:?}");
+    }
+
+    /// Surface detail traces as it rasterises: a noise-coloured ball and a
+    /// checker-mapped, bump-mapped wall agree, and the denoiser keeps the
+    /// checker's edges (the albedo guide carries the map).
+    #[test]
+    fn surface_detail_is_traced() {
+        let Some(mut r) = tracer(16) else { return };
+        let dir = std::env::temp_dir().join(format!("lahza-ptdetail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tex = dir.join("check.png");
+        image::RgbaImage::from_fn(64, 64, |x, y| image::Rgba(if (x / 16 + y / 16) % 2 == 0 { [240, 240, 240, 255] } else { [30, 30, 30, 255] })).save(&tex).unwrap();
+        let mut p = project(json!([
+            {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [140, 140]}, "material": {"preset": "matte", "color": "#ffffff", "map": tex.to_str().unwrap(), "specular": 0}, "transform": {"position": [90, 120]}},
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": {"preset": "matte", "color": "#ffffff", "specular": 0, "noise": {"scale": 20, "color": "#ff2020", "seed": 4}}, "transform": {"position": [240, 120]}}
+        ]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0, 0, -1], "shadow": false}])).unwrap();
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+        let c = Compiled::new(&p);
+        let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+        let changes = |img: &image::RgbaImage| (25..155u32).filter(|&x| (img.get_pixel(x, 121).0[1] > 100) != (img.get_pixel(x + 1, 121).0[1] > 100)).count();
+        assert_eq!(changes(&a), changes(&b), "the checker's edges, traced and rasterised");
+        assert_eq!(changes(&b), 3);
+        for (name, cx) in [("wall", 90.0), ("ball", 240.0)] {
+            let (ma, mb) = (disc(&a, cx, 120.0, 0.0, 50.0, |_, _| true), disc(&b, cx, 120.0, 0.0, 50.0, |_, _| true));
+            for k in 0..3 {
+                assert!((ma[k] - mb[k]).abs() < 10.0, "{name}: traced {ma:?}, raster {mb:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Lists with what the tracer can't draw yet (wires, effects such as
