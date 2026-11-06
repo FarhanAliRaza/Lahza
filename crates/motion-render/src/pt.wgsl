@@ -60,7 +60,7 @@ fn unpack(v: u32) -> vec4<f32> {
 
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 18u;
+const MAT_ROWS: u32 = 25u;
 // Rows per instance (pt.rs INST_ROWS).
 const INST_ROWS: u32 = 13u;
 // Rows per light (mesh3d::LROWS).
@@ -69,6 +69,7 @@ const FLAG_UNLIT: u32 = 1u;
 const FLAG_FACETED: u32 = 2u;
 const FLAG_SHADOW_CATCHER: u32 = 8u;
 const FLAG_WIRE: u32 = 32u;
+const FLAG_VOLUME: u32 = 64u;
 const TWO_SIDED: u32 = 0x80000000u;
 
 // ---------------------------------------------------------------- random
@@ -500,9 +501,11 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     hit.two_sided = (tag & TWO_SIDED) != 0u;
     let flags = u32(b_mat[hit.mat + 2u].w);
     if (flags & FLAG_FACETED) != 0u { n = g; }
-    // Which side was hit: by the geometric normal against the ray.
-    hit.front = dot(g, d) < 0.0;
-    if !hit.front { g = -g; }
+    // Which side was hit: by the mesh's outward (vertex) normal against
+    // the ray (triangle winding is not consistently outward); then both
+    // normals face the ray.
+    hit.front = dot(normalize(n_obj * m3), d) < 0.0;
+    if dot(g, d) > 0.0 { g = -g; }
     if dot(n, g) < 0.0 { n = -n; }
     hit.g = g;
     hit.n = n;
@@ -510,16 +513,70 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
 }
 
 // Whether anything blocks the segment from `o` along `d` up to `tmax`.
-fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> bool {
-    let h = cast_ray(o, d, tmax, rng);
-    if !h.found { return false; }
-    if h.card { return true; }
-    // Glass and see-through surfaces let some light by; the shadow catcher
-    // casts nothing.
-    let flags = u32(b_mat[h.mat + 2u].w);
-    if (flags & FLAG_SHADOW_CATCHER) != 0u || (flags & FLAG_WIRE) != 0u { return false; }
-    let opacity = b_mat[h.mat].w * (1.0 - b_mat[h.mat + 3u].x);
-    return opacity >= rnd(rng);
+fn occluded(o_in: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> bool {
+    var o = o_in;
+    var left = tmax;
+    // Volumes' boundaries let light through: look past them.
+    for (var k = 0u; k < 4u; k++) {
+        let h = cast_ray(o, d, left, rng);
+        if !h.found { return false; }
+        if h.card { return true; }
+        // Glass and see-through surfaces let some light by; the shadow
+        // catcher casts nothing.
+        let flags = u32(b_mat[h.mat + 2u].w);
+        if (flags & FLAG_VOLUME) != 0u {
+            o = offset(h, d);
+            left = left - h.t;
+            continue;
+        }
+        if (flags & FLAG_SHADOW_CATCHER) != 0u || (flags & FLAG_WIRE) != 0u { return false; }
+        let opacity = b_mat[h.mat].w * (1.0 - b_mat[h.mat + 3u].x);
+        return opacity >= rnd(rng);
+    }
+    return false;
+}
+
+fn hg_phase(g: f32, c: f32) -> f32 {
+    let k = 1.0 + g * g - 2.0 * g * c;
+    return (1.0 - g * g) / (4.0 * PI * max(k * sqrt(max(k, 0.0)), 1e-6));
+}
+
+// A direction scattered from travel direction d by Henyey–Greenstein g.
+fn sample_hg(d: vec3<f32>, g: f32, u1: f32, u2: f32) -> vec3<f32> {
+    var c = 2.0 * u1 - 1.0;
+    if abs(g) > 1e-3 {
+        let q = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
+        c = (1.0 + g * g - q * q) / (2.0 * g);
+    }
+    c = clamp(c, -1.0, 1.0);
+    let sn = sqrt(max(1.0 - c * c, 0.0));
+    let phi = 2.0 * PI * u2;
+    let f = basis(d);
+    return normalize(f[0] * (sn * cos(phi)) + f[1] * (sn * sin(phi)) + f[2] * c);
+}
+
+// Light reaching a point inside a volume (travelling along d), times the
+// phase toward the viewer: delta and area lights, with shadow rays.
+fn volume_direct(p: vec3<f32>, d: vec3<f32>, g: f32, rng: ptr<function, Rng>) -> vec3<f32> {
+    var out = vec3<f32>(0.0);
+    let lights = u32(b_light[0].x);
+    for (var i = 0u; i < lights; i++) {
+        let kind = u32(b_light[7u + i * LROWS].w);
+        if kind == 2u { continue; }
+        let ls = sample_light(i, p, rng);
+        if dot(ls.col, ls.col) <= 0.0 { continue; }
+        if ls.shadow && occluded(p, ls.l, ls.dist * 0.999, rng) { continue; }
+        // Light travels −l, scatters toward −d: cos between them is l·d.
+        let ph = hg_phase(g, dot(ls.l, d));
+        if kind == 3u {
+            let row = 7u + i * LROWS;
+            let pdf = area_pdf(row, p, ls.l, ls.dist);
+            if pdf > 0.0 { out += ph * area_radiance(row) * ls.col / pdf; }
+        } else {
+            out += ph * PI * ls.col;
+        }
+    }
+    return out;
 }
 
 fn offset(h: Hit, toward: vec3<f32>) -> vec3<f32> {
@@ -1295,8 +1352,39 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     // The pdf of the last bounce (0: a mirror-like event), for MIS on the
     // area lights it reaches.
     var last_pdf = 0.0;
+    // Inside a volume, and its material row.
+    var in_vol = false;
+    var vol = 0u;
     for (var step = 0u; step < bounces + 16u; step++) {
         let h = cast_ray(o, d, 1e30, rng);
+        if in_vol {
+            // A homogeneous medium: free flight to a scattering point, or
+            // through to the next surface. Glow adds along the way.
+            let v18 = b_mat[vol + 18u];
+            let sigma = max(v18.x, 1e-6);
+            let s_free = -log(max(1.0 - rnd(rng), 1e-7)) / sigma;
+            var seg = 1e30;
+            if h.found { seg = h.t; }
+            out.color += throughput * b_mat[vol + 20u].xyz * (sigma * min(s_free, seg));
+            if s_free < seg {
+                let p = o + d * s_free;
+                throughput *= b_mat[vol + 19u].xyz;
+                through = false;
+                out.alpha = 1.0;
+                out.color += throughput * volume_direct(p, d, v18.y, rng);
+                bounce++;
+                if bounce > bounces { return out; }
+                if bounce >= 3u {
+                    let q = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);
+                    if rnd(rng) > q { return out; }
+                    throughput /= q;
+                }
+                d = sample_hg(d, v18.y, rnd(rng), rnd(rng));
+                o = p;
+                last_pdf = 0.0;
+                continue;
+            }
+        }
         if !through {
             // Area lights are seen in reflections, not by the camera.
             var tmax = 1e30;
@@ -1335,6 +1423,14 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         let m3 = b_mat[h.mat + 3u];
         let flags = u32(m2.w);
         let v = -d;
+        if (flags & FLAG_VOLUME) != 0u {
+            // A volume's boundary: entering or leaving its medium.
+            if step == 0u { out.albedo = vec3<f32>(1.0); }
+            in_vol = h.front;
+            vol = h.mat;
+            o = offset(h, d);
+            continue;
+        }
         if step == 0u { out.albedo = m0.xyz; }
         if (flags & FLAG_SHADOW_CATCHER) != 0u {
             if through {
@@ -1522,6 +1618,9 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     b_guides[i * 4u + 3u] = prev;
     // The lighting, straight (not times coverage) and with the surface's
     // colour divided out, so the filter smooths light, not texture.
+    // Light with little coverage (glowing volumes, highlights on glass
+    // over nothing) still needs coverage to show.
+    alpha = max(alpha, min(max(color.x, max(color.y, color.z)), 1.0));
     var straight = vec3<f32>(0.0);
     if alpha > 0.0 { straight = color / alpha; }
     let var_l = max(m2 / n - (m1 / n) * (m1 / n), 0.0) / n;

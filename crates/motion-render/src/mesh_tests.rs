@@ -947,3 +947,38 @@ fn drifting_noise_ripples() {
     let lahza_motion_core::compile::Content::Mesh(m) = &c.frame(0.0).layers[0].content else { panic!() };
     assert!(m.materials[0].noise.is_some_and(|n| n.bump > 0.0), "the liquid preset ripples");
 }
+
+/// Volumes: a box of haze covers by its density (thicker, more opaque),
+/// glows by its emission, scatters a light shining through it; casts no
+/// shadow-map shadows; GPU and CPU agree.
+#[test]
+fn volumes_scatter_and_glow() {
+    let haze = |density: f64, emission: Option<&str>| {
+        let mut v = json!({"density": density, "color": "#ffffff"});
+        if let Some(e) = emission {
+            v["emission"] = json!(e);
+            v["color"] = json!("#000000");
+        }
+        scene(320, 240, json!({"layers": [{"id": "haze", "kind": "mesh", "mesh": {"type": "box", "size": [160, 120], "depth": 160}, "material": {"volume": v}, "transform": {"position": [160, 120]}}],
+            "lights": [{"type": "directional", "from": [0.3, -0.2, 1], "intensity": 1.5}], "environment": {"preset": "none"}}))
+    };
+    let alpha_of = |p: &Project| {
+        let c = Compiled::new(p);
+        let mut r = Renderer::new(None, RenderOptions { backend: Backend::Cpu, ..Default::default() });
+        r.render(&c, 0.0);
+        // The background is opaque: read coverage from brightness over black.
+        let mut q = p.clone();
+        q.settings.background = lahza_motion_core::value::Color::BLACK;
+        let img = render(&q, 0.0);
+        luma(px(&img, 160, 120))
+    };
+    let (thin, thick) = (alpha_of(&haze(0.3, None)), alpha_of(&haze(3.0, None)));
+    assert!(thin > 5.0 && thick > thin * 1.5, "lit haze glows, more when thicker: {thin} vs {thick}");
+    let glow = render(&haze(1.0, Some("#ff2000")), 0.0);
+    assert!(px(&glow, 160, 120)[0] > px(&glow, 160, 120)[1] + 40, "an emissive volume glows its colour: {:?}", px(&glow, 160, 120));
+    assert_eq!(px(&glow, 20, 20), px(&render(&scene(320, 240, json!({"layers": []})), 0.0), 20, 20), "outside it, the background");
+    crate::tests::assert_gpu_matches_cpu_within(&haze(1.0, Some("#3080ff")), &[0.0], 0.0005);
+    let mut cyl = haze(1.0, Some("#ff2000"));
+    cyl.scenes[0].layers[0] = serde_json::from_value(json!({"id": "beam", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 30, "height": 200}, "material": {"volume": {"density": 1, "emission": "#ff4000"}}, "transform": {"position": [160, 120], "rotation": 60}})).unwrap();
+    crate::tests::assert_gpu_matches_cpu_within(&cyl, &[0.0], 0.0005);
+}

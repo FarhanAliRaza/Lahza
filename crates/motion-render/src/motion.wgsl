@@ -1044,6 +1044,78 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
     return d;
 }
 
+// A volume's chord along the camera ray through p: camera space → the
+// mesh's centred box (rows 21..23), half extents (row 24); a box exactly,
+// other shapes as the ellipsoid in their box.
+fn volume_chord(row: u32, p: vec3<f32>) -> f32 {
+    let d = normalize(p);
+    let r0 = b_mesh[row + 21u];
+    let r1 = b_mesh[row + 22u];
+    let r2 = b_mesh[row + 23u];
+    let h = max(b_mesh[row + 24u].xyz, vec3<f32>(1e-3));
+    let o = vec3<f32>(r0.w, r1.w, r2.w);
+    let dd = vec3<f32>(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d));
+    if b_mesh[row + 18u].z < 0.5 {
+        let inv = vec3<f32>(1.0) / select(dd, vec3<f32>(1e-9), abs(dd) < vec3<f32>(1e-9));
+        let t1 = (-h - o) * inv;
+        let t2 = (h - o) * inv;
+        let tn = min(t1, t2);
+        let tf = max(t1, t2);
+        let t0 = max(max(tn.x, tn.y), tn.z);
+        let t3 = min(min(tf.x, tf.y), tf.z);
+        return max(t3 - max(t0, 0.0), 0.0);
+    }
+    let os = o / h;
+    let ds = dd / h;
+    let a = dot(ds, ds);
+    let b = dot(os, ds);
+    let c = dot(os, os) - 1.0;
+    let disc = b * b - a * c;
+    if disc <= 0.0 || a <= 0.0 { return 0.0; }
+    let sq = sqrt(disc);
+    return max((-b + sq) / a - max((-b - sq) / a, 0.0), 0.0);
+}
+
+fn hg_phase(g: f32, c: f32) -> f32 {
+    let k = 1.0 + g * g - 2.0 * g * c;
+    return (1.0 - g * g) / (4.0 * PI * max(k * sqrt(max(k, 0.0)), 1e-6));
+}
+
+// A volume's front face at p: the light it scatters toward the camera and
+// gives off over its chord, and how much it covers (1 − transmittance).
+fn volume_shade(row: u32, lb: u32, p: vec3<f32>, opacity: f32) -> vec4<f32> {
+    let v18 = b_mesh[row + 18u];
+    let chord = volume_chord(row, p);
+    let a = (1.0 - exp(-v18.x * chord)) * opacity;
+    if a <= 0.0 { return vec4<f32>(0.0); }
+    let d = normalize(p);
+    var sc = vec3<f32>(0.0);
+    let lights = u32(b_mesh[lb].x);
+    for (var i = 0u; i < lights; i++) {
+        let row_l = b_mesh[lb + 7u + i * LROWS];
+        var col = b_mesh[lb + 7u + i * LROWS + 1u].xyz;
+        let kind = u32(row_l.w);
+        if kind == 2u { sc += col; continue; }
+        var l = row_l.xyz;
+        if kind == 1u || kind == 3u {
+            let dl = row_l.xyz - p;
+            let dist = sqrt(dot(dl, dl));
+            l = dl / max(dist, 1e-20);
+            col = col * range_window(dist, b_mesh[lb + 7u + i * LROWS + 2u].x);
+            if kind == 3u {
+                let area = max(b_mesh[lb + 7u + i * LROWS + 4u].w, 1.0);
+                col = col * (1e6 / (dist * dist + area / PI));
+            }
+        }
+        sc += col * (PI * hg_phase(v18.y, dot(l, d)));
+    }
+    // The environment, evenly (its mean light from above and below).
+    sc += (env_diffuse(lb, vec3<f32>(0.0, -1.0, 0.0)) + env_diffuse(lb, vec3<f32>(0.0, 1.0, 0.0))) * 0.5;
+    let straight = b_mesh[row + 19u].xyz * sc + b_mesh[row + 20u].xyz;
+    let t = tone_map(lb, straight);
+    return vec4<f32>(encode(t.x) * a, encode(t.y) * a, encode(t.z) * a, a);
+}
+
 const SHADOW_TAP_X = array<f32, 8>(-0.613, 0.170, -0.299, 0.645, -0.651, 0.421, -0.084, 0.874);
 const SHADOW_TAP_Y = array<f32, 8>(0.617, -0.040, -0.792, 0.493, -0.075, -0.718, 0.290, -0.130);
 const NO_SURFACE: f32 = -1.0e30;
@@ -1414,7 +1486,7 @@ fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
 }
 
 // Rows per mesh material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 18u;
+const MAT_ROWS: u32 = 25u;
 // Rows per light (mesh3d::LROWS).
 const LROWS: u32 = 5u;
 // Rows per vertex (mesh3d::VROWS).
@@ -1512,6 +1584,9 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let base = det.base;
     let opacity = m0.w;
     let emissive = m2.xyz;
+    if (flags & 64u) != 0u {
+        return volume_shade(mb + mat * MAT_ROWS, lb, p, opacity);
+    }
     if (flags & 8u) != 0u {
         var blocked = 0.0;
         var total = 0.0;

@@ -389,6 +389,23 @@ break the silhouette, a drifting `displace`):
  "material": {"preset": "matte", "color": "#8a7a68", "noise": {"type": "cellular", "scale": 20, "color": "#4a4038", "bump": 4}}}
 ```
 
+A material's `volume` makes a closed mesh a volume of haze, smoke or a
+beam instead of a surface: `{"density": light crossing 100 px keeps
+e^−density of itself (1), "color": what scattered light takes on (white),
+"anisotropy": −1 back … 1 forward scattering (0.3), "emission": colour of
+a thick part's glow, "emission_strength": 1}` (all animatable). The path
+tracer scatters light inside it (free flights, Henyey–Greenstein, shadow
+rays to every light); the raster estimates single scattering along the
+chord through the mesh's box (exact for boxes, the ellipsoid in the box
+for other shapes). Volumes cast no shadows and never hide what is behind
+them; a laser is a thin `cylinder` of glowing volume, a light column a
+cone (`cylinder` with `top`) of thin haze lit from above.
+
+```json
+{"id": "laser", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 6, "height": 900}, "transform": {"position": [960, 400], "rotation": 90},
+ "material": {"volume": {"density": 4, "color": "#000000", "emission": "#ff2a10", "emission_strength": 3}}}
+```
+
 Reflection keeps its energy at every roughness (rough metals stay bright,
 as with multiple scattering), and the diffuse under a lobe gets only the
 light that lobe leaves. Presets `brushed` (spun metal, anisotropy 0.8) and

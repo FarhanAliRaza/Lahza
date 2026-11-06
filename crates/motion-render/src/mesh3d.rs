@@ -89,7 +89,7 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
         || layer.blend != lahza_motion_core::document::Blend::Normal
         || m.materials.iter().any(|x| x.opacity < 1.0 || x.transmission > 0.0 || x.color.0[3] < 1.0)
         || m.colors.iter().any(|c| c.0[3] < 1.0)
-        || m.materials.iter().any(|x| x.wireframe > 0.0 && x.wire_fill.is_none())
+        || m.materials.iter().any(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some())
 }
 
 impl MeshCache {
@@ -207,7 +207,7 @@ impl MeshCache {
         // triangle's outward side (+1/−1 on its winding), 0 when open.
         let mut caster = Caster::default();
         for rm in &run.meshes {
-            if rm.state.materials.iter().all(|x| x.wireframe > 0.0 && x.wire_fill.is_none()) {
+            if rm.state.materials.iter().all(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some()) {
                 continue;
             }
             let Some(mesh) = self.get(&rm.state) else { continue };
@@ -406,6 +406,29 @@ pub(crate) struct ShadowMap {
 }
 
 const NO_SURFACE: f32 = -1.0e30;
+
+/// The inverse of an affine 4 × 4 (row-major, last row 0 0 0 1), as 3 × 4
+/// rows in a 16-array.
+fn affine_inverse(m: [f64; 16]) -> Option<[f64; 16]> {
+    let a = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
+    let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let i = [
+        [(a[1][1] * a[2][2] - a[1][2] * a[2][1]) / det, (a[0][2] * a[2][1] - a[0][1] * a[2][2]) / det, (a[0][1] * a[1][2] - a[0][2] * a[1][1]) / det],
+        [(a[1][2] * a[2][0] - a[1][0] * a[2][2]) / det, (a[0][0] * a[2][2] - a[0][2] * a[2][0]) / det, (a[0][2] * a[1][0] - a[0][0] * a[1][2]) / det],
+        [(a[1][0] * a[2][1] - a[1][1] * a[2][0]) / det, (a[0][1] * a[2][0] - a[0][0] * a[2][1]) / det, (a[0][0] * a[1][1] - a[0][1] * a[1][0]) / det],
+    ];
+    let t = [m[3], m[7], m[11]];
+    let mut out = [0.0; 16];
+    for r in 0..3 {
+        out[r * 4..r * 4 + 3].copy_from_slice(&i[r]);
+        out[r * 4 + 3] = -(i[r][0] * t[0] + i[r][1] * t[1] + i[r][2] * t[2]);
+    }
+    out[15] = 1.0;
+    Some(out)
+}
 
 fn len3(v: [f64; 3]) -> f64 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
@@ -623,6 +646,8 @@ pub const CARD_STANDS: f32 = 1.0 / 512.0;
 /// A wireframe: edges `row 3.w` px wide in row 0's colour; faces in row 1's
 /// colour, or see-through when its alpha is 0.
 pub const FLAG_WIRE: u32 = 32;
+/// A volume (haze, beam): scattered light along the chord, not a surface.
+pub const FLAG_VOLUME: u32 = 64;
 
 /// Shadow filter taps (a Poisson disk on the unit circle).
 pub const SHADOW_TAPS: [[f32; 2]; 8] = [[-0.613, 0.617], [0.170, -0.040], [-0.299, -0.792], [0.645, 0.493], [-0.651, -0.075], [0.421, -0.718], [-0.084, 0.290], [0.874, -0.130]];
@@ -656,7 +681,7 @@ pub(crate) fn piece_colors(m: &MeshState, part: usize) -> usize {
 }
 
 /// Rows per material (GPU raster, CPU raster and path tracer agree).
-pub(crate) const MAT_ROWS: usize = 18;
+pub(crate) const MAT_ROWS: usize = 25;
 
 /// Rows of one material:
 /// 0 [base rgb linear, opacity], 1 [metallic, roughness, clear coat, its
@@ -668,7 +693,10 @@ pub(crate) const MAT_ROWS: usize = 18;
 /// bits], 10 [noise colour rgb, amount], 11 [noise roughness ±, noise bump
 /// px, 0, 0], 12 [colour map offset, w, h (bits), 1 if set], 13 [normal map
 /// the same], 14 [bump map offset, w, h, height px], 15 [uv scale x, y,
-/// offset x, y], 16 [uv rotation, wraps, 0, 0], 17 [noise drift offset xyz, 0].
+/// offset x, y], 16 [uv rotation, wraps, 0, 0], 17 [noise drift offset xyz, 0],
+/// volume: 18 [σ per px, anisotropy, shape (0 box, 1 ellipsoid), 1], 19
+/// [scattering colour], 20 [emission], 21..23 camera → mesh box (centred,
+/// 3 × 4), 24 [box half extents, 0].
 pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64, textures: &HashMap<Arc<str>, Option<crate::images::Texture>>) -> [[f32; 4]; MAT_ROWS] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
@@ -684,7 +712,7 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
         rows[3] = [0.0, 0.0, 0.0, (mat.wireframe * scale) as f32];
         return rows;
     }
-    let flags = (mat.unlit as u32) * FLAG_UNLIT | (mat.faceted as u32) * FLAG_FACETED | (mat.shadow_catcher as u32) * FLAG_SHADOW_CATCHER;
+    let flags = (mat.unlit as u32) * FLAG_UNLIT | (mat.faceted as u32) * FLAG_FACETED | (mat.shadow_catcher as u32) * FLAG_SHADOW_CATCHER | (mat.volume.is_some() as u32) * FLAG_VOLUME;
     let base = lin(color);
     rows[0] = [base[0], base[1], base[2], (color.0[3] * mat.opacity * opacity) as f32];
     rows[1] = [mat.metallic as f32, mat.roughness as f32, mat.clearcoat as f32, mat.clearcoat_roughness as f32];
@@ -734,6 +762,22 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
         _ => 0.0,
     };
     rows[16] = [mat.uv[4] as f32, wraps, 0.0, 0.0];
+    if let Some(v) = &mat.volume {
+        // The medium and the chord's geometry: camera space → the mesh's
+        // local box (centred), and its half extents; a box is exact, other
+        // shapes use the ellipsoid in their box.
+        let shape = if matches!(m.params.shape, mesh::MeshShape::Box { .. }) { 0.0 } else { 1.0 };
+        rows[18] = [v.sigma as f32, v.g as f32, shape, 1.0];
+        rows[19] = [v.albedo[0] as f32, v.albedo[1] as f32, v.albedo[2] as f32, 0.0];
+        rows[20] = [v.emission[0] as f32, v.emission[1] as f32, v.emission[2] as f32, 0.0];
+        if let (Some((lo, hi)), Some(iv)) = (m.params.local_bounds(), affine_inverse(m.camera.view.then(m.world).0)) {
+            let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+            for r in 0..3 {
+                rows[21 + r] = [iv[r * 4] as f32, iv[r * 4 + 1] as f32, iv[r * 4 + 2] as f32, (iv[r * 4 + 3] - c[r]) as f32];
+            }
+            rows[24] = [((hi[0] - lo[0]) / 2.0) as f32, ((hi[1] - lo[1]) / 2.0) as f32, ((hi[2] - lo[2]) / 2.0) as f32, 0.0];
+        }
+    }
     rows
 }
 
@@ -1766,6 +1810,75 @@ fn agx(c: F3) -> F3 {
     mul(outset, v).map(|x| x.max(0.0).powf(2.2).min(1.0))
 }
 
+/// Mirrors `volume_chord` in motion.wgsl.
+fn volume_chord(m: &[[f32; 4]], row: usize, p: F3) -> f32 {
+    let d = fnorm(p);
+    let (r0, r1, r2) = (m[row + 21], m[row + 22], m[row + 23]);
+    let h = f3(m[row + 24]).map(|v| v.max(1e-3));
+    let o = [r0[3], r1[3], r2[3]];
+    let dd = [fdot(f3(r0), d), fdot(f3(r1), d), fdot(f3(r2), d)];
+    if m[row + 18][2] < 0.5 {
+        let inv = dd.map(|v| 1.0 / if v.abs() < 1e-9 { 1e-9 } else { v });
+        let t1: F3 = std::array::from_fn(|k| (-h[k] - o[k]) * inv[k]);
+        let t2: F3 = std::array::from_fn(|k| (h[k] - o[k]) * inv[k]);
+        let t0 = t1[0].min(t2[0]).max(t1[1].min(t2[1])).max(t1[2].min(t2[2]));
+        let t3 = t1[0].max(t2[0]).min(t1[1].max(t2[1])).min(t1[2].max(t2[2]));
+        return (t3 - t0.max(0.0)).max(0.0);
+    }
+    let os: F3 = std::array::from_fn(|k| o[k] / h[k]);
+    let ds: F3 = std::array::from_fn(|k| dd[k] / h[k]);
+    let (a, b, c) = (fdot(ds, ds), fdot(os, ds), fdot(os, os) - 1.0);
+    let disc = b * b - a * c;
+    if disc <= 0.0 || a <= 0.0 {
+        return 0.0;
+    }
+    let sq = disc.sqrt();
+    ((-b + sq) / a - ((-b - sq) / a).max(0.0)).max(0.0)
+}
+
+fn hg_phase(g: f32, c: f32) -> f32 {
+    let k = 1.0 + g * g - 2.0 * g * c;
+    (1.0 - g * g) / (4.0 * std::f32::consts::PI * (k * k.max(0.0).sqrt()).max(1e-6))
+}
+
+/// Mirrors `volume_shade` in motion.wgsl.
+fn volume_shade(m: &[[f32; 4]], row: usize, lb: usize, p: F3, opacity: f32) -> [f32; 4] {
+    let v18 = m[row + 18];
+    let chord = volume_chord(m, row, p);
+    let a = (1.0 - (-v18[0] * chord).exp()) * opacity;
+    if a <= 0.0 {
+        return [0.0; 4];
+    }
+    let d = fnorm(p);
+    let pi = std::f32::consts::PI;
+    let mut sc = [0.0f32; 3];
+    for i in 0..m[lb][0] as usize {
+        let row_l = m[lb + 7 + i * LROWS];
+        let mut col = f3(m[lb + 7 + i * LROWS + 1]);
+        let kind = row_l[3] as u32;
+        if kind == 2 {
+            sc = fadd(sc, col);
+            continue;
+        }
+        let mut l = f3(row_l);
+        if kind == 1 || kind == 3 {
+            let dl = fsub(f3(row_l), p);
+            let dist = fdot(dl, dl).sqrt();
+            l = fmul(dl, 1.0 / dist.max(1e-20));
+            col = fmul(col, range_window(dist, m[lb + 7 + i * LROWS + 2][0]));
+            if kind == 3 {
+                let area = m[lb + 7 + i * LROWS + 4][3].max(1.0);
+                col = fmul(col, 1e6 / (dist * dist + area / pi));
+            }
+        }
+        sc = fadd(sc, fmul(col, pi * hg_phase(v18[1], fdot(l, d))));
+    }
+    sc = fadd(sc, fmul(fadd(env_diffuse(m, lb, [0.0, -1.0, 0.0]), env_diffuse(m, lb, [0.0, 1.0, 0.0])), 0.5));
+    let straight = fadd(fmul3(f3(m[row + 19]), sc), f3(m[row + 20]));
+    let t = tone_map(m, lb, straight).map(encode);
+    [t[0] * a, t[1] * a, t[2] * a, a]
+}
+
 /// A point light's fade to its range (0: none). Mirrors motion.wgsl.
 pub(crate) fn range_window(dist: f32, range: f32) -> f32 {
     if range <= 0.0 {
@@ -1980,6 +2093,9 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     n = nd;
     let opacity = m0[3];
     let emissive = f3(m2);
+    if flags & FLAG_VOLUME != 0 {
+        return volume_shade(m, mb + mat * MAT_ROWS, lb, p, opacity);
+    }
     if flags & FLAG_SHADOW_CATCHER != 0 {
         // Only the shadows: how much of the shadowing light is blocked.
         let (mut blocked, mut total) = (0.0f32, 0.0f32);

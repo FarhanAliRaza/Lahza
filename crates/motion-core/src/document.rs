@@ -2419,6 +2419,10 @@ pub struct Material {
     /// flint; more for a stylised prism). Path tracing only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispersion: Option<Property<f64>>,
+    /// The mesh is a volume of haze, smoke or beam instead of a surface:
+    /// light scatters (and glows) inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<Volume>,
     /// Procedural noise on the surface (no UVs needed): colour variation,
     /// roughness variation and bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2445,6 +2449,36 @@ pub struct Material {
     /// Faceted: one normal per triangle (low-poly look).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub faceted: Option<bool>,
+}
+
+fn one_f64_prop() -> Property<f64> {
+    Property::Constant(1.0)
+}
+fn point_three_prop() -> Property<f64> {
+    Property::Constant(0.3)
+}
+
+/// A homogeneous participating medium filling a closed mesh.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Volume {
+    /// How thick: light crossing 100 px keeps e^−density of itself
+    /// (default 1).
+    #[serde(default = "one_f64_prop")]
+    pub density: Property<f64>,
+    /// What light scattered inside takes on (default white).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Property<Color>>,
+    /// −1 back … 0 even … 1 forward scattering (default 0.3: haze and
+    /// beams glow most looking toward the light).
+    #[serde(default = "point_three_prop")]
+    pub anisotropy: Property<f64>,
+    /// Light the volume gives off (a glowing beam), as the colour a thick
+    /// part of it shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emission: Option<Property<Color>>,
+    #[serde(default = "one_f64_prop")]
+    pub emission_strength: Property<f64>,
 }
 
 /// Where surface noise is measured: the mesh's own space (it moves with

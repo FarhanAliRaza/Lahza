@@ -67,6 +67,18 @@ pub struct MaterialState {
     pub bump: f64,
     /// UV scale x, y, offset x, y, rotation (radians).
     pub uv: [f64; 5],
+    /// A volume instead of a surface.
+    pub volume: Option<VolumeState>,
+}
+
+/// A medium at a moment: extinction per px, scattering colour (linear),
+/// anisotropy, emission (linear radiance of a thick part).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VolumeState {
+    pub sigma: f64,
+    pub albedo: [f64; 3],
+    pub g: f64,
+    pub emission: [f64; 3],
 }
 
 /// Surface noise at a moment (see `document::SurfaceNoise`).
@@ -114,6 +126,7 @@ impl MaterialState {
             bump_map: None,
             bump: 2.0,
             uv: [1.0, 1.0, 0.0, 0.0, 0.0],
+            volume: None,
         };
         match p {
             MaterialPreset::Matte => MaterialState { roughness: 0.85, ..base },
@@ -260,6 +273,15 @@ pub(super) struct CMaterial {
     bump_map: Option<Arc<str>>,
     bump: Option<Prop<f64>>,
     uv: Option<(Prop<crate::value::Vec2>, Prop<crate::value::Vec2>, Prop<f64>)>,
+    volume: Option<CVolume>,
+}
+
+pub(super) struct CVolume {
+    density: Prop<f64>,
+    color: Option<Prop<Color>>,
+    anisotropy: Prop<f64>,
+    emission: Option<Prop<Color>>,
+    emission_strength: Prop<f64>,
 }
 
 pub(super) struct CNoise {
@@ -326,6 +348,15 @@ impl CMaterial {
         }) {
             m.noise = Some(n);
         }
+        m.volume = self.volume.as_ref().map(|v| {
+            let lin = |c: Color, k: f64| linear(c, k * c.0[3]);
+            VolumeState {
+                sigma: v.density.at(t).max(0.0) / 100.0,
+                albedo: lin(v.color.as_ref().map(|c| clamp_color(c.at(t))).unwrap_or(Color::WHITE), 1.0),
+                g: v.anisotropy.at(t).clamp(-0.95, 0.95),
+                emission: v.emission.as_ref().map(|c| lin(clamp_color(c.at(t)), v.emission_strength.at(t).max(0.0))).unwrap_or([0.0; 3]),
+            }
+        });
         m.map = self.map.clone();
         m.normal_map = self.normal_map.clone();
         m.bump_map = self.bump_map.clone();
@@ -409,6 +440,7 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         bump_map: o.bump_map.clone().or_else(|| base.bump_map.clone()),
         bump: o.bump.clone().or_else(|| base.bump.clone()),
         uv: o.uv.clone().or_else(|| base.uv.clone()),
+        volume: o.volume.clone().or_else(|| base.volume.clone()),
     }
 }
 
@@ -488,6 +520,13 @@ impl Compiler<'_> {
             bump_map: m.bump_map.as_deref().map(Arc::from),
             bump: m.bump.as_ref().map(|p| self.prop(p, id, &w("bump"), start, step, shift)),
             uv: m.uv.as_ref().map(|u| (self.prop(&u.scale, id, &w("uv.scale"), start, step, shift), self.prop(&u.offset, id, &w("uv.offset"), start, step, shift), self.prop(&u.rotation, id, &w("uv.rotation"), start, step, shift))),
+            volume: m.volume.as_ref().map(|v| CVolume {
+                density: self.prop(&v.density, id, &w("volume.density"), start, step, shift),
+                color: v.color.as_ref().map(|p| self.prop(p, id, &w("volume.color"), start, step, shift)),
+                anisotropy: self.prop(&v.anisotropy, id, &w("volume.anisotropy"), start, step, shift),
+                emission: v.emission.as_ref().map(|p| self.prop(p, id, &w("volume.emission"), start, step, shift)),
+                emission_strength: self.prop(&v.emission_strength, id, &w("volume.emission_strength"), start, step, shift),
+            }),
         }
     }
 

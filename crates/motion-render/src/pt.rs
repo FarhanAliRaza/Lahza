@@ -1357,6 +1357,33 @@ mod physics_tests {
         }
     }
 
+    /// Volumes, traced: a glowing beam (no scattering) gives off what the
+    /// raster's estimate gives (the same integral), and a lit box of haze
+    /// scatters light toward the camera.
+    #[test]
+    fn volumes_are_traced() {
+        let Some(mut r) = tracer(64) else { return };
+        let setup = |material: serde_json::Value, lights: serde_json::Value| {
+            let mut p = project(json!([{"id": "v", "kind": "mesh", "mesh": {"type": "box", "size": [160, 120], "depth": 160}, "material": material, "transform": {"position": [160, 120]}}]));
+            p.settings.width = 320;
+            p.settings.height = 240;
+            p.scenes[0].lights = serde_json::from_value(lights).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+            Compiled::new(&p)
+        };
+        let glow = setup(json!({"volume": {"density": 0.8, "color": "#000000", "emission": "#ff6020"}}), json!([{"type": "ambient", "intensity": 0}]));
+        let (a, b) = (r.render(&glow, 0.0), cpu().render(&glow, 0.0));
+        let (ma, mb) = (disc(&a, 160.0, 120.0, 0.0, 40.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 40.0, |_, _| true));
+        for k in 0..3 {
+            assert!((ma[k] - mb[k]).abs() < 10.0, "glow: traced {ma:?}, raster {mb:?}");
+        }
+        let lit = setup(json!({"volume": {"density": 1.0, "color": "#ffffff", "anisotropy": 0.5}}), json!([{"type": "directional", "from": [0.2, -0.3, 1], "intensity": 2, "shadow": true}]));
+        let img = r.render(&lit, 0.0);
+        let inside = disc(&img, 160.0, 120.0, 0.0, 40.0, |_, _| true);
+        let outside = disc(&img, 20.0, 20.0, 0.0, 10.0, |_, _| true);
+        assert!(inside[1] > outside[1] + 20.0, "lit haze shows: {inside:?} vs {outside:?}");
+    }
+
     /// Lists with what the tracer can't draw yet (wires, effects such as
     /// depth of field, mattes, blend modes) keep the raster's picture.
     #[test]
