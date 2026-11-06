@@ -24,6 +24,8 @@ use std::sync::Arc;
 /// Generated meshes by parameters; entries unused for a while are dropped.
 #[derive(Default)]
 pub struct MeshCache {
+    /// Parsed glTF files (meshes from Blender).
+    gltf_files: crate::model::Files,
     meshes: HashMap<Vec<u8>, (Arc<Mesh>, u64)>,
     /// Per generated mesh: each triangle's outward winding (+1/−1, 0 open).
     sides: HashMap<usize, Arc<Vec<f32>>>,
@@ -324,7 +326,11 @@ impl MeshCache {
             *used = self.frame;
             return Some(mesh.clone());
         }
-        match mesh::generate(&m.params) {
+        let generated = match &m.params.shape {
+            mesh::MeshShape::Gltf { src, mesh: index, primitive, unit, .. } => crate::model::load_mesh(&mut self.gltf_files, self.root.as_deref(), src, *index, *primitive, *unit),
+            _ => mesh::generate(&m.params),
+        };
+        match generated {
             Ok(mesh) => {
                 let mesh = Arc::new(mesh);
                 self.meshes.insert(key, (mesh.clone(), self.frame));
@@ -681,7 +687,7 @@ pub(crate) fn piece_colors(m: &MeshState, part: usize) -> usize {
 }
 
 /// Rows per material (GPU raster, CPU raster and path tracer agree).
-pub(crate) const MAT_ROWS: usize = 25;
+pub(crate) const MAT_ROWS: usize = 29;
 
 /// Rows of one material:
 /// 0 [base rgb linear, opacity], 1 [metallic, roughness, clear coat, its
@@ -696,7 +702,9 @@ pub(crate) const MAT_ROWS: usize = 25;
 /// offset x, y], 16 [uv rotation, wraps, 0, 0], 17 [noise drift offset xyz, 0],
 /// volume: 18 [σ per px, anisotropy, shape (0 box, 1 ellipsoid), 1], 19
 /// [scattering colour], 20 [emission], 21..23 camera → mesh box (centred,
-/// 3 × 4), 24 [box half extents, 0].
+/// 3 × 4), 24 [box half extents, 0]; 25 [roughness map offset, w, h, 1 if
+/// set], 26 [metallic map the same]; subsurface: 27 [weight, scale px,
+/// anisotropy, 0], 28 [radius rgb (relative), 0].
 pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64, textures: &HashMap<Arc<str>, Option<crate::images::Texture>>) -> [[f32; 4]; MAT_ROWS] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
@@ -752,6 +760,14 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
     }
     if let Some(t) = texture(&mat.bump_map) {
         rows[14] = [b(t.offset), b(t.width), b(t.height), mat.bump as f32];
+    }
+    rows[27] = [mat.subsurface as f32, mat.subsurface_scale as f32, mat.subsurface_anisotropy as f32, 0.0];
+    rows[28] = [mat.subsurface_radius[0] as f32, mat.subsurface_radius[1] as f32, mat.subsurface_radius[2] as f32, 0.0];
+    if let Some(t) = texture(&mat.roughness_map) {
+        rows[25] = [b(t.offset), b(t.width), b(t.height), 1.0];
+    }
+    if let Some(t) = texture(&mat.metallic_map) {
+        rows[26] = [b(t.offset), b(t.width), b(t.height), 1.0];
     }
     rows[15] = [mat.uv[0] as f32, mat.uv[1] as f32, mat.uv[2] as f32, mat.uv[3] as f32];
     // Which UVs wrap around (1: u, 2: v), so a triangle across the seam
@@ -1676,19 +1692,23 @@ fn map_height(images: &[u32], r: [f32; 4], t: [f32; 2]) -> f32 {
 }
 
 /// A material's surface detail (mirrors `surface_detail` in motion.wgsl):
-/// colour, roughness change, bent normal.
+/// colour, roughness change, bent normal, and the roughness and metallic
+/// maps' scales.
 #[allow(clippy::too_many_arguments)]
-fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps: [F3; 3], uvs_in: [[f32; 2]; 3], b: F3, n_in: F3, base_in: F3) -> (F3, f32, F3) {
+fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps: [F3; 3], uvs_in: [[f32; 2]; 3], b: F3, n_in: F3, base_in: F3) -> (F3, f32, F3, f32, f32) {
     let (r9, r12, r13, r14) = (m[row + 9], m[row + 12], m[row + 13], m[row + 14]);
+    let (r25, r26) = (m[row + 25], m[row + 26]);
+    let pbr_maps = r25[3] > 0.5 || r26[3] > 0.5;
     let mut base = base_in;
     let mut rough = 0.0f32;
-    if r9[0] < 0.5 && r12[3] < 0.5 && r13[3] < 0.5 && r14[3] == 0.0 {
-        return (base, rough, n_in);
+    let (mut rough_mul, mut metal_mul) = (1.0f32, 1.0f32);
+    if r9[0] < 0.5 && r12[3] < 0.5 && r13[3] < 0.5 && r14[3] == 0.0 && !pbr_maps {
+        return (base, rough, n_in, rough_mul, metal_mul);
     }
     let e1 = fsub(pos[1], pos[0]);
     let e2 = fsub(pos[2], pos[0]);
     let mut n = n_in;
-    if r12[3] > 0.5 || r13[3] > 0.5 || r14[3] != 0.0 {
+    if r12[3] > 0.5 || r13[3] > 0.5 || r14[3] != 0.0 || pbr_maps {
         let mut uvs = uvs_in;
         let wraps = m[row + 16][1] as u32;
         for c in 0..2 {
@@ -1724,6 +1744,19 @@ fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps:
             let c = map_sample(images, r12, t);
             let straight = if c[3] > 0.0 { [c[0] / c[3], c[1] / c[3], c[2] / c[3]] } else { [0.0; 3] };
             base = fmul3(base, straight.map(srgb_decode));
+        }
+        // Linear data, as glTF packs it: roughness in green, metallic in blue.
+        if r25[3] > 0.5 {
+            let c = map_sample(images, r25, t);
+            if c[3] > 0.0 {
+                rough_mul = c[1] / c[3];
+            }
+        }
+        if r26[3] > 0.5 {
+            let c = map_sample(images, r26, t);
+            if c[3] > 0.0 {
+                metal_mul = c[2] / c[3];
+            }
         }
         let (lu, lv) = (fdot(dpdu, dpdu).sqrt(), fdot(dpdv, dpdv).sqrt());
         if lu > 1e-9 && lv > 1e-9 {
@@ -1775,7 +1808,7 @@ fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps:
             }
         }
     }
-    (base, rough, n)
+    (base, rough, n, rough_mul, metal_mul)
 }
 
 /// Lit colour → display (mirrors `tone_map` in motion.wgsl): exposure,
@@ -2089,7 +2122,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     let vid = |k: usize| ids[k].to_bits() as usize;
     let uvs = [0, 1, 2].map(|k| [m[vb + vid(k) * VROWS + 1][3], m[vb + vid(k) * VROWS + 2][3]]);
     let nps = [0, 1, 2].map(|k| f3(m[vb + vid(k) * VROWS + 2]));
-    let (base, rough_d, nd) = surface_detail(m, images, mb + mat * MAT_ROWS, pos, nps, uvs, b, n, f3(m0));
+    let (base, rough_d, nd, rough_mul, metal_mul) = surface_detail(m, images, mb + mat * MAT_ROWS, pos, nps, uvs, b, n, f3(m0));
     n = nd;
     let opacity = m0[3];
     let emissive = f3(m2);
@@ -2114,7 +2147,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         let c = fadd(base, emissive).map(|x| encode(x));
         return [c[0] * opacity, c[1] * opacity, c[2] * opacity, opacity];
     }
-    let (metal, rough, cc, ccr) = (m1[0], (m1[1] + rough_d).clamp(0.03, 1.0), m1[2], m1[3].max(0.03));
+    let (metal, rough, cc, ccr) = (m1[0] * metal_mul, (m1[1] * rough_mul + rough_d).clamp(0.03, 1.0), m1[2], m1[3].max(0.03));
     let trans = m3[0];
     let row = |k: usize| m[mb + mat * MAT_ROWS + k];
     let (m4, m5, m6, m7, m8) = (row(4), row(5), row(6), row(7), row(8));

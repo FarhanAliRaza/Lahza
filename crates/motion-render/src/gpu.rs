@@ -81,10 +81,11 @@ impl Buffer {
     fn new(context: &gpu::Context, name: &'static str, size: usize, staged: bool) -> Self {
         Self::with_host(context, name, size, staged.then_some(gpu::Memory::Upload))
     }
-    /// A buffer read back by the CPU: its twin is host-cached memory
-    /// (reading write-combined upload memory costs tens of ms per frame).
+    /// A buffer read back by the CPU: its twin is host-cached memory.
+    /// Write-combined upload memory costs ~80 ms per 1080p frame to read,
+    /// and `Shared` can land in BAR-mapped VRAM (~500 ms).
     fn readback(context: &gpu::Context, name: &'static str, size: usize) -> Self {
-        Self::with_host(context, name, size, Some(gpu::Memory::Shared))
+        Self::with_host(context, name, size, Some(gpu::Memory::Download))
     }
     fn with_host(context: &gpu::Context, name: &'static str, size: usize, host: Option<gpu::Memory>) -> Self {
         let capacity = size.max(256);
@@ -314,6 +315,11 @@ impl Gpu {
     /// Whether this GPU can path-trace.
     pub fn can_trace(&self) -> bool {
         self.tracer.is_some()
+    }
+
+    /// Why traced frames used the built-in denoiser instead of OIDN, if so.
+    pub(crate) fn denoise_warning(&self) -> Option<String> {
+        self.tracer.as_ref().and_then(|t| t.denoise_warning())
     }
 
     /// Vertices the path tracer holds for its geometry (tests).

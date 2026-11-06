@@ -36,6 +36,12 @@ pub struct ExportOptions {
     pub samples: Option<u32>,
     /// Path tracing: filter the noise (default true).
     pub denoise: bool,
+    /// Output size relative to the project's (1 = full; 0.25 for quick
+    /// checks), on top of draft's half size.
+    pub scale: f64,
+    /// Render every Nth frame only (1 = all), played at fps / N, so a long
+    /// shot can be checked quickly; the timing stays the project's.
+    pub every: u32,
 }
 
 /// The path tracer's options for an export, or None to rasterise: the
@@ -282,12 +288,16 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
         render.scale *= 0.5;
         render.motion_blur = false;
     }
+    if options.scale > 0.0 && options.scale.is_finite() {
+        render.scale *= options.scale.min(1.0);
+    }
+    let every = options.every.max(1);
     let mut renderer = Renderer::new(Some(dir), render);
     let fps = compiled.fps();
     let (from, to) = options.range.unwrap_or((0.0, compiled.settings.duration));
     let first = fps.nearest_frame(from.max(0.0));
     let last = fps.nearest_frame(to.min(compiled.settings.duration)).max(first + 1);
-    let total = (last - first) as u64;
+    let total = ((last - first) as u64).div_ceil(every as u64);
     progress.total.store(total, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
     let w = ((compiled.settings.width as f64 * renderer.options().scale).round() as u32).max(2) & !1;
@@ -302,7 +312,7 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
     if let Some(Encoder::Vaapi(dev)) = &encoder {
         cmd.arg("-vaapi_device").arg(dev);
     }
-    cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{w}x{h}"), "-framerate", &format!("{}/{}", fps.num, fps.den), "-i", "-"]);
+    cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{w}x{h}"), "-framerate", &format!("{}/{}", fps.num, fps.den as u64 * every as u64), "-i", "-"]);
     let start_time = fps.time_of(first);
     let (audio_args, audio_filter) = if options.audio && ext != "gif" { audio_inputs(project, compiled, dir, start_time) } else { (Vec::new(), None) };
     cmd.args(&audio_args);
@@ -334,7 +344,7 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
             };
         }
     }
-    cmd.args(["-t", &format!("{:.6}", total as f64 * fps.frame())]);
+    cmd.args(["-t", &format!("{:.6}", total as f64 * fps.frame() * every as f64)]);
     cmd.arg(&options.output).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("cannot start ffmpeg: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("ffmpeg has no stdin")?;
@@ -348,7 +358,7 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
     progress.set_status(format!("rendering on {}", renderer.backend_label()));
     let started = Instant::now();
     let mut failed = None;
-    for n in first..last {
+    for n in (first..last).step_by(every as usize) {
         if progress.cancel.load(Ordering::Relaxed) {
             failed = Some("cancelled".to_string());
             break;

@@ -164,6 +164,8 @@ pub enum Memory {
     Shared,
     /// Upload memory. Can only be transferred on GPU.
     Upload,
+    /// Readback memory: host-cached, for the CPU to read what the GPU wrote.
+    Download,
     /// External memory
     External(ExternalMemorySource),
 }
@@ -193,6 +195,7 @@ impl Memory {
         match *self {
             Self::Shared
             | Self::Upload
+            | Self::Download
             | Self::External(ExternalMemorySource::HostAllocation(_)) => true,
             Self::Device | Self::External(_) => false,
         }

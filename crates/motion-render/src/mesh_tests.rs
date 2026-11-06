@@ -884,11 +884,55 @@ fn gpu_matches_cpu_surface_detail() {
          "material": {"preset": "matte", "color": "#a08060", "noise": {"type": "fbm", "scale": 15, "color": "#403020", "roughness": 0.3, "bump": 3}}, "transform": {"position": [90, 120]}},
         {"id": "tile", "kind": "mesh", "mesh": {"type": "box", "size": [110, 110], "depth": 110}, "material": {"preset": "plastic", "map": tex.to_str().unwrap(), "normal_map": nrm.to_str().unwrap(), "uv": {"scale": [2, 2], "rotation": 15}},
          "transform": {"position": [260, 120], "rotation_y": 30, "rotation_x": 20}},
-        {"id": "can", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 50, "height": 120}, "material": {"preset": "metal", "color": "#d0d0d0", "bump_map": tex.to_str().unwrap(), "bump": 4, "noise": {"type": "value", "scale": 25, "space": "world", "roughness": 0.2}},
+        {"id": "can", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 50, "height": 120}, "material": {"preset": "metal", "color": "#d0d0d0", "bump_map": tex.to_str().unwrap(), "bump": 4, "noise": {"type": "value", "scale": 25, "space": "world", "roughness": 0.2},
+            "roughness_map": tex.to_str().unwrap(), "metallic_map": tex.to_str().unwrap()},
          "transform": {"position": [440, 120], "rotation_x": 20}},
         {"id": "ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 50, "tube": 16}, "material": {"preset": "glossy", "color": "#ffffff", "map": tex.to_str().unwrap()}, "transform": {"position": [580, 120], "rotation_x": 50}}
     ]}));
     crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0005);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A roughness map scales roughness by its green channel and a metallic map
+/// metallic by its blue (glTF's metallic-roughness texture): where the map
+/// is white the surface is as without it, where black it turns glossy (or
+/// stops being metal).
+#[test]
+fn roughness_and_metallic_maps_scale_the_material() {
+    let dir = detail_dir("pbr");
+    let halves = dir.join("halves.png");
+    // Left half black, right half white.
+    image::RgbaImage::from_fn(64, 64, |x, _| image::Rgba(if x < 32 { [0, 0, 0, 255] } else { [255, 255, 255, 255] })).save(&halves).unwrap();
+    let shot = |material: serde_json::Value| {
+        scene(320, 240, json!({"layers": [{"id": "plate", "kind": "mesh", "mesh": {"type": "plane", "size": [280, 200]}, "material": material,
+            "transform": {"position": [160, 120], "rotation_x": 35}}],
+            "lights": [{"type": "directional", "from": [0.3, -1, -0.6], "intensity": 2}], "environment": {"preset": "studio"}}))
+    };
+    let path = halves.to_str().unwrap();
+    let diff = |a: &image::RgbaImage, b: &image::RgbaImage, x0: u32, x1: u32| {
+        let mut d = 0.0;
+        for y in 60..180 {
+            for x in x0..x1 {
+                d += (luma(px(a, x, y)) - luma(px(b, x, y))).abs();
+            }
+        }
+        d / ((x1 - x0) * 120) as f64
+    };
+    let rough = json!({"preset": "matte", "color": "#808890", "roughness": 0.9});
+    let mut rough_mapped = rough.clone();
+    rough_mapped["roughness_map"] = json!(path);
+    let (plain, mapped) = (render(&shot(rough), 0.0), render(&shot(rough_mapped.clone()), 0.0));
+    assert!(diff(&plain, &mapped, 175, 290) < 0.5, "white keeps the roughness: {}", diff(&plain, &mapped, 175, 290));
+    assert!(diff(&plain, &mapped, 30, 145) > 3.0, "black makes it glossy: {}", diff(&plain, &mapped, 30, 145));
+    let metal = json!({"preset": "metal", "color": "#c08040", "metallic": 1.0, "roughness": 0.4});
+    let mut metal_mapped = metal.clone();
+    metal_mapped["metallic_map"] = json!(path);
+    let (plain, mapped) = (render(&shot(metal), 0.0), render(&shot(metal_mapped.clone()), 0.0));
+    assert!(diff(&plain, &mapped, 175, 290) < 0.5, "white keeps the metal: {}", diff(&plain, &mapped, 175, 290));
+    assert!(diff(&plain, &mapped, 30, 145) > 3.0, "black is not metal: {}", diff(&plain, &mapped, 30, 145));
+    for m in [rough_mapped, metal_mapped] {
+        crate::tests::assert_gpu_matches_cpu_within(&shot(m), &[0.0], 0.0005);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

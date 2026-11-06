@@ -923,6 +923,8 @@ struct Detail {
     base: vec3<f32>,
     rough: f32,
     n: vec3<f32>,
+    rough_mul: f32,  // roughness map (green)
+    metal_mul: f32,  // metallic map (blue)
 }
 
 // A material's surface detail at barycentric b of a triangle (camera-space
@@ -933,15 +935,20 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
     d.base = base_in;
     d.rough = 0.0;
     d.n = n_in;
+    d.rough_mul = 1.0;
+    d.metal_mul = 1.0;
     let r9 = b_mesh[row + 9u];
     let r12 = b_mesh[row + 12u];
     let r13 = b_mesh[row + 13u];
     let r14 = b_mesh[row + 14u];
-    if r9.x < 0.5 && r12.w < 0.5 && r13.w < 0.5 && r14.w == 0.0 { return d; }
+    let r25 = b_mesh[row + 25u];
+    let r26 = b_mesh[row + 26u];
+    let pbr_maps = r25.w > 0.5 || r26.w > 0.5;
+    if r9.x < 0.5 && r12.w < 0.5 && r13.w < 0.5 && r14.w == 0.0 && !pbr_maps { return d; }
     let e1 = pos[1] - pos[0];
     let e2 = pos[2] - pos[0];
     var n = n_in;
-    if r12.w > 0.5 || r13.w > 0.5 || r14.w != 0.0 {
+    if r12.w > 0.5 || r13.w > 0.5 || r14.w != 0.0 || pbr_maps {
         // UVs: across a wrap seam, bring the corners together; then tile,
         // offset and turn (about the middle).
         var uvs = uvs_in;
@@ -980,6 +987,15 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
             var straight = vec3<f32>(0.0);
             if c.w > 0.0 { straight = c.xyz / c.w; }
             d.base = d.base * vec3<f32>(srgb_decode(straight.x), srgb_decode(straight.y), srgb_decode(straight.z));
+        }
+        // Linear data, as glTF packs it: roughness in green, metallic in blue.
+        if r25.w > 0.5 {
+            let c = map_sample(r25, t);
+            if c.w > 0.0 { d.rough_mul = c.y / c.w; }
+        }
+        if r26.w > 0.5 {
+            let c = map_sample(r26, t);
+            if c.w > 0.0 { d.metal_mul = c.z / c.w; }
         }
         let lu = length(dpdu);
         let lv = length(dpdv);
@@ -1486,7 +1502,7 @@ fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
 }
 
 // Rows per mesh material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 25u;
+const MAT_ROWS: u32 = 29u;
 // Rows per light (mesh3d::LROWS).
 const LROWS: u32 = 5u;
 // Rows per vertex (mesh3d::VROWS).
@@ -1606,8 +1622,8 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
         let c = base + emissive;
         return vec4<f32>(encode(c.x) * opacity, encode(c.y) * opacity, encode(c.z) * opacity, opacity);
     }
-    let metal = m1.x;
-    let rough = clamp(m1.y + det.rough, 0.03, 1.0);
+    let metal = m1.x * det.metal_mul;
+    let rough = clamp(m1.y * det.rough_mul + det.rough, 0.03, 1.0);
     let cc = m1.z;
     let ccr = max(m1.w, 0.03);
     let trans = m3.x;

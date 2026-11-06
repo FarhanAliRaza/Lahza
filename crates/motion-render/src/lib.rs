@@ -20,6 +20,8 @@ pub mod images;
 pub mod list;
 pub mod mesh3d;
 pub mod pt;
+pub mod model;
+mod oidn;
 pub mod raster;
 pub mod sheet;
 
@@ -214,6 +216,7 @@ impl Renderer {
         w.extend(self.footage.warnings.iter().cloned());
         w.extend(self.meshes.warnings.iter().cloned());
         w.extend(self.fallbacks.iter().cloned());
+        w.extend(self.gpu.as_ref().and_then(|g| g.denoise_warning()));
         w.sort();
         w.dedup();
         w

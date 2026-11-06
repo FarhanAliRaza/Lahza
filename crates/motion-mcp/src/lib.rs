@@ -30,8 +30,11 @@ Usage:
                     [--color HEX | --point x,y | --box x,y,w,h]   (curve: track it, fit an ease)
   lahza motion fit-camera <project> <marks.json> [--scene ID] [--fix fov,shift] [--apply]
                     marks.json: {\"frames\": [{\"at\": REF, \"marks\": [{\"world\": [x, y, z], \"image\": [x, y]}]}], \"start\": {camera}}
+  lahza motion model-import <project> <file.glb> --scene ID [--id ID] [--parent COMP] [--unit PX_PER_M] [--at S] [--position x,y] [--z Z] [--time START,END] [--source S] [--licence L]
+                    [--frames N [--fps F] [--start K]]   a glTF model (Blender), or a baked sequence with {frame} in the name
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
                     [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
+                    [--scale F] [--every N]   quick checks: output size ×F, every Nth frame only (played at fps/N)
 
 Times and references: 2.5, \"48f\", beat:17, bar:5, word:canal, hit:2, \"#title.end + 0.25\".";
 
@@ -345,6 +348,41 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 }
             }
         }
+        "model-import" => {
+            let file = args.get(2).ok_or("model-import needs a file: lahza motion model-import <project> <file.glb> --scene ID")?;
+            let mut a = json!({"project": need()?, "path": file});
+            for (f, k) in [("--scene", "scene"), ("--id", "id"), ("--parent", "parent"), ("--source", "source"), ("--licence", "licence")] {
+                if let Some(v) = flag(args, f) {
+                    a[k] = json!(v);
+                }
+            }
+            for (f, k) in [("--unit", "unit"), ("--at", "at"), ("--z", "z"), ("--fps", "fps")] {
+                if let Some(v) = flag(args, f) {
+                    a[k] = json!(v.parse::<f64>().map_err(|e| format!("{f}: {e}"))?);
+                }
+            }
+            for (f, k) in [("--frames", "frames"), ("--start", "start")] {
+                if let Some(v) = flag(args, f) {
+                    a[k] = json!(v.parse::<u64>().map_err(|e| format!("{f}: {e}"))?);
+                }
+            }
+            if let Some(v) = flag(args, "--position") {
+                let p: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                a["position"] = json!(p);
+            }
+            if let Some(v) = flag(args, "--time") {
+                // START,END: either may be left out ("2.17," or ",2.19").
+                let (s, e) = v.split_once(',').unwrap_or((v.as_str(), ""));
+                let mut time = json!({});
+                for (k, x) in [("start", s), ("end", e)] {
+                    if !x.trim().is_empty() {
+                        time[k] = json!(x.trim().parse::<f64>().map_err(|e| format!("--time: {e}"))?);
+                    }
+                }
+                a["time"] = time;
+            }
+            print(&tb.call("model_import", a)?.json);
+        }
         "render" => {
             let mut a = json!({"project": need()?, "wait": false});
             if let Some(o) = flag(args, "-o") {
@@ -355,6 +393,12 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             }
             if has(args, "--no-audio") {
                 a["audio"] = json!(false);
+            }
+            if let Some(v) = flag(args, "--scale") {
+                a["scale"] = json!(v.parse::<f64>().map_err(|e| format!("--scale: {e}"))?);
+            }
+            if let Some(v) = flag(args, "--every") {
+                a["every"] = json!(v.parse::<u64>().map_err(|e| format!("--every: {e}"))?);
             }
             renderer_flags(args, &mut a)?;
             for f in ["from", "to"] {

@@ -429,7 +429,7 @@ impl Builder<'_> {
     /// Loads a mesh's image maps into the pool (once) for its material rows.
     fn mesh_textures(&mut self, m: &lahza_motion_core::compile::MeshState) {
         for mat in &m.materials {
-            for path in [&mat.map, &mat.normal_map, &mat.bump_map].into_iter().flatten() {
+            for path in [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map].into_iter().flatten() {
                 if !self.meshes.textures.contains_key(path) {
                     let t = self.images.get(path);
                     self.meshes.textures.insert(path.clone(), t);

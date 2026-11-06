@@ -2270,6 +2270,25 @@ pub enum MeshDef {
         #[serde(default)]
         axis: RevolveAxis,
     },
+    /// One primitive of a mesh in a glTF file (Blender exports these):
+    /// metres become px by `unit` (px per metre), glTF's y up and z toward
+    /// the viewer become the layer's y down and z away. A `src` with
+    /// `{frame}` (or `{frame:04}`, zero-padded) is a baked simulation, one
+    /// file per frame, showing `frame` (animatable). `model_import` writes
+    /// these, with `bounds` (px) for layout checks.
+    Gltf {
+        src: String,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        mesh: u32,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        primitive: u32,
+        #[serde(default = "gltf_unit")]
+        unit: f64,
+        #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+        frame: Property<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bounds: Option<[[f64; 3]; 2]>,
+    },
     /// A tube along `d` in the layer plane, drawn on by `trim` [from, to],
     /// with an optional ball (`head` radius) leading it.
     Sweep {
@@ -2290,6 +2309,12 @@ pub enum MeshDef {
     },
 }
 
+fn gltf_unit() -> f64 {
+    100.0
+}
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
 fn fifty_f() -> Property<f64> {
     Property::Constant(50.0)
 }
@@ -2411,6 +2436,21 @@ pub struct Material {
     pub sheen_color: Option<Property<Color>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sheen_roughness: Option<Property<f64>>,
+    /// Light that enters the surface and scatters inside before it leaves
+    /// (Principled subsurface: marble, milky quartz, wax, skin, milk), 0..1
+    /// of the diffuse light; path tracing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsurface: Option<Property<f64>>,
+    /// How far each colour travels inside, relative: red, green, blue
+    /// (default 1, 0.2, 0.1, as Blender), times `subsurface_scale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsurface_radius: Option<[f64; 3]>,
+    /// The radius' scale, px (default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsurface_scale: Option<Property<f64>>,
+    /// Scattering inside, -1..1: forward (+), back (−), even (0, default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsurface_anisotropy: Option<Property<f64>>,
     /// The clear coat's tint (candy paint): what is under it is seen
     /// through this colour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2437,6 +2477,14 @@ pub struct Material {
     /// A height image (project path): bright is raised, by `bump` px.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bump_map: Option<String>,
+    /// An image (project path) whose green channel scales `roughness`
+    /// (glTF's metallic-roughness texture; a grey map works too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness_map: Option<String>,
+    /// An image (project path) whose blue channel scales `metallic` (glTF's
+    /// metallic-roughness texture; a grey map works too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metallic_map: Option<String>,
     /// Height of `bump_map`'s white, px (default 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bump: Option<Property<f64>>,

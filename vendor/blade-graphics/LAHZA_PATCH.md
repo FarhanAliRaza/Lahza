@@ -7,3 +7,8 @@ The only functional changes expose optional `Capabilities::shader_f16`, query
 and enable Vulkan shaderFloat16 when supported, and grant Naga FLOAT16 validation
 only on an enabled device. GLES/Metal remain false and use existing f32 shaders.
 No 16-bit buffer storage is enabled; neural inputs and outputs remain f32/u32.
+
+A `Memory::Download` variant requests host-cached memory for GPU→CPU
+readback (`HOST_ACCESS | DOWNLOAD` on Vulkan; shared storage on Metal and
+GLES). `Memory::Shared` also asks for fast device access, which with
+Resizable BAR lands in VRAM mapped over PCIe, where CPU reads are uncached.

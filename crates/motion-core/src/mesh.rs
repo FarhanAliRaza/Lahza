@@ -44,6 +44,9 @@ pub struct Mesh {
     pub uvs: Vec<[f32; 2]>,
 }
 
+/// A glTF sequence's file for a frame (`{frame}`, `{frame:04}`).
+pub use crate::compile::frame_path;
+
 pub fn tag(part: u32, segment: u32) -> u32 {
     part | (segment.min(0xffff) << 8)
 }
@@ -187,6 +190,9 @@ pub enum MeshShape {
     Revolve { profile: PathMorph, angles: [f64; 2], axis_y: bool },
     /// A tube along a path in the layer plane, drawn on by `trim`.
     Sweep { path: PathMorph, radius: f64, width: f64, profile: SweepProfile, trim: [f64; 2], caps: Caps, head: f64 },
+    /// A glTF primitive, loaded by the renderer (it knows the project's
+    /// folder): `src` with any `{frame}` already filled in.
+    Gltf { src: String, mesh: u32, primitive: u32, unit: f64, bounds: Option<[[f64; 3]; 2]> },
 }
 
 /// Shape plus the splitting and tessellation settings every kind shares.
@@ -275,6 +281,12 @@ impl MeshParams {
                 f(8.0);
                 [*radius, *width, *profile as u8 as f64, trim[0], trim[1], *caps as u8 as f64, *head].iter().for_each(|v| f(*v));
                 path(p, &mut f);
+            }
+            MeshShape::Gltf { src, mesh, primitive, unit, .. } => {
+                f(11.0);
+                [*mesh as f64, *primitive as f64, *unit].iter().for_each(|v| f(*v));
+                text.push_str(src);
+                text.push('\n');
             }
         }
         if let Some((field, amount)) = &self.displace {
@@ -380,6 +392,7 @@ impl MeshParams {
                 let z = radius.max(width / 2.0).max(*head);
                 Some(([b[0] - pad, b[1] - pad, -z], [b[2] + pad, b[3] + pad, z]))
             }
+            MeshShape::Gltf { bounds, .. } => bounds.map(|[lo, hi]| (lo, hi)),
         }
     }
 }
@@ -430,6 +443,7 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
     let detail = detail * screen;
     let mut mesh = Mesh::default();
     match &params.shape {
+        MeshShape::Gltf { src, .. } => return Err(format!("{src}: glTF meshes are loaded by the renderer")),
         MeshShape::Sphere { radius } => {
             let r = radius.max(0.0);
             let profile = Profile::arc((0.0, 0.0), r, -FRAC_PI_2, FRAC_PI_2, circle_steps(r, detail, PI), PART_SIDE);

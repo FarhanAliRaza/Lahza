@@ -55,6 +55,12 @@ pub struct MaterialState {
     pub sheen: f64,
     pub sheen_color: Color,
     pub sheen_roughness: f64,
+    /// Subsurface weight, per-channel radius (relative), its scale (px),
+    /// anisotropy.
+    pub subsurface: f64,
+    pub subsurface_radius: [f64; 3],
+    pub subsurface_scale: f64,
+    pub subsurface_anisotropy: f64,
     pub clearcoat_color: Color,
     /// 1 / Abbe number.
     pub dispersion: f64,
@@ -63,6 +69,9 @@ pub struct MaterialState {
     pub map: Option<Arc<str>>,
     pub normal_map: Option<Arc<str>>,
     pub bump_map: Option<Arc<str>>,
+    /// Scale roughness (green channel) and metallic (blue channel).
+    pub roughness_map: Option<Arc<str>>,
+    pub metallic_map: Option<Arc<str>>,
     /// bump_map's height, px.
     pub bump: f64,
     /// UV scale x, y, offset x, y, rotation (radians).
@@ -118,12 +127,18 @@ impl MaterialState {
             sheen: 0.0,
             sheen_color: Color::WHITE,
             sheen_roughness: 0.5,
+            subsurface: 0.0,
+            subsurface_radius: [1.0, 0.2, 0.1],
+            subsurface_scale: 5.0,
+            subsurface_anisotropy: 0.0,
             clearcoat_color: Color::WHITE,
             dispersion: 0.0,
             noise: None,
             map: None,
             normal_map: None,
             bump_map: None,
+            roughness_map: None,
+            metallic_map: None,
             bump: 2.0,
             uv: [1.0, 1.0, 0.0, 0.0, 0.0],
             volume: None,
@@ -265,12 +280,18 @@ pub(super) struct CMaterial {
     sheen: Option<Prop<f64>>,
     sheen_color: Option<Prop<Color>>,
     sheen_roughness: Option<Prop<f64>>,
+    subsurface: Option<Prop<f64>>,
+    subsurface_radius: Option<[f64; 3]>,
+    subsurface_scale: Option<Prop<f64>>,
+    subsurface_anisotropy: Option<Prop<f64>>,
     clearcoat_color: Option<Prop<Color>>,
     dispersion: Option<Prop<f64>>,
     noise: Option<CNoise>,
     map: Option<Arc<str>>,
     normal_map: Option<Arc<str>>,
     bump_map: Option<Arc<str>>,
+    roughness_map: Option<Arc<str>>,
+    metallic_map: Option<Arc<str>>,
     bump: Option<Prop<f64>>,
     uv: Option<(Prop<crate::value::Vec2>, Prop<crate::value::Vec2>, Prop<f64>)>,
     volume: Option<CVolume>,
@@ -332,6 +353,10 @@ impl CMaterial {
         m.anisotropy_rotation = self.anisotropy_rotation.as_ref().map(|p| p.at(t)).unwrap_or(0.0).to_radians();
         m.sheen = f(&self.sheen, m.sheen, 0.0, 1.0);
         m.sheen_roughness = f(&self.sheen_roughness, m.sheen_roughness, 0.05, 1.0);
+        m.subsurface = f(&self.subsurface, m.subsurface, 0.0, 1.0);
+        m.subsurface_radius = self.subsurface_radius.map(|r| r.map(|v| v.max(0.0))).unwrap_or(m.subsurface_radius);
+        m.subsurface_scale = f(&self.subsurface_scale, m.subsurface_scale, 0.0, 1e5);
+        m.subsurface_anisotropy = f(&self.subsurface_anisotropy, m.subsurface_anisotropy, -0.95, 0.95);
         m.dispersion = f(&self.dispersion, m.dispersion, 0.0, 0.5);
         let colour = |p: &Option<Prop<Color>>, d: Color| p.as_ref().map(|p| clamp_color(p.at(t))).unwrap_or(d);
         m.specular_tint = colour(&self.specular_tint, m.specular_tint);
@@ -360,6 +385,8 @@ impl CMaterial {
         m.map = self.map.clone();
         m.normal_map = self.normal_map.clone();
         m.bump_map = self.bump_map.clone();
+        m.roughness_map = self.roughness_map.clone();
+        m.metallic_map = self.metallic_map.clone();
         m.bump = f(&self.bump, m.bump, -1000.0, 1000.0);
         if let Some((sc, off, rot)) = &self.uv {
             let (sc, off) = (sc.at(t), off.at(t));
@@ -379,6 +406,7 @@ pub(super) enum CMeshShape {
     Extrude((Vec<Arc<str>>, Prop<f64>), Prop<f64>, Prop<f64>),
     Revolve((Vec<Arc<str>>, Prop<f64>), Prop<Vec2>, bool),
     Sweep { path: (Vec<Arc<str>>, Prop<f64>), radius: Prop<f64>, width: Prop<f64>, profile: SweepProfile, trim: Prop<Vec2>, caps: Caps, head: Prop<f64> },
+    Gltf { src: Arc<str>, mesh: u32, primitive: u32, unit: f64, frame: Prop<f64>, bounds: Option<[[f64; 3]; 2]> },
 }
 
 pub(super) struct CMesh {
@@ -432,12 +460,18 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         sheen: o.sheen.clone().or_else(|| base.sheen.clone()),
         sheen_color: o.sheen_color.clone().or_else(|| base.sheen_color.clone()),
         sheen_roughness: o.sheen_roughness.clone().or_else(|| base.sheen_roughness.clone()),
+        subsurface: o.subsurface.clone().or_else(|| base.subsurface.clone()),
+        subsurface_radius: o.subsurface_radius.or(base.subsurface_radius),
+        subsurface_scale: o.subsurface_scale.clone().or_else(|| base.subsurface_scale.clone()),
+        subsurface_anisotropy: o.subsurface_anisotropy.clone().or_else(|| base.subsurface_anisotropy.clone()),
         clearcoat_color: o.clearcoat_color.clone().or_else(|| base.clearcoat_color.clone()),
         dispersion: o.dispersion.clone().or_else(|| base.dispersion.clone()),
         noise: o.noise.clone().or_else(|| base.noise.clone()),
         map: o.map.clone().or_else(|| base.map.clone()),
         normal_map: o.normal_map.clone().or_else(|| base.normal_map.clone()),
         bump_map: o.bump_map.clone().or_else(|| base.bump_map.clone()),
+        roughness_map: o.roughness_map.clone().or_else(|| base.roughness_map.clone()),
+        metallic_map: o.metallic_map.clone().or_else(|| base.metallic_map.clone()),
         bump: o.bump.clone().or_else(|| base.bump.clone()),
         uv: o.uv.clone().or_else(|| base.uv.clone()),
         volume: o.volume.clone().or_else(|| base.volume.clone()),
@@ -501,6 +535,10 @@ impl Compiler<'_> {
             sheen: m.sheen.as_ref().map(|p| self.prop(p, id, &w("sheen"), start, step, shift)),
             sheen_color: m.sheen_color.as_ref().map(|p| self.prop(p, id, &w("sheen_color"), start, step, shift)),
             sheen_roughness: m.sheen_roughness.as_ref().map(|p| self.prop(p, id, &w("sheen_roughness"), start, step, shift)),
+            subsurface: m.subsurface.as_ref().map(|p| self.prop(p, id, &w("subsurface"), start, step, shift)),
+            subsurface_radius: m.subsurface_radius,
+            subsurface_scale: m.subsurface_scale.as_ref().map(|p| self.prop(p, id, &w("subsurface_scale"), start, step, shift)),
+            subsurface_anisotropy: m.subsurface_anisotropy.as_ref().map(|p| self.prop(p, id, &w("subsurface_anisotropy"), start, step, shift)),
             clearcoat_color: m.clearcoat_color.as_ref().map(|p| self.prop(p, id, &w("clearcoat_color"), start, step, shift)),
             dispersion: m.dispersion.as_ref().map(|p| self.prop(p, id, &w("dispersion"), start, step, shift)),
             noise: m.noise.as_ref().map(|n| CNoise {
@@ -518,6 +556,8 @@ impl Compiler<'_> {
             map: m.map.as_deref().map(Arc::from),
             normal_map: m.normal_map.as_deref().map(Arc::from),
             bump_map: m.bump_map.as_deref().map(Arc::from),
+            roughness_map: m.roughness_map.as_deref().map(Arc::from),
+            metallic_map: m.metallic_map.as_deref().map(Arc::from),
             bump: m.bump.as_ref().map(|p| self.prop(p, id, &w("bump"), start, step, shift)),
             uv: m.uv.as_ref().map(|u| (self.prop(&u.scale, id, &w("uv.scale"), start, step, shift), self.prop(&u.offset, id, &w("uv.offset"), start, step, shift), self.prop(&u.rotation, id, &w("uv.rotation"), start, step, shift))),
             volume: m.volume.as_ref().map(|v| CVolume {
@@ -566,6 +606,14 @@ impl Compiler<'_> {
                 trim: self.prop(trim, id, "mesh.trim", start, step, shift),
                 caps: caps(*c),
                 head: p(head, "mesh.head", self),
+            },
+            MeshDef::Gltf { src, mesh, primitive, unit, frame, bounds } => CMeshShape::Gltf {
+                src: src.as_str().into(),
+                mesh: *mesh,
+                primitive: *primitive,
+                unit: if unit.is_finite() && *unit > 0.0 { *unit } else { 100.0 },
+                frame: p(frame, "mesh.frame", self),
+                bounds: *bounds,
             },
         };
         let parts = m.parts.list();
@@ -855,6 +903,9 @@ impl CMesh {
                 let tr = trim.at(t);
                 MeshShape::Sweep { path: path(p), radius: radius.at(t), width: width.at(t), profile: *profile, trim: [tr.x(), tr.y()], caps: *caps, head: head.at(t) }
             }
+            CMeshShape::Gltf { src, mesh, primitive, unit, frame, bounds } => {
+                MeshShape::Gltf { src: frame_path(src, frame.at(t)), mesh: *mesh, primitive: *primitive, unit: *unit, bounds: *bounds }
+            }
         };
         let displace = self.displace.as_ref().map(|(kind, scale, octaves, seed, amount, drift)| {
             (crate::noise::Field { kind: *kind, scale: scale.at(t).max(0.5), octaves: (*octaves).clamp(1, 8), seed: *seed, offset: [drift[0] * t, drift[1] * t, drift[2] * t] }, amount.at(t))
@@ -1010,5 +1061,27 @@ mod tessellation_tests {
         // Drawn 16× bigger, the circle around the axis has ~16× the steps
         // (one every ~9 px on screen), not the same 24.
         assert!(n16 > n1 * 8, "{n1} → {n16}");
+    }
+}
+
+/// A glTF sequence's file for `frame`: `{frame}` becomes the frame number,
+/// `{frame:04}` the number zero-padded to 4 digits; other paths unchanged.
+pub fn frame_path(src: &str, frame: f64) -> String {
+    let Some(open) = src.find("{frame") else { return src.to_string() };
+    let Some(close) = src[open..].find('}').map(|k| open + k) else { return src.to_string() };
+    let n = frame.floor().max(0.0) as u64;
+    let width = src[open + 6..close].trim_start_matches(':').parse::<usize>().unwrap_or(0);
+    format!("{}{:0width$}{}", &src[..open], n, &src[close + 1..], width = width)
+}
+
+#[cfg(test)]
+mod gltf_tests {
+    use super::frame_path;
+
+    #[test]
+    fn sequence_paths_take_the_frame() {
+        assert_eq!(frame_path("assets/splash/s_{frame:04}.glb", 12.7), "assets/splash/s_0012.glb");
+        assert_eq!(frame_path("a/{frame}.glb", 3.0), "a/3.glb");
+        assert_eq!(frame_path("a/model.glb", 3.0), "a/model.glb");
     }
 }

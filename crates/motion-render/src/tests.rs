@@ -654,7 +654,7 @@ fn export_mixes_footage_audio() {
     assert_eq!(clips.len(), 1);
     assert_eq!((clips[0].start, clips[0].trim, clips[0].speed), (0.5, 0.5, 1.5));
     let out = dir.join("out.mp4");
-    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true };
+    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, scale: 1.0, every: 1 };
     let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
     assert_eq!(report.frames, 60);
     let info = crate::footage::probe(&out).unwrap();
@@ -662,6 +662,30 @@ fn export_mixes_footage_audio() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+
+/// A quick check renders every Nth frame at a fraction of the size, and
+/// plays them at fps / N, so the clip keeps the project's timing.
+#[test]
+fn quick_exports_skip_frames_and_shrink() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("lahza-quick-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut p = project(json!([{"id": "dot", "kind": "shape", "shape": "circle", "size": 40, "fill": "#ffffff",
+                                "transform": {"position": {"keys": [{"at": 0, "v": [40, 90]}, {"at": 2, "v": [280, 90]}]}}}]));
+    p.settings.duration = 2.0;
+    let c = Compiled::new(&p);
+    let out = dir.join("quick.mp4");
+    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Final, range: None, audio: false,
+        render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, scale: 0.5, every: 4 };
+    let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
+    assert_eq!(report.frames, 15, "60 frames, every 4th");
+    let info = crate::footage::probe(&out).unwrap();
+    assert_eq!((info.width, info.height), (160, 90));
+    assert!((info.duration - 2.0).abs() < 0.1, "the clip keeps the project's length: {}", info.duration);
+    std::fs::remove_dir_all(&dir).ok();
+}
 
 fn one_pixel(layers: serde_json::Value, bg: &str) -> [u8; 4] {
     let mut p = project(layers);

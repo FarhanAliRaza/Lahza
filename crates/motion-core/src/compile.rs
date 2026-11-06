@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 mod instancer;
 mod meshes;
+pub use meshes::frame_path;
 use instancer::CInstancer;
 pub use meshes::{srgb_to_linear, EnvState, LightState, Lighting, Lobe, MaterialState, MeshState};
 use meshes::{CLighting, CMesh};

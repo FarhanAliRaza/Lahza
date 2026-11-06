@@ -363,6 +363,12 @@ Surface detail (raster and path tracer alike):
 | `map` | an image (project path) over the UVs, multiplying `color` |
 | `normal_map` | a tangent-space normal map (green up) |
 | `bump_map`, `bump` | a height image (bright = raised) and its height in px (2) |
+| `roughness_map` | an image whose green channel scales `roughness` (glTF's metallic-roughness texture; a grey map works too): polished and dull patches on one surface |
+| `metallic_map` | an image whose blue channel scales `metallic` (the same glTF texture) |
+| `subsurface` | 0..1 of the diffuse light enters the surface and scatters inside before it leaves (Principled subsurface, Cycles' random walk: marble, milky quartz, wax, skin, milk); path tracing only |
+| `subsurface_radius` | how far each colour travels inside, relative, `[r, g, b]` (default `[1, 0.2, 0.1]`, as Blender: red furthest) |
+| `subsurface_scale` | the radius' scale in px (default 5); an imported model's comes from Blender's Subsurface Scale × `unit` |
+| `subsurface_anisotropy` | -1..1 scattering inside: forward (+), back (−), even (0) |
 | `uv` | `{"scale": [x, y] repeats (1, 1), "offset": [x, y], "rotation": degrees}` (animatable) |
 
 UVs run 0..1 across each flat face of planes, boxes and extrusions,
@@ -462,9 +468,12 @@ so. The same frame traces the same picture (samples are seeded by time).
 Depth of field is a real thin lens (the camera's `aperture` and `focus`),
 so defocus is exact per pixel, through glass and in reflections; motion
 blur traces each shutter sub-frame with its share of the samples, so it
-costs no more than a still frame. A denoiser (edge-aware à-trous
-filtering of the lighting, guided by each pixel's albedo, normal, depth
-and noise) cleans the picture, so a few samples per pixel give a clean
+costs no more than a still frame. A denoiser cleans the picture: Intel
+Open Image Denoise, as in Blender's Cycles, where it is installed (Lahza
+finds the copy Blender ships, or `$LAHZA_OIDN`; it runs on CUDA on NVIDIA),
+which also removes depth of field's grain, else an edge-aware à-trous
+filter of the lighting (`LAHZA_DENOISER=builtin` forces it; the render's
+warnings say when it was used), so a few samples per pixel give a clean
 frame (`--no-denoise` / `denoise: false` to see the raw samples); in an
 export each frame also builds on the previous ones, reprojected along
 each surface's motion (camera and objects), and rejects history that no

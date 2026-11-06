@@ -429,7 +429,7 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
             if let LayerKind::Mesh(m) = &l.kind {
                 let parts = m.parts.list();
                 for mat in std::iter::once(&m.material).chain(parts.into_iter().flatten()) {
-                    for path in [&mat.map, &mat.normal_map, &mat.bump_map].into_iter().flatten() {
+                    for path in [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map].into_iter().flatten() {
                         used.push((l.id.clone(), path.clone()));
                     }
                 }

@@ -209,7 +209,9 @@ pub fn tool_defs() -> Vec<ToolDef> {
             schema: obj(json!({"output": {"type": "string", "description": "default renders/<name>.mp4 in the project"}, "quality": {"type": "string", "enum": ["draft", "final"], "default": "final"},
                 "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
                 "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"},
-                "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"}}), &[]),
+                "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"},
+                "scale": {"type": "number", "description": "output size relative to the project (default 1; e.g. 0.25 for a quick check)"},
+                "every": {"type": "integer", "description": "render every Nth frame only, played at fps/N (default 1): quick checks of long shots"}}), &[]),
             read_only: false,
         },
         ToolDef { name: "render_status", description: "Progress and result of render jobs.", schema: json!({"type": "object", "properties": {"job": {"type": "string"}}}), read_only: true },
@@ -217,6 +219,19 @@ pub fn tool_defs() -> Vec<ToolDef> {
             name: "history",
             description: "Recent edits by person and agent; undo the last n steps or back to an entry; redo the last undo.",
             schema: obj(json!({"limit": {"type": "integer", "default": 20}, "undo": {"type": "integer"}, "undo_to": {"type": "integer"}, "redo": {"type": "boolean"}}), &[]),
+            read_only: false,
+        },
+        ToolDef {
+            name: "model_import",
+            description: "Import a glTF model (.glb, e.g. Blender's export) into a scene as ordinary layers: one three_d comp per node (its transform, keyed when the file animates it, e.g. a rigid-body simulation baked to keyframes) holding one mesh layer per part with its material (colour, metallic, roughness, emission, transmission; colour, normal and metallic-roughness textures). The file is copied to assets/models/<id>/. A baked simulation that changes shape (a liquid, cloth) is a sequence: a path with {frame} or {frame:04} plus frames (and fps, default the project's; start, default 1): its meshes show frame start + (t - at)·fps. Rendered by the rasteriser and the path tracer like any mesh. Units: unit px per metre (default 100); glTF's y up becomes the layer's y down.",
+            schema: obj(json!({"path": {"type": "string"}, "scene": {"type": "string"}, "id": {"type": "string", "description": "the model's root layer id (default the file name); an existing layer with it is replaced"},
+                "unit": {"type": "number", "description": "px per metre (default 100)"}, "at": {"type": "number", "description": "seconds the file's animation (or sequence) starts at (default 0)"},
+                "parent": {"type": "string", "description": "a comp to put the model in, so the comp's transform and timing apply to it; position and z are then in the comp's space (default the scene's top level)"},
+                "position": {"type": "array", "items": {"type": "number"}, "description": "[x, y] of the model's origin (default the canvas centre, or the parent comp's origin)"}, "z": {"type": "number"},
+                "frames": {"type": "integer", "description": "sequence: number of frame files"}, "fps": {"type": "number", "description": "sequence: frames per second (default the project's)"},
+                "start": {"type": "integer", "description": "sequence: first frame number (default 1)"},
+                "time": {"type": "object", "description": "when the model shows, {\"start\": s, \"end\": s} (default always): e.g. an intact object until it breaks, its pieces from then"},
+                "source": {"type": "string", "description": "where it came from (default user)"}, "licence": {"type": "string", "description": "default user-supplied"}}), &["path", "scene"]),
             read_only: false,
         },
         ToolDef {
@@ -404,6 +419,7 @@ impl Toolbox {
             "history" => self.history(&args),
             "audio_analyze" => self.audio_analyze(&args),
             "media_import" => self.media_import(&args),
+            "model_import" => self.model_import(&args),
             "blender_run" => self.blender_run(&args),
             "track" => self.track(&args),
             "fit_curve" => self.fit_curve(&args),
@@ -1767,6 +1783,8 @@ impl Toolbox {
             renderer: renderer_arg(args)?,
             samples: samples_arg(args)?,
             denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true),
+            scale: get_f64(args, "scale").unwrap_or(1.0),
+            every: args.get("every").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1000) as u32,
         };
         let progress = Arc::new(Progress::default());
         let p2 = progress.clone();
@@ -2283,6 +2301,83 @@ print("LAHZA_DONE " + json.dumps({"frame_start": scene.frame_start, "frame_end":
 "#;
 
 impl Toolbox {
+    fn model_import(&mut self, args: &Value) -> ToolResult {
+        use lahza_motion_render::model;
+        let dir = self.dir(args)?;
+        let path = get_str(args, "path").ok_or("model_import needs \"path\"")?.to_string();
+        let scene = get_str(args, "scene").ok_or("model_import needs \"scene\"")?.to_string();
+        let source = self.path(&path);
+        let file_name = source.file_name().ok_or("bad model path")?.to_string_lossy().into_owned();
+        let stem = file_name.split(['.', '{']).next().unwrap_or("model").trim_end_matches(['_', '-']).to_string();
+        let id = get_str(args, "id").map(str::to_string).unwrap_or_else(|| if stem.is_empty() { "model".into() } else { stem.clone() });
+        let unit = get_f64(args, "unit").unwrap_or(100.0);
+        let at = get_f64(args, "at").unwrap_or(0.0);
+        let project = self.state(&dir).project.clone();
+        let fps = get_f64(args, "fps").unwrap_or(project.settings.fps.as_f64());
+        let is_sequence = file_name.contains("{frame");
+        let sequence = if is_sequence {
+            let frames = args.get("frames").and_then(Value::as_u64).ok_or("a sequence ({frame} in the path) needs \"frames\"")? as u32;
+            let start = args.get("start").and_then(Value::as_u64).unwrap_or(1) as u32;
+            Some((start, frames, fps))
+        } else {
+            None
+        };
+        // Copy the file (each frame of a sequence) into assets/models/<id>/.
+        let rel_dir = format!("assets/models/{id}");
+        let model_dir = dir.join(&rel_dir);
+        std::fs::create_dir_all(&model_dir).map_err(|e| e.to_string())?;
+        let files: Vec<(String, String)> = match sequence {
+            Some((start, frames, _)) => (start..start + frames)
+                .map(|k| {
+                    let src = lahza_motion_core::mesh::frame_path(&source.to_string_lossy(), k as f64);
+                    let name = lahza_motion_core::mesh::frame_path(&file_name, k as f64);
+                    (src, name)
+                })
+                .collect(),
+            None => vec![(source.to_string_lossy().into_owned(), file_name.clone())],
+        };
+        for (src, name) in &files {
+            let dest = model_dir.join(name);
+            if Path::new(src) != dest {
+                std::fs::copy(src, &dest).map_err(|e| format!("{src}: {e}"))?;
+            }
+        }
+        let first = model_dir.join(&files[0].1);
+        let file = model::open(&first)?;
+        let src = format!("{rel_dir}/{file_name}");
+        let options = model::Import { id: &id, src: &src, unit, at, texture_dir: &model_dir, texture_src: &rel_dir, sequence };
+        let (mut layer, report) = model::to_layers(&file, &options)?;
+        let parent = get_str(args, "parent");
+        let position = match args.get("position").and_then(Value::as_array) {
+            Some(p) if p.len() == 2 => json!([p[0].as_f64().unwrap_or(0.0), p[1].as_f64().unwrap_or(0.0)]),
+            _ if parent.is_some() => json!([0.0, 0.0]),
+            _ => json!([project.settings.width as f64 / 2.0, project.settings.height as f64 / 2.0]),
+        };
+        layer["transform"] = json!({"position": position, "z": get_f64(args, "z").unwrap_or(0.0)});
+        if let Some(time) = args.get("time").filter(|t| t.is_object()) {
+            layer["time"] = time.clone();
+        }
+        // Replace an earlier import of the same id.
+        let _ = self.call("edit_apply", json!({"project": dir.display().to_string(), "ops": [{"op": "remove", "id": id}]}));
+        let add = match parent {
+            Some(p) => json!({"op": "add", "parent": p, "layer": layer}),
+            None => json!({"op": "add", "scene": scene, "layer": layer}),
+        };
+        self.call("edit_apply", json!({"project": dir.display().to_string(), "ops": [add]}))?;
+        // The model's files and the textures taken out of it are assets.
+        for (_, name) in &files {
+            self.register_asset(&dir, &format!("{rel_dir}/{name}"), args)?;
+        }
+        for t in &report.textures {
+            self.register_asset(&dir, t, args)?;
+        }
+        let mut out = json!({"id": id, "src": src, "files": files.len(), "report": report});
+        if !report.cameras.is_empty() || !report.lights.is_empty() {
+            out["note"] = json!("cameras and lights in the file are listed, not imported: set the scene's camera and lights to match");
+        }
+        Ok(Output { json: out, images: Vec::new() })
+    }
+
     fn media_import(&mut self, args: &Value) -> ToolResult {
         let dir = self.dir(args)?;
         let path = get_str(args, "path").ok_or("media_import needs \"path\"")?;

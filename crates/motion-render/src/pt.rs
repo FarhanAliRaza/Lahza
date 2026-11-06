@@ -229,6 +229,11 @@ pub struct Tracer {
     /// (each trace's passes finish before the next one's start): texels
     /// they hold, guides, lighting twice.
     work: Option<(u64, [gpu::Buffer; 3])>,
+    /// Open Image Denoise, loaded on first use (None: not tried yet).
+    oidn: Option<Result<crate::oidn::Denoiser, String>>,
+    /// Host copies for OIDN: texels they hold, lighting and guides read
+    /// back, lighting to upload.
+    oidn_host: Option<(u64, [gpu::Buffer; 3])>,
 }
 
 /// Geometry not used for this many frames is dropped. Animated meshes
@@ -254,7 +259,7 @@ impl Tracer {
         let temporal = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace temporal", data_layouts: &[&TraceData::layout()], compute: shader.at("temporal") });
         let atrous = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace denoise", data_layouts: &[&TraceData::layout()], compute: shader.at("atrous") });
         let resolve = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace resolve", data_layouts: &[&TraceData::layout()], compute: shader.at("resolve") });
-        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None, work: None })
+        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None, work: None, oidn: None, oidn_host: None })
     }
 
     /// Frees the last frame's transient buffers and structures; call when
@@ -599,7 +604,7 @@ impl Tracer {
             pc.dispatch(groups_x);
             current = 1;
         }
-        if t.options.denoise {
+        if t.options.denoise && !self.oidn_denoise(context, encoder, size, hdr[current], guides) {
             for k in 0..DENOISE_PASSES {
                 let mut pass = encoder.compute("trace denoise");
                 let mut pc = pass.with(&self.atrous);
@@ -612,6 +617,89 @@ impl Tracer {
         let mut pc = pass.with(&self.resolve);
         pc.bind(0, &data(0, hdr[current], hdr[1 - current]));
         pc.dispatch(groups_x);
+    }
+
+    /// Denoises the trace's lighting with Open Image Denoise, as Blender's
+    /// Cycles does: the full colour (lighting × albedo), guided by albedo
+    /// and normal, so grain in the surface colour (depth of field, glass)
+    /// goes too. OIDN runs outside this command buffer: the work so far is
+    /// submitted and waited for, the result copied back in, and the encoder
+    /// started again. False when OIDN is unavailable (the caller's à-trous
+    /// filter runs instead).
+    fn oidn_denoise(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, size: (u32, u32), hdr: gpu::Buffer, guides: gpu::Buffer) -> bool {
+        // LAHZA_DENOISER=builtin keeps the à-trous filter (to compare).
+        if std::env::var("LAHZA_DENOISER").is_ok_and(|v| v == "builtin") {
+            return false;
+        }
+        if self.oidn.is_none() {
+            self.oidn = Some(crate::oidn::Denoiser::new());
+        }
+        if !matches!(self.oidn, Some(Ok(_))) {
+            return false;
+        }
+        let texels = (size.0 * size.1) as u64;
+        if self.oidn_host.as_ref().is_none_or(|(have, _)| *have < texels) {
+            if let Some((_, old)) = self.oidn_host.take() {
+                self.retired.extend(old);
+            }
+            let make = |name, per: u64, memory| context.create_buffer(gpu::BufferDesc { name, size: (texels * per).max(16), memory });
+            self.oidn_host = Some((texels, [make("oidn lighting", 32, gpu::Memory::Download), make("oidn guides", 64, gpu::Memory::Download), make("oidn upload", 32, gpu::Memory::Upload)]));
+        }
+        let [back, guides_back, up] = self.oidn_host.as_ref().unwrap().1;
+        {
+            let mut pass = encoder.transfer("oidn readback");
+            pass.copy_buffer_to_buffer(hdr.into(), back.into(), texels * 32);
+            pass.copy_buffer_to_buffer(guides.into(), guides_back.into(), texels * 64);
+        }
+        let sync = context.submit(encoder);
+        let done = context.wait_for(&sync, 120_000);
+        encoder.start();
+        if !done {
+            self.oidn = Some(Err("the GPU timed out before denoising".into()));
+            return false;
+        }
+        context.sync_buffer(back);
+        context.sync_buffer(guides_back);
+        let n = texels as usize;
+        // SAFETY: the copies finished; the buffers hold n·2 and n·4 vec4 rows.
+        let (light, guide) = unsafe {
+            (std::slice::from_raw_parts(back.data() as *const [f32; 4], n * 2), std::slice::from_raw_parts(guides_back.data() as *const [f32; 4], n * 4))
+        };
+        let (mut color, mut albedo, mut normal) = (vec![0.0f32; n * 3], vec![0.0f32; n * 3], vec![0.0f32; n * 3]);
+        for i in 0..n {
+            let (l, a, nr) = (light[i * 2], guide[i * 4], guide[i * 4 + 1]);
+            for c in 0..3 {
+                color[i * 3 + c] = l[c] * a[c];
+                albedo[i * 3 + c] = a[c];
+                normal[i * 3 + c] = nr[c];
+            }
+        }
+        let mut out = vec![0.0f32; n * 3];
+        let Some(Ok(denoiser)) = self.oidn.as_mut() else { return false };
+        if let Err(e) = denoiser.denoise(size.0 as usize, size.1 as usize, &color, &albedo, &normal, &mut out) {
+            self.oidn = Some(Err(e));
+            return false;
+        }
+        // Back as lighting over albedo: the resolve pass multiplies the same
+        // albedo in again, which gives OIDN's colour exactly.
+        // SAFETY: the upload buffer holds n·2 vec4 rows and the GPU is idle.
+        let rows = unsafe { std::slice::from_raw_parts_mut(up.data() as *mut [f32; 4], n * 2) };
+        for i in 0..n {
+            let a = guide[i * 4];
+            rows[i * 2] = [out[i * 3] / a[0].max(1e-4), out[i * 3 + 1] / a[1].max(1e-4), out[i * 3 + 2] / a[2].max(1e-4), light[i * 2][3]];
+            rows[i * 2 + 1] = light[i * 2 + 1];
+        }
+        context.sync_buffer(up);
+        encoder.transfer("oidn upload").copy_buffer_to_buffer(up.into(), hdr.into(), texels * 32);
+        true
+    }
+
+    /// Why traced frames were not denoised with Open Image Denoise, if so.
+    pub(crate) fn denoise_warning(&self) -> Option<String> {
+        match &self.oidn {
+            Some(Err(e)) => Some(format!("path tracing used the built-in denoiser: {e}")),
+            _ => None,
+        }
     }
 
     pub fn destroy(&mut self, context: &gpu::Context) {
@@ -630,6 +718,11 @@ impl Tracer {
             context.destroy_buffer(b);
         }
         if let Some((_, w)) = self.work.take() {
+            for b in w {
+                context.destroy_buffer(b);
+            }
+        }
+        if let Some((_, w)) = self.oidn_host.take() {
             for b in w {
                 context.destroy_buffer(b);
             }
@@ -1286,6 +1379,41 @@ mod physics_tests {
         assert!((far as f64) > 0.4 * raster_far as f64 && (far as f64) < 2.5 * raster_far as f64, "traced {far} px vs raster {raster_far} px");
     }
 
+    /// Where Open Image Denoise is installed (Blender ships it), traced
+    /// frames go through it, as in Cycles: no fall-back warning, and a 4 spp
+    /// still life loses most of its noise. (On the replica's bond-wire shot
+    /// it removed the depth-of-field speckle the à-trous filter kept.)
+    #[test]
+    fn traced_frames_are_denoised_with_oidn_when_installed() {
+        if crate::oidn::Denoiser::new().is_err() {
+            eprintln!("skipping: no Open Image Denoise");
+            return;
+        }
+        let Some(mut denoised) = tracer(4) else { return };
+        let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+        let mut raw = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow,
+            path: Some(super::TraceOptions { spp: 4, bounces: 4, denoise: false, ..Default::default() }), ..Default::default() });
+        let c = Compiled::new(&still_life());
+        let (a, b) = (denoised.render(&c, 0.0), raw.render(&c, 0.0));
+        assert!(!denoised.warnings().iter().any(|w| w.contains("built-in denoiser")), "{:?}", denoised.warnings());
+        // Noise: the energy left after subtracting a 3×3 box blur.
+        let noise = |img: &image::RgbaImage| {
+            let l = |x: u32, y: u32| img.get_pixel(x, y).0[..3].iter().map(|v| *v as f64).sum::<f64>() / 3.0;
+            let (w, h) = img.dimensions();
+            let (mut sum, mut n) = (0.0, 0.0);
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let mean = (0..9u32).map(|k| l(x + k % 3 - 1, y + k / 3 - 1)).sum::<f64>() / 9.0;
+                    sum += (l(x, y) - mean).abs();
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+        let (na, nb) = (noise(&a), noise(&b));
+        assert!(na < nb / 3.0, "denoised {na:.2} vs raw {nb:.2}");
+    }
+
     /// Motion blur: each shutter sub-frame traces its share of the samples
     /// and a fast ball streaks.
     #[test]
@@ -1377,6 +1505,49 @@ mod physics_tests {
     /// Surface detail traces as it rasterises: a noise-coloured ball and a
     /// checker-mapped, bump-mapped wall agree, and the denoiser keeps the
     /// checker's edges (the albedo guide carries the map).
+    /// Subsurface scattering (a random walk below the surface): with a short
+    /// reach it looks like the plain diffuse surface (the walk gives back
+    /// the base colour's energy); a thin plate lit only from behind glows
+    /// on its dark side, red most (it travels furthest), where a plain one
+    /// stays dark.
+    #[test]
+    fn subsurface_scatters_inside() {
+        let Some(mut r) = tracer(64) else { return };
+        let render = |r: &mut Renderer, layers: serde_json::Value, from: [f64; 3]| {
+            let mut p = project(layers);
+            p.settings.width = 320;
+            p.settings.height = 240;
+            p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": from, "shadow": true}])).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+            r.render(&Compiled::new(&p), 0.0)
+        };
+        let ball = |x: f64, extra: serde_json::Value| {
+            let mut m = json!({"preset": "matte", "color": "#b0b0b0", "specular": 0});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            json!({"id": format!("b{x}"), "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": m, "transform": {"position": [x, 120]}})
+        };
+        // Each alone in the same place: side by side, perspective shows each from another side.
+        let (a, b) = (render(&mut r, json!([ball(160.0, json!({}))]), [-0.5, -0.4, -1.0]), render(&mut r, json!([ball(160.0, json!({"subsurface": 1, "subsurface_scale": 3}))]), [-0.5, -0.4, -1.0]));
+        let (plain, sss) = (disc(&a, 160.0, 120.0, 0.0, 55.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 55.0, |_, _| true));
+        let l = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        // (Display values: a few percent here is about twice that in light.)
+        assert!((l(sss) / l(plain) - 1.0).abs() < 0.05, "a short walk reflects as diffuse: plain {plain:?}, subsurface {sss:?}");
+        let plate = |x: f64, extra: serde_json::Value| {
+            let mut m = json!({"preset": "matte", "color": "#e0e0e0", "specular": 0});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            json!({"id": format!("p{x}"), "kind": "mesh", "mesh": {"type": "box", "size": [110, 110], "depth": 8}, "material": m, "transform": {"position": [x, 120]}})
+        };
+        let (a, b) = (render(&mut r, json!([plate(160.0, json!({}))]), [0.0, 0.0, 1.0]), render(&mut r, json!([plate(160.0, json!({"subsurface": 1, "subsurface_scale": 20}))]), [0.0, 0.0, 1.0]));
+        let (plain, sss) = (disc(&a, 160.0, 120.0, 0.0, 40.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 40.0, |_, _| true));
+        assert!(l(plain) < 3.0, "a plain plate lit from behind is dark in front: {plain:?}");
+        assert!(l(sss) > 20.0, "light scattered through the plate: {sss:?}");
+        assert!(sss[0] > sss[2] + 10.0, "red travels furthest: {sss:?}");
+    }
+
     #[test]
     fn surface_detail_is_traced() {
         let Some(mut r) = tracer(16) else { return };

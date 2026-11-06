@@ -60,7 +60,7 @@ fn unpack(v: u32) -> vec4<f32> {
 
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 25u;
+const MAT_ROWS: u32 = 29u;
 // Rows per instance (pt.rs INST_ROWS).
 const INST_ROWS: u32 = 13u;
 // Rows per light (mesh3d::LROWS).
@@ -679,6 +679,8 @@ struct Detail {
     base: vec3<f32>,
     rough: f32,
     n: vec3<f32>,
+    rough_mul: f32,  // roughness map (green)
+    metal_mul: f32,  // metallic map (blue)
 }
 
 // A material's surface detail at barycentric b of a triangle (camera-space
@@ -689,15 +691,20 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
     d.base = base_in;
     d.rough = 0.0;
     d.n = n_in;
+    d.rough_mul = 1.0;
+    d.metal_mul = 1.0;
     let r9 = b_mat[row + 9u];
     let r12 = b_mat[row + 12u];
     let r13 = b_mat[row + 13u];
     let r14 = b_mat[row + 14u];
-    if r9.x < 0.5 && r12.w < 0.5 && r13.w < 0.5 && r14.w == 0.0 { return d; }
+    let r25 = b_mat[row + 25u];
+    let r26 = b_mat[row + 26u];
+    let pbr_maps = r25.w > 0.5 || r26.w > 0.5;
+    if r9.x < 0.5 && r12.w < 0.5 && r13.w < 0.5 && r14.w == 0.0 && !pbr_maps { return d; }
     let e1 = pos[1] - pos[0];
     let e2 = pos[2] - pos[0];
     var n = n_in;
-    if r12.w > 0.5 || r13.w > 0.5 || r14.w != 0.0 {
+    if r12.w > 0.5 || r13.w > 0.5 || r14.w != 0.0 || pbr_maps {
         // UVs: across a wrap seam, bring the corners together; then tile,
         // offset and turn (about the middle).
         var uvs = uvs_in;
@@ -736,6 +743,15 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
             var straight = vec3<f32>(0.0);
             if c.w > 0.0 { straight = c.xyz / c.w; }
             d.base = d.base * vec3<f32>(decode(straight.x), decode(straight.y), decode(straight.z));
+        }
+        // Linear data, as glTF packs it: roughness in green, metallic in blue.
+        if r25.w > 0.5 {
+            let c = map_sample(r25, t);
+            if c.w > 0.0 { d.rough_mul = c.y / c.w; }
+        }
+        if r26.w > 0.5 {
+            let c = map_sample(r26, t);
+            if c.w > 0.0 { d.metal_mul = c.z / c.w; }
         }
         let lu = length(dpdu);
         let lv = length(dpdv);
@@ -989,8 +1005,8 @@ fn surface(h: Hit, v: vec3<f32>) -> Surface {
     if dot(s.n, v) < 0.02 { s.n = normalize(s.n + v * (0.02 - dot(s.n, v))); }
     let base = det.base;
     s.albedo = base;
-    let metal = m1.x;
-    s.rough = clamp(m1.y + det.rough, 0.03, 1.0);
+    let metal = m1.x * det.metal_mul;
+    s.rough = clamp(m1.y * det.rough_mul + det.rough, 0.03, 1.0);
     s.trans = m3.x;
     s.f0 = mix(vec3<f32>(m3.w) * m4.xyz, base, metal);
     s.f82 = mix(vec3<f32>(1.0), m4.xyz, metal);
@@ -1324,6 +1340,213 @@ struct Sample {
     prev: vec3<f32>,
 }
 
+// A plain diffuse surface facing n (albedo 1): where a subsurface walk
+// leaves, its light is lit and continues as from a Lambert surface.
+fn lambert_surface(n: vec3<f32>) -> Surface {
+    var s: Surface;
+    s.albedo = vec3<f32>(1.0);
+    s.n = n;
+    s.t = basis(n)[0];
+    s.b = cross(n, s.t);
+    s.at = 1.0;
+    s.ab = 1.0;
+    s.rough = 1.0;
+    s.f0 = vec3<f32>(0.0);
+    s.f82 = vec3<f32>(1.0);
+    s.f90 = 0.0;
+    s.comp = vec3<f32>(1.0);
+    s.kd = vec3<f32>(1.0);
+    s.sheen = vec3<f32>(0.0);
+    s.sheen_a = 0.0;
+    s.coat = 0.0;
+    s.coat_a = 1.0;
+    s.coat_tint = vec3<f32>(1.0);
+    s.trans = 0.0;
+    s.p_coat = 0.0;
+    s.p_spec = 0.0;
+    return s;
+}
+
+// The single-scattering albedo that makes a random walk (anisotropy g)
+// reflect colour c in all: van de Hulst's relation (d'Eon, "A Hitchhiker's
+// Guide to Multiple Scattering", Eq. 53.7), as Cycles' random walk.
+fn walk_albedo(c: f32, g: f32) -> f32 {
+    let s = 4.20863 * c - sqrt(9.59217 + 41.6808 * c + 17.7126 * c * c) + 4.09712;
+    let s2 = s * s;
+    let den = 1.0 - g * s2;
+    if abs(den) < 1e-8 { return 0.0; }
+    return clamp((1.0 - s2) / den, 0.0, 0.999999);
+}
+
+// Henyey–Greenstein phase function for the cosine between directions.
+fn hg_eval(cos_t: f32, g: f32) -> f32 {
+    let d = 1.0 + g * g - 2.0 * g * cos_t;
+    return (1.0 - g * g) / (4.0 * PI * d * sqrt(max(d, 1e-8)));
+}
+
+fn max3(v: vec3<f32>) -> f32 { return max(v.x, max(v.y, v.z)); }
+fn min3(v: vec3<f32>) -> f32 { return min(v.x, min(v.y, v.z)); }
+
+// The walk's free-flight pdf per channel: of flying t and stopping
+// (scattering), or of flying past t (leaving).
+fn flight_pdf(sigma: vec3<f32>, t: f32, leaves: bool) -> vec3<f32> {
+    let tr = exp(-sigma * t);
+    if leaves { return tr; }
+    return sigma * tr;
+}
+
+struct Walk {
+    found: bool,
+    h: Hit,               // where it leaves, its normals turned outward
+    weight: vec3<f32>,
+}
+
+// Subsurface scattering, Cycles' random walk: the light enters below
+// the surface (cosine-weighted), flies through a medium whose mean free
+// path is radius × scale per colour and whose albedo makes the whole walk
+// reflect the surface's colour, scattering at each stop, until it crosses
+// the surface again. As Cycles, steps are guided back toward the surface
+// (Dwivedi sampling; toward the far side when a thin object's is near) and
+// weighed against classic sampling and across the colour channels (MIS),
+// so pale materials that scatter long get out within the step budget.
+fn sss_walk(h_in: Hit, n_in: vec3<f32>, base: vec3<f32>, rng: ptr<function, Rng>) -> Walk {
+    var w: Walk;
+    w.found = false;
+    let r27 = b_mat[h_in.mat + 27u];
+    let r28 = b_mat[h_in.mat + 28u];
+    let g0 = r27.z;
+    let a = clamp(base, vec3<f32>(0.0), vec3<f32>(1.0));
+    var alpha = vec3<f32>(walk_albedo(a.x, g0), walk_albedo(a.y, g0), walk_albedo(a.z, g0));
+    let sigma_t0 = 1.0 / max(r28.xyz * r27.y, vec3<f32>(1e-3));
+    var weight = vec3<f32>(1.0);
+    // Very dark: a floor on the albedo, the weight making up for it.
+    for (var k = 0u; k < 3u; k++) {
+        if alpha[k] < 0.2 {
+            weight[k] *= alpha[k] / 0.2;
+            alpha[k] = 0.2;
+        }
+    }
+    let sigma_s0 = sigma_t0 * alpha;
+    let dl = 1.0 / sqrt(max(1.0 - pow(max3(alpha), 2.44294 - 0.0215813 * max3(alpha) + 0.578637 / max3(alpha)), 1e-12));
+    if dl <= 1.0 + 1e-6 { return w; }
+    let phase_log = log((dl + 1.0) / (dl - 1.0));
+    let guided0 = 1.0 - max(0.5, pow(abs(g0), 0.125));
+    // Past a few bounces: isotropic with the similar (reduced) medium.
+    let sigma_s_star = sigma_s0 * (1.0 - g0);
+    let sigma_t_star = sigma_t0 - sigma_s0 + sigma_s_star;
+    // The surface where it entered: its outward shading normal, with its
+    // detail (normal map, bump), as Cycles.
+    let n = n_in;
+    let p0 = h_in.p;
+    let fin = basis(-n);
+    let u1 = rnd(rng);
+    let rr = sqrt(u1);
+    let phi = 2.0 * PI * rnd(rng);
+    var d = normalize(fin[0] * (rr * cos(phi)) + fin[1] * (rr * sin(phi)) + fin[2] * sqrt(max(1.0 - u1, 0.0)));
+    var o = offset(h_in, d);
+    let fn_ = basis(n);
+    var have_opposite = false;
+    var opposite = 0.0;
+    for (var bounce = 0u; bounce < 256u; bounce++) {
+        var g = g0;
+        var guided_fraction = guided0;
+        var sigma_t = sigma_t0;
+        var sigma_s = sigma_s0;
+        if bounce > 9u {
+            g = 0.0;
+            guided_fraction = 0.75;
+            sigma_t = sigma_t_star;
+            sigma_s = sigma_s_star;
+        }
+        // A colour channel by albedo × weight (balance heuristic over them).
+        let cw = alpha * weight;
+        let cs = cw.x + cw.y + cw.z;
+        if !(cs > 0.0) { return w; }
+        let channel_pdf = cw / cs;
+        let uc = rnd(rng);
+        var c = 2u;
+        if uc < channel_pdf.x { c = 0u; } else if uc < channel_pdf.x + channel_pdf.y { c = 1u; }
+        var sample_sigma = sigma_t[c];
+        var back_fraction = 0.0;
+        var fwd_factor = 0.0;
+        var back_factor = 0.0;
+        var fwd_stretch = 1.0;
+        var back_stretch = 1.0;
+        if bounce > 0u {
+            let guided = rnd(rng) < guided_fraction;
+            var backward = false;
+            if have_opposite {
+                let x = clamp(dot(o - p0, -n), 0.0, opposite);
+                back_fraction = 1.0 / (1.0 + exp((opposite - 2.0 * x) / dl));
+                backward = rnd(rng) < back_fraction;
+            }
+            var cos_t: f32;
+            var hg_pdf: f32;
+            if guided {
+                cos_t = dl - (dl + 1.0) * exp(-rnd(rng) * phase_log);
+                if backward { cos_t = -cos_t; }
+                let sn = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+                let ph = 2.0 * PI * rnd(rng);
+                let nd = normalize(fn_[0] * (sn * cos(ph)) + fn_[1] * (sn * sin(ph)) + n * cos_t);
+                hg_pdf = hg_eval(dot(d, nd), g);
+                d = nd;
+            } else {
+                let nd = sample_hg(d, g, rnd(rng), rnd(rng));
+                hg_pdf = hg_eval(dot(d, nd), g);
+                cos_t = dot(nd, n);
+                d = nd;
+            }
+            fwd_factor = 1.0 / (2.0 * PI * (dl - cos_t) * phase_log * hg_pdf);
+            back_factor = 1.0 / (2.0 * PI * (dl + cos_t) * phase_log * hg_pdf);
+            fwd_stretch = 1.0 - cos_t / dl;
+            back_stretch = 1.0 + cos_t / dl;
+            if guided {
+                if backward { sample_sigma *= back_stretch; } else { sample_sigma *= fwd_stretch; }
+            }
+        }
+        var t = -log(max(1.0 - rnd(rng), 1e-7)) / sample_sigma;
+        // The first flight also looks further, for a thin object's far side.
+        var reach_t = t;
+        if bounce == 0u { reach_t = max(t, 10.0 / min3(sigma_t)); }
+        let h = cast_ray(o, d, reach_t, rng);
+        var hit = h.found && h.t < reach_t;
+        if bounce == 0u {
+            if hit {
+                have_opposite = true;
+                opposite = dot(o + d * h.t - p0, -n);
+            }
+            hit = hit && h.t < t;
+        }
+        if hit { t = h.t; }
+        var pdf = flight_pdf(sigma_t, t, hit);
+        if bounce > 0u {
+            var gpdf = flight_pdf(sigma_t * fwd_stretch, t, hit);
+            if have_opposite {
+                let bpdf = flight_pdf(sigma_t * back_stretch, t, hit);
+                gpdf = mix(gpdf * fwd_factor, bpdf * back_factor, back_fraction);
+            } else {
+                gpdf *= fwd_factor;
+            }
+            pdf = mix(pdf, gpdf, guided_fraction);
+        }
+        let tr = exp(-sigma_t * t);
+        var f = sigma_s * tr;
+        if hit { f = tr; }
+        weight *= f / max(dot(channel_pdf, pdf), 1e-12);
+        if hit {
+            var hx = h;
+            hx.n = -h.n;
+            hx.g = -h.g;
+            w.found = true;
+            w.h = hx;
+            w.weight = weight;
+            return w;
+        }
+        o = o + d * t;
+    }
+    return w;
+}
+
 fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     var out: Sample;
     var o = o_in;
@@ -1457,7 +1680,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         }
         out.alpha = 1.0;
         out.color += throughput * m2.xyz;
-        let s = surface(h, v);
+        var s = surface(h, v);
         if step == 0u { out.albedo = s.albedo; }
         // Glass: a dielectric boundary (rough: on a visible microfacet),
         // reflecting or refracting by exact Fresnel.
@@ -1513,14 +1736,51 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             continue;
         }
         through = false;
+        // Subsurface: that share of the diffuse light goes into the body
+        // (a random walk) instead of bouncing here.
+        let sss = b_mat[h.mat + 27u].x;
+        var kd_in = vec3<f32>(0.0);
+        if sss > 0.0 {
+            kd_in = s.kd * sss;
+            s.kd *= 1.0 - sss;
+        }
         out.color += throughput * direct(s, h, v, rng);
         bounce++;
         if bounce > bounces { return out; }
+        // The walk is chosen as often as the diffuse lobe it replaces.
+        let p_sss = sss * (1.0 - s.p_coat - s.p_spec);
+        if p_sss > 0.0 && rnd(rng) < p_sss {
+            let wk = sss_walk(h, s.n, s.albedo, rng);
+            if !wk.found { return out; }
+            // The walk reflects about the base colour; kd_in is that colour
+            // times what the layers above it leave.
+            throughput *= kd_in / max(s.albedo, vec3<f32>(1e-4)) * wk.weight / p_sss;
+            // It leaves as from a diffuse surface, shaded with the exit's
+            // detail (normal map, bump) like the entry.
+            var nx = detail_at(wk.h, wk.h.n, vec3<f32>(1.0)).n;
+            if dot(nx, wk.h.g) < 0.02 { nx = wk.h.n; }
+            let sx = lambert_surface(nx);
+            out.color += throughput * direct(sx, wk.h, nx, rng);
+            bounce++;
+            if bounce > bounces { return out; }
+            let sm = sample_bsdf(sx, nx, rng);
+            if sm.w <= 0.0 { return out; }
+            throughput *= bsdf_cos(sx, nx, sm.xyz) / sm.w;
+            last_pdf = sm.w;
+            if bounce >= 3u {
+                let q = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);
+                if rnd(rng) > q { return out; }
+                throughput /= q;
+            }
+            d = sm.xyz;
+            o = offset(wk.h, d);
+            continue;
+        }
         let smp = sample_bsdf(s, v, rng);
         if smp.w <= 0.0 { return out; }
         let l = smp.xyz;
-        throughput *= bsdf_cos(s, v, l) / smp.w;
-        last_pdf = smp.w;
+        throughput *= bsdf_cos(s, v, l) / (smp.w * (1.0 - p_sss));
+        last_pdf = smp.w * (1.0 - p_sss);
         // Russian roulette after a few bounces.
         if bounce >= 3u {
             let q = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);

@@ -515,6 +515,12 @@ dependencies = [
 
 [[package]]
 name = "base64"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
+
+[[package]]
+name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -2222,6 +2228,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "gltf"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3ce1918195723ce6ac74e80542c5a96a40c2b26162c1957a5cd70799b8cacf7"
+dependencies = [
+ "base64 0.13.1",
+ "byteorder",
+ "gltf-json",
+ "image",
+ "lazy_static",
+ "serde_json",
+ "urlencoding",
+]
+
+[[package]]
+name = "gltf-derive"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14070e711538afba5d6c807edb74bcb84e5dbb9211a3bf5dea0dfab5b24f4c51"
+dependencies = [
+ "inflections",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "gltf-json"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6176f9d60a7eab0a877e8e96548605dedbde9190a7ae1e80bbcc1c9af03ab14"
+dependencies = [
+ "gltf-derive",
+ "serde",
+ "serde_derive",
+ "serde_json",
+]
+
+[[package]]
 name = "gobject-sys"
 version = "0.22.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3037,6 +3082,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "inflections"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a257582fdcde896fd96463bf2d40eefea0580021c0712a0e2b028b60b47a837a"
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3230,7 +3281,7 @@ version = "2.0.0"
 dependencies = [
  "ashpd 0.12.3",
  "async-io",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "gpui",
@@ -3267,7 +3318,7 @@ dependencies = [
 name = "lahza-annotations"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "gpui",
  "image",
  "lyon",
@@ -3395,7 +3446,7 @@ dependencies = [
 name = "lahza-cursor-assets"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "image",
  "lahza-model",
  "resvg",
@@ -3413,7 +3464,7 @@ dependencies = [
 name = "lahza-cursor-theme"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "image",
  "lahza-cursor-assets",
  "lahza-model",
@@ -3462,7 +3513,7 @@ dependencies = [
 name = "lahza-input"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "image",
  "lahza-cursor-theme",
  "lahza-model",
@@ -3554,7 +3605,7 @@ dependencies = [
 name = "lahza-motion-mcp"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "image",
  "lahza-motion-audio",
  "lahza-motion-core",
@@ -3574,9 +3625,11 @@ dependencies = [
  "blade-graphics",
  "blade-macros",
  "bytemuck",
+ "gltf",
  "image",
  "kurbo",
  "lahza-motion-core",
+ "libloading 0.8.9",
  "naga",
  "rustybuzz 0.20.1",
  "serde",
@@ -3772,7 +3825,7 @@ name = "lahza-scene"
 version = "0.1.0"
 dependencies = [
  "ash",
- "base64",
+ "base64 0.22.1",
  "blade-graphics",
  "blade-macros",
  "bytemuck",
@@ -7522,12 +7575,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
 name = "usvg"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80be9b06fbae3b8b303400ab20778c80bbaf338f563afe567cf3c9eea17b47ef"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "data-url",
  "flate2",
  "fontdb 0.23.0",
@@ -8697,7 +8756,7 @@ version = "0.12.15-zed"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2d05756ff48539950c3282ad7acf3817ad3f08797c205ad1c34a2ce03b9970"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "encoding_rs",
  "futures-core",
