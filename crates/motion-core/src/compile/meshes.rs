@@ -137,6 +137,11 @@ pub struct EnvState {
     pub horizon: [f64; 3],
     pub ground: [f64; 3],
     pub lobes: Vec<Lobe>,
+    /// An equirectangular image lighting the scene (project-relative
+    /// path), with its intensity and turn about the vertical (radians).
+    pub image: Option<std::sync::Arc<str>>,
+    pub image_intensity: f64,
+    pub image_rotation: f64,
 }
 
 /// A soft bright area of the environment (a softbox or the sun).
@@ -506,6 +511,7 @@ impl Compiler<'_> {
             sky: env.sky.as_ref().map(|p| self.prop(p, id, "environment.sky", start, None, pre_roll)),
             horizon: env.horizon.as_ref().map(|p| self.prop(p, id, "environment.horizon", start, None, pre_roll)),
             ground: env.ground.as_ref().map(|p| self.prop(p, id, "environment.ground", start, None, pre_roll)),
+            image: env.image.as_deref().map(std::sync::Arc::from),
         }
     }
 }
@@ -549,6 +555,7 @@ pub(super) struct CLighting {
     sky: Option<Prop<Color>>,
     horizon: Option<Prop<Color>>,
     ground: Option<Prop<Color>>,
+    image: Option<std::sync::Arc<str>>,
 }
 
 impl CLighting {
@@ -619,11 +626,19 @@ impl CLighting {
             let (s, c) = rot.sin_cos();
             unit([d[0] * c - d[2] * s, d[1], d[0] * s + d[2] * c])
         };
-        let env = EnvState {
-            sky: linear(self.sky.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(sky), k),
-            horizon: linear(self.horizon.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(horizon), k),
-            ground: linear(self.ground.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(ground), k),
-            lobes: lobes.into_iter().map(|(d, size, c, s)| Lobe { dir: turn(d), size, color: linear(c, s * k) }).collect(),
+        let env = if self.image.is_some() {
+            // The image replaces the preset's colours and lobes.
+            EnvState { sky: [0.0; 3], horizon: [0.0; 3], ground: [0.0; 3], lobes: Vec::new(), image: self.image.clone(), image_intensity: k, image_rotation: rot }
+        } else {
+            EnvState {
+                sky: linear(self.sky.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(sky), k),
+                horizon: linear(self.horizon.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(horizon), k),
+                ground: linear(self.ground.as_ref().map(|p| clamp_color(p.at(tc))).unwrap_or(ground), k),
+                lobes: lobes.into_iter().map(|(d, size, c, s)| Lobe { dir: turn(d), size, color: linear(c, s * k) }).collect(),
+                image: None,
+                image_intensity: 0.0,
+                image_rotation: 0.0,
+            }
         };
         Lighting { lights, env }
     }

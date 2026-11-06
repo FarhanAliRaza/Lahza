@@ -439,6 +439,17 @@ environment (`studio` default, `soft`, `sunset`, `night`, `none`; `sky`,
 what glossy surfaces reflect and gives soft ambient light. A scene's
 `background` is animatable too.
 
+`"environment": {"image": "assets/studio.hdr", "intensity": 1, "rotation": 30}`
+lights the scene with an equirectangular image instead of the preset
+(image-based lighting): an HDR (`.hdr`, `.exr`) gives real light and
+sharp bright reflections; `.png`/`.jpg` are read as sRGB. The image's
+centre faces away from the viewer, its top is straight up; `rotation`
+turns it. Glossy surfaces reflect it (blurred by roughness), matte ones
+take its light, and the path tracer samples its bright parts directly, so
+a small sun in it gives clean light and sharp shadows. It lights and is
+reflected but is not drawn behind the scene (the 2D layers are). A
+missing image is reported and leaves the environment dark.
+
 ## Properties
 
 Any animatable field is a plain value or

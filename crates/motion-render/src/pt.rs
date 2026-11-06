@@ -76,6 +76,8 @@ pub struct Trace {
     pub options: TraceOptions,
     /// Seeds the samples (the frame's time): the same frame renders the same.
     pub seed: u32,
+    /// The environment image (the lights' row 0 says whether it is used).
+    pub env: Option<Arc<crate::envmap::EnvMap>>,
 }
 
 impl Trace {
@@ -98,6 +100,9 @@ impl Trace {
         out.extend(self.options.spp.to_le_bytes());
         out.extend(self.options.bounces.to_le_bytes());
         out.extend(self.seed.to_le_bytes());
+        if let Some(e) = &self.env {
+            out.extend((Arc::as_ptr(e) as usize as u64).to_le_bytes());
+        }
     }
 }
 
@@ -139,6 +144,7 @@ struct TraceData {
     b_card: gpu::BufferPiece,
     b_groups: gpu::BufferPiece,
     b_guides: gpu::BufferPiece,
+    b_env: gpu::BufferPiece,
 }
 
 /// A mesh's bottom-level structure and where its attributes live.
@@ -173,6 +179,8 @@ pub struct Tracer {
     /// Record hits by hand (see `cast_ray` in pt.wgsl): software Vulkan
     /// (Mesa lavapipe) reports committed hits with the wrong instance.
     manual_commit: bool,
+    /// The environment image's rows on the GPU, by the map's address.
+    env: Option<(usize, Arc<crate::envmap::EnvMap>, gpu::Buffer)>,
 }
 
 impl Tracer {
@@ -180,7 +188,7 @@ impl Tracer {
         let shader = context.try_create_shader(gpu::ShaderDesc { source: SHADER })?;
         let pipeline = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") });
         let manual_commit = context.device_information().is_software_emulated;
-        Ok(Self { pipeline, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, manual_commit })
+        Ok(Self { pipeline, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, manual_commit, env: None })
     }
 
     /// Frees the last frame's transient buffers and structures; call when
@@ -358,6 +366,24 @@ impl Tracer {
         if lights.is_empty() {
             lights.push([0.0; 4]);
         }
+        // The environment image: uploaded once while it stays the same.
+        let env_buf = match &t.env {
+            Some(e) => {
+                let key = Arc::as_ptr(e) as usize;
+                if self.env.as_ref().map(|(k, _, _)| *k) != Some(key) {
+                    if let Some((_, _, old)) = self.env.take() {
+                        self.retired.push(old);
+                    }
+                    let b = context.create_buffer(gpu::BufferDesc { name: "trace environment", size: (e.trace.len() * 16) as u64, memory: gpu::Memory::Shared });
+                    // SAFETY: a fresh mapped buffer of exactly this size.
+                    unsafe { std::ptr::copy_nonoverlapping(e.trace.as_ptr() as *const u8, b.data(), e.trace.len() * 16) };
+                    context.sync_buffer(b);
+                    self.env = Some((key, e.clone(), b));
+                }
+                self.env.as_ref().map(|(_, _, b)| *b).unwrap()
+            }
+            None => self.transient(context, "trace no environment", &[0u8; 16]),
+        };
         let inst_buf = self.transient(context, "trace instances", bytemuck::cast_slice(&inst_rows));
         let mat_buf = self.transient(context, "trace materials", bytemuck::cast_slice(&mat_rows));
         let light_buf = self.transient(context, "trace lights", bytemuck::cast_slice(&lights));
@@ -393,6 +419,7 @@ impl Tracer {
             b_card: card_buf.into(),
             b_groups: groups.into(),
             b_guides: guides.into(),
+            b_env: env_buf.into(),
         };
         let mut pass = encoder.compute("trace");
         let mut pc = pass.with(&self.pipeline);
@@ -411,6 +438,9 @@ impl Tracer {
             context.destroy_acceleration_structure(g.blas);
             context.destroy_buffer(g.positions);
             context.destroy_buffer(g.indices);
+        }
+        if let Some((_, _, b)) = self.env.take() {
+            context.destroy_buffer(b);
         }
     }
 }
@@ -936,6 +966,44 @@ mod physics_tests {
         assert!(mean > 20.0, "lit by the sun: {mean:.1}");
         assert!(sd < 0.08 * mean, "clean: sd {sd:.1} of {mean:.1}");
         assert!((mean - raster).abs() < 0.12 * raster.max(20.0), "as bright as the raster: {mean:.1} vs {raster}");
+    }
+
+    /// An environment image: traced reflections show it, a matte ball
+    /// lit by it agrees with the raster, and its small bright sun is
+    /// sampled directly (clean at a few samples per pixel).
+    #[test]
+    fn environment_images_are_traced_and_sampled() {
+        let Some(mut r) = tracer(16) else { return };
+        let dir = std::env::temp_dir().join(format!("lahza-envpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sky, sun) = (dir.join("sky.hdr"), dir.join("sun.hdr"));
+        crate::envmap::tests::write_hdr(&sky, 0.0);
+        crate::envmap::tests::write_hdr(&sun, 400.0);
+        let none = json!([{"type": "ambient", "intensity": 0}]);
+        let img = r.render(&Compiled::new(&sphere_in(json!({"preset": "metal", "color": "#ffffff", "roughness": 0}), none.clone(), json!({"image": sky.to_str().unwrap()}))), 0.0);
+        let (top, bottom) = (img.get_pixel(160, 70).0, img.get_pixel(160, 170).0);
+        assert!(top[0] > 150 && top[2] < 80 && bottom[2] > 150 && bottom[0] < 80, "mirrored: {top:?} {bottom:?}");
+        let c = Compiled::new(&sphere_in(json!({"preset": "matte", "color": "#ffffff", "specular": 0}), none.clone(), json!({"image": sky.to_str().unwrap()})));
+        let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+        // Patch means (single pixels carry the samples' noise).
+        for (name, keep) in [("top", (|_: f64, dy: f64| dy < -40.0) as fn(f64, f64) -> bool), ("bottom", |_, dy| dy > 40.0), ("middle", |_, dy| dy.abs() < 20.0)] {
+            let (ta, tb) = (disc(&a, 160.0, 120.0, 0.0, 85.0, keep), disc(&b, 160.0, 120.0, 0.0, 85.0, keep));
+            for k in 0..3 {
+                assert!((ta[k] - tb[k]).abs() <= 8.0, "{name}: traced {ta:?}, raster {tb:?}");
+            }
+        }
+        // The sun, on a wall facing it.
+        let mut p = project(json!([{"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [2000, 2000]}, "material": {"preset": "matte", "color": "#ffffff", "specular": 0}, "transform": {"position": [160, 120]}}]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.scenes[0].lights = serde_json::from_value(none).unwrap();
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"image": sun.to_str().unwrap()})).unwrap());
+        let img = r.render(&Compiled::new(&p), 0.0);
+        let patch: Vec<f64> = (100..140u32).flat_map(|y| (140..180u32).map(move |x| (x, y))).map(|(x, y)| img.get_pixel(x, y).0[1] as f64).collect();
+        let mean = patch.iter().sum::<f64>() / patch.len() as f64;
+        let sd = (patch.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / patch.len() as f64).sqrt();
+        assert!(mean > 60.0 && sd < 0.08 * mean, "sunlit and clean: mean {mean:.1}, sd {sd:.1}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Lists with what the tracer can't draw yet (wires, effects such as

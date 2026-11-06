@@ -2444,10 +2444,14 @@ pub struct Environment {
     pub horizon: Option<Property<Color>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ground: Option<Property<Color>>,
+    /// An equirectangular image (HDR .hdr/.exr, or .png/.jpg) lighting the
+    /// scene instead of the preset: image-based light and reflections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 impl Default for Environment {
     fn default() -> Self {
-        Self { preset: EnvironmentPreset::Studio, intensity: one_prop(), rotation: zero_prop(), sky: None, horizon: None, ground: None }
+        Self { preset: EnvironmentPreset::Studio, intensity: one_prop(), rotation: zero_prop(), sky: None, horizon: None, ground: None, image: None }
     }
 }

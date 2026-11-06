@@ -33,6 +33,9 @@ var<storage, read> b_light: array<vec4<f32>>;
 var<storage, read> b_card: array<vec4<f32>>;
 var<storage, read_write> b_groups: array<vec4<f32>>;
 var<storage, read_write> b_guides: array<vec4<f32>>;
+// The environment image (envmap.rs): [w, h, sampling w, sampling h], the
+// map, the marginal CDF, then per sampling texel [row CDF, probability].
+var<storage, read> b_env: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
@@ -108,7 +111,92 @@ fn to_world(v: vec3<f32>) -> vec3<f32> {
 // the smooth part (sky/horizon/ground by height, plus ambient lights, a
 // uniform environment) and the lobes (softboxes, the sun), which are
 // also sampled directly (see env_lobe_*).
+fn has_image() -> bool {
+    return b_light[0].z > 0.5;
+}
+
+// Where world direction w falls on the environment image (u, v in 0..1).
+fn env_uv(w: vec3<f32>) -> vec2<f32> {
+    let phi = atan2(w.x, w.z) + b_light[4].w;
+    return vec2<f32>(fract(0.5 + phi / (2.0 * PI)), acos(clamp(-w.y, -1.0, 1.0)) / PI);
+}
+
+// The image's radiance toward camera-space d (bilinear, sharp).
+fn env_image(d: vec3<f32>) -> vec3<f32> {
+    let uv = env_uv(to_world(d));
+    let w = u32(b_env[0].x);
+    let h = u32(b_env[0].y);
+    let x = uv.x * f32(w) - 0.5;
+    let y = clamp(uv.y * f32(h) - 0.5, 0.0, f32(h - 1u));
+    let xf = floor(x);
+    let fx = x - xf;
+    let y0 = u32(floor(y));
+    let y1 = min(y0 + 1u, h - 1u);
+    let fy = y - floor(y);
+    let x0 = u32(i32(xf) + i32(w)) % w;
+    let x1 = (x0 + 1u) % w;
+    let a = mix(b_env[1u + y0 * w + x0].xyz, b_env[1u + y0 * w + x1].xyz, fx);
+    let b = mix(b_env[1u + y1 * w + x0].xyz, b_env[1u + y1 * w + x1].xyz, fx);
+    return mix(a, b, fy) * b_light[0].w;
+}
+
+// Sampling the image by brightness: the table's place and its pdf.
+fn env_image_pdf(d: vec3<f32>) -> f32 {
+    let uv = env_uv(to_world(d));
+    let gw = u32(b_env[0].z);
+    let gh = u32(b_env[0].w);
+    let x = min(u32(uv.x * f32(gw)), gw - 1u);
+    let y = min(u32(uv.y * f32(gh)), gh - 1u);
+    let base = 1u + u32(b_env[0].x) * u32(b_env[0].y);
+    let p = b_env[base + gh + y * gw + x].y;
+    let st = sin(uv.y * PI);
+    if st <= 1e-6 { return 0.0; }
+    return p * f32(gw * gh) / (2.0 * PI * PI * st);
+}
+
+fn env_image_sample(rng: ptr<function, Rng>) -> vec4<f32> {
+    let gw = u32(b_env[0].z);
+    let gh = u32(b_env[0].w);
+    let base = 1u + u32(b_env[0].x) * u32(b_env[0].y);
+    // Row by the marginal CDF, then the texel by its row's CDF.
+    let u1 = rnd(rng);
+    var lo = 0u;
+    var hi = gh - 1u;
+    while lo < hi {
+        let mid = (lo + hi) / 2u;
+        if b_env[base + mid].x < u1 { lo = mid + 1u; } else { hi = mid; }
+    }
+    let y = lo;
+    let u2 = rnd(rng);
+    let row = base + gh + y * gw;
+    lo = 0u;
+    hi = gw - 1u;
+    while lo < hi {
+        let mid = (lo + hi) / 2u;
+        if b_env[row + mid].x < u2 { lo = mid + 1u; } else { hi = mid; }
+    }
+    let x = lo;
+    let u = (f32(x) + rnd(rng)) / f32(gw);
+    let v = (f32(y) + rnd(rng)) / f32(gh);
+    let theta = v * PI;
+    let phi = (u - 0.5) * 2.0 * PI - b_light[4].w;
+    let ww = vec3<f32>(sin(theta) * sin(phi), -cos(theta), sin(theta) * cos(phi));
+    let d = normalize(b_light[1].xyz * ww.x + b_light[2].xyz * ww.y + b_light[3].xyz * ww.z);
+    return vec4<f32>(d, 1.0);
+}
+
+// Ambient lights: a uniform environment, added to the image or the sky.
+fn env_ambient() -> vec3<f32> {
+    var c = vec3<f32>(0.0);
+    let lights = u32(b_light[0].x);
+    for (var i = 0u; i < lights; i++) {
+        if u32(b_light[7u + i * LROWS].w) == 2u { c += b_light[7u + i * LROWS + 1u].xyz; }
+    }
+    return c;
+}
+
 fn env_smooth(d: vec3<f32>) -> vec3<f32> {
+    if has_image() { return env_image(d) + env_ambient(); }
     let w = to_world(d);
     let up = -w.y;
     let sky = b_light[4].xyz;
@@ -809,7 +897,19 @@ fn direct(s: Surface, h: Hit, v: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32
         if ls.shadow && occluded(offset(h, ls.l), ls.l, ls.dist * 0.999, rng) { continue; }
         out += bsdf_cos(s, v, ls.l) * PI * ls.col;
     }
-    // The environment's lobes, sampled directly (MIS with the BSDF).
+    // The environment's bright parts (an image by its brightness, or the
+    // lobes), sampled directly (MIS with the BSDF).
+    if has_image() {
+        let e = env_image_sample(rng);
+        if dot(h.n, e.xyz) > 0.0 {
+            let pdf = env_image_pdf(e.xyz);
+            if pdf > 0.0 && !occluded(offset(h, e.xyz), e.xyz, 1e30, rng) {
+                let w = pdf / (pdf + bsdf_pdf(s, v, e.xyz));
+                out += bsdf_cos(s, v, e.xyz) * env_image(e.xyz) * (w / pdf);
+            }
+        }
+        return out;
+    }
     let e = env_lobe_sample(rng);
     if e.w > 0.0 && dot(h.n, e.xyz) > 0.0 {
         let pdf = env_lobe_pdf(e.xyz);
@@ -893,11 +993,13 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
                 // Lobes were also sampled directly at the last surface:
                 // weigh this sample against that (MIS).
                 var w = 1.0;
-                if last_pdf > 0.0 {
-                    let lp = env_lobe_pdf(d);
-                    w = last_pdf / (last_pdf + lp);
+                if has_image() {
+                    if last_pdf > 0.0 { w = last_pdf / (last_pdf + env_image_pdf(d)); }
+                    out.color += throughput * (env_image(d) * w + env_ambient());
+                } else {
+                    if last_pdf > 0.0 { w = last_pdf / (last_pdf + env_lobe_pdf(d)); }
+                    out.color += throughput * (env_smooth(d) + env_lobes(d) * w);
                 }
-                out.color += throughput * (env_smooth(d) + env_lobes(d) * w);
                 out.alpha = 1.0;
             }
             return out;

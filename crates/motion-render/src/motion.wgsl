@@ -707,7 +707,54 @@ const SAMPLE_X = array<f32, 8>(1.0, -1.0, 5.0, -3.0, -5.0, -7.0, 3.0, 7.0);
 const SAMPLE_Y = array<f32, 8>(-3.0, 3.0, 1.0, -5.0, 5.0, -1.0, 7.0, -7.0);
 const NO_TRI: u32 = 0xffffffffu;
 
+// Environment image (envmap.rs): where world direction d falls on it.
+fn env_uv(lb: u32, d: vec3<f32>) -> vec2<f32> {
+    let phi = atan2(d.x, d.z) + b_mesh[lb + 4u].w;
+    return vec2<f32>(fract(0.5 + phi / (2.0 * PI)), acos(clamp(-d.y, -1.0, 1.0)) / PI);
+}
+
+// Bilinear texel of a w × h equirect level at `at` (u wraps).
+fn env_tex(at: u32, w: u32, h: u32, uv: vec2<f32>) -> vec3<f32> {
+    let x = uv.x * f32(w) - 0.5;
+    let y = clamp(uv.y * f32(h) - 0.5, 0.0, f32(h - 1u));
+    let xf = floor(x);
+    let fx = x - xf;
+    let y0 = u32(floor(y));
+    let y1 = min(y0 + 1u, h - 1u);
+    let fy = y - floor(y);
+    let x0 = u32(i32(xf) + i32(w)) % w;
+    let x1 = (x0 + 1u) % w;
+    let a = mix(b_mesh[at + y0 * w + x0].xyz, b_mesh[at + y0 * w + x1].xyz, fx);
+    let b = mix(b_mesh[at + y1 * w + x0].xyz, b_mesh[at + y1 * w + x1].xyz, fx);
+    return mix(a, b, fy);
+}
+
+// The image's radiance toward d, blurred for roughness r (between levels).
+fn env_image(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
+    let e = u32(i32(lb) + bitcast<i32>(b_mesh[lb + 5u].w));
+    let uv = env_uv(lb, d);
+    let n = u32(b_mesh[e].x);
+    var k = 0u;
+    for (var i = 1u; i + 1u < n; i++) {
+        if b_mesh[e + 1u + i].w <= r { k = i; }
+    }
+    let la = b_mesh[e + 1u + k];
+    let lb2 = b_mesh[e + 1u + min(k + 1u, n - 1u)];
+    let a = env_tex(e + u32(la.x), u32(la.y), u32(la.z), uv);
+    let b = env_tex(e + u32(lb2.x), u32(lb2.y), u32(lb2.z), uv);
+    let t = clamp((r - la.w) / max(lb2.w - la.w, 1e-4), 0.0, 1.0);
+    return mix(a, b, t) * b_mesh[lb].w;
+}
+
+// The image's light on a matte surface facing n (irradiance / π).
+fn env_image_diffuse(lb: u32, n: vec3<f32>) -> vec3<f32> {
+    let e = u32(i32(lb) + bitcast<i32>(b_mesh[lb + 5u].w));
+    let d = b_mesh[e];
+    return env_tex(e + u32(d.y), u32(d.z), u32(d.w), env_uv(lb, n)) * b_mesh[lb].w;
+}
+
 fn env_light(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
+    if b_mesh[lb].z > 0.5 { return env_image(lb, d, r); }
     let up = -d.y;
     let sky = b_mesh[lb + 4u].xyz;
     let horizon = b_mesh[lb + 5u].xyz;
@@ -736,6 +783,7 @@ fn env_light(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
 // lobe (a spherical Gaussian) by Hill's fitted cosine convolution, so
 // small bright lobes (the sun) light as much as they do traced.
 fn env_diffuse(lb: u32, n: vec3<f32>) -> vec3<f32> {
+    if b_mesh[lb].z > 0.5 { return env_image_diffuse(lb, n); }
     let up = -n.y;
     let sky = b_mesh[lb + 4u].xyz;
     let horizon = b_mesh[lb + 5u].xyz;

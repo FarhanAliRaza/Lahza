@@ -11,6 +11,7 @@
 //! atlas and images upload only when they change, and blurred layers are
 //! drawn at reduced resolution before blurring.
 
+mod envmap;
 pub mod export;
 pub mod font;
 pub mod footage;
@@ -125,7 +126,7 @@ impl Renderer {
             fonts: Fonts::new(root),
             images: Images::new(root),
             footage: footage::Footage::new(root),
-            meshes: mesh3d::MeshCache::default(),
+            meshes: mesh3d::MeshCache::new(root),
             gpu,
             gpu_error,
             fallbacks: Vec::new(),
@@ -219,6 +220,7 @@ impl Renderer {
         let mut d: Vec<String> = self.images.warnings.iter().cloned().collect();
         d.extend(self.fonts.warnings.iter().cloned());
         d.extend(self.footage.warnings.iter().cloned());
+        d.extend(self.meshes.dropped.iter().cloned());
         d.sort();
         d.dedup();
         d

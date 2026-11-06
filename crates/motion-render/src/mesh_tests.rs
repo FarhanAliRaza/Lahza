@@ -747,3 +747,32 @@ fn gpu_matches_cpu_area_lights() {
     ], "environment": {"preset": "night"}}));
     crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0002);
 }
+
+/// An environment image lights and is reflected: a chrome ball shows its
+/// red sky above and blue ground below; GPU and CPU agree; a missing image
+/// is reported, not silently dark.
+#[test]
+fn environment_images_light_and_reflect() {
+    let dir = std::env::temp_dir().join(format!("lahza-envimg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let hdr = dir.join("sky.hdr");
+    crate::envmap::tests::write_hdr(&hdr, 0.0);
+    let env = json!({"image": hdr.to_str().unwrap()});
+    let p = sphere_in(json!({"preset": "metal", "color": "#ffffff", "roughness": 0}), json!([{"type": "ambient", "intensity": 0}]), env.clone());
+    let img = render(&p, 0.0);
+    let (top, bottom) = (px(&img, 160, 70), px(&img, 160, 170));
+    assert!(top[0] > 150 && top[2] < 80, "sky above: {top:?}");
+    assert!(bottom[2] > 150 && bottom[0] < 80, "ground below: {bottom:?}");
+    let matte = sphere_in(json!({"preset": "matte", "color": "#ffffff"}), json!([{"type": "ambient", "intensity": 0}]), env);
+    let m = render(&matte, 0.0);
+    let (mt, mb) = (px(&m, 160, 50), px(&m, 160, 190));
+    assert!(mt[0] > mt[2] && mb[2] > mb[0], "a matte ball takes the light from each side: {mt:?} {mb:?}");
+    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0002);
+    crate::tests::assert_gpu_matches_cpu_within(&matte, &[0.0], 0.0002);
+    let missing = sphere_in(json!({"preset": "matte"}), json!([]), json!({"image": dir.join("nope.hdr").to_str().unwrap()}));
+    let c = Compiled::new(&missing);
+    let mut r = cpu();
+    r.render(&c, 0.0);
+    assert!(r.dropped().iter().any(|d| d.contains("environment image")), "{:?}", r.dropped());
+    let _ = std::fs::remove_dir_all(&dir);
+}

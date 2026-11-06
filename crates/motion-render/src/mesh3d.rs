@@ -37,6 +37,12 @@ pub struct MeshCache {
     pub(crate) placed: HashMap<usize, u32>,
     serial: u64,
     pub warnings: Vec<String>,
+    /// The project folder (environment images resolve against it).
+    pub root: Option<std::path::PathBuf>,
+    /// Environment images, loaded and prefiltered once.
+    envs: HashMap<Arc<str>, Option<Arc<crate::envmap::EnvMap>>>,
+    /// Environment images that could not be loaded (not drawn as asked).
+    pub dropped: Vec<String>,
 }
 
 /// A mesh layer of a layer list, for the other batches of that list.
@@ -85,6 +91,11 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
 }
 
 impl MeshCache {
+    /// `root`: the project folder.
+    pub fn new(root: Option<&std::path::Path>) -> Self {
+        Self { root: root.map(std::path::Path::to_path_buf), ..Default::default() }
+    }
+
     pub(crate) fn begin(&mut self) {
         self.frame += 1;
         self.batches.clear();
@@ -281,6 +292,27 @@ impl MeshCache {
         Some(crate::pt::TraceInstance { mesh, key: m.params.key(), transform, materials, parts })
     }
 
+    /// The environment image of these lights, loaded once.
+    pub(crate) fn env_map(&mut self, l: &Lighting) -> Option<Arc<crate::envmap::EnvMap>> {
+        let path = l.env.image.clone()?;
+        if let Some(e) = self.envs.get(&path) {
+            return e.clone();
+        }
+        let full = match &self.root {
+            Some(root) => root.join(&*path),
+            None => std::path::PathBuf::from(&*path),
+        };
+        let env = match crate::envmap::EnvMap::load(&full) {
+            Ok(e) => Some(Arc::new(e)),
+            Err(e) => {
+                self.dropped.push(format!("environment image '{path}': {e}"));
+                None
+            }
+        };
+        self.envs.insert(path, env.clone());
+        env
+    }
+
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
         let key = m.params.key();
         if let Some((mesh, used)) = self.meshes.get_mut(&key) {
@@ -329,6 +361,8 @@ pub(crate) struct Batch {
     pub(crate) see_through: bool,
     /// Per light of the lighting: its shadow map, if it casts shadows.
     shadows: Arc<Vec<Option<Arc<ShadowMap>>>>,
+    /// The environment image (written once per display list).
+    pub(crate) env: Option<Arc<crate::envmap::EnvMap>>,
     /// Glass: a group holding everything behind, to refract.
     pub(crate) backdrop: Option<Backdrop>,
     /// Camera focal length in output pixels (refraction offsets).
@@ -674,11 +708,15 @@ pub(crate) fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
     let r = [[v[0], v[1], v[2]], [v[4], v[5], v[6]], [v[8], v[9], v[10]]];
     let rot = |d: [f64; 3]| [r[0][0] * d[0] + r[0][1] * d[1] + r[0][2] * d[2], r[1][0] * d[0] + r[1][1] * d[1] + r[1][2] * d[2], r[2][0] * d[0] + r[2][1] * d[1] + r[2][2] * d[2]];
     let f = |a: [f64; 3], w: f64| [a[0] as f32, a[1] as f32, a[2] as f32, w as f32];
-    let mut rows = vec![[l.lights.len() as f32, l.env.lobes.len() as f32, 0.0, 0.0]];
+    // Row 0: [lights, lobes, environment image (1), its intensity]; the
+    // sky row's w is the image's rotation and the horizon row's w its
+    // offset from this block (set where the image is placed).
+    let image = l.env.image.is_some();
+    let mut rows = vec![[l.lights.len() as f32, l.env.lobes.len() as f32, if image { 1.0 } else { 0.0 }, l.env.image_intensity as f32]];
     for c in 0..3 {
         rows.push([r[0][c] as f32, r[1][c] as f32, r[2][c] as f32, 0.0]);
     }
-    rows.push(f(l.env.sky, 0.0));
+    rows.push(f(l.env.sky, l.env.image_rotation));
     rows.push(f(l.env.horizon, 0.0));
     rows.push(f(l.env.ground, 0.0));
     for light in &l.lights {
@@ -721,7 +759,7 @@ impl Batch {
             verts: Vec::new(),
             tris: Vec::new(),
             materials: Vec::new(),
-            lighting: Arc::new(Lighting { lights: Vec::new(), env: lahza_motion_core::compile::EnvState { sky: [0.0; 3], horizon: [0.0; 3], ground: [0.0; 3], lobes: Vec::new() } }),
+            lighting: Arc::new(Lighting { lights: Vec::new(), env: lahza_motion_core::compile::EnvState { sky: [0.0; 3], horizon: [0.0; 3], ground: [0.0; 3], lobes: Vec::new(), image: None, image_intensity: 0.0, image_rotation: 0.0 } }),
             light_rows: rows,
             bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
             layers: 0,
@@ -730,6 +768,7 @@ impl Batch {
             members: Vec::new(),
             see_through: false,
             shadows: Arc::default(),
+            env: None,
             backdrop: None,
             focal: 1.0,
             cards_only: true,
@@ -752,6 +791,7 @@ impl Batch {
             members: Vec::new(),
             see_through: false,
             shadows: Arc::default(),
+            env: None,
             backdrop: None,
             focal: m.camera.focal,
             cards_only: false,
@@ -802,6 +842,9 @@ impl Batch {
     }
 
     fn add_mesh(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
+        if self.env.is_none() {
+            self.env = cache.env_map(&self.lighting);
+        }
         let Some(mesh) = cache.get(m) else { return };
         self.layers += 1;
         if self.tris.len() + mesh.tris.len() > MAX_TRIS {
@@ -1089,6 +1132,19 @@ impl Batch {
         mesh_rows.extend_from_slice(&self.materials);
         let light_base = mesh_rows.len() as u32;
         mesh_rows.extend_from_slice(&self.light_rows);
+        match &self.env {
+            Some(env) => {
+                let key = Arc::as_ptr(env) as usize;
+                let at = *placed.entry(key).or_insert_with(|| {
+                    let at = mesh_rows.len() as u32;
+                    mesh_rows.extend_from_slice(&env.raster);
+                    at
+                });
+                mesh_rows[light_base as usize + 5][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
+            }
+            // Its image did not load: the environment is dark.
+            None => mesh_rows[light_base as usize][2] = 0.0,
+        }
         // Shadow maps (shared by the list's batches: written once), linked
         // from each light's colour row as an offset from the light block.
         for (i, map) in self.shadows.iter().enumerate() {
@@ -1244,9 +1300,57 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Environment image lookups (mirror motion.wgsl's env_image*).
+fn env_uv(m: &[[f32; 4]], lb: usize, d: F3) -> [f32; 2] {
+    let phi = d[0].atan2(d[2]) + m[lb + 4][3];
+    let u = 0.5 + phi / (2.0 * std::f32::consts::PI);
+    [u - u.floor(), (-d[1]).clamp(-1.0, 1.0).acos() / std::f32::consts::PI]
+}
+
+fn env_tex(m: &[[f32; 4]], at: usize, w: usize, h: usize, uv: [f32; 2]) -> F3 {
+    let x = uv[0] * w as f32 - 0.5;
+    let y = (uv[1] * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+    let xf = x.floor();
+    let fx = x - xf;
+    let y0 = y.floor() as usize;
+    let y1 = (y0 + 1).min(h - 1);
+    let fy = y - y.floor();
+    let x0 = ((xf as i64 + w as i64) as usize) % w;
+    let x1 = (x0 + 1) % w;
+    let a = fmix(f3(m[at + y0 * w + x0]), f3(m[at + y0 * w + x1]), fx);
+    let b = fmix(f3(m[at + y1 * w + x0]), f3(m[at + y1 * w + x1]), fx);
+    fmix(a, b, fy)
+}
+
+fn env_image(m: &[[f32; 4]], lb: usize, d: F3, r: f32) -> F3 {
+    let e = (lb as i64 + m[lb + 5][3].to_bits() as i32 as i64) as usize;
+    let uv = env_uv(m, lb, d);
+    let n = m[e][0] as usize;
+    let mut k = 0;
+    for i in 1..n.saturating_sub(1) {
+        if m[e + 1 + i][3] <= r {
+            k = i;
+        }
+    }
+    let (la, lb2) = (m[e + 1 + k], m[e + 1 + (k + 1).min(n - 1)]);
+    let a = env_tex(m, e + la[0] as usize, la[1] as usize, la[2] as usize, uv);
+    let b = env_tex(m, e + lb2[0] as usize, lb2[1] as usize, lb2[2] as usize, uv);
+    let t = ((r - la[3]) / (lb2[3] - la[3]).max(1e-4)).clamp(0.0, 1.0);
+    fmul(fmix(a, b, t), m[lb][3])
+}
+
+fn env_image_diffuse(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
+    let e = (lb as i64 + m[lb + 5][3].to_bits() as i32 as i64) as usize;
+    let d = m[e];
+    fmul(env_tex(m, e + d[1] as usize, d[2] as usize, d[3] as usize, env_uv(m, lb, n)), m[lb][3])
+}
+
 /// The environment's radiance toward world direction `d`, blurred for
 /// roughness `r`.
 fn env(m: &[[f32; 4]], lb: usize, d: F3, r: f32) -> F3 {
+    if m[lb][2] > 0.5 {
+        return env_image(m, lb, d, r);
+    }
     let up = -d[1];
     let sky = f3(m[lb + 4]);
     let horizon = f3(m[lb + 5]);
@@ -1268,6 +1372,9 @@ fn env(m: &[[f32; 4]], lb: usize, d: F3, r: f32) -> F3 {
 /// Irradiance / π from the environment on a matte surface facing world
 /// direction n (mirrors `env_diffuse` in motion.wgsl).
 fn env_diffuse(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
+    if m[lb][2] > 0.5 {
+        return env_image_diffuse(m, lb, n);
+    }
     let up = -n[1];
     let (sky, horizon, ground) = (f3(m[lb + 4]), f3(m[lb + 5]), f3(m[lb + 6]));
     let mut c = if up >= 0.0 { fmix(horizon, sky, smoothstep(0.0, 1.6, up)) } else { fmix(horizon, ground, smoothstep(0.0, 1.2, -up)) };

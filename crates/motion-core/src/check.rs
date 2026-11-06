@@ -408,8 +408,12 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
     for clip in project.audio.clips() {
         used.push(("audio".into(), clip.path.clone()));
     }
-    // Font files (bundled fonts are names: "Inter SemiBold") and LUTs.
+    // Font files (bundled fonts are names: "Inter SemiBold"), LUTs and
+    // environment images.
     for scene in &project.scenes {
+        if let Some(image) = scene.environment.as_ref().and_then(|e| e.image.clone()) {
+            used.push((format!("{}.environment", scene.id), image));
+        }
         walk_layers(&scene.layers, &mut |l| {
             if let LayerKind::Text(t) = &l.kind {
                 if t.font.contains('.') || t.font.contains('/') {
