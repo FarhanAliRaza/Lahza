@@ -79,6 +79,25 @@ Measurements of a reference (`track`, `fit_curve`, sampled colours) fill in
 the numbers: when things move, where they sit, colours, sizes, the camera.
 They never replace the build line.
 
+## Measuring a reference
+
+`measure {video, kind}` (CLI `lahza motion measure <video> <kind>`) reads
+numbers off a reference instead of eyeballing them:
+
+- `cuts`: every cut, flash (a brief jump in brightness that comes back),
+  dissolve (frames that are blends of the frames around them) and whip (a
+  run of blurred, fast-changing frames), with times, from frame
+  differences at 64 × 36.
+- `events`: where the picture starts and stops changing (cuts left out),
+  with the box of what changed: when a move begins and lands.
+- `ink`: text size at `at` inside `region`: each line's top, bottom and
+  height in px, and the stroke width; set a text layer's size from it.
+- `captions`: when the caption band (`region`, default the bottom fifth)
+  holds caption text (pixels near `color`, default white) and when it
+  changes: caption timing to match.
+- `curve`: track a target (`color`, `point` or `box`, as `track`) and fit
+  one of the engine's eases to its x and y.
+
 ## Matching a reference camera
 
 `fit_camera` (CLI `lahza motion fit-camera <project> <marks.json>`) solves

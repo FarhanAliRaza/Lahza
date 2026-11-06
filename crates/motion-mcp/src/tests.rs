@@ -589,3 +589,104 @@ fn fit_camera_solves_and_sets_the_scene_camera() {
     assert!((fov - 45.0).abs() < 0.5 && (orbit[0].as_f64().unwrap() - 12.0).abs() < 0.5, "the scene's camera: {}", scene["camera"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A synthetic reference (lossless, 30 fps, 320 × 180): a checker A, a hard
+/// cut to stripes B at 1 s, a one-frame white flash at 1.5 s, a dissolve
+/// B → A over 2.0–2.5 s, a blurred whip A → B at 3.0–3.2 s; a box moving
+/// 3.6–4.0 s; captions (bars in the bottom band) 4.2–4.8 s and 4.8–5.4 s.
+fn reference_video(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return None;
+    }
+    let (w, h) = (320u32, 180u32);
+    let a = |x: u32, y: u32| if (x / 20 + y / 20) % 2 == 0 { 230.0 } else { 30.0 };
+    let b = |x: u32, _y: u32| if (x / 10) % 2 == 0 { 200.0 } else { 60.0 };
+    let frames_dir = dir.join("frames");
+    std::fs::create_dir_all(&frames_dir).unwrap();
+    for f in 0..170u32 {
+        let t = f as f64 / 30.0;
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            let v: f64 = if t < 1.0 {
+                a(x, y)
+            } else if f == 45 {
+                255.0
+            } else if t < 2.0 {
+                b(x, y)
+            } else if t < 2.5 {
+                let k = (t - 2.0) / 0.5;
+                b(x, y) * (1.0 - k) + a(x, y) * k
+            } else if t < 3.0 || (3.6..).contains(&t) {
+                // A (and the still background later), with a box that moves.
+                let mut v = a(x, y);
+                let bx = if t < 3.6 { 40.0 } else if t < 4.0 { 40.0 + (t - 3.6) / 0.4 * 120.0 } else { 160.0 };
+                if (bx..bx + 30.0).contains(&(x as f64)) && (20..50).contains(&y) {
+                    v = 128.0;
+                }
+                // Captions: bars on a plain band at the bottom.
+                if t >= 3.6 && y >= 140 {
+                    v = 90.0;
+                }
+                if (4.2..4.8).contains(&t) && (150..165).contains(&y) && (60..260).contains(&x) && (x / 8) % 3 != 0 {
+                    v = 255.0;
+                }
+                if (4.8..5.4).contains(&t) && (150..165).contains(&y) && (90..230).contains(&x) && (x / 6) % 2 == 0 {
+                    v = 255.0;
+                }
+                v
+            } else if t < 3.2 {
+                // Whip: a horizontally smeared slide from A to B.
+                let k = (t - 3.0) / 0.2;
+                let shift = (k * w as f64) as i64;
+                let mut s = 0.0;
+                for d in -12..=12i64 {
+                    let xx = x as i64 + shift + d;
+                    s += if xx < w as i64 { a(xx.max(0) as u32 % w, y) } else { b((xx - w as i64) as u32 % w, y) };
+                }
+                s / 25.0
+            } else {
+                b(x, y)
+            };
+            let v = v as u8;
+            image::Rgb([v, v, v])
+        });
+        img.save(frames_dir.join(format!("f{f:04}.png"))).unwrap();
+    }
+    let out = dir.join("ref.mkv");
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-framerate", "30", "-i"])
+        .arg(frames_dir.join("f%04d.png"))
+        .args(["-c:v", "ffv1"])
+        .arg(&out)
+        .status()
+        .unwrap()
+        .success();
+    ok.then_some(out)
+}
+
+#[test]
+fn measure_finds_cuts_events_ink_and_captions() {
+    let (mut tb, dir) = toolbox("measure");
+    let Some(video) = reference_video(&dir) else { return };
+    let v = video.to_str().unwrap();
+    let cuts = tb.call("measure", json!({"video": v, "kind": "cuts"})).unwrap().json;
+    let ev = cuts["events"].as_array().unwrap();
+    let find = |kind: &str, t: f64| ev.iter().any(|e| e["kind"] == kind && (e["t"].as_f64().unwrap() - t).abs() < 0.1);
+    assert!(find("cut", 1.0), "a cut at 1 s: {cuts}");
+    assert!(find("flash", 1.5), "a flash at 1.5 s: {cuts}");
+    assert!(find("dissolve", 2.0), "a dissolve from 2 s: {cuts}");
+    assert!(find("whip", 3.0), "a whip at 3 s: {cuts}");
+    let events = tb.call("measure", json!({"video": v, "kind": "events", "from": 3.4, "to": 4.1})).unwrap().json;
+    let e = &events["events"][0];
+    assert!((e["start"].as_f64().unwrap() - 3.6).abs() < 0.1 && (e["end"].as_f64().unwrap() - 4.0).abs() < 0.1, "{events}");
+    let caps = tb.call("measure", json!({"video": v, "kind": "captions", "from": 4.0, "to": 5.6})).unwrap().json;
+    let c = caps["captions"].as_array().unwrap();
+    assert_eq!(c.len(), 2, "{caps}");
+    assert!((c[0]["start"].as_f64().unwrap() - 4.2).abs() < 0.1 && (c[1]["start"].as_f64().unwrap() - 4.8).abs() < 0.1, "{caps}");
+    let ink = tb.call("measure", json!({"video": v, "kind": "ink", "at": 4.5, "region": [40, 140, 240, 35]})).unwrap().json;
+    assert_eq!(ink["lines"][0]["height_px"], 15, "{ink}");
+    // curve: the box's move, tracked and fitted.
+    let curve = tb.call("measure", json!({"video": v, "kind": "curve", "box": [40, 20, 30, 30], "search": 40, "from": 3.4, "to": 4.2})).unwrap().json;
+    assert!(curve.is_object() && !curve.as_object().unwrap().is_empty(), "{curve}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

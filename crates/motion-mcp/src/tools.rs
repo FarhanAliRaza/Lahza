@@ -174,6 +174,15 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: true,
         },
         ToolDef {
+            name: "measure",
+            description: "Measure a reference video. kind cuts: cuts, flashes, dissolves and whips from frame differences at 64×36. events: where the picture starts and stops changing (cuts left out) and the box of what changed. ink: text size at `at` in `region` (each line's height, stroke width). captions: when the caption band (region, default the bottom fifth) holds caption text (pixels near `color`, default white, within `tolerance`) and when it changes. curve: track `target` (as track: color/point/box) and fit an ease to its x and y.",
+            schema: obj(json!({"video": {"type": "string"}, "kind": {"type": "string", "enum": ["cuts", "events", "ink", "captions", "curve"]},
+                "from": {"type": "number"}, "to": {"type": "number"}, "at": {"type": "number", "description": "ink: the time"},
+                "region": {"type": "array", "items": {"type": "number"}, "description": "[x, y, w, h] source px"},
+                "color": {"type": "string"}, "point": {"type": "array", "items": {"type": "number"}}, "box": {"type": "array", "items": {"type": "number"}}, "tolerance": {"type": "number"}}), &["video", "kind"]),
+            read_only: true,
+        },
+        ToolDef {
             name: "fit_camera",
             description: "Solve the scene camera from marks: in each reference frame, 3D scene points (px, like a layer's position and z) and where they appear (px). Levenberg–Marquardt through the engine's own camera; returns per frame the camera (fov, orbit, dolly, position, shift) and its rms error, and `set` ops putting them on a scene's camera as keys (apply=true applies them). Fixed parameters (fix) stay at `start`; shift is fixed by default.",
             schema: obj(json!({"frames": {"type": "array", "items": {"type": "object", "properties": {"at": time, "marks": {"type": "array", "items": {"type": "object", "properties": {"world": {"type": "array", "items": {"type": "number"}}, "image": {"type": "array", "items": {"type": "number"}}}}}}}},
@@ -388,6 +397,7 @@ impl Toolbox {
             "snapshot" => self.snapshot(&args),
             "compare" => self.compare(&args),
             "fit_camera" => self.fit_camera(&args),
+            "measure" => self.measure(&args),
             "render" => self.render(&args),
             "render_status" => self.render_status(&args),
             "history" => self.history(&args),
@@ -1167,6 +1177,37 @@ impl Toolbox {
         let mut elements: &Compiled = &compiled;
         let t = r.resolve(markers, &base, &mut elements).map_err(|e| e.to_string())?;
         Ok((r.text(), t))
+    }
+
+    fn measure(&mut self, args: &Value) -> ToolResult {
+        let video = self.input_file(get_str(args, "video").ok_or("measure needs \"video\"")?);
+        let from = get_f64(args, "from").unwrap_or(0.0);
+        let to = get_f64(args, "to");
+        let region = args.get("region").and_then(Value::as_array).and_then(|a| {
+            let v: Vec<f64> = a.iter().filter_map(Value::as_f64).collect();
+            (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+        });
+        let out = match get_str(args, "kind").unwrap_or("") {
+            "cuts" => crate::measure::cuts(&video, from, to)?,
+            "events" => crate::measure::events(&video, from, to)?,
+            "ink" => crate::measure::ink(&video, get_f64(args, "at").unwrap_or(from), region)?,
+            "captions" => {
+                let c = lahza_motion_core::value::Color::parse(get_str(args, "color").unwrap_or("#ffffff"))?;
+                crate::measure::captions(&video, from, to, region, [c.0[0] * 255.0, c.0[1] * 255.0, c.0[2] * 255.0], get_f64(args, "tolerance").unwrap_or(24.0))?
+            }
+            "curve" => {
+                let target = crate::measure::Target::from_json(args)?;
+                let (info, samples) = crate::measure::track(&video, &target, from, to, None)?;
+                let pts: Vec<(f64, Vec<f64>)> = samples.iter().filter(|s| s.found).map(|s| (s.t, vec![s.x, s.y])).collect();
+                if pts.len() < 3 {
+                    return Err("curve: the target was found in fewer than 3 frames".into());
+                }
+                let fps = lahza_motion_core::time::Fps::whole(info.fps.round().max(1.0) as u32);
+                crate::measure::fit_curve(&pts, fps)?
+            }
+            other => return Err(format!("measure: kind '{other}': cuts, events, ink, captions or curve")),
+        };
+        Ok(Output::json(out))
     }
 
     fn fit_camera(&mut self, args: &Value) -> ToolResult {

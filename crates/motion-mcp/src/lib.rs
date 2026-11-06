@@ -24,6 +24,8 @@ Usage:
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
   lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
+  lahza motion measure <video> cuts|events|ink|captions|curve [--from S] [--to S] [--at S] [--region x,y,w,h]
+                    [--color HEX | --point x,y | --box x,y,w,h]   (curve: track it, fit an ease)
   lahza motion fit-camera <project> <marks.json> [--scene ID] [--fix fov,shift] [--apply]
                     marks.json: {\"frames\": [{\"at\": REF, \"marks\": [{\"world\": [x, y, z], \"image\": [x, y]}]}], \"start\": {camera}}
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
@@ -205,6 +207,25 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             if r["drift"].as_u64().unwrap_or(0) > 0 {
                 return Err("events drift from their markers".into());
             }
+        }
+        "measure" => {
+            let video = args.get(1).ok_or("measure needs <video> <kind>")?;
+            let kind = args.get(2).ok_or("measure needs <video> <kind>")?;
+            let mut a = json!({"video": video, "kind": kind});
+            for f in ["from", "to", "at", "tolerance"] {
+                if let Some(v) = flag(args, &format!("--{f}")) {
+                    a[f] = json!(v.parse::<f64>().map_err(|e| format!("--{f}: {e}"))?);
+                }
+            }
+            for f in ["region", "point", "box"] {
+                if let Some(v) = flag(args, &format!("--{f}")) {
+                    a[f] = json!(v.split(',').map(|x| x.trim().parse::<f64>().unwrap_or(0.0)).collect::<Vec<_>>());
+                }
+            }
+            if let Some(c) = flag(args, "--color") {
+                a["color"] = json!(c);
+            }
+            print(&tb.call("measure", a)?.json);
         }
         "fit-camera" => {
             let file = args.get(2).ok_or("fit-camera needs <project> <marks.json>")?;

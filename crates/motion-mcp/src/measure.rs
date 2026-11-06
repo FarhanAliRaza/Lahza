@@ -871,3 +871,315 @@ mod tests {
         assert!(fit_curve(&[(0.0, vec![1.0])], Fps::whole(30)).is_err());
     }
 }
+
+// ---------------------------------------------------------------- measure
+
+/// Decodes `video` from `from` to `to` at w × h (RGB), calling `f` with each
+/// frame's time and pixels.
+pub fn frames(video: &Path, from: f64, to: Option<f64>, w: u32, h: u32, mut f: impl FnMut(f64, &[u8])) -> Result<VideoInfo, String> {
+    let info = probe(video)?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{:.6}", from.max(0.0)), "-i"]).arg(video);
+    if let Some(to) = to {
+        cmd.args(["-t", &format!("{:.6}", (to - from).max(0.0))]);
+    }
+    let mut child = cmd
+        .args(["-vf", &format!("scale={w}:{h}:flags=area"), "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run ffmpeg: {e}"))?;
+    let mut out = child.stdout.take().ok_or("ffmpeg gave no output")?;
+    let mut buf = vec![0u8; (w * h * 3) as usize];
+    let first = (from.max(0.0) * info.fps).round() as i64;
+    let mut i = 0i64;
+    while out.read_exact(&mut buf).is_ok() {
+        f((first + i) as f64 / info.fps.max(1e-6), &buf);
+        i += 1;
+    }
+    let _ = child.wait();
+    Ok(info)
+}
+
+fn gray(buf: &[u8]) -> Vec<f32> {
+    buf.chunks_exact(3).map(|p| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32).collect()
+}
+
+fn mean_abs(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len().max(1) as f32
+}
+
+/// Edge energy: mean |gradient| (sharp pictures high, blurred low).
+fn edge_energy(g: &[f32], w: usize, h: usize) -> f32 {
+    let mut s = 0.0;
+    for y in 0..h - 1 {
+        for x in 0..w - 1 {
+            let i = y * w + x;
+            s += (g[i + 1] - g[i]).abs() + (g[i + w] - g[i]).abs();
+        }
+    }
+    s / ((w - 1) * (h - 1)).max(1) as f32
+}
+
+/// Cuts and transitions, from frame differences at 64 × 36: a cut changes
+/// the picture in one frame and keeps it; a flash jumps in brightness and
+/// comes back; a dissolve is a run of frames that are blends of the frames
+/// around it; a whip is a run of blurred, fast-changing frames.
+pub fn cuts(video: &Path, from: f64, to: Option<f64>) -> Result<Value, String> {
+    let (w, h) = (64usize, 36usize);
+    let mut fr: Vec<(f64, Vec<f32>)> = Vec::new();
+    let info = frames(video, from, to, w as u32, h as u32, |t, buf| fr.push((t, gray(buf))))?;
+    if fr.len() < 3 {
+        return Ok(json!({"events": [], "frames": fr.len()}));
+    }
+    let d: Vec<f32> = (0..fr.len()).map(|i| if i == 0 { 0.0 } else { mean_abs(&fr[i].1, &fr[i - 1].1) }).collect();
+    let mut sorted = d[1..].to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = sorted[sorted.len() / 2];
+    let high = (median * 4.0).max(6.0);
+    let lum = |i: usize| fr[i].1.iter().sum::<f32>() / fr[i].1.len() as f32;
+    let mut events = Vec::new();
+    let mut i = 1;
+    while i < fr.len() {
+        if d[i] < high {
+            i += 1;
+            continue;
+        }
+        // A run of high differences [i, j).
+        let mut j = i + 1;
+        while j < fr.len() && d[j] >= high * 0.5 {
+            j += 1;
+        }
+        let before = i - 1;
+        let after = j.min(fr.len() - 1);
+        let span = j - i;
+        let back = mean_abs(&fr[before].1, &fr[after].1);
+        let t = fr[i].0;
+        let jump = (lum(i) - lum(before)).abs();
+        let (kind, extra) = if back < high * 0.5 && jump > 8.0 {
+            ("flash", json!({"brightness": round((lum(i) - lum(before)) as f64)}))
+        } else if span == 1 {
+            ("cut", json!({}))
+        } else {
+            // Blends of the frames around the run: a dissolve.
+            let residual = (i..j)
+                .map(|k| {
+                    let (a, b) = (&fr[before].1, &fr[after].1);
+                    // Best mix of a and b for frame k.
+                    let (mut num, mut den) = (0.0f32, 0.0f32);
+                    for p in 0..a.len() {
+                        let (x, y) = (fr[k].1[p] - b[p], a[p] - b[p]);
+                        num += x * y;
+                        den += y * y;
+                    }
+                    let alpha = (num / den.max(1e-6)).clamp(0.0, 1.0);
+                    fr[k].1.iter().zip(a.iter().zip(b)).map(|(v, (x, y))| (v - (alpha * x + (1.0 - alpha) * y)).abs()).sum::<f32>() / a.len() as f32
+                })
+                .fold(0.0f32, f32::max);
+            let sharp = (edge_energy(&fr[before].1, w, h) + edge_energy(&fr[after].1, w, h)) / 2.0;
+            let blur = (i..j).map(|k| edge_energy(&fr[k].1, w, h)).fold(f32::MAX, f32::min);
+            if residual < 4.0 {
+                ("dissolve", json!({"end": round(fr[after].0)}))
+            } else if blur < sharp * 0.6 {
+                ("whip", json!({"end": round(fr[after].0)}))
+            } else {
+                ("motion", json!({"end": round(fr[after].0)}))
+            }
+        };
+        let mut e = json!({"t": round(t), "frame": (t * info.fps).round(), "kind": kind, "strength": round(d[i] as f64)});
+        if let (Some(o), Some(x)) = (e.as_object_mut(), extra.as_object()) {
+            o.extend(x.clone());
+        }
+        events.push(e);
+        i = j;
+    }
+    Ok(json!({"events": events, "frames": fr.len(), "fps": info.fps, "threshold": round(high as f64)}))
+}
+
+/// Motion events: where the picture starts and stops changing (cuts left
+/// out), with the box of what changed, at 160 px wide.
+pub fn events(video: &Path, from: f64, to: Option<f64>) -> Result<Value, String> {
+    let info0 = probe(video)?;
+    let w = 160usize;
+    let h = ((info0.height as f64 * w as f64 / info0.width.max(1) as f64).round() as usize).max(2);
+    let mut fr: Vec<(f64, Vec<f32>)> = Vec::new();
+    let info = frames(video, from, to, w as u32, h as u32, |t, buf| fr.push((t, gray(buf))))?;
+    let s = info.width as f64 / w as f64;
+    let mut out = Vec::new();
+    let mut moving: Option<(f64, [usize; 4])> = None;
+    for k in 1..fr.len() {
+        let (a, b) = (&fr[k - 1].1, &fr[k].1);
+        let mut bb = [usize::MAX, usize::MAX, 0, 0];
+        let mut n = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                if (a[y * w + x] - b[y * w + x]).abs() > 12.0 {
+                    n += 1;
+                    bb = [bb[0].min(x), bb[1].min(y), bb[2].max(x), bb[3].max(y)];
+                }
+            }
+        }
+        let frac = n as f64 / (w * h) as f64;
+        // A cut changes most of the frame at once: not an event.
+        let is_cut = frac > 0.6;
+        let active = frac > 0.002 && !is_cut;
+        let t = fr[k].0;
+        match (&mut moving, active) {
+            (None, true) => moving = Some((t, bb)),
+            (Some((_, b0)), true) => *b0 = [b0[0].min(bb[0]), b0[1].min(bb[1]), b0[2].max(bb[2]), b0[3].max(bb[3])],
+            (Some((t0, b0)), false) => {
+                let r = [b0[0] as f64 * s, b0[1] as f64 * s, (b0[2] + 1 - b0[0]) as f64 * s, (b0[3] + 1 - b0[1]) as f64 * s];
+                out.push(json!({"start": round(*t0), "end": round(t), "region": r.map(round)}));
+                moving = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some((t0, b0)) = moving {
+        let r = [b0[0] as f64 * s, b0[1] as f64 * s, (b0[2] + 1 - b0[0]) as f64 * s, (b0[3] + 1 - b0[1]) as f64 * s];
+        out.push(json!({"start": round(t0), "end": round(fr.last().map(|f| f.0).unwrap_or(t0)), "region": r.map(round)}));
+    }
+    Ok(json!({"events": out}))
+}
+
+fn otsu(v: &[f32]) -> f32 {
+    let mut hist = [0usize; 256];
+    for x in v {
+        hist[(*x).clamp(0.0, 255.0) as usize] += 1;
+    }
+    let total = v.len() as f64;
+    let sum: f64 = hist.iter().enumerate().map(|(i, c)| i as f64 * *c as f64).sum();
+    let (mut wb, mut sb, mut best, mut thr) = (0.0, 0.0, 0.0, 128.0);
+    for (i, c) in hist.iter().enumerate() {
+        wb += *c as f64;
+        if wb == 0.0 {
+            continue;
+        }
+        let wf = total - wb;
+        if wf == 0.0 {
+            break;
+        }
+        sb += i as f64 * *c as f64;
+        let (mb, mf) = (sb / wb, (sum - sb) / wf);
+        let between = wb * wf * (mb - mf) * (mb - mf);
+        if between > best {
+            best = between;
+            thr = i as f64 + 0.5;
+        }
+    }
+    thr as f32
+}
+
+/// Text size ("ink") in `region` [x, y, w, h] at time `at`: the ink (the
+/// minority side of an Otsu threshold) is split into lines by its row
+/// profile; each line's top, bottom and height (px), and the median stroke
+/// width.
+pub fn ink(video: &Path, at: f64, region: Option<[f64; 4]>) -> Result<Value, String> {
+    let info0 = probe(video)?;
+    let (w, h) = (info0.width.max(2), info0.height.max(2));
+    let mut frame: Option<Vec<u8>> = None;
+    frames(video, at, Some(at + 0.5 / info0.fps.max(1.0)), w, h, |_, buf| {
+        if frame.is_none() {
+            frame = Some(buf.to_vec());
+        }
+    })?;
+    let buf = frame.ok_or("no frame there")?;
+    let [rx, ry, rw, rh] = region.unwrap_or([0.0, 0.0, w as f64, h as f64]);
+    let (x0, y0) = (rx.max(0.0) as usize, ry.max(0.0) as usize);
+    let (x1, y1) = (((rx + rw) as usize).min(w as usize), ((ry + rh) as usize).min(h as usize));
+    if x1 <= x0 || y1 <= y0 {
+        return Err("region is empty".into());
+    }
+    let g: Vec<f32> = (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| {
+        let p = &buf[(y * w as usize + x) * 3..];
+        0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+    }).collect();
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let thr = otsu(&g);
+    let above = g.iter().filter(|v| **v > thr).count();
+    // Ink is the smaller side (light text on dark or dark on light).
+    let light_ink = above * 2 < g.len();
+    let is_ink = |v: f32| if light_ink { v > thr } else { v <= thr };
+    let rows: Vec<usize> = (0..ch).map(|y| (0..cw).filter(|&x| is_ink(g[y * cw + x])).count()).collect();
+    let mut lines = Vec::new();
+    let mut y = 0;
+    while y < ch {
+        if rows[y] == 0 {
+            y += 1;
+            continue;
+        }
+        let top = y;
+        while y < ch && rows[y] > 0 {
+            y += 1;
+        }
+        let height = y - top;
+        if height >= 2 {
+            lines.push(json!({"top": y0 + top, "bottom": y0 + y, "height_px": height}));
+        }
+    }
+    let mut runs = Vec::new();
+    for yy in 0..ch {
+        let mut run = 0;
+        for xx in 0..cw {
+            if is_ink(g[yy * cw + xx]) {
+                run += 1;
+            } else if run > 0 {
+                runs.push(run);
+                run = 0;
+            }
+        }
+    }
+    runs.sort_unstable();
+    let stroke = runs.get(runs.len() / 2).copied().unwrap_or(0);
+    Ok(json!({"lines": lines, "stroke_px": stroke, "ink": if light_ink { "light" } else { "dark" }, "threshold": round(thr as f64)}))
+}
+
+/// Caption timing from the caption band's pixels: when the band holds
+/// caption text (pixels within `tolerance` of the text colour, default
+/// white) and when that text changes. `region` is the band [x, y, w, h]
+/// (default the bottom fifth).
+pub fn captions(video: &Path, from: f64, to: Option<f64>, region: Option<[f64; 4]>, color: [f64; 3], tolerance: f64) -> Result<Value, String> {
+    let info0 = probe(video)?;
+    let (w, h) = (320u32, ((info0.height as f64 * 320.0 / info0.width.max(1) as f64).round() as u32).max(2));
+    let s = info0.width as f64 / w as f64;
+    let band = region.unwrap_or([0.0, info0.height as f64 * 0.8, info0.width as f64, info0.height as f64 * 0.2]).map(|v| v / s);
+    let (bx0, by0) = (band[0].max(0.0) as usize, band[1].max(0.0) as usize);
+    let (bx1, by1) = (((band[0] + band[2]) as usize).min(w as usize), ((band[1] + band[3]) as usize).min(h as usize));
+    let tol2 = tolerance * tolerance;
+    let mut masks: Vec<(f64, Vec<bool>)> = Vec::new();
+    frames(video, from, to, w, h, |t, buf| {
+        let m: Vec<bool> = (by0..by1)
+            .flat_map(|y| (bx0..bx1).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = &buf[(y * w as usize + x) * 3..];
+                (0..3).map(|c| (p[c] as f64 - color[c]).powi(2)).sum::<f64>() <= tol2
+            })
+            .collect();
+        masks.push((t, m));
+    })?;
+    let area = ((bx1 - bx0) * (by1 - by0)).max(1) as f64;
+    let mut out = Vec::new();
+    let mut cur: Option<(f64, usize)> = None;
+    for k in 0..masks.len() {
+        let count = masks[k].1.iter().filter(|b| **b).count();
+        let has_text = count as f64 / area > 0.005;
+        let changed = cur.is_some_and(|(_, at)| {
+            let (a, b) = (&masks[k].1, &masks[at].1);
+            let union = a.iter().zip(b).filter(|(x, y)| **x || **y).count();
+            let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+            union > 0 && diff as f64 / union as f64 > 0.3
+        });
+        match cur {
+            Some((t0, _)) if !has_text || changed => {
+                out.push(json!({"start": round(t0), "end": round(masks[k].0)}));
+                cur = if has_text { Some((masks[k].0, k)) } else { None };
+            }
+            None if has_text => cur = Some((masks[k].0, k)),
+            _ => {}
+        }
+    }
+    if let Some((t0, _)) = cur {
+        out.push(json!({"start": round(t0), "end": round(masks.last().map(|x| x.0 + 1.0 / info0.fps.max(1.0)).unwrap_or(t0))}));
+    }
+    Ok(json!({"captions": out}))
+}
