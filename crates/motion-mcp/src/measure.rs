@@ -1183,3 +1183,102 @@ pub fn captions(video: &Path, from: f64, to: Option<f64>, region: Option<[f64; 4
     }
     Ok(json!({"captions": out}))
 }
+
+// ---------------------------------------------------------------- SSIM
+
+/// Cells across and down in the SSIM grid.
+pub const SSIM_GRID: usize = 4;
+
+/// Structural similarity of two equal-size pictures' luminance (Wang et
+/// al. 2004: Gaussian window σ 1.5, K₁ 0.01, K₂ 0.03), optionally inside
+/// `region` [x, y, w, h] (px of these pictures). Returns the mean SSIM
+/// and the mean of each cell of a [`SSIM_GRID`]² grid over the region,
+/// row by row (1 identical; around 0 unrelated).
+pub fn ssim(a: &image::RgbaImage, b: &image::RgbaImage, region: Option<[u32; 4]>) -> (f64, Vec<f64>) {
+    let (iw, ih) = a.dimensions();
+    let [rx, ry, rw, rh] = region.unwrap_or([0, 0, iw, ih]);
+    let (rx, ry) = (rx.min(iw.saturating_sub(1)), ry.min(ih.saturating_sub(1)));
+    let (w, h) = (rw.clamp(1, iw - rx) as usize, rh.clamp(1, ih - ry) as usize);
+    let crop = |img: &image::RgbaImage| -> Vec<f32> {
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let p = img.get_pixel(rx + x as u32, ry + y as u32).0;
+                out.push(0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32);
+            }
+        }
+        out
+    };
+    let (x, y) = (crop(a), crop(b));
+    let xx: Vec<f32> = x.iter().map(|v| v * v).collect();
+    let yy: Vec<f32> = y.iter().map(|v| v * v).collect();
+    let xy: Vec<f32> = x.iter().zip(&y).map(|(a, b)| a * b).collect();
+    let [mx, my, sxx, syy, sxy] = [&x, &y, &xx, &yy, &xy].map(|v| gauss(v, w, h));
+    let (c1, c2) = ((0.01f32 * 255.0).powi(2), (0.03f32 * 255.0).powi(2));
+    let mut cells = vec![(0.0f64, 0usize); SSIM_GRID * SSIM_GRID];
+    let mut total = 0.0f64;
+    for j in 0..h {
+        let cy = j * SSIM_GRID / h;
+        for i in 0..w {
+            let k = j * w + i;
+            let (ux, uy) = (mx[k], my[k]);
+            let (vx, vy, cxy) = ((sxx[k] - ux * ux).max(0.0), (syy[k] - uy * uy).max(0.0), sxy[k] - ux * uy);
+            let s = ((2.0 * ux * uy + c1) * (2.0 * cxy + c2)) / ((ux * ux + uy * uy + c1) * (vx + vy + c2));
+            total += s as f64;
+            let cell = &mut cells[cy * SSIM_GRID + i * SSIM_GRID / w];
+            cell.0 += s as f64;
+            cell.1 += 1;
+        }
+    }
+    let grid = cells.iter().map(|&(s, n)| if n == 0 { f64::NAN } else { s / n as f64 }).collect();
+    (total / (w * h) as f64, grid)
+}
+
+/// Gaussian blur, σ 1.5 over ±5 px, edges clamped.
+fn gauss(v: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let k: [f32; 11] = std::array::from_fn(|i| (-((i as f32 - 5.0).powi(2)) / (2.0 * 1.5 * 1.5)).exp());
+    let sum: f32 = k.iter().sum();
+    let k = k.map(|x| x / sum);
+    let mut tmp = vec![0.0f32; w * h];
+    for y in 0..h {
+        let row = &v[y * w..(y + 1) * w];
+        for x in 0..w {
+            tmp[y * w + x] = (0..11).map(|i| k[i] * row[(x as i64 + i as i64 - 5).clamp(0, w as i64 - 1) as usize]).sum();
+        }
+    }
+    let mut out = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            out[y * w + x] = (0..11).map(|i| k[i] * tmp[(y as i64 + i as i64 - 5).clamp(0, h as i64 - 1) as usize * w + x]).sum();
+        }
+    }
+    out
+}
+
+/// A set of frames' SSIM summarised as `score.py` does: the mean, the 5th
+/// percentile (the bad moments), and the worst grid cell over the set (the
+/// cell whose mean SSIM is lowest: where in the frame it differs).
+pub fn ssim_summary(frames: &[(f64, Vec<f64>)]) -> Value {
+    if frames.is_empty() {
+        return Value::Null;
+    }
+    let mut v: Vec<f64> = frames.iter().map(|f| f.0).collect();
+    v.sort_by(f64::total_cmp);
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    let p05 = v[((v.len() - 1) as f64 * 0.05).floor() as usize];
+    let cells = frames[0].1.len();
+    let mut worst = (0usize, f64::INFINITY);
+    for c in 0..cells {
+        let vals: Vec<f64> = frames.iter().map(|f| f.1[c]).filter(|x| x.is_finite()).collect();
+        if vals.is_empty() {
+            continue;
+        }
+        let m = vals.iter().sum::<f64>() / vals.len() as f64;
+        if m < worst.1 {
+            worst = (c, m);
+        }
+    }
+    let (col, row) = (worst.0 % SSIM_GRID, worst.0 / SSIM_GRID);
+    json!({"mean": round(mean), "p05": round(p05), "min": round(v[0]),
+           "worst_cell": {"column": col, "row": row, "ssim": round(worst.1.min(1.0))}})
+}

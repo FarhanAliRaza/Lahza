@@ -19,8 +19,10 @@ Usage:
   lahza motion check <project> [--json]
   lahza motion sync-check <project> [--frames N] [--tracks a,b] [--all] [--json]
   lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N] [--no-denoise]] [-o out.png]
-  lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [-o compare.png]
-                                          (no --at: every frame, first to last, plus a side-by-side video)
+  lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [--drawn x,y,w,h]
+                    [--video side_by_side.mp4] [-o compare.png]
+                    (no --at: every frame, first to last, scored by SSIM per scene, plus a side-by-side video;
+                     --drawn also scores one element's box)
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
   lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
@@ -290,6 +292,13 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             if let Some(w) = flag(args, "--width") {
                 a["width"] = json!(w.parse::<u32>().map_err(|e| e.to_string())?);
             }
+            if let Some(v) = flag(args, "--video") {
+                a["video"] = json!(v);
+            }
+            if let Some(d) = flag(args, "--drawn") {
+                let v: Vec<f64> = d.split(',').map(|s| s.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|e| format!("--drawn: {e}"))?;
+                a["drawn"] = json!(v);
+            }
             let out = tb.call("compare", a)?;
             let path = flag(args, "-o").unwrap_or_else(|| "compare.png".into());
             for (i, png) in out.images.iter().enumerate() {
@@ -301,7 +310,8 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             // Shading ratio (ours ÷ reference) as a percentage; "–" when the reference is flat.
             let pct = |v: &Value| v.as_f64().map(|r| format!("{:.0}%", r * 100.0)).unwrap_or_else(|| "–".into());
             for row in r["rows"].as_array().into_iter().flatten() {
-                println!("  {:<14} ours {:>6}s  reference {:>6}s  difference {:>5}  missing detail {:>5}  extra {:>5}  shading {:>5}{}", row["at"].as_str().unwrap_or(""), row["t"], row["reference_t"], row["mean_difference"], row["missing_detail"], row["extra_detail"],
+                println!("  {:<14} ours {:>6}s  reference {:>6}s  ssim {:>6}{}  difference {:>5}  missing detail {:>5}  extra {:>5}  shading {:>5}{}", row["at"].as_str().unwrap_or(""), row["t"], row["reference_t"], row["ssim"],
+                         row["ssim_drawn"].as_f64().map(|v| format!(" (drawn {v})")).unwrap_or_default(), row["mean_difference"], row["missing_detail"], row["extra_detail"],
                          pct(&row["shading_ratio"]), row["shading_verdict"].as_str().map(|v| format!("  {v}")).unwrap_or_default());
             }
             if r.get("scenes").is_some() {
@@ -312,6 +322,19 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                     println!("  {:<16} {:>7} {:>7} {:>6} {:>7} {:>7} {:>7}  {}", sc["scene"].as_str().unwrap_or(""), sc["from"], sc["to"], sc["mean_difference"],
                              sc["motion_ours"], sc["motion_reference"], pct(&sc["shading_ratio"]), sc["verdict"].as_str().unwrap_or(""));
                 }
+                // SSIM, as score.py prints it: mean, 5th percentile, worst grid cell.
+                let ssim_line = |s: &Value| -> String {
+                    let c = &s["worst_cell"];
+                    format!("{:>6} {:>6}   worst cell {:>6} at {}", s["mean"], s["p05"], c["ssim"], c["box"])
+                };
+                let drawn = r["drawn"].is_object();
+                println!("  {:<16} {:>6} {:>6}{}", "SSIM", "mean", "p05", if drawn { "   (whole frame  |  drawn box)" } else { "" });
+                for sc in r["scenes"].as_array().into_iter().flatten() {
+                    let d = if drawn { format!("  |  {}", ssim_line(&sc["drawn_ssim"])) } else { String::new() };
+                    println!("  {:<16} {}{}", sc["scene"].as_str().unwrap_or(""), ssim_line(&sc["ssim"]), d);
+                }
+                let d = if drawn { format!("  |  {}", ssim_line(&r["drawn"]["ssim"])) } else { String::new() };
+                println!("  {:<16} {}{}", "all", ssim_line(&r["ssim"]), d);
                 println!("  worst stretches:");
                 for w in r["worst"].as_array().into_iter().flatten() {
                     println!("    {:>6}–{:<6}s  {:<36} diff {:>5}  motion ours {:>5} ref {:>5}  missing detail {:>5}  shading {:>5}", w["from"], w["to"], w["verdict"].as_str().unwrap_or(""),

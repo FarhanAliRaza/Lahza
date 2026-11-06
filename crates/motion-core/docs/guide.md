@@ -120,6 +120,22 @@ looks), the worst stretches with a sheet of them, a timeline graph and a
 side-by-side video (ours | reference | difference). With `at: [...]` it
 shows only those moments.
 
+Every frame is scored by SSIM (structural similarity of the luminance,
+Gaussian window σ 1.5; 1 is identical, around 0 unrelated), at the
+comparison width (`width`, default 270 px). Each scene and the whole run
+report `ssim: {mean, p05, min, worst_cell}`: `p05` is the 5th percentile
+of the frames (the bad moments a mean hides), and `worst_cell` the cell of
+a 4×4 grid whose mean SSIM over those frames is lowest, with its `box`
+in project px, so it says *where* the replica differs. `drawn: [x, y, w,
+h]` (project px) scores one element's box as well (`drawn_ssim` per
+scene, `drawn` for the run, `ssim_drawn` per moment) and outlines it in
+the pictures and the video. On the command line:
+
+```bash
+lahza motion compare film.lahza --against original.mp4 --video out/side_by_side.mp4
+lahza motion compare film.lahza --against original.mp4 --drawn 640,300,420,180
+```
+
 The mean difference is dominated by large areas: thin lines, cages and
 outlines barely move it, and leaving them out can even lower it. Each
 scene also reports `missing_detail` and `extra_detail` (the share of edges

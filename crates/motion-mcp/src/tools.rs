@@ -193,12 +193,13 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "compare",
-            description: "Compare the project with a reference video. Without `at` it compares every frame from first to last: per frame the difference and how much each side moves, a per-scene summary with a verdict (motion, look, missing/extra detail, and interior shading: shading_ratio is ours ÷ reference, \"ours is flatter\" when below 0.5 against a reference that has real shading), the worst stretches (with a sheet of them), a timeline graph, and a side-by-side video (ours | reference | difference) of the whole piece. With `at` it returns those moments side by side. The reference time is ours + offset.",
+            description: "Compare the project with a reference video. Without `at` it compares every frame from first to last: per frame the difference and how much each side moves, a per-scene summary with a verdict (motion, look, missing/extra detail, and interior shading: shading_ratio is ours ÷ reference, \"ours is flatter\" when below 0.5 against a reference that has real shading), the worst stretches (with a sheet of them), a timeline graph, and a side-by-side video (ours | reference | difference) of the whole piece. With `at` it returns those moments side by side. Every frame is scored by SSIM (luminance, Gaussian window; 1 identical): per scene and overall the mean, the 5th percentile and the worst cell of a 4×4 grid (with its box), and with `drawn` the same inside one element's box. The reference time is ours + offset.",
             schema: obj(json!({"against": {"type": "string", "description": "reference video or image"}, "at": {"type": "array", "items": time, "description": "only these moments (default: every frame)"},
                 "from": {"type": "number"}, "to": {"type": "number"},
                 "offset": {"type": "number", "description": "reference seconds = ours + offset (default 0)"},
                 "width": {"type": "integer", "description": "px per frame (default 360 for moments, 270 for a full run)"},
                 "video": {"type": "string", "description": "full run: side-by-side video path (default renders/compare.mp4)"},
+                "drawn": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x, y, w, h] (project px): also score this box alone (one element), outlined in the pictures"},
                 "save": {"type": "string", "description": "also write the first PNG here"}}), &["against"]),
             read_only: true,
         },
@@ -1386,6 +1387,7 @@ impl Toolbox {
         let scale = (width * 2.0 / compiled.settings.width as f64).clamp(0.05, 1.0);
         let renderer = self.renderer(&dir);
         renderer.set_scale(scale);
+        let drawn = drawn_box(args)?;
         let mut cells = Vec::new();
         let mut rows = Vec::new();
         for (label, t) in &times {
@@ -1396,6 +1398,9 @@ impl Toolbox {
             let rt = (ft + offset).max(0.0);
             let reference = reference_frame(&against, rt, w, h)?;
             let (diff, mean) = difference(&ours, &reference);
+            let s = w as f64 / compiled.settings.width as f64;
+            let region = drawn.map(|d| scaled_box(d, s, w, h));
+            let (ssim, _) = crate::measure::ssim(&ours, &reference, None);
             let luma = |img: &image::RgbaImage| img.pixels().map(|p| 0.2126 * p.0[0] as f64 + 0.7152 * p.0[1] as f64 + 0.0722 * p.0[2] as f64).sum::<f64>() / (w as f64 * h as f64);
             let (missing, extra) = detail(&ours, &reference);
             let (so, sr) = (crate::measure::shading(&ours), crate::measure::shading(&reference));
@@ -1406,6 +1411,13 @@ impl Toolbox {
                              "brightness_ours": round(luma(&ours)), "brightness_reference": round(luma(&reference))});
             if let Some(v) = crate::measure::flatness_verdict(ratio) {
                 row["shading_verdict"] = json!(v);
+            }
+            row["ssim"] = json!(round(ssim));
+            let (mut ours, mut reference) = (ours, reference);
+            if let Some(b) = region {
+                row["ssim_drawn"] = json!(round(crate::measure::ssim(&ours, &reference, Some(b)).0));
+                outline(&mut ours, b);
+                outline(&mut reference, b);
             }
             rows.push(row);
             cells.push((format!("ours {label} · {ft:.2}s"), ours));
@@ -1436,10 +1448,13 @@ impl Toolbox {
             None => dir.join("renders").join("compare.mp4"),
         };
         let save = get_str(args, "save").map(|p| self.path(p));
+        let drawn = drawn_box(args)?;
         let renderer = self.renderer(dir);
         renderer.set_scale(scale);
         let probe = renderer.render(&compiled, fps.time_of(first_n));
         let (w, h) = probe.dimensions();
+        let px = w as f64 / compiled.settings.width as f64;
+        let region = drawn.map(|d| scaled_box(d, px, w, h));
         // Pair frames by index, not by resampled timestamps: our frame n
         // shows the reference frame on screen at n/fps + offset.
         let timing = ref_timing(against);
@@ -1473,6 +1488,8 @@ impl Toolbox {
         let mut series: Vec<[f64; 5]> = Vec::new();
         // Interior shading (ours, reference); `None` where a frame has no interior.
         let mut shades: Vec<(Option<f64>, Option<f64>)> = Vec::new();
+        // SSIM per frame (mean, grid cells): whole frame and the drawn box.
+        let (mut ssims, mut ssims_drawn): (Vec<(f64, Vec<f64>)>, Vec<(f64, Vec<f64>)>) = (Vec::new(), Vec::new());
         let (mut prev_ours, mut prev_ref): (Option<image::RgbaImage>, Option<image::RgbaImage>) = (None, None);
         let black = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
         // The last decoded reference frame and its index.
@@ -1499,9 +1516,16 @@ impl Toolbox {
             let (missing, extra) = detail(&ours, &reference);
             series.push([mean, motion(&prev_ours, &ours), motion(&prev_ref, &reference), missing, extra]);
             shades.push((crate::measure::shading(&ours), crate::measure::shading(&reference)));
+            ssims.push(crate::measure::ssim(&ours, &reference, None));
+            if let Some(b) = region {
+                ssims_drawn.push(crate::measure::ssim(&ours, &reference, Some(b)));
+            }
             let mut frame = image::RgbaImage::from_pixel(vw, vh, image::Rgba([20, 20, 26, 255]));
             for (i, img) in [&ours, &reference, &diff].into_iter().enumerate() {
                 image::imageops::replace(&mut frame, img, (i as u32 * (w + 4)) as i64, 0);
+                if let Some(b) = region {
+                    outline(&mut frame, [b[0] + i as u32 * (w + 4), b[1], b[2], b[3]]);
+                }
             }
             if std::io::Write::write_all(&mut sink, frame.as_raw()).is_err() {
                 break;
@@ -1614,6 +1638,19 @@ impl Toolbox {
                    "missing_detail": round((s.0..=s.1).map(|i| miss[i]).sum::<f64>() / n),
                    "shading_ratio": shading_of(&mut (s.0..=s.1)).2.map(round)})
         }).collect();
+        // SSIM of a set of frames, with the worst cell's box in project px.
+        let score = |frames: &[(f64, Vec<f64>)], idx: &[usize], b: [u32; 4]| -> Value {
+            let picked: Vec<(f64, Vec<f64>)> = idx.iter().map(|&i| frames[i].clone()).collect();
+            let mut v = crate::measure::ssim_summary(&picked);
+            if let Some(cell) = v.get_mut("worst_cell") {
+                let g = crate::measure::SSIM_GRID as f64;
+                let (c, r) = (cell["column"].as_f64().unwrap_or(0.0), cell["row"].as_f64().unwrap_or(0.0));
+                let (cw, ch) = (b[2] as f64 / g, b[3] as f64 / g);
+                cell["box"] = json!([b[0] as f64 / px + c * cw / px, b[1] as f64 / px + r * ch / px, cw / px, ch / px].map(|v| v.round()));
+            }
+            v
+        };
+        let all: Vec<usize> = (0..series.len()).collect();
         let scenes: Vec<Value> = compiled.scenes.iter().filter_map(|sc| {
             let idx: Vec<usize> = (0..series.len()).filter(|&i| time(i) >= sc.start && time(i) < sc.end).collect();
             if idx.is_empty() {
@@ -1625,7 +1662,9 @@ impl Toolbox {
             let (m, x) = (avg(&|i| miss[i]), avg(&|i| extra[i]));
             let (shade_o, shade_r, ratio) = shading_of(&mut idx.iter().copied());
             let flatter = crate::measure::flatness_verdict(ratio).map(|v| format!("; {v}")).unwrap_or_default();
-            Some(json!({"scene": sc.id.as_ref(), "from": round(sc.start), "to": round(sc.end), "mean_difference": round(d),
+            let ssim = score(&ssims, &idx, [0, 0, w, h]);
+            let drawn_ssim = region.map(|b| score(&ssims_drawn, &idx, b));
+            Some(json!({"ssim": ssim, "drawn_ssim": drawn_ssim, "scene": sc.id.as_ref(), "from": round(sc.start), "to": round(sc.end), "mean_difference": round(d),
                         "motion_ours": round(o), "motion_reference": round(r), "missing_detail": round(m), "extra_detail": round(x),
                         "shading_ours": shade_o.map(round), "shading_reference": shade_r.map(round), "shading_ratio": ratio.map(round),
                         "verdict": format!("{}; {}{}{}", moves(o, r), looks(d), details(m, x), flatter)}))
@@ -1692,6 +1731,8 @@ impl Toolbox {
             json: json!({
                 "frames": series.len(), "from": round(time(0)), "to": round(time(series.len() - 1)), "offset": offset,
                 "mean_difference": round(diffs.iter().sum::<f64>() / diffs.len().max(1) as f64),
+                "ssim": score(&ssims, &all, [0, 0, w, h]),
+                "drawn": region.map(|b| json!({"box": drawn, "ssim": score(&ssims_drawn, &all, b)})),
                 "scenes": scenes, "worst": seg_json,
                 "reference_ended_at": ended_at.map(round),
                 "video": if written { Some(video.display().to_string()) } else { None },
@@ -2686,6 +2727,46 @@ pub(crate) fn detail(ours: &image::RgbaImage, reference: &image::RgbaImage) -> (
         if total < 20 { 0.0 } else { lost as f64 / total as f64 }
     };
     (unmatched(&b, &a), unmatched(&a, &b))
+}
+
+/// `drawn` [x, y, w, h] (project px), if given.
+fn drawn_box(args: &Value) -> Result<Option<[f64; 4]>, String> {
+    let Some(v) = args.get("drawn") else { return Ok(None) };
+    let a: Vec<f64> = v.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+    match a[..] {
+        [x, y, w, h] if w > 0.0 && h > 0.0 => Ok(Some([x, y, w, h])),
+        _ => Err("drawn is [x, y, w, h] with a positive size".into()),
+    }
+}
+
+/// A project-px box in a picture rendered at `s` px per project px,
+/// clipped to it (at least 1 px).
+fn scaled_box(d: [f64; 4], s: f64, w: u32, h: u32) -> [u32; 4] {
+    let x = ((d[0] * s).round().max(0.0) as u32).min(w - 1);
+    let y = ((d[1] * s).round().max(0.0) as u32).min(h - 1);
+    let bw = ((d[2] * s).round() as u32).clamp(1, w - x);
+    let bh = ((d[3] * s).round() as u32).clamp(1, h - y);
+    [x, y, bw, bh]
+}
+
+/// A one-pixel yellow outline just outside box `b`.
+fn outline(img: &mut image::RgbaImage, b: [u32; 4]) {
+    let (w, h) = img.dimensions();
+    let c = image::Rgba([255, 220, 40, 255]);
+    let (x0, y0, x1, y1) = (b[0] as i64 - 1, b[1] as i64 - 1, (b[0] + b[2]) as i64, (b[1] + b[3]) as i64);
+    let mut put = |x: i64, y: i64| {
+        if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+            img.put_pixel(x as u32, y as u32, c);
+        }
+    };
+    for x in x0..=x1 {
+        put(x, y0);
+        put(x, y1);
+    }
+    for y in y0..=y1 {
+        put(x0, y);
+        put(x1, y);
+    }
 }
 
 /// Per-pixel |ours − reference| (amplified 3× so small differences show)

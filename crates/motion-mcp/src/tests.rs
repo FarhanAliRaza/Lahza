@@ -295,6 +295,78 @@ fn compare_runs_every_frame_and_names_motion_gaps() {
 }
 
 #[test]
+fn ssim_is_one_for_identical_pictures_and_finds_the_differing_cell() {
+    let mut a = image::RgbaImage::new(64, 64);
+    for (x, y, p) in a.enumerate_pixels_mut() {
+        let v = ((x * 7 + y * 13) % 256) as u8;
+        p.0 = [v, v / 2, 255 - v, 255];
+    }
+    let (s, grid) = crate::measure::ssim(&a, &a, None);
+    assert!((s - 1.0).abs() < 1e-4 && grid.len() == 16, "{s}");
+    // Flatten the bottom-right cell: SSIM drops there and only there.
+    let mut b = a.clone();
+    for y in 48..64 {
+        for x in 48..64 {
+            b.put_pixel(x, y, image::Rgba([128, 128, 128, 255]));
+        }
+    }
+    let (s, grid) = crate::measure::ssim(&a, &b, None);
+    assert!(s < 0.97 && s > 0.8, "{s}");
+    let worst = (0..16).min_by(|&i, &j| grid[i].total_cmp(&grid[j])).unwrap();
+    assert_eq!(worst, 15, "{grid:?}");
+    assert!(grid[0] > 0.999, "{grid:?}");
+    // Inside a box away from the change: identical.
+    assert!(crate::measure::ssim(&a, &b, Some([0, 0, 32, 32])).0 > 0.999);
+    let summary = crate::measure::ssim_summary(&[(s, grid.clone()), (1.0, vec![1.0; 16])]);
+    assert_eq!(summary["worst_cell"]["column"], 3);
+    assert_eq!(summary["worst_cell"]["row"], 3);
+    assert_eq!(summary["p05"].as_f64().unwrap(), crate::measure::ssim_summary(&[(s, grid)])["mean"].as_f64().unwrap());
+}
+
+#[test]
+fn compare_scores_ssim_per_scene_and_in_a_drawn_box() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("compare-ssim");
+    tb.call("project_create", json!({"path": "score", "duration": 1, "fps": 10, "width": 160, "height": 96, "background": "#202024"})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "scene": "s1", "layer": {"id": "dot", "kind": "shape", "shape": "circle", "size": 20, "fill": "#ffffff",
+            "transform": {"position": {"keys": [{"at": 0, "v": [20, 36]}, {"at": 0.9, "v": [140, 36]}]}}}},
+        {"op": "add", "scene": "s1", "layer": {"id": "bar", "kind": "shape", "shape": "rect", "size": [120, 12], "fill": "#e07030",
+            "transform": {"position": [80, 80]}}}
+    ]})).unwrap();
+    tb.call("render", json!({"output": "ref.mp4", "wait": true, "audio": false})).unwrap();
+    let same = tb.call("compare", json!({"against": "ref.mp4", "width": 160, "drawn": [20, 72, 120, 16]})).unwrap().json;
+    let s = same["scenes"][0]["ssim"]["mean"].as_f64().unwrap();
+    assert!(s > 0.95, "against itself: {same:#}");
+    assert!(same["drawn"]["ssim"]["mean"].as_f64().unwrap() > 0.95, "{same:#}");
+    // Hold the dot still: the frame scores lower, the worst cell is on the
+    // dot's path (row 1 of 4 at y 24–48), and the bar's box still matches.
+    tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "dot.transform.position", "value": [20, 36]}]})).unwrap();
+    let held = tb.call("compare", json!({"against": "ref.mp4", "width": 160, "drawn": [20, 72, 120, 16]})).unwrap().json;
+    let sc = &held["scenes"][0];
+    let s2 = sc["ssim"]["mean"].as_f64().unwrap();
+    assert!(s2 < s - 0.02, "held {s2} vs {s}: {held:#}");
+    assert!(sc["ssim"]["p05"].as_f64().unwrap() <= s2, "{held:#}");
+    assert_eq!(sc["ssim"]["worst_cell"]["row"], 1, "{held:#}");
+    let cell = &sc["ssim"]["worst_cell"]["box"];
+    assert!(cell[1] == json!(24.0) && cell[2] == json!(40.0) && cell[3] == json!(24.0), "{held:#}");
+    assert!(sc["drawn_ssim"]["mean"].as_f64().unwrap() > 0.95, "the bar is unchanged: {held:#}");
+    assert!(held["ssim"]["mean"].is_number() && held["drawn"]["box"] == json!([20.0, 72.0, 120.0, 16.0]), "{held:#}");
+    // A box on the dot's path scores lower than the whole frame.
+    let path = tb.call("compare", json!({"against": "ref.mp4", "width": 160, "drawn": [0, 24, 160, 24]})).unwrap().json;
+    assert!(path["drawn"]["ssim"]["mean"].as_f64().unwrap() < s2, "{path:#}");
+    // Moments carry it too.
+    let at = tb.call("compare", json!({"against": "ref.mp4", "at": [0.8], "width": 160, "drawn": [20, 72, 120, 16]})).unwrap().json;
+    assert!(at["rows"][0]["ssim"].as_f64().unwrap() < 0.99 && at["rows"][0]["ssim_drawn"].as_f64().unwrap() > 0.95, "{at:#}");
+    assert!(tb.call("compare", json!({"against": "ref.mp4", "drawn": [0, 0, 0, 5]})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn detail_score_notices_missing_thin_lines() {
     // A reference with a few thin lines on grey; ours is the same grey without them.
     let grey = image::Rgba([70, 70, 74, 255]);
