@@ -316,6 +316,12 @@ impl Gpu {
         self.tracer.is_some()
     }
 
+    /// Vertices the path tracer holds for its geometry (tests).
+    #[cfg(test)]
+    pub(crate) fn trace_cached_vertices(&self) -> usize {
+        self.tracer.as_ref().map_or(0, |t| t.cached_vertices())
+    }
+
     /// Renders weighted sub-samples (weights sum to 1) to straight RGBA8.
     pub fn render(&mut self, samples: &[DisplayList], fonts: &Fonts, images: &Images, footage: &[u32]) -> Result<Vec<u8>, String> {
         let main = samples.first().ok_or("nothing to render")?.main();

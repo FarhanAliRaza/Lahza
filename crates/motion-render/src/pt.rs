@@ -188,10 +188,12 @@ struct Geometry {
     blas: gpu::AccelerationStructure,
     positions: gpu::Buffer,
     indices: gpu::Buffer,
-    /// Offsets (in vertices, indices and triangles) into the shared arrays.
+    /// Offsets (in vertices, indices and triangles) into the shared arrays,
+    /// and how many of each it has there.
     attr_base: u32,
     idx_base: u32,
     tag_base: u32,
+    counts: [u32; 3],
     used: u64,
 }
 
@@ -223,7 +225,15 @@ pub struct Tracer {
     history: HashMap<u32, History>,
     /// The next trace's order in this frame.
     slot: u32,
+    /// The denoiser's guides and lighting, shared by every trace of a frame
+    /// (each trace's passes finish before the next one's start): texels
+    /// they hold, guides, lighting twice.
+    work: Option<(u64, [gpu::Buffer; 3])>,
 }
+
+/// Geometry not used for this many frames is dropped. Animated meshes
+/// are new geometry every frame, so the cache must not outlive them.
+const GEOMETRY_FRAMES: u64 = 2;
 
 /// What a traced group looked like on the previous frame: its
 /// accumulated lighting (three rows per texel, see pt.wgsl `temporal`),
@@ -244,7 +254,7 @@ impl Tracer {
         let temporal = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace temporal", data_layouts: &[&TraceData::layout()], compute: shader.at("temporal") });
         let atrous = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace denoise", data_layouts: &[&TraceData::layout()], compute: shader.at("atrous") });
         let resolve = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace resolve", data_layouts: &[&TraceData::layout()], compute: shader.at("resolve") });
-        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None })
+        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None, work: None })
     }
 
     /// Frees the last frame's transient buffers and structures; call when
@@ -256,10 +266,23 @@ impl Tracer {
         for a in self.retired_structures.drain(..) {
             context.destroy_acceleration_structure(a);
         }
+        // History of traces the last frame no longer had (fewer lists).
+        let used_slots = self.slot;
+        let gone: Vec<u32> = self.history.keys().copied().filter(|k| *k >= used_slots).collect();
+        for k in gone {
+            if let Some(h) = self.history.remove(&k) {
+                for b in h.buffers {
+                    context.destroy_buffer(b);
+                }
+            }
+        }
         self.frame += 1;
         self.slot = 0;
         let frame = self.frame;
-        let stale: Vec<Vec<u8>> = self.geometry.iter().filter(|(_, g)| frame - g.used > 120).map(|(k, _)| k.clone()).collect();
+        let stale: Vec<Vec<u8>> = self.geometry.iter().filter(|(_, g)| frame - g.used > GEOMETRY_FRAMES).map(|(k, _)| k.clone()).collect();
+        if stale.is_empty() {
+            return;
+        }
         for k in stale {
             if let Some(g) = self.geometry.remove(&k) {
                 context.destroy_acceleration_structure(g.blas);
@@ -267,6 +290,31 @@ impl Tracer {
                 context.destroy_buffer(g.indices);
             }
         }
+        // Pack the shared arrays down to the geometry that is left: they
+        // only ever grew, so an animated mesh filled the GPU.
+        let (mut attrs, mut idx, mut tags) = (Vec::new(), Vec::new(), Vec::new());
+        for g in self.geometry.values_mut() {
+            let [nv, ni, nt] = g.counts.map(|c| c as usize);
+            let (a, i, t) = (g.attr_base as usize * 2, g.idx_base as usize, g.tag_base as usize);
+            g.attr_base = (attrs.len() / 2) as u32;
+            g.idx_base = idx.len() as u32;
+            g.tag_base = tags.len() as u32;
+            attrs.extend_from_slice(&self.attrs[a..a + nv * 2]);
+            idx.extend_from_slice(&self.idx[i..i + ni]);
+            tags.extend_from_slice(&self.tags[t..t + nt]);
+        }
+        (self.attrs, self.idx, self.tags) = (attrs, idx, tags);
+        if let Some(old) = self.shared.take() {
+            for b in old {
+                context.destroy_buffer(b);
+            }
+        }
+    }
+
+    /// Vertices held for traced geometry (for tests: the cache stays bounded).
+    #[cfg(test)]
+    pub(crate) fn cached_vertices(&self) -> usize {
+        self.attrs.len() / 2
     }
 
     /// A shared-memory buffer holding `bytes`, freed after this frame.
@@ -336,7 +384,7 @@ impl Tracer {
         if let Some(old) = self.shared.take() {
             self.retired.extend(old);
         }
-        self.geometry.insert(key.to_vec(), Geometry { blas, positions: pb, indices: ib, attr_base, idx_base, tag_base, used: self.frame });
+        self.geometry.insert(key.to_vec(), Geometry { blas, positions: pb, indices: ib, attr_base, idx_base, tag_base, counts: [mesh.positions.len() as u32, indices.len() as u32, mesh.tags.len() as u32], used: self.frame });
         true
     }
 
@@ -462,16 +510,20 @@ impl Tracer {
         let scratch = self.scratch(context, tsizes.scratch);
         encoder.acceleration_structure("trace tlas").build_top_level(tlas, &blases, instances.len() as u32, ibuf.into(), scratch.into());
         // Guides for the denoiser: albedo, normal, depth, motion per texel.
-        let guides = context.create_buffer(gpu::BufferDesc { name: "trace guides", size: ((size.0 * size.1) as u64 * 64).max(16), memory: gpu::Memory::Device });
-        self.retired.push(guides);
         // Lighting and its variance (two rows per texel), twice: the
-        // denoiser's passes read one and write the other.
-        let hdr_size = ((size.0 * size.1) as u64 * 32).max(16);
-        let hdr = [0, 1].map(|_| {
-            let b = context.create_buffer(gpu::BufferDesc { name: "trace hdr", size: hdr_size, memory: gpu::Memory::Device });
-            self.retired.push(b);
-            b
-        });
+        // denoiser's passes read one and write the other. Every trace of
+        // the frame uses the same buffers, grown to the largest.
+        let texels = (size.0 * size.1) as u64;
+        if self.work.as_ref().is_none_or(|(have, _)| *have < texels) {
+            if let Some((_, old)) = self.work.take() {
+                // Earlier traces of this frame may still read them.
+                self.retired.extend(old);
+            }
+            let make = |name, per: u64| context.create_buffer(gpu::BufferDesc { name, size: (texels * per).max(16), memory: gpu::Memory::Device });
+            self.work = Some((texels, [make("trace guides", 64), make("trace hdr", 32), make("trace hdr", 32)]));
+        }
+        let [guides, hdr0, hdr1] = self.work.as_ref().unwrap().1;
+        let hdr = [hdr0, hdr1];
         let r = |m: &[f32; 9]| [[m[0], m[1], m[2], 0.0], [m[3], m[4], m[5], 0.0], [m[6], m[7], m[8], 0.0]];
         // Temporal history for this trace (its order in the frame).
         let slot = self.slot;
@@ -576,6 +628,11 @@ impl Tracer {
         }
         if let Some((_, _, b)) = self.env.take() {
             context.destroy_buffer(b);
+        }
+        if let Some((_, w)) = self.work.take() {
+            for b in w {
+                context.destroy_buffer(b);
+            }
         }
         for (_, h) in self.history.drain() {
             for b in h.buffers {
@@ -1409,6 +1466,24 @@ mod physics_tests {
             let id = layer["id"].as_str().unwrap();
             assert!(r.warnings().iter().any(|w| w.contains("rasterised") && w.contains(id)), "the report names '{id}': {:?}", r.warnings());
         }
+    }
+
+    /// An animated mesh is new geometry every frame: the tracer keeps the
+    /// last few frames of it, not every frame since the start (its shared
+    /// arrays only grew, and a minute of animated rods filled a 12 GB GPU).
+    #[test]
+    fn an_animated_mesh_keeps_the_trace_cache_bounded() {
+        let Some(mut r) = tracer(1) else { return };
+        let c = Compiled::new(&project(json!([{"id": "ball", "kind": "mesh",
+            "mesh": {"type": "sphere", "radius": {"keys": [{"at": 0, "v": 50}, {"at": 2, "v": 52}]}}, "transform": {"position": [160, 90]}}])));
+        let held: Vec<usize> = (0..40).map(|f| {
+            r.render(&c, f as f64 / 20.0);
+            r.trace_cached_vertices()
+        }).collect();
+        assert!(held[0] > 0, "the ball was traced");
+        let most = *held.iter().max().unwrap();
+        // This frame and the last two: at most about four balls' worth, not 40.
+        assert!(most <= held[0] * 4, "held {most} vertices for a {}-vertex ball: {held:?}", held[0]);
     }
 
     /// Without ray queries a path-traced render is rasterised, and says so.

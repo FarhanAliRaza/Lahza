@@ -202,6 +202,12 @@ impl Renderer {
         self.gpu.as_ref().is_some_and(|g| g.can_trace())
     }
 
+    /// Vertices the path tracer holds for its geometry (tests).
+    #[cfg(test)]
+    pub(crate) fn trace_cached_vertices(&self) -> usize {
+        self.gpu.as_ref().map_or(0, |g| g.trace_cached_vertices())
+    }
+
     pub fn warnings(&self) -> Vec<String> {
         let mut w = self.fonts.warnings.clone();
         w.extend(self.images.warnings.iter().cloned());
@@ -266,7 +272,9 @@ impl Renderer {
         // Motion blur: each sub-frame traces its share of the samples, so
         // the frame costs what a still one does.
         let n = states.len().max(1) as u32;
-        let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), ..o });
+        // Motion-blur sub-frames already average over the shutter; history
+        // per sub-frame would hold a full-size buffer set for each of them.
+        let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), temporal: o.temporal && n == 1, ..o });
         let lists = self.build_lists(states, trace);
         let mut key = Vec::new();
         for l in &lists {
