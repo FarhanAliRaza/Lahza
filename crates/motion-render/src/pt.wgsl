@@ -35,6 +35,8 @@ var<storage, read_write> b_groups: array<vec4<f32>>;
 var<storage, read_write> b_guides: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265;
+// Rows per material (mesh3d::MAT_ROWS).
+const MAT_ROWS: u32 = 9u;
 const FLAG_UNLIT: u32 = 1u;
 const FLAG_FACETED: u32 = 2u;
 const FLAG_SHADOW_CATCHER: u32 = 8u;
@@ -265,8 +267,8 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     var base: u32;
     var count: u32;
     if part % 2u == 0u { base = bitcast<u32>(row.x); count = bitcast<u32>(row.y); } else { base = bitcast<u32>(row.z); count = bitcast<u32>(row.w); }
-    hit.mat = (base + seg % max(count, 1u)) * 4u;
-    if hit.mat + 3u >= arrayLength(&b_mat) { hit.found = false; return hit; }
+    hit.mat = (base + seg % max(count, 1u)) * MAT_ROWS;
+    if hit.mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { hit.found = false; return hit; }
     hit.two_sided = (tag & TWO_SIDED) != 0u;
     let flags = u32(b_mat[hit.mat + 2u].w);
     if (flags & FLAG_FACETED) != 0u { n = g; }
@@ -300,77 +302,289 @@ fn offset(h: Hit, toward: vec3<f32>) -> vec3<f32> {
 
 // ---------------------------------------------------------------- shading
 
+// The material at a hit, as the raster's model (mesh3d::material_rows):
+// GGX base with F82-tinted Fresnel and energy compensation, Lambert
+// diffuse, Charlie sheen, a clear coat (tinting what is under it).
 struct Surface {
-    base: vec3<f32>,
-    metal: f32,
+    n: vec3<f32>,
+    t: vec3<f32>,
+    b: vec3<f32>,
+    at: f32,             // GGX alpha along t
+    ab: f32,             // and along b (across the grain)
     rough: f32,
+    f0: vec3<f32>,
+    f82: vec3<f32>,
+    f90: f32,
+    comp: vec3<f32>,     // given back for multiple scattering
+    kd: vec3<f32>,       // diffuse albedo left after the lobes above it
+    sheen: vec3<f32>,
+    sheen_a: f32,
     coat: f32,
-    coat_rough: f32,
+    coat_a: f32,
+    coat_tint: vec3<f32>,
     trans: f32,
+    // Lobe choice when sampling: coat, specular (the rest diffuse).
+    p_coat: f32,
+    p_spec: f32,
 }
 
-// BRDF · cos for light from `l` seen from `v` (no transmission).
-fn brdf_cos(s: Surface, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
-    let n_l = dot(n, l);
-    let n_v = max(dot(n, v), 1e-4);
-    if n_l <= 0.0 { return vec3<f32>(0.0); }
-    let h = normalize(l + v);
-    let n_h = max(dot(n, h), 0.0);
-    let v_h = max(dot(v, h), 0.0);
-    let f0 = mix(vec3<f32>(0.04), s.base, s.metal);
-    let fw = pow(1.0 - v_h, 5.0);
-    let f = f0 + (1.0 - f0) * fw;
-    let a = s.rough * s.rough;
-    let spec = f * ggx_d(n_h, a) * smith(n_v, n_l, s.rough) / max(4.0 * n_v * n_l, 1e-4);
-    let fc_v = 0.04 + 0.96 * pow(1.0 - n_v, 5.0);
-    let coat = 1.0 - s.coat * fc_v;
-    let diffuse = s.base * (1.0 - s.metal) * (1.0 - s.trans) * (vec3<f32>(1.0) - f) / PI;
-    var out = (diffuse + spec) * coat * n_l;
-    if s.coat > 0.0 {
-        let fc = 0.04 + 0.96 * fw;
-        let ca = s.coat_rough * s.coat_rough;
-        out += vec3<f32>(fc * s.coat * ggx_d(n_h, ca) * smith(n_v, n_l, s.coat_rough) / max(4.0 * n_v * n_l, 1e-4) * n_l);
+fn pow5(x: f32) -> f32 {
+    let x2 = x * x;
+    return x2 * x2 * x;
+}
+
+fn env_brdf(r: f32, n_v: f32) -> vec2<f32> {
+    let rr = r * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let a004 = min(rr.x * rr.x, exp2(-9.28 * n_v)) * rr.x + rr.y;
+    return vec2<f32>(-1.04 * a004 + rr.z, 1.04 * a004 + rr.w);
+}
+
+fn fresnel_f82(f0: vec3<f32>, f82: vec3<f32>, f90: f32, mu: f32) -> vec3<f32> {
+    let m = clamp(mu, 0.0, 1.0);
+    let s = f0 + (vec3<f32>(f90) - f0) * pow5(1.0 - m);
+    let sb = f0 + (vec3<f32>(f90) - f0) * 0.46266437;
+    let a = sb * (vec3<f32>(1.0) - f82) / 0.0566527;
+    let x = 1.0 - m;
+    return max(s - a * (m * x * x * x * x * x * x), vec3<f32>(0.0));
+}
+
+// Exact Fresnel of a dielectric boundary; eta = n_incident / n_transmitted.
+fn fresnel_dielectric(cosi: f32, eta: f32) -> f32 {
+    let s2 = eta * eta * (1.0 - cosi * cosi);
+    if s2 >= 1.0 { return 1.0; }
+    let cost = sqrt(1.0 - s2);
+    let rs = (eta * cosi - cost) / (eta * cosi + cost);
+    let rp = (cosi - eta * cost) / (cosi + eta * cost);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+fn charlie(n_h: f32, a: f32) -> f32 {
+    let inv = 1.0 / a;
+    let s2 = max(1.0 - n_h * n_h, 0.0078125);
+    return (2.0 + inv) * pow(s2, inv * 0.5) / (2.0 * PI);
+}
+
+fn neubelt(n_v: f32, n_l: f32) -> f32 {
+    return 1.0 / max(4.0 * (n_l + n_v - n_l * n_v), 1e-4);
+}
+
+const SHEEN_E = array<f32, 64>(
+    1.0000, 0.1364, 0.0009, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 1.0000, 0.6862, 0.2519, 0.0837, 0.0229, 0.0044, 0.0004, 0.0000,
+    1.0000, 0.6499, 0.3698, 0.2068, 0.1081, 0.0498, 0.0177, 0.0026, 0.8886, 0.5849, 0.3937, 0.2658, 0.1739, 0.1065, 0.0570, 0.0217,
+    0.7538, 0.5358, 0.3933, 0.2921, 0.2137, 0.1504, 0.0981, 0.0545, 0.6738, 0.5014, 0.3874, 0.3044, 0.2377, 0.1814, 0.1323, 0.0885,
+    0.6227, 0.4772, 0.3811, 0.3105, 0.2530, 0.2033, 0.1589, 0.1180, 0.5882, 0.4599, 0.3757, 0.3138, 0.2631, 0.2190, 0.1790, 0.1418);
+
+fn sheen_albedo(n_v: f32, r: f32) -> f32 {
+    let x = clamp(n_v, 0.0, 1.0) * 7.0;
+    let y = clamp((r - 0.05) / 0.95, 0.0, 1.0) * 7.0;
+    let x0 = min(u32(x), 6u);
+    let y0 = min(u32(y), 6u);
+    let fx = x - f32(x0);
+    let fy = y - f32(y0);
+    var e = SHEEN_E;
+    let a = mix(e[y0 * 8u + x0], e[y0 * 8u + x0 + 1u], fx);
+    let b = mix(e[(y0 + 1u) * 8u + x0], e[(y0 + 1u) * 8u + x0 + 1u], fx);
+    return mix(a, b, fy);
+}
+
+// Single-scattering albedo of this GGX (white, height-correlated Smith),
+// by roughness 0..1 (rows) and cos 0..1 (columns), 16 × 16, measured by
+// sampling visible normals: what multiple scattering would add back is
+// 1 / E − 1 of it.
+const E_SS = array<f32, 256>(
+    0.9989, 0.9999, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000,
+    0.9709, 0.9976, 0.9993, 0.9997, 0.9998, 0.9999, 0.9999, 0.9999, 0.9999, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000,
+    0.8907, 0.9604, 0.9890, 0.9952, 0.9973, 0.9983, 0.9988, 0.9990, 0.9993, 0.9994, 0.9995, 0.9995, 0.9996, 0.9995, 0.9996, 0.9996,
+    0.9182, 0.9005, 0.9511, 0.9752, 0.9855, 0.9905, 0.9930, 0.9948, 0.9958, 0.9965, 0.9972, 0.9974, 0.9978, 0.9979, 0.9983, 0.9983,
+    0.9446, 0.8888, 0.9053, 0.9353, 0.9566, 0.9696, 0.9778, 0.9830, 0.9861, 0.9886, 0.9904, 0.9915, 0.9924, 0.9933, 0.9938, 0.9943,
+    0.9594, 0.9007, 0.8799, 0.8958, 0.9163, 0.9345, 0.9486, 0.9580, 0.9654, 0.9713, 0.9746, 0.9782, 0.9807, 0.9825, 0.9839, 0.9852,
+    0.9657, 0.9115, 0.8742, 0.8699, 0.8792, 0.8933, 0.9074, 0.9209, 0.9310, 0.9405, 0.9472, 0.9531, 0.9586, 0.9623, 0.9655, 0.9679,
+    0.9676, 0.9176, 0.8733, 0.8543, 0.8508, 0.8560, 0.8645, 0.8763, 0.8869, 0.8974, 0.9060, 0.9143, 0.9213, 0.9275, 0.9330, 0.9374,
+    0.9669, 0.9170, 0.8704, 0.8426, 0.8270, 0.8218, 0.8239, 0.8296, 0.8370, 0.8439, 0.8517, 0.8619, 0.8704, 0.8769, 0.8820, 0.8892,
+    0.9639, 0.9113, 0.8597, 0.8248, 0.8034, 0.7909, 0.7839, 0.7819, 0.7838, 0.7861, 0.7917, 0.7977, 0.8056, 0.8116, 0.8194, 0.8242,
+    0.9589, 0.9009, 0.8449, 0.8059, 0.7764, 0.7568, 0.7428, 0.7335, 0.7280, 0.7254, 0.7257, 0.7271, 0.7285, 0.7329, 0.7380, 0.7425,
+    0.9535, 0.8882, 0.8252, 0.7791, 0.7443, 0.7184, 0.6989, 0.6835, 0.6703, 0.6630, 0.6562, 0.6520, 0.6506, 0.6499, 0.6497, 0.6486,
+    0.9464, 0.8726, 0.7999, 0.7485, 0.7094, 0.6765, 0.6512, 0.6305, 0.6126, 0.5993, 0.5888, 0.5783, 0.5698, 0.5642, 0.5580, 0.5554,
+    0.9389, 0.8540, 0.7749, 0.7163, 0.6691, 0.6323, 0.6022, 0.5750, 0.5545, 0.5357, 0.5178, 0.5021, 0.4900, 0.4826, 0.4709, 0.4630,
+    0.9303, 0.8356, 0.7452, 0.6792, 0.6272, 0.5844, 0.5485, 0.5201, 0.4938, 0.4721, 0.4523, 0.4357, 0.4163, 0.4050, 0.3926, 0.3806,
+    0.9210, 0.8161, 0.7147, 0.6420, 0.5838, 0.5383, 0.4995, 0.4639, 0.4366, 0.4109, 0.3890, 0.3696, 0.3504, 0.3358, 0.3195, 0.3071);
+
+fn e_ss(r: f32, n_v: f32) -> f32 {
+    let x = clamp(n_v, 0.0, 1.0) * 15.0;
+    let y = clamp(r, 0.0, 1.0) * 15.0;
+    let x0 = min(u32(x), 14u);
+    let y0 = min(u32(y), 14u);
+    let fx = x - f32(x0);
+    let fy = y - f32(y0);
+    var e = E_SS;
+    let a = mix(e[y0 * 16u + x0], e[y0 * 16u + x0 + 1u], fx);
+    let b = mix(e[(y0 + 1u) * 16u + x0], e[(y0 + 1u) * 16u + x0 + 1u], fx);
+    return mix(a, b, fy);
+}
+
+// GGX in the (t, b, n) frame; w is a direction in that frame.
+fn ggx_aniso(h: vec3<f32>, at: f32, ab: f32) -> f32 {
+    let x = h.x / at;
+    let y = h.y / ab;
+    let d = x * x + y * y + h.z * h.z;
+    return 1.0 / max(PI * at * ab * d * d, 1e-12);
+}
+
+fn smith_lambda(w: vec3<f32>, at: f32, ab: f32) -> f32 {
+    let z2 = max(w.z * w.z, 1e-8);
+    return (-1.0 + sqrt(1.0 + (at * at * w.x * w.x + ab * ab * w.y * w.y) / z2)) * 0.5;
+}
+
+// Visible normals (Heitz 2018): a microfacet normal seen from w.
+fn sample_vndf(w: vec3<f32>, at: f32, ab: f32, u1: f32, u2: f32) -> vec3<f32> {
+    let vh = normalize(vec3<f32>(at * w.x, ab * w.y, w.z));
+    let lensq = vh.x * vh.x + vh.y * vh.y;
+    var t1 = vec3<f32>(1.0, 0.0, 0.0);
+    if lensq > 0.0 { t1 = vec3<f32>(-vh.y, vh.x, 0.0) / sqrt(lensq); }
+    let t2v = cross(vh, t1);
+    let r = sqrt(u1);
+    let phi = 2.0 * PI * u2;
+    let p1 = r * cos(phi);
+    let s = 0.5 * (1.0 + vh.z);
+    let p2 = (1.0 - s) * sqrt(max(1.0 - p1 * p1, 0.0)) + s * r * sin(phi);
+    let nh = p1 * t1 + p2 * t2v + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * vh;
+    return normalize(vec3<f32>(at * nh.x, ab * nh.y, max(0.0, nh.z)));
+}
+
+fn local(s: Surface, w: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(w, s.t), dot(w, s.b), dot(w, s.n));
+}
+
+fn surface(h: Hit, v: vec3<f32>) -> Surface {
+    let m0 = b_mat[h.mat];
+    let m1 = b_mat[h.mat + 1u];
+    let m3 = b_mat[h.mat + 3u];
+    let m4 = b_mat[h.mat + 4u];
+    let m5 = b_mat[h.mat + 5u];
+    let m6 = b_mat[h.mat + 6u];
+    let m7 = b_mat[h.mat + 7u];
+    let m8 = b_mat[h.mat + 8u];
+    var s: Surface;
+    s.n = h.n;
+    let base = m0.xyz;
+    let metal = m1.x;
+    s.rough = max(m1.y, 0.03);
+    s.trans = m3.x;
+    s.f0 = mix(vec3<f32>(m3.w) * m4.xyz, base, metal);
+    s.f82 = mix(vec3<f32>(1.0), m4.xyz, metal);
+    s.f90 = clamp(dot(s.f0, vec3<f32>(16.5)), 0.0, 1.0);
+    let n_v = max(dot(s.n, v), 1e-4);
+    let ab = env_brdf(s.rough, n_v);
+    s.comp = vec3<f32>(1.0) + s.f0 * (1.0 / max(e_ss(s.rough, n_v), 1e-3) - 1.0);
+    let e_spec = min((s.f0 * ab.x + vec3<f32>(s.f90 * ab.y)) * s.comp, vec3<f32>(1.0));
+    s.sheen = m5.xyz;
+    s.sheen_a = m5.w * m5.w;
+    let e_sheen = sheen_albedo(n_v, m5.w) * max(max(s.sheen.x, s.sheen.y), s.sheen.z);
+    s.kd = base * ((1.0 - metal) * (1.0 - s.trans) * (1.0 - e_sheen)) * (vec3<f32>(1.0) - e_spec);
+    s.coat = m1.z;
+    let cr = max(m1.w, 0.03);
+    s.coat_a = cr * cr;
+    s.coat_tint = mix(vec3<f32>(1.0), m6.xyz, s.coat);
+    // The grain: around the mesh's axis, turned (as the raster).
+    let alpha = s.rough * s.rough;
+    s.at = alpha;
+    s.ab = alpha;
+    var t = vec3<f32>(0.0);
+    let aniso = m4.w;
+    if aniso > 0.0 {
+        t = cross(m7.xyz, h.p - m8.xyz);
+        t = t - s.n * dot(s.n, t);
     }
-    return out;
+    if dot(t, t) < 1e-12 { t = basis(s.n)[0]; }
+    t = normalize(t);
+    if aniso > 0.0 {
+        t = t * cos(m7.w) + cross(s.n, t) * sin(m7.w);
+        let aspect = sqrt(1.0 - 0.9 * aniso);
+        s.at = alpha * aspect;
+        s.ab = alpha / aspect;
+    }
+    s.t = t;
+    s.b = cross(s.n, t);
+    // Sample each lobe by roughly what it reflects.
+    let fc_v = 0.04 + 0.96 * pow5(1.0 - n_v);
+    let w_coat = s.coat * fc_v;
+    let under = (1.0 - w_coat) * luminance(s.coat_tint);
+    let w_spec = luminance(e_spec) * under;
+    let w_diff = (luminance(s.kd) + luminance(s.sheen) * 0.5) * under;
+    let total = max(w_coat + w_spec + w_diff, 1e-6);
+    s.p_coat = w_coat / total;
+    s.p_spec = w_spec / total;
+    if w_diff <= 0.0 && w_coat + w_spec <= 0.0 { s.p_spec = 1.0; }
+    return s;
 }
 
-fn spec_weight(s: Surface, n_v: f32) -> f32 {
-    let f0 = mix(vec3<f32>(0.04), s.base, s.metal);
-    let fs = luminance(f0 + (1.0 - f0) * pow(1.0 - n_v, 5.0));
-    let fd = luminance(s.base) * (1.0 - s.metal) * (1.0 - s.trans);
-    return clamp(fs / max(fs + fd, 1e-4), 0.1, 0.9);
+// BSDF · cos for light from `l` seen from `v` (reflection only).
+fn bsdf_cos(s: Surface, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
+    let lv = local(s, v);
+    let ll = local(s, l);
+    if ll.z <= 0.0 || lv.z <= 0.0 { return vec3<f32>(0.0); }
+    let n_v = max(lv.z, 1e-4);
+    let n_l = ll.z;
+    let hl = normalize(lv + ll);
+    let v_h = max(dot(lv, hl), 0.0);
+    let d = ggx_aniso(hl, s.at, s.ab);
+    let g2 = 1.0 / (1.0 + smith_lambda(lv, s.at, s.ab) + smith_lambda(ll, s.at, s.ab));
+    let f = fresnel_f82(s.f0, s.f82, s.f90, v_h);
+    let spec = f * s.comp * (d * g2 / (4.0 * n_v * n_l));
+    var sheen = vec3<f32>(0.0);
+    if s.sheen_a > 0.0 && dot(s.sheen, s.sheen) > 0.0 {
+        sheen = s.sheen * (charlie(hl.z, s.sheen_a) * neubelt(n_v, n_l));
+    }
+    let fc_v = 0.04 + 0.96 * pow5(1.0 - n_v);
+    var out = (s.kd / PI + spec + sheen) * s.coat_tint * (1.0 - s.coat * fc_v);
+    if s.coat > 0.0 {
+        let dc = ggx_aniso(hl, s.coat_a, s.coat_a);
+        let gc = 1.0 / (1.0 + smith_lambda(lv, s.coat_a, s.coat_a) + smith_lambda(ll, s.coat_a, s.coat_a));
+        let fc = 0.04 + 0.96 * pow5(1.0 - v_h);
+        out += vec3<f32>(s.coat * fc * dc * gc / (4.0 * n_v * n_l));
+    }
+    return out * n_l;
 }
 
-fn ggx_pdf(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32) -> f32 {
-    let h = normalize(l + v);
-    let n_h = max(dot(n, h), 0.0);
-    let v_h = max(dot(v, h), 1e-4);
-    return ggx_d(n_h, rough * rough) * n_h / (4.0 * v_h);
+// The pdf of sampling `l` from `v` (all lobes, as sample_bsdf chooses).
+fn bsdf_pdf(s: Surface, v: vec3<f32>, l: vec3<f32>) -> f32 {
+    let lv = local(s, v);
+    let ll = local(s, l);
+    if ll.z <= 0.0 || lv.z <= 0.0 { return 0.0; }
+    let hl = normalize(lv + ll);
+    let n_v = max(lv.z, 1e-4);
+    var pdf = (1.0 - s.p_coat - s.p_spec) * ll.z / PI;
+    let g1 = 1.0 / (1.0 + smith_lambda(lv, s.at, s.ab));
+    pdf += s.p_spec * g1 * ggx_aniso(hl, s.at, s.ab) / (4.0 * n_v);
+    if s.p_coat > 0.0 {
+        let gc = 1.0 / (1.0 + smith_lambda(lv, s.coat_a, s.coat_a));
+        pdf += s.p_coat * gc * ggx_aniso(hl, s.coat_a, s.coat_a) / (4.0 * n_v);
+    }
+    return pdf;
 }
 
-// Samples a reflected direction: cosine-weighted diffuse or a GGX lobe,
-// returning (direction, combined pdf of both strategies).
-fn sample_brdf(s: Surface, n: vec3<f32>, v: vec3<f32>, rng: ptr<function, Rng>) -> vec4<f32> {
-    let tbn = basis(n);
-    let ps = spec_weight(s, max(dot(n, v), 1e-4));
-    var l: vec3<f32>;
+// Samples a reflected direction from one lobe; returns (direction, pdf of
+// all lobes together).
+fn sample_bsdf(s: Surface, v: vec3<f32>, rng: ptr<function, Rng>) -> vec4<f32> {
+    let lv = local(s, v);
+    let u0 = rnd(rng);
     let u1 = rnd(rng);
     let u2 = rnd(rng);
-    if rnd(rng) < ps {
-        let a = s.rough * s.rough;
-        let theta = atan(a * sqrt(u1 / max(1.0 - u1, 1e-6)));
-        let phi = 2.0 * PI * u2;
-        let h = tbn * vec3<f32>(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
-        l = reflect(-v, h);
+    var ll: vec3<f32>;
+    if u0 < s.p_coat {
+        let m = sample_vndf(lv, s.coat_a, s.coat_a, u1, u2);
+        ll = reflect(-lv, m);
+    } else if u0 < s.p_coat + s.p_spec {
+        let m = sample_vndf(lv, s.at, s.ab, u1, u2);
+        ll = reflect(-lv, m);
     } else {
         let r = sqrt(u1);
         let phi = 2.0 * PI * u2;
-        l = tbn * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
+        ll = vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
     }
-    let n_l = dot(n, l);
-    if n_l <= 0.0 { return vec4<f32>(l, 0.0); }
-    let pdf = ps * ggx_pdf(n, v, l, s.rough) + (1.0 - ps) * n_l / PI;
-    return vec4<f32>(l, pdf);
+    let l = s.t * ll.x + s.b * ll.y + s.n * ll.z;
+    if ll.z <= 0.0 { return vec4<f32>(l, 0.0); }
+    return vec4<f32>(l, bsdf_pdf(s, v, l));
 }
 
 // Light arriving at `h` from the delta lights (directional and point),
@@ -394,9 +608,20 @@ fn direct(s: Surface, h: Hit, v: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32
         }
         if dot(h.n, l) <= 0.0 { continue; }
         if col.w > 0.5 && occluded(offset(h, l), l, dist * 0.999, rng) { continue; }
-        out += brdf_cos(s, h.n, v, l) * PI * col.xyz;
+        out += bsdf_cos(s, v, l) * PI * col.xyz;
     }
     return out;
+}
+
+// Index of refraction for colour channel c (0 r, 1 g, 2 b) with dispersion
+// as 1 / Abbe number (Cauchy's law through the d line).
+fn ior_at(ior: f32, dispersion: f32, c: u32) -> f32 {
+    if dispersion <= 0.0 { return ior; }
+    let bb = (ior - 1.0) * dispersion / (1.0 / (0.4861 * 0.4861) - 1.0 / (0.6563 * 0.6563));
+    let aa = ior - bb / (0.5876 * 0.5876);
+    var lambda = 0.55;
+    if c == 0u { lambda = 0.61; } else if c == 2u { lambda = 0.465; }
+    return aa + bb / (lambda * lambda);
 }
 
 // What fraction of the shadow-casting light reaches a shadow catcher.
@@ -441,8 +666,16 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     // Only see-through events so far (glass, opacity): a path that then
     // leaves the scene shows what is behind the layer list, not the sky.
     var through = true;
+    // Inside glass: what it absorbs per px (Beer–Lambert).
+    var inside = false;
+    var sigma = vec3<f32>(0.0);
+    // Dispersion: the colour channel this path carries (3: all of them).
+    var hero = 3u;
     let bounces = u.opts.x;
-    for (var bounce = 0u; bounce <= bounces; bounce++) {
+    // Scattering off surfaces counts against `bounces`; passing through
+    // glass and see-through layers has its own, larger allowance.
+    var bounce = 0u;
+    for (var step = 0u; step < bounces + 16u; step++) {
         let h = cast_ray(o, d, 1e30, rng);
         if !h.found {
             if !through {
@@ -451,13 +684,14 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             }
             return out;
         }
-        if bounce == 0u { out.depth = h.t; out.normal = h.n; }
+        if inside { throughput *= exp(-sigma * h.t); }
+        if step == 0u { out.depth = h.t; out.normal = h.n; }
         if h.card {
             let c = h.card_color;
             let straight = vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
             out.color += throughput * straight;
             out.alpha = 1.0;
-            if bounce == 0u { out.albedo = straight; }
+            if step == 0u { out.albedo = straight; }
             return out;
         }
         let m0 = b_mat[h.mat];
@@ -466,7 +700,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         let m3 = b_mat[h.mat + 3u];
         let flags = u32(m2.w);
         let v = -d;
-        if bounce == 0u { out.albedo = m0.xyz; }
+        if step == 0u { out.albedo = m0.xyz; }
         if (flags & FLAG_SHADOW_CATCHER) != 0u {
             if through {
                 // Only the shadows: their darkness is this sample's coverage.
@@ -499,49 +733,68 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             return out;
         }
         out.alpha = 1.0;
-        var s: Surface;
-        s.base = m0.xyz;
-        s.metal = m1.x;
-        s.rough = max(m1.y, 0.03);
-        s.coat = m1.z;
-        s.coat_rough = max(m1.w, 0.03);
-        s.trans = m3.x;
         out.color += throughput * m2.xyz;
-        // Glass: a dielectric boundary, reflect or refract by Fresnel.
+        let s = surface(h, v);
+        // Glass: a dielectric boundary (rough: on a visible microfacet),
+        // reflecting or refracting by exact Fresnel.
         if s.trans > 0.0 && rnd(rng) < s.trans {
-            let ior = max(m3.y, 1.0);
+            let m6 = b_mat[h.mat + 6u];
+            if m6.w > 0.0 && hero == 3u {
+                // Dispersion: carry one colour from here on.
+                hero = min(u32(rnd(rng) * 3.0), 2u);
+                var keep = vec3<f32>(0.0);
+                keep[hero] = 3.0;
+                throughput *= keep;
+            }
+            var ior = max(m3.y, 1.0);
+            if hero < 3u { ior = ior_at(ior, m6.w, hero); }
             var eta = 1.0 / ior;
             if !h.front { eta = ior; }
-            var nn = h.n;
-            if s.rough > 0.04 {
-                // Frosted: a microfacet normal from the GGX distribution.
-                let a = s.rough * s.rough;
-                let u1 = rnd(rng);
-                let theta = atan(a * sqrt(u1 / max(1.0 - u1, 1e-6)));
-                let phi = 2.0 * PI * rnd(rng);
-                nn = normalize(basis(h.n) * vec3<f32>(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta)));
-            }
-            let cosi = clamp(dot(nn, v), 0.0, 1.0);
+            let lv = local(s, v);
+            var m = vec3<f32>(0.0, 0.0, 1.0);
+            let glass_a = s.rough * s.rough;
+            if s.rough > 0.04 { m = sample_vndf(lv, glass_a, glass_a, rnd(rng), rnd(rng)); }
+            let cosi = clamp(dot(lv, m), 0.0, 1.0);
+            let fr = fresnel_dielectric(cosi, eta);
             let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
-            let f0 = ((1.0 - eta) / (1.0 + eta)) * ((1.0 - eta) / (1.0 + eta));
-            let fr = f0 + (1.0 - f0) * pow(1.0 - cosi, 5.0);
+            var ll: vec3<f32>;
+            var refracted = false;
             if k < 0.0 || rnd(rng) < fr {
-                d = reflect(d, nn);
+                ll = reflect(-lv, m);
                 through = false;
             } else {
-                d = normalize(eta * d + (eta * cosi - sqrt(k)) * nn);
-                // Tinted by its colour on the way in.
-                if h.front { throughput *= s.base; }
+                ll = normalize(-lv * eta + m * (eta * cosi - sqrt(k)));
+                refracted = true;
+            }
+            if s.rough > 0.04 {
+                // Visible-normal sampling leaves the outgoing shadowing.
+                let lw = vec3<f32>(ll.x, ll.y, abs(ll.z));
+                throughput *= 1.0 / (1.0 + smith_lambda(lw, glass_a, glass_a));
+            }
+            d = s.t * ll.x + s.b * ll.y + s.n * ll.z;
+            if refracted {
+                if h.two_sided {
+                    // A thin pane: straight through, tinted once.
+                    d = -v;
+                    throughput *= m0.xyz;
+                } else if h.front {
+                    inside = true;
+                    sigma = -log(max(m0.xyz, vec3<f32>(1e-4))) / max(m3.z, 1.0);
+                } else {
+                    inside = false;
+                }
             }
             o = offset(h, d);
             continue;
         }
         through = false;
         out.color += throughput * direct(s, h, v, rng);
-        let smp = sample_brdf(s, h.n, v, rng);
+        bounce++;
+        if bounce > bounces { return out; }
+        let smp = sample_bsdf(s, v, rng);
         if smp.w <= 0.0 { return out; }
         let l = smp.xyz;
-        throughput *= brdf_cos(s, h.n, v, l) / smp.w;
+        throughput *= bsdf_cos(s, v, l) / smp.w;
         // Russian roulette after a few bounces.
         if bounce >= 3u {
             let q = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);

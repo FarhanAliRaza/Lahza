@@ -43,7 +43,7 @@ pub struct TraceInstance {
     pub key: Vec<u8>,
     /// Object → camera space, row-major 3 × 4.
     pub transform: [[f32; 4]; 3],
-    /// Material rows (4 per material, see `mesh3d::material_rows`).
+    /// Material rows (`mesh3d::MAT_ROWS` per material, see `mesh3d::material_rows`).
     pub materials: Vec<[f32; 4]>,
     /// Per part: (first material, count): a triangle of part p and segment
     /// s uses material first + s mod count.
@@ -303,7 +303,7 @@ impl Tracer {
                 continue;
             }
             let g = &self.geometry[&inst.key];
-            let mat_base = (mat_rows.len() / 4) as u32;
+            let mat_base = (mat_rows.len() / crate::mesh3d::MAT_ROWS) as u32;
             mat_rows.extend_from_slice(&inst.materials);
             let p = |k: usize| [b(mat_base + inst.parts[k].0), b(inst.parts[k].1.max(1))];
             let custom = (inst_rows.len() / 4) as u32;
@@ -569,6 +569,34 @@ mod scene_tests {
         p
     }
 
+    /// The principled materials, traced and rasterised, to $LAHZA_PT_OUT.
+    #[test]
+    #[ignore]
+    fn dump_materials() {
+        let Some(mut r) = tracer(128) else { return };
+        let mut p = project(json!([
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#c8c2b8"}, "transform": {"position": [480, 235], "rotation_x": 90}},
+            {"id": "spun", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 80, "height": 30, "bevel": 6}, "material": {"preset": "brushed", "color": "#d0d4da"}, "transform": {"position": [110, 200], "rotation_x": 10}},
+            {"id": "velvet", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": {"preset": "velvet", "color": "#5a1030", "sheen_color": "#ffc0d0"}, "transform": {"position": [290, 175]}},
+            {"id": "gold", "kind": "mesh", "mesh": {"type": "torus", "radius": 55, "tube": 20}, "material": {"preset": "metal", "color": "#ffc356", "specular_tint": "#ff8040", "roughness": 0.25}, "transform": {"position": [450, 160], "rotation_x": 10}},
+            {"id": "candy", "kind": "mesh", "mesh": {"type": "box", "size": [90, 90], "depth": 90, "bevel": 12}, "material": {"preset": "coated", "color": "#f0f0f0", "clearcoat_color": "#30a0ff"}, "transform": {"position": [620, 190], "rotation_y": 30}},
+            {"id": "prism", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": {"preset": "glass", "color": "#e8f4ff", "transmission": 1, "roughness": 0, "dispersion": 0.08, "thickness": 300}, "transform": {"position": [800, 175]}}
+        ]));
+        p.settings.width = 960;
+        p.settings.height = 300;
+        p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12]})).unwrap();
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let t0 = std::time::Instant::now();
+        let traced = r.render(&c, 0.0);
+        eprintln!("traced in {:?}", t0.elapsed());
+        let raster = cpu().render(&c, 0.0);
+        let mut both = image::RgbaImage::new(960, 600);
+        image::imageops::overlay(&mut both, &traced, 0, 0);
+        image::imageops::overlay(&mut both, &raster, 0, 300);
+        both.save(std::env::var("LAHZA_PT_OUT").unwrap_or_else(|_| "/tmp/pt_materials.png".into())).unwrap();
+    }
+
     #[test]
     #[ignore]
     fn dump_still_life() {
@@ -662,6 +690,132 @@ mod physics_tests {
         }
         let mean = sum / n;
         assert!((mean - 188.0).abs() < 8.0, "the sphere shows: mean {mean:.1}, environment 188");
+    }
+
+    /// A sphere of `material` (radius 90 at the centre of 320 × 240).
+    fn sphere_in(material: serde_json::Value, lights: serde_json::Value, environment: serde_json::Value) -> lahza_motion_core::document::Project {
+        let mut p = project(json!([{"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 90}, "material": material, "transform": {"position": [160, 120]}}]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.scenes[0].lights = serde_json::from_value(lights).unwrap();
+        p.scenes[0].environment = Some(serde_json::from_value(environment).unwrap());
+        p
+    }
+
+    fn disc(img: &image::RgbaImage, cx: f64, cy: f64, r0: f64, r1: f64, keep: impl Fn(f64, f64) -> bool) -> [f64; 3] {
+        let (mut sum, mut n) = ([0.0f64; 3], 0.0f64);
+        for (x, y, p) in img.enumerate_pixels() {
+            let (dx, dy) = (x as f64 - cx, y as f64 - cy);
+            let d = (dx * dx + dy * dy).sqrt();
+            if d >= r0 && d < r1 && keep(dx, dy) {
+                for c in 0..3 {
+                    sum[c] += p.0[c] as f64;
+                }
+                n += 1.0;
+            }
+        }
+        sum.map(|v| v / n.max(1.0))
+    }
+
+    /// The furnace for every lobe: white rough metals, plastics and coats
+    /// in a uniform environment reflect all that arrives.
+    #[test]
+    fn white_materials_vanish_in_a_uniform_environment() {
+        let Some(mut r) = tracer(64) else { return };
+        let lights = json!([{"type": "ambient", "intensity": 0}]);
+        let env = json!({"preset": "none", "sky": "#bcbcbc", "horizon": "#bcbcbc", "ground": "#bcbcbc"});
+        for material in [
+            json!({"preset": "metal", "color": "#ffffff", "roughness": 1}),
+            json!({"preset": "metal", "color": "#ffffff", "roughness": 0.5}),
+            json!({"preset": "brushed", "color": "#ffffff"}),
+            json!({"preset": "plastic", "color": "#ffffff", "roughness": 0.2}),
+        ] {
+            let img = r.render(&Compiled::new(&sphere_in(material.clone(), lights.clone(), env.clone())), 0.0);
+            let mean = disc(&img, 160.0, 120.0, 0.0, 80.0, |_, _| true)[1];
+            assert!((mean - 188.0).abs() < 8.0, "{material}: mean {mean:.1}, environment 188");
+        }
+    }
+
+    /// A mirror ball shows the sky in its upper half and the ground in its
+    /// lower half, as bright as they are.
+    #[test]
+    fn a_mirror_ball_reflects_sky_and_ground() {
+        let Some(mut r) = tracer(16) else { return };
+        let env = json!({"preset": "none", "sky": "#e04030", "horizon": "#e04030", "ground": "#3040e0"});
+        let img = r.render(&Compiled::new(&sphere_in(json!({"preset": "metal", "color": "#ffffff", "roughness": 0}), json!([{"type": "ambient", "intensity": 0}]), env)), 0.0);
+        let top = disc(&img, 160.0, 120.0, 20.0, 70.0, |_, dy| dy < -20.0);
+        let bottom = disc(&img, 160.0, 120.0, 20.0, 70.0, |_, dy| dy > 20.0);
+        assert!((top[0] - 224.0).abs() < 14.0 && top[2] < 80.0, "sky above: {top:?}");
+        assert!((bottom[2] - 224.0).abs() < 14.0 && bottom[0] < 80.0, "ground below: {bottom:?}");
+    }
+
+    /// Under one light and nothing else, tracing and rasterising agree on
+    /// every material (the same BSDF, shaded two ways).
+    #[test]
+    fn traced_and_rasterised_materials_agree_under_one_light() {
+        let Some(mut r) = tracer(64) else { return };
+        let lights = json!([{"type": "directional", "from": [-0.5, -0.6, -1], "shadow": false}]);
+        let env = json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"});
+        for material in [
+            json!({"preset": "plastic", "color": "#c03030"}),
+            json!({"preset": "metal", "color": "#ffc356", "specular_tint": "#ff8040", "roughness": 0.35}),
+            json!({"preset": "brushed", "color": "#d0d4da"}),
+            json!({"preset": "velvet", "color": "#5a1030", "sheen_color": "#ffc0d0"}),
+            json!({"preset": "coated", "color": "#f0f0f0", "clearcoat_color": "#30a0ff"}),
+        ] {
+            let c = Compiled::new(&sphere_in(material.clone(), lights.clone(), env.clone()));
+            let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+            let (ma, mb) = (disc(&a, 160.0, 120.0, 0.0, 85.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 85.0, |_, _| true));
+            let worst = (0..3).map(|k| (ma[k] - mb[k]).abs()).fold(0.0, f64::max);
+            assert!(worst < 6.0, "{material}: traced {ma:?}, raster {mb:?}");
+        }
+    }
+
+    /// Brushed metal: the traced highlight stretches across the grain too.
+    #[test]
+    fn traced_brushed_highlights_stretch() {
+        let Some(mut r) = tracer(64) else { return };
+        let lights = json!([{"type": "directional", "from": [0, 0, -1], "intensity": 1.5, "shadow": false}]);
+        let env = json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"});
+        let img = r.render(&Compiled::new(&sphere_in(json!({"preset": "brushed", "color": "#ffffff"}), lights, env)), 0.0);
+        let luma = |p: &image::Rgba<u8>| 0.2126 * p.0[0] as f64 + 0.7152 * p.0[1] as f64 + 0.0722 * p.0[2] as f64;
+        let max = img.pixels().map(luma).fold(0.0, f64::max);
+        let pts: Vec<(f64, f64)> = img.enumerate_pixels().filter(|(_, _, p)| luma(p) > 0.5 * max).map(|(x, y, _)| (x as f64, y as f64)).collect();
+        let n = pts.len() as f64;
+        let (mx, my) = (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n);
+        let sx = (pts.iter().map(|p| (p.0 - mx).powi(2)).sum::<f64>() / n).sqrt();
+        let sy = (pts.iter().map(|p| (p.1 - my).powi(2)).sum::<f64>() / n).sqrt();
+        assert!(sy > 1.8 * sx, "tall highlight: {sx:.1} × {sy:.1}");
+    }
+
+    /// A glass ball in front of a white wall: the colour deepens with the
+    /// distance travelled inside (a smaller `thickness` absorbs more), and
+    /// dispersion splits the wall's edge into colours.
+    #[test]
+    fn glass_absorbs_with_depth_and_disperses() {
+        let Some(mut r) = tracer(64) else { return };
+        let shot = |glass: serde_json::Value, wall: serde_json::Value, r: &mut crate::Renderer| {
+            let mut p = project(json!([
+                {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": wall}, "material": {"preset": "flat", "color": "#ffffff"}, "transform": {"position": [160, 120], "z": 300}},
+                {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 90}, "material": glass, "transform": {"position": [160, 120]}}
+            ]));
+            p.settings.width = 320;
+            p.settings.height = 240;
+            p.scenes[0].lights = serde_json::from_value(json!([{"type": "ambient", "intensity": 0}])).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none"})).unwrap());
+            r.render(&Compiled::new(&p), 0.0)
+        };
+        let deep = shot(json!({"preset": "glass", "color": "#80c0ff", "transmission": 1, "roughness": 0, "thickness": 40}), json!([2000, 2000]), &mut r);
+        let light = shot(json!({"preset": "glass", "color": "#80c0ff", "transmission": 1, "roughness": 0, "thickness": 400}), json!([2000, 2000]), &mut r);
+        let (d, l) = (disc(&deep, 160.0, 120.0, 0.0, 20.0, |_, _| true), disc(&light, 160.0, 120.0, 0.0, 20.0, |_, _| true));
+        assert!(d[0] < 0.6 * l[0] && d[2] > d[0], "deeper through less thickness: {d:?} vs {l:?}");
+        let fringes = |img: &image::RgbaImage| img.pixels().filter(|p| (p.0[0] as i32 - p.0[2] as i32).abs() > 60).count();
+        let clear = json!({"preset": "glass", "color": "#ffffff", "transmission": 1, "roughness": 0, "thickness": 10000});
+        let mut prism = clear.clone();
+        prism["dispersion"] = json!(0.3);
+        let plain = fringes(&shot(clear, json!([40, 2000]), &mut r));
+        let split = fringes(&shot(prism, json!([40, 2000]), &mut r));
+        assert!(split > plain + 150, "colour fringes: {split} with dispersion, {plain} without");
     }
 
     /// Lists with what the tracer can't draw yet (wires, effects such as

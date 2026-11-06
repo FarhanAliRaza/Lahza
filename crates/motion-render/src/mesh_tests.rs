@@ -561,3 +561,142 @@ fn wireframes_draw_edges() {
 fn gpu_matches_cpu_wireframes() {
     crate::tests::assert_gpu_matches_cpu_within(&wire_scene(), &[0.0], 0.001);
 }
+
+/// A sphere of `material` under `lights`, in `environment`.
+fn sphere_in(material: serde_json::Value, lights: serde_json::Value, environment: serde_json::Value) -> Project {
+    scene(320, 240, json!({"layers": [{"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 90}, "material": material,
+        "transform": {"position": [160, 120]}}], "lights": lights, "environment": environment}))
+}
+
+/// Linear 0.5 everywhere (sRGB 188), and no lights.
+fn uniform() -> (serde_json::Value, serde_json::Value) {
+    (json!([{"type": "ambient", "intensity": 0}]), json!({"preset": "none", "sky": "#bcbcbc", "horizon": "#bcbcbc", "ground": "#bcbcbc"}))
+}
+
+/// Mean of channel `c` over the sphere's disc (radius `r` around the centre).
+fn disc_mean(img: &image::RgbaImage, r: f64, c: usize) -> f64 {
+    let (mut sum, mut n) = (0.0, 0.0);
+    for y in 0..240u32 {
+        for x in 0..320u32 {
+            if ((x as f64 - 160.0).powi(2) + (y as f64 - 120.0).powi(2)).sqrt() < r {
+                sum += px(img, x, y)[c] as f64;
+                n += 1.0;
+            }
+        }
+    }
+    sum / n
+}
+
+/// The furnace: white surfaces lit only by a uniform environment reflect
+/// exactly what arrives, rough metals included (their light that single
+/// scattering loses is given back), so they vanish against it.
+#[test]
+fn white_surfaces_vanish_in_a_uniform_environment() {
+    let (lights, env) = uniform();
+    for material in [
+        json!({"preset": "metal", "color": "#ffffff", "roughness": 1}),
+        json!({"preset": "metal", "color": "#ffffff", "roughness": 0.5}),
+        json!({"preset": "matte", "color": "#ffffff"}),
+        json!({"preset": "plastic", "color": "#ffffff", "roughness": 0.2}),
+    ] {
+        let img = render(&sphere_in(material.clone(), lights.clone(), env.clone()), 0.0);
+        let mean = disc_mean(&img, 80.0, 1);
+        assert!((mean - 188.0).abs() < 5.0, "{material}: mean {mean:.1}, environment 188");
+    }
+}
+
+/// Pixels of the highlight (luma above `k` × the brightest) and their
+/// spread (standard deviation) across x and y.
+fn highlight_spread(img: &image::RgbaImage, k: f64) -> (f64, f64) {
+    let max = img.pixels().map(|p| luma(p.0)).fold(0.0, f64::max);
+    let pts: Vec<(f64, f64)> = img.enumerate_pixels().filter(|(_, _, p)| luma(p.0) > k * max).map(|(x, y, _)| (x as f64, y as f64)).collect();
+    let n = pts.len() as f64;
+    let (mx, my) = (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n);
+    ((pts.iter().map(|p| (p.0 - mx).powi(2)).sum::<f64>() / n).sqrt(), (pts.iter().map(|p| (p.1 - my).powi(2)).sum::<f64>() / n).sqrt())
+}
+
+/// Brushed metal: the grain runs around the mesh's axis (y), so a light's
+/// highlight stretches across it, up and down the sphere; turned 90° it
+/// stretches sideways.
+#[test]
+fn brushed_metal_stretches_highlights_across_the_grain() {
+    let lights = json!([{"type": "directional", "from": [0, 0, -1], "intensity": 1.5}]);
+    let env = json!({"preset": "none"});
+    let spread = |m: serde_json::Value| highlight_spread(&render(&sphere_in(m, lights.clone(), env.clone()), 0.0), 0.5);
+    let (px_, py_) = spread(json!({"preset": "metal", "color": "#ffffff", "roughness": 0.3}));
+    assert!((px_ / py_ - 1.0).abs() < 0.2, "isotropic: round ({px_:.1} × {py_:.1})");
+    let (bx, by) = spread(json!({"preset": "brushed", "color": "#ffffff"}));
+    assert!(by > 1.8 * bx, "brushed: tall ({bx:.1} × {by:.1})");
+    let (rx, ry) = spread(json!({"preset": "brushed", "color": "#ffffff", "anisotropy_rotation": 90}));
+    assert!(rx > 1.8 * ry, "turned: wide ({rx:.1} × {ry:.1})");
+}
+
+/// Sheen lights a velvet's edges: brighter rim against the centre than the
+/// same matte without it.
+#[test]
+fn sheen_brightens_the_rim() {
+    let lights = json!([{"type": "directional", "from": [0, -0.3, -1]}]);
+    let env = json!({"preset": "soft"});
+    let rim_over_centre = |m: serde_json::Value| {
+        let img = render(&sphere_in(m, lights.clone(), env.clone()), 0.0);
+        let rim = (disc_mean(&img, 88.0, 1) * 88.0f64.powi(2) - disc_mean(&img, 80.0, 1) * 80.0f64.powi(2)) / (88.0f64.powi(2) - 80.0f64.powi(2));
+        rim / disc_mean(&img, 30.0, 1)
+    };
+    let plain = rim_over_centre(json!({"preset": "matte", "color": "#802040"}));
+    let velvet = rim_over_centre(json!({"preset": "velvet", "color": "#802040", "sheen_color": "#ffffff"}));
+    assert!(velvet > plain * 1.3, "rim/centre: velvet {velvet:.2}, matte {plain:.2}");
+}
+
+/// `specular` sets how much a dielectric reflects (0: none) and
+/// `specular_tint` colours it; `clearcoat_color` tints what is under a coat.
+#[test]
+fn specular_level_and_tints() {
+    let lights = json!([{"type": "directional", "from": [0, 0, -1], "intensity": 0.5}]);
+    let env = json!({"preset": "studio"});
+    let shot = |m: serde_json::Value| render(&sphere_in(m, lights.clone(), env.clone()), 0.0);
+    let off = shot(json!({"preset": "glossy", "color": "#000000", "clearcoat": 0, "specular": 0}));
+    let on_ball = (0..240u32).flat_map(|y| (0..320u32).map(move |x| (x, y))).filter(|&(x, y)| ((x as f64 - 160.0).powi(2) + (y as f64 - 120.0).powi(2)).sqrt() < 85.0);
+    let brightest = on_ball.map(|(x, y)| luma(px(&off, x, y))).fold(0.0, f64::max);
+    assert!(brightest < 3.0, "no reflection at specular 0: {brightest}");
+    let tinted = shot(json!({"preset": "glossy", "color": "#000000", "clearcoat": 0, "specular": 1, "specular_tint": "#ff2020", "roughness": 0.2}));
+    let c = px(&tinted, 160, 120);
+    assert!(c[0] > 60 && c[0] as f64 > 2.0 * c[1] as f64, "red reflection at the highlight: {c:?}");
+    let candy = shot(json!({"preset": "coated", "color": "#ffffff", "clearcoat_color": "#ff3030"}));
+    let c = px(&candy, 130, 150);
+    assert!(c[0] as f64 > 2.0 * c[1] as f64, "red under the coat: {c:?}");
+}
+
+#[test]
+fn gpu_matches_cpu_principled_materials() {
+    let p = scene(640, 240, json!({"layers": [
+        {"id": "spun", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 60, "height": 50, "bevel": 6}, "material": {"preset": "brushed", "color": "#d0d4da", "anisotropy_rotation": 30},
+         "transform": {"position": [90, 120], "rotation_x": 40}},
+        {"id": "velvet", "kind": "mesh", "mesh": {"type": "sphere", "radius": 55}, "material": {"preset": "velvet", "color": "#5a1030", "sheen_color": "#ffc0d0"},
+         "transform": {"position": [230, 120]}},
+        {"id": "gold", "kind": "mesh", "mesh": {"type": "torus", "radius": 50, "tube": 18}, "material": {"preset": "metal", "color": "#ffc356", "specular_tint": "#ff8040", "roughness": 0.25},
+         "transform": {"position": [370, 120], "rotation_x": 60}},
+        {"id": "candy", "kind": "mesh", "mesh": {"type": "box", "size": [80, 80], "depth": 80, "bevel": 10}, "material": {"preset": "coated", "color": "#f0f0f0", "clearcoat_color": "#30a0ff", "specular": 0.8},
+         "transform": {"position": [510, 120], "rotation_y": 30, "rotation_x": 20}}
+    ]}));
+    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0002);
+}
+
+#[test]
+#[ignore]
+fn dump_principled() {
+    let p = scene(960, 300, json!({"layers": [
+        {"id": "spun", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 90, "height": 40, "bevel": 8}, "material": {"preset": "brushed", "color": "#d0d4da"},
+         "transform": {"position": [120, 150], "rotation_x": 55}},
+        {"id": "velvet", "kind": "mesh", "mesh": {"type": "sphere", "radius": 80}, "material": {"preset": "velvet", "color": "#5a1030", "sheen_color": "#ffc0d0"},
+         "transform": {"position": [330, 150]}},
+        {"id": "gold", "kind": "mesh", "mesh": {"type": "torus", "radius": 70, "tube": 24}, "material": {"preset": "metal", "color": "#ffc356", "specular_tint": "#ff8040", "roughness": 0.25},
+         "transform": {"position": [530, 150], "rotation_x": 60}},
+        {"id": "candy", "kind": "mesh", "mesh": {"type": "box", "size": [110, 110], "depth": 110, "bevel": 14}, "material": {"preset": "coated", "color": "#f0f0f0", "clearcoat_color": "#30a0ff"},
+         "transform": {"position": [720, 150], "rotation_y": 30, "rotation_x": 20}},
+        {"id": "rough", "kind": "mesh", "mesh": {"type": "sphere", "radius": 70}, "material": {"preset": "metal", "color": "#ffffff", "roughness": 0.8},
+         "transform": {"position": [880, 150]}}
+    ]}));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    cpu().render(&c, 0.0).save(std::env::var("LAHZA_MESH_OUT").unwrap_or_else(|_| "/tmp/principled.png".into())).unwrap();
+}

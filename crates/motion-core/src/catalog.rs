@@ -120,6 +120,15 @@ pub fn catalog_json() -> Value {
             })
         })
         .collect();
+    let material = json!({"preset": "matte | plastic | glossy (default) | coated (lacquer: crisp reflections over colour) | metal | chrome | brushed (spun metal) | velvet (fabric sheen) | glass (refracts what is behind) | emissive | flat (unlit flat colour) | shadow (invisible except shadows: drops shadows onto 2D layers) | wireframe (edges only: 3D viewport look)",
+                    "specular": "0..1 dielectric reflection (0.5 default = 4% head-on; 0 none)", "specular_tint": "colour: tints a dielectric's reflection and a metal's edges (Blender F82 tint)",
+                    "anisotropy": "0..1 brushed/spun metal: grain around the mesh's axis, highlights stretch across it", "anisotropy_rotation": "degrees the grain turns",
+                    "sheen": "0..1 soft grazing light (velvet, fabric)", "sheen_color": "colour (default white)", "sheen_roughness": "0..1 (default 0.5)",
+                    "clearcoat_color": "colour the coat tints what is under it (candy paint)", "dispersion": "glass, path tracing: 1/Abbe (0.02 glass, 0.05 flint, more: stylised rainbows)",
+                    "ior": "glass: index of refraction (default 1.45)", "thickness": "glass: px light travels inside (default 60)",
+                    "colors": "[colour, …] per piece, in turn, for this part (over the layer's colors)", "wireframe": "px: draw edges instead of the surface (preset wireframe)", "fill": "wireframe face colour (hidden-line; omit for see-through wires)",
+                    "color": "base colour (animatable)", "metallic": "0..1", "roughness": "0 mirror … 1 diffuse", "clearcoat": "0..1 lacquer layer", "clearcoat_roughness": "0..1",
+                    "emissive": "colour it glows with", "emissive_strength": "multiplier", "opacity": "0..1", "transmission": "0..1 glass (background shows through, edges reflect)", "unlit": "bool", "faceted": "bool: low-poly normals"});
     let mut catalog = json!({
         "presets": presets,
         "raw_curves": [
@@ -266,11 +275,7 @@ pub fn catalog_json() -> Value {
                 ],
                 "segments": "split rings, revolves and sweeps into this many pieces (default 1)", "gap": "degrees between pieces (sweeps: fraction of the length)", "spans": "[relative size, …] of the pieces in turn (default equal)",
                 "colors": "[colour, …] one per piece in turn (animatable)",
-                "material": {"preset": "matte | plastic | glossy (default) | coated (lacquer: crisp reflections over colour) | metal | chrome | glass (refracts what is behind) | emissive | flat (unlit flat colour) | shadow (invisible except shadows: drops shadows onto 2D layers) | wireframe (edges only: 3D viewport look)",
-                    "ior": "glass: index of refraction (default 1.45)", "thickness": "glass: px light travels inside (default 60)",
-                    "colors": "[colour, …] per piece, in turn, for this part (over the layer's colors)", "wireframe": "px: draw edges instead of the surface (preset wireframe)", "fill": "wireframe face colour (hidden-line; omit for see-through wires)",
-                    "color": "base colour (animatable)", "metallic": "0..1", "roughness": "0 mirror … 1 diffuse", "clearcoat": "0..1 lacquer layer", "clearcoat_roughness": "0..1",
-                    "emissive": "colour it glows with", "emissive_strength": "multiplier", "opacity": "0..1", "transmission": "0..1 glass (background shows through, edges reflect)", "unlit": "bool", "faceted": "bool: low-poly normals"},
+                "material": material,
                 "parts": {"front": "material over `material` for the part (rings/revolves: facing −axis)", "back": "…", "side": "… (rings/revolves: facing away from the axis)", "bevel": "…", "caps": "…", "inside": "rings/revolves: facing the axis"},
                 "detail": "tessellation multiplier (default 1)",
                 "depth": "meshes and flat 3D layers in the same layer list share one depth test (planes cut through meshes, any order); see-through meshes (opacity, glass, blend) draw after the opaque ones",

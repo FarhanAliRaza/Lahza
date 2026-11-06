@@ -44,6 +44,18 @@ pub struct MaterialState {
     pub wireframe: f64,
     /// Wireframe face colour (hidden-line); `None`: see-through wires.
     pub wire_fill: Option<Color>,
+    /// Dielectric reflection (0.5: 4% head-on).
+    pub specular: f64,
+    pub specular_tint: Color,
+    pub anisotropy: f64,
+    /// Radians.
+    pub anisotropy_rotation: f64,
+    pub sheen: f64,
+    pub sheen_color: Color,
+    pub sheen_roughness: f64,
+    pub clearcoat_color: Color,
+    /// 1 / Abbe number.
+    pub dispersion: f64,
 }
 
 impl MaterialState {
@@ -64,6 +76,15 @@ impl MaterialState {
             shadow_catcher: false,
             wireframe: 0.0,
             wire_fill: None,
+            specular: 0.5,
+            specular_tint: Color::WHITE,
+            anisotropy: 0.0,
+            anisotropy_rotation: 0.0,
+            sheen: 0.0,
+            sheen_color: Color::WHITE,
+            sheen_roughness: 0.5,
+            clearcoat_color: Color::WHITE,
+            dispersion: 0.0,
         };
         match p {
             MaterialPreset::Matte => MaterialState { roughness: 0.85, ..base },
@@ -72,6 +93,8 @@ impl MaterialState {
             MaterialPreset::Coated => MaterialState { roughness: 0.45, clearcoat: 1.0, clearcoat_roughness: 0.04, ..base },
             MaterialPreset::Metal => MaterialState { metallic: 1.0, roughness: 0.32, ..base },
             MaterialPreset::Chrome => MaterialState { metallic: 1.0, roughness: 0.06, ..base },
+            MaterialPreset::Brushed => MaterialState { metallic: 1.0, roughness: 0.3, anisotropy: 0.8, ..base },
+            MaterialPreset::Velvet => MaterialState { roughness: 0.9, specular: 0.2, sheen: 1.0, sheen_roughness: 0.4, ..base },
             MaterialPreset::Glass => MaterialState { roughness: 0.04, transmission: 0.92, ..base },
             MaterialPreset::Emissive => MaterialState { roughness: 0.5, ..base },
             MaterialPreset::Flat => MaterialState { unlit: true, ..base },
@@ -157,6 +180,15 @@ pub(super) struct CMaterial {
     faceted: Option<bool>,
     wireframe: Option<Prop<f64>>,
     fill: Option<Prop<Color>>,
+    specular: Option<Prop<f64>>,
+    specular_tint: Option<Prop<Color>>,
+    anisotropy: Option<Prop<f64>>,
+    anisotropy_rotation: Option<Prop<f64>>,
+    sheen: Option<Prop<f64>>,
+    sheen_color: Option<Prop<Color>>,
+    sheen_roughness: Option<Prop<f64>>,
+    clearcoat_color: Option<Prop<Color>>,
+    dispersion: Option<Prop<f64>>,
 }
 
 impl CMaterial {
@@ -189,6 +221,16 @@ impl CMaterial {
         }
         m.unlit = self.unlit.unwrap_or(m.unlit);
         m.faceted = self.faceted.unwrap_or(m.faceted);
+        m.specular = f(&self.specular, m.specular, 0.0, 1.0);
+        m.anisotropy = f(&self.anisotropy, m.anisotropy, 0.0, 1.0);
+        m.anisotropy_rotation = self.anisotropy_rotation.as_ref().map(|p| p.at(t)).unwrap_or(0.0).to_radians();
+        m.sheen = f(&self.sheen, m.sheen, 0.0, 1.0);
+        m.sheen_roughness = f(&self.sheen_roughness, m.sheen_roughness, 0.05, 1.0);
+        m.dispersion = f(&self.dispersion, m.dispersion, 0.0, 0.5);
+        let colour = |p: &Option<Prop<Color>>, d: Color| p.as_ref().map(|p| clamp_color(p.at(t))).unwrap_or(d);
+        m.specular_tint = colour(&self.specular_tint, m.specular_tint);
+        m.sheen_color = colour(&self.sheen_color, m.sheen_color);
+        m.clearcoat_color = colour(&self.clearcoat_color, m.clearcoat_color);
         m
     }
 }
@@ -248,6 +290,15 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         thickness: o.thickness.clone().or_else(|| base.thickness.clone()),
         unlit: o.unlit.or(base.unlit),
         faceted: o.faceted.or(base.faceted),
+        specular: o.specular.clone().or_else(|| base.specular.clone()),
+        specular_tint: o.specular_tint.clone().or_else(|| base.specular_tint.clone()),
+        anisotropy: o.anisotropy.clone().or_else(|| base.anisotropy.clone()),
+        anisotropy_rotation: o.anisotropy_rotation.clone().or_else(|| base.anisotropy_rotation.clone()),
+        sheen: o.sheen.clone().or_else(|| base.sheen.clone()),
+        sheen_color: o.sheen_color.clone().or_else(|| base.sheen_color.clone()),
+        sheen_roughness: o.sheen_roughness.clone().or_else(|| base.sheen_roughness.clone()),
+        clearcoat_color: o.clearcoat_color.clone().or_else(|| base.clearcoat_color.clone()),
+        dispersion: o.dispersion.clone().or_else(|| base.dispersion.clone()),
     }
 }
 
@@ -301,6 +352,15 @@ impl Compiler<'_> {
             faceted: m.faceted,
             wireframe: m.wireframe.as_ref().map(|p| self.prop(p, id, &w("wireframe"), start, step, shift)),
             fill: m.fill.as_ref().map(|p| self.prop(p, id, &w("fill"), start, step, shift)),
+            specular: m.specular.as_ref().map(|p| self.prop(p, id, &w("specular"), start, step, shift)),
+            specular_tint: m.specular_tint.as_ref().map(|p| self.prop(p, id, &w("specular_tint"), start, step, shift)),
+            anisotropy: m.anisotropy.as_ref().map(|p| self.prop(p, id, &w("anisotropy"), start, step, shift)),
+            anisotropy_rotation: m.anisotropy_rotation.as_ref().map(|p| self.prop(p, id, &w("anisotropy_rotation"), start, step, shift)),
+            sheen: m.sheen.as_ref().map(|p| self.prop(p, id, &w("sheen"), start, step, shift)),
+            sheen_color: m.sheen_color.as_ref().map(|p| self.prop(p, id, &w("sheen_color"), start, step, shift)),
+            sheen_roughness: m.sheen_roughness.as_ref().map(|p| self.prop(p, id, &w("sheen_roughness"), start, step, shift)),
+            clearcoat_color: m.clearcoat_color.as_ref().map(|p| self.prop(p, id, &w("clearcoat_color"), start, step, shift)),
+            dispersion: m.dispersion.as_ref().map(|p| self.prop(p, id, &w("dispersion"), start, step, shift)),
         }
     }
 

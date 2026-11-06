@@ -834,6 +834,65 @@ fn env_brdf(r: f32, n_v: f32) -> vec2<f32> {
     return vec2<f32>(-1.04 * a004 + rr.z, 1.04 * a004 + rr.w);
 }
 
+// A tangent perpendicular to n (any).
+fn basis_t(n: vec3<f32>) -> vec3<f32> {
+    var a = vec3<f32>(1.0, 0.0, 0.0);
+    if abs(n.x) > 0.9 { a = vec3<f32>(0.0, 1.0, 0.0); }
+    return normalize(cross(a, n));
+}
+
+// Anisotropic GGX: h in the (t, b, n) frame, roughness at along t, ab along b.
+fn ggx_aniso(h_t: f32, h_b: f32, n_h: f32, at: f32, ab: f32) -> f32 {
+    let x = h_t / at;
+    let y = h_b / ab;
+    let d = x * x + y * y + n_h * n_h;
+    return 1.0 / max(PI * at * ab * d * d, 1e-12);
+}
+
+// Schlick with the F82 edge tint (Hoffman; Blender's metallic Fresnel):
+// tint 1 is plain Schlick.
+// f90: reflectance at grazing (1, less for surfaces that barely reflect).
+fn fresnel_f82(f0: vec3<f32>, f82: vec3<f32>, f90: f32, mu: f32) -> vec3<f32> {
+    let m = clamp(mu, 0.0, 1.0);
+    let s = f0 + (vec3<f32>(f90) - f0) * pow5(1.0 - m);
+    let sb = f0 + (vec3<f32>(f90) - f0) * 0.46266437;
+    let a = sb * (vec3<f32>(1.0) - f82) / 0.0566527;
+    let x = 1.0 - m;
+    return max(s - a * (m * x * x * x * x * x * x), vec3<f32>(0.0));
+}
+
+// Sheen: Charlie distribution (alpha = roughness²) and Neubelt visibility.
+fn charlie(n_h: f32, a: f32) -> f32 {
+    let inv = 1.0 / a;
+    let s2 = max(1.0 - n_h * n_h, 0.0078125);
+    return (2.0 + inv) * pow(s2, inv * 0.5) / (2.0 * PI);
+}
+
+fn neubelt(n_v: f32, n_l: f32) -> f32 {
+    return 1.0 / max(4.0 * (n_l + n_v - n_l * n_v), 1e-4);
+}
+
+// Directional albedo of the sheen lobe (precomputed: roughness 0.05..1 ×
+// cos 0..1, 8 × 8), so the base under it loses what it reflects.
+const SHEEN_E = array<f32, 64>(
+    1.0000, 0.1364, 0.0009, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 1.0000, 0.6862, 0.2519, 0.0837, 0.0229, 0.0044, 0.0004, 0.0000,
+    1.0000, 0.6499, 0.3698, 0.2068, 0.1081, 0.0498, 0.0177, 0.0026, 0.8886, 0.5849, 0.3937, 0.2658, 0.1739, 0.1065, 0.0570, 0.0217,
+    0.7538, 0.5358, 0.3933, 0.2921, 0.2137, 0.1504, 0.0981, 0.0545, 0.6738, 0.5014, 0.3874, 0.3044, 0.2377, 0.1814, 0.1323, 0.0885,
+    0.6227, 0.4772, 0.3811, 0.3105, 0.2530, 0.2033, 0.1589, 0.1180, 0.5882, 0.4599, 0.3757, 0.3138, 0.2631, 0.2190, 0.1790, 0.1418);
+
+fn sheen_albedo(n_v: f32, r: f32) -> f32 {
+    let x = clamp(n_v, 0.0, 1.0) * 7.0;
+    let y = clamp((r - 0.05) / 0.95, 0.0, 1.0) * 7.0;
+    let x0 = min(u32(x), 6u);
+    let y0 = min(u32(y), 6u);
+    let fx = x - f32(x0);
+    let fy = y - f32(y0);
+    var e = SHEEN_E;
+    let a = mix(e[y0 * 8u + x0], e[y0 * 8u + x0 + 1u], fx);
+    let b = mix(e[(y0 + 1u) * 8u + x0], e[(y0 + 1u) * 8u + x0 + 1u], fx);
+    return mix(a, b, fy);
+}
+
 fn shoulder(x: f32) -> f32 {
     if x < 0.8 { return x; }
     return 0.8 + 0.2 * (1.0 - exp(-(x - 0.8) / 0.2));
@@ -944,6 +1003,9 @@ fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
     return b_groups[u32(off + y * w + x)];
 }
 
+// Rows per mesh material (mesh3d::MAT_ROWS).
+const MAT_ROWS: u32 = 9u;
+
 // Mirrors `card_sample` in mesh3d.rs: a card's picture at target point q.
 fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
     let r0 = b_mesh[material];
@@ -973,16 +1035,16 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let vb = bitcast<u32>(prim.geom2.y);
     let mb = bitcast<u32>(prim.geom2.z);
     let lb = bitcast<u32>(prim.geom2.w);
-    let mat_flags = u32(b_mesh[mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u + 2u].w);
+    let mat_flags = u32(b_mesh[mb + bitcast<u32>(b_mesh[tb + 1u].w) * MAT_ROWS + 2u].w);
     if (mat_flags & 4u) != 0u {
         // A depth-only occluder: another batch draws this surface.
         return vec4<f32>(0.0);
     }
     if (mat_flags & 16u) != 0u {
-        return card_sample(prim, mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u, q);
+        return card_sample(prim, mb + bitcast<u32>(b_mesh[tb + 1u].w) * MAT_ROWS, q);
     }
     if (mat_flags & 32u) != 0u {
-        let row = mb + bitcast<u32>(b_mesh[tb + 1u].w) * 4u;
+        let row = mb + bitcast<u32>(b_mesh[tb + 1u].w) * MAT_ROWS;
         let wc = cover(b_mesh[tb], b_mesh[tb + 1u], q);
         let on_wire = wire_distance(b_mesh[tb], b_mesh[tb + 1u], wc.e, u32(b_mesh[tb + 2u].w) >> 2u) <= b_mesh[row + 3u].w * 0.5;
         var c = b_mesh[row + 1u];
@@ -1008,10 +1070,10 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let p = pos[0] * b.x + pos[1] * b.y + pos[2] * b.z;
     let navg = nrm[0] * b.x + nrm[1] * b.y + nrm[2] * b.z;
     let mat = bitcast<u32>(b_mesh[tb + 1u].w);
-    let m0 = b_mesh[mb + mat * 4u];
-    let m1 = b_mesh[mb + mat * 4u + 1u];
-    let m2 = b_mesh[mb + mat * 4u + 2u];
-    let m3 = b_mesh[mb + mat * 4u + 3u];
+    let m0 = b_mesh[mb + mat * MAT_ROWS];
+    let m1 = b_mesh[mb + mat * MAT_ROWS + 1u];
+    let m2 = b_mesh[mb + mat * MAT_ROWS + 2u];
+    let m3 = b_mesh[mb + mat * MAT_ROWS + 3u];
     let flags = u32(m2.w);
     var n = navg / max(sqrt(dot(navg, navg)), 1e-20);
     if (flags & 2u) != 0u {
@@ -1050,13 +1112,52 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     let cc = m1.z;
     let ccr = max(m1.w, 0.03);
     let trans = m3.x;
-    let f0 = mix(vec3<f32>(0.04), base, metal);
-    let diffuse = base * ((1.0 - metal) * (1.0 - trans));
+    let m4 = b_mesh[mb + mat * MAT_ROWS + 4u];
+    let m5 = b_mesh[mb + mat * MAT_ROWS + 5u];
+    let m6 = b_mesh[mb + mat * MAT_ROWS + 6u];
+    let m7 = b_mesh[mb + mat * MAT_ROWS + 7u];
+    let m8 = b_mesh[mb + mat * MAT_ROWS + 8u];
+    // Reflectance head-on (dielectric: specular level × tint; metal: its
+    // colour) and the metal's edge tint (F82).
+    let f0 = mix(vec3<f32>(m3.w) * m4.xyz, base, metal);
+    let f82 = mix(vec3<f32>(1.0), m4.xyz, metal);
+    // No reflection head-on, none at grazing either (specular 0).
+    let f90 = clamp(dot(f0, vec3<f32>(16.5)), 0.0, 1.0);
     let n_v = max(dot(n, v), 1e-4);
+    let ab = env_brdf(rough, n_v);
+    // Energy lost to single scattering, given back (rough metals stay bright).
+    let comp = vec3<f32>(1.0) + f0 * (1.0 / max(ab.x + ab.y, 1e-3) - 1.0);
+    let e_spec = min((f0 * ab.x + vec3<f32>(f90 * ab.y)) * comp, vec3<f32>(1.0));
+    let sheen = m5.xyz;
+    let sheen_r = m5.w;
+    let e_sheen = sheen_albedo(n_v, sheen_r) * max(max(sheen.x, sheen.y), sheen.z);
+    let diffuse = base * ((1.0 - metal) * (1.0 - trans) * (1.0 - e_sheen)) * (vec3<f32>(1.0) - e_spec);
     let fc_v = 0.04 + 0.96 * pow5(1.0 - n_v);
     let coat = 1.0 - cc * fc_v;
+    let coat_tint = mix(vec3<f32>(1.0), m6.xyz, cc);
+    // Brushed grain: tangent around the mesh's axis, turned by the rotation;
+    // highlights stretch across it (along b).
+    let aniso = m4.w;
+    let alpha = rough * rough;
+    var at = alpha;
+    var ab_ = alpha;
+    var tg = vec3<f32>(0.0);
+    var bt = vec3<f32>(0.0);
+    if aniso > 0.0 {
+        var t = cross(m7.xyz, p - m8.xyz);
+        t = t - n * dot(n, t);
+        if dot(t, t) < 1e-12 { t = basis_t(n); }
+        t = normalize(t);
+        t = t * cos(m7.w) + cross(n, t) * sin(m7.w);
+        tg = t;
+        bt = cross(n, t);
+        let aspect = sqrt(1.0 - 0.9 * aniso);
+        at = alpha * aspect;
+        ab_ = alpha / aspect;
+    }
     var d_light = vec3<f32>(0.0);
     var s_light = vec3<f32>(0.0);
+    var c_light = vec3<f32>(0.0);
     let lights = u32(b_mesh[lb].x);
     for (var i = 0u; i < lights; i++) {
         let row = b_mesh[lb + 7u + i * 2u];
@@ -1080,27 +1181,44 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
         let n_h = max(dot(n, h), 0.0);
         let v_h = max(dot(v, h), 0.0);
         let fw = pow5(1.0 - v_h);
-        let f = f0 + (vec3<f32>(1.0) - f0) * fw;
-        let spec = ggx(n_h, rough * rough) * smith(n_v, n_l, rough) / max(4.0 * n_v * n_l, 1e-4) * PI;
-        let kd = vec3<f32>(1.0) - f;
-        d_light = d_light + (kd * diffuse) * (col * (n_l * coat));
-        s_light = s_light + (f * (spec * n_l * coat)) * col;
+        let f = fresnel_f82(f0, f82, f90, v_h);
+        var d = ggx(n_h, alpha);
+        if aniso > 0.0 { d = ggx_aniso(dot(h, tg), dot(h, bt), n_h, at, ab_); }
+        let spec = d * smith(n_v, n_l, rough) / max(4.0 * n_v * n_l, 1e-4) * PI;
+        d_light = d_light + diffuse * (col * (n_l * coat));
+        s_light = s_light + (f * comp * (spec * n_l * coat)) * col;
+        if e_sheen > 0.0 {
+            s_light = s_light + sheen * col * (charlie(n_h, sheen_r * sheen_r) * neubelt(n_v, n_l) * n_l * PI * coat);
+        }
         if cc > 0.0 {
             let fc = 0.04 + 0.96 * fw;
             let sc = ggx(n_h, ccr * ccr) * smith(n_v, n_l, ccr) / max(4.0 * n_v * n_l, 1e-4) * PI;
-            s_light = s_light + col * (sc * fc * cc * n_l);
+            c_light = c_light + col * (sc * fc * cc * n_l);
         }
     }
     let nw = to_world(lb, n);
-    let r_view = n * (2.0 * dot(n, v)) - v;
+    var rn = n;
+    if aniso > 0.0 {
+        // Bent normal: reflections stretch across the grain too.
+        let at_dir = cross(bt, v);
+        let an = cross(at_dir, bt);
+        rn = normalize(mix(n, an, aniso));
+    }
+    let r_view = rn * (2.0 * dot(rn, v)) - v;
     let rw = to_world(lb, r_view);
     d_light = d_light + (diffuse * env_light(lb, nw, 1.0)) * coat;
-    let ab = env_brdf(rough, n_v);
-    let spec_env = env_light(lb, rw, rough) * (f0 * ab.x + vec3<f32>(ab.y));
+    let spec_env = env_light(lb, rw, rough) * (f0 * ab.x + f82 * (f90 * ab.y)) * comp;
     s_light = s_light + spec_env * coat;
-    if cc > 0.0 {
-        s_light = s_light + env_light(lb, rw, ccr) * (fc_v * cc);
+    if e_sheen > 0.0 {
+        s_light = s_light + sheen * env_light(lb, nw, 1.0) * (sheen_albedo(n_v, sheen_r) * coat);
     }
+    if cc > 0.0 {
+        let cr = n * (2.0 * dot(n, v)) - v;
+        c_light = c_light + env_light(lb, to_world(lb, cr), ccr) * (fc_v * cc);
+    }
+    // What is under the coat is seen through its colour.
+    d_light = d_light * coat_tint;
+    s_light = s_light * coat_tint + c_light;
     if trans > 0.0 && prim.paint.w > 0.5 {
         let ior = max(m3.y, 1.0);
         let i = -v;
@@ -1181,7 +1299,7 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
                 if z >= depth[s] * (1.0 - TIE) {
                     var stands = true;
                     let tf = u32(b_mesh[r + 2u].w);
-                    let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * 4u;
+                    let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * MAT_ROWS;
                     if (tf & 1u) != 0u {
                         stands = card_sample(prim, material, q).w >= 1.0 / 512.0; // CARD_STANDS
                     } else if (tf & 2u) != 0u {

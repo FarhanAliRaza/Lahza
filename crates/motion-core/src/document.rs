@@ -2245,6 +2245,35 @@ pub struct Material {
     /// `colors`): two-tone segmented rings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub colors: Vec<Property<Color>>,
+    /// Dielectric reflection strength: 0.5 (default) reflects 4% head-on,
+    /// like most plastics and paints; 0 none, 1 twice as much.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specular: Option<Property<f64>>,
+    /// Tints reflections: a dielectric's (head-on) and a metal's edges
+    /// (gold that turns paler, copper that turns redder at grazing angles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specular_tint: Option<Property<Color>>,
+    /// Brushed or spun metal: highlights stretch across the grain, 0..1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anisotropy: Option<Property<f64>>,
+    /// Degrees the grain turns from running around the mesh's axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anisotropy_rotation: Option<Property<f64>>,
+    /// Soft velvet-like light at grazing angles (fabric, peach skin), 0..1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheen: Option<Property<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheen_color: Option<Property<Color>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheen_roughness: Option<Property<f64>>,
+    /// The clear coat's tint (candy paint): what is under it is seen
+    /// through this colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearcoat_color: Option<Property<Color>>,
+    /// Glass: rainbow fringes, as 1 / Abbe number (0.02 window glass, 0.05
+    /// flint; more for a stylised prism). Path tracing only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispersion: Option<Property<f64>>,
     /// Ignore lights: the flat colour (flat-shaded idents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlit: Option<bool>,
@@ -2270,6 +2299,10 @@ pub enum MaterialPreset {
     Coated,
     Metal,
     Chrome,
+    /// Spun metal: grain around the mesh's axis.
+    Brushed,
+    /// Fabric: matte with a soft sheen at the edges.
+    Velvet,
     Glass,
     Emissive,
     /// Unlit flat colour.

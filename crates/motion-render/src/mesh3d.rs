@@ -267,7 +267,7 @@ impl MeshCache {
         let mut parts = [(0u32, 1u32); PARTS];
         for (part, slot) in parts.iter_mut().enumerate() {
             let colors = piece_colors(m, part);
-            *slot = ((materials.len() / 4) as u32, colors as u32);
+            *slot = ((materials.len() / MAT_ROWS) as u32, colors as u32);
             for segment in 0..colors as u32 {
                 materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale));
             }
@@ -307,7 +307,7 @@ pub(crate) struct Batch {
     verts: Vec<Vert>,
     /// Vertex indices and material index.
     tris: Vec<([u32; 3], u32, u8)>,
-    /// 4 rows per material (see `material_rows`).
+    /// MAT_ROWS rows per material (see `material_rows`).
     materials: Vec<[f32; 4]>,
     lighting: Arc<Lighting>,
     /// Rows of the light block.
@@ -600,31 +600,54 @@ pub(crate) fn piece_colors(m: &MeshState, part: usize) -> usize {
     }
 }
 
-/// Rows of one material: [rgb linear, opacity], [metallic, roughness,
-/// clear coat, its roughness], [emissive rgb, flags (1 unlit, 2 faceted)],
-/// [transmission, 0, 0, 0].
-pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64) -> [[f32; 4]; 4] {
+/// Rows per material (GPU raster, CPU raster and path tracer agree).
+pub(crate) const MAT_ROWS: usize = 9;
+
+/// Rows of one material:
+/// 0 [base rgb linear, opacity], 1 [metallic, roughness, clear coat, its
+/// roughness], 2 [emissive rgb, flags], 3 [transmission, ior, thickness,
+/// dielectric F0], 4 [specular tint rgb, anisotropy], 5 [sheen rgb (colour ×
+/// amount), sheen roughness], 6 [clear coat colour rgb, dispersion], 7 [grain
+/// axis (camera space), grain rotation], 8 [mesh centre (camera space), 0].
+pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64) -> [[f32; 4]; MAT_ROWS] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
+    let lin = |c: lahza_motion_core::value::Color| [srgb_to_linear(c.0[0]) as f32, srgb_to_linear(c.0[1]) as f32, srgb_to_linear(c.0[2]) as f32];
+    let mut rows = [[0.0f32; 4]; MAT_ROWS];
     if mat.wireframe > 0.0 {
         // Wires: [colour, opacity], [fill colour, fill opacity (0: see-through)],
         // [_, flags], [_, _, _, width in output px].
-        let lin = |c: lahza_motion_core::value::Color| [srgb_to_linear(c.0[0]) as f32, srgb_to_linear(c.0[1]) as f32, srgb_to_linear(c.0[2]) as f32];
         let (w, f) = (lin(color), mat.wire_fill.map(|c| (lin(c), c.0[3] * mat.opacity * opacity)).unwrap_or(([0.0; 3], 0.0)));
-        return [
-            [w[0], w[1], w[2], (color.0[3] * mat.opacity * opacity) as f32],
-            [f.0[0], f.0[1], f.0[2], f.1 as f32],
-            [0.0, 0.0, 0.0, (FLAG_WIRE | FLAG_UNLIT) as f32],
-            [0.0, 0.0, 0.0, (mat.wireframe * scale) as f32],
-        ];
+        rows[0] = [w[0], w[1], w[2], (color.0[3] * mat.opacity * opacity) as f32];
+        rows[1] = [f.0[0], f.0[1], f.0[2], f.1 as f32];
+        rows[2] = [0.0, 0.0, 0.0, (FLAG_WIRE | FLAG_UNLIT) as f32];
+        rows[3] = [0.0, 0.0, 0.0, (mat.wireframe * scale) as f32];
+        return rows;
     }
     let flags = (mat.unlit as u32) * FLAG_UNLIT | (mat.faceted as u32) * FLAG_FACETED | (mat.shadow_catcher as u32) * FLAG_SHADOW_CATCHER;
-    [
-        [srgb_to_linear(color.0[0]) as f32, srgb_to_linear(color.0[1]) as f32, srgb_to_linear(color.0[2]) as f32, (color.0[3] * mat.opacity * opacity) as f32],
-        [mat.metallic as f32, mat.roughness as f32, mat.clearcoat as f32, mat.clearcoat_roughness as f32],
-        [mat.emissive[0] as f32, mat.emissive[1] as f32, mat.emissive[2] as f32, flags as f32],
-        [mat.transmission as f32, mat.ior as f32, mat.thickness as f32, 0.0],
-    ]
+    let base = lin(color);
+    rows[0] = [base[0], base[1], base[2], (color.0[3] * mat.opacity * opacity) as f32];
+    rows[1] = [mat.metallic as f32, mat.roughness as f32, mat.clearcoat as f32, mat.clearcoat_roughness as f32];
+    rows[2] = [mat.emissive[0] as f32, mat.emissive[1] as f32, mat.emissive[2] as f32, flags as f32];
+    rows[3] = [mat.transmission as f32, mat.ior as f32, mat.thickness as f32, (0.08 * mat.specular) as f32];
+    let tint = lin(mat.specular_tint);
+    rows[4] = [tint[0], tint[1], tint[2], mat.anisotropy as f32];
+    let sheen = lin(mat.sheen_color).map(|c| c * mat.sheen as f32);
+    rows[5] = [sheen[0], sheen[1], sheen[2], mat.sheen_roughness as f32];
+    let coat = lin(mat.clearcoat_color);
+    rows[6] = [coat[0], coat[1], coat[2], mat.dispersion as f32];
+    // The grain runs around the mesh's axis (y; z for rings and revolves
+    // about z): spun metal.
+    let mv = m.camera.view.then(m.world).0;
+    let axis_obj = match &m.params.shape {
+        mesh::MeshShape::Torus { .. } | mesh::MeshShape::Revolve { axis_y: false, .. } => [0.0, 0.0, 1.0],
+        _ => [0.0, 1.0, 0.0],
+    };
+    let a = [0, 1, 2].map(|r| mv[r * 4] * axis_obj[0] + mv[r * 4 + 1] * axis_obj[1] + mv[r * 4 + 2] * axis_obj[2]);
+    let a = unit3(a);
+    rows[7] = [a[0] as f32, a[1] as f32, a[2] as f32, mat.anisotropy_rotation as f32];
+    rows[8] = [mv[3] as f32, mv[7] as f32, mv[11] as f32, 0.0];
+    rows
 }
 
 /// The light block: [lights, lobes, 0, 0], camera→world rotation (3
@@ -720,8 +743,10 @@ impl Batch {
     /// batch shows nothing.
     pub(crate) fn add_occluder(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj) {
         if self.occluder.is_none() {
-            self.occluder = Some((self.materials.len() / 4) as u32);
-            self.materials.extend_from_slice(&[[0.0; 4], [0.0; 4], [0.0, 0.0, 0.0, FLAG_OCCLUDER as f32], [0.0; 4]]);
+            self.occluder = Some((self.materials.len() / MAT_ROWS) as u32);
+            let mut rows = [[0.0; 4]; MAT_ROWS];
+            rows[2][3] = FLAG_OCCLUDER as f32;
+            self.materials.extend_from_slice(&rows);
         }
         self.add_mesh(cache, m, root, 1.0, true);
     }
@@ -732,13 +757,12 @@ impl Batch {
         let b = |v: u32| f32::from_bits(v);
         let p = card.picture;
         let flags = FLAG_CARD | if occluder { FLAG_OCCLUDER } else { 0 };
-        let material = (self.materials.len() / 4) as u32;
-        self.materials.extend_from_slice(&[
-            [p.origin[0] as f32, p.origin[1] as f32, p.factor[0] as f32, p.factor[1] as f32],
-            [b(p.offset), b(p.size.0), b(p.size.1), 0.0],
-            [0.0, 0.0, 0.0, flags as f32],
-            [0.0; 4],
-        ]);
+        let material = (self.materials.len() / MAT_ROWS) as u32;
+        let mut rows = [[0.0; 4]; MAT_ROWS];
+        rows[0] = [p.origin[0] as f32, p.origin[1] as f32, p.factor[0] as f32, p.factor[1] as f32];
+        rows[1] = [b(p.offset), b(p.size.0), b(p.size.1), 0.0];
+        rows[2] = [0.0, 0.0, 0.0, flags as f32];
+        self.materials.extend_from_slice(&rows);
         let n = cross(sub(card.view[1], card.view[0]), sub(card.view[3], card.view[0]));
         let n = unit3(n);
         let base = self.verts.len() as u32;
@@ -821,7 +845,7 @@ impl Batch {
                     let colors = piece_colors(m, part) as u32;
                     let mslot = &mut slots[part * colors_n + (segment % colors) as usize];
                     if *mslot == u32::MAX {
-                        *mslot = (self.materials.len() / 4) as u32;
+                        *mslot = (self.materials.len() / MAT_ROWS) as u32;
                         self.materials.extend_from_slice(&material_rows(m, part, segment, opacity, wire_scale));
                     }
                     *mslot
@@ -908,7 +932,7 @@ impl Batch {
                 [f(p[2][0]), f(p[2][1]), sign, f32::from_bits(*material)],
                 [f32::from_bits(ids[0]), f32::from_bits(ids[1]), f32::from_bits(ids[2]), {
                     // Bits: card, wireframe, then the real-edge mask.
-                    let flags = self.materials[*material as usize * 4 + 2][3] as u32;
+                    let flags = self.materials[*material as usize * MAT_ROWS + 2][3] as u32;
                     ((flags & FLAG_CARD != 0) as u32 | ((flags & FLAG_WIRE != 0) as u32) << 1 | (*edges as u32) << 2) as f32
                 }],
                 [f(depth[0]), f(depth[1]), f(depth[2]), 0.0],
@@ -932,7 +956,7 @@ impl Batch {
         };
         // The drawn triangles set the covered area; occluders only matter
         // inside it.
-        let is_occluder = |t: &Tri| self.materials[t.rows[1][3].to_bits() as usize * 4 + 2][3] as u32 & FLAG_OCCLUDER != 0;
+        let is_occluder = |t: &Tri| self.materials[t.rows[1][3].to_bits() as usize * MAT_ROWS + 2][3] as u32 & FLAG_OCCLUDER != 0;
         let mut used = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for t in tris.iter().filter(|t| !is_occluder(t)) {
             let bbox = t.bbox.map(|v| v as f64);
@@ -1313,6 +1337,63 @@ fn env_brdf(r: f32, n_v: f32) -> [f32; 2] {
     [-1.04 * a004 + rr[2], 1.04 * a004 + rr[3]]
 }
 
+/// A tangent perpendicular to n (any). Mirrors motion.wgsl.
+fn basis_t(n: F3) -> F3 {
+    let a = if n[0].abs() > 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    fnorm(fcross(a, n))
+}
+
+/// Anisotropic GGX (h in the t, b, n frame).
+fn ggx_aniso(h_t: f32, h_b: f32, n_h: f32, at: f32, ab: f32) -> f32 {
+    let (x, y) = (h_t / at, h_b / ab);
+    let d = x * x + y * y + n_h * n_h;
+    1.0 / (std::f32::consts::PI * at * ab * d * d).max(1e-12)
+}
+
+/// Schlick with the F82 edge tint (Hoffman; Blender's metallic Fresnel).
+fn fresnel_f82(f0: F3, f82: F3, f90: f32, mu: f32) -> F3 {
+    let m = mu.clamp(0.0, 1.0);
+    let x = 1.0 - m;
+    let w = x * x * x * x * x;
+    let k = m * x * x * x * x * x * x;
+    std::array::from_fn(|c| {
+        let s = f0[c] + (f90 - f0[c]) * w;
+        let sb = f0[c] + (f90 - f0[c]) * 0.462_664_37;
+        let a = sb * (1.0 - f82[c]) / 0.056_652_7;
+        (s - a * k).max(0.0)
+    })
+}
+
+/// Sheen: Charlie distribution (alpha = roughness²).
+fn charlie(n_h: f32, a: f32) -> f32 {
+    let inv = 1.0 / a;
+    let s2 = (1.0 - n_h * n_h).max(0.007_812_5);
+    (2.0 + inv) * s2.powf(inv * 0.5) / (2.0 * std::f32::consts::PI)
+}
+
+fn neubelt(n_v: f32, n_l: f32) -> f32 {
+    1.0 / (4.0 * (n_l + n_v - n_l * n_v)).max(1e-4)
+}
+
+/// Directional albedo of the sheen lobe: roughness 0.05..1 × cos 0..1.
+pub(crate) const SHEEN_E: [f32; 64] = [
+    1.0000, 0.1364, 0.0009, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 1.0000, 0.6862, 0.2519, 0.0837, 0.0229, 0.0044, 0.0004, 0.0000, //
+    1.0000, 0.6499, 0.3698, 0.2068, 0.1081, 0.0498, 0.0177, 0.0026, 0.8886, 0.5849, 0.3937, 0.2658, 0.1739, 0.1065, 0.0570, 0.0217, //
+    0.7538, 0.5358, 0.3933, 0.2921, 0.2137, 0.1504, 0.0981, 0.0545, 0.6738, 0.5014, 0.3874, 0.3044, 0.2377, 0.1814, 0.1323, 0.0885, //
+    0.6227, 0.4772, 0.3811, 0.3105, 0.2530, 0.2033, 0.1589, 0.1180, 0.5882, 0.4599, 0.3757, 0.3138, 0.2631, 0.2190, 0.1790, 0.1418,
+];
+
+fn sheen_albedo(n_v: f32, r: f32) -> f32 {
+    let x = n_v.clamp(0.0, 1.0) * 7.0;
+    let y = ((r - 0.05) / 0.95).clamp(0.0, 1.0) * 7.0;
+    let (x0, y0) = ((x as usize).min(6), (y as usize).min(6));
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let e = &SHEEN_E;
+    let a = e[y0 * 8 + x0] + (e[y0 * 8 + x0 + 1] - e[y0 * 8 + x0]) * fx;
+    let b = e[(y0 + 1) * 8 + x0] + (e[(y0 + 1) * 8 + x0 + 1] - e[(y0 + 1) * 8 + x0]) * fx;
+    a + (b - a) * fy
+}
+
 fn shoulder(x: f32) -> f32 {
     if x < 0.8 {
         x
@@ -1406,16 +1487,16 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     let vb = prim.geom2[1].to_bits() as usize;
     let mb = prim.geom2[2].to_bits() as usize;
     let lb = prim.geom2[3].to_bits() as usize;
-    let mat_flags = m[mb + m[tb + 1][3].to_bits() as usize * 4 + 2][3] as u32;
+    let mat_flags = m[mb + m[tb + 1][3].to_bits() as usize * MAT_ROWS + 2][3] as u32;
     if mat_flags & FLAG_OCCLUDER != 0 {
         // Another batch draws this surface.
         return [0.0; 4];
     }
     if mat_flags & FLAG_CARD != 0 {
-        return card_sample(prim, m, groups, mb + m[tb + 1][3].to_bits() as usize * 4, q);
+        return card_sample(prim, m, groups, mb + m[tb + 1][3].to_bits() as usize * MAT_ROWS, q);
     }
     if mat_flags & FLAG_WIRE != 0 {
-        let row = mb + m[tb + 1][3].to_bits() as usize * 4;
+        let row = mb + m[tb + 1][3].to_bits() as usize * MAT_ROWS;
         let (e, _) = cover(m[tb], m[tb + 1], q);
         let on_wire = wire_distance(m[tb], m[tb + 1], e, m[tb + 2][3] as u32 >> 2) <= m[row + 3][3] * 0.5;
         let c = if on_wire { m[row] } else { m[row + 1] };
@@ -1439,10 +1520,10 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     let p = fadd(fadd(fmul(pos[0], b[0]), fmul(pos[1], b[1])), fmul(pos[2], b[2]));
     let navg = fadd(fadd(fmul(nrm[0], b[0]), fmul(nrm[1], b[1])), fmul(nrm[2], b[2]));
     let mat = m[tb + 1][3].to_bits() as usize;
-    let m0 = m[mb + mat * 4];
-    let m1 = m[mb + mat * 4 + 1];
-    let m2 = m[mb + mat * 4 + 2];
-    let m3 = m[mb + mat * 4 + 3];
+    let m0 = m[mb + mat * MAT_ROWS];
+    let m1 = m[mb + mat * MAT_ROWS + 1];
+    let m2 = m[mb + mat * MAT_ROWS + 2];
+    let m3 = m[mb + mat * MAT_ROWS + 3];
     let flags = m2[3] as u32;
     let mut n = fnorm(navg);
     if flags & 2 != 0 {
@@ -1476,13 +1557,44 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     }
     let (metal, rough, cc, ccr) = (m1[0], m1[1].max(0.03), m1[2], m1[3].max(0.03));
     let trans = m3[0];
-    let f0 = fmix([0.04; 3], base, metal);
-    let diffuse = fmul(base, (1.0 - metal) * (1.0 - trans));
+    let row = |k: usize| m[mb + mat * MAT_ROWS + k];
+    let (m4, m5, m6, m7, m8) = (row(4), row(5), row(6), row(7), row(8));
+    // Mirrors motion.wgsl: F0 and the metal's edge tint (F82).
+    let f0 = fmix(fmul(f3(m4), m3[3]), base, metal);
+    let f82 = fmix([1.0; 3], f3(m4), metal);
+    let f90 = fdot(f0, [16.5; 3]).clamp(0.0, 1.0);
     let n_v = fdot(n, v).max(1e-4);
+    let ab = env_brdf(rough, n_v);
+    let comp = fadd([1.0; 3], fmul(f0, 1.0 / (ab[0] + ab[1]).max(1e-3) - 1.0));
+    let e_spec = fmul3(fadd(fmul(f0, ab[0]), [f90 * ab[1]; 3]), comp).map(|x| x.min(1.0));
+    let sheen = f3(m5);
+    let sheen_r = m5[3];
+    let e_sheen = sheen_albedo(n_v, sheen_r) * sheen[0].max(sheen[1]).max(sheen[2]);
+    let diffuse = fmul3(fmul(base, (1.0 - metal) * (1.0 - trans) * (1.0 - e_sheen)), fsub([1.0; 3], e_spec));
     let fc_v = 0.04 + 0.96 * (1.0 - n_v).powi(5);
     let coat = 1.0 - cc * fc_v;
+    let coat_tint = fmix([1.0; 3], f3(m6), cc);
+    let aniso = m4[3];
+    let alpha = rough * rough;
+    let (mut at, mut ab_) = (alpha, alpha);
+    let (mut tg, mut bt) = ([0.0f32; 3], [0.0f32; 3]);
+    if aniso > 0.0 {
+        let mut t = fcross(f3(m7), fsub(p, f3(m8)));
+        t = fsub(t, fmul(n, fdot(n, t)));
+        if fdot(t, t) < 1e-12 {
+            t = basis_t(n);
+        }
+        t = fnorm(t);
+        t = fadd(fmul(t, m7[3].cos()), fmul(fcross(n, t), m7[3].sin()));
+        tg = t;
+        bt = fcross(n, t);
+        let aspect = (1.0 - 0.9 * aniso).sqrt();
+        at = alpha * aspect;
+        ab_ = alpha / aspect;
+    }
     let mut d_light = [0.0f32; 3];
     let mut s_light = [0.0f32; 3];
+    let mut c_light = [0.0f32; 3];
     let lights = m[lb][0] as usize;
     for i in 0..lights {
         let row = m[lb + 7 + i * 2];
@@ -1505,27 +1617,41 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
         let n_h = fdot(n, h).max(0.0);
         let v_h = fdot(v, h).max(0.0);
         let fw = (1.0 - v_h).powi(5);
-        let f = fadd(f0, fmul(fsub([1.0; 3], f0), fw));
-        let spec = ggx(n_h, rough * rough) * smith(n_v, n_l, rough) / (4.0 * n_v * n_l).max(1e-4) * std::f32::consts::PI;
-        let kd = fsub([1.0; 3], f);
-        d_light = fadd(d_light, fmul3(fmul3(kd, diffuse), fmul(col, n_l * coat)));
-        s_light = fadd(s_light, fmul3(fmul(f, spec * n_l * coat), col));
+        let f = fresnel_f82(f0, f82, f90, v_h);
+        let d = if aniso > 0.0 { ggx_aniso(fdot(h, tg), fdot(h, bt), n_h, at, ab_) } else { ggx(n_h, alpha) };
+        let spec = d * smith(n_v, n_l, rough) / (4.0 * n_v * n_l).max(1e-4) * std::f32::consts::PI;
+        d_light = fadd(d_light, fmul3(diffuse, fmul(col, n_l * coat)));
+        s_light = fadd(s_light, fmul3(fmul(fmul3(f, comp), spec * n_l * coat), col));
+        if e_sheen > 0.0 {
+            s_light = fadd(s_light, fmul(fmul3(sheen, col), charlie(n_h, sheen_r * sheen_r) * neubelt(n_v, n_l) * n_l * std::f32::consts::PI * coat));
+        }
         if cc > 0.0 {
             let fc = 0.04 + 0.96 * fw;
             let sc = ggx(n_h, ccr * ccr) * smith(n_v, n_l, ccr) / (4.0 * n_v * n_l).max(1e-4) * std::f32::consts::PI;
-            s_light = fadd(s_light, fmul(col, sc * fc * cc * n_l));
+            c_light = fadd(c_light, fmul(col, sc * fc * cc * n_l));
         }
     }
     let nw = to_world(m, lb, n);
-    let r_view = fsub(fmul(n, 2.0 * fdot(n, v)), v);
+    let rn = if aniso > 0.0 {
+        let at_dir = fcross(bt, v);
+        fnorm(fmix(n, fcross(at_dir, bt), aniso))
+    } else {
+        n
+    };
+    let r_view = fsub(fmul(rn, 2.0 * fdot(rn, v)), v);
     let rw = to_world(m, lb, r_view);
     d_light = fadd(d_light, fmul(fmul3(diffuse, env(m, lb, nw, 1.0)), coat));
-    let ab = env_brdf(rough, n_v);
-    let spec_env = fmul3(env(m, lb, rw, rough), fadd(fmul(f0, ab[0]), [ab[1]; 3]));
+    let spec_env = fmul3(fmul3(env(m, lb, rw, rough), fadd(fmul(f0, ab[0]), fmul(f82, f90 * ab[1]))), comp);
     s_light = fadd(s_light, fmul(spec_env, coat));
-    if cc > 0.0 {
-        s_light = fadd(s_light, fmul(env(m, lb, rw, ccr), fc_v * cc));
+    if e_sheen > 0.0 {
+        s_light = fadd(s_light, fmul(fmul3(sheen, env(m, lb, nw, 1.0)), sheen_albedo(n_v, sheen_r) * coat));
     }
+    if cc > 0.0 {
+        let cr = fsub(fmul(n, 2.0 * fdot(n, v)), v);
+        c_light = fadd(c_light, fmul(env(m, lb, to_world(m, lb, cr), ccr), fc_v * cc));
+    }
+    d_light = fmul3(d_light, coat_tint);
+    s_light = fadd(fmul3(s_light, coat_tint), c_light);
     if trans > 0.0 && prim.paint[3] > 0.5 {
         // Refraction: what is behind, seen through the glass where the
         // bent ray leaves it, tinted by the colour.
@@ -1605,7 +1731,7 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
                 // Cards only stand where their picture is (alpha test).
                 // Later surfaces win ties: coplanar layers keep their order.
                 let tf = m[r + 2][3] as u32;
-                let material = prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * 4;
+                let material = prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * MAT_ROWS;
                 let stands = if tf & 1 != 0 {
                     card_sample(prim, m, groups, material, q)[3] >= CARD_STANDS
                 } else if tf & 2 != 0 {

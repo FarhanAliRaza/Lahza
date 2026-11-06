@@ -312,7 +312,7 @@ colour.
 Depth scales with `scale` (times `transform.scale_z`, default 1).
 
 Material: `preset` (`matte`, `plastic`, `glossy`, `coated`, `metal`,
-`chrome`, `glass`, `emissive`, `flat`, `shadow`) then any of `color`,
+`chrome`, `brushed`, `velvet`, `glass`, `emissive`, `flat`, `shadow`) then any of `color`,
 `metallic` (0..1), `roughness` (0 mirror … 1 diffuse), `clearcoat` (0..1),
 `clearcoat_roughness`, `emissive` (colour), `emissive_strength`, `opacity`,
 `transmission` (0..1, glass), `ior` (glass: 1 no bending, 1.45 default,
@@ -323,6 +323,25 @@ unlit, in `color`; quad diagonals and cap fills are skipped) and `fill`
 (wireframe face colour: hidden-line; without it the wires are see-through
 and show the back edges). Preset `wireframe` is 1.5 px light grey wires.
 Colours and numbers are animatable.
+
+The model follows Blender's Principled BSDF, so materials carry over:
+
+| field | meaning |
+|---|---|
+| `specular` | dielectric reflection, 0..1: 0.5 (default) reflects 4% head-on like most plastics and paints, 0 none at all |
+| `specular_tint` | colour: tints a dielectric's reflection and a metal's edges (Blender's F82 tint: gold turning paler, copper redder at grazing angles) |
+| `anisotropy` | 0..1 brushed or spun metal: the grain runs around the mesh's axis (y; z for rings and revolves about z), highlights and reflections stretch across it |
+| `anisotropy_rotation` | degrees the grain turns (90: along the axis) |
+| `sheen`, `sheen_color`, `sheen_roughness` | soft light at grazing angles (velvet, fabric, peach skin); default colour white, roughness 0.5 |
+| `clearcoat_color` | the coat's tint: what is under it is seen through this colour (candy paint) |
+| `dispersion` | glass: rainbow fringes as 1 / Abbe number (0.02 window glass, 0.05 flint, more for a stylised prism); path tracing only |
+
+Reflection keeps its energy at every roughness (rough metals stay bright,
+as with multiple scattering), and the diffuse under a lobe gets only the
+light that lobe leaves. Presets `brushed` (spun metal, anisotropy 0.8) and
+`velvet` (matte with full sheen) start from these. With the path tracer
+glass absorbs by depth: its `color` is what light keeps after `thickness`
+px inside, so thick parts are deeper; a `plane` of glass is a thin pane.
 
 ```json
 {"id": "cage", "kind": "mesh", "mesh": {"type": "torus", "radius": 200, "tube": 60},
