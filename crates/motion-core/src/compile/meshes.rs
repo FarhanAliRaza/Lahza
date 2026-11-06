@@ -121,6 +121,8 @@ pub struct LightState {
     pub shadow: bool,
     /// 0 sharp … 1 very soft.
     pub softness: f64,
+    /// Point lights: px where the light has faded out (0: no falloff).
+    pub range: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -469,6 +471,7 @@ impl Compiler<'_> {
                         intensity: self.prop(&l.intensity, id, &format!("lights.{i}.intensity"), start, None, pre_roll),
                         shadow: l.shadow.unwrap_or(Some(i) == key) && l.kind != LightKind::Ambient,
                         softness: self.prop(&l.softness, id, &format!("lights.{i}.softness"), start, None, pre_roll),
+                        range: l.range.as_ref().map(|r| self.prop(r, id, &format!("lights.{i}.range"), start, None, pre_roll)),
                     }
                 })
                 .collect()
@@ -494,6 +497,7 @@ fn default_rig() -> Vec<CLight> {
         intensity: Prop::constant(intensity),
         shadow,
         softness: Prop::constant(0.35),
+        range: None,
     };
     // The key casts shadows; the rim only outlines.
     vec![light([-0.55, -0.8, -0.7], 1.0, true), light([0.75, -0.35, 0.8], 0.7, false)]
@@ -507,6 +511,7 @@ pub(super) struct CLight {
     intensity: Prop<f64>,
     shadow: bool,
     softness: Prop<f64>,
+    range: Option<Prop<f64>>,
 }
 
 pub(super) struct CLighting {
@@ -528,7 +533,14 @@ impl CLighting {
                 let c = clamp_color(l.color.at(tc));
                 let v = l.vector.at(tc).0;
                 let vector = if l.kind == LightKind::Point { v } else { unit(v) };
-                LightState { kind: l.kind, vector, color: linear(c, l.intensity.at(tc).max(0.0) * c.0[3]), shadow: l.shadow, softness: l.softness.at(tc).clamp(0.0, 1.0) }
+                LightState {
+                    kind: l.kind,
+                    vector,
+                    color: linear(c, l.intensity.at(tc).max(0.0) * c.0[3]),
+                    shadow: l.shadow,
+                    softness: l.softness.at(tc).clamp(0.0, 1.0),
+                    range: l.range.as_ref().map(|r| r.at(tc).max(1.0)).unwrap_or(0.0),
+                }
             })
             .collect();
         let k = self.intensity.at(tc).max(0.0);

@@ -720,7 +720,7 @@ fn env_light(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
     }
     let lights = u32(b_mesh[lb].x);
     let lobes = u32(b_mesh[lb].y);
-    let first = lb + 7u + lights * 2u;
+    let first = lb + 7u + lights * LROWS;
     for (var i = 0u; i < lobes; i++) {
         let l = b_mesh[first + i * 2u];
         let s2 = l.w * l.w;
@@ -810,7 +810,7 @@ fn shadow(base: u32, p: vec3<f32>, n_in: vec3<f32>) -> f32 {
 
 // The shadow map linked from light i's colour row (0: none).
 fn shadow_of(lb: u32, i: u32) -> i32 {
-    return bitcast<i32>(b_mesh[lb + 7u + i * 2u + 1u].w);
+    return bitcast<i32>(b_mesh[lb + 7u + i * LROWS + 1u].w);
 }
 
 fn to_world(lb: u32, v: vec3<f32>) -> vec3<f32> {
@@ -832,6 +832,14 @@ fn env_brdf(r: f32, n_v: f32) -> vec2<f32> {
     let rr = r * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
     let a004 = min(rr.x * rr.x, exp2(-9.28 * n_v)) * rr.x + rr.y;
     return vec2<f32>(-1.04 * a004 + rr.z, 1.04 * a004 + rr.w);
+}
+
+// A point light's fade to its range (0: none): smooth, reaching zero there.
+fn range_window(dist: f32, range: f32) -> f32 {
+    if range <= 0.0 { return 1.0; }
+    let x = dist / range;
+    let w = clamp(1.0 - x * x * x * x, 0.0, 1.0);
+    return w * w;
 }
 
 // A tangent perpendicular to n (any).
@@ -1005,6 +1013,8 @@ fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
 
 // Rows per mesh material (mesh3d::MAT_ROWS).
 const MAT_ROWS: u32 = 9u;
+// Rows per light (mesh3d::LROWS).
+const LROWS: u32 = 5u;
 
 // Mirrors `card_sample` in mesh3d.rs: a card's picture at target point q.
 fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
@@ -1094,7 +1104,7 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
         for (var i = 0u; i < u32(b_mesh[lb].x); i++) {
             let off = shadow_of(lb, i);
             if off != 0 {
-                let w = dot(b_mesh[lb + 7u + i * 2u + 1u].xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
+                let w = dot(b_mesh[lb + 7u + i * LROWS + 1u].xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
                 blocked += w * (1.0 - shadow(u32(i32(lb) + off), p, n));
                 total += w;
             }
@@ -1160,8 +1170,9 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     var c_light = vec3<f32>(0.0);
     let lights = u32(b_mesh[lb].x);
     for (var i = 0u; i < lights; i++) {
-        let row = b_mesh[lb + 7u + i * 2u];
-        var col = b_mesh[lb + 7u + i * 2u + 1u].xyz;
+        let row = b_mesh[lb + 7u + i * LROWS];
+        var col = b_mesh[lb + 7u + i * LROWS + 1u].xyz;
+        let extra = b_mesh[lb + 7u + i * LROWS + 2u];
         let kind = u32(row.w);
         if kind == 2u {
             d_light = d_light + diffuse * col;
@@ -1170,7 +1181,9 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
         var l = row.xyz;
         if kind == 1u {
             let dl = row.xyz - p;
-            l = dl / max(sqrt(dot(dl, dl)), 1e-20);
+            let dist = sqrt(dot(dl, dl));
+            l = dl / max(dist, 1e-20);
+            col = col * range_window(dist, extra.x);
         }
         let n_l = dot(n, l);
         if n_l <= 0.0 { continue; }

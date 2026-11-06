@@ -2377,6 +2377,10 @@ pub struct Light {
     /// Shadow edge: 0 sharp … 1 very soft (default 0.35).
     #[serde(default = "shadow_softness", skip_serializing_if = "is_shadow_softness")]
     pub softness: Property<f64>,
+    /// Point lights: px at which the light has faded to nothing (smoothly;
+    /// default none: it lights everything evenly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<Property<f64>>,
 }
 
 fn shadow_softness() -> Property<f64> {

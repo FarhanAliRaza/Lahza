@@ -415,7 +415,10 @@ from the upper left front and a rim from behind on the right. Lights cast
 soft shadows from every mesh onto every other mesh of the layer list:
 `shadow` (bool; default true for the first directional or point light,
 false for the rest) and `softness` (0 sharp … 1 very soft, default 0.35;
-animatable). The
+animatable; the path tracer makes it the light's size: a sun up to 0.1 rad
+across, a ball up to 40 px in radius). A point light's `range` (px,
+animatable) fades it smoothly to nothing at that distance; without one it
+lights near and far alike. The
 environment (`studio` default, `soft`, `sunset`, `night`, `none`; `sky`,
 `horizon`, `ground` override its colours; all three are animatable) is
 what glossy surfaces reflect and gives soft ambient light. A scene's

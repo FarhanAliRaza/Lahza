@@ -818,6 +818,46 @@ mod physics_tests {
         assert!(split > plain + 150, "colour fringes: {split} with dispersion, {plain} without");
     }
 
+    /// A light's `softness` sizes it: the shadow of a box on a floor keeps
+    /// a sharp edge from a sharp light and a wide one from a soft light;
+    /// and a point light's `range` fades it as the raster does.
+    #[test]
+    fn soft_lights_soften_shadows_and_range_fades() {
+        let Some(mut r) = tracer(64) else { return };
+        let shot = |softness: f64, r: &mut crate::Renderer| {
+            let mut p = project(json!([
+                {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#ffffff"}, "transform": {"position": [160, 120]}},
+                {"id": "block", "kind": "mesh", "mesh": {"type": "box", "size": [60, 2000], "depth": 20}, "material": {"preset": "matte", "color": "#000000", "specular": 0}, "transform": {"position": [80, 120], "z": -150}}
+            ]));
+            p.settings.width = 320;
+            p.settings.height = 240;
+            p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [-1, 0, -1], "softness": softness, "shadow": true}])).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none"})).unwrap());
+            r.render(&Compiled::new(&p), 0.0)
+        };
+        // Penumbra: columns along the middle row between 10% and 90% lit.
+        let width = |img: &image::RgbaImage| {
+            let row: Vec<f64> = (115..320u32).map(|x| img.get_pixel(x, 120).0[1] as f64).collect();
+            let lit = row.iter().cloned().fold(0.0, f64::max);
+            row.iter().filter(|v| **v > 0.1 * lit && **v < 0.9 * lit).count()
+        };
+        let (sharp, soft) = (width(&shot(0.0, &mut r)), width(&shot(1.0, &mut r)));
+        assert!(sharp <= 3, "a sharp light's shadow edge: {sharp} px");
+        assert!(soft >= sharp + 8, "a soft light's: {soft} px (sharp {sharp})");
+        // Range: traced as the raster fades it.
+        let mut p = project(json!([{"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [2000, 2000]}, "material": {"preset": "matte", "color": "#ffffff"}, "transform": {"position": [160, 120]}}]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.scenes[0].lights = serde_json::from_value(json!([{"type": "point", "position": [40, 120, -60], "range": 220, "softness": 0, "shadow": false}])).unwrap();
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+        let c = Compiled::new(&p);
+        let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+        for x in [60u32, 150, 230, 300] {
+            let (ta, tb) = (a.get_pixel(x, 120).0[1] as i32, b.get_pixel(x, 120).0[1] as i32);
+            assert!((ta - tb).abs() <= 8, "x {x}: traced {ta}, raster {tb}");
+        }
+    }
+
     /// Lists with what the tracer can't draw yet (wires, effects such as
     /// depth of field, mattes, blend modes) keep the raster's picture.
     #[test]

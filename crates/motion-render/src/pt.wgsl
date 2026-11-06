@@ -37,6 +37,8 @@ var<storage, read_write> b_guides: array<vec4<f32>>;
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
 const MAT_ROWS: u32 = 9u;
+// Rows per light (mesh3d::LROWS).
+const LROWS: u32 = 5u;
 const FLAG_UNLIT: u32 = 1u;
 const FLAG_FACETED: u32 = 2u;
 const FLAG_SHADOW_CATCHER: u32 = 8u;
@@ -115,14 +117,14 @@ fn env(d: vec3<f32>) -> vec3<f32> {
     if up >= 0.0 { c = mix(horizon, sky, smoothstep(0.0, 0.6, up)); } else { c = mix(horizon, ground, smoothstep(0.0, 0.2, -up)); }
     let lights = u32(b_light[0].x);
     let lobes = u32(b_light[0].y);
-    let first = 7u + lights * 2u;
+    let first = 7u + lights * LROWS;
     for (var i = 0u; i < lobes; i++) {
         let l = b_light[first + i * 2u];
         let s2 = max(l.w * l.w, 1e-6);
         c += b_light[first + i * 2u + 1u].xyz * exp((dot(w, l.xyz) - 1.0) / s2);
     }
     for (var i = 0u; i < lights; i++) {
-        if u32(b_light[7u + i * 2u].w) == 2u { c += b_light[7u + i * 2u + 1u].xyz; }
+        if u32(b_light[7u + i * LROWS].w) == 2u { c += b_light[7u + i * LROWS + 1u].xyz; }
     }
     return c;
 }
@@ -587,28 +589,68 @@ fn sample_bsdf(s: Surface, v: vec3<f32>, rng: ptr<function, Rng>) -> vec4<f32> {
     return vec4<f32>(l, bsdf_pdf(s, v, l));
 }
 
-// Light arriving at `h` from the delta lights (directional and point),
-// with shadow rays where the light casts shadows.
+// A point light's fade to its range (0: none), as the raster.
+fn range_window(dist: f32, range: f32) -> f32 {
+    if range <= 0.0 { return 1.0; }
+    let x = dist / range;
+    let w = clamp(1.0 - x * x * x * x, 0.0, 1.0);
+    return w * w;
+}
+
+struct LightSample {
+    l: vec3<f32>,      // toward the light
+    dist: f32,         // to it (1e30: directional)
+    col: vec3<f32>,    // irradiance it gives facing it
+    shadow: bool,      // casts shadows
+}
+
+// One light (directional or point) seen from `p`: its `softness` sizes
+// it, so shadows soften as the raster's do (directional: a disc of sky up
+// to 0.1 rad across; point: a ball up to 40 px in radius).
+fn sample_light(i: u32, p: vec3<f32>, rng: ptr<function, Rng>) -> LightSample {
+    let row = b_light[7u + i * LROWS];
+    let col = b_light[7u + i * LROWS + 1u];
+    let extra = b_light[7u + i * LROWS + 2u];
+    var ls: LightSample;
+    ls.shadow = col.w > 0.5;
+    ls.col = col.xyz;
+    let soft = extra.y;
+    let u1 = rnd(rng);
+    let u2 = rnd(rng);
+    let r = sqrt(u1);
+    let phi = 2.0 * PI * u2;
+    let disc = vec2<f32>(r * cos(phi), r * sin(phi));
+    if u32(row.w) == 1u {
+        let to = row.xyz - p;
+        let d = length(to);
+        let c = to / max(d, 1e-6);
+        let f = basis(c);
+        let aim = row.xyz + (f[0] * disc.x + f[1] * disc.y) * (soft * 40.0);
+        let tt = aim - p;
+        ls.dist = length(tt);
+        ls.l = tt / max(ls.dist, 1e-6);
+        ls.col *= range_window(d, extra.x);
+    } else {
+        let c = normalize(row.xyz);
+        let f = basis(c);
+        ls.l = normalize(c + (f[0] * disc.x + f[1] * disc.y) * (soft * 0.1));
+        ls.dist = 1e30;
+    }
+    return ls;
+}
+
+// Light arriving at `h` from the lights (directional and point), with
+// shadow rays where the light casts shadows.
 fn direct(s: Surface, h: Hit, v: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32> {
     var out = vec3<f32>(0.0);
     let lights = u32(b_light[0].x);
     for (var i = 0u; i < lights; i++) {
-        let row = b_light[7u + i * 2u];
-        let col = b_light[7u + i * 2u + 1u];
-        let kind = u32(row.w);
+        let kind = u32(b_light[7u + i * LROWS].w);
         if kind == 2u { continue; }
-        var l: vec3<f32>;
-        var dist = 1e30;
-        if kind == 1u {
-            let to = row.xyz - h.p;
-            dist = length(to);
-            l = to / max(dist, 1e-6);
-        } else {
-            l = normalize(row.xyz);
-        }
-        if dot(h.n, l) <= 0.0 { continue; }
-        if col.w > 0.5 && occluded(offset(h, l), l, dist * 0.999, rng) { continue; }
-        out += bsdf_cos(s, v, l) * PI * col.xyz;
+        let ls = sample_light(i, h.p, rng);
+        if dot(h.n, ls.l) <= 0.0 || dot(ls.col, ls.col) <= 0.0 { continue; }
+        if ls.shadow && occluded(offset(h, ls.l), ls.l, ls.dist * 0.999, rng) { continue; }
+        out += bsdf_cos(s, v, ls.l) * PI * ls.col;
     }
     return out;
 }
@@ -630,19 +672,13 @@ fn catcher_shadow(h: Hit, rng: ptr<function, Rng>) -> f32 {
     var total = 0.0;
     let lights = u32(b_light[0].x);
     for (var i = 0u; i < lights; i++) {
-        let row = b_light[7u + i * 2u];
-        let col = b_light[7u + i * 2u + 1u];
-        if u32(row.w) == 2u || col.w < 0.5 { continue; }
-        var l = normalize(row.xyz);
-        var dist = 1e30;
-        if u32(row.w) == 1u {
-            let to = row.xyz - h.p;
-            dist = length(to);
-            l = to / max(dist, 1e-6);
-        }
-        let w = luminance(col.xyz);
+        let kind = u32(b_light[7u + i * LROWS].w);
+        if kind == 2u { continue; }
+        let ls = sample_light(i, h.p, rng);
+        if !ls.shadow { continue; }
+        let w = luminance(ls.col);
         total += w;
-        if occluded(offset(h, l), l, dist * 0.999, rng) { blocked += w; }
+        if occluded(offset(h, ls.l), ls.l, ls.dist * 0.999, rng) { blocked += w; }
     }
     if total <= 0.0 { return 0.0; }
     return blocked / total;

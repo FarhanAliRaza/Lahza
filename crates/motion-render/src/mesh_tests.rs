@@ -715,3 +715,22 @@ fn background_and_environment_colours_animate() {
     let (ca, cb) = (px(&a, 160, 120), px(&b, 160, 120));
     assert!(ca[0] > 150 && ca[2] < 40 && cb[2] > 150 && cb[0] < 40, "the chrome reflects red, then blue: {ca:?} → {cb:?}");
 }
+
+/// A point light's `range`: it fades smoothly to nothing there; without
+/// one it lights near and far alike (today's look).
+#[test]
+fn point_lights_fade_out_at_their_range() {
+    let floor = |range: Option<f64>| {
+        let mut light = json!({"type": "point", "position": [40, 120, -60], "intensity": 1.0, "shadow": false});
+        if let Some(r) = range {
+            light["range"] = json!(r);
+        }
+        scene(320, 240, json!({"layers": [{"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [2000, 2000]}, "material": {"preset": "matte", "color": "#ffffff"},
+            "transform": {"position": [160, 120]}}], "lights": [light], "environment": {"preset": "none"}}))
+    };
+    let (open, ranged) = (render(&floor(None), 0.0), render(&floor(Some(220.0)), 0.0));
+    let (near, far) = ((60, 120), (300, 120));
+    assert!(luma(px(&open, far.0, far.1)) > 0.5 * luma(px(&open, near.0, near.1)), "no range: far still lit");
+    assert!(luma(px(&ranged, near.0, near.1)) > 0.8 * luma(px(&open, near.0, near.1)), "in range: as before");
+    assert!(luma(px(&ranged, far.0, far.1)) < 3.0, "beyond range: dark ({:?})", px(&ranged, far.0, far.1));
+}

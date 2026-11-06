@@ -533,7 +533,7 @@ impl Builder<'_> {
         if let Some(l) = &m.lighting {
             // Which lights cast shadows (the raster links its maps here).
             for (i, light) in l.lights.iter().enumerate() {
-                lights[7 + i * 2 + 1][3] = if light.shadow { 1.0 } else { 0.0 };
+                lights[7 + i * crate::mesh3d::LROWS + 1][3] = if light.shadow { 1.0 } else { 0.0 };
             }
         }
         let inv = root.inverse().unwrap_or(root);

@@ -650,10 +650,14 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
     rows
 }
 
+/// Rows per light in the light block.
+pub(crate) const LROWS: usize = 5;
+
 /// The light block: [lights, lobes, 0, 0], camera→world rotation (3
-/// rows), sky, horizon, ground, then per light [vector, kind] [colour]
-/// and per lobe [direction, size] [colour]. Light vectors are in camera
-/// space; lobes in world space.
+/// rows), sky, horizon, ground, then per light (LROWS) [vector, kind]
+/// [colour, shadow] [range (0: none), softness, 0, 0] and two rows for
+/// area lights, and per lobe [direction, size] [colour]. Light vectors are
+/// in camera space; lobes in world space.
 pub(crate) fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
     let v = m.camera.view.0;
     // World → camera rotation R (rows of the view matrix); camera → world is Rᵀ.
@@ -678,6 +682,9 @@ pub(crate) fn light_rows(l: &Lighting, m: &MeshState) -> Vec<[f32; 4]> {
         };
         rows.push(f(vector, kind));
         rows.push(f(light.color, 0.0));
+        rows.push([light.range as f32, light.softness as f32, 0.0, 0.0]);
+        rows.push([0.0; 4]);
+        rows.push([0.0; 4]);
     }
     for lobe in &l.env.lobes {
         rows.push(f(lobe.dir, lobe.size));
@@ -1075,7 +1082,7 @@ impl Batch {
                 mesh_rows.extend_from_slice(&map.rows);
                 at
             });
-            let row = light_base as usize + 7 + i * 2 + 1;
+            let row = light_base as usize + 7 + i * LROWS + 1;
             mesh_rows[row][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
         }
         let b = |v: u32| f32::from_bits(v);
@@ -1230,7 +1237,7 @@ fn env(m: &[[f32; 4]], lb: usize, d: F3, r: f32) -> F3 {
     let mut c = if up >= 0.0 { fmix(horizon, sky, smoothstep(0.0, 0.6 + r, up)) } else { fmix(horizon, ground, smoothstep(0.0, 0.2 + r, -up)) };
     let lights = m[lb][0] as usize;
     let lobes = m[lb][1] as usize;
-    let first = lb + 7 + lights * 2;
+    let first = lb + 7 + lights * LROWS;
     for i in 0..lobes {
         let l = m[first + i * 2];
         let s2 = l[3] * l[3];
@@ -1309,7 +1316,7 @@ fn shadow(m: &[[f32; 4]], base: usize, p: F3, n: F3) -> f32 {
 
 /// The shadow map linked from light `i`'s colour row, if any.
 fn shadow_of(m: &[[f32; 4]], lb: usize, i: usize) -> Option<usize> {
-    let off = m[lb + 7 + i * 2 + 1][3].to_bits() as i32;
+    let off = m[lb + 7 + i * LROWS + 1][3].to_bits() as i32;
     (off != 0).then(|| (lb as i64 + off as i64) as usize)
 }
 
@@ -1335,6 +1342,16 @@ fn env_brdf(r: f32, n_v: f32) -> [f32; 2] {
     let rr: [f32; 4] = std::array::from_fn(|i| r * c0[i] + c1[i]);
     let a004 = (rr[0] * rr[0]).min((-9.28 * n_v).exp2()) * rr[0] + rr[1];
     [-1.04 * a004 + rr[2], 1.04 * a004 + rr[3]]
+}
+
+/// A point light's fade to its range (0: none). Mirrors motion.wgsl.
+pub(crate) fn range_window(dist: f32, range: f32) -> f32 {
+    if range <= 0.0 {
+        return 1.0;
+    }
+    let x = dist / range;
+    let w = (1.0 - x * x * x * x).clamp(0.0, 1.0);
+    w * w
 }
 
 /// A tangent perpendicular to n (any). Mirrors motion.wgsl.
@@ -1542,7 +1559,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
         let (mut blocked, mut total) = (0.0f32, 0.0f32);
         for i in 0..m[lb][0] as usize {
             if let Some(sm) = shadow_of(m, lb, i) {
-                let w = fdot(f3(m[lb + 7 + i * 2 + 1]), [0.2126, 0.7152, 0.0722]);
+                let w = fdot(f3(m[lb + 7 + i * LROWS + 1]), [0.2126, 0.7152, 0.0722]);
                 blocked += w * (1.0 - shadow(m, sm, p, n));
                 total += w;
             }
@@ -1597,14 +1614,21 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], tri: u32, q: [f32
     let mut c_light = [0.0f32; 3];
     let lights = m[lb][0] as usize;
     for i in 0..lights {
-        let row = m[lb + 7 + i * 2];
-        let col = f3(m[lb + 7 + i * 2 + 1]);
+        let row = m[lb + 7 + i * LROWS];
+        let col = f3(m[lb + 7 + i * LROWS + 1]);
+        let extra = m[lb + 7 + i * LROWS + 2];
         let kind = row[3] as u32;
         if kind == 2 {
             d_light = fadd(d_light, fmul3(diffuse, col));
             continue;
         }
-        let l = if kind == 1 { fnorm(fsub(f3(row), p)) } else { f3(row) };
+        let (l, col) = if kind == 1 {
+            let dl = fsub(f3(row), p);
+            let dist = fdot(dl, dl).sqrt();
+            (fmul(dl, 1.0 / dist.max(1e-20)), fmul(col, range_window(dist, extra[0])))
+        } else {
+            (f3(row), col)
+        };
         let n_l = fdot(n, l);
         if n_l <= 0.0 {
             continue;
