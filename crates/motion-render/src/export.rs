@@ -34,6 +34,8 @@ pub struct ExportOptions {
     pub renderer: Option<RendererKind>,
     /// Overrides the project's `samples` (paths per pixel).
     pub samples: Option<u32>,
+    /// Path tracing: filter the noise (default true).
+    pub denoise: bool,
 }
 
 /// The path tracer's options for an export, or None to rasterise: the
@@ -274,6 +276,8 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
     }
     let mut render = options.render;
     render.path = render.path.filter(|_| options.renderer != Some(RendererKind::Raster)).or_else(|| trace_options(&compiled.settings, options.quality, options.renderer, options.samples));
+    // Frames go out in order: each builds on the last one's samples.
+    render.path = render.path.map(|o| TraceOptions { temporal: true, denoise: o.denoise && options.denoise, ..o });
     if options.quality == Quality::Draft {
         render.scale *= 0.5;
         render.motion_blur = false;

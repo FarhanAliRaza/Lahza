@@ -18,14 +18,14 @@ Usage:
   lahza motion apply <project> <ops.json>
   lahza motion check <project> [--json]
   lahza motion sync-check <project> [--frames N] [--tracks a,b] [--all] [--json]
-  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N]] [-o out.png]
+  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N] [--no-denoise]] [-o out.png]
   lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [-o compare.png]
                                           (no --at: every frame, first to last, plus a side-by-side video)
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
   lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
-                    [--pt|--raster] [--spp N]   path-trace meshes (default: the project's settings.renderer)
+                    [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
 
 Times and references: 2.5, \"48f\", beat:17, bar:5, word:canal, hit:2, \"#title.end + 0.25\".";
 
@@ -76,6 +76,9 @@ fn renderer_flags(args: &[String], a: &mut Value) -> Result<(), String> {
     }
     if let Some(n) = flag(args, "--spp") {
         a["samples"] = json!(n.parse::<u32>().map_err(|e| format!("--spp: {e}"))?);
+    }
+    if has(args, "--no-denoise") {
+        a["denoise"] = json!(false);
     }
     Ok(())
 }

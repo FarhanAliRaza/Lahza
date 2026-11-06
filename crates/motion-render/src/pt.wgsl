@@ -21,6 +21,12 @@ struct Uniforms {
     inv1: vec4<f32>,
     inv2: vec4<f32>,
     lens: vec4<f32>,      // aperture radius, focus depth (camera px)
+    denoise: vec4<u32>,   // denoiser: step (px), temporal (1), 0, 0
+    prev_cam: vec4<f32>,  // previous frame: focal, centre x, y, valid
+    prev_place: vec4<f32>,
+    prev_root0: vec4<f32>,
+    prev_root1: vec4<f32>,
+    prev_root2: vec4<f32>,
 }
 
 var<uniform> u: Uniforms;
@@ -37,10 +43,20 @@ var<storage, read_write> b_guides: array<vec4<f32>>;
 // The environment image (envmap.rs): [w, h, sampling w, sampling h], the
 // map, the marginal CDF, then per sampling texel [row CDF, probability].
 var<storage, read> b_env: array<vec4<f32>>;
+// Denoising (per texel two rows: [lighting / albedo (straight), coverage],
+// [variance of its luminance, 0, 0, 0]); passes read b_hdr, write b_tmp.
+var<storage, read_write> b_hdr: array<vec4<f32>>;
+var<storage, read_write> b_tmp: array<vec4<f32>>;
+// Temporal history (three rows per texel: [lighting, coverage], [frames,
+// camera z, 0, 0], [normal, 0]): last frame's, and this frame's.
+var<storage, read_write> b_hist: array<vec4<f32>>;
+var<storage, read_write> b_next: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
 const MAT_ROWS: u32 = 9u;
+// Rows per instance (pt.rs INST_ROWS).
+const INST_ROWS: u32 = 7u;
 // Rows per light (mesh3d::LROWS).
 const LROWS: u32 = 5u;
 const FLAG_UNLIT: u32 = 1u;
@@ -300,6 +316,7 @@ struct Hit {
     mat: u32,          // material row index (x4) or card index
     two_sided: bool,
     card_color: vec4<f32>,
+    prev: vec3<f32>,   // where this point was on the previous frame (camera space)
 }
 
 fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
@@ -391,6 +408,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
         hit.card = true;
         hit.mat = prim / 2u;
         hit.card_color = card_picture(hit.mat, hit.p);
+        hit.prev = hit.p;
         hit.n = -d;
         hit.g = -d;
         hit.front = true;
@@ -398,8 +416,8 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     }
     // Every index is checked: a driver reporting a wrong instance or
     // primitive must not read past the buffers (that is a crash).
-    let inst = custom * 4u;
-    if inst + 3u >= arrayLength(&b_inst) { hit.found = false; return hit; }
+    let inst = custom * INST_ROWS;
+    if inst + INST_ROWS - 1u >= arrayLength(&b_inst) { hit.found = false; return hit; }
     let r0 = b_inst[inst];
     let attr = bitcast<u32>(r0.x);
     let ib = bitcast<u32>(r0.y) + prim * 3u;
@@ -415,6 +433,9 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     let p0 = b_attr[(attr + i0) * 2u].xyz;
     let p1 = b_attr[(attr + i1) * 2u].xyz;
     let p2 = b_attr[(attr + i2) * 2u].xyz;
+    // The same point of the object on the previous frame.
+    let obj = vec4<f32>(p0 * bw.x + p1 * bw.y + p2 * bw.z, 1.0);
+    hit.prev = vec3<f32>(dot(b_inst[inst + 4u], obj), dot(b_inst[inst + 5u], obj), dot(b_inst[inst + 6u], obj));
     let n_obj = b_attr[(attr + i0) * 2u + 1u].xyz * bw.x + b_attr[(attr + i1) * 2u + 1u].xyz * bw.y + b_attr[(attr + i2) * 2u + 1u].xyz * bw.z;
     // Normals go through the inverse transpose: n · world_to_object.
     let m3 = mat3x3<f32>(w2o[0], w2o[1], w2o[2]);
@@ -959,6 +980,7 @@ struct Sample {
     albedo: vec3<f32>,
     normal: vec3<f32>,
     depth: f32,
+    prev: vec3<f32>,
 }
 
 fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
@@ -1006,7 +1028,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             return out;
         }
         if inside { throughput *= exp(-sigma * h.t); }
-        if step == 0u { out.depth = h.t; out.normal = h.n; }
+        if step == 0u { out.depth = h.t; out.normal = h.n; out.prev = h.prev; }
         if h.card {
             let c = h.card_color;
             let straight = vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
@@ -1140,7 +1162,14 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     rng.s = pcg(id.x + pcg(id.y + pcg(u.opts.y)));
     var color = vec3<f32>(0.0);
     var alpha = 0.0;
-    var first: Sample;
+    var albedo = vec3<f32>(0.0);
+    var normal = vec3<f32>(0.0);
+    var depth = 0.0;
+    var hits = 0.0;
+    var m1 = 0.0;
+    var m2 = 0.0;
+    var camz = 0.0;
+    var prev = vec4<f32>(0.0);
     for (var s = 0u; s < spp; s++) {
         // A point in the texel (stratified jitter), target → canvas → ray.
         let jx = (f32(s % 4u) + rnd(&rng)) / 4.0;
@@ -1162,10 +1191,172 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let smp = path(origin, dir, &rng);
         color += smp.color;
         alpha += smp.alpha;
-        if s == 0u { first = smp; }
+        let l = luminance(smp.color);
+        m1 += l;
+        m2 += l * l;
+        if s == 0u && smp.depth > 0.0 {
+            // Motion: where the first surface was last frame, in this
+            // group's texels.
+            camz = (origin + dir * smp.depth).z;
+            if u.prev_cam.w > 0.5 && smp.prev.z > 1.0 {
+                let sp = vec3<f32>(u.prev_cam.x * smp.prev.x / smp.prev.z + u.prev_cam.y, u.prev_cam.x * smp.prev.y / smp.prev.z + u.prev_cam.z, 1.0);
+                let tq = vec3<f32>(dot(u.prev_root0.xyz, sp), dot(u.prev_root1.xyz, sp), dot(u.prev_root2.xyz, sp));
+                let tp = tq.xy / tq.z;
+                prev = vec4<f32>((tp.x - u.prev_place.x) / u.prev_place.z - 0.5, (tp.y - u.prev_place.y) / u.prev_place.w - 0.5, smp.prev.z, 1.0);
+            }
+        }
+        if smp.depth > 0.0 {
+            albedo += smp.albedo;
+            normal += smp.normal;
+            depth += smp.depth;
+            hits += 1.0;
+        }
     }
-    color /= f32(spp);
-    alpha /= f32(spp);
+    let n = f32(spp);
+    color /= n;
+    alpha /= n;
+    let i = id.y * w + id.x;
+    // Guides: what the samples hit, on average.
+    var a = vec3<f32>(1.0);
+    if hits > 0.0 {
+        a = max(albedo / hits, vec3<f32>(0.02));
+        normal = normalize(normal + vec3<f32>(0.0, 0.0, -1e-6));
+        depth /= hits;
+    }
+    b_guides[i * 4u] = vec4<f32>(a, alpha);
+    b_guides[i * 4u + 1u] = vec4<f32>(normal, camz);
+    b_guides[i * 4u + 2u] = vec4<f32>(depth, 0.0, 0.0, 0.0);
+    b_guides[i * 4u + 3u] = prev;
+    // The lighting, straight (not times coverage) and with the surface's
+    // colour divided out, so the filter smooths light, not texture.
+    var straight = vec3<f32>(0.0);
+    if alpha > 0.0 { straight = color / alpha; }
+    let var_l = max(m2 / n - (m1 / n) * (m1 / n), 0.0) / n;
+    let al = max(luminance(a), 0.02);
+    b_hdr[i * 2u] = vec4<f32>(straight / a, alpha);
+    b_hdr[i * 2u + 1u] = vec4<f32>(var_l / (al * al) / max(alpha * alpha, 1e-4), 0.0, 0.0, 0.0);
+}
+
+// Temporal accumulation: last frame's lighting at where this surface was
+// (its motion, camera and object), if it was the same surface there (camera
+// depth and normal agree), clamped to what this frame's neighbourhood
+// allows (no ghosts when light changes), blended in by how long it has
+// been seen. Keeps animation from boiling.
+@compute @workgroup_size(8, 8, 1)
+fn temporal(@builtin(global_invocation_id) id: vec3<u32>) {
+    let w = u.size.x;
+    let h = u.size.y;
+    if id.x >= w || id.y >= h { return; }
+    let i = id.y * w + id.x;
+    let c = b_hdr[i * 2u];
+    let var_c = b_hdr[i * 2u + 1u].x;
+    let g1 = b_guides[i * 4u + 1u];
+    let mv = b_guides[i * 4u + 3u];
+    var out = c.xyz;
+    var var_o = var_c;
+    var frames = 1.0;
+    if c.w > 0.0 && mv.w > 0.5 && u.denoise.y == 1u {
+        // This frame's neighbourhood: mean and spread of the lighting.
+        var m1 = vec3<f32>(0.0);
+        var m2 = vec3<f32>(0.0);
+        var k = 0.0;
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let x = i32(id.x) + dx;
+                let y = i32(id.y) + dy;
+                if x < 0 || y < 0 || x >= i32(w) || y >= i32(h) { continue; }
+                let q = b_hdr[(u32(y) * w + u32(x)) * 2u];
+                if q.w <= 0.0 { continue; }
+                m1 += q.xyz;
+                m2 += q.xyz * q.xyz;
+                k += 1.0;
+            }
+        }
+        m1 /= k;
+        let sd = sqrt(max(m2 / k - m1 * m1, vec3<f32>(0.0)));
+        let px = i32(round(mv.x));
+        let py = i32(round(mv.y));
+        if px >= 0 && py >= 0 && px < i32(w) && py < i32(h) {
+            let j = u32(py) * w + u32(px);
+            let hz = b_hist[j * 3u + 1u];
+            let same = hz.x > 0.0 && abs(hz.y - mv.z) < 0.03 * max(mv.z, 1.0) && dot(b_hist[j * 3u + 2u].xyz, g1.xyz) > 0.8;
+            if same {
+                let hist = clamp(b_hist[j * 3u].xyz, m1 - 1.5 * sd, m1 + 1.5 * sd);
+                frames = min(hz.x + 1.0, 32.0);
+                let a = max(1.0 / frames, 0.15);
+                out = mix(hist, c.xyz, a);
+                var_o = var_c * a;
+            }
+        }
+    }
+    b_tmp[i * 2u] = vec4<f32>(out, c.w);
+    b_tmp[i * 2u + 1u] = vec4<f32>(var_o, 0.0, 0.0, 0.0);
+    var seen = frames;
+    if c.w <= 0.0 { seen = 0.0; }
+    b_next[i * 3u] = vec4<f32>(out, c.w);
+    b_next[i * 3u + 1u] = vec4<f32>(seen, g1.w, 0.0, 0.0);
+    b_next[i * 3u + 2u] = vec4<f32>(g1.xyz, 0.0);
+}
+
+// One à-trous pass (SVGF): a 5 × 5 B-spline kernel `step` px apart, each
+// tap weighed by how alike its surface is (depth, normal, coverage) and
+// its lighting (against the noise expected there).
+@compute @workgroup_size(8, 8, 1)
+fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
+    let w = u.size.x;
+    let h = u.size.y;
+    if id.x >= w || id.y >= h { return; }
+    let i = id.y * w + id.x;
+    let c = b_hdr[i * 2u];
+    let cv = b_hdr[i * 2u + 1u].x;
+    if c.w <= 0.0 {
+        b_tmp[i * 2u] = c;
+        b_tmp[i * 2u + 1u] = b_hdr[i * 2u + 1u];
+        return;
+    }
+    let n0 = b_guides[i * 4u + 1u].xyz;
+    let z0 = b_guides[i * 4u + 2u].x;
+    let l0 = luminance(c.xyz);
+    let step = i32(u.denoise.x);
+    let sigma_l = 4.0 * sqrt(max(cv, 0.0)) + 1e-4;
+    var kern = array<f32, 3>(0.375, 0.25, 0.0625);
+    var sum = vec3<f32>(0.0);
+    var wsum = 0.0;
+    var vsum = 0.0;
+    for (var dy = -2; dy <= 2; dy++) {
+        for (var dx = -2; dx <= 2; dx++) {
+            let x = i32(id.x) + dx * step;
+            let y = i32(id.y) + dy * step;
+            if x < 0 || y < 0 || x >= i32(w) || y >= i32(h) { continue; }
+            let j = u32(y) * w + u32(x);
+            let q = b_hdr[j * 2u];
+            if q.w <= 0.0 { continue; }
+            let k = kern[abs(dx)] * kern[abs(dy)];
+            let wz = exp(-abs(z0 - b_guides[j * 4u + 2u].x) / (0.01 * max(z0, 1.0) * f32(step) + 1.0));
+            let wn = pow(max(dot(n0, b_guides[j * 4u + 1u].xyz), 0.0), 64.0);
+            let wl = exp(-abs(l0 - luminance(q.xyz)) / sigma_l);
+            let wa = exp(-abs(c.w - q.w) * 8.0);
+            let wt = k * wz * wn * wl * wa;
+            sum += q.xyz * wt;
+            wsum += wt;
+            vsum += wt * wt * b_hdr[j * 2u + 1u].x;
+        }
+    }
+    b_tmp[i * 2u] = vec4<f32>(sum / max(wsum, 1e-8), c.w);
+    b_tmp[i * 2u + 1u] = vec4<f32>(vsum / max(wsum * wsum, 1e-12), 0.0, 0.0, 0.0);
+}
+
+// The picture: lighting × albedo × coverage, tone-mapped as the raster,
+// premultiplied sRGB into the group.
+@compute @workgroup_size(8, 8, 1)
+fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
+    let w = u.size.x;
+    let h = u.size.y;
+    if id.x >= w || id.y >= h { return; }
+    let i = id.y * w + id.x;
+    let c = b_hdr[i * 2u];
+    let alpha = c.w;
+    let color = c.xyz * b_guides[i * 4u].xyz * alpha;
     // Highlights on glass over nothing still need coverage to show.
     let peak = min(max(color.x, max(color.y, color.z)), 1.0);
     let a = max(alpha, peak);
@@ -1174,9 +1365,5 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let straight = color / a;
         out = vec4<f32>(encode(shoulder(straight.x)) * a, encode(shoulder(straight.y)) * a, encode(shoulder(straight.z)) * a, a);
     }
-    let i = id.y * w + id.x;
     b_groups[u.size.z + i] = out;
-    b_guides[i * 3u] = vec4<f32>(first.albedo, alpha);
-    b_guides[i * 3u + 1u] = vec4<f32>(first.normal, 0.0);
-    b_guides[i * 3u + 2u] = vec4<f32>(first.depth, 0.0, 0.0, 0.0);
 }

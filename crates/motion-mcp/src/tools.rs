@@ -169,7 +169,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
             description: "Render frames as images: at given times/references, at a track's markers, or (default) at the project's sync points. sheet=true returns one labelled contact sheet.",
             schema: obj(json!({"at": {"type": "array", "items": time}, "track": {"type": "string"}, "from": {"type": "number"}, "to": {"type": "number"},
                 "sheet": {"type": "boolean"}, "width": {"type": "integer", "description": "px per frame (default 960, 360 in sheets)"}, "save": {"type": "string", "description": "also write the PNG here"},
-                "pt": {"type": "boolean", "description": "path-trace meshes, as a path-traced export draws them (default false: the preview's raster)"}, "samples": {"type": "integer", "description": "with pt: paths per pixel (default the project's samples, else 64)"}}), &[]),
+                "pt": {"type": "boolean", "description": "path-trace meshes, as a path-traced export draws them (default false: the preview's raster)"}, "samples": {"type": "integer", "description": "with pt: paths per pixel (default the project's samples, else 64)"},
+                "denoise": {"type": "boolean", "description": "with pt: filter the noise (default true)"}}), &[]),
             read_only: true,
         },
         ToolDef {
@@ -188,7 +189,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
             description: "Export video (mp4, webm or gif by extension) in the background; poll render_status. quality=draft renders half size without motion blur. pt=true (or settings.renderer \"path\") path-traces meshes on a GPU with ray queries (else rasterised, with a warning).",
             schema: obj(json!({"output": {"type": "string", "description": "default renders/<name>.mp4 in the project"}, "quality": {"type": "string", "enum": ["draft", "final"], "default": "final"},
                 "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
-                "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"}}), &[]),
+                "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"},
+                "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"}}), &[]),
             read_only: false,
         },
         ToolDef { name: "render_status", description: "Progress and result of render jobs.", schema: json!({"type": "object", "properties": {"job": {"type": "string"}}}), read_only: true },
@@ -1194,7 +1196,8 @@ impl Toolbox {
         // Render at the size we return (sheets render at 2× thumbnail size).
         let scale = ((if sheet { width * 2.0 } else { width }) / pw).clamp(0.05, 1.0);
         let path = match renderer_arg(args)? {
-            Some(RendererKind::Path) => export::trace_options(&compiled.settings, Quality::Final, Some(RendererKind::Path), samples_arg(args)?),
+            Some(RendererKind::Path) => export::trace_options(&compiled.settings, Quality::Final, Some(RendererKind::Path), samples_arg(args)?)
+                .map(|o| lahza_motion_render::pt::TraceOptions { denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true), ..o }),
             _ => None,
         };
         let renderer = self.renderer(&dir);
@@ -1601,6 +1604,7 @@ impl Toolbox {
             render: RenderOptions { backend: self.backend, ..Default::default() },
             renderer: renderer_arg(args)?,
             samples: samples_arg(args)?,
+            denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true),
         };
         let progress = Arc::new(Progress::default());
         let p2 = progress.clone();

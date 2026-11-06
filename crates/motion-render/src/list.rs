@@ -516,7 +516,7 @@ impl Builder<'_> {
             }
             at.get_or_insert(out.len());
             if let Content::Mesh(m) = &layer.content {
-                if let Some(i) = self.meshes.trace_instance(m, layer.opacity, root.max_scale()) {
+                if let Some(i) = self.meshes.trace_instance(layer.id.clone(), m, layer.opacity, root.max_scale()) {
                     instances.push(i);
                 }
                 first.get_or_insert_with(|| (**m).clone());

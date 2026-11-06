@@ -276,7 +276,7 @@ impl MeshCache {
 
     /// A mesh layer as an instance for the path tracer: its geometry, its
     /// object → camera transform and its materials by part and segment.
-    pub(crate) fn trace_instance(&mut self, m: &MeshState, opacity: f64, scale: f64) -> Option<crate::pt::TraceInstance> {
+    pub(crate) fn trace_instance(&mut self, id: Arc<str>, m: &MeshState, opacity: f64, scale: f64) -> Option<crate::pt::TraceInstance> {
         let mesh = self.get(m)?;
         let mv = m.camera.view.then(m.world).0;
         let transform = [0, 1, 2].map(|r| [mv[r * 4] as f32, mv[r * 4 + 1] as f32, mv[r * 4 + 2] as f32, mv[r * 4 + 3] as f32]);
@@ -289,7 +289,7 @@ impl MeshCache {
                 materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale));
             }
         }
-        Some(crate::pt::TraceInstance { mesh, key: m.params.key(), transform, materials, parts })
+        Some(crate::pt::TraceInstance { id, mesh, key: m.params.key(), transform, materials, parts })
     }
 
     /// The environment image of these lights, loaded once.

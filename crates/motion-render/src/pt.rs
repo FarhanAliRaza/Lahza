@@ -27,17 +27,27 @@ pub struct TraceOptions {
     pub spp: u32,
     /// Surface interactions per path.
     pub bounces: u32,
+    /// Filter the noise (edge-aware, guided by albedo, normal and depth).
+    pub denoise: bool,
+    /// Accumulate over consecutive frames (reprojected along each surface's
+    /// motion): for sequences rendered in order, such as an export.
+    pub temporal: bool,
 }
 
 impl Default for TraceOptions {
     fn default() -> Self {
-        Self { spp: 64, bounces: 6 }
+        Self { spp: 64, bounces: 6, denoise: true, temporal: false }
     }
 }
+
+/// À-trous passes (steps 1, 2, 4, … px).
+const DENOISE_PASSES: u32 = 5;
 
 /// One mesh layer in a traced list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TraceInstance {
+    /// The layer (finds its transform on the previous frame).
+    pub id: Arc<str>,
     pub mesh: Arc<Mesh>,
     /// Identifies the geometry across frames (the mesh parameters).
     pub key: Vec<u8>,
@@ -101,6 +111,8 @@ impl Trace {
         f(out, &[self.origin[0], self.origin[1], self.factor[0], self.factor[1]]);
         out.extend(self.options.spp.to_le_bytes());
         out.extend(self.options.bounces.to_le_bytes());
+        out.push(self.options.denoise as u8);
+        out.push(self.options.temporal as u8);
         out.extend(self.seed.to_le_bytes());
         f(out, &self.lens);
         if let Some(e) = &self.env {
@@ -115,6 +127,10 @@ pub fn supported(context: &gpu::Context) -> bool {
 }
 
 const SHADER: &str = include_str!("pt.wgsl");
+
+/// Rows per instance: [attribute, index, tag bases], part materials (3),
+/// the previous frame's object → camera transform (3).
+const INST_ROWS: usize = 7;
 
 /// The custom index marking the cards' instance.
 const CARD_INSTANCE: u32 = 0x00FF_FFFF;
@@ -134,6 +150,13 @@ struct Uniforms {
     inv_root: [[f32; 4]; 3],
     /// Lens aperture radius, focus depth, 0, 0.
     lens: [f32; 4],
+    /// Denoiser pass: step px, temporal history (1), 0, 0.
+    denoise: [u32; 4],
+    /// The previous frame's camera (focal, centre, valid) and group
+    /// placement and canvas → target, for reprojection.
+    prev_cam: [f32; 4],
+    prev_place: [f32; 4],
+    prev_root: [[f32; 4]; 3],
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -150,6 +173,10 @@ struct TraceData {
     b_groups: gpu::BufferPiece,
     b_guides: gpu::BufferPiece,
     b_env: gpu::BufferPiece,
+    b_hdr: gpu::BufferPiece,
+    b_tmp: gpu::BufferPiece,
+    b_hist: gpu::BufferPiece,
+    b_next: gpu::BufferPiece,
 }
 
 /// A mesh's bottom-level structure and where its attributes live.
@@ -167,6 +194,9 @@ struct Geometry {
 /// GPU side of the path tracer, owned by `gpu::Gpu`.
 pub struct Tracer {
     pipeline: gpu::ComputePipeline,
+    temporal: gpu::ComputePipeline,
+    atrous: gpu::ComputePipeline,
+    resolve: gpu::ComputePipeline,
     geometry: HashMap<Vec<u8>, Geometry>,
     /// Per-vertex [position, normal] rows, indices and triangle tags of every
     /// cached mesh, uploaded again when a mesh is added.
@@ -186,14 +216,35 @@ pub struct Tracer {
     manual_commit: bool,
     /// The environment image's rows on the GPU, by the map's address.
     env: Option<(usize, Arc<crate::envmap::EnvMap>, gpu::Buffer)>,
+    /// Each mesh layer's object → camera transform on the last frame.
+    prev_transforms: HashMap<Arc<str>, [[f32; 4]; 3]>,
+    /// Temporal history per trace of the frame (by its order).
+    history: HashMap<u32, History>,
+    /// The next trace's order in this frame.
+    slot: u32,
+}
+
+/// What a traced group looked like on the previous frame: its
+/// accumulated lighting (three rows per texel, see pt.wgsl `temporal`),
+/// twice (read last frame's, write this one's), and where it was.
+struct History {
+    size: (u32, u32),
+    buffers: [gpu::Buffer; 2],
+    current: usize,
+    cam: [f32; 4],
+    place: [f32; 4],
+    root: [[f32; 4]; 3],
 }
 
 impl Tracer {
     pub fn new(context: &gpu::Context) -> Result<Self, String> {
         let shader = context.try_create_shader(gpu::ShaderDesc { source: SHADER })?;
         let pipeline = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") });
+        let temporal = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace temporal", data_layouts: &[&TraceData::layout()], compute: shader.at("temporal") });
+        let atrous = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace denoise", data_layouts: &[&TraceData::layout()], compute: shader.at("atrous") });
+        let resolve = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace resolve", data_layouts: &[&TraceData::layout()], compute: shader.at("resolve") });
         let manual_commit = context.device_information().is_software_emulated;
-        Ok(Self { pipeline, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, manual_commit, env: None })
+        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, manual_commit, env: None })
     }
 
     /// Frees the last frame's transient buffers and structures; call when
@@ -206,6 +257,7 @@ impl Tracer {
             context.destroy_acceleration_structure(a);
         }
         self.frame += 1;
+        self.slot = 0;
         let frame = self.frame;
         let stale: Vec<Vec<u8>> = self.geometry.iter().filter(|(_, g)| frame - g.used > 120).map(|(k, _)| k.clone()).collect();
         for k in stale {
@@ -309,6 +361,7 @@ impl Tracer {
         let mut instances = Vec::new();
         let mut blases = Vec::new();
         let mut inst_rows: Vec<[f32; 4]> = Vec::new();
+        let mut next_transforms = HashMap::new();
         let mut mat_rows: Vec<[f32; 4]> = Vec::new();
         let b = |v: u32| f32::from_bits(v);
         for inst in &t.instances {
@@ -319,11 +372,15 @@ impl Tracer {
             let mat_base = (mat_rows.len() / crate::mesh3d::MAT_ROWS) as u32;
             mat_rows.extend_from_slice(&inst.materials);
             let p = |k: usize| [b(mat_base + inst.parts[k].0), b(inst.parts[k].1.max(1))];
-            let custom = (inst_rows.len() / 4) as u32;
+            let custom = (inst_rows.len() / INST_ROWS) as u32;
             inst_rows.push([b(g.attr_base), b(g.idx_base), b(g.tag_base), 0.0]);
             inst_rows.push([p(0)[0], p(0)[1], p(1)[0], p(1)[1]]);
             inst_rows.push([p(2)[0], p(2)[1], p(3)[0], p(3)[1]]);
             inst_rows.push([p(4)[0], p(4)[1], p(5)[0], p(5)[1]]);
+            // Where it was on the previous frame (object → camera then).
+            let prev = self.prev_transforms.get(&inst.id).copied().unwrap_or(inst.transform);
+            inst_rows.extend_from_slice(&prev);
+            next_transforms.insert(inst.id.clone(), inst.transform);
             instances.push(gpu::AccelerationStructureInstance { acceleration_structure_index: blases.len() as u32, transform: inst.transform.into(), mask: 0xFF, custom_index: custom });
             blases.push(g.blas);
         }
@@ -401,11 +458,47 @@ impl Tracer {
         self.retired.push(ibuf);
         let scratch = self.scratch(context, tsizes.scratch);
         encoder.acceleration_structure("trace tlas").build_top_level(tlas, &blases, instances.len() as u32, ibuf.into(), scratch.into());
-        // Guides for the denoiser: albedo, normal, depth per texel.
-        let guides = context.create_buffer(gpu::BufferDesc { name: "trace guides", size: ((size.0 * size.1) as u64 * 48).max(16), memory: gpu::Memory::Device });
+        // Guides for the denoiser: albedo, normal, depth, motion per texel.
+        let guides = context.create_buffer(gpu::BufferDesc { name: "trace guides", size: ((size.0 * size.1) as u64 * 64).max(16), memory: gpu::Memory::Device });
         self.retired.push(guides);
+        // Lighting and its variance (two rows per texel), twice: the
+        // denoiser's passes read one and write the other.
+        let hdr_size = ((size.0 * size.1) as u64 * 32).max(16);
+        let hdr = [0, 1].map(|_| {
+            let b = context.create_buffer(gpu::BufferDesc { name: "trace hdr", size: hdr_size, memory: gpu::Memory::Device });
+            self.retired.push(b);
+            b
+        });
         let r = |m: &[f32; 9]| [[m[0], m[1], m[2], 0.0], [m[3], m[4], m[5], 0.0], [m[6], m[7], m[8], 0.0]];
-        let data = TraceData {
+        // Temporal history for this trace (its order in the frame).
+        let slot = self.slot;
+        self.slot += 1;
+        if t.options.temporal {
+            self.prev_transforms.extend(next_transforms.iter().map(|(k, v)| (k.clone(), *v)));
+        }
+        let hist_size = ((size.0 * size.1) as u64 * 48).max(16);
+        let (hist_read, hist_write, prev) = if t.options.temporal {
+            let fresh = self.history.get(&slot).is_none_or(|h| h.size != size);
+            if fresh {
+                if let Some(old) = self.history.remove(&slot) {
+                    self.retired.extend(old.buffers);
+                }
+                let make = || context.create_buffer(gpu::BufferDesc { name: "trace history", size: hist_size, memory: gpu::Memory::Device });
+                self.history.insert(slot, History { size, buffers: [make(), make()], current: 0, cam: [0.0; 4], place: [0.0; 4], root: [[0.0; 4]; 3] });
+            }
+            let h = self.history.get_mut(&slot).unwrap();
+            let prev = (h.cam, h.place, h.root);
+            let (read, write) = (h.buffers[h.current], h.buffers[1 - h.current]);
+            h.current = 1 - h.current;
+            h.cam = [t.focal, t.centre[0], t.centre[1], 1.0];
+            h.place = [t.origin[0], t.origin[1], t.factor[0], t.factor[1]];
+            h.root = r(&t.root);
+            (read, write, prev)
+        } else {
+            let b = self.transient(context, "trace no history", &[0u8; 16]);
+            (b, b, ([0.0; 4], [0.0; 4], [[0.0; 4]; 3]))
+        };
+        let data = |step: u32, read: gpu::Buffer, write: gpu::Buffer| TraceData {
             u: Uniforms {
                 size: [size.0, size.1, offset, t.options.spp.max(1)],
                 opts: [t.options.bounces.max(1), t.seed, CARD_INSTANCE, t.cards.len() as u32],
@@ -414,6 +507,10 @@ impl Tracer {
                 root: r(&t.root),
                 inv_root: r(&t.inv_root),
                 lens: [t.lens[0], t.lens[1], 0.0, 0.0],
+                denoise: [step, t.options.temporal as u32, 0, 0],
+                prev_cam: prev.0,
+                prev_place: prev.1,
+                prev_root: prev.2,
             },
             acc: tlas,
             b_inst: inst_buf.into(),
@@ -426,11 +523,39 @@ impl Tracer {
             b_groups: groups.into(),
             b_guides: guides.into(),
             b_env: env_buf.into(),
+            b_hdr: read.into(),
+            b_tmp: write.into(),
+            b_hist: hist_read.into(),
+            b_next: hist_write.into(),
         };
-        let mut pass = encoder.compute("trace");
-        let mut pc = pass.with(&self.pipeline);
-        pc.bind(0, &data);
-        pc.dispatch([size.0.div_ceil(8), size.1.div_ceil(8), 1]);
+        let groups_x = [size.0.div_ceil(8), size.1.div_ceil(8), 1];
+        {
+            let mut pass = encoder.compute("trace");
+            let mut pc = pass.with(&self.pipeline);
+            pc.bind(0, &data(0, hdr[0], hdr[1]));
+            pc.dispatch(groups_x);
+        }
+        let mut current = 0;
+        if t.options.temporal {
+            let mut pass = encoder.compute("trace temporal");
+            let mut pc = pass.with(&self.temporal);
+            pc.bind(0, &data(0, hdr[0], hdr[1]));
+            pc.dispatch(groups_x);
+            current = 1;
+        }
+        if t.options.denoise {
+            for k in 0..DENOISE_PASSES {
+                let mut pass = encoder.compute("trace denoise");
+                let mut pc = pass.with(&self.atrous);
+                pc.bind(0, &data(1 << k, hdr[current], hdr[1 - current]));
+                pc.dispatch(groups_x);
+                current = 1 - current;
+            }
+        }
+        let mut pass = encoder.compute("trace resolve");
+        let mut pc = pass.with(&self.resolve);
+        pc.bind(0, &data(0, hdr[current], hdr[1 - current]));
+        pc.dispatch(groups_x);
     }
 
     pub fn destroy(&mut self, context: &gpu::Context) {
@@ -447,6 +572,11 @@ impl Tracer {
         }
         if let Some((_, _, b)) = self.env.take() {
             context.destroy_buffer(b);
+        }
+        for (_, h) in self.history.drain() {
+            for b in h.buffers {
+                context.destroy_buffer(b);
+            }
         }
     }
 }
@@ -584,7 +714,7 @@ mod scene_tests {
     /// A renderer that path-traces, or None (and a note) without ray queries.
     pub(crate) fn tracer(spp: u32) -> Option<Renderer> {
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
-        let r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp, bounces: 4 }), ..Default::default() });
+        let r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp, bounces: 4, ..Default::default() }), ..Default::default() });
         // Asked for the GPU and it (or the tracer's shader) failed: a bug.
         assert!(!allow || r.is_gpu(), "no GPU: {}", r.backend_label());
         let trace_error = r.gpu.as_ref().and_then(|g| g.trace_error.clone());
@@ -609,11 +739,16 @@ mod scene_tests {
         p
     }
 
-    /// The principled materials, traced and rasterised, to $LAHZA_PT_OUT.
+    /// The principled materials, traced and rasterised, to $LAHZA_PT_OUT
+    /// ($LAHZA_PT_SPP samples, default 128; $LAHZA_PT_RAW=1: no denoiser).
     #[test]
     #[ignore]
     fn dump_materials() {
-        let Some(mut r) = tracer(128) else { return };
+        let spp = std::env::var("LAHZA_PT_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let Some(mut r) = tracer(spp) else { return };
+        if std::env::var_os("LAHZA_PT_RAW").is_some() {
+            r.options.path = Some(super::TraceOptions { spp, bounces: 4, denoise: false, temporal: false });
+        }
         let mut p = project(json!([
             {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#c8c2b8"}, "transform": {"position": [480, 235], "rotation_x": 90}},
             {"id": "spun", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 80, "height": 30, "bevel": 6}, "material": {"preset": "brushed", "color": "#d0d4da"}, "transform": {"position": [110, 200], "rotation_x": 10}},
@@ -1092,6 +1227,78 @@ mod physics_tests {
         let img = r.render(&Compiled::new(&p), 0.5);
         let covered = (0..320u32).filter(|&x| img.get_pixel(x, 120).0[0] > 20).count();
         assert!(covered > 90, "the streak covers {covered} px (still: 60)");
+    }
+
+    /// The denoiser: at 4 samples per pixel a softly lit floor is far
+    /// smoother with it, as bright on average, and a ball's silhouette
+    /// against it stays sharp.
+    #[test]
+    fn the_denoiser_smooths_without_blurring_edges() {
+        let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+        let with = |denoise: bool| {
+            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 4, bounces: 4, denoise, temporal: false }), ..Default::default() });
+            r.can_trace().then_some(r)
+        };
+        let (Some(mut on), Some(mut off)) = (with(true), with(false)) else { return };
+        let mut p = project(json!([
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#d0d0d0"}, "transform": {"position": [160, 120]}},
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 50}, "material": {"preset": "matte", "color": "#c03030"}, "transform": {"position": [160, 120], "z": -80}}
+        ]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+        let c = Compiled::new(&p);
+        let (a, b) = (on.render(&c, 0.0), off.render(&c, 0.0));
+        let stats = |img: &image::RgbaImage| {
+            let v: Vec<f64> = (20..60u32).flat_map(|y| (20..60u32).map(move |x| (x, y))).map(|(x, y)| img.get_pixel(x, y).0[1] as f64).collect();
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            (m, (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt())
+        };
+        let ((ma, sa), (mb, sb)) = (stats(&a), stats(&b));
+        assert!(sa < sb / 3.0, "smoother: sd {sa:.1} with, {sb:.1} without");
+        assert!((ma - mb).abs() < 0.04 * mb, "as bright: {ma:.1} with, {mb:.1} without");
+        // The ball's left edge: from floor to red within a few px.
+        let row: Vec<i32> = (60..130u32).map(|x| a.get_pixel(x, 120).0[1] as i32).collect();
+        let floor_g = row[0];
+        let ball_g = row[row.len() - 1];
+        let between = row.iter().filter(|g| (**g - floor_g).abs() > (floor_g - ball_g).abs() / 5 && (**g - ball_g).abs() > (floor_g - ball_g).abs() / 5).count();
+        assert!(between <= 4, "a sharp silhouette: {between} px between floor and ball ({row:?})");
+    }
+
+    /// Temporal accumulation over a sequence: a still floor flickers far
+    /// less from frame to frame, and a moving ball leaves no ghost where it
+    /// was.
+    #[test]
+    fn sequences_accumulate_without_ghosts() {
+        let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+        let make = |temporal: bool| {
+            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, motion_blur: false, path: Some(super::TraceOptions { spp: 2, bounces: 3, denoise: true, temporal }), ..Default::default() });
+            r.can_trace().then_some(r)
+        };
+        let (Some(mut on), Some(mut off)) = (make(true), make(false)) else { return };
+        let mut p = project(json!([
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#d0d0d0"}, "transform": {"position": [160, 120]}},
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"preset": "matte", "color": "#ff2020"},
+             "transform": {"position": {"keys": [{"at": 0, "v": [80, 120]}, {"at": 1, "v": [240, 120]}]}, "z": -60}}
+        ]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.settings.fps = lahza_motion_core::time::Fps::whole(10);
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+        let c = Compiled::new(&p);
+        let flicker = |r: &mut Renderer| {
+            let frames: Vec<image::RgbaImage> = (0..10).map(|k| r.render(&c, k as f64 / 10.0)).collect();
+            let patch = |img: &image::RgbaImage| (180..220u32).flat_map(|y| (20..60u32).map(move |x| (x, y))).map(|(x, y)| img.get_pixel(x, y).0[1] as f64).collect::<Vec<_>>();
+            let (a, b) = (patch(&frames[8]), patch(&frames[9]));
+            (a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f64>() / a.len() as f64, frames)
+        };
+        let (still, frames) = flicker(&mut on);
+        let (boil, _) = flicker(&mut off);
+        assert!(still < 0.6 * boil, "flicker {still:.2} with history, {boil:.2} without");
+        // Frame 9: the ball is at x ≈ 224; where it was at frame 0 (x 80)
+        // is floor again, not a red trail.
+        let old = frames[9].get_pixel(80, 120).0;
+        assert!((old[0] as i32 - old[1] as i32).abs() < 25, "no ghost: {old:?}");
     }
 
     /// Lists with what the tracer can't draw yet (wires, effects such as

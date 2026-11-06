@@ -392,7 +392,13 @@ so. The same frame traces the same picture (samples are seeded by time).
 Depth of field is a real thin lens (the camera's `aperture` and `focus`),
 so defocus is exact per pixel, through glass and in reflections; motion
 blur traces each shutter sub-frame with its share of the samples, so it
-costs no more than a still frame. Lists with what the tracer does not
+costs no more than a still frame. A denoiser (edge-aware à-trous
+filtering of the lighting, guided by each pixel's albedo, normal, depth
+and noise) cleans the picture, so a few samples per pixel give a clean
+frame (`--no-denoise` / `denoise: false` to see the raw samples); in an
+export each frame also builds on the previous ones, reprojected along
+each surface's motion (camera and objects), and rejects history that no
+longer matches, so animation does not boil or ghost. Lists with what the tracer does not
 draw yet (wireframes, effects, mattes, blend modes on their 3D layers)
 are rasterised.
 

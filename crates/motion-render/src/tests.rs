@@ -654,7 +654,7 @@ fn export_mixes_footage_audio() {
     assert_eq!(clips.len(), 1);
     assert_eq!((clips[0].start, clips[0].trim, clips[0].speed), (0.5, 0.5, 1.5));
     let out = dir.join("out.mp4");
-    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None };
+    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true };
     let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
     assert_eq!(report.frames, 60);
     let info = crate::footage::probe(&out).unwrap();
