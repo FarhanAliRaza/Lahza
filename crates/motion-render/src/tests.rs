@@ -1657,10 +1657,11 @@ fn defocused_cards_blend_over_the_meshes_behind_them() {
     assert_gpu_matches_cpu(&p, &[0.0]);
 }
 
-/// Depth of field caps its blur (an eighth of the frame), so a far layer
-/// is a soft wash instead of a picture too large to blur.
+/// Depth of field blurs like a thin lens: far away its blur levels off
+/// (per_px × the focus distance), never past an eighth of the frame, so a
+/// far layer is a soft wash instead of a picture too large to blur.
 #[test]
-fn depth_of_field_blur_is_capped() {
+fn depth_of_field_blur_levels_off_far_away() {
     let mut p = project(json!([
         {"id": "sky", "kind": "shape", "shape": "rect", "size": [400000, 200000], "fill": "#88aacc", "three_d": true,
          "transform": {"position": [160, 90], "z": 150000}},
@@ -1673,7 +1674,10 @@ fn depth_of_field_blur_is_capped() {
         lahza_motion_core::compile::EffectState::Blur { sigma, .. } => Some(*sigma),
         _ => None,
     });
-    assert_eq!(sigma, Some(320.0 / 8.0), "capped at an eighth of the frame");
+    let sigma = sigma.expect("the sky is blurred");
+    let focus = lahza_motion_core::space::focal(180.0, 39.6);
+    let limit = 0.03 * focus;
+    assert!(sigma <= 320.0 / 8.0 && (sigma - limit).abs() < 0.05 * limit, "levels off at {limit:.1}: {sigma:.1}");
     let img = cpu().render(&c, 0.0);
     let corner = px(&img, 5, 5);
     assert!(corner[2] > 150 && corner[0] < 160, "the sky is a wash of its colour: {corner:?}");

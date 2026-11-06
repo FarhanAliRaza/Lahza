@@ -21,6 +21,8 @@ pub struct MeshState {
     pub part_colors: [Vec<Color>; PARTS],
     /// The scene's lights (set for every mesh of a frame).
     pub lighting: Option<Arc<Lighting>>,
+    /// Depth of field: [focus depth (camera z), blur px per px of depth].
+    pub lens: Option<[f64; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -702,8 +704,9 @@ impl CMesh {
         }
     }
 
-    pub(super) fn state(&self, t: f64, world: Mat4, camera: Camera3) -> MeshState {
+    pub(super) fn state(&self, t: f64, world: Mat4, camera: Camera3, lens: Option<[f64; 2]>) -> MeshState {
         MeshState {
+            lens,
             params: self.params_at(t, screen_scale(world, &camera)),
             world,
             camera,

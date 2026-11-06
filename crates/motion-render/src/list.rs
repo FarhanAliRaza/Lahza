@@ -561,6 +561,10 @@ impl Builder<'_> {
             options,
             seed: self.seed,
             env,
+            // Thin lens matching the raster's depth of field: its blur
+            // σ = per_px · |z − focus| is a circle of confusion of radius
+            // ≈ 2σ near the focus plane.
+            lens: m.lens.filter(|l| l[0] > 1.0 && l[1] > 0.0).map(|[focus, per_px]| [(2.0 * per_px * focus * focus / m.camera.focal) as f32, focus as f32]).unwrap_or([0.0; 2]),
         });
         let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(factor[0], factor[1])));
         let prim = Prim { kind: [PRIM_IMAGE, 1, blend_code(Blend::Normal), 0], geom: [gw as f32, gh as f32, 1.0, 0.0], geom2: [f32::from_bits(offset), 0.0, 0.0, 0.0], ..Default::default() };
@@ -857,7 +861,7 @@ impl Builder<'_> {
         let mut post_pad = 0.0f64;
         for e in &layer.effects {
             match e {
-                EffectState::Blur { sigma, repeat_edges } => {
+                EffectState::Blur { sigma, repeat_edges, .. } => {
                     blur = (blur * blur + sigma * sigma).sqrt();
                     clamp |= *repeat_edges;
                 }
@@ -1248,16 +1252,17 @@ fn trace_card_candidate(layer: &LayerState) -> bool {
     layer.view.is_some() && !matches!(layer.content, Content::Mesh(_) | Content::Group(_)) && plain(layer)
 }
 
-/// No effects (depth of field is one), matte or blend mode.
+/// No effects (but depth of field's blur, which the tracer's lens makes),
+/// matte or blend mode.
 fn plain(layer: &LayerState) -> bool {
-    layer.matte.is_none() && layer.effects.is_empty() && layer.blend == Blend::Normal
+    layer.matte.is_none() && layer.effects.iter().all(|e| matches!(e, EffectState::Blur { lens: true, .. })) && layer.blend == Blend::Normal
 }
 
 /// Whether the path tracer draws everything 3D in this list as the raster
 /// would: plain meshes without wireframes and plain flat 3D layers. Other
 /// lists are rasterised (the tracer has no effects, mattes, blend modes or
 /// wires yet, and a 3D layer drawn flat beside the traced picture would
-/// lose its depth).
+/// lose its depth). Depth of field is traced through a lens.
 fn traceable(layers: &[LayerState]) -> bool {
     layers.iter().all(|l| match &l.content {
         Content::Mesh(m) => plain(l) && m.materials.iter().all(|x| x.wireframe <= 0.0),

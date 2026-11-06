@@ -78,6 +78,8 @@ pub struct Trace {
     pub seed: u32,
     /// The environment image (the lights' row 0 says whether it is used).
     pub env: Option<Arc<crate::envmap::EnvMap>>,
+    /// Thin lens: [aperture radius, focus depth] in camera px (0: pinhole).
+    pub lens: [f32; 2],
 }
 
 impl Trace {
@@ -100,6 +102,7 @@ impl Trace {
         out.extend(self.options.spp.to_le_bytes());
         out.extend(self.options.bounces.to_le_bytes());
         out.extend(self.seed.to_le_bytes());
+        f(out, &self.lens);
         if let Some(e) = &self.env {
             out.extend((Arc::as_ptr(e) as usize as u64).to_le_bytes());
         }
@@ -129,6 +132,8 @@ struct Uniforms {
     place: [f32; 4],
     root: [[f32; 4]; 3],
     inv_root: [[f32; 4]; 3],
+    /// Lens aperture radius, focus depth, 0, 0.
+    lens: [f32; 4],
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -408,6 +413,7 @@ impl Tracer {
                 place: [t.origin[0], t.origin[1], t.factor[0], t.factor[1]],
                 root: r(&t.root),
                 inv_root: r(&t.inv_root),
+                lens: [t.lens[0], t.lens[1], 0.0, 0.0],
             },
             acc: tlas,
             b_inst: inst_buf.into(),
@@ -1039,6 +1045,53 @@ mod physics_tests {
         let sd = (patch.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / patch.len() as f64).sqrt();
         assert!(mean > 60.0 && sd < 0.08 * mean, "sunlit and clean: mean {mean:.1}, sd {sd:.1}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Width (px) of a silhouette's edge along a row: columns between 10%
+    /// and 90% of the way from the background to the inside.
+    fn edge_width(img: &image::RgbaImage, y: u32, xs: std::ops::Range<u32>) -> usize {
+        let v: Vec<f64> = xs.map(|x| img.get_pixel(x, y).0[0] as f64).collect();
+        let (lo, hi) = (v.iter().cloned().fold(f64::MAX, f64::min), v.iter().cloned().fold(0.0, f64::max));
+        v.iter().filter(|c| **c > lo + 0.1 * (hi - lo) && **c < lo + 0.9 * (hi - lo)).count()
+    }
+
+    /// Depth of field through a thin lens: the ball in focus keeps a sharp
+    /// edge, the far one blurs about as much as the raster blurs it.
+    #[test]
+    fn a_lens_focuses_and_defocuses() {
+        let Some(mut r) = tracer(64) else { return };
+        let mut p = project(json!([
+            {"id": "far", "kind": "mesh", "mesh": {"type": "sphere", "radius": 50}, "material": {"color": "#ff0000", "unlit": true}, "transform": {"position": [230, 120], "z": 600}},
+            {"id": "near", "kind": "mesh", "mesh": {"type": "sphere", "radius": 50}, "material": {"color": "#ff0000", "unlit": true}, "transform": {"position": [80, 120]}}
+        ]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.scenes[0].camera = serde_json::from_value(json!({"aperture": 1.5, "focus": "near"})).unwrap();
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let (traced, raster) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+        let near = edge_width(&traced, 120, 110..160);
+        let far = edge_width(&traced, 120, 186..260);
+        let raster_far = edge_width(&raster, 120, 186..260);
+        assert!(near <= 3, "in focus: {near} px");
+        assert!(far >= 5, "out of focus: {far} px (raster {raster_far} px)");
+        assert!((far as f64) > 0.4 * raster_far as f64 && (far as f64) < 2.5 * raster_far as f64, "traced {far} px vs raster {raster_far} px");
+    }
+
+    /// Motion blur: each shutter sub-frame traces its share of the samples
+    /// and a fast ball streaks.
+    #[test]
+    fn moving_meshes_streak() {
+        let Some(mut r) = tracer(32) else { return };
+        let mut p = project(json!([{"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"color": "#ff0000", "unlit": true},
+            "transform": {"position": {"keys": [{"at": 0, "v": [60, 120]}, {"at": 1, "v": [260, 120]}]}}}]));
+        p.settings.width = 320;
+        p.settings.height = 240;
+        p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 360.0, samples: 8 });
+        p.settings.fps = lahza_motion_core::time::Fps::whole(4);
+        let img = r.render(&Compiled::new(&p), 0.5);
+        let covered = (0..320u32).filter(|&x| img.get_pixel(x, 120).0[0] > 20).count();
+        assert!(covered > 90, "the streak covers {covered} px (still: 60)");
     }
 
     /// Lists with what the tracer can't draw yet (wires, effects such as

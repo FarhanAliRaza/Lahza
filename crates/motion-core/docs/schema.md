@@ -389,9 +389,12 @@ that refracts the meshes behind it. Flat 3D layers in the list are cards in
 the traced scene. It needs a GPU with ray queries (Vulkan
 `VK_KHR_ray_query`); elsewhere the frame is rasterised and a warning says
 so. The same frame traces the same picture (samples are seeded by time).
-Lists with what the tracer does not draw yet (wireframes, effects
-including depth of field, mattes, blend modes on their 3D layers) are
-rasterised.
+Depth of field is a real thin lens (the camera's `aperture` and `focus`),
+so defocus is exact per pixel, through glass and in reflections; motion
+blur traces each shutter sub-frame with its share of the samples, so it
+costs no more than a still frame. Lists with what the tracer does not
+draw yet (wireframes, effects, mattes, blend modes on their 3D layers)
+are rasterised.
 
 ```json
 "settings": {"width": 1920, "height": 1080, "fps": 30, "duration": 20, "renderer": "path", "samples": 128}

@@ -20,6 +20,7 @@ struct Uniforms {
     inv0: vec4<f32>,
     inv1: vec4<f32>,
     inv2: vec4<f32>,
+    lens: vec4<f32>,      // aperture radius, focus depth (camera px)
 }
 
 var<uniform> u: Uniforms;
@@ -1147,8 +1148,18 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let tp = vec3<f32>(u.place.x + u.place.z * (f32(id.x) + jx), u.place.y + u.place.w * (f32(id.y) + jy), 1.0);
         let q = vec3<f32>(dot(u.inv0.xyz, tp), dot(u.inv1.xyz, tp), dot(u.inv2.xyz, tp));
         let c = q.xy / q.z;
-        let dir = normalize(vec3<f32>((c.x - u.cam.y) / u.cam.x, (c.y - u.cam.z) / u.cam.x, 1.0));
-        let smp = path(vec3<f32>(0.0), dir, &rng);
+        var dir = normalize(vec3<f32>((c.x - u.cam.y) / u.cam.x, (c.y - u.cam.z) / u.cam.x, 1.0));
+        var origin = vec3<f32>(0.0);
+        if u.lens.x > 0.0 {
+            // Thin lens: a point on the aperture, aimed at where the pinhole
+            // ray meets the focus plane.
+            let focus = dir * (u.lens.y / dir.z);
+            let r = u.lens.x * sqrt(rnd(&rng));
+            let phi = 2.0 * PI * rnd(&rng);
+            origin = vec3<f32>(r * cos(phi), r * sin(phi), 0.0);
+            dir = normalize(focus - origin);
+        }
+        let smp = path(origin, dir, &rng);
         color += smp.color;
         alpha += smp.alpha;
         if s == 0u { first = smp; }

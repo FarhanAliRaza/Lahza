@@ -119,7 +119,8 @@ impl LayerState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EffectState {
-    Blur { sigma: f64, repeat_edges: bool },
+    /// `lens`: depth of field's blur (a path tracer's lens makes it instead).
+    Blur { sigma: f64, repeat_edges: bool, lens: bool },
     Shadow { color: Color, offset: Vec2, sigma: f64 },
     Glow { color: Color, sigma: f64, intensity: f64 },
     /// Per-pixel post effects applied when the layer is composited.
@@ -1646,7 +1647,7 @@ impl Compiled {
                         self.scene_group(b, tb, Affine::translate(sx - dx, sy - dy), 1.0),
                     ];
                     let mut g = self.scene_group_layers(&format!("{}-whip", b.id), pair);
-                    g.effects.push(EffectState::Blur { sigma, repeat_edges: true });
+                    g.effects.push(EffectState::Blur { sigma, repeat_edges: true, lens: false });
                     vec![g]
                 } else {
                     vec![self.scene_group(a, ta, shift(p), 1.0), self.scene_group(b, tb, behind(p), 1.0)]
@@ -1924,7 +1925,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
         .filter_map(|e| match e {
             CEffect::Blur(r, repeat_edges) => {
                 let sigma = r.at(t).max(0.0) * scale;
-                (sigma > 0.05).then_some(EffectState::Blur { sigma, repeat_edges: *repeat_edges })
+                (sigma > 0.05).then_some(EffectState::Blur { sigma, repeat_edges: *repeat_edges, lens: false })
             }
             CEffect::Shadow { color, offset, radius } => {
                 let o = offset.at(t);
@@ -1973,9 +1974,12 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
     // Depth of field blurs each 3D layer by its distance from the focus
     // plane (comps pass it on to their children instead).
     if let (true, Some(dof), false) = (three_d, space.dof, matches!(l.kind, CKind::Comp(_))) {
-        let sigma = (dof.per_px * (view_depth(space, world) - dof.plane).abs()).min(dof.max);
+        // A thin lens: per_px of blur per px of depth near the focus plane,
+        // levelling off far away (σ = per_px · f² · |1/f − 1/z|).
+        let z = view_depth(space, world);
+        let sigma = if z > 1.0 { (dof.per_px * dof.plane * dof.plane * (1.0 / dof.plane - 1.0 / z).abs()).min(dof.max) } else { dof.max };
         if sigma > 0.05 {
-            effects.insert(0, EffectState::Blur { sigma, repeat_edges: false });
+            effects.insert(0, EffectState::Blur { sigma, repeat_edges: false, lens: true });
         }
     }
     let matte = l.matte.map(|(mi, mode)| {
@@ -2042,7 +2046,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             }),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
-        CKind::Mesh(m) => Content::Mesh(Box::new(m.state(t, world, space.cam))),
+        CKind::Mesh(m) => Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))),
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
         CKind::Video(v) => Content::Video(VideoState {
             src: v.src.clone(),

@@ -263,6 +263,10 @@ impl Renderer {
             }
             (None, _) => None,
         };
+        // Motion blur: each sub-frame traces its share of the samples, so
+        // the frame costs what a still one does.
+        let n = states.len().max(1) as u32;
+        let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), ..o });
         let lists = self.build_lists(states, trace);
         let mut key = Vec::new();
         for l in &lists {
