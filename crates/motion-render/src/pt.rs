@@ -631,6 +631,41 @@ mod scene_tests {
         both.save(std::env::var("LAHZA_PT_OUT").unwrap_or_else(|_| "/tmp/pt_materials.png".into())).unwrap();
     }
 
+    /// Area lights and an HDR environment, traced and rasterised, to
+    /// $LAHZA_PT_OUT.
+    #[test]
+    #[ignore]
+    fn dump_lights() {
+        let Some(mut r) = tracer(128) else { return };
+        let dir = std::env::temp_dir().join(format!("lahza-dumplights-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sun = dir.join("sun.hdr");
+        crate::envmap::tests::write_hdr(&sun, 60.0);
+        let mut p = project(json!([
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#c8c2b8"}, "transform": {"position": [480, 235], "rotation_x": 90}},
+            {"id": "chrome", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": {"preset": "chrome"}, "transform": {"position": [260, 175]}},
+            {"id": "gold", "kind": "mesh", "mesh": {"type": "torus", "radius": 55, "tube": 20}, "material": {"preset": "metal", "color": "#ffc356", "roughness": 0.2}, "transform": {"position": [480, 160], "rotation_x": 10}},
+            {"id": "matte", "kind": "mesh", "mesh": {"type": "box", "size": [90, 90], "depth": 90, "bevel": 12}, "material": {"preset": "plastic", "color": "#e8e8e8"}, "transform": {"position": [700, 190], "rotation_y": 30}}
+        ]));
+        p.settings.width = 960;
+        p.settings.height = 300;
+        p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12]})).unwrap();
+        p.scenes[0].lights = serde_json::from_value(json!([
+            {"type": "area", "position": [200, -150, -300], "aim": [480, 200, 0], "size": [500, 200], "intensity": 0.8, "shadow": true},
+            {"type": "area", "position": [950, 100, -100], "aim": [600, 200, 0], "size": [120, 120], "shape": "disc", "color": "#7fb0ff", "intensity": 0.6}
+        ])).unwrap();
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"image": sun.to_str().unwrap(), "intensity": 0.6})).unwrap());
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let traced = r.render(&c, 0.0);
+        let raster = cpu().render(&c, 0.0);
+        let mut both = image::RgbaImage::new(960, 600);
+        image::imageops::overlay(&mut both, &traced, 0, 0);
+        image::imageops::overlay(&mut both, &raster, 0, 300);
+        both.save(std::env::var("LAHZA_PT_OUT").unwrap_or_else(|_| "/tmp/pt_lights.png".into())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore]
     fn dump_still_life() {
