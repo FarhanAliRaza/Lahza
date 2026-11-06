@@ -174,6 +174,15 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: true,
         },
         ToolDef {
+            name: "fit_camera",
+            description: "Solve the scene camera from marks: in each reference frame, 3D scene points (px, like a layer's position and z) and where they appear (px). Levenberg–Marquardt through the engine's own camera; returns per frame the camera (fov, orbit, dolly, position, shift) and its rms error, and `set` ops putting them on a scene's camera as keys (apply=true applies them). Fixed parameters (fix) stay at `start`; shift is fixed by default.",
+            schema: obj(json!({"frames": {"type": "array", "items": {"type": "object", "properties": {"at": time, "marks": {"type": "array", "items": {"type": "object", "properties": {"world": {"type": "array", "items": {"type": "number"}}, "image": {"type": "array", "items": {"type": "number"}}}}}}}},
+                "start": {"type": "object", "description": "camera to start from: fov, orbit, dolly, position, shift (default the default camera)"},
+                "fix": {"type": "array", "items": {"type": "string", "enum": ["fov", "orbit", "dolly", "position", "shift"]}, "description": "parameters to keep (default [\"shift\"])"},
+                "scene": {"type": "string", "description": "scene whose camera the ops set"}, "apply": {"type": "boolean"}}), &["frames"]),
+            read_only: false,
+        },
+        ToolDef {
             name: "compare",
             description: "Compare the project with a reference video. Without `at` it compares every frame from first to last: per frame the difference and how much each side moves, a per-scene summary with a verdict (motion, look, missing/extra detail, and interior shading: shading_ratio is ours ÷ reference, \"ours is flatter\" when below 0.5 against a reference that has real shading), the worst stretches (with a sheet of them), a timeline graph, and a side-by-side video (ours | reference | difference) of the whole piece. With `at` it returns those moments side by side. The reference time is ours + offset.",
             schema: obj(json!({"against": {"type": "string", "description": "reference video or image"}, "at": {"type": "array", "items": time, "description": "only these moments (default: every frame)"},
@@ -378,6 +387,7 @@ impl Toolbox {
             "sync_check" => self.sync_check(&args),
             "snapshot" => self.snapshot(&args),
             "compare" => self.compare(&args),
+            "fit_camera" => self.fit_camera(&args),
             "render" => self.render(&args),
             "render_status" => self.render_status(&args),
             "history" => self.history(&args),
@@ -1157,6 +1167,76 @@ impl Toolbox {
         let mut elements: &Compiled = &compiled;
         let t = r.resolve(markers, &base, &mut elements).map_err(|e| e.to_string())?;
         Ok((r.text(), t))
+    }
+
+    fn fit_camera(&mut self, args: &Value) -> ToolResult {
+        use lahza_motion_core::camfit::{fit, CameraParams, Free, Mark};
+        let dir = self.dir(args)?;
+        let project = self.state(&dir).project.clone();
+        let (w, h) = (project.settings.width as f64, project.settings.height as f64);
+        let frames = args.get("frames").and_then(Value::as_array).ok_or("fit_camera needs \"frames\"")?.clone();
+        let mut start: CameraParams = match args.get("start") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| format!("start: {e}"))?,
+            _ => CameraParams::default(),
+        };
+        let fixed: Vec<String> = args.get("fix").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_else(|| vec!["shift".into()]);
+        let free = Free {
+            fov: !fixed.iter().any(|f| f == "fov"),
+            orbit: !fixed.iter().any(|f| f == "orbit"),
+            dolly: !fixed.iter().any(|f| f == "dolly"),
+            position: !fixed.iter().any(|f| f == "position"),
+            shift: !fixed.iter().any(|f| f == "shift"),
+        };
+        let mut rows = Vec::new();
+        let mut solved = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let (label, t) = self.resolve_time(&dir, f.get("at").ok_or(format!("frames.{i}: needs \"at\""))?)?;
+            let marks: Vec<Mark> = serde_json::from_value(f.get("marks").cloned().unwrap_or(json!([]))).map_err(|e| format!("frames.{i}.marks: {e}"))?;
+            if marks.len() < 3 {
+                return Err(format!("frames.{i}: at least 3 marks (more pin the camera down better)"));
+            }
+            let (c, e) = fit(w, h, &marks, &start, free);
+            start = c;
+            rows.push(json!({"at": label, "t": round(t), "rms_px": round(e), "camera": c}));
+            solved.push((t, c));
+        }
+        let mut out = json!({"frames": rows});
+        if let Some(scene) = get_str(args, "scene") {
+            let compiled = self.compiled(&dir);
+            let sc = compiled.scenes.iter().find(|s| &*s.id == scene).ok_or(format!("no scene '{scene}'"))?;
+            // Keys are in the scene's own time.
+            let at = |t: f64| round(t - sc.start + sc.pre_roll);
+            let keys = |v: &dyn Fn(&CameraParams) -> Value| -> Value {
+                if solved.len() == 1 {
+                    v(&solved[0].1)
+                } else {
+                    json!({"keys": solved.iter().map(|(t, c)| json!({"at": at(*t), "v": v(c)})).collect::<Vec<_>>()})
+                }
+            };
+            let mut ops = Vec::new();
+            let set = |name: &str, value: Value| json!({"op": "set", "target": format!("{scene}.camera.{name}"), "value": value});
+            if free.fov {
+                ops.push(set("fov", keys(&|c| json!(round(c.fov)))));
+            }
+            if free.orbit {
+                ops.push(set("orbit", keys(&|c| json!([round(c.orbit[0]), round(c.orbit[1])]))));
+            }
+            if free.dolly {
+                ops.push(set("dolly", keys(&|c| json!(round(c.dolly)))));
+            }
+            if free.position {
+                ops.push(set("position", keys(&|c| json!(c.position.map(|p| [round(p[0]), round(p[1])])))));
+            }
+            if free.shift {
+                ops.push(set("shift", keys(&|c| json!([round(c.shift[0]), round(c.shift[1])]))));
+            }
+            if args.get("apply").and_then(Value::as_bool).unwrap_or(false) {
+                self.call("edit_apply", json!({"project": dir.display().to_string(), "ops": ops.clone()}))?;
+                out["applied"] = json!(true);
+            }
+            out["ops"] = json!(ops);
+        }
+        Ok(Output { json: out, images: Vec::new() })
     }
 
     fn snapshot(&mut self, args: &Value) -> ToolResult {

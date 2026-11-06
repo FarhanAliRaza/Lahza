@@ -568,3 +568,24 @@ fn a_path_traced_snapshot_without_ray_queries_warns() {
     assert!(tb.call("snapshot", json!({"at": [0.5], "pt": "yes"})).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// fit_camera: marks seen through a known camera give that camera back,
+/// as `set` ops that, applied, put the scene's camera there.
+#[test]
+fn fit_camera_solves_and_sets_the_scene_camera() {
+    use lahza_motion_core::camfit::{project, CameraParams};
+    let (mut tb, dir) = toolbox("fitcam");
+    tb.call("project_create", json!({"path": "shot", "duration": 2, "width": 1920, "height": 1080})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
+    let truth = CameraParams { fov: 45.0, orbit: [12.0, -8.0], dolly: 200.0, position: Some([1000.0, 500.0]), shift: [0.0, 0.0] };
+    let pts = [[300.0, 200.0, 0.0], [1500.0, 260.0, 120.0], [900.0, 800.0, -200.0], [400.0, 900.0, 300.0], [1700.0, 950.0, 0.0], [960.0, 500.0, 600.0]];
+    let marks: Vec<_> = pts.iter().map(|&p| json!({"world": p, "image": project(&truth, 1920.0, 1080.0, p).unwrap()})).collect();
+    let out = tb.call("fit_camera", json!({"frames": [{"at": 0.5, "marks": marks}], "scene": "s1", "apply": true})).unwrap().json;
+    assert!(out["frames"][0]["rms_px"].as_f64().unwrap() < 0.5, "{out}");
+    assert_eq!(out["applied"], true);
+    let scene: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("shot.lahza/scenes/s1.json")).unwrap()).unwrap();
+    let fov = scene["camera"]["fov"].as_f64().unwrap();
+    let orbit = scene["camera"]["orbit"].clone();
+    assert!((fov - 45.0).abs() < 0.5 && (orbit[0].as_f64().unwrap() - 12.0).abs() < 0.5, "the scene's camera: {}", scene["camera"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

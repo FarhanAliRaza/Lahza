@@ -24,6 +24,8 @@ Usage:
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
   lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
+  lahza motion fit-camera <project> <marks.json> [--scene ID] [--fix fov,shift] [--apply]
+                    marks.json: {\"frames\": [{\"at\": REF, \"marks\": [{\"world\": [x, y, z], \"image\": [x, y]}]}], \"start\": {camera}}
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
                     [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
 
@@ -202,6 +204,31 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             }
             if r["drift"].as_u64().unwrap_or(0) > 0 {
                 return Err("events drift from their markers".into());
+            }
+        }
+        "fit-camera" => {
+            let file = args.get(2).ok_or("fit-camera needs <project> <marks.json>")?;
+            let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+            let marks: Value = serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
+            let mut a = json!({"project": need()?, "frames": marks["frames"].clone()});
+            if !marks["start"].is_null() {
+                a["start"] = marks["start"].clone();
+            }
+            if let Some(scene) = flag(args, "--scene") {
+                a["scene"] = json!(scene);
+            }
+            if let Some(fix) = flag(args, "--fix") {
+                a["fix"] = json!(fix.split(',').map(str::trim).collect::<Vec<_>>());
+            }
+            if has(args, "--apply") {
+                a["apply"] = json!(true);
+            }
+            let out = tb.call("fit_camera", a)?.json;
+            for f in out["frames"].as_array().into_iter().flatten() {
+                println!("{:>10}  rms {:>6} px  {}", f["at"].as_str().unwrap_or(""), f["rms_px"], f["camera"]);
+            }
+            if out.get("ops").is_some() {
+                print(&out["ops"]);
             }
         }
         "snapshot" => {

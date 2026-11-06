@@ -79,6 +79,19 @@ Measurements of a reference (`track`, `fit_curve`, sampled colours) fill in
 the numbers: when things move, where they sit, colours, sizes, the camera.
 They never replace the build line.
 
+## Matching a reference camera
+
+`fit_camera` (CLI `lahza motion fit-camera <project> <marks.json>`) solves
+the scene camera instead of guessing it: for each reference frame, mark a
+few 3D points of the scene (px, like a layer's position and z: corners of
+a box, the tip of a rod) and where they appear in the frame. It solves
+`fov`, `orbit`, `dolly` and `position` (`shift` too unless fixed; `fix`
+keeps others) through the engine's own camera, frame by frame starting
+from the last, and reports each frame's rms error in px. With `scene` it
+returns `set` ops putting the result on that scene's camera as keys
+(`apply: true` applies them). Six or more marks spread across the frame
+and in depth pin it down; three to five work with more fixed.
+
 ## Comparing with a reference
 
 `compare {against: "ref.mp4"}` checks every frame from first to last

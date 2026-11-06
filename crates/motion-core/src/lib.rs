@@ -7,6 +7,7 @@
 //! [`compile::Compiled::frame`], which turns a time into a flat list of
 //! resolved layer states.
 
+pub mod camfit;
 pub mod catalog;
 pub mod check;
 pub mod compile;
