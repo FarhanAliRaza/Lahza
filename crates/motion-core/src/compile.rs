@@ -693,6 +693,12 @@ impl<'a> Windows<'a> {
     fn parent_time(&mut self, parent: Parent<'a>, end: bool) -> Result<f64> {
         match parent {
             Parent::Scene(i) => self.window(&self.project.scenes[i].id.clone(), end),
+            // An emitter's template plays in particle time, from each
+            // particle's birth (age 0): the scene's window, in timeline
+            // seconds, hid every particle younger than the scene's start.
+            Parent::Layer(Layer { kind: LayerKind::Instancer(n), .. }) if matches!(n.layout, crate::document::Layout::Emitter(_)) => {
+                Ok(if end { f64::INFINITY } else { 0.0 })
+            }
             Parent::Layer(l) => self.window(&l.id.clone(), end),
         }
     }

@@ -785,6 +785,16 @@ mod tests {
         assert!(reds.iter().any(|c| c[1] < 0.5) && reds.iter().any(|c| c[1] > 0.8), "white to red over life");
         // Nothing before the start; prewarm starts full; stop empties.
         assert!(copies(&compiled(json!([dots(emitter(json!({"start": 1})), json!({}))])).frame(0.5), "dot").is_empty());
+        // In a scene that starts later, particles still show: the template
+        // plays in particle time, not in the scene's window.
+        let late = {
+            let mut p = crate::document::Project::new(320, 180, crate::time::Fps::whole(30), 6.0);
+            let scene: crate::document::Scene = serde_json::from_value(json!({"id": "late", "start": 2, "end": 6, "layers": [dots(emitter(json!({"start": 2.5})), json!({}))]})).unwrap();
+            p.scenes.push(scene);
+            Compiled::new(&p)
+        };
+        assert!(late.errors.is_empty(), "{:?}", late.errors);
+        assert!(!copies(&late.frame(3.5), "dot").is_empty(), "particles in a scene starting at 2 s");
         assert!(copies(&compiled(json!([dots(emitter(json!({"prewarm": true})), json!({}))])).frame(0.0), "dot").len() >= 38);
         let stopped = compiled(json!([dots(emitter(json!({"stop": 1})), json!({}))]));
         assert!(!copies(&stopped.frame(1.5), "dot").is_empty());
