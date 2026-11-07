@@ -1666,6 +1666,32 @@ mod physics_tests {
         assert!(shade[0] < lit[0] * 0.75, "the shadow darkens the card: {shade:?} vs {lit:?}");
     }
 
+    /// Thin lit haze is smooth at a few samples: every path through it
+    /// gathers single-scattered light, not only the few that happen to
+    /// scatter (which left bright and dark specks).
+    #[test]
+    fn thin_haze_is_smooth_at_few_samples() {
+        if tracer(1).is_none() {
+            return;
+        }
+        let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+        let mut r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow,
+            path: Some(super::TraceOptions { spp: 8, bounces: 4, denoise: false, temporal: false }), ..Default::default() });
+        let mut p = project(json!([{"id": "v", "kind": "mesh", "mesh": {"type": "box", "size": [300, 170], "depth": 400},
+            "material": {"volume": {"density": 0.15, "color": "#ffffff", "anisotropy": 0.3}}, "transform": {"position": [160, 90]}}]));
+        p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0.3, -1, 0.2], "intensity": 2, "shadow": true}])).unwrap();
+        p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+        let img = r.render(&Compiled::new(&p), 0.0);
+        let g: Vec<f64> = (70..110).flat_map(|y| (120..200).map(move |x| (x, y))).map(|(x, y)| img.get_pixel(x, y).0[1] as f64).collect();
+        let mean = g.iter().sum::<f64>() / g.len() as f64;
+        let sd = (g.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / g.len() as f64).sqrt();
+        assert!(mean > 20.0, "the haze is lit: {mean}");
+        // Raw, undenoised, 8 paths: 41% before (37 on 90), 24% with every
+        // path gathering single scattering; what is left is light scattered
+        // more than once, for the denoiser.
+        assert!(sd < 0.3 * mean, "noise {sd:.1} on a mean of {mean:.1}");
+    }
+
     /// Lists with what the tracer can't draw yet (wires, effects such as
     /// depth of field, mattes, blend modes) keep the raster's picture.
     #[test]

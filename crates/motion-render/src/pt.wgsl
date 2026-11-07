@@ -1588,12 +1588,22 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             var seg = 1e30;
             if h.found { seg = h.t; }
             out.color += throughput * b_mat[vol + 20u].xyz * (sigma * min(s_free, seg));
+            // Light scattered once toward the camera: gathered on every path
+            // through the medium, at a point drawn along this stretch by
+            // its transmittance, weighted by the chance of scattering in it
+            // (1 − T). A path that does scatter below carries only the
+            // light of further scattering, so nothing is counted twice and
+            // thin haze is smooth instead of specks of light and dark.
+            if bounce < bounces {
+                let tr = exp(-sigma * min(seg, 1e6));
+                let ts = -log(max(1.0 - rnd(rng) * (1.0 - tr), 1e-7)) / sigma;
+                out.color += throughput * b_mat[vol + 19u].xyz * (1.0 - tr) * volume_direct(o + d * ts, d, v18.y, rng);
+            }
             if s_free < seg {
                 let p = o + d * s_free;
                 throughput *= b_mat[vol + 19u].xyz;
                 through = false;
                 out.alpha = 1.0;
-                out.color += throughput * volume_direct(p, d, v18.y, rng);
                 bounce++;
                 if bounce > bounces { return out; }
                 if bounce >= 3u {
