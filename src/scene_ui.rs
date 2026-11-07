@@ -1250,8 +1250,9 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        let has_pointer = (self.video_project.is_some() && self.video_pointer_synthesized)
-            || (self.animation_active && self.has_walkthrough());
+        let has_pointer = ((self.video_project.is_some() && self.video_pointer_synthesized)
+            || (self.animation_active && self.has_walkthrough()))
+            && !self.motion_pieces.as_ref().is_some_and(|pieces| pieces.covers_screen_at(time));
         let camera = if self.video_project.is_some() && style.has_camera_content() {
             self.camera_frame_rgba.clone()
         } else {
@@ -2425,6 +2426,10 @@ impl Studio {
                                         return;
                                     }
                                     this.focus_handle.focus(window);
+                                    if this.motion_canvas_pointer_down(event.position, bounds, cx) {
+                                        cx.notify();
+                                        return;
+                                    }
                                     if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, interaction_bounds, &annotation_bounds, event.click_count) {
                                         cx.notify();
                                         return;

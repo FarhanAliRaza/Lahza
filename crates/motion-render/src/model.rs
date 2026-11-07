@@ -287,10 +287,15 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
             out["roughness_map"] = json!(t);
             out["metallic_map"] = json!(t);
         }
+        // glTF's emission is the factor times the texture (sRGB), as
+        // emissive × emissive_map.
         let e = m.emissive_factor();
         if e.iter().any(|v| *v > 0.0) {
             out["emissive"] = json!(hex(e));
             out["emissive_strength"] = json!(round(m.emissive_strength().unwrap_or(1.0) as f64));
+            if let Some(t) = m.emissive_texture().and_then(|i| texture(ctx, i.texture(), textures, report)) {
+                out["emissive_map"] = json!(t);
+            }
         }
         // What glTF has no field for travels in the material's extras, under
         // "lahza" (tools/blender/lahza_export.py writes it): subsurface

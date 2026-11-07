@@ -18,6 +18,11 @@ use lahza_motion_core::value::Color;
 use lahza_motion_render::export::{self, ExportOptions, ExportReport, Progress, Quality};
 use lahza_motion_render::font::Fonts;
 use lahza_motion_render::{sheet, Backend, RenderOptions, Renderer};
+use lahza_audio_mode::AudioMode;
+use lahza_clips::RecordingClipSegment;
+use lahza_model::NormalizedPoint;
+use lahza_scene_model::scene_model::SceneStyle;
+use lahza_viewport::ZoomCue;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +53,28 @@ pub struct ToolDef {
 }
 
 const PROJECT: &str = "Project folder (*.lahza). Optional after project_open/project_create: defaults to the current project.";
+
+/// `review`: long side (px) of a sheet thumbnail, and the width of a phone.
+const REVIEW_THUMB: f64 = 270.0;
+const PHONE_WIDTH: f64 = 360.0;
+
+/// What `review` asks of the person looking at its sheets.
+const REVIEW_CHECKLIST: &str = "\
+Look at every sheet before calling the film done (run check first: first_frame_empty and empty_after_cut point at blank frames).
+1. Scenes sheet: describe each frame in one line as a stranger would, naming every object in it. Anything you would have to explain is a P0.
+2. Cover the words: do the frames alone still tell the story?
+3. Cuts sheet: no blank or near-blank frame, no half-faded box or ghosted text, nothing of one scene drawn over the other.
+4. Phone sheets: can every line be read at 360 px wide? If not, make it bigger or cut it.
+One note per problem, worst first (P0 the viewer is lost or sees a broken frame, P1 it costs attention, P2 polish):
+  P0 t=4.2s · where · problem → exact change";
+
+/// Width (px) of the renders the empty-frame checks measure.
+const EMPTY_WIDTH: f64 = 270.0;
+/// A frame with less than this share of its pixels on a drawn edge shows
+/// only its background (`measure::drawn`). Calibrated at 270 px: blank
+/// paper with creases and a vignette reads 0.09%, a lone 32 px word on a
+/// 1280 × 720 frame 0.4%, a 60 px dot 0.3%.
+const EMPTY_DETAIL: f64 = 0.002;
 
 fn obj(props: Value, required: &[&str]) -> Value {
     let mut props = props;
@@ -99,9 +126,30 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "recording_info",
-            description: "A Lahza screen recording (*.lahzarec): its size, the edited video's duration, transcript availability, shared media files (as paths usable from a piece inside it) and the motion pieces placed on its timeline.",
-            schema: obj(json!({"recording": {"type": "string"}}), &["recording"]),
+            description: "A Lahza screen recording (*.lahzarec): its size, the edited video's duration, transcript availability, shared media files (as paths usable from a piece inside it), the motion pieces placed on its timeline and the last recording_export. With edit=true also its look (`scene`), zooms (`zoomCues`, null while they are generated from the clicks), cuts (`clips`), audio (`lahzaExtras`) and the clicks in raw-recording seconds (`source_clicks`): what recording_edit changes.",
+            schema: obj(json!({"recording": {"type": "string"}, "edit": {"type": "boolean"}}), &["recording"]),
             read_only: true,
+        },
+        ToolDef {
+            name: "recording_edit",
+            description: "Edit a Lahza screen recording's own video. `scene` (background, padding, corners, shadow, aspect, camera, pointer, inputOverlays, subtitles…) is merged into its look: send only what changes. `zoomCues` and `clips` replace the zooms and the cuts; their times are seconds on the raw recording, not the edited video. A zoom cue with an existing id is merged into that cue; one without starts as a 2× zoom pinned to the centre (start, end, zoom 1–4, anchorMode pointerAnchor | smartAnchor | pinnedAnchor, pinnedPoint {x, y} in 0–1). A clip is {sourceStart, sourceEnd, speed 0.5–16, gapBefore}. Read the current values with recording_info {edit: true}. The studio showing the recording reloads it and the person can undo.",
+            schema: obj(json!({
+                "recording": {"type": "string"},
+                "scene": {"type": "object"},
+                "zoomCues": {"type": "array", "items": {"type": "object"}},
+                "clips": {"type": "array", "items": {"type": "object"}},
+                "audioMode": {"type": "string", "enum": ["off", "noise-reduction"], "description": "noise-reduction: Enhance audio (removes noise and echo)"},
+                "audioMuted": {"type": "boolean"}}), &["recording"]),
+            read_only: false,
+        },
+        ToolDef {
+            name: "recording_export",
+            description: "Export the edited recording to a video file through the Lahza studio, exactly as its Export button does (the inspector's resolution, codec and frame rate). The extension picks the format: .mp4, .webm or .gif. The studio must be showing this recording (`lahza <recording>` opens it). Returns once the export starts; wait=true returns when the file is written. recording_info shows its state.",
+            schema: obj(json!({
+                "recording": {"type": "string"},
+                "path": {"type": "string", "description": "output file"},
+                "wait": {"type": "boolean", "default": false}}), &["recording", "path"]),
+            read_only: false,
         },
         ToolDef {
             name: "recording_place",
@@ -149,7 +197,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "check",
-            description: "Structure, timing (measured sync drift per anchored key on the frame grid, long holds), layout (title-safe, overlapping text, contrast) and licences. ok=false means errors.",
+            description: "Structure, timing (measured sync drift per anchored key on the frame grid, long holds), layout (title-safe, overlapping text, contrast) and licences, plus two pixel checks on small renders: first_frame_empty (frame 0, the thumbnail social players show, is only background) and empty_after_cut (0.1–0.4 s after a cut nothing but background is on screen: dead air). ok=false means errors.",
             schema: obj(json!({"tolerance_frames": {"type": "number", "default": 1}, "verbose": {"type": "boolean"}}), &[]),
             read_only: true,
         },
@@ -170,7 +218,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
             schema: obj(json!({"at": {"type": "array", "items": time}, "track": {"type": "string"}, "from": {"type": "number"}, "to": {"type": "number"},
                 "sheet": {"type": "boolean"}, "width": {"type": "integer", "description": "px per frame (default 960, 360 in sheets)"}, "save": {"type": "string", "description": "also write the PNG here"},
                 "pt": {"type": "boolean", "description": "path-trace meshes, as a path-traced export draws them (default false: the preview's raster)"}, "samples": {"type": "integer", "description": "with pt: paths per pixel (default the project's samples, else 64)"},
-                "denoise": {"type": "boolean", "description": "with pt: filter the noise (default true)"}}), &[]),
+                "denoise": {"type": "boolean", "description": "with pt: filter the noise (default true)"},
+                "profile": {"type": "boolean", "description": "report where the time goes: CPU stages, GPU passes, path tracer work per layer"}}), &[]),
             read_only: true,
         },
         ToolDef {
@@ -192,6 +241,12 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: false,
         },
         ToolDef {
+            name: "review",
+            description: "Review the whole film as a viewer meets it, before calling it done; per-scene snapshots miss what only shows at cuts and on a phone. Renders three sheets (small, no motion blur), every frame labelled with its scene and time: scenes (each scene 0.4 s after it starts and at its middle), cuts (a strip at −0.2, −0.1, 0, +0.1, +0.2 s around every scene boundary, spanning the transition when it is longer: blank frames, half-faded boxes, ghosted text, one scene drawn over another) and phone (the scene frames 360 px wide, in pages). Returns the sheets as images and a checklist: describe each frame as a stranger would, naming every object (anything you would have to explain is a P0); cover the words and see if the frames still tell the story; read every line at 360 px. Write notes as `P0 t=4.2s · where · problem → exact change`.",
+            schema: obj(json!({"save": {"type": "string", "description": "also write the sheets into this folder: review-scenes.png, review-cuts.png, review-phone-1.png, …"}}), &[]),
+            read_only: true,
+        },
+        ToolDef {
             name: "compare",
             description: "Compare the project with a reference video. Without `at` it compares every frame from first to last: per frame the difference and how much each side moves, a per-scene summary with a verdict (motion, look, missing/extra detail, and interior shading: shading_ratio is ours ÷ reference, \"ours is flatter\" when below 0.5 against a reference that has real shading), the worst stretches (with a sheet of them), a timeline graph, and a side-by-side video (ours | reference | difference) of the whole piece. With `at` it returns those moments side by side. Every frame is scored by SSIM (luminance, Gaussian window; 1 identical): per scene and overall the mean, the 5th percentile and the worst cell of a 4×4 grid (with its box), and with `drawn` the same inside one element's box. The reference time is ours + offset.",
             schema: obj(json!({"against": {"type": "string", "description": "reference video or image"}, "at": {"type": "array", "items": time, "description": "only these moments (default: every frame)"},
@@ -210,6 +265,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
                 "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"},
                 "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"},
+                "profile": {"type": "boolean", "description": "report where the time goes: CPU stages, GPU passes, path tracer work per layer (in the render report)"},
                 "scale": {"type": "number", "description": "output size relative to the project (default 1; e.g. 0.25 for a quick check)"},
                 "every": {"type": "integer", "description": "render every Nth frame only, played at fps/N (default 1): quick checks of long shots"}}), &[]),
             read_only: false,
@@ -374,6 +430,18 @@ fn samples_arg(args: &Value) -> Result<Option<u32>, String> {
     }
 }
 
+/// JSON merge patch: objects merge key by key, anything else replaces.
+fn merge(base: &mut Value, patch: &Value) {
+    match (base, patch) {
+        (Value::Object(b), Value::Object(p)) => {
+            for (k, v) in p {
+                merge(b.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+        (b, p) => *b = p.clone(),
+    }
+}
+
 fn round(v: f64) -> f64 {
     (v * 10000.0).round() / 10000.0
 }
@@ -403,6 +471,8 @@ impl Toolbox {
             "sfx_add" => self.sfx_add(&args),
             "recording_sound_add" => self.recording_sound_add(&args),
             "recording_place" => self.recording_place(&args),
+            "recording_edit" => self.recording_edit(&args),
+            "recording_export" => self.recording_export(&args),
             "timeline_get" => self.timeline_get(&args),
             "markers_query" => self.markers_query(&args),
             "markers_import" => self.markers_import(&args),
@@ -411,6 +481,7 @@ impl Toolbox {
             "check" => self.check(&args),
             "sync_check" => self.sync_check(&args),
             "snapshot" => self.snapshot(&args),
+            "review" => self.review(&args),
             "compare" => self.compare(&args),
             "fit_camera" => self.fit_camera(&args),
             "measure" => self.measure(&args),
@@ -629,6 +700,11 @@ impl Toolbox {
             .collect();
         let sounds: Vec<Value> = doc["audioClips"].as_array().into_iter().flatten()
             .map(|c| json!({"name": c["name"], "start": c["start"], "duration": c["duration"]})).collect();
+        let edit = args.get("edit").and_then(Value::as_bool).unwrap_or(false).then(|| json!({
+            "scene": doc["scene"], "zoomCues": doc["zoomCues"], "clips": doc["clips"], "lahzaExtras": doc["lahzaExtras"],
+            "source_clicks": input["presses"].as_array().into_iter().flatten()
+                .filter(|p| p["phase"] == "down").filter_map(|p| p["time"].as_f64()).map(round).collect::<Vec<_>>(),
+        }));
         Ok(Output::json(json!({
             "recording": rec,
             "size": recording_size(&rec),
@@ -640,8 +716,122 @@ impl Toolbox {
             "sounds": sounds,
             "shared": {"recording": "../../screen.mkv", "media": media},
             "pieces": pieces,
+            "export": recording::read_export_status(&rec),
+            "edit": edit,
             "next": "project_create {path: name, recording} → edit_apply → recording_place {start, placement}",
         })))
+    }
+
+    fn recording_edit(&mut self, args: &Value) -> ToolResult {
+        let rec = self.path(get_str(args, "recording").ok_or("recording_edit needs \"recording\"")?);
+        if !recording::is_recording(&rec) {
+            return Err(format!("{} is not a Lahza recording (*.lahzarec folder)", rec.display()));
+        }
+        let doc = recording::read_edit(&rec);
+        let mut keys = Map::new();
+        if let Some(patch) = args.get("scene") {
+            if !patch.is_object() {
+                return Err("scene: an object with the settings to change".into());
+            }
+            let mut scene = match doc.get("scene").filter(|v| v.is_object()) {
+                Some(v) => v.clone(),
+                None => serde_json::to_value(SceneStyle::default()).map_err(|e| e.to_string())?,
+            };
+            merge(&mut scene, patch);
+            let style: SceneStyle = serde_json::from_value(scene).map_err(|e| format!("scene: {e}"))?;
+            keys.insert("scene".into(), serde_json::to_value(style).map_err(|e| e.to_string())?);
+        }
+        if let Some(list) = args.get("zoomCues") {
+            let list = list.as_array().ok_or("zoomCues: a list of zoom cues")?;
+            let old = doc["zoomCues"].as_array().cloned().unwrap_or_default();
+            let mut cues = Vec::new();
+            for (i, patch) in list.iter().enumerate() {
+                let existing = patch.get("id").and_then(|id| old.iter().find(|c| c.get("id") == Some(id)));
+                let mut cue = match existing {
+                    Some(c) => c.clone(),
+                    None => serde_json::to_value(ZoomCue::pinned(0.0, 0.0, 2.0, NormalizedPoint { x: 0.5, y: 0.5 })).map_err(|e| e.to_string())?,
+                };
+                merge(&mut cue, patch);
+                let cue: ZoomCue = serde_json::from_value(cue).map_err(|e| format!("zoomCues[{i}]: {e}"))?;
+                if !(cue.start >= 0.0 && cue.end - cue.start >= ZoomCue::MINIMUM_DURATION) {
+                    return Err(format!("zoomCues[{i}]: needs start ≥ 0 and end ≥ start + {} s", ZoomCue::MINIMUM_DURATION));
+                }
+                if !(ZoomCue::MINIMUM_ZOOM..=ZoomCue::MAXIMUM_ZOOM).contains(&cue.zoom) {
+                    return Err(format!("zoomCues[{i}]: zoom is {}–{}", ZoomCue::MINIMUM_ZOOM, ZoomCue::MAXIMUM_ZOOM));
+                }
+                cues.push(cue);
+            }
+            keys.insert("zoomCues".into(), serde_json::to_value(cues).map_err(|e| e.to_string())?);
+        }
+        if let Some(list) = args.get("clips") {
+            let clips: Vec<RecordingClipSegment> = serde_json::from_value(list.clone()).map_err(|e| format!("clips: {e}"))?;
+            if clips.is_empty() {
+                return Err("clips: at least one clip".into());
+            }
+            for (i, c) in clips.iter().enumerate() {
+                let ok = c.source_start >= 0.0
+                    && c.source_end - c.source_start >= RecordingClipSegment::MINIMUM_DURATION
+                    && (RecordingClipSegment::MINIMUM_SPEED..=RecordingClipSegment::MAXIMUM_SPEED).contains(&c.speed)
+                    && c.gap_before >= 0.0;
+                if !ok {
+                    return Err(format!(
+                        "clips[{i}]: needs sourceStart ≥ 0, sourceEnd ≥ sourceStart + {} s, speed {}–{}, gapBefore ≥ 0",
+                        RecordingClipSegment::MINIMUM_DURATION, RecordingClipSegment::MINIMUM_SPEED, RecordingClipSegment::MAXIMUM_SPEED
+                    ));
+                }
+            }
+            keys.insert("clips".into(), serde_json::to_value(clips).map_err(|e| e.to_string())?);
+        }
+        if args.get("audioMode").is_some() || args.get("audioMuted").is_some() {
+            let mut extras = doc.get("lahzaExtras").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+            if let Some(mode) = args.get("audioMode") {
+                let mode: AudioMode = serde_json::from_value(mode.clone()).map_err(|_| "audioMode: off or noise-reduction")?;
+                extras["audioMode"] = serde_json::to_value(mode).map_err(|e| e.to_string())?;
+            }
+            if let Some(muted) = args.get("audioMuted") {
+                extras["audioMuted"] = json!(muted.as_bool().ok_or("audioMuted: true or false")?);
+            }
+            keys.insert("lahzaExtras".into(), extras);
+        }
+        if keys.is_empty() {
+            return Err("nothing to change: pass scene, zoomCues, clips, audioMode or audioMuted".into());
+        }
+        recording::write_agent_edit(&rec, keys)?;
+        self.recording_info(&json!({"recording": rec, "edit": true}))
+    }
+
+    fn recording_export(&mut self, args: &Value) -> ToolResult {
+        let rec = self.path(get_str(args, "recording").ok_or("recording_export needs \"recording\"")?);
+        if !recording::is_recording(&rec) {
+            return Err(format!("{} is not a Lahza recording (*.lahzarec folder)", rec.display()));
+        }
+        let out = self.path(get_str(args, "path").ok_or("recording_export needs \"path\"")?);
+        let ext = out.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+        if !matches!(ext.as_deref(), Some("mp4" | "webm" | "gif")) {
+            return Err("path: end it in .mp4, .webm or .gif".into());
+        }
+        if !out.parent().is_some_and(Path::is_dir) {
+            return Err(format!("path: {} does not exist", out.parent().unwrap_or(&out).display()));
+        }
+        let job = recording::ExportJob { id: uuid::Uuid::new_v4().to_string(), path: out };
+        recording::request_export(&rec, &job)?;
+        // The studio looks about twice a second and reloads the recording
+        // before it starts; it reports through the status file.
+        let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            match recording::read_export_status(&rec).filter(|s| s.id == job.id) {
+                Some(s) if !(wait && s.state == recording::ExportState::Running) => break s,
+                None if Instant::now() > deadline && recording::take_export_request(&rec).is_some() => {
+                    return Err(format!("Lahza is not showing this recording: open it (`lahza {}`), then call recording_export again", rec.display()));
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        };
+        if let Some(error) = &status.error {
+            return Err(format!("export failed: {error}"));
+        }
+        Ok(Output::json(json!({"export": status, "next": "recording_info shows the export's state"})))
     }
 
     fn sfx_add(&mut self, args: &Value) -> ToolResult {
@@ -1021,6 +1211,12 @@ impl Toolbox {
         }
         let issues: Vec<Value> = narration.validate().into_iter().map(|(clip, word, message)| json!({"line": clip, "word": word, "message": message})).collect();
         let end = narration.clips.last().map(|c| c.at + c.duration).unwrap_or(0.0);
+        // A project shorter than its narration would cut the voice off.
+        let fps = project.settings.fps.as_f64();
+        let needed = (end * fps - 1e-6).ceil() / fps;
+        if needed > project.settings.duration {
+            project.settings.duration = needed;
+        }
         let summary = json!({
             "lines": narration.clips.len(),
             "imported": imported, "reused": reused,
@@ -1151,9 +1347,58 @@ impl Toolbox {
                 ),
             );
         }
+        self.empty_frames(&dir, &compiled, &mut report);
         let mut v = serde_json::to_value(&report).unwrap_or_default();
         v["sync_count"] = json!(sync_count);
         Ok(Output::json(v))
+    }
+
+    /// Pixel checks: frames that show only the background where a viewer
+    /// looks hardest. Frame 0 is the thumbnail social players show; the
+    /// frames 0.1–0.4 s after a cut are dead air when nothing is on yet.
+    /// Small renders (270 px wide), no motion blur, and a cut stops at its
+    /// first frame with something on it.
+    fn empty_frames(&mut self, dir: &Path, compiled: &Compiled, report: &mut check::Report) {
+        let fps = compiled.fps();
+        let last = compiled.frame_count().saturating_sub(1) as i64;
+        let renderer = self.renderer(dir);
+        let options = renderer.options();
+        renderer.set_scale(EMPTY_WIDTH / compiled.settings.width as f64);
+        renderer.set_motion_blur(false);
+        let mut detail = |t: f64| crate::measure::drawn(&renderer.render(compiled, fps.time_of(fps.nearest_frame(t).clamp(0, last))));
+        let d = detail(0.0);
+        if d < EMPTY_DETAIL {
+            report.add(
+                check::Severity::Warning,
+                "first_frame_empty",
+                None,
+                Some(0.0),
+                format!("frame 0 shows only the background (detail {:.2}% of the frame): it is the thumbnail social players show; open on the subject", d * 100.0),
+            );
+        }
+        let mut cuts: Vec<(&str, f64, f64)> = compiled.scenes.iter().filter(|s| s.start > 1e-9).map(|s| (&*s.id, s.start, s.end)).collect();
+        cuts.sort_by(|a, b| a.1.total_cmp(&b.1));
+        for (id, start, end) in cuts {
+            let mut most: f64 = 0.0;
+            for t in (1..=4).map(|k| start + 0.1 * k as f64).take_while(|t| *t < end) {
+                most = most.max(detail(t));
+                if most >= EMPTY_DETAIL {
+                    break;
+                }
+            }
+            if most < EMPTY_DETAIL && end - start > 0.1 {
+                report.add(
+                    check::Severity::Warning,
+                    "empty_after_cut",
+                    Some(id),
+                    Some(start),
+                    format!("0.1–0.4 s after the cut to '{id}' at {start:.2} s the frame shows only the background (detail ≤ {:.2}%): dead air at the cut; bring the scene's first element on with the cut", most * 100.0),
+                );
+            }
+        }
+        let renderer = self.renderer(dir);
+        renderer.set_scale(options.scale);
+        renderer.set_motion_blur(options.motion_blur);
     }
 
     fn sync_check(&mut self, args: &Value) -> ToolResult {
@@ -1338,7 +1583,16 @@ impl Toolbox {
                 .map(|o| lahza_motion_render::pt::TraceOptions { denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true), ..o }),
             _ => None,
         };
-        let renderer = self.renderer(&dir);
+        // Profiling needs GPU timestamps from the start: a renderer of its own.
+        let mut profiled = args
+            .get("profile")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then(|| Renderer::new(Some(dir.as_path()), RenderOptions { backend: self.backend, profile: true, ..Default::default() }));
+        let renderer = match profiled.as_mut() {
+            Some(r) => r,
+            None => self.renderer(&dir),
+        };
         renderer.set_scale(scale);
         renderer.set_path(path);
         renderer.clear_fallbacks();
@@ -1354,7 +1608,8 @@ impl Toolbox {
         }
         let backend = renderer.backend_label();
         let dropped = renderer.dropped();
-        let fell_back: Vec<String> = renderer.warnings().into_iter().filter(|w| w.starts_with("GPU failed") || w.starts_with("path tracing needs")).collect();
+        // Every path tracing note too: a list drawn by the rasteriser instead must not pass as traced.
+        let fell_back: Vec<String> = renderer.warnings().into_iter().filter(|w| w.starts_with("GPU failed") || w.starts_with("path tracing")).collect();
         renderer.set_scale(1.0);
         renderer.set_path(None);
         let images: Vec<Vec<u8>> = if sheet {
@@ -1368,12 +1623,118 @@ impl Toolbox {
             std::fs::write(&path, &images[0]).map_err(|e| format!("{}: {e}", path.display()))?;
         }
         let mut out = json!({"frames": listed, "renderer": backend});
+        if let Some(p) = profiled.as_ref().and_then(|r| r.profile.as_ref()) {
+            out["profile"] = p.report();
+        }
         // A GPU failure mid-snapshot is reported, not silent.
         if !fell_back.is_empty() {
             out["warnings"] = json!(fell_back);
         }
         if !dropped.is_empty() {
             // Not drawn as asked: the frames are wrong.
+            out["ok"] = json!(false);
+            out["errors"] = json!(dropped);
+        }
+        Ok(Output { json: out, images })
+    }
+
+    /// The whole film as a viewer meets it, in three sheets: each scene
+    /// just after it starts and at its middle; a strip across every cut;
+    /// and the scene frames at phone width. No motion blur.
+    fn review(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let compiled = self.compiled(&dir);
+        let fps = compiled.fps();
+        let last = compiled.frame_count().saturating_sub(1) as i64;
+        let (pw, ph) = (compiled.settings.width as f64, compiled.settings.height as f64);
+        let portrait = ph > pw;
+        let mut scenes: Vec<(String, f64, f64, f64)> = compiled.scenes.iter().map(|s| (s.id.to_string(), s.start, s.end, s.lead_in())).collect();
+        scenes.sort_by(|a, b| a.1.total_cmp(&b.1));
+        if scenes.is_empty() {
+            return Err("no scenes to review".into());
+        }
+        // Thumbnails REVIEW_THUMB px on their long side.
+        let thumb = if portrait { (REVIEW_THUMB * pw / ph).round() } else { REVIEW_THUMB };
+        let renderer = self.renderer(&dir);
+        let options = renderer.options();
+        renderer.set_motion_blur(false);
+        let mut shot = |t: f64, width: f64, scene: &str| {
+            let n = fps.nearest_frame(t).clamp(0, last);
+            let ft = fps.time_of(n);
+            renderer.set_scale(width / pw);
+            ((format!("{scene} {ft:.2}s"), renderer.render(&compiled, ft)), json!({"scene": scene, "t": round(ft), "frame": n}))
+        };
+        // In timeline order, so each scene's images load once. A cut: −0.2
+        // to +0.2 s, or across its transition when that is longer. Scene
+        // frames render at phone width; the first sheet shows them small.
+        let (mut frames, mut listed, mut strips, mut cuts) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, (id, start, end, lead)) in scenes.iter().enumerate() {
+            if i > 0 {
+                let before = &scenes[i - 1].0;
+                let reach = lead.max(0.2);
+                let mut times = Vec::new();
+                for o in [-reach, -reach / 2.0, 0.0, reach / 2.0, reach] {
+                    let (frame, row) = shot(start + o, thumb * 2.0, if o < 0.0 { before } else { id });
+                    strips.push(frame);
+                    times.push(row["t"].clone());
+                }
+                cuts.push(json!({"at": round(*start), "from": before, "to": id, "transition": round(lead * 2.0), "t": times}));
+            }
+            let len = end - start;
+            for t in [start + 0.4f64.min(len / 4.0), start + len / 2.0] {
+                let (frame, row) = shot(t, PHONE_WIDTH, id);
+                frames.push(frame);
+                listed.push(row);
+            }
+        }
+        let backend = renderer.backend_label();
+        let dropped = renderer.dropped();
+        renderer.set_scale(options.scale);
+        renderer.set_motion_blur(options.motion_blur);
+        let mut sheets = vec![("scenes", sheet::contact_sheet(&frames, if portrait { 8 } else { 6 }, thumb as u32))];
+        if !strips.is_empty() {
+            sheets.push(("cuts", sheet::contact_sheet(&strips, if portrait { 10 } else { 5 }, thumb as u32)));
+        }
+        // Phone pages: four across, about 1400 px tall, at their own size.
+        let rows = ((1400.0 / (PHONE_WIDTH * ph / pw + 40.0)) as usize).max(1);
+        for page in frames.chunks(4 * rows) {
+            sheets.push(("phone", sheet::contact_sheet(page, 4, PHONE_WIDTH as u32)));
+        }
+        let images: Vec<Vec<u8>> = sheets.iter().map(|(_, s)| lahza_motion_render::encode_png(s)).collect();
+        let mut saved = Vec::new();
+        if let Some(folder) = get_str(args, "save") {
+            let folder = self.path(folder);
+            std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+            let folder = folder.canonicalize().unwrap_or(folder);
+            let mut page = 0;
+            for ((name, _), png) in sheets.iter().zip(&images) {
+                let file = if *name == "phone" {
+                    page += 1;
+                    format!("review-phone-{page}.png")
+                } else {
+                    format!("review-{name}.png")
+                };
+                let path = folder.join(file);
+                std::fs::write(&path, png).map_err(|e| format!("{}: {e}", path.display()))?;
+                saved.push(path.display().to_string());
+            }
+        }
+        let what = |name: &str| match name {
+            "scenes" => "each scene 0.4 s after it starts and at its middle",
+            "cuts" => "every cut at −0.2, −0.1, 0, +0.1, +0.2 s (across the transition when it is longer); the label's scene changes at the cut",
+            _ => "the scene frames 360 px wide, as on a phone",
+        };
+        let mut out = json!({
+            "sheets": sheets.iter().enumerate().map(|(i, (name, _))| json!({"image": i, "sheet": name, "shows": what(name)})).collect::<Vec<_>>(),
+            "scenes": listed,
+            "cuts": cuts,
+            "checklist": REVIEW_CHECKLIST,
+            "renderer": backend,
+        });
+        if !saved.is_empty() {
+            out["saved"] = json!(saved);
+        }
+        if !dropped.is_empty() {
             out["ok"] = json!(false);
             out["errors"] = json!(dropped);
         }
@@ -1779,7 +2140,7 @@ impl Toolbox {
             quality,
             range,
             audio: args.get("audio").and_then(Value::as_bool).unwrap_or(true),
-            render: RenderOptions { backend: self.backend, ..Default::default() },
+            render: RenderOptions { backend: self.backend, profile: args.get("profile").and_then(Value::as_bool).unwrap_or(false), ..Default::default() },
             renderer: renderer_arg(args)?,
             samples: samples_arg(args)?,
             denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true),

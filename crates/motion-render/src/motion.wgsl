@@ -925,6 +925,7 @@ struct Detail {
     n: vec3<f32>,
     rough_mul: f32,  // roughness map (green)
     metal_mul: f32,  // metallic map (blue)
+    emit: vec3<f32>, // emissive map (multiplies the emission)
 }
 
 // A material's surface detail at barycentric b of a triangle (camera-space
@@ -937,13 +938,15 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
     d.n = n_in;
     d.rough_mul = 1.0;
     d.metal_mul = 1.0;
+    d.emit = vec3<f32>(1.0);
     let r9 = b_mesh[row + 9u];
     let r12 = b_mesh[row + 12u];
     let r13 = b_mesh[row + 13u];
     let r14 = b_mesh[row + 14u];
     let r25 = b_mesh[row + 25u];
     let r26 = b_mesh[row + 26u];
-    let pbr_maps = r25.w > 0.5 || r26.w > 0.5;
+    let r29 = b_mesh[row + 29u];
+    let pbr_maps = r25.w > 0.5 || r26.w > 0.5 || r29.w > 0.5;
     if r9.x < 0.5 && r12.w < 0.5 && r13.w < 0.5 && r14.w == 0.0 && !pbr_maps { return d; }
     let e1 = pos[1] - pos[0];
     let e2 = pos[2] - pos[0];
@@ -996,6 +999,11 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
         if r26.w > 0.5 {
             let c = map_sample(r26, t);
             if c.w > 0.0 { d.metal_mul = c.z / c.w; }
+        }
+        if r29.w > 0.5 {
+            let c = map_sample(r29, t);
+            d.emit = vec3<f32>(0.0);
+            if c.w > 0.0 { d.emit = vec3<f32>(srgb_decode(c.x / c.w), srgb_decode(c.y / c.w), srgb_decode(c.z / c.w)); }
         }
         let lu = length(dpdu);
         let lv = length(dpdv);
@@ -1060,10 +1068,11 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
     return d;
 }
 
-// A volume's chord along the camera ray through p: camera space → the
-// mesh's centred box (rows 21..23), half extents (row 24); a box exactly,
-// other shapes as the ellipsoid in their box.
-fn volume_chord(row: u32, p: vec3<f32>) -> f32 {
+// Where the view ray through p enters and leaves the volume's box (or the
+// ellipsoid in it), as distances from the eye (enter > leave: missed):
+// camera space → the mesh's centred box (rows 21..23), half extents (row
+// 24); a box exactly, other shapes as the ellipsoid in their box.
+fn volume_span(row: u32, p: vec3<f32>) -> vec2<f32> {
     let d = normalize(p);
     let r0 = b_mesh[row + 21u];
     let r1 = b_mesh[row + 22u];
@@ -1079,7 +1088,7 @@ fn volume_chord(row: u32, p: vec3<f32>) -> f32 {
         let tf = max(t1, t2);
         let t0 = max(max(tn.x, tn.y), tn.z);
         let t3 = min(min(tf.x, tf.y), tf.z);
-        return max(t3 - max(t0, 0.0), 0.0);
+        return vec2<f32>(t0, t3);
     }
     let os = o / h;
     let ds = dd / h;
@@ -1087,9 +1096,80 @@ fn volume_chord(row: u32, p: vec3<f32>) -> f32 {
     let b = dot(os, ds);
     let c = dot(os, os) - 1.0;
     let disc = b * b - a * c;
-    if disc <= 0.0 || a <= 0.0 { return 0.0; }
+    if disc <= 0.0 || a <= 0.0 { return vec2<f32>(1.0, 0.0); }
     let sq = sqrt(disc);
-    return max((-b + sq) / a - max((-b - sq) / a, 0.0), 0.0);
+    return vec2<f32>((-b - sq) / a, (-b + sq) / a);
+}
+
+
+// A density grid's value at uvw (0..1 across the box; mirrors mesh3d.rs):
+// trilinear, between two of its tiled z slices.
+fn grid_density(row: u32, uvw: vec3<f32>) -> f32 {
+    let r31 = b_mesh[row + 31u];
+    if r31.w < 0.5 { return 0.0; }
+    let n = b_mesh[row + 32u];
+    let x = clamp(uvw.x * n.x - 0.5, 0.0, n.x - 1.0);
+    let y = clamp(uvw.y * n.y - 0.5, 0.0, n.y - 1.0);
+    let z = clamp(uvw.z * n.z - 0.5, 0.0, n.z - 1.0);
+    let z0 = floor(z);
+    let z1 = min(z0 + 1.0, n.z - 1.0);
+    return mix(grid_slice(r31, n, z0, x, y), grid_slice(r31, n, z1, x, y), z - z0);
+}
+
+// Slice k of a grid image (n: cells x, y, z, tiles per row), bilinear
+// inside its tile.
+fn grid_slice(r31: vec4<f32>, n: vec4<f32>, k: f32, x: f32, y: f32) -> f32 {
+    let ox = i32((k % n.w) * n.x);
+    let oy = i32(floor(k / n.w) * n.y);
+    let x0 = floor(x);
+    let y0 = floor(y);
+    let x1 = min(x0 + 1.0, n.x - 1.0);
+    let y1 = min(y0 + 1.0, n.y - 1.0);
+    let a = mix(map_texel(r31, ox + i32(x0), oy + i32(y0)).x, map_texel(r31, ox + i32(x1), oy + i32(y0)).x, x - x0);
+    let b = mix(map_texel(r31, ox + i32(x0), oy + i32(y1)).x, map_texel(r31, ox + i32(x1), oy + i32(y1)).x, x - x0);
+    return mix(a, b, y - y0);
+}
+// A volume's density at camera-space p, as a share of its sigma (mirrors
+// `volume_density` in mesh3d.rs and pt.wgsl): 1 for an even medium; with
+// noise, the noise above 1 − coverage, faded over `softness` and toward the
+// container's edge (its outer 35%), so the mesh's shape never shows.
+fn volume_density(row: u32, p: vec3<f32>) -> f32 {
+    let r30 = b_mesh[row + 30u];
+    if r30.z < 0.5 { return 1.0; }
+    let r0 = b_mesh[row + 21u];
+    let r1 = b_mesh[row + 22u];
+    let r2 = b_mesh[row + 23u];
+    let q = vec3<f32>(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w);
+    let s = q / max(b_mesh[row + 24u].xyz, vec3<f32>(1e-3));
+    if r30.z > 1.5 {
+        let uvw = s * 0.5 + vec3<f32>(0.5);
+        if any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0)) { return 0.0; }
+        return grid_density(row, uvw);
+    }
+    var e = length(s);
+    if b_mesh[row + 18u].z < 0.5 { e = max(max(abs(s.x), abs(s.y)), abs(s.z)); }
+    let fall = clamp((1.0 - e) / 0.35, 0.0, 1.0);
+    if fall <= 0.0 { return 0.0; }
+    let r9 = b_mesh[row + 9u];
+    let at = (q + b_mesh[row + 17u].xyz) * r9.y;
+    let n = n_sample(u32(r9.x + 0.5), at, u32(r9.z), bitcast<u32>(r9.w));
+    return shaped_density(row, s, at, n, fall);
+}
+
+// A noise volume's density from its noise n at noise-space point `at`,
+// box position s (-1..1) and edge fade (mirrors mesh3d.rs). Cumulus (row
+// 33.w = 1): round billows from cellular noise twice the noise's size
+// over the noise, a flat base at 18% of the height, a rounded top, and
+// coverage that erodes faster with height (cauliflower heads).
+fn shaped_density(row: u32, s: vec3<f32>, at: vec3<f32>, n: f32, fall: f32) -> f32 {
+    let r30 = b_mesh[row + 30u];
+    let r33 = b_mesh[row + 33u];
+    if r33.w < 0.5 { return clamp((n * fall - (1.0 - r30.x)) / max(r30.y, 1e-3), 0.0, 1.0); }
+    let t = clamp(dot(s, r33.xyz) * 0.5 + 0.5, 0.0, 1.0);
+    let profile = smoothstep(0.18, 0.24, t) * (1.0 - smoothstep(0.6, 1.0, t));
+    let billow = 1.0 - n_cellular(at * 0.5, bitcast<u32>(b_mesh[row + 9u].w) ^ 0x5bd1u);
+    let v = (0.6 * billow + 0.4 * n) * fall * profile;
+    return clamp((v - (1.0 - r30.x) - 0.25 * t) / max(r30.y, 1e-3), 0.0, 1.0);
 }
 
 fn hg_phase(g: f32, c: f32) -> f32 {
@@ -1099,12 +1179,66 @@ fn hg_phase(g: f32, c: f32) -> f32 {
 
 // A volume's front face at p: the light it scatters toward the camera and
 // gives off over its chord, and how much it covers (1 − transmittance).
-fn volume_shade(row: u32, lb: u32, p: vec3<f32>, opacity: f32) -> vec4<f32> {
+fn volume_shade(row: u32, lb: u32, p: vec3<f32>, opacity: f32, occ: f32) -> vec4<f32> {
+    let span = volume_span(row, p);
+    let end = min(span.y, volume_stop(p, occ));
+    if b_mesh[row + 30u].z > 0.5 { return volume_march(row, lb, p, opacity, vec2<f32>(span.x, end)); }
     let v18 = b_mesh[row + 18u];
-    let chord = volume_chord(row, p);
+    let chord = max(end - max(span.x, 0.0), 0.0);
     let a = (1.0 - exp(-v18.x * chord)) * opacity;
     if a <= 0.0 { return vec4<f32>(0.0); }
     let d = normalize(p);
+    let straight = b_mesh[row + 19u].xyz * volume_lights(row, lb, p, d, 0.0) + b_mesh[row + 20u].xyz;
+    let t = tone_map(lb, straight);
+    return vec4<f32>(encode(t.x) * a, encode(t.y) * a, encode(t.z) * a, a);
+}
+
+// A noise volume in the preview (mirrors mesh3d.rs): 16 steps through it
+// along the view ray, each lit with one density tap toward every light for
+// its self-shadow. The path tracer walks it exactly.
+fn volume_march(row: u32, lb: u32, p: vec3<f32>, opacity: f32, span: vec2<f32>) -> vec4<f32> {
+    let t0 = max(span.x, 0.0);
+    if span.y <= t0 { return vec4<f32>(0.0); }
+    let sigma = b_mesh[row + 18u].x;
+    let d = normalize(p);
+    // The tap reaches a quarter of the container's mean half size.
+    let h = b_mesh[row + 24u].xyz;
+    let k = (length(b_mesh[row + 21u].xyz) + length(b_mesh[row + 22u].xyz) + length(b_mesh[row + 23u].xyz)) / 3.0;
+    let reach = 0.25 * (h.x + h.y + h.z) / 3.0 / max(k, 1e-6);
+    let dt = (span.y - t0) / 16.0;
+    var tr = 1.0;
+    var lit = vec3<f32>(0.0);
+    for (var i = 0u; i < 16u; i++) {
+        let q = d * (t0 + (f32(i) + 0.5) * dt);
+        let rho = volume_density(row, q);
+        if rho <= 0.0 { continue; }
+        let a = 1.0 - exp(-sigma * rho * dt);
+        lit += tr * a * (b_mesh[row + 19u].xyz * volume_lights(row, lb, q, d, reach) + b_mesh[row + 20u].xyz);
+        tr *= 1.0 - a;
+    }
+    let cover = 1.0 - tr;
+    let a = cover * opacity;
+    if a <= 0.0 { return vec4<f32>(0.0); }
+    let t = tone_map(lb, lit / cover);
+    return vec4<f32>(encode(t.x) * a, encode(t.y) * a, encode(t.z) * a, a);
+}
+
+// How far along the view ray through p the surface behind lies (occ: its
+// 1 / camera z; 0: none, never).
+fn volume_stop(p: vec3<f32>, occ: f32) -> f32 {
+    let d = normalize(p);
+    if occ <= 0.0 || d.z <= 1e-6 { return 1e30; }
+    return 1.0 / (occ * d.z);
+}
+
+// Light scattered toward the eye at p inside a volume (travelling along
+// d): every light by its phase, and the environment evenly. With reach > 0
+// (noise volumes) each light is dimmed by the medium one tap toward it,
+// and light scattered many times is estimated in three octaves, each
+// shadowed half as much with half the anisotropy (Wrenninge): the bright,
+// soft look of clouds that the path tracer gets by walking.
+fn volume_lights(row: u32, lb: u32, p: vec3<f32>, d: vec3<f32>, reach: f32) -> vec3<f32> {
+    let v18 = b_mesh[row + 18u];
     var sc = vec3<f32>(0.0);
     let lights = u32(b_mesh[lb].x);
     for (var i = 0u; i < lights; i++) {
@@ -1123,13 +1257,24 @@ fn volume_shade(row: u32, lb: u32, p: vec3<f32>, opacity: f32) -> vec4<f32> {
                 col = col * (1e6 / (dist * dist + area / PI));
             }
         }
+        if reach > 0.0 {
+            // Two taps toward the light: shaded sides go deep enough for the
+            // sky's colour to show.
+            let tau = v18.x * (volume_density(row, p + l * (0.5 * reach)) + volume_density(row, p + l * (1.5 * reach))) * reach;
+            var ms = 0.0;
+            var k = 1.0;
+            for (var o = 0u; o < 3u; o++) {
+                ms += k * exp(-tau * k) * hg_phase(v18.y * k, dot(l, d));
+                k *= 0.5;
+            }
+            sc += col * (PI * ms);
+            continue;
+        }
         sc += col * (PI * hg_phase(v18.y, dot(l, d)));
     }
     // The environment, evenly (its mean light from above and below).
     sc += (env_diffuse(lb, vec3<f32>(0.0, -1.0, 0.0)) + env_diffuse(lb, vec3<f32>(0.0, 1.0, 0.0))) * 0.5;
-    let straight = b_mesh[row + 19u].xyz * sc + b_mesh[row + 20u].xyz;
-    let t = tone_map(lb, straight);
-    return vec4<f32>(encode(t.x) * a, encode(t.y) * a, encode(t.z) * a, a);
+    return sc;
 }
 
 const SHADOW_TAP_X = array<f32, 8>(-0.613, 0.170, -0.299, 0.645, -0.651, 0.421, -0.084, 0.874);
@@ -1502,7 +1647,7 @@ fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
 }
 
 // Rows per mesh material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 29u;
+const MAT_ROWS: u32 = 34u;
 // Rows per light (mesh3d::LROWS).
 const LROWS: u32 = 5u;
 // Rows per vertex (mesh3d::VROWS).
@@ -1532,7 +1677,9 @@ fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
     return top + (bottom - top) * fy;
 }
 
-fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
+// occ: the nearest occluder behind (1 / camera z; 0: none), where a volume
+// stops.
+fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32) -> vec4<f32> {
     let tb = bitcast<u32>(prim.geom2.x) + tri * 4u;
     let vb = bitcast<u32>(prim.geom2.y);
     let mb = bitcast<u32>(prim.geom2.z);
@@ -1599,9 +1746,9 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>) -> vec4<f32> {
     n = det.n;
     let base = det.base;
     let opacity = m0.w;
-    let emissive = m2.xyz;
+    let emissive = m2.xyz * det.emit;
     if (flags & 64u) != 0u {
-        return volume_shade(mb + mat * MAT_ROWS, lb, p, opacity);
+        return volume_shade(mb + mat * MAT_ROWS, lb, p, opacity, occ);
     }
     if (flags & 8u) != 0u {
         var blocked = 0.0;
@@ -1811,9 +1958,13 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
     let tb = bitcast<u32>(prim.geom2.x);
     var best: array<u32, 8>;
     var depth: array<f32, 8>;
+    // The nearest occluder at each sample (1 / camera z; 0: none), where a
+    // volume in front of it stops.
+    var occ: array<f32, 8>;
     for (var s = 0u; s < 8u; s++) {
         best[s] = NO_TRI;
         depth[s] = 0.0;
+        occ[s] = 0.0;
     }
     for (var j = 0u; j < count; j++) {
         let tri = b_bins[start + j];
@@ -1835,19 +1986,24 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
             let q = vec2<f32>(p.x + SAMPLE_X[s] / 16.0, p.y + SAMPLE_Y[s] / 16.0);
             if cover(r0, r1, q).inside {
                 let z = d.x * q.x + d.y * q.y + d.z;
+                let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * MAT_ROWS;
+                let occludes = (u32(b_mesh[material + 2u].w) & 4u) != 0u && z > occ[s];
                 // Later surfaces win ties; cards only where their picture is.
-                if z >= depth[s] * (1.0 - TIE) {
+                let wins = z >= depth[s] * (1.0 - TIE);
+                if wins || occludes {
                     var stands = true;
                     let tf = u32(b_mesh[r + 2u].w);
-                    let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * MAT_ROWS;
                     if (tf & 1u) != 0u {
                         stands = card_sample(prim, material, q).w >= 1.0 / 512.0; // CARD_STANDS
                     } else if (tf & 2u) != 0u {
                         stands = wire_stands(material, r0, r1, tf, q);
                     }
                     if stands {
-                        depth[s] = z;
-                        best[s] = tri;
+                        if occludes { occ[s] = z; }
+                        if wins {
+                            depth[s] = z;
+                            best[s] = tri;
+                        }
                     }
                 }
             }
@@ -1864,14 +2020,16 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
         if seen { continue; }
         var n = 0.0;
         var q = vec2<f32>(0.0);
+        var oz = 0.0;
         for (var j = s; j < 8u; j++) {
             if best[j] == tri {
                 n += 1.0;
                 q = q + vec2<f32>(SAMPLE_X[j], SAMPLE_Y[j]);
+                oz = max(oz, occ[j]);
             }
         }
         let centroid = vec2<f32>(p.x + q.x / (16.0 * n), p.y + q.y / (16.0 * n));
-        out = out + shade_tri(prim, tri, centroid) * (n / 8.0);
+        out = out + shade_tri(prim, tri, centroid, oz) * (n / 8.0);
     }
     return out * prim.inv_y.w;
 }

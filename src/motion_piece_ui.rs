@@ -1,14 +1,13 @@
 //! Studio UI for motion pieces: a "Motion" lane with one bar per piece,
-//! dragging a bar moves it, the inspector shows a few options, and "Edit
-//! design" opens the full motion editor inside this window (see
-//! `motion_space`). Frames, sound and export come from `motion_pieces`.
+//! dragging a bar moves it, and the inspector shows its placement. Their
+//! layers are edited in the Motion tab (`motion_timeline`). Frames, sound
+//! and export come from `motion_pieces`.
 
-use crate::controls::{button, ButtonKind, ButtonSize};
 use crate::motion_pieces::MotionPieces;
 use crate::Studio;
-use gpui::{div, prelude::*, px, AnyElement, Context, CursorStyle, MouseButton, MouseDownEvent, Pixels, RenderImage, Timer, Window};
-use crate::motion_editor::{CloseSpace, MotionEditor};
-use lahza_motion_core::recording::Placement;
+use gpui::{div, prelude::*, px, AnyElement, Context, CursorStyle, MouseButton, MouseDownEvent, Pixels, RenderImage, Timer};
+use lahza_motion_core::recording::{self, Placement};
+use crate::recording::export::ExportFormat;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +52,6 @@ impl Studio {
         if self.motion_pieces.as_ref().map(|m| &m.recording) == dir.as_ref() {
             return;
         }
-        self.close_motion_space();
         self.selected_motion_piece = None;
         self.motion_piece_drag = None;
         let old: Vec<Arc<RenderImage>> = self.motion_pieces.take().map(|m| m.frames.into_iter().map(|f| f.image).collect()).unwrap_or_default();
@@ -77,6 +75,7 @@ impl Studio {
                     let mut changed = pieces.frames_ready();
                     if tick % 30 == 0 && !dragging && pieces.poll() {
                         changed = true;
+                        let agent_edit = std::mem::take(&mut pieces.agent_edit);
                         let missing = this.selected_motion_piece.as_ref().is_some_and(|id| pieces.get(id).is_none());
                         if missing {
                             this.selected_motion_piece = None;
@@ -84,6 +83,9 @@ impl Studio {
                         // The edit document changed on disk: an agent may
                         // have added sounds to the video too.
                         this.reload_external_audio_clips();
+                        if agent_edit {
+                            this.reload_after_agent_edit(cx);
+                        }
                     }
                     if changed {
                         cx.notify();
@@ -96,6 +98,78 @@ impl Studio {
             }
         })
         .detach();
+    }
+
+    /// An agent edited the recording through MCP (`recording_edit`,
+    /// `recording_export`): reload it in the background, keeping the
+    /// playhead and the undo history, then run any export it asked for.
+    fn reload_after_agent_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.video_project.as_ref().map(|s| s.directory.clone()) else { return };
+        let load = dir.clone();
+        let task = cx.background_executor().spawn(async move { crate::capture::PreparedVideoProject::load(load) });
+        cx.spawn(async move |weak, cx| {
+            let result = task.await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.video_project.as_ref().map(|s| &s.directory) != Some(&dir) {
+                    return;
+                }
+                match result {
+                    Ok(prepared) => {
+                        let position = this.video_position;
+                        let undo = std::mem::take(&mut this.video_undo_stack);
+                        let redo = std::mem::take(&mut this.video_redo_stack);
+                        this.parked_video_history = Some((dir.clone(), undo, redo));
+                        this.apply_video_project(prepared);
+                        this.seek_video_frame(position, cx);
+                        this.run_agent_export(cx);
+                    }
+                    Err(error) => {
+                        this.toast = Some(crate::Notification::error(format!("Could not reload the agent's edit: {error}")));
+                        Self::report_agent_export(&dir, recording::take_export_request(&dir), Err(error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Runs the export an agent left for this recording, if any, through
+    /// the same path as the Export button, without the file picker.
+    fn run_agent_export(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.video_project.clone() else { return };
+        let dir = session.directory.clone();
+        let Some(job) = recording::take_export_request(&dir) else { return };
+        if self.video_edit_busy || self.export_progress.is_some() {
+            return Self::report_agent_export(&dir, Some(job), Err("an export or edit is already running".into()));
+        }
+        if let Err(error) = session.commit_draft() {
+            return Self::report_agent_export(&dir, Some(job), Err(format!("could not save the recording's edits: {error}")));
+        }
+        let format = ExportFormat::from_path(&job.path).unwrap_or(ExportFormat::Mp4);
+        let (source, mut request) = self.video_export_request(&session, format);
+        if format != self.export_format {
+            request.frame_rate = format.default_frame_rate();
+        }
+        request.destination = format.apply_to_path(&job.path);
+        let running = recording::ExportStatus { id: job.id, path: request.destination.clone(), state: recording::ExportState::Running, error: None };
+        let _ = recording::write_export_status(&dir, &running);
+        self.run_scene_export(source, request, move |result| {
+            let status = match result {
+                Ok(()) => recording::ExportStatus { state: recording::ExportState::Done, ..running },
+                Err(error) => recording::ExportStatus { state: recording::ExportState::Failed, error: Some(error.clone()), ..running },
+            };
+            let _ = recording::write_export_status(&dir, &status);
+        }, cx);
+    }
+
+    fn report_agent_export(dir: &std::path::Path, job: Option<recording::ExportJob>, result: Result<(), String>) {
+        let Some(job) = job else { return };
+        let (state, error) = match result {
+            Ok(()) => (recording::ExportState::Done, None),
+            Err(error) => (recording::ExportState::Failed, Some(error)),
+        };
+        let _ = recording::write_export_status(dir, &recording::ExportStatus { id: job.id, path: job.path, state, error });
     }
 
     /// Swaps in finished piece frames and asks for the ones at the playhead:
@@ -308,63 +382,12 @@ impl Studio {
                     |this| this.set_motion_piece_opacity(100),
                     cx,
                 ))
-                .child(
-                    button("motion-piece-edit", "Edit design", ButtonKind::Primary, ButtonSize::Sm)
-                        .icon("icons/pen.svg")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_motion_space(window, cx);
-                            cx.notify();
-                        })),
-                )
+                .child(div().text_xs().text_color(crate::theme::muted()).child(
+                    "Edit its layers and sounds on the timeline, or click one in the preview. Isolate shows the design alone.",
+                ))
                 .child(div().flex().justify_end().child(self.selection_action_button("motion-piece-delete", true, true, cx, |this, _| this.remove_selected_piece())))
                 .into_any_element(),
         )
     }
 
-    /// Opens the selected piece in the full motion editor, in place of the
-    /// video preview and timeline.
-    pub(crate) fn open_motion_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((dir, piece)) = self.selected_motion_piece.as_ref().and_then(|id| self.motion_pieces.as_ref()?.get(id)).map(|p| (p.dir.clone(), p.piece.clone())) else { return };
-        // Over the video, the recording shows under the design while editing.
-        let guide = (piece.placement == Placement::Overlay).then(|| {
-            let session = self.video_project.as_ref()?;
-            let mut source = Self::media_source_for(session);
-            // A media-bank index (imported clips) is not footage.
-            if source.extension().is_some_and(|e| e == "json") {
-                source = session.screen_path();
-            }
-            let src = lahza_motion_core::recording::shared_path(&dir, &session.directory, &source)?;
-            let source_start = self.video_clip_timeline.content_source_time_at(piece.start).unwrap_or(piece.start);
-            Some(crate::motion_editor::Guide { src, source_start })
-        }).flatten();
-        if let Err(e) = lahza_motion_core::io::load(&dir) {
-            self.toast = Some(crate::Notification::error(format!("Could not open the motion design: {e}")));
-            return;
-        }
-        self.pause_video_playback();
-        let editor = cx.new(|cx| {
-            let mut editor = MotionEditor::new(dir.clone(), cx).unwrap_or_else(|e| panic!("cannot open {}: {e}", dir.display()));
-            editor.embedded = true;
-            editor.set_guide(guide);
-            editor.start_ticking(cx);
-            cx.on_release_in(window, |this, window, _| this.release_images(window)).detach();
-            editor
-        });
-        cx.subscribe_in(&editor, window, |this, _, _: &CloseSpace, _, cx| {
-            this.close_motion_space();
-            cx.notify();
-        })
-        .detach();
-        window.focus(&editor.read(cx).focus_handle());
-        self.motion_space = Some(editor);
-    }
-
-    /// Back to the video: the piece reloads with whatever changed.
-    pub(crate) fn close_motion_space(&mut self) {
-        if self.motion_space.take().is_some() {
-            if let Some(m) = self.motion_pieces.as_mut() {
-                m.poll();
-            }
-        }
-    }
 }

@@ -1,7 +1,7 @@
 //! Image textures: decoded once, premultiplied, with a 2×2 box mip chain,
 //! packed into one texel pool that the CPU and GPU paths sample alike.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Longest side kept; larger images are downscaled on load.
@@ -23,6 +23,14 @@ pub struct Images {
     entries: HashMap<String, Option<Texture>>,
     pub generation: u64,
     pub warnings: Vec<String>,
+    /// Sources looked up since `begin_frame`; `compact` keeps only these.
+    used: HashSet<String>,
+    /// Registered pixels with no file behind them, never evicted.
+    pinned: HashSet<String>,
+    /// An image did not fit in the pool since `begin_frame`.
+    pub overflowed: bool,
+    /// Time spent loading images since the renderer last took it.
+    pub(crate) busy: std::time::Duration,
     luts: HashMap<String, Option<std::sync::Arc<(usize, Vec<[f32; 4]>)>>>,
 }
 
@@ -32,13 +40,43 @@ pub fn pack(c: [u8; 4]) -> u32 {
 
 impl Images {
     pub fn new(root: Option<&Path>) -> Self {
-        Self { root: root.map(Path::to_path_buf), texels: Vec::new(), entries: HashMap::new(), generation: 1, warnings: Vec::new(), luts: HashMap::new() }
+        Self { root: root.map(Path::to_path_buf), texels: Vec::new(), entries: HashMap::new(), generation: 1, warnings: Vec::new(), used: HashSet::new(), pinned: HashSet::new(), overflowed: false, luts: HashMap::new(), busy: std::time::Duration::ZERO }
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.used.clear();
+        self.overflowed = false;
+    }
+
+    /// Drops every texture the current frame has not used and packs the rest
+    /// to the front of the pool, so the frame's missing images fit when it
+    /// is built again. Offsets change, so lists built before are stale.
+    pub fn compact(&mut self) {
+        let mut texels = Vec::new();
+        let old = std::mem::take(&mut self.texels);
+        self.entries.retain(|src, e| match e {
+            Some(t) if self.used.contains(src) || self.pinned.contains(src) => {
+                let n = mip_texels(t.width, t.height, t.levels);
+                let at = t.offset as usize;
+                t.offset = texels.len() as u32;
+                texels.extend_from_slice(&old[at..at + n]);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        });
+        self.texels = texels;
+        self.generation += 1;
     }
 
     pub fn get(&mut self, src: &str) -> Option<Texture> {
+        if !self.used.contains(src) {
+            self.used.insert(src.to_string());
+        }
         if let Some(e) = self.entries.get(src) {
             return *e;
         }
+        let started = std::time::Instant::now();
         let path = match &self.root {
             Some(root) => root.join(src),
             None => PathBuf::from(src),
@@ -55,13 +93,19 @@ impl Images {
                         image::imageops::FilterType::Triangle,
                     );
                 }
-                self.insert_rgba(&img)
+                let texture = self.insert_rgba(&img);
+                if texture.is_none() {
+                    // Pool full: not cached, so it loads once there is room.
+                    return None;
+                }
+                texture
             }
             Err(e) => {
                 self.warnings.push(format!("image '{src}': {e}"));
                 None
             }
         };
+        self.busy += started.elapsed();
         self.entries.insert(src.to_string(), texture);
         texture
     }
@@ -91,6 +135,7 @@ impl Images {
     pub fn insert_named(&mut self, name: &str, img: &image::RgbaImage) -> Option<Texture> {
         let texture = self.insert_rgba(img);
         self.entries.insert(name.to_string(), texture);
+        self.pinned.insert(name.to_string());
         texture
     }
 
@@ -120,7 +165,7 @@ impl Images {
             lh = (lh / 2).max(1);
         }
         if self.texels.len() + total > MAX_TEXELS {
-            self.warnings.push("image memory budget reached; some images are not drawn".into());
+            self.overflowed = true;
             return None;
         }
         let offset = self.texels.len() as u32;
@@ -153,6 +198,17 @@ impl Images {
         self.generation += 1;
         Some(Texture { offset, width: w, height: h, levels })
     }
+}
+
+/// Texels of a texture and its mip chain, as `insert_rgba` lays them out.
+fn mip_texels(width: u32, height: u32, levels: u32) -> usize {
+    let (mut w, mut h, mut n) = (width, height, 0usize);
+    for _ in 0..levels {
+        n += (w * h) as usize;
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+    }
+    n
 }
 
 /// Parses an Adobe/Resolve .cube 3D LUT (red varies fastest).

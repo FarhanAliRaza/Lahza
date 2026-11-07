@@ -19,6 +19,8 @@ use lahza_motion_core::compile::Compiled;
 use lahza_motion_core::document::Project;
 use lahza_motion_core::io;
 use lahza_motion_core::recording::{self, MotionPiece, Placement};
+use lahza_motion_render::export::{self, Quality};
+use lahza_motion_render::pt::TraceOptions;
 use lahza_motion_render::{RenderOptions, Renderer};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -48,6 +50,12 @@ impl LoadedPiece {
     }
     pub fn active_at(&self, t: f64) -> bool {
         !self.piece.hidden && t >= self.piece.start && t < self.end()
+    }
+    /// Drawn over the video with an opaque background at full opacity: it
+    /// replaces the screen, so the screen's pointer is not drawn over it.
+    fn covers_screen(&self) -> bool {
+        !self.piece.hidden && self.piece.placement == Placement::Overlay && self.piece.opacity >= 1.0
+            && rgba8(self.project.settings.background)[3] == 255
     }
     fn size(&self) -> (f64, f64) {
         (self.project.settings.width as f64, self.project.settings.height as f64)
@@ -94,6 +102,10 @@ pub(crate) struct MotionPieces {
     pub items: Vec<LoadedPiece>,
     pub errors: Vec<String>,
     edit_stamp: SystemTime,
+    /// The edit document's `agentRevision` when last read.
+    agent_revision: u64,
+    /// An agent edited the recording since the studio last reloaded it.
+    pub agent_edit: bool,
     worker: Worker,
     /// Full-screen pieces, drawn over the preview canvas.
     pub frames: Vec<PieceFrame>,
@@ -113,6 +125,8 @@ impl MotionPieces {
             items: Vec::new(),
             errors: Vec::new(),
             edit_stamp: SystemTime::UNIX_EPOCH,
+            agent_revision: 0,
+            agent_edit: false,
             worker: Worker::new(),
             frames: Vec::new(),
             media_frame: None,
@@ -121,11 +135,15 @@ impl MotionPieces {
             request_key: 0,
         };
         pieces.reload();
+        pieces.agent_edit = false;
         pieces
     }
 
     fn reload(&mut self) {
         self.edit_stamp = edit_stamp(&self.recording);
+        let revision = recording::revision(&recording::read_edit(&self.recording));
+        self.agent_edit |= revision != self.agent_revision;
+        self.agent_revision = revision;
         let previous = std::mem::take(&mut self.items);
         self.errors.clear();
         for piece in recording::read_pieces(&self.recording) {
@@ -156,12 +174,31 @@ impl MotionPieces {
         Ok(())
     }
 
+    /// Draws piece `id` from `compiled` (an edit in progress) until the
+    /// next reload from disk.
+    pub(crate) fn show_compiled(&mut self, id: &str, compiled: Arc<Compiled>) {
+        if let Some(p) = self.items.iter_mut().find(|p| p.piece.id == id) {
+            p.compiled = compiled;
+            self.last_request = 0;
+        }
+    }
+
     pub(crate) fn pieces(&self) -> Vec<MotionPiece> {
         self.items.iter().map(|p| p.piece.clone()).collect()
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<&LoadedPiece> {
         self.items.iter().find(|p| p.piece.id == id)
+    }
+
+    /// Whether a piece replaces the screen at editor time `t`.
+    pub(crate) fn covers_screen_at(&self, t: f64) -> bool {
+        self.items.iter().any(|p| p.covers_screen() && p.active_at(t))
+    }
+
+    /// Editor-time ranges where a piece replaces the screen.
+    pub(crate) fn screen_covered(&self) -> Vec<(f64, f64)> {
+        self.items.iter().filter(|p| p.covers_screen()).map(|p| (p.piece.start, p.end())).collect()
     }
 
     pub(crate) fn any_active(&self, t: f64, placement: Placement) -> bool {
@@ -190,6 +227,7 @@ impl MotionPieces {
                     placement: p.piece.placement,
                     background: rgba8(p.project.settings.background),
                     blur: !proxy,
+                    path: None,
                 }
             })
             .collect();
@@ -345,6 +383,9 @@ struct PieceJob {
     placement: Placement,
     background: [u8; 4],
     blur: bool,
+    /// Path-trace meshes (the final export of a piece whose project asks
+    /// for it); the preview always rasterises.
+    path: Option<TraceOptions>,
 }
 
 struct Request {
@@ -444,6 +485,7 @@ fn render_piece(renderers: &mut HashMap<PathBuf, Renderer>, job: &PieceJob) -> R
     let renderer = renderers.entry(job.dir.clone()).or_insert_with(|| Renderer::new(Some(&job.dir), RenderOptions::default()));
     renderer.set_scale(job.scale);
     renderer.set_motion_blur(job.blur);
+    renderer.set_path(job.path);
     let mut pixels = renderer.render(&job.compiled, job.t);
     if job.placement == Placement::Full {
         let [br, bg, bb, ba] = job.background;
@@ -537,6 +579,10 @@ fn export_thread(items: Vec<LoadedPiece>, width: u32, height: u32) -> (mpsc::Sen
                         placement: p.piece.placement,
                         background: rgba8(p.project.settings.background),
                         blur: true,
+                        // Frames are asked in order, so each builds on the
+                        // last one's samples, as in a motion export.
+                        path: export::trace_options(&p.project.settings, Quality::Final, None, None)
+                            .map(|o| TraceOptions { temporal: true, ..o }),
                     };
                     let frame = render_piece(&mut renderers, &job);
                     over(&mut layer, &frame, x.round() as i64, y.round() as i64, p.piece.opacity as f32);

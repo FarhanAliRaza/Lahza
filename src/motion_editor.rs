@@ -10,16 +10,14 @@
 //! render a half-size proxy, a paused frame renders at full preview size
 //! with motion blur. GPU images are released with `Window::drop_image`.
 
-use crate::controls::{button, icon_button, ButtonKind, ButtonSize};
 use crate::motion_sound::{self, PeakCache, Player, Wave};
-use crate::theme::{self, TextRoles};
+use crate::theme;
 use gpui::{
-    canvas, div, img, prelude::*, px, size, App, Bounds, Context, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, Pixels, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Timer, TitlebarOptions,
-    Window, WindowBounds, WindowDecorations, WindowOptions,
+    canvas, div, img, prelude::*, px, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels,
+    Render, RenderImage, Timer, Window,
 };
 use lahza_motion_core::compile::{Compiled, Content, LayerState};
-use lahza_motion_core::document::{Layer, LayerKind, Project};
+use lahza_motion_core::document::{Layer, Project};
 use lahza_motion_core::property::{compile as compile_prop, Ctx, Property};
 use lahza_motion_core::timeref::TimeRef;
 use lahza_motion_core::value::{Animatable, Vec2};
@@ -33,9 +31,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-const LABEL_WIDTH: f32 = 168.0;
-const ROW: f32 = 24.0;
-const INSPECTOR_WIDTH: f32 = 280.0;
 
 // ------------------------------------------------------------ render worker
 
@@ -106,9 +101,6 @@ impl Worker {
         self.shared.0.lock().unwrap().done.take()
     }
 
-    fn label(&self) -> String {
-        self.shared.0.lock().unwrap().label.clone()
-    }
 }
 
 impl Drop for Worker {
@@ -123,20 +115,18 @@ impl Drop for Worker {
 
 // ------------------------------------------------------------------ model
 
+/// A layer moved on the canvas: the pointer at press and the layer's
+/// position then.
 #[derive(Clone)]
-enum Drag {
-    Scrub,
-    /// Editing a sound: what is dragged, the time under the pointer at
-    /// press, and the sound as it was.
-    Sound { id: String, part: SoundPart, grab: f64, orig: SoundShape },
-    Key { layer: String, path: String, index: usize, from: f64 },
-    Move { layer: String, start: (f32, f32), origin: Vec2 },
-    Value { layer: String, field: Field, start_x: f32, origin: f64 },
+struct Drag {
+    layer: String,
+    start: (f32, f32),
+    origin: Vec2,
 }
 
 /// The handle of a sound bar being dragged.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum SoundPart {
+pub(crate) enum SoundPart {
     Move,
     /// Leading edge: trims the start of the file (the sound starts later).
     Start,
@@ -148,24 +138,24 @@ enum SoundPart {
 
 /// Where and how a sound plays, for drag previews.
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct SoundShape {
-    start: f64,
+pub(crate) struct SoundShape {
+    pub start: f64,
     trim: f64,
-    length: f64,
-    fade_in: f64,
-    fade_out: f64,
+    pub length: f64,
+    pub fade_in: f64,
+    pub fade_out: f64,
     source_duration: f64,
 }
 
 const MIN_SOUND: f64 = 0.05;
 
 impl SoundShape {
-    fn of(w: &Wave) -> Self {
+    pub(crate) fn of(w: &Wave) -> Self {
         Self { start: w.start, trim: w.source_start, length: w.duration, fade_in: w.fade_in, fade_out: w.fade_out, source_duration: w.source_duration }
     }
 
     /// The shape after dragging `part` by `d` seconds.
-    fn dragged(self, part: SoundPart, d: f64) -> Self {
+    pub(crate) fn dragged(self, part: SoundPart, d: f64) -> Self {
         let mut s = self;
         match part {
             SoundPart::Move => s.start = (self.start + d).max(0.0),
@@ -189,7 +179,7 @@ impl SoundShape {
         s
     }
 
-    fn apply(self, w: &Wave) -> Wave {
+    pub(crate) fn apply(self, w: &Wave) -> Wave {
         Wave { start: self.start, source_start: self.trim, duration: self.length, fade_in: self.fade_in, fade_out: self.fade_out, ..w.clone() }
     }
 }
@@ -228,15 +218,15 @@ fn split_offset(text: &str, fps: f64) -> (String, f64) {
 
 /// A scrubbable inspector value: property path and vector component.
 #[derive(Clone, Copy, PartialEq)]
-struct Field {
-    path: &'static str,
-    component: Option<usize>,
-    label: &'static str,
+pub(crate) struct Field {
+    pub path: &'static str,
+    pub component: Option<usize>,
+    pub label: &'static str,
     /// Value change per dragged pixel.
-    step: f64,
+    pub step: f64,
 }
 
-const FIELDS: &[Field] = &[
+pub(crate) const FIELDS: &[Field] = &[
     Field { path: "transform.position", component: Some(0), label: "X", step: 1.0 },
     Field { path: "transform.position", component: Some(1), label: "Y", step: 1.0 },
     Field { path: "transform.scale", component: Some(0), label: "Scale X", step: 0.005 },
@@ -248,19 +238,20 @@ const FIELDS: &[Field] = &[
     Field { path: "transform.rotation_y", component: None, label: "Turn Y", step: 0.5 },
 ];
 
-struct KeyMark {
-    path: String,
-    index: usize,
-    t: f64,
+pub(crate) struct KeyMark {
+    pub path: String,
+    pub index: usize,
+    pub t: f64,
 }
 
-struct Row {
-    id: String,
-    kind: &'static str,
-    depth: usize,
-    start: f64,
-    end: f64,
-    keys: Vec<KeyMark>,
+/// One layer on the timeline: its window and keys, in project seconds.
+pub(crate) struct Row {
+    pub id: String,
+    pub kind: &'static str,
+    pub depth: usize,
+    pub start: f64,
+    pub end: f64,
+    pub keys: Vec<KeyMark>,
 }
 
 pub(crate) struct MotionEditor {
@@ -279,10 +270,6 @@ pub(crate) struct MotionEditor {
     request_key: u64,
     dirty: bool,
     selected: Option<String>,
-    /// Timeline pixels per second and left edge (seconds).
-    zoom: f64,
-    scroll: f64,
-    track_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     drag: Option<Drag>,
     focus: FocusHandle,
@@ -297,50 +284,9 @@ pub(crate) struct MotionEditor {
     waves: Arc<Vec<Wave>>,
     wave_signature: String,
     wave_inbox: Arc<Mutex<Option<(String, Vec<Wave>)>>>,
-    /// Shown inside the studio window, with a way back to the video.
-    pub(crate) embedded: bool,
-    /// The recording under an over-the-video piece while it is edited.
-    guide: Option<Guide>,
     /// Decoded peaks per sound file.
     peaks: PeakCache,
-    /// The "+ Sound" menu is open.
-    sound_menu: bool,
-    /// A sound being dragged: its id and shape while dragging.
-    sound_preview: Option<(String, SoundShape)>,
 }
-
-/// A reference picture under the design: never saved, never selectable.
-#[derive(Clone, Debug)]
-pub(crate) struct Guide {
-    /// Footage path as seen from the project (`../../screen.mkv`).
-    pub src: String,
-    /// Footage time at the project's time zero.
-    pub source_start: f64,
-}
-
-const GUIDE_ID: &str = "__guide";
-
-/// Compiles `project`, with `guide` as a muted footage layer under every
-/// scene when there is one.
-fn compile_with_guide(project: &Project, guide: Option<&Guide>) -> Compiled {
-    let Some(guide) = guide else { return Compiled::new(project) };
-    let plain = Compiled::new(project);
-    let mut with = project.clone();
-    let (w, h) = (project.settings.width as f64, project.settings.height as f64);
-    for (scene, c) in with.scenes.iter_mut().zip(&plain.scenes) {
-        let layer = json!({"id": GUIDE_ID, "kind": "video", "src": guide.src, "size": [w, h], "mute": true,
-            "trim": round(guide.source_start + c.start), "transform": {"position": [w / 2.0, h / 2.0]}});
-        if let Ok(layer) = serde_json::from_value::<Layer>(layer) {
-            scene.layers.insert(0, layer);
-        }
-    }
-    Compiled::new(&with)
-}
-
-/// Emitted by an embedded editor's "Back to video".
-pub(crate) struct CloseSpace;
-
-impl gpui::EventEmitter<CloseSpace> for MotionEditor {}
 
 /// Newest modification time of a motion project's files.
 pub(crate) fn stamp(dir: &Path) -> SystemTime {
@@ -468,7 +414,6 @@ impl MotionEditor {
         let mut toolbox = Toolbox::new();
         toolbox.cwd = dir.parent().map(Path::to_path_buf).unwrap_or_default();
         toolbox.call("project_open", json!({"path": dir})).map_err(|e| e.to_string())?;
-        let duration = project.settings.duration.max(0.1);
         let editor = Self {
             worker: Worker::new(dir.clone()),
             fonts: Fonts::new(Some(&dir)),
@@ -486,9 +431,6 @@ impl MotionEditor {
             request_key: 0,
             dirty: true,
             selected: None,
-            zoom: 900.0 / duration,
-            scroll: 0.0,
-            track_bounds: Arc::default(),
             canvas_bounds: Arc::default(),
             drag: None,
             focus: cx.focus_handle(),
@@ -500,11 +442,7 @@ impl MotionEditor {
             waves: Arc::default(),
             wave_signature: String::new(),
             wave_inbox: Arc::default(),
-            embedded: false,
-            guide: None,
             peaks: PeakCache::default(),
-            sound_menu: false,
-            sound_preview: None,
         };
         let mut editor = editor;
         editor.refresh_waves();
@@ -517,17 +455,6 @@ impl MotionEditor {
         for image in self.retired.drain(..).chain(self.frame.take()) {
             let _ = window.drop_image(image);
         }
-    }
-
-    pub(crate) fn focus_handle(&self) -> FocusHandle {
-        self.focus.clone()
-    }
-
-    /// Shows `guide` under the design (over-the-video pieces).
-    pub(crate) fn set_guide(&mut self, guide: Option<Guide>) {
-        self.guide = guide;
-        self.compiled = Arc::new(compile_with_guide(&self.project, self.guide.as_ref()));
-        self.dirty = true;
     }
 
     /// Ticks at 60 Hz: playback, finished frames, and live reload.
@@ -553,7 +480,6 @@ impl MotionEditor {
             if self.time >= d {
                 self.time = 0.0;
             }
-            self.follow_playhead();
             self.dirty = true;
             changed = true;
         }
@@ -607,7 +533,7 @@ impl MotionEditor {
         match io::load(&self.dir) {
             Ok(p) => {
                 self.project = p;
-                self.compiled = Arc::new(compile_with_guide(&self.project, self.guide.as_ref()));
+                self.compiled = Arc::new(Compiled::new(&self.project));
                 self.rows = layer_rows(&self.project, &self.compiled);
                 self.stamp = stamp(&self.dir);
                 self.dirty = true;
@@ -640,7 +566,7 @@ impl MotionEditor {
     /// Shows ops without saving them (live drags).
     fn preview(&mut self, ops: &[Value]) {
         if let Ok(a) = edit::apply(&self.project, ops) {
-            self.compiled = Arc::new(compile_with_guide(&a.project, self.guide.as_ref()));
+            self.compiled = Arc::new(Compiled::new(&a.project));
             self.dirty = true;
         }
     }
@@ -654,15 +580,8 @@ impl MotionEditor {
         self.reload();
     }
 
-    fn follow_playhead(&mut self) {
-        let Some(b) = *self.track_bounds.lock().unwrap() else { return };
-        let span = f64::from(b.size.width) / self.zoom;
-        if self.time < self.scroll || self.time > self.scroll + span * 0.95 {
-            self.scroll = (self.time - span * 0.1).max(0.0);
-        }
-    }
 
-    fn seek(&mut self, t: f64) {
+    pub(crate) fn seek(&mut self, t: f64) {
         let fps = self.project.settings.fps;
         let n = fps.nearest_frame(t.clamp(0.0, self.project.settings.duration)).clamp(0, self.compiled.frame_count().saturating_sub(1) as i64);
         self.time = fps.time_of(n);
@@ -691,15 +610,11 @@ impl MotionEditor {
         });
     }
 
-    fn step(&mut self, frames: i64) {
+    pub(crate) fn step(&mut self, frames: i64) {
         let fps = self.project.settings.fps;
         self.seek(fps.time_of(fps.nearest_frame(self.time) + frames));
     }
 
-    fn time_at(&self, x: f32) -> Option<f64> {
-        let b = (*self.track_bounds.lock().unwrap())?;
-        Some(self.scroll + f64::from(x - f32::from(b.origin.x)) / self.zoom)
-    }
 
     /// Screen point → project pixel, through the fitted preview.
     fn project_point(&self, x: f32, y: f32) -> Option<(f64, f64)> {
@@ -784,7 +699,7 @@ impl MotionEditor {
                 Content::Group(_) => None,
                 _ => lahza_motion_core::check::bounds(l, None),
             }?;
-            (&*l.id != GUIDE_ID && x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]).then(|| l.id.to_string())
+            (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]).then(|| l.id.to_string())
         })
     }
 
@@ -810,33 +725,20 @@ impl MotionEditor {
 
     // ------------------------------------------------------------ input
 
+    /// The canvas handles Delete; the studio owns playback, undo and the
+    /// timeline keys.
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let k = &event.keystroke;
-        let command = k.modifiers.control || k.modifiers.platform;
-        match k.key.as_str() {
-            "space" => self.toggle_play(cx),
-            "left" => self.step(if k.modifiers.shift { -10 } else { -1 }),
-            "right" => self.step(if k.modifiers.shift { 10 } else { 1 }),
-            "home" => self.seek(0.0),
-            "end" => self.seek(self.project.settings.duration),
-            "z" if command => self.undo(k.modifiers.shift),
-            "y" if command => self.undo(true),
-            "delete" | "backspace" => {
-                if let Some(id) = self.selected.take() {
-                    self.commit(vec![json!({"op": "remove", "id": id})]);
-                }
-            }
-            "escape" if self.sound_menu => self.sound_menu = false,
-            "=" | "+" => self.zoom = (self.zoom * 1.25).min(4000.0),
-            "-" => self.zoom = (self.zoom / 1.25).max(5.0),
-            _ => return,
+        if !matches!(event.keystroke.key.as_str(), "delete" | "backspace") {
+            return;
         }
-        // Inside the studio, keys must not also drive the video behind.
+        if let Some(id) = self.selected.take() {
+            self.commit(vec![json!({"op": "remove", "id": id})]);
+        }
         cx.stop_propagation();
         cx.notify();
     }
 
-    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_play(&mut self, cx: &mut Context<Self>) {
         self.playing = !self.playing;
         self.generation.fetch_add(1, Ordering::SeqCst);
         if self.playing {
@@ -849,41 +751,180 @@ impl MotionEditor {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some(drag) = self.drag.clone() else { return };
+        let Some(Drag { layer, start, origin }) = self.drag.clone() else { return };
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
-        match drag {
-            Drag::Scrub => {
-                if let Some(t) = self.time_at(x) {
-                    self.seek(t);
-                }
-            }
-            Drag::Sound { id, part, grab, orig } => {
-                if let Some(t) = self.time_at(x) {
-                    self.sound_preview = Some((id, orig.dragged(part, t - grab)));
-                }
-            }
-            Drag::Key { layer, path, index, .. } => {
-                if let Some(t) = self.time_at(x) {
-                    let t = self.project.settings.fps.time_of(self.project.settings.fps.nearest_frame(t.max(0.0)));
-                    let ops = self.key_ops(&layer, &path, index, json!(round(t)));
-                    self.preview(&ops);
-                }
-            }
-            Drag::Move { layer, start, origin } => {
-                if let (Some(a), Some(b)) = (self.project_point(start.0, start.1), self.project_point(x, y)) {
-                    let p = [round(origin.x() + b.0 - a.0), round(origin.y() + b.1 - a.1)];
-                    let (_, animated) = self.eval::<Vec2>(&layer, "transform.position", Vec2::ZERO);
-                    let ops = self.value_ops(&layer, "transform.position", json!(p), animated);
-                    self.preview(&ops);
-                }
-            }
-            Drag::Value { layer, field, start_x, origin } => {
-                let v = origin + (x - start_x) as f64 * field.step;
-                let ops = self.field_ops(&layer, field, v);
-                self.preview(&ops);
-            }
+        if let (Some(a), Some(b)) = (self.project_point(start.0, start.1), self.project_point(x, y)) {
+            self.move_layer(&layer, [origin.x() + b.0 - a.0, origin.y() + b.1 - a.1], false);
         }
         cx.notify();
+    }
+
+    /// Shows key `index` of `layer.path` at project time `t` (unsaved).
+    pub(crate) fn drag_key(&mut self, layer: &str, path: &str, index: usize, t: f64) {
+        let fps = self.project.settings.fps;
+        let t = fps.time_of(fps.nearest_frame(t.max(0.0)));
+        let ops = self.key_ops(layer, path, index, json!(round(t)));
+        self.preview(&ops);
+    }
+
+    /// Saves key `index` of `layer.path` at project time `t`, moved from
+    /// `from`; Shift snaps to the nearest beat and keeps the sync by
+    /// writing the marker reference.
+    pub(crate) fn drop_key(&mut self, layer: &str, path: &str, index: usize, from: f64, t: f64, shift: bool) {
+        let fps = self.project.settings.fps;
+        let t = fps.time_of(fps.nearest_frame(t.max(0.0)));
+        let at = if shift { self.nearest_marker("beat", t).map(Value::from).unwrap_or(json!(round(t))) } else { json!(round(t)) };
+        if (t - from).abs() > 1e-6 || shift {
+            let ops = self.key_ops(layer, path, index, at);
+            self.commit(ops);
+        } else {
+            // A click: drop the drag preview.
+            self.compiled = Arc::new(Compiled::new(&self.project));
+        }
+    }
+
+    /// Saves a dragged sound: `orig` moved by `d` seconds at `part`.
+    /// `moved` says the pointer travelled far enough to mean it; `reach`
+    /// is the snapping distance in seconds.
+    pub(crate) fn drop_sound(&mut self, id: &str, part: SoundPart, orig: SoundShape, d: f64, moved: bool, reach: f64, shift: bool) {
+        let new = orig.dragged(part, d);
+        let set = |field: &str, value: Value| json!({"op": "set", "target": format!("{id}.{field}"), "value": value});
+        let ops = match part {
+            SoundPart::Move if moved || shift => vec![set("at", self.sound_anchor(new.start, reach, shift))],
+            SoundPart::Start if moved => {
+                let at = self.sound_clip(id).and_then(|c| serde_json::to_value(&c.at).ok()).unwrap_or(json!(0));
+                let fps = self.project.settings.fps.as_f64();
+                vec![set("at", shift_time(&at, new.start - orig.start, fps)), set("trim", json!(round(new.trim))), set("length", json!(round(new.length)))]
+            }
+            SoundPart::End if moved => vec![set("length", json!(round(new.length)))],
+            SoundPart::FadeIn | SoundPart::FadeOut if moved => {
+                vec![set("fade_in", json!(round(new.fade_in))), set("fade_out", json!(round(new.fade_out)))]
+            }
+            _ => Vec::new(),
+        };
+        if !ops.is_empty() {
+            self.commit(ops);
+        }
+    }
+
+    pub(crate) fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    pub(crate) fn waves(&self) -> Arc<Vec<Wave>> {
+        self.waves.clone()
+    }
+
+    /// The compiled project as it shows now, drag previews included.
+    pub(crate) fn compiled(&self) -> Arc<Compiled> {
+        self.compiled.clone()
+    }
+
+    pub(crate) fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    pub(crate) fn select(&mut self, id: Option<String>) {
+        self.selected = id;
+    }
+
+    pub(crate) fn undo_edit(&mut self, redo: bool) {
+        self.undo(redo);
+    }
+
+    /// Moves the editor's playhead (project seconds): values are read and
+    /// keyed there.
+    pub(crate) fn set_time(&mut self, t: f64) {
+        let t = t.clamp(0.0, self.project.settings.duration);
+        if (t - self.time).abs() > 1e-9 {
+            self.time = t;
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn layer(&self, id: &str) -> Option<&Layer> {
+        find_layer(&self.project, id)
+    }
+
+    pub(crate) fn sound(&self, id: &str) -> Option<&lahza_motion_core::document::AudioClip> {
+        self.sound_clip(id)
+    }
+
+    /// `field` of layer `id` at the playhead, and whether it is keyed.
+    pub(crate) fn field_state(&self, id: &str, field: Field) -> (f64, bool) {
+        let animated = if field.component.is_some() { self.eval::<Vec2>(id, field.path, Vec2::ZERO).1 } else { self.eval::<f64>(id, field.path, 0.0).1 };
+        (self.field_value(id, field), animated)
+    }
+
+    /// Shows `field` of `layer` at `value` (unsaved).
+    pub(crate) fn drag_value(&mut self, layer: &str, field: Field, value: f64) {
+        let ops = self.field_ops(layer, field, value);
+        self.preview(&ops);
+    }
+
+    /// Saves `field` of `layer` at `value`: a key at the playhead when the
+    /// property is animated, otherwise a plain value.
+    pub(crate) fn drop_value(&mut self, layer: &str, field: Field, value: f64) {
+        let ops = self.field_ops(layer, field, value);
+        self.commit(ops);
+    }
+
+    /// Drops any unsaved drag preview.
+    pub(crate) fn cancel_preview(&mut self) {
+        self.compiled = Arc::new(Compiled::new(&self.project));
+        self.dirty = true;
+    }
+
+    /// Saves edit ops through the piece's history.
+    pub(crate) fn commit_ops(&mut self, ops: Vec<Value>) {
+        self.commit(ops);
+    }
+
+    pub(crate) fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub(crate) fn time(&self) -> f64 {
+        self.time
+    }
+
+    pub(crate) fn playing(&self) -> bool {
+        self.playing
+    }
+
+    pub(crate) fn project(&self) -> &Project {
+        &self.project
+    }
+
+    pub(crate) fn frame_at_playhead(&self) -> i64 {
+        self.project.settings.fps.nearest_frame(self.time)
+    }
+
+    /// The topmost layer under project point (`x`, `y`) at the playhead.
+    pub(crate) fn hit_at(&mut self, x: f64, y: f64) -> Option<String> {
+        self.hit(x, y)
+    }
+
+    /// The selected layer's box at the playhead, in project pixels.
+    pub(crate) fn selection_bounds(&mut self) -> Option<[f64; 4]> {
+        self.selection_rect()
+    }
+
+    /// `layer`'s position at the playhead.
+    pub(crate) fn position_of(&self, layer: &str) -> Vec2 {
+        self.eval::<Vec2>(layer, "transform.position", Vec2::ZERO).0
+    }
+
+    /// Moves `layer` to `p` (a key at the playhead when its position is
+    /// animated): shown only, or saved with `commit`.
+    pub(crate) fn move_layer(&mut self, layer: &str, p: [f64; 2], commit: bool) {
+        let (_, animated) = self.eval::<Vec2>(layer, "transform.position", Vec2::ZERO);
+        let ops = self.value_ops(layer, "transform.position", json!([round(p[0]), round(p[1])]), animated);
+        if commit {
+            self.commit(ops);
+        } else {
+            self.preview(&ops);
+        }
     }
 
     fn key_ops(&self, layer: &str, path: &str, index: usize, at: Value) -> Vec<Value> {
@@ -895,65 +936,14 @@ impl MotionEditor {
         }
     }
 
-    fn mouse_up(&mut self, x: f32, y: f32, shift: bool, cx: &mut Context<Self>) {
-        let Some(drag) = self.drag.take() else { return };
-        match drag {
-            Drag::Scrub => {}
-            Drag::Sound { id, part, grab, orig } => {
-                self.sound_preview = None;
-                if let Some(t) = self.time_at(x) {
-                    let new = orig.dragged(part, t - grab);
-                    let moved = (t - grab).abs() * self.zoom >= 2.0;
-                    let set = |field: &str, value: Value| json!({"op": "set", "target": format!("{id}.{field}"), "value": value});
-                    let ops = match part {
-                        SoundPart::Move if moved || shift => vec![set("at", self.sound_anchor(new.start, shift))],
-                        SoundPart::Start if moved => {
-                            let at = self.sound_clip(&id).and_then(|c| serde_json::to_value(&c.at).ok()).unwrap_or(json!(0));
-                            let fps = self.project.settings.fps.as_f64();
-                            vec![set("at", shift_time(&at, new.start - orig.start, fps)), set("trim", json!(round(new.trim))), set("length", json!(round(new.length)))]
-                        }
-                        SoundPart::End if moved => vec![set("length", json!(round(new.length)))],
-                        SoundPart::FadeIn | SoundPart::FadeOut if moved => {
-                            vec![set("fade_in", json!(round(new.fade_in))), set("fade_out", json!(round(new.fade_out)))]
-                        }
-                        _ => Vec::new(),
-                    };
-                    if !ops.is_empty() {
-                        self.commit(ops);
-                    }
-                }
+    fn mouse_up(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let Some(Drag { layer, start, origin }) = self.drag.take() else { return };
+        match (self.project_point(start.0, start.1), self.project_point(x, y)) {
+            (Some(a), Some(b)) if (b.0 - a.0).abs() + (b.1 - a.1).abs() > 0.5 => {
+                self.move_layer(&layer, [origin.x() + b.0 - a.0, origin.y() + b.1 - a.1], true);
             }
-            Drag::Key { layer, path, index, from } => {
-                if let Some(t) = self.time_at(x) {
-                    let fps = self.project.settings.fps;
-                    let t = fps.time_of(fps.nearest_frame(t.max(0.0)));
-                    // Shift snaps to the nearest beat and keeps the sync
-                    // by writing the marker reference.
-                    let at = if shift { self.nearest_marker("beat", t).map(Value::from).unwrap_or(json!(round(t))) } else { json!(round(t)) };
-                    if (t - from).abs() > 1e-6 || shift {
-                        let ops = self.key_ops(&layer, &path, index, at);
-                        self.commit(ops);
-                    }
-                }
-            }
-            Drag::Move { layer, start, origin } => {
-                if let (Some(a), Some(b)) = (self.project_point(start.0, start.1), self.project_point(x, y)) {
-                    if (b.0 - a.0).abs() + (b.1 - a.1).abs() > 0.5 {
-                        let p = [round(origin.x() + b.0 - a.0), round(origin.y() + b.1 - a.1)];
-                        let (_, animated) = self.eval::<Vec2>(&layer, "transform.position", Vec2::ZERO);
-                        let ops = self.value_ops(&layer, "transform.position", json!(p), animated);
-                        self.commit(ops);
-                    }
-                }
-            }
-            Drag::Value { layer, field, start_x, origin } => {
-                if (x - start_x).abs() > 0.5 {
-                    let ops = self.field_ops(&layer, field, origin + (x - start_x) as f64 * field.step);
-                    self.commit(ops);
-                }
-            }
+            _ => self.cancel_preview(),
         }
-        let _ = y;
         self.dirty = true;
         cx.notify();
     }
@@ -961,14 +951,13 @@ impl MotionEditor {
     /// Where a dragged sound lands: snapped (within 8 px) to a layer's start
     /// or end, written as an anchor so the sound follows that layer, or to a
     /// key; with Shift, to the nearest beat. Otherwise the frame.
-    fn sound_anchor(&self, start: f64, shift: bool) -> Value {
+    fn sound_anchor(&self, start: f64, reach: f64, shift: bool) -> Value {
         let fps = self.project.settings.fps;
         if shift {
             if let Some(beat) = self.nearest_marker("beat", start) {
                 return json!(beat);
             }
         }
-        let reach = 8.0 / self.zoom;
         let mut best: Option<(f64, Value)> = None;
         let mut consider = |t: f64, v: Value| {
             let d = (t - start).abs();
@@ -996,11 +985,12 @@ impl MotionEditor {
         }
     }
 
-    /// Adds a built-in effect at the playhead; on the selected layer's start
-    /// it anchors to that layer so it moves with it.
-    fn add_sound_effect(&mut self, name: &str) {
+
+    /// Adds a built-in effect at project time `t`; on the selected layer's
+    /// start it anchors to that layer so it moves with it.
+    pub(crate) fn add_sound_effect_at(&mut self, name: &str, t: f64) {
         let fps = self.project.settings.fps;
-        let t = fps.time_of(fps.nearest_frame(self.time));
+        let t = fps.time_of(fps.nearest_frame(t.max(0.0)));
         let anchored = self.selected.as_ref().and_then(|id| self.rows.iter().find(|r| &r.id == id)).filter(|r| (r.start - t).abs() < 0.1).map(|r| format!("#{}.start", r.id));
         let at = anchored.map(Value::from).unwrap_or(json!(round(t)));
         match self.toolbox.call("sfx_add", json!({"project": self.dir, "sound": name, "at": at})) {
@@ -1012,247 +1002,12 @@ impl MotionEditor {
             }
             Err(e) => self.status = e,
         }
-        self.sound_menu = false;
         self.reload();
     }
 
-    fn sound_inspector(&mut self, id: &str, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        let clip = self.sound_clip(id)?.clone();
-        let wave = self.waves.iter().find(|w| w.id.as_deref() == Some(id)).cloned();
-        let at = serde_json::to_value(&clip.at).ok().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default();
-        let gain = clip.gain_db;
-        let step = |label: &'static str, delta: f64, id: String| {
-            button(SharedString::from(format!("sound-gain-{label}")), label, ButtonKind::Secondary, ButtonSize::Sm).on_click(cx.listener(move |this, _, _, cx| {
-                this.commit(vec![json!({"op": "set", "target": format!("{id}.gain_db"), "value": round((gain + delta).clamp(-60.0, 12.0))})]);
-                cx.notify();
-            }))
-        };
-        let remove = id.to_string();
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(div().panel_title().child(format!("♪ {}", wave.as_ref().map(|w| w.name.clone()).unwrap_or_else(|| id.to_string()))))
-                .child(div().text_size(px(12.0)).text_color(theme::muted()).child(clip.path.clone()))
-                .child(div().row_label().child(format!("Starts at {at}{}", wave.as_ref().map(|w| format!("  ({:.2} s, {:.2} s long)", w.start, w.duration)).unwrap_or_default())))
-                .child(div().text_size(px(12.0)).text_color(theme::muted()).child("Drag it on the timeline: it snaps to a layer's start or end and then follows that layer. Shift snaps to beats."))
-                .child(div().flex().items_center().gap_2().child(div().row_label().child(format!("Gain {gain:+.1} dB"))).child(step("−3 dB", -3.0, id.to_string())).child(step("+3 dB", 3.0, id.to_string())))
-                .children(wave.as_ref().map(|w| {
-                    div().text_size(px(12.0)).text_color(theme::muted()).child(format!(
-                        "Plays {:.2} s of the file's {:.2} s, from {:.2} s. Drag the bar's ends to trim; drag the dots on its top to fade.",
-                        w.duration, w.source_duration, w.source_start
-                    ))
-                }))
-                .child(self.sound_fade_row(id, "Fade in", "fade_in", clip.fade_in, wave.as_ref().map_or(0.0, |w| w.duration - w.fade_out), cx))
-                .child(self.sound_fade_row(id, "Fade out", "fade_out", clip.fade_out, wave.as_ref().map_or(0.0, |w| w.duration - w.fade_in), cx))
-                .when(clip.trim != 0.0 || clip.length.is_some() || clip.fade_in != 0.0 || clip.fade_out != 0.0, |d| {
-                    let id = id.to_string();
-                    d.child(button("sound-reset", "Reset trim and fades", ButtonKind::Secondary, ButtonSize::Sm).on_click(cx.listener(move |this, _, _, cx| {
-                        let set = |f: &str, v: Option<Value>| match v {
-                            Some(v) => json!({"op": "set", "target": format!("{id}.{f}"), "value": v}),
-                            None => json!({"op": "set", "target": format!("{id}.{f}")}),
-                        };
-                        this.commit(vec![set("trim", Some(json!(0.0))), set("length", None), set("fade_in", Some(json!(0.0))), set("fade_out", Some(json!(0.0)))]);
-                        cx.notify();
-                    })))
-                })
-                .child(
-                    button("sound-delete", "Delete sound", ButtonKind::Danger, ButtonSize::Sm).icon("icons/trash.svg").on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = None;
-                        this.commit(vec![json!({"op": "remove", "id": remove})]);
-                        cx.notify();
-                    })),
-                ),
-        )
-    }
 
-    /// "Fade in 0.10 s  [−] [+]": steps of 50 ms, up to `most` seconds.
-    fn sound_fade_row(&self, id: &str, label: &'static str, field: &'static str, value: f64, most: f64, cx: &mut Context<Self>) -> gpui::Div {
-        let stepper = |sign: f64| {
-            let id = id.to_string();
-            button(SharedString::from(format!("sound-{field}-{sign}")), if sign < 0.0 { "−" } else { "+" }, ButtonKind::Secondary, ButtonSize::Sm)
-                .disabled(if sign < 0.0 { value <= 0.0 } else { value >= most - 1e-6 })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let v = round((value + sign * 0.05).clamp(0.0, most.max(0.0)));
-                    this.commit(vec![json!({"op": "set", "target": format!("{id}.{field}"), "value": v})]);
-                    cx.notify();
-                }))
-        };
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(div().row_label().w(px(110.0)).child(format!("{label} {value:.2} s")))
-            .child(stepper(-1.0))
-            .child(stepper(1.0))
-    }
 
-    /// One row per sound: its waveform in a bar where it plays.
-    fn sound_rows(&self, width: f32, cx: &mut Context<Self>) -> Vec<gpui::Div> {
-        let mut rows = Vec::new();
-        for (i, wave) in self.waves.iter().enumerate() {
-            let shape = match (&self.sound_preview, &wave.id) {
-                (Some((pid, shape)), Some(id)) if pid == id => *shape,
-                _ => SoundShape::of(wave),
-            };
-            let shown = shape.apply(wave);
-            let (x0, x1) = (self.x_of(shape.start), self.x_of(shape.start + shape.length));
-            let selected = wave.id.is_some() && wave.id == self.selected;
-            let anchor = wave.id.as_deref().and_then(|id| self.sound_clip(id)).and_then(|c| serde_json::to_value(&c.at).ok()).and_then(|v| v.as_str().map(str::to_string));
-            let label = format!("♪ {}{}", wave.name, anchor.map(|a| format!("  {a}")).unwrap_or_default());
-            let mut track = div().relative().flex_1().h(px(ROW)).overflow_hidden();
-            if x1 > 0.0 && x0 < width {
-                let (w, zoom, colour, line) = (shown.clone(), self.zoom, theme::lane_audio(), theme::ink());
-                let bar_w = (x1 - x0).max(3.0);
-                let bar_h = ROW - 6.0;
-                let mut bar = div()
-                    .id(("motion-sound", i))
-                    .absolute()
-                    .left(px(x0))
-                    .w(px(bar_w))
-                    .top(px(3.0))
-                    .h(px(bar_h))
-                    .rounded(px(3.0))
-                    .bg(colour.opacity(if selected { 0.35 } else { 0.18 }))
-                    .border_1()
-                    .border_color(if selected { theme::accent() } else { colour.opacity(0.5) })
-                    .child(
-                        canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, _| {
-                                let (bw, bh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-                                let mut x = 0.0f32;
-                                while x < bw {
-                                    let t0 = w.start + f64::from(x) / zoom;
-                                    let peak = w.peak(t0, t0 + 2.0 / zoom);
-                                    if peak > 0.0 {
-                                        let h = (peak * (bh - 2.0)).max(1.0);
-                                        window.paint_quad(gpui::fill(
-                                            Bounds::new(gpui::point(bounds.origin.x + px(x), bounds.origin.y + px((bh - h) / 2.0)), size(px(1.5), px(h))),
-                                            colour,
-                                        ));
-                                    }
-                                    // The fade envelope as a line over the fades.
-                                    let env = w.envelope(t0 + 1.0 / zoom);
-                                    if env < 0.999 {
-                                        let y = 1.0 + (1.0 - env) * (bh - 2.0);
-                                        window.paint_quad(gpui::fill(Bounds::new(gpui::point(bounds.origin.x + px(x), bounds.origin.y + px(y - 0.75)), size(px(2.0), px(1.5))), line.opacity(0.7)));
-                                    }
-                                    x += 2.0;
-                                }
-                            },
-                        )
-                        .absolute()
-                        .size_full(),
-                    );
-                if let Some(id) = wave.id.clone() {
-                    let press = |part: SoundPart, id: String| {
-                        cx.listener(move |this: &mut Self, e: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            window.focus(&this.focus);
-                            this.selected = Some(id.clone());
-                            if let Some(grab) = this.time_at(f32::from(e.position.x)) {
-                                this.drag = Some(Drag::Sound { id: id.clone(), part, grab, orig: shape });
-                            }
-                            cx.notify();
-                        })
-                    };
-                    bar = bar.cursor_grab().on_mouse_down(MouseButton::Left, press(SoundPart::Move, id.clone()));
-                    // Trim edges: the outer 5 px of each end.
-                    for (part, left) in [(SoundPart::Start, true), (SoundPart::End, false)] {
-                        let edge = div().id(SharedString::from(format!("sound-trim-{id}-{left}"))).absolute().top_0().bottom_0().w(px(5.0)).cursor_ew_resize();
-                        let edge = if left { edge.left_0() } else { edge.right_0() };
-                        bar = bar.child(edge.hover(|s| s.bg(theme::accent().opacity(0.35))).on_mouse_down(MouseButton::Left, press(part, id.clone())));
-                    }
-                    // Fade handles on the top edge, at the end of each fade.
-                    if bar_w >= 24.0 {
-                        let fin = (shape.fade_in * zoom) as f32;
-                        let fout = bar_w - (shape.fade_out * zoom) as f32;
-                        for (part, x, tip) in [(SoundPart::FadeIn, fin.clamp(6.0, bar_w - 6.0), "Fade in"), (SoundPart::FadeOut, fout.clamp(6.0, bar_w - 6.0), "Fade out")] {
-                            bar = bar.child(
-                                // A 12 px target around an 8 px dot.
-                                div()
-                                    .id(SharedString::from(format!("sound-fade-{id}-{tip}")))
-                                    .absolute()
-                                    .top(px(-5.0))
-                                    .left(px(x - 6.0))
-                                    .size(px(12.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_ew_resize()
-                                    .group("fade-dot")
-                                    .child(
-                                        div()
-                                            .size(px(8.0))
-                                            .rounded_full()
-                                            .bg(gpui::white())
-                                            .border_1()
-                                            .border_color(theme::ink().opacity(0.6))
-                                            .group_hover("fade-dot", |s| s.bg(theme::accent())),
-                                    )
-                                    .on_mouse_down(MouseButton::Left, press(part, id.clone())),
-                            );
-                        }
-                    }
-                }
-                track = track.child(bar);
-            }
-            rows.push(
-                div()
-                    .flex()
-                    .border_b_1()
-                    .border_color(theme::line())
-                    .bg(if selected { theme::selection_fill() } else { theme::panel() })
-                    .child(div().w(px(LABEL_WIDTH)).px_2().flex().items_center().text_size(px(12.0)).text_color(theme::ink()).overflow_hidden().whitespace_nowrap().child(label))
-                    .child(track),
-            );
-        }
-        rows
-    }
 
-    /// The "+ Sound" menu: the built-in effects.
-    fn sound_menu(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let mut menu = div()
-            .id("sound-menu")
-            .occlude()
-            .absolute()
-            .top(px(44.0))
-            .right(px(INSPECTOR_WIDTH + 8.0))
-            .w(px(320.0))
-            .p_1()
-            .flex()
-            .flex_col()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(theme::line())
-            .bg(theme::popover())
-            .shadow_lg()
-            .child(div().px_2().py_1().text_size(px(11.0)).text_color(theme::muted()).child(
-                if self.selected.as_ref().is_some_and(|id| self.rows.iter().any(|r| &r.id == id)) { "At the playhead (on the selected layer's start it follows that layer)" } else { "At the playhead" },
-            ));
-        for (i, &(name, seconds, use_for)) in lahza_motion_audio::sfx::SOUNDS.iter().enumerate() {
-            menu = menu.child(
-                div()
-                    .id(("sound-effect", i))
-                    .px_2()
-                    .py_1()
-                    .rounded(px(5.0))
-                    .hover(|s| s.bg(theme::control_hover()))
-                    .cursor_pointer()
-                    .flex()
-                    .flex_col()
-                    .child(div().text_size(px(12.0)).text_color(theme::ink()).child(format!("{name}  ·  {seconds:.2} s")))
-                    .child(div().text_size(px(11.0)).text_color(theme::muted()).child(use_for))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.add_sound_effect(name);
-                        cx.notify();
-                    })),
-            );
-        }
-        menu
-    }
 
     fn nearest_marker(&self, track: &str, t: f64) -> Option<String> {
         let tr = self.project.markers.get(track)?;
@@ -1262,72 +1017,7 @@ impl MotionEditor {
 
     // ------------------------------------------------------------ views
 
-    fn x_of(&self, t: f64) -> f32 {
-        ((t - self.scroll) * self.zoom) as f32
-    }
 
-    fn top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let fps = self.project.settings.fps;
-        let frame = fps.nearest_frame(self.time);
-        let name = self.dir.file_stem().and_then(|s| s.to_str()).unwrap_or("motion").to_string();
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .h(px(44.0))
-            .px_3()
-            .border_b_1()
-            .border_color(theme::line())
-            .when(self.embedded, |d| {
-                d.child(
-                    button("motion-space-back", "Video", ButtonKind::Secondary, ButtonSize::Sm)
-                        .icon("icons/chevron-left.svg")
-                        .tooltip("Back to the video timeline")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.player = None;
-                            this.playing = false;
-                            cx.emit(CloseSpace);
-                        })),
-                )
-            })
-            .child(div().panel_title().child(name))
-            .child(div().w(px(16.0)))
-            .child(
-                button("motion-add-sound", "Add sound", ButtonKind::Secondary, ButtonSize::Sm)
-                    .icon("icons/volume.svg")
-                    .tooltip("Add a sound effect at the playhead")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sound_menu = !this.sound_menu;
-                        cx.notify();
-                    })),
-            )
-            .child(icon_button("motion-back", "icons/skip-back.svg", ButtonKind::Ghost, ButtonSize::Sm).tooltip("Start (Home)").on_click(cx.listener(|this, _, _, cx| {
-                this.seek(0.0);
-                cx.notify();
-            })))
-            .child(
-                icon_button("motion-play", if self.playing { "icons/pause.svg" } else { "icons/play.svg" }, ButtonKind::Secondary, ButtonSize::Sm)
-                    .tooltip("Play / pause (Space)")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
-            )
-            .child(icon_button("motion-end", "icons/skip-forward.svg", ButtonKind::Ghost, ButtonSize::Sm).tooltip("End (End)").on_click(cx.listener(|this, _, _, cx| {
-                let d = this.project.settings.duration;
-                this.seek(d);
-                cx.notify();
-            })))
-            .child(div().row_label().child(format!("{:>6.2} s  ·  f{frame}", self.time)))
-            .child(div().flex_1())
-            .child(div().text_size(px(12.0)).text_color(theme::muted()).child(SharedString::from(self.status.clone())))
-            .child(icon_button("motion-undo", "icons/undo.svg", ButtonKind::Ghost, ButtonSize::Sm).tooltip("Undo (Ctrl+Z)").on_click(cx.listener(|this, _, _, cx| {
-                this.undo(false);
-                cx.notify();
-            })))
-            .child(icon_button("motion-redo", "icons/redo.svg", ButtonKind::Ghost, ButtonSize::Sm).tooltip("Redo (Ctrl+Shift+Z)").on_click(cx.listener(|this, _, _, cx| {
-                this.undo(true);
-                cx.notify();
-            })))
-            .child(div().text_size(px(11.0)).text_color(theme::muted()).child(self.worker.label()))
-    }
 
     fn preview_area(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds_store = self.canvas_bounds.clone();
@@ -1365,7 +1055,7 @@ impl MotionEditor {
                     this.selected = this.hit(px_, py_);
                     if let Some(id) = this.selected.clone() {
                         let (origin, _) = this.eval::<Vec2>(&id, "transform.position", Vec2::ZERO);
-                        this.drag = Some(Drag::Move { layer: id, start: (x, y), origin });
+                        this.drag = Some(Drag { layer: id, start: (x, y), origin });
                     }
                     cx.notify();
                 }),
@@ -1393,277 +1083,7 @@ impl MotionEditor {
         area
     }
 
-    fn inspector(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut panel = div().w(px(INSPECTOR_WIDTH)).h_full().border_l_1().border_color(theme::line()).p_3().flex().flex_col().gap_2();
-        let Some(id) = self.selected.clone() else {
-            let s = &self.project.settings;
-            return panel
-                .child(div().panel_title().child("Project"))
-                .child(div().row_label().child(format!("{} × {} · {} fps · {:.2} s", s.width, s.height, s.fps.as_f64(), s.duration)))
-                .child(div().text_size(px(12.0)).text_color(theme::muted()).child(format!(
-                    "{} scenes · {} marker tracks · style {}",
-                    self.project.scenes.len(),
-                    self.project.markers.tracks.len(),
-                    s.style.clone().unwrap_or_else(|| "none".into())
-                )))
-                .child(div().text_size(px(12.0)).text_color(theme::muted()).child("Click a layer in the preview or the timeline. Drag values to change them; drag keys to retime (Shift snaps to beats)."));
-        };
-        if let Some(sound) = self.sound_inspector(&id, cx) {
-            return panel.child(sound);
-        }
-        let Some(layer) = find_layer(&self.project, &id).cloned() else { return panel };
-        panel = panel
-            .child(div().panel_title().child(id.clone()))
-            .child(div().text_size(px(12.0)).text_color(theme::muted()).child(format!("{} · blend {:?}{}", layer.kind.name(), layer.common.blend, if layer.common.three_d { " · 3D" } else { "" })));
-        if let LayerKind::Text(t) = &layer.kind {
-            panel = panel.child(div().row_label().child(format!("“{}”", t.text)));
-        }
-        for (i, field) in FIELDS.iter().enumerate() {
-            if field.path.contains("_x") || field.path.contains("_y") || field.path.ends_with(".z") {
-                if !layer.common.three_d {
-                    continue;
-                }
-            }
-            let value = self.field_value(&id, *field);
-            let (_, animated) = if field.component.is_some() { let (v, a) = self.eval::<Vec2>(&id, field.path, Vec2::ZERO); (v.0[0], a) } else { self.eval::<f64>(&id, field.path, 0.0) };
-            let lid = id.clone();
-            let f = *field;
-            panel = panel.child(
-                div()
-                    .id(("motion-field", i))
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .h(px(26.0))
-                    .px_2()
-                    .rounded(px(4.0))
-                    .bg(theme::control_bg())
-                    .hover(|s| s.bg(theme::control_hover()))
-                    .cursor_ew_resize()
-                    .child(div().text_size(px(12.0)).text_color(theme::muted()).child(format!("{}{}", f.label, if animated { "  ◆" } else { "" })))
-                    .child(div().text_size(px(12.0)).text_color(theme::ink()).child(format!("{value:.2}")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                            let origin = this.field_value(&lid, f);
-                            this.drag = Some(Drag::Value { layer: lid.clone(), field: f, start_x: f32::from(e.position.x), origin });
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        let effects: Vec<String> = serde_json::to_value(&layer.common.effects)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|e| e.get("type").and_then(Value::as_str).map(String::from))
-            .collect();
-        if !effects.is_empty() {
-            panel = panel.child(div().section_title().child("Effects")).child(div().text_size(px(12.0)).text_color(theme::muted()).child(effects.join(" · ")));
-        }
-        let keys = self.rows.iter().find(|r| r.id == id).map(|r| r.keys.len()).unwrap_or(0);
-        panel.child(div().text_size(px(12.0)).text_color(theme::muted()).child(format!("{keys} keys · Delete removes the layer")))
-    }
 
-    fn timeline(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let track_store = self.track_bounds.clone();
-        let duration = self.project.settings.duration;
-        let width = self.track_bounds.lock().unwrap().map(|b| f32::from(b.size.width)).unwrap_or(800.0);
-        // Ruler ticks every "nice" step of about 80 px.
-        let target = 80.0 / self.zoom;
-        let step = [0.04, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0].into_iter().find(|s| *s >= target).unwrap_or(60.0);
-        let mut ruler = div()
-            .id("motion-ruler")
-            .relative()
-            .flex_1()
-            .h(px(ROW))
-            .overflow_hidden()
-            .bg(theme::surface())
-            .cursor_text()
-            .child(
-                canvas(
-                    move |bounds, window, _| {
-                        let mut s = track_store.lock().unwrap();
-                        if *s != Some(bounds) {
-                            *s = Some(bounds);
-                            window.refresh();
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, e: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus);
-                    this.drag = Some(Drag::Scrub);
-                    if let Some(t) = this.time_at(f32::from(e.position.x)) {
-                        this.seek(t);
-                    }
-                    cx.notify();
-                }),
-            );
-        let mut t = (self.scroll / step).floor() * step;
-        while t <= duration && self.x_of(t) < width {
-            let x = self.x_of(t);
-            if x >= 0.0 {
-                ruler = ruler.child(div().absolute().left(px(x)).top_0().h_full().w(px(1.0)).bg(theme::line())).child(
-                    div().absolute().left(px(x + 3.0)).top(px(4.0)).text_size(px(10.0)).text_color(theme::muted()).child(format!("{t:.2}")),
-                );
-            }
-            t += step;
-        }
-        // Marker lane: bars bold, beats thin, hits as dots.
-        let mut markers = div().relative().flex_1().h(px(18.0)).overflow_hidden();
-        for (track, colour, w) in [("beat", theme::muted(), 1.0f32), ("bar", theme::ink_secondary(), 2.0), ("hit", theme::brand(), 3.0)] {
-            if let Some(tr) = self.project.markers.get(track) {
-                for m in &tr.markers {
-                    let x = self.x_of(m.t);
-                    if x < 0.0 || x > width {
-                        continue;
-                    }
-                    markers = markers.child(div().absolute().left(px(x)).top(px(if track == "hit" { 12.0 } else { 3.0 })).w(px(w)).h(px(if track == "hit" { 3.0 } else { 12.0 })).bg(colour));
-                }
-            }
-        }
-        if let Some(words) = self.project.markers.get("word") {
-            for m in &words.markers {
-                let x = self.x_of(m.t);
-                if x >= 0.0 && x < width {
-                    markers = markers.child(div().absolute().left(px(x)).top_0().text_size(px(9.0)).text_color(theme::muted()).child(m.label.clone().unwrap_or_default()));
-                }
-            }
-        }
-        let sound_rows = self.sound_rows(width, cx);
-        // Scenes.
-        let mut scenes = div().relative().flex_1().h(px(ROW)).overflow_hidden();
-        for s in &self.compiled.scenes {
-            let (x0, x1) = (self.x_of(s.start).max(0.0), self.x_of(s.end).min(width));
-            if x1 <= x0 {
-                continue;
-            }
-            scenes = scenes.child(
-                div()
-                    .absolute()
-                    .left(px(x0))
-                    .w(px(x1 - x0 - 1.0))
-                    .top(px(3.0))
-                    .h(px(ROW - 6.0))
-                    .rounded(px(3.0))
-                    .bg(theme::lane_clip())
-                    .px_1()
-                    .text_size(px(11.0))
-                    .text_color(theme::ink())
-                    .overflow_hidden()
-                    .child(s.id.to_string()),
-            );
-        }
-        let lane = |label: String, track: gpui::AnyElement| -> gpui::Div {
-            div()
-                .flex()
-                .border_b_1()
-                .border_color(theme::line())
-                .child(div().w(px(LABEL_WIDTH)).px_2().flex().items_center().text_size(px(11.0)).text_color(theme::muted()).child(label))
-                .child(track)
-        };
-        let mut rows = div().id("motion-rows").flex().flex_col().overflow_y_scroll().flex_1();
-        let selected = self.selected.clone();
-        for (ri, row) in self.rows.iter().enumerate() {
-            let is_sel = selected.as_deref() == Some(row.id.as_str());
-            let (x0, x1) = (self.x_of(row.start).max(0.0), self.x_of(row.end).min(width));
-            let mut track = div().relative().flex_1().h(px(ROW)).overflow_hidden();
-            if x1 > x0 {
-                let colour: Hsla = match row.kind {
-                    "text" => theme::lane_zoom(),
-                    "video" | "image" => theme::lane_video(),
-                    "comp" => theme::lane_camera(),
-                    _ => theme::lane_audio(),
-                };
-                track = track.child(div().absolute().left(px(x0)).w(px(x1 - x0)).top(px(5.0)).h(px(ROW - 10.0)).rounded(px(3.0)).bg(colour).opacity(if is_sel { 0.9 } else { 0.55 }));
-            }
-            for (ki, k) in row.keys.iter().enumerate() {
-                let x = self.x_of(k.t);
-                if x < -6.0 || x > width + 6.0 {
-                    continue;
-                }
-                let (layer, path, index, from) = (row.id.clone(), k.path.clone(), k.index, k.t);
-                track = track.child(
-                    div()
-                        .id(("motion-key", ri * 10_000 + ki))
-                        .absolute()
-                        .left(px(x - 5.0))
-                        .top(px(3.0))
-                        .text_size(px(12.0))
-                        .text_color(if is_sel { theme::accent() } else { theme::ink() })
-                        .cursor_ew_resize()
-                        .child("◆")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.selected = Some(layer.clone());
-                                this.drag = Some(Drag::Key { layer: layer.clone(), path: path.clone(), index, from });
-                                cx.notify();
-                            }),
-                        ),
-                );
-            }
-            let id = row.id.clone();
-            let label = format!("{}{} {}", "  ".repeat(row.depth), row.id, row.kind);
-            rows = rows.child(
-                div()
-                    .id(("motion-row", ri))
-                    .flex()
-                    .border_b_1()
-                    .border_color(theme::line())
-                    .bg(if is_sel { theme::selection_fill() } else { theme::panel() })
-                    .child(div().w(px(LABEL_WIDTH)).px_2().flex().items_center().text_size(px(12.0)).text_color(theme::ink()).overflow_hidden().child(label))
-                    .child(track)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                            window.focus(&this.focus);
-                            this.selected = Some(id.clone());
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        let playhead = LABEL_WIDTH + self.x_of(self.time);
-        div()
-            .id("motion-timeline")
-            .relative()
-            .h(px(260.0))
-            .border_t_1()
-            .border_color(theme::line())
-            .flex()
-            .flex_col()
-            .bg(theme::panel())
-            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
-                let (dx, dy) = match e.delta {
-                    ScrollDelta::Pixels(d) => (f64::from(d.x), f64::from(d.y)),
-                    ScrollDelta::Lines(d) => (d.x as f64 * 16.0, d.y as f64 * 16.0),
-                };
-                if e.modifiers.control {
-                    this.zoom = (this.zoom * 2f64.powf(-dy / 220.0)).clamp(5.0, 4000.0);
-                } else if dx.abs() > 0.0 || e.modifiers.shift {
-                    let d = if dx.abs() > 0.0 { dx } else { dy };
-                    this.scroll = (this.scroll - d / this.zoom).max(0.0);
-                } else {
-                    return;
-                }
-                cx.notify();
-            }))
-            .child(lane("Time".into(), ruler.into_any_element()))
-            .child(lane("Markers".into(), markers.into_any_element()))
-            .children(sound_rows)
-            .child(lane("Scenes".into(), scenes.into_any_element()))
-            .child(rows)
-            .child(div().absolute().top_0().bottom_0().left(px(playhead)).w(px(2.0)).bg(theme::brand()))
-    }
 }
 
 impl Render for MotionEditor {
@@ -1684,53 +1104,16 @@ impl Render for MotionEditor {
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| this.mouse_move(e, cx)))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseUpEvent, _, cx| this.mouse_up(f32::from(e.position.x), f32::from(e.position.y), e.modifiers.shift, cx)),
+                cx.listener(|this, e: &gpui::MouseUpEvent, _, cx| this.mouse_up(f32::from(e.position.x), f32::from(e.position.y), cx)),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseUpEvent, _, cx| this.mouse_up(f32::from(e.position.x), f32::from(e.position.y), e.modifiers.shift, cx)),
+                cx.listener(|this, e: &gpui::MouseUpEvent, _, cx| this.mouse_up(f32::from(e.position.x), f32::from(e.position.y), cx)),
             )
-            .child(self.top_bar(cx))
-            .child(div().flex().flex_1().min_h(px(200.0)).child(self.preview_area(cx)).child(self.inspector(cx)))
-            .child(self.timeline(cx))
-            .when(self.sound_menu, |d| d.child(gpui::deferred(self.sound_menu(cx)).with_priority(1)))
+            .child(div().flex().flex_1().min_h_0().child(self.preview_area(cx)))
     }
 }
 
-/// Opens a motion project in its own window.
-pub(crate) fn open(dir: PathBuf, cx: &mut App) -> Result<gpui::WindowHandle<MotionEditor>, String> {
-    let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
-    let name = dir.file_stem().and_then(|s| s.to_str()).unwrap_or("motion").to_string();
-    let result = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(980.0), px(640.0))),
-            titlebar: Some(TitlebarOptions { title: Some(format!("{name} — Lahza motion").into()), ..Default::default() }),
-            app_id: Some("com.lahza.Lahza".into()),
-            window_decorations: Some(WindowDecorations::Server),
-            ..Default::default()
-        },
-        move |window, cx| {
-            theme::follow_appearance(window);
-            let editor = cx.new(|cx| {
-                let mut e = MotionEditor::new(dir.clone(), cx).unwrap_or_else(|err| panic!("cannot open {}: {err}", dir.display()));
-                e.start_ticking(cx);
-                // Release GPU textures however the window closes.
-                cx.on_release_in(window, |this, window, _| {
-                    for image in this.retired.drain(..).chain(this.frame.take()) {
-                        let _ = window.drop_image(image);
-                    }
-                })
-                .detach();
-                e
-            });
-            window.focus(&editor.read(cx).focus);
-            editor
-        },
-    );
-    cx.activate(true);
-    result.map_err(|e| e.to_string())
-}
 
 #[cfg(test)]
 mod tests {
@@ -1766,7 +1149,7 @@ mod tests {
         assert_eq!(split_offset("#a.end + 6f", 30.0), ("#a.end".to_string(), 0.2));
     }
     use super::*;
-    use gpui::{point, Application, Modifiers};
+    use gpui::Application;
 
     fn sample(dir: &Path) -> PathBuf {
         let mut tb = Toolbox::new();
@@ -1811,7 +1194,18 @@ mod tests {
         let project = sample(&dir);
         let project2 = project.clone();
         Application::new().with_assets(crate::Assets { base: crate::asset_directory() }).run(move |cx| {
-            let handle = open(project2.clone(), cx).unwrap();
+            let bounds = gpui::Bounds::centered(None, gpui::size(px(1200.0), px(800.0)), cx);
+            let options = gpui::WindowOptions { window_bounds: Some(gpui::WindowBounds::Windowed(bounds)), ..Default::default() };
+            let dir = project2.clone();
+            let handle = cx
+                .open_window(options, move |_, cx| {
+                    cx.new(|cx| {
+                        let mut editor = MotionEditor::new(dir, cx).unwrap();
+                        editor.start_ticking(cx);
+                        editor
+                    })
+                })
+                .unwrap();
             let project = project2.clone();
             cx.spawn(async move |cx| {
                 let wait = |ms| Timer::after(Duration::from_millis(ms));
@@ -1829,27 +1223,21 @@ mod tests {
                 }
                 assert!(framed, "the preview rendered a frame");
                 handle
-                    .update(cx, |editor, _, cx| {
+                    .update(cx, |editor, _, _| {
                         // Hit-test the box at its first key position.
                         editor.seek(0.0);
-                        assert_eq!(editor.hit(200.0, 180.0).as_deref(), Some("box"));
-                        assert_eq!(editor.hit(10.0, 10.0), None);
+                        assert_eq!(editor.hit_at(200.0, 180.0).as_deref(), Some("box"));
+                        assert_eq!(editor.hit_at(10.0, 10.0), None);
                         // Scrub the title's opacity (constant → set).
-                        editor.selected = Some("title".into());
                         let field = FIELDS[5];
-                        editor.drag = Some(Drag::Value { layer: "title".into(), field, start_x: 100.0, origin: 1.0 });
-                        let moved = gpui::MouseMoveEvent { position: point(px(0.0), px(0.0)), pressed_button: Some(MouseButton::Left), modifiers: Modifiers::default() };
-                        editor.mouse_move(&moved, cx);
-                        editor.mouse_up(0.0, 0.0, false, cx);
-                        assert!((editor.field_value("title", field) - 0.5).abs() < 1e-9, "opacity scrubbed to 0.5");
+                        editor.drag_value("title", field, 0.5);
+                        editor.drop_value("title", field, 0.5);
+                        assert!((editor.field_state("title", field).0 - 0.5).abs() < 1e-9, "opacity scrubbed to 0.5");
                         // Retime the box's second key onto beat 4 (Shift snaps).
-                        let b = editor.track_bounds.lock().unwrap().expect("timeline laid out");
-                        let x = f32::from(b.origin.x) + ((1.95 - editor.scroll) * editor.zoom) as f32;
-                        editor.drag = Some(Drag::Key { layer: "box".into(), path: "transform.position".into(), index: 1, from: 1.5 });
-                        editor.mouse_up(x, 0.0, true, cx);
+                        editor.drop_key("box", "transform.position", 1, 1.5, 1.95, true);
                         let p = io::load(&editor.dir).unwrap();
                         let json = serde_json::to_value(find_layer(&p, "box").unwrap()).unwrap();
-                        assert_eq!(json["transform"]["position"]["keys"][1]["at"], "beat:4", "status: {} (x {x}, bounds {b:?})", editor.status);
+                        assert_eq!(json["transform"]["position"]["keys"][1]["at"], "beat:4", "status: {}", editor.status);
                         // Undo the retime, then redo it.
                         editor.undo(false);
                         let json = serde_json::to_value(find_layer(&editor.project, "box").unwrap()).unwrap();

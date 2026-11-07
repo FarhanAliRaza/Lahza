@@ -56,7 +56,7 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
         let name = op.get("op").and_then(Value::as_str).unwrap_or("");
         let result = match child_target(op) {
             Some((component, child)) => op_child(&mut doc, op, &component, &child, project, &base, &mut ripples, &mut created),
-            None => dispatch(&mut doc, op, &base, &mut ripples, &mut created),
+            None => dispatch(&mut doc, op, &base, &project.markers, &mut ripples, &mut created),
         };
         let (inv, ids, line) = result.map_err(|e| format!("op {} ({name}): {e}", i + 1))?;
         inverse.splice(0..0, inv);
@@ -77,7 +77,7 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
 
 type OpResult = Result<(Vec<Value>, Vec<String>, String)>;
 
-fn dispatch(doc: &mut Value, op: &Value, base: &crate::time::TimeBase, ripples: &mut Vec<(f64, f64)>, created: &mut Vec<String>) -> OpResult {
+fn dispatch(doc: &mut Value, op: &Value, base: &crate::time::TimeBase, markers: &crate::markers::Markers, ripples: &mut Vec<(f64, f64)>, created: &mut Vec<String>) -> OpResult {
     match op.get("op").and_then(Value::as_str).unwrap_or("") {
         "add" => op_add(doc, op, created),
         "add_scene" => op_add_scene(doc, op, created),
@@ -91,7 +91,7 @@ fn dispatch(doc: &mut Value, op: &Value, base: &crate::time::TimeBase, ripples: 
         "add_sound" => op_add_sound(doc, op, created),
         "insert_time" => op_insert_time(doc, op, base, ripples),
         "shift" => op_shift(doc, op, base),
-        "detach" => op_detach(doc, op),
+        "detach" => op_detach(doc, op, markers),
         "set_override" => op_set_override(doc, op),
         "replace_layer" => op_replace_layer(doc, op),
         "" => Err("op needs an \"op\" field".into()),
@@ -150,7 +150,7 @@ fn op_child(doc: &mut Value, op: &Value, component: &str, child: &str, project: 
         if let Some(t) = op.get("target").and_then(Value::as_str) {
             local["target"] = json!(t.split_once('/').map(|(_, rest)| rest).unwrap_or(t));
         }
-        dispatch(&mut scratch, &local, base, ripples, created)?;
+        dispatch(&mut scratch, &local, base, &project.markers, ripples, created)?;
         crate::components::diff_patch(&base_child, &scratch["scenes"][0]["layers"][0])
     };
     let overrides = doc.pointer_mut(&ptr).unwrap().as_object_mut().unwrap().entry("overrides").or_insert_with(|| json!({}));
@@ -192,17 +192,20 @@ fn op_set_override(doc: &mut Value, op: &Value) -> OpResult {
 
 /// Turns a component into a comp of its children as plain layers (ids
 /// `<component>-<child>`), overrides applied.
-fn op_detach(doc: &mut Value, op: &Value) -> OpResult {
+fn op_detach(doc: &mut Value, op: &Value, markers: &crate::markers::Markers) -> OpResult {
     let id = op.get("id").and_then(Value::as_str).ok_or("detach needs \"id\"")?;
     let (ptr, _, _) = find(doc, id).ok_or_else(|| format!("no component '{id}'"))?;
     let layer = doc.pointer(&ptr).cloned().unwrap_or_default();
     if layer.get("kind").and_then(Value::as_str) != Some("component") {
         bail!("'{id}' is not a component");
     }
+    // Settings as edited so far; markers are not in the document JSON, so
+    // they come from the project the ops apply to (captions need them).
     let project: Project = serde_json::from_value(doc.clone()).map_err(|e| e.to_string())?;
+    let ctx = crate::components::Ctx { markers, ..component_ctx(&project) };
     let kind = layer["component"].as_str().unwrap_or("");
     let overrides = layer.get("overrides").and_then(Value::as_object).cloned().unwrap_or_default();
-    let mut children = crate::components::children(kind, layer.get("params").unwrap_or(&json!({})), &overrides, &component_ctx(&project))?;
+    let mut children = crate::components::children(kind, layer.get("params").unwrap_or(&json!({})), &overrides, &ctx)?;
     crate::components::rename(&mut children, &format!("{id}-"), true);
     for c in &children {
         let cid = c["id"].as_str().unwrap_or("");

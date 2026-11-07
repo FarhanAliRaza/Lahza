@@ -213,8 +213,40 @@ pub struct MeshParams {
     /// steps): tessellation follows the drawn size, so small profiles
     /// scaled up and far meshes both get the segments they need.
     pub screen: f64,
-    /// Displacement by noise along the normals: the field and its reach (px).
-    pub displace: Option<(crate::noise::Field, f64)>,
+    /// Displacement along the normals: what pushes, and its reach (px).
+    pub displace: Option<(Displacement, f64)>,
+}
+
+/// What pushes a displaced surface out and in.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Displacement {
+    /// Noise: out and in by `amount` × (2·noise − 1).
+    Noise(crate::noise::Field),
+    /// A height image (project path) over the mesh's UVs: white rises by
+    /// `amount`, black stays. The renderer loads it (`displace_by_image`).
+    Image(String),
+}
+
+/// Heights over UVs, row-major, 0..1 (bright = raised).
+#[derive(Clone, Debug, Default)]
+pub struct Heightfield {
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<f32>,
+}
+
+impl Heightfield {
+    /// Bilinear, clamped at the edges.
+    fn at(&self, uv: [f32; 2]) -> f64 {
+        let (w, h) = (self.width, self.height);
+        let x = (uv[0] as f64 * w as f64 - 0.5).clamp(0.0, (w - 1) as f64);
+        let y = (uv[1] as f64 * h as f64 - 0.5).clamp(0.0, (h - 1) as f64);
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+        let v = |x: usize, y: usize| self.data[y * w + x] as f64;
+        (v(x0, y0) * (1.0 - fx) + v(x1, y0) * fx) * (1.0 - fy) + (v(x0, y1) * (1.0 - fx) + v(x1, y1) * fx) * fy
+    }
 }
 
 impl MeshParams {
@@ -289,7 +321,13 @@ impl MeshParams {
                 text.push('\n');
             }
         }
-        if let Some((field, amount)) = &self.displace {
+        if let Some((Displacement::Image(src), amount)) = &self.displace {
+            f(12.0);
+            f(*amount);
+            text.push_str(src);
+            text.push('\n');
+        }
+        if let Some((Displacement::Noise(field), amount)) = &self.displace {
             [10.0, field.kind.code() as f64, field.scale, field.octaves as f64, field.seed as f64, *amount, field.offset[0], field.offset[1], field.offset[2]].iter().for_each(|v| f(*v));
         }
         k.extend_from_slice(text.as_bytes());
@@ -347,7 +385,7 @@ impl MeshParams {
     /// loose box: arcs count as full rings).
     pub fn local_bounds(&self) -> Option<([f64; 3], [f64; 3])> {
         // Displacement reaches this far out.
-        let pad = self.displace.map(|(_, a)| a.abs()).unwrap_or(0.0);
+        let pad = self.displace.as_ref().map(|(_, a)| a.abs()).unwrap_or(0.0);
         self.shape_bounds().map(|(lo, hi)| (lo.map(|v| v - pad), hi.map(|v| v + pad)))
     }
 
@@ -541,9 +579,10 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
         }
     }
     set_uvs(&mut mesh, &params.shape);
-    if let Some((field, amount)) = params.displace {
-        if amount != 0.0 {
-            displace(&mut mesh, &field, amount, screen);
+    if let Some((Displacement::Noise(field), amount)) = &params.displace {
+        if *amount != 0.0 {
+            let amount = *amount;
+            displace(&mut mesh, field.scale / 3.0, screen, |q, _| amount * (2.0 * field.at(q) - 1.0));
         }
     }
     Ok(mesh)
@@ -612,13 +651,28 @@ const DISPLACE_MAX_TRIS: usize = 200_000;
 /// and 18 close-up displaced rods at the cap filled the path tracer's GPU.
 const DISPLACE_MIN_EDGE_PX: f64 = 6.0;
 
-/// Pushes the surface along its normals by `amount` × (2·noise − 1),
-/// subdividing first until edges average a third of the noise's features,
-/// or `DISPLACE_MIN_EDGE_PX` on screen (`screen`: screen px per layer unit),
-/// whichever is longer. Copies of one point (hard edges) move together, so
-/// nothing cracks.
-fn displace(mesh: &mut Mesh, field: &crate::noise::Field, amount: f64, screen: f64) {
-    let target = (field.scale / 3.0).max(DISPLACE_MIN_EDGE_PX / screen).max(0.5);
+/// Displaces a generated mesh by its height image (`Displacement::Image`),
+/// subdividing to about one texel per edge (within the same limits as noise).
+pub fn displace_by_image(mesh: &mut Mesh, params: &MeshParams, heights: &Heightfield) {
+    let Some((Displacement::Image(_), amount)) = &params.displace else { return };
+    if *amount == 0.0 || heights.width == 0 || heights.height == 0 || heights.data.len() < heights.width * heights.height {
+        return;
+    }
+    let screen = if params.screen.is_finite() && params.screen > 0.0 { params.screen.clamp(1.0 / 16.0, 32.0) } else { 1.0 };
+    let (lo, hi) = mesh.bounds();
+    let extent = (0..3).map(|k| (hi[k] - lo[k]) as f64).fold(0.0, f64::max);
+    let texel = extent / heights.width.max(heights.height) as f64;
+    let amount = *amount;
+    displace(mesh, texel, screen, |_, uv| amount * heights.at(uv));
+}
+
+/// Pushes the surface along its normals by `offset` (px, from the point and
+/// its UV), subdividing first until edges average `feature` px, or
+/// `DISPLACE_MIN_EDGE_PX` on screen (`screen`: screen px per layer unit),
+/// whichever is longer. Copies of one point (hard edges, UV seams) move
+/// together, by the first copy's offset, so nothing cracks.
+fn displace(mesh: &mut Mesh, feature: f64, screen: f64, offset: impl Fn([f64; 3], [f32; 2]) -> f64) {
+    let target = feature.max(DISPLACE_MIN_EDGE_PX / screen).max(0.5);
     loop {
         // The mean edge, not the longest: a few long seam or equator edges
         // would force another 4x subdivision of the whole mesh.
@@ -635,18 +689,18 @@ fn displace(mesh: &mut Mesh, field: &crate::noise::Field, amount: f64, screen: f
     }
     // One direction per point (welded), the average of its copies' normals.
     let key = |p: [f32; 3]| [(p[0] * 64.0).round() as i64, (p[1] * 64.0).round() as i64, (p[2] * 64.0).round() as i64];
-    let mut dirs: std::collections::HashMap<[i64; 3], [f64; 3]> = std::collections::HashMap::new();
-    for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
-        let e = dirs.entry(key(*p)).or_insert([0.0; 3]);
-        *e = add(*e, [n[0] as f64, n[1] as f64, n[2] as f64]);
+    let mut dirs: std::collections::HashMap<[i64; 3], ([f64; 3], f64)> = std::collections::HashMap::new();
+    for (i, (p, n)) in mesh.positions.iter().zip(&mesh.normals).enumerate() {
+        let e = dirs.entry(key(*p)).or_insert_with(|| ([0.0; 3], offset([p[0] as f64, p[1] as f64, p[2] as f64], mesh.uvs.get(i).copied().unwrap_or([0.0; 2]))));
+        e.0 = add(e.0, [n[0] as f64, n[1] as f64, n[2] as f64]);
     }
     let moved: Vec<[f32; 3]> = mesh
         .positions
         .iter()
         .map(|p| {
             let q = [p[0] as f64, p[1] as f64, p[2] as f64];
-            let d = norm(dirs[&key(*p)]);
-            let h = amount * (2.0 * field.at(q) - 1.0);
+            let (d, h) = dirs[&key(*p)];
+            let d = norm(d);
             [(q[0] + d[0] * h) as f32, (q[1] + d[1] * h) as f32, (q[2] + d[2] * h) as f32]
         })
         .collect();
@@ -1626,7 +1680,7 @@ mod tests {
     fn displacement_roughens_without_cracks() {
         let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 12.0, octaves: 4, seed: 7, offset: [0.0; 3] };
         let mut p = params(MeshShape::Sphere { radius: 100.0 });
-        p.displace = Some((field, 12.0));
+        p.displace = Some((Displacement::Noise(field), 12.0));
         let m = generate(&p).unwrap();
         let plain = generate(&params(MeshShape::Sphere { radius: 100.0 })).unwrap();
         assert!(m.tris.len() > plain.tris.len() * 3, "subdivided: {} vs {}", m.tris.len(), plain.tris.len());
@@ -1659,7 +1713,7 @@ mod tests {
         let field = crate::noise::Field { kind: crate::noise::NoiseKind::Fbm, scale: 3.0, octaves: 3, seed: 3, offset: [0.0; 3] };
         let rock = |screen: f64, displace: bool| {
             let mut p = params(MeshShape::Sphere { radius: 150.0 });
-            p.displace = displace.then_some((field, 4.0));
+            p.displace = displace.then_some((Displacement::Noise(field), 4.0));
             p.screen = screen;
             generate(&p).unwrap()
         };

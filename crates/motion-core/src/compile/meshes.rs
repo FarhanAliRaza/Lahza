@@ -72,12 +72,16 @@ pub struct MaterialState {
     /// Scale roughness (green channel) and metallic (blue channel).
     pub roughness_map: Option<Arc<str>>,
     pub metallic_map: Option<Arc<str>>,
+    /// Multiplies `emissive` (sRGB colour image).
+    pub emissive_map: Option<Arc<str>>,
     /// bump_map's height, px.
     pub bump: f64,
     /// UV scale x, y, offset x, y, rotation (radians).
     pub uv: [f64; 5],
     /// A volume instead of a surface.
     pub volume: Option<VolumeState>,
+    /// The volume's density grid at this moment: its image and cells.
+    pub volume_grid: Option<(Arc<str>, [u32; 3])>,
 }
 
 /// A medium at a moment: extinction per px, scattering colour (linear),
@@ -88,6 +92,16 @@ pub struct VolumeState {
     pub albedo: [f64; 3],
     pub g: f64,
     pub emission: [f64; 3],
+    /// With the material's noise: the share of it that is medium, and the
+    /// fade at its edges (noise units).
+    pub coverage: f64,
+    pub softness: f64,
+    /// Noise and grid volumes: marched as the preview draws them (true) or
+    /// walked exactly.
+    pub artistic: bool,
+    /// A cumulus form, and its up direction (mesh space, unit).
+    pub cumulus: bool,
+    pub up: [f64; 3],
 }
 
 /// Surface noise at a moment (see `document::SurfaceNoise`).
@@ -139,9 +153,11 @@ impl MaterialState {
             bump_map: None,
             roughness_map: None,
             metallic_map: None,
+            emissive_map: None,
             bump: 2.0,
             uv: [1.0, 1.0, 0.0, 0.0, 0.0],
             volume: None,
+            volume_grid: None,
         };
         match p {
             MaterialPreset::Matte => MaterialState { roughness: 0.85, ..base },
@@ -292,6 +308,7 @@ pub(super) struct CMaterial {
     bump_map: Option<Arc<str>>,
     roughness_map: Option<Arc<str>>,
     metallic_map: Option<Arc<str>>,
+    emissive_map: Option<Arc<str>>,
     bump: Option<Prop<f64>>,
     uv: Option<(Prop<crate::value::Vec2>, Prop<crate::value::Vec2>, Prop<f64>)>,
     volume: Option<CVolume>,
@@ -303,6 +320,12 @@ pub(super) struct CVolume {
     anisotropy: Prop<f64>,
     emission: Option<Prop<Color>>,
     emission_strength: Prop<f64>,
+    coverage: Option<Prop<f64>>,
+    softness: Option<Prop<f64>>,
+    grid: Option<(String, [u32; 3], Prop<f64>)>,
+    model: crate::document::VolumeModel,
+    shape: crate::document::VolumeShape,
+    up: [f64; 3],
 }
 
 pub(super) struct CNoise {
@@ -337,6 +360,7 @@ impl CMaterial {
         let emissive = match (&self.emissive, self.preset) {
             (Some(c), _) => Some(clamp_color(c.at(t))),
             (None, MaterialPreset::Emissive) => Some(m.color),
+            (None, _) if self.emissive_map.is_some() => Some(Color([1.0; 4])),
             _ => None,
         };
         if let Some(e) = emissive {
@@ -373,6 +397,7 @@ impl CMaterial {
         }) {
             m.noise = Some(n);
         }
+        m.volume_grid = self.volume.as_ref().and_then(|v| v.grid.as_ref()).map(|(src, size, frame)| (Arc::from(frame_path(src, frame.at(t))), *size));
         m.volume = self.volume.as_ref().map(|v| {
             let lin = |c: Color, k: f64| linear(c, k * c.0[3]);
             VolumeState {
@@ -380,6 +405,11 @@ impl CMaterial {
                 albedo: lin(v.color.as_ref().map(|c| clamp_color(c.at(t))).unwrap_or(Color::WHITE), 1.0),
                 g: v.anisotropy.at(t).clamp(-0.95, 0.95),
                 emission: v.emission.as_ref().map(|c| lin(clamp_color(c.at(t)), v.emission_strength.at(t).max(0.0))).unwrap_or([0.0; 3]),
+                coverage: v.coverage.as_ref().map_or(0.5, |p| p.at(t).clamp(0.0, 1.0)),
+                softness: v.softness.as_ref().map_or(0.1, |p| p.at(t).clamp(0.01, 1.0)),
+                artistic: v.model == crate::document::VolumeModel::Artistic,
+                cumulus: v.shape == crate::document::VolumeShape::Cumulus,
+                up: v.up,
             }
         });
         m.map = self.map.clone();
@@ -387,6 +417,7 @@ impl CMaterial {
         m.bump_map = self.bump_map.clone();
         m.roughness_map = self.roughness_map.clone();
         m.metallic_map = self.metallic_map.clone();
+        m.emissive_map = self.emissive_map.clone();
         m.bump = f(&self.bump, m.bump, -1000.0, 1000.0);
         if let Some((sc, off, rot)) = &self.uv {
             let (sc, off) = (sc.at(t), off.at(t));
@@ -419,7 +450,7 @@ pub(super) struct CMesh {
     segments: u32,
     gap: Prop<f64>,
     detail: f64,
-    displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>, [f64; 3])>,
+    displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>, [f64; 3], Option<String>)>,
     /// Last parameters, so unchanged frames share one `Arc` (and one
     /// cached mesh in the renderer).
     last: std::sync::Mutex<Option<Arc<MeshParams>>>,
@@ -472,6 +503,7 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         bump_map: o.bump_map.clone().or_else(|| base.bump_map.clone()),
         roughness_map: o.roughness_map.clone().or_else(|| base.roughness_map.clone()),
         metallic_map: o.metallic_map.clone().or_else(|| base.metallic_map.clone()),
+        emissive_map: o.emissive_map.clone().or_else(|| base.emissive_map.clone()),
         bump: o.bump.clone().or_else(|| base.bump.clone()),
         uv: o.uv.clone().or_else(|| base.uv.clone()),
         volume: o.volume.clone().or_else(|| base.volume.clone()),
@@ -558,6 +590,7 @@ impl Compiler<'_> {
             bump_map: m.bump_map.as_deref().map(Arc::from),
             roughness_map: m.roughness_map.as_deref().map(Arc::from),
             metallic_map: m.metallic_map.as_deref().map(Arc::from),
+            emissive_map: m.emissive_map.as_deref().map(Arc::from),
             bump: m.bump.as_ref().map(|p| self.prop(p, id, &w("bump"), start, step, shift)),
             uv: m.uv.as_ref().map(|u| (self.prop(&u.scale, id, &w("uv.scale"), start, step, shift), self.prop(&u.offset, id, &w("uv.offset"), start, step, shift), self.prop(&u.rotation, id, &w("uv.rotation"), start, step, shift))),
             volume: m.volume.as_ref().map(|v| CVolume {
@@ -566,6 +599,16 @@ impl Compiler<'_> {
                 anisotropy: self.prop(&v.anisotropy, id, &w("volume.anisotropy"), start, step, shift),
                 emission: v.emission.as_ref().map(|p| self.prop(p, id, &w("volume.emission"), start, step, shift)),
                 emission_strength: self.prop(&v.emission_strength, id, &w("volume.emission_strength"), start, step, shift),
+                coverage: v.coverage.as_ref().map(|p| self.prop(p, id, &w("volume.coverage"), start, step, shift)),
+                softness: v.softness.as_ref().map(|p| self.prop(p, id, &w("volume.softness"), start, step, shift)),
+                grid: v.grid.as_ref().map(|g| (g.src.clone(), g.size.map(|n| n.clamp(1, 1024)), self.prop(&g.frame, id, &w("volume.grid.frame"), start, step, shift))),
+                model: v.model.unwrap_or_default(),
+                shape: v.shape.unwrap_or_default(),
+                up: {
+                    let u = v.up.map(|u| u.0).unwrap_or([0.0, -1.0, 0.0]);
+                    let l = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+                    if l > 1e-9 { u.map(|c| c / l) } else { [0.0, -1.0, 0.0] }
+                },
             }),
         }
     }
@@ -639,7 +682,7 @@ impl Compiler<'_> {
             self.errors.push(format!("{id}.segments: must be at least 1"));
         }
         let displace = m.displace.as_ref().map(|d| {
-            (d.kind, self.prop(&d.scale, id, "displace.scale", start, step, shift), d.octaves, d.seed, self.prop(&d.amount, id, "displace.amount", start, step, shift), d.drift.map(|v| v.0).unwrap_or([0.0; 3]))
+            (d.kind, self.prop(&d.scale, id, "displace.scale", start, step, shift), d.octaves, d.seed, self.prop(&d.amount, id, "displace.amount", start, step, shift), d.drift.map(|v| v.0).unwrap_or([0.0; 3]), d.src.clone())
         });
         CMesh {
             displace,
@@ -907,8 +950,12 @@ impl CMesh {
                 MeshShape::Gltf { src: frame_path(src, frame.at(t)), mesh: *mesh, primitive: *primitive, unit: *unit, bounds: *bounds }
             }
         };
-        let displace = self.displace.as_ref().map(|(kind, scale, octaves, seed, amount, drift)| {
-            (crate::noise::Field { kind: *kind, scale: scale.at(t).max(0.5), octaves: (*octaves).clamp(1, 8), seed: *seed, offset: [drift[0] * t, drift[1] * t, drift[2] * t] }, amount.at(t))
+        let displace = self.displace.as_ref().map(|(kind, scale, octaves, seed, amount, drift, src)| {
+            let how = match src {
+                Some(src) => crate::mesh::Displacement::Image(src.clone()),
+                None => crate::mesh::Displacement::Noise(crate::noise::Field { kind: *kind, scale: scale.at(t).max(0.5), octaves: (*octaves).clamp(1, 8), seed: *seed, offset: [drift[0] * t, drift[1] * t, drift[2] * t] }),
+            };
+            (how, amount.at(t))
         });
         let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone(), screen, displace };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());

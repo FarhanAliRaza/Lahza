@@ -157,6 +157,12 @@ pub struct Gpu {
     /// The path tracer, where the device has ray queries.
     tracer: Option<crate::pt::Tracer>,
     pub(crate) trace_error: Option<String>,
+    /// With profiling: this frame's stages and GPU pass timestamps (the
+    /// renderer takes them after each frame).
+    pub(crate) profile: Option<crate::profile::Profile>,
+    /// The encoder was started at the end of the last frame (to read its
+    /// timestamps) and is ready to record.
+    started: bool,
 }
 
 /// Concatenates sub-sample display lists into one upload. Returns the
@@ -247,9 +253,10 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
 impl Gpu {
     /// Opens a headless Vulkan context. Software rasterisers (llvmpipe) are
     /// rejected unless `allow_software`; the CPU path is faster than them.
-    pub fn new(allow_software: bool) -> Result<Self, String> {
+    /// `profile` times every GPU pass (`profile`).
+    pub fn new(allow_software: bool, profile: bool) -> Result<Self, String> {
         // SAFETY: headless context; no external handles or shared ownership.
-        let context = catch_unwind(AssertUnwindSafe(|| unsafe { gpu::Context::init(gpu::ContextDesc::default()) }))
+        let context = catch_unwind(AssertUnwindSafe(|| unsafe { gpu::Context::init(gpu::ContextDesc { timing: profile, ..Default::default() }) }))
             .map_err(|_| "Vulkan initialisation panicked".to_string())?
             .map_err(|e| format!("no Vulkan device: {e:?}"))?;
         let info = context.device_information().clone();
@@ -277,7 +284,7 @@ impl Gpu {
         let (tracer, trace_error) = if !crate::pt::supported(&context) {
             (None, Some(format!("{} has no ray queries", info.device_name)))
         } else {
-            match crate::pt::Tracer::new(&context) {
+            match crate::pt::Tracer::new(&context, profile) {
                 Ok(t) => (Some(t), None),
                 Err(e) => (None, Some(format!("path tracer: {e}"))),
             }
@@ -309,6 +316,8 @@ impl Gpu {
             label,
             tracer,
             trace_error,
+            profile: profile.then(crate::profile::Profile::default),
+            started: false,
         })
     }
 
@@ -338,10 +347,14 @@ impl Gpu {
         let (list, targets) = merge(samples);
         let weight = 1.0 / samples.len() as f32;
         let ctx = &self.context;
+        let recording = std::time::Instant::now();
         if let Some(t) = self.tracer.as_mut() {
             t.begin_frame(&self.context);
         }
-        self.encoder.start();
+        if !std::mem::take(&mut self.started) {
+            self.encoder.start();
+        }
+        let mut in_tracer = std::time::Duration::ZERO;
         self.prims.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.prims))?;
         self.ranges.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ranges))?;
         self.indices.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.indices))?;
@@ -389,7 +402,9 @@ impl Gpu {
                 if let Some(ti) = g.trace {
                     paths += t.width as u64 * t.height as u64 * list.traces[ti as usize].options.spp.max(1) as u64;
                     let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
-                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device, self.images.device);
+                    let entered = std::time::Instant::now();
+                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device, self.images.device, self.profile.as_mut());
+                    in_tracer += entered.elapsed();
                     continue;
                 }
                 let data = raster_data(
@@ -454,6 +469,7 @@ impl Gpu {
         }
         let host = self.output.host.unwrap();
         self.encoder.transfer("readback").copy_buffer_to_buffer(self.output.device.into(), host.into(), (w * h * 4) as u64);
+        let submitted = std::time::Instant::now();
         let sync = self.context.submit(&mut self.encoder);
         self.pending = Some(sync.clone());
         if !self.context.wait_for(&sync, frame_timeout_ms(paths)) {
@@ -461,6 +477,17 @@ impl Gpu {
             return Err("GPU timed out".into());
         }
         self.pending = None;
+        if let Some(p) = self.profile.as_mut() {
+            p.add("gpu frame › record + upload", submitted - recording - in_tracer);
+            p.stage("gpu frame › wait for GPU", submitted);
+            // Starting the encoder reads the finished frame's timestamps.
+            self.encoder.start();
+            self.started = true;
+            p.add_gpu(self.encoder.timings());
+            if let Some(t) = self.tracer.as_mut() {
+                t.collect_profile(p);
+            }
+        }
         self.context.sync_buffer(host);
         // SAFETY: the copy completed and the mapping holds w·h·4 bytes.
         let bytes = unsafe { std::slice::from_raw_parts(host.data(), (w * h * 4) as usize) }.to_vec();

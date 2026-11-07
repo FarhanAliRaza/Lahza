@@ -1,0 +1,1325 @@
+{
+  "experiment": "UI-specific teacher and matched 2x students",
+  "date": "2026-11-03",
+  "decision": "Keep bundled v2 weights; distilled candidate reduces grayscale color artifacts but does not establish a broad reconstruction or sharpness improvement.",
+  "run_directory": "ignore/upscaler-distill-stream",
+  "model_parameters": {
+    "v2": 11468,
+    "teacher": 304140,
+    "supervised": 11468,
+    "distilled": 11468
+  },
+  "test": {
+    "hashes": {
+      "v2": "d4e6451c448591a874688ddf41f4a2725e836657c9236d2141e82414fe32f26b",
+      "teacher": "0ecdcb1493b2b2b13f1b51cc791e8ea80fb1b6201071b07cf69cd408fae7bfa5",
+      "supervised": "24f66aebeb200e4bd735ad50f92e1a2272dbe37d2c8db10f0ec438faca4194d3",
+      "distilled": "b174c914522170bbddd4d27e87f6442ca23ca51c270c7669375f518b25ea4878"
+    },
+    "sets": {
+      "docs-native": {
+        "v2": {
+          "mse": 0.005825314437970519,
+          "psnr": 22.346806273852295,
+          "edge_error": 0.02269434416666627,
+          "stroke_error": 0.1887858510017395,
+          "chroma_mse": 0.00041278417605402257,
+          "halo": 0.1293941336007265,
+          "source_gradient_error": 0.006615076718541483
+        },
+        "teacher": {
+          "mse": 0.005896273398927103,
+          "psnr": 22.294223872771287,
+          "edge_error": 0.022728987969458103,
+          "stroke_error": 0.18975548694531122,
+          "chroma_mse": 0.00047129859861646156,
+          "halo": 0.11558656729903305,
+          "source_gradient_error": 0.005145619235311945
+        },
+        "supervised": {
+          "mse": 0.005874672846402973,
+          "psnr": 22.310163137299305,
+          "edge_error": 0.022792961137990158,
+          "stroke_error": 0.18953493113319078,
+          "chroma_mse": 0.0004421125134588995,
+          "halo": 0.13586352457423345,
+          "source_gradient_error": 0.00614148248375083
+        },
+        "distilled": {
+          "mse": 0.005922381087051083,
+          "psnr": 22.27503650530229,
+          "edge_error": 0.022938123826558392,
+          "stroke_error": 0.19304433092474937,
+          "chroma_mse": 0.0004489577756127498,
+          "halo": 0.11420879240176873,
+          "source_gradient_error": 0.005582680401857942
+        }
+      },
+      "docs-native-vp8": {
+        "v2": {
+          "mse": 0.0058643351270196336,
+          "psnr": 22.317812191894703,
+          "edge_error": 0.024085721466690302,
+          "stroke_error": 0.20301418006420135,
+          "chroma_mse": 0.0003601791856150764,
+          "halo": 0.08929064177209511,
+          "source_gradient_error": 0.017292923216397565
+        },
+        "teacher": {
+          "mse": 0.005882568929033975,
+          "psnr": 22.30432975274132,
+          "edge_error": 0.023222668406864006,
+          "stroke_error": 0.20633228992422423,
+          "chroma_mse": 0.0003577822450703631,
+          "halo": 0.08028714086321997,
+          "source_gradient_error": 0.015691993835692603
+        },
+        "supervised": {
+          "mse": 0.00589378469157964,
+          "psnr": 22.296057335975338,
+          "edge_error": 0.024000084803750116,
+          "stroke_error": 0.20467165236671767,
+          "chroma_mse": 0.0003611766017759995,
+          "halo": 0.08406262544667698,
+          "source_gradient_error": 0.017062710132449865
+        },
+        "distilled": {
+          "mse": 0.005917834991123527,
+          "psnr": 22.278371485778194,
+          "edge_error": 0.024129249155521393,
+          "stroke_error": 0.20606956258416176,
+          "chroma_mse": 0.00036086953574946773,
+          "halo": 0.07303002383196144,
+          "source_gradient_error": 0.017246456739182275
+        }
+      },
+      "docs-down-vp8": {
+        "v2": {
+          "mse": 0.0006071023866146182,
+          "psnr": 32.1673805984403,
+          "edge_error": 0.009599419931570688,
+          "stroke_error": 0.11542713580032189,
+          "chroma_mse": 0.0003036733942280989,
+          "halo": 0.122188485438528,
+          "source_gradient_error": 0.00859623025947561
+        },
+        "teacher": {
+          "mse": 0.0005125864675695387,
+          "psnr": 32.90232863499909,
+          "edge_error": 0.007923915089728931,
+          "stroke_error": 0.10704626763860385,
+          "chroma_mse": 0.00029768593109717284,
+          "halo": 0.12002046056295512,
+          "source_gradient_error": 0.0072284450676913066
+        },
+        "supervised": {
+          "mse": 0.0006033601263576808,
+          "psnr": 32.19423393987053,
+          "edge_error": 0.009419616078957915,
+          "stroke_error": 0.11564822122454643,
+          "chroma_mse": 0.0003023929178501324,
+          "halo": 0.11507919711220893,
+          "source_gradient_error": 0.008446072305863103
+        },
+        "distilled": {
+          "mse": 0.0006044014444341883,
+          "psnr": 32.18674506429227,
+          "edge_error": 0.00942262343596667,
+          "stroke_error": 0.11382921660939853,
+          "chroma_mse": 0.00030133705634701374,
+          "halo": 0.10386808517068857,
+          "source_gradient_error": 0.008483395252066353
+        }
+      },
+      "scenes-native": {
+        "v2": {
+          "mse": 0.007549590819204847,
+          "psnr": 21.220765860896293,
+          "edge_error": 0.04921879557271799,
+          "stroke_error": 0.19051631353795528,
+          "chroma_mse": 0.0016851857605312641,
+          "halo": 0.5733528941345867,
+          "source_gradient_error": 0.017151538010997076
+        },
+        "teacher": {
+          "mse": 0.007675252272747457,
+          "psnr": 21.14907341080535,
+          "edge_error": 0.04842785885557532,
+          "stroke_error": 0.18382224316398302,
+          "chroma_mse": 0.001741057902108878,
+          "halo": 0.5745800081058405,
+          "source_gradient_error": 0.013399393646977842
+        },
+        "supervised": {
+          "mse": 0.007495827060968925,
+          "psnr": 21.251804417752005,
+          "edge_error": 0.050078481901437044,
+          "stroke_error": 0.18807363385955492,
+          "chroma_mse": 0.0016652648046147078,
+          "halo": 0.6378403000417165,
+          "source_gradient_error": 0.017529238558684785
+        },
+        "distilled": {
+          "mse": 0.007633571765230347,
+          "psnr": 21.172722071343596,
+          "edge_error": 0.04984318822001418,
+          "stroke_error": 0.18813231525321802,
+          "chroma_mse": 0.0016822561350030203,
+          "halo": 0.6486808758927509,
+          "source_gradient_error": 0.016137611392575007
+        }
+      },
+      "scenes-native-vp8": {
+        "v2": {
+          "mse": 0.009622271095092097,
+          "psnr": 20.167224115735465,
+          "edge_error": 0.05856223916634917,
+          "stroke_error": 0.21746766505142054,
+          "chroma_mse": 0.0032818319256572672,
+          "halo": 0.15003205418906873,
+          "source_gradient_error": 0.05471983210494121
+        },
+        "teacher": {
+          "mse": 0.009415760733342418,
+          "psnr": 20.261445860088607,
+          "edge_error": 0.05602345569059253,
+          "stroke_error": 0.21276100166141987,
+          "chroma_mse": 0.003150795557303354,
+          "halo": 0.2708460394569556,
+          "source_gradient_error": 0.04908526176586747
+        },
+        "supervised": {
+          "mse": 0.009618512839855006,
+          "psnr": 20.16892070932264,
+          "edge_error": 0.05875979193175832,
+          "stroke_error": 0.21674766888221106,
+          "chroma_mse": 0.003308516985271126,
+          "halo": 0.15906643307971535,
+          "source_gradient_error": 0.05486986227333546
+        },
+        "distilled": {
+          "mse": 0.00970918524156635,
+          "psnr": 20.128172129280486,
+          "edge_error": 0.05905025716250142,
+          "stroke_error": 0.21736911435921988,
+          "chroma_mse": 0.0033406381553504616,
+          "halo": 0.14580787794329808,
+          "source_gradient_error": 0.05509967030957341
+        }
+      },
+      "scenes-down-vp8": {
+        "v2": {
+          "mse": 0.004530767754962047,
+          "psnr": 23.43828198982473,
+          "edge_error": 0.04262115620076656,
+          "stroke_error": 0.16908344253897667,
+          "chroma_mse": 0.0026759535006325073,
+          "halo": 0.17708721843519015,
+          "source_gradient_error": 0.0445669861510396
+        },
+        "teacher": {
+          "mse": 0.004051652513832475,
+          "psnr": 23.923678085724415,
+          "edge_error": 0.03898150303090612,
+          "stroke_error": 0.15681231829027334,
+          "chroma_mse": 0.002433916374381321,
+          "halo": 0.3106822835979983,
+          "source_gradient_error": 0.04023574432358146
+        },
+        "supervised": {
+          "mse": 0.004534778592642397,
+          "psnr": 23.434439122071925,
+          "edge_error": 0.04278590716421604,
+          "stroke_error": 0.1679734860857328,
+          "chroma_mse": 0.0027076209080405533,
+          "halo": 0.18660436438949546,
+          "source_gradient_error": 0.044941696183135114
+        },
+        "distilled": {
+          "mse": 0.00455694777580599,
+          "psnr": 23.413259485536592,
+          "edge_error": 0.04275681419918934,
+          "stroke_error": 0.16740319753686586,
+          "chroma_mse": 0.0027534843150836727,
+          "halo": 0.17672426183708012,
+          "source_gradient_error": 0.04509835115944346
+        }
+      },
+      "code-native": {
+        "v2": {
+          "mse": 0.007301136362366378,
+          "psnr": 21.36609540222379,
+          "edge_error": 0.04193376768380404,
+          "stroke_error": 0.15246380120515823,
+          "chroma_mse": 0.0006248117657378316,
+          "halo": 0.40433257492259145,
+          "source_gradient_error": 0.014293978456407785
+        },
+        "teacher": {
+          "mse": 0.007416119822300971,
+          "psnr": 21.29823261907825,
+          "edge_error": 0.04189828373491764,
+          "stroke_error": 0.14795711040496826,
+          "chroma_mse": 0.0006950901210075244,
+          "halo": 0.4631296372390352,
+          "source_gradient_error": 0.01060362821444869
+        },
+        "supervised": {
+          "mse": 0.007314334833063185,
+          "psnr": 21.358251625619282,
+          "edge_error": 0.042039054073393346,
+          "stroke_error": 0.15106116235256195,
+          "chroma_mse": 0.000647267431486398,
+          "halo": 0.4388930474524386,
+          "source_gradient_error": 0.013145931251347064
+        },
+        "distilled": {
+          "mse": 0.007452750275842845,
+          "psnr": 21.27683430713993,
+          "edge_error": 0.042476354725658895,
+          "stroke_error": 0.154428693652153,
+          "chroma_mse": 0.0006689197354717181,
+          "halo": 0.39270981203299016,
+          "source_gradient_error": 0.011713458970189095
+        }
+      },
+      "code-native-vp8": {
+        "v2": {
+          "mse": 0.008363540517166257,
+          "psnr": 20.77609834814273,
+          "edge_error": 0.047157348692417146,
+          "stroke_error": 0.18025219142436982,
+          "chroma_mse": 0.0011831803189124913,
+          "halo": 0.22442823453457095,
+          "source_gradient_error": 0.04018704742193222
+        },
+        "teacher": {
+          "mse": 0.008326675416901708,
+          "psnr": 20.79528364295221,
+          "edge_error": 0.04517354927957058,
+          "stroke_error": 0.17960115224123002,
+          "chroma_mse": 0.0011538868362549692,
+          "halo": 0.28385913698002696,
+          "source_gradient_error": 0.03648488391190767
+        },
+        "supervised": {
+          "mse": 0.008373999129980802,
+          "psnr": 20.770670885659438,
+          "edge_error": 0.04714512154459953,
+          "stroke_error": 0.18024849742650986,
+          "chroma_mse": 0.001184586400631815,
+          "halo": 0.23529552374384366,
+          "source_gradient_error": 0.04027275964617729
+        },
+        "distilled": {
+          "mse": 0.008449284080415963,
+          "psnr": 20.73180087866497,
+          "edge_error": 0.04740492068231106,
+          "stroke_error": 0.18197291642427443,
+          "chroma_mse": 0.0011835995828732848,
+          "halo": 0.20428253046702594,
+          "source_gradient_error": 0.04031629804521799
+        }
+      },
+      "code-down-vp8": {
+        "v2": {
+          "mse": 0.0018670303747057916,
+          "psnr": 27.28848616459166,
+          "edge_error": 0.02544812373816967,
+          "stroke_error": 0.1300794765353203,
+          "chroma_mse": 0.001090077089611441,
+          "halo": 0.3813561756396666,
+          "source_gradient_error": 0.024802040494978427
+        },
+        "teacher": {
+          "mse": 0.001615865109488368,
+          "psnr": 27.915948964388964,
+          "edge_error": 0.022139516286551954,
+          "stroke_error": 0.12331394031643868,
+          "chroma_mse": 0.0010475994437001645,
+          "halo": 0.4687409327016212,
+          "source_gradient_error": 0.021927951835095882
+        },
+        "supervised": {
+          "mse": 0.0018605542019940913,
+          "psnr": 27.303576735144933,
+          "edge_error": 0.02532357517629862,
+          "stroke_error": 0.1296912334859371,
+          "chroma_mse": 0.0010912742814980446,
+          "halo": 0.38707131685805507,
+          "source_gradient_error": 0.024901381321251394
+        },
+        "distilled": {
+          "mse": 0.0019029479124583303,
+          "psnr": 27.205730990705813,
+          "edge_error": 0.025574270635843277,
+          "stroke_error": 0.13045800849795341,
+          "chroma_mse": 0.0010887120792176575,
+          "halo": 0.33602273344877176,
+          "source_gradient_error": 0.024806362204253675
+        }
+      },
+      "fresh-glyph-native": {
+        "v2": {
+          "mse": 0.008187942206859589,
+          "psnr": 20.86825231389423,
+          "edge_error": 0.03872907906770706,
+          "stroke_error": 0.20000682771205902,
+          "chroma_mse": 8.095237717498094e-05,
+          "halo": 0.3146741772070527,
+          "source_gradient_error": 0.005226463079452515,
+          "edge_energy": 8.703437805175781
+        },
+        "teacher": {
+          "mse": 0.00822107307612896,
+          "psnr": 20.85071491386323,
+          "edge_error": 0.03773938864469528,
+          "stroke_error": 0.19641996920108795,
+          "chroma_mse": 9.145167132373899e-05,
+          "halo": 0.23415493924403563,
+          "source_gradient_error": 0.003333006054162979,
+          "edge_energy": 8.549792289733887
+        },
+        "supervised": {
+          "mse": 0.008109021931886673,
+          "psnr": 20.910315249750667,
+          "edge_error": 0.03838455677032471,
+          "stroke_error": 0.1990993469953537,
+          "chroma_mse": 7.453434227500111e-05,
+          "halo": 0.29426256311126053,
+          "source_gradient_error": 0.005158092826604843,
+          "edge_energy": 8.631394386291504
+        },
+        "distilled": {
+          "mse": 0.008179577067494392,
+          "psnr": 20.872691513411368,
+          "edge_error": 0.03840671107172966,
+          "stroke_error": 0.19945776462554932,
+          "chroma_mse": 7.268918125191703e-05,
+          "halo": 0.26791813143063337,
+          "source_gradient_error": 0.004108482040464878,
+          "edge_energy": 8.638046264648438
+        }
+      },
+      "fresh-glyph-vp8": {
+        "v2": {
+          "mse": 0.00817945133894682,
+          "psnr": 20.87275826947178,
+          "edge_error": 0.040572334080934525,
+          "stroke_error": 0.20577958226203918,
+          "chroma_mse": 0.0001409546530339867,
+          "halo": 0.18568779778433964,
+          "source_gradient_error": 0.013574881479144096,
+          "edge_energy": 8.89543342590332
+        },
+        "teacher": {
+          "mse": 0.008164971135556698,
+          "psnr": 20.880453462231618,
+          "edge_error": 0.0385957807302475,
+          "stroke_error": 0.20296448469161987,
+          "chroma_mse": 0.00012279688962735236,
+          "halo": 0.17762022209353745,
+          "source_gradient_error": 0.009679799899458885,
+          "edge_energy": 8.485858917236328
+        },
+        "supervised": {
+          "mse": 0.008116408251225948,
+          "psnr": 20.906361162967126,
+          "edge_error": 0.040151044726371765,
+          "stroke_error": 0.20511043071746826,
+          "chroma_mse": 0.00013779581058770418,
+          "halo": 0.17388585372827947,
+          "source_gradient_error": 0.013393907807767391,
+          "edge_energy": 8.798066139221191
+        },
+        "distilled": {
+          "mse": 0.008164388127624989,
+          "psnr": 20.880763574984577,
+          "edge_error": 0.04025138169527054,
+          "stroke_error": 0.20579522848129272,
+          "chroma_mse": 0.00013622005644720048,
+          "halo": 0.15052209491841495,
+          "source_gradient_error": 0.012928767129778862,
+          "edge_energy": 8.8069486618042
+        }
+      },
+      "fresh-ui-native": {
+        "v2": {
+          "mse": 0.007381509989500046,
+          "psnr": 21.31854788173083,
+          "edge_error": 0.0492372028529644,
+          "stroke_error": 0.18839499354362488,
+          "chroma_mse": 0.0016655290964990854,
+          "halo": 0.5587061669211835,
+          "source_gradient_error": 0.017041724175214767,
+          "edge_energy": 12.117082595825195
+        },
+        "teacher": {
+          "mse": 0.007530688773840666,
+          "psnr": 21.231653004263542,
+          "edge_error": 0.048458635807037354,
+          "stroke_error": 0.18152351677417755,
+          "chroma_mse": 0.0017309959512203932,
+          "halo": 0.5666182329878211,
+          "source_gradient_error": 0.013125324621796608,
+          "edge_energy": 12.318066596984863
+        },
+        "supervised": {
+          "mse": 0.00733401533216238,
+          "psnr": 21.34658186457969,
+          "edge_error": 0.05009668692946434,
+          "stroke_error": 0.1858437955379486,
+          "chroma_mse": 0.0016473341966047883,
+          "halo": 0.6269016419537365,
+          "source_gradient_error": 0.017428774386644363,
+          "edge_energy": 12.32490062713623
+        },
+        "distilled": {
+          "mse": 0.007478207815438509,
+          "psnr": 21.26202470200234,
+          "edge_error": 0.04976353049278259,
+          "stroke_error": 0.18578150868415833,
+          "chroma_mse": 0.0016690209740772843,
+          "halo": 0.6267208547797054,
+          "source_gradient_error": 0.015635455027222633,
+          "edge_energy": 12.360601425170898
+        }
+      },
+      "fresh-ui-vp8": {
+        "v2": {
+          "mse": 0.008763656951487064,
+          "psnr": 20.573146309963285,
+          "edge_error": 0.05680679529905319,
+          "stroke_error": 0.20893438160419464,
+          "chroma_mse": 0.002848559059202671,
+          "halo": 0.15429429797222838,
+          "source_gradient_error": 0.047868192195892334,
+          "edge_energy": 12.43912124633789
+        },
+        "teacher": {
+          "mse": 0.008626648224890232,
+          "psnr": 20.641579111430502,
+          "edge_error": 0.05475146323442459,
+          "stroke_error": 0.20355477929115295,
+          "chroma_mse": 0.002727641724050045,
+          "halo": 0.28278943500481546,
+          "source_gradient_error": 0.04287064075469971,
+          "edge_energy": 12.27542781829834
+        },
+        "supervised": {
+          "mse": 0.008755356073379517,
+          "psnr": 20.577261868096297,
+          "edge_error": 0.05701488256454468,
+          "stroke_error": 0.20825804769992828,
+          "chroma_mse": 0.002878884319216013,
+          "halo": 0.1561231873347424,
+          "source_gradient_error": 0.04829038679599762,
+          "edge_energy": 12.434403419494629
+        },
+        "distilled": {
+          "mse": 0.008869307115674019,
+          "psnr": 20.521103066161963,
+          "edge_error": 0.05734550952911377,
+          "stroke_error": 0.20870278775691986,
+          "chroma_mse": 0.002918846905231476,
+          "halo": 0.1516545974300243,
+          "source_gradient_error": 0.0483817532658577,
+          "edge_energy": 12.557883262634277
+        }
+      }
+    },
+    "diagnostics": {
+      "v2": {
+        "geometry": {
+          "chroma_rms_8bit": 1.1268388032913208,
+          "chroma_max_8bit": 26.0
+        },
+        "text": {
+          "chroma_rms_8bit": 1.2161785364151,
+          "chroma_max_8bit": 20.999998092651367
+        },
+        "flat_max_error_8bit": 0.0,
+        "integer_pan_max_error_8bit": 0.0
+      },
+      "teacher": {
+        "geometry": {
+          "chroma_rms_8bit": 1.2793124914169312,
+          "chroma_max_8bit": 26.999998092651367
+        },
+        "text": {
+          "chroma_rms_8bit": 0.7565910816192627,
+          "chroma_max_8bit": 16.999998092651367
+        },
+        "flat_max_error_8bit": 2.0,
+        "integer_pan_max_error_8bit": 0.9999999403953552
+      },
+      "supervised": {
+        "geometry": {
+          "chroma_rms_8bit": 1.0317232608795166,
+          "chroma_max_8bit": 17.999998092651367
+        },
+        "text": {
+          "chroma_rms_8bit": 0.8047844171524048,
+          "chroma_max_8bit": 15.000000953674316
+        },
+        "flat_max_error_8bit": 0.0,
+        "integer_pan_max_error_8bit": 0.0
+      },
+      "distilled": {
+        "geometry": {
+          "chroma_rms_8bit": 0.3536638617515564,
+          "chroma_max_8bit": 3.999999761581421
+        },
+        "text": {
+          "chroma_rms_8bit": 0.37216129899024963,
+          "chroma_max_8bit": 4.999999523162842
+        },
+        "flat_max_error_8bit": 0.0,
+        "integer_pan_max_error_8bit": 0.0
+      }
+    },
+    "synthetic_pan_error_8bit": {
+      "v2": 2.0383831797516905,
+      "teacher": 1.9535740165156312,
+      "supervised": 2.052781186066568,
+      "distilled": 2.079868745058775
+    },
+    "encoded_pan_excess_error_8bit": {
+      "v2": 0.726040244102478,
+      "teacher": 0.7276936173439026,
+      "supervised": 0.7493245601654053,
+      "distilled": 0.7551895976066589
+    },
+    "real_crispness": {
+      "bilinear": {
+        "contrast_retention": 0.794040322303772,
+        "backprojection_mae": 0.018284467980265617,
+        "halo": 0.0,
+        "edge_energy": 47.73408508300781
+      },
+      "v2": {
+        "contrast_retention": 0.9705701470375061,
+        "backprojection_mae": 0.005419256631284952,
+        "halo": 1.1871914863586426,
+        "edge_energy": 61.560665130615234
+      },
+      "teacher": {
+        "contrast_retention": 0.9642826914787292,
+        "backprojection_mae": 0.008512187749147415,
+        "halo": 1.2213255167007446,
+        "edge_energy": 59.980987548828125
+      },
+      "supervised": {
+        "contrast_retention": 0.9723268151283264,
+        "backprojection_mae": 0.005333698354661465,
+        "halo": 1.1575181484222412,
+        "edge_energy": 61.39862823486328
+      },
+      "distilled": {
+        "contrast_retention": 0.9703832864761353,
+        "backprojection_mae": 0.004931642673909664,
+        "halo": 1.01353919506073,
+        "edge_energy": 61.17932891845703
+      }
+    }
+  },
+  "selection": {
+    "baseline_score": 1.75,
+    "student_source_gradient_weight": 0,
+    "teacher_source_gradient_weight": 2,
+    "checkpoints": {
+      "teacher": {
+        "name": "teacher",
+        "step": 3000,
+        "score": 2.1144525602034374,
+        "rows": {
+          "docs-native": {
+            "mse": 0.006192618049681187,
+            "psnr": 22.081257057212994,
+            "edge_error": 0.028814923018217087,
+            "stroke_error": 0.18655675649642944,
+            "chroma_mse": 0.0007704521995037794,
+            "halo": 0.19287108967546374,
+            "source_gradient_error": 0.008494309149682522,
+            "edge_energy": 9.434181213378906
+          },
+          "docs-native-vp8": {
+            "mse": 0.008435872383415699,
+            "psnr": 20.738699988232074,
+            "edge_error": 0.03880198299884796,
+            "stroke_error": 0.20109407603740692,
+            "chroma_mse": 0.0009284969419240952,
+            "halo": 0.17368345521390438,
+            "source_gradient_error": 0.030378252267837524,
+            "edge_energy": 11.284364700317383
+          },
+          "docs-down-vp8": {
+            "mse": 0.0011931140907108784,
+            "psnr": 29.233180252340567,
+            "edge_error": 0.01572015881538391,
+            "stroke_error": 0.12872762978076935,
+            "chroma_mse": 0.0007399076712317765,
+            "halo": 0.2539657847955823,
+            "source_gradient_error": 0.014665605500340462,
+            "edge_energy": 10.614526748657227
+          },
+          "scenes-native": {
+            "mse": 0.009999454021453857,
+            "psnr": 20.00023712194306,
+            "edge_error": 0.06358236074447632,
+            "stroke_error": 0.17941604554653168,
+            "chroma_mse": 0.002277798019349575,
+            "halo": 0.7346195087302476,
+            "source_gradient_error": 0.017600327730178833,
+            "edge_energy": 16.625959396362305
+          },
+          "scenes-native-vp8": {
+            "mse": 0.012405375950038433,
+            "psnr": 19.06390069718809,
+            "edge_error": 0.07333396375179291,
+            "stroke_error": 0.20808345079421997,
+            "chroma_mse": 0.004197654780000448,
+            "halo": 0.35431020660325885,
+            "source_gradient_error": 0.06487738341093063,
+            "edge_energy": 16.319557189941406
+          },
+          "scenes-down-vp8": {
+            "mse": 0.005127625539898872,
+            "psnr": 22.900836979770688,
+            "edge_error": 0.05043090507388115,
+            "stroke_error": 0.1555553823709488,
+            "chroma_mse": 0.0030135272536426783,
+            "halo": 0.40501685289200395,
+            "source_gradient_error": 0.05022815614938736,
+            "edge_energy": 15.321382522583008
+          },
+          "code-native": {
+            "mse": 0.00901760533452034,
+            "psnr": 20.449087759922712,
+            "edge_error": 0.049166880548000336,
+            "stroke_error": 0.1664925068616867,
+            "chroma_mse": 0.0008538509136997163,
+            "halo": 0.4423213214613497,
+            "source_gradient_error": 0.01240178756415844,
+            "edge_energy": 12.652551651000977
+          },
+          "code-native-vp8": {
+            "mse": 0.009514565579593182,
+            "psnr": 20.216110361412856,
+            "edge_error": 0.05051068216562271,
+            "stroke_error": 0.19002604484558105,
+            "chroma_mse": 0.0013848404632881284,
+            "halo": 0.2834508667001501,
+            "source_gradient_error": 0.03987796604633331,
+            "edge_energy": 12.099640846252441
+          },
+          "code-down-vp8": {
+            "mse": 0.0019516227766871452,
+            "psnr": 27.09604122035575,
+            "edge_error": 0.02437227964401245,
+            "stroke_error": 0.12903988361358643,
+            "chroma_mse": 0.0012060321168974042,
+            "halo": 0.4704209917690605,
+            "source_gradient_error": 0.024246446788311005,
+            "edge_energy": 11.780525207519531
+          },
+          "glyph-native": {
+            "mse": 0.007900849916040897,
+            "psnr": 21.023261879509967,
+            "edge_error": 0.03718225657939911,
+            "stroke_error": 0.19681526720523834,
+            "chroma_mse": 5.24933057022281e-05,
+            "halo": 0.24212956835981458,
+            "source_gradient_error": 0.003307487117126584,
+            "edge_energy": 8.570525169372559
+          },
+          "glyph-vp8": {
+            "mse": 0.007853762246668339,
+            "psnr": 21.04922250063675,
+            "edge_error": 0.03796851634979248,
+            "stroke_error": 0.20312823355197906,
+            "chroma_mse": 7.76830202084966e-05,
+            "halo": 0.18103196402080357,
+            "source_gradient_error": 0.008939563296735287,
+            "edge_energy": 8.473837852478027
+          }
+        }
+      },
+      "supervised": {
+        "name": "supervised",
+        "step": 17000,
+        "score": 1.7463560912064067,
+        "rows": {
+          "docs-native": {
+            "mse": 0.006166819948703051,
+            "psnr": 22.099387313898518,
+            "edge_error": 0.0290040485560894,
+            "stroke_error": 0.1892191469669342,
+            "chroma_mse": 0.0007294962415471673,
+            "halo": 0.1935515203513205,
+            "source_gradient_error": 0.010018943808972836,
+            "edge_energy": 9.402000427246094
+          },
+          "docs-native-vp8": {
+            "mse": 0.008498456329107285,
+            "psnr": 20.70659952948504,
+            "edge_error": 0.040309444069862366,
+            "stroke_error": 0.20227807760238647,
+            "chroma_mse": 0.0009378452086821198,
+            "halo": 0.16761307313572615,
+            "source_gradient_error": 0.03267305716872215,
+            "edge_energy": 11.581623077392578
+          },
+          "docs-down-vp8": {
+            "mse": 0.001393262529745698,
+            "psnr": 28.55967042601604,
+            "edge_error": 0.018225450068712234,
+            "stroke_error": 0.13680821657180786,
+            "chroma_mse": 0.0007527853013016284,
+            "halo": 0.23666192893870175,
+            "source_gradient_error": 0.016831740736961365,
+            "edge_energy": 10.843525886535645
+          },
+          "scenes-native": {
+            "mse": 0.009714044630527496,
+            "psnr": 20.12599905521487,
+            "edge_error": 0.06535999476909637,
+            "stroke_error": 0.18398436903953552,
+            "chroma_mse": 0.002151520224288106,
+            "halo": 0.7820128812454641,
+            "source_gradient_error": 0.02272041141986847,
+            "edge_energy": 16.573389053344727
+          },
+          "scenes-native-vp8": {
+            "mse": 0.01262248307466507,
+            "psnr": 18.988552029723053,
+            "edge_error": 0.07650935649871826,
+            "stroke_error": 0.211702361702919,
+            "chroma_mse": 0.004371826536953449,
+            "halo": 0.21081657672766596,
+            "source_gradient_error": 0.07184884697198868,
+            "edge_energy": 16.681777954101562
+          },
+          "scenes-down-vp8": {
+            "mse": 0.00573607487604022,
+            "psnr": 22.413851882260904,
+            "edge_error": 0.05508137494325638,
+            "stroke_error": 0.16682453453540802,
+            "chroma_mse": 0.003343169344589114,
+            "halo": 0.2361679999739863,
+            "source_gradient_error": 0.05618101730942726,
+            "edge_energy": 15.395156860351562
+          },
+          "code-native": {
+            "mse": 0.008962418884038925,
+            "psnr": 20.475747619655614,
+            "edge_error": 0.049415647983551025,
+            "stroke_error": 0.16906827688217163,
+            "chroma_mse": 0.0007966390112414956,
+            "halo": 0.4414686234667897,
+            "source_gradient_error": 0.015433044172823429,
+            "edge_energy": 12.576691627502441
+          },
+          "code-native-vp8": {
+            "mse": 0.009588678367435932,
+            "psnr": 20.18241248646259,
+            "edge_error": 0.05248495936393738,
+            "stroke_error": 0.1898074448108673,
+            "chroma_mse": 0.0014295702567324042,
+            "halo": 0.25063478853553534,
+            "source_gradient_error": 0.04360387474298477,
+            "edge_energy": 12.538514137268066
+          },
+          "code-down-vp8": {
+            "mse": 0.00225515803322196,
+            "psnr": 26.46823018951686,
+            "edge_error": 0.027599692344665527,
+            "stroke_error": 0.13611090183258057,
+            "chroma_mse": 0.0012907552300021052,
+            "halo": 0.3683005808852613,
+            "source_gradient_error": 0.027426987886428833,
+            "edge_energy": 11.912147521972656
+          },
+          "glyph-native": {
+            "mse": 0.007820934057235718,
+            "psnr": 21.067413758815245,
+            "edge_error": 0.03789146617054939,
+            "stroke_error": 0.2003328949213028,
+            "chroma_mse": 4.2693853174569085e-05,
+            "halo": 0.29254348191898316,
+            "source_gradient_error": 0.0049947714433074,
+            "edge_energy": 8.630837440490723
+          },
+          "glyph-vp8": {
+            "mse": 0.007816699333488941,
+            "psnr": 21.069765927016935,
+            "edge_error": 0.039562106132507324,
+            "stroke_error": 0.20596493780612946,
+            "chroma_mse": 8.569901547161862e-05,
+            "halo": 0.18001339602051303,
+            "source_gradient_error": 0.012478351593017578,
+            "edge_energy": 8.764877319335938
+          }
+        }
+      },
+      "distilled": {
+        "name": "distilled",
+        "step": 17000,
+        "score": 1.758223394542538,
+        "rows": {
+          "docs-native": {
+            "mse": 0.006225822027772665,
+            "psnr": 22.05803298279427,
+            "edge_error": 0.02914494276046753,
+            "stroke_error": 0.19282682240009308,
+            "chroma_mse": 0.0007322237361222506,
+            "halo": 0.16536384617211297,
+            "source_gradient_error": 0.009248901158571243,
+            "edge_energy": 9.369112014770508
+          },
+          "docs-native-vp8": {
+            "mse": 0.008542616851627827,
+            "psnr": 20.684090719181274,
+            "edge_error": 0.04048914089798927,
+            "stroke_error": 0.2036105990409851,
+            "chroma_mse": 0.0009371929918415844,
+            "halo": 0.1460541135747917,
+            "source_gradient_error": 0.03297097235918045,
+            "edge_energy": 11.565784454345703
+          },
+          "docs-down-vp8": {
+            "mse": 0.001418479485437274,
+            "psnr": 28.481769407463915,
+            "edge_error": 0.018381215631961823,
+            "stroke_error": 0.13610844314098358,
+            "chroma_mse": 0.0007476548780687153,
+            "halo": 0.2088389461277984,
+            "source_gradient_error": 0.017028888687491417,
+            "edge_energy": 10.808477401733398
+          },
+          "scenes-native": {
+            "mse": 0.009916783310472965,
+            "psnr": 20.036291763394473,
+            "edge_error": 0.06529852002859116,
+            "stroke_error": 0.1845061480998993,
+            "chroma_mse": 0.0021935768891125917,
+            "halo": 0.7944521075114608,
+            "source_gradient_error": 0.020843591541051865,
+            "edge_energy": 16.636411666870117
+          },
+          "scenes-native-vp8": {
+            "mse": 0.012739848345518112,
+            "psnr": 18.948357417884747,
+            "edge_error": 0.07694444060325623,
+            "stroke_error": 0.2128923237323761,
+            "chroma_mse": 0.004402279853820801,
+            "halo": 0.18657767737749964,
+            "source_gradient_error": 0.07219596207141876,
+            "edge_energy": 16.76004409790039
+          },
+          "scenes-down-vp8": {
+            "mse": 0.005757602397352457,
+            "psnr": 22.397583294888406,
+            "edge_error": 0.055145978927612305,
+            "stroke_error": 0.16670362651348114,
+            "chroma_mse": 0.0033948083873838186,
+            "halo": 0.22348962404066697,
+            "source_gradient_error": 0.05645275115966797,
+            "edge_energy": 15.492696762084961
+          },
+          "code-native": {
+            "mse": 0.009135414846241474,
+            "psnr": 20.392717262159074,
+            "edge_error": 0.0499909371137619,
+            "stroke_error": 0.17318159341812134,
+            "chroma_mse": 0.0008234012639150023,
+            "halo": 0.3907940676435828,
+            "source_gradient_error": 0.014073383063077927,
+            "edge_energy": 12.518655776977539
+          },
+          "code-native-vp8": {
+            "mse": 0.009664913639426231,
+            "psnr": 20.148020222446583,
+            "edge_error": 0.05270735174417496,
+            "stroke_error": 0.19160568714141846,
+            "chroma_mse": 0.0014314722502604127,
+            "halo": 0.2178430528147146,
+            "source_gradient_error": 0.043727338314056396,
+            "edge_energy": 12.509979248046875
+          },
+          "code-down-vp8": {
+            "mse": 0.0023316761944442987,
+            "psnr": 26.323317612587367,
+            "edge_error": 0.027923231944441795,
+            "stroke_error": 0.1375240683555603,
+            "chroma_mse": 0.001288966159336269,
+            "halo": 0.312846326851286,
+            "source_gradient_error": 0.027503952383995056,
+            "edge_energy": 11.80917739868164
+          },
+          "glyph-native": {
+            "mse": 0.00788387656211853,
+            "psnr": 21.03260184089506,
+            "edge_error": 0.03791661560535431,
+            "stroke_error": 0.20122303068637848,
+            "chroma_mse": 4.069886199431494e-05,
+            "halo": 0.2651772019453347,
+            "source_gradient_error": 0.004033659119158983,
+            "edge_energy": 8.624192237854004
+          },
+          "glyph-vp8": {
+            "mse": 0.007859834469854832,
+            "psnr": 21.045866002183054,
+            "edge_error": 0.03964988887310028,
+            "stroke_error": 0.20717975497245789,
+            "chroma_mse": 8.374171738978475e-05,
+            "halo": 0.1560150712612085,
+            "source_gradient_error": 0.01200223620980978,
+            "edge_energy": 8.758565902709961
+          }
+        }
+      }
+    }
+  },
+  "training": {
+    "students": {
+      "seed": 2601104,
+      "steps": 20000,
+      "seconds": 451.80481991099987,
+      "lr": 0.001,
+      "batch": 32,
+      "torch": "2.14.1+cu130",
+      "device": "NVIDIA GeForce RTX 3060",
+      "parameters": {
+        "supervised": 11468,
+        "distilled": 11468
+      },
+      "base_objective": {
+        "charbonnier": 1,
+        "gradient_l1": 1.0,
+        "backprojection_l1": 1,
+        "halo": 0.0
+      },
+      "source_gradient_weight": 0,
+      "teacher_start": null,
+      "distillation": "0.5 output L1 + 0.5 gradient L1",
+      "kd_weight": 2.0,
+      "scratch": true,
+      "augmentation": {
+        "inversion": true,
+        "RGB_permutation": true,
+        "grayscale_rate": 0.0
+      },
+      "schedule": "onecycle",
+      "streaming": true,
+      "fp32_students": true,
+      "init_seed": 2604
+    },
+    "student_options": {
+      "command": "train",
+      "stage": "students",
+      "teacher_steps": 8000,
+      "student_steps": 20000,
+      "source_gradient": 0,
+      "teacher_start": null,
+      "lr": 0.001,
+      "kd_weight": 2.0,
+      "scratch": true,
+      "crops_per_source": 1024,
+      "schedule": "onecycle",
+      "streaming": true,
+      "fp32_students": true,
+      "grayscale_rate": 0.0,
+      "edge_weight": 1.0,
+      "halo_weight": 0.0,
+      "init_seed": 2604,
+      "data": "/home/farhan/code/screendrop-rs/ignore/upscaler-data",
+      "out": "ignore/upscaler-distill-stream"
+    },
+    "teacher_initial": {
+      "seed": 2601104,
+      "steps": 8000,
+      "seconds": 179.18718047699986,
+      "lr": 0.0002,
+      "batch": 32,
+      "torch": "2.14.1+cu130",
+      "device": "NVIDIA GeForce RTX 3060",
+      "parameters": {
+        "teacher": 304140
+      },
+      "base_objective": "Charbonnier + 1.5 gradient L1 + backprojection L1 + 0.2 halo",
+      "distillation": "0.5 output L1 + 0.5 gradient L1",
+      "augmentation": "inversion, RGB permutation, 25% grayscale"
+    },
+    "teacher_continuation": {
+      "seed": 2601104,
+      "steps": 4000,
+      "seconds": 89.64654084799986,
+      "lr": 5e-05,
+      "batch": 32,
+      "torch": "2.14.1+cu130",
+      "device": "NVIDIA GeForce RTX 3060",
+      "parameters": {
+        "teacher": 304140
+      },
+      "base_objective": "Charbonnier + 1.5 gradient L1 + backprojection L1 + 0.2 halo",
+      "source_gradient_weight": 2.0,
+      "teacher_start": "ignore/upscaler-distill/teacher.pt",
+      "distillation": "0.5 output L1 + 0.5 gradient L1",
+      "augmentation": "inversion, RGB permutation, 25% grayscale"
+    }
+  },
+  "provenance": {
+    "seed": 2601104,
+    "original_crop_seed": 2601103,
+    "original_training_crops": 12288,
+    "generated_training_pairs": 1024,
+    "training_seed_start": 2100000,
+    "validation_seed_start": 2200000,
+    "test_seed_start": 2300000,
+    "train_fonts": [
+      "dejavu/DejaVuSans.ttf",
+      "dejavu/DejaVuSansMono.ttf",
+      "dejavu/DejaVuSans-Bold.ttf",
+      "dejavu/DejaVuSerif.ttf",
+      "liberation/LiberationSans-Regular.ttf",
+      "liberation/LiberationSans-Bold.ttf",
+      "liberation/LiberationMono-Regular.ttf",
+      "freefont/FreeSans.ttf",
+      "freefont/FreeMono.ttf",
+      "crosextra/Carlito-Regular.ttf"
+    ],
+    "heldout_fonts": [
+      "dejavu/DejaVuSerif-Bold.ttf",
+      "liberation/LiberationSerif-Regular.ttf",
+      "crosextra/Caladea-Regular.ttf"
+    ],
+    "generated_codec": "VP8 realtime, yuv420p, q=28, g=1",
+    "manifest_sha256": "c562001b64911426ac5e1f494b12c1346ddfb53b6c9a8f5ad23aa829a9f080f8",
+    "original_splits": {
+      "train-docs": {
+        "count": 360,
+        "sha256": "6215bdc4637ac46fd6bb11afa4ca0ce0f076bc7d23869b3b87eb00f8878a59ee"
+      },
+      "train-scenes": {
+        "count": 1200,
+        "sha256": "4e3fd2dbdbf1bba15d158befa750ef59c009d47e917e1c59bd4d76582036b279"
+      },
+      "train-code": {
+        "count": 300,
+        "sha256": "cc5932b0a1fd2378fe3b6d436e4902abff06ec04ce3bb6616f56a8d1b07117e0"
+      },
+      "valid-docs": {
+        "count": 48,
+        "sha256": "aaa6b4070c2cc67c4b23471dd9ee004adfdebcc645c7cec0131319f937021151"
+      },
+      "valid-scenes": {
+        "count": 96,
+        "sha256": "d9e35161609b851dd7e32d627be305a9c686076748fafd033e89e456fee0eb4f"
+      },
+      "valid-code": {
+        "count": 40,
+        "sha256": "a7d34c10bfa9c451108744b1e5fd17c3a532f90c19664046a5c7bb5467a09466"
+      },
+      "test-docs": {
+        "count": 48,
+        "sha256": "10d5727094fa8bd0363d4407bf467602577f87d2f37b6bcfb875b1be04027c21"
+      },
+      "test-scenes": {
+        "count": 96,
+        "sha256": "312eaeff6a7e6e08396815dab545cd09706c43e4d55a62a2a581bee29c1cba6f"
+      },
+      "test-code": {
+        "count": 40,
+        "sha256": "6ec88e1856825cb22d572c486dd1df4a62e9341324324f722a67a23841b6dcd5"
+      }
+    },
+    "cached_bank_original_crops_used_in_final_streaming_run": 0,
+    "generated_validation_pairs": 96,
+    "fresh_test_glyph_pairs": 128,
+    "fresh_test_ui_pairs": 32,
+    "fresh_ui_seed_start": 2400000,
+    "encoded_pan_seed": 2500000,
+    "final_batch_composition": {
+      "fresh_original_crops": 30,
+      "generated_glyph_crops": 2
+    },
+    "font_files": {
+      "dejavu/DejaVuSans.ttf": {
+        "path": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "sha256": "b4c632e3cdf9acc7f28758fb5a323c8524d7fc6660d46904d9b6cbe2809c419c"
+      },
+      "dejavu/DejaVuSansMono.ttf": {
+        "path": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "sha256": "a54dca07c76d6289e717e75e0a58c0128f6d7269ef3faf76417c9d7d3bba37ab"
+      },
+      "dejavu/DejaVuSans-Bold.ttf": {
+        "path": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "sha256": "e1d733afbbfce842a1b43dced0c9885a76a4e67290dc7e690c4e9b76ebfc7d23"
+      },
+      "dejavu/DejaVuSerif.ttf": {
+        "path": "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "sha256": "a52c2a69dfc93d0b511b98c1019a57eb3d6a62d328bdf1387f00851b02e3a315"
+      },
+      "liberation/LiberationSans-Regular.ttf": {
+        "path": "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "sha256": "075e71be4c58beda172ecb574a799308f04c3d054c6a5b7434954d3b0f1b28d8"
+      },
+      "liberation/LiberationSans-Bold.ttf": {
+        "path": "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "sha256": "b72c65e551d653b54217ffad0d1454ce0657e4e8d4a28bcc79e0acd2598f4bf3"
+      },
+      "liberation/LiberationMono-Regular.ttf": {
+        "path": "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "sha256": "d18235f1e874771f4eaec3ddd6ddb4db849d334bdc6930c5c2185d9344834e62"
+      },
+      "freefont/FreeSans.ttf": {
+        "path": "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "sha256": "fd3cf5f7a88bb469fd0936ce6152509b60b817711b07d19abcb69e6c744b08ca"
+      },
+      "freefont/FreeMono.ttf": {
+        "path": "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        "sha256": "5d8c9689e6108a04da659f98631faf577aa630ccac204137575d948207137684"
+      },
+      "crosextra/Carlito-Regular.ttf": {
+        "path": "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf",
+        "sha256": "f6418f708baede9789daef5d458c0f53d2a888af9820e8062934e504fedc6595"
+      },
+      "dejavu/DejaVuSerif-Bold.ttf": {
+        "path": "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+        "sha256": "3f704f75238454f68a8202e5098cb0687887480dd63d3dc20b34bdbdfa9d9f3f"
+      },
+      "liberation/LiberationSerif-Regular.ttf": {
+        "path": "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "sha256": "350f4ffd773cae53560c63dca3d89a5070595614fde12f772bf43feb63d81064"
+      },
+      "crosextra/Caladea-Regular.ttf": {
+        "path": "/usr/share/fonts/truetype/crosextra/Caladea-Regular.ttf",
+        "sha256": "f1e899278b7b4491aba5b6a8253c4b04c050cc59b21865be5c37559a775153cd"
+      }
+    },
+    "generated_validation_bank_sha256": "b9e74e12b5c585f8d3bcd9a6e5ffe3d83cf6c6fed9b04131c11773cb3235b5c7",
+    "cached_training_bank_sha256": "41e69fa276cb44b682857e4240c5b32daec77a9013a93ce035d4665e9d5bdddd",
+    "real_frames": {
+      "ignore/upscaler-data/real/0-5.png": "a8e88ea036c675bf4a3e9380b5cd7ecd4966e57907d393be9e749a571a3a64c5",
+      "ignore/upscaler-data/real/1-20.png": "932980f99c3a95219cda93c2af9b0a35f6d465712a20ddf2b41ca92d56d9778b",
+      "ignore/upscaler-data/real/1-5.png": "5e75d35e946526af13936f90f64033be9c29edea1c85ba0e30bd055a092d3cae",
+      "ignore/upscaler-data/real/2-5.png": "c0d3ae0199d2600c65fd2dbeee4eaf931e5874afd7ae9a06d5d75be6b791d507",
+      "ignore/upscaler-data/real/3-20.png": "1f9f305d1e3d8421ffc0acff282453fe589552b72ad81a96437f6fc08544a5a5",
+      "ignore/upscaler-data/real/3-5.png": "17ea430a4431ef5a02505ee1bd61061019d1251884caa01382dd611b6a427e29"
+    }
+  },
+  "checkpoint_sha256": {
+    "ignore/upscaler-distill-stream/teacher.pt": "f0154385f73805d8b2c01dd55c99849fdac91e940c92482189ee137bdc78837d",
+    "ignore/upscaler-distill-stream/supervised.pt": "3b8c9add3f3f8c8236b8235378c039de454cea5d2841dee103f7d1956cbd69e8",
+    "ignore/upscaler-distill-stream/distilled.pt": "8053eb86733666a0e1520264bae29ecd69688188ede6739b8fb1d9be31c39a41",
+    "ignore/upscaler-v2-runs/2x-c24-l7-sharp/model.pt": "8ab0f44f05710efdd14d38c64af92729572a9a03f0e062dfeb9552c95bf90d2f"
+  },
+  "source_sha256": {
+    "tools/distill_ui_upscaler.py": "5c83ae55cf373fb6cea8fd55ddcbe707e246722b715507515e41856ac6a8678c",
+    "tools/experiment_ui_upscaler_weights.py": "1eb411284ad3e1585d610d6fa7805bd54373287f1151ea4013f32f1bb30bb2bb",
+    "tools/train_ui_upscaler_v2.py": "0f0961c542c2d2a54c1a959866513349b78292e88fda590c0139f125cede018e",
+    "tools/build_upscaler_data.py": "e98c3eeb346da9147f0d19a6bf06e6cbc126b93adbd11797266c638cd2379958",
+    "tools/export_ui_upscaler_v2.py": "da97463e0dea2e8530572c67b9b5f7bafad1f4b60bdcff7d0b7324ab4fa5a9bb",
+    "crates/screen-upscale/src/screen_upscale.rs": "d8e8a47394564e3f2584836dbf0ddd54ec2e4820981dc7105b117414e509d306"
+  },
+  "export": {
+    "supervised": {
+      "layout_max_error": 1.7881393432617188e-07,
+      "parameters": 11468,
+      "sha256": "24f66aebeb200e4bd735ad50f92e1a2272dbe37d2c8db10f0ec438faca4194d3",
+      "bytes_with_padding": 46448
+    },
+    "distilled": {
+      "layout_max_error": 2.086162567138672e-07,
+      "parameters": 11468,
+      "sha256": "b174c914522170bbddd4d27e87f6442ca23ca51c270c7669375f518b25ea4878",
+      "bytes_with_padding": 46448
+    }
+  },
+  "gpu_tests": [
+    {
+      "model": "supervised",
+      "precision": "f16",
+      "maximum_error_8bit": 1,
+      "case_errors_8bit": [
+        1,
+        1,
+        1,
+        0
+      ],
+      "passed": true,
+      "alpha_tolerance_8bit": 1,
+      "log": "    Finished `release` profile [optimized] target(s) in 0.14s\n     Running unittests src/lib.rs (target/release/deps/lahza_screen_upscale-313830c67eb60dd6)\n\nrunning 1 test\ntest screen_upscale::tests::hardware_neural_tiles_match_cpu_reference_for_2x_and_4x ... neural GPU: DeviceInformation { is_software_emulated: false, device_name: \"NVIDIA GeForce RTX 3060\", driver_name: \"NVIDIA\", driver_info: \"595.99.02\" }\nneural precision: native f16\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 2 }: maximum reference error 1/255\nneural UpscalePlan { x: 3, y: 2, width: 139, height: 31, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 140, y: 31, width: 5, height: 4, scale: 2 }: maximum reference error 0/255\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.42s\n\n"
+    },
+    {
+      "model": "supervised",
+      "precision": "f32",
+      "maximum_error_8bit": 1,
+      "case_errors_8bit": [
+        1,
+        1,
+        1,
+        0
+      ],
+      "passed": true,
+      "alpha_tolerance_8bit": 1,
+      "log": "    Finished `release` profile [optimized] target(s) in 0.13s\n     Running unittests src/lib.rs (target/release/deps/lahza_screen_upscale-313830c67eb60dd6)\n\nrunning 1 test\ntest screen_upscale::tests::hardware_neural_tiles_match_cpu_reference_for_2x_and_4x ... neural GPU: DeviceInformation { is_software_emulated: false, device_name: \"NVIDIA GeForce RTX 3060\", driver_name: \"NVIDIA\", driver_info: \"595.99.02\" }\nneural precision: f32\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 2 }: maximum reference error 1/255\nneural UpscalePlan { x: 3, y: 2, width: 139, height: 31, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 140, y: 31, width: 5, height: 4, scale: 2 }: maximum reference error 0/255\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.42s\n\n"
+    },
+    {
+      "model": "distilled",
+      "precision": "f16",
+      "maximum_error_8bit": 1,
+      "case_errors_8bit": [
+        1,
+        1,
+        1,
+        0
+      ],
+      "passed": true,
+      "alpha_tolerance_8bit": 1,
+      "log": "    Finished `release` profile [optimized] target(s) in 0.18s\n     Running unittests src/lib.rs (target/release/deps/lahza_screen_upscale-313830c67eb60dd6)\n\nrunning 1 test\ntest screen_upscale::tests::hardware_neural_tiles_match_cpu_reference_for_2x_and_4x ... neural GPU: DeviceInformation { is_software_emulated: false, device_name: \"NVIDIA GeForce RTX 3060\", driver_name: \"NVIDIA\", driver_info: \"595.99.02\" }\nneural precision: native f16\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 2 }: maximum reference error 1/255\nneural UpscalePlan { x: 3, y: 2, width: 139, height: 31, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 140, y: 31, width: 5, height: 4, scale: 2 }: maximum reference error 0/255\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.60s\n\n"
+    },
+    {
+      "model": "distilled",
+      "precision": "f32",
+      "maximum_error_8bit": 1,
+      "case_errors_8bit": [
+        1,
+        1,
+        1,
+        0
+      ],
+      "passed": true,
+      "alpha_tolerance_8bit": 1,
+      "log": "    Finished `release` profile [optimized] target(s) in 0.14s\n     Running unittests src/lib.rs (target/release/deps/lahza_screen_upscale-313830c67eb60dd6)\n\nrunning 1 test\ntest screen_upscale::tests::hardware_neural_tiles_match_cpu_reference_for_2x_and_4x ... neural GPU: DeviceInformation { is_software_emulated: false, device_name: \"NVIDIA GeForce RTX 3060\", driver_name: \"NVIDIA\", driver_info: \"595.99.02\" }\nneural precision: f32\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 2 }: maximum reference error 1/255\nneural UpscalePlan { x: 3, y: 2, width: 139, height: 31, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 0, y: 0, width: 145, height: 35, scale: 4 }: maximum reference error 1/255\nneural UpscalePlan { x: 140, y: 31, width: 5, height: 4, scale: 2 }: maximum reference error 0/255\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.51s\n\n"
+    }
+  ],
+  "other_checks": {
+    "rust_unit_tests_passed": 4,
+    "python_numerical_tests_passed": 5,
+    "bundled_2x_bytes_match_git_HEAD": true
+  },
+  "comparison_images": {
+    "docs/screenshots/upscaler-distillation-glyph-vp8.png": {
+      "source": "ignore/upscaler-distill-stream/compare-fresh-glyph-vp8-0.png",
+      "sha256": "2dcf96de20f563b83a11f3fbf8eb162d820e38852d43fab848a7eeaaff836e48"
+    },
+    "docs/screenshots/upscaler-distillation-ui-vp8.png": {
+      "source": "ignore/upscaler-distill-stream/compare-fresh-ui-vp8-7.png",
+      "sha256": "d4d8f83f7acbbccb6767d07d68193e4c0ef05b16731a15885ab9dd7afab1245d"
+    }
+  },
+  "limitations": [
+    "One final training seed; no statistical significance claim.",
+    "Teacher has 304,140 parameters and is trained here, not an external state-of-the-art large model.",
+    "Original test groups and real crops were also evaluated in the earlier weight-edit study; fresh glyph/UI seeds are new.",
+    "Procedural evaluation font files are excluded from procedural training font list; browser docs/code do not have a font-family holdout.",
+    "OCR and arbitrary real-video temporal quality were not evaluated.",
+    "Teacher integer-pan probe trims only 16 HR pixels, insufficient for its ten-layer receptive field; its discrepancy may include boundary effects.",
+    "Original-group scalar metrics average four-image batches; blank batches are excluded from stroke error. PSNR is recomputed from aggregate MSE.",
+    "Real crispness uses clamped float predictions and halo scaled by 1000; paired and temporal metrics quantize to 8 bits, paired halo is scaled by 255.",
+    "Final student training is FP32 but frozen teacher guidance is computed in FP16.",
+    "The training report objective fields were corrected from saved CLI options after training; weights and training behavior were unchanged."
+  ]
+}

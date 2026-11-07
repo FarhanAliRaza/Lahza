@@ -12,3 +12,8 @@ A `Memory::Download` variant requests host-cached memory for GPU→CPU
 readback (`HOST_ACCESS | DOWNLOAD` on Vulkan; shared storage on Metal and
 GLES). `Memory::Shared` also asks for fast device access, which with
 Resizable BAR lands in VRAM mapped over PCIe, where CPU reads are uncached.
+
+`LAHZA_PIPELINE_STATS=1` (Vulkan, where VK_KHR_pipeline_executable_properties
+is supported) enables the extension and its `pipelineExecutableInfo` feature,
+creates compute pipelines with `CAPTURE_STATISTICS` and prints each driver
+statistic (registers, local memory, instructions) to stderr. Off by default.

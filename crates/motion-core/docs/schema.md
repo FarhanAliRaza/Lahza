@@ -61,6 +61,21 @@ camera's zoom, orbit and dolly and stays where its transform puts it on
 screen, drawn in layer order above a moving 3D camera; use it for titles,
 captions and finishing layers in 3D scenes).
 
+What a layer is, for `check` (see the guide's
+[Declaring intent](guide.md#declaring-intent-role-facing-allow)):
+`role` (`background`, `subject`, `foreground`, `caption` or
+`decoration`; a comp's role passes to its layers unless they set their
+own), `facing` (`"right"`, `"left"`, `"up"`, `"down"` or degrees
+clockwise from +x: the way the content points in its own space; a
+`follow` with `rotate` faces the path's way unless `facing` says
+otherwise) and `allow` (check kinds the layer and its children break on
+purpose, e.g. `["text_below_floor"]`). Scenes take `allow` too
+(`["world_crossfade"]`).
+
+```json
+{"id": "car", "kind": "image", "src": "assets/car.png", "role": "subject", "facing": "right"}
+```
+
 3D layers (`three_d`, and every `mesh`) also take `transform.z`,
 `rotation_x`, `rotation_y` and `scale_z`. Space is x right, y down, z away
 from the viewer; angles are degrees. A layer's point p goes to its
@@ -365,6 +380,7 @@ Surface detail (raster and path tracer alike):
 | `bump_map`, `bump` | a height image (bright = raised) and its height in px (2) |
 | `roughness_map` | an image whose green channel scales `roughness` (glTF's metallic-roughness texture; a grey map works too): polished and dull patches on one surface |
 | `metallic_map` | an image whose blue channel scales `metallic` (the same glTF texture) |
+| `emissive_map` | a colour image that multiplies the emission (`emissive` × `emissive_strength`; white × strength when `emissive` is not set): city lights on a map, a screen's picture. Above 1 it glows past white and blooms |
 | `subsurface` | 0..1 of the diffuse light enters the surface and scatters inside before it leaves (Principled subsurface, Cycles' random walk: marble, milky quartz, wax, skin, milk); path tracing only |
 | `subsurface_radius` | how far each colour travels inside, relative, `[r, g, b]` (default `[1, 0.2, 0.1]`, as Blender: red furthest) |
 | `subsurface_scale` | the radius' scale in px (default 5); an imported model's comes from Blender's Subsurface Scale × `unit` |
@@ -377,7 +393,17 @@ over spheres equirectangularly, and around and across a ring's tube.
 A mesh's `displace` pushes its surface out and in for real (the
 silhouette changes): `{"type", "scale", "octaves", "seed", "amount": px, "drift": [x, y, z] px/s}`;
 the mesh is subdivided to the noise's scale (up to 200k triangles) and
-stays closed.
+stays closed. With `"src": "assets/height.png"` a height image over the
+mesh's UVs pushes instead of noise: white rises `amount` px, black stays
+(terrain from elevation data; 16-bit greys stay smooth). The mesh is
+subdivided to about one texel per edge, within the same limits, so pair
+it with the same image as `bump_map` for detail finer than the triangles.
+
+```json
+{"id": "land", "kind": "mesh", "mesh": {"type": "plane", "size": [1800, 1200]}, "transform": {"position": [960, 560], "rotation_x": 60},
+ "displace": {"src": "assets/elevation.png", "amount": 40},
+ "material": {"map": "assets/satellite.png", "bump_map": "assets/elevation.png", "bump": 4, "emissive_map": "assets/night_lights.png", "emissive_strength": 3}}
+```
 
 A liquid is a clear surface whose ripples flow: preset `liquid` (ior
 1.33, a gentle ripple bump) with a drifting `noise` (and, for waves that
@@ -403,9 +429,38 @@ a thick part's glow, "emission_strength": 1}` (all animatable). The path
 tracer scatters light inside it (free flights, Henyey–Greenstein, shadow
 rays to every light); the raster estimates single scattering along the
 chord through the mesh's box (exact for boxes, the ellipsoid in the box
-for other shapes). Volumes cast no shadows and never hide what is behind
-them; a laser is a thin `cylinder` of glowing volume, a light column a
-cone (`cylinder` with `top`) of thin haze lit from above.
+for other shapes). Even volumes cast no shadows and never hide what is
+behind them; a laser is a thin `cylinder` of glowing volume, a light
+column a cone (`cylinder` with `top`) of thin haze lit from above.
+
+With the material's `noise`, the medium follows the noise instead of
+filling the mesh: clouds, smoke, dust. `"coverage"` (0..1, default 0.5,
+animatable) is how much of the noise is medium (animate it up and clouds
+grow), `"softness"` (default 0.1; 0.4 for soft haze) how gradually it
+fades at its edges, and it thins out toward the container's edge, so the
+mesh's shape never shows (a `sphere` or stretched `box` sized to the
+cloud). The noise's `scale` sets the puffs, `drift` makes them roll. The
+path tracer walks it exactly (delta tracking): clouds shade themselves,
+light bounces inside them, and they cast shadows onto everything below;
+overlapping volumes add up. The preview marches 16 steps through it,
+stopping at the surface behind, with a cheap self-shadow and an estimate
+of the light scattered many times; it casts no shadows.
+
+For smoke and clouds that billow, simulate them in Blender and give the
+volume a `grid` instead of noise: `{"src": "assets/smoke/d_{frame:04}.png",
+"size": [nx, ny, nz], "frame": keys}`. The image tiles the grid's z slices
+(front to back, left to right then top to bottom, y down), grey is density,
+and the grid fills the mesh's box (a `box` with the domain's proportions).
+`export_density` in tools/blender/lahza_export.py writes these from a baked
+smoke domain and returns `size`, the box in metres and the frame range; key
+`frame` linearly over the shot to play the simulation. Atlases stay within
+4096 px (the texture limit): about 128 cells a side.
+
+```json
+{"id": "cloud", "kind": "mesh", "mesh": {"type": "sphere", "radius": 220}, "transform": {"position": [900, 380], "z": -120, "scale": [1, 0.6]},
+ "material": {"volume": {"density": 6, "color": "#f4f1ec", "anisotropy": 0.5, "coverage": {"keys": [{"at": 0, "v": 0.2}, {"at": 4, "v": 0.6}]}},
+              "noise": {"type": "fbm", "scale": 90, "octaves": 5, "drift": [6, -4, 0]}}}
+```
 
 ```json
 {"id": "laser", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 6, "height": 900}, "transform": {"position": [960, 400], "rotation": 90},
@@ -612,6 +667,19 @@ generates ordinary layers from parameters: `captions`, `card`, `callout`,
   params change.
 - **`{"op": "detach", "id": "caps"}`** replaces the component with a comp of
   plain layers (`caps-c3`), with the overrides applied.
+- **Map arcs** (`arcs` on a `map`) draw on with `trim`. `route: "bow"`
+  (default) arches between the two points as they sit on the flat map,
+  the way explainers draw routes: `lift` × their distance high (default
+  0.2; positive toward the top of the map, negative toward the bottom),
+  lowered where it would leave the map. `route: "great_circle"` is the true
+  shortest route: across the date line it leaves one edge and comes back
+  in at the other (separate subpaths, never a line across the map), and
+  near a pole it stops at the map's top or bottom edge. The draw runs on
+  from origin to destination across the subpaths.
+- **Declared roles**: `captions` children have `"role": "caption"`; the
+  map's water, countries and lakes are `"background"`; counter values
+  `"allow": ["line_unread"]` (a count is read as one number). An override
+  can change them.
 
 ## Time edits
 

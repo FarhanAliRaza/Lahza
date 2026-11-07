@@ -669,6 +669,15 @@ pub(crate) fn edges(img: &image::RgbaImage) -> (Vec<f32>, u32, u32) {
     (e, w, h)
 }
 
+/// How much a frame draws beyond its background: the share of its pixels
+/// on a drawn edge (Sobel above [`SHADING_EDGE`], a step of 15+ levels).
+/// Flat colour, gradients and vignettes read 0, creased paper under 0.1%; at 270
+/// px wide a lone 32 px word on a 1280 × 720 frame reads 0.4%.
+pub fn drawn(img: &image::RgbaImage) -> f64 {
+    let (e, w, h) = edges(img);
+    e.iter().filter(|&&v| v > SHADING_EDGE).count() as f64 / (w as f64 * h as f64).max(1.0)
+}
+
 fn luma(img: &image::RgbaImage) -> Vec<f32> {
     img.pixels().map(|p| 0.2126 * p.0[0] as f32 + 0.7152 * p.0[1] as f32 + 0.0722 * p.0[2] as f32).collect()
 }

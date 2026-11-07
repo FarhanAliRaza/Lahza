@@ -337,6 +337,10 @@ impl Studio {
     /// Adds a built-in sound effect at the playhead on the Music / SFX
     /// lane. The sound is generated once into the recording's media folder.
     pub(crate) fn add_sound_effect_to_video(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        // In the Motion tab, inside the open piece, the sound joins the piece.
+        if self.motion_editing() && self.add_sound_effect_to_piece(name, cx) {
+            return;
+        }
         let Some(session) = self.video_project.as_ref() else { return };
         let file = std::path::PathBuf::from("media").join(format!("sfx-{name}.wav"));
         if let Err(e) = lahza_motion_audio::sfx::ensure(name, &session.directory.join(&file)) {

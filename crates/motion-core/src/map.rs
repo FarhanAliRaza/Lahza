@@ -220,6 +220,128 @@ fn path_d(rings: &[Vec<(f64, f64)>]) -> String {
     d
 }
 
+/// Segments of a bow; a great circle is sampled twice as finely.
+const ROUTE_SEGMENTS: usize = 64;
+/// Bows and routes keep this share of the world's width from its edges.
+const ROUTE_MARGIN: f64 = 0.02;
+
+/// A screen-space bow from `p0` to `p1` as they sit on the flat map (no
+/// wrapping): a parabola `lift` × the distance high at its middle,
+/// toward the top of the map for a positive `lift` and the bottom for a
+/// negative one (for a vertical route: left of the direction of travel),
+/// lowered where it would leave the map.
+fn bow(p0: (f64, f64), p1: (f64, f64), lift: f64, world: f64) -> Vec<(f64, f64)> {
+    let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    let chord = |t: f64| (p0.0 + dx * t, p0.1 + dy * t);
+    if len < 1e-9 {
+        return vec![p0, p1];
+    }
+    // The normal left of travel, turned to point up (−y) unless vertical,
+    // and down for a negative lift.
+    let mut n = (dy / len, -dx / len);
+    if n.1 > 1e-9 {
+        n = (-n.0, -n.1);
+    }
+    if lift < 0.0 {
+        n = (-n.0, -n.1);
+    }
+    let shape = |t: f64| 4.0 * t * (1.0 - t);
+    // The highest bow that stays inside the map's margins.
+    let (lo, hi) = (world * ROUTE_MARGIN, world * (1.0 - ROUTE_MARGIN));
+    let mut h = lift.abs() * len;
+    for k in 1..ROUTE_SEGMENTS {
+        let t = k as f64 / ROUTE_SEGMENTS as f64;
+        let (c, s) = (chord(t), shape(t));
+        for (c, o) in [(c.0, n.0 * s), (c.1, n.1 * s)] {
+            if o > 1e-12 {
+                h = h.min((hi - c) / o);
+            } else if o < -1e-12 {
+                h = h.min((lo - c) / o);
+            }
+        }
+    }
+    let h = h.max(0.0);
+    (0..=ROUTE_SEGMENTS)
+        .map(|k| {
+            let t = k as f64 / ROUTE_SEGMENTS as f64;
+            let (c, s) = (chord(t), shape(t) * h);
+            (c.0 + n.0 * s, c.1 + n.1 * s)
+        })
+        .collect()
+}
+
+/// The great circle from `a` to `b` ([lon, lat]) on the flat map, as
+/// subpaths: split where it crosses the date line (it leaves one edge and
+/// comes back in at the other) and cut where it runs past the map's top
+/// or bottom (Mercator's ±85.05°) near a pole, never a segment across the
+/// map.
+fn great_circle(a: (f64, f64), b: (f64, f64), world: f64) -> Vec<Vec<(f64, f64)>> {
+    const LAT: f64 = 85.05;
+    let to3 = |(lon, lat): (f64, f64)| {
+        let (l, p) = (lon.to_radians(), lat.to_radians());
+        [p.cos() * l.cos(), p.cos() * l.sin(), p.sin()]
+    };
+    let (va, vb) = (to3(a), to3(b));
+    let omega = (va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]).clamp(-1.0, 1.0).acos();
+    let n = ROUTE_SEGMENTS * 2;
+    let samples: Vec<(f64, f64)> = (0..=n)
+        .map(|k| {
+            let t = k as f64 / n as f64;
+            let (sa, sb) = if omega < 1e-9 { (1.0 - t, t) } else { (((1.0 - t) * omega).sin() / omega.sin(), (t * omega).sin() / omega.sin()) };
+            let v = [sa * va[0] + sb * vb[0], sa * va[1] + sb * vb[1], sa * va[2] + sb * vb[2]];
+            (v[1].atan2(v[0]).to_degrees(), v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt()).to_degrees())
+        })
+        .collect();
+    let on = |lat: f64| lat.abs() <= LAT;
+    let mut lines: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut cur: Vec<(f64, f64)> = Vec::new();
+    if on(samples[0].1) {
+        cur.push(project(samples[0].0, samples[0].1, world));
+    }
+    for w in samples.windows(2) {
+        let (p, mut q) = (w[0], w[1]);
+        // Longitudes unwrapped: q may run past ±180 (the date line).
+        if q.0 - p.0 > 180.0 {
+            q.0 -= 360.0;
+        } else if p.0 - q.0 > 180.0 {
+            q.0 += 360.0;
+        }
+        let (p_on, q_on) = (on(p.1), on(q.1));
+        if !p_on && !q_on {
+            continue;
+        }
+        let at = |f: f64| (p.0 + (q.0 - p.0) * f, p.1 + (q.1 - p.1) * f);
+        // The part of the step on the map: it leaves or comes back at the
+        // top or bottom edge.
+        let s = if p_on { p } else { at((LAT.copysign(p.1) - p.1) / (q.1 - p.1)) };
+        let e = if q_on { q } else { at((LAT.copysign(q.1) - p.1) / (q.1 - p.1)) };
+        if !p_on {
+            cur.push(project(wrap(s.0), s.1, world));
+        }
+        if e.0.abs() > 180.0 && s.0.abs() <= 180.0 {
+            // Across the date line: out at one edge, in at the other.
+            let edge = 180f64.copysign(e.0);
+            let lat = s.1 + (e.1 - s.1) * (edge - s.0) / (e.0 - s.0);
+            cur.push(project(edge, lat, world));
+            lines.push(std::mem::take(&mut cur));
+            cur.push(project(-edge, lat, world));
+        }
+        cur.push(project(wrap(e.0), e.1, world));
+        if !q_on {
+            lines.push(std::mem::take(&mut cur));
+        }
+    }
+    lines.push(cur);
+    lines.retain(|l| l.len() >= 2);
+    lines
+}
+
+/// A longitude in [−180, 180].
+fn wrap(lon: f64) -> f64 {
+    (lon + 180.0).rem_euclid(360.0) - 180.0
+}
+
 struct CamKey {
     at: Value,
     center: (f64, f64),
@@ -418,30 +540,15 @@ pub fn generate(p: &Value, width: f64, height: f64) -> Result<Vec<Value>, String
         let a = locate(arc.get("from").ok_or("an arc needs \"from\"")?)?;
         let b = locate(arc.get("to").ok_or("an arc needs \"to\"")?)?;
         let id = arc.get("id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| format!("arc{}", i + 1));
-        // Great circle, then lifted sideways into a bow.
-        let to3 = |(lon, lat): (f64, f64)| {
-            let (l, p) = (lon.to_radians(), lat.to_radians());
-            [p.cos() * l.cos(), p.cos() * l.sin(), p.sin()]
-        };
-        let (va, vb) = (to3(a), to3(b));
-        let omega = (va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]).clamp(-1.0, 1.0).acos();
-        let n = 64;
-        let mut pts: Vec<(f64, f64)> = (0..=n)
-            .map(|k| {
-                let t = k as f64 / n as f64;
-                let (sa, sb) = if omega < 1e-9 { (1.0 - t, t) } else { (((1.0 - t) * omega).sin() / omega.sin(), (t * omega).sin() / omega.sin()) };
-                let v = [sa * va[0] + sb * vb[0], sa * va[1] + sb * vb[1], sa * va[2] + sb * vb[2]];
-                project(v[1].atan2(v[0]).to_degrees(), v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt()).to_degrees(), world)
-            })
-            .collect();
         let lift = arc.get("lift").and_then(Value::as_f64).unwrap_or(0.2);
-        let (p0, p1) = (pts[0], pts[n]);
-        let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
-        for (k, p) in pts.iter_mut().enumerate() {
-            let s = (std::f64::consts::PI * k as f64 / n as f64).sin() * lift;
-            *p = (p.0 + dy * s, p.1 - dx * s);
-        }
-        let d: String = pts.iter().enumerate().map(|(k, p)| format!("{}{:.3} {:.3} ", if k == 0 { "M" } else { "L" }, p.0, p.1)).collect();
+        let lines = match arc.get("route").and_then(Value::as_str).unwrap_or("bow") {
+            "bow" => vec![bow(project(a.0, a.1, world), project(b.0, b.1, world), lift, world)],
+            "great_circle" => great_circle(a, b, world),
+            other => return Err(format!("arc '{id}': route '{other}' is \"bow\" or \"great_circle\"")),
+        };
+        // Open polylines, origin to destination: `trim` draws across the
+        // subpaths in order, so the draw runs on through a split.
+        let d: String = lines.iter().flat_map(|l| l.iter().enumerate().map(|(k, p)| format!("{}{:.3} {:.3} ", if k == 0 { "M" } else { "L" }, p.0, p.1))).collect();
         let at = arc.get("at").cloned().unwrap_or(json!(0));
         let dur = arc.get("dur").cloned().unwrap_or(json!("1s"));
         out.push(json!({"id": id, "kind": "shape", "shape": "path", "d": d.trim(), "parent": "pan",
@@ -481,6 +588,70 @@ mod tests {
         assert!(simplify(&ring, 0.1).len() > 10);
         let out = generate(&json!({"camera": {"center": [52, 28], "zoom": 2.2}}), 1080.0, 1920.0).unwrap();
         assert!(out.iter().any(|c| c["id"] == "IRN"), "Iran is in view");
+    }
+
+    /// An arc's subpaths, read back from its path data.
+    fn arc_lines(route: &str, world: f64) -> Vec<Vec<(f64, f64)>> {
+        let out = generate(&json!({"arcs": [{"from": "Karachi", "to": "San Francisco", "route": route}]}), world, world).unwrap();
+        let d = out.iter().find(|c| c["id"] == "arc1").unwrap()["d"].as_str().unwrap().to_string();
+        let mut lines: Vec<Vec<(f64, f64)>> = Vec::new();
+        for pair in d.split_whitespace().collect::<Vec<_>>().chunks(2) {
+            let (cmd, x) = pair[0].split_at(1);
+            if cmd == "M" {
+                lines.push(Vec::new());
+            }
+            lines.last_mut().unwrap().push((x.parse().unwrap(), pair[1].parse().unwrap()));
+        }
+        lines
+    }
+
+    #[test]
+    fn pacific_arcs_never_jump_across_the_map() {
+        let world = 1000.0;
+        let (ka, sf) = (project(67.01, 24.86, world), project(-122.42, 37.77, world));
+        for route in ["bow", "great_circle"] {
+            let lines = arc_lines(route, world);
+            for l in &lines {
+                for w in l.windows(2) {
+                    let len = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+                    assert!(len < world * 0.5, "{route}: a segment {len:.0} px long, {w:?}");
+                }
+            }
+            let (first, last) = (lines[0][0], *lines.last().unwrap().last().unwrap());
+            assert!((first.0 - ka.0).abs() < 1.0 && (first.1 - ka.1).abs() < 1.0, "{route} starts at Karachi: {first:?}");
+            assert!((last.0 - sf.0).abs() < 1.0 && (last.1 - sf.1).abs() < 1.0, "{route} ends at San Francisco: {last:?}");
+        }
+        let bow = arc_lines("bow", world);
+        assert_eq!(bow.len(), 1);
+        assert!(bow[0].iter().all(|p| (0.0..=world).contains(&p.0) && (0.0..=world).contains(&p.1)), "the bow stays on the map");
+        // Arched up toward the top of the map, `lift` (0.2) × the distance high.
+        let mid = bow[0][ROUTE_SEGMENTS / 2];
+        let chord = ((ka.0 + sf.0) / 2.0, (ka.1 + sf.1) / 2.0);
+        let len = ((sf.0 - ka.0).powi(2) + (sf.1 - ka.1).powi(2)).sqrt();
+        assert!(mid.1 < chord.1 && (((mid.0 - chord.0).powi(2) + (mid.1 - chord.1).powi(2)).sqrt() - 0.2 * len).abs() < 1.0, "{mid:?} vs {chord:?}");
+        // The true route leaves at the date line and comes back at the other edge.
+        let gc = arc_lines("great_circle", world);
+        assert_eq!(gc.len(), 2, "{gc:?}");
+        let (out, back) = (*gc[0].last().unwrap(), gc[1][0]);
+        assert!((out.0 - world).abs() < 1e-6 && back.0.abs() < 1e-6 && (out.1 - back.1).abs() < 1e-6, "{out:?} {back:?}");
+        assert!(gc.iter().flatten().all(|p| p.1 > 0.0), "below the top edge (peaks near 82°N)");
+    }
+
+    #[test]
+    fn bows_stay_on_the_map_and_routes_stop_at_its_edges() {
+        let world = 1000.0;
+        // A big lift on a long route is lowered to keep inside the map.
+        let lines = bow(project(-150.0, 60.0, world), project(150.0, 60.0, world), 1.0, world);
+        let top = lines.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        assert!((top - world * ROUTE_MARGIN).abs() < 1.0, "{top}");
+        // Negative lift arches down.
+        let down = bow(project(0.0, 0.0, world), project(40.0, 0.0, world), -0.3, world);
+        assert!(down[ROUTE_SEGMENTS / 2].1 > project(0.0, 0.0, world).1);
+        // Over the pole: leaves at the top edge and comes back down from it.
+        let polar = great_circle((10.0, 70.0), (-170.0, 70.0), world);
+        assert_eq!(polar.len(), 2, "{polar:?}");
+        assert!(polar[0].last().unwrap().1.abs() < 0.5 && polar[1][0].1.abs() < 0.5, "{:?} {:?}", polar[0].last(), polar[1][0]);
+        assert!(generate(&json!({"arcs": [{"from": "Karachi", "to": "Tokyo", "route": "rhumb"}]}), world, world).is_err());
     }
 
     #[test]

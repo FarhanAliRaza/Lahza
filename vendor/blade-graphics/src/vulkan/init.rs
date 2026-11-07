@@ -60,6 +60,8 @@ struct AdapterCapabilities {
     full_screen_exclusive: bool,
     external_memory: bool,
     timing: bool,
+    /// Lahza: `LAHZA_PIPELINE_STATS` set and VK_KHR_pipeline_executable_properties available.
+    pipeline_stats: bool,
     bugs: SystemBugs,
 }
 
@@ -266,6 +268,8 @@ unsafe fn inspect_adapter(
     let buffer_marker = supported_extensions.contains(&vk::AMD_BUFFER_MARKER_NAME);
     let shader_info = supported_extensions.contains(&vk::AMD_SHADER_INFO_NAME);
     let full_screen_exclusive = supported_extensions.contains(&vk::EXT_FULL_SCREEN_EXCLUSIVE_NAME);
+    let pipeline_stats = std::env::var_os("LAHZA_PIPELINE_STATS").is_some()
+        && supported_extensions.contains(&vk::KHR_PIPELINE_EXECUTABLE_PROPERTIES_NAME);
 
     let device_information = crate::DeviceInformation {
         is_software_emulated: properties.device_type == vk::PhysicalDeviceType::CPU,
@@ -294,6 +298,7 @@ unsafe fn inspect_adapter(
         full_screen_exclusive,
         external_memory,
         timing,
+        pipeline_stats,
         bugs,
     })
 }
@@ -506,6 +511,9 @@ impl super::Context {
             if capabilities.full_screen_exclusive {
                 device_extensions.push(vk::EXT_FULL_SCREEN_EXCLUSIVE_NAME);
             }
+            if capabilities.pipeline_stats {
+                device_extensions.push(vk::KHR_PIPELINE_EXECUTABLE_PROPERTIES_NAME);
+            }
             if capabilities.external_memory {
                 device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME);
                 device_extensions.push(if cfg!(target_os = "windows") {
@@ -543,6 +551,12 @@ impl super::Context {
                 .shader_float16(capabilities.shader_f16);
             if capabilities.shader_f16 {
                 device_create_info = device_create_info.push_next(&mut float16_features);
+            }
+            let mut pipeline_stats_features =
+                vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+                    .pipeline_executable_info(true);
+            if capabilities.pipeline_stats {
+                device_create_info = device_create_info.push_next(&mut pipeline_stats_features);
             }
 
             let mut ext_descriptor_indexing;
@@ -612,6 +626,11 @@ impl super::Context {
             },
             shader_info: if capabilities.shader_info {
                 Some(amd::shader_info::Device::new(&instance.core, &device_core))
+            } else {
+                None
+            },
+            pipeline_stats: if capabilities.pipeline_stats {
+                Some(khr::pipeline_executable_properties::Device::new(&instance.core, &device_core))
             } else {
                 None
             },

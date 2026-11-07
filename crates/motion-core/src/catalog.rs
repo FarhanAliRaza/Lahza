@@ -133,7 +133,7 @@ pub fn catalog_json() -> Value {
                     "anisotropy": "0..1 brushed/spun metal: grain around the mesh's axis, highlights stretch across it", "anisotropy_rotation": "degrees the grain turns",
                     "sheen": "0..1 soft grazing light (velvet, fabric)", "sheen_color": "colour (default white)", "sheen_roughness": "0..1 (default 0.5)", "subsurface": "0..1 light scattering inside before leaving (marble, milky quartz, wax, skin); path tracing", "subsurface_radius": "[r, g, b] relative reach per colour (1, 0.2, 0.1)", "subsurface_scale": "px the radius is scaled by (5)", "subsurface_anisotropy": "-1..1 (0)",
                     "clearcoat_color": "colour the coat tints what is under it (candy paint)",
-                    "noise": "{type: fbm|value|cellular, scale px, octaves, seed, space: object|world, drift: [x,y,z] px/s (flowing), color, amount, roughness ±, bump px}: procedural surface detail, no UVs", "volume": "{density (e^-density per 100 px), color (scattering), anisotropy -1..1 (0.3), emission, emission_strength}: the closed mesh is haze/smoke/a beam, not a surface", "map": "image over the UVs (multiplies color)", "normal_map": "tangent-space normal image (green up)", "bump_map": "height image", "roughness_map": "image: green scales roughness (glTF metallic-roughness)", "metallic_map": "image: blue scales metallic", "bump": "bump_map height px (2)", "uv": "{scale: [x, y], offset: [x, y], rotation: deg}", "dispersion": "glass, path tracing: 1/Abbe (0.02 glass, 0.05 flint, more: stylised rainbows)",
+                    "noise": "{type: fbm|value|cellular, scale px, octaves, seed, space: object|world, drift: [x,y,z] px/s (flowing), color, amount, roughness ±, bump px}: procedural surface detail, no UVs", "volume": "{density (e^-density per 100 px), color (scattering), anisotropy -1..1 (0.3), emission, emission_strength, coverage 0..1 (0.5), softness (0.1), grid: {src (z slices tiled, {frame}), size: [nx, ny, nz], frame}}: the closed mesh is haze/smoke/a beam, not a surface; with the material's noise the medium follows it (clouds that self-shadow and cast shadows when path traced; animate coverage to grow them); with grid, a Blender smoke simulation (export_density) fills the box", "map": "image over the UVs (multiplies color)", "normal_map": "tangent-space normal image (green up)", "bump_map": "height image", "roughness_map": "image: green scales roughness (glTF metallic-roughness)", "metallic_map": "image: blue scales metallic", "emissive_map": "colour image multiplying the emission (white × emissive_strength without emissive): city lights, screens", "bump": "bump_map height px (2)", "uv": "{scale: [x, y], offset: [x, y], rotation: deg}", "dispersion": "glass, path tracing: 1/Abbe (0.02 glass, 0.05 flint, more: stylised rainbows)",
                     "ior": "glass: index of refraction (default 1.45)", "thickness": "glass: px light travels inside (default 60)",
                     "colors": "[colour, …] per piece, in turn, for this part (over the layer's colors)", "wireframe": "px: draw edges instead of the surface (preset wireframe)", "fill": "wireframe face colour (hidden-line; omit for see-through wires)",
                     "color": "base colour (animatable)", "metallic": "0..1", "roughness": "0 mirror … 1 diffuse", "clearcoat": "0..1 lacquer layer", "clearcoat_roughness": "0..1",
@@ -205,7 +205,10 @@ pub fn catalog_json() -> Value {
             "transform_3d": {"z": "depth, + is away from the viewer", "rotation_x": "degrees, + tilts the top away", "rotation_y": "degrees, + turns the right side away"},
             "parent": "transform parent: sibling layer id",
             "follow": {"layer": "sibling shape \"path\" layer to ride (replaces position, z and parent)", "at": "head (trim end, default) | tail (trim start) | fraction 0..1 of the full length (animatable)", "rotate": "bool: also turn along the path (added to rotation)", "offset": "[x, y] px from the point (along the path frame when rotate)"},
-            "hidden": "bool"
+            "hidden": "bool",
+            "role": "background | subject | foreground | caption | decoration: what the layer is, for check (depth_order verifies backgrounds stay behind subjects and foregrounds in front; captions and decoration change the text checks); a comp passes it to its layers",
+            "facing": "right | left | up | down | degrees clockwise from +x: the way the art points in its own space; check's moves_backwards verifies it travels that way (follow with rotate faces the path's way unless this says otherwise)",
+            "allow": "[check kind, …] the layer and its children break on purpose: depth_order, moves_backwards, text_below_floor, text_crowded, line_unread, repeats_caption, persistent_chrome, draws_off_frame, layout"
         },
         "layer_kinds": {
             "shape": {
@@ -280,7 +283,7 @@ pub fn catalog_json() -> Value {
                 "colors": "[colour, …] one per piece in turn (animatable)",
                 "material": material,
                 "parts": {"front": "material over `material` for the part (rings/revolves: facing −axis)", "back": "…", "side": "… (rings/revolves: facing away from the axis)", "bevel": "…", "caps": "…", "inside": "rings/revolves: facing the axis"},
-                "detail": "tessellation multiplier (default 1)", "displace": "{type, scale px, octaves, seed, amount px, drift: [x,y,z] px/s}: pushes the surface out and in by noise (real silhouette; subdivided, stays closed; drift makes waves)",
+                "detail": "tessellation multiplier (default 1)", "displace": "{type, scale px, octaves, seed, amount px, drift: [x,y,z] px/s}: pushes the surface out and in by noise (real silhouette; subdivided, stays closed; drift makes waves); or {src: height image, amount px}: white rises amount over the UVs (terrain)",
                 "depth": "meshes and flat 3D layers in the same layer list share one depth test (planes cut through meshes, any order); see-through meshes (opacity, glass, blend) draw after the opaque ones",
                 "path_tracing": "export only: project settings.renderer \"path\" (samples: paths per pixel, default 64, drafts a quarter) or render --pt / snapshot --pt (--spp N): ray-traced shadows, bounced light, reflections of the scene, refraction of meshes behind glass; same camera, so meshes stand where the raster draws them. Needs a GPU with ray queries, else rasterised with a warning; depth of field is a traced thin lens, motion blur splits the samples across the shutter; a denoiser cleans few-sample frames (--no-denoise to skip) and exports accumulate frame to frame along the motion; lists with wireframes, effects, mattes or blend modes on 3D layers are rasterised"
             }
@@ -295,13 +298,25 @@ pub fn catalog_json() -> Value {
             "environment": {"image": "equirectangular image lighting the scene instead of the preset (HDR .hdr/.exr best; .png/.jpg as sRGB); intensity and rotation apply", "preset": "studio (default) | soft | sunset | night | none", "intensity": "animatable", "rotation": "degrees about the vertical axis", "sky": "colour (animatable)", "horizon": "colour (animatable)", "ground": "colour (animatable)", "note": "what glossy meshes reflect and their ambient light"},
             "motion_blur": {"shutter": "degrees (180 film-like)", "samples": 8},
             "look": {"tone": "standard (default) | filmic | agx: tone mapping of lit meshes", "exposure": "stops (animatable)", "bloom": {"threshold": "display brightness 0..1 (0.8)", "radius": "px (24)", "intensity": "0.8"}, "note": "also settings.look for every scene"},
-            "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first"
+            "step_fps": "stepped clock for all layers (camera stays smooth)", "layers": "bottom first",
+            "allow": "[\"world_crossfade\"]: check kinds the scene breaks on purpose"
         },
         "text_shaping": "HarfBuzz shaping (kerning, ligatures, marks) with bidi runs; use a project font for scripts Inter lacks (Arabic, Urdu, Devanagari…)",
         "edit_ops": ["add", "add_scene", "set", "remove", "move", "key", "anchor", "group", "ungroup"],
         "style_packs": styles_json(),
     });
     catalog["components"] = Value::from(components);
+    catalog["checks"] = json!({
+        "depth_order": "error: a background drawn in front of a subject, or a foreground behind one (camera depth in 3D), overlapping ≥ 20% for two samples",
+        "moves_backwards": "error: a layer with a facing moving against it (in its own world, not the camera's) for 0.3 s",
+        "text_below_floor": "text under 2.6% of the short side tall on screen (28 px at 1080) for 0.5 s",
+        "text_crowded": "more than 12 words or 5 text layers on screen at once for 1 s (captions and decoration aside)",
+        "line_unread": "a line on screen shorter than 0.75 × (0.5 s + 0.3 s per word); 0.4 s for 1–2 words; 2 s for the film's last line",
+        "repeats_caption": "text saying the caption shown with it (3+ words in a row)",
+        "persistent_chrome": "the same text or small shape at the same place on the frame's edge in 3+ scenes or 60% of the film",
+        "world_crossfade": "a scene that fades into another: cut on a cause, carry, colour flood or whip",
+        "draws_off_frame": "a stroke drawn on with trim whose head lands off the frame while its start is on it"
+    });
     catalog["component_layer"] = json!("{\"kind\": \"component\", \"component\": <name>, \"params\": {…}} plus the usual transform/time/effects. It expands to ordinary layers, addressed as <id>/<child> (timeline_get lists them): set/key/anchor/remove on a child (\"map/IRN.fill\", \"caps/c3.text\") is kept in `overrides` and survives changes to params; {\"op\": \"detach\", \"id\": <id>} turns it into a comp of plain layers.");
     catalog
 }

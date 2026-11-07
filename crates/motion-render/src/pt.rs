@@ -171,6 +171,9 @@ struct Uniforms {
     prev_cam: [f32; 4],
     prev_place: [f32; 4],
     prev_root: [[f32; 4]; 3],
+    /// The rows the trace pass covers: [first, end, the profiling density
+    /// experiment's repeats, 0] (the pass runs in bands).
+    band: [u32; 4],
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -192,6 +195,9 @@ struct TraceData {
     b_hist: gpu::BufferPiece,
     b_next: gpu::BufferPiece,
     b_images: gpu::BufferPiece,
+    b_prof: gpu::BufferPiece,
+    b_bounds: gpu::BufferPiece,
+    b_jobs: gpu::BufferPiece,
 }
 
 /// A mesh's bottom-level structure and where its attributes live.
@@ -214,6 +220,14 @@ pub struct Tracer {
     temporal: gpu::ComputePipeline,
     atrous: gpu::ComputePipeline,
     resolve: gpu::ComputePipeline,
+    /// Bakes noise and grid volumes' density bounds (`bounds` in pt.wgsl).
+    bounds: gpu::ComputePipeline,
+    /// Trace pipelines specialised to a scene's features (`specialise`), by
+    /// feature mask (None: that build failed); `pipeline` is the general
+    /// build (all features).
+    specialised: HashMap<u32, Option<gpu::ComputePipeline>>,
+    /// Whether these pipelines count work (`PROFILE`).
+    profile: bool,
     geometry: HashMap<Vec<u8>, Geometry>,
     /// Per-vertex [position, normal] rows, indices and triangle tags of every
     /// cached mesh, uploaded again when a mesh is added.
@@ -245,6 +259,9 @@ pub struct Tracer {
     /// Host copies for OIDN: texels they hold, lighting and guides read
     /// back, lighting to upload.
     oidn_host: Option<(u64, [gpu::Buffer; 3])>,
+    /// Profiling: this frame's work counters (ray queries; per material,
+    /// hits and density lookups) and the layer that owns each material.
+    counts: Vec<(gpu::Buffer, Vec<Arc<str>>, usize)>,
 }
 
 /// Geometry not used for this many frames is dropped. Animated meshes
@@ -264,13 +281,16 @@ struct History {
 }
 
 impl Tracer {
-    pub fn new(context: &gpu::Context) -> Result<Self, String> {
-        let shader = context.try_create_shader(gpu::ShaderDesc { source: SHADER })?;
+    /// `profile` builds the counting variant of the shader (`PROFILE`).
+    pub fn new(context: &gpu::Context, profile: bool) -> Result<Self, String> {
+        let source = specialise(ALL_FEATURES, profile);
+        let shader = context.try_create_shader(gpu::ShaderDesc { source: &source })?;
         let pipeline = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") });
         let temporal = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace temporal", data_layouts: &[&TraceData::layout()], compute: shader.at("temporal") });
         let atrous = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace denoise", data_layouts: &[&TraceData::layout()], compute: shader.at("atrous") });
         let resolve = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace resolve", data_layouts: &[&TraceData::layout()], compute: shader.at("resolve") });
-        Ok(Self { pipeline, temporal, atrous, resolve, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None, work: None, oidn: None, oidn_host: None })
+        let bounds = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "volume bounds", data_layouts: &[&TraceData::layout()], compute: shader.at("bounds") });
+        Ok(Self { pipeline, temporal, atrous, resolve, bounds, specialised: HashMap::new(), profile, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None, work: None, oidn: None, oidn_host: None, counts: Vec::new() })
     }
 
     /// Frees the last frame's transient buffers and structures; call when
@@ -421,8 +441,11 @@ impl Tracer {
     }
 
     /// Records the trace of `t` into group texels at `offset` (w × h).
+    /// With `profile`, times its stages and counts its work per layer.
     #[allow(clippy::too_many_arguments)]
-    pub fn trace(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, t: &Trace, offset: u32, size: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer) {
+    pub fn trace(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, t: &Trace, offset: u32, size: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer, mut profile: Option<&mut crate::profile::Profile>) {
+        let entered = std::time::Instant::now();
+        let mut owners: Vec<Arc<str>> = Vec::new();
         let mut instances = Vec::new();
         let mut blases = Vec::new();
         let mut inst_rows: Vec<[f32; 4]> = Vec::new();
@@ -436,6 +459,7 @@ impl Tracer {
             let g = &self.geometry[&inst.key];
             let mat_base = (mat_rows.len() / crate::mesh3d::MAT_ROWS) as u32;
             mat_rows.extend_from_slice(&inst.materials);
+            owners.extend(std::iter::repeat_n(inst.id.clone(), inst.materials.len() / crate::mesh3d::MAT_ROWS));
             let p = |k: usize| [b(mat_base + inst.parts[k].0), b(inst.parts[k].1.max(1))];
             let custom = (inst_rows.len() / INST_ROWS) as u32;
             inst_rows.push([b(g.attr_base), b(g.idx_base), b(g.tag_base), 0.0]);
@@ -486,11 +510,27 @@ impl Tracer {
             blases.push(blas);
         }
         let [attr, idx, tag] = self.shared(context);
+        // Physical noise and grid volumes get density bounds (their walk
+        // steps through them; artistic ones are marched and need none): a
+        // job each, and their cells' offset (+ 1) in material row 30.w.
+        let mut jobs: Vec<u32> = Vec::new();
+        let mut cells_total = 0usize;
+        for m in 0..mat_rows.len() / crate::mesh3d::MAT_ROWS {
+            let r = m * crate::mesh3d::MAT_ROWS;
+            if mat_rows[r + 2][3] as u32 & crate::mesh3d::FLAG_VOLUME != 0 && mat_rows[r + 30][2] > 0.5 && mat_rows[r + 24][3] < 0.5 {
+                jobs.extend([r as u32, cells_total as u32]);
+                mat_rows[r + 30][3] = f32::from_bits(cells_total as u32 + 1);
+                cells_total += BOUNDS_CELLS;
+            }
+        }
+        let bounds_buf = if cells_total > 0 { self.scratch(context, (cells_total * 4) as u64) } else { self.transient(context, "trace no bounds", &[0u8; 16]) };
+        let jobs_buf = self.transient(context, "trace bounds jobs", bytemuck::cast_slice(&jobs));
         for v in [&mut inst_rows, &mut mat_rows, &mut card_rows] {
             if v.is_empty() {
                 v.push([0.0; 4]);
             }
         }
+        let features = scene_features(&mat_rows, t);
         let mut lights = t.lights.clone();
         if lights.is_empty() {
             lights.push([0.0; 4]);
@@ -569,7 +609,18 @@ impl Tracer {
             let b = self.transient(context, "trace no history", &[0u8; 16]);
             (b, b, ([0.0; 4], [0.0; 4], [[0.0; 4]; 3]))
         };
-        let data = |step: u32, row: u32, mode: u32, read: gpu::Buffer, write: gpu::Buffer| TraceData {
+        // Profiling: [ray queries, triangle candidates, empty lookups, 0],
+        // per 8 × 4 block [lookups summed, most], per material [hits, lookups].
+        let profiling = profile.is_some();
+        let blocks = (size.0.div_ceil(8) * size.1.div_ceil(4)) as usize;
+        let counts = if profiling {
+            let b = self.transient(context, "trace profile", &vec![0u8; (PROF_HEADER + blocks * 2 + owners.len() * 2) * 4]);
+            self.counts.push((b, owners, blocks));
+            b
+        } else {
+            self.transient(context, "trace no profile", &[0u8; 16])
+        };
+        let data = |step: u32, mode: u32, read: gpu::Buffer, write: gpu::Buffer, band: [u32; 2]| TraceData {
             u: Uniforms {
                 size: [size.0, size.1, offset, t.options.spp.max(1)],
                 opts: [t.options.bounces.max(1), t.seed, CARD_INSTANCE, t.cards.len() as u32],
@@ -578,10 +629,11 @@ impl Tracer {
                 root: r(&t.root),
                 inv_root: r(&t.inv_root),
                 lens: [t.lens[0], t.lens[1], 0.0, 0.0],
-                denoise: [step, t.options.temporal as u32, row, mode],
+                denoise: [step, t.options.temporal as u32, 0, mode],
                 prev_cam: prev.0,
                 prev_place: prev.1,
                 prev_root: prev.2,
+                band: [band[0], band[1], if profiling { density_repeat() } else { 0 }, 0],
             },
             acc: tlas,
             b_inst: inst_buf.into(),
@@ -599,47 +651,82 @@ impl Tracer {
             b_hist: hist_read.into(),
             b_next: hist_write.into(),
             b_images: images.into(),
+            b_prof: counts.into(),
+            b_bounds: bounds_buf.into(),
+            b_jobs: jobs_buf.into(),
         };
         let groups_x = [size.0.div_ceil(8), size.1.div_ceil(8), 1];
+        let all_rows = [0, size.1];
+        if !jobs.is_empty() {
+            let mut pass = encoder.compute("volume bounds");
+            let mut pc = pass.with(&self.bounds);
+            pc.bind(0, &data(0, 0, hdr[0], hdr[1], all_rows));
+            pc.dispatch([(BOUNDS_CELLS as u32).div_ceil(64), (jobs.len() / 2) as u32, 1]);
+        }
         {
-            // In bands of rows, each its own dispatch: one dispatch of every
-            // path of a large frame (64 paths at 1080 x 1920 is 130 million)
-            // crashes Mesa's software Vulkan past ~20 million, and on GPUs
-            // runs long enough to trip a driver's watchdog.
-            let mut pass = encoder.compute("trace");
-            let mut pc = pass.with(&self.pipeline);
-            let rows = band_rows(size.0, t.options.spp.max(1));
-            let mut y = 0;
-            while y < size.1 {
-                let band = rows.min(size.1 - y);
-                pc.bind(0, &data(0, y, 0, hdr[0], hdr[1]));
-                pc.dispatch([size.0.div_ceil(8), band.div_ceil(8), 1]);
-                y += band;
+            let profiled = self.profile;
+            let pipeline = self.specialised.entry(features).or_insert_with(|| {
+                // A build with only this scene's features; the general one if it fails.
+                context
+                    .try_create_shader(gpu::ShaderDesc { source: &specialise(features, profiled) })
+                    .ok()
+                    .map(|shader| context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") }))
+            });
+            let pipeline = pipeline.as_ref().unwrap_or(&self.pipeline);
+            if let Some(p) = profile.as_deref_mut() {
+                p.stage("gpu frame › trace setup (structures, buffers, pipeline)", entered);
+            }
+            // In bands of rows, each its own dispatch and submission: one
+            // dispatch of every path of a large frame (64 paths at 1080 x
+            // 1920 is 130 million) crashes Mesa's software Vulkan past ~20
+            // million and on GPUs runs long enough to trip a driver's
+            // watchdog; submitting each on its own also hands the GPU back
+            // to the desktop between bands, so it keeps drawing.
+            let band = band_rows(size.0, t.options.spp.max(1)).min(TRACE_BAND_ROWS);
+            let bands = size.1.div_ceil(band);
+            for b in 0..bands {
+                let rows = [b * band, ((b + 1) * band).min(size.1)];
+                {
+                    let mut pass = encoder.compute("trace");
+                    let mut pc = pass.with(pipeline);
+                    pc.bind(0, &data(0, 0, hdr[0], hdr[1], rows));
+                    pc.dispatch([groups_x[0], (rows[1] - rows[0]).div_ceil(8), 1]);
+                }
+                if b + 1 < bands {
+                    let waiting = std::time::Instant::now();
+                    let sync = context.submit(encoder);
+                    context.wait_for(&sync, 120_000);
+                    encoder.start();
+                    if let Some(p) = profile.as_deref_mut() {
+                        p.stage("gpu frame › wait for GPU (trace bands)", waiting);
+                        p.add_gpu(encoder.timings());
+                    }
+                }
             }
         }
         let mut current = 0;
         if t.options.temporal {
             let mut pass = encoder.compute("trace temporal");
             let mut pc = pass.with(&self.temporal);
-            pc.bind(0, &data(0, 0, 0, hdr[0], hdr[1]));
+            pc.bind(0, &data(0, 0, hdr[0], hdr[1], all_rows));
             pc.dispatch(groups_x);
             current = 1;
         }
         if t.options.denoise {
             // With OIDN the à-trous passes still smooth the shadow
             // catchers' visibility (mode 1), leaving OIDN's colour alone.
-            let mode = self.oidn_denoise(context, encoder, size, hdr[current], guides) as u32;
+            let mode = self.oidn_denoise(context, encoder, size, hdr[current], guides, profile) as u32;
             for k in 0..DENOISE_PASSES {
                 let mut pass = encoder.compute("trace denoise");
                 let mut pc = pass.with(&self.atrous);
-                pc.bind(0, &data(1 << k, 0, mode, hdr[current], hdr[1 - current]));
+                pc.bind(0, &data(1 << k, mode, hdr[current], hdr[1 - current], all_rows));
                 pc.dispatch(groups_x);
                 current = 1 - current;
             }
         }
         let mut pass = encoder.compute("trace resolve");
         let mut pc = pass.with(&self.resolve);
-        pc.bind(0, &data(0, 0, 0, hdr[current], hdr[1 - current]));
+        pc.bind(0, &data(0, 0, hdr[current], hdr[1 - current], all_rows));
         pc.dispatch(groups_x);
     }
 
@@ -650,7 +737,7 @@ impl Tracer {
     /// submitted and waited for, the result copied back in, and the encoder
     /// started again. False when OIDN is unavailable (the caller's à-trous
     /// filter runs instead).
-    fn oidn_denoise(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, size: (u32, u32), hdr: gpu::Buffer, guides: gpu::Buffer) -> bool {
+    fn oidn_denoise(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, size: (u32, u32), hdr: gpu::Buffer, guides: gpu::Buffer, mut profile: Option<&mut crate::profile::Profile>) -> bool {
         // LAHZA_DENOISER=builtin keeps the à-trous filter (to compare).
         if std::env::var("LAHZA_DENOISER").is_ok_and(|v| v == "builtin") {
             return false;
@@ -675,9 +762,16 @@ impl Tracer {
             pass.copy_buffer_to_buffer(hdr.into(), back.into(), texels * 32);
             pass.copy_buffer_to_buffer(guides.into(), guides_back.into(), texels * 64);
         }
+        let waiting = std::time::Instant::now();
         let sync = context.submit(encoder);
         let done = context.wait_for(&sync, 120_000);
         encoder.start();
+        let denoising = std::time::Instant::now();
+        if let Some(p) = profile.as_deref_mut() {
+            // The frame's GPU work so far (uploads, rasters, the trace).
+            p.stage("gpu frame › wait for GPU (before OIDN)", waiting);
+            p.add_gpu(encoder.timings());
+        }
         if !done {
             self.oidn = Some(Err("the GPU timed out before denoising".into()));
             return false;
@@ -715,7 +809,39 @@ impl Tracer {
         }
         context.sync_buffer(up);
         encoder.transfer("oidn upload").copy_buffer_to_buffer(up.into(), hdr.into(), texels * 32);
+        if let Some(p) = profile {
+            p.stage("gpu frame › OIDN denoise (CPU)", denoising);
+        }
         true
+    }
+
+    /// Adds this frame's work counters to `profile` by layer (call once the
+    /// frame's GPU work has finished, before the next `begin_frame`).
+    pub(crate) fn collect_profile(&mut self, profile: &mut crate::profile::Profile) {
+        let k = crate::profile::COUNT_EVERY;
+        for (buffer, owners, blocks) in self.counts.drain(..) {
+            let n = PROF_HEADER + blocks * 2 + owners.len() * 2;
+            // SAFETY: a mapped buffer of n u32 counters; the GPU is done with it.
+            let c = unsafe { std::slice::from_raw_parts(buffer.data() as *const u32, n) };
+            profile.rays += c[0] as u64 * k;
+            profile.candidates += c[1] as u64 * k;
+            profile.density_empty += c[2] as u64 * k;
+            for d in 0..4 {
+                profile.rays_by_scatter[d] += c[4 + d] as u64 * k;
+                profile.lookups_by_scatter[d] += c[8 + d] as u64 * k;
+            }
+            for b in 0..blocks {
+                let (sum, most) = (c[PROF_HEADER + b * 2] as u64, c[PROF_HEADER + 1 + b * 2] as u64);
+                profile.lane_lookups += sum;
+                profile.lane_slots += most * 32;
+            }
+            let m0 = PROF_HEADER + blocks * 2;
+            for (m, id) in owners.iter().enumerate() {
+                let l = profile.layers.entry(id.to_string()).or_default();
+                l.hits += c[m0 + m * 2] as u64 * k;
+                l.density += c[m0 + m * 2 + 1] as u64 * k;
+            }
+        }
     }
 
     /// Why traced frames were not denoised with Open Image Denoise, if so.
@@ -1849,3 +1975,88 @@ mod physics_tests {
         assert!(r.warnings().iter().any(|w| w.contains("path tracing needs a GPU with ray queries")), "{:?}", r.warnings());
     }
 }
+
+/// Counters before the per-block ones (pt.wgsl `PROF_HEADER`).
+const PROF_HEADER: usize = 12;
+
+/// Cells of a volume's density bounds (pt.wgsl `BOUNDS_N`³).
+const BOUNDS_CELLS: usize = 32 * 32 * 32;
+
+/// Trace features (pt.wgsl `F_*`): a scene's build compiles only those it
+/// uses, so the kernel holds fewer registers and spills less.
+const FEATURES: [(u32, &str); 9] = [
+    (1 << 0, "F_VOLUME"),
+    (1 << 1, "F_VOL_PHYSICAL"),
+    (1 << 2, "F_GLASS"),
+    (1 << 3, "F_SSS"),
+    (1 << 4, "F_CARDS"),
+    (1 << 5, "F_CATCHER"),
+    (1 << 6, "F_AREA"),
+    (1 << 7, "F_ENV_IMAGE"),
+    (1 << 8, "F_DETAIL"),
+];
+const ALL_FEATURES: u32 = (1 << 9) - 1;
+
+/// The tracer's source with only `features` on (and counting with `profile`).
+fn specialise(features: u32, profile: bool) -> String {
+    let mut s = SHADER.to_string();
+    for (bit, name) in FEATURES {
+        if features & bit == 0 {
+            s = s.replacen(&format!("const {name}: bool = true;"), &format!("const {name}: bool = false;"), 1);
+        }
+    }
+    if profile {
+        s = s.replacen("const PROFILE: bool = false;", "const PROFILE: bool = true;", 1);
+    }
+    s
+}
+
+/// The features a trace needs: from its materials (rows as `mesh3d::material_rows`), cards and lights.
+fn scene_features(mat_rows: &[[f32; 4]], t: &Trace) -> u32 {
+    use crate::mesh3d::{FLAG_SHADOW_CATCHER, FLAG_VOLUME, LROWS, MAT_ROWS};
+    let mut f = 0;
+    for m in mat_rows.chunks_exact(MAT_ROWS) {
+        let flags = m[2][3] as u32;
+        if flags & FLAG_VOLUME != 0 {
+            f |= 1 << 0;
+            // Even volumes and physical noise or grid ones are walked exactly.
+            if m[30][2] < 0.5 || m[24][3] < 0.5 {
+                f |= 1 << 1;
+            }
+        }
+        if m[3][0] > 0.0 {
+            f |= 1 << 2;
+        }
+        if m[27][0] > 0.0 {
+            f |= 1 << 3;
+        }
+        if flags & FLAG_SHADOW_CATCHER != 0 {
+            f |= 1 << 5;
+        }
+        if m[9][0] > 0.5 || m[14][3] != 0.0 || [12, 13, 25, 26, 29].iter().any(|&k| m[k][3] > 0.5) {
+            f |= 1 << 8;
+        }
+    }
+    if !t.cards.is_empty() {
+        f |= 1 << 4;
+    }
+    let count = t.lights.first().map_or(0, |r| r[0] as usize);
+    if (0..count).any(|i| t.lights.get(7 + i * LROWS).is_some_and(|r| r[3] as u32 == 3)) {
+        f |= 1 << 6;
+    }
+    if t.env.is_some() || t.lights.first().is_some_and(|r| r[2] > 0.5) {
+        f |= 1 << 7;
+    }
+    f
+}
+
+/// Profiling experiment: `LAHZA_PROFILE_DENSITY_REPEAT=k` evaluates every
+/// density lookup's noise k more times (profiling builds only), so the
+/// trace's growth is the cost of the density work in place.
+fn density_repeat() -> u32 {
+    std::env::var("LAHZA_PROFILE_DENSITY_REPEAT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).min(16)
+}
+
+/// Rows per trace band (each submitted on its own, so the desktop gets the
+/// GPU between them: about 70 ms each at 1080p and 16 samples).
+const TRACE_BAND_ROWS: u32 = 32;

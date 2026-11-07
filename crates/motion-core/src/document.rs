@@ -289,6 +289,9 @@ pub struct Scene {
     /// Stepped clock for every layer of the scene (the camera stays smooth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_fps: Option<f64>,
+    /// Check kinds this scene breaks on purpose (`world_crossfade`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
     #[serde(default)]
     pub layers: Vec<Layer>,
 }
@@ -311,6 +314,7 @@ impl Scene {
             look: None,
             motion_blur: None,
             step_fps: None,
+            allow: Vec::new(),
             layers: Vec::new(),
         }
     }
@@ -864,6 +868,86 @@ pub struct Common {
     /// layers over a moving 3D shot. Default "world".
     #[serde(default, skip_serializing_if = "LayerSpace::is_world")]
     pub space: LayerSpace,
+    /// What the layer is, for `check`; children of a comp share its role
+    /// unless they declare their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    /// The way the content faces in its own space (`check` verifies it
+    /// moves that way).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facing: Option<Facing>,
+    /// Check kinds this layer (and its children) breaks on purpose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+/// What a layer is in the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Behind everything it overlaps (a map, a backdrop).
+    Background,
+    /// What the shot is about.
+    Subject,
+    /// In front of the subject (a label on it, a frame around it).
+    Foreground,
+    /// Spoken words shown on screen.
+    Caption,
+    /// Deliberately small or brief (credits, a texture label): no text checks.
+    Decoration,
+}
+
+/// A direction in the layer's own space: `right` (+x), `left`, `up`,
+/// `down` (+y) or degrees clockwise from +x.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Facing {
+    Right,
+    Left,
+    Up,
+    Down,
+    Degrees(f64),
+}
+
+impl Facing {
+    /// Degrees clockwise from +x (y down).
+    pub fn degrees(self) -> f64 {
+        match self {
+            Facing::Right => 0.0,
+            Facing::Down => 90.0,
+            Facing::Left => 180.0,
+            Facing::Up => 270.0,
+            Facing::Degrees(d) => d,
+        }
+    }
+}
+
+impl Serialize for Facing {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Facing::Right => s.serialize_str("right"),
+            Facing::Left => s.serialize_str("left"),
+            Facing::Up => s.serialize_str("up"),
+            Facing::Down => s.serialize_str("down"),
+            Facing::Degrees(d) => s.serialize_f64(*d),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Facing {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) => match s.as_str() {
+                "right" => Ok(Facing::Right),
+                "left" => Ok(Facing::Left),
+                "up" => Ok(Facing::Up),
+                "down" => Ok(Facing::Down),
+                other => Err(D::Error::custom(format!("facing: \"right\", \"left\", \"up\", \"down\" or degrees, not \"{other}\""))),
+            },
+            serde_json::Value::Number(n) => Ok(Facing::Degrees(n.as_f64().unwrap_or(0.0))),
+            other => Err(D::Error::custom(format!("facing: \"right\", \"left\", \"up\", \"down\" or degrees, not {other}"))),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -884,7 +968,7 @@ fn is_normal(b: &Blend) -> bool {
     *b == Blend::Normal
 }
 
-const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "follow", "three_d", "hidden", "space"];
+const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "follow", "three_d", "hidden", "space", "role", "facing", "allow"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -2485,6 +2569,11 @@ pub struct Material {
     /// metallic-roughness texture; a grey map works too).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metallic_map: Option<String>,
+    /// A colour image (project path, sRGB) that multiplies the emission: city
+    /// lights on a map, a screen's picture. Without `emissive` the emission
+    /// is white × `emissive_strength`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive_map: Option<String>,
     /// Height of `bump_map`'s white, px (default 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bump: Option<Property<f64>>,
@@ -2527,6 +2616,70 @@ pub struct Volume {
     pub emission: Option<Property<Color>>,
     #[serde(default = "one_f64_prop")]
     pub emission_strength: Property<f64>,
+    /// With the material's `noise`: how much of the noise is medium, 0..1
+    /// (default 0.5); animating it up grows clouds and smoke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Property<f64>>,
+    /// With `noise`: how gradually the medium fades out at its edges, in
+    /// noise units (default 0.1: crisp cumulus; 0.4: soft haze).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub softness: Option<Property<f64>>,
+    /// A simulated density grid instead (smoke and clouds baked in Blender:
+    /// `export_density` in tools/blender/lahza_export.py).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<VolumeGrid>,
+    /// How the path tracer lights a noise or grid volume (default artistic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<VolumeModel>,
+    /// With `noise`: the medium's form (default `noise`: the noise as it is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<VolumeShape>,
+    /// Which way is up in the mesh's own space, for `cumulus` (default
+    /// [0, -1, 0]: up the screen; a cloud parented to a map tilted back
+    /// uses [0, 0, -1], toward the viewer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up: Option<crate::value::Vec3>,
+}
+
+/// The form of a noise volume.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeShape {
+    /// The noise as it is: haze, smoke, soft clouds.
+    #[default]
+    Noise,
+    /// A cumulus: round cell billows over the noise, a flat base, a rounded
+    /// top eroded into cauliflower heads.
+    Cumulus,
+}
+
+/// How the path tracer renders a noise or grid volume.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeModel {
+    /// As the preview draws it: marched in steps, lit by its lights through
+    /// a short self-shadow with an estimate of light scattered many times,
+    /// and by the sky; soft shadows on what is below. Fast and steady.
+    #[default]
+    Artistic,
+    /// Light walked through the medium exactly (scattering, bounces inside):
+    /// slow; for close-up smoke and the like.
+    Physical,
+}
+
+/// A density grid filling the mesh's box: an image of its z slices, front
+/// to back, tiled left to right then top to bottom, each `size[0]` ×
+/// `size[1]` px with y down; grey is density (white: the full `density`).
+/// A `src` with `{frame}` (or `{frame:04}`) is one image per simulated
+/// frame, showing `frame` (animatable).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeGrid {
+    pub src: String,
+    /// Cells across x, y and z.
+    pub size: [u32; 3],
+    #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
+    pub frame: Property<f64>,
 }
 
 /// Where surface noise is measured: the mesh's own space (it moves with
@@ -2620,6 +2773,10 @@ pub struct Displace {
     /// px/s the noise moves (the surface ripples; regenerated each frame).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift: Option<crate::value::Vec3>,
+    /// A height image (project path) over the mesh's UVs instead of noise:
+    /// white rises `amount` px, black stays (terrain from elevation data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
 }
 
 impl Material {

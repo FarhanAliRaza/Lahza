@@ -13,7 +13,7 @@
 //! studio commits the draft on export.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -114,15 +114,92 @@ pub fn write_pieces(recording: &Path, pieces: &[MotionPiece]) -> Result<(), Stri
 /// Replaces one top-level key of the edit document in the draft, keeping
 /// every other key (the studio's `write_edit_field`).
 pub fn write_key(recording: &Path, key: &str, value: Value) -> Result<(), String> {
+    write_keys(recording, Map::from_iter([(key.to_string(), value)]), false)
+}
+
+/// Replaces top-level keys of the edit document in the draft and bumps
+/// [`REVISION_KEY`], so a studio showing the recording reloads it. For
+/// edits the studio does not pick up on its own (scene, zooms, clips).
+pub fn write_agent_edit(recording: &Path, keys: Map<String, Value>) -> Result<(), String> {
+    write_keys(recording, keys, true)
+}
+
+fn write_keys(recording: &Path, keys: Map<String, Value>, bump: bool) -> Result<(), String> {
     let mut doc = read_edit(recording);
+    let revision = revision(&doc);
     let object = doc.as_object_mut().ok_or("edit document is not an object")?;
     let version = object.get("formatVersion").and_then(Value::as_u64).unwrap_or(0).max(5);
     object.insert("formatVersion".into(), json!(version));
-    object.insert(key.into(), value);
-    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    let tmp = recording.join(format!("{DRAFT_FILE}.tmp"));
+    if bump {
+        object.insert(REVISION_KEY.into(), json!(revision + 1));
+    }
+    object.extend(keys);
+    write_atomic(&recording.join(DRAFT_FILE), &doc)
+}
+
+fn write_atomic(path: &Path, value: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    fs::rename(&tmp, recording.join(DRAFT_FILE)).map_err(|e| e.to_string())
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Counter in the edit document that agents bump on every edit.
+pub const REVISION_KEY: &str = "agentRevision";
+
+pub fn revision(doc: &Value) -> u64 {
+    doc.get(REVISION_KEY).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// An export the studio showing the recording runs for an agent.
+pub const EXPORT_REQUEST_FILE: &str = "export-request.json";
+/// Where that studio reports how the export went.
+pub const EXPORT_STATUS_FILE: &str = "export-status.json";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExportJob {
+    pub id: String,
+    /// Absolute destination; its extension picks the format.
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportState {
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExportStatus {
+    pub id: String,
+    pub path: PathBuf,
+    pub state: ExportState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Leaves `job` for the studio and bumps the revision so it looks.
+pub fn request_export(recording: &Path, job: &ExportJob) -> Result<(), String> {
+    write_atomic(&recording.join(EXPORT_REQUEST_FILE), &serde_json::to_value(job).map_err(|e| e.to_string())?)?;
+    write_agent_edit(recording, Map::new())
+}
+
+/// The pending export request, removed so it runs once.
+pub fn take_export_request(recording: &Path) -> Option<ExportJob> {
+    let path = recording.join(EXPORT_REQUEST_FILE);
+    let job = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok());
+    fs::remove_file(&path).ok()?;
+    job
+}
+
+pub fn write_export_status(recording: &Path, status: &ExportStatus) -> Result<(), String> {
+    write_atomic(&recording.join(EXPORT_STATUS_FILE), &serde_json::to_value(status).map_err(|e| e.to_string())?)
+}
+
+pub fn read_export_status(recording: &Path) -> Option<ExportStatus> {
+    serde_json::from_str(&fs::read_to_string(recording.join(EXPORT_STATUS_FILE)).ok()?).ok()
 }
 
 /// Editor time (on the edited video) of source time `t`, through the

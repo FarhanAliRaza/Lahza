@@ -26,8 +26,8 @@ dependencies. Pass `--cpu` to force the CPU renderer.
 Tools: `project_create`, `project_open`, `project_info`, `timeline_get`,
 `markers_query`, `markers_import`, `edit_apply`, `check`, `snapshot`,
 `render`, `render_status`, `history`, `audio_analyze`, `media_import`,
-`blender_run`, `recording_info`, `recording_place`, `sfx_add`,
-`recording_sound_add`.
+`blender_run`, `recording_info`, `recording_place`, `recording_edit`,
+`recording_export`, `sfx_add`, `recording_sound_add`.
 Resources: `lahza://guide` (the production loop and timing rules),
 `lahza://schema` (the project format), `lahza://catalog` (presets with
 their measured numbers, curves, anchors, references, layer kinds, ops),

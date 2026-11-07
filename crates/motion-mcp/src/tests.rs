@@ -210,6 +210,55 @@ fn sounds_on_a_recordings_own_timeline() {
 }
 
 #[test]
+fn an_agent_edits_a_recordings_look_zooms_and_cuts() {
+    let (mut tb, dir) = toolbox("recedit");
+    let rec = dir.join("demo.lahzarec");
+    std::fs::create_dir_all(&rec).unwrap();
+    std::fs::write(rec.join("edit.json"), json!({"formatVersion": 6, "scene": {"padding": 8, "corners": 21}, "audioClips": []}).to_string()).unwrap();
+    std::fs::write(rec.join("input.json"), json!({"presses": [{"time": 2.0, "phase": "down"}]}).to_string()).unwrap();
+    let draft = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(rec.join("edit.draft.json")).unwrap()).unwrap() };
+
+    let out = tb.call("recording_edit", json!({"recording": "demo.lahzarec",
+        "scene": {"padding": 20},
+        "zoomCues": [{"start": 1.5, "end": 3.0, "zoom": 2.5, "pinnedPoint": {"x": 0.25, "y": 0.75}}],
+        "clips": [{"sourceStart": 0.0, "sourceEnd": 4.0, "speed": 2.0}],
+        "audioMode": "noise-reduction"})).unwrap().json;
+    let edit = &out["edit"];
+    assert_eq!(edit["scene"]["padding"], 20);
+    assert_eq!(edit["scene"]["corners"], 21, "the rest of the look is kept");
+    assert_eq!(edit["zoomCues"][0]["zoom"], 2.5);
+    assert_eq!(edit["zoomCues"][0]["anchorMode"], "pinnedAnchor");
+    assert_eq!(edit["clips"][0]["speed"], 2.0);
+    assert_eq!(edit["lahzaExtras"]["audioMode"], "noise-reduction");
+    assert_eq!(edit["source_clicks"], json!([2.0]));
+    assert_eq!(out["clicks"], json!([1.0]), "at 2× the click plays at 1 s");
+    assert_eq!(draft()["agentRevision"], 1, "the studio reloads on a new revision");
+    assert!(draft()["audioClips"].is_array(), "other keys survive");
+
+    // A cue with a known id is merged into that cue.
+    let id = edit["zoomCues"][0]["id"].clone();
+    let out = tb.call("recording_edit", json!({"recording": "demo.lahzarec", "zoomCues": [{"id": id, "zoom": 3.0}]})).unwrap().json;
+    assert_eq!(out["edit"]["zoomCues"][0]["start"], 1.5);
+    assert_eq!(out["edit"]["zoomCues"][0]["zoom"], 3.0);
+
+    // Bad input changes nothing.
+    for bad in [
+        json!({"zoomCues": [{"start": 1.0, "end": 1.1}]}),
+        json!({"clips": [{"sourceStart": 0.0, "sourceEnd": 1.0, "speed": 40.0}]}),
+        json!({"scene": {"padding": "wide"}}),
+        json!({"audioMode": "loudest"}),
+        json!({}),
+    ] {
+        let mut args = bad.clone();
+        args["recording"] = json!("demo.lahzarec");
+        assert!(tb.call("recording_edit", args).is_err(), "{bad}");
+    }
+    assert!(tb.call("recording_export", json!({"recording": "demo.lahzarec", "path": "out.mov"})).is_err());
+    assert_eq!(draft()["agentRevision"], 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn sound_trim_and_fades_shape_the_render() {
     let (mut tb, dir) = toolbox("fades");
     tb.call("project_create", json!({"path": "p", "duration": 3, "width": 320, "height": 180})).unwrap();
@@ -464,7 +513,8 @@ fn audio_files_import_as_sounds_and_paths_resolve_inside_the_project() {
 #[test]
 fn narration_manifest_times_everything_and_survives_a_new_hook() {
     let (mut tb, dir) = toolbox("narration");
-    tb.call("project_create", json!({"path": "p", "duration": 10, "width": 320, "height": 180})).unwrap();
+    // Shorter than the narration: the import makes room for it.
+    tb.call("project_create", json!({"path": "p", "duration": 3, "width": 320, "height": 180})).unwrap();
     // "Speech": a tone where each word is, silence between words.
     let tone = |name: &str, spans: &[(f64, f64)], total: f64| {
         let expr = spans.iter().map(|(a, b)| format!("between(t,{a},{b})")).collect::<Vec<_>>().join("+");
@@ -490,6 +540,9 @@ fn narration_manifest_times_everything_and_survives_a_new_hook() {
     manifest(json!([a, b]));
     let out = tb.call("narration_import", json!({"manifest": "narration.json"})).unwrap().json;
     assert_eq!(out["lines"], 2, "{out:#}");
+    // s01 at 0.5 (2.3 s), s02 at 3.2 (2.0 s): the project now ends at 5.2.
+    assert_eq!(out["narration_ends"], 5.2, "{out:#}");
+    assert_eq!(out["project_duration"], 5.2, "{out:#}");
     // "hits" was never spoken: an error, with the line and the word.
     assert_eq!(out["issues"].as_array().unwrap().len(), 1, "{out:#}");
     assert!(out["issues"][0]["word"].as_str().unwrap().contains("hits"), "{out:#}");
@@ -761,4 +814,78 @@ fn measure_finds_cuts_events_ink_and_captions() {
     let curve = tb.call("measure", json!({"video": v, "kind": "curve", "box": [40, 20, 30, 30], "search": 40, "from": 3.4, "to": 4.2})).unwrap().json;
     assert!(curve.is_object() && !curve.as_object().unwrap().is_empty(), "{curve}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_flags_blank_frames_at_the_start_and_after_cuts() {
+    let (mut tb, dir) = toolbox("empty");
+    tb.call("project_create", json!({"path": "cuts", "duration": 3, "width": 640, "height": 360})).unwrap();
+    let word = |id: &str, text: &str, size: f64| json!({"op": "add", "id": id, "kind": "text", "text": text, "size": size, "color": "#1d1b19", "transform": {"position": [320, 180]}});
+    let mut late = word("late", "Tokyo", 64.0);
+    late["time"] = json!({"start": 1.5});
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1", "start": 0, "end": 1, "background": "#efe7d6"}, word("title", "Karachi", 64.0),
+        // Half a second of bare paper after the cut: dead air.
+        {"op": "add_scene", "id": "s2", "start": 1, "end": 2, "background": "#efe7d6"}, late,
+        // One small word from the cut is something on screen.
+        {"op": "add_scene", "id": "s3", "start": 2, "end": 3, "background": "#efe7d6"}, word("small", "Lagos", 24.0)
+    ]}))
+    .unwrap();
+    let pixel = |r: &serde_json::Value| -> Vec<(String, String)> {
+        r["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["kind"] == "first_frame_empty" || i["kind"] == "empty_after_cut")
+            .map(|i| (i["kind"].as_str().unwrap().to_string(), i["element"].as_str().unwrap_or("").to_string()))
+            .collect()
+    };
+    let r = tb.call("check", json!({})).unwrap().json;
+    assert_eq!(pixel(&r), [("empty_after_cut".to_string(), "s2".to_string())], "{r:#}");
+    assert_eq!(r["ok"], true, "warnings only");
+    // The title arriving 0.3 s in leaves frame 0, the thumbnail, blank.
+    tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "title.time", "value": {"start": 0.3}}]})).unwrap();
+    let r = tb.call("check", json!({})).unwrap().json;
+    assert!(pixel(&r).contains(&("first_frame_empty".to_string(), String::new())), "{r:#}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn review_renders_scenes_cuts_and_phone_sheets() {
+    let (mut tb, dir) = toolbox("review");
+    tb.call("project_create", json!({"path": "film", "duration": 6, "width": 640, "height": 360})).unwrap();
+    let mut ops = Vec::new();
+    for (i, text) in ["One", "Two", "Three"].iter().enumerate() {
+        ops.push(json!({"op": "add_scene", "id": format!("s{}", i + 1), "start": i * 2, "end": i * 2 + 2}));
+        ops.push(json!({"op": "add", "id": format!("t{}", i + 1), "kind": "text", "text": text, "size": 64, "color": "#ffffff", "transform": {"position": [320, 180]}}));
+    }
+    // A one-second fade into s3: its strip spans the transition.
+    ops.push(json!({"op": "set", "target": "s3.transition", "value": {"type": "fade", "dur": "30f"}}));
+    tb.call("edit_apply", json!({"ops": ops})).unwrap();
+    let out = tb.call("review", json!({"save": "sheets"})).unwrap();
+    let r = &out.json;
+    let names: Vec<&str> = r["sheets"].as_array().unwrap().iter().map(|s| s["sheet"].as_str().unwrap()).collect();
+    assert_eq!(names, ["scenes", "cuts", "phone"], "{r:#}");
+    assert_eq!(out.images.len(), 3);
+    // Each scene 0.4 s in and at its middle, labelled with its scene.
+    let scenes: Vec<(String, f64)> = r["scenes"].as_array().unwrap().iter().map(|f| (f["scene"].as_str().unwrap().to_string(), f["t"].as_f64().unwrap())).collect();
+    assert_eq!(scenes.len(), 6);
+    assert_eq!(scenes[0], ("s1".to_string(), 0.4));
+    assert_eq!(scenes[1], ("s1".to_string(), 1.0));
+    // Cuts at −0.2 … +0.2 s; the fade's strip runs across it (±0.5 s).
+    let cuts = r["cuts"].as_array().unwrap();
+    assert_eq!(cuts.len(), 2);
+    assert_eq!((cuts[0]["from"].as_str(), cuts[0]["to"].as_str()), (Some("s1"), Some("s2")));
+    let t = |c: &serde_json::Value| -> Vec<f64> { c["t"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect() };
+    assert_eq!(t(&cuts[0]), [1.8, 1.9, 2.0, 2.1, 2.2]);
+    let fade = t(&cuts[1]);
+    assert_eq!((fade[0], fade[2], fade[4]), (3.5, 4.0, 4.5), "{fade:?}");
+    // Phone frames are 360 px wide, four across, at their own size.
+    let phone = image::load_from_memory(&out.images[2]).unwrap();
+    assert!(phone.width() >= 360 * 4, "{}", phone.width());
+    assert!(r["checklist"].as_str().unwrap().contains("P0 t=4.2s · where · problem → exact change"));
+    for f in ["review-scenes.png", "review-cuts.png", "review-phone-1.png"] {
+        assert!(dir.join("sheets").join(f).is_file(), "{f}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }

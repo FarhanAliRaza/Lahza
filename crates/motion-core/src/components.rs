@@ -43,7 +43,7 @@ pub const KINDS: &[Kind] = &[
             ("labels", "ISO codes to label at their label points", "[]"),
             ("label", "{size, color, font, uppercase}", "{h/48, #3a352c, Inter SemiBold, true}"),
             ("places", "names from Natural Earth's populated places, or {name, lon, lat, at, color, size, label}", "[]"),
-            ("arcs", "[{from, to (place or [lon, lat]), at, dur, color, width, lift}] great-circle arcs drawn on", "[]"),
+            ("arcs", "[{from, to (place or [lon, lat]), at, dur, color, width, route, lift}] routes drawn on (trim). route \"bow\" (default): an arch between the two points as they sit on the map, lift (default 0.2) × their distance high (+ toward the top of the map, − toward the bottom), lowered to stay on the map; \"great_circle\": the true shortest route (lift unused), split where it crosses the date line (out at one edge, back in at the other) or runs off the top or bottom near a pole", "[]"),
             ("lakes", "draw lakes", "true"),
             ("detail", "simplification, px at the deepest zoom", "0.35"),
         ],
@@ -130,7 +130,16 @@ pub fn generate(component: &str, params: &Value, ctx: &Ctx) -> Result<Vec<Value>
         "callout" => callout(&p),
         "counter" => counter(&p, ctx),
         "chart" => chart(&p),
-        "map" => crate::map::generate(params, ctx.width, ctx.height),
+        // The sea, the countries (the children with a `name`) and the
+        // lakes are the map itself: background for `check`.
+        "map" => crate::map::generate(params, ctx.width, ctx.height).map(|mut out| {
+            for c in &mut out {
+                if c["id"] == "water" || c["id"] == "lakes" || c.get("name").is_some() {
+                    c["role"] = json!("background");
+                }
+            }
+            out
+        }),
         other => Err(format!("unknown component '{other}': {}", KINDS.iter().map(|k| k.name).collect::<Vec<_>>().join(", "))),
     }
 }
@@ -462,10 +471,10 @@ fn captions(p: &Params, ctx: &Ctx) -> Result<Vec<Value>, String> {
         };
         if style == "boxed" {
             let (bw, bh) = (text_width(&text, size) + size * 1.2, size * (1.35 * text.lines().count() as f64) + size * 0.6);
-            out.push(json!({"id": format!("{id}-box"), "kind": "shape", "shape": "rect", "size": [bw, bh], "radius": size * 0.25,
+            out.push(json!({"id": format!("{id}-box"), "kind": "shape", "shape": "rect", "size": [bw, bh], "radius": size * 0.25, "role": "caption",
                 "fill": "#000000c0", "time": {"start": r(start), "end": r(end)}, "transform": {"position": pos.clone(), "scale": scale_keys.clone(), "opacity": opacity_keys.clone()}}));
         }
-        let mut layer = json!({"id": id, "kind": "text", "text": text, "font": font, "size": size, "color": color, "align": "center",
+        let mut layer = json!({"id": id, "kind": "text", "role": "caption", "text": text, "font": font, "size": size, "color": color, "align": "center",
             "line_height": 1.15, "animators": animators,
             "time": {"start": r(start), "end": r(end)}, "transform": {"position": pos, "scale": scale_keys, "opacity": opacity_keys}});
         match style {
@@ -620,7 +629,8 @@ fn counter(p: &Params, ctx: &Ctx) -> Result<Vec<Value>, String> {
         } else if i == 0 {
             time = json!({"start": at.clone()});
         }
-        out.push(json!({"id": format!("v{i}"), "kind": "text", "text": text, "font": font, "size": size, "color": color, "align": "center", "time": time}));
+        // A count is read as one number, not line by line.
+        out.push(json!({"id": format!("v{i}"), "kind": "text", "text": text, "font": font, "size": size, "color": color, "align": "center", "time": time, "allow": ["line_unread"]}));
     }
     // Before the count, show the start value.
     if let Some(first) = out.first_mut() {
@@ -792,6 +802,11 @@ mod tests {
         let crate::compile::Content::Text(t) = &cap.expect("chunk 2 is on").content else { panic!() };
         let lit: Vec<bool> = t.glyphs.iter().map(|g| g.color.is_some_and(|c| (c.0[2] - 0.0).abs() < 0.05)).collect();
         assert!(lit[5..9].iter().all(|x| *x), "'Iran' is yellow: {lit:?}");
+        // Detaching reads the word track too: plain layers, same chunks.
+        let d = crate::edit::apply(&p, &[json!({"op": "detach", "id": "caps"})]).unwrap();
+        let v = serde_json::to_value(&d.project).unwrap();
+        let kids: Vec<&str> = v["scenes"][0]["layers"][0]["layers"].as_array().unwrap().iter().filter_map(|l| l["text"].as_str()).collect();
+        assert_eq!(kids, vec!["One bomb.", "Over Iran.", "It hit 81", "cities."]);
         assert!(!lit[0], "'Over' is not");
     }
 

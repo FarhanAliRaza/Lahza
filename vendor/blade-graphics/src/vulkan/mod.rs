@@ -59,6 +59,8 @@ struct Device {
     ray_tracing: Option<RayTracingDevice>,
     buffer_marker: Option<ash::amd::buffer_marker::Device>,
     shader_info: Option<ash::amd::shader_info::Device>,
+    /// Lahza: compiled pipelines' driver statistics (`LAHZA_PIPELINE_STATS`).
+    pipeline_stats: Option<khr::pipeline_executable_properties::Device>,
     full_screen_exclusive: Option<ash::ext::full_screen_exclusive::Device>,
     #[cfg(target_os = "windows")]
     external_memory: Option<ash::khr::external_memory_win32::Device>,

@@ -765,6 +765,7 @@ impl Studio {
         self.autosave_scene_style();
         self.sync_reframe();
         self.ensure_motion_pieces(cx);
+        self.ensure_motion_doc(window, cx);
         if self.video_audio_prepare_pending {
             self.prepare_video_audio(cx);
         }
@@ -782,16 +783,18 @@ impl Studio {
         self.ensure_camera_frame(cx);
         self.fit_timeline_to_window(window.viewport_size());
         let top_bar = self.top_bar(cx);
-        // A motion piece open for editing takes the place of the video
-        // preview, timeline and inspector.
-        let body = if let Some(space) = self.motion_space.clone() {
-            div().flex_1().min_h_0().flex().child(div().size_full().child(space)).into_any_element()
-        } else {
+        let body = {
             let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
-            let video_canvas = if self.crop_active {
+            let video_canvas = if let Some(isolated) = self.motion_isolate_canvas(canvas_width, canvas_height) {
+                isolated
+            } else if self.crop_active {
                 self.video_crop_canvas(canvas_width, canvas_height, cx)
             } else {
-                self.scene_canvas(canvas_width, canvas_height, cx)
+                let scene = self.scene_canvas(canvas_width, canvas_height, cx);
+                match self.motion_selection_outline(canvas_width, canvas_height, cx) {
+                    Some(outline) => div().relative().child(scene).child(outline).into_any_element(),
+                    None => scene,
+                }
             };
             let canvas_area = self.canvas_area(video_canvas);
             let timeline = if self.crop_active { div().into_any_element() } else { self.timeline_bar(cx) };
@@ -864,6 +867,8 @@ impl Studio {
                     changed |= this.update_audio_drag(event.position.x);
                 } else if event.dragging() && this.motion_piece_drag.is_some() {
                     changed |= this.update_piece_drag(event.position.x);
+                } else if event.dragging() && this.motion_layer_drag.is_some() {
+                    changed |= this.update_motion_layer_drag(event.position, cx);
                 } else if event.dragging() {
                     changed |= this.update_video_move_drag(event.position.x);
                     if this.video_zoom_drag.is_some() {
@@ -902,6 +907,7 @@ impl Studio {
                         cx.notify();
                     }
                     if this.finish_piece_drag(event.position.x, cx)
+                        || this.finish_motion_layer_drag(event.position, event.modifiers.shift, cx)
                         || this.finish_audio_drag(event.position.x, cx)
                         || this.finish_video_move_drag(event.position.x, cx)
                     {
@@ -933,6 +939,7 @@ impl Studio {
                     this.end_media_drag();
                     this.end_annotation_drag();
                     this.finish_piece_drag(event.position.x, cx);
+                    this.finish_motion_layer_drag(event.position, event.modifiers.shift, cx);
                     this.finish_audio_drag(event.position.x, cx);
                     this.finish_video_move_drag(event.position.x, cx);
                     if this.video_trim_drag.is_some() {

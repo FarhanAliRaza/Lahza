@@ -27,6 +27,7 @@ struct Uniforms {
     prev_root0: vec4<f32>,
     prev_root1: vec4<f32>,
     prev_root2: vec4<f32>,
+    band: vec4<u32>,      // rows the trace pass covers: first, end; profiling density repeats
 }
 
 var<uniform> u: Uniforms;
@@ -53,6 +54,50 @@ var<storage, read_write> b_hist: array<vec4<f32>>;
 var<storage, read_write> b_next: array<vec4<f32>>;
 // The image pool (premultiplied sRGB RGBA8): mesh image maps.
 var<storage, read> b_images: array<u32>;
+// Profiling (denoise.z = 1): [ray queries, candidates, empty density
+// lookups, 0], counted on one pixel in 64 (profile.rs); then per 8 × 4
+// pixel block (the lanes that run in lockstep), every pixel's density
+// lookups summed and their maximum; then per material: ray hits, density
+// lookups (one pixel in 64).
+var<storage, read_write> b_prof: array<atomic<u32>>;
+// Noise and grid volumes' density bounds: per volume (material row 30.w =
+// offset + 1) BOUNDS_N³ cells over its box, each the most density (a share
+// of sigma) found in it, baked each frame by `bounds` from the jobs
+// [material row, offset].
+var<storage, read_write> b_bounds: array<f32>;
+var<storage, read> b_jobs: array<u32>;
+const BOUNDS_N: u32 = 32u;
+var<private> prof_on: bool;
+// The profiling build of this shader sets this true (pt.rs `shader`); with
+// it false the compiler drops all counting, so renders carry none of it.
+const PROFILE: bool = false;
+// Features this build traces (pt.rs `specialise`): each scene compiles
+// only what its materials and lights use, so the kernel stays small. All
+// on is the general build.
+const F_VOLUME: bool = true;        // any volume
+const F_VOL_PHYSICAL: bool = true;  // volumes walked exactly (even, physical)
+const F_GLASS: bool = true;         // transmission (and dispersion)
+const F_SSS: bool = true;           // subsurface walks
+const F_CARDS: bool = true;         // flat 3D layers as cards
+const F_CATCHER: bool = true;       // shadow catchers
+const F_AREA: bool = true;          // area lights
+const F_ENV_IMAGE: bool = true;     // an environment image
+const F_DETAIL: bool = true;        // surface noise and image maps
+// This pixel's density lookups (profiling, every pixel).
+var<private> px_lookups: u32;
+// Volume scattering events so far on this path (0..3, 3 = three or more):
+// header slots 4..7 count ray queries and 8..11 density lookups by it.
+var<private> vol_depth: u32;
+const PROF_HEADER: u32 = 12u;
+
+// Where the per-material counters start: after the header and the blocks.
+fn prof_materials() -> u32 {
+    return PROF_HEADER + ((u.size.x + 7u) / 8u) * ((u.size.y + 3u) / 4u) * 2u;
+}
+
+fn prof_count(i: u32) {
+    if PROFILE && prof_on && i < arrayLength(&b_prof) { atomicAdd(&b_prof[i], 1u); }
+}
 
 fn unpack(v: u32) -> vec4<f32> {
     return vec4<f32>(vec4<u32>(v, v >> 8u, v >> 16u, v >> 24u) & vec4<u32>(255u)) / 255.0;
@@ -60,7 +105,7 @@ fn unpack(v: u32) -> vec4<f32> {
 
 const PI: f32 = 3.14159265;
 // Rows per material (mesh3d::MAT_ROWS).
-const MAT_ROWS: u32 = 29u;
+const MAT_ROWS: u32 = 34u;
 // Rows per instance (pt.rs INST_ROWS).
 const INST_ROWS: u32 = 13u;
 // Rows per light (mesh3d::LROWS).
@@ -165,7 +210,7 @@ fn to_world(v: vec3<f32>) -> vec3<f32> {
 // uniform environment) and the lobes (softboxes, the sun), which are
 // also sampled directly (see env_lobe_*).
 fn has_image() -> bool {
-    return b_light[0].z > 0.5;
+    return F_ENV_IMAGE && b_light[0].z > 0.5;
 }
 
 // Where world direction w falls on the environment image (u, v in 0..1).
@@ -394,6 +439,8 @@ fn card_picture(card: u32, p: vec3<f32>) -> vec4<f32> {
 }
 
 fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> Hit {
+    prof_count(0u);
+    prof_count(4u + vol_depth);
     var rq: ray_query;
     // Every hit is recorded by hand from the candidates, on every device:
     // every triangle is a candidate (no opaque fast path) and the hit is the
@@ -416,9 +463,10 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     var w2o = mat4x3<f32>();
     while rayQueryProceed(&rq) {
         let c = rayQueryGetCandidateIntersection(&rq);
+        prof_count(1u);
         if c.kind != RAY_QUERY_INTERSECTION_TRIANGLE { continue; }
         var take = true;
-        if c.instance_custom_data == u.opts.z {
+        if F_CARDS && c.instance_custom_data == u.opts.z {
             // Cards are not opaque: a candidate stands where its picture
             // does (stochastically by its alpha, so soft edges average out).
             let pic = card_picture(c.primitive_index / 2u, o + d * c.t);
@@ -439,7 +487,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     if !hit.found { return hit; }
     hit.t = hit_t;
     hit.p = o + d * hit_t;
-    if custom == u.opts.z {
+    if F_CARDS && custom == u.opts.z {
         hit.card = true;
         hit.mat = prim / 2u;
         hit.card_color = card_picture(hit.mat, hit.p);
@@ -490,6 +538,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     if part % 2u == 0u { base = bitcast<u32>(row.x); count = bitcast<u32>(row.y); } else { base = bitcast<u32>(row.z); count = bitcast<u32>(row.w); }
     hit.mat = (base + seg % max(count, 1u)) * MAT_ROWS;
     if hit.mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { hit.found = false; return hit; }
+    prof_count(prof_materials() + hit.mat / MAT_ROWS * 2u);
     hit.two_sided = (tag & TWO_SIDED) != 0u;
     let flags = u32(b_mat[hit.mat + 2u].w);
     if (flags & FLAG_FACETED) != 0u { n = g; }
@@ -508,24 +557,331 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
 fn occluded(o_in: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> bool {
     var o = o_in;
     var left = tmax;
-    // Volumes' boundaries let light through: look past them.
-    for (var k = 0u; k < 4u; k++) {
+    // Volumes' boundaries let light through: look past them. A noise
+    // volume (clouds, smoke) may block over its stretch of the ray: from
+    // where the ray entered it, or from the start when it began inside.
+    // Each blocks independently, so overlapping ones multiply.
+    var entered = array<u32, 4>(0u, 0u, 0u, 0u);
+    var einst = array<u32, 4>(0u, 0u, 0u, 0u);
+    var at = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+    var n = 0u;
+    var dist = 0.0;
+    for (var k = 0u; k < 16u; k++) {
         let h = cast_ray(o, d, left, rng);
-        if !h.found { return false; }
-        if h.card { return true; }
+        if !h.found {
+            // Still inside the volumes entered: they block up to the end.
+            for (var i = 0u; i < n; i++) {
+                if volume_shadow(entered[i], o_in + d * at[i], d, tmax - at[i], rng) { return true; }
+            }
+            return false;
+        }
+        if F_CARDS && h.card { return true; }
         // Glass and see-through surfaces let some light by; the shadow
         // catcher casts nothing.
         let flags = u32(b_mat[h.mat + 2u].w);
-        if (flags & FLAG_VOLUME) != 0u {
+        if F_VOLUME && (flags & FLAG_VOLUME) != 0u {
+            let here = dist + h.t;
+            if b_mat[h.mat + 30u].z > 0.5 {
+                if h.front {
+                    if n < 4u {
+                        entered[n] = h.mat;
+                        einst[n] = h.inst;
+                        at[n] = here;
+                        n++;
+                    }
+                } else {
+                    var start = 0.0;
+                    for (var i = 0u; i < n; i++) {
+                        if einst[i] == h.inst {
+                            start = at[i];
+                            n--;
+                            entered[i] = entered[n];
+                            einst[i] = einst[n];
+                            at[i] = at[n];
+                            break;
+                        }
+                    }
+                    if volume_shadow(h.mat, o_in + d * start, d, here - start, rng) { return true; }
+                }
+            }
             o = offset(h, d);
             left = left - h.t;
+            dist = here;
             continue;
         }
-        if (flags & FLAG_SHADOW_CATCHER) != 0u || (flags & FLAG_WIRE) != 0u { return false; }
+        if (F_CATCHER && (flags & FLAG_SHADOW_CATCHER) != 0u) || (flags & FLAG_WIRE) != 0u { return false; }
         let opacity = b_mat[h.mat].w * (1.0 - b_mat[h.mat + 3u].x);
         return opacity >= rnd(rng);
     }
     return false;
+}
+
+
+// A density grid's value at uvw (0..1 across the box; mirrors mesh3d.rs):
+// trilinear, between two of its tiled z slices.
+fn grid_density(row: u32, uvw: vec3<f32>) -> f32 {
+    let r31 = b_mat[row + 31u];
+    if r31.w < 0.5 { return 0.0; }
+    let n = b_mat[row + 32u];
+    let x = clamp(uvw.x * n.x - 0.5, 0.0, n.x - 1.0);
+    let y = clamp(uvw.y * n.y - 0.5, 0.0, n.y - 1.0);
+    let z = clamp(uvw.z * n.z - 0.5, 0.0, n.z - 1.0);
+    let z0 = floor(z);
+    let z1 = min(z0 + 1.0, n.z - 1.0);
+    return mix(grid_slice(r31, n, z0, x, y), grid_slice(r31, n, z1, x, y), z - z0);
+}
+
+// Slice k of a grid image (n: cells x, y, z, tiles per row), bilinear
+// inside its tile.
+fn grid_slice(r31: vec4<f32>, n: vec4<f32>, k: f32, x: f32, y: f32) -> f32 {
+    let ox = i32((k % n.w) * n.x);
+    let oy = i32(floor(k / n.w) * n.y);
+    let x0 = floor(x);
+    let y0 = floor(y);
+    let x1 = min(x0 + 1.0, n.x - 1.0);
+    let y1 = min(y0 + 1.0, n.y - 1.0);
+    let a = mix(map_texel(r31, ox + i32(x0), oy + i32(y0)).x, map_texel(r31, ox + i32(x1), oy + i32(y0)).x, x - x0);
+    let b = mix(map_texel(r31, ox + i32(x0), oy + i32(y1)).x, map_texel(r31, ox + i32(x1), oy + i32(y1)).x, x - x0);
+    return mix(a, b, y - y0);
+}
+// A volume's density at camera-space p, as a share of its sigma (mirrors
+// `volume_density` in motion.wgsl).
+fn volume_density(row: u32, p: vec3<f32>) -> f32 {
+    if b_mat[row + 30u].z < 0.5 { return 1.0; }
+    if !PROFILE { return density_at(row, p); }
+    // Profiling: count the lookup, and whether it found nothing.
+    prof_count(prof_materials() + row / MAT_ROWS * 2u + 1u);
+    px_lookups += 1u;
+    prof_count(8u + vol_depth);
+    let v = density_at(row, p);
+    if v <= 0.0 { prof_count(2u); }
+    return v;
+}
+
+fn density_at(row: u32, p: vec3<f32>) -> f32 {
+    return density_local(row, vol_local(row, p));
+}
+
+// A camera-space point on a volume's own centred box (rows 21..23).
+fn vol_local(row: u32, p: vec3<f32>) -> vec3<f32> {
+    let r0 = b_mat[row + 21u];
+    let r1 = b_mat[row + 22u];
+    let r2 = b_mat[row + 23u];
+    return vec3<f32>(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w);
+}
+
+// A camera-space direction in a volume's box: how its local point moves
+// per unit along the ray.
+fn vol_dir(row: u32, d: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(b_mat[row + 21u].xyz, d), dot(b_mat[row + 22u].xyz, d), dot(b_mat[row + 23u].xyz, d));
+}
+
+// The density at local point q of a noise or grid volume.
+fn density_local(row: u32, q: vec3<f32>) -> f32 {
+    let r30 = b_mat[row + 30u];
+    let s = q / max(b_mat[row + 24u].xyz, vec3<f32>(1e-3));
+    if r30.z > 1.5 {
+        let uvw = s * 0.5 + vec3<f32>(0.5);
+        if any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0)) { return 0.0; }
+        return grid_density(row, uvw);
+    }
+    var e = length(s);
+    if b_mat[row + 18u].z < 0.5 { e = max(max(abs(s.x), abs(s.y)), abs(s.z)); }
+    let fall = clamp((1.0 - e) / 0.35, 0.0, 1.0);
+    if fall <= 0.0 { return 0.0; }
+    let r9 = b_mat[row + 9u];
+    let at = (q + b_mat[row + 17u].xyz) * r9.y;
+    let n = n_sample(u32(r9.x + 0.5), at, u32(r9.z), bitcast<u32>(r9.w));
+    if PROFILE {
+        // Cost experiment (profiling builds only; denoise.w = k): the noise
+        // k more times, nothing else changed, so the trace's growth is what
+        // the density work costs in place.
+        var extra = 0.0;
+        for (var i = 0u; i < u.band.z; i++) {
+            extra += n_sample(u32(r9.x + 0.5), at + vec3<f32>(f32(i + 1u) * 1e-3), u32(r9.z), bitcast<u32>(r9.w));
+        }
+        if extra < -1.0e30 { return 0.0; }
+    }
+    return shaped_density(row, s, at, n, fall);
+}
+
+// A noise volume's density from its noise n at noise-space point `at`,
+// box position s (-1..1) and edge fade (mirrors mesh3d.rs). Cumulus (row
+// 33.w = 1): round billows from cellular noise twice the noise's size
+// over the noise, a flat base at 18% of the height, a rounded top, and
+// coverage that erodes faster with height (cauliflower heads).
+fn shaped_density(row: u32, s: vec3<f32>, at: vec3<f32>, n: f32, fall: f32) -> f32 {
+    let r30 = b_mat[row + 30u];
+    let r33 = b_mat[row + 33u];
+    if r33.w < 0.5 { return clamp((n * fall - (1.0 - r30.x)) / max(r30.y, 1e-3), 0.0, 1.0); }
+    let t = clamp(dot(s, r33.xyz) * 0.5 + 0.5, 0.0, 1.0);
+    let profile = smoothstep(0.18, 0.24, t) * (1.0 - smoothstep(0.6, 1.0, t));
+    let billow = 1.0 - n_cellular(at * 0.5, bitcast<u32>(b_mat[row + 9u].w) ^ 0x5bd1u);
+    let v = (0.6 * billow + 0.4 * n) * fall * profile;
+    return clamp((v - (1.0 - r30.x) - 0.25 * t) / max(r30.y, 1e-3), 0.0, 1.0);
+}
+
+struct Cell {
+    bound: f32,  // the most density in the cell (a share of sigma)
+    exit: f32,   // how much further along the ray the cell lasts
+}
+
+// The bounds cell of a volume at local point q, for a ray moving dq per
+// unit: its bound and where the ray leaves it. Without baked bounds (even
+// volumes): 1, for ever. Outside the box there is no medium until the ray
+// reaches it.
+fn bounds_cell(row: u32, q: vec3<f32>, dq: vec3<f32>) -> Cell {
+    var c: Cell;
+    c.bound = 1.0;
+    c.exit = 1e30;
+    let off = bitcast<u32>(b_mat[row + 30u].w);
+    if off == 0u { return c; }
+    let h = max(b_mat[row + 24u].xyz, vec3<f32>(1e-3));
+    let n = f32(BOUNDS_N);
+    let size = 2.0 * h / n;
+    let u = (q + h) / size;
+    if any(u < vec3<f32>(0.0)) || any(u >= vec3<f32>(n)) {
+        // Outside: empty up to where the ray enters the box (slab test).
+        c.bound = 0.0;
+        var enter = 0.0;
+        let lo = (-h - q) / dq;
+        let hi = (h - q) / dq;
+        let near = min(lo, hi);
+        let far = max(lo, hi);
+        enter = max(max(near.x, near.y), max(near.z, 0.0));
+        if enter >= min(min(far.x, far.y), far.z) { return c; }
+        c.exit = enter + 1e-3 * min(size.x, min(size.y, size.z)) / max(length(dq), 1e-12);
+        return c;
+    }
+    let i = floor(u);
+    let ii = vec3<u32>(i);
+    c.bound = b_bounds[off - 1u + ii.x + BOUNDS_N * (ii.y + BOUNDS_N * ii.z)];
+    // The nearest of the cell's faces ahead.
+    let ahead = select(i, i + vec3<f32>(1.0), dq > vec3<f32>(0.0)) * size - h;
+    let tx = select(1e30, (ahead.x - q.x) / dq.x, abs(dq.x) > 1e-12);
+    let ty = select(1e30, (ahead.y - q.y) / dq.y, abs(dq.y) > 1e-12);
+    let tz = select(1e30, (ahead.z - q.z) / dq.z, abs(dq.z) > 1e-12);
+    // Just past the face, so the next lookup lands in the next cell.
+    c.exit = max(min(tx, min(ty, tz)), 0.0) + 1e-3 * min(size.x, min(size.y, size.z)) / max(length(dq), 1e-12);
+    return c;
+}
+
+// Bakes the density bounds: one invocation per cell (x) of a volume (y,
+// a job). Sixteen samples spread over the cell grown by half a cell each
+// way, so a wisp near a face counts for both cells, and half as much again
+// for what the samples missed (as Cycles does for estimated bounds).
+@compute @workgroup_size(64, 1, 1)
+fn bounds(@builtin(global_invocation_id) id: vec3<u32>) {
+    let cells = BOUNDS_N * BOUNDS_N * BOUNDS_N;
+    if id.x >= cells || id.y * 2u + 1u >= arrayLength(&b_jobs) { return; }
+    let row = b_jobs[id.y * 2u];
+    let off = b_jobs[id.y * 2u + 1u];
+    let h = max(b_mat[row + 24u].xyz, vec3<f32>(1e-3));
+    let size = 2.0 * h / f32(BOUNDS_N);
+    let cell = vec3<f32>(f32(id.x % BOUNDS_N), f32((id.x / BOUNDS_N) % BOUNDS_N), f32(id.x / (BOUNDS_N * BOUNDS_N)));
+    let lo = -h + cell * size;
+    var rng: Rng;
+    rng.s = pcg(id.x + pcg(id.y + pcg(u.opts.y)));
+    var most = 0.0;
+    for (var k = 0u; k < 16u; k++) {
+        let r = vec3<f32>(rnd(&rng), rnd(&rng), rnd(&rng)) * 2.0 - vec3<f32>(0.5);
+        most = max(most, density_local(row, lo + r * size));
+    }
+    if most > 0.0 { most = min(1.0, most * 1.5); }
+    if off + id.x < arrayLength(&b_bounds) { b_bounds[off + id.x] = most; }
+}
+
+// Artistic volumes (24.w = 1): marched as the preview draws them.
+fn vol_artistic(row: u32) -> bool {
+    return b_mat[row + 24u].w > 0.5;
+}
+
+// The preview's self-shadow tap: a quarter of the box's mean half size,
+// in camera px.
+fn vol_reach(row: u32) -> f32 {
+    let h = b_mat[row + 24u].xyz;
+    let k = (length(b_mat[row + 21u].xyz) + length(b_mat[row + 22u].xyz) + length(b_mat[row + 23u].xyz)) / 3.0;
+    return 0.25 * (h.x + h.y + h.z) / 3.0 / max(k, 1e-6);
+}
+
+// Light an artistic volume scatters toward -d at p (as the preview's
+// `volume_lights`): each light through one density tap toward it, with
+// light scattered many times in three octaves (each shadowed half as much,
+// half as anisotropic), plus the sky from one random direction, unshadowed.
+fn artistic_lights(row: u32, p: vec3<f32>, d: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32> {
+    let v18 = b_mat[row + 18u];
+    let reach = vol_reach(row);
+    var out = vec3<f32>(0.0);
+    let lights = u32(b_light[0].x);
+    for (var i = 0u; i < lights; i++) {
+        let kind = u32(b_light[7u + i * LROWS].w);
+        if kind == 2u { continue; }
+        let ls = sample_light(i, p, rng);
+        if dot(ls.col, ls.col) <= 0.0 { continue; }
+        let tau = v18.x * (density_at(row, p + ls.l * (0.5 * reach)) + density_at(row, p + ls.l * (1.5 * reach))) * reach;
+        var ms = 0.0;
+        var k = 1.0;
+        for (var o = 0u; o < 3u; o++) {
+            ms += k * exp(-tau * k) * hg_phase(v18.y * k, dot(ls.l, d));
+            k *= 0.5;
+        }
+        if F_AREA && kind == 3u {
+            let row_l = 7u + i * LROWS;
+            let pdf = area_pdf(row_l, p, ls.l, ls.dist);
+            if pdf > 0.0 { out += ms * area_radiance(row_l) * ls.col / pdf; }
+        } else {
+            out += ms * PI * ls.col;
+        }
+    }
+    // The sky (and ambient lights), one direction per step.
+    let z = 1.0 - 2.0 * rnd(rng);
+    let r = sqrt(max(1.0 - z * z, 0.0));
+    let phi = 2.0 * PI * rnd(rng);
+    let w = vec3<f32>(r * cos(phi), r * sin(phi), z);
+    out += env(w) * hg_phase(v18.y, dot(w, d)) * 4.0 * PI;
+    return out;
+}
+
+// Whether a shadow ray is blocked crossing `len` px of a noise volume: an
+// artistic one by its marched transmittance (blocks with probability
+// 1 − T), a physical one by delta tracking.
+fn volume_shadow(row: u32, o: vec3<f32>, d: vec3<f32>, len: f32, rng: ptr<function, Rng>) -> bool {
+    if F_VOL_PHYSICAL && !vol_artistic(row) { return volume_blocks(row, o, d, len, rng); }
+    let sigma = b_mat[row + 18u].x;
+    let dt = len / 8.0;
+    let j = rnd(rng);
+    var tau = 0.0;
+    for (var s = 0u; s < 8u; s++) {
+        tau += sigma * volume_density(row, o + d * ((f32(s) + j) * dt)) * dt;
+    }
+    return rnd(rng) >= exp(-tau);
+}
+
+// Whether the medium blocks a ray crossing `len` px of a noise volume:
+// delta tracking, cell by cell through its bounds (empty cells skipped,
+// each other cell at its own bound × sigma); unbiased while the bounds
+// hold: blocks with probability one minus the transmittance.
+fn volume_blocks(row: u32, o: vec3<f32>, d: vec3<f32>, len: f32, rng: ptr<function, Rng>) -> bool {
+    let sigma = max(b_mat[row + 18u].x, 1e-6);
+    let q0 = vol_local(row, o);
+    let dq = vol_dir(row, d);
+    var t = 0.0;
+    for (var k = 0u; k < 1024u; k++) {
+        let c = bounds_cell(row, q0 + dq * t, dq);
+        let until = min(len, t + c.exit);
+        let major = sigma * c.bound;
+        if major > 0.0 {
+            let step = -log(max(1.0 - rnd(rng), 1e-7)) / major;
+            if t + step < until {
+                t += step;
+                if rnd(rng) * c.bound < volume_density(row, o + d * t) { return true; }
+                continue;
+            }
+        }
+        if until >= len { return false; }
+        t = until;
+    }
+    return true;
 }
 
 fn hg_phase(g: f32, c: f32) -> f32 {
@@ -560,7 +916,7 @@ fn volume_direct(p: vec3<f32>, d: vec3<f32>, g: f32, rng: ptr<function, Rng>) ->
         if ls.shadow && occluded(p, ls.l, ls.dist * 0.999, rng) { continue; }
         // Light travels −l, scatters toward −d: cos between them is l·d.
         let ph = hg_phase(g, dot(ls.l, d));
-        if kind == 3u {
+        if F_AREA && kind == 3u {
             let row = 7u + i * LROWS;
             let pdf = area_pdf(row, p, ls.l, ls.dist);
             if pdf > 0.0 { out += ph * area_radiance(row) * ls.col / pdf; }
@@ -681,6 +1037,7 @@ struct Detail {
     n: vec3<f32>,
     rough_mul: f32,  // roughness map (green)
     metal_mul: f32,  // metallic map (blue)
+    emit: vec3<f32>, // emissive map (multiplies the emission)
 }
 
 // A material's surface detail at barycentric b of a triangle (camera-space
@@ -693,13 +1050,15 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
     d.n = n_in;
     d.rough_mul = 1.0;
     d.metal_mul = 1.0;
+    d.emit = vec3<f32>(1.0);
     let r9 = b_mat[row + 9u];
     let r12 = b_mat[row + 12u];
     let r13 = b_mat[row + 13u];
     let r14 = b_mat[row + 14u];
     let r25 = b_mat[row + 25u];
     let r26 = b_mat[row + 26u];
-    let pbr_maps = r25.w > 0.5 || r26.w > 0.5;
+    let r29 = b_mat[row + 29u];
+    let pbr_maps = r25.w > 0.5 || r26.w > 0.5 || r29.w > 0.5;
     if r9.x < 0.5 && r12.w < 0.5 && r13.w < 0.5 && r14.w == 0.0 && !pbr_maps { return d; }
     let e1 = pos[1] - pos[0];
     let e2 = pos[2] - pos[0];
@@ -752,6 +1111,11 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
         if r26.w > 0.5 {
             let c = map_sample(r26, t);
             if c.w > 0.0 { d.metal_mul = c.z / c.w; }
+        }
+        if r29.w > 0.5 {
+            let c = map_sample(r29, t);
+            d.emit = vec3<f32>(0.0);
+            if c.w > 0.0 { d.emit = vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w)); }
         }
         let lu = length(dpdu);
         let lv = length(dpdv);
@@ -819,6 +1183,16 @@ fn surface_detail(row: u32, pos: array<vec3<f32>, 3>, nps: array<vec3<f32>, 3>, 
 // Surface detail at a mesh hit: the triangle's corners in camera and
 // noise space with their UVs, then `surface_detail` as the raster.
 fn detail_at(h: Hit, n: vec3<f32>, base: vec3<f32>) -> Detail {
+    if !F_DETAIL {
+        var plain: Detail;
+        plain.base = base;
+        plain.rough = 0.0;
+        plain.n = n;
+        plain.rough_mul = 1.0;
+        plain.metal_mul = 1.0;
+        plain.emit = vec3<f32>(1.0);
+        return plain;
+    }
     var pos: array<vec3<f32>, 3>;
     var nps: array<vec3<f32>, 3>;
     var uvs: array<vec2<f32>, 3>;
@@ -860,6 +1234,7 @@ struct Surface {
     // Lobe choice when sampling: coat, specular (the rest diffuse).
     p_coat: f32,
     p_spec: f32,
+    emit: vec3<f32>,     // the emissive map's colour (multiplies the emission)
 }
 
 fn pow5(x: f32) -> f32 {
@@ -1000,6 +1375,7 @@ fn surface(h: Hit, v: vec3<f32>) -> Surface {
     let m8 = b_mat[h.mat + 8u];
     var s: Surface;
     let det = detail_at(h, h.n, m0.xyz);
+    s.emit = det.emit;
     s.n = det.n;
     // Bent past the viewer: keep it just facing (no light from behind).
     if dot(s.n, v) < 0.02 { s.n = normalize(s.n + v * (0.02 - dot(s.n, v))); }
@@ -1262,7 +1638,7 @@ fn direct(s: Surface, h: Hit, v: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32
         if kind == 2u { continue; }
         let ls = sample_light(i, h.p, rng);
         if dot(h.n, ls.l) <= 0.0 || dot(ls.col, ls.col) <= 0.0 { continue; }
-        if kind == 3u {
+        if F_AREA && kind == 3u {
             // A point on the panel: radiance / pdf, weighted against
             // finding it by sampling the surface (MIS, balance).
             let row = 7u + i * LROWS;
@@ -1574,40 +1950,144 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     // Scattering off surfaces counts against `bounces`; passing through
     // glass and see-through layers has its own, larger allowance.
     var bounce = 0u;
+    if PROFILE { vol_depth = 0u; }
     // The pdf of the last bounce (0: a mirror-like event), for MIS on the
     // area lights it reaches.
     var last_pdf = 0.0;
-    // Inside a volume, and its material row.
-    var in_vol = false;
-    var vol = 0u;
     // The step whose surface gives the denoiser its guides: the first one
     // the camera sees (a shadow catcher is looked through).
     var guide = 0u;
+    // The volumes the path is inside: material rows and, to find them
+    // again on the way out, instances (a mesh's faces have a row per part).
+    // Overlapping clouds are several at once.
+    var vols = array<u32, 4>(0u, 0u, 0u, 0u);
+    var vinst = array<u32, 4>(0u, 0u, 0u, 0u);
+    var nvol = 0u;
     for (var step = 0u; step < bounces + 16u; step++) {
         let h = cast_ray(o, d, 1e30, rng);
-        if in_vol {
-            // A homogeneous medium: free flight to a scattering point, or
-            // through to the next surface. Glow adds along the way.
-            let v18 = b_mat[vol + 18u];
-            let sigma = max(v18.x, 1e-6);
-            let s_free = -log(max(1.0 - rnd(rng), 1e-7)) / sigma;
+        if F_VOLUME && nvol > 0u {
+            // Free flight to a scattering point, or through to the next
+            // surface. Glow adds along the way.
             var seg = 1e30;
             if h.found { seg = h.t; }
-            out.color += throughput * b_mat[vol + 20u].xyz * (sigma * min(s_free, seg));
-            // Light scattered once toward the camera: gathered on every path
-            // through the medium, at a point drawn along this stretch by
-            // its transmittance, weighted by the chance of scattering in it
-            // (1 − T). A path that does scatter below carries only the
-            // light of further scattering, so nothing is counted twice and
-            // thin haze is smooth instead of specks of light and dark.
-            if bounce < bounces {
-                let tr = exp(-sigma * min(seg, 1e6));
-                let ts = -log(max(1.0 - rnd(rng) * (1.0 - tr), 1e-7)) / sigma;
-                out.color += throughput * b_mat[vol + 19u].xyz * (1.0 - tr) * volume_direct(o + d * ts, d, v18.y, rng);
+            var scatters = false;
+            var p = o;
+            var sv = vols[0];
+            // Whether single scattering was gathered along this stretch (an
+            // even medium): a scatter then adds no direct light of its own.
+            var gathered = false;
+            var artistic = false;
+            for (var i = 0u; i < nvol; i++) { artistic = artistic || vol_artistic(vols[i]); }
+            if artistic {
+                // Marched as the preview draws it: 16 jittered steps to the
+                // next surface, light gathered on the way, the path going on
+                // behind the medium dimmed by what it let through.
+                if seg < 1e29 {
+                    let dt = seg / 16.0;
+                    let j = rnd(rng);
+                    var tr = 1.0;
+                    var lit = vec3<f32>(0.0);
+                    for (var s = 0u; s < 16u; s++) {
+                        let q = o + d * ((f32(s) + j) * dt);
+                        var ext = 0.0;
+                        var col = vec3<f32>(0.0);
+                        for (var i = 0u; i < nvol; i++) {
+                            let rho = volume_density(vols[i], q);
+                            if rho <= 0.0 { continue; }
+                            let sig = b_mat[vols[i] + 18u].x * rho;
+                            ext += sig;
+                            col += sig * (b_mat[vols[i] + 19u].xyz * artistic_lights(vols[i], q, d, rng) + b_mat[vols[i] + 20u].xyz);
+                        }
+                        if ext <= 0.0 { continue; }
+                        let a = 1.0 - exp(-ext * dt);
+                        lit += tr * a * col / ext;
+                        tr *= 1.0 - a;
+                    }
+                    out.color += throughput * lit;
+                    throughput *= tr;
+                    out.alpha = max(out.alpha, 1.0 - tr);
+                }
+            } else if !F_VOL_PHYSICAL {
+                // This build has no physical volumes.
+            } else if nvol == 1u && b_mat[vols[0] + 30u].z < 0.5 {
+                // One even medium.
+                let sigma = max(b_mat[sv + 18u].x, 1e-6);
+                let s_free = -log(max(1.0 - rnd(rng), 1e-7)) / sigma;
+                out.color += throughput * b_mat[sv + 20u].xyz * (sigma * min(s_free, seg));
+                // Light scattered once toward the camera: gathered on every
+                // path through the medium, at a point drawn along this
+                // stretch by its transmittance, weighted by the chance of
+                // scattering in it (1 − T). A path that does scatter below
+                // carries only the light of further scattering, so nothing
+                // is counted twice and thin haze is smooth instead of specks.
+                if bounce < bounces {
+                    let tr = exp(-sigma * min(seg, 1e6));
+                    let ts = -log(max(1.0 - rnd(rng) * (1.0 - tr), 1e-7)) / sigma;
+                    out.color += throughput * b_mat[sv + 19u].xyz * (1.0 - tr) * volume_direct(o + d * ts, d, b_mat[sv + 18u].y, rng);
+                    gathered = true;
+                }
+                scatters = s_free < seg;
+                p = o + d * s_free;
+            } else {
+                // Noise or overlapping media: delta tracking, piecewise
+                // through each medium's bounds cells (Cycles' octree idea
+                // on a grid): empty cells are skipped and inside one the
+                // walk steps at the media's summed cell bounds × sigma.
+                // Each tentative collision adds their glow (collision
+                // estimator); a real one picks the medium that scatters by
+                // its share.
+                var q0: array<vec3<f32>, 4>;
+                var dq: array<vec3<f32>, 4>;
+                for (var i = 0u; i < nvol; i++) {
+                    q0[i] = vol_local(vols[i], o);
+                    dq[i] = vol_dir(vols[i], d);
+                }
+                var t = 0.0;
+                for (var k = 0u; k < 1024u; k++) {
+                    // The majorant up to the nearest cell face.
+                    var major = 0.0;
+                    var until = seg;
+                    for (var i = 0u; i < nvol; i++) {
+                        let c = bounds_cell(vols[i], q0[i] + dq[i] * t, dq[i]);
+                        major += max(b_mat[vols[i] + 18u].x, 1e-6) * c.bound;
+                        until = min(until, t + c.exit);
+                    }
+                    var step = 1e30;
+                    if major > 0.0 { step = -log(max(1.0 - rnd(rng), 1e-7)) / major; }
+                    if t + step >= until {
+                        if until >= seg { break; }
+                        t = until;
+                        continue;
+                    }
+                    t += step;
+                    let q = o + d * t;
+                    var w = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+                    var real = 0.0;
+                    for (var i = 0u; i < nvol; i++) {
+                        w[i] = max(b_mat[vols[i] + 18u].x, 1e-6) * volume_density(vols[i], q);
+                        out.color += throughput * b_mat[vols[i] + 20u].xyz * (w[i] / major);
+                        real += w[i];
+                    }
+                    var pick = rnd(rng) * major;
+                    if pick < real {
+                        for (var i = 0u; i < nvol; i++) {
+                            sv = vols[i];
+                            if pick < w[i] { break; }
+                            pick -= w[i];
+                        }
+                        scatters = true;
+                        p = q;
+                        break;
+                    }
+                }
             }
-            if s_free < seg {
-                let p = o + d * s_free;
-                throughput *= b_mat[vol + 19u].xyz;
+            if F_VOL_PHYSICAL && scatters {
+                if PROFILE { vol_depth = min(vol_depth + 1u, 3u); }
+                let v18 = b_mat[sv + 18u];
+                throughput *= b_mat[sv + 19u].xyz;
+                // Noise and overlapping media gather nothing on the way:
+                // light reaching the scattering point, here.
+                if !gathered { out.color += throughput * volume_direct(p, d, v18.y, rng); }
                 through = false;
                 out.alpha = 1.0;
                 bounce++;
@@ -1627,7 +2107,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             // Area lights are seen in reflections, not by the camera.
             var tmax = 1e30;
             if h.found { tmax = h.t; }
-            out.color += throughput * area_emission(o, d, tmax, last_pdf);
+            if F_AREA { out.color += throughput * area_emission(o, d, tmax, last_pdf); }
         }
         if !h.found {
             if !through {
@@ -1647,7 +2127,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         }
         if inside { throughput *= exp(-sigma * h.t); }
         if step == guide { out.depth = h.t; out.normal = h.n; out.prev = h.prev; }
-        if h.card {
+        if F_CARDS && h.card {
             let c = h.card_color;
             let straight = vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
             if step == guide { out.flat += straight; } else { out.color += throughput * straight; }
@@ -1661,16 +2141,30 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         let m3 = b_mat[h.mat + 3u];
         let flags = u32(m2.w);
         let v = -d;
-        if (flags & FLAG_VOLUME) != 0u {
+        if F_VOLUME && (flags & FLAG_VOLUME) != 0u {
             // A volume's boundary: entering or leaving its medium.
             if step == guide { out.albedo = vec3<f32>(1.0); }
-            in_vol = h.front;
-            vol = h.mat;
+            if h.front {
+                if nvol < 4u {
+                    vols[nvol] = h.mat;
+                    vinst[nvol] = h.inst;
+                    nvol++;
+                }
+            } else {
+                for (var i = 0u; i < nvol; i++) {
+                    if vinst[i] == h.inst {
+                        nvol--;
+                        vols[i] = vols[nvol];
+                        vinst[i] = vinst[nvol];
+                        break;
+                    }
+                }
+            }
             o = offset(h, d);
             continue;
         }
         if step == guide { out.albedo = m0.xyz; }
-        if (flags & FLAG_SHADOW_CATCHER) != 0u {
+        if F_CATCHER && (flags & FLAG_SHADOW_CATCHER) != 0u {
             if through {
                 // Only the shadows: their darkness covers what is behind
                 // (cards, meshes) or, over nothing, is the coverage.
@@ -1702,17 +2196,19 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             continue;
         }
         if (flags & FLAG_UNLIT) != 0u {
-            if step == guide { out.flat += m0.xyz + m2.xyz; } else { out.color += throughput * (m0.xyz + m2.xyz); }
+            let det = detail_at(h, h.n, m0.xyz);
+            let c = det.base + m2.xyz * det.emit;
+            if step == guide { out.flat += c; } else { out.color += throughput * c; }
             out.alpha = 1.0;
             return out;
         }
         out.alpha = 1.0;
-        out.color += throughput * m2.xyz;
         var s = surface(h, v);
+        out.color += throughput * m2.xyz * s.emit;
         if step == guide { out.albedo = s.albedo; }
         // Glass: a dielectric boundary (rough: on a visible microfacet),
         // reflecting or refracting by exact Fresnel.
-        if s.trans > 0.0 && rnd(rng) < s.trans {
+        if F_GLASS && s.trans > 0.0 && rnd(rng) < s.trans {
             let m6 = b_mat[h.mat + 6u];
             if m6.w > 0.0 && hero == 3u {
                 // Dispersion: carry one colour from here on.
@@ -1777,7 +2273,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         if bounce > bounces { return out; }
         // The walk is chosen as often as the diffuse lobe it replaces.
         let p_sss = sss * (1.0 - s.p_coat - s.p_spec);
-        if p_sss > 0.0 && rnd(rng) < p_sss {
+        if F_SSS && p_sss > 0.0 && rnd(rng) < p_sss {
             let wk = sss_walk(h, s.n, s.albedo, rng);
             if !wk.found { return out; }
             // The walk reflects about the base colour; kd_in is that colour
@@ -1822,13 +2318,15 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
+fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
     let w = u.size.x;
     let h = u.size.y;
-    // Rows come in bands (one dispatch each, see `trace_rows`): this
-    // band starts at row denoise.z.
-    let py = id.y + u.denoise.z;
-    if id.x >= w || py >= h { return; }
+    // Rows come in bands (one dispatch and submission each, see `trace`
+    // in pt.rs): this band covers rows band.x up to band.y.
+    let py = id_in.y + u.band.x;
+    let id = vec3<u32>(id_in.x, py, id_in.z);
+    if id.x >= w || py >= h || py >= u.band.y { return; }
+    prof_on = PROFILE && (id.x & 7u) == 0u && (py & 7u) == 0u;
     let spp = u.size.w;
     var rng: Rng;
     rng.s = pcg(id.x + pcg(py + pcg(u.opts.y)));
@@ -1926,6 +2424,14 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let al = max(luminance(a), 0.02);
     b_hdr[i * 2u] = vec4<f32>(straight / a, alpha);
     b_hdr[i * 2u + 1u] = vec4<f32>(var_l / (al * al) / max(alpha * alpha, 1e-4), blur, vis, 0.0);
+    if PROFILE {
+        // The lockstep block: its lanes' lookups summed, and the most any did.
+        let blk = PROF_HEADER + ((id.y / 4u) * ((w + 7u) / 8u) + id.x / 8u) * 2u;
+        if blk + 1u < arrayLength(&b_prof) {
+            atomicAdd(&b_prof[blk], px_lookups);
+            atomicMax(&b_prof[blk + 1u], px_lookups);
+        }
+    }
 }
 
 // Temporal accumulation: last frame's lighting at where this surface was

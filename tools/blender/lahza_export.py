@@ -14,11 +14,17 @@ Use from a bpy script (Blender's own Python):
     lx.blast(hit_point, 400, frame=1)                    # a short push that breaks them apart
     lx.bake_rigid_bodies(1, 240); lx.export_model("smash.glb", pieces)  # physics → keys
     lx.export_sequence(liquid, "splash_{frame:04}.glb", 1, 48)          # fluid, cloth: one file per frame
+    lx.bake_fluid(smoke_domain); lx.export_density(smoke_domain, "smoke/d_{frame:04}.png", 1, 96)  # smoke → volume grid
 
 Then:
 
     lahza motion model-import proj.lahza rock.glb --scene s02 --unit 100
     lahza motion model-import proj.lahza "splash_{frame:04}.glb" --scene s02 --frames 48 --fps 24 --at 8.0
+
+A density export is not a model: put its PNGs in the project's assets and
+give a `box` mesh (size = box_m × px per metre) a volume with the returned
+`grid` and a `frame` keyed linearly over the sequence (see the schema's
+volume section).
 
 Units: Blender metres; `--unit` is px per metre in Lahza (default 100).
 Shade objects smooth in Blender if they should look smooth: glTF carries the
@@ -117,6 +123,59 @@ def bake_fluid(domain):
     _select_only([domain])
     with bpy.context.temp_override(active_object=domain, object=domain, selected_objects=[domain]):
         bpy.ops.fluid.bake_all()
+
+
+def export_density(domain, pattern, frame_start, frame_end, scale=None):
+    """A baked smoke domain's density as one PNG per frame for a Lahza
+    volume `grid`: the z slices tiled left to right, top to bottom, in
+    Lahza's axes (x right, y down, z away; Blender's z up and y away).
+    Grey is density over `scale` (default: the sequence's peak), so white is
+    the volume's full `density`. Turn the domain's adaptive size off: the
+    grid fills the domain's box. Returns the fields for the layer: the grid
+    (src with {frame}, size), the box in metres (Lahza x, y, z) and the
+    frame range."""
+    import numpy as np
+    scene = bpy.context.scene
+    frames = []
+    for f in range(frame_start, frame_end + 1):
+        scene.frame_set(f)
+        ds = domain.evaluated_get(bpy.context.evaluated_depsgraph_get()).modifiers["Fluid"].domain_settings
+        rx, ry, rz = ds.domain_resolution
+        g = np.array(ds.density_grid, dtype=np.float32)
+        if g.size != rx * ry * rz or g.size == 0:
+            raise RuntimeError(f"frame {f}: no density (bake the domain first; adaptive domain off)")
+        # Blender: x fastest, z slowest. Lahza's slice k is Blender's y = k,
+        # its rows run down from Blender's top.
+        frames.append(g.reshape(rz, ry, rx)[::-1, :, :])
+    peak = scale or max(float(d.max()) for d in frames) or 1.0
+    rz, ry, rx = frames[0].shape
+    nx, ny, nz = rx, rz, ry
+    cols = max(1, min(nz, 4096 // nx))
+    rows = -(-nz // cols)
+    if rows * ny > 4096:
+        raise RuntimeError(f"grid {nx}x{ny}x{nz} does not fit a 4096 px image; lower the domain's resolution")
+    os.makedirs(os.path.dirname(os.path.abspath(pattern.replace("{frame:04}", "0").replace("{frame}", "0"))), exist_ok=True)
+    for i, d in enumerate(frames):
+        atlas = np.zeros((rows * ny, cols * nx), dtype=np.float32)
+        for k in range(nz):
+            r, c = divmod(k, cols)
+            atlas[r * ny:(r + 1) * ny, c * nx:(c + 1) * nx] = d[:, k, :]
+        v = np.clip(atlas / peak, 0.0, 1.0)
+        # Blender images start at the bottom row.
+        rgba = np.empty((rows * ny, cols * nx, 4), dtype=np.float32)
+        rgba[..., 0] = rgba[..., 1] = rgba[..., 2] = v
+        rgba[..., 3] = 1.0
+        img = bpy.data.images.new("lahza_density", cols * nx, rows * ny, alpha=False, float_buffer=False, is_data=True)
+        img.colorspace_settings.name = "Non-Color"
+        img.pixels.foreach_set(rgba[::-1].ravel())
+        f = frame_start + i
+        img.filepath_raw = os.path.abspath(pattern.replace("{frame:04}", f"{f:04d}").replace("{frame}", str(f)))
+        img.file_format = "PNG"
+        img.save()
+        bpy.data.images.remove(img)
+    dims = domain.dimensions
+    return {"grid": {"src": pattern, "size": [nx, ny, nz]}, "box_m": [dims.x, dims.z, dims.y],
+            "frames": [frame_start, frame_end], "peak": peak}
 
 
 def export_sequence(obj, pattern, frame_start, frame_end):

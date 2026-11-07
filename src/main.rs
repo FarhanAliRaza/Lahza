@@ -34,6 +34,7 @@ mod models;
 mod motion_ui;
 mod motion_editor;
 mod motion_piece_ui;
+mod motion_timeline;
 mod motion_pieces;
 mod motion_sound;
 mod motion_overview_ui;
@@ -554,7 +555,15 @@ struct Studio {
     selected_motion_piece: Option<String>,
     motion_piece_drag: Option<crate::motion_piece_ui::PieceDrag>,
     /// A motion piece open for editing in place of the video timeline.
-    motion_space: Option<gpui::Entity<crate::motion_editor::MotionEditor>>,
+    /// The piece open on the timeline in the Motion tab.
+    motion_doc: Option<crate::motion_timeline::MotionDoc>,
+    motion_layer_drag: Option<crate::motion_timeline::LayerDrag>,
+    /// The preview shows only the open motion piece.
+    motion_isolate: bool,
+    /// A motion project opened on its own (`lahza project.lahza`).
+    motion_project: Option<PathBuf>,
+    /// The motion project's ruler is being dragged.
+    motion_scrub: bool,
     effect_revision: u64,
     annotations: Vec<AnnotationMark>,
     undo_stack: Vec<Vec<AnnotationMark>>,
@@ -990,7 +999,11 @@ impl Studio {
             motion_pieces_loop: 0,
             selected_motion_piece: None,
             motion_piece_drag: None,
-            motion_space: None,
+            motion_doc: None,
+            motion_layer_drag: None,
+            motion_isolate: false,
+            motion_project: None,
+            motion_scrub: false,
             effect_revision: 0,
             annotations: Vec::new(),
             undo_stack: Vec::new(),
@@ -1637,6 +1650,9 @@ impl Studio {
         if self.video_project.is_some() {
             return self.render_video(window, cx);
         }
+        if self.motion_project.is_some() {
+            return self.render_motion_project(window, cx);
+        }
         self.fit_timeline_to_window(window.viewport_size());
         let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
         let composited = if self.preview_needs_compositor() {
@@ -1942,10 +1958,20 @@ fn main() {
             theme::load_theme_preference();
             theme::set_appearance(cx.window_appearance());
             if let Some(dir) = initial_motion.clone() {
-                if let Err(e) = motion_editor::open(dir, cx).map(|_| ()) {
-                    eprintln!("lahza: {e}");
+                if let Err(e) = lahza_motion_core::io::load(&dir) {
+                    eprintln!("lahza: {}: {e}", dir.display());
                     cx.quit();
+                    return;
                 }
+                open_studio_window(cx, true, move |window_handle, cx| {
+                    cx.new(|cx| {
+                        let mut studio = Studio::new(window_handle, None, None, cx);
+                        studio.open_motion_project(dir.clone());
+                        studio
+                    })
+                })
+                .expect("failed to open Lahza window");
+                cx.activate(true);
                 return;
             }
             let starts_in_editor = initial_recording.is_some() || initial_image.is_some();

@@ -609,7 +609,7 @@ def s07():
                   "arcs": [{"from": "Karachi", "to": n, "at": t, "dur": "16f", "color": RED, "width": 4, "lift": 0.25} for n, t in cities],
                   "detail": 0.35}})
     L += spec_list("m-spec", [(26.5, "MAP", "NATURAL EARTH 1:50M · NATIVE"), (27.2, "CAMERA", "ZOOM 0.35 → 2.4 → 0.55" if not V else "ZOOM 0.9 → 2.6 → 0.05"),
-                              (27.5, "ARCS", "GREAT CIRCLES · DRAWN ON THE BEAT")], M, low(3) if V else H - M - 160, PAPER)
+                              (27.5, "ARCS", "BOWED ROUTES · DRAWN ON THE BEAT")], M, low(3) if V else H - M - 160, PAPER)
     L.append(text("m-title", "Karachi, to everywhere.", M, M + 70, 46, F_LIGHT, PAPER, "left", -10, space="screen",
                   animators=[{"at": 26.5, "unit": "glyph", "order": {"axis": "x", "feather": 0.3}, "stagger": "1f", "dur": "14f", "from": {"opacity": 0}}]))
     L += hud(sid, start, end, "dark", (7, "DATA"))

@@ -31,7 +31,7 @@ into a **narration manifest**, which `narration_import` reads:
 
 | Provider | Timings | Adapter |
 |---|---|---|
-| Kokoro (`kokoro-onnx` `create_timed`) | phoneme durations, needs a model export with a `duration` output | `kokoro_manifest.py` |
+| Kokoro (`kokoro-onnx` `create_timed`) | phoneme durations; needs an export with a duration output, e.g. `onnx-community/Kokoro-82M-v1.0-ONNX-timestamped` (`onnx/model_quantized.onnx`); `kokoro-v1.0.int8.onnx` has none | `kokoro_manifest.py` |
 | ElevenLabs `with-timestamps` | per character | `elevenlabs_manifest.py` |
 | Azure Speech | word boundary events (offset and duration, 100 ns ticks) | convert the events to `words` |
 | OpenAI TTS, most others | none | an external aligner (for example Montreal Forced Aligner, aeneas or whisper with forced alignment) produces `words` |

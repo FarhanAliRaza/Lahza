@@ -225,6 +225,9 @@ pub struct SceneExportRequest {
     pub media_end: Option<f64>,
     /// Image scenes that follow the main source back to back.
     pub followers: Vec<ImageSegment>,
+    /// Editor-time ranges `[start, end)` that draw no pointer, such as
+    /// while a motion piece covers the screen.
+    pub pointer_hidden: Vec<(f64, f64)>,
 }
 
 impl SceneExportRequest {
@@ -258,6 +261,7 @@ impl SceneExportRequest {
             media_start: 0.0,
             media_end: None,
             followers: Vec::new(),
+            pointer_hidden: Vec::new(),
         }
     }
 }
@@ -861,6 +865,7 @@ fn encode(
             None => canvas_overlay,
         };
         let media_visible = time >= request.media_start && request.media_end.is_none_or(|end| time < end);
+        let pointer_hidden = request.pointer_hidden.iter().any(|&(start, end)| time >= start && time < end);
         let rendered=(||->Result<RgbaImage,VideoError>{
             use super::motion_blur::Accumulator;
             let temporal=plan.samples.len()>1;
@@ -892,7 +897,7 @@ fn encode(
                 let overlay=request.overlay.as_mut().and_then(|source|source(sample.time, compositor.camera_viewport(sample.viewport)));
                 let frame=renderer.compose_with_quality(&compositor,FrameInput {
                     source,overlay:overlay.as_deref(),viewport:sample.viewport,
-                    pointer:sample.pointer.as_ref().or(pointer_overlay.as_ref()),camera,
+                    pointer:if pointer_hidden {None} else {sample.pointer.as_ref().or(pointer_overlay.as_ref())},camera,
                 },media_visible,canvas_overlay.as_deref(),super::scene::gpu::RenderQuality {
                     enhance:true,motion_pixels:plan.motion_pixels,trail_pixels:plan.trail_pixels,
                 });

@@ -132,7 +132,7 @@ pub(crate) struct TimelineUiState {
     pub hovered_clip: Option<Uuid>,
     pub hover_time: Option<f64>,
     pub vertical_scroll: gpui::ScrollHandle,
-    context: Option<(TimelineContextTarget, Point<Pixels>)>,
+    pub(crate) context: Option<(TimelineContextTarget, Point<Pixels>)>,
     context_highlight: Option<usize>,
     scrollbar_drag: Option<(Pixels, f64)>,
     resize_drag: Option<(Pixels, f32)>,
@@ -798,6 +798,17 @@ impl Studio {
                 cx,
                 |this, cx| this.add_motion_region_at(this.video_position, cx),
             ))
+            .when(self.motion_editing() && self.motion_doc.is_some(), |d| {
+                d.child(self.timeline_button(
+                    "motion-isolate",
+                    "Isolate",
+                    "Show only the motion design in the preview",
+                    true,
+                    self.motion_isolate,
+                    cx,
+                    |this, cx| this.toggle_motion_isolate(cx),
+                ))
+            })
             .when(!video, |d| {
                 d.child(self.timeline_button(
                     "timeline-extend-scene",
@@ -1257,7 +1268,7 @@ impl Studio {
         }
     }
 
-    fn render_timeline_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_timeline_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (target, position) = self.timeline_ui.context?;
         let highlight = self.timeline_ui.context_highlight;
         let rows = self

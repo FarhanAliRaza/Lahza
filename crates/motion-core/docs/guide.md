@@ -4,7 +4,9 @@
 
 1. **Brief → visual script.** One row per spoken line or musical section:
    the words, the visual, the sync anchor (`word:canal`, `bar:5`, `hit:2`)
-   and the style. Get it approved before building.
+   and the style, plus a `BANNED:` line (see
+   [A film, not a page](#a-film-not-a-page)). Get it approved before
+   building.
 2. **Audio first.** Put the music (and voiceover) in `assets/`, register it
    with `audio_analyze` (writes `beat`, `bar`, `half`, `sixteenth`,
    `triplet`, `onset.*`, `hit`, `stop`, `drop`, `music.start`,
@@ -32,13 +34,86 @@
    says. Batches are atomic and undoable (`history`). Geometry is built,
    never traced from a reference (see [No tracing](#no-tracing-as-content)).
 6. **Review**: `check` (no errors, sync drift ≤ ±1 f, no `tracing`
-   warnings), `sync_check {flagged: true}` (every cut, entrance, key
+   warnings, every craft warning — `first_frame_empty` and
+   `empty_after_cut` included — fixed or `allow`ed: see
+   [What check verifies](#what-check-verifies-and-measures)),
+   `sync_check {flagged: true}` (every cut, entrance, key
    landing and jump against its nearest word, cue, beat or sound effect:
    `drift` means it misses the marker it was keyed to, `unsynced` means a
    hit with nothing to hit; key it to the marker instead of nudging
-   seconds) and `snapshot` with `sheet: true` at the scene's sync points.
-   Look at the frames; fix; repeat.
-7. **Render** a draft (`quality: "draft"`), then the final.
+   seconds), `snapshot` with `sheet: true` at the scene's sync points, and
+   `review` for the whole film (scenes, every cut, phone width). Look at the
+   frames; fix; repeat.
+7. **Whole-film review** with `review` before calling it done (see
+   [Whole-film review](#whole-film-review)).
+8. **Render** a draft (`quality: "draft"`), then the final.
+
+## A film, not a page
+
+A viewer sees the film once, at full speed, often on a phone. When nothing
+is decided, generated video falls back on web defaults: a header and a
+footer, labels on everything, feature lists, stat blocks, a paragraph of
+small print. Decide instead.
+
+- **One idea per shot, shown by the picture.** With the words covered,
+  the frames should still tell the story. Text names what the picture
+  cannot (a number, a name, a quote); it never describes what is on
+  screen.
+- **Few words, large.** Besides captions, at most about 12 words on
+  screen at once, and no line smaller than 2.6% of the frame's short side
+  (28 px on a 1080-wide Short). A line stays up long enough to read: 0.4 s
+  for one or two words, otherwise about 0.75 × (0.5 s + 0.3 s a word); the
+  film's last line at least 2 s. (`text_crowded`, `text_below_floor`,
+  `line_unread`.)
+- **Don't say it twice.** On-screen text that repeats the caption at the
+  same moment is noise; show the picture the words describe instead
+  (`repeats_caption`).
+- **No chrome.** Nothing sits unchanged in every scene: no header or
+  footer, section index ("07 / 10"), frame counter, progress bar or docked
+  logo. A video player already has all of these (`persistent_chrome`).
+- **Fill the frame for its shape.** A vertical film is laid out for the
+  tall frame (a map fills it, it is not a landscape strip with bands
+  above and below).
+- **Cuts have a cause.** Use three to five kinds of transition in a film,
+  each caused by something on screen (a push through an object, an object
+  that becomes the next world, a carry across, a colour flood, a whip).
+  Two unrelated worlds never crossfade into each other, and a cut never
+  lands on an empty frame: the first frame after a cut already shows the
+  new idea. Frame 0 is the thumbnail: never empty. (`world_crossfade`,
+  `empty_after_cut`, `first_frame_empty`; `review` shows every cut.)
+- **Say what each layer is.** Give layers a `role` (`background`,
+  `subject`, `foreground`, `caption`, `decoration`) and anything that
+  travels a `facing`. `check` then proves depth (scenery never in front
+  of the subject) and direction (nothing walks or flies backwards), and
+  exempts captions and deliberate small print from the text rules. Keep
+  a rule broken on purpose with `allow` on that layer, not by ignoring
+  `check` (see [Declaring intent](#declaring-intent-role-facing-allow)).
+- **Maps.** Flat-map routes are `bow` arcs between the two cities as they
+  sit on the map; `great_circle` only when the true path is the point
+  (and then prefer a camera that shows it). Both ends of a route are in
+  the frame when it lands (`draws_off_frame`).
+
+### Banned by default
+
+These are where generated video lands when nothing else is decided. Each
+is banned unless the brand's own material or the person's reference uses
+it, and then only as they use it:
+
+- a dark void with small elements floating in its middle;
+- glow, bloom, neon, lens flares and floating particles as decoration;
+- purple or blue gradients, glass cards;
+- a cream paper ground with a serif display, numbered "01 / 02" labels and
+  small monospace caps labels everywhere;
+- corner labels, frame borders, HUD readouts, frame counters as
+  decoration;
+- three cards in a row, KPI grids, spec tables, feature lists;
+- everything centred; everything fading and sliding up; titles that keep
+  drifting after they land;
+- the logo docked in a corner.
+
+After the first render, name every default the film used anyway, from
+this list or not, write it on the film's `BANNED:` line in the visual
+script, and fix it. The list grows with every film.
 
 ## Breakdown (before building a shot)
 
@@ -317,6 +392,18 @@ video timeline:
    frame like an inserted clip. Call again to move it; `remove: true` takes
    it off. The person sees it live and can open it in the editor.
 
+The recording itself is edited with `recording_edit`: its look (`scene`:
+background, padding, corners, shadow, aspect, camera, pointer, keystroke
+overlays, subtitles), its zooms (`zoomCues`), its cuts and speed (`clips`)
+and its audio (`audioMode`, `audioMuted`). Read what is there first with
+`recording_info {recording, edit: true}`; zoom and clip times are seconds
+on the raw recording, and `source_clicks` gives the clicks in those
+seconds. `scene` and a
+zoom cue with a known id are merged, so send only what changes.
+`recording_export {recording, path}` then writes the finished video
+through the studio's own export; the studio must be showing the
+recording.
+
 ## Repeaters: many copies of one thing
 
 Dot fields, rings of petals or shards, rows of bars: build one `instancer`
@@ -410,10 +497,126 @@ outside the radius instead.
   (`{"axis": "x"}`, `{"radial": [0.5, 0.5]}`) on one animator, not one
   layer per letter; add `"feather"` for a soft wipe through the glyphs.
 
+## Whole-film review
+
+Per-scene snapshots miss what only shows at cuts and on a phone: a cut to
+half a second of blank paper, a transition showing a half-faded box with
+ghosted text, a 3D object drawn over the next scene's map in a crossfade,
+labels too small to read on a phone. `review` renders three sheets of the
+whole film (small, no motion blur), every frame labelled with its scene and
+time:
+
+- **scenes**: each scene 0.4 s after it starts and at its middle;
+- **cuts**: a strip at −0.2, −0.1, 0, +0.1, +0.2 s around every scene
+  boundary, spanning the transition when it is longer;
+- **phone**: the scene frames 360 px wide, in pages.
+
+Then, sheet by sheet:
+
+1. Describe each frame in one line as a stranger would, naming every
+   object in it. Anything you would have to explain is a P0.
+2. Cover the words: do the frames alone still tell the story?
+3. At every cut: no blank or near-blank frame, no half-faded box or
+   ghosted text, nothing of one scene drawn over the other.
+4. At 360 px: can every line be read? If not, make it bigger or cut it.
+
+One note per problem, worst first: P0 (the viewer is lost or sees a broken
+frame), P1 (it costs attention), P2 (polish), as
+`P0 t=5.2s · s01 opening · bare paper for half a second after the cut → bring the 81 on with the cut`.
+
+`check` measures two of these on small renders: `first_frame_empty` (frame
+0, the thumbnail social players show, is only background) and
+`empty_after_cut` (0.1–0.4 s after a cut nothing but background is on
+screen: dead air). Only background means under 0.2% of a 270 px render's
+pixels on a drawn edge: flat colour, gradients, paper grain and vignettes
+don't count, one small word or a dot does. A flash that clears within
+0.1 s of the cut is not dead air.
+
+## Declaring intent: role, facing, allow
+
+You write the film from your intent and never watch it as a viewer;
+`check` does, frame by frame, but only knows what a layer *is* if you say
+so. Declare it while you build:
+
+- **`"role"`**: `background` (the map, the room, the backdrop: behind
+  everything it overlaps), `subject` (what the shot is about),
+  `foreground` (in front of the subject: a label on it, a frame around
+  it), `caption` (spoken words on screen) or `decoration` (deliberately
+  small or brief: credits, a texture label; no text checks). A comp's role
+  passes to its layers unless they set their own. `captions` children are
+  `caption` and the map's water, countries and lakes are `background`
+  without asking. Plain text layers used as captions need
+  `"role": "caption"`, or the text checks count them as on-screen text.
+- **`"facing"`**: the way the art points in its own space: `"right"`
+  (+x), `"left"`, `"up"`, `"down"` or degrees clockwise from +x. Give it to
+  anything that travels: cars, planes, ships, fish, arrows. A layer that
+  `follow`s a path with `rotate: true` faces along the path unless
+  `facing` says the art points elsewhere. On a comp it is measured on the
+  comp's first layer, so keep that layer unturned.
+- **`"allow"`**: check kinds the layer (and its children) breaks on
+  purpose: `["text_below_floor"]` on deliberate small print,
+  `["persistent_chrome"]` on a watermark. Scenes take
+  `["world_crossfade"]`. Keep the thing *and* say so; a warning you leave
+  standing hides the next one.
+
+```json
+{"id": "world", "kind": "comp", "role": "background", "layers": [
+  {"id": "iran-label", "kind": "text", "text": "IRAN", "role": "foreground"},
+  {"id": "tanker", "kind": "comp", "facing": "right", "follow": {"layer": "lane", "rotate": true}, "layers": […]}]}
+```
+
+## What check verifies and measures
+
+Errors: the picture contradicts what you declared.
+
+- **`depth_order`**: a `background` drawn in front of a `subject`, or a
+  `foreground` drawn behind one, where their screen boxes overlap by at
+  least 20% of the one hidden, on two samples in a row (¼ s apart). 3D
+  layers are compared by camera depth, not list order. Fix the order (or
+  `z`), or the role if you declared the wrong one.
+- **`moves_backwards`**: a layer with a facing whose motion points against
+  it (dot < −0.3) faster than 3% of the frame's short side per second for
+  0.3 s. Motion is measured in the layer's own world (its follow path, its
+  parent or a sibling that does not move), so a camera or comp carrying it
+  doesn't count; flips (negative scale) and rotation do. Flip it
+  (`scale` x −1), turn it, or set `facing` to the way the art points.
+
+Warnings: measured craft. One finding per cause and scene, listing the
+layers; `role` and `allow` are respected.
+
+- **`text_below_floor`**: text under 2.6% of the frame's short side tall
+  on screen (28 px at 1080; its `size` times its on-screen scale) for
+  0.5 s or more. Captions are judged too. Make it bigger, say it in the
+  voice-over, or mark deliberate small print `decoration`.
+- **`text_crowded`**: more than 12 words or more than 5 text layers on
+  screen at once (captions and decoration aside) for a second: the web-page
+  tell. Keep one short idea on screen; the voice carries the rest.
+- **`line_unread`**: a line (not a caption) on screen shorter than it
+  takes to read: 0.75 × (0.5 s + 0.3 s per word), 0.4 s for one or two
+  words, 2 s for the film's last line. Numbers replaced at one place (a
+  count) and words the next scene carries on don't count. Hold it or cut
+  it.
+- **`repeats_caption`**: text saying the caption shown with it (three or
+  more words in a row in common): read twice. Show what the words can't (a
+  number, a place, a face), or drop one.
+- **`persistent_chrome`**: the same text or small shape at the same place
+  in the frame's outer 15% in 3 or more scenes, or for 60% of the film: a
+  header, footer, frame counter or progress bar. Films have no chrome.
+- **`world_crossfade`**: a scene that dissolves (`fade`) into another,
+  both showing something. Worlds never crossfade: cut on a cause (a hit, a
+  word), carry one element across, flood the frame with a colour or whip.
+- **`draws_off_frame`**: a stroke drawn on with `trim` (open, not an
+  outline) whose head is off the frame when its draw ends, or on its
+  scene's last frame, while its start is on it: an arc to a city the
+  viewer cannot see. Frame the destination before the draw lands.
+
 ## Review checklist
 
 - `check` has no errors; every anchored key's drift is within ±1 frame;
-  no `tracing` warnings.
+  no `tracing` warnings; craft warnings (`first_frame_empty` and
+  `empty_after_cut` included) fixed or `allow`ed.
+- `review`: every frame describable without explanation, the cuts clean,
+  every line readable at 360 px.
 - `sync_check {flagged: true}` lists nothing you did not mean (ambient
   motion may land between markers on purpose).
 - Every shot was built from its breakdown; against a reference, no scene

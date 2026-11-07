@@ -18,7 +18,8 @@ Usage:
   lahza motion apply <project> <ops.json>
   lahza motion check <project> [--json]
   lahza motion sync-check <project> [--frames N] [--tracks a,b] [--all] [--json]
-  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N] [--no-denoise]] [-o out.png]
+  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N] [--no-denoise]] [--profile] [-o out.png]
+  lahza motion review <project> [-o DIR]  the whole film: scenes, cuts and phone-width sheets (default DIR review/)
   lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [--drawn x,y,w,h]
                     [--video side_by_side.mp4] [-o compare.png]
                     (no --at: every frame, first to last, scored by SSIM per scene, plus a side-by-side video;
@@ -34,6 +35,7 @@ Usage:
                     [--frames N [--fps F] [--start K]]   a glTF model (Blender), or a baked sequence with {frame} in the name
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
                     [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
+                    [--profile]   where the time goes: CPU stages, GPU passes, path tracer work per layer
                     [--scale F] [--every N]   quick checks: output size ×F, every Nth frame only (played at fps/N)
 
 Times and references: 2.5, \"48f\", beat:17, bar:5, word:canal, hit:2, \"#title.end + 0.25\".";
@@ -89,7 +91,17 @@ fn renderer_flags(args: &[String], a: &mut Value) -> Result<(), String> {
     if has(args, "--no-denoise") {
         a["denoise"] = json!(false);
     }
+    if has(args, "--profile") {
+        a["profile"] = json!(true);
+    }
     Ok(())
+}
+
+/// A profile's readable lines, to stderr.
+fn print_profile(report: &Value) {
+    for line in report["profile"]["summary"].as_array().into_iter().flatten() {
+        eprintln!("{}", line.as_str().unwrap_or(""));
+    }
 }
 
 fn print(v: &Value) {
@@ -276,7 +288,22 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 std::fs::write(&path, png).map_err(|e| format!("{path}: {e}"))?;
                 println!("{path}");
             }
-            eprintln!("{}", serde_json::to_string(&out.json).unwrap_or_default());
+            let mut shown = out.json.clone();
+            if let Some(p) = shown.get_mut("profile").and_then(Value::as_object_mut) {
+                p.remove("summary");
+            }
+            eprintln!("{}", serde_json::to_string(&shown).unwrap_or_default());
+            print_profile(&out.json);
+            if out.json["ok"] == false {
+                return Err(format!("not drawn as asked: {}", out.json["errors"]));
+            }
+        }
+        "review" => {
+            let out = tb.call("review", json!({"project": need()?, "save": flag(args, "-o").unwrap_or_else(|| "review".into())}))?;
+            for p in out.json["saved"].as_array().into_iter().flatten() {
+                println!("{}", p.as_str().unwrap_or(""));
+            }
+            println!("\n{}", out.json["checklist"].as_str().unwrap_or(""));
             if out.json["ok"] == false {
                 return Err(format!("not drawn as asked: {}", out.json["errors"]));
             }
@@ -417,6 +444,7 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                     Some("done") => {
                         eprintln!();
                         print(&s["report"]);
+                        print_profile(&s["report"]);
                         if s["ok"] == false {
                             return Err(format!("rendered, but not as asked: {}", s["errors"]));
                         }

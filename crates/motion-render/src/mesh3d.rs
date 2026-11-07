@@ -43,6 +43,10 @@ pub struct MeshCache {
     pub root: Option<std::path::PathBuf>,
     /// Environment images, loaded and prefiltered once.
     envs: HashMap<Arc<str>, Option<Arc<crate::envmap::EnvMap>>>,
+    /// Height images of displaced meshes, loaded once.
+    heights: HashMap<String, Option<Arc<mesh::Heightfield>>>,
+    /// Time spent generating meshes since the renderer last took it.
+    pub(crate) busy: std::time::Duration,
     /// Environment images that could not be loaded (not drawn as asked).
     pub dropped: Vec<String>,
     /// Image maps of the meshes being added (resolved by the list builder).
@@ -320,16 +324,48 @@ impl MeshCache {
         env
     }
 
+    /// A displacement height image, loaded once at 16 bits (grey levels of
+    /// elevation data stay smooth); a missing one is reported, not drawn.
+    fn heightfield(&mut self, path: &str) -> Option<Arc<mesh::Heightfield>> {
+        if let Some(h) = self.heights.get(path) {
+            return h.clone();
+        }
+        let full = match &self.root {
+            Some(root) => root.join(path),
+            None => std::path::PathBuf::from(path),
+        };
+        let h = match image::open(&full) {
+            Ok(img) => {
+                let g = img.to_luma16();
+                let (width, height) = (g.width() as usize, g.height() as usize);
+                Some(Arc::new(mesh::Heightfield { width, height, data: g.pixels().map(|p| p.0[0] as f32 / 65535.0).collect() }))
+            }
+            Err(e) => {
+                self.dropped.push(format!("displacement image '{path}': {e}"));
+                None
+            }
+        };
+        self.heights.insert(path.to_string(), h.clone());
+        h
+    }
+
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
         let key = m.params.key();
         if let Some((mesh, used)) = self.meshes.get_mut(&key) {
             *used = self.frame;
             return Some(mesh.clone());
         }
-        let generated = match &m.params.shape {
+        let started = std::time::Instant::now();
+        let mut generated = match &m.params.shape {
             mesh::MeshShape::Gltf { src, mesh: index, primitive, unit, .. } => crate::model::load_mesh(&mut self.gltf_files, self.root.as_deref(), src, *index, *primitive, *unit),
             _ => mesh::generate(&m.params),
         };
+        if let (Ok(g), Some((mesh::Displacement::Image(src), _))) = (&mut generated, &m.params.displace) {
+            if let Some(h) = self.heightfield(src) {
+                mesh::displace_by_image(g, &m.params, &h);
+            }
+        }
+        self.busy += started.elapsed();
         match generated {
             Ok(mesh) => {
                 let mesh = Arc::new(mesh);
@@ -687,7 +723,7 @@ pub(crate) fn piece_colors(m: &MeshState, part: usize) -> usize {
 }
 
 /// Rows per material (GPU raster, CPU raster and path tracer agree).
-pub(crate) const MAT_ROWS: usize = 29;
+pub(crate) const MAT_ROWS: usize = 34;
 
 /// Rows of one material:
 /// 0 [base rgb linear, opacity], 1 [metallic, roughness, clear coat, its
@@ -704,7 +740,12 @@ pub(crate) const MAT_ROWS: usize = 29;
 /// [scattering colour], 20 [emission], 21..23 camera → mesh box (centred,
 /// 3 × 4), 24 [box half extents, 0]; 25 [roughness map offset, w, h, 1 if
 /// set], 26 [metallic map the same]; subsurface: 27 [weight, scale px,
-/// anisotropy, 0], 28 [radius rgb (relative), 0].
+/// anisotropy, 0], 28 [radius rgb (relative), 0]; 29 [emissive map offset,
+/// w, h, 1 if set]; 24.w: 1 when the path tracer marches it (artistic);
+/// 30 [volume coverage, softness, its density: 0 even, 1
+/// the noise (rows 9 and 17), 2 a grid, 0]; 31 [grid image offset, w, h, 1
+/// if set], 32 [grid cells x, y, z, tiles per row]; 33 [volume up xyz (mesh
+/// space), 1 if cumulus].
 pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f64, scale: f64, textures: &HashMap<Arc<str>, Option<crate::images::Texture>>) -> [[f32; 4]; MAT_ROWS] {
     let mat = &m.materials[part];
     let color = piece_color(m, part, segment);
@@ -769,6 +810,9 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
     if let Some(t) = texture(&mat.metallic_map) {
         rows[26] = [b(t.offset), b(t.width), b(t.height), 1.0];
     }
+    if let Some(t) = texture(&mat.emissive_map) {
+        rows[29] = [b(t.offset), b(t.width), b(t.height), 1.0];
+    }
     rows[15] = [mat.uv[0] as f32, mat.uv[1] as f32, mat.uv[2] as f32, mat.uv[3] as f32];
     // Which UVs wrap around (1: u, 2: v), so a triangle across the seam
     // joins its corners.
@@ -786,12 +830,27 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
         rows[18] = [v.sigma as f32, v.g as f32, shape, 1.0];
         rows[19] = [v.albedo[0] as f32, v.albedo[1] as f32, v.albedo[2] as f32, 0.0];
         rows[20] = [v.emission[0] as f32, v.emission[1] as f32, v.emission[2] as f32, 0.0];
+        let kind = if mat.volume_grid.is_some() { 2.0 } else if mat.noise.is_some() { 1.0 } else { 0.0 };
+        rows[30] = [v.coverage as f32, v.softness as f32, kind, 0.0];
+        rows[33] = [v.up[0] as f32, v.up[1] as f32, v.up[2] as f32, if v.cumulus { 1.0 } else { 0.0 }];
+        // The path tracer marches artistic noise and grid volumes (24.w).
+        let artistic = if kind > 0.5 && v.artistic { 1.0 } else { 0.0 };
+        // The grid image tiles its z slices; it shows only when they fit.
+        if let Some((path, [nx, ny, nz])) = &mat.volume_grid {
+            if let Some(t) = textures.get(path).copied().flatten() {
+                let cols = t.width / nx;
+                if cols > 0 && cols * (t.height / ny) >= *nz {
+                    rows[31] = [b(t.offset), b(t.width), b(t.height), 1.0];
+                    rows[32] = [*nx as f32, *ny as f32, *nz as f32, cols as f32];
+                }
+            }
+        }
         if let (Some((lo, hi)), Some(iv)) = (m.params.local_bounds(), affine_inverse(m.camera.view.then(m.world).0)) {
             let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
             for r in 0..3 {
                 rows[21 + r] = [iv[r * 4] as f32, iv[r * 4 + 1] as f32, iv[r * 4 + 2] as f32, (iv[r * 4 + 3] - c[r]) as f32];
             }
-            rows[24] = [((hi[0] - lo[0]) / 2.0) as f32, ((hi[1] - lo[1]) / 2.0) as f32, ((hi[2] - lo[2]) / 2.0) as f32, 0.0];
+            rows[24] = [((hi[0] - lo[0]) / 2.0) as f32, ((hi[1] - lo[1]) / 2.0) as f32, ((hi[2] - lo[2]) / 2.0) as f32, artistic];
         }
     }
     rows
@@ -1692,18 +1751,19 @@ fn map_height(images: &[u32], r: [f32; 4], t: [f32; 2]) -> f32 {
 }
 
 /// A material's surface detail (mirrors `surface_detail` in motion.wgsl):
-/// colour, roughness change, bent normal, and the roughness and metallic
-/// maps' scales.
+/// colour, roughness change, bent normal, the roughness and metallic maps'
+/// scales and the emissive map's colour.
 #[allow(clippy::too_many_arguments)]
-fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps: [F3; 3], uvs_in: [[f32; 2]; 3], b: F3, n_in: F3, base_in: F3) -> (F3, f32, F3, f32, f32) {
+fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps: [F3; 3], uvs_in: [[f32; 2]; 3], b: F3, n_in: F3, base_in: F3) -> (F3, f32, F3, f32, f32, F3) {
     let (r9, r12, r13, r14) = (m[row + 9], m[row + 12], m[row + 13], m[row + 14]);
-    let (r25, r26) = (m[row + 25], m[row + 26]);
-    let pbr_maps = r25[3] > 0.5 || r26[3] > 0.5;
+    let (r25, r26, r29) = (m[row + 25], m[row + 26], m[row + 29]);
+    let pbr_maps = r25[3] > 0.5 || r26[3] > 0.5 || r29[3] > 0.5;
     let mut base = base_in;
     let mut rough = 0.0f32;
     let (mut rough_mul, mut metal_mul) = (1.0f32, 1.0f32);
+    let mut emit = [1.0f32; 3];
     if r9[0] < 0.5 && r12[3] < 0.5 && r13[3] < 0.5 && r14[3] == 0.0 && !pbr_maps {
-        return (base, rough, n_in, rough_mul, metal_mul);
+        return (base, rough, n_in, rough_mul, metal_mul, emit);
     }
     let e1 = fsub(pos[1], pos[0]);
     let e2 = fsub(pos[2], pos[0]);
@@ -1758,6 +1818,10 @@ fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps:
                 metal_mul = c[2] / c[3];
             }
         }
+        if r29[3] > 0.5 {
+            let c = map_sample(images, r29, t);
+            emit = if c[3] > 0.0 { [c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(srgb_decode) } else { [0.0; 3] };
+        }
         let (lu, lv) = (fdot(dpdu, dpdu).sqrt(), fdot(dpdv, dpdv).sqrt());
         if lu > 1e-9 && lv > 1e-9 {
             let tu = fnorm(fsub(dpdu, fmul(n, fdot(n, dpdu))));
@@ -1808,7 +1872,7 @@ fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps:
             }
         }
     }
-    (base, rough, n, rough_mul, metal_mul)
+    (base, rough, n, rough_mul, metal_mul, emit)
 }
 
 /// Lit colour → display (mirrors `tone_map` in motion.wgsl): exposure,
@@ -1843,8 +1907,8 @@ fn agx(c: F3) -> F3 {
     mul(outset, v).map(|x| x.max(0.0).powf(2.2).min(1.0))
 }
 
-/// Mirrors `volume_chord` in motion.wgsl.
-fn volume_chord(m: &[[f32; 4]], row: usize, p: F3) -> f32 {
+/// Mirrors `volume_span` in motion.wgsl.
+fn volume_span(m: &[[f32; 4]], row: usize, p: F3) -> (f32, f32) {
     let d = fnorm(p);
     let (r0, r1, r2) = (m[row + 21], m[row + 22], m[row + 23]);
     let h = f3(m[row + 24]).map(|v| v.max(1e-3));
@@ -1856,17 +1920,89 @@ fn volume_chord(m: &[[f32; 4]], row: usize, p: F3) -> f32 {
         let t2: F3 = std::array::from_fn(|k| (h[k] - o[k]) * inv[k]);
         let t0 = t1[0].min(t2[0]).max(t1[1].min(t2[1])).max(t1[2].min(t2[2]));
         let t3 = t1[0].max(t2[0]).min(t1[1].max(t2[1])).min(t1[2].max(t2[2]));
-        return (t3 - t0.max(0.0)).max(0.0);
+        return (t0, t3);
     }
     let os: F3 = std::array::from_fn(|k| o[k] / h[k]);
     let ds: F3 = std::array::from_fn(|k| dd[k] / h[k]);
     let (a, b, c) = (fdot(ds, ds), fdot(os, ds), fdot(os, os) - 1.0);
     let disc = b * b - a * c;
     if disc <= 0.0 || a <= 0.0 {
-        return 0.0;
+        return (1.0, 0.0);
     }
     let sq = disc.sqrt();
-    ((-b + sq) / a - ((-b - sq) / a).max(0.0)).max(0.0)
+    ((-b - sq) / a, (-b + sq) / a)
+}
+
+/// Mirrors `grid_density` in motion.wgsl.
+fn grid_density(m: &[[f32; 4]], images: &[u32], row: usize, uvw: F3) -> f32 {
+    let (r31, n) = (m[row + 31], m[row + 32]);
+    if r31[3] < 0.5 {
+        return 0.0;
+    }
+    let x = (uvw[0] * n[0] - 0.5).clamp(0.0, n[0] - 1.0);
+    let y = (uvw[1] * n[1] - 0.5).clamp(0.0, n[1] - 1.0);
+    let z = (uvw[2] * n[2] - 0.5).clamp(0.0, n[2] - 1.0);
+    let z0 = z.floor();
+    let z1 = (z0 + 1.0).min(n[2] - 1.0);
+    let (a, b) = (grid_slice(images, r31, n, z0, x, y), grid_slice(images, r31, n, z1, x, y));
+    a + (b - a) * (z - z0)
+}
+
+/// Mirrors `grid_slice` in motion.wgsl.
+fn grid_slice(images: &[u32], r31: [f32; 4], n: [f32; 4], k: f32, x: f32, y: f32) -> f32 {
+    let (ox, oy) = (((k % n[3]) * n[0]) as i32, ((k / n[3]).floor() * n[1]) as i32);
+    let (x0, y0) = (x.floor(), y.floor());
+    let (x1, y1) = ((x0 + 1.0).min(n[0] - 1.0), (y0 + 1.0).min(n[1] - 1.0));
+    let (fx, fy) = (x - x0, y - y0);
+    let t = |xx: f32, yy: f32| map_texel(images, r31, ox + xx as i32, oy + yy as i32)[0];
+    let (a, b) = (t(x0, y0) + (t(x1, y0) - t(x0, y0)) * fx, t(x0, y1) + (t(x1, y1) - t(x0, y1)) * fx);
+    a + (b - a) * fy
+}
+
+/// Mirrors `volume_density` in motion.wgsl.
+fn volume_density(m: &[[f32; 4]], images: &[u32], row: usize, p: F3) -> f32 {
+    let r30 = m[row + 30];
+    if r30[2] < 0.5 {
+        return 1.0;
+    }
+    let (r0, r1, r2) = (m[row + 21], m[row + 22], m[row + 23]);
+    let q = [fdot(f3(r0), p) + r0[3], fdot(f3(r1), p) + r1[3], fdot(f3(r2), p) + r2[3]];
+    let h = m[row + 24];
+    let s: F3 = std::array::from_fn(|k| q[k] / h[k].max(1e-3));
+    if r30[2] > 1.5 {
+        let uvw = s.map(|v| v * 0.5 + 0.5);
+        if uvw.iter().any(|v| !(0.0..=1.0).contains(v)) {
+            return 0.0;
+        }
+        return grid_density(m, images, row, uvw);
+    }
+    let e = if m[row + 18][2] < 0.5 { s[0].abs().max(s[1].abs()).max(s[2].abs()) } else { fdot(s, s).sqrt() };
+    let fall = ((1.0 - e) / 0.35).clamp(0.0, 1.0);
+    if fall <= 0.0 {
+        return 0.0;
+    }
+    let r9 = m[row + 9];
+    let at = fmul(fadd(q, f3(m[row + 17])), r9[1]);
+    // Core codes: 0 value, 1 fbm, 2 cellular; the rows store code + 1.
+    let n = lahza_motion_core::noise::sample((r9[0] + 0.5) as u32 - 1, at, r9[2] as u32, r9[3].to_bits());
+    shaped_density(m, row, s, at, n, fall)
+}
+
+/// Mirrors `shaped_density` in motion.wgsl.
+fn shaped_density(m: &[[f32; 4]], row: usize, s: F3, at: F3, n: f32, fall: f32) -> f32 {
+    let (r30, r33) = (m[row + 30], m[row + 33]);
+    if r33[3] < 0.5 {
+        return ((n * fall - (1.0 - r30[0])) / r30[1].max(1e-3)).clamp(0.0, 1.0);
+    }
+    let smooth = |a: f32, b: f32, x: f32| {
+        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let t = (fdot(s, f3(r33)) * 0.5 + 0.5).clamp(0.0, 1.0);
+    let profile = smooth(0.18, 0.24, t) * (1.0 - smooth(0.6, 1.0, t));
+    let billow = 1.0 - lahza_motion_core::noise::cellular(fmul(at, 0.5), m[row + 9][3].to_bits() ^ 0x5bd1);
+    let v = (0.6 * billow + 0.4 * n) * fall * profile;
+    ((v - (1.0 - r30[0]) - 0.25 * t) / r30[1].max(1e-3)).clamp(0.0, 1.0)
 }
 
 fn hg_phase(g: f32, c: f32) -> f32 {
@@ -1875,14 +2011,70 @@ fn hg_phase(g: f32, c: f32) -> f32 {
 }
 
 /// Mirrors `volume_shade` in motion.wgsl.
-fn volume_shade(m: &[[f32; 4]], row: usize, lb: usize, p: F3, opacity: f32) -> [f32; 4] {
+fn volume_shade(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, opacity: f32, occ: f32) -> [f32; 4] {
+    let (span0, span1) = volume_span(m, row, p);
+    let end = span1.min(volume_stop(p, occ));
+    if m[row + 30][2] > 0.5 {
+        return volume_march(m, images, row, lb, p, opacity, (span0, end));
+    }
     let v18 = m[row + 18];
-    let chord = volume_chord(m, row, p);
+    let chord = (end - span0.max(0.0)).max(0.0);
     let a = (1.0 - (-v18[0] * chord).exp()) * opacity;
     if a <= 0.0 {
         return [0.0; 4];
     }
     let d = fnorm(p);
+    let straight = fadd(fmul3(f3(m[row + 19]), volume_lights(m, images, row, lb, p, d, 0.0)), f3(m[row + 20]));
+    let t = tone_map(m, lb, straight).map(encode);
+    [t[0] * a, t[1] * a, t[2] * a, a]
+}
+
+/// Mirrors `volume_march` in motion.wgsl.
+fn volume_march(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, opacity: f32, (span0, span1): (f32, f32)) -> [f32; 4] {
+    let t0 = span0.max(0.0);
+    if span1 <= t0 {
+        return [0.0; 4];
+    }
+    let sigma = m[row + 18][0];
+    let d = fnorm(p);
+    let h = m[row + 24];
+    let len = |r: [f32; 4]| fdot(f3(r), f3(r)).sqrt();
+    let k = (len(m[row + 21]) + len(m[row + 22]) + len(m[row + 23])) / 3.0;
+    let reach = 0.25 * (h[0] + h[1] + h[2]) / 3.0 / k.max(1e-6);
+    let dt = (span1 - t0) / 16.0;
+    let (mut tr, mut lit) = (1.0f32, [0.0f32; 3]);
+    for i in 0..16 {
+        let q = fmul(d, t0 + (i as f32 + 0.5) * dt);
+        let rho = volume_density(m, images, row, q);
+        if rho <= 0.0 {
+            continue;
+        }
+        let a = 1.0 - (-sigma * rho * dt).exp();
+        let c = fadd(fmul3(f3(m[row + 19]), volume_lights(m, images, row, lb, q, d, reach)), f3(m[row + 20]));
+        lit = fadd(lit, fmul(c, tr * a));
+        tr *= 1.0 - a;
+    }
+    let cover = 1.0 - tr;
+    let a = cover * opacity;
+    if a <= 0.0 {
+        return [0.0; 4];
+    }
+    let t = tone_map(m, lb, fmul(lit, 1.0 / cover)).map(encode);
+    [t[0] * a, t[1] * a, t[2] * a, a]
+}
+
+/// Mirrors `volume_stop` in motion.wgsl.
+fn volume_stop(p: F3, occ: f32) -> f32 {
+    let d = fnorm(p);
+    if occ <= 0.0 || d[2] <= 1e-6 {
+        return 1e30;
+    }
+    1.0 / (occ * d[2])
+}
+
+/// Mirrors `volume_lights` in motion.wgsl.
+fn volume_lights(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, d: F3, reach: f32) -> F3 {
+    let v18 = m[row + 18];
     let pi = std::f32::consts::PI;
     let mut sc = [0.0f32; 3];
     for i in 0..m[lb][0] as usize {
@@ -1904,12 +2096,20 @@ fn volume_shade(m: &[[f32; 4]], row: usize, lb: usize, p: F3, opacity: f32) -> [
                 col = fmul(col, 1e6 / (dist * dist + area / pi));
             }
         }
+        if reach > 0.0 {
+            let tau = v18[0] * (volume_density(m, images, row, fadd(p, fmul(l, 0.5 * reach))) + volume_density(m, images, row, fadd(p, fmul(l, 1.5 * reach)))) * reach;
+            let mut ms = 0.0f32;
+            let mut k = 1.0f32;
+            for _ in 0..3 {
+                ms += k * (-tau * k).exp() * hg_phase(v18[1] * k, fdot(l, d));
+                k *= 0.5;
+            }
+            sc = fadd(sc, fmul(col, pi * ms));
+            continue;
+        }
         sc = fadd(sc, fmul(col, pi * hg_phase(v18[1], fdot(l, d))));
     }
-    sc = fadd(sc, fmul(fadd(env_diffuse(m, lb, [0.0, -1.0, 0.0]), env_diffuse(m, lb, [0.0, 1.0, 0.0])), 0.5));
-    let straight = fadd(fmul3(f3(m[row + 19]), sc), f3(m[row + 20]));
-    let t = tone_map(m, lb, straight).map(encode);
-    [t[0] * a, t[1] * a, t[2] * a, a]
+    fadd(sc, fmul(fadd(env_diffuse(m, lb, [0.0, -1.0, 0.0]), env_diffuse(m, lb, [0.0, 1.0, 0.0])), 0.5))
 }
 
 /// A point light's fade to its range (0: none). Mirrors motion.wgsl.
@@ -2067,7 +2267,9 @@ fn card_sample(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], material: usize
     })
 }
 
-fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], tri: u32, q: [f32; 2]) -> [f32; 4] {
+/// `occ`: the nearest occluder behind (1 / camera z; 0: none), where a
+/// volume stops.
+fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], tri: u32, q: [f32; 2], occ: f32) -> [f32; 4] {
     let tb = prim.geom2[0].to_bits() as usize + tri as usize * 4;
     let vb = prim.geom2[1].to_bits() as usize;
     let mb = prim.geom2[2].to_bits() as usize;
@@ -2122,12 +2324,12 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     let vid = |k: usize| ids[k].to_bits() as usize;
     let uvs = [0, 1, 2].map(|k| [m[vb + vid(k) * VROWS + 1][3], m[vb + vid(k) * VROWS + 2][3]]);
     let nps = [0, 1, 2].map(|k| f3(m[vb + vid(k) * VROWS + 2]));
-    let (base, rough_d, nd, rough_mul, metal_mul) = surface_detail(m, images, mb + mat * MAT_ROWS, pos, nps, uvs, b, n, f3(m0));
+    let (base, rough_d, nd, rough_mul, metal_mul, emit) = surface_detail(m, images, mb + mat * MAT_ROWS, pos, nps, uvs, b, n, f3(m0));
     n = nd;
     let opacity = m0[3];
-    let emissive = f3(m2);
+    let emissive = fmul3(f3(m2), emit);
     if flags & FLAG_VOLUME != 0 {
-        return volume_shade(m, mb + mat * MAT_ROWS, lb, p, opacity);
+        return volume_shade(m, images, mb + mat * MAT_ROWS, lb, p, opacity, occ);
     }
     if flags & FLAG_SHADOW_CATCHER != 0 {
         // Only the shadows: how much of the shadowing light is blocked.
@@ -2322,6 +2524,9 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
     let tb = prim.geom2[0].to_bits() as usize;
     let mut best = [u32::MAX; 8];
     let mut depth = [0.0f32; 8];
+    // The nearest occluder at each sample (1 / camera z; 0: none), where a
+    // volume in front of it stops.
+    let mut occ = [0.0f32; 8];
     for &tri in &bins[start..start + count] {
         let r = tb + tri as usize * 4;
         let (r0, r1, d) = (m[r], m[r + 1], m[r + 3]);
@@ -2346,6 +2551,11 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
                 // Later surfaces win ties: coplanar layers keep their order.
                 let tf = m[r + 2][3] as u32;
                 let material = prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * MAT_ROWS;
+                let occludes = m[material + 2][3] as u32 & FLAG_OCCLUDER != 0 && z > occ[s];
+                let wins = z >= depth[s] * (1.0 - TIE);
+                if !(wins || occludes) {
+                    continue;
+                }
                 let stands = if tf & 1 != 0 {
                     card_sample(prim, m, groups, material, q)[3] >= CARD_STANDS
                 } else if tf & 2 != 0 {
@@ -2353,9 +2563,14 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
                 } else {
                     true
                 };
-                if z >= depth[s] * (1.0 - TIE) && stands {
-                    depth[s] = z;
-                    best[s] = tri;
+                if stands {
+                    if occludes {
+                        occ[s] = z;
+                    }
+                    if wins {
+                        depth[s] = z;
+                        best[s] = tri;
+                    }
                 }
             }
         }
@@ -2368,14 +2583,16 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
         }
         let mut n = 0.0f32;
         let mut q = [0.0f32; 2];
+        let mut oz = 0.0f32;
         for j in s..8 {
             if best[j] == tri {
                 n += 1.0;
                 q = [q[0] + SAMPLES[j][0], q[1] + SAMPLES[j][1]];
+                oz = oz.max(occ[j]);
             }
         }
         let centroid = [p[0] + q[0] / (16.0 * n), p[1] + q[1] / (16.0 * n)];
-        let c = shade_tri(prim, m, groups, images, tri, centroid);
+        let c = shade_tri(prim, m, groups, images, tri, centroid, oz);
         for i in 0..4 {
             out[i] += c[i] * n / 8.0;
         }

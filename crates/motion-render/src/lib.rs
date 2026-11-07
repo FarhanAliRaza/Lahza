@@ -19,6 +19,7 @@ pub mod gpu;
 pub mod images;
 pub mod list;
 pub mod mesh3d;
+pub mod profile;
 pub mod pt;
 pub mod model;
 mod oidn;
@@ -64,6 +65,9 @@ pub struct RenderOptions {
     /// Needs a GPU with ray queries, else the frame is rasterised and a
     /// warning says so.
     pub path: Option<pt::TraceOptions>,
+    /// Record where the time goes (`Renderer::profile`): CPU stages, GPU
+    /// pass timestamps and the path tracer's work per layer.
+    pub profile: bool,
 }
 
 impl Default for RenderOptions {
@@ -74,6 +78,7 @@ impl Default for RenderOptions {
             backend: Backend::Auto,
             allow_software_gpu: std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some(),
             path: None,
+            profile: false,
         }
     }
 }
@@ -101,6 +106,8 @@ pub struct Renderer {
     options: RenderOptions,
     last: Option<(Vec<u8>, RgbaImage)>,
     pub stats: Stats,
+    /// With `RenderOptions::profile`: where the frames' time went.
+    pub profile: Option<profile::Profile>,
     threads: usize,
     /// CPU frame buffers, kept between frames: a fresh 33 MB buffer per
     /// 1080p frame costs more in page faults than drawing into it.
@@ -119,7 +126,7 @@ impl Renderer {
     pub fn new(root: Option<&Path>, options: RenderOptions) -> Self {
         let (gpu, gpu_error) = match options.backend {
             Backend::Cpu => (None, None),
-            _ => match gpu_with_retry(options.allow_software_gpu) {
+            _ => match gpu_with_retry(options.allow_software_gpu, options.profile) {
                 Ok(g) => (Some(g), None),
                 Err(e) => (None, Some(e)),
             },
@@ -137,6 +144,7 @@ impl Renderer {
             options,
             last: None,
             stats: Stats::default(),
+            profile: options.profile.then(profile::Profile::default),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             scratch: Scratch::default(),
         }
@@ -237,6 +245,7 @@ impl Renderer {
 
     /// The frame at timeline time `t`, with motion blur when the scene asks.
     pub fn render(&mut self, compiled: &Compiled, t: f64) -> RgbaImage {
+        let started = Instant::now();
         let mut states = Vec::new();
         match compiled.motion_blur_at(t).filter(|_| self.options.motion_blur) {
             Some(mb) => {
@@ -252,6 +261,9 @@ impl Renderer {
                 }
             }
             None => states.push(compiled.frame(t)),
+        }
+        if let Some(p) = self.profile.as_mut() {
+            p.stage("evaluate scene", started);
         }
         self.render_states(&states)
     }
@@ -278,7 +290,18 @@ impl Renderer {
         // Motion-blur sub-frames already average over the shutter; history
         // per sub-frame would hold a full-size buffer set for each of them.
         let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), temporal: o.temporal && n == 1, ..o });
-        let lists = self.build_lists(states, trace);
+        self.images.begin_frame();
+        let mut lists = self.build_lists(states, trace);
+        if self.images.overflowed {
+            // The image pool is full: keep only this frame's images and build again.
+            self.images.compact();
+            self.images.begin_frame();
+            lists = self.build_lists(states, trace);
+            const FULL: &str = "image memory budget reached; some images are not drawn";
+            if self.images.overflowed && !self.images.warnings.iter().any(|w| w == FULL) {
+                self.images.warnings.push(FULL.into());
+            }
+        }
         let mut key = Vec::new();
         for l in &lists {
             key.extend(l.signature());
@@ -288,6 +311,12 @@ impl Renderer {
         let built = Instant::now();
         self.stats.build_ms += (built - started).as_secs_f64() * 1000.0;
         self.stats.frames += 1;
+        if let Some(p) = self.profile.as_mut() {
+            p.frames += 1;
+            p.add("display lists", built - started);
+            p.add("display lists › meshes (generate, displace)", std::mem::take(&mut self.meshes.busy));
+            p.add("display lists › images (load)", std::mem::take(&mut self.images.busy));
+        }
         if let Some((last_key, image)) = &self.last {
             if *last_key == key {
                 self.stats.cached += 1;
@@ -300,6 +329,12 @@ impl Renderer {
         #[cfg(not(test))]
         let fail = false;
         let result = self.gpu.as_mut().map(|g| if fail { Err("ERROR_DEVICE_LOST (test)".to_string()) } else { g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic) });
+        if let (Some(p), Some(g)) = (self.profile.as_mut(), self.gpu.as_mut()) {
+            p.add("gpu frame", built.elapsed());
+            if let Some(gp) = g.profile.as_mut() {
+                p.merge(std::mem::take(gp));
+            }
+        }
         let bytes = match result {
             Some(Ok(bytes)) => bytes,
             Some(Err(e)) => {
@@ -310,7 +345,7 @@ impl Renderer {
                 let fail_again = self.take_failure();
                 #[cfg(not(test))]
                 let fail_again = false;
-                let retried = gpu_with_retry(self.options.allow_software_gpu).ok().and_then(|mut g| {
+                let retried = gpu_with_retry(self.options.allow_software_gpu, self.options.profile).ok().and_then(|mut g| {
                     let r = if fail_again { None } else { g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic).ok() };
                     self.gpu = Some(g);
                     r
@@ -334,7 +369,13 @@ impl Renderer {
                     }
                 }
             }
-            None => self.cpu(&lists),
+            None => {
+                let bytes = self.cpu(&lists);
+                if let Some(p) = self.profile.as_mut() {
+                    p.add("cpu raster", built.elapsed());
+                }
+                bytes
+            }
         };
         self.stats.raster_ms += built.elapsed().as_secs_f64() * 1000.0;
         let image = RgbaImage::from_raw(main.width, main.height, bytes).expect("frame size");
@@ -397,10 +438,10 @@ impl Renderer {
 /// Makes the GPU renderer, trying again on transient failures (a device
 /// busy or lost under contention); a missing or software-only device is not
 /// retried.
-fn gpu_with_retry(allow_software: bool) -> Result<gpu::Gpu, String> {
+fn gpu_with_retry(allow_software: bool, profile: bool) -> Result<gpu::Gpu, String> {
     let mut last = String::new();
     for attempt in 0..3 {
-        match gpu::Gpu::new(allow_software) {
+        match gpu::Gpu::new(allow_software, profile) {
             Ok(g) => return Ok(g),
             Err(e) if e.starts_with("only a software") || e.starts_with("no Vulkan device") && !e.contains("DEVICE_LOST") => return Err(e),
             Err(e) => last = e,

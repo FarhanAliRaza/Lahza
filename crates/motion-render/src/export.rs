@@ -92,6 +92,9 @@ pub struct ExportReport {
     /// Assets that were not drawn (see `Renderer::dropped`): errors.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<String>,
+    /// With `RenderOptions::profile`: where the time went (`Profile::report`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,9 +372,14 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
         } else {
             frame
         };
+        let sending = Instant::now();
         if tx.send(frame.into_raw()).is_err() {
             failed = Some("ffmpeg stopped accepting frames".into());
             break;
+        }
+        if let Some(p) = renderer.profile.as_mut() {
+            // Blocks only while the encoder is three frames behind.
+            p.stage("wait for the encoder", sending);
         }
         progress.done.fetch_add(1, Ordering::Relaxed);
     }
@@ -400,5 +408,6 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
         cached_frames: renderer.stats.cached,
         warnings: renderer.warnings(),
         dropped: renderer.dropped(),
+        profile: renderer.profile.as_ref().map(|p| p.report()),
     })
 }

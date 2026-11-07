@@ -143,6 +143,28 @@ fn images_and_gradients() {
 }
 
 #[test]
+fn a_film_shows_more_images_than_the_pool_holds_at_once() {
+    // Three 4096² images, one after another: two fill the pool.
+    let dir = std::env::temp_dir().join(format!("lahza-pool-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+    let mut layers = Vec::new();
+    for (i, c) in colors.iter().enumerate() {
+        image::RgbaImage::from_pixel(4096, 4096, image::Rgba(*c)).save(dir.join(format!("big{i}.png"))).unwrap();
+        layers.push(json!({"id": format!("i{i}"), "kind": "image", "src": format!("big{i}.png"), "size": [320, 180],
+            "transform": {"position": [160, 90]}, "time": {"start": i as f64 * 0.5, "end": (i + 1) as f64 * 0.5}}));
+    }
+    let compiled = Compiled::new(&project(json!(layers)));
+    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, scale: 0.25, ..Default::default() });
+    for (i, c) in colors.iter().enumerate() {
+        let out = r.render(&compiled, i as f64 * 0.5 + 0.25);
+        assert_eq!(px(&out, 40, 22), *c, "image {i}");
+    }
+    assert!(r.dropped().is_empty(), "{:?}", r.dropped());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn shader_validates_and_layouts_match() {
     let module = naga::front::wgsl::parse_str(gpu::SHADER).unwrap_or_else(|e| panic!("{}", e.emit_to_string(gpu::SHADER)));
     let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -1621,6 +1643,36 @@ fn defocused_cards_keep_their_depth() {
     let sum = |img: &image::RgbaImage| (60..110).flat_map(|y| (110..210).map(move |x| (x, y))).map(|(x, y)| px(img, x, y)[0] as u64).sum::<u64>();
     let (a, b) = (sum(&sharp), sum(&soft));
     assert!(b as f64 > 0.8 * a as f64, "defocused word lost to the floor: {b} vs {a}");
+    assert_gpu_matches_cpu(&p, &[0.0]);
+}
+
+/// An instancer's mesh copies keep the depth test under depth of field:
+/// pegs under a floor stay hidden by it, as they are with a sharp lens.
+#[test]
+fn defocused_instancer_copies_keep_their_depth() {
+    let build = |aperture: f64| {
+        let mut p = project(json!([
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [240, 10], "depth": 240},
+             "material": {"preset": "matte", "color": "#40a060"}, "transform": {"position": [160, 80]}},
+            {"id": "pegs", "kind": "instancer", "three_d": true, "transform": {"position": [160, 112], "z": -60},
+             "layout": {"type": "line", "count": 3, "from": [-80, 0], "to": [80, 0]},
+             "layers": [{"id": "peg", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 8, "height": 40},
+                         "material": {"preset": "matte", "color": "#ffffff"}}]}
+        ]));
+        p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 35], "aperture": aperture, "focus": 0})).unwrap();
+        p
+    };
+    let sharp = cpu().render(&Compiled::new(&build(0.0)), 0.0);
+    let p = build(0.3);
+    let soft = cpu().render(&Compiled::new(&p), 0.0);
+    // Where the sharp frame shows the floor, the defocused one must not show pegs.
+    let floor: Vec<(u32, u32)> = (0..180u32).flat_map(|y| (0..320u32).map(move |x| (x, y))).filter(|&(x, y)| {
+        let c = px(&sharp, x, y);
+        c[1] as i32 > c[0] as i32 + 30
+    }).collect();
+    let white = floor.iter().filter(|&&(x, y)| px(&soft, x, y)[..3].iter().all(|&v| v > 170)).count();
+    assert!(floor.len() > 2000, "the floor is in frame: {}", floor.len());
+    assert!(white * 50 < floor.len(), "pegs painted over the floor: {white} of {} floor pixels", floor.len());
     assert_gpu_matches_cpu(&p, &[0.0]);
 }
 

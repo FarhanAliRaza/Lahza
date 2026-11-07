@@ -360,6 +360,9 @@ pub struct Compiled {
     /// Problems found while compiling; a project with errors still
     /// evaluates (bad properties keep their initial value).
     pub errors: Vec<String>,
+    /// Declared roles, facings and allowed checks by layer id (components
+    /// expanded), for `check`.
+    pub intents: HashMap<Arc<str>, crate::check::Intent>,
 }
 
 #[derive(Clone, Debug)]
@@ -1440,7 +1443,8 @@ impl Compiled {
         }
         let Compiler { errors, syncs, mut events, .. } = c;
         events.sort_by(|a, b| a.t.total_cmp(&b.t));
-        Compiled { settings: project.settings.clone(), base, scenes, syncs, events, errors }
+        let intents = crate::check::intents(&project.scenes);
+        Compiled { settings: project.settings.clone(), base, scenes, syncs, events, errors, intents }
     }
 
     pub fn fps(&self) -> Fps {
@@ -1997,8 +2001,10 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
         .collect();
     let mut effects = effects;
     // Depth of field blurs each 3D layer by its distance from the focus
-    // plane (comps pass it on to their children instead).
-    if let (true, Some(dof), false) = (three_d, space.dof, matches!(l.kind, CKind::Comp(_))) {
+    // plane. Comps and instancers pass it on to their children and copies
+    // instead: blurring the whole group would draw it as one picture,
+    // outside the mesh depth test, at one depth for every copy.
+    if let (true, Some(dof), false) = (three_d, space.dof, matches!(l.kind, CKind::Comp(_) | CKind::Instancer(_))) {
         // A thin lens: per_px of blur per px of depth near the focus plane,
         // levelling off far away (σ = per_px · f² · |1/f − 1/z|).
         let z = view_depth(space, world);

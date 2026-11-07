@@ -389,6 +389,15 @@ than real time. Measured reference: a CPU prototype rendered a 16.3 s flat
 ident at 60 fps with 5× motion blur in 27 s; the GPU path should be well
 under that.
 
+### 9.1 Incremental rendering
+
+Renders reuse work whose inputs did not change, like an incremental compiler:
+frames, then render passes (mesh pass, isolated groups), then upstream stages
+(Blender, audio mix) are cached by a hash of all their inputs, so an edit
+re-renders only the frames and passes it affects. Correctness rests on the
+keys being complete, not on tracking edits. Full plan with phases and
+acceptance: `notes/MOTION_INCREMENTAL_RENDER_PLAN.md`.
+
 ## 10. Quality loop
 
 1. Visual script approved.
