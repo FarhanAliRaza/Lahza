@@ -135,9 +135,7 @@ def glass():
     """Liquid glass: clear, dispersive shapes sliding over live, coloured type."""
     return {
         "background": "#101018",
-        # The standard curve leaves colours under 0.8 alone: the type and
-        # the wash behind the glass keep their exact colours.
-        "look": {"tone": "standard"},
+        "look": {"tone": "agx"},
         "camera": {"fov": 34, "orbit": lin((0, [-6, 2]), (10, [6, -2]))},
         "environment": {"preset": "studio", "intensity": 1.0},
         "lights": [{"type": "area", "position": [CX - 300, -200, -900], "size": [900, 500], "intensity": 1.4},
@@ -176,7 +174,7 @@ def type_():
     rings = [(360, 24, "#ff5a1f", 72, 0), (430, 18, "#e9edf5", 64, 60), (300, 16, "#3d6bff", 80, 120)]
     return {
         "background": "#07080f",
-        "look": {"tone": "standard", "bloom": {"threshold": 0.95, "radius": 26, "intensity": 0.4}},
+        "look": {"tone": "agx", "bloom": {"threshold": 0.95, "radius": 26, "intensity": 0.4}},
         "camera": {"fov": 34, "orbit": keys((0, [-24, 14]), (10, [18, -6]), ease="linear"), "aperture": 0.8},
         "environment": {"preset": "studio", "intensity": 0.9},
         "lights": [{"type": "area", "position": [-200, 0, -900], "size": [800, 600], "intensity": 1.3},
@@ -396,11 +394,11 @@ def screen():
     heart = ("M 0 90 C -40 60 -150 -10 -150 -80 C -150 -150 -60 -180 0 -110 C 60 -180 150 -150 150 -80 C 150 -10 40 60 0 90 Z")
     return {
         "background": "#0d0d10",
-        "look": {"tone": "standard"},
+        "look": {"tone": "agx"},
         "camera": {"fov": 34, "orbit": keys((0, [0, 0]), (2.0, [0, 0]), (4.0, [-16, 10], "glide"), (10, [14, 6], "glide")),
                    "dolly": keys((0, 0), (4, -500), (10, -400))},
         "environment": {"preset": "studio", "intensity": 0.9},
-        "lights": [{"type": "area", "position": [-200, 200, -1200], "size": [900, 700], "intensity": 1.4},
+        "lights": [{"type": "area", "position": [-200, 200, -1200], "size": [260, 260], "intensity": 1.4, "shadow": True},
                    {"type": "directional", "from": [-0.5, -1, -0.9], "intensity": 0.6, "softness": 0.4}],
         "layers": [
             {"id": "rec", "kind": "video", "src": "assets/screen-feed.mp4", "three_d": True, "transform": {"position": [CX, CY]}},
