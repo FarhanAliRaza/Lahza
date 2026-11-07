@@ -1976,10 +1976,22 @@ impl Studio {
         request.noise_reduction = self.video_noise_reduction;
         request.audio_mode = Some(self.video_audio_mode);
         request.audio_clips = self.video_audio_clips.iter().cloned().map(|clip| (session.directory.join(&clip.file), clip)).collect();
+        request.audio_clips.extend(self.motion_piece_audio());
         request.recording_duration = Some(self.video_recording_duration);
         request.overlay = self.annotation_overlay_source();
         request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(
             self.annotations.clone(), self.selected_canvas_ratio() as f64);
+        // Motion pieces render at export size under the canvas annotations.
+        if let Some(pieces) = self.motion_pieces.as_ref() {
+            request.canvas_overlay = pieces.export_canvas_overlay(request.canvas_overlay.take(), self.export_canvas_height(), self.selected_canvas_ratio() as f64);
+            // Over-the-video pieces in the recording's space (long side
+            // capped; the compositor resamples the layer).
+            if let Some((w, h)) = self.media_dimensions() {
+                let s = (2560.0 / w.max(h) as f64).min(1.0);
+                let media = (((w as f64 * s).round() as u32).max(2), ((h as f64 * s).round() as u32).max(2));
+                request.overlay = pieces.export_media_overlay(request.overlay.take(), media);
+            }
+        }
         request.studio_overlays = Some((*self.studio_overlays()).clone());
         let source = SceneSource::Video {
             media: Self::media_source_for(&session),

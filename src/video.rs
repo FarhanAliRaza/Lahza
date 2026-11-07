@@ -1050,8 +1050,9 @@ impl Studio {
         let audio_mode = self.video_audio_mode;
         let audio_control = ProcessingControl::default();
         self.video_audio_playback_control = Some(audio_control.clone());
-        let audio_clips = self.video_project.as_ref().map(|session| self.video_audio_clips.iter().cloned()
+        let mut audio_clips: Vec<_> = self.video_project.as_ref().map(|session| self.video_audio_clips.iter().cloned()
             .map(|clip| (session.directory.join(&clip.file), clip)).collect()).unwrap_or_default();
+        audio_clips.extend(self.motion_piece_audio());
         let generation = self.video_playback_generation.clone();
         let token = generation.fetch_add(1, Ordering::SeqCst) + 1;
         let receiver = PlaybackMailbox::default();

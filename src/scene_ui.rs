@@ -1284,6 +1284,12 @@ impl Studio {
         } else {
             None
         };
+        // Motion pieces placed over the video join the media layer, under
+        // the annotations, so zooms and camera moves carry them too.
+        let overlay = match self.motion_pieces.as_mut() {
+            Some(pieces) => pieces.media_overlay(time, overlay),
+            None => overlay,
+        };
         let temporal_overlay = motion.as_ref().filter(|plan| plan.samples.len() > 1)
             .and_then(|_| {
                 let marks:Vec<_> = self.annotations.iter().chain(self.annotation_draft.iter())
@@ -2189,6 +2195,7 @@ impl Studio {
     ) -> AnyElement {
         let canvas_annotations = self.canvas_annotation_marks();
         let media_visible = self.image_visible_at(self.timeline_display_time());
+        let piece_frames = self.motion_piece_frames((f32::from(canvas_width) as f64, f32::from(canvas_height) as f64));
         let image = self.scene_preview_image(canvas_width, canvas_height);
         self.watch_scene_preview(cx);
         let bounds_store = self.scene_canvas_bounds.clone();
@@ -2262,6 +2269,13 @@ impl Studio {
                         .object_fit(ObjectFit::Fill),
                 )
             })
+            // Motion pieces: canvas-space, over the scene, under annotations.
+            .children(piece_frames.into_iter().map(|(frame, placement)| {
+                img(frame).absolute().inset_0().size_full().object_fit(match placement {
+                    lahza_motion_core::recording::Placement::Full => ObjectFit::Cover,
+                    lahza_motion_core::recording::Placement::Overlay => ObjectFit::Contain,
+                })
+            }))
             .child(
                 canvas(
                     // The hitbox lets occluding overlays (dialogs) shadow the

@@ -36,6 +36,9 @@ impl super::Context {
             crate::Memory::Upload => {
                 gpu_alloc::UsageFlags::HOST_ACCESS | gpu_alloc::UsageFlags::UPLOAD
             }
+            crate::Memory::Download => {
+                gpu_alloc::UsageFlags::HOST_ACCESS | gpu_alloc::UsageFlags::DOWNLOAD
+            }
         };
         let memory_types = requirements.memory_type_bits & manager.valid_ash_memory_types;
         let mut block = match memory {
@@ -131,7 +134,7 @@ impl super::Context {
                 ptr as *mut u8
             }
             crate::Memory::Device | crate::Memory::External(_) => ptr::null_mut(),
-            crate::Memory::Shared | crate::Memory::Upload => unsafe {
+            crate::Memory::Shared | crate::Memory::Upload | crate::Memory::Download => unsafe {
                 block
                     .map(
                         AshMemoryDevice::wrap(&self.device.core),
