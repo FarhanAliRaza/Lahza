@@ -1570,6 +1570,9 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     // Inside a volume, and its material row.
     var in_vol = false;
     var vol = 0u;
+    // The step whose surface gives the denoiser its guides: the first one
+    // the camera sees (a shadow catcher is looked through).
+    var guide = 0u;
     for (var step = 0u; step < bounces + 16u; step++) {
         let h = cast_ray(o, d, 1e30, rng);
         if in_vol {
@@ -1623,13 +1626,13 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             return out;
         }
         if inside { throughput *= exp(-sigma * h.t); }
-        if step == 0u { out.depth = h.t; out.normal = h.n; out.prev = h.prev; }
+        if step == guide { out.depth = h.t; out.normal = h.n; out.prev = h.prev; }
         if h.card {
             let c = h.card_color;
             let straight = vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
             out.color += throughput * straight;
             out.alpha = 1.0;
-            if step == 0u { out.albedo = straight; }
+            if step == guide { out.albedo = straight; }
             return out;
         }
         let m0 = b_mat[h.mat];
@@ -1640,20 +1643,22 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         let v = -d;
         if (flags & FLAG_VOLUME) != 0u {
             // A volume's boundary: entering or leaving its medium.
-            if step == 0u { out.albedo = vec3<f32>(1.0); }
+            if step == guide { out.albedo = vec3<f32>(1.0); }
             in_vol = h.front;
             vol = h.mat;
             o = offset(h, d);
             continue;
         }
-        if step == 0u { out.albedo = m0.xyz; }
+        if step == guide { out.albedo = m0.xyz; }
         if (flags & FLAG_SHADOW_CATCHER) != 0u {
             if through {
-                // Only the shadows: their darkness is this sample's coverage.
+                // Only the shadows: their darkness covers what is behind
+                // (cards, meshes) or, over nothing, is the coverage.
                 let a = catcher_shadow(h, rng) * m0.w;
                 out.color += throughput * m0.xyz * a;
-                out.alpha = a;
-                return out;
+                out.alpha = max(out.alpha, a);
+                throughput *= 1.0 - a;
+                if step == guide { guide = step + 1u; }
             }
             o = offset(h, d);
             continue;
@@ -1681,7 +1686,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         out.alpha = 1.0;
         out.color += throughput * m2.xyz;
         var s = surface(h, v);
-        if step == 0u { out.albedo = s.albedo; }
+        if step == guide { out.albedo = s.albedo; }
         // Glass: a dielectric boundary (rough: on a visible microfacet),
         // reflecting or refracting by exact Fresnel.
         if s.trans > 0.0 && rnd(rng) < s.trans {

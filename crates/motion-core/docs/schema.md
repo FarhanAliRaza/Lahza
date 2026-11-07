@@ -429,7 +429,9 @@ behind are seen bent through it (by `ior` and `thickness`), tinted by its
 colour, blurred by its `roughness` (frosted glass). The `shadow` preset is
 invisible except for the shadows falling on it (`color` tints them,
 `opacity` is their strength): a `plane` with it drops meshes' shadows onto
-2D backgrounds.
+2D backgrounds, or, just in front of footage or another flat 3D layer in
+the same list, onto that layer (a 3D object casting its shadow on a screen
+recording).
 
 Depth: mesh layers in the same layer list hide each other where nearer,
 also when one has effects, a matte or depth of field. Meshes that let

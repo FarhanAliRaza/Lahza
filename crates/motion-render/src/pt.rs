@@ -1620,6 +1620,31 @@ mod physics_tests {
         assert!(inside[1] > outside[1] + 20.0, "lit haze shows: {inside:?} vs {outside:?}");
     }
 
+    /// A shadow catcher in front of a card (footage, a shape) lets the card
+    /// show and darkens it only where a mesh's shadow falls; it used to end
+    /// every path, drawing the card black.
+    #[test]
+    fn a_shadow_catcher_shows_the_card_behind_it() {
+        let Some(mut r) = tracer(64) else { return };
+        let mut p = project(json!([
+            {"id": "card", "kind": "shape", "shape": "rect", "size": [300, 170], "fill": "#d02020", "three_d": true, "transform": {"position": [160, 90]}},
+            {"id": "catch", "kind": "mesh", "mesh": {"type": "plane", "size": [300, 170]}, "material": {"preset": "shadow", "opacity": 0.8},
+             "transform": {"position": [160, 90], "z": -2}},
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"preset": "matte", "color": "#ffffff"},
+             "transform": {"position": [90, 90], "z": -120}}
+        ]));
+        p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0, 0, -1], "softness": 0, "shadow": true}])).unwrap();
+        let img = r.render(&Compiled::new(&p), 0.0);
+        let open = disc(&img, 250.0, 90.0, 0.0, 12.0, |_, _| true);
+        assert!(open[0] > 140.0 && open[1] < 70.0, "the card shows through the catcher: {open:?}");
+        // The light shines straight away from the camera: the shadow lies
+        // behind the ball at x 90 on the card, while the much nearer ball
+        // is seen further left (x ≈ 25).
+        let shade = disc(&img, 100.0, 90.0, 0.0, 12.0, |_, _| true);
+        let lit = disc(&img, 210.0, 90.0, 0.0, 10.0, |_, _| true);
+        assert!(shade[0] < lit[0] * 0.75, "the shadow darkens the card: {shade:?} vs {lit:?}");
+    }
+
     /// Lists with what the tracer can't draw yet (wires, effects such as
     /// depth of field, mattes, blend modes) keep the raster's picture.
     #[test]
