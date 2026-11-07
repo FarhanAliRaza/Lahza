@@ -1338,10 +1338,15 @@ struct Sample {
     normal: vec3<f32>,
     depth: f32,
     prev: vec3<f32>,
-    // Flat colour (cards, unlit materials) the camera sees straight on or
-    // through clear layers, premultiplied: it skips the look (tone curve,
-    // exposure), as in the raster, so it is kept apart from `color`.
+    // Flat colour (cards, unlit materials) the camera sees first (a shadow
+    // catcher is looked through), premultiplied: it skips the look (tone
+    // curve, exposure), as in the raster, so it is kept apart from `color`;
+    // seen through glass it is lit picture, denoised with the rest.
     flat: vec3<f32>,
+    // How much of the flat colour shadow catchers in front let through
+    // (1: none in the way); denoised apart from it, so a soft shadow on
+    // footage is smooth while the footage keeps its exact colour.
+    vis: f32,
 }
 
 // A plain diffuse surface facing n (albedo 1): where a subsurface walk
@@ -1553,6 +1558,7 @@ fn sss_walk(h_in: Hit, n_in: vec3<f32>, base: vec3<f32>, rng: ptr<function, Rng>
 
 fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     var out: Sample;
+    out.vis = 1.0;
     var o = o_in;
     var d = d_in;
     var throughput = vec3<f32>(1.0);
@@ -1644,7 +1650,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         if h.card {
             let c = h.card_color;
             let straight = vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
-            if through { out.flat += throughput * straight; } else { out.color += throughput * straight; }
+            if step == guide { out.flat += straight; } else { out.color += throughput * straight; }
             out.alpha = 1.0;
             if step == guide { out.albedo = straight; }
             return out;
@@ -1672,7 +1678,10 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
                 out.color += throughput * m0.xyz * a;
                 out.alpha = max(out.alpha, a);
                 throughput *= 1.0 - a;
-                if step == guide { guide = step + 1u; }
+                if step == guide {
+                    guide = step + 1u;
+                    out.vis *= 1.0 - a;
+                }
             }
             o = offset(h, d);
             continue;
@@ -1693,7 +1702,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             continue;
         }
         if (flags & FLAG_UNLIT) != 0u {
-            if through { out.flat += throughput * (m0.xyz + m2.xyz); } else { out.color += throughput * (m0.xyz + m2.xyz); }
+            if step == guide { out.flat += m0.xyz + m2.xyz; } else { out.color += throughput * (m0.xyz + m2.xyz); }
             out.alpha = 1.0;
             return out;
         }
@@ -1834,6 +1843,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     var camz = 0.0;
     var prev = vec4<f32>(0.0);
     var flat = vec3<f32>(0.0);
+    var vis = 0.0;
     for (var s = 0u; s < spp; s++) {
         // A point in the texel (stratified jitter), target → canvas → ray.
         let jx = (f32(s % 4u) + rnd(&rng)) / 4.0;
@@ -1855,6 +1865,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let smp = path(origin, dir, &rng);
         color += smp.color;
         flat += smp.flat;
+        vis += smp.vis;
         alpha += smp.alpha;
         let l = luminance(smp.color);
         m1 += l;
@@ -1880,6 +1891,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = f32(spp);
     color /= n;
     flat /= n;
+    vis /= n;
     alpha /= n;
     let i = py * w + id.x;
     // Guides: what the samples hit, on average.
@@ -1913,7 +1925,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let var_l = max(m2 / n - (m1 / n) * (m1 / n), 0.0) / n;
     let al = max(luminance(a), 0.02);
     b_hdr[i * 2u] = vec4<f32>(straight / a, alpha);
-    b_hdr[i * 2u + 1u] = vec4<f32>(var_l / (al * al) / max(alpha * alpha, 1e-4), blur, 0.0, 0.0);
+    b_hdr[i * 2u + 1u] = vec4<f32>(var_l / (al * al) / max(alpha * alpha, 1e-4), blur, vis, 0.0);
 }
 
 // Temporal accumulation: last frame's lighting at where this surface was
@@ -1969,7 +1981,7 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     b_tmp[i * 2u] = vec4<f32>(out, c.w);
-    b_tmp[i * 2u + 1u] = vec4<f32>(var_o, b_hdr[i * 2u + 1u].y, 0.0, 0.0);
+    b_tmp[i * 2u + 1u] = vec4<f32>(var_o, b_hdr[i * 2u + 1u].y, b_hdr[i * 2u + 1u].z, 0.0);
     var seen = frames;
     if c.w <= 0.0 { seen = 0.0; }
     b_next[i * 3u] = vec4<f32>(out, c.w);
@@ -2003,6 +2015,7 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
     var sum = vec3<f32>(0.0);
     var wsum = 0.0;
     var vsum = 0.0;
+    var zsum = 0.0;
     for (var dy = -2; dy <= 2; dy++) {
         for (var dx = -2; dx <= 2; dx++) {
             let x = i32(id.x) + dx * step;
@@ -2020,10 +2033,15 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
             sum += q.xyz * wt;
             wsum += wt;
             vsum += wt * wt * b_hdr[j * 2u + 1u].x;
+            zsum += wt * b_hdr[j * 2u + 1u].z;
         }
     }
-    b_tmp[i * 2u] = vec4<f32>(sum / max(wsum, 1e-8), c.w);
-    b_tmp[i * 2u + 1u] = vec4<f32>(vsum / max(wsum * wsum, 1e-12), blur, 0.0, 0.0);
+    // denoise.w: the lighting is denoised already (OIDN); only smooth
+    // the shadow catchers' visibility.
+    var lighting = sum / max(wsum, 1e-8);
+    if u.denoise.w == 1u { lighting = c.xyz; }
+    b_tmp[i * 2u] = vec4<f32>(lighting, c.w);
+    b_tmp[i * 2u + 1u] = vec4<f32>(vsum / max(wsum * wsum, 1e-12), blur, zsum / max(wsum, 1e-8), 0.0);
 }
 
 // The picture: lighting × albedo × coverage, tone-mapped as the raster,
@@ -2038,7 +2056,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let alpha = c.w;
     let color = c.xyz * b_guides[i * 4u].xyz * alpha;
     // Cards and unlit materials seen directly: not tone-mapped.
-    let flat = b_guides[i * 4u + 2u].yzw;
+    let flat = b_guides[i * 4u + 2u].yzw * b_hdr[i * 2u + 1u].z;
     // Highlights on glass over nothing still need coverage to show.
     let lit = color + flat;
     let peak = min(max(lit.x, max(lit.y, lit.z)), 1.0);

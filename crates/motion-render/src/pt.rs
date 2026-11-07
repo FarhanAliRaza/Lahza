@@ -569,7 +569,7 @@ impl Tracer {
             let b = self.transient(context, "trace no history", &[0u8; 16]);
             (b, b, ([0.0; 4], [0.0; 4], [[0.0; 4]; 3]))
         };
-        let data = |step: u32, row: u32, read: gpu::Buffer, write: gpu::Buffer| TraceData {
+        let data = |step: u32, row: u32, mode: u32, read: gpu::Buffer, write: gpu::Buffer| TraceData {
             u: Uniforms {
                 size: [size.0, size.1, offset, t.options.spp.max(1)],
                 opts: [t.options.bounces.max(1), t.seed, CARD_INSTANCE, t.cards.len() as u32],
@@ -578,7 +578,7 @@ impl Tracer {
                 root: r(&t.root),
                 inv_root: r(&t.inv_root),
                 lens: [t.lens[0], t.lens[1], 0.0, 0.0],
-                denoise: [step, t.options.temporal as u32, row, 0],
+                denoise: [step, t.options.temporal as u32, row, mode],
                 prev_cam: prev.0,
                 prev_place: prev.1,
                 prev_root: prev.2,
@@ -612,7 +612,7 @@ impl Tracer {
             let mut y = 0;
             while y < size.1 {
                 let band = rows.min(size.1 - y);
-                pc.bind(0, &data(0, y, hdr[0], hdr[1]));
+                pc.bind(0, &data(0, y, 0, hdr[0], hdr[1]));
                 pc.dispatch([size.0.div_ceil(8), band.div_ceil(8), 1]);
                 y += band;
             }
@@ -621,22 +621,25 @@ impl Tracer {
         if t.options.temporal {
             let mut pass = encoder.compute("trace temporal");
             let mut pc = pass.with(&self.temporal);
-            pc.bind(0, &data(0, 0, hdr[0], hdr[1]));
+            pc.bind(0, &data(0, 0, 0, hdr[0], hdr[1]));
             pc.dispatch(groups_x);
             current = 1;
         }
-        if t.options.denoise && !self.oidn_denoise(context, encoder, size, hdr[current], guides) {
+        if t.options.denoise {
+            // With OIDN the à-trous passes still smooth the shadow
+            // catchers' visibility (mode 1), leaving OIDN's colour alone.
+            let mode = self.oidn_denoise(context, encoder, size, hdr[current], guides) as u32;
             for k in 0..DENOISE_PASSES {
                 let mut pass = encoder.compute("trace denoise");
                 let mut pc = pass.with(&self.atrous);
-                pc.bind(0, &data(1 << k, 0, hdr[current], hdr[1 - current]));
+                pc.bind(0, &data(1 << k, 0, mode, hdr[current], hdr[1 - current]));
                 pc.dispatch(groups_x);
                 current = 1 - current;
             }
         }
         let mut pass = encoder.compute("trace resolve");
         let mut pc = pass.with(&self.resolve);
-        pc.bind(0, &data(0, 0, hdr[current], hdr[1 - current]));
+        pc.bind(0, &data(0, 0, 0, hdr[current], hdr[1 - current]));
         pc.dispatch(groups_x);
     }
 
@@ -1765,6 +1768,39 @@ mod physics_tests {
         // path gathering single scattering; what is left is light scattered
         // more than once, for the denoiser.
         assert!(sd < 0.3 * mean, "noise {sd:.1} on a mean of {mean:.1}");
+    }
+
+    /// A soft shadow a catcher casts onto a card is denoised like the rest:
+    /// the card keeps its exact colour and only how much light reaches it
+    /// is filtered (it was left raw, speckled at export sample counts).
+    #[test]
+    fn soft_shadows_on_a_card_are_smooth_at_few_samples() {
+        let scene = || {
+            let mut p = project(json!([
+                {"id": "card", "kind": "shape", "shape": "rect", "size": [320, 180], "fill": "#e8e8e8", "three_d": true, "transform": {"position": [160, 90]}},
+                {"id": "catch", "kind": "mesh", "mesh": {"type": "plane", "size": [320, 180]}, "material": {"preset": "shadow", "opacity": 0.8},
+                 "transform": {"position": [160, 90], "z": -2}},
+                {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 40}, "material": {"preset": "matte"},
+                 "transform": {"position": [160, 90], "z": -90}}
+            ]));
+            p.scenes[0].lights = serde_json::from_value(json!([{"type": "area", "position": [100, 20, -400], "aim": [160, 90, 0], "size": [260, 260], "shadow": true}])).unwrap();
+            Compiled::new(&p)
+        };
+        // Pixel-to-pixel change beside the ball, across its soft shadow.
+        let grain = |img: &image::RgbaImage| {
+            let (mut sum, mut n) = (0.0, 0.0);
+            for y in 60..150 {
+                for x in 200..300 {
+                    sum += (img.get_pixel(x, y).0[1] as f64 - img.get_pixel(x + 1, y).0[1] as f64).abs();
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+        let Some(mut reference) = tracer(256) else { return };
+        let Some(mut r) = tracer(4) else { return };
+        let (want, got) = (grain(&reference.render(&scene(), 0.0)), grain(&r.render(&scene(), 0.0)));
+        assert!(got < want * 2.5 + 1.0, "grain {got:.2} at 4 paths, {want:.2} at 256");
     }
 
     /// Lists with what the tracer can't draw yet (wires, effects such as
