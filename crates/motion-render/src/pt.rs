@@ -1593,6 +1593,27 @@ mod physics_tests {
         }
     }
 
+    /// The look (tone curve, exposure) is for lit meshes: flat cards and
+    /// unlit materials keep their exact colours, traced as rasterised.
+    #[test]
+    fn traced_cards_and_unlit_meshes_keep_their_colours_under_the_look() {
+        let Some(mut r) = tracer(16) else { return };
+        let mut p = project(json!([
+            {"id": "card", "kind": "shape", "shape": "rect", "size": [120, 120], "fill": "#e02828", "three_d": true, "transform": {"position": [90, 90]}},
+            {"id": "flat", "kind": "mesh", "mesh": {"type": "sphere", "radius": 50}, "material": {"preset": "flat", "color": "#2860e0"},
+             "transform": {"position": [235, 90]}}
+        ]));
+        p.scenes[0].look = Some(serde_json::from_value(json!({"tone": "agx", "exposure": 1.0})).unwrap());
+        let c = Compiled::new(&p);
+        let (a, b) = (r.render(&c, 0.0), cpu().render(&c, 0.0));
+        for (x, what) in [(90.0, "card"), (235.0, "unlit sphere")] {
+            let (ma, mb) = (disc(&a, x, 90.0, 0.0, 30.0, |_, _| true), disc(&b, x, 90.0, 0.0, 30.0, |_, _| true));
+            for k in 0..3 {
+                assert!((ma[k] - mb[k]).abs() < 4.0, "{what}: traced {ma:?}, raster {mb:?}");
+            }
+        }
+    }
+
     /// Volumes, traced: a glowing beam (no scattering) gives off what the
     /// raster's estimate gives (the same integral), and a lit box of haze
     /// scatters light toward the camera.

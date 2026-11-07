@@ -494,8 +494,9 @@ content becomes the picture: `{"tone": "standard" (default soft shoulder)
 colours desaturate toward white like film), "exposure": stops (animatable),
 "bloom": {"threshold": 0.8 (display brightness), "radius": 24 px,
 "intensity": 0.8}}` (bloom values animatable). Tone mapping applies to
-lit meshes (raster and path tracer alike); flat 2D layers and unlit
-materials keep their exact colours. Bloom blurs what is brighter than the
+lit meshes (raster and path tracer alike); flat 2D layers, flat 3D
+layers among meshes (cards: footage, type, shapes) and unlit materials
+keep their exact colours. Bloom blurs what is brighter than the
 threshold across the whole scene (2D layers too) and adds it on top.
 
 Scenes light meshes with `lights` and `environment`:

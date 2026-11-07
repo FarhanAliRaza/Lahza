@@ -1338,6 +1338,10 @@ struct Sample {
     normal: vec3<f32>,
     depth: f32,
     prev: vec3<f32>,
+    // Flat colour (cards, unlit materials) the camera sees straight on or
+    // through clear layers, premultiplied: it skips the look (tone curve,
+    // exposure), as in the raster, so it is kept apart from `color`.
+    flat: vec3<f32>,
 }
 
 // A plain diffuse surface facing n (albedo 1): where a subsurface walk
@@ -1630,7 +1634,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         if h.card {
             let c = h.card_color;
             let straight = vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
-            out.color += throughput * straight;
+            if through { out.flat += throughput * straight; } else { out.color += throughput * straight; }
             out.alpha = 1.0;
             if step == guide { out.albedo = straight; }
             return out;
@@ -1679,7 +1683,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             continue;
         }
         if (flags & FLAG_UNLIT) != 0u {
-            out.color += throughput * (m0.xyz + m2.xyz);
+            if through { out.flat += throughput * (m0.xyz + m2.xyz); } else { out.color += throughput * (m0.xyz + m2.xyz); }
             out.alpha = 1.0;
             return out;
         }
@@ -1816,6 +1820,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     var m2 = 0.0;
     var camz = 0.0;
     var prev = vec4<f32>(0.0);
+    var flat = vec3<f32>(0.0);
     for (var s = 0u; s < spp; s++) {
         // A point in the texel (stratified jitter), target → canvas → ray.
         let jx = (f32(s % 4u) + rnd(&rng)) / 4.0;
@@ -1836,6 +1841,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let smp = path(origin, dir, &rng);
         color += smp.color;
+        flat += smp.flat;
         alpha += smp.alpha;
         let l = luminance(smp.color);
         m1 += l;
@@ -1860,6 +1866,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let n = f32(spp);
     color /= n;
+    flat /= n;
     alpha /= n;
     let i = id.y * w + id.x;
     // Guides: what the samples hit, on average.
@@ -1871,7 +1878,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     b_guides[i * 4u] = vec4<f32>(a, alpha);
     b_guides[i * 4u + 1u] = vec4<f32>(normal, camz);
-    b_guides[i * 4u + 2u] = vec4<f32>(depth, 0.0, 0.0, 0.0);
+    b_guides[i * 4u + 2u] = vec4<f32>(depth, flat);
     b_guides[i * 4u + 3u] = prev;
     // The lighting, straight (not times coverage) and with the surface's
     // colour divided out, so the filter smooths light, not texture.
@@ -2006,15 +2013,17 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let c = b_hdr[i * 2u];
     let alpha = c.w;
     let color = c.xyz * b_guides[i * 4u].xyz * alpha;
+    // Cards and unlit materials seen directly: not tone-mapped.
+    let flat = b_guides[i * 4u + 2u].yzw;
     // Highlights on glass over nothing still need coverage to show.
-    let peak = min(max(color.x, max(color.y, color.z)), 1.0);
+    let lit = color + flat;
+    let peak = min(max(lit.x, max(lit.y, lit.z)), 1.0);
     let a = max(alpha, peak);
     var out = vec4<f32>(0.0);
     if a > 0.0 {
-        let straight = color / a;
         var e = b_light[1].w;
         if e <= 0.0 { e = 1.0; }
-        let tm = tone_curve(straight * e, u32(b_light[2].w));
+        let tm = (tone_curve(color / a * e, u32(b_light[2].w)) * a + flat) / a;
         out = vec4<f32>(encode(tm.x) * a, encode(tm.y) * a, encode(tm.z) * a, a);
     }
     b_groups[u.size.z + i] = out;
