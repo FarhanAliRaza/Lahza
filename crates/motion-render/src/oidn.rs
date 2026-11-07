@@ -4,7 +4,8 @@
 //! `lib/` folder. Its "RT" filter is trained on path-traced renders: it
 //! denoises the full colour guided by albedo and normal, so the grain of
 //! depth of field and other noise in the surface colour goes too (the
-//! à-trous filter only smooths the light and keeps that grain as texture).
+//! à-trous filter smooths the light, and the whole colour only where the
+//! lens blurs by more than a texel).
 //! OIDN picks its fastest device itself (CUDA on NVIDIA, else the CPU).
 
 use std::ffi::{c_char, c_void, CStr, CString};

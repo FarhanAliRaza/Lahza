@@ -474,7 +474,8 @@ costs no more than a still frame. A denoiser cleans the picture: Intel
 Open Image Denoise, as in Blender's Cycles, where it is installed (Lahza
 finds the copy Blender ships, or `$LAHZA_OIDN`; it runs on CUDA on NVIDIA),
 which also removes depth of field's grain, else an edge-aware à-trous
-filter of the lighting (`LAHZA_DENOISER=builtin` forces it; the render's
+filter of the lighting (of the whole colour where the lens blurs, so
+defocused areas are smooth too; `LAHZA_DENOISER=builtin` forces it; the render's
 warnings say when it was used), so a few samples per pixel give a clean
 frame (`--no-denoise` / `denoise: false` to see the raw samples); in an
 export each frame also builds on the previous ones, reprojected along

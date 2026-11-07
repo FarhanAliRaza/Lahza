@@ -1666,6 +1666,39 @@ mod physics_tests {
         assert!(shade[0] < lit[0] * 0.75, "the shadow darkens the card: {shade:?} vs {lit:?}");
     }
 
+    /// Out of focus, a textured surface is a smooth blur at a few samples:
+    /// the built-in denoiser filters the whole colour where a pixel's
+    /// samples saw different colours, instead of keeping their average as
+    /// if it were texture (which left defocused areas grainy).
+    #[test]
+    fn defocused_texture_is_smooth_at_few_samples() {
+        let scene = || {
+            let mut p = project(json!([{"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 600]},
+                "material": {"preset": "matte", "color": "#f0e0c0", "noise": {"type": "cellular", "scale": 10, "color": "#202a80"}},
+                "transform": {"position": [160, 90], "z": 500}}]));
+            p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0, 0, -1], "intensity": 1.2, "shadow": false}])).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+            p.scenes[0].camera = serde_json::from_value(json!({"aperture": 6, "focus": 0})).unwrap();
+            Compiled::new(&p)
+        };
+        // Pixel-to-pixel change: grain, where the blur should be smooth.
+        let grain = |img: &image::RgbaImage| {
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for y in 40..140 {
+                for x in 60..260 {
+                    sum += (img.get_pixel(x, y).0[1] as f64 - img.get_pixel(x + 1, y).0[1] as f64).abs();
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+        let Some(mut reference) = tracer(256) else { return };
+        let Some(mut r) = tracer(8) else { return };
+        let (want, got) = (grain(&reference.render(&scene(), 0.0)), grain(&r.render(&scene(), 0.0)));
+        assert!(got < want * 2.5 + 1.0, "grain {got:.2} at 8 paths, {want:.2} at 256");
+    }
+
     /// Thin lit haze is smooth at a few samples: every path through it
     /// gathers single-scattered light, not only the few that happen to
     /// scatter (which left bright and dark specks).

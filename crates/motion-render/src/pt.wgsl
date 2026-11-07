@@ -1886,6 +1886,16 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         normal = normalize(normal + vec3<f32>(0.0, 0.0, -1e-6));
         depth /= hits;
     }
+    // Out of focus by more than a texel (the lens's circle of confusion
+    // at this depth): the samples saw a blur of different surfaces, so
+    // their average colour is noise, not texture. Filter the whole colour
+    // there (a white guide) and let the filter reach across the blur.
+    var blur = 0.0;
+    if u.lens.x > 0.0 && camz > 0.0 {
+        let coc = u.cam.x * u.lens.x * abs(camz - u.lens.y) / (camz * max(u.lens.y, 1.0)) / max(u.place.z, 1e-6);
+        blur = clamp(coc - 1.0, 0.0, 1.0);
+    }
+    a = mix(a, vec3<f32>(1.0), blur);
     b_guides[i * 4u] = vec4<f32>(a, alpha);
     b_guides[i * 4u + 1u] = vec4<f32>(normal, camz);
     b_guides[i * 4u + 2u] = vec4<f32>(depth, flat);
@@ -1900,7 +1910,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let var_l = max(m2 / n - (m1 / n) * (m1 / n), 0.0) / n;
     let al = max(luminance(a), 0.02);
     b_hdr[i * 2u] = vec4<f32>(straight / a, alpha);
-    b_hdr[i * 2u + 1u] = vec4<f32>(var_l / (al * al) / max(alpha * alpha, 1e-4), 0.0, 0.0, 0.0);
+    b_hdr[i * 2u + 1u] = vec4<f32>(var_l / (al * al) / max(alpha * alpha, 1e-4), blur, 0.0, 0.0);
 }
 
 // Temporal accumulation: last frame's lighting at where this surface was
@@ -1956,7 +1966,7 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     b_tmp[i * 2u] = vec4<f32>(out, c.w);
-    b_tmp[i * 2u + 1u] = vec4<f32>(var_o, 0.0, 0.0, 0.0);
+    b_tmp[i * 2u + 1u] = vec4<f32>(var_o, b_hdr[i * 2u + 1u].y, 0.0, 0.0);
     var seen = frames;
     if c.w <= 0.0 { seen = 0.0; }
     b_next[i * 3u] = vec4<f32>(out, c.w);
@@ -1975,6 +1985,7 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.y * w + id.x;
     let c = b_hdr[i * 2u];
     let cv = b_hdr[i * 2u + 1u].x;
+    let blur = b_hdr[i * 2u + 1u].y;
     if c.w <= 0.0 {
         b_tmp[i * 2u] = c;
         b_tmp[i * 2u + 1u] = b_hdr[i * 2u + 1u];
@@ -1998,8 +2009,8 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
             let q = b_hdr[j * 2u];
             if q.w <= 0.0 { continue; }
             let k = kern[abs(dx)] * kern[abs(dy)];
-            let wz = exp(-abs(z0 - b_guides[j * 4u + 2u].x) / (0.01 * max(z0, 1.0) * f32(step) + 1.0));
-            let wn = pow(max(dot(n0, b_guides[j * 4u + 1u].xyz), 0.0), 64.0);
+            let wz = exp(-abs(z0 - b_guides[j * 4u + 2u].x) / ((0.01 * max(z0, 1.0) * f32(step) + 1.0) * (1.0 + 30.0 * blur)));
+            let wn = pow(max(dot(n0, b_guides[j * 4u + 1u].xyz), 0.0), mix(64.0, 1.0, blur));
             let wl = exp(-abs(l0 - luminance(q.xyz)) / sigma_l);
             let wa = exp(-abs(c.w - q.w) * 8.0);
             let wt = k * wz * wn * wl * wa;
@@ -2009,7 +2020,7 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     b_tmp[i * 2u] = vec4<f32>(sum / max(wsum, 1e-8), c.w);
-    b_tmp[i * 2u + 1u] = vec4<f32>(vsum / max(wsum * wsum, 1e-12), 0.0, 0.0, 0.0);
+    b_tmp[i * 2u + 1u] = vec4<f32>(vsum / max(wsum * wsum, 1e-12), blur, 0.0, 0.0);
 }
 
 // The picture: lighting × albedo × coverage, tone-mapped as the raster,
