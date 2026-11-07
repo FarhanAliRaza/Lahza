@@ -40,6 +40,17 @@ impl Default for TraceOptions {
     }
 }
 
+/// Paths per trace dispatch, at most (see `band_rows`).
+const PATHS_PER_DISPATCH: u64 = 8 << 20;
+
+/// Rows of a `width`-texel group traced per dispatch at `spp` paths per
+/// texel: whole 8-row workgroups, at most `PATHS_PER_DISPATCH` paths
+/// (one band of 8 rows when even that is more).
+fn band_rows(width: u32, spp: u32) -> u32 {
+    let per_row = width.max(1) as u64 * spp.max(1) as u64;
+    ((PATHS_PER_DISPATCH / per_row) as u32 / 8 * 8).max(8)
+}
+
 /// À-trous passes (steps 1, 2, 4, … px).
 const DENOISE_PASSES: u32 = 5;
 
@@ -558,7 +569,7 @@ impl Tracer {
             let b = self.transient(context, "trace no history", &[0u8; 16]);
             (b, b, ([0.0; 4], [0.0; 4], [[0.0; 4]; 3]))
         };
-        let data = |step: u32, read: gpu::Buffer, write: gpu::Buffer| TraceData {
+        let data = |step: u32, row: u32, read: gpu::Buffer, write: gpu::Buffer| TraceData {
             u: Uniforms {
                 size: [size.0, size.1, offset, t.options.spp.max(1)],
                 opts: [t.options.bounces.max(1), t.seed, CARD_INSTANCE, t.cards.len() as u32],
@@ -567,7 +578,7 @@ impl Tracer {
                 root: r(&t.root),
                 inv_root: r(&t.inv_root),
                 lens: [t.lens[0], t.lens[1], 0.0, 0.0],
-                denoise: [step, t.options.temporal as u32, 0, 0],
+                denoise: [step, t.options.temporal as u32, row, 0],
                 prev_cam: prev.0,
                 prev_place: prev.1,
                 prev_root: prev.2,
@@ -591,16 +602,26 @@ impl Tracer {
         };
         let groups_x = [size.0.div_ceil(8), size.1.div_ceil(8), 1];
         {
+            // In bands of rows, each its own dispatch: one dispatch of every
+            // path of a large frame (64 paths at 1080 x 1920 is 130 million)
+            // crashes Mesa's software Vulkan past ~20 million, and on GPUs
+            // runs long enough to trip a driver's watchdog.
             let mut pass = encoder.compute("trace");
             let mut pc = pass.with(&self.pipeline);
-            pc.bind(0, &data(0, hdr[0], hdr[1]));
-            pc.dispatch(groups_x);
+            let rows = band_rows(size.0, t.options.spp.max(1));
+            let mut y = 0;
+            while y < size.1 {
+                let band = rows.min(size.1 - y);
+                pc.bind(0, &data(0, y, hdr[0], hdr[1]));
+                pc.dispatch([size.0.div_ceil(8), band.div_ceil(8), 1]);
+                y += band;
+            }
         }
         let mut current = 0;
         if t.options.temporal {
             let mut pass = encoder.compute("trace temporal");
             let mut pc = pass.with(&self.temporal);
-            pc.bind(0, &data(0, hdr[0], hdr[1]));
+            pc.bind(0, &data(0, 0, hdr[0], hdr[1]));
             pc.dispatch(groups_x);
             current = 1;
         }
@@ -608,14 +629,14 @@ impl Tracer {
             for k in 0..DENOISE_PASSES {
                 let mut pass = encoder.compute("trace denoise");
                 let mut pc = pass.with(&self.atrous);
-                pc.bind(0, &data(1 << k, hdr[current], hdr[1 - current]));
+                pc.bind(0, &data(1 << k, 0, hdr[current], hdr[1 - current]));
                 pc.dispatch(groups_x);
                 current = 1 - current;
             }
         }
         let mut pass = encoder.compute("trace resolve");
         let mut pc = pass.with(&self.resolve);
-        pc.bind(0, &data(0, hdr[current], hdr[1 - current]));
+        pc.bind(0, &data(0, 0, hdr[current], hdr[1 - current]));
         pc.dispatch(groups_x);
     }
 
@@ -784,6 +805,27 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
     /// hardware ray tracing (NVIDIA) every miss became a hit at t = 0 and
     /// every lit frame came out black. Software Vulkan (CI) can't show it,
     /// so this guards the source.
+    #[test]
+    fn traces_run_in_bounded_bands_of_rows() {
+        for (w, spp) in [(1080, 64), (540, 8), (1920, 1), (8000, 512), (1, 1)] {
+            let rows = band_rows(w, spp);
+            assert!(rows % 8 == 0 && rows >= 8, "{w} x {spp}: {rows}");
+            assert!(rows == 8 || w as u64 * spp as u64 * rows as u64 <= PATHS_PER_DISPATCH, "{w} x {spp}: {rows} rows");
+        }
+        assert!(band_rows(1080, 64) < 1920, "a full-HD frame at 64 paths is split");
+    }
+
+    /// A traced frame gets time in proportion to its paths: a final-quality
+    /// frame on a software GPU took over 30 s, timed out, and its buffers
+    /// were freed while the trace still wrote to them (a crash).
+    #[test]
+    fn traced_frames_get_time_for_their_paths() {
+        use crate::gpu::frame_timeout_ms;
+        assert_eq!(frame_timeout_ms(0), 30_000);
+        assert!(frame_timeout_ms(1080 * 1920 * 64) > 20 * 60_000);
+        assert_eq!(frame_timeout_ms(u64::MAX), u32::MAX);
+    }
+
     #[test]
     fn the_tracer_reads_candidates_only() {
         assert!(SHADER.contains("rayQueryGetCandidateIntersection"));

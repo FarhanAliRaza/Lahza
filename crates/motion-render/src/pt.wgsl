@@ -1816,10 +1816,13 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
 fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let w = u.size.x;
     let h = u.size.y;
-    if id.x >= w || id.y >= h { return; }
+    // Rows come in bands (one dispatch each, see `trace_rows`): this
+    // band starts at row denoise.z.
+    let py = id.y + u.denoise.z;
+    if id.x >= w || py >= h { return; }
     let spp = u.size.w;
     var rng: Rng;
-    rng.s = pcg(id.x + pcg(id.y + pcg(u.opts.y)));
+    rng.s = pcg(id.x + pcg(py + pcg(u.opts.y)));
     var color = vec3<f32>(0.0);
     var alpha = 0.0;
     var albedo = vec3<f32>(0.0);
@@ -1835,7 +1838,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         // A point in the texel (stratified jitter), target → canvas → ray.
         let jx = (f32(s % 4u) + rnd(&rng)) / 4.0;
         let jy = (f32((s / 4u) % 4u) + rnd(&rng)) / 4.0;
-        let tp = vec3<f32>(u.place.x + u.place.z * (f32(id.x) + jx), u.place.y + u.place.w * (f32(id.y) + jy), 1.0);
+        let tp = vec3<f32>(u.place.x + u.place.z * (f32(id.x) + jx), u.place.y + u.place.w * (f32(py) + jy), 1.0);
         let q = vec3<f32>(dot(u.inv0.xyz, tp), dot(u.inv1.xyz, tp), dot(u.inv2.xyz, tp));
         let c = q.xy / q.z;
         var dir = normalize(vec3<f32>((c.x - u.cam.y) / u.cam.x, (c.y - u.cam.z) / u.cam.x, 1.0));
@@ -1878,7 +1881,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     color /= n;
     flat /= n;
     alpha /= n;
-    let i = id.y * w + id.x;
+    let i = py * w + id.x;
     // Guides: what the samples hit, on average.
     var a = vec3<f32>(1.0);
     if hits > 0.0 {

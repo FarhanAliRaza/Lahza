@@ -381,10 +381,13 @@ impl Gpu {
             b_bins: s.bins.device.into(),
             b_target: target.into(),
         };
+        // Paths traced this frame: how long the GPU may take.
+        let mut paths = 0u64;
         for (i, (main, groups)) in targets.iter().enumerate() {
             for g in groups {
                 let t = g.target;
                 if let Some(ti) = g.trace {
+                    paths += t.width as u64 * t.height as u64 * list.traces[ti as usize].options.spp.max(1) as u64;
                     let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
                     tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device, self.images.device);
                     continue;
@@ -453,7 +456,8 @@ impl Gpu {
         self.encoder.transfer("readback").copy_buffer_to_buffer(self.output.device.into(), host.into(), (w * h * 4) as u64);
         let sync = self.context.submit(&mut self.encoder);
         self.pending = Some(sync.clone());
-        if !self.context.wait_for(&sync, 30_000) {
+        if !self.context.wait_for(&sync, frame_timeout_ms(paths)) {
+            // `pending` stays set: dropping this device waits for the work.
             return Err("GPU timed out".into());
         }
         self.pending = None;
@@ -464,10 +468,24 @@ impl Gpu {
     }
 }
 
+/// How long a frame may take on the GPU: 30 s, plus a millisecond per 100
+/// traced paths (a final-quality trace on a software GPU takes minutes; 64
+/// paths at 1080 x 1920 may take 22).
+pub(crate) fn frame_timeout_ms(traced_paths: u64) -> u32 {
+    (30_000 + traced_paths / 100).min(u32::MAX as u64) as u32
+}
+
 impl Drop for Gpu {
     fn drop(&mut self) {
+        // Work still running (a frame that timed out) writes into these
+        // buffers: freeing them under it crashes the process. Wait for it
+        // (a lost device returns at once).
         if let Some(sync) = self.pending.take() {
-            let _ = self.context.wait_for(&sync, 5000);
+            for _ in 0..30 {
+                if self.context.wait_for(&sync, 60_000) {
+                    break;
+                }
+            }
         }
         if let Some(mut t) = self.tracer.take() {
             t.destroy(&self.context);
