@@ -402,11 +402,17 @@ struct Hit {
     // The triangle, for surface detail: instance row, its vertices' rows
     // (attribute base + index), barycentrics.
     inst: u32,
+    prim: u32,
     v0: u32,
     v1: u32,
     v2: u32,
     bary: vec3<f32>,
 }
+
+// The triangle the next ray does not see (`pass_boundary`).
+var<private> skip_on: bool;
+var<private> skip_custom: u32;
+var<private> skip_prim: u32;
 
 fn card_at(off: i32, w: i32, h: i32, x: i32, y: i32) -> vec4<f32> {
     if x < 0 || y < 0 || x >= w || y >= h || u32(off + y * w + x) >= arrayLength(&b_groups) { return vec4<f32>(0.0); }
@@ -466,6 +472,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
         let c = rayQueryGetCandidateIntersection(&rq);
         prof_count(1u);
         if c.kind != RAY_QUERY_INTERSECTION_TRIANGLE { continue; }
+        if F_VOLUME && skip_on && c.instance_custom_data == skip_custom && c.primitive_index == skip_prim { continue; }
         var take = true;
         if F_CARDS && c.instance_custom_data == u.opts.z {
             // Cards are not opaque: a candidate stands where its picture
@@ -483,6 +490,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
             w2o = c.world_to_object;
         }
     }
+    skip_on = false;
     var hit: Hit;
     hit.found = kind != RAY_QUERY_INTERSECTION_NONE;
     if !hit.found { return hit; }
@@ -521,6 +529,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     let obj = vec4<f32>(p0 * bw.x + p1 * bw.y + p2 * bw.z, 1.0);
     hit.prev = vec3<f32>(dot(b_inst[inst + 4u], obj), dot(b_inst[inst + 5u], obj), dot(b_inst[inst + 6u], obj));
     hit.inst = inst;
+    hit.prim = prim;
     hit.v0 = attr + i0;
     hit.v1 = attr + i1;
     hit.v2 = attr + i2;
@@ -605,9 +614,10 @@ fn occluded(o_in: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -
                     if volume_shadow(h.mat, o_in + d * start, d, here - start, rng) { return true; }
                 }
             }
-            o = offset(h, d);
-            left = left - h.t;
-            dist = here;
+            let back = boundary_back(h);
+            o = pass_boundary(h, d);
+            left = left - h.t + back;
+            dist = here - back;
             continue;
         }
         if (F_CATCHER && (flags & FLAG_SHADOW_CATCHER) != 0u) || (flags & FLAG_WIRE) != 0u { return false; }
@@ -932,6 +942,23 @@ fn offset(h: Hit, toward: vec3<f32>) -> vec3<f32> {
     let eps = 0.02 + h.t * 1e-5;
     if dot(toward, h.g) >= 0.0 { return h.p + h.g * eps; }
     return h.p - h.g * eps;
+}
+
+// How far before a volume's boundary the ray that passes it starts again
+// (never before where it came from).
+fn boundary_back(h: Hit) -> f32 {
+    return min(0.02 + h.t * 1e-5, h.t * 0.5);
+}
+
+// The origin of the ray going on through a volume's boundary: just before
+// it, and that ray does not see the boundary's triangle again. Starting
+// past the boundary by the usual offset would start behind a surface lying
+// exactly on it (a beam standing on a floor), which was then missed.
+fn pass_boundary(h: Hit, d: vec3<f32>) -> vec3<f32> {
+    skip_on = true;
+    skip_custom = h.inst / INST_ROWS;
+    skip_prim = h.prim;
+    return h.p - d * boundary_back(h);
 }
 
 // ---------------------------------------------------------------- shading
@@ -1919,6 +1946,13 @@ fn sss_walk(h_in: Hit, n_in: vec3<f32>, base: vec3<f32>, rng: ptr<function, Rng>
         var f = sigma_s * tr;
         if hit { f = tr; }
         weight *= f / max(dot(channel_pdf, pdf), 1e-12);
+        // Long walks that carry little are ended by chance (the rest make
+        // up for them), so a dark or deep body does not take every step.
+        if !hit && bounce >= 8u {
+            let q = clamp(max3(weight), 0.1, 1.0);
+            if rnd(rng) >= q { return w; }
+            weight /= q;
+        }
         if hit {
             var hx = h;
             hx.n = -h.n;
@@ -1958,6 +1992,8 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     // The step whose surface gives the denoiser its guides: the first one
     // the camera sees (a shadow catcher is looked through).
     var guide = 0u;
+    // The path has scattered widely (see the subsurface walk below).
+    var soft = false;
     // The volumes the path is inside: material rows and, to find them
     // again on the way out, instances (a mesh's faces have a row per part).
     // Overlapping clouds are several at once.
@@ -1966,6 +2002,18 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     var nvol = 0u;
     for (var step = 0u; step < bounces + 16u; step++) {
         let h = cast_ray(o, d, 1e30, rng);
+        if F_VOLUME && h.found && !h.card && !h.front && nvol < 4u && (u32(b_mat[h.mat + 2u].w) & FLAG_VOLUME) != 0u {
+            // Leaving a volume the path did not see itself enter (it
+            // started on a surface lying on the volume's face, or the
+            // camera is inside): this stretch was in its medium.
+            var known = false;
+            for (var i = 0u; i < nvol; i++) { known = known || vinst[i] == h.inst; }
+            if !known {
+                vols[nvol] = h.mat;
+                vinst[nvol] = h.inst;
+                nvol++;
+            }
+        }
         if F_VOLUME && nvol > 0u {
             // Free flight to a scattering point, or through to the next
             // surface. Glow adds along the way.
@@ -2101,6 +2149,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
                 d = sample_hg(d, v18.y, rnd(rng), rnd(rng));
                 o = p;
                 last_pdf = 0.0;
+                soft = true;
                 continue;
             }
         }
@@ -2146,7 +2195,10 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             // A volume's boundary: entering or leaving its medium.
             if step == guide { out.albedo = vec3<f32>(1.0); }
             if h.front {
-                if nvol < 4u {
+                // (Once: its face may be met again from a surface on it.)
+                var known = false;
+                for (var i = 0u; i < nvol; i++) { known = known || vinst[i] == h.inst; }
+                if !known && nvol < 4u {
                     vols[nvol] = h.mat;
                     vinst[nvol] = h.inst;
                     nvol++;
@@ -2161,7 +2213,7 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
                     }
                 }
             }
-            o = offset(h, d);
+            o = pass_boundary(h, d);
             continue;
         }
         if step == guide { out.albedo = m0.xyz; }
@@ -2207,6 +2259,9 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         var s = surface(h, v);
         out.color += throughput * m2.xyz * s.emit;
         if step == guide { out.albedo = s.albedo; }
+        // Reflects and lets through nothing (black, no specular, coat or
+        // sheen): the path ends here, as on an unlit surface.
+        if s.trans <= 0.0 && s.coat <= 0.0 && s.f90 <= 0.0 && max3(s.kd) <= 0.0 && max3(s.f0) <= 0.0 && max3(s.sheen) <= 0.0 { return out; }
         // Glass: a dielectric boundary (rough: on a visible microfacet),
         // reflecting or refracting by exact Fresnel.
         if F_GLASS && s.trans > 0.0 && rnd(rng) < s.trans {
@@ -2263,7 +2318,18 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
         through = false;
         // Subsurface: that share of the diffuse light goes into the body
         // (a random walk) instead of bouncing here.
-        let sss = b_mat[h.mat + 27u].x;
+        var sss = b_mat[h.mat + 27u].x;
+        if sss > 0.0 {
+            // A walk shows where the light comes out and what it passed
+            // through. Not when its longest mean free path is under a
+            // quarter of a texel here, nor on a path that has scattered
+            // widely already (off a diffuse surface, in a medium): the
+            // surface is then diffuse in its colour, which is what the
+            // walk reflects in all.
+            let free = max3(b_mat[h.mat + 28u].xyz) * b_mat[h.mat + 27u].y;
+            let texels = free * u.cam.x / max(abs(h.p.z), 1.0) / max(u.place.z, 1e-6);
+            if soft || texels < 0.25 { sss = 0.0; }
+        }
         var kd_in = vec3<f32>(0.0);
         if sss > 0.0 {
             kd_in = s.kd * sss;
@@ -2299,13 +2365,18 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             }
             d = sm.xyz;
             o = offset(wk.h, d);
+            soft = true;
             continue;
         }
         let smp = sample_bsdf(s, v, rng);
         if smp.w <= 0.0 { return out; }
         let l = smp.xyz;
         throughput *= bsdf_cos(s, v, l) / (smp.w * (1.0 - p_sss));
+        if max3(throughput) <= 0.0 { return out; }
         last_pdf = smp.w * (1.0 - p_sss);
+        // A direction drawn from a wide lobe (a diffuse one is at most 1/π
+        // per steradian; a mirror-like one far above 1).
+        if smp.w < 1.0 { soft = true; }
         // Russian roulette after a few bounces.
         if bounce >= 3u {
             let q = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);

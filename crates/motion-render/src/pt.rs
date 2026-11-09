@@ -2008,6 +2008,118 @@ mod physics_tests {
         assert!(most <= held[0] * 4, "held {most} vertices for a {}-vertex ball: {held:?}", held[0]);
     }
 
+    /// A volume whose face lies exactly on a surface (a beam standing on a
+    /// wafer): the surface under it is found and lit as with a gap between.
+    #[test]
+    fn a_surface_on_a_volumes_face_is_shaded_as_one_just_off_it() {
+        let Some(mut r) = tracer(32) else { return };
+        let mut scene = |beam_z: f64| {
+            let mut p = project(json!([
+                {"id": "wafer", "kind": "mesh", "mesh": {"type": "box", "size": [220, 180], "depth": 20}, "material": {"preset": "matte", "color": "#20c040", "specular": 0},
+                 "transform": {"position": [160, 120]}},
+                {"id": "beam", "kind": "mesh", "mesh": {"type": "box", "size": [120, 100], "depth": 60},
+                 "material": {"volume": {"density": 0.3, "color": "#000000", "emission": "#2040ff"}},
+                 "transform": {"position": [160, 120], "z": beam_z}}
+            ]));
+            p.settings.width = 320;
+            p.settings.height = 240;
+            p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [-0.3, -0.3, -1.0], "shadow": true}])).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#000000", "horizon": "#000000", "ground": "#000000"})).unwrap());
+            r.render(&Compiled::new(&p), 0.0)
+        };
+        // In front of the wafer (toward the camera) and behind it.
+        for side in [-1.0, 1.0] {
+            let (on, off) = (scene(side * 40.0), scene(side * 42.0));
+            let (a, b) = (disc(&on, 160.0, 120.0, 0.0, 35.0, |_, _| true), disc(&off, 160.0, 120.0, 0.0, 35.0, |_, _| true));
+            assert!(b[1] > 60.0, "the wafer shows through the beam: {b:?}");
+            for k in 0..3 {
+                assert!((a[k] - b[k]).abs() < 5.0, "beam at z {}: on the wafer {a:?}, 2 px off it {b:?}", side * 40.0);
+            }
+        }
+    }
+
+    /// A tracing renderer that counts its rays, and the ray queries a
+    /// frame of `p` takes.
+    fn counting(spp: u32) -> Option<Renderer> {
+        tracer(spp)?;
+        let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+        Some(Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, profile: true, path: Some(super::TraceOptions { spp, bounces: 4, denoise: false, ..Default::default() }), ..Default::default() }))
+    }
+
+    fn rays(r: &mut Renderer, p: &lahza_motion_core::document::Project) -> (u64, image::RgbaImage) {
+        let img = r.render(&Compiled::new(p), 0.0);
+        (std::mem::take(&mut r.profile.as_mut().unwrap().rays), img)
+    }
+
+    /// A surface that reflects nothing (black, no specular) ends its paths
+    /// as an unlit one does: no light sampling, no bounce.
+    #[test]
+    fn surfaces_that_reflect_nothing_end_their_paths() {
+        let Some(mut r) = counting(8) else { return };
+        let lights = json!([{"type": "directional", "from": [-0.5, -0.4, -1.0], "shadow": true}]);
+        let env = json!({"preset": "studio"});
+        let ball = |extra: serde_json::Value| {
+            let mut m = json!({"preset": "matte", "color": "#000000", "emissive": "#ff8800", "specular": 0});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            sphere_in(m, lights.clone(), env.clone())
+        };
+        let (unlit, a) = rays(&mut r, &ball(json!({"unlit": true})));
+        let (dead, b) = rays(&mut r, &ball(json!({})));
+        let (lit, _) = rays(&mut r, &ball(json!({"color": "#808080"})));
+        assert!(lit * 2 > unlit * 3, "a lit ball samples lights and bounces: {lit} rays, unlit {unlit}");
+        assert!(dead * 10 <= unlit * 11, "a black ball without specular traces as an unlit one: {dead} rays, unlit {unlit}");
+        let (ca, cb) = (disc(&a, 160.0, 120.0, 0.0, 60.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 60.0, |_, _| true));
+        assert!(cb[0] > 100.0 && cb[0] > cb[2] + 60.0, "and still glows: {cb:?} (unlit {ca:?})");
+    }
+
+    /// Subsurface walks are traced where they show: not when the light
+    /// travels less than a texel inside, and not on paths that already
+    /// scattered off a diffuse surface.
+    #[test]
+    fn subsurface_walks_only_where_they_show() {
+        let Some(mut r) = counting(8) else { return };
+        let lights = json!([{"type": "directional", "from": [-0.5, -0.4, -1.0], "shadow": true}]);
+        let env = json!({"preset": "studio"});
+        let ball = |extra: serde_json::Value| {
+            let mut m = json!({"preset": "matte", "color": "#c8b8a0", "specular": 0});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            sphere_in(m, lights.clone(), env.clone())
+        };
+        let (plain, a) = rays(&mut r, &ball(json!({})));
+        let (walked, _) = rays(&mut r, &ball(json!({"subsurface": 1, "subsurface_scale": 8})));
+        assert!(walked * 10 > plain * 13, "a visible walk costs rays: {walked}, plain {plain}");
+        // A hundredth of a pixel: the walk leaves where it entered.
+        let (tiny, b) = rays(&mut r, &ball(json!({"subsurface": 1, "subsurface_scale": 0.01})));
+        assert!(tiny * 10 <= plain * 11, "light that travels 0.01 px inside is diffuse: {tiny} rays, plain {plain}");
+        let (ca, cb) = (disc(&a, 160.0, 120.0, 0.0, 80.0, |_, _| true), disc(&b, 160.0, 120.0, 0.0, 80.0, |_, _| true));
+        for k in 0..3 {
+            assert!((ca[k] - cb[k]).abs() < 6.0, "and looks it: {cb:?}, plain {ca:?}");
+        }
+        // A diffuse floor fills the view; a slab above it, out of view, is
+        // only found by the floor's bounced paths.
+        let room = |slab: serde_json::Value| {
+            let mut p = project(json!([
+                {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [2000, 2000]}, "material": {"preset": "matte", "color": "#b0b0b0", "specular": 0},
+                 "transform": {"position": [160, 200], "rotation_x": 90}},
+                {"id": "slab", "kind": "mesh", "mesh": {"type": "box", "size": [1200, 60], "depth": 1200}, "material": slab,
+                 "transform": {"position": [160, -200]}}
+            ]));
+            p.settings.width = 320;
+            p.settings.height = 240;
+            p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 40]})).unwrap();
+            p.scenes[0].lights = serde_json::from_value(lights.clone()).unwrap();
+            p.scenes[0].environment = Some(serde_json::from_value(env.clone()).unwrap());
+            p
+        };
+        let (plain, _) = rays(&mut r, &room(json!({"preset": "matte", "color": "#c8b8a0", "specular": 0})));
+        let (sss, _) = rays(&mut r, &room(json!({"preset": "matte", "color": "#c8b8a0", "specular": 0, "subsurface": 1, "subsurface_scale": 8})));
+        assert!(sss * 100 <= plain * 104, "bounced light does not walk: {sss} rays, plain {plain}");
+    }
+
     /// Without ray queries a path-traced render is rasterised, and says so.
     #[test]
     fn without_ray_queries_the_raster_draws_and_says_so() {

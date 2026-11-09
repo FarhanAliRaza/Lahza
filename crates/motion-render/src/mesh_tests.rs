@@ -1026,3 +1026,29 @@ fn volumes_scatter_and_glow() {
     cyl.scenes[0].layers[0] = serde_json::from_value(json!({"id": "beam", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 30, "height": 200}, "material": {"volume": {"density": 1, "emission": "#ff4000"}}, "transform": {"position": [160, 120], "rotation": 60}})).unwrap();
     crate::tests::assert_gpu_matches_cpu_within(&cyl, &[0.0], 0.0005);
 }
+
+/// A wall of 66 × 36 finely bevelled tiles is millions of triangles, but
+/// one pooled mesh drawn 2376 times: the GPU's lists (instances of pooled
+/// meshes) take it and still draw the meshes after it.
+#[test]
+fn a_wall_of_instanced_tiles_leaves_the_other_meshes_drawn() {
+    let p = scene(1920, 1080, json!({"layers": [
+        {"id": "wall", "kind": "instancer", "transform": {"position": [960, 540], "z": 300},
+         "layout": {"type": "grid", "columns": 66, "rows": 36, "spacing": [130, 130]},
+         "layers": [{"id": "tile", "kind": "mesh", "mesh": {"type": "box", "size": [120, 120], "depth": 40, "bevel": 30}, "detail": 2,
+                     "material": {"preset": "glossy", "color": "#e8e4dc"}}]},
+        {"id": "pipe", "kind": "mesh", "mesh": {"type": "torus", "radius": 120, "tube": 30}, "material": {"preset": "metal", "color": "#c08040"}, "transform": {"position": [500, 540]}},
+        {"id": "rock", "kind": "mesh", "mesh": {"type": "sphere", "radius": 80}, "material": {"preset": "plastic", "color": "#d03734"}, "transform": {"position": [1300, 400]}}
+    ]}));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let state = c.frame(0.0);
+    let mut r = cpu();
+    let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, seed: 0, compact: true }.build(&state);
+    let tiles = list.pool.iter().filter(|x| x.mesh.mesh.tris.len() == list.pool[0].mesh.mesh.tris.len()).count();
+    let triangles: usize = list.pool.iter().map(|x| x.mesh.mesh.tris.len()).sum();
+    assert!(triangles > 4_000_000, "the wall is over four million triangles: {triangles}");
+    assert_eq!(tiles, 66 * 36, "every tile is an instance");
+    assert_eq!(list.pool.len(), 66 * 36 + 2, "and the pipe and the rock after them");
+    assert!(r.meshes.warnings.is_empty() && r.meshes.dropped.is_empty(), "{:?} {:?}", r.meshes.warnings, r.meshes.dropped);
+}

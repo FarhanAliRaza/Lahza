@@ -160,6 +160,15 @@ impl MeshCache {
         }
     }
 
+    /// A batch is full: the meshes past `limit` triangles are not drawn,
+    /// which is an error (the picture is wrong), said once.
+    fn too_many_triangles(&mut self, limit: usize) {
+        let e = format!("too many mesh triangles next to each other (over {limit}): some meshes are not drawn; lower their `detail` or split them over layers that do not sit next to each other");
+        if !self.dropped.contains(&e) {
+            self.dropped.push(e);
+        }
+    }
+
     /// Numbers the triangles of the list's batches (the visibility pass's
     /// ids): each batch takes the next range. Returns how many there are.
     pub(crate) fn number_batches(&mut self) -> u32 {
@@ -1074,6 +1083,9 @@ pub const FLAG_VOLUME: u32 = 64;
 pub const SHADOW_TAPS: [[f32; 2]; 8] = [[-0.613, 0.617], [0.170, -0.040], [-0.299, -0.792], [0.645, 0.493], [-0.651, -0.075], [0.421, -0.718], [-0.084, 0.290], [0.874, -0.130]];
 /// Most triangles one batch may hold (beyond this, meshes are skipped).
 const MAX_TRIS: usize = 4_000_000;
+/// Triangles of a batch of pooled-mesh instances (the GPU's lists): their
+/// ids in the visibility pass are 32 bits, shared by a frame's batches.
+const MAX_INSTANCED_TRIS: usize = 1 << 28;
 
 use lahza_motion_core::compile::srgb_to_linear;
 
@@ -1412,7 +1424,7 @@ impl Batch {
         let Some(mesh) = cache.get(m) else { return };
         self.layers += 1;
         if self.tris.len() + mesh.tris.len() > MAX_TRIS {
-            cache.warnings.push("too many mesh triangles in one frame; some meshes were skipped".into());
+            cache.too_many_triangles(MAX_TRIS);
             return;
         }
         let mv = m.camera.view.then(m.world);
@@ -1570,8 +1582,11 @@ impl Batch {
         if tris == 0 {
             return;
         }
-        if self.tris.len() + self.inst_tris as usize + tris > MAX_TRIS {
-            cache.warnings.push("too many mesh triangles in one frame; some meshes were skipped".into());
+        // Instances cost a row each, not their triangles: a wall of 2376
+        // finely bevelled tiles is five million triangles of one pooled
+        // mesh. Only the triangle ids bound them.
+        if self.tris.len() + self.inst_tris as usize + tris > MAX_INSTANCED_TRIS {
+            cache.too_many_triangles(MAX_INSTANCED_TRIS);
             return;
         }
         let mv = m.camera.view.then(m.world);

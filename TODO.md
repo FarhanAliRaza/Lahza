@@ -12,26 +12,6 @@
   `lahza motion snapshot cpu.lahza --at 9.0,10.4 --width 540 --profile`
   (stage "display lists › meshes (shadow maps)").
 
-- **Raster drops meshes when a scene has a large mesh instancer.** With a
-  66×36 instancer of bevelled boxes (the tile wall of the CPU film's s02,
-  round 2: `~/Videos/cpu/out_b/shots_b.round2.py`), a raster snapshot at
-  8.0 s loses the pipe, counter, basket, rocks and label; removing that one
-  layer brings them back. The path tracer is unaffected. Likely in the
-  hardware visibility pass or the mesh pool's instance runs.
-- **Paths keep bouncing off surfaces that reflect nothing.** A black
-  emissive surface with `specular: 0` costs as much to trace as a lit one,
-  while `unlit: true` ends the path (about +0.2 s per frame inside a
-  refracting block). Subsurface is also expensive even on small objects
-  (+0.3–0.45 s per frame for 14 small rocks).
-
-- **A surface lying on a volume's face is shaded wrongly.** In the CPU
-  film's s06 (`~/Videos/cpu/shots_c.py`), the doping beam (an emissive
-  volume cylinder) ended exactly on the mirror wafer; traced, the wafer
-  under the beam went dark navy in the blue phase (and washed pink in the
-  pink one). Removing the beam restores it; ending the volume 20 px above
-  the wafer works around it. Rays leaving a surface that touches a volume
-  likely get the wrong inside/outside medium.
-
 - **A frame whose images exceed the image pool is a hard error.** The pool
   is 48 Mi texels (with mips). It used to leave the image that did not fit
   undrawn and decode it again every frame (s01 of the CPU film went from

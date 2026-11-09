@@ -381,7 +381,7 @@ Surface detail (raster and path tracer alike):
 | `roughness_map` | an image whose green channel scales `roughness` (glTF's metallic-roughness texture; a grey map works too): polished and dull patches on one surface |
 | `metallic_map` | an image whose blue channel scales `metallic` (the same glTF texture) |
 | `emissive_map` | a colour image that multiplies the emission (`emissive` × `emissive_strength`; white × strength when `emissive` is not set): city lights on a map, a screen's picture. Above 1 it glows past white and blooms |
-| `subsurface` | 0..1 of the diffuse light enters the surface and scatters inside before it leaves (Principled subsurface, Cycles' random walk: marble, milky quartz, wax, skin, milk); path tracing only |
+| `subsurface` | 0..1 of the diffuse light enters the surface and scatters inside before it leaves (Principled subsurface, Cycles' random walk: marble, milky quartz, wax, skin, milk); path tracing only. The walk is traced where it shows: seen directly, in mirrors and through glass. Where the light would travel under a quarter of a pixel inside (a small or distant object), and in light that already bounced off a diffuse surface, the surface is diffuse in the same colour, which costs far fewer rays |
 | `subsurface_radius` | how far each colour travels inside, relative, `[r, g, b]` (default `[1, 0.2, 0.1]`, as Blender: red furthest) |
 | `subsurface_scale` | the radius' scale in px (default 5); an imported model's comes from Blender's Subsurface Scale × `unit` |
 | `subsurface_anisotropy` | -1..1 scattering inside: forward (+), back (−), even (0) |
