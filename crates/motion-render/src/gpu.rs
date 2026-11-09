@@ -384,6 +384,11 @@ pub struct Gpu {
 
 /// Concatenates sub-sample display lists into one upload. Returns the
 /// merged buffers and each sample's targets (main, groups) re-based.
+/// Group texels are not concatenated: a sample's groups are read only by
+/// its own passes, which run before the next sample's, so every sample
+/// draws its groups in the same texels (eight sub-frames of a full-frame
+/// transition would otherwise need eight frames' worth, past the buffer
+/// limit).
 pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::list::Group>, Vec<MeshDraw>)>) {
     let mut out = DisplayList::default();
     let mut targets = Vec::new();
@@ -392,7 +397,6 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let index_base = out.indices.len() as u32;
         let range_base = (out.ranges.len() / 2) as u32;
         let stop_base = (out.stops.len() / 2) as f32;
-        let texel_base = out.group_texels;
         let seg_base = out.segments.len() as u32;
         let ops_base = out.ops.len() as u32;
         let mesh_base = out.mesh.len() as u32;
@@ -403,13 +407,7 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let id_base = out.mesh_ids;
         out.mesh_ids += list.mesh_ids;
         out.pool.extend(list.pool.iter().map(|r| crate::mesh3d::PoolRef { row: r.row + mesh_base, ..r.clone() }));
-        out.traces.extend(list.traces.iter().map(|t| {
-            let mut t = t.clone();
-            for c in &mut t.cards {
-                c.picture.offset += texel_base;
-            }
-            t
-        }));
+        out.traces.extend(list.traces.iter().cloned());
         for p in &list.prims {
             let mut p: Prim = *p;
             let rebase = |v: f32, by: u32| f32::from_bits(v.to_bits() + by);
@@ -428,16 +426,6 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
                         p.geom[1] = rebase(p.geom[1], id_base);
                     }
                     p.geom2 = p.geom2.map(|v| rebase(v, mesh_base));
-                    if p.paint[3] > 0.5 {
-                        p.paint[0] = rebase(p.paint[0], texel_base);
-                    }
-                    // Cards' pictures are relative to this base.
-                    p.stroke[2] = rebase(p.stroke[2], texel_base);
-                }
-                crate::list::PRIM_IMAGE if p.kind[1] == 1 => p.geom2[0] = rebase(p.geom2[0], texel_base),
-                crate::list::PRIM_MATTE => {
-                    p.geom2[0] = rebase(p.geom2[0], texel_base);
-                    p.geom2[1] = rebase(p.geom2[1], texel_base);
                 }
                 crate::list::PRIM_SHAPE if p.kind[1] == crate::list::SHAPE_PATH => p.geom2[0] = rebase(p.geom2[0], seg_base),
                 _ => {}
@@ -457,7 +445,7 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
             out.ranges.push(pair[1]);
         }
         out.stops.extend_from_slice(&list.stops);
-        out.group_texels += list.group_texels;
+        out.group_texels = out.group_texels.max(list.group_texels);
         let mut main = list.main();
         main.range_base += range_base;
         let groups = list
@@ -466,7 +454,6 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
             .map(|g| {
                 let mut g = *g;
                 g.target.range_base += range_base;
-                g.offset += texel_base;
                 g.trace = g.trace.map(|i| i + trace_base);
                 g.shader = g.shader.map(|i| i + shader_base);
                 g

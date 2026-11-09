@@ -1804,3 +1804,27 @@ fn the_export_renderer_follows_the_project_and_the_flag() {
     assert_eq!(trace_options(&traced, Quality::Final, Some(RendererKind::Raster), None), None);
     assert!(serde_json::from_value::<Settings>(json!({"width": 1, "height": 1, "fps": 30, "duration": 1, "renderer": "ray"})).is_err());
 }
+
+/// A transition under motion blur: every sub-frame draws both scenes into
+/// groups. Their texels are shared between sub-frames (eight sub-frames of
+/// a full-HD whip otherwise need 800 MB of them, over the buffer limit).
+#[test]
+fn motion_blur_sub_frames_share_their_group_texels() {
+    let mut p = Project::new(320, 180, Fps::whole(30), 4.0);
+    p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 8 });
+    let dot = |id: &str| json!([{"id": id, "kind": "shape", "shape": "circle", "size": 60, "fill": "#ffffff", "transform": {"position": [160, 90]}}]);
+    p.scenes.push(serde_json::from_value(json!({"id": "a", "background": "#ff0000", "layers": dot("da")})).unwrap());
+    p.scenes.push(serde_json::from_value(json!({"id": "b", "start": 2, "background": "#0000ff", "layers": dot("db"),
+        "transition": {"type": "whip", "dur": 1, "ease": "linear", "direction": "up"}})).unwrap());
+    let c = Compiled::new(&p);
+    let states: Vec<FrameState> = (0..8).map(|i| c.frame(2.4 + i as f64 / 480.0)).collect();
+    let mut r = cpu();
+    let lists = r.build_lists(&states, None);
+    let one = lists.iter().map(|l| l.group_texels).max().unwrap();
+    assert!(one > 0, "the transition draws its scenes into groups");
+    let (merged, targets) = gpu::merge(&lists);
+    assert_eq!(merged.group_texels, one, "sub-frames share the group texels");
+    assert_eq!(targets.len(), 8);
+    // And the frame is the same picture on both paths.
+    assert_gpu_matches_cpu(&p, &[2.4]);
+}

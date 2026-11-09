@@ -12,15 +12,6 @@
   `lahza motion snapshot cpu.lahza --at 9.0,10.4 --width 540 --profile`
   (stage "display lists › meshes (shadow maps)").
 
-- **Transition + motion blur overflows a GPU buffer.** A scene with a
-  transition (whip, `"dur": "6f"`) and 8-sample motion blur over a
-  full-frame shader layer and meshes fails the export:
-  `GPU failed at frame 240: motion groups needs 800409600 bytes, over the
-  GPU buffer limit`. Repro: `~/Videos/slang-reel/reel.lahza` with the
-  `motion` scene back at 8 blur samples, then
-  `lahza motion render reel.lahza --from 7.9 --to 8.1`. `check`,
-  `snapshot` and `review` don't use motion blur, so nothing warns before
-  the render. The reel works around it with 4 samples.
 - **Raster drops meshes when a scene has a large mesh instancer.** With a
   66×36 instancer of bevelled boxes (the tile wall of the CPU film's s02,
   round 2: `~/Videos/cpu/out_b/shots_b.round2.py`), a raster snapshot at
