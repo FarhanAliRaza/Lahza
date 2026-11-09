@@ -82,6 +82,8 @@ pub struct MaterialState {
     pub volume: Option<VolumeState>,
     /// The volume's density grid at this moment: its image and cells.
     pub volume_grid: Option<(Arc<str>, [u32; 3])>,
+    /// A Slang function shading the surface.
+    pub slang: Option<crate::surface::SurfaceState>,
 }
 
 /// A medium at a moment: extinction per px, scattering colour (linear),
@@ -158,6 +160,7 @@ impl MaterialState {
             uv: [1.0, 1.0, 0.0, 0.0, 0.0],
             volume: None,
             volume_grid: None,
+            slang: None,
         };
         match p {
             MaterialPreset::Matte => MaterialState { roughness: 0.85, ..base },
@@ -312,6 +315,19 @@ pub(super) struct CMaterial {
     bump: Option<Prop<f64>>,
     uv: Option<(Prop<crate::value::Vec2>, Prop<crate::value::Vec2>, Prop<f64>)>,
     volume: Option<CVolume>,
+    slang: Option<CSurface>,
+}
+
+/// A material's Slang function (`surface::Surfaces`), its params and the
+/// layer's start (its time is local).
+pub(super) struct CSurface {
+    function: Arc<str>,
+    id: u32,
+    linked: crate::slang::Linked,
+    program: Arc<std::sync::OnceLock<Arc<crate::surface::Program>>>,
+    params: Vec<Prop<f64>>,
+    see_through: bool,
+    start: f64,
 }
 
 pub(super) struct CVolume {
@@ -423,6 +439,15 @@ impl CMaterial {
             let (sc, off) = (sc.at(t), off.at(t));
             m.uv = [sc.x(), sc.y(), off.x(), off.y(), rot.at(t).to_radians()];
         }
+        m.slang = self.slang.as_ref().map(|s| crate::surface::SurfaceState {
+            function: s.function.clone(),
+            id: s.id,
+            params: std::array::from_fn(|k| s.params.get(k).map_or(0.0, |p| p.at(t) as f32)),
+            time: t - s.start,
+            see_through: s.see_through,
+            linked: s.linked.clone(),
+            program: s.program.clone(),
+        });
         m
     }
 }
@@ -438,6 +463,39 @@ pub(super) enum CMeshShape {
     Revolve((Vec<Arc<str>>, Prop<f64>), Prop<Vec2>, bool),
     Sweep { path: (Vec<Arc<str>>, Prop<f64>), radius: Prop<f64>, width: Prop<f64>, profile: SweepProfile, trim: Prop<Vec2>, caps: Caps, head: Prop<f64> },
     Gltf { src: Arc<str>, mesh: u32, primitive: u32, unit: f64, frame: Prop<f64>, bounds: Option<[[f64; 3]; 2]> },
+    Slang(Box<CSlang>),
+}
+
+/// A Slang mesh or deformer: its exported function, params (in the order
+/// passed) and when the layer starts (its `t` counts from there).
+pub(super) struct CSlang {
+    function: String,
+    call: crate::slang::Linked,
+    params: Vec<Prop<f64>>,
+    animated: bool,
+    start: f64,
+    /// Generators: counts, outputs, sides and given bounds.
+    vertices: u32,
+    triangles: u32,
+    outputs: crate::slang_mesh::Outputs,
+    two_sided: bool,
+    bounds: Option<[[f64; 3]; 2]>,
+    /// Deformers: subdivision and reach.
+    subdivide: u32,
+    reach: f64,
+}
+
+impl CSlang {
+    fn time(&self, t: f64) -> f32 {
+        if self.animated {
+            (t - self.start) as f32
+        } else {
+            0.0
+        }
+    }
+    fn params(&self, t: f64) -> Vec<f32> {
+        self.params.iter().map(|p| p.at(t) as f32).collect()
+    }
 }
 
 pub(super) struct CMesh {
@@ -451,6 +509,7 @@ pub(super) struct CMesh {
     gap: Prop<f64>,
     detail: f64,
     displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>, [f64; 3], Option<String>)>,
+    deform: Option<CSlang>,
     /// Last parameters, so unchanged frames share one `Arc` (and one
     /// cached mesh in the renderer).
     last: std::sync::Mutex<Option<Arc<MeshParams>>>,
@@ -507,6 +566,7 @@ fn merge(base: &Material, over: Option<&Material>) -> Material {
         bump: o.bump.clone().or_else(|| base.bump.clone()),
         uv: o.uv.clone().or_else(|| base.uv.clone()),
         volume: o.volume.clone().or_else(|| base.volume.clone()),
+        slang: o.slang.clone().or_else(|| base.slang.clone()),
     }
 }
 
@@ -610,6 +670,24 @@ impl Compiler<'_> {
                     if l > 1e-9 { u.map(|c| c / l) } else { [0.0, -1.0, 0.0] }
                 },
             }),
+            slang: m.slang.as_ref().map(|sl| {
+                if sl.params.len() > crate::surface::MAX_PARAMS {
+                    self.errors.push(format!("{id}.{what}.slang.params: at most {} numbers", crate::surface::MAX_PARAMS));
+                }
+                if m.volume.is_some() {
+                    self.errors.push(format!("{id}.{what}.slang: a volume has no surface to shade"));
+                }
+                let (fid, linked) = self.surfaces.add(&self.slang, &sl.function);
+                CSurface {
+                    function: sl.function.as_str().into(),
+                    id: fid,
+                    linked,
+                    program: self.surfaces.handle(),
+                    params: sl.params.iter().enumerate().map(|(k, p)| self.prop(p, id, &w(&format!("slang.params.{k}")), start, step, shift)).collect(),
+                    see_through: sl.see_through,
+                    start,
+                }
+            }),
         }
     }
 
@@ -658,6 +736,31 @@ impl Compiler<'_> {
                 frame: p(frame, "mesh.frame", self),
                 bounds: *bounds,
             },
+            MeshDef::Slang { function, vertices, triangles, params, animated, normals, uvs, segments, one_sided, bounds } => {
+                use crate::slang_mesh::{MAX_TRIANGLES, MAX_VERTICES};
+                if !(1..=MAX_VERTICES).contains(vertices) {
+                    self.errors.push(format!("{id}.mesh.vertices: {vertices} must be 1 to {MAX_VERTICES}"));
+                }
+                if !(1..=MAX_TRIANGLES).contains(triangles) {
+                    self.errors.push(format!("{id}.mesh.triangles: {triangles} must be 1 to {MAX_TRIANGLES}"));
+                }
+                let outputs = crate::slang_mesh::Outputs { normals: *normals, uvs: *uvs, segments: *segments };
+                let names: Vec<String> = params.keys().cloned().collect();
+                CMeshShape::Slang(Box::new(CSlang {
+                    call: crate::slang_mesh::generator(&self.slang, &format!("{id}.mesh"), function, &names, outputs),
+                    function: function.clone(),
+                    params: params.iter().map(|(k, v)| self.prop(v, id, &format!("mesh.params.{k}"), start, step, shift)).collect(),
+                    animated: *animated,
+                    start,
+                    vertices: (*vertices).min(MAX_VERTICES),
+                    triangles: (*triangles).min(MAX_TRIANGLES),
+                    outputs,
+                    two_sided: !*one_sided,
+                    bounds: *bounds,
+                    subdivide: 0,
+                    reach: 0.0,
+                }))
+            }
         };
         let parts = m.parts.list();
         let part_colors = (0..PARTS)
@@ -684,8 +787,29 @@ impl Compiler<'_> {
         let displace = m.displace.as_ref().map(|d| {
             (d.kind, self.prop(&d.scale, id, "displace.scale", start, step, shift), d.octaves, d.seed, self.prop(&d.amount, id, "displace.amount", start, step, shift), d.drift.map(|v| v.0).unwrap_or([0.0; 3]), d.src.clone())
         });
+        let deform = m.deform.as_ref().map(|d| {
+            if d.subdivide > crate::slang_mesh::MAX_SUBDIVIDE {
+                self.errors.push(format!("{id}.deform.subdivide: {} is more than {}", d.subdivide, crate::slang_mesh::MAX_SUBDIVIDE));
+            }
+            let names: Vec<String> = d.params.keys().cloned().collect();
+            CSlang {
+                call: crate::slang_mesh::deformer(&self.slang, &format!("{id}.deform"), &d.function, &names),
+                function: d.function.clone(),
+                params: d.params.iter().map(|(k, v)| self.prop(v, id, &format!("deform.params.{k}"), start, step, shift)).collect(),
+                animated: d.animated,
+                start,
+                vertices: 0,
+                triangles: 0,
+                outputs: Default::default(),
+                two_sided: false,
+                bounds: None,
+                subdivide: d.subdivide.min(crate::slang_mesh::MAX_SUBDIVIDE),
+                reach: if d.reach.is_finite() { d.reach.abs() } else { 0.0 },
+            }
+        });
         CMesh {
             displace,
+            deform,
             shape,
             materials,
             own_color,
@@ -949,6 +1073,19 @@ impl CMesh {
             CMeshShape::Gltf { src, mesh, primitive, unit, frame, bounds } => {
                 MeshShape::Gltf { src: frame_path(src, frame.at(t)), mesh: *mesh, primitive: *primitive, unit: *unit, bounds: *bounds }
             }
+            CMeshShape::Slang(s) => MeshShape::Slang(crate::slang_mesh::SlangShape {
+                function: s.function.clone(),
+                call: s.call.clone(),
+                vertices: s.vertices,
+                triangles: s.triangles,
+                params: s.params(t),
+                time: s.time(t),
+                animated: s.animated,
+                outputs: s.outputs,
+                two_sided: s.two_sided,
+                bounds: s.bounds,
+                generated: Default::default(),
+            }),
         };
         let displace = self.displace.as_ref().map(|(kind, scale, octaves, seed, amount, drift, src)| {
             let how = match src {
@@ -957,7 +1094,19 @@ impl CMesh {
             };
             (how, amount.at(t))
         });
-        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone(), screen, displace };
+        let deform = self.deform.as_ref().map(|d| crate::slang_mesh::Deform {
+            function: d.function.clone(),
+            call: d.call.clone(),
+            params: d.params(t),
+            time: d.time(t),
+            animated: d.animated,
+            subdivide: d.subdivide,
+            reach: d.reach,
+        });
+        // A Slang mesh is the same at every drawn size (unless noise
+        // subdivides it): one mesh however the camera moves.
+        let screen = if matches!(shape, MeshShape::Slang(_)) && displace.is_none() { 1.0 } else { screen };
+        let params = MeshParams { shape, segments: self.segments, gap: self.gap.at(t), detail: self.detail, spans: self.spans.clone(), screen, displace, deform };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         match &*last {
             Some(p) if **p == params => p.clone(),

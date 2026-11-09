@@ -10,7 +10,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-const INSTRUCTIONS: &str = "Lahza motion engine. Loop: project_create (or project_open) → audio_analyze (music) / narration_import (a narration manifest: one clip per line with the voice provider's word or character timings) → markers_query → edit_apply (scenes, layers, keys anchored to markers) → check (sync drift ≤ ±1 f, no errors) → sync_check (flagged: true: events that miss their marker or hit nothing) → snapshot (contact sheet at sync points) → fix → review (the whole film before calling it done: scenes, every cut, phone width; notes as P0 t=4.2s · where · problem → exact change) → render. Before building each shot, write its breakdown (prompt `breakdown`, or lahza://guide/breakdown): every element's kind, structure, material, lighting, motion and how it will be built. Build geometry from engine shapes, 3D meshes or Blender; measurements of a reference set parameters only, never traced shapes. Narrated pieces time everything with narration references — cue:<name> (from [name] in the script), word:<word> (word:'81' for numbers), line:<id>, sentence#n — never literal seconds, so re-narrating moves every scene. A film is not a web page (lahza://guide, 'A film, not a page'): one idea per shot shown by the picture; besides captions at most ~12 words on screen and no text under 2.6% of the frame's short side; no header, footer, frame counter or progress bar; no text repeating the caption; cuts with a cause, never a crossfade between two worlds or a cut onto an empty frame; the guide's banned defaults stay out unless the brand uses them. Declare each layer's role (background, subject, foreground, caption, decoration) and the facing of anything that travels, so check proves depth order and direction; keep a rule broken on purpose with allow, never by ignoring check. Read lahza://guide first, lahza://schema for the format and lahza://catalog for presets, layer kinds and time references.";
+const INSTRUCTIONS: &str = "Lahza motion engine. Loop: project_create (or project_open) → audio_analyze (music) / narration_import (a narration manifest: one clip per line with the voice provider's word or character timings) → markers_query → edit_apply (scenes, layers, keys anchored to markers) → check (sync drift ≤ ±1 f, no errors) → sync_check (flagged: true: events that miss their marker or hit nothing) → snapshot (contact sheet at sync points) → fix → review (the whole film before calling it done: scenes, every cut, phone width; notes as P0 t=4.2s · where · problem → exact change) → render. Before building each shot, write its breakdown (prompt `breakdown`, or lahza://guide/breakdown): every element's kind, structure, material, lighting, motion and how it will be built. Build geometry from engine shapes, 3D meshes or Blender; measurements of a reference set parameters only, never traced shapes. Narrated pieces time everything with narration references — cue:<name> (from [name] in the script), word:<word> (word:'81' for numbers), line:<id>, sentence#n — never literal seconds, so re-narrating moves every scene. A film is not a web page (lahza://guide, 'A film, not a page'): one idea per shot shown by the picture; besides captions at most ~12 words on screen and no text under 2.6% of the frame's short side; no header, footer, frame counter or progress bar; no text repeating the caption; cuts with a cause, never a crossfade between two worlds or a cut onto an empty frame; the guide's banned defaults stay out unless the brand uses them. Declare each layer's role (background, subject, foreground, caption, decoration) and the facing of anything that travels, so check proves depth order and direction; keep a rule broken on purpose with allow, never by ignoring check. Read lahza://guide first, lahza://schema for the format and lahza://catalog for presets, layer kinds and time references; for code (Slang scene parameters, shader layers, generated geometry, materials) lahza://slang.";
 
 #[derive(Clone)]
 pub struct Server {
@@ -36,6 +36,15 @@ const DOCS: &[Doc] = &[
     Doc { uri: "lahza://schema", name: "schema", description: "Project folder and JSON format", mime: "text/markdown" },
     Doc { uri: "lahza://catalog", name: "catalog", description: "Presets with measured numbers, raw curves, anchors, time references, layer kinds, ops", mime: "application/json" },
     Doc { uri: "lahza://styles", name: "styles", description: "Style packs with palettes, defaults and rules", mime: "application/json" },
+    Doc { uri: "lahza://slang", name: "slang", description: "Slang code in a project: scene parameters, shader layers, geometry generators and deformers, materials (contracts, inputs, examples, errors)", mime: "text/markdown" },
+];
+
+/// The Slang contracts, one document (docs/slang/*.md).
+const SLANG: [&str; 4] = [
+    include_str!("../../../docs/slang/README.md"),
+    include_str!("../../../docs/slang/shader-layers.md"),
+    include_str!("../../../docs/slang/geometry.md"),
+    include_str!("../../../docs/slang/materials.md"),
 ];
 
 fn read_doc(uri: &str) -> Option<(String, &'static str)> {
@@ -51,6 +60,7 @@ fn read_doc(uri: &str) -> Option<(String, &'static str)> {
             (serde_json::to_string_pretty(&c).ok()?, "application/json")
         }
         "lahza://styles" => (serde_json::to_string_pretty(&catalog::styles_json()).ok()?, "application/json"),
+        "lahza://slang" => (SLANG.join("\n\n"), "text/markdown"),
         other => {
             let name = other.strip_prefix("lahza://styles/")?;
             let pack = catalog::styles_json().as_array()?.iter().find(|p| p["name"] == name)?.clone();

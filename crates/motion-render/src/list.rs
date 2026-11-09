@@ -14,7 +14,7 @@ use crate::images::Images;
 use bytemuck::{Pod, Zeroable};
 use lahza_motion_core::path::{self, morph, trim_measured};
 use lahza_motion_core::space::Proj;
-use lahza_motion_core::compile::{Affine, Content, EffectState, FieldState, FrameState, LayerState, PaintState, PostKind, ShapeState, TextState};
+use lahza_motion_core::compile::{Affine, Content, EffectState, FieldState, FrameState, LayerState, PaintState, PostKind, ShaderState, ShapeState, TextState};
 use lahza_motion_core::document::{Blend, Gradient, GradientKind, GradientUnits, LineCap, LineJoin, MatteMode, ShapeKind, StrokeAlign, StrokeStyle};
 use lahza_motion_core::value::Color;
 
@@ -130,6 +130,9 @@ pub struct Group {
     pub clamp: bool,
     /// Traced instead of rasterised: index into `DisplayList::traces`.
     pub trace: Option<u32>,
+    /// Painted by a shader layer's function instead of rasterised: index
+    /// into `DisplayList::shaders`.
+    pub shader: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -155,7 +158,34 @@ pub struct DisplayList {
     pub bins: Vec<u32>,
     /// Layer lists the path tracer renders (export), by group.
     pub traces: Vec<crate::pt::Trace>,
+    /// Where each mesh primitive is drawn, for the GPU's hardware
+    /// visibility pass.
+    pub mesh_draws: Vec<MeshDraw>,
+    /// Mesh instances' rows the GPU's mesh pool completes (where their
+    /// meshes are), with the meshes.
+    pub pool: Vec<crate::mesh3d::PoolRef>,
+    /// Triangle ids the mesh batches take (the visibility pass's).
+    pub mesh_ids: u32,
+    /// The project's Slang surfaces its meshes use (the GPU draws them with
+    /// a variant of its raster shader).
+    pub surfaces: Option<std::sync::Arc<lahza_motion_core::surface::Program>>,
+    /// Shader layers' pictures, by group.
+    pub shaders: Vec<crate::shader::ShaderPass>,
 }
+
+/// A mesh primitive placed on a target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshDraw {
+    /// Index in `DisplayList::prims`.
+    pub prim: u32,
+    /// Index in `DisplayList::groups`, or `MAIN_TARGET`.
+    pub target: u32,
+    /// Target pixels [x0, y0, x1, y1) its triangles may touch (whole tiles).
+    pub rect: [u32; 4],
+}
+
+/// `MeshDraw::target` of the main target.
+pub const MAIN_TARGET: u32 = u32::MAX;
 
 impl DisplayList {
     pub fn main(&self) -> Target {
@@ -176,8 +206,19 @@ impl DisplayList {
         out.extend_from_slice(bytemuck::cast_slice(&self.ops));
         out.extend_from_slice(bytemuck::cast_slice(&self.mesh));
         out.extend_from_slice(bytemuck::cast_slice(&self.bins));
+        // Pooled meshes are not in `mesh`: their parameters are.
+        for r in &self.pool {
+            out.extend_from_slice(&r.row.to_le_bytes());
+            out.extend_from_slice(r.key());
+        }
         for t in &self.traces {
             t.signature(&mut out);
+        }
+        if let Some(s) = &self.surfaces {
+            out.extend_from_slice(&s.key.to_le_bytes());
+        }
+        for s in &self.shaders {
+            s.signature(&mut out);
         }
         out
     }
@@ -282,6 +323,14 @@ struct Pending {
     factor: [f64; 2],
 }
 
+/// A glass mesh waiting for its backdrop (see `Builder::glass_backdrops`).
+struct Glass {
+    /// Index of its item in the layer list's items.
+    at: usize,
+    reach: f64,
+    sigma: f64,
+}
+
 pub struct Builder<'a> {
     pub fonts: &'a mut Fonts,
     pub images: &'a mut Images,
@@ -294,6 +343,10 @@ pub struct Builder<'a> {
     /// Seeds the tracer's samples (the frame's time), so a frame renders
     /// the same every time.
     pub seed: u32,
+    /// Mesh triangles as shared records the GPU maps onto each target
+    /// (its hardware visibility pass), instead of per-target edge rows and
+    /// tile bins (the CPU rasteriser's).
+    pub compact: bool,
 }
 
 impl Builder<'_> {
@@ -302,10 +355,14 @@ impl Builder<'_> {
         let h = ((frame.height as f64 * self.scale).round() as u32).max(1);
         let root = Proj::from(Affine::scale(self.scale, self.scale));
         let mut list = DisplayList::default();
-        self.meshes.begin();
+        self.meshes.begin(self.compact);
         let mut pending: Vec<Pending> = Vec::new();
         let mut main_items: Vec<Item> = Vec::new();
         self.emit_list(&frame.layers, root, (w, h), &mut list, &mut pending, &mut main_items);
+        if self.compact {
+            list.mesh_ids = self.meshes.number_batches();
+        }
+        list.surfaces = self.meshes.surfaces.take();
         let background = premul(frame.background, 1.0);
         // Groups first (inner before outer), then the main target.
         let mut range_base = 0;
@@ -322,7 +379,8 @@ impl Builder<'_> {
                     Some((p, [(b[0] - origin[0]) / factor[0], (b[1] - origin[1]) / factor[1], (b[2] - origin[0]) / factor[0], (b[3] - origin[1]) / factor[1]]))
                 })
                 .collect();
-            bin(&mut list, &group.target, prims);
+            let which = list.groups.len() as u32;
+            bin(&mut list, &group.target, which, prims);
             range_base += group.target.tiles();
             list.groups.push(group);
         }
@@ -331,7 +389,7 @@ impl Builder<'_> {
             .iter()
             .filter_map(|it| if it.prim.kind[0] == PRIM_MESH { self.place_mesh(&mut list, it, &main, [0.0, 0.0], [1.0, 1.0]) } else { Some((it.prim, canvas_bounds(it))) })
             .collect();
-        bin(&mut list, &main, prims);
+        bin(&mut list, &main, MAIN_TARGET, prims);
         list.main = Some(main);
         list
     }
@@ -347,7 +405,7 @@ impl Builder<'_> {
         let gw = (w / factor).ceil().max(1.0) as u32;
         let gh = (h / factor).ceil().max(1.0) as u32;
         let f = [w / gw as f64, h / gh as f64];
-        let group = Group { target: Target::new(gw, gh, 0, [0.0; 4]), offset: list.group_texels, sigma: (sigma / ((f[0] + f[1]) / 2.0)) as f32, clamp, trace: None };
+        let group = Group { target: Target::new(gw, gh, 0, [0.0; 4]), offset: list.group_texels, sigma: (sigma / ((f[0] + f[1]) / 2.0)) as f32, clamp, trace: None, shader: None };
         list.group_texels += gw * gh;
         let origin = [rect[0], rect[1]];
         pending.push(Pending { group, items, origin, factor: f });
@@ -419,9 +477,14 @@ impl Builder<'_> {
     }
 
     fn place_mesh(&mut self, list: &mut DisplayList, item: &Item, target: &Target, origin: [f64; 2], factor: [f64; 2]) -> Option<(Prim, [f64; 4])> {
+        let started = std::time::Instant::now();
         let cache = &mut *self.meshes;
         let batch = cache.batches.get(item.prim.kind[1] as usize)?;
-        batch.place(&mut list.mesh, &mut list.bins, &mut cache.placed, target, origin, factor, item.prim.kind[2])
+        let mut setup = std::time::Duration::ZERO;
+        let placed = batch.place(&mut list.mesh, &mut list.bins, &mut list.pool, &mut cache.placed, target, origin, factor, item.prim.kind[2], self.compact, &mut setup);
+        cache.placing_setup += setup;
+        cache.placing += started.elapsed();
+        placed
     }
 
     /// A mesh item: a new batch, or `m` added to the batch of the item just
@@ -608,9 +671,21 @@ impl Builder<'_> {
                 self.emit(&layers[j], root, canvas, list, pending, out);
             }
         }
+        // Glass refracts what was drawn before it, in groups its meshes
+        // share (see `glass_backdrops`).
+        let mut glass: Vec<Glass> = Vec::new();
         for j in deferred.drain(..) {
             self.meshes.set_current(j);
+            let at = out.len();
             self.emit(&layers[j], root, canvas, list, pending, out);
+            let Content::Mesh(m) = &layers[j].content else { continue };
+            if layers[j].is_isolated() || !crate::mesh3d::refracts(m) || out.len() <= at || out[at].prim.kind[0] != PRIM_MESH {
+                continue;
+            }
+            glass.push(self.glass(m, at));
+        }
+        if glass.first().is_some_and(|g| g.at > 0) {
+            self.glass_backdrops(&glass, canvas, list, pending, out);
         }
     }
 
@@ -626,7 +701,7 @@ impl Builder<'_> {
         let Some(view) = layer.view else { return Err(()) };
         let Some(inverse) = root.then(layer.matrix).inverse() else { return Err(()) };
         let bare = LayerState { effects: Vec::new(), ..layer.clone() };
-        let items = self.layer_items(&bare, root, &mut list.stops, &mut list.segments);
+        let items = self.layer_items(&bare, root, list, pending);
         let blur = if blurred { card_blur(layer, self.scale) } else { 0.0 };
         let pad = if blur > 0.3 { 3.0 * blur + 2.0 } else { 0.0 };
         if items.is_empty() {
@@ -694,27 +769,81 @@ impl Builder<'_> {
         true
     }
 
-    /// Glass refracts what is drawn before it: those items, drawn again
-    /// into a group around the glass (blurred by its roughness: frosted).
-    fn glass_backdrop(&mut self, m: &lahza_motion_core::compile::MeshState, item: &Item, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &[Item]) {
-        let glass = m.materials.iter().filter(|x| x.transmission > 0.0);
+    /// A glass mesh (its item at `at` in the list's items) and how far it
+    /// bends and blurs what is behind it (output px).
+    fn glass(&self, m: &lahza_motion_core::compile::MeshState, at: usize) -> Glass {
         let (mut reach, mut rough) = (0.0f64, 0.0f64);
-        for x in glass {
+        for x in m.materials.iter().filter(|x| x.transmission > 0.0) {
             reach = reach.max(x.thickness);
             rough = rough.max(x.roughness);
         }
-        let sigma = rough * rough * 60.0 * self.scale;
-        let pad = reach * self.scale + 3.0 * sigma + 8.0;
-        let b = item.bounds;
+        Glass { at, reach: reach * self.scale, sigma: rough * rough * 60.0 * self.scale }
+    }
+
+    /// Glass refracts what is drawn before it: those items, drawn again
+    /// into a group around the glass (blurred by its roughness: frosted).
+    /// A group per glass mesh would draw the scene again per mesh (a tank
+    /// of bubbles: once per bubble), so glass meshes share groups, as
+    /// screen-space refraction shares one copy of the frame: glass over
+    /// nothing drawn since the first glass mesh shares one group of what
+    /// was drawn before it. A glass mesh's picture replaces what is under
+    /// it, so glass drawn over earlier items of the run (glass behind
+    /// glass) sits a layer above them and shares a group that holds them
+    /// too: as many groups as glass stacks deep, not one per mesh. Frosted
+    /// glass shares one group per blur level, in half-octave steps blurred
+    /// by their mean.
+    fn glass_backdrops(&mut self, glass: &[Glass], canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &[Item]) {
         let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
-        let rect = [(b[0] - pad).floor().max(0.0), (b[1] - pad).floor().max(0.0), (b[2] + pad).ceil().min(cw), (b[3] + pad).ceil().min(ch)];
-        if rect[2] <= rect[0] || rect[3] <= rect[1] {
-            return;
+        let overlap = |a: [f64; 4], b: [f64; 4]| a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];
+        // Each item of the run gets a layer: glass one above every earlier
+        // item it is drawn over; other items the highest of those, so glass
+        // they are drawn over does not also show them refracted. Items
+        // only in reach of a glass mesh's bent rays don't count (it shows
+        // what is behind them instead), which keeps a cloud of bubbles to a
+        // few layers.
+        let first = glass[0].at;
+        let bounds: Vec<[f64; 4]> = out[first..].iter().map(canvas_bounds).collect();
+        let mut layers: Vec<usize> = Vec::with_capacity(bounds.len());
+        let mut g = glass.iter().peekable();
+        for k in 0..bounds.len() {
+            let glassy = g.next_if(|g| g.at == first + k).is_some();
+            let under = (0..k).filter(|&j| overlap(bounds[j], bounds[k])).map(|j| layers[j] + glassy as usize);
+            layers.push(under.max().unwrap_or(0));
         }
-        let factor = if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
-        let (offset, origin, f, size) = self.reserve(list, pending, out.to_vec(), rect, if sigma > 0.3 { sigma } else { 0.0 }, factor, false);
-        let i = item.prim.kind[1] as usize;
-        self.meshes.batches[i].backdrop = Some(crate::mesh3d::Backdrop { offset, size, origin, factor: f });
+        let layer = |g: &Glass| layers[g.at - first];
+        let level = |s: f64| if s > 0.3 { (s.log2() * 2.0).round() as i32 } else { i32::MIN };
+        // Lower layers first: their glass draws in the groups above.
+        let mut keys: Vec<(usize, i32)> = glass.iter().map(|g| (layer(g), level(g.sigma))).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for (l, lv) in keys {
+            let members: Vec<&Glass> = glass.iter().filter(|g| layer(g) == l && level(g.sigma) == lv).collect();
+            let sigma = if lv == i32::MIN { 0.0 } else { members.iter().map(|g| g.sigma).sum::<f64>() / members.len() as f64 };
+            // Out to the members' refraction offsets and blur.
+            let mut rect = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+            for g in &members {
+                let (b, pad) = (bounds[g.at - first], g.reach + 3.0 * sigma + 8.0);
+                rect = [rect[0].min(b[0] - pad), rect[1].min(b[1] - pad), rect[2].max(b[2] + pad), rect[3].max(b[3] + pad)];
+            }
+            let rect = [rect[0].floor().max(0.0), rect[1].floor().max(0.0), rect[2].ceil().min(cw), rect[3].ceil().min(ch)];
+            if !(rect[2] > rect[0] && rect[3] > rect[1]) {
+                continue;
+            }
+            let factor = if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
+            // Only what lands in the rect.
+            let items: Vec<Item> = out
+                .iter()
+                .enumerate()
+                .filter(|(i, it)| (*i < first || layers[i - first] < l) && overlap(canvas_bounds(it), rect))
+                .map(|(_, it)| it.clone())
+                .collect();
+            let (offset, origin, f, size) = self.reserve(list, pending, items, rect, sigma, factor, false);
+            // Each glass prim maps its own target's pixels onto this group
+            // (`mesh_prim`), so one group serves every mesh and target.
+            for g in members {
+                self.meshes.batches[out[g.at].prim.kind[1] as usize].backdrop = Some(crate::mesh3d::Backdrop { offset, size, origin, factor: f });
+            }
+        }
     }
 
     /// A plain group drawn straight into its parent, without an offscreen
@@ -752,7 +881,7 @@ impl Builder<'_> {
         let mut boxes: Vec<[f64; 4]> = Vec::with_capacity(children.len());
         for child in children {
             let faded = LayerState { opacity: child.opacity * layer.opacity, ..child.clone() };
-            let its = self.layer_items(&faded, inner, &mut list.stops, &mut list.segments);
+            let its = self.layer_items(&faded, inner, list, pending);
             let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
             for it in &its {
                 let c = canvas_bounds(it);
@@ -811,7 +940,7 @@ impl Builder<'_> {
         if factor < 2.0 {
             return None;
         }
-        let items = self.layer_items(layer, root, &mut list.stops, &mut list.segments);
+        let items = self.layer_items(layer, root, list, pending);
         let mut t = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for it in &items {
             let b = tight_bounds(it);
@@ -836,9 +965,6 @@ impl Builder<'_> {
     fn emit(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         if let (false, Content::Mesh(m)) = (layer.is_isolated(), &layer.content) {
             if let Some(item) = self.mesh_item(layer, m, root, out.last_mut()) {
-                if crate::mesh3d::refracts(m) && !out.is_empty() {
-                    self.glass_backdrop(m, &item, canvas, list, pending, out);
-                }
                 out.push(item);
             }
             return;
@@ -848,7 +974,7 @@ impl Builder<'_> {
                 out.push(item);
                 return;
             }
-            out.extend(self.layer_items(layer, root, &mut list.stops, &mut list.segments));
+            out.extend(self.layer_items(layer, root, list, pending));
             return;
         }
         if let Content::Group(children) = &layer.content {
@@ -868,7 +994,11 @@ impl Builder<'_> {
             }
             _ => {
                 let bare = LayerState { effects: Vec::new(), matte: None, ..layer.clone() };
-                items = self.layer_items(&bare, root, &mut list.stops, &mut list.segments);
+                items = self.layer_items(&bare, root, list, pending);
+                // Drawn in this picture, apart from the rest of the list.
+                for it in items.iter().filter(|it| it.prim.kind[0] == PRIM_MESH) {
+                    self.meshes.batches[it.prim.kind[1] as usize].isolated = true;
+                }
                 1.0
             }
         };
@@ -1065,12 +1195,16 @@ impl Builder<'_> {
         }
     }
 
-    fn layer_items(&mut self, layer: &LayerState, root: Proj, stops: &mut Vec<[f32; 4]>, segments: &mut Vec<[f32; 4]>) -> Vec<Item> {
+    fn layer_items(&mut self, layer: &LayerState, root: Proj, list: &mut DisplayList, pending: &mut Vec<Pending>) -> Vec<Item> {
+        if let Content::Shader(s) = &layer.content {
+            return self.shader_items(layer, s, root, list, pending).into_iter().collect();
+        }
+        let (stops, segments) = (&mut list.stops, &mut list.segments);
         let matrix = root.then(layer.matrix);
         let blend = blend_code(layer.blend);
         let mut items = Vec::new();
         match &layer.content {
-            Content::Group(_) => {}
+            Content::Group(_) | Content::Shader(_) => {}
             Content::Mesh(m) => items.extend(self.mesh_item(layer, m, root, None)),
             Content::Shape(s) if s.shape == ShapeKind::Path => {
                 items.extend(path_items(s, matrix, layer.opacity, blend, stops, segments));
@@ -1295,7 +1429,55 @@ impl Builder<'_> {
         }
         items
     }
+
+    /// A shader layer: its function paints its picture into a group (the
+    /// GPU's kernel or the CPU's calls, not the rasteriser), at about the
+    /// size it shows, drawn as an image.
+    fn shader_items(&mut self, layer: &LayerState, s: &ShaderState, root: Proj, list: &mut DisplayList, pending: &mut Vec<Pending>) -> Option<Item> {
+        let (w, h) = (s.size.x(), s.size.y());
+        if !(w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite()) {
+            return None;
+        }
+        // A texel per canvas pixel at the layer's centre, per axis.
+        let matrix = root.then(layer.matrix);
+        let o = matrix.apply(0.0, 0.0);
+        let along = |x: f64, y: f64| {
+            let p = matrix.apply(x, y);
+            let k = (p.0 - o.0).hypot(p.1 - o.1);
+            if k.is_finite() { k.clamp(1.0 / 64.0, 64.0) } else { 1.0 }
+        };
+        let (mut gw, mut gh) = ((w * along(1.0, 0.0) - 1e-6).ceil().max(1.0), (h * along(0.0, 1.0) - 1e-6).ceil().max(1.0));
+        // Huge pictures (zoomed in) are drawn coarser.
+        let over = gw * gh / SHADER_TEXELS;
+        if over > 1.0 {
+            (gw, gh) = ((gw / over.sqrt()).floor().max(1.0), (gh / over.sqrt()).floor().max(1.0));
+        }
+        let (gw, gh) = ((gw as u32).min(8192), (gh as u32).min(8192));
+        let offset = list.group_texels;
+        let group = Group { target: Target::new(gw, gh, 0, [0.0; 4]), offset, sigma: 0.0, clamp: false, trace: None, shader: Some(list.shaders.len() as u32) };
+        list.group_texels += gw * gh;
+        list.shaders.push(crate::shader::ShaderPass {
+            program: s.program.clone(),
+            t: s.t as f32,
+            size: [w as f32, h as f32],
+            params: s.params.iter().map(|p| p.map(|v| v as f32)).collect(),
+        });
+        pending.push(Pending { group, items: Vec::new(), origin: [0.0; 2], factor: [1.0; 2] });
+        // Texel space → layer space: centred, scaled to the layer's size.
+        let forward = matrix.then(Affine::translate(-w / 2.0, -h / 2.0)).then(Affine::scale(w / gw as f64, h / gh as f64));
+        let prim = Prim {
+            kind: [PRIM_IMAGE, SOURCE_GROUP, blend_code(layer.blend), 0],
+            geom: [gw as f32, gh as f32, 1.0, 0.0],
+            geom2: [f32::from_bits(offset), 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        let (prim, _) = with_inverse(prim, forward, layer.opacity)?;
+        Some(Item { prim, forward, bounds: [0.0, 0.0, gw as f64, gh as f64] })
+    }
 }
+
+/// Most texels a shader layer's picture takes (a 4K frame's).
+const SHADER_TEXELS: f64 = 3840.0 * 2160.0;
 
 /// A flat 3D layer the path tracer can place in its scene as a card.
 fn trace_card_candidate(layer: &LayerState) -> bool {
@@ -1385,7 +1567,7 @@ fn canvas_bounds(item: &Item) -> [f64; 4] {
 }
 
 /// Appends prims and their per-tile index lists for one target.
-fn bin(list: &mut DisplayList, target: &Target, prims: Vec<(Prim, [f64; 4])>) {
+fn bin(list: &mut DisplayList, target: &Target, which: u32, prims: Vec<(Prim, [f64; 4])>) {
     let n = target.tiles() as usize;
     let mut per_tile: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (prim, b) in prims {
@@ -1405,6 +1587,10 @@ fn bin(list: &mut DisplayList, target: &Target, prims: Vec<(Prim, [f64; 4])>) {
         let ty0 = (b[1].max(0.0) as u32) / TILE;
         let tx1 = ((b[2].min(target.width as f64 - 1.0)).max(0.0) as u32) / TILE;
         let ty1 = ((b[3].min(target.height as f64 - 1.0)).max(0.0) as u32) / TILE;
+        if prim.kind[0] == PRIM_MESH {
+            let rect = [tx0 * TILE, ty0 * TILE, ((tx1 + 1) * TILE).min(target.width), ((ty1 + 1) * TILE).min(target.height)];
+            list.mesh_draws.push(MeshDraw { prim: index, target: which, rect });
+        }
         for ty in ty0..=ty1.min(target.tiles_y - 1) {
             for tx in tx0..=tx1.min(target.tiles_x - 1) {
                 per_tile[(ty * target.tiles_x + tx) as usize].push(index);

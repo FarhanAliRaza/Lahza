@@ -196,6 +196,18 @@ pub fn tool_defs() -> Vec<ToolDef> {
             read_only: false,
         },
         ToolDef {
+            name: "shader_write",
+            description: "Write a Slang module to the project's shaders/<name>.slang and compile it; returns the compiler's errors as shaders/<file>:<line>:<col>: <what> (the file is written either way: fix and write again). Modules are plain Slang (https://shader-slang.org) functions; `import other;` reaches other modules and `import lahza;` Lahza's types and helpers. Uses (contracts and examples in lahza://slang): scene parameters (any animatable property's \"add\": [{\"type\": \"slang\", \"function\": \"orbit\"}] with `T orbit(float t)`: camera, transforms, lights, materials), shader layers ({\"kind\": \"shader\", \"function\": \"sky\"} with `float4 sky(float2 uv, float2 px, float t, …params)`), generated geometry and deformers (\"mesh\": {\"type\": \"slang\", …}, \"deform\": {…}) and materials (\"material\": {\"slang\": \"marble\"} with `Surface marble(SurfaceInput s)`). The same code runs for GPU and CPU renders.",
+            schema: obj(json!({"name": {"type": "string", "description": "module name (letters, digits, _): what `import` and the file use"}, "source": {"type": "string", "description": "Slang source"}}), &["name", "source"]),
+            read_only: false,
+        },
+        ToolDef {
+            name: "shader_check",
+            description: "Compile the project's Slang modules (one by `name`, else all) and list errors as shaders/<file>:<line>:<col>: <what>. `check` also reports Slang errors of functions the project uses.",
+            schema: obj(json!({"name": {"type": "string"}}), &[]),
+            read_only: true,
+        },
+        ToolDef {
             name: "check",
             description: "Structure, timing (measured sync drift per anchored key on the frame grid, long holds), layout (title-safe, overlapping text, contrast) and licences, plus two pixel checks on small renders: first_frame_empty (frame 0, the thumbnail social players show, is only background) and empty_after_cut (0.1–0.4 s after a cut nothing but background is on screen: dead air). ok=false means errors.",
             schema: obj(json!({"tolerance_frames": {"type": "number", "default": 1}, "verbose": {"type": "boolean"}}), &[]),
@@ -389,7 +401,7 @@ fn stamp(dir: &Path) -> SystemTime {
         }
     };
     look(&dir.join("project.json"));
-    for sub in ["scenes", "markers"] {
+    for sub in ["scenes", "markers", "shaders"] {
         look(&dir.join(sub));
         if let Ok(rd) = std::fs::read_dir(dir.join(sub)) {
             for e in rd.flatten() {
@@ -452,7 +464,7 @@ impl Toolbox {
             current: None,
             projects: HashMap::new(),
             jobs: Vec::new(),
-            backend: Backend::Auto,
+            backend: Backend::Gpu,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
@@ -479,6 +491,8 @@ impl Toolbox {
             "narration_import" => self.narration_import(&args),
             "edit_apply" => self.edit_apply(&args),
             "check" => self.check(&args),
+            "shader_write" => self.shader_write(&args),
+            "shader_check" => self.shader_check(&args),
             "sync_check" => self.sync_check(&args),
             "snapshot" => self.snapshot(&args),
             "review" => self.review(&args),
@@ -1013,6 +1027,7 @@ impl Toolbox {
                             lahza_motion_core::document::LayerKind::Shape(s) => out["shape"] = json!(s.shape),
                             lahza_motion_core::document::LayerKind::Image(i) => out["src"] = json!(i.src),
                             lahza_motion_core::document::LayerKind::Video(v) => out["src"] = json!(v.src),
+                            lahza_motion_core::document::LayerKind::Shader(s) => out["function"] = json!(s.function),
                             lahza_motion_core::document::LayerKind::Comp(_) => out["layers"] = json!(layers(l.children(), compiled, project)),
                             lahza_motion_core::document::LayerKind::Instancer(n) => {
                                 out["layout"] = json!(n.layout);
@@ -1309,6 +1324,51 @@ impl Toolbox {
             "summary": applied.summary,
             "errors": compiled.errors,
         })))
+    }
+
+    fn shader_write(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let name = get_str(args, "name").ok_or("shader_write needs \"name\"")?;
+        let source = get_str(args, "source").ok_or("shader_write needs \"source\"")?;
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.starts_with(|c: char| c.is_ascii_digit()) {
+            return Err("a module name is letters, digits and _ (not starting with a digit)".into());
+        }
+        let folder = dir.join("shaders");
+        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+        let path = folder.join(format!("{name}.slang"));
+        io::write_atomic(&path, source.as_bytes()).map_err(|e| e.to_string())?;
+        let shaders = lahza_motion_core::slang::load(&dir).map_err(|e| e.to_string())?;
+        // With the built-in module (`import lahza;`).
+        let result = lahza_motion_core::slang::check(&lahza_motion_core::surface::modules(&shaders), name);
+        let open = self.state(&dir);
+        open.project.shaders = shaders;
+        open.compiled = None;
+        open.stamp = stamp(&dir);
+        Ok(Output::json(match result {
+            Ok(()) => json!({"path": path.strip_prefix(&dir).unwrap_or(&path), "ok": true}),
+            Err(e) => json!({"path": path.strip_prefix(&dir).unwrap_or(&path), "ok": false, "errors": e}),
+        }))
+    }
+
+    fn shader_check(&mut self, args: &Value) -> ToolResult {
+        let dir = self.dir(args)?;
+        let shaders = self.state(&dir).project.shaders.clone();
+        let names: Vec<String> = match get_str(args, "name") {
+            Some(n) => vec![n.to_string()],
+            None => shaders.iter().map(|m| m.name.clone()).collect(),
+        };
+        let mut modules = Vec::new();
+        for n in names {
+            if !shaders.iter().any(|m| m.name == n) {
+                return Err(format!("no module '{n}' in shaders/"));
+            }
+            modules.push(match lahza_motion_core::slang::check(&lahza_motion_core::surface::modules(&shaders), &n) {
+                Ok(()) => json!({"name": n, "ok": true}),
+                Err(e) => json!({"name": n, "ok": false, "errors": e}),
+            });
+        }
+        let ok = modules.iter().all(|m| m["ok"] == true);
+        Ok(Output::json(json!({"ok": ok, "modules": modules})))
     }
 
     fn check(&mut self, args: &Value) -> ToolResult {

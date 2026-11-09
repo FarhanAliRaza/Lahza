@@ -366,7 +366,13 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
             failed = Some("cancelled".to_string());
             break;
         }
-        let frame = renderer.render(compiled, fps.time_of(n));
+        let frame = match renderer.try_render(compiled, fps.time_of(n)) {
+            Ok(frame) => frame,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
         let frame = if frame.dimensions() != (w, h) {
             image::imageops::resize(&frame, w, h, image::imageops::FilterType::Triangle)
         } else {

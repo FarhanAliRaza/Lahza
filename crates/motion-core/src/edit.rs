@@ -66,6 +66,8 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
     let mut next: Project = serde_json::from_value(doc).map_err(|e| format!("result is not a valid project: {e}"))?;
     next.markers = project.markers.clone();
     next.narration = project.narration.clone();
+    // Not in the JSON either (`shaders/` on disk).
+    next.shaders = project.shaders.clone();
     let markers_changed = !ripples.is_empty();
     for (at, d) in ripples {
         ripple_markers(&mut next, project, at, d);

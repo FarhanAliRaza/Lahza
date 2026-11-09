@@ -58,6 +58,7 @@ pub fn load(dir: &Path) -> Result<Project> {
     }
     let mut project: Project = serde_json::from_value(doc).map_err(|e| err(&file, e))?;
     project.markers = load_markers(dir)?;
+    project.shaders = crate::slang::load(dir).map_err(|e| err(&dir.join("shaders"), e))?;
     let narration = dir.join("narration.json");
     if narration.is_file() {
         project.narration = Some(serde_json::from_value(read_json(&narration)?).map_err(|e| err(&narration, e))?);

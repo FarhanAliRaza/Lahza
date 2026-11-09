@@ -372,7 +372,7 @@ impl crate::traits::ShaderDevice for super::Context {
         let mut raw_vec = unsafe {
             self.device
                 .core
-                .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_compute_pipelines(self.pipeline_cache, &[create_info], None)
                 .unwrap()
         };
         let raw = raw_vec.pop().unwrap();
@@ -613,7 +613,7 @@ impl crate::traits::ShaderDevice for super::Context {
         let mut raw_vec = unsafe {
             self.device
                 .core
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(self.pipeline_cache, &[create_info], None)
                 .unwrap()
         };
         let raw = raw_vec.pop().unwrap();

@@ -11,7 +11,19 @@
 //! clear coat, fresnel) under the scene's lights and a procedural
 //! environment, in linear light, encoded to sRGB.
 //!
-//! `shade_mesh` mirrors `mesh_shade` in `motion.wgsl` line for line.
+//! Between batches of one layer list, depth is shared per pixel: the
+//! rasteriser first gathers the nearest surface of the list's opaque
+//! batches on the target (`run_depth`), and every batch of the list shows
+//! only where it is in front of that. A layer drawn in a picture of its own
+//! (effects, a matte) is not on the same target, so across that boundary
+//! the opaque mesh is copied into the batch as an occluder instead.
+//!
+//! For the GPU's hardware visibility pass the CPU does none of the per
+//! vertex work: each generated mesh is kept on the GPU (`pool.rs`) and a
+//! batch holds its layers as instances of them (transforms, projection,
+//! materials); the GPU moves, culls and clips their triangles every frame.
+//!
+//! `shade_mesh` and `run_depth` mirror their namesakes in `motion.wgsl`.
 
 use crate::list::{Prim, Target, PRIM_MESH, TILE};
 use lahza_motion_core::compile::{Lighting, MeshState};
@@ -26,9 +38,16 @@ use std::sync::Arc;
 pub struct MeshCache {
     /// Parsed glTF files (meshes from Blender).
     gltf_files: crate::model::Files,
-    meshes: HashMap<Vec<u8>, (Arc<Mesh>, u64)>,
+    /// By key: the mesh, the frame that last used it, and whether it is
+    /// new every frame (`MeshParams::animated`).
+    meshes: HashMap<Vec<u8>, (Arc<Mesh>, u64, bool)>,
     /// Per generated mesh: each triangle's outward winding (+1/−1, 0 open).
     sides: HashMap<usize, Arc<Vec<f32>>>,
+    /// Per generated mesh: the mesh as the GPU's mesh pool takes it.
+    pooled: HashMap<usize, Arc<Pooled>>,
+    /// Lists are being built for the GPU's visibility pass: mesh layers
+    /// become instances of pooled meshes (`Batch::add_instance`).
+    compact: bool,
     frame: u64,
     /// Batches of the display list being built.
     pub(crate) batches: Vec<Batch>,
@@ -47,10 +66,25 @@ pub struct MeshCache {
     heights: HashMap<String, Option<Arc<mesh::Heightfield>>>,
     /// Time spent generating meshes since the renderer last took it.
     pub(crate) busy: std::time::Duration,
-    /// Environment images that could not be loaded (not drawn as asked).
+    /// Time spent placing batches on targets (for `--profile`).
+    pub(crate) placing: std::time::Duration,
+    /// Of `placing`: triangle setup (projection onto the target).
+    pub(crate) placing_setup: std::time::Duration,
+    /// Time spent adding other meshes to batches as occluders.
+    pub(crate) occluding: std::time::Duration,
+    /// Time spent building shadow maps (from the meshes' CPU geometry).
+    pub(crate) shadowing: std::time::Duration,
+    /// Environment images that could not be loaded and Slang geometry
+    /// that failed (not drawn as asked).
     pub dropped: Vec<String>,
     /// Image maps of the meshes being added (resolved by the list builder).
     pub(crate) textures: HashMap<Arc<str>, Option<crate::images::Texture>>,
+    /// The project's Slang surfaces, when the list's meshes use them (for
+    /// the GPU's shader variant).
+    pub(crate) surfaces: Option<Arc<lahza_motion_core::surface::Program>>,
+    /// A Slang surface function a traced mesh uses (the path tracer cannot
+    /// run them: the frame fails).
+    pub(crate) traced_slang: Option<Arc<str>>,
 }
 
 /// A mesh layer of a layer list, for the other batches of that list.
@@ -60,6 +94,8 @@ struct RunMesh {
     root: Proj,
     /// Opaque, normal blend: it hides what is behind it.
     occludes: bool,
+    /// Drawn in a picture of its own (effects, matte), not with the list.
+    isolated: bool,
     bounds: [f64; 4],
 }
 
@@ -96,6 +132,7 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
         || m.materials.iter().any(|x| x.opacity < 1.0 || x.transmission > 0.0 || x.color.0[3] < 1.0)
         || m.colors.iter().any(|c| c.0[3] < 1.0)
         || m.materials.iter().any(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some())
+        || m.materials.iter().any(|x| x.slang.as_ref().is_some_and(|s| s.see_through))
 }
 
 impl MeshCache {
@@ -104,18 +141,37 @@ impl MeshCache {
         Self { root: root.map(std::path::Path::to_path_buf), ..Default::default() }
     }
 
-    pub(crate) fn begin(&mut self) {
+    pub(crate) fn begin(&mut self, compact: bool) {
+        self.compact = compact;
         self.frame += 1;
         self.batches.clear();
         self.runs.clear();
         self.placed.clear();
         self.textures.clear();
-        if self.meshes.len() > 96 {
-            let keep = self.frame.saturating_sub(4);
-            self.meshes.retain(|_, (_, used)| *used >= keep);
-            let live: std::collections::HashSet<usize> = self.meshes.values().map(|(m, _)| Arc::as_ptr(m) as usize).collect();
+        self.surfaces = None;
+        // Animated Slang geometry is new every frame: only the last frame's
+        // is kept, however big it is.
+        let frame = self.frame;
+        let gone = |used: u64, animated: bool| animated && used + 1 < frame;
+        let full = self.meshes.len() > 96;
+        if full || self.meshes.values().any(|(_, used, animated)| gone(*used, *animated)) {
+            let keep = if full { frame.saturating_sub(4) } else { 0 };
+            self.meshes.retain(|_, (_, used, animated)| *used >= keep && !gone(*used, *animated));
+            let live: std::collections::HashSet<usize> = self.meshes.values().map(|(m, ..)| Arc::as_ptr(m) as usize).collect();
             self.sides.retain(|k, _| live.contains(k));
+            self.pooled.retain(|k, _| live.contains(k));
         }
+    }
+
+    /// Numbers the triangles of the list's batches (the visibility pass's
+    /// ids): each batch takes the next range. Returns how many there are.
+    pub(crate) fn number_batches(&mut self) -> u32 {
+        let mut next = 0u32;
+        for b in &mut self.batches {
+            b.id_base = next;
+            next = next.saturating_add(b.tris.len() as u32 + b.inst_tris);
+        }
+        next
     }
 
     /// Starts emitting a layer list drawn through `root`.
@@ -127,6 +183,9 @@ impl MeshCache {
             .enumerate()
             .filter_map(|(index, l)| {
                 let Content::Mesh(m) = &l.content else { return None };
+                if let Some(p) = m.materials.iter().find_map(|x| x.slang.as_ref().and_then(|s| s.program())) {
+                    self.surfaces = Some(p);
+                }
                 let b = m.screen_bounds()?;
                 let pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])].map(|(x, y)| root.apply(x, y));
                 let bounds = [
@@ -135,7 +194,7 @@ impl MeshCache {
                     pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
                     pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
                 ];
-                Some(RunMesh { index, state: (**m).clone(), root, occludes: !see_through(l), bounds })
+                Some(RunMesh { index, state: (**m).clone(), root, occludes: !see_through(l), isolated: l.is_isolated(), bounds })
             })
             .collect();
         self.runs.push(Run { serial: self.serial, meshes, cards: Vec::new(), current: 0 });
@@ -169,7 +228,9 @@ impl MeshCache {
             return;
         }
         // Shadows: every mesh of the list casts onto every other.
+        let started = std::time::Instant::now();
         let shadows = self.shadow_maps(&run);
+        self.shadowing += started.elapsed();
         let mut batches = std::mem::take(&mut self.batches);
         // Cards are unlit pictures: no light rows to hang shadow maps on.
         for b in batches.iter_mut().filter(|b| b.list == run.serial && !b.cards_only) {
@@ -179,15 +240,21 @@ impl MeshCache {
             self.batches = batches;
             return;
         }
+        // Opaque meshes hide the list's other batches drawn with them
+        // through the depth the rasteriser gathers per pixel from the
+        // list's opaque batches (`run_depth`). A mesh drawn in a picture of
+        // its own (effects, matte) is not there, so across that boundary,
+        // either way, the opaque mesh goes into the batch as an occluder.
+        // Cards are drawn after the opaque meshes and blend over them, so
+        // they hide only other cards (in another cards' batch).
+        let started = std::time::Instant::now();
         for b in batches.iter_mut().filter(|b| b.list == run.serial) {
             for rm in &run.meshes {
                 let overlaps = rm.bounds[2] >= b.bounds[0] && rm.bounds[0] <= b.bounds[2] && rm.bounds[3] >= b.bounds[1] && rm.bounds[1] <= b.bounds[3];
-                if rm.occludes && overlaps && !b.members.contains(&rm.index) {
+                if rm.occludes && (rm.isolated || b.isolated) && overlaps && !b.members.contains(&rm.index) {
                     b.add_occluder(self, &rm.state, rm.root);
                 }
             }
-            // Cards are drawn after the opaque meshes and blend over them,
-            // so they hide only other cards (in another cards' batch).
             if !b.cards_only {
                 continue;
             }
@@ -198,6 +265,7 @@ impl MeshCache {
                 }
             }
         }
+        self.occluding += started.elapsed();
         self.batches = batches;
     }
 
@@ -286,6 +354,9 @@ impl MeshCache {
     /// A mesh layer as an instance for the path tracer: its geometry, its
     /// object → camera transform and its materials by part and segment.
     pub(crate) fn trace_instance(&mut self, id: Arc<str>, m: &MeshState, opacity: f64, scale: f64) -> Option<crate::pt::TraceInstance> {
+        if let Some(s) = m.materials.iter().find_map(|x| x.slang.as_ref()) {
+            self.traced_slang.get_or_insert(s.function.clone());
+        }
         let mesh = self.get(m)?;
         let mv = m.camera.view.then(m.world).0;
         let transform = [0, 1, 2].map(|r| [mv[r * 4] as f32, mv[r * 4 + 1] as f32, mv[r * 4 + 2] as f32, mv[r * 4 + 3] as f32]);
@@ -349,9 +420,21 @@ impl MeshCache {
         h
     }
 
+    /// The generated mesh as the GPU's mesh pool takes it.
+    fn pooled(&mut self, m: &MeshState) -> Option<Arc<Pooled>> {
+        let mesh = self.get(m)?;
+        let at = Arc::as_ptr(&mesh) as usize;
+        if let Some(p) = self.pooled.get(&at) {
+            return Some(p.clone());
+        }
+        let p = Arc::new(Pooled::new(m.params.key().into(), mesh, m.params.animated()));
+        self.pooled.insert(at, p.clone());
+        Some(p)
+    }
+
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
         let key = m.params.key();
-        if let Some((mesh, used)) = self.meshes.get_mut(&key) {
+        if let Some((mesh, used, _)) = self.meshes.get_mut(&key) {
             *used = self.frame;
             return Some(mesh.clone());
         }
@@ -365,15 +448,27 @@ impl MeshCache {
                 mesh::displace_by_image(g, &m.params, &h);
             }
         }
+        if let (Ok(g), Some(d)) = (&mut generated, &m.params.deform) {
+            if let Err(e) = lahza_motion_core::slang_mesh::deform(g, d) {
+                generated = Err(e);
+            }
+        }
         self.busy += started.elapsed();
         match generated {
             Ok(mesh) => {
                 let mesh = Arc::new(mesh);
-                self.meshes.insert(key, (mesh.clone(), self.frame));
+                self.meshes.insert(key, (mesh.clone(), self.frame, m.params.animated()));
                 Some(mesh)
             }
             Err(e) => {
-                self.warnings.push(e);
+                // Slang geometry that fails (NaN, a triangle past the
+                // points) is not drawn as asked: an error, like a missing
+                // image. A failing mesh is tried again every frame: said once.
+                let slang = m.params.deform.is_some() || matches!(m.params.shape, mesh::MeshShape::Slang(_));
+                let list = if slang { &mut self.dropped } else { &mut self.warnings };
+                if !list.contains(&e) {
+                    list.push(e);
+                }
                 None
             }
         }
@@ -391,8 +486,165 @@ pub(crate) struct Vert {
 }
 
 /// Rows per vertex: [camera position, 1/z], [normal, u], [noise-space
-/// position, v].
-pub(crate) const VROWS: usize = 3;
+/// position, v], [canvas position, 0, 0].
+pub(crate) const VROWS: usize = 4;
+
+/// A generated mesh as the GPU's mesh pool (`pool.rs`) holds it: uploaded
+/// once in object space and shared by every layer that shows it, so a
+/// frame sends the GPU only each layer's transform and materials.
+pub(crate) struct Pooled {
+    /// The mesh parameters: identifies the geometry across frames.
+    pub key: Arc<[u8]>,
+    pub mesh: Arc<Mesh>,
+    /// Object-space bounding box (placement bounds without the vertices).
+    lo: [f64; 3],
+    hi: [f64; 3],
+    /// Per part: the segments its triangles use (highest + 1; 0: none), so
+    /// a layer writes materials only for the parts and colours it shows.
+    segments: [u32; PARTS],
+    /// New every frame (`MeshParams::animated`): the pool frees it as soon
+    /// as a frame does not draw it.
+    pub animated: bool,
+}
+
+/// Pool rows per vertex: [position, u], [normal, v].
+pub(crate) const PROWS: usize = 2;
+
+impl Pooled {
+    fn new(key: Arc<[u8]>, mesh: Arc<Mesh>, animated: bool) -> Self {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in &mesh.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k] as f64);
+                hi[k] = hi[k].max(p[k] as f64);
+            }
+        }
+        let mut segments = [0u32; PARTS];
+        for k in 0..mesh.tris.len() {
+            let tag = mesh.tags.get(k).copied().unwrap_or(0);
+            let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
+            segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
+        }
+        Self { key, mesh, lo, hi, segments, animated }
+    }
+
+    /// Rows the mesh takes in the pool.
+    pub(crate) fn rows(&self) -> usize {
+        self.mesh.positions.len() * PROWS + self.mesh.tris.len()
+    }
+
+    /// The pool rows: per vertex [position, u] [normal, v], then per
+    /// triangle [vertex ids, packed] with packed = segment (bits 0..16), part
+    /// (16..19), real-edge mask (19..22), two-sided (22) and which winding
+    /// faces out (23..25: 1 as wound, 2 reversed), taken from the vertex
+    /// normals once here rather than per frame.
+    pub(crate) fn write(&self, out: &mut Vec<[f32; 4]>) {
+        let m = &*self.mesh;
+        for (i, p) in m.positions.iter().enumerate() {
+            let n = m.normals.get(i).copied().unwrap_or([0.0; 3]);
+            let uv = m.uvs.get(i).copied().unwrap_or([0.0; 2]);
+            out.push([p[0], p[1], p[2], uv[0]]);
+            out.push([n[0], n[1], n[2], uv[1]]);
+        }
+        let b = f32::from_bits;
+        // One record per triangle, whatever the tags and edges hold (the
+        // pool reserved `rows`).
+        for (k, t) in m.tris.iter().enumerate() {
+            let (tag, edges) = (m.tags.get(k).copied().unwrap_or(0), m.edges.get(k).copied().unwrap_or(7));
+            let part = mesh::tag_part(tag).min(PARTS as u32 - 1);
+            let side = if tag & TWO_SIDED != 0 {
+                0
+            } else {
+                let p = t.map(|i| m.positions[i as usize].map(|v| v as f64));
+                let n = t.iter().fold([0.0; 3], |acc, &i| add(acc, m.normals[i as usize].map(|v| v as f64)));
+                if dot(cross(sub(p[1], p[0]), sub(p[2], p[0])), n) >= 0.0 { 1 } else { 2 }
+            };
+            let packed = (mesh::tag_segment(tag) & 0xffff) | part << 16 | (edges as u32 & 7) << 19 | ((tag & TWO_SIDED != 0) as u32) << 22 | side << 23;
+            out.push([b(t[0]), b(t[1]), b(t[2]), b(packed)]);
+        }
+    }
+}
+
+/// Instance rows (one mesh layer drawing a pooled mesh): 0–2 object →
+/// camera (3 × 4), 3–5 the normal matrix, 6–8 object → noise space
+/// (identity, or the world transform when a part's noise asks), 9 [focal,
+/// centre x, y, flags (1: mirrored)], 10–12 `root` (canvas → output px),
+/// 13 [pool row of its vertices, of its triangles (both set by the GPU's
+/// pool), triangles, first triangle among the batch's instances], 14 [0,
+/// x-ray parts (bit per part: never culled), 0, 0], 15–16 per part its
+/// first material, 17–18 per part its colours (a triangle's material is
+/// first + segment mod colours), 19 its bounds in output px (the GPU draws
+/// it only on visibility pages it may touch).
+pub(crate) const IROWS: usize = 20;
+/// Instance flag: the transform mirrors (outward windings reverse).
+const INST_MIRRORED: u32 = 1;
+
+/// An instance row the GPU's pool fills in with where its mesh is.
+#[derive(Clone)]
+pub struct PoolRef {
+    /// Row of `DisplayList::mesh` (instance row 13).
+    pub row: u32,
+    pub(crate) mesh: Arc<Pooled>,
+}
+
+impl PoolRef {
+    pub(crate) fn key(&self) -> &[u8] {
+        &self.mesh.key
+    }
+}
+
+impl PartialEq for PoolRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.row == other.row && self.key() == other.key()
+    }
+}
+
+impl std::fmt::Debug for PoolRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PoolRef(row {}, {} triangles)", self.row, self.mesh.mesh.tris.len())
+    }
+}
+
+/// A mesh layer of a batch as an instance of a pooled mesh.
+struct Instance {
+    mesh: Arc<Pooled>,
+    rows: [[f32; 4]; IROWS],
+}
+
+/// Canvas bounds (through `root`) of what the box lo..hi holds under `mv`
+/// in front of the near plane, and the box's camera depths (nearest,
+/// farthest); None when it is wholly behind the near plane. The box's
+/// corners in front and its edges' crossings of the plane span that part,
+/// so their projections bound everything in it.
+fn box_bounds(lo: [f64; 3], hi: [f64; 3], mv: lahza_motion_core::space::Mat4, focal: f64, centre: (f64, f64), root: Proj) -> Option<([f64; 4], f64, f64)> {
+    let corners: [[f64; 3]; 8] = std::array::from_fn(|k| {
+        let q = mv.apply(if k & 1 != 0 { hi[0] } else { lo[0] }, if k & 2 != 0 { hi[1] } else { lo[1] }, if k & 4 != 0 { hi[2] } else { lo[2] });
+        [q[0], q[1], q[2]]
+    });
+    let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let mut any = false;
+    let mut take = |p: [f64; 3]| {
+        let (x, y) = root.apply(focal * p[0] / p[2] + centre.0, focal * p[1] / p[2] + centre.1);
+        b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+        any = true;
+    };
+    for (k, &a) in corners.iter().enumerate() {
+        if a[2] >= NEAR {
+            take(a);
+        }
+        for bit in [1, 2, 4] {
+            let c = corners[k | bit];
+            if k & bit == 0 && (a[2] >= NEAR) != (c[2] >= NEAR) {
+                let s = (NEAR - a[2]) / (c[2] - a[2]);
+                take([a[0] + (c[0] - a[0]) * s, a[1] + (c[1] - a[1]) * s, NEAR]);
+            }
+        }
+    }
+    let near = corners.iter().map(|c| c[2]).fold(f64::INFINITY, f64::min);
+    let far = corners.iter().map(|c| c[2]).fold(f64::NEG_INFINITY, f64::max);
+    any.then_some((b, near, far))
+}
 
 pub(crate) struct Batch {
     verts: Vec<Vert>,
@@ -405,9 +657,6 @@ pub(crate) struct Batch {
     light_rows: Vec<[f32; 4]>,
     pub(crate) bounds: [f64; 4],
     layers: usize,
-    /// The material standing for other meshes' surfaces: they win the
-    /// depth test but draw nothing (their own batch draws them).
-    occluder: Option<u32>,
     /// The layer list this batch was made in and its layers' places in it.
     pub(crate) list: u64,
     pub(crate) members: Vec<usize>,
@@ -422,6 +671,136 @@ pub(crate) struct Batch {
     focal: f64,
     /// Holds only cards (no meshes, no lighting).
     pub(crate) cards_only: bool,
+    /// Triangles by canvas cell, built on first placement.
+    grid: std::sync::OnceLock<TriGrid>,
+    /// The material standing for other meshes' surfaces: they win the
+    /// depth test but draw nothing (their own batch draws them).
+    occluder: Option<u32>,
+    /// Drawn in a picture of its own (a layer with effects or a matte).
+    pub(crate) isolated: bool,
+    /// Camera depth of the farthest point the batch draws, and whether a
+    /// volume reads what lies behind it (occluder culling).
+    far: f64,
+    volume: bool,
+    /// Mesh layers as instances of pooled meshes (lists for the GPU's
+    /// visibility pass), and their triangles.
+    instances: Vec<Instance>,
+    inst_tris: u32,
+    /// The batch's first triangle id in its display list (`number_batches`).
+    pub(crate) id_base: u32,
+}
+
+/// A batch's triangles by canvas cell, so a target over a small part of
+/// the canvas (a glass bead's backdrop) sets up only the triangles there
+/// instead of every triangle of the batch.
+struct TriGrid {
+    origin: [f64; 2],
+    cell: f64,
+    cols: usize,
+    rows: usize,
+    /// Per cell, its range in `items` (prefix sums).
+    starts: Vec<u32>,
+    items: Vec<u32>,
+    /// Triangles spanning many cells: candidates everywhere.
+    big: Vec<u32>,
+}
+
+impl TriGrid {
+    /// Cells across the longer side.
+    const SIDE: f64 = 128.0;
+    /// Triangles over more cells than this go to `big`.
+    const SPREAD: usize = 64;
+
+    fn new(verts: &[Vert], tris: &[([u32; 3], u32, u8)]) -> Self {
+        let boxes: Vec<Option<[f64; 4]>> = tris
+            .iter()
+            .map(|(ids, _, _)| {
+                let p = ids.map(|i| verts[i as usize].screen);
+                let b = [p[0][0].min(p[1][0]).min(p[2][0]), p[0][1].min(p[1][1]).min(p[2][1]), p[0][0].max(p[1][0]).max(p[2][0]), p[0][1].max(p[1][1]).max(p[2][1])];
+                b.iter().all(|v| v.is_finite()).then_some(b)
+            })
+            .collect();
+        // The grid spans where most triangles are (geometry far off the
+        // canvas, a wall reaching past the frame, would make every cell
+        // huge); triangles outside clamp into the edge cells.
+        let (mut xs, mut ys): (Vec<f64>, Vec<f64>) = boxes.iter().flatten().map(|b| ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)).unzip();
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        if !xs.is_empty() {
+            let (a, z) = (xs.len() / 100, xs.len() - 1 - xs.len() / 100);
+            for (k, v) in [&mut xs, &mut ys].into_iter().enumerate() {
+                lo[k] = *v.select_nth_unstable_by(a, f64::total_cmp).1;
+                hi[k] = *v.select_nth_unstable_by(z, f64::total_cmp).1;
+            }
+        }
+        if !(hi[0] >= lo[0] && hi[1] >= lo[1]) {
+            return Self { origin: [0.0; 2], cell: 1.0, cols: 0, rows: 0, starts: vec![0], items: Vec::new(), big: Vec::new() };
+        }
+        let cell = ((hi[0] - lo[0]).max(hi[1] - lo[1]) / Self::SIDE).max(4.0);
+        let cols = (((hi[0] - lo[0]) / cell).floor() as usize + 1).min(Self::SIDE as usize + 1);
+        let rows = (((hi[1] - lo[1]) / cell).floor() as usize + 1).min(Self::SIDE as usize + 1);
+        let span = |b: &[f64; 4]| {
+            let c = |v: f64, n: usize| (((v) / cell).floor().max(0.0) as usize).min(n - 1);
+            (c(b[0] - lo[0], cols), c(b[1] - lo[1], rows), c(b[2] - lo[0], cols), c(b[3] - lo[1], rows))
+        };
+        let mut counts = vec![0u32; cols * rows + 1];
+        let mut big = Vec::new();
+        for (i, b) in boxes.iter().enumerate() {
+            let Some(b) = b else { continue };
+            let (x0, y0, x1, y1) = span(b);
+            if (x1 - x0 + 1) * (y1 - y0 + 1) > Self::SPREAD {
+                big.push(i as u32);
+                continue;
+            }
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    counts[y * cols + x + 1] += 1;
+                }
+            }
+        }
+        for k in 1..counts.len() {
+            counts[k] += counts[k - 1];
+        }
+        let starts = counts.clone();
+        let mut items = vec![0u32; *counts.last().unwrap() as usize];
+        for (i, b) in boxes.iter().enumerate() {
+            let Some(b) = b else { continue };
+            let (x0, y0, x1, y1) = span(b);
+            if (x1 - x0 + 1) * (y1 - y0 + 1) > Self::SPREAD {
+                continue;
+            }
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let slot = &mut counts[y * cols + x];
+                    items[*slot as usize] = i as u32;
+                    *slot += 1;
+                }
+            }
+        }
+        Self { origin: lo, cell, cols, rows, starts, items, big }
+    }
+
+    /// The triangles that may touch canvas rect `r`, in batch order; None
+    /// when `r` covers much of the batch (scan them all).
+    fn pick(&self, r: [f64; 4]) -> Option<Vec<u32>> {
+        if self.cols == 0 {
+            return Some(Vec::new());
+        }
+        let c = |v: f64, n: usize| ((v / self.cell).floor().clamp(0.0, (n - 1) as f64)) as usize;
+        let (x0, y0) = (c(r[0] - self.origin[0], self.cols), c(r[1] - self.origin[1], self.rows));
+        let (x1, y1) = (c(r[2] - self.origin[0], self.cols), c(r[3] - self.origin[1], self.rows));
+        if (x1 - x0 + 1) * (y1 - y0 + 1) * 4 > self.cols * self.rows {
+            return None;
+        }
+        let mut out = self.big.clone();
+        for y in y0..=y1 {
+            let row = y * self.cols;
+            out.extend_from_slice(&self.items[self.starts[row + x0] as usize..self.starts[row + x1 + 1] as usize]);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
 }
 
 /// A group over output-pixel rect `origin + factor·(x, y)`.
@@ -451,7 +830,7 @@ const NO_SURFACE: f32 = -1.0e30;
 
 /// The inverse of an affine 4 × 4 (row-major, last row 0 0 0 1), as 3 × 4
 /// rows in a 16-array.
-fn affine_inverse(m: [f64; 16]) -> Option<[f64; 16]> {
+pub(crate) fn affine_inverse(m: [f64; 16]) -> Option<[f64; 16]> {
     let a = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
     let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
     if det.abs() < 1e-12 {
@@ -677,6 +1056,12 @@ const NEAR: f64 = 1.0;
 pub const FLAG_UNLIT: u32 = 1;
 pub const FLAG_FACETED: u32 = 2;
 pub const FLAG_OCCLUDER: u32 = 4;
+
+/// A mesh prim's `kind[3]`: its layer list (31 bits) and whether it is
+/// opaque (bit 0). `run_depth` gathers a list's opaque batches.
+pub(crate) fn run_tag(list: u64, opaque: bool) -> u32 {
+    ((list as u32 & 0x7fff_ffff) << 1) | opaque as u32
+}
 pub const FLAG_SHADOW_CATCHER: u32 = 8;
 /// A card: rows 0–1 hold its picture (canvas → texel map, texel offset
 /// relative to the primitive's texel base, size).
@@ -853,6 +1238,7 @@ pub(crate) fn material_rows(m: &MeshState, part: usize, segment: u32, opacity: f
             rows[24] = [((hi[0] - lo[0]) / 2.0) as f32, ((hi[1] - lo[1]) / 2.0) as f32, ((hi[2] - lo[2]) / 2.0) as f32, artistic];
         }
     }
+    crate::surfaces::rows(m, mat, &mut rows);
     rows
 }
 
@@ -928,7 +1314,6 @@ impl Batch {
             light_rows: rows,
             bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
             layers: 0,
-            occluder: None,
             list: 0,
             members: Vec::new(),
             see_through: false,
@@ -937,6 +1322,14 @@ impl Batch {
             backdrop: None,
             focal: 1.0,
             cards_only: true,
+            grid: std::sync::OnceLock::new(),
+            occluder: None,
+            isolated: false,
+            far: f64::NEG_INFINITY,
+            volume: false,
+            instances: Vec::new(),
+            inst_tris: 0,
+            id_base: 0,
         }
     }
 
@@ -951,7 +1344,6 @@ impl Batch {
             light_rows,
             bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
             layers: 0,
-            occluder: None,
             list: 0,
             members: Vec::new(),
             see_through: false,
@@ -960,6 +1352,14 @@ impl Batch {
             backdrop: None,
             focal: m.camera.focal,
             cards_only: false,
+            grid: std::sync::OnceLock::new(),
+            occluder: None,
+            isolated: false,
+            far: f64::NEG_INFINITY,
+            volume: false,
+            instances: Vec::new(),
+            inst_tris: 0,
+            id_base: 0,
         })
     }
 
@@ -1000,6 +1400,7 @@ impl Batch {
             self.verts.push(Vert { screen: s, pos: q.map(|v| v as f32), normal: n.map(|v| v as f32), aux: [0.0; 5] });
             if !occluder {
                 self.bounds = [self.bounds[0].min(s[0]), self.bounds[1].min(s[1]), self.bounds[2].max(s[0]), self.bounds[3].max(s[1])];
+                self.far = self.far.max(q[2]);
             }
         }
         self.tris.push(([base, base + 1, base + 2], material, 7));
@@ -1009,6 +1410,10 @@ impl Batch {
     fn add_mesh(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
         if self.env.is_none() {
             self.env = cache.env_map(&self.lighting);
+        }
+        if cache.compact {
+            self.add_instance(cache, m, root, opacity, occluder);
+            return;
         }
         let Some(mesh) = cache.get(m) else { return };
         self.layers += 1;
@@ -1021,7 +1426,9 @@ impl Batch {
         let (focal, (cx, cy)) = (m.camera.focal, m.camera.centre);
         if !occluder {
             self.focal = focal * root.max_scale();
+            self.volume |= m.materials.iter().any(|x| x.volume.is_some());
         }
+        let first_vert = self.verts.len();
         let project = |p: [f64; 3]| -> [f64; 2] {
             let sx = focal * p[0] / p[2] + cx;
             let sy = focal * p[1] / p[2] + cy;
@@ -1101,6 +1508,25 @@ impl Batch {
                 continue;
             }
             if behind == 0 {
+                // An occluder only hides this batch where the batch draws
+                // (placing keeps no others). The margin covers placing's
+                // half-texel bounds on downsampled (frosted) targets.
+                if occluder {
+                    const MARGIN: f64 = 32.0;
+                    let s = t.map(|i| project(cam[i as usize].0));
+                    let lo = [s[0][0].min(s[1][0]).min(s[2][0]), s[0][1].min(s[1][1]).min(s[2][1])];
+                    let hi = [s[0][0].max(s[1][0]).max(s[2][0]), s[0][1].max(s[1][1]).max(s[2][1])];
+                    let b = self.bounds;
+                    if hi[0] < b[0] - MARGIN || lo[0] > b[2] + MARGIN || hi[1] < b[1] - MARGIN || lo[1] > b[3] + MARGIN {
+                        continue;
+                    }
+                    // Wholly behind everything the batch draws, it is never
+                    // nearer (so hides nothing); only a volume reads the
+                    // surface behind it.
+                    if !self.volume && v.iter().all(|q| q.0[2] > self.far * (1.0 + 1e-5) + 1e-3) {
+                        continue;
+                    }
+                }
                 let ids = t.map(|i| {
                     let s = &mut slot[i as usize];
                     if *s == u32::MAX {
@@ -1132,14 +1558,177 @@ impl Batch {
                 self.tris.push(([ids[0], ids[k], ids[k + 1]], material, 7));
             }
         }
+        if !occluder {
+            self.far = self.verts[first_vert..].iter().fold(self.far, |f, v| f.max(v.pos[2] as f64));
+        }
+    }
+
+    /// `add_mesh` for the GPU's visibility pass: the mesh goes to the GPU's
+    /// pool once, and the layer is an instance of it (its transforms,
+    /// projection and materials). The GPU transforms, culls and clips its
+    /// triangles as `add_mesh` does on the CPU (`vis_instance`,
+    /// `instance_tri` in motion.wgsl); the batch's bounds come from the
+    /// mesh's box.
+    fn add_instance(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
+        let Some(pooled) = cache.pooled(m) else { return };
+        self.layers += 1;
+        let tris = pooled.mesh.tris.len();
+        if tris == 0 {
+            return;
+        }
+        if self.tris.len() + self.inst_tris as usize + tris > MAX_TRIS {
+            cache.warnings.push("too many mesh triangles in one frame; some meshes were skipped".into());
+            return;
+        }
+        let mv = m.camera.view.then(m.world);
+        let Some(nm) = mv.normal_matrix() else { return };
+        let (focal, centre) = (m.camera.focal, m.camera.centre);
+        let Some((bounds, near, far)) = box_bounds(pooled.lo, pooled.hi, mv, focal, centre, root) else { return };
+        if occluder {
+            // An occluder only hides this batch where the batch draws, and
+            // only when it is nearer than something the batch draws (a
+            // volume reads the surface behind it, though).
+            const MARGIN: f64 = 32.0;
+            let b = self.bounds;
+            if bounds[2] < b[0] - MARGIN || bounds[0] > b[2] + MARGIN || bounds[3] < b[1] - MARGIN || bounds[1] > b[3] + MARGIN {
+                return;
+            }
+            if !self.volume && near > self.far * (1.0 + 1e-5) + 1e-3 {
+                return;
+            }
+        } else {
+            self.focal = focal * root.max_scale();
+            self.volume |= m.materials.iter().any(|x| x.volume.is_some());
+            self.bounds = [self.bounds[0].min(bounds[0]), self.bounds[1].min(bounds[1]), self.bounds[2].max(bounds[2]), self.bounds[3].max(bounds[3])];
+            self.far = self.far.max(far);
+        }
+        // Materials by part and colour: those the mesh's triangles use.
+        let mut first = [0u32; PARTS];
+        let mut colors = [1u32; PARTS];
+        match (occluder, self.occluder) {
+            (true, Some(o)) => first = [o; PARTS],
+            _ => {
+                let wire_scale = root.max_scale();
+                for part in 0..PARTS {
+                    if pooled.segments[part] == 0 {
+                        continue;
+                    }
+                    first[part] = (self.materials.len() / MAT_ROWS) as u32;
+                    colors[part] = piece_colors(m, part) as u32;
+                    for segment in 0..colors[part].min(pooled.segments[part]) {
+                        self.materials.extend_from_slice(&material_rows(m, part, segment, opacity, wire_scale, &cache.textures));
+                    }
+                }
+            }
+        }
+        // See-through wireframes show their back edges too.
+        let xray = (0..PARTS).filter(|&p| m.materials[p].wireframe > 0.0 && m.materials[p].wire_fill.is_none()).fold(0u32, |acc, p| acc | 1 << p);
+        let a = mv.0;
+        let det = a[0] * (a[5] * a[10] - a[6] * a[9]) - a[1] * (a[4] * a[10] - a[6] * a[8]) + a[2] * (a[4] * a[9] - a[5] * a[8]);
+        let world_noise = m.materials.iter().any(|x| x.noise.is_some_and(|n| n.world));
+        let noise = if world_noise { m.world.0 } else { lahza_motion_core::space::Mat4::IDENTITY.0 };
+        let (f, b) = (|v: f64| v as f32, f32::from_bits);
+        let r = root.0;
+        let mut rows = [[0.0f32; 4]; IROWS];
+        for k in 0..3 {
+            rows[k] = [f(a[k * 4]), f(a[k * 4 + 1]), f(a[k * 4 + 2]), f(a[k * 4 + 3])];
+            rows[3 + k] = [f(nm[k][0]), f(nm[k][1]), f(nm[k][2]), 0.0];
+            rows[6 + k] = [f(noise[k * 4]), f(noise[k * 4 + 1]), f(noise[k * 4 + 2]), f(noise[k * 4 + 3])];
+            rows[10 + k] = [f(r[k * 3]), f(r[k * 3 + 1]), f(r[k * 3 + 2]), 0.0];
+        }
+        rows[9] = [f(focal), f(centre.0), f(centre.1), b(if det < 0.0 { INST_MIRRORED } else { 0 })];
+        rows[13] = [b(0), b(0), b(tris as u32), b(self.inst_tris)];
+        rows[14] = [b(0), b(xray), 0.0, 0.0];
+        rows[19] = bounds.map(f);
+        for part in 0..PARTS {
+            rows[15 + part / 4][part % 4] = b(first[part]);
+            rows[17 + part / 4][part % 4] = b(colors[part]);
+        }
+        self.inst_tris += tris as u32;
+        self.instances.push(Instance { mesh: pooled, rows });
+    }
+
+    /// Writes the vertex, material and light rows (with the environment
+    /// and shadow maps they link to) and returns where the vertices start.
+    /// `compact`: also one record per triangle after the lights (vertex
+    /// ids; material and real-edge mask), for targets that take them as
+    /// they are (`place`), then the instances' rows (whose pooled meshes
+    /// go to `pool`).
+    fn write_shared(&self, mesh_rows: &mut Vec<[f32; 4]>, pool: &mut Vec<PoolRef>, placed: &mut HashMap<usize, u32>, compact: bool) -> u32 {
+        let vert_base = mesh_rows.len() as u32;
+        for v in &self.verts {
+            mesh_rows.push([v.pos[0], v.pos[1], v.pos[2], 1.0 / v.pos[2]]);
+            mesh_rows.push([v.normal[0], v.normal[1], v.normal[2], v.aux[3]]);
+            mesh_rows.push([v.aux[0], v.aux[1], v.aux[2], v.aux[4]]);
+            mesh_rows.push([v.screen[0] as f32, v.screen[1] as f32, 0.0, 0.0]);
+        }
+        mesh_rows.extend_from_slice(&self.materials);
+        let light_base = mesh_rows.len() as u32;
+        mesh_rows.extend_from_slice(&self.light_rows);
+        if compact {
+            let b = f32::from_bits;
+            mesh_rows.extend(self.tris.iter().map(|(ids, material, edges)| [b(ids[0]), b(ids[1]), b(ids[2]), b(material | (*edges as u32) << 24)]));
+            for inst in &self.instances {
+                pool.push(PoolRef { row: (mesh_rows.len() + 13) as u32, mesh: inst.mesh.clone() });
+                mesh_rows.extend_from_slice(&inst.rows);
+            }
+        }
+        match &self.env {
+            Some(env) => {
+                let key = Arc::as_ptr(env) as usize;
+                let at = *placed.entry(key).or_insert_with(|| {
+                    let at = mesh_rows.len() as u32;
+                    mesh_rows.extend_from_slice(&env.raster);
+                    at
+                });
+                mesh_rows[light_base as usize + 5][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
+            }
+            // Its image did not load: the environment is dark.
+            None => mesh_rows[light_base as usize][2] = 0.0,
+        }
+        // Shadow maps (shared by the list's batches: written once), linked
+        // from each light's colour row as an offset from the light block.
+        for (i, map) in self.shadows.iter().enumerate() {
+            let Some(map) = map else { continue };
+            let key = Arc::as_ptr(map) as usize;
+            let at = *placed.entry(key).or_insert_with(|| {
+                let at = mesh_rows.len() as u32;
+                mesh_rows.extend_from_slice(&map.rows);
+                at
+            });
+            let row = light_base as usize + 7 + i * LROWS + 1;
+            mesh_rows[row][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
+        }
+        vert_base
     }
 
     /// Writes the batch for `target` (whose pixel (x, y) is canvas
     /// `origin + factor·(x, y)`) into the list's mesh buffers and returns
     /// its primitive, or None when nothing lands on the target.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn place(&self, mesh_rows: &mut Vec<[f32; 4]>, bins: &mut Vec<u32>, placed: &mut HashMap<usize, u32>, target: &Target, origin: [f64; 2], factor: [f64; 2], blend: u32) -> Option<(Prim, [f64; 4])> {
+    pub(crate) fn place(&self, mesh_rows: &mut Vec<[f32; 4]>, bins: &mut Vec<u32>, pool: &mut Vec<PoolRef>, placed: &mut HashMap<usize, u32>, target: &Target, origin: [f64; 2], factor: [f64; 2], blend: u32, compact: bool, setup_time: &mut std::time::Duration) -> Option<(Prim, [f64; 4])> {
+        let started = std::time::Instant::now();
         let (tw_px, th_px) = (target.width as f64, target.height as f64);
+        if compact {
+            // The triangles as they are, shared by every placement: the GPU
+            // maps their vertices onto this target (`prim.fill`) itself.
+            let to = |x: f64, o: f64, f: f64| (x - o) / f;
+            let b = self.bounds;
+            let r = [to(b[0], origin[0], factor[0]) - 1.0, to(b[1], origin[1], factor[1]) - 1.0, to(b[2], origin[0], factor[0]) + 1.0, to(b[3], origin[1], factor[1]) + 1.0];
+            let count = self.tris.len() as u32 + self.inst_tris;
+            if count == 0 || !(r[2] >= 0.0 && r[3] >= 0.0 && r[0] < tw_px && r[1] < th_px) {
+                return None;
+            }
+            let (vert_base, mat_base, light_base) = self.shared_rows(mesh_rows, pool, placed, true);
+            // Triangle records, then the instances.
+            let rec_base = light_base + self.light_rows.len() as u32;
+            // geom: [0, first triangle id, triangles with records, instances].
+            let b = f32::from_bits;
+            let geom = [0.0, b(self.id_base), b(self.tris.len() as u32), b(self.instances.len() as u32)];
+            let prim = self.mesh_prim(origin, factor, blend, count, geom, [rec_base, vert_base, mat_base, light_base]);
+            *setup_time += started.elapsed();
+            return Some((prim, [r[0].max(0.0), r[1].max(0.0), r[2].min(tw_px - 1.0), r[3].min(th_px - 1.0)]));
+        }
         let target_origin = origin;
         let to_target = |s: [f64; 2]| [(s[0] - origin[0]) / factor[0], (s[1] - origin[1]) / factor[1]];
         // Triangles on the target with their edge and depth planes.
@@ -1187,13 +1776,22 @@ impl Batch {
             ];
             Some(Tri { rows, bbox: bbox.map(|v| v as f32) })
         };
+        // Only the triangles that may land on the target (its canvas rect,
+        // padded past the setup's half-pixel bounds).
+        let pad = 2.0 * factor[0].abs().max(factor[1].abs()) + 1.0;
+        let rect = [origin[0] - pad, origin[1] - pad, origin[0] + factor[0] * tw_px + pad, origin[1] + factor[1] * th_px + pad];
+        let picked = if self.tris.len() < 8192 { None } else { self.grid.get_or_init(|| TriGrid::new(&self.verts, &self.tris)).pick(rect) };
+        let candidates: Vec<&([u32; 3], u32, u8)> = match &picked {
+            Some(ids) => ids.iter().map(|&i| &self.tris[i as usize]).collect(),
+            None => self.tris.iter().collect(),
+        };
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
-        let tris: Vec<Tri> = if self.tris.len() < 8192 || threads < 2 {
-            self.tris.iter().filter_map(setup).collect()
+        let tris: Vec<Tri> = if candidates.len() < 8192 || threads < 2 {
+            candidates.iter().copied().filter_map(setup).collect()
         } else {
-            let chunk = self.tris.len().div_ceil(threads);
+            let chunk = candidates.len().div_ceil(threads);
             std::thread::scope(|scope| {
-                let jobs: Vec<_> = self.tris.chunks(chunk).map(|c| scope.spawn(move || c.iter().filter_map(setup).collect::<Vec<Tri>>())).collect();
+                let jobs: Vec<_> = candidates.chunks(chunk).map(|c| scope.spawn(move || c.iter().copied().filter_map(setup).collect::<Vec<Tri>>())).collect();
                 let parts: Vec<Vec<Tri>> = jobs.into_iter().map(|j| j.join().expect("triangle setup")).collect();
                 let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
                 for p in parts {
@@ -1202,6 +1800,7 @@ impl Batch {
                 all
             })
         };
+        *setup_time += started.elapsed();
         // The drawn triangles set the covered area; occluders only matter
         // inside it.
         let is_occluder = |t: &Tri| self.materials[t.rows[1][3].to_bits() as usize * MAT_ROWS + 2][3] as u32 & FLAG_OCCLUDER != 0;
@@ -1214,9 +1813,7 @@ impl Batch {
             return None;
         }
         let mut tris = tris;
-        if self.occluder.is_some() {
-            tris.retain(|t| !is_occluder(t) || (t.bbox[2] as f64 >= used[0] && t.bbox[0] as f64 <= used[2] && t.bbox[3] as f64 >= used[1] && t.bbox[1] as f64 <= used[3]));
-        }
+        tris.retain(|t| !is_occluder(t) || (t.bbox[2] as f64 >= used[0] && t.bbox[0] as f64 <= used[2] && t.bbox[3] as f64 >= used[1] && t.bbox[1] as f64 <= used[3]));
         let clamp_x = |v: f64| (v.max(0.0).min(tw_px - 1.0) as u32 / TILE).min(target.tiles_x - 1);
         let clamp_y = |v: f64| (v.max(0.0).min(th_px - 1.0) as u32 / TILE).min(target.tiles_y - 1);
         let (tx0, ty0, tx1, ty1) = (clamp_x(used[0]), clamp_y(used[1]), clamp_x(used[2]), clamp_y(used[3]));
@@ -1246,22 +1843,24 @@ impl Batch {
         // own slots: tiles list triangles in batch order, as serially.
         let chunk = if tris.len() < 8192 || threads < 2 { tris.len().max(1) } else { tris.len().div_ceil(threads) };
         let chunks: Vec<&[Tri]> = tris.chunks(chunk).collect();
-        let counts: Vec<Vec<u32>> = std::thread::scope(|scope| {
-            let jobs: Vec<_> = chunks
-                .iter()
-                .map(|c| {
-                    let (clamp_x, clamp_y) = (&clamp_x, &clamp_y);
-                    scope.spawn(move || {
-                        let mut counts = vec![0u32; tiles];
-                        for t in c.iter() {
-                            visit(t, clamp_x, clamp_y, origin, tw, |k| counts[k] += 1);
-                        }
-                        counts
-                    })
-                })
-                .collect();
-            jobs.into_iter().map(|j| j.join().expect("binning")).collect()
-        });
+        // One chunk (most placements: small batches, small targets) runs
+        // here; a thread per call costs more than the work.
+        let (clamp_x, clamp_y) = (&clamp_x, &clamp_y);
+        let count = |c: &[Tri]| {
+            let mut counts = vec![0u32; tiles];
+            for t in c {
+                visit(t, clamp_x, clamp_y, origin, tw, |k| counts[k] += 1);
+            }
+            counts
+        };
+        let counts: Vec<Vec<u32>> = if chunks.len() == 1 {
+            vec![count(chunks[0])]
+        } else {
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = chunks.iter().map(|c| scope.spawn(move || count(c))).collect();
+                jobs.into_iter().map(|j| j.join().expect("binning")).collect()
+            })
+        };
         let bins_base = bins.len();
         let header = tiles * 2;
         let total: usize = counts.iter().flatten().map(|c| *c as usize).sum();
@@ -1282,64 +1881,61 @@ impl Batch {
         {
             let out = &mut bins[bins_base..];
             let addr = out.as_mut_ptr() as usize;
-            std::thread::scope(|scope| {
-                for (c, (ts, mut next)) in chunks.iter().zip(starts).enumerate() {
-                    let (clamp_x, clamp_y) = (&clamp_x, &clamp_y);
-                    let first = c * chunk;
-                    scope.spawn(move || {
-                        let out = addr as *mut u32;
-                        for (i, t) in ts.iter().enumerate() {
-                            visit(t, clamp_x, clamp_y, origin, tw, |k| {
-                                // SAFETY: (chunk, tile) runs are disjoint and inside `out`.
-                                unsafe { *out.add(next[k] as usize) = (first + i) as u32 };
-                                next[k] += 1;
-                            });
-                        }
+            let fill = |c: usize, ts: &[Tri], mut next: Vec<u32>| {
+                let out = addr as *mut u32;
+                let first = c * chunk;
+                for (i, t) in ts.iter().enumerate() {
+                    visit(t, clamp_x, clamp_y, origin, tw, |k| {
+                        // SAFETY: (chunk, tile) runs are disjoint and inside `out`.
+                        unsafe { *out.add(next[k] as usize) = (first + i) as u32 };
+                        next[k] += 1;
                     });
                 }
-            });
+            };
+            if chunks.len() == 1 {
+                fill(0, chunks[0], starts.pop().unwrap());
+            } else {
+                std::thread::scope(|scope| {
+                    for (c, (ts, next)) in chunks.iter().zip(starts).enumerate() {
+                        scope.spawn(move || fill(c, ts, next));
+                    }
+                });
+            }
         }
         let bins_base = bins_base as u32;
         let tri_base = mesh_rows.len() as u32;
         for t in &tris {
             mesh_rows.extend_from_slice(&t.rows);
         }
-        let vert_base = mesh_rows.len() as u32;
-        for v in &self.verts {
-            mesh_rows.push([v.pos[0], v.pos[1], v.pos[2], 1.0 / v.pos[2]]);
-            mesh_rows.push([v.normal[0], v.normal[1], v.normal[2], v.aux[3]]);
-            mesh_rows.push([v.aux[0], v.aux[1], v.aux[2], v.aux[4]]);
-        }
-        let mat_base = mesh_rows.len() as u32;
-        mesh_rows.extend_from_slice(&self.materials);
-        let light_base = mesh_rows.len() as u32;
-        mesh_rows.extend_from_slice(&self.light_rows);
-        match &self.env {
-            Some(env) => {
-                let key = Arc::as_ptr(env) as usize;
-                let at = *placed.entry(key).or_insert_with(|| {
-                    let at = mesh_rows.len() as u32;
-                    mesh_rows.extend_from_slice(&env.raster);
-                    at
-                });
-                mesh_rows[light_base as usize + 5][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
-            }
-            // Its image did not load: the environment is dark.
-            None => mesh_rows[light_base as usize][2] = 0.0,
-        }
-        // Shadow maps (shared by the list's batches: written once), linked
-        // from each light's colour row as an offset from the light block.
-        for (i, map) in self.shadows.iter().enumerate() {
-            let Some(map) = map else { continue };
-            let key = Arc::as_ptr(map) as usize;
-            let at = *placed.entry(key).or_insert_with(|| {
-                let at = mesh_rows.len() as u32;
-                mesh_rows.extend_from_slice(&map.rows);
+        let (vert_base, mat_base, light_base) = self.shared_rows(mesh_rows, pool, placed, false);
+        let b = |v: u32| f32::from_bits(v);
+        let prim = self.mesh_prim(target_origin, factor, blend, tris.len() as u32, [b(bins_base), b(tx0), b(ty0), b(tw)], [tri_base, vert_base, mat_base, light_base]);
+        let bounds = [(tx0 * TILE) as f64, (ty0 * TILE) as f64, ((tx1 + 1) * TILE) as f64 - 1.0, ((ty1 + 1) * TILE) as f64 - 1.0];
+        Some((prim, bounds))
+    }
+
+    /// Vertices, materials and lights read the same on every target the
+    /// batch is placed on (glass backdrops place it again per glass mesh: a
+    /// jar of glass bubbles is hundreds of placements), so they are written
+    /// once per list. Returns where the vertices, materials and lights
+    /// start.
+    fn shared_rows(&self, mesh_rows: &mut Vec<[f32; 4]>, pool: &mut Vec<PoolRef>, placed: &mut HashMap<usize, u32>, compact: bool) -> (u32, u32, u32) {
+        let shared = self as *const Self as usize;
+        let vert_base = match placed.get(&shared) {
+            Some(&at) => at,
+            None => {
+                let at = self.write_shared(mesh_rows, pool, placed, compact);
+                placed.insert(shared, at);
                 at
-            });
-            let row = light_base as usize + 7 + i * LROWS + 1;
-            mesh_rows[row][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
-        }
+            }
+        };
+        let mat_base = vert_base + (VROWS * self.verts.len()) as u32;
+        (vert_base, mat_base, mat_base + self.materials.len() as u32)
+    }
+
+    /// The batch's primitive on a target whose pixel (x, y) is canvas
+    /// `origin + factor·(x, y)`: `count` triangles from row `geom2[0]`.
+    fn mesh_prim(&self, target_origin: [f64; 2], factor: [f64; 2], blend: u32, count: u32, geom: [f32; 4], geom2: [u32; 4]) -> Prim {
         let b = |v: u32| f32::from_bits(v);
         // Glass: target pixel p → backdrop texel a + b·p, and output px per
         // unit of x/z for refraction offsets.
@@ -1358,8 +1954,13 @@ impl Batch {
         };
         let mut stroke = stroke;
         stroke[2] = b(0);
-        let prim = Prim {
-            kind: [PRIM_MESH, 0, blend, 0],
+        // The layer list it belongs to and whether it is opaque: the
+        // rasteriser's per-pixel depth of a list's opaque batches hides the
+        // list's batches (see `run_depth`).
+        let opaque = !self.see_through && !self.cards_only;
+        Prim {
+            // kind[1]: triangles (the GPU's visibility pass draws them).
+            kind: [PRIM_MESH, count, blend, run_tag(self.list, opaque)],
             paint,
             paint2,
             stroke,
@@ -1368,12 +1969,10 @@ impl Batch {
             inv_x: [1.0, 0.0, 0.0, 1.0],
             inv_y: [0.0, 1.0, 0.0, 1.0],
             inv_w: [0.0, 0.0, 1.0, 1.0],
-            geom: [b(bins_base), b(tx0), b(ty0), b(tw)],
-            geom2: [b(tri_base), b(vert_base), b(mat_base), b(light_base)],
+            geom,
+            geom2: geom2.map(b),
             ..Default::default()
-        };
-        let bounds = [(tx0 * TILE) as f64, (ty0 * TILE) as f64, ((tx1 + 1) * TILE) as f64 - 1.0, ((ty1 + 1) * TILE) as f64 - 1.0];
-        Some((prim, bounds))
+        }
     }
 }
 
@@ -1875,6 +2474,59 @@ fn surface_detail(m: &[[f32; 4]], images: &[u32], row: usize, pos: [F3; 3], nps:
     (base, rough, n, rough_mul, metal_mul, emit)
 }
 
+/// A Slang surface's function (`surfaces.rs`): 10 input and 3 output
+/// float4s, packed as `lahza_surface_input` and `lahza_surface_output`.
+type SurfaceFn = unsafe extern "C" fn(*const [f32; 4], *mut [f32; 4]);
+
+/// The material's values at p (base, normal, metallic, roughness,
+/// emission, opacity) through its Slang function (mirrors
+/// `apply_slang_surface` in the GPU's Slang variant): inputs in object
+/// space, the normal back in camera space.
+#[allow(clippy::too_many_arguments)]
+fn slang_surface(m: &[[f32; 4]], row: usize, lb: usize, p: F3, v: F3, uvs_in: [[f32; 2]; 3], b: F3, s: (F3, F3, f32, f32, F3, f32)) -> (F3, F3, f32, f32, F3, f32) {
+    let (base, n, metal, rough, emissive, opacity) = s;
+    let address = crate::surfaces::address(m[row + 18]);
+    if address == 0 {
+        return s;
+    }
+    let (r21, r22, r23, r24) = (m[row + 21], m[row + 22], m[row + 23], m[row + 24]);
+    let po = [fdot(f3(r21), p) + r21[3], fdot(f3(r22), p) + r22[3], fdot(f3(r23), p) + r23[3]];
+    let no = fnorm([fdot(f3(m[row + 31]), n), fdot(f3(m[row + 32]), n), fdot(f3(m[row + 33]), n)]);
+    let vo = fnorm([fdot(f3(r21), v), fdot(f3(r22), v), fdot(f3(r23), v)]);
+    let world = fadd(to_world(m, lb, p), f3(r24));
+    let wn = to_world(m, lb, n);
+    // UVs across a wrapping seam joined, as `surface_detail` does.
+    let mut uvs = uvs_in;
+    let wraps = m[row + 16][1] as u32;
+    for c in 0..2 {
+        if wraps & (1 << c) == 0 {
+            continue;
+        }
+        for k in 1..3 {
+            if uvs[k][c] - uvs[0][c] > 0.5 {
+                uvs[k][c] -= 1.0;
+            }
+            if uvs[k][c] - uvs[0][c] < -0.5 {
+                uvs[k][c] += 1.0;
+            }
+        }
+    }
+    let uv = [0, 1].map(|c| uvs[0][c] * b[0] + uvs[1][c] * b[1] + uvs[2][c] * b[2]);
+    let w = |a: F3, x: f32| [a[0], a[1], a[2], x];
+    let input = [w(po, r24[3]), w(world, 0.0), w(no, 0.0), w(vo, 0.0), w(wn, 0.0), [uv[0], uv[1], metal, 0.0], m[row + 19], m[row + 20], w(base, rough), w(emissive, opacity)];
+    let mut o = [[0.0f32; 4]; 3];
+    // SAFETY: rows 18 hold the address of the project's export
+    // `lahza_material_<function>` (`surfaces::rows`), which has exactly this
+    // signature; the library stays loaded for the process.
+    unsafe {
+        let f: SurfaceFn = std::mem::transmute(address as usize as *const ());
+        f(input.as_ptr(), o.as_mut_ptr());
+    }
+    let nc = fadd(fadd(fmul(f3(r21), o[2][0]), fmul(f3(r22), o[2][1])), fmul(f3(r23), o[2][2]));
+    let n = if fdot(nc, nc) > 1e-20 { fnorm(nc) } else { n };
+    (f3(o[0]).map(|x| x.max(0.0)), n, o[2][3].clamp(0.0, 1.0), o[0][3].clamp(0.03, 1.0), f3(o[1]).map(|x| x.max(0.0)), o[1][3].clamp(0.0, 1.0))
+}
+
 /// Lit colour → display (mirrors `tone_map` in motion.wgsl): exposure,
 /// then the scene's curve (standard shoulder, Hable filmic or AgX).
 fn tone_map(m: &[[f32; 4]], lb: usize, c: F3) -> F3 {
@@ -2328,6 +2980,12 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     n = nd;
     let opacity = m0[3];
     let emissive = fmul3(f3(m2), emit);
+    let (metal, rough) = (m1[0] * metal_mul, (m1[1] * rough_mul + rough_d).clamp(0.03, 1.0));
+    let (base, n, metal, rough, emissive, opacity) = if flags & crate::surfaces::FLAG_SLANG != 0 {
+        slang_surface(m, mb + mat * MAT_ROWS, lb, p, v, uvs, b, (base, n, metal, rough, emissive, opacity))
+    } else {
+        (base, n, metal, rough, emissive, opacity)
+    };
     if flags & FLAG_VOLUME != 0 {
         return volume_shade(m, images, mb + mat * MAT_ROWS, lb, p, opacity, occ);
     }
@@ -2349,7 +3007,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         let c = fadd(base, emissive).map(|x| encode(x));
         return [c[0] * opacity, c[1] * opacity, c[2] * opacity, opacity];
     }
-    let (metal, rough, cc, ccr) = (m1[0] * metal_mul, (m1[1] * rough_mul + rough_d).clamp(0.03, 1.0), m1[2], m1[3].max(0.03));
+    let (cc, ccr) = (m1[2], m1[3].max(0.03));
     let trans = m3[0];
     let row = |k: usize| m[mb + mat * MAT_ROWS + k];
     let (m4, m5, m6, m7, m8) = (row(4), row(5), row(6), row(7), row(8));
@@ -2509,38 +3167,89 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     [c[0] * a, c[1] * a, c[2] * a, a]
 }
 
-/// Premultiplied colour of a mesh primitive at target pixel centre `p`.
-pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups: &[[f32; 4]], images: &[u32]) -> [f32; 4] {
+/// The triangles a mesh primitive bins to the tile of pixel `p`.
+fn tile_tris<'a>(prim: &Prim, p: [f32; 2], bins: &'a [u32]) -> &'a [u32] {
     let tx = (p[0] as u32) / TILE;
     let ty = (p[1] as u32) / TILE;
     let (tx0, ty0, tw) = (prim.geom[1].to_bits(), prim.geom[2].to_bits(), prim.geom[3].to_bits());
     if tx < tx0 || ty < ty0 || tx - tx0 >= tw {
-        return [0.0; 4];
+        return &[];
     }
     let base = prim.geom[0].to_bits() as usize;
     let k = ((ty - ty0) * tw + (tx - tx0)) as usize;
     let start = base + bins[base + k * 2] as usize;
-    let count = bins[base + k * 2 + 1] as usize;
+    &bins[start..start + bins[base + k * 2 + 1] as usize]
+}
+
+/// Quick reject: no sample of pixel `p` can be inside the triangle.
+fn misses(r0: [f32; 4], r1: [f32; 4], p: [f32; 2]) -> bool {
+    let (c, _) = cover(r0, r1, p);
+    let pts = [[r0[0], r0[1]], [r0[2], r0[3]], [r1[0], r1[1]]];
+    (0..3).any(|k| {
+        let (a, b) = (pts[(k + 1) % 3], pts[(k + 2) % 3]);
+        c[k] < -((b[0] - a[0]).abs() + (b[1] - a[1]).abs()) * 0.4375 - 1e-3
+    })
+}
+
+/// Per sample of pixel centre `p`, the nearest surface (1 / camera z; 0:
+/// none) of the opaque mesh primitives tagged `tag` (`run_tag`): the depth
+/// that hides the rest of that layer list's meshes, and where its volumes
+/// stop. Mirrors `run_depth` in motion.wgsl.
+pub fn run_depth<'a>(prims: impl Iterator<Item = &'a Prim>, tag: u32, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups: &[[f32; 4]]) -> [f32; 8] {
+    let mut scene = [0.0f32; 8];
+    for prim in prims.filter(|q| q.kind[0] == PRIM_MESH && q.kind[3] == tag) {
+        let tb = prim.geom2[0].to_bits() as usize;
+        for &tri in tile_tris(prim, p, bins) {
+            let r = tb + tri as usize * 4;
+            let (r0, r1, d) = (m[r], m[r + 1], m[r + 3]);
+            if misses(r0, r1, p) {
+                continue;
+            }
+            for s in 0..8 {
+                let q = [p[0] + SAMPLES[s][0] / 16.0, p[1] + SAMPLES[s][1] / 16.0];
+                if !cover(r0, r1, q).1 {
+                    continue;
+                }
+                let z = d[0] * q[0] + d[1] * q[1] + d[2];
+                if z <= scene[s] {
+                    continue;
+                }
+                let tf = m[r + 2][3] as u32;
+                let material = prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * MAT_ROWS;
+                if m[material + 2][3] as u32 & FLAG_OCCLUDER != 0 {
+                    continue;
+                }
+                let stands = if tf & 1 != 0 {
+                    card_sample(prim, m, groups, material, q)[3] >= CARD_STANDS
+                } else if tf & 2 != 0 {
+                    wire_stands(m, material, r0, r1, tf, q)
+                } else {
+                    true
+                };
+                if stands {
+                    scene[s] = z;
+                }
+            }
+        }
+    }
+    scene
+}
+
+/// Premultiplied colour of a mesh primitive at target pixel centre `p`;
+/// `scene`: `run_depth` of its layer list there.
+pub fn shade_mesh(prim: &Prim, p: [f32; 2], scene: &[f32; 8], m: &[[f32; 4]], bins: &[u32], groups: &[[f32; 4]], images: &[u32]) -> [f32; 4] {
     let tb = prim.geom2[0].to_bits() as usize;
+    let opaque = prim.kind[3] & 1 != 0;
     let mut best = [u32::MAX; 8];
     let mut depth = [0.0f32; 8];
     // The nearest occluder at each sample (1 / camera z; 0: none), where a
-    // volume in front of it stops.
-    let mut occ = [0.0f32; 8];
-    for &tri in &bins[start..start + count] {
+    // volume in front of it stops: the list's opaque surface, or a card
+    // occluder nearer than it.
+    let mut occ = *scene;
+    for &tri in tile_tris(prim, p, bins) {
         let r = tb + tri as usize * 4;
         let (r0, r1, d) = (m[r], m[r + 1], m[r + 3]);
-        // Quick reject: no sample of this pixel can be inside.
-        let (c, _) = cover(r0, r1, p);
-        let pts = [[r0[0], r0[1]], [r0[2], r0[3]], [r1[0], r1[1]]];
-        let mut reject = false;
-        for k in 0..3 {
-            let (a, b) = (pts[(k + 1) % 3], pts[(k + 2) % 3]);
-            if c[k] < -((b[0] - a[0]).abs() + (b[1] - a[1]).abs()) * 0.4375 - 1e-3 {
-                reject = true;
-            }
-        }
-        if reject {
+        if misses(r0, r1, p) {
             continue;
         }
         for s in 0..8 {
@@ -2549,10 +3258,15 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], m: &[[f32; 4]], bins: &[u32], groups
                 let z = d[0] * q[0] + d[1] * q[1] + d[2];
                 // Cards only stand where their picture is (alpha test).
                 // Later surfaces win ties: coplanar layers keep their order.
+                // The list's opaque surface hides what is behind it; an
+                // opaque batch's own surface is in it (so ties pass), and
+                // it wins ties against what is see-through, as when it was
+                // drawn last.
                 let tf = m[r + 2][3] as u32;
                 let material = prim.geom2[2].to_bits() as usize + r1[3].to_bits() as usize * MAT_ROWS;
                 let occludes = m[material + 2][3] as u32 & FLAG_OCCLUDER != 0 && z > occ[s];
-                let wins = z >= depth[s] * (1.0 - TIE);
+                let seen = if opaque { z >= scene[s] * (1.0 - TIE) } else { z * (1.0 - TIE) > scene[s] };
+                let wins = seen && z >= depth[s] * (1.0 - TIE);
                 if !(wins || occludes) {
                     continue;
                 }

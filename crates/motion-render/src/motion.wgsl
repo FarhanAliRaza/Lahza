@@ -48,6 +48,9 @@ var<storage, read> b_segs: array<vec4<f32>>;
 var<storage, read> b_footage: array<u32>;
 var<storage, read> b_ops: array<vec4<f32>>;
 var<storage, read> b_mesh: array<vec4<f32>>;
+// The GPU's mesh pool (pool.rs): generated meshes in object space, kept
+// across frames; mesh instances point into it.
+var<storage, read> b_pool: array<vec4<f32>>;
 var<storage, read> b_bins: array<u32>;
 var<storage, read_write> b_target: array<vec4<f32>>;
 
@@ -1651,7 +1654,12 @@ const MAT_ROWS: u32 = 34u;
 // Rows per light (mesh3d::LROWS).
 const LROWS: u32 = 5u;
 // Rows per vertex (mesh3d::VROWS).
-const VROWS: u32 = 3u;
+const VROWS: u32 = 4u;
+// Rows per mesh instance (mesh3d::IROWS) and per pooled vertex (PROWS).
+const IROWS: u32 = 20u;
+const PROWS: u32 = 2u;
+// The camera's near plane (mesh3d::NEAR).
+const MESH_NEAR: f32 = 1.0;
 
 // Mirrors `card_sample` in mesh3d.rs: a card's picture at target point q.
 fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
@@ -1677,48 +1685,267 @@ fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
     return top + (bottom - top) * fy;
 }
 
+// A triangle's rows as the shading reads them: r0 [p0, p1] and r1 [p2,
+// orientation sign, material] in target px, r2 [vertex ids, flags: card,
+// wire, real-edge mask << 2] (ids 0 for instances' triangles). `compact`:
+// built here from the shared record and its vertices' canvas positions
+// (`prim.fill` maps canvas to target); else the per-target rows the CPU
+// wrote.
+struct TriRows {
+    r0: vec4<f32>,
+    r1: vec4<f32>,
+    r2: vec4<f32>,
+}
+
+fn tri_rows(prim: Prim, tri: u32, compact: bool) -> TriRows {
+    if !compact {
+        let tb = bitcast<u32>(prim.geom2.x) + tri * 4u;
+        return TriRows(b_mesh[tb], b_mesh[tb + 1u], b_mesh[tb + 2u]);
+    }
+    let rec = b_mesh[bitcast<u32>(prim.geom2.x) + tri];
+    let vb = bitcast<u32>(prim.geom2.y);
+    let id = vec3<u32>(bitcast<u32>(rec.x), bitcast<u32>(rec.y), bitcast<u32>(rec.z));
+    let packed = bitcast<u32>(rec.w);
+    let material = packed & 0xffffffu;
+    let to = vec2<f32>(prim.fill.x, prim.fill.y);
+    let k = vec2<f32>(prim.fill.z, prim.fill.w);
+    let a = (b_mesh[vb + id.x * VROWS + 3u].xy - to) / k;
+    let b = (b_mesh[vb + id.y * VROWS + 3u].xy - to) / k;
+    let c = (b_mesh[vb + id.z * VROWS + 3u].xy - to) / k;
+    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    var sign = 1.0;
+    if area < 0.0 { sign = -1.0; }
+    let mf = u32(b_mesh[bitcast<u32>(prim.geom2.z) + material * MAT_ROWS + 2u].w);
+    let flags = u32((mf & 16u) != 0u) | (u32((mf & 32u) != 0u) << 1u) | ((packed >> 24u) << 2u);
+    return TriRows(vec4<f32>(a, b), vec4<f32>(c, sign, bitcast<f32>(material)), vec4<f32>(rec.xyz, f32(flags)));
+}
+
+// A triangle with its vertices as shading reads them: camera position and
+// 1 / z, normal and u, noise-space position and v.
+struct TriGeo {
+    t: TriRows,
+    pos: array<vec4<f32>, 3>,
+    nrm: array<vec4<f32>, 3>,
+    aux: array<vec4<f32>, 3>,
+}
+
+// Triangle `tri` of a mesh primitive at target point q. `compact`: the
+// visibility pass's primitives, whose triangles after those with records
+// are their instances' (`mesh3d::Batch::add_instance`).
+fn tri_geo(prim: Prim, tri: u32, q: vec2<f32>, compact: bool) -> TriGeo {
+    let records = bitcast<u32>(prim.geom.z);
+    if compact && tri >= records {
+        let i = find_instance(prim, tri - records);
+        return instance_tri(prim, i, tri - records - bitcast<u32>(b_mesh[i + 13u].w), q);
+    }
+    var g: TriGeo;
+    g.t = tri_rows(prim, tri, compact);
+    let vb = bitcast<u32>(prim.geom2.y);
+    for (var k = 0u; k < 3u; k++) {
+        let v = vb + bitcast<u32>(g.t.r2[k]) * VROWS;
+        g.pos[k] = b_mesh[v];
+        g.nrm[k] = b_mesh[v + 1u];
+        g.aux[k] = b_mesh[v + 2u];
+    }
+    return g;
+}
+
+// The row of the instance holding triangle t (counted over the instances).
+fn find_instance(prim: Prim, t: u32) -> u32 {
+    let base = bitcast<u32>(prim.geom2.x) + bitcast<u32>(prim.geom.z);
+    var lo = 0u;
+    var hi = bitcast<u32>(prim.geom.w);
+    loop {
+        if hi - lo <= 1u { break; }
+        let mid = (lo + hi) / 2u;
+        if bitcast<u32>(b_mesh[base + mid * IROWS + 13u].w) <= t { lo = mid; } else { hi = mid; }
+    }
+    return base + lo * IROWS;
+}
+
+// Instance i's object point p in camera space.
+fn inst_cam(i: u32, p: vec3<f32>) -> vec3<f32> {
+    let h = vec4<f32>(p, 1.0);
+    return vec3<f32>(dot(b_mesh[i], h), dot(b_mesh[i + 1u], h), dot(b_mesh[i + 2u], h));
+}
+
+// Camera point q in output px, homogeneous (the camera's projection, then
+// `root`): linear in q, so clipping it is clipping in camera space.
+fn inst_out(i: u32, q: vec3<f32>) -> vec3<f32> {
+    let c = b_mesh[i + 9u];
+    let s = vec3<f32>(c.x * q.x + c.y * q.z, c.x * q.y + c.z * q.z, q.z);
+    return vec3<f32>(dot(b_mesh[i + 10u].xyz, s), dot(b_mesh[i + 11u].xyz, s), dot(b_mesh[i + 12u].xyz, s));
+}
+
+// Camera point q (in front of the near plane) in target px, as `add_mesh`
+// projects it.
+fn inst_px(prim: Prim, i: u32, q: vec3<f32>) -> vec2<f32> {
+    let c = b_mesh[i + 9u];
+    let s = vec3<f32>(c.x * q.x / q.z + c.y, c.x * q.y / q.z + c.z, 1.0);
+    let o = vec3<f32>(dot(b_mesh[i + 10u].xyz, s), dot(b_mesh[i + 11u].xyz, s), dot(b_mesh[i + 12u].xyz, s));
+    return (o.xy / o.z - prim.fill.xy) / prim.fill.zw;
+}
+
+// A pooled triangle's material in its batch: its part's first, then its
+// segment's colour.
+fn inst_material(i: u32, packed: u32) -> u32 {
+    let part = (packed >> 16u) & 7u;
+    let first = bitcast<u32>(b_mesh[i + 15u + part / 4u][part % 4u]);
+    let colors = max(bitcast<u32>(b_mesh[i + 17u + part / 4u][part % 4u]), 1u);
+    return first + (packed & 0xffffu) % colors;
+}
+
+// Back faces of closed surfaces never show (`add_mesh`): the face's
+// outward side is the pool's (from the vertex normals), turned over by a
+// mirroring transform; open surfaces and see-through wireframes stay.
+fn inst_culled(i: u32, packed: u32, q0: vec3<f32>, q1: vec3<f32>, q2: vec3<f32>) -> bool {
+    let part = (packed >> 16u) & 7u;
+    let xray = (bitcast<u32>(b_mesh[i + 14u].y) >> part) & 1u;
+    let side = (packed >> 23u) & 3u;
+    if (packed & (1u << 22u)) != 0u || xray != 0u || side == 0u { return false; }
+    var g = cross(q1 - q0, q2 - q0);
+    let mirrored = (bitcast<u32>(b_mesh[i + 9u].w) & 1u) != 0u;
+    if (side == 2u) != mirrored { g = -g; }
+    return dot(g, q0) >= 0.0;
+}
+
+// Triangle rows of target points a, b, c.
+fn rows_of(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, material: u32, flags: u32) -> TriRows {
+    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    var sign = 1.0;
+    if area < 0.0 { sign = -1.0; }
+    return TriRows(vec4<f32>(a, b), vec4<f32>(c, sign, bitcast<f32>(material)), vec4<f32>(0.0, 0.0, 0.0, f32(flags)));
+}
+
+// A pooled vertex in camera space: position, normal and u, noise-space
+// position and v.
+struct InstVert {
+    p: vec3<f32>,
+    n: vec4<f32>,
+    a: vec4<f32>,
+}
+
+fn inst_vertex(i: u32, v: u32) -> InstVert {
+    let a = b_pool[v];
+    let n = b_pool[v + 1u];
+    let nn = vec3<f32>(dot(b_mesh[i + 3u].xyz, n.xyz), dot(b_mesh[i + 4u].xyz, n.xyz), dot(b_mesh[i + 5u].xyz, n.xyz));
+    let ah = vec4<f32>(a.xyz, 1.0);
+    return InstVert(inst_cam(i, a.xyz), vec4<f32>(nn / max(sqrt(dot(nn, nn)), 1e-12), a.w), vec4<f32>(dot(b_mesh[i + 6u], ah), dot(b_mesh[i + 7u], ah), dot(b_mesh[i + 8u], ah), n.w));
+}
+
+// Where edge x→y crosses the near plane.
+fn near_cut(x: InstVert, y: InstVert) -> InstVert {
+    let s = (MESH_NEAR - x.p.z) / (y.p.z - x.p.z);
+    return InstVert(x.p + (y.p - x.p) * s, x.n + (y.n - x.n) * s, x.a + (y.a - x.a) * s);
+}
+
+fn geo_vertex(g: ptr<function, TriGeo>, k: u32, v: InstVert) {
+    (*g).pos[k] = vec4<f32>(v.p, 1.0 / v.p.z);
+    (*g).nrm[k] = v.n;
+    (*g).aux[k] = v.a;
+}
+
+// Pooled triangle `tri` of the instance at row i, at target point q: its
+// vertices moved into camera space. One crossing the near plane is cut
+// there as `add_mesh` cuts it (what is left in front: a triangle, or a
+// quad in two, of which the one at q); named vertices rather than a
+// polygon array keep the shader's registers, and so every pass, lean.
+fn instance_tri(prim: Prim, i: u32, tri: u32, q: vec2<f32>) -> TriGeo {
+    let h = b_mesh[i + 13u];
+    let vb = bitcast<u32>(h.x);
+    let rec = b_pool[bitcast<u32>(h.y) + tri];
+    let packed = bitcast<u32>(rec.w);
+    let v0 = inst_vertex(i, vb + bitcast<u32>(rec.x) * PROWS);
+    let v1 = inst_vertex(i, vb + bitcast<u32>(rec.y) * PROWS);
+    let v2 = inst_vertex(i, vb + bitcast<u32>(rec.z) * PROWS);
+    let material = inst_material(i, packed);
+    var edges = (packed >> 19u) & 7u;
+    let front = u32(v0.p.z >= MESH_NEAR) + u32(v1.p.z >= MESH_NEAR) + u32(v2.p.z >= MESH_NEAR);
+    var a = v0;
+    var b = v1;
+    var c = v2;
+    if front < 3u {
+        // Turn the odd vertex out (the one in front, or the one behind) to x.
+        let odd0 = (v0.p.z >= MESH_NEAR) == (front == 1u);
+        let odd1 = (v1.p.z >= MESH_NEAR) == (front == 1u);
+        var x = v2;
+        var y = v0;
+        var z = v1;
+        if odd0 {
+            x = v0;
+            y = v1;
+            z = v2;
+        } else if odd1 {
+            x = v1;
+            y = v2;
+            z = v0;
+        }
+        if front == 1u {
+            a = x;
+            b = near_cut(x, y);
+            c = near_cut(z, x);
+        } else {
+            // x behind: the quad (x→y cut, y, z, z→x cut).
+            let xy = near_cut(x, y);
+            a = xy;
+            b = y;
+            c = z;
+            let first = rows_of(inst_px(prim, i, xy.p), inst_px(prim, i, y.p), inst_px(prim, i, z.p), 0u, 0u);
+            if !cover(first.r0, first.r1, q).inside {
+                b = z;
+                c = near_cut(z, x);
+            }
+        }
+        edges = 7u;
+    }
+    var g: TriGeo;
+    geo_vertex(&g, 0u, a);
+    geo_vertex(&g, 1u, b);
+    geo_vertex(&g, 2u, c);
+    let mf = u32(b_mesh[bitcast<u32>(prim.geom2.z) + material * MAT_ROWS + 2u].w);
+    let flags = u32((mf & 16u) != 0u) | (u32((mf & 32u) != 0u) << 1u) | (edges << 2u);
+    g.t = rows_of(inst_px(prim, i, a.p), inst_px(prim, i, b.p), inst_px(prim, i, c.p), material, flags);
+    return g;
+}
+
 // occ: the nearest occluder behind (1 / camera z; 0: none), where a volume
 // stops.
-fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32) -> vec4<f32> {
-    let tb = bitcast<u32>(prim.geom2.x) + tri * 4u;
-    let vb = bitcast<u32>(prim.geom2.y);
+fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec4<f32> {
+    let g = tri_geo(prim, tri, q, compact);
+    let t = g.t;
     let mb = bitcast<u32>(prim.geom2.z);
     let lb = bitcast<u32>(prim.geom2.w);
-    let mat_flags = u32(b_mesh[mb + bitcast<u32>(b_mesh[tb + 1u].w) * MAT_ROWS + 2u].w);
+    let mat_flags = u32(b_mesh[mb + bitcast<u32>(t.r1.w) * MAT_ROWS + 2u].w);
     if (mat_flags & 4u) != 0u {
         // A depth-only occluder: another batch draws this surface.
         return vec4<f32>(0.0);
     }
     if (mat_flags & 16u) != 0u {
-        return card_sample(prim, mb + bitcast<u32>(b_mesh[tb + 1u].w) * MAT_ROWS, q);
+        return card_sample(prim, mb + bitcast<u32>(t.r1.w) * MAT_ROWS, q);
     }
     if (mat_flags & 32u) != 0u {
-        let row = mb + bitcast<u32>(b_mesh[tb + 1u].w) * MAT_ROWS;
-        let wc = cover(b_mesh[tb], b_mesh[tb + 1u], q);
-        let on_wire = wire_distance(b_mesh[tb], b_mesh[tb + 1u], wc.e, u32(b_mesh[tb + 2u].w) >> 2u) <= b_mesh[row + 3u].w * 0.5;
+        let row = mb + bitcast<u32>(t.r1.w) * MAT_ROWS;
+        let wc = cover(t.r0, t.r1, q);
+        let on_wire = wire_distance(t.r0, t.r1, wc.e, u32(t.r2.w) >> 2u) <= b_mesh[row + 3u].w * 0.5;
         var c = b_mesh[row + 1u];
         if on_wire { c = b_mesh[row]; }
         return vec4<f32>(encode(c.x) * c.w, encode(c.y) * c.w, encode(c.z) * c.w, c.w);
     }
-    let cv = cover(b_mesh[tb], b_mesh[tb + 1u], q);
+    let cv = cover(t.r0, t.r1, q);
     let ev = array<f32, 3>(cv.e.x, cv.e.y, cv.e.z);
-    let ids = b_mesh[tb + 2u];
-    let idv = array<u32, 3>(bitcast<u32>(ids.x), bitcast<u32>(ids.y), bitcast<u32>(ids.z));
     var w: array<f32, 3>;
     var pos: array<vec3<f32>, 3>;
     var nrm: array<vec3<f32>, 3>;
     for (var k = 0u; k < 3u; k++) {
-        let v = idv[k];
-        let a = b_mesh[vb + v * VROWS];
-        pos[k] = a.xyz;
-        nrm[k] = b_mesh[vb + v * VROWS + 1u].xyz;
-        w[k] = max(ev[k], 0.0) * a.w;
+        pos[k] = g.pos[k].xyz;
+        nrm[k] = g.nrm[k].xyz;
+        w[k] = max(ev[k], 0.0) * g.pos[k].w;
     }
     let s = max(w[0] + w[1] + w[2], 1e-30);
     let b = vec3<f32>(w[0] / s, w[1] / s, w[2] / s);
     let p = pos[0] * b.x + pos[1] * b.y + pos[2] * b.z;
     let navg = nrm[0] * b.x + nrm[1] * b.y + nrm[2] * b.z;
-    let mat = bitcast<u32>(b_mesh[tb + 1u].w);
+    let mat = bitcast<u32>(t.r1.w);
     let m0 = b_mesh[mb + mat * MAT_ROWS];
     let m1 = b_mesh[mb + mat * MAT_ROWS + 1u];
     let m2 = b_mesh[mb + mat * MAT_ROWS + 2u];
@@ -1737,10 +1964,8 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32) -> vec4<f32> {
     var uvs: array<vec2<f32>, 3>;
     var nps: array<vec3<f32>, 3>;
     for (var k = 0u; k < 3u; k++) {
-        let r1 = b_mesh[vb + idv[k] * VROWS + 1u];
-        let r2 = b_mesh[vb + idv[k] * VROWS + 2u];
-        uvs[k] = vec2<f32>(r1.w, r2.w);
-        nps[k] = r2.xyz;
+        uvs[k] = vec2<f32>(g.nrm[k].w, g.aux[k].w);
+        nps[k] = g.aux[k].xyz;
     }
     let det = surface_detail(mb + mat * MAT_ROWS, pos, nps, uvs, b, n, m0.xyz);
     n = det.n;
@@ -1944,27 +2169,89 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32) -> vec4<f32> {
     return vec4<f32>(c * a, a);
 }
 
-fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
+// The triangles a mesh primitive bins to the tile of pixel p: (start in
+// b_bins, count).
+fn tile_bins(prim: Prim, p: vec2<f32>) -> vec2<u32> {
     let tx = u32(p.x) / 16u;
     let ty = u32(p.y) / 16u;
     let tx0 = bitcast<u32>(prim.geom.y);
     let ty0 = bitcast<u32>(prim.geom.z);
     let tw = bitcast<u32>(prim.geom.w);
-    if tx < tx0 || ty < ty0 || tx - tx0 >= tw { return vec4<f32>(0.0); }
+    if tx < tx0 || ty < ty0 || tx - tx0 >= tw { return vec2<u32>(0u, 0u); }
     let base = bitcast<u32>(prim.geom.x);
     let k = (ty - ty0) * tw + (tx - tx0);
-    let start = base + b_bins[base + k * 2u];
-    let count = b_bins[base + k * 2u + 1u];
+    return vec2<u32>(base + b_bins[base + k * 2u], b_bins[base + k * 2u + 1u]);
+}
+
+// Quick reject: no sample of pixel p can be inside the triangle.
+fn misses(r0: vec4<f32>, r1: vec4<f32>, p: vec2<f32>) -> bool {
+    let c = cover(r0, r1, p);
+    let ca = array<f32, 3>(c.e.x, c.e.y, c.e.z);
+    var pts = array<vec2<f32>, 3>(r0.xy, r0.zw, r1.xy);
+    for (var k = 0u; k < 3u; k++) {
+        let ea = pts[(k + 1u) % 3u];
+        let eb = pts[(k + 2u) % 3u];
+        if ca[k] < -(abs(eb.x - ea.x) + abs(eb.y - ea.y)) * 0.4375 - 1e-3 { return true; }
+    }
+    return false;
+}
+
+// Per sample of pixel p, the nearest surface (1 / camera z; 0: none) of the
+// tile's opaque mesh primitives tagged `tag` (a layer list): the depth that
+// hides the rest of that list's meshes, and where its volumes stop.
+// Mirrors `run_depth` in mesh3d.rs.
+fn run_depth(first: u32, count: u32, tag: u32, p: vec2<f32>) -> array<f32, 8> {
+    var scene: array<f32, 8>;
+    for (var s = 0u; s < 8u; s++) { scene[s] = 0.0; }
+    for (var k = 0u; k < count; k++) {
+        let prim = b_prims[b_indices[first + k]];
+        if prim.kind.x != 4u || prim.kind.w != tag { continue; }
+        let span = tile_bins(prim, p);
+        let tb = bitcast<u32>(prim.geom2.x);
+        for (var j = 0u; j < span.y; j++) {
+            let r = tb + b_bins[span.x + j] * 4u;
+            let r0 = b_mesh[r];
+            let r1 = b_mesh[r + 1u];
+            let d = b_mesh[r + 3u];
+            if misses(r0, r1, p) { continue; }
+            for (var s = 0u; s < 8u; s++) {
+                let q = vec2<f32>(p.x + SAMPLE_X[s] / 16.0, p.y + SAMPLE_Y[s] / 16.0);
+                if !cover(r0, r1, q).inside { continue; }
+                let z = d.x * q.x + d.y * q.y + d.z;
+                if z <= scene[s] { continue; }
+                let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * MAT_ROWS;
+                if (u32(b_mesh[material + 2u].w) & 4u) != 0u { continue; }
+                let tf = u32(b_mesh[r + 2u].w);
+                var stands = true;
+                if (tf & 1u) != 0u {
+                    stands = card_sample(prim, material, q).w >= 1.0 / 512.0; // CARD_STANDS
+                } else if (tf & 2u) != 0u {
+                    stands = wire_stands(material, r0, r1, tf, q);
+                }
+                if stands { scene[s] = z; }
+            }
+        }
+    }
+    return scene;
+}
+
+// scene: run_depth of the primitive's layer list at p.
+fn shade_mesh(prim: Prim, p: vec2<f32>, scene: array<f32, 8>) -> vec4<f32> {
+    let span = tile_bins(prim, p);
+    let start = span.x;
+    let count = span.y;
     let tb = bitcast<u32>(prim.geom2.x);
+    let opaque = (prim.kind.w & 1u) != 0u;
     var best: array<u32, 8>;
     var depth: array<f32, 8>;
     // The nearest occluder at each sample (1 / camera z; 0: none), where a
-    // volume in front of it stops.
+    // volume in front of it stops: the list's opaque surface, or a card
+    // occluder nearer than it.
     var occ: array<f32, 8>;
     for (var s = 0u; s < 8u; s++) {
         best[s] = NO_TRI;
         depth[s] = 0.0;
-        occ[s] = 0.0;
+        occ[s] = scene[s];
     }
     for (var j = 0u; j < count; j++) {
         let tri = b_bins[start + j];
@@ -1972,16 +2259,7 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
         let r0 = b_mesh[r];
         let r1 = b_mesh[r + 1u];
         let d = b_mesh[r + 3u];
-        let c = cover(r0, r1, p);
-        let ca = array<f32, 3>(c.e.x, c.e.y, c.e.z);
-        var pts = array<vec2<f32>, 3>(r0.xy, r0.zw, r1.xy);
-        var reject = false;
-        for (var k = 0u; k < 3u; k++) {
-            let ea = pts[(k + 1u) % 3u];
-            let eb = pts[(k + 2u) % 3u];
-            if ca[k] < -(abs(eb.x - ea.x) + abs(eb.y - ea.y)) * 0.4375 - 1e-3 { reject = true; }
-        }
-        if reject { continue; }
+        if misses(r0, r1, p) { continue; }
         for (var s = 0u; s < 8u; s++) {
             let q = vec2<f32>(p.x + SAMPLE_X[s] / 16.0, p.y + SAMPLE_Y[s] / 16.0);
             if cover(r0, r1, q).inside {
@@ -1989,7 +2267,12 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
                 let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * MAT_ROWS;
                 let occludes = (u32(b_mesh[material + 2u].w) & 4u) != 0u && z > occ[s];
                 // Later surfaces win ties; cards only where their picture is.
-                let wins = z >= depth[s] * (1.0 - TIE);
+                // The list's opaque surface hides what is behind it (an
+                // opaque batch's own surface is in it, so ties pass; it wins
+                // ties against what is see-through).
+                var seen = z * (1.0 - TIE) > scene[s];
+                if opaque { seen = z >= scene[s] * (1.0 - TIE); }
+                let wins = seen && z >= depth[s] * (1.0 - TIE);
                 if wins || occludes {
                     var stands = true;
                     let tf = u32(b_mesh[r + 2u].w);
@@ -2009,6 +2292,12 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
             }
         }
     }
+    return shade_samples(prim, p, best, occ, false) * prim.inv_y.w;
+}
+
+// Shades each distinct triangle of `best` (per sample; NO_TRI: none) once,
+// at the centroid of the samples it won, weighted by their share.
+fn shade_samples(prim: Prim, p: vec2<f32>, best: array<u32, 8>, occ: array<f32, 8>, compact: bool) -> vec4<f32> {
     var out = vec4<f32>(0.0);
     for (var s = 0u; s < 8u; s++) {
         let tri = best[s];
@@ -2029,9 +2318,165 @@ fn shade_mesh(prim: Prim, p: vec2<f32>) -> vec4<f32> {
             }
         }
         let centroid = vec2<f32>(p.x + q.x / (16.0 * n), p.y + q.y / (16.0 * n));
-        out = out + shade_tri(prim, tri, centroid, oz) * (n / 8.0);
+        out = out + shade_tri(prim, tri, centroid, oz, compact) * (n / 8.0);
     }
-    return out * prim.inv_y.w;
+    return out;
+}
+
+// The hardware visibility pass (gpu.rs): per 8x sample, the id + 1 (0:
+// none; a primitive's from `geom.y`) of the mesh triangle nearest there,
+// and its depth (1 / camera z; NEAR = 1, so 0..1). Pages of one atlas, reused target by target.
+var t_vis_ids: texture_multisampled_2d<u32>;
+var t_vis_depth: texture_depth_multisampled_2d;
+// Per primitive: atlas px = target px + xy of its page; zw likewise for its
+// layer list's opaque page (the depth behind it); VIS_NONE: no page.
+var<storage, read> b_vis: array<vec4<i32>>;
+const VIS_NONE: i32 = -2147483647;
+
+// A mesh primitive's colour from its hardware visibility page.
+fn shade_mesh_vis(prim: Prim, index: u32, p: vec2<f32>) -> vec4<f32> {
+    let page = b_vis[index];
+    if page.x == VIS_NONE { return vec4<f32>(0.0); }
+    let px = vec2<i32>(floor(p));
+    // The primitive's triangle ids (`mesh3d::MeshCache::number_batches`).
+    let tb = bitcast<u32>(prim.geom.y);
+    let end = tb + prim.kind.y;
+    var best: array<u32, 8>;
+    var occ: array<f32, 8>;
+    for (var s = 0u; s < 8u; s++) {
+        best[s] = NO_TRI;
+        let id = textureLoad(t_vis_ids, px + page.xy, i32(s)).x;
+        if id != 0u && id - 1u >= tb && id - 1u < end {
+            best[s] = id - 1u - tb;
+        }
+        occ[s] = 0.0;
+        if page.z != VIS_NONE {
+            occ[s] = textureLoad(t_vis_depth, px + page.zw, i32(s));
+        }
+    }
+    return shade_samples(prim, p, best, occ, true) * prim.inv_y.w;
+}
+
+struct VisPass {
+    // Target px of the page's corner, and its size.
+    page: vec4<f32>,
+    // Atlas px of the page's corner.
+    atlas: vec4<f32>,
+    // 0, primitive index, mode (0 clear, 1 opaque, 2 see-through: strictly
+    // in front of what is there by TIE), what is drawn (0 the triangles
+    // with records, 1 instances: one per draw instance).
+    draw: vec4<u32>,
+}
+var<uniform> u_vis: VisPass;
+
+struct VisOut {
+    @builtin(position) pos: vec4<f32>,
+    // The triangle's id + 1 (0: none).
+    @location(0) @interpolate(flat) row: u32,
+    // Its instance's row (instances only).
+    @location(1) @interpolate(flat) inst: u32,
+}
+
+// A pooled mesh's triangle per three vertices (instance `inst`): moved
+// into camera space and projected here. Back faces come out empty; the
+// clip-space w is the projection's, so the hardware clips the triangle at
+// the near plane (z ≤ w where camera z ≥ 1) with the depth 1 / camera z.
+fn vis_instance(vi: u32, inst: u32) -> VisOut {
+    var out: VisOut;
+    let prim = b_prims[u_vis.draw.y];
+    let records = bitcast<u32>(prim.geom.z);
+    let i = bitcast<u32>(prim.geom2.x) + records + inst * IROWS;
+    let h = b_mesh[i + 13u];
+    let vb = bitcast<u32>(h.x);
+    let tri = vi / 3u;
+    let rec = b_pool[bitcast<u32>(h.y) + tri];
+    let q0 = inst_cam(i, b_pool[vb + bitcast<u32>(rec.x) * PROWS].xyz);
+    let q1 = inst_cam(i, b_pool[vb + bitcast<u32>(rec.y) * PROWS].xyz);
+    let q2 = inst_cam(i, b_pool[vb + bitcast<u32>(rec.z) * PROWS].xyz);
+    out.row = bitcast<u32>(prim.geom.y) + records + bitcast<u32>(h.w) + tri + 1u;
+    out.inst = i;
+    if inst_culled(i, bitcast<u32>(rec.w), q0, q1, q2) {
+        // Past the far side of the depth range: clipped away.
+        out.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        return out;
+    }
+    var q = q0;
+    if vi % 3u == 1u { q = q1; } else if vi % 3u == 2u { q = q2; }
+    let o = inst_out(i, q);
+    let t = (o.xy - o.z * prim.fill.xy) / prim.fill.zw;
+    let f = (t - o.z * u_vis.page.xy) / u_vis.page.zw;
+    var z = 1.0;
+    if q.z != 0.0 { z = o.z / q.z; }
+    if u_vis.draw.z == 2u { z = z * (1.0 - TIE); }
+    out.pos = vec4<f32>(f.x * 2.0 - o.z, o.z - f.y * 2.0, z, o.z);
+    return out;
+}
+
+// One mesh triangle per three vertices, from its record or its instance;
+// mode 0 covers the page.
+@vertex
+fn vis_vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VisOut {
+    var out: VisOut;
+    out.inst = 0u;
+    if u_vis.draw.z == 0u {
+        let c = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+        out.pos = vec4<f32>(c * 2.0 - 1.0, 0.0, 1.0);
+        out.row = 0u;
+        return out;
+    }
+    if u_vis.draw.w == 1u {
+        return vis_instance(vi, inst);
+    }
+    // A shared triangle record: its vertex's canvas position mapped onto
+    // this target, and its 1 / camera z.
+    let prim = b_prims[u_vis.draw.y];
+    let rec = b_mesh[bitcast<u32>(prim.geom2.x) + vi / 3u];
+    let ids = vec3<u32>(bitcast<u32>(rec.x), bitcast<u32>(rec.y), bitcast<u32>(rec.z));
+    let vrow = bitcast<u32>(prim.geom2.y) + ids[vi % 3u] * VROWS;
+    let v = (b_mesh[vrow + 3u].xy - prim.fill.xy) / prim.fill.zw;
+    var z = b_mesh[vrow].w;
+    if u_vis.draw.z == 2u { z = z * (1.0 - TIE); }
+    // Clip space follows WebGPU: +y up (target y runs down).
+    let f = (v - u_vis.page.xy) / u_vis.page.zw;
+    out.pos = vec4<f32>(f.x * 2.0 - 1.0, 1.0 - f.y * 2.0, clamp(z, 0.0, 1.0), 1.0);
+    out.row = bitcast<u32>(prim.geom.y) + vi / 3u + 1u;
+    return out;
+}
+
+// Cards stand only where their picture is, wireframes on their wires
+// (tested at the pixel centre).
+@fragment
+fn vis_fragment(in: VisOut) -> @location(0) u32 {
+    if in.row != 0u {
+        let prim = b_prims[u_vis.draw.y];
+        let q = in.pos.xy - u_vis.atlas.xy + u_vis.page.xy;
+        let tri = in.row - 1u - bitcast<u32>(prim.geom.y);
+        var t: TriRows;
+        if u_vis.draw.w == 1u {
+            // Only wireframes need the triangle's geometry here.
+            let h = b_mesh[in.inst + 13u];
+            let local = tri - bitcast<u32>(prim.geom.z) - bitcast<u32>(h.w);
+            let material = inst_material(in.inst, bitcast<u32>(b_pool[bitcast<u32>(h.y) + local].w));
+            if (u32(b_mesh[bitcast<u32>(prim.geom2.z) + material * MAT_ROWS + 2u].w) & 32u) == 0u { return in.row; }
+            t = instance_tri(prim, in.inst, local, q).t;
+        } else {
+            t = tri_rows(prim, tri, true);
+        }
+        let tf = u32(t.r2.w);
+        if (tf & 3u) != 0u {
+            let r0 = t.r0;
+            let r1 = t.r1;
+            let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * MAT_ROWS;
+            var stands = true;
+            if (tf & 1u) != 0u {
+                stands = card_sample(prim, material, q).w >= 1.0 / 512.0; // CARD_STANDS
+            } else {
+                stands = wire_stands(material, r0, r1, tf, q);
+            }
+            if !stands { discard; }
+        }
+    }
+    return in.row;
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -2045,10 +2490,25 @@ fn raster(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li
     let count = b_ranges[tile * 2u + 1u];
     let p = vec2<f32>(f32(x) + 0.5, f32(y) + 0.5);
     var c = u_pass.background;
+    // The depth of the opaque meshes of the layer list last drawn.
+    var scene_tag = 0xffffffffu;
+    var scene: array<f32, 8>;
     for (var k = 0u; k < count; k++) {
-        let prim = b_prims[b_indices[start + k]];
+        let index = b_indices[start + k];
+        let prim = b_prims[index];
         var s: vec4<f32>;
-        if prim.kind.x == 4u { s = shade_mesh(prim, p); } else { s = shade(prim, p); }
+        if prim.kind.x == 4u && u_pass.dest.z == 1u {
+            s = shade_mesh_vis(prim, index, p);
+        } else if prim.kind.x == 4u {
+            let tag = prim.kind.w | 1u;
+            if tag != scene_tag {
+                scene = run_depth(start, count, tag, p);
+                scene_tag = tag;
+            }
+            s = shade_mesh(prim, p, scene);
+        } else {
+            s = shade(prim, p);
+        }
         if s.w > 0.0 {
             c = blend(c, s, prim.kind.z);
         }

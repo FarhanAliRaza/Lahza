@@ -1527,6 +1527,7 @@ pub fn bounds(layer: &LayerState, measure: Option<Measure>) -> Option<[f64; 4]> 
         }
         Content::Image { size: Some(size), .. } => (size.x() / 2.0, size.y() / 2.0),
         Content::Image { size: None, .. } => return None,
+        Content::Shader(s) => (s.size.x() / 2.0, s.size.y() / 2.0),
         Content::Video(v) => match v.size {
             Some(size) => (size.x() / 2.0, size.y() / 2.0),
             None => return None,

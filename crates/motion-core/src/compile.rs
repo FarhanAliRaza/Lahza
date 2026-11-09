@@ -184,6 +184,20 @@ pub enum Content {
     Group(Vec<LayerState>),
     /// A lit 3D object.
     Mesh(Box<MeshState>),
+    /// A picture a Slang function paints (`crate::slang_layer`).
+    Shader(ShaderState),
+}
+
+/// A shader layer this frame: its function paints a `size` box centred
+/// on the layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShaderState {
+    pub program: Arc<crate::slang_layer::Program>,
+    pub size: Vec2,
+    /// Seconds since the layer started.
+    pub t: f64,
+    /// The arguments after `t` (unused components 0).
+    pub params: Vec<[f64; 4]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -544,6 +558,38 @@ enum CKind {
     Comp(Vec<CLayer>),
     Instancer(Box<CInstancer>),
     Mesh(Box<CMesh>),
+    Shader(CShader),
+}
+
+struct CShader {
+    program: Arc<crate::slang_layer::Program>,
+    size: Prop<Vec2>,
+    params: Vec<CParam>,
+}
+
+enum CParam {
+    Float(Prop<f64>),
+    Float2(Prop<Vec2>),
+    Float3(Prop<crate::value::Vec3>),
+    Float4(Prop<crate::value::Vec4>),
+}
+
+impl CParam {
+    fn at(&self, t: f64) -> [f64; 4] {
+        let pad = |v: &dyn Fn(usize) -> f64, n: usize| std::array::from_fn(|i| if i < n { v(i) } else { 0.0 });
+        match self {
+            CParam::Float(p) => pad(&|_| p.at(t), 1),
+            CParam::Float2(p) => {
+                let v = p.at(t);
+                pad(&|i| v.get(i), 2)
+            }
+            CParam::Float3(p) => {
+                let v = p.at(t);
+                pad(&|i| v.get(i), 3)
+            }
+            CParam::Float4(p) => p.at(t).0,
+        }
+    }
 }
 
 struct CVideo {
@@ -756,6 +802,12 @@ impl ElementTimes for Windows<'_> {
 
 struct Compiler<'a> {
     windows: Windows<'a>,
+    /// Slang functions the project's properties use (linked at the end).
+    slang: crate::slang::Linker,
+    /// Slang surface functions the project's materials use.
+    surfaces: crate::surface::Surfaces,
+    /// Shader layers' functions, by function and argument components.
+    programs: HashMap<(String, Vec<usize>), Arc<crate::slang_layer::Program>>,
     errors: Vec<String>,
     syncs: Vec<SyncRecord>,
     events: Vec<VisualEvent>,
@@ -765,7 +817,7 @@ impl<'a> Compiler<'a> {
     fn prop<T: Animatable>(&mut self, p: &Property<T>, element: &str, what: &str, origin: f64, step: Option<Step>, shift: f64) -> Prop<T> {
         let markers = &self.windows.project.markers;
         let base = self.windows.base;
-        let mut ctx = Ctx { markers, base, elements: &mut self.windows, origin };
+        let mut ctx = Ctx { markers, base, elements: &mut self.windows, origin, slang: &self.slang };
         match compile_prop(p, &mut ctx) {
             Ok(prop) => {
                 for seg in &prop.segments {
@@ -1140,6 +1192,7 @@ impl<'a> Compiler<'a> {
             LayerKind::Comp(comp) => CKind::Comp(self.layers(&comp.layers, step, shift - offset)),
             LayerKind::Instancer(n) => CKind::Instancer(Box::new(self.instancer(n, id, start, step, shift, siblings))),
             LayerKind::Mesh(m) => CKind::Mesh(Box::new(self.mesh(m, id, start, step, shift))),
+            LayerKind::Shader(s) => CKind::Shader(self.shader(s, id, start, step, shift)),
             // Expanded before compiling (`components::expand_project`).
             LayerKind::Component(_) => CKind::Comp(Vec::new()),
         };
@@ -1172,6 +1225,40 @@ impl<'a> Compiler<'a> {
             hidden: c.hidden,
             kind,
         }
+    }
+
+    fn shader(&mut self, s: &ShaderLayer, id: &str, start: f64, step: Option<Step>, shift: f64) -> CShader {
+        let settings = &self.windows.project.settings;
+        let frame = Vec2::new(settings.width as f64, settings.height as f64);
+        let size = match &s.size {
+            Some(p) => self.prop(p, id, "size", start, step, shift),
+            None => Prop::constant(frame),
+        };
+        let mut params = Vec::new();
+        for (name, p) in &s.params {
+            let what = format!("params.{name}");
+            params.push(match p {
+                ShaderParam::Float(p) => CParam::Float(self.prop(p, id, &what, start, step, shift)),
+                ShaderParam::Float2(p) => CParam::Float2(self.prop(p, id, &what, start, step, shift)),
+                ShaderParam::Float3(p) => CParam::Float3(self.prop(p, id, &what, start, step, shift)),
+                ShaderParam::Float4(p) => CParam::Float4(self.prop(p, id, &what, start, step, shift)),
+            });
+        }
+        let components: Vec<usize> = s.params.values().map(ShaderParam::components).collect();
+        let key = (s.function.clone(), components);
+        let program = match self.programs.get(&key) {
+            Some(p) => p.clone(),
+            None => {
+                let (program, check) = crate::slang_layer::Program::new(&self.slang, &self.windows.project.shaders, &key.0, key.1.clone());
+                if let Err(e) = check {
+                    self.errors.push(format!("{id}: {e}"));
+                }
+                let program = Arc::new(program);
+                self.programs.insert(key, program.clone());
+                program
+            }
+        };
+        CShader { program, size, params }
     }
 
     fn text(&mut self, tx: &TextLayer, id: &str, start: f64, step: Option<Step>, shift: f64) -> CText {
@@ -1352,7 +1439,7 @@ impl Compiled {
             errors.push("settings.duration must be positive".into());
         }
         let windows = Windows::new(project, base, &mut errors);
-        let mut c = Compiler { windows, errors, syncs: Vec::new(), events: Vec::new() };
+        let mut c = Compiler { windows, slang: Default::default(), surfaces: Default::default(), programs: HashMap::new(), errors, syncs: Vec::new(), events: Vec::new() };
         let mut scenes = Vec::new();
         for scene in &project.scenes {
             let id = scene.id.as_str();
@@ -1440,6 +1527,37 @@ impl Compiled {
                 transition,
                 layers,
             });
+        }
+        // The Slang functions the properties asked for, built into one
+        // library they read from (an error, never a silent zero).
+        if !c.slang.is_empty() {
+            // The project's modules plus the built-in `lahza` module.
+            let modules = crate::surface::modules(&project.shaders);
+            match c.slang.link(&modules) {
+                Ok(_) => {
+                    // Materials' functions reach the GPU through the program.
+                    if !c.surfaces.is_empty() {
+                        if let Err(e) = c.surfaces.finish(&project.shaders) {
+                            c.errors.push(e);
+                        }
+                    }
+                    // Shader layers' GPU kernels: the same sources, so they
+                    // build once the CPU library did.
+                    let mut programs: Vec<_> = c.programs.values().collect();
+                    programs.sort_by(|a, b| a.function.cmp(&b.function));
+                    for p in programs {
+                        if let Err(e) = p.build_gpu(&modules) {
+                            c.errors.push(format!("shader '{}' (GPU): {e}", p.function));
+                        }
+                    }
+                }
+                // An error in Lahza's generated callers: arguments that do
+                // not fit the function.
+                Err(e) if !c.programs.is_empty() && e.contains("lahza_cpu.slang") => {
+                    c.errors.push(format!("{e} (in Lahza's callers: a shader layer passes uv, px, t, then its params in name order; compare them with its function's arguments)"))
+                }
+                Err(e) => c.errors.push(e),
+            }
         }
         let Compiler { errors, syncs, mut events, .. } = c;
         events.sort_by(|a, b| a.t.total_cmp(&b.t));
@@ -2079,6 +2197,12 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
         CKind::Mesh(m) => Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))),
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
+        CKind::Shader(s) => Content::Shader(ShaderState {
+            program: s.program.clone(),
+            size: s.size.at(t),
+            t: t - l.start,
+            params: s.params.iter().map(|p| p.at(t)).collect(),
+        }),
         CKind::Video(v) => Content::Video(VideoState {
             src: v.src.clone(),
             size: v.size.as_ref().map(|s| s.at(t)),

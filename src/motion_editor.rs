@@ -46,6 +46,8 @@ struct Job {
 struct Mailbox {
     job: Option<Job>,
     done: Option<(u64, Arc<RenderImage>)>,
+    /// Why the last frame could not render (a missing or failed GPU).
+    error: Option<String>,
     label: String,
     quit: bool,
 }
@@ -79,13 +81,21 @@ impl Worker {
                     };
                     renderer.set_scale(job.scale);
                     renderer.set_motion_blur(job.blur);
-                    let mut pixels = renderer.render(&job.compiled, job.t);
+                    let mut pixels = match renderer.try_render(&job.compiled, job.t) {
+                        Ok(pixels) => pixels,
+                        Err(e) => {
+                            inner.0.lock().unwrap().error = Some(e);
+                            continue;
+                        }
+                    };
                     // GPUI uploads BGRA.
                     for p in pixels.chunks_exact_mut(4) {
                         p.swap(0, 2);
                     }
                     let image = Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]));
-                    inner.0.lock().unwrap().done = Some((job.key, image));
+                    let mut mailbox = inner.0.lock().unwrap();
+                    mailbox.done = Some((job.key, image));
+                    mailbox.error = None;
                 }
             })
             .expect("preview thread");
@@ -99,6 +109,10 @@ impl Worker {
 
     fn take(&self) -> Option<(u64, Arc<RenderImage>)> {
         self.shared.0.lock().unwrap().done.take()
+    }
+
+    fn error(&self) -> Option<String> {
+        self.shared.0.lock().unwrap().error.clone()
     }
 
 }
@@ -266,6 +280,8 @@ pub(crate) struct MotionEditor {
     generation: Arc<AtomicU64>,
     worker: Worker,
     frame: Option<Arc<RenderImage>>,
+    /// The preview renderer's error, shown over the canvas.
+    render_error: Option<String>,
     retired: Vec<Arc<RenderImage>>,
     request_key: u64,
     dirty: bool,
@@ -297,7 +313,7 @@ pub(crate) fn stamp(dir: &Path) -> SystemTime {
         }
     };
     look(&dir.join("project.json"));
-    for sub in ["scenes", "markers"] {
+    for sub in ["scenes", "markers", "shaders"] {
         if let Ok(rd) = std::fs::read_dir(dir.join(sub)) {
             for e in rd.flatten() {
                 look(&e.path());
@@ -427,6 +443,7 @@ impl MotionEditor {
             playing: false,
             generation: Arc::default(),
             frame: None,
+            render_error: None,
             retired: Vec::new(),
             request_key: 0,
             dirty: true,
@@ -503,6 +520,11 @@ impl MotionEditor {
         }
         if self.dirty {
             self.request_frame();
+        }
+        let error = self.worker.error();
+        if error != self.render_error {
+            self.render_error = error;
+            changed = true;
         }
         if let Some((key, image)) = self.worker.take() {
             if key <= self.request_key {
@@ -636,9 +658,16 @@ impl MotionEditor {
         let Ok(prop) = serde_json::from_value::<Property<T>>(v) else { return (default, false) };
         let animated = prop.is_animated();
         let mut elements: &Compiled = &self.compiled;
-        let mut ctx = Ctx { markers: &self.project.markers, base: self.compiled.base, elements: &mut elements, origin: 0.0 };
+        let linker = lahza_motion_core::slang::Linker::default();
+        let mut ctx = Ctx { markers: &self.project.markers, base: self.compiled.base, elements: &mut elements, origin: 0.0, slang: &linker };
         match compile_prop(&prop, &mut ctx) {
-            Ok(p) => (p.at(self.time), animated),
+            Ok(p) => {
+                // A Slang track shows its value (the build is cached).
+                if !linker.is_empty() {
+                    let _ = linker.link(&lahza_motion_core::surface::modules(&self.project.shaders));
+                }
+                (p.at(self.time), animated)
+            }
             Err(_) => (default, animated),
         }
     }
@@ -809,6 +838,15 @@ impl MotionEditor {
 
     pub(crate) fn rows(&self) -> &[Row] {
         &self.rows
+    }
+
+    /// The rows the timeline lists: layers alive at the playhead, so it
+    /// shows what is on screen now (the comp you are in, as in After
+    /// Effects) rather than every layer of every scene; the selected layer
+    /// always stays listed.
+    pub(crate) fn visible_rows(&self) -> Vec<&Row> {
+        let t = self.time;
+        self.rows.iter().filter(|r| (r.start <= t && t <= r.end) || self.selected.as_deref() == Some(r.id.as_str())).collect()
     }
 
     pub(crate) fn waves(&self) -> Arc<Vec<Wave>> {
@@ -1062,6 +1100,21 @@ impl MotionEditor {
             );
         if let Some(frame) = self.frame.clone() {
             area = area.child(img(frame).absolute().inset_0().size_full().object_fit(ObjectFit::Contain));
+        }
+        if let Some(error) = &self.render_error {
+            area = area.child(
+                div()
+                    .absolute()
+                    .left_3()
+                    .right_3()
+                    .bottom_3()
+                    .p_3()
+                    .rounded(px(6.0))
+                    .bg(theme::danger())
+                    .text_sm()
+                    .text_color(gpui::white())
+                    .child(format!("Preview cannot render: {error}")),
+            );
         }
         if let (Some(r), Some(b)) = (selection, canvas_bounds) {
             let (bw, bh) = (f64::from(b.size.width), f64::from(b.size.height));

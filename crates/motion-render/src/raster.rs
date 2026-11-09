@@ -843,10 +843,26 @@ fn raster_band(list: &DisplayList, target: &Target, src: &Sources, ty: u32, band
         let front = indices.iter().all(|&i| list.prims[i as usize].kind[2] == 0);
         tile[..n].fill(if front { [0.0; 4] } else { target.background });
         let order: &mut dyn Iterator<Item = &u32> = if front { &mut indices.iter().rev() } else { &mut indices.iter() };
+        // Per pixel, the depth of the opaque meshes of the layer list last
+        // drawn (`run_depth`), gathered from the whole tile so drawing
+        // order does not matter.
+        let mut scene_tag = None;
+        let mut scene = [[0.0f32; 8]; (TILE * TILE) as usize];
         for &i in order {
             let prim = &list.prims[i as usize];
             let done = ((prim.kind[0] == PRIM_IMAGE || prim.kind[0] == PRIM_MATTE) && image_tile(prim, src, &mut tile, x0, y0, cols, rows, front))
                 || (prim.kind[0] == PRIM_SHAPE && solid_tile(prim, &list.segments, &mut tile, x0, y0, cols, rows, front));
+            if prim.kind[0] == PRIM_MESH && scene_tag != Some(prim.kind[3] | 1) {
+                let tag = prim.kind[3] | 1;
+                for y in 0..rows {
+                    for x in 0..cols {
+                        let p = [(x0 + x) as f32 + 0.5, (y0 + y) as f32 + 0.5];
+                        let prims = indices.iter().map(|&j| &list.prims[j as usize]);
+                        scene[(y * TILE + x) as usize] = crate::mesh3d::run_depth(prims, tag, p, &list.mesh, &list.bins, src.groups);
+                    }
+                }
+                scene_tag = Some(tag);
+            }
             if !done {
                 for y in 0..rows {
                     for x in 0..cols {
@@ -855,7 +871,11 @@ fn raster_band(list: &DisplayList, target: &Target, src: &Sources, ty: u32, band
                         if front && c[3] >= OPAQUE {
                             continue;
                         }
-                        let s = if prim.kind[0] == PRIM_MESH { crate::mesh3d::shade_mesh(prim, p, &list.mesh, &list.bins, src.groups, src.images) } else { shade(prim, p, &list.stops, &list.segments, src) };
+                        let s = if prim.kind[0] == PRIM_MESH {
+                            crate::mesh3d::shade_mesh(prim, p, &scene[(y * TILE + x) as usize], &list.mesh, &list.bins, src.groups, src.images)
+                        } else {
+                            shade(prim, p, &list.stops, &list.segments, src)
+                        };
                         if s[3] > 0.0 {
                             *c = if front { under(*c, s) } else { blend(*c, s, prim.kind[2]) };
                         }

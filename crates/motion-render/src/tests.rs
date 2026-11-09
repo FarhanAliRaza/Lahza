@@ -961,7 +961,7 @@ fn instancer_2000_copies_at_1080p() {
         let started = Instant::now();
         let f = c.frame(times(n));
         let evaluated = Instant::now();
-        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, meshes: &mut Default::default(), scale: 1.0, trace: None, seed: 0 }.build(&f);
+        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, meshes: &mut Default::default(), scale: 1.0, trace: None, seed: 0, compact: false }.build(&f);
         build += evaluated.elapsed().as_secs_f64() * 1000.0;
         eval += (evaluated - started).as_secs_f64() * 1000.0;
         assert_eq!(list.prims.len(), 2000);

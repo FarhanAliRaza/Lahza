@@ -237,7 +237,7 @@ impl Studio {
     /// Height of the open piece's rows, or None when none is open.
     pub(crate) fn motion_layer_lane_height(&self, cx: &App) -> Option<f32> {
         let editor = self.motion_doc.as_ref()?.editor.read(cx);
-        let rows = editor.rows().len() + editor.waves().len();
+        let rows = editor.visible_rows().len() + editor.waves().len();
         (rows > 0).then(|| rows as f32 * LAYER_ROW)
     }
 
@@ -275,7 +275,7 @@ impl Studio {
                     })),
             );
         }
-        for (i, row) in editor.rows().iter().enumerate() {
+        for (i, row) in editor.visible_rows().into_iter().enumerate() {
             let id = row.id.clone();
             column = column.child(
                 label(format!("{}{}", "  ".repeat(row.depth), row.id), row.kind.to_string(), selected.as_deref() == Some(row.id.as_str()))
@@ -305,7 +305,7 @@ impl Studio {
         let editor = doc.editor.read(cx);
         let selected = editor.selected().map(str::to_string);
         let mut lane = div().relative().w_full().flex_none().h(px(height)).overflow_hidden().rounded_lg().bg(theme::control_bg());
-        let rows = editor.rows();
+        let rows = editor.visible_rows();
         let waves = editor.waves();
         for (ri, row) in rows.iter().enumerate() {
             let top = (waves.len() + ri) as f32 * LAYER_ROW;
@@ -853,27 +853,29 @@ impl Studio {
             .gap_2()
             .px_3()
             .h(px(44.0))
+            // Equal halves either side keep the transport centred while the
+            // time readout changes width.
             .child(
-                div()
-                    .relative()
-                    .flex_none()
-                    .child(
-                        button("motion-project-sound", "+ Sound", ButtonKind::Secondary, ButtonSize::Sm)
-                            .selected(sound_open)
-                            .tooltip("Add a sound effect at the playhead")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.timeline_ui.context = (!sound_open).then_some((crate::timeline_ui::TimelineContextTarget::SoundEffects, Default::default()));
-                                cx.notify();
-                            })),
-                    )
-                    .children(menu),
+                div().flex_1().flex().child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(
+                            button("motion-project-sound", "+ Sound", ButtonKind::Secondary, ButtonSize::Sm)
+                                .selected(sound_open)
+                                .tooltip("Add a sound effect at the playhead")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.timeline_ui.context = (!sound_open).then_some((crate::timeline_ui::TimelineContextTarget::SoundEffects, Default::default()));
+                                    cx.notify();
+                                })),
+                        )
+                        .children(menu),
+                ),
             )
-            .child(div().flex_1())
             .child(crate::controls::icon_button("motion-project-start", "icons/skip-back.svg", ButtonKind::Ghost, ButtonSize::Sm).tooltip("Start (Home)").on_click(to_start))
             .child(crate::controls::icon_button("motion-project-play", if playing { "icons/pause.svg" } else { "icons/play.svg" }, ButtonKind::Secondary, ButtonSize::Sm).tooltip("Play / pause (Space)").on_click(play))
             .child(crate::controls::icon_button("motion-project-end", "icons/skip-forward.svg", ButtonKind::Ghost, ButtonSize::Sm).tooltip("End (End)").on_click(to_end))
-            .child(div().flex_1())
-            .child(div().text_xs().text_color(theme::muted()).child(format!("{time:.2} s · f{frame} / {duration:.2} s")));
+            .child(div().flex_1().flex().justify_end().child(div().text_xs().text_color(theme::muted()).child(format!("{time:.2} s · f{frame} / {duration:.2} s"))));
         // Ruler: ticks every "nice" step of about 80 px; press or drag seeks.
         let bounds_store = self.video_timeline_bounds.clone();
         let width = self.video_timeline_bounds.lock().ok().and_then(|b| *b).map_or(800.0, |b| f32::from(b.size.width));

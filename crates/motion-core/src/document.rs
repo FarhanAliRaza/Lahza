@@ -31,6 +31,9 @@ pub struct Project {
     /// Narration lines and their word timings; `narration.json` on disk.
     #[serde(skip)]
     pub narration: Option<crate::narration::Narration>,
+    /// Slang modules; `shaders/<name>.slang` on disk.
+    #[serde(skip)]
+    pub shaders: Vec<crate::slang::Shader>,
 }
 
 fn version() -> u32 {
@@ -47,6 +50,7 @@ impl Project {
             scenes: Vec::new(),
             markers: Markers::default(),
             narration: None,
+            shaders: Vec::new(),
         }
     }
 }
@@ -981,6 +985,7 @@ pub enum LayerKind {
     Instancer(InstancerLayer),
     Mesh(MeshLayer),
     Component(ComponentLayer),
+    Shader(ShaderLayer),
 }
 
 /// A component (`crate::components`): its generator expands `params` to
@@ -1010,6 +1015,7 @@ impl LayerKind {
             LayerKind::Instancer(_) => "instancer",
             LayerKind::Mesh(_) => "mesh",
             LayerKind::Component(_) => "component",
+            LayerKind::Shader(_) => "shader",
         }
     }
 }
@@ -1060,7 +1066,7 @@ impl Layer {
         let common: Common = serde_json::from_value(serde_json::Value::Object(common))
             .map_err(|e| format!("layer '{id}': {e}"))?;
         if !map.contains_key("kind") {
-            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image, video, comp, instancer, mesh or component"));
+            return Err(format!("layer '{id}' needs a \"kind\": shape, text, image, video, comp, instancer, mesh, component or shader"));
         }
         let kind: LayerKind =
             serde_json::from_value(serde_json::Value::Object(map)).map_err(|e| format!("layer '{id}': {e}"))?;
@@ -1808,6 +1814,81 @@ pub struct ImageLayer {
     pub size: Option<Property<Vec2>>,
 }
 
+/// A picture painted per pixel by a Slang function of the project's
+/// `shaders/`: `float4 function(float2 uv, float2 px, float t, params…)`
+/// returning straight (not premultiplied) colour, over a `size` box
+/// centred on the layer (docs/slang/shader-layers.md).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShaderLayer {
+    pub function: String,
+    /// Picture size in pixels; default the frame's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Property<Vec2>>,
+    /// The function's arguments after `t`, in name order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, ShaderParam>,
+}
+
+/// A shader layer's argument, animatable: a number is a `float`, `[x, y]` a
+/// `float2`, `[x, y, z]` a `float3`, `[x, y, z, w]` or a colour a `float4`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShaderParam {
+    Float(Property<f64>),
+    Float2(Property<Vec2>),
+    Float3(Property<crate::value::Vec3>),
+    Float4(Property<crate::value::Vec4>),
+}
+
+impl ShaderParam {
+    /// Components of the Slang type it is passed as.
+    pub fn components(&self) -> usize {
+        match self {
+            ShaderParam::Float(_) => 1,
+            ShaderParam::Float2(_) => 2,
+            ShaderParam::Float3(_) => 3,
+            ShaderParam::Float4(_) => 4,
+        }
+    }
+}
+
+impl Serialize for ShaderParam {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ShaderParam::Float(p) => p.serialize(s),
+            ShaderParam::Float2(p) => p.serialize(s),
+            ShaderParam::Float3(p) => p.serialize(s),
+            ShaderParam::Float4(p) => p.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShaderParam {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        use serde_json::Value;
+        let value = Value::deserialize(d)?;
+        // The type is the value's (a keyed one's first key or base).
+        let sample = match &value {
+            Value::Object(o) => o.get("keys").and_then(|k| k.get(0)).and_then(|k| k.get("v").or_else(|| k.get("from"))).or_else(|| o.get("base")).cloned(),
+            v => Some(v.clone()),
+        };
+        let components = match sample {
+            Some(Value::Number(_)) => 1,
+            Some(Value::String(_)) => 4,
+            Some(Value::Array(a)) if (2..=4).contains(&a.len()) => a.len(),
+            _ => return Err(D::Error::custom("a shader param is a number, [x, y], [x, y, z], [x, y, z, w] or a colour (keyed: its keys' values; additive only: give \"base\")")),
+        };
+        let p = match components {
+            1 => serde_json::from_value(value).map(ShaderParam::Float),
+            2 => serde_json::from_value(value).map(ShaderParam::Float2),
+            3 => serde_json::from_value(value).map(ShaderParam::Float3),
+            _ => serde_json::from_value(value).map(ShaderParam::Float4),
+        };
+        p.map_err(D::Error::custom)
+    }
+}
+
 /// Footage: a video file (mp4, mov, webm, mkv; alpha from ProRes 4444,
 /// VP8/VP9 alpha or PNG/QT-RLE) or an image sequence (`"renders/shot_####.png"`,
 /// Blender-style, or a folder of frames).
@@ -2273,6 +2354,34 @@ pub struct MeshLayer {
     /// Pushes the surface out and in by noise (real bumps on the silhouette).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub displace: Option<Displace>,
+    /// Moves every point of the mesh by a Slang function of the project
+    /// (`docs/slang/geometry.md`), after displacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deform: Option<Deform>,
+}
+
+/// A Slang deformer: `float3 <function>(float3 p, float3 n, float t)`
+/// returns where point `p` (normal `n`) goes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deform {
+    pub function: String,
+    /// Fields of the author's `<function>_params` struct (animatable),
+    /// passed as a last argument.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, Property<f64>>,
+    /// `t` is the layer's local seconds (else 0, and the deformed mesh is
+    /// made once).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub animated: bool,
+    /// Splits every triangle into four this many times first (0–4), so
+    /// coarse meshes bend.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub subdivide: u32,
+    /// How far (px) the function may move a point: pads the mesh's bounds
+    /// for layout checks.
+    #[serde(default, skip_serializing_if = "zero")]
+    pub reach: f64,
 }
 
 fn one_u32() -> u32 {
@@ -2370,6 +2479,39 @@ pub enum MeshDef {
         unit: f64,
         #[serde(default = "zero_prop", skip_serializing_if = "is_zero")]
         frame: Property<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bounds: Option<[[f64; 3]; 2]>,
+    },
+    /// Generated by the project's Slang (`docs/slang/geometry.md`):
+    /// `float3 <function>_position(uint i, float t)` for each of `vertices`
+    /// points and `uint3 <function>_triangle(uint j, float t)` for each of
+    /// `triangles`; `normals`, `uvs` and `segments` add
+    /// `<function>_normal`, `_uv` and `_segment`. Normals not given are
+    /// smoothed from the triangles.
+    Slang {
+        function: String,
+        vertices: u32,
+        triangles: u32,
+        /// Fields of the author's `<function>_params` struct (animatable),
+        /// passed as a last argument.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        params: std::collections::BTreeMap<String, Property<f64>>,
+        /// `t` is the layer's local seconds (else 0, and the mesh is made
+        /// once).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        animated: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        normals: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        uvs: bool,
+        /// Per triangle, which of the layer's `colors` it takes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        segments: bool,
+        /// Closed: back faces are culled (a triangle's outside is where its
+        /// normals point). Default: seen from both sides.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        one_sided: bool,
+        /// Local bounds [min, max] in px (default: measured from the mesh).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bounds: Option<[[f64; 3]; 2]>,
     },
@@ -2586,6 +2728,61 @@ pub struct Material {
     /// Faceted: one normal per triangle (low-poly look).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub faceted: Option<bool>,
+    /// A Slang function of the project's shaders that shades the surface
+    /// over the rest of the material (docs/slang/materials.md): `"marble"`
+    /// or `{"function": "marble", "params": [...]}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slang: Option<SlangSurface>,
+}
+
+/// A material's Slang surface function (`Material::slang`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SlangSurfaceForm", into = "SlangSurfaceForm")]
+pub struct SlangSurface {
+    /// `Surface <function>(SurfaceInput s)` in a module of `shaders/`.
+    pub function: String,
+    /// Up to 8 animatable numbers, `s.params[0]` …
+    pub params: Vec<Property<f64>>,
+    /// The function's opacity lets other meshes behind show (the mesh is
+    /// drawn after the opaque ones, as glass is).
+    pub see_through: bool,
+}
+
+/// `SlangSurface` as written: a function name, or the full form.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SlangSurfaceForm {
+    Name(String),
+    Full(SlangSurfaceFull),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SlangSurfaceFull {
+    function: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    params: Vec<Property<f64>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    see_through: bool,
+}
+
+impl From<SlangSurfaceForm> for SlangSurface {
+    fn from(f: SlangSurfaceForm) -> Self {
+        match f {
+            SlangSurfaceForm::Name(function) => SlangSurface { function, ..Default::default() },
+            SlangSurfaceForm::Full(f) => SlangSurface { function: f.function, params: f.params, see_through: f.see_through },
+        }
+    }
+}
+
+impl From<SlangSurface> for SlangSurfaceForm {
+    fn from(s: SlangSurface) -> Self {
+        if s.params.is_empty() && !s.see_through {
+            SlangSurfaceForm::Name(s.function)
+        } else {
+            SlangSurfaceForm::Full(SlangSurfaceFull { function: s.function, params: s.params, see_through: s.see_through })
+        }
+    }
 }
 
 fn one_f64_prop() -> Property<f64> {

@@ -161,6 +161,8 @@ pub struct Context {
     shader_debug_path: Option<PathBuf>,
     min_buffer_alignment: u64,
     sample_count_flags: vk::SampleCountFlags,
+    pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<PathBuf>,
     instance: Instance,
     entry: ash::Entry,
 }

@@ -37,6 +37,20 @@ pub struct Profile {
     /// scattered inside a volume (0, 1, 2, 3 or more).
     pub rays_by_scatter: [u64; 4],
     pub lookups_by_scatter: [u64; 4],
+    /// The GPU's mesh pool.
+    pub pool: PoolStats,
+}
+
+/// The GPU's mesh pool (`pool.rs`): uploads and evictions summed over the
+/// frames, its size after the last one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolStats {
+    pub uploads: u64,
+    pub upload_bytes: u64,
+    pub evictions: u64,
+    pub meshes: u64,
+    pub bytes: u64,
+    pub capacity: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,6 +95,13 @@ impl Profile {
             self.rays_by_scatter[d] += other.rays_by_scatter[d];
             self.lookups_by_scatter[d] += other.lookups_by_scatter[d];
         }
+        let p = other.pool;
+        self.pool.uploads += p.uploads;
+        self.pool.upload_bytes += p.upload_bytes;
+        self.pool.evictions += p.evictions;
+        if p.capacity > 0 {
+            (self.pool.meshes, self.pool.bytes, self.pool.capacity) = (p.meshes, p.bytes, p.capacity);
+        }
     }
 
     pub fn add_gpu(&mut self, passes: &[(String, Duration)]) {
@@ -121,6 +142,8 @@ impl Profile {
             "gpu": table(&self.gpu, gpu_total),
             "tracer": {"ray_queries_per_frame": self.rays / self.frames.max(1), "candidates_per_ray": round(self.candidates as f64 / self.rays.max(1) as f64), "empty_lookup_share": round(self.density_empty as f64 / self.layers.values().map(|l| l.density).sum::<u64>().max(1) as f64), "lockstep_use": round(self.lane_lookups as f64 / self.lane_slots.max(1) as f64), "rays_by_volume_scatters": self.rays_by_scatter, "lookups_by_volume_scatters": self.lookups_by_scatter, "density_lookups_per_frame": density / self.frames.max(1),
                        "counted_on": format!("1 pixel in {COUNT_EVERY}, scaled"), "layers": layers},
+            "mesh_pool": {"meshes": self.pool.meshes, "bytes": self.pool.bytes, "capacity": self.pool.capacity, "budget": crate::pool::MESH_POOL_BUDGET,
+                          "uploads": self.pool.uploads, "upload_bytes": self.pool.upload_bytes, "evictions": self.pool.evictions},
             "summary": self.summary(),
         })
     }
@@ -140,6 +163,20 @@ impl Profile {
         };
         section("CPU stages", &self.cpu, true);
         section("GPU passes", &self.gpu, false);
+        if self.pool.capacity > 0 {
+            let mb = |b: u64| b as f64 / (1 << 20) as f64;
+            let p = self.pool;
+            out.push(format!(
+                "mesh pool: {} meshes, {:.1} MB in a {:.1} MB buffer (budget {:.0} MB); {} uploaded ({:.1} MB), {} evicted over the frames",
+                p.meshes,
+                mb(p.bytes),
+                mb(p.capacity),
+                mb(crate::pool::MESH_POOL_BUDGET as u64),
+                p.uploads,
+                mb(p.upload_bytes),
+                p.evictions
+            ));
+        }
         if !self.layers.is_empty() {
             let density: u64 = self.layers.values().map(|l| l.density).sum::<u64>().max(1);
             out.push(format!("tracer: {} ray queries/frame, {:.1} triangle candidates per ray, {} density lookups/frame", self.rays / self.frames.max(1), self.candidates as f64 / self.rays.max(1) as f64, density / self.frames.max(1)));

@@ -23,8 +23,11 @@ pub mod profile;
 pub mod pt;
 pub mod model;
 mod oidn;
+mod pool;
 pub mod raster;
+pub mod shader;
 pub mod sheet;
+mod surfaces;
 
 use font::Fonts;
 use image::RgbaImage;
@@ -38,6 +41,8 @@ use std::time::Instant;
 pub enum Backend {
     /// Hardware GPU when available, else CPU.
     Auto,
+    /// Hardware GPU only: a missing or failing GPU is an error, never a
+    /// silent switch to the much slower CPU.
     Gpu,
     Cpu,
 }
@@ -75,7 +80,7 @@ impl Default for RenderOptions {
         Self {
             scale: 1.0,
             motion_blur: true,
-            backend: Backend::Auto,
+            backend: Backend::Gpu,
             allow_software_gpu: std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some(),
             path: None,
             profile: false,
@@ -225,6 +230,7 @@ impl Renderer {
         w.extend(self.meshes.warnings.iter().cloned());
         w.extend(self.fallbacks.iter().cloned());
         w.extend(self.gpu.as_ref().and_then(|g| g.denoise_warning()));
+        w.extend(self.gpu.as_ref().and_then(|g| g.pool_warning()));
         w.sort();
         w.dedup();
         w
@@ -243,8 +249,14 @@ impl Renderer {
         d
     }
 
-    /// The frame at timeline time `t`, with motion blur when the scene asks.
+    /// The frame at timeline time `t`; panics where `try_render` errs.
     pub fn render(&mut self, compiled: &Compiled, t: f64) -> RgbaImage {
+        self.try_render(compiled, t).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// The frame at timeline time `t`, with motion blur when the scene asks.
+    /// Errs when the backend is `Gpu` and the GPU is missing or fails.
+    pub fn try_render(&mut self, compiled: &Compiled, t: f64) -> Result<RgbaImage, String> {
         let started = Instant::now();
         let mut states = Vec::new();
         match compiled.motion_blur_at(t).filter(|_| self.options.motion_blur) {
@@ -265,11 +277,19 @@ impl Renderer {
         if let Some(p) = self.profile.as_mut() {
             p.stage("evaluate scene", started);
         }
-        self.render_states(&states)
+        self.try_render_states(&states)
+    }
+
+    /// `try_render_states`; panics where it errs.
+    pub fn render_states(&mut self, states: &[FrameState]) -> RgbaImage {
+        self.try_render_states(states).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Renders equally weighted sub-samples of one output frame.
-    pub fn render_states(&mut self, states: &[FrameState]) -> RgbaImage {
+    pub fn try_render_states(&mut self, states: &[FrameState]) -> Result<RgbaImage, String> {
+        if self.gpu.is_none() && self.options.backend == Backend::Gpu {
+            return Err(format!("GPU unavailable: {}", self.gpu_error.as_deref().unwrap_or("no device")));
+        }
         let started = Instant::now();
         self.footage.begin_frame();
         let trace = match (self.options.path, self.gpu.as_ref()) {
@@ -302,6 +322,10 @@ impl Renderer {
                 self.images.warnings.push(FULL.into());
             }
         }
+        if let Some(f) = self.meshes.traced_slang.take() {
+            return Err(format!("the path tracer cannot run Slang materials yet (function '{f}'): render without path tracing"));
+        }
+        let keying = Instant::now();
         let mut key = Vec::new();
         for l in &lists {
             key.extend(l.signature());
@@ -309,18 +333,25 @@ impl Renderer {
         // Footage pixels are part of the picture.
         key.extend(self.footage.signature());
         let built = Instant::now();
+        if let Some(p) = self.profile.as_mut() {
+            p.add("display lists › frame key", built - keying);
+        }
         self.stats.build_ms += (built - started).as_secs_f64() * 1000.0;
         self.stats.frames += 1;
         if let Some(p) = self.profile.as_mut() {
             p.frames += 1;
             p.add("display lists", built - started);
             p.add("display lists › meshes (generate, displace)", std::mem::take(&mut self.meshes.busy));
+            p.add("display lists › meshes (place on targets)", std::mem::take(&mut self.meshes.placing));
+            p.add("display lists › meshes (place on targets) › triangle setup", std::mem::take(&mut self.meshes.placing_setup));
+            p.add("display lists › meshes (occluders)", std::mem::take(&mut self.meshes.occluding));
+            p.add("display lists › meshes (shadow maps)", std::mem::take(&mut self.meshes.shadowing));
             p.add("display lists › images (load)", std::mem::take(&mut self.images.busy));
         }
         if let Some((last_key, image)) = &self.last {
             if *last_key == key {
                 self.stats.cached += 1;
-                return image.clone();
+                return Ok(image.clone());
             }
         }
         let main = lists[0].main();
@@ -356,16 +387,19 @@ impl Renderer {
                         bytes
                     }
                     None => {
+                        // GPU only: this frame fails, the (new) device stays
+                        // for the next ones.
+                        if self.options.backend == Backend::Gpu {
+                            return Err(format!("GPU failed at frame {}: {e}", self.stats.frames));
+                        }
                         self.gpu = None;
                         self.gpu_error = Some(format!("GPU failed: {e}"));
                         self.fallbacks.push(format!("GPU failed at frame {} ({e}); this and later frames rendered on the CPU", self.stats.frames));
-                        // The CPU cannot trace: rasterise the frame instead.
-                        if trace.is_some() {
-                            let raster = self.build_lists(states, None);
-                            self.cpu(&raster)
-                        } else {
-                            self.cpu(&lists)
-                        }
+                        // Lists in the CPU's form (the GPU's shared triangle
+                        // records are not); the CPU cannot trace, so the
+                        // frame is rasterised.
+                        let raster = self.build_lists(states, None);
+                        self.cpu(&raster)
                     }
                 }
             }
@@ -380,17 +414,18 @@ impl Renderer {
         self.stats.raster_ms += built.elapsed().as_secs_f64() * 1000.0;
         let image = RgbaImage::from_raw(main.width, main.height, bytes).expect("frame size");
         self.last = Some((key, image.clone()));
-        image
+        Ok(image)
     }
 
     fn build_lists(&mut self, states: &[FrameState], trace: Option<pt::TraceOptions>) -> Vec<DisplayList> {
         let scale = self.options.scale;
+        let compact = self.gpu.as_ref().is_some_and(|g| g.has_vis());
         states
             .iter()
             .map(|s| {
                 // Seeded by the frame's time: the same frame traces the same.
                 let seed = ((s.t * 1000.0).round() as i64 as u64).wrapping_mul(0x9E37_79B9) as u32;
-                Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, meshes: &mut self.meshes, scale, trace, seed }.build(s)
+                Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, meshes: &mut self.meshes, scale, trace, seed, compact }.build(s)
             })
             .collect()
     }
@@ -409,6 +444,10 @@ impl Renderer {
             // Every group is drawn in full before it is read.
             groups.resize(list.group_texels as usize, [0.0; 4]);
             for g in &list.groups {
+                if let Some(i) = g.shader {
+                    shader::paint_cpu(&list.shaders[i as usize], g, groups, self.threads);
+                    continue;
+                }
                 let n = (g.target.width * g.target.height) as usize;
                 // Outer groups sample inner ones, so draw into a scratch
                 // buffer and copy it in place.

@@ -105,6 +105,11 @@ pub struct ContextDesc {
     pub overlay: bool,
     /// Force selection of a specific Device ID, unless 0.
     pub device_id: u32,
+    /// A file holding compiled pipelines between runs: loaded at start and
+    /// written by `save_pipeline_cache`, so shaders compile once per
+    /// driver instead of on every launch. Data from another device or
+    /// driver is ignored by the driver.
+    pub pipeline_cache: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]

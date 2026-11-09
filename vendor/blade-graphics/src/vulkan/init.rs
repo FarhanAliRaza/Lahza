@@ -769,6 +769,24 @@ impl super::Context {
             .create_semaphore(&timeline_semaphore_create_info, None)
             .unwrap();
 
+        let pipeline_cache_data = desc
+            .pipeline_cache
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .unwrap_or_default();
+        let pipeline_cache = device
+            .core
+            .create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default().initial_data(&pipeline_cache_data),
+                None,
+            )
+            .or_else(|_| {
+                device
+                    .core
+                    .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+            })
+            .unwrap_or(vk::PipelineCache::null());
+
         let mut naga_flags = spv::WriterFlags::FORCE_POINT_SIZE;
         let shader_debug_path = if desc.validation || desc.capture {
             use std::{env, fs};
@@ -801,9 +819,33 @@ impl super::Context {
                     .properties
                     .limits
                     .framebuffer_depth_sample_counts,
+            pipeline_cache,
+            pipeline_cache_path: desc.pipeline_cache,
             instance,
             entry,
         })
+    }
+
+    /// Writes the compiled pipelines to `ContextDesc::pipeline_cache`
+    /// (nothing without one). Written to a temporary file and renamed, so
+    /// another process never reads half a cache.
+    pub fn save_pipeline_cache(&self) {
+        let Some(path) = &self.pipeline_cache_path else {
+            return;
+        };
+        if self.pipeline_cache == vk::PipelineCache::null() {
+            return;
+        }
+        let Ok(data) = (unsafe { self.device.core.get_pipeline_cache_data(self.pipeline_cache) }) else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, &data).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 
     pub(super) fn set_object_name<T: vk::Handle>(&self, object: T, name: &str) {
@@ -846,6 +888,9 @@ impl Drop for super::Context {
                     .core
                     .destroy_semaphore(queue.timeline_semaphore, None);
             }
+            self.device
+                .core
+                .destroy_pipeline_cache(self.pipeline_cache, None);
             self.device.core.destroy_device(None);
             self.instance.core.destroy_instance(None);
         }

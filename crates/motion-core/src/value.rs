@@ -221,6 +221,45 @@ impl<'de> Deserialize<'de> for Color {
     }
 }
 
+/// Four numbers (a shader layer's `float4` parameter). Deserialises from
+/// `[x, y, z, w]` or a colour ("#rrggbb", "#rrggbbaa"); serialises as the
+/// array, so values outside 0..1 keep.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Vec4(pub [f64; 4]);
+
+impl Animatable for Vec4 {
+    const COMPONENTS: usize = 4;
+    fn get(&self, i: usize) -> f64 {
+        self.0[i]
+    }
+    fn from_fn(mut f: impl FnMut(usize) -> f64) -> Self {
+        Vec4([f(0), f(1), f(2), f(3)])
+    }
+}
+
+impl Serialize for Vec4 {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Vec4 {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) => Color::parse(&s).map(|c| Vec4(c.0)).map_err(D::Error::custom),
+            serde_json::Value::Array(a) if a.len() == 4 => {
+                let mut v = [0.0; 4];
+                for (slot, x) in v.iter_mut().zip(&a) {
+                    *slot = x.as_f64().ok_or_else(|| D::Error::custom("vector components must be numbers"))?;
+                }
+                Ok(Vec4(v))
+            }
+            other => Err(D::Error::custom(format!("expected [x, y, z, w] or a colour, got {other}"))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

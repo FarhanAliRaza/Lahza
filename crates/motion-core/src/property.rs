@@ -80,6 +80,19 @@ pub enum Additive<T> {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<TimeRef>,
     },
+    /// A Slang function of local time (seconds since `from`, by default
+    /// the layer start) from the project's `shaders/`, returning `float` …
+    /// `float4` (one component per value component). `add` adds it to the
+    /// keyed value; `mul` multiplies.
+    Slang {
+        function: String,
+        #[serde(default)]
+        mode: Mode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<TimeRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<TimeRef>,
+    },
     /// Smooth seeded noise.
     Wiggle {
         hz: f64,
@@ -217,6 +230,7 @@ enum CAdd<T> {
     Drift { rate: T, mul: bool, from: f64, until: f64 },
     Wiggle { hz: f64, amp: T, seed: u32, octaves: u32, from: f64, until: f64 },
     Sine { hz: f64, amp: T, phase: f64, from: f64, until: f64 },
+    Slang { function: crate::slang::Param, mul: bool, from: f64, until: f64 },
 }
 
 /// A compiled property: every time resolved, evaluation is pure arithmetic.
@@ -272,6 +286,18 @@ impl<T: Animatable> Prop<T> {
 
 fn apply_add<T: Animatable>(add: &CAdd<T>, v: T, t: f64) -> T {
     match add {
+        CAdd::Slang { function, mul, from, until } => {
+            if t < *from || t > *until {
+                return v;
+            }
+            let r = function.at(t - from);
+            let r = T::from_fn(|i| r.get(i).copied().unwrap_or(0.0));
+            if *mul {
+                v.map2(&r, |a, b| a * b)
+            } else {
+                v.add(&r)
+            }
+        }
         CAdd::Drift { rate, mul, from, until } => {
             let elapsed = (t.min(*until) - from).max(0.0);
             if *mul {
@@ -330,6 +356,8 @@ pub struct Ctx<'a> {
     pub elements: &'a mut dyn ElementTimes,
     /// Default time for additive tracks with no `from` (the layer start).
     pub origin: f64,
+    /// Binds Slang additive tracks to the project's shader functions.
+    pub slang: &'a crate::slang::Linker,
 }
 
 impl Ctx<'_> {
@@ -460,6 +488,10 @@ pub fn compile<T: Animatable>(prop: &Property<T>, ctx: &mut Ctx) -> Result<Prop<
                 let (from, until) = window(ctx, from, until)?;
                 CAdd::Sine { hz: *hz, amp: amp.clone(), phase: *phase, from, until }
             }
+            Additive::Slang { function, mode, from, until } => {
+                let (from, until) = window(ctx, from, until)?;
+                CAdd::Slang { function: ctx.slang.param(function, *mode == Mode::Mul), mul: *mode == Mode::Mul, from, until }
+            }
         });
     }
     prop.step = animated.step_fps.filter(|f| *f > 0.0).map(|fps| Step { fps, phase: 0.0 });
@@ -476,7 +508,8 @@ mod tests {
     fn compiled<T: Animatable>(json: &str, markers: &Markers) -> Prop<T> {
         let prop: Property<T> = serde_json::from_str(json).unwrap();
         let mut elements = NoElements;
-        let mut ctx = Ctx { markers, base: TimeBase::new(Fps::whole(25)), elements: &mut elements, origin: 0.0 };
+        let linker = crate::slang::Linker::default();
+        let mut ctx = Ctx { markers, base: TimeBase::new(Fps::whole(25)), elements: &mut elements, origin: 0.0, slang: &linker };
         compile(&prop, &mut ctx).unwrap()
     }
 
