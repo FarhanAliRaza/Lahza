@@ -29,6 +29,8 @@ pub struct Images {
     pinned: HashSet<String>,
     /// An image did not fit in the pool since `begin_frame`.
     pub overflowed: bool,
+    /// Images refused since `begin_frame` (no room): source, size, texels with mips.
+    refused: Vec<(String, u32, u32, usize)>,
     /// Time spent loading images since the renderer last took it.
     pub(crate) busy: std::time::Duration,
     luts: HashMap<String, Option<std::sync::Arc<(usize, Vec<[f32; 4]>)>>>,
@@ -40,12 +42,38 @@ pub fn pack(c: [u8; 4]) -> u32 {
 
 impl Images {
     pub fn new(root: Option<&Path>) -> Self {
-        Self { root: root.map(Path::to_path_buf), texels: Vec::new(), entries: HashMap::new(), generation: 1, warnings: Vec::new(), used: HashSet::new(), pinned: HashSet::new(), overflowed: false, luts: HashMap::new(), busy: std::time::Duration::ZERO }
+        Self { root: root.map(Path::to_path_buf), texels: Vec::new(), entries: HashMap::new(), generation: 1, warnings: Vec::new(), used: HashSet::new(), pinned: HashSet::new(), overflowed: false, refused: Vec::new(), luts: HashMap::new(), busy: std::time::Duration::ZERO }
     }
 
     pub fn begin_frame(&mut self) {
         self.used.clear();
         self.overflowed = false;
+        self.refused.clear();
+    }
+
+    /// Why this frame's images do not fit the pool: what they need against
+    /// `MAX_TEXELS`, the largest of them, and what to do (an error for the
+    /// project's author to fix; nothing is shrunk or dropped silently).
+    pub fn overflow_report(&self) -> String {
+        let mut all: Vec<(String, u32, u32, usize)> = self
+            .entries
+            .iter()
+            .filter(|(src, _)| self.used.contains(*src))
+            .filter_map(|(src, e)| e.map(|t| (src.clone(), t.width, t.height, mip_texels(t.width, t.height, t.levels))))
+            .collect();
+        all.extend(self.refused.iter().cloned());
+        all.sort_by(|a, b| b.3.cmp(&a.3));
+        let need: usize = all.iter().map(|a| a.3).sum();
+        let m = |n: usize| format!("{:.1}M", n as f64 / 1e6);
+        let largest: Vec<String> = all.iter().take(6).map(|(s, w, h, n)| format!("{s} {w}×{h} ({})", m(*n))).collect();
+        format!(
+            "image memory budget exceeded: this frame's {} images need {} texels (with mips) of the {} pool. Largest: {}. \
+             Make these textures smaller (a texture needs no more pixels than it covers on screen) or show fewer images at once.",
+            all.len(),
+            m(need),
+            m(MAX_TEXELS),
+            largest.join(", ")
+        )
     }
 
     /// Drops every texture the current frame has not used and packs the rest
@@ -95,7 +123,12 @@ impl Images {
                 }
                 let texture = self.insert_rgba(&img);
                 if texture.is_none() {
-                    // Pool full: not cached, so it loads once there is room.
+                    // Pool full: not cached, so it loads once there is room;
+                    // recorded for `overflow_report`.
+                    let (w, h) = img.dimensions();
+                    if !self.refused.iter().any(|r| r.0 == src) {
+                        self.refused.push((src.to_string(), w, h, mip_texels(w, h, (32 - w.max(h).leading_zeros()).min(12))));
+                    }
                     return None;
                 }
                 texture

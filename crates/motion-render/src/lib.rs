@@ -317,13 +317,11 @@ impl Renderer {
             self.images.compact();
             self.images.begin_frame();
             lists = self.build_lists(states, trace);
-            const FULL: &str = "image memory budget reached; some images are not drawn";
-            if self.images.overflowed && !self.images.warnings.iter().any(|w| w == FULL) {
-                self.images.warnings.push(FULL.into());
+            // This frame's images alone do not fit: an error, not a frame
+            // with images missing (and decoded again every frame).
+            if self.images.overflowed {
+                return Err(self.images.overflow_report());
             }
-        }
-        if let Some(f) = self.meshes.traced_slang.take() {
-            return Err(format!("the path tracer cannot run Slang materials yet (function '{f}'): render without path tracing"));
         }
         let keying = Instant::now();
         let mut key = Vec::new();

@@ -82,9 +82,6 @@ pub struct MeshCache {
     /// The project's Slang surfaces, when the list's meshes use them (for
     /// the GPU's shader variant).
     pub(crate) surfaces: Option<Arc<lahza_motion_core::surface::Program>>,
-    /// A Slang surface function a traced mesh uses (the path tracer cannot
-    /// run them: the frame fails).
-    pub(crate) traced_slang: Option<Arc<str>>,
 }
 
 /// A mesh layer of a layer list, for the other batches of that list.
@@ -354,9 +351,6 @@ impl MeshCache {
     /// A mesh layer as an instance for the path tracer: its geometry, its
     /// object → camera transform and its materials by part and segment.
     pub(crate) fn trace_instance(&mut self, id: Arc<str>, m: &MeshState, opacity: f64, scale: f64) -> Option<crate::pt::TraceInstance> {
-        if let Some(s) = m.materials.iter().find_map(|x| x.slang.as_ref()) {
-            self.traced_slang.get_or_insert(s.function.clone());
-        }
         let mesh = self.get(m)?;
         let mv = m.camera.view.then(m.world).0;
         let transform = [0, 1, 2].map(|r| [mv[r * 4] as f32, mv[r * 4 + 1] as f32, mv[r * 4 + 2] as f32, mv[r * 4 + 3] as f32]);

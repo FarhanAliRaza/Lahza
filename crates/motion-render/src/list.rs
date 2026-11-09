@@ -596,6 +596,7 @@ impl Builder<'_> {
         let mut instances = Vec::new();
         let mut cards = Vec::new();
         let mut first: Option<lahza_motion_core::compile::MeshState> = None;
+        let mut surfaces = None;
         for layer in layers {
             let card = trace_card_candidate(layer);
             if !matches!(layer.content, Content::Mesh(_)) && !card {
@@ -605,6 +606,7 @@ impl Builder<'_> {
             at.get_or_insert(out.len());
             if let Content::Mesh(m) = &layer.content {
                 self.mesh_textures(m);
+                surfaces = surfaces.or_else(|| m.materials.iter().find_map(|x| x.slang.as_ref().and_then(|s| s.program())));
                 if let Some(i) = self.meshes.trace_instance(layer.id.clone(), m, layer.opacity, root.max_scale()) {
                     instances.push(i);
                 }
@@ -654,6 +656,7 @@ impl Builder<'_> {
             // σ = per_px · |z − focus| is a circle of confusion of radius
             // ≈ 2σ near the focus plane.
             lens: m.lens.filter(|l| l[0] > 1.0 && l[1] > 0.0).map(|[focus, per_px]| [(2.0 * per_px * focus * focus / m.camera.focal) as f32, focus as f32]).unwrap_or([0.0; 2]),
+            surfaces,
         });
         let forward = Proj::from(Affine::translate(origin[0], origin[1]).then(Affine::scale(factor[0], factor[1])));
         let prim = Prim { kind: [PRIM_IMAGE, 1, blend_code(Blend::Normal), 0], geom: [gw as f32, gh as f32, 1.0, 0.0], geom2: [f32::from_bits(offset), 0.0, 0.0, 0.0], ..Default::default() };

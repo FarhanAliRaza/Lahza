@@ -21,6 +21,69 @@
   `lahza motion render reel.lahza --from 7.9 --to 8.1`. `check`,
   `snapshot` and `review` don't use motion blur, so nothing warns before
   the render. The reel works around it with 4 samples.
+- **Raster drops meshes when a scene has a large mesh instancer.** With a
+  66×36 instancer of bevelled boxes (the tile wall of the CPU film's s02,
+  round 2: `~/Videos/cpu/out_b/shots_b.round2.py`), a raster snapshot at
+  8.0 s loses the pipe, counter, basket, rocks and label; removing that one
+  layer brings them back. The path tracer is unaffected. Likely in the
+  hardware visibility pass or the mesh pool's instance runs.
+- **Paths keep bouncing off surfaces that reflect nothing.** A black
+  emissive surface with `specular: 0` costs as much to trace as a lit one,
+  while `unlit: true` ends the path (about +0.2 s per frame inside a
+  refracting block). Subsurface is also expensive even on small objects
+  (+0.3–0.45 s per frame for 14 small rocks).
+
+- **A surface lying on a volume's face is shaded wrongly.** In the CPU
+  film's s06 (`~/Videos/cpu/shots_c.py`), the doping beam (an emissive
+  volume cylinder) ended exactly on the mirror wafer; traced, the wafer
+  under the beam went dark navy in the blue phase (and washed pink in the
+  pink one). Removing the beam restores it; ending the volume 20 px above
+  the wafer works around it. Rays leaving a surface that touches a volume
+  likely get the wrong inside/outside medium.
+
+- **A frame whose images exceed the image pool is a hard error.** The pool
+  is 48 Mi texels (with mips). It used to leave the image that did not fit
+  undrawn and decode it again every frame (s01 of the CPU film went from
+  ~0.5 to ~6 s a frame, with only a warning at the end); now the frame fails
+  with `Images::overflow_report` (the images, their sizes, what to do).
+  Still open: `check` does not catch it before a render, and the budget is
+  fixed rather than sized from the GPU. A texture's size could also follow
+  its on-screen footprint (mip residency) so a 4K map seen small costs
+  little.
+- **Path-traced renders keep the GPU idle two thirds of the time.** s01 of
+  the CPU film (`~/Videos/cpu/work_a.lahza`: ~400 scanned-rock layers,
+  4-sample motion blur, half size, 16 spp) takes 486 ms an output frame,
+  of which the GPU works 170 ms (trace 121, built-in denoise 20, OIDN
+  copies 21). Measure with `lahza motion render ~/Videos/cpu/work_a.lahza
+  --from 4 --to 5 --pt --spp 16 --scale 0.5 --profile`. The CPU side, per
+  output frame, and what to do about each:
+  - **CPU and GPU take turns (153 ms waiting for the trace, 17 ms more
+    before OIDN).** The next frame is evaluated and recorded only after
+    this one's trace finishes. Overlap them: record frame N+1 (and its
+    motion-blur sub-frames) while the GPU traces frame N, with a buffer
+    set per frame in flight.
+  - **Record + upload (96 ms).** Per sub-frame work for every layer,
+    times 4 motion-blur sub-frames; most of it likely re-uploads data
+    that did not change. Profile which buffers are written and upload
+    only what changed (instance transforms, not whole meshes or
+    material tables).
+  - **OIDN round trip (80 ms).** OIDN runs on CUDA (its default device on
+    the RTX 3060), but the tracer is Vulkan, so every frame downloads
+    ~50 MB of lighting and guides to host memory, repacks them on one CPU
+    thread, uploads to CUDA, reads the result back and uploads it to
+    Vulkan (`pt.rs` `oidn_denoise`). Share the memory instead: allocate
+    the denoise buffers exportable (`VK_KHR_external_memory_fd` in the
+    vendored blade), import them with OIDN's shared buffers
+    (`oidnNewSharedBufferFromFD`), pack colour/albedo/normal with a
+    compute pass, and keep one sync point. Expected ~10-20 ms. Also the
+    profile stage is labelled "OIDN denoise (CPU)" but times the whole
+    host round trip: rename it.
+  - **Trace setup (47 ms).** Structures, buffers and the pipeline are set
+    up every frame even when nothing moved. Keep the TLAS and per-frame
+    buffers, refit or rebuild only what changed.
+  - Display lists (31 ms) and scene evaluation (7 ms) are small now.
+  Target: close to the GPU's own time, ~170 ms a frame here (about 3×),
+  for every path-traced scene.
 
 ## Slang
 
@@ -44,6 +107,3 @@
   `params` reach the author's function sorted by name, not as written, so a
   mismatch shows up as a compile error in the generated caller. Pass them
   by name instead (a params struct, as geometry generators do).
-- **Path tracer can't run Slang materials.** Traced frames with a Slang
-  material fail with a clear error; `pt.wgsl` needs the same dispatch the
-  raster shader has.

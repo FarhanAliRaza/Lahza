@@ -740,7 +740,7 @@ impl Gpu {
                     paths += t.width as u64 * t.height as u64 * list.traces[ti as usize].options.spp.max(1) as u64;
                     let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
                     let entered = std::time::Instant::now();
-                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device, self.images.device, self.profile.as_mut());
+                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device, self.images.device, self.profile.as_mut())?;
                     in_tracer += entered.elapsed();
                     continue;
                 }

@@ -1662,7 +1662,7 @@ impl Toolbox {
             // The frame nearest the reference: where a cut or anchor on it lands.
             let n = fps.nearest_frame(*t).clamp(0, compiled.frame_count().saturating_sub(1) as i64);
             let ft = fps.time_of(n);
-            let image = renderer.render(&compiled, ft);
+            let image = renderer.try_render(&compiled, ft)?;
             listed.push(json!({"at": label, "t": round(ft), "frame": n}));
             frames.push((format!("{label} · {ft:.2}s · f{n}"), image));
         }
@@ -1830,7 +1830,7 @@ impl Toolbox {
         for (label, t) in &times {
             let n = fps.nearest_frame(*t).clamp(0, compiled.frame_count().saturating_sub(1) as i64);
             let ft = fps.time_of(n);
-            let ours = renderer.render(&compiled, ft);
+            let ours = renderer.try_render(&compiled, ft)?;
             let (w, h) = ours.dimensions();
             let rt = (ft + offset).max(0.0);
             let reference = reference_frame(&against, rt, w, h)?;
@@ -1888,7 +1888,7 @@ impl Toolbox {
         let drawn = drawn_box(args)?;
         let renderer = self.renderer(dir);
         renderer.set_scale(scale);
-        let probe = renderer.render(&compiled, fps.time_of(first_n));
+        let probe = renderer.try_render(&compiled, fps.time_of(first_n))?;
         let (w, h) = probe.dimensions();
         let px = w as f64 / compiled.settings.width as f64;
         let region = drawn.map(|d| scaled_box(d, px, w, h));
@@ -1932,7 +1932,7 @@ impl Toolbox {
         // The last decoded reference frame and its index.
         let (mut held, mut held_index): (Option<image::RgbaImage>, i64) = (None, first_ref - 1);
         for n in first_n..=last_n {
-            let ours = renderer.render(&compiled, fps.time_of(n));
+            let ours = renderer.try_render(&compiled, fps.time_of(n))?;
             let want = ref_index(fps.time_of(n) + offset);
             while held_index < want && ended_at.is_none() {
                 let mut buf = vec![0u8; frame_bytes];
@@ -2149,7 +2149,7 @@ impl Toolbox {
         let mut cells = Vec::new();
         for s in &segments {
             let t = time((s.0 + s.1) / 2);
-            let ours = renderer.render(&compiled, t);
+            let ours = renderer.try_render(&compiled, t)?;
             let reference = reference_frame(against, t + offset, w, h).unwrap_or_else(|_| image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255])));
             let (diff, _) = difference(&ours, &reference);
             cells.push((format!("ours {:.2}–{:.2}s", time(s.0), time(s.1)), ours));

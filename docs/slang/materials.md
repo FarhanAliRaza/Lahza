@@ -4,7 +4,8 @@ A mesh material can name a Slang function from the project's `shaders/`
 that decides, at every point of the surface, its base colour, roughness,
 metallic, emission, opacity and normal. Lahza then lights the result as it
 lights any material (GGX highlights, clear coat, sheen, shadows, the
-environment, tone mapping). The same function runs in GPU renders and in
+environment, tone mapping). The same function runs in GPU renders,
+rasterised or path-traced (`--pt`, at every surface a path hits), and in
 CPU (`--cpu`) renders.
 
 ## The material field
@@ -171,12 +172,12 @@ that error (an automatic render then continues on the CPU and says so).
 
 ## Limits
 
-- Path-traced renders (`--pt`, `"pt": true`) do not run Slang materials
-  yet: such a frame fails with an error naming the function. Render those
-  scenes rasterised (`--raster`).
+- Path-traced subsurface scattering leaves the body with the material's
+  own normal, not the function's.
 - Wireframe materials and volumes ignore (volumes reject) a Slang
   function.
 - Shadows are cast by the mesh's shape; a function's opacity does not cut
   holes in shadows.
 - Changing a function rebuilds the project's library (cached by content)
-  and, on the GPU, compiles a raster shader variant once (a second or two).
+  and, on the GPU, compiles a raster shader variant once (a second or two),
+  and a path tracer variant once per traced scene's features.

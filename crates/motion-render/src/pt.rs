@@ -103,6 +103,9 @@ pub struct Trace {
     pub env: Option<Arc<crate::envmap::EnvMap>>,
     /// Thin lens: [aperture radius, focus depth] in camera px (0: pinhole).
     pub lens: [f32; 2],
+    /// The project's Slang surfaces its meshes use (traced with a variant
+    /// of the trace shader, `surfaces::trace_source`).
+    pub surfaces: Option<Arc<lahza_motion_core::surface::Program>>,
 }
 
 impl Trace {
@@ -130,6 +133,9 @@ impl Trace {
         f(out, &self.lens);
         if let Some(e) = &self.env {
             out.extend((Arc::as_ptr(e) as usize as u64).to_le_bytes());
+        }
+        if let Some(s) = &self.surfaces {
+            out.extend(s.key.to_le_bytes());
         }
     }
 }
@@ -226,6 +232,12 @@ pub struct Tracer {
     /// feature mask (None: that build failed); `pipeline` is the general
     /// build (all features).
     specialised: HashMap<u32, Option<gpu::ComputePipeline>>,
+    /// Trace pipelines with a project's Slang surfaces
+    /// (`surfaces::trace_source`): the program's key and its builds by
+    /// feature mask. Another program's replace them.
+    slang: Option<(u64, HashMap<u32, gpu::ComputePipeline>)>,
+    /// Replaced Slang pipelines, destroyed by the next `begin_frame`.
+    retired_pipelines: Vec<gpu::ComputePipeline>,
     /// Whether these pipelines count work (`PROFILE`).
     profile: bool,
     geometry: HashMap<Vec<u8>, Geometry>,
@@ -290,7 +302,7 @@ impl Tracer {
         let atrous = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace denoise", data_layouts: &[&TraceData::layout()], compute: shader.at("atrous") });
         let resolve = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace resolve", data_layouts: &[&TraceData::layout()], compute: shader.at("resolve") });
         let bounds = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "volume bounds", data_layouts: &[&TraceData::layout()], compute: shader.at("bounds") });
-        Ok(Self { pipeline, temporal, atrous, resolve, bounds, specialised: HashMap::new(), profile, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None, work: None, oidn: None, oidn_host: None, counts: Vec::new() })
+        Ok(Self { pipeline, temporal, atrous, resolve, bounds, specialised: HashMap::new(), slang: None, retired_pipelines: Vec::new(), profile, prev_transforms: HashMap::new(), history: HashMap::new(), slot: 0, geometry: HashMap::new(), attrs: Vec::new(), idx: Vec::new(), tags: Vec::new(), shared: None, retired: Vec::new(), retired_structures: Vec::new(), frame: 0, alignment: 256, env: None, work: None, oidn: None, oidn_host: None, counts: Vec::new() })
     }
 
     /// Frees the last frame's transient buffers and structures; call when
@@ -301,6 +313,9 @@ impl Tracer {
         }
         for a in self.retired_structures.drain(..) {
             context.destroy_acceleration_structure(a);
+        }
+        for mut p in self.retired_pipelines.drain(..) {
+            context.destroy_compute_pipeline(&mut p);
         }
         // History of traces the last frame no longer had (fewer lists).
         let used_slots = self.slot;
@@ -442,8 +457,9 @@ impl Tracer {
 
     /// Records the trace of `t` into group texels at `offset` (w × h).
     /// With `profile`, times its stages and counts its work per layer.
+    /// Fails only when `t`'s Slang surfaces do not build.
     #[allow(clippy::too_many_arguments)]
-    pub fn trace(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, t: &Trace, offset: u32, size: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer, mut profile: Option<&mut crate::profile::Profile>) {
+    pub fn trace(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, t: &Trace, offset: u32, size: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer, mut profile: Option<&mut crate::profile::Profile>) -> Result<(), String> {
         let entered = std::time::Instant::now();
         let mut owners: Vec<Arc<str>> = Vec::new();
         let mut instances = Vec::new();
@@ -665,14 +681,19 @@ impl Tracer {
         }
         {
             let profiled = self.profile;
-            let pipeline = self.specialised.entry(features).or_insert_with(|| {
-                // A build with only this scene's features; the general one if it fails.
-                context
-                    .try_create_shader(gpu::ShaderDesc { source: &specialise(features, profiled) })
-                    .ok()
-                    .map(|shader| context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") }))
-            });
-            let pipeline = pipeline.as_ref().unwrap_or(&self.pipeline);
+            let pipeline = match &t.surfaces {
+                Some(program) => self.slang_pipeline(context, program, features)?,
+                None => {
+                    let pipeline = self.specialised.entry(features).or_insert_with(|| {
+                        // A build with only this scene's features; the general one if it fails.
+                        context
+                            .try_create_shader(gpu::ShaderDesc { source: &specialise(features, profiled) })
+                            .ok()
+                            .map(|shader| context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") }))
+                    });
+                    pipeline.as_ref().unwrap_or(&self.pipeline)
+                }
+            };
             if let Some(p) = profile.as_deref_mut() {
                 p.stage("gpu frame › trace setup (structures, buffers, pipeline)", entered);
             }
@@ -728,6 +749,24 @@ impl Tracer {
         let mut pc = pass.with(&self.resolve);
         pc.bind(0, &data(0, 0, hdr[current], hdr[1 - current], all_rows));
         pc.dispatch(groups_x);
+        Ok(())
+    }
+
+    /// The trace pipeline with `program`'s Slang surfaces for `features`,
+    /// built once; another program's are retired.
+    fn slang_pipeline(&mut self, context: &gpu::Context, program: &lahza_motion_core::surface::Program, features: u32) -> Result<&gpu::ComputePipeline, String> {
+        if let Some((_, old)) = self.slang.take_if(|(key, _)| *key != program.key) {
+            self.retired_pipelines.extend(old.into_values());
+        }
+        let profiled = self.profile;
+        let (_, built) = self.slang.get_or_insert_with(|| (program.key, HashMap::new()));
+        if !built.contains_key(&features) {
+            let source = crate::surfaces::trace_source(&specialise(features, profiled), program)?;
+            let shader = context.try_create_shader(gpu::ShaderDesc { source: &source }).map_err(|e| format!("Slang materials' trace shader: {e}"))?;
+            let pipeline = context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace (Slang surfaces)", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") });
+            built.insert(features, pipeline);
+        }
+        Ok(&built[&features])
     }
 
     /// Denoises the trace's lighting with Open Image Denoise, as Blender's
@@ -853,6 +892,9 @@ impl Tracer {
     }
 
     pub fn destroy(&mut self, context: &gpu::Context) {
+        if let Some((_, old)) = self.slang.take() {
+            self.retired_pipelines.extend(old.into_values());
+        }
         self.begin_frame(context);
         if let Some(s) = self.shared.take() {
             for b in s {

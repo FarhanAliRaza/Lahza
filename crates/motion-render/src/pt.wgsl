@@ -48,8 +48,9 @@ var<storage, read> b_env: array<vec4<f32>>;
 // [variance of its luminance, 0, 0, 0]); passes read b_hdr, write b_tmp.
 var<storage, read_write> b_hdr: array<vec4<f32>>;
 var<storage, read_write> b_tmp: array<vec4<f32>>;
-// Temporal history (three rows per texel: [lighting, coverage], [frames,
-// camera z, 0, 0], [normal, 0]): last frame's, and this frame's.
+// Temporal history (three rows per texel: [lighting × guide albedo,
+// coverage], [frames, camera z, 0, 0], [normal, 0]): last frame's, and
+// this frame's.
 var<storage, read_write> b_hist: array<vec4<f32>>;
 var<storage, read_write> b_next: array<vec4<f32>>;
 // The image pool (premultiplied sRGB RGBA8): mesh image maps.
@@ -2449,6 +2450,10 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>) {
     let var_c = b_hdr[i * 2u + 1u].x;
     let g1 = b_guides[i * 4u + 1u];
     let mv = b_guides[i * 4u + 3u];
+    // The lighting is divided by the guide albedo, which is not the
+    // surface's alone (out of focus it turns white, see `trace`): history
+    // keeps it multiplied back and takes this texel's.
+    let alb = b_guides[i * 4u].xyz;
     var out = c.xyz;
     var var_o = var_c;
     var frames = 1.0;
@@ -2478,7 +2483,7 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>) {
             let hz = b_hist[j * 3u + 1u];
             let same = hz.x > 0.0 && abs(hz.y - mv.z) < 0.03 * max(mv.z, 1.0) && dot(b_hist[j * 3u + 2u].xyz, g1.xyz) > 0.8;
             if same {
-                let hist = clamp(b_hist[j * 3u].xyz, m1 - 1.5 * sd, m1 + 1.5 * sd);
+                let hist = clamp(b_hist[j * 3u].xyz / alb, m1 - 1.5 * sd, m1 + 1.5 * sd);
                 frames = min(hz.x + 1.0, 32.0);
                 let a = max(1.0 / frames, 0.15);
                 out = mix(hist, c.xyz, a);
@@ -2490,7 +2495,7 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>) {
     b_tmp[i * 2u + 1u] = vec4<f32>(var_o, b_hdr[i * 2u + 1u].y, b_hdr[i * 2u + 1u].z, 0.0);
     var seen = frames;
     if c.w <= 0.0 { seen = 0.0; }
-    b_next[i * 3u] = vec4<f32>(out, c.w);
+    b_next[i * 3u] = vec4<f32>(out * alb, c.w);
     b_next[i * 3u + 1u] = vec4<f32>(seen, g1.w, 0.0, 0.0);
     b_next[i * 3u + 2u] = vec4<f32>(g1.xyz, 0.0);
 }
