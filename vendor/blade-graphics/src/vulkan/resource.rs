@@ -219,6 +219,24 @@ impl super::Context {
         }
     }
 
+    /// The device address of an acceleration structure: what an instance
+    /// record refers to its bottom-level structure by, for callers that
+    /// keep and rewrite their own instance buffers.
+    pub fn acceleration_structure_address(
+        &self,
+        acceleration_structure: super::AccelerationStructure,
+    ) -> u64 {
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        let info = vk::AccelerationStructureDeviceAddressInfoKHR {
+            acceleration_structure: acceleration_structure.raw,
+            ..Default::default()
+        };
+        unsafe {
+            rt.acceleration_structure
+                .get_acceleration_structure_device_address(&info)
+        }
+    }
+
     pub fn create_acceleration_structure_instance_buffer(
         &self,
         instances: &[crate::AccelerationStructureInstance],

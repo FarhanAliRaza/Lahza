@@ -110,6 +110,11 @@ pub struct Renderer {
     pub(crate) fail_gpu: u32,
     options: RenderOptions,
     last: Option<(Vec<u8>, RgbaImage)>,
+    /// Frames begun with `push` and not yet taken with `pop`, oldest first.
+    queue: std::collections::VecDeque<Queued>,
+    /// Counts the GPU devices this renderer has had: a queued frame begun
+    /// on an earlier one (lost since) is drawn again when it is taken.
+    device: u64,
     pub stats: Stats,
     /// With `RenderOptions::profile`: where the frames' time went.
     pub profile: Option<profile::Profile>,
@@ -117,6 +122,25 @@ pub struct Renderer {
     /// CPU frame buffers, kept between frames: a fresh 33 MB buffer per
     /// 1080p frame costs more in page faults than drawing into it.
     scratch: Scratch,
+}
+
+/// A frame between `Renderer::push` and `pop`.
+struct Queued {
+    /// What determines its picture (`DisplayList::signature`s).
+    key: Vec<u8>,
+    /// The scene at its samples, to draw it again if its device is lost.
+    states: Vec<FrameState>,
+    size: (u32, u32),
+    work: Work,
+}
+
+enum Work {
+    /// The same picture as the frame before it.
+    Repeat,
+    /// On the GPU: its flight there and the device it is on.
+    Gpu { id: u64, device: u64 },
+    /// Drawn when it is taken (the CPU; a frame the GPU refused).
+    Later,
 }
 
 #[derive(Default)]
@@ -148,6 +172,8 @@ impl Renderer {
             fail_gpu: 0,
             options,
             last: None,
+            queue: Default::default(),
+            device: 0,
             stats: Stats::default(),
             profile: options.profile.then(profile::Profile::default),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
@@ -257,6 +283,13 @@ impl Renderer {
     /// The frame at timeline time `t`, with motion blur when the scene asks.
     /// Errs when the backend is `Gpu` and the GPU is missing or fails.
     pub fn try_render(&mut self, compiled: &Compiled, t: f64) -> Result<RgbaImage, String> {
+        let states = self.sample_states(compiled, t);
+        self.try_render_states(&states)
+    }
+
+    /// The scene at the moments frame `t` samples: one, or with motion
+    /// blur several across the shutter.
+    fn sample_states(&mut self, compiled: &Compiled, t: f64) -> Vec<FrameState> {
         let started = Instant::now();
         let mut states = Vec::new();
         match compiled.motion_blur_at(t).filter(|_| self.options.motion_blur) {
@@ -277,7 +310,7 @@ impl Renderer {
         if let Some(p) = self.profile.as_mut() {
             p.stage("evaluate scene", started);
         }
-        self.try_render_states(&states)
+        states
     }
 
     /// `try_render_states`; panics where it errs.
@@ -287,6 +320,40 @@ impl Renderer {
 
     /// Renders equally weighted sub-samples of one output frame.
     pub fn try_render_states(&mut self, states: &[FrameState]) -> Result<RgbaImage, String> {
+        let (lists, key) = self.prepare(states)?;
+        if let Some((last_key, image)) = &self.last {
+            if *last_key == key {
+                self.stats.cached += 1;
+                return Ok(image.clone());
+            }
+        }
+        let built = Instant::now();
+        let main = lists[0].main();
+        #[cfg(test)]
+        let fail = self.take_failure();
+        #[cfg(not(test))]
+        let fail = false;
+        let result = self.gpu.as_mut().map(|g| if fail { Err("ERROR_DEVICE_LOST (test)".to_string()) } else { g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic) });
+        self.take_gpu_profile(built);
+        let bytes = self.settle(result, lists, states, built)?;
+        self.stats.raster_ms += built.elapsed().as_secs_f64() * 1000.0;
+        let image = RgbaImage::from_raw(main.width, main.height, bytes).expect("frame size");
+        self.last = Some((key, image.clone()));
+        Ok(image)
+    }
+
+    /// Adds the GPU's stages and passes since `since` to the profile.
+    fn take_gpu_profile(&mut self, since: Instant) {
+        if let (Some(p), Some(g)) = (self.profile.as_mut(), self.gpu.as_mut()) {
+            p.add("gpu frame", since.elapsed());
+            if let Some(gp) = g.profile.as_mut() {
+                p.merge(std::mem::take(gp));
+            }
+        }
+    }
+
+    /// The display lists of a frame's samples and the key of its picture.
+    fn prepare(&mut self, states: &[FrameState]) -> Result<(Vec<DisplayList>, Vec<u8>), String> {
         if self.gpu.is_none() && self.options.backend == Backend::Gpu {
             return Err(format!("GPU unavailable: {}", self.gpu_error.as_deref().unwrap_or("no device")));
         }
@@ -346,24 +413,13 @@ impl Renderer {
             p.add("display lists › meshes (shadow maps)", std::mem::take(&mut self.meshes.shadowing));
             p.add("display lists › images (load)", std::mem::take(&mut self.images.busy));
         }
-        if let Some((last_key, image)) = &self.last {
-            if *last_key == key {
-                self.stats.cached += 1;
-                return Ok(image.clone());
-            }
-        }
-        let main = lists[0].main();
-        #[cfg(test)]
-        let fail = self.take_failure();
-        #[cfg(not(test))]
-        let fail = false;
-        let result = self.gpu.as_mut().map(|g| if fail { Err("ERROR_DEVICE_LOST (test)".to_string()) } else { g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic) });
-        if let (Some(p), Some(g)) = (self.profile.as_mut(), self.gpu.as_mut()) {
-            p.add("gpu frame", built.elapsed());
-            if let Some(gp) = g.profile.as_mut() {
-                p.merge(std::mem::take(gp));
-            }
-        }
+        Ok((lists, key))
+    }
+
+    /// A frame's pixels from the GPU's answer (None: there is no GPU):
+    /// a failed frame is tried again on a new device, then is an error or
+    /// (the "auto" backend) drawn on the CPU; without a GPU the CPU draws.
+    fn settle(&mut self, result: Option<Result<Vec<u8>, String>>, lists: Vec<DisplayList>, states: &[FrameState], built: Instant) -> Result<Vec<u8>, String> {
         let bytes = match result {
             Some(Ok(bytes)) => bytes,
             Some(Err(e)) => {
@@ -376,7 +432,9 @@ impl Renderer {
                 let fail_again = false;
                 let retried = gpu_with_retry(self.options.allow_software_gpu, self.options.profile).ok().and_then(|mut g| {
                     let r = if fail_again { None } else { g.render(&lists, &self.fonts, &self.images, &self.footage.dynamic).ok() };
+                    // (Frames queued on the old device are drawn again.)
                     self.gpu = Some(g);
+                    self.device += 1;
                     r
                 });
                 match retried {
@@ -391,6 +449,7 @@ impl Renderer {
                             return Err(format!("GPU failed at frame {}: {e}", self.stats.frames));
                         }
                         self.gpu = None;
+                        self.device += 1;
                         self.gpu_error = Some(format!("GPU failed: {e}"));
                         self.fallbacks.push(format!("GPU failed at frame {} ({e}); this and later frames rendered on the CPU", self.stats.frames));
                         // Lists in the CPU's form (the GPU's shared triangle
@@ -409,10 +468,98 @@ impl Renderer {
                 bytes
             }
         };
-        self.stats.raster_ms += built.elapsed().as_secs_f64() * 1000.0;
-        let image = RgbaImage::from_raw(main.width, main.height, bytes).expect("frame size");
-        self.last = Some((key, image.clone()));
-        Ok(image)
+        Ok(bytes)
+    }
+
+    /// Begins the frame at `t` and returns the oldest frame begun before
+    /// it once enough are under way (None until then): frames come out of
+    /// `push` and then `pop` in the order they went in. Rendering a
+    /// sequence this way keeps the GPU busy: while it draws one frame the
+    /// next is evaluated, built and recorded, and a traced frame at Open
+    /// Image Denoise does not hold up the one being traced. (`render`
+    /// draws one frame at a time; do not mix the two.)
+    pub fn push(&mut self, compiled: &Compiled, t: f64) -> Result<Option<RgbaImage>, String> {
+        let states = self.sample_states(compiled, t);
+        let (lists, key) = self.prepare(&states)?;
+        let main = lists[0].main();
+        let began = Instant::now();
+        let same = match self.queue.back() {
+            Some(q) => q.key == key,
+            None => self.last.as_ref().is_some_and(|(k, _)| *k == key),
+        };
+        #[cfg(test)]
+        let fail = self.fail_gpu > 0;
+        #[cfg(not(test))]
+        let fail = false;
+        let work = match self.gpu.as_mut() {
+            _ if same => Work::Repeat,
+            Some(g) if !fail => match g.begin(&lists, &self.fonts, &self.images, &self.footage.dynamic) {
+                Ok(id) => Work::Gpu { id, device: self.device },
+                // Tried again, and reported, when it is taken.
+                Err(_) => Work::Later,
+            },
+            _ => Work::Later,
+        };
+        // The frame begun before this one: through Open Image Denoise
+        // while the GPU traces this one.
+        if let (Some(Queued { work: Work::Gpu { id, device }, .. }), Some(g)) = (self.queue.back(), self.gpu.as_mut()) {
+            if *device == self.device {
+                // (A failure is met again, and handled, when it is taken.)
+                let _ = g.advance(*id);
+            }
+        }
+        self.queue.push_back(Queued { key, states, size: (main.width, main.height), work });
+        self.take_gpu_profile(began);
+        self.stats.raster_ms += began.elapsed().as_secs_f64() * 1000.0;
+        let depth = if self.gpu.as_mut().is_some_and(|g| g.denoises_between()) { gpu::FLIGHTS } else { 2 };
+        if self.queue.len() >= depth {
+            return self.pop();
+        }
+        Ok(None)
+    }
+
+    /// The oldest frame begun with `push`, or None when there is none
+    /// left (call until then after the last `push`).
+    pub fn pop(&mut self) -> Result<Option<RgbaImage>, String> {
+        let Some(q) = self.queue.pop_front() else { return Ok(None) };
+        let taking = Instant::now();
+        let image = match q.work {
+            Work::Repeat => {
+                self.stats.cached += 1;
+                self.last.as_ref().map(|(_, image)| image.clone()).ok_or("a repeated frame with none before it")?
+            }
+            Work::Gpu { id, device } if device == self.device && self.gpu.is_some() => {
+                let result = self.gpu.as_mut().map(|g| g.finish(id));
+                self.take_gpu_profile(taking);
+                match result {
+                    Some(Ok(bytes)) => RgbaImage::from_raw(q.size.0, q.size.1, bytes).expect("frame size"),
+                    // As a frame drawn on its own would be: again on this
+                    // device, then on a new one.
+                    _ => {
+                        self.last = None;
+                        self.try_render_states(&q.states)?
+                    }
+                }
+            }
+            Work::Gpu { .. } | Work::Later => {
+                self.last = None;
+                self.try_render_states(&q.states)?
+            }
+        };
+        self.stats.raster_ms += taking.elapsed().as_secs_f64() * 1000.0;
+        self.last = Some((q.key, image.clone()));
+        Ok(Some(image))
+    }
+
+    /// With profiling: collects what the GPU has timed and not yet handed
+    /// over (call before reading `profile` after the last frame).
+    pub fn flush_profile(&mut self) {
+        if let (Some(p), Some(g)) = (self.profile.as_mut(), self.gpu.as_mut()) {
+            g.flush_profile();
+            if let Some(gp) = g.profile.as_mut() {
+                p.merge(std::mem::take(gp));
+            }
+        }
     }
 
     fn build_lists(&mut self, states: &[FrameState], trace: Option<pt::TraceOptions>) -> Vec<DisplayList> {

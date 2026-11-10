@@ -524,8 +524,10 @@ the traced scene. It needs a GPU with ray queries (Vulkan
 so. The same frame traces the same picture (samples are seeded by time).
 Depth of field is a real thin lens (the camera's `aperture` and `focus`),
 so defocus is exact per pixel, through glass and in reflections; motion
-blur traces each shutter sub-frame with its share of the samples, so it
-costs no more than a still frame. A denoiser cleans the picture: Intel
+blur traces each shutter sub-frame with its share of the samples into one
+picture, so it costs no more than a still frame, is denoised once, and
+what moves in the traced scene blurs in light, before the look's tone
+curve (as a camera's shutter does). A denoiser cleans the picture: Intel
 Open Image Denoise, as in Blender's Cycles, where it is installed (Lahza
 finds the copy Blender ships, or `$LAHZA_OIDN`; it runs on CUDA on NVIDIA),
 which also removes depth of field's grain, else an edge-aware à-trous
@@ -535,7 +537,11 @@ warnings say when it was used), so a few samples per pixel give a clean
 frame (`--no-denoise` / `denoise: false` to see the raw samples); in an
 export each frame also builds on the previous ones, reprojected along
 each surface's motion (camera and objects), and rejects history that no
-longer matches, so animation does not boil or ghost. Lists with what the tracer does not
+longer matches, so animation does not boil or ghost. An export keeps the
+GPU busy: while it traces one frame the next is built and recorded, and a
+frame at the denoiser does not hold up the one being traced (if the
+desktop stutters during a long trace, `LAHZA_TRACE_YIELD=1` hands it the
+GPU between a frame's bands of rows, for a slower render). Lists with what the tracer does not
 draw yet (wireframes, effects, mattes, blend modes on their 3D layers)
 are rasterised, and the render's warnings name the list's layer and why
 (for depth of field, use the camera's `aperture`, not a blur effect).

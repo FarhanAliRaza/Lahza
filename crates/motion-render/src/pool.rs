@@ -36,12 +36,9 @@ pub(crate) struct MeshPool {
     /// Free ranges: first row → rows (neighbours merged).
     free: BTreeMap<u32, u32>,
     staging: Option<(gpu::Buffer, usize)>,
-    /// Buffers the frame being drawn still reads (a pool outgrown this
-    /// frame): freed once it is done.
-    retired: Vec<gpu::Buffer>,
-    /// A frame resolved meshes and has not finished: if it never does (it
-    /// failed before or on the GPU), its uploads may not have happened.
-    in_flight: bool,
+    /// Buffers a frame still reads (a pool outgrown while that frame was
+    /// recorded), with the frame: freed once it is done.
+    retired: Vec<(u64, gpu::Buffer)>,
     frame: u64,
     /// Counts since the profile last took them.
     pub uploads: u64,
@@ -60,7 +57,6 @@ impl MeshPool {
             free: BTreeMap::from([(0, capacity)]),
             staging: None,
             retired: Vec::new(),
-            in_flight: false,
             frame: 0,
             uploads: 0,
             upload_bytes: 0,
@@ -86,12 +82,8 @@ impl MeshPool {
     /// that are not) and writes where it is into the instance's row of
     /// `mesh`: [vertex row, triangle row, triangles, _]. An instance whose
     /// mesh finds no room keeps 0 triangles and is not drawn.
-    pub fn resolve(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, refs: &[PoolRef], mesh: &mut [[f32; 4]]) -> Result<(), String> {
-        if std::mem::replace(&mut self.in_flight, true) {
-            // The last frame failed: trust nothing it may have moved.
-            self.entries.clear();
-            self.free = BTreeMap::from([(0, self.capacity)]);
-        }
+    /// `id` is the frame being recorded (`after_frame` names it again).
+    pub fn resolve(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, id: u64, refs: &[PoolRef], mesh: &mut [[f32; 4]]) -> Result<(), String> {
         self.frame += 1;
         let frame = self.frame;
         // New meshes, once each.
@@ -131,7 +123,7 @@ impl MeshPool {
                 let rows = (self.capacity * 2).max(used.min(u32::MAX as usize) as u32).min(budget);
                 let bigger = Self::create(context, rows);
                 encoder.transfer("mesh pool grow").copy_buffer_to_buffer(self.buffer.into(), bigger.into(), self.capacity as u64 * ROW as u64);
-                self.retired.push(std::mem::replace(&mut self.buffer, bigger));
+                self.retired.push((id, std::mem::replace(&mut self.buffer, bigger)));
                 self.release(self.capacity, rows - self.capacity);
                 self.capacity = rows;
             }
@@ -222,16 +214,26 @@ impl MeshPool {
         self.free.insert(at, n);
     }
 
-    /// After the frame's GPU work: frees the buffers it was still reading.
-    pub fn after_frame(&mut self, context: &gpu::Context) {
-        self.in_flight = false;
-        for b in self.retired.drain(..) {
-            context.destroy_buffer(b);
-        }
+    /// Whether `resolve` would write to the pool for these instances (new
+    /// meshes to upload): the frames in flight must be off the GPU first,
+    /// since they read the pool and its staging memory is written again.
+    pub fn changes(&self, refs: &[PoolRef]) -> bool {
+        refs.iter().any(|r| !self.entries.contains_key(r.key()))
+    }
+
+    /// After frame `id`'s GPU work (and that of the frames before it):
+    /// frees the buffers they were still reading.
+    pub fn after_frame(&mut self, context: &gpu::Context, id: u64) {
+        self.retired.retain(|(frame, b)| {
+            if *frame <= id {
+                context.destroy_buffer(*b);
+            }
+            *frame > id
+        });
     }
 
     pub fn destroy(&mut self, context: &gpu::Context) {
-        self.after_frame(context);
+        self.after_frame(context, u64::MAX);
         context.destroy_buffer(self.buffer);
         if let Some((b, _)) = self.staging.take() {
             context.destroy_buffer(b);

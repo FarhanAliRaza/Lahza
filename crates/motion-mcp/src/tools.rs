@@ -1666,6 +1666,8 @@ impl Toolbox {
             listed.push(json!({"at": label, "t": round(ft), "frame": n}));
             frames.push((format!("{label} · {ft:.2}s · f{n}"), image));
         }
+        // (With profiling: what the GPU timed and has not handed over yet.)
+        renderer.flush_profile();
         let backend = renderer.backend_label();
         let dropped = renderer.dropped();
         // Every path tracing note too: a list drawn by the rasteriser instead must not pass as traced.

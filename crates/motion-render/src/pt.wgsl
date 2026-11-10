@@ -27,7 +27,7 @@ struct Uniforms {
     prev_root0: vec4<f32>,
     prev_root1: vec4<f32>,
     prev_root2: vec4<f32>,
-    band: vec4<u32>,      // rows the trace pass covers: first, end; profiling density repeats
+    band: vec4<u32>,      // rows the trace pass covers: first, end; profiling density repeats; sub-frame (low 16 bits) of how many (high)
 }
 
 var<uniform> u: Uniforms;
@@ -2389,6 +2389,15 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
     return out;
 }
 
+// Profiling: the lockstep block's lanes' lookups summed, and the most any did.
+fn prof_block(id: vec3<u32>, w: u32) {
+    let blk = PROF_HEADER + ((id.y / 4u) * ((w + 7u) / 8u) + id.x / 8u) * 2u;
+    if blk + 1u < arrayLength(&b_prof) {
+        atomicAdd(&b_prof[blk], px_lookups);
+        atomicMax(&b_prof[blk + 1u], px_lookups);
+    }
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
     let w = u.size.x;
@@ -2458,12 +2467,51 @@ fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
             hits += 1.0;
         }
     }
-    let n = f32(spp);
+    let i = py * w + id.x;
+    // Motion blur: the frame's sub-frames (the scene at moments across the
+    // shutter, each its own structure) are traced one after another into
+    // the same texels and filtered once. Until the last, the texel holds
+    // their sums: [albedo, alpha], [normal, camera z], [depth, flat],
+    // motion; [colour, hits], [luminance, its square, visibility].
+    let part = u.band.w & 0xffffu;
+    let parts = max(u.band.w >> 16u, 1u);
+    if part > 0u {
+        let g0 = b_guides[i * 4u];
+        let g1 = b_guides[i * 4u + 1u];
+        let g2 = b_guides[i * 4u + 2u];
+        let h0 = b_hdr[i * 2u];
+        let h1 = b_hdr[i * 2u + 1u];
+        albedo += g0.xyz;
+        alpha += g0.w;
+        normal += g1.xyz;
+        // The first sub-frame that saw a surface says where it is.
+        if g1.w > 0.0 {
+            camz = g1.w;
+            prev = b_guides[i * 4u + 3u];
+        }
+        depth += g2.x;
+        flat += g2.yzw;
+        color += h0.xyz;
+        hits += h0.w;
+        m1 += h1.x;
+        m2 += h1.y;
+        vis += h1.z;
+    }
+    if part + 1u < parts {
+        b_guides[i * 4u] = vec4<f32>(albedo, alpha);
+        b_guides[i * 4u + 1u] = vec4<f32>(normal, camz);
+        b_guides[i * 4u + 2u] = vec4<f32>(depth, flat);
+        b_guides[i * 4u + 3u] = prev;
+        b_hdr[i * 2u] = vec4<f32>(color, hits);
+        b_hdr[i * 2u + 1u] = vec4<f32>(m1, m2, vis, 0.0);
+        if PROFILE { prof_block(id, w); }
+        return;
+    }
+    let n = f32(spp * parts);
     color /= n;
     flat /= n;
     vis /= n;
     alpha /= n;
-    let i = py * w + id.x;
     // Guides: what the samples hit, on average.
     var a = vec3<f32>(1.0);
     if hits > 0.0 {
@@ -2496,14 +2544,7 @@ fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
     let al = max(luminance(a), 0.02);
     b_hdr[i * 2u] = vec4<f32>(straight / a, alpha);
     b_hdr[i * 2u + 1u] = vec4<f32>(var_l / (al * al) / max(alpha * alpha, 1e-4), blur, vis, 0.0);
-    if PROFILE {
-        // The lockstep block: its lanes' lookups summed, and the most any did.
-        let blk = PROF_HEADER + ((id.y / 4u) * ((w + 7u) / 8u) + id.x / 8u) * 2u;
-        if blk + 1u < arrayLength(&b_prof) {
-            atomicAdd(&b_prof[blk], px_lookups);
-            atomicMax(&b_prof[blk + 1u], px_lookups);
-        }
-    }
+    if PROFILE { prof_block(id, w); }
 }
 
 // Temporal accumulation: last frame's lighting at where this surface was
@@ -2624,6 +2665,41 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
     if u.denoise.w == 1u { lighting = c.xyz; }
     b_tmp[i * 2u] = vec4<f32>(lighting, c.w);
     b_tmp[i * 2u + 1u] = vec4<f32>(vsum / max(wsum * wsum, 1e-12), blur, zsum / max(wsum, 1e-8), 0.0);
+}
+
+// To Open Image Denoise: per texel the colour (lighting × albedo), the
+// albedo and the normal, nine floats in `b_bounds`.
+@compute @workgroup_size(8, 8, 1)
+fn oidn_pack(@builtin(global_invocation_id) id: vec3<u32>) {
+    let w = u.size.x;
+    if id.x >= w || id.y >= u.size.y { return; }
+    let i = id.y * w + id.x;
+    let a = b_guides[i * 4u].xyz;
+    let c = b_hdr[i * 2u].xyz * a;
+    let n = b_guides[i * 4u + 1u].xyz;
+    b_bounds[i * 9u] = c.x;
+    b_bounds[i * 9u + 1u] = c.y;
+    b_bounds[i * 9u + 2u] = c.z;
+    b_bounds[i * 9u + 3u] = a.x;
+    b_bounds[i * 9u + 4u] = a.y;
+    b_bounds[i * 9u + 5u] = a.z;
+    b_bounds[i * 9u + 6u] = n.x;
+    b_bounds[i * 9u + 7u] = n.y;
+    b_bounds[i * 9u + 8u] = n.z;
+}
+
+// And back: its colour (three floats per texel in `b_bounds`) as lighting
+// over the albedo, which `resolve` multiplies in again; coverage,
+// variance, blur and visibility stay.
+@compute @workgroup_size(8, 8, 1)
+fn oidn_unpack(@builtin(global_invocation_id) id: vec3<u32>) {
+    let w = u.size.x;
+    if id.x >= w || id.y >= u.size.y { return; }
+    let i = id.y * w + id.x;
+    let a = max(b_guides[i * 4u].xyz, vec3<f32>(1e-4));
+    let c = vec3<f32>(b_bounds[i * 3u], b_bounds[i * 3u + 1u], b_bounds[i * 3u + 2u]);
+    b_tmp[i * 2u] = vec4<f32>(c / a, b_hdr[i * 2u].w);
+    b_tmp[i * 2u + 1u] = b_hdr[i * 2u + 1u];
 }
 
 // The picture: lighting × albedo × coverage, tone-mapped as the raster,

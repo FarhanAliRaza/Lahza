@@ -21,40 +21,43 @@
   fixed rather than sized from the GPU. A texture's size could also follow
   its on-screen footprint (mip residency) so a 4K map seen small costs
   little.
-- **Path-traced renders keep the GPU idle two thirds of the time.** s01 of
-  the CPU film (`~/Videos/cpu/work_a.lahza`: ~400 scanned-rock layers,
-  4-sample motion blur, half size, 16 spp) takes 486 ms an output frame,
-  of which the GPU works 170 ms (trace 121, built-in denoise 20, OIDN
-  copies 21). Measure with `lahza motion render ~/Videos/cpu/work_a.lahza
-  --from 4 --to 5 --pt --spp 16 --scale 0.5 --profile`. The CPU side, per
-  output frame, and what to do about each:
-  - **CPU and GPU take turns (153 ms waiting for the trace, 17 ms more
-    before OIDN).** The next frame is evaluated and recorded only after
-    this one's trace finishes. Overlap them: record frame N+1 (and its
-    motion-blur sub-frames) while the GPU traces frame N, with a buffer
-    set per frame in flight.
-  - **Record + upload (96 ms).** Per sub-frame work for every layer,
-    times 4 motion-blur sub-frames; most of it likely re-uploads data
-    that did not change. Profile which buffers are written and upload
-    only what changed (instance transforms, not whole meshes or
-    material tables).
-  - **OIDN round trip (80 ms).** OIDN runs on CUDA (its default device on
-    the RTX 3060), but the tracer is Vulkan, so every frame downloads
-    ~50 MB of lighting and guides to host memory, repacks them on one CPU
-    thread, uploads to CUDA, reads the result back and uploads it to
-    Vulkan (`pt.rs` `oidn_denoise`). Share the memory instead: allocate
-    the denoise buffers exportable (`VK_KHR_external_memory_fd` in the
-    vendored blade), import them with OIDN's shared buffers
-    (`oidnNewSharedBufferFromFD`), pack colour/albedo/normal with a
-    compute pass, and keep one sync point. Expected ~10-20 ms. Also the
-    profile stage is labelled "OIDN denoise (CPU)" but times the whole
-    host round trip: rename it.
-  - **Trace setup (47 ms).** Structures, buffers and the pipeline are set
-    up every frame even when nothing moved. Keep the TLAS and per-frame
-    buffers, refit or rebuild only what changed.
-  - Display lists (31 ms) and scene evaluation (7 ms) are small now.
-  Target: close to the GPU's own time, ~170 ms a frame here (about 3×),
-  for every path-traced scene.
+- **Path-traced renders: what is left of the idle GPU.** Measured on s01
+  of the CPU film (`~/Videos/cpu/work_a.lahza`, ~400 scanned-rock layers,
+  4-sample motion blur, half size, 16 spp): 486 ms an output frame, of
+  which the GPU worked 170. Done since, and not yet measured on that
+  machine (`lahza motion render ~/Videos/cpu/work_a.lahza --from 4 --to 5
+  --pt --spp 16 --scale 0.5 --profile`; the stages are finer now):
+  - Frames overlap: an export pushes frames through the renderer
+    (`Renderer::push`/`pop`), up to three on the GPU (one traced, one at
+    Open Image Denoise, one read back), each with its own set of the
+    buffers a frame writes. A trace's bands of rows queue up behind each
+    other instead of each being waited for.
+  - A motion-blurred frame's sub-frames are traced into one picture and
+    denoised once (four OIDN runs and four filter chains a frame became
+    one).
+  - The tracer keeps its tables, scratch and top-level structures between
+    frames (nothing is allocated or freed in a steady frame), builds a
+    top-level structure only when its instances changed, and writes
+    instance records itself with each mesh's address looked up once.
+  - To OIDN and back is packed on the GPU (36 bytes a texel down, 12 up,
+    no per-texel work on the CPU; it was 96 down, 32 up and two passes
+    over them on one thread).
+  Still open:
+  - **OIDN's memory is still copied.** OIDN runs on CUDA, the tracer on
+    Vulkan: the packed picture goes through host memory both ways. Share
+    it instead (`VK_KHR_external_memory_fd` in the vendored blade,
+    `oidnNewSharedBufferFromFD`), with one sync point. Needs an NVIDIA
+    machine to write against.
+  - **Display lists are rebuilt per sub-frame** (31 ms on s01): each
+    sub-frame evaluates the scene and builds every layer's instance and
+    material rows again. Layers whose state did not change between
+    sub-frames (most materials) could reuse theirs.
+  - **Shared uploads wait for the GPU.** New glyphs, new images and new
+    pooled meshes are uploaded only once the frames in flight are off the
+    GPU (`drain`), so a film that adds one every frame (animated Slang
+    geometry) does not overlap. Per-frame staging would lift that.
+  - If the desktop stutters now that bands are not waited for, see
+    `LAHZA_TRACE_YIELD` (and say so here).
 
 ## Slang
 

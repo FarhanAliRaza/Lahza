@@ -179,7 +179,8 @@ fn shader_validates_and_layouts_match() {
     assert_eq!(size("Prim"), std::mem::size_of::<list::Prim>());
     assert_eq!(size("Pass"), 64);
     assert_eq!(size("BlurPass"), 32);
-    assert_eq!(module.entry_points.len(), 3);
+    // raster, blur, resolve and the visibility pass's vertex and fragment.
+    assert_eq!(module.entry_points.len(), 5);
 }
 
 /// GPU and CPU draw the same picture. Runs when a Vulkan device exists
@@ -1767,7 +1768,7 @@ fn a_lost_gpu_is_retried_then_reported() {
     let p = project(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [100, 60], "fill": "#ff0000", "transform": {"position": [160, 90]}}]));
     let c = Compiled::new(&p);
     let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
-    let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
+    let mut r = Renderer::new(None, RenderOptions { backend: Backend::Auto, allow_software_gpu: allow, ..Default::default() });
     if !r.is_gpu() {
         eprintln!("skipping: {}", r.backend_label());
         return;
@@ -1778,13 +1779,21 @@ fn a_lost_gpu_is_retried_then_reported() {
     assert_eq!(r.render(&c, 0.0), want);
     assert!(r.is_gpu(), "still on the GPU");
     assert!(r.warnings().iter().any(|w| w.contains("a new device rendered it")), "{:?}", r.warnings());
-    // Two in a row: the CPU takes over, and says so.
+    // Two in a row: the "auto" backend lets the CPU take over, and says so.
     r.last_invalidate();
     r.fail_gpu = 2;
     assert_eq!(r.render(&c, 0.5), want);
     assert!(!r.is_gpu());
     assert!(r.backend_label().starts_with("CPU (GPU failed"), "{}", r.backend_label());
     assert!(r.warnings().iter().any(|w| w.contains("rendered on the CPU")), "{:?}", r.warnings());
+    // The GPU backend never does: the frame is an error, and the next
+    // frame is drawn on the (new) device.
+    let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
+    r.fail_gpu = 2;
+    let e = r.try_render(&c, 0.0).unwrap_err();
+    assert!(e.contains("GPU failed at frame"), "{e}");
+    assert_eq!(r.render(&c, 0.0), want);
+    assert!(r.is_gpu());
 }
 
 /// Exports path-trace when the project says `"renderer": "path"` or the
@@ -1822,9 +1831,11 @@ fn motion_blur_sub_frames_share_their_group_texels() {
     let lists = r.build_lists(&states, None);
     let one = lists.iter().map(|l| l.group_texels).max().unwrap();
     assert!(one > 0, "the transition draws its scenes into groups");
-    let (merged, targets) = gpu::merge(&lists);
+    let (merged, targets) = gpu::merge(&lists, false);
     assert_eq!(merged.group_texels, one, "sub-frames share the group texels");
     assert_eq!(targets.len(), 8);
+    // (Side by side only for traced lists the sub-frames share.)
+    assert_eq!(gpu::merge(&lists, true).0.group_texels, lists.iter().map(|l| l.group_texels).sum::<u32>());
     // And the frame is the same picture on both paths.
     assert_gpu_matches_cpu(&p, &[2.4]);
 }

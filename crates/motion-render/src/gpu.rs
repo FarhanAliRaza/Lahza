@@ -334,24 +334,109 @@ impl Buffer {
     }
 }
 
-pub struct Gpu {
-    context: gpu::Context,
-    encoder: gpu::CommandEncoder,
-    raster: gpu::ComputePipeline,
-    /// The raster pipeline with a project's Slang surfaces (`surfaces.rs`),
-    /// by program key: built when the program changes, the last destroyed.
-    slang_raster: Option<(u64, gpu::ComputePipeline)>,
-    /// Hardware mesh visibility, where the device has 8x MSAA (else the
-    /// raster shader finds the nearest triangles itself).
-    vis: Option<VisPipelines>,
-    vis_atlas: VisAtlas,
-    vis_pages: Buffer,
-    /// Generated meshes kept on the device across frames.
-    pool: crate::pool::MeshPool,
-    /// Shader layers' kernels.
-    shaders: crate::shader::Pipelines,
-    blur: gpu::ComputePipeline,
-    resolve: gpu::ComputePipeline,
+/// Frames that may be on the GPU at once: one being traced, one at Open
+/// Image Denoise, one being read back. Each has its own set of the
+/// buffers a frame writes.
+pub const FLIGHTS: usize = 3;
+
+/// Command buffers the encoder cycles through: a traced frame is many
+/// submissions (a band of rows each) that queue up behind each other.
+const RING: usize = 64;
+
+/// The work handed to the GPU. A frame is recorded into command buffers
+/// that are submitted as they fill (`split`) without waiting for them;
+/// the encoder has `RING` of them and takes one up again only once the
+/// work it last held is done.
+pub(crate) struct Queue {
+    /// Submissions not known to have finished, oldest first.
+    pending: std::collections::VecDeque<gpu::SyncPoint>,
+    /// The last submission: when it is done, everything is.
+    last: Option<gpu::SyncPoint>,
+    /// A command buffer is being recorded.
+    open: bool,
+    /// LAHZA_TRACE_YIELD=1: wait for every submission before recording
+    /// the next (the GPU is then idle between a trace's bands, for a
+    /// desktop that stutters while a film is traced).
+    wait_each: bool,
+    /// Time spent waiting for room in the ring (not recording).
+    waited: std::time::Duration,
+}
+
+impl Queue {
+    fn new() -> Self {
+        Self { pending: Default::default(), last: None, open: false, wait_each: std::env::var_os("LAHZA_TRACE_YIELD").is_some(), waited: Default::default() }
+    }
+
+    /// Starts recording, if nothing is being recorded. With `profile`,
+    /// takes the pass timings of the work the command buffer last held.
+    pub(crate) fn start(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, profile: Option<&mut crate::profile::Profile>) {
+        if self.open {
+            return;
+        }
+        let waiting = std::time::Instant::now();
+        let mut waited = false;
+        while self.pending.len() >= if self.wait_each { 1 } else { RING } {
+            let Some(sync) = self.pending.pop_front() else { break };
+            // (A lost device returns at once; the frame's own wait reports it.)
+            context.wait_for(&sync, 600_000);
+            waited = true;
+        }
+        if waited {
+            self.waited += waiting.elapsed();
+        }
+        encoder.start();
+        self.open = true;
+        if let Some(p) = profile {
+            if waited {
+                p.stage("gpu frame › wait for GPU (queue full)", waiting);
+            }
+            p.add_gpu(encoder.timings());
+        }
+    }
+
+    /// Submits what was recorded; returns when it will be done.
+    pub(crate) fn submit(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder) -> gpu::SyncPoint {
+        let sync = context.submit(encoder);
+        self.open = false;
+        self.pending.push_back(sync.clone());
+        self.last = Some(sync.clone());
+        sync
+    }
+
+    /// Submits what was recorded and goes on recording.
+    pub(crate) fn split(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, profile: Option<&mut crate::profile::Profile>) {
+        self.submit(context, encoder);
+        self.start(context, encoder, profile);
+    }
+
+    /// Waits for everything submitted. False when it did not finish.
+    fn idle(&mut self, context: &gpu::Context, timeout_ms: u32) -> bool {
+        match &self.last {
+            Some(sync) if !self.pending.is_empty() => {
+                if !context.wait_for(sync, timeout_ms) {
+                    return false;
+                }
+                self.pending.clear();
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Ends a recording that failed part-way by submitting what there is
+    /// of it (uploads and passes of a frame that will not be finished:
+    /// harmless, and what they uploaded or built is then really there).
+    fn discard(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder) {
+        if self.open {
+            self.submit(context, encoder);
+        }
+    }
+}
+
+/// The buffers one frame writes: frames in flight have a set each, so
+/// recording a frame (the CPU fills the staging halves) does not touch
+/// what another still reads on the GPU.
+struct FrameSet {
     prims: Buffer,
     ranges: Buffer,
     indices: Buffer,
@@ -361,15 +446,119 @@ pub struct Gpu {
     ops: Buffer,
     mesh: Buffer,
     bins: Buffer,
-    atlas: Buffer,
-    images: Buffer,
     groups: Buffer,
     groups_tmp: Buffer,
     accum: Buffer,
     output: Buffer,
+    vis_pages: Buffer,
+    vis_atlas: VisAtlas,
+}
+
+impl FrameSet {
+    fn new(context: &gpu::Context, vis: bool) -> Self {
+        Self {
+            prims: Buffer::new(context, "motion prims", 1 << 16, true),
+            ranges: Buffer::new(context, "motion ranges", 1 << 16, true),
+            indices: Buffer::new(context, "motion indices", 1 << 16, true),
+            stops: Buffer::new(context, "motion stops", 1 << 12, true),
+            segs: Buffer::new(context, "motion segments", 1 << 12, true),
+            footage: Buffer::new(context, "motion footage", 1 << 12, true),
+            ops: Buffer::new(context, "motion post ops", 1 << 12, true),
+            mesh: Buffer::new(context, "motion mesh", 1 << 12, true),
+            bins: Buffer::new(context, "motion mesh bins", 1 << 12, true),
+            groups: Buffer::new(context, "motion groups", 1 << 12, false),
+            groups_tmp: Buffer::new(context, "motion groups tmp", 1 << 12, false),
+            accum: Buffer::new(context, "motion accum", 1 << 12, false),
+            output: Buffer::readback(context, "motion output", 1 << 12),
+            vis_pages: Buffer::new(context, "motion visibility pages", 1 << 12, true),
+            // Without the pass the raster shader still binds an atlas.
+            vis_atlas: VisAtlas::new(context, 16, 16, if vis { VIS_SAMPLES } else { 4 }, vis),
+        }
+    }
+
+    fn destroy(&mut self, context: &gpu::Context) {
+        for b in [
+            &mut self.prims,
+            &mut self.ranges,
+            &mut self.indices,
+            &mut self.stops,
+            &mut self.segs,
+            &mut self.footage,
+            &mut self.ops,
+            &mut self.mesh,
+            &mut self.bins,
+            &mut self.groups,
+            &mut self.groups_tmp,
+            &mut self.accum,
+            &mut self.output,
+            &mut self.vis_pages,
+        ] {
+            b.destroy(context);
+        }
+        self.vis_atlas.destroy(context);
+    }
+}
+
+/// A sample's targets after `merge`: its main target, its groups and
+/// where its meshes are drawn.
+type Targets = Vec<(Target, Vec<crate::list::Group>, Vec<MeshDraw>)>;
+
+/// What is left to record of a frame once its traced lists are through
+/// Open Image Denoise: their filters and pictures, then the rasters that
+/// composite them.
+struct Rest {
+    list: DisplayList,
+    targets: Targets,
+    plans: Vec<(Vec<TargetVis>, TargetVis)>,
+    draws: std::collections::HashMap<u32, VisPrim>,
+    slang: bool,
+    /// Per traced list: the group texels its picture goes to (one place
+    /// per sample).
+    pictures: Vec<Vec<u32>>,
+}
+
+/// A frame on the GPU.
+struct Flight {
+    id: u64,
+    set: usize,
+    size: (u32, u32),
+    /// Its last submission.
+    sync: gpu::SyncPoint,
+    /// Paths it traces (how long the GPU may take).
+    paths: u64,
+    /// Waiting for Open Image Denoise (`advance`).
+    rest: Option<Rest>,
+}
+
+pub struct Gpu {
+    context: gpu::Context,
+    encoder: gpu::CommandEncoder,
+    queue: Queue,
+    raster: gpu::ComputePipeline,
+    /// The raster pipeline with a project's Slang surfaces (`surfaces.rs`),
+    /// by program key: built when the program changes, the last destroyed.
+    slang_raster: Option<(u64, gpu::ComputePipeline)>,
+    /// Hardware mesh visibility, where the device has 8x MSAA (else the
+    /// raster shader finds the nearest triangles itself).
+    vis: Option<VisPipelines>,
+    /// Generated meshes kept on the device across frames.
+    pool: crate::pool::MeshPool,
+    /// Shader layers' kernels.
+    shaders: crate::shader::Pipelines,
+    blur: gpu::ComputePipeline,
+    resolve: gpu::ComputePipeline,
+    /// The buffers frames write, one set per frame in flight (made when a
+    /// frame first needs it: one frame at a time uses the first only).
+    sets: Vec<FrameSet>,
+    /// Frames on the GPU, oldest first.
+    flights: Vec<Flight>,
+    /// The next frame's number, and the last one finished.
+    next: u64,
+    completed: u64,
+    atlas: Buffer,
+    images: Buffer,
     atlas_generation: u64,
     images_generation: u64,
-    pending: Option<gpu::SyncPoint>,
     pub label: String,
     /// The path tracer, where the device has ray queries.
     tracer: Option<crate::pt::Tracer>,
@@ -377,19 +566,19 @@ pub struct Gpu {
     /// With profiling: this frame's stages and GPU pass timestamps (the
     /// renderer takes them after each frame).
     pub(crate) profile: Option<crate::profile::Profile>,
-    /// The encoder was started at the end of the last frame (to read its
-    /// timestamps) and is ready to record.
-    started: bool,
 }
 
 /// Concatenates sub-sample display lists into one upload. Returns the
 /// merged buffers and each sample's targets (main, groups) re-based.
-/// Group texels are not concatenated: a sample's groups are read only by
-/// its own passes, which run before the next sample's, so every sample
-/// draws its groups in the same texels (eight sub-frames of a full-frame
-/// transition would otherwise need eight frames' worth, past the buffer
-/// limit).
-pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::list::Group>, Vec<MeshDraw>)>) {
+///
+/// Group texels: a sample's groups are read only by its own passes. When
+/// each sample is drawn in full before the next (`separate` false), every
+/// sample draws its groups in the same texels (eight sub-frames of a
+/// full-frame transition would otherwise need eight frames' worth, past
+/// the buffer limit). When the samples' groups are all drawn first and
+/// their main targets afterwards (traced lists, which the samples share),
+/// each sample keeps its own (`separate`).
+pub fn merge(samples: &[DisplayList], separate: bool) -> (DisplayList, Targets) {
     let mut out = DisplayList::default();
     let mut targets = Vec::new();
     for list in samples {
@@ -397,6 +586,7 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let index_base = out.indices.len() as u32;
         let range_base = (out.ranges.len() / 2) as u32;
         let stop_base = (out.stops.len() / 2) as f32;
+        let texel_base = if separate { out.group_texels } else { 0 };
         let seg_base = out.segments.len() as u32;
         let ops_base = out.ops.len() as u32;
         let mesh_base = out.mesh.len() as u32;
@@ -407,7 +597,13 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
         let id_base = out.mesh_ids;
         out.mesh_ids += list.mesh_ids;
         out.pool.extend(list.pool.iter().map(|r| crate::mesh3d::PoolRef { row: r.row + mesh_base, ..r.clone() }));
-        out.traces.extend(list.traces.iter().cloned());
+        out.traces.extend(list.traces.iter().map(|t| {
+            let mut t = t.clone();
+            for c in &mut t.cards {
+                c.picture.offset += texel_base;
+            }
+            t
+        }));
         for p in &list.prims {
             let mut p: Prim = *p;
             let rebase = |v: f32, by: u32| f32::from_bits(v.to_bits() + by);
@@ -426,6 +622,16 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
                         p.geom[1] = rebase(p.geom[1], id_base);
                     }
                     p.geom2 = p.geom2.map(|v| rebase(v, mesh_base));
+                    if p.paint[3] > 0.5 {
+                        p.paint[0] = rebase(p.paint[0], texel_base);
+                    }
+                    // Cards' pictures are relative to this base.
+                    p.stroke[2] = rebase(p.stroke[2], texel_base);
+                }
+                crate::list::PRIM_IMAGE if p.kind[1] == 1 => p.geom2[0] = rebase(p.geom2[0], texel_base),
+                crate::list::PRIM_MATTE => {
+                    p.geom2[0] = rebase(p.geom2[0], texel_base);
+                    p.geom2[1] = rebase(p.geom2[1], texel_base);
                 }
                 crate::list::PRIM_SHAPE if p.kind[1] == crate::list::SHAPE_PATH => p.geom2[0] = rebase(p.geom2[0], seg_base),
                 _ => {}
@@ -445,7 +651,7 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
             out.ranges.push(pair[1]);
         }
         out.stops.extend_from_slice(&list.stops);
-        out.group_texels = out.group_texels.max(list.group_texels);
+        out.group_texels = if separate { out.group_texels + list.group_texels } else { out.group_texels.max(list.group_texels) };
         let mut main = list.main();
         main.range_base += range_base;
         let groups = list
@@ -454,6 +660,7 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
             .map(|g| {
                 let mut g = *g;
                 g.target.range_base += range_base;
+                g.offset += texel_base;
                 g.trace = g.trace.map(|i| i + trace_base);
                 g.shader = g.shader.map(|i| i + shader_base);
                 g
@@ -464,6 +671,20 @@ pub fn merge(samples: &[DisplayList]) -> (DisplayList, Vec<(Target, Vec<crate::l
     }
     out.main = samples.first().and_then(|s| s.main);
     (out, targets)
+}
+
+/// Whether the samples of a frame can share their traced pictures: every
+/// sample has the same traced lists, on the same texels (a moving camera
+/// moves the scene under them, not them), and the samples' groups fit the
+/// buffer side by side. Each traced list is then traced sample after
+/// sample into one picture and filtered once. (One sample always can.)
+fn shares_traces(samples: &[DisplayList]) -> bool {
+    let traced = |s: &DisplayList| -> Vec<(u32, u32, [f32; 2], [f32; 2], [f32; 9], bool)> {
+        s.groups.iter().filter_map(|g| g.trace.map(|i| (g, &s.traces[i as usize]))).map(|(g, t)| (g.target.width, g.target.height, t.origin, t.factor, t.root, t.options.denoise)).collect()
+    };
+    let Some(first) = samples.first().map(traced) else { return false };
+    let texels: u64 = samples.iter().map(|s| s.group_texels as u64).sum();
+    !first.is_empty() && samples.iter().all(|s| traced(s) == first) && texels * 16 <= MAX_BUFFER as u64
 }
 
 impl Gpu {
@@ -512,8 +733,6 @@ impl Gpu {
                 see: make("mesh visibility see-through", gpu::CompareFunction::Greater),
             }
         });
-        // Without the pass the raster shader still binds an atlas.
-        let vis_atlas = VisAtlas::new(&context, 16, 16, if vis.is_some() { VIS_SAMPLES } else { 4 }, vis.is_some());
         let blur = context.create_compute_pipeline(gpu::ComputePipelineDesc {
             name: "motion blur",
             data_layouts: &[&BlurData::layout()],
@@ -524,7 +743,7 @@ impl Gpu {
             data_layouts: &[&ResolveData::layout()],
             compute: shader.at("resolve"),
         });
-        let encoder = context.create_command_encoder(gpu::CommandEncoderDesc { name: "motion", buffer_count: 1 });
+        let encoder = context.create_command_encoder(gpu::CommandEncoderDesc { name: "motion", buffer_count: RING as u32 });
         let label = format!("GPU · {}", info.device_name);
         let (tracer, trace_error) = if !crate::pt::supported(&context) {
             (None, Some(format!("{} has no ray queries", info.device_name)))
@@ -537,40 +756,28 @@ impl Gpu {
         // Every pipeline exists now: keep them for the next launch.
         context.save_pipeline_cache();
         Ok(Self {
-            prims: Buffer::new(&context, "motion prims", 1 << 16, true),
-            ranges: Buffer::new(&context, "motion ranges", 1 << 16, true),
-            indices: Buffer::new(&context, "motion indices", 1 << 16, true),
-            stops: Buffer::new(&context, "motion stops", 1 << 12, true),
-            segs: Buffer::new(&context, "motion segments", 1 << 12, true),
-            footage: Buffer::new(&context, "motion footage", 1 << 12, true),
-            ops: Buffer::new(&context, "motion post ops", 1 << 12, true),
-            mesh: Buffer::new(&context, "motion mesh", 1 << 12, true),
-            bins: Buffer::new(&context, "motion mesh bins", 1 << 12, true),
+            sets: vec![FrameSet::new(&context, vis.is_some())],
+            flights: Vec::new(),
+            next: 1,
+            completed: 0,
             atlas: Buffer::new(&context, "motion atlas", (ATLAS_SIZE * ATLAS_SIZE) as usize, true),
             images: Buffer::new(&context, "motion images", 1 << 12, true),
-            groups: Buffer::new(&context, "motion groups", 1 << 12, false),
-            groups_tmp: Buffer::new(&context, "motion groups tmp", 1 << 12, false),
-            accum: Buffer::new(&context, "motion accum", 1 << 12, false),
-            output: Buffer::readback(&context, "motion output", 1 << 12),
             atlas_generation: 0,
             images_generation: 0,
-            pending: None,
-            vis_pages: Buffer::new(&context, "motion visibility pages", 1 << 12, true),
             pool: crate::pool::MeshPool::new(&context),
             shaders: Default::default(),
+            queue: Queue::new(),
             context,
             encoder,
             raster,
             slang_raster: None,
             vis,
-            vis_atlas,
             blur,
             resolve,
             label,
             tracer,
             trace_error,
             profile: profile.then(crate::profile::Profile::default),
-            started: false,
         })
     }
 
@@ -601,15 +808,85 @@ impl Gpu {
         self.tracer.as_ref().map_or(0, |t| t.cached_vertices())
     }
 
+    /// Tests: the tracer's kept buffers, and a stand-in for OIDN.
+    #[cfg(test)]
+    pub(crate) fn tracer_for_tests(&mut self) -> Option<&mut crate::pt::Tracer> {
+        self.tracer.as_mut()
+    }
+
+    /// Frames begun and not finished.
+    pub fn in_flight(&self) -> usize {
+        self.flights.len()
+    }
+
+    /// Whether traced frames wait for Open Image Denoise between `begin`
+    /// and `finish` (a third frame in flight then keeps the GPU busy).
+    pub fn denoises_between(&mut self) -> bool {
+        self.tracer.as_mut().is_some_and(|t| t.wants_oidn())
+    }
+
     /// Renders weighted sub-samples (weights sum to 1) to straight RGBA8.
     pub fn render(&mut self, samples: &[DisplayList], fonts: &Fonts, images: &Images, footage: &[u32]) -> Result<Vec<u8>, String> {
+        let id = self.begin(samples, fonts, images, footage)?;
+        self.finish(id)
+    }
+
+    /// Records a frame and hands it to the GPU; `finish` waits for it and
+    /// returns its pixels (in the order frames were begun). Up to
+    /// `FLIGHTS` frames may be begun before the first is finished: the
+    /// next frame's lists are then built and recorded while the GPU works
+    /// on this one. On an error the frame is not in flight.
+    pub fn begin(&mut self, samples: &[DisplayList], fonts: &Fonts, images: &Images, footage: &[u32]) -> Result<u64, String> {
+        let set = (0..FLIGHTS).find(|s| self.flights.iter().all(|f| f.set != *s)).ok_or("too many frames in flight")?;
+        while self.sets.len() <= set {
+            self.sets.push(FrameSet::new(&self.context, self.vis.is_some()));
+        }
+        let id = self.next;
+        self.next += 1;
+        match self.record(id, set, samples, fonts, images, footage) {
+            Ok(flight) => {
+                self.flights.push(flight);
+                Ok(id)
+            }
+            Err(e) => {
+                self.queue.discard(&self.context, &mut self.encoder);
+                Err(e)
+            }
+        }
+    }
+
+    /// Waits for the frames in flight to leave the GPU (they stay to be
+    /// finished): before something they share is written again.
+    fn drain(&mut self, why: &str) -> Result<(), String> {
+        if self.flights.is_empty() {
+            return Ok(());
+        }
+        let waiting = std::time::Instant::now();
+        let paths: u64 = self.flights.iter().map(|f| f.paths).sum();
+        if !self.queue.idle(&self.context, frame_timeout_ms(paths)) {
+            return Err("GPU timed out".into());
+        }
+        if let Some(p) = self.profile.as_mut() {
+            p.stage(&format!("gpu frame › wait for GPU ({why})"), waiting);
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, id: u64, set: usize, samples: &[DisplayList], fonts: &Fonts, images: &Images, footage: &[u32]) -> Result<Flight, String> {
         let main = samples.first().ok_or("nothing to render")?.main();
         let (w, h) = (main.width, main.height);
         if w.div_ceil(TILE) > 65535 || h.div_ceil(TILE) > 65535 {
             return Err("canvas exceeds the GPU dispatch limit".into());
         }
-        let (mut list, targets) = merge(samples);
-        let weight = 1.0 / samples.len() as f32;
+        let recording = std::time::Instant::now();
+        let waited = self.queue.waited;
+        // Traced lists the samples share are traced sample after sample
+        // into one picture; the samples' own groups then sit side by side.
+        let shared = shares_traces(samples);
+        let (mut list, targets) = merge(samples, shared);
+        if let Some(p) = self.profile.as_mut() {
+            p.stage("gpu frame › record + upload › merge samples", recording);
+        }
         let slang = samples.iter().find_map(|s| s.surfaces.as_ref());
         if let Some(program) = slang {
             self.surface_raster(program)?;
@@ -641,24 +918,27 @@ impl Gpu {
             }
             // Grow in steps; shrink once far too big.
             let need = atlas_height.next_multiple_of(256);
-            if self.vis_atlas.width != atlas_width || need > self.vis_atlas.height || need * 4 < self.vis_atlas.height {
-                self.vis_atlas.destroy(&self.context);
-                self.vis_atlas = VisAtlas::new(&self.context, atlas_width, need, VIS_SAMPLES, true);
+            let atlas = &mut self.sets[set].vis_atlas;
+            if atlas.width != atlas_width || need > atlas.height || need * 4 < atlas.height {
+                atlas.destroy(&self.context);
+                *atlas = VisAtlas::new(&self.context, atlas_width, need, VIS_SAMPLES, true);
             }
         }
-        let ctx = &self.context;
-        let recording = std::time::Instant::now();
+        // What the frames in flight share is written only while the GPU
+        // is idle: new glyphs, new images, new meshes in the pool.
+        if self.atlas_generation != fonts.generation || self.images_generation != images.generation || self.pool.changes(&list.pool) {
+            self.drain("shared uploads")?;
+        }
         if let Some(t) = self.tracer.as_mut() {
-            t.begin_frame(&self.context);
+            t.begin_frame(&self.context, id, self.completed, set);
         }
-        if !std::mem::take(&mut self.started) {
-            self.encoder.start();
-        }
+        self.queue.start(&self.context, &mut self.encoder, self.profile.as_mut());
+        let ctx = &self.context;
         let mut in_tracer = std::time::Duration::ZERO;
         // Instances' meshes into the pool (where they are goes into their
         // rows), then each mesh primitive's visibility draws.
         let pooling = std::time::Instant::now();
-        self.pool.resolve(ctx, &mut self.encoder, &list.pool, &mut list.mesh)?;
+        self.pool.resolve(ctx, &mut self.encoder, id, &list.pool, &mut list.mesh)?;
         let mut draws: std::collections::HashMap<u32, VisPrim> = std::collections::HashMap::new();
         if use_vis {
             for (_, _, ds) in &targets {
@@ -670,21 +950,23 @@ impl Gpu {
         if let Some(p) = self.profile.as_mut() {
             p.add("gpu frame › mesh pool", pooling.elapsed());
         }
-        self.prims.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.prims))?;
-        self.ranges.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ranges))?;
-        self.indices.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.indices))?;
-        self.stops.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.stops))?;
-        self.segs.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.segments))?;
+        let uploading = std::time::Instant::now();
+        let s = &mut self.sets[set];
+        s.prims.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.prims))?;
+        s.ranges.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ranges))?;
+        s.indices.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.indices))?;
+        s.stops.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.stops))?;
+        s.segs.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.segments))?;
         // Footage frames change every frame and upload every time.
-        self.footage.upload(ctx, &mut self.encoder, bytemuck::cast_slice(footage))?;
-        self.ops.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ops))?;
-        self.mesh.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.mesh))?;
+        s.footage.upload(ctx, &mut self.encoder, bytemuck::cast_slice(footage))?;
+        s.ops.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.ops))?;
+        s.mesh.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.mesh))?;
         // Tile bins are only read when the raster shader finds the nearest
         // triangles itself.
         if !use_vis {
-            self.bins.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.bins))?;
+            s.bins.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&list.bins))?;
         }
-        self.vis_pages.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&vis_table))?;
+        s.vis_pages.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&vis_table))?;
         if self.atlas_generation != fonts.generation {
             self.atlas.upload(ctx, &mut self.encoder, &fonts.atlas)?;
             self.atlas_generation = fonts.generation;
@@ -694,19 +976,223 @@ impl Gpu {
             self.images_generation = images.generation;
         }
         let group_bytes = list.group_texels as usize * 16;
-        self.groups.ensure(ctx, group_bytes)?;
-        self.groups_tmp.ensure(ctx, group_bytes)?;
-        self.accum.ensure(ctx, (w * h) as usize * 16)?;
-        self.output.ensure(ctx, (w * h) as usize * 4)?;
-        let raster_data = |pass: Pass, target: gpu::Buffer, groups: gpu::Buffer, s: &Self| RasterData {
+        s.groups.ensure(ctx, group_bytes)?;
+        s.groups_tmp.ensure(ctx, group_bytes)?;
+        s.accum.ensure(ctx, (w * h) as usize * 16)?;
+        s.output.ensure(ctx, (w * h) as usize * 4)?;
+        if let Some(p) = self.profile.as_mut() {
+            p.stage("gpu frame › record + upload › uploads", uploading);
+        }
+        let (groups_buf, images_buf) = (self.sets[set].groups.device, self.images.device);
+        // Paths traced this frame: how long the GPU may take.
+        let mut paths = 0u64;
+        let parts = targets.len() as u32;
+        // Per traced list: where its picture goes (one place per sample
+        // that shares it; else it is drawn as soon as it is traced).
+        let mut pictures: Vec<Vec<u32>> = Vec::new();
+        for (i, (_, groups, _)) in targets.iter().enumerate() {
+            let mut slot = 0u32;
+            for (gi, g) in groups.iter().enumerate() {
+                let t = g.target;
+                if let Some(ti) = g.trace {
+                    let trace = &list.traces[ti as usize];
+                    paths += t.width as u64 * t.height as u64 * trace.options.spp.max(1) as u64;
+                    let entered = std::time::Instant::now();
+                    let waited_in = self.queue.waited;
+                    let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
+                    if shared {
+                        tracer.part(&self.context, &mut self.encoder, &mut self.queue, trace, slot, i as u32, parts, (t.width, t.height), groups_buf, images_buf, self.profile.as_mut())?;
+                        if i == 0 {
+                            pictures.push(Vec::new());
+                        }
+                        pictures[slot as usize].push(g.offset);
+                        slot += 1;
+                    } else {
+                        // On its own, start to finish: the next trace
+                        // takes over its lighting and guides.
+                        tracer.part(&self.context, &mut self.encoder, &mut self.queue, trace, 0, 0, 1, (t.width, t.height), groups_buf, images_buf, self.profile.as_mut())?;
+                        let oidn = tracer.wants_oidn();
+                        tracer.settle(&self.context, &mut self.encoder, 0, groups_buf, images_buf, oidn);
+                        if tracer.awaits_denoise(0) {
+                            in_tracer += entered.elapsed().saturating_sub(self.queue.waited - waited_in);
+                            let waiting = std::time::Instant::now();
+                            let sync = self.queue.submit(&self.context, &mut self.encoder);
+                            let done = self.context.wait_for(&sync, frame_timeout_ms(paths));
+                            self.queue.start(&self.context, &mut self.encoder, self.profile.as_mut());
+                            if !done {
+                                return Err("GPU timed out".into());
+                            }
+                            let denoising = std::time::Instant::now();
+                            if let Some(p) = self.profile.as_mut() {
+                                p.add("gpu frame › wait for GPU (before OIDN)", denoising - waiting);
+                            }
+                            let tracer = self.tracer.as_mut().ok_or("no path tracer")?;
+                            tracer.denoise(&self.context, set, 0);
+                            if let Some(p) = self.profile.as_mut() {
+                                p.stage("gpu frame › OIDN denoise", denoising);
+                            }
+                        }
+                        let entered = std::time::Instant::now();
+                        let tracer = self.tracer.as_mut().ok_or("no path tracer")?;
+                        tracer.post(&self.context, &mut self.encoder, 0, &[g.offset], groups_buf, images_buf);
+                        in_tracer += entered.elapsed();
+                        continue;
+                    }
+                    in_tracer += entered.elapsed().saturating_sub(self.queue.waited - waited_in);
+                    continue;
+                }
+                // A shader layer's kernel paints it; one that did not build
+                // (the project says why) is rasterised empty: transparent.
+                if let Some(si) = g.shader {
+                    if self.shaders.dispatch(&self.context, &mut self.encoder, &list.shaders[si as usize], g, groups_buf)? {
+                        continue;
+                    }
+                }
+                if let Some((group_plans, _)) = plans.get(i) {
+                    self.record_vis(set, &group_plans[gi], &draws, &list.prims);
+                }
+                self.record_group(set, g, use_vis, slang);
+            }
+            if !shared {
+                self.record_main(set, i, &targets, plans.get(i).map(|p| &p.1), &draws, &list.prims, use_vis, slang);
+            }
+        }
+        let mut rest = shared.then_some(Rest { list, targets, plans, draws, slang, pictures });
+        let mut waits = false;
+        if let Some(r) = &rest {
+            // The lists' parts are all traced: on to their filters.
+            let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
+            let oidn = tracer.wants_oidn();
+            for slot in 0..r.pictures.len() as u32 {
+                tracer.settle(&self.context, &mut self.encoder, slot, groups_buf, images_buf, oidn);
+                waits |= tracer.awaits_denoise(slot);
+            }
+        }
+        if !waits {
+            if let Some(r) = rest.take() {
+                self.record_rest(set, &r);
+            }
+            self.record_end(set, (w, h), parts);
+        }
+        if let Some(p) = self.profile.as_mut() {
+            // (Not the tracer's own stages, nor waits for the GPU.)
+            p.add("gpu frame › record + upload", recording.elapsed().saturating_sub(in_tracer + (self.queue.waited - waited)));
+        }
+        let sync = self.queue.submit(&self.context, &mut self.encoder);
+        Ok(Flight { id, set, size: (w, h), sync, paths, rest })
+    }
+
+    /// Rasterises group `g` of the frame in `set` (and blurs it).
+    fn record_group(&mut self, set: usize, g: &crate::list::Group, use_vis: bool, slang: bool) {
+        let t = g.target;
+        let s = &self.sets[set];
+        let data = self.raster_data(
+            set,
+            Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, use_vis as u32, 0], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
+            // Outer groups sample inner ones in other regions of the same
+            // buffer; regions never overlap.
+            s.groups.device,
+        );
+        {
+            let mut pass = self.encoder.compute("group raster");
+            let mut pc = pass.with(match &self.slang_raster {
+                Some((_, p)) if slang => p,
+                _ => &self.raster,
+            });
+            pc.bind(0, &data);
+            pc.dispatch([t.tiles_x, t.tiles_y, 1]);
+        }
+        if g.sigma <= 0.0 {
+            // Same as the CPU path: no blur pass (σ = 0 would make the
+            // Gaussian weights NaN).
+            return;
+        }
+        let radius = (g.sigma * 3.0).ceil();
+        let norm: f32 = (-(radius as i32)..=radius as i32).map(|d| (-(d * d) as f32 / (2.0 * g.sigma * g.sigma)).exp()).sum();
+        for (horizontal, src, dst) in [(1u32, s.groups.device, s.groups_tmp.device), (0, s.groups_tmp.device, s.groups.device)] {
+            let data = BlurData {
+                u_blur: BlurPass { size: [t.width, t.height, g.offset, horizontal], sigma: [g.sigma, radius, 1.0 / norm, if g.clamp { 1.0 } else { 0.0 }] },
+                b_blur_src: src.into(),
+                b_blur_dst: dst.into(),
+            };
+            let mut pass = self.encoder.compute("group blur");
+            let mut pc = pass.with(&self.blur);
+            pc.bind(0, &data);
+            pc.dispatch([t.width.div_ceil(16), t.height.div_ceil(16), 1]);
+        }
+    }
+
+    /// Rasterises sample `i`'s main target into the frame's sum.
+    #[allow(clippy::too_many_arguments)]
+    fn record_main(&mut self, set: usize, i: usize, targets: &Targets, plan: Option<&TargetVis>, draws: &std::collections::HashMap<u32, VisPrim>, prims: &[Prim], use_vis: bool, slang: bool) {
+        if let Some(plan) = plan {
+            self.record_vis(set, plan, draws, prims);
+        }
+        let main = targets[i].0;
+        let data = self.raster_data(
+            set,
+            Pass {
+                size: [main.width, main.height, main.tiles_x, main.range_base],
+                dest: [0, if i == 0 { 2 } else { 1 }, use_vis as u32, 0],
+                background: main.background,
+                weight: [1.0 / targets.len() as f32, 0.0, 0.0, 0.0],
+            },
+            self.sets[set].accum.device,
+        );
+        let mut pass = self.encoder.compute("main raster");
+        let mut pc = pass.with(match &self.slang_raster {
+            Some((_, p)) if slang => p,
+            _ => &self.raster,
+        });
+        pc.bind(0, &data);
+        pc.dispatch([main.tiles_x, main.tiles_y, 1]);
+    }
+
+    /// The traced lists' filters and pictures, then every sample's main
+    /// target over them.
+    fn record_rest(&mut self, set: usize, r: &Rest) {
+        let (groups_buf, images_buf) = (self.sets[set].groups.device, self.images.device);
+        if let Some(tracer) = self.tracer.as_mut() {
+            tracer.resume(set);
+            for (slot, offsets) in r.pictures.iter().enumerate() {
+                tracer.post(&self.context, &mut self.encoder, slot as u32, offsets, groups_buf, images_buf);
+            }
+        }
+        let use_vis = self.vis.is_some();
+        for i in 0..r.targets.len() {
+            self.record_main(set, i, &r.targets, r.plans.get(i).map(|p| &p.1), &r.draws, &r.list.prims, use_vis, r.slang);
+        }
+    }
+
+    /// The frame's sum to RGBA8 and into the host's hands.
+    fn record_end(&mut self, set: usize, (w, h): (u32, u32), samples: u32) {
+        let s = &self.sets[set];
+        {
+            let data = ResolveData {
+                u_resolve: ResolvePass { size: [w, h, samples, 0] },
+                b_accum: s.accum.device.into(),
+                b_output: s.output.device.into(),
+            };
+            let mut pass = self.encoder.compute("resolve");
+            let mut pc = pass.with(&self.resolve);
+            pc.bind(0, &data);
+            pc.dispatch([w.div_ceil(16), h.div_ceil(16), 1]);
+        }
+        let host = s.output.host.unwrap();
+        self.encoder.transfer("readback").copy_buffer_to_buffer(s.output.device.into(), host.into(), (w * h * 4) as u64);
+    }
+
+    fn raster_data(&self, set: usize, pass: Pass, target: gpu::Buffer) -> RasterData {
+        let s = &self.sets[set];
+        RasterData {
             u_pass: pass,
             b_prims: s.prims.device.into(),
             b_ranges: s.ranges.device.into(),
             b_indices: s.indices.device.into(),
             b_stops: s.stops.device.into(),
-            b_atlas: s.atlas.device.into(),
-            b_images: s.images.device.into(),
-            b_groups: groups.into(),
+            b_atlas: self.atlas.device.into(),
+            b_images: self.images.device.into(),
+            b_groups: s.groups.device.into(),
             b_segs: s.segs.device.into(),
             b_footage: s.footage.device.into(),
             b_ops: s.ops.device.into(),
@@ -716,111 +1202,54 @@ impl Gpu {
             t_vis_ids: s.vis_atlas.ids_view,
             t_vis_depth: s.vis_atlas.depth_view,
             b_vis: s.vis_pages.device.into(),
-            b_pool: s.pool.buffer.into(),
-        };
-        // Paths traced this frame: how long the GPU may take.
-        let mut paths = 0u64;
-        for (i, (main, groups, _)) in targets.iter().enumerate() {
-            for (gi, g) in groups.iter().enumerate() {
-                let t = g.target;
-                if let Some(ti) = g.trace {
-                    paths += t.width as u64 * t.height as u64 * list.traces[ti as usize].options.spp.max(1) as u64;
-                    let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
-                    let entered = std::time::Instant::now();
-                    tracer.trace(&self.context, &mut self.encoder, &list.traces[ti as usize], g.offset, (t.width, t.height), self.groups.device, self.images.device, self.profile.as_mut())?;
-                    in_tracer += entered.elapsed();
-                    continue;
-                }
-                // A shader layer's kernel paints it; one that did not build
-                // (the project says why) is rasterised empty: transparent.
-                if let Some(si) = g.shader {
-                    if self.shaders.dispatch(&self.context, &mut self.encoder, &list.shaders[si as usize], g, self.groups.device)? {
-                        continue;
-                    }
-                }
-                if let Some((group_plans, _)) = plans.get(i) {
-                    self.record_vis(&group_plans[gi], &draws, &list.prims);
-                }
-                let data = raster_data(
-                    Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, use_vis as u32, 0], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
-                    self.groups.device,
-                    // Outer groups sample inner ones in other regions of
-                    // the same buffer; regions never overlap.
-                    self.groups.device,
-                    self,
-                );
-                {
-                    let mut pass = self.encoder.compute("group raster");
-                    let mut pc = pass.with(match &self.slang_raster {
-                        Some((_, p)) if slang => p,
-                        _ => &self.raster,
-                    });
-                    pc.bind(0, &data);
-                    pc.dispatch([t.tiles_x, t.tiles_y, 1]);
-                }
-                if g.sigma <= 0.0 {
-                    // Same as the CPU path: no blur pass (σ = 0 would make
-                    // the Gaussian weights NaN).
-                    continue;
-                }
-                let radius = (g.sigma * 3.0).ceil();
-                let norm: f32 = (-(radius as i32)..=radius as i32).map(|d| (-(d * d) as f32 / (2.0 * g.sigma * g.sigma)).exp()).sum();
-                for (horizontal, src, dst) in [(1u32, self.groups.device, self.groups_tmp.device), (0, self.groups_tmp.device, self.groups.device)] {
-                    let data = BlurData {
-                        u_blur: BlurPass { size: [t.width, t.height, g.offset, horizontal], sigma: [g.sigma, radius, 1.0 / norm, if g.clamp { 1.0 } else { 0.0 }] },
-                        b_blur_src: src.into(),
-                        b_blur_dst: dst.into(),
-                    };
-                    let mut pass = self.encoder.compute("group blur");
-                    let mut pc = pass.with(&self.blur);
-                    pc.bind(0, &data);
-                    pc.dispatch([t.width.div_ceil(16), t.height.div_ceil(16), 1]);
-                }
-            }
-            if let Some((_, main_plan)) = plans.get(i) {
-                self.record_vis(main_plan, &draws, &list.prims);
-            }
-            let data = raster_data(
-                Pass {
-                    size: [main.width, main.height, main.tiles_x, main.range_base],
-                    dest: [0, if i == 0 { 2 } else { 1 }, use_vis as u32, 0],
-                    background: main.background,
-                    weight: [weight, 0.0, 0.0, 0.0],
-                },
-                self.accum.device,
-                self.groups.device,
-                self,
-            );
-            let mut pass = self.encoder.compute("main raster");
-            let mut pc = pass.with(match &self.slang_raster {
-                Some((_, p)) if slang => p,
-                _ => &self.raster,
-            });
-            pc.bind(0, &data);
-            pc.dispatch([main.tiles_x, main.tiles_y, 1]);
+            b_pool: self.pool.buffer.into(),
         }
-        {
-            let data = ResolveData {
-                u_resolve: ResolvePass { size: [w, h, targets.len() as u32, 0] },
-                b_accum: self.accum.device.into(),
-                b_output: self.output.device.into(),
-            };
-            let mut pass = self.encoder.compute("resolve");
-            let mut pc = pass.with(&self.resolve);
-            pc.bind(0, &data);
-            pc.dispatch([w.div_ceil(16), h.div_ceil(16), 1]);
-        }
-        let host = self.output.host.unwrap();
-        self.encoder.transfer("readback").copy_buffer_to_buffer(self.output.device.into(), host.into(), (w * h * 4) as u64);
-        let submitted = std::time::Instant::now();
-        let sync = self.context.submit(&mut self.encoder);
-        self.pending = Some(sync.clone());
+    }
+
+    /// Takes frame `id` through Open Image Denoise, if it waits for it:
+    /// waits for its traces, denoises, and hands the rest of the frame to
+    /// the GPU. Call it once the next frame has begun, so the GPU traces
+    /// that one meanwhile. (`finish` does it otherwise.)
+    pub fn advance(&mut self, id: u64) -> Result<(), String> {
+        let Some(at) = self.flights.iter().position(|f| f.id == id) else { return Err("no such frame in flight".into()) };
+        let Some(rest) = self.flights[at].rest.take() else { return Ok(()) };
+        let (set, size, sync, paths) = (self.flights[at].set, self.flights[at].size, self.flights[at].sync.clone(), self.flights[at].paths);
+        let waiting = std::time::Instant::now();
         if !self.context.wait_for(&sync, frame_timeout_ms(paths)) {
-            // `pending` stays set: dropping this device waits for the work.
             return Err("GPU timed out".into());
         }
-        self.pending = None;
-        self.pool.after_frame(&self.context);
+        let denoising = std::time::Instant::now();
+        if let Some(tracer) = self.tracer.as_mut() {
+            for slot in 0..rest.pictures.len() as u32 {
+                tracer.denoise(&self.context, set, slot);
+            }
+        }
+        let recording = std::time::Instant::now();
+        self.queue.start(&self.context, &mut self.encoder, self.profile.as_mut());
+        self.record_rest(set, &rest);
+        self.record_end(set, size, rest.targets.len() as u32);
+        self.flights[at].sync = self.queue.submit(&self.context, &mut self.encoder);
+        if let Some(p) = self.profile.as_mut() {
+            p.add("gpu frame › wait for GPU (before OIDN)", denoising - waiting);
+            p.add("gpu frame › OIDN denoise", recording - denoising);
+            p.stage("gpu frame › record + upload", recording);
+        }
+        Ok(())
+    }
+
+    /// Waits for frame `id` and returns its pixels.
+    pub fn finish(&mut self, id: u64) -> Result<Vec<u8>, String> {
+        self.advance(id)?;
+        let at = self.flights.iter().position(|f| f.id == id).ok_or("no such frame in flight")?;
+        let flight = self.flights.remove(at);
+        let waiting = std::time::Instant::now();
+        if !self.context.wait_for(&flight.sync, frame_timeout_ms(flight.paths)) {
+            // Its work may still be running: dropping this device waits for it.
+            return Err("GPU timed out".into());
+        }
+        // Every frame before the oldest still in flight is done.
+        self.completed = self.flights.iter().map(|f| f.id).min().unwrap_or(self.next) - 1;
+        self.pool.after_frame(&self.context, self.completed);
         self.shaders.end_frame(&self.context);
         if let Some(p) = self.profile.as_mut() {
             let (used, size) = self.pool.bytes();
@@ -828,20 +1257,33 @@ impl Gpu {
             p.pool.upload_bytes += std::mem::take(&mut self.pool.upload_bytes);
             p.pool.evictions += std::mem::take(&mut self.pool.evictions);
             (p.pool.meshes, p.pool.bytes, p.pool.capacity) = (self.pool.meshes() as u64, used as u64, size as u64);
-            p.add("gpu frame › record + upload", submitted - recording - in_tracer);
-            p.stage("gpu frame › wait for GPU", submitted);
-            // Starting the encoder reads the finished frame's timestamps.
-            self.encoder.start();
-            self.started = true;
-            p.add_gpu(self.encoder.timings());
+            p.stage("gpu frame › wait for GPU", waiting);
             if let Some(t) = self.tracer.as_mut() {
-                t.collect_profile(p);
+                t.collect_profile(flight.set, p);
             }
         }
+        let host = self.sets[flight.set].output.host.unwrap();
         self.context.sync_buffer(host);
+        let (w, h) = flight.size;
         // SAFETY: the copy completed and the mapping holds w·h·4 bytes.
         let bytes = unsafe { std::slice::from_raw_parts(host.data(), (w * h * 4) as usize) }.to_vec();
         Ok(bytes)
+    }
+
+    /// With profiling: the pass timings of work still in the encoder's
+    /// command buffers (they are read as each is taken up again), once the
+    /// GPU is idle. Call before reading the profile.
+    pub fn flush_profile(&mut self) {
+        if self.profile.is_none() || !self.flights.is_empty() || !self.queue.idle(&self.context, 600_000) {
+            return;
+        }
+        // Each command buffer in turn, empty: taking it up reads what it
+        // last timed.
+        for _ in 0..RING {
+            self.queue.start(&self.context, &mut self.encoder, self.profile.as_mut());
+            self.queue.submit(&self.context, &mut self.encoder);
+        }
+        self.queue.idle(&self.context, 600_000);
     }
 }
 
@@ -859,15 +1301,10 @@ impl Gpu {
             data_layouts: &[&RasterData::layout()],
             compute: shader.at("raster"),
         });
-        // The old variant's last frame is done: every frame is waited for,
-        // and one that timed out is waited for here.
-        if let Some(sync) = self.pending.take() {
-            if !self.context.wait_for(&sync, 60_000) {
-                self.pending = Some(sync);
-            }
-        }
+        // The old variant's last frames are done once the GPU is idle.
+        let idle = self.queue.idle(&self.context, 60_000);
         if let Some((_, mut old)) = self.slang_raster.replace((program.key, pipeline)) {
-            if self.pending.is_none() {
+            if idle {
                 self.context.destroy_compute_pipeline(&mut old);
             }
         }
@@ -878,13 +1315,14 @@ impl Gpu {
     /// Records one target's visibility pass: clears its pages, draws each
     /// layer list's opaque meshes into the list's opaque page, then each
     /// see-through mesh into its own page over that list's opaque meshes.
-    fn record_vis(&mut self, plan: &TargetVis, vis_prims: &std::collections::HashMap<u32, VisPrim>, prims: &[Prim]) {
+    fn record_vis(&mut self, set: usize, plan: &TargetVis, vis_prims: &std::collections::HashMap<u32, VisPrim>, prims: &[Prim]) {
         let Some(vis) = self.vis.as_ref() else { return };
         if plan.pages.is_empty() {
             return;
         }
-        let atlas = &self.vis_atlas;
-        let (mesh, prims_buf, groups, pool) = (self.mesh.device, self.prims.device, self.groups.device, self.pool.buffer);
+        let s = &self.sets[set];
+        let atlas = &s.vis_atlas;
+        let (mesh, prims_buf, groups, pool) = (s.mesh.device, s.prims.device, s.groups.device, self.pool.buffer);
         let mut pass = self.encoder.render(
             "mesh visibility",
             gpu::RenderTargetSet {
@@ -966,40 +1404,22 @@ pub(crate) fn frame_timeout_ms(traced_paths: u64) -> u32 {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        // Work still running (a frame that timed out) writes into these
-        // buffers: freeing them under it crashes the process. Wait for it
-        // (a lost device returns at once).
-        if let Some(sync) = self.pending.take() {
-            for _ in 0..30 {
-                if self.context.wait_for(&sync, 60_000) {
-                    break;
-                }
+        // Work still running (a frame that timed out, frames begun and
+        // never finished) writes into these buffers: freeing them under it
+        // crashes the process. Wait for it (a lost device returns at once).
+        for _ in 0..30 {
+            if self.queue.idle(&self.context, 60_000) {
+                break;
             }
         }
         if let Some(mut t) = self.tracer.take() {
             t.destroy(&self.context);
         }
-        for b in [
-            &mut self.prims,
-            &mut self.ranges,
-            &mut self.indices,
-            &mut self.stops,
-            &mut self.segs,
-            &mut self.footage,
-            &mut self.ops,
-            &mut self.mesh,
-            &mut self.bins,
-            &mut self.atlas,
-            &mut self.images,
-            &mut self.groups,
-            &mut self.groups_tmp,
-            &mut self.accum,
-            &mut self.output,
-            &mut self.vis_pages,
-        ] {
-            b.destroy(&self.context);
+        for s in &mut self.sets {
+            s.destroy(&self.context);
         }
-        self.vis_atlas.destroy(&self.context);
+        self.atlas.destroy(&self.context);
+        self.images.destroy(&self.context);
         self.pool.destroy(&self.context);
         self.shaders.destroy(&self.context);
         if let Some(mut v) = self.vis.take() {

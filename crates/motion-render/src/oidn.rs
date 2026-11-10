@@ -109,23 +109,31 @@ impl Api {
     }
 }
 
-/// A committed "RT" filter for one image size, with its device buffers.
+/// A committed "RT" filter for one image size, with its device buffers:
+/// the input (colour, albedo and normal, nine floats per pixel) and the
+/// output (three).
 struct Sized {
     size: (usize, usize),
     filter: Handle,
-    buffers: [Handle; 4],
+    buffers: [Handle; 2],
 }
 
 /// The OIDN device and a filter for the last size denoised.
 pub struct Denoiser {
-    api: Api,
+    /// None: a stand-in that returns the colour it is given (tests).
+    api: Option<Api>,
     device: Handle,
     sized: Option<Sized>,
+    /// Pictures denoised (tests: once per traced list and frame).
+    pub(crate) runs: u64,
 }
 
 // SAFETY: the handles are only used from the thread that owns the Denoiser
 // (the renderer's), one call at a time.
 unsafe impl Send for Denoiser {}
+
+/// Floats per pixel of the denoiser's input: colour, albedo, normal.
+pub const INPUT_FLOATS: usize = 9;
 
 impl Denoiser {
     pub fn new() -> Result<Self, String> {
@@ -137,17 +145,25 @@ impl Denoiser {
                 return Err("Open Image Denoise: no device".into());
             }
             (api.commit_device)(device);
-            let d = Denoiser { api, device, sized: None };
+            let d = Denoiser { api: Some(api), device, sized: None, runs: 0 };
             d.check()?;
             Ok(d)
         }
     }
 
+    /// Tests: no library; `denoise` returns the colour unchanged, so what
+    /// leads to it and back can be checked without OIDN.
+    #[cfg(test)]
+    pub(crate) fn pass_through() -> Self {
+        Denoiser { api: None, device: std::ptr::null_mut(), sized: None, runs: 0 }
+    }
+
     fn check(&self) -> Result<(), String> {
+        let Some(api) = &self.api else { return Ok(()) };
         let mut msg: *const c_char = std::ptr::null();
         // SAFETY: the device is live; the message, when set, is a C string
         // owned by OIDN until the next call.
-        let code = unsafe { (self.api.device_error)(self.device, &mut msg) };
+        let code = unsafe { (api.device_error)(self.device, &mut msg) };
         if code == 0 {
             return Ok(());
         }
@@ -156,53 +172,66 @@ impl Denoiser {
     }
 
     fn release_sized(&mut self) {
-        if let Some(s) = self.sized.take() {
+        if let (Some(s), Some(api)) = (self.sized.take(), &self.api) {
             // SAFETY: handles from this device, not used after this.
             unsafe {
-                (self.api.release_filter)(s.filter);
+                (api.release_filter)(s.filter);
                 for b in s.buffers {
-                    (self.api.release_buffer)(b);
+                    (api.release_buffer)(b);
                 }
             }
         }
     }
 
-    /// Denoises `color` (linear, straight RGB) guided by `albedo` and
-    /// `normal`, all `w × h` RGB f32 rows, into `out`.
-    pub fn denoise(&mut self, w: usize, h: usize, color: &[f32], albedo: &[f32], normal: &[f32], out: &mut [f32]) -> Result<(), String> {
-        let n = w * h * 3;
-        if color.len() != n || albedo.len() != n || normal.len() != n || out.len() != n {
+    /// Denoises a `w × h` picture. `input` holds per pixel the colour
+    /// (linear, straight RGB), the albedo and the normal that guide it
+    /// (`INPUT_FLOATS` floats, as the tracer's pack pass writes them);
+    /// `output` takes the colour, three floats per pixel. The images are
+    /// read in place from the one input buffer (their offsets and the
+    /// pixel stride say where), so nothing is repacked on the way.
+    pub fn denoise(&mut self, w: usize, h: usize, input: &[f32], output: &mut [f32]) -> Result<(), String> {
+        let n = w * h;
+        if input.len() != n * INPUT_FLOATS || output.len() != n * 3 {
             return Err("denoise: image sizes differ".into());
         }
-        let bytes = n * 4;
+        self.runs += 1;
+        if self.api.is_none() {
+            for (o, i) in output.chunks_exact_mut(3).zip(input.chunks_exact(INPUT_FLOATS)) {
+                o.copy_from_slice(&i[..3]);
+            }
+            return Ok(());
+        }
+        let (in_bytes, out_bytes) = (n * INPUT_FLOATS * 4, n * 12);
         if self.sized.as_ref().map(|s| s.size) != Some((w, h)) {
             self.release_sized();
+            let api = self.api.as_ref().unwrap();
             // SAFETY: OIDN C API calls on this device; names are C strings.
             unsafe {
-                let buffers = [0; 4].map(|_| (self.api.new_buffer)(self.device, bytes));
-                let filter = (self.api.new_filter)(self.device, c"RT".as_ptr());
-                let image = |name: &str, b: Handle| {
+                let buffers = [(api.new_buffer)(self.device, in_bytes), (api.new_buffer)(self.device, out_bytes)];
+                let filter = (api.new_filter)(self.device, c"RT".as_ptr());
+                let stride = INPUT_FLOATS * 4;
+                let image = |name: &str, b: Handle, offset: usize, stride: usize| {
                     let name = CString::new(name).unwrap();
-                    (self.api.set_filter_image)(filter, name.as_ptr(), b, FORMAT_FLOAT3, w, h, 0, 0, 0);
+                    (api.set_filter_image)(filter, name.as_ptr(), b, FORMAT_FLOAT3, w, h, offset, stride, stride * w);
                 };
-                image("color", buffers[0]);
-                image("albedo", buffers[1]);
-                image("normal", buffers[2]);
-                image("output", buffers[3]);
-                (self.api.set_filter_bool)(filter, c"hdr".as_ptr(), true);
-                (self.api.commit_filter)(filter);
+                image("color", buffers[0], 0, stride);
+                image("albedo", buffers[0], 12, stride);
+                image("normal", buffers[0], 24, stride);
+                image("output", buffers[1], 0, 12);
+                (api.set_filter_bool)(filter, c"hdr".as_ptr(), true);
+                (api.commit_filter)(filter);
                 self.sized = Some(Sized { size: (w, h), filter, buffers });
             }
             self.check()?;
         }
+        let api = self.api.as_ref().unwrap();
         let s = self.sized.as_ref().unwrap();
-        // SAFETY: each buffer holds `bytes`; the slices are `n` f32 long.
+        // SAFETY: the buffers hold `in_bytes` and `out_bytes`; the slices
+        // are that long.
         unsafe {
-            (self.api.write_buffer)(s.buffers[0], 0, bytes, color.as_ptr() as *const c_void);
-            (self.api.write_buffer)(s.buffers[1], 0, bytes, albedo.as_ptr() as *const c_void);
-            (self.api.write_buffer)(s.buffers[2], 0, bytes, normal.as_ptr() as *const c_void);
-            (self.api.execute_filter)(s.filter);
-            (self.api.read_buffer)(s.buffers[3], 0, bytes, out.as_mut_ptr() as *mut c_void);
+            (api.write_buffer)(s.buffers[0], 0, in_bytes, input.as_ptr() as *const c_void);
+            (api.execute_filter)(s.filter);
+            (api.read_buffer)(s.buffers[1], 0, out_bytes, output.as_mut_ptr() as *mut c_void);
         }
         self.check()
     }
@@ -211,8 +240,10 @@ impl Denoiser {
 impl Drop for Denoiser {
     fn drop(&mut self) {
         self.release_sized();
-        // SAFETY: the device is not used after this.
-        unsafe { (self.api.release_device)(self.device) };
+        if let Some(api) = &self.api {
+            // SAFETY: the device is not used after this.
+            unsafe { (api.release_device)(self.device) };
+        }
     }
 }
 
@@ -234,10 +265,9 @@ mod tests {
             (seed >> 8) as f32 / (1u32 << 24) as f32
         };
         let color: Vec<f32> = (0..w * h * 3).map(|_| 0.5 + (rnd() - 0.5) * 0.4).collect();
-        let albedo = vec![0.8f32; w * h * 3];
-        let normal: Vec<f32> = (0..w * h).flat_map(|_| [0.0f32, 0.0, 1.0]).collect();
+        let input: Vec<f32> = color.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 0.8, 0.8, 0.8, 0.0, 0.0, 1.0]).collect();
         let mut out = vec![0.0f32; w * h * 3];
-        d.denoise(w, h, &color, &albedo, &normal, &mut out).unwrap();
+        d.denoise(w, h, &input, &mut out).unwrap();
         let sd = |v: &[f32]| {
             let m = v.iter().sum::<f32>() / v.len() as f32;
             (v.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / v.len() as f32).sqrt()

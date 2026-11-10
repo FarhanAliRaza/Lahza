@@ -361,13 +361,25 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
     progress.set_status(format!("rendering on {}", renderer.backend_label()));
     let started = Instant::now();
     let mut failed = None;
-    for n in (first..last).step_by(every as usize) {
+    // Frames go in as they are begun and come out, in order, a frame or
+    // two later: the GPU draws one while the next is built and recorded
+    // (`Renderer::push`). After the last, the rest are taken.
+    let mut times = (first..last).step_by(every as usize).map(|n| fps.time_of(n));
+    loop {
         if progress.cancel.load(Ordering::Relaxed) {
             failed = Some("cancelled".to_string());
             break;
         }
-        let frame = match renderer.try_render(compiled, fps.time_of(n)) {
-            Ok(frame) => frame,
+        let frame = match times.next() {
+            Some(t) => renderer.push(compiled, t),
+            None => match renderer.pop() {
+                Ok(None) => break,
+                taken => taken,
+            },
+        };
+        let frame = match frame {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
             Err(e) => {
                 failed = Some(e);
                 break;
@@ -389,6 +401,7 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
         }
         progress.done.fetch_add(1, Ordering::Relaxed);
     }
+    renderer.flush_profile();
     drop(tx);
     let write_result = writer.join().map_err(|_| "writer thread panicked".to_string())?;
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
