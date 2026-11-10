@@ -480,6 +480,8 @@ pub(super) struct CSlang {
     outputs: crate::slang_mesh::Outputs,
     two_sided: bool,
     bounds: Option<[[f64; 3]; 2]>,
+    /// Generators: the GPU's kernel.
+    gpu: Option<Arc<crate::slang_mesh::Kernel>>,
     /// Deformers: subdivision and reach.
     subdivide: u32,
     reach: f64,
@@ -748,7 +750,13 @@ impl Compiler<'_> {
                 }
                 let outputs = crate::slang_mesh::Outputs { normals: *normals, uvs: *uvs, segments: *segments };
                 let names: Vec<String> = params.keys().cloned().collect();
+                let gpu = self
+                    .mesh_kernels
+                    .entry((function.clone(), names.clone(), outputs))
+                    .or_insert_with(|| crate::slang_mesh::Kernel::new(&self.windows.project.shaders, function, &names, outputs).map(Arc::new))
+                    .clone();
                 CMeshShape::Slang(Box::new(CSlang {
+                    gpu,
                     call: crate::slang_mesh::generator(&self.slang, &self.windows.project.shaders, &format!("{id}.mesh"), function, &names, outputs),
                     function: function.clone(),
                     params: params.iter().map(|(k, v)| self.prop(v, id, &format!("mesh.params.{k}"), start, step, shift)).collect(),
@@ -805,6 +813,7 @@ impl Compiler<'_> {
                 outputs: Default::default(),
                 two_sided: false,
                 bounds: None,
+                gpu: None,
                 subdivide: d.subdivide.min(crate::slang_mesh::MAX_SUBDIVIDE),
                 reach: if d.reach.is_finite() { d.reach.abs() } else { 0.0 },
             }
@@ -1086,6 +1095,7 @@ impl CMesh {
                 outputs: s.outputs,
                 two_sided: s.two_sided,
                 bounds: s.bounds,
+                gpu: s.gpu.clone(),
                 generated: Default::default(),
             }),
         };

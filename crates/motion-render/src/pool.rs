@@ -4,7 +4,8 @@
 //! A fixed budget bounds the device memory; when a new mesh does not fit,
 //! the meshes used longest ago give way.
 
-use crate::mesh3d::{PoolRef, PROWS};
+use crate::mesh3d::{PoolRef, Pooled, Source, PROWS};
+use crate::mesh_gen::{Generators, Job};
 use blade_graphics as gpu;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -45,6 +46,14 @@ pub(crate) struct MeshPool {
     pub upload_bytes: u64,
     pub evictions: u64,
     pub warning: Option<String>,
+    /// Slang meshes the GPU generates in the pool, not the CPU.
+    pub generators: Generators,
+    /// What generated meshes got wrong (values that are not numbers,
+    /// triangles past their points): errors, known once their frame is
+    /// back from the GPU.
+    pub errors: Vec<String>,
+    /// Why a mesh the GPU could have generated came from the CPU.
+    pub notes: Vec<String>,
 }
 
 impl MeshPool {
@@ -62,6 +71,9 @@ impl MeshPool {
             upload_bytes: 0,
             evictions: 0,
             warning: None,
+            generators: Generators::default(),
+            errors: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -128,18 +140,50 @@ impl MeshPool {
                 self.capacity = rows;
             }
             let mut rows: Vec<[f32; 4]> = Vec::with_capacity(need);
-            // (staging row, pool row, rows) per placed mesh.
+            // (staging row, pool row, rows) per placed mesh the CPU has.
             let mut copies: Vec<(usize, u32, u32)> = Vec::new();
+            // Those the GPU generates where they are placed.
+            let mut jobs: Vec<Job> = Vec::new();
             for r in new {
                 let n = r.mesh.rows() as u32;
+                // A Slang mesh the GPU was to generate, when its kernel is
+                // not one this GPU takes: from the CPU after all.
+                let mut fallback: Option<lahza_motion_core::mesh::Mesh> = None;
+                if let Source::Generated(params) = &r.mesh.source {
+                    let ready = self.generators.ready(context, &r.mesh).unwrap_or_else(|e| {
+                        self.notes.push(e);
+                        false
+                    });
+                    if !ready {
+                        match lahza_motion_core::mesh::generate(params) {
+                            Ok(m) if m.positions.len() == r.mesh.verts as usize && m.tris.len() == r.mesh.tris as usize => fallback = Some(m),
+                            Ok(_) => continue,
+                            Err(e) => {
+                                if !self.errors.contains(&e) {
+                                    self.errors.push(e);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let Some(at) = self.alloc(n) else {
                     self.warning = Some("mesh memory budget reached; some meshes are not drawn".into());
                     continue;
                 };
-                copies.push((rows.len(), at, n));
-                r.mesh.write(&mut rows);
+                let from_cpu: Option<&lahza_motion_core::mesh::Mesh> = match &r.mesh.source {
+                    Source::Mesh(m) => Some(m),
+                    Source::Generated(_) => fallback.as_ref(),
+                };
+                match from_cpu {
+                    Some(m) => {
+                        copies.push((rows.len(), at, n));
+                        Pooled::write(m, &mut rows);
+                        self.uploads += 1;
+                    }
+                    None => jobs.push(Job { at, mesh: r.mesh.clone() }),
+                }
                 self.entries.insert(r.mesh.key.clone(), Entry { at, rows: n, used: frame, animated: r.mesh.animated });
-                self.uploads += 1;
             }
             let bytes = rows.len() * ROW;
             self.upload_bytes += bytes as u64;
@@ -161,13 +205,14 @@ impl MeshPool {
                     pass.copy_buffer_to_buffer(host.at((from * ROW) as u64), self.buffer.at(at as u64 * ROW as u64), n as u64 * ROW as u64);
                 }
             }
+            self.generators.run(context, encoder, id, self.buffer, &jobs);
         }
         let b = f32::from_bits;
         for r in refs {
             let row = &mut mesh[r.row as usize];
             match self.entries.get(r.key()) {
                 Some(e) => {
-                    let verts = (r.mesh.mesh.positions.len() * PROWS) as u32;
+                    let verts = r.mesh.verts * PROWS as u32;
                     row[0] = b(e.at);
                     row[1] = b(e.at + verts);
                 }
@@ -224,6 +269,7 @@ impl MeshPool {
     /// After frame `id`'s GPU work (and that of the frames before it):
     /// frees the buffers they were still reading.
     pub fn after_frame(&mut self, context: &gpu::Context, id: u64) {
+        self.generators.after_frame(context, id, &mut self.errors);
         self.retired.retain(|(frame, b)| {
             if *frame <= id {
                 context.destroy_buffer(*b);
@@ -234,6 +280,7 @@ impl MeshPool {
 
     pub fn destroy(&mut self, context: &gpu::Context) {
         self.after_frame(context, u64::MAX);
+        self.generators.destroy(context);
         context.destroy_buffer(self.buffer);
         if let Some((b, _)) = self.staging.take() {
             context.destroy_buffer(b);

@@ -366,6 +366,17 @@ impl MeshParams {
         matches!(&self.shape, MeshShape::Slang(s) if s.animated) || self.deform.as_ref().is_some_and(|d| d.animated)
     }
 
+    /// The Slang generator and its kernel's WGSL, when the GPU can make
+    /// this mesh itself, in its mesh pool: the kernel built, the layer
+    /// gives `bounds` (the CPU places and culls the mesh by them without
+    /// its points), and nothing moves the points afterwards.
+    pub fn gpu_generator(&self) -> Option<(&crate::slang_mesh::SlangShape, &std::sync::Arc<str>)> {
+        let MeshShape::Slang(s) = &self.shape else { return None };
+        let wgsl = s.gpu.as_ref()?.wgsl()?;
+        let fits = s.bounds.is_some() && self.displace.is_none() && self.deform.is_none() && s.vertices > 0 && s.triangles > 0 && s.params.len() <= crate::slang_mesh::GPU_PARAMS;
+        fits.then_some((s, wgsl))
+    }
+
     /// What generation will change from the parameters asked for (bevels
     /// and tubes too big for the shape), as messages for `check`.
     pub fn adjustments(&self) -> Vec<String> {
@@ -626,7 +637,14 @@ pub fn generate(params: &MeshParams) -> Result<Mesh, String> {
 /// revolved surfaces around their axis (caps planar), rings around and
 /// across the tube, flat faces planar by the axis they face.
 fn set_uvs(mesh: &mut Mesh, shape: &MeshShape) {
-    let (lo, hi) = mesh.bounds();
+    // A Slang mesh with `bounds` spreads its planar UVs over that box, not
+    // the box its points fill at the moment: the picture on an animated
+    // mesh stays where it is as the points move (and the GPU, generating
+    // the mesh itself, has the same box).
+    let (lo, hi) = match shape {
+        MeshShape::Slang(crate::slang_mesh::SlangShape { bounds: Some([lo, hi]), .. }) => (lo.map(|v| v as f32), hi.map(|v| v as f32)),
+        _ => mesh.bounds(),
+    };
     let span = |k: usize| ((hi[k] - lo[k]) as f64).max(1e-6);
     let unit = |v: f64, k: usize| ((v - lo[k] as f64) / span(k)) as f32;
     let around = |a: f64, b: f64| (0.5 + a.atan2(b) / TAU) as f32;

@@ -23,6 +23,7 @@ pub mod profile;
 pub mod pt;
 pub mod model;
 mod oidn;
+mod mesh_gen;
 mod pool;
 pub mod raster;
 pub mod shader;
@@ -261,6 +262,7 @@ impl Renderer {
         w.extend(self.fallbacks.iter().cloned());
         w.extend(self.gpu.as_ref().and_then(|g| g.denoise_warning()));
         w.extend(self.gpu.as_ref().and_then(|g| g.pool_warning()));
+        w.extend(self.gpu.iter().flat_map(|g| g.pool_notes().iter().cloned()));
         w.sort();
         w.dedup();
         w
@@ -274,6 +276,7 @@ impl Renderer {
         d.extend(self.fonts.warnings.iter().cloned());
         d.extend(self.footage.warnings.iter().cloned());
         d.extend(self.meshes.dropped.iter().cloned());
+        d.extend(self.gpu.iter().flat_map(|g| g.pool_errors().iter().cloned()));
         d.sort();
         d.dedup();
         d

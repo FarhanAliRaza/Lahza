@@ -45,6 +45,13 @@ pub struct MeshCache {
     sides: HashMap<usize, Arc<Vec<f32>>>,
     /// Per generated mesh: the mesh as the GPU's mesh pool takes it.
     pooled: HashMap<usize, Arc<Pooled>>,
+    /// Slang meshes the GPU generates in its pool (`Pooled::generated`),
+    /// by key, with the frame that last drew each.
+    generated: HashMap<Vec<u8>, (Arc<Pooled>, u64)>,
+    /// Whether the GPU generates the Slang meshes it can (not with
+    /// `LAHZA_SLANG_MESH_CPU=1`: the CPU then generates them all, to
+    /// compare).
+    pub(crate) gpu_geometry: bool,
     /// Lists are being built for the GPU's visibility pass: mesh layers
     /// become instances of pooled meshes (`Batch::add_instance`).
     compact: bool,
@@ -135,7 +142,8 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
 impl MeshCache {
     /// `root`: the project folder.
     pub fn new(root: Option<&std::path::Path>) -> Self {
-        Self { root: root.map(std::path::Path::to_path_buf), ..Default::default() }
+        let gpu_geometry = std::env::var_os("LAHZA_SLANG_MESH_CPU").is_none_or(|v| v.is_empty() || v == "0");
+        Self { root: root.map(std::path::Path::to_path_buf), gpu_geometry, ..Default::default() }
     }
 
     pub(crate) fn begin(&mut self, compact: bool) {
@@ -149,6 +157,8 @@ impl MeshCache {
         // Animated Slang geometry is new every frame: only the last frame's
         // is kept, however big it is.
         let frame = self.frame;
+        // (Nothing to keep of a mesh the GPU makes but its parameters.)
+        self.generated.retain(|_, (_, used)| *used + 2 > frame);
         let gone = |used: u64, animated: bool| animated && used + 1 < frame;
         let full = self.meshes.len() > 96;
         if full || self.meshes.values().any(|(_, used, animated)| gone(*used, *animated)) {
@@ -296,7 +306,7 @@ impl MeshCache {
                     continue;
                 }
                 let Some(pooled) = self.pooled(&rm.state) else { continue };
-                if pooled.mesh.tris.is_empty() {
+                if pooled.tris == 0 {
                     continue;
                 }
                 let mv = rm.state.camera.view.then(rm.state.world);
@@ -306,7 +316,7 @@ impl MeshCache {
                     casters.rows.push([a[k * 4] as f32, a[k * 4 + 1] as f32, a[k * 4 + 2] as f32, a[k * 4 + 3] as f32]);
                 }
                 let b = f32::from_bits;
-                casters.rows.push([b(0), b(0), b(pooled.mesh.tris.len() as u32), b(if det < 0.0 { INST_MIRRORED } else { 0 })]);
+                casters.rows.push([b(0), b(0), b(pooled.tris), b(if det < 0.0 { INST_MIRRORED } else { 0 })]);
                 let (lo, hi) = (pooled.lo, pooled.hi);
                 boxes.push(std::array::from_fn(|k| {
                     let q = mv.apply(if k & 1 != 0 { hi[0] } else { lo[0] }, if k & 2 != 0 { hi[1] } else { lo[1] }, if k & 4 != 0 { hi[2] } else { lo[2] });
@@ -474,6 +484,19 @@ impl MeshCache {
 
     /// The generated mesh as the GPU's mesh pool takes it.
     fn pooled(&mut self, m: &MeshState) -> Option<Arc<Pooled>> {
+        // A Slang mesh the GPU generates itself: nothing to make here.
+        if self.gpu_geometry && m.params.gpu_generator().is_some() {
+            let key = m.params.key();
+            if let Some((p, used)) = self.generated.get_mut(&key) {
+                *used = self.frame;
+                return Some(p.clone());
+            }
+            if let Some(p) = Pooled::generated(key.clone().into(), m.params.clone()) {
+                let p = Arc::new(p);
+                self.generated.insert(key, (p.clone(), self.frame));
+                return Some(p);
+            }
+        }
         let mesh = self.get(m)?;
         let at = Arc::as_ptr(&mesh) as usize;
         if let Some(p) = self.pooled.get(&at) {
@@ -547,7 +570,10 @@ pub(crate) const VROWS: usize = 4;
 pub(crate) struct Pooled {
     /// The mesh parameters: identifies the geometry across frames.
     pub key: Arc<[u8]>,
-    pub mesh: Arc<Mesh>,
+    pub source: Source,
+    /// Points and triangles it has.
+    pub verts: u32,
+    pub tris: u32,
     /// Object-space bounding box (placement bounds without the vertices).
     lo: [f64; 3],
     hi: [f64; 3],
@@ -557,6 +583,15 @@ pub(crate) struct Pooled {
     /// New every frame (`MeshParams::animated`): the pool frees it as soon
     /// as a frame does not draw it.
     pub animated: bool,
+}
+
+/// Where a pooled mesh's rows come from.
+pub(crate) enum Source {
+    /// The CPU's mesh, uploaded.
+    Mesh(Arc<Mesh>),
+    /// The GPU generates it in the pool from the project's Slang
+    /// (`mesh_gen.rs`): only its parameters are here.
+    Generated(Arc<mesh::MeshParams>),
 }
 
 /// Pool rows per vertex: [position, u], [normal, v].
@@ -578,21 +613,35 @@ impl Pooled {
             let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
             segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
         }
-        Self { key, mesh, lo, hi, segments, animated }
+        Self { key, verts: mesh.positions.len() as u32, tris: mesh.tris.len() as u32, source: Source::Mesh(mesh), lo, hi, segments, animated }
+    }
+
+    /// A Slang mesh the GPU generates (`MeshParams::gpu_generator`): its
+    /// counts and the layer's `bounds` stand for the points the CPU does
+    /// not have.
+    fn generated(key: Arc<[u8]>, params: Arc<mesh::MeshParams>) -> Option<Self> {
+        let (s, _) = params.gpu_generator()?;
+        let [lo, hi] = s.bounds?;
+        let mut segments = [0u32; PARTS];
+        // Every triangle is `front`; which colours the author's
+        // `_segment` picks is the GPU's to know: all the layer has.
+        segments[mesh::PART_FRONT as usize] = if s.outputs.segments { 1 << 16 } else { 1 };
+        let (verts, tris, animated) = (s.vertices, s.triangles, params.animated());
+        Some(Self { key, verts, tris, source: Source::Generated(params), lo, hi, segments, animated })
     }
 
     /// Rows the mesh takes in the pool.
     pub(crate) fn rows(&self) -> usize {
-        self.mesh.positions.len() * PROWS + self.mesh.tris.len()
+        self.verts as usize * PROWS + self.tris as usize
     }
 
-    /// The pool rows: per vertex [position, u] [normal, v], then per
-    /// triangle [vertex ids, packed] with packed = segment (bits 0..16), part
-    /// (16..19), real-edge mask (19..22), two-sided (22) and which winding
-    /// faces out (23..25: 1 as wound, 2 reversed), taken from the vertex
-    /// normals once here rather than per frame.
-    pub(crate) fn write(&self, out: &mut Vec<[f32; 4]>) {
-        let m = &*self.mesh;
+    /// The pool rows of a mesh the CPU has: per vertex [position, u]
+    /// [normal, v], then per triangle [vertex ids, packed] with packed =
+    /// segment (bits 0..16), part (16..19), real-edge mask (19..22),
+    /// two-sided (22) and which winding faces out (23..25: 1 as wound, 2
+    /// reversed), taken from the vertex normals once here rather than per
+    /// frame. (meshgen.wgsl writes the same for a mesh the GPU generates.)
+    pub(crate) fn write(m: &Mesh, out: &mut Vec<[f32; 4]>) {
         for (i, p) in m.positions.iter().enumerate() {
             let n = m.normals.get(i).copied().unwrap_or([0.0; 3]);
             let uv = m.uvs.get(i).copied().unwrap_or([0.0; 2]);
@@ -654,7 +703,7 @@ impl PartialEq for PoolRef {
 
 impl std::fmt::Debug for PoolRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PoolRef(row {}, {} triangles)", self.row, self.mesh.mesh.tris.len())
+        write!(f, "PoolRef(row {}, {} triangles)", self.row, self.mesh.tris)
     }
 }
 
@@ -1804,7 +1853,7 @@ impl Batch {
     fn add_instance(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
         let Some(pooled) = cache.pooled(m) else { return };
         self.layers += 1;
-        let tris = pooled.mesh.tris.len();
+        let tris = pooled.tris as usize;
         if tris == 0 {
             return;
         }

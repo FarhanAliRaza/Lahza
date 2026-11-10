@@ -4,6 +4,7 @@ use super::*;
 use lahza_motion_core::document::{Project, Scene};
 use lahza_motion_core::time::Fps;
 use serde_json::json;
+use std::sync::Arc;
 
 fn cpu() -> Renderer {
     Renderer::new(None, RenderOptions { backend: Backend::Cpu, ..Default::default() })
@@ -1045,8 +1046,8 @@ fn a_wall_of_instanced_tiles_leaves_the_other_meshes_drawn() {
     let state = c.frame(0.0);
     let mut r = cpu();
     let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, seed: 0, compact: true }.build(&state);
-    let tiles = list.pool.iter().filter(|x| x.mesh.mesh.tris.len() == list.pool[0].mesh.mesh.tris.len()).count();
-    let triangles: usize = list.pool.iter().map(|x| x.mesh.mesh.tris.len()).sum();
+    let tiles = list.pool.iter().filter(|x| x.mesh.tris as usize == list.pool[0].mesh.tris as usize).count();
+    let triangles: usize = list.pool.iter().map(|x| x.mesh.tris as usize).sum();
     assert!(triangles > 2 * 4_000_000, "the wall is over four million triangles: {}", triangles / 2);
     // (Each mesh twice: drawn, and as a caster of the list's shadow map.)
     assert_eq!(tiles, 2 * 66 * 36, "every tile is an instance");
@@ -1190,4 +1191,328 @@ fn lists_for_the_gpu_leave_their_shadow_maps_to_it() {
     assert_eq!(gpu_list.pool.iter().filter(|r| r.row >= first && r.row < first + 3 * crate::mesh3d::CROWS as u32).count(), 3);
     // Two 1024² maps are half a million rows of texels the CPU's list holds.
     assert!(cpu_list.mesh.len() > gpu_list.mesh.len() + 400_000, "{} rows for the CPU, {} for the GPU", cpu_list.mesh.len(), gpu_list.mesh.len());
+}
+
+/// What slangc makes of `slang_mesh::KERNEL` for a generator `wave` (a
+/// dome over a grid of `WAVE_CELLS` cells, params size and height), written
+/// by hand: Slang's names for the globals, its binding attributes, the
+/// author's values written as bits. `bad`: point 7 is not a number and
+/// triangle 5 names a point the mesh does not have.
+fn wave_kernel(out: lahza_motion_core::slang_mesh::Outputs, bad: bool) -> String {
+    let normal = if out.normals { "wave_normal(i, t, size, height)" } else { "vec3<f32>(0.0)" };
+    let uv = if out.uvs { "vec2<f32>(f32(i % (CELLS + 1u)), f32(i / (CELLS + 1u))) / f32(CELLS)" } else { "vec2<f32>(0.0)" };
+    let segment = if out.segments { "((i / 2u) % CELLS) * 3u / CELLS" } else { "0u" };
+    let (bad_point, bad_triangle) = if bad { ("if i == 7u { let z = f32(u_mesh_0.counts_0.w); v.y = z / z; }", "if i == 5u { k.z = 99999u; }") } else { ("", "") };
+    format!(
+        r#"
+struct LahzaMeshPass_std140_0 {{
+    @align(16) counts_0 : vec4<u32>,
+    @align(16) time_0 : vec4<f32>,
+    @align(16) params_0 : array<vec4<f32>, i32(8)>,
+}};
+@binding(0) @group(0) var<uniform> u_mesh_0 : LahzaMeshPass_std140_0;
+@binding(1) @group(0) var<storage, read_write> b_mesh_0 : array<vec4<u32>>;
+
+const CELLS: u32 = {WAVE_CELLS}u;
+
+fn wave_grid(i: u32) -> vec2<f32> {{
+    let n = CELLS + 1u;
+    return vec2<f32>(f32(i % n), f32(i / n)) / f32(CELLS) * 2.0 - 1.0;
+}}
+fn wave_position(i: u32, t: f32, size: f32, height: f32) -> vec3<f32> {{
+    let g = wave_grid(i);
+    return vec3<f32>(g * size * 0.5, -height * (1.0 + 0.5 * t) * (1.0 - g.x * g.x) * (1.0 - g.y * g.y));
+}}
+fn wave_normal(i: u32, t: f32, size: f32, height: f32) -> vec3<f32> {{
+    let g = wave_grid(i);
+    let h = -height * (1.0 + 0.5 * t);
+    let slope = vec2<f32>(-2.0 * g.x * (1.0 - g.y * g.y), -2.0 * g.y * (1.0 - g.x * g.x)) * h / (size * 0.5);
+    return vec3<f32>(slope, -1.0) * 3.0;
+}}
+fn wave_triangle(j: u32) -> vec3<u32> {{
+    let n = CELLS + 1u;
+    let q = j / 2u;
+    let a = (q / CELLS) * n + q % CELLS;
+    if j % 2u == 0u {{
+        return vec3<u32>(a, a + n, a + 1u);
+    }}
+    return vec3<u32>(a + 1u, a + n, a + n + 1u);
+}}
+
+@compute @workgroup_size(64, 1, 1)
+fn lahza_mesh(@builtin(global_invocation_id) id : vec3<u32>) {{
+    let i = id.x;
+    let t = u_mesh_0.time_0.x;
+    let size = u_mesh_0.params_0[0].x;
+    let height = u_mesh_0.params_0[0].y;
+    if u_mesh_0.counts_0.w == 0u {{
+        if i >= u_mesh_0.counts_0.x {{
+            return;
+        }}
+        var v = wave_position(i, t, size, height);
+        {bad_point}
+        let n = {normal};
+        let w = {uv};
+        let at = u_mesh_0.counts_0.z + i * 2u;
+        b_mesh_0[at] = vec4<u32>(bitcast<vec3<u32>>(v), bitcast<u32>(w.x));
+        b_mesh_0[at + 1u] = vec4<u32>(bitcast<vec3<u32>>(n), bitcast<u32>(w.y));
+    }} else {{
+        if i >= u_mesh_0.counts_0.y {{
+            return;
+        }}
+        var k = wave_triangle(i);
+        {bad_triangle}
+        let s = {segment};
+        b_mesh_0[u_mesh_0.counts_0.z + u_mesh_0.counts_0.x * 2u + i] = vec4<u32>(k, s);
+    }}
+}}
+"#
+    )
+}
+
+const WAVE_CELLS: u32 = 40;
+
+/// The generator `wave_kernel` stands for, as a layer's mesh at local
+/// time `t`: its kernel for the GPU and, for the CPU (there is no library
+/// to call), the mesh `SlangShape::generate` makes of the same values.
+fn wave_shape(out: lahza_motion_core::slang_mesh::Outputs, two_sided: bool, t: f32, kernel: Option<&str>) -> lahza_motion_core::slang_mesh::SlangShape {
+    use lahza_motion_core::slang_mesh::{Generated, Kernel, SlangShape};
+    let (size, height) = (360.0f32, 90.0f32);
+    let (cells, n) = (WAVE_CELLS, WAVE_CELLS + 1);
+    let grid = |i: u32| [(i % n) as f32 / cells as f32 * 2.0 - 1.0, (i / n) as f32 / cells as f32 * 2.0 - 1.0];
+    let (mut pos, mut nor, mut uv, mut tri, mut seg) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for i in 0..n * n {
+        let g = grid(i);
+        let h = -height * (1.0 + 0.5 * t);
+        pos.extend([g[0] * size * 0.5, g[1] * size * 0.5, h * (1.0 - g[0] * g[0]) * (1.0 - g[1] * g[1])]);
+        if out.normals {
+            let k = h / (size * 0.5);
+            nor.extend([-2.0 * g[0] * (1.0 - g[1] * g[1]) * k * 3.0, -2.0 * g[1] * (1.0 - g[0] * g[0]) * k * 3.0, -3.0]);
+        }
+        if out.uvs {
+            uv.extend([(i % n) as f32 / cells as f32, (i / n) as f32 / cells as f32]);
+        }
+    }
+    for j in 0..cells * cells * 2 {
+        let q = j / 2;
+        let a = (q / cells) * n + q % cells;
+        tri.extend(if j % 2 == 0 { [a, a + n, a + 1] } else { [a + 1, a + n, a + n + 1] });
+        if out.segments {
+            seg.push((q % cells) * 3 / cells);
+        }
+    }
+    let mut shape = SlangShape {
+        function: "wave".into(),
+        call: lahza_motion_core::slang::Linker::default().export("lahza_mesh_wave_test", String::new),
+        vertices: n * n,
+        triangles: cells * cells * 2,
+        params: vec![size, height],
+        time: t,
+        animated: true,
+        outputs: out,
+        two_sided,
+        bounds: Some([[-180.0, -180.0, -150.0], [180.0, 180.0, 0.0]]),
+        gpu: Some(Arc::new(Kernel::stand_in("wave", kernel.unwrap_or(&wave_kernel(out, false))))),
+        generated: Default::default(),
+    };
+    shape.generated = Generated::of(shape.assemble(&pos, &nor, &uv, &tri, &seg).unwrap());
+    shape
+}
+
+/// A lit scene whose one mesh layer is `shape`, at `turn` degrees about y.
+fn wave_states(shape: lahza_motion_core::slang_mesh::SlangShape, turn: f64) -> Vec<lahza_motion_core::compile::FrameState> {
+    use lahza_motion_core::compile::Content;
+    let p = scene(
+        640,
+        400,
+        json!({"lights": [{"type": "ambient", "intensity": 0.25}, {"type": "directional", "from": [-0.5, -0.7, -1.0], "intensity": 1.0, "shadow": true}],
+        "layers": [
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 700]}, "material": {"preset": "matte", "color": "#d8d2c6"}, "transform": {"position": [320, 200], "z": 60}},
+            {"id": "wave", "kind": "mesh", "mesh": {"type": "plane", "size": [10, 10]}, "colors": ["#ff3b5c", "#ffd23f", "#2ec4ff"],
+             "material": {"preset": "plastic"}, "transform": {"position": [320, 200], "rotation_y": turn, "rotation_x": 20}}]}),
+    );
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let mut state = c.frame(0.0);
+    for layer in state.layers.iter_mut().filter(|l| &*l.id == "wave") {
+        let Content::Mesh(m) = &mut layer.content else { panic!("a mesh layer") };
+        let mut params = (*m.params).clone();
+        params.shape = lahza_motion_core::mesh::MeshShape::Slang(shape.clone());
+        m.params = Arc::new(params);
+    }
+    vec![state]
+}
+
+/// A Slang mesh the GPU generates in its mesh pool is the mesh the CPU
+/// generates and uploads: with the author's normals, UVs and segments and
+/// without (smooth normals from the faces, planar UVs), open and closed
+/// (which side of a triangle is out), over time; and its shadow.
+#[test]
+fn the_gpu_generates_slang_meshes_in_its_pool() {
+    use lahza_motion_core::slang_mesh::Outputs;
+    let (Some(mut gpu), Some(mut cpu)) = (vis_gpu(), vis_gpu()) else { return };
+    // The same GPU raster, the mesh from the CPU.
+    cpu.meshes.gpu_geometry = false;
+    let all = Outputs { normals: true, uvs: true, segments: true };
+    let mut frames = 0;
+    let mut shown = Vec::new();
+    for (out, two_sided, turn) in [(Outputs::default(), true, 0.0), (all, false, 0.0), (all, false, 180.0), (Outputs { segments: true, ..Default::default() }, false, 25.0)] {
+        for t in [0.0f32, 1.0] {
+            let states = wave_states(wave_shape(out, two_sided, t, None), turn);
+            let (a, b) = (gpu.try_render_states(&states).unwrap(), cpu.try_render_states(&states).unwrap());
+            frames += 1;
+            let (mean, worst) = difference(&a, &b);
+            assert!(mean < 0.02 && worst <= 24, "{out:?} two-sided {two_sided} turned {turn} at {t}: mean difference {mean:.4}, worst {worst}");
+            let floor = a.get_pixel(40, 200).0;
+            shown.push(a.pixels().filter(|p| (0..3).any(|k| p.0[k].abs_diff(floor[k]) > 40)).count());
+        }
+    }
+    // The mesh is there (not empty frames alike): seen from behind, the
+    // closed one is culled, and only its shadow shows.
+    assert!(shown[0] > 4000 && shown[2] > 4000 && shown[6] > 4000 && shown[4] > 100 && shown[4] * 4 < shown[2], "pixels of the mesh and its shadow: {shown:?}");
+    let ((generated, _), (none, uploads)) = (gpu.gpu.as_ref().unwrap().pool_counts(), cpu.gpu.as_ref().unwrap().pool_counts());
+    assert_eq!((generated, none), (frames, 0), "a mesh generated per frame on one, none on the other");
+    assert!(uploads >= frames, "{uploads} uploads");
+    assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
+    // Over time the mesh changes (the frames above were not one picture).
+    let at = |r: &mut Renderer, t: f32| r.try_render_states(&wave_states(wave_shape(all, false, t, None), 0.0)).unwrap();
+    assert!(difference(&at(&mut gpu, 0.0), &at(&mut gpu, 1.0)).0 > 0.5);
+}
+
+/// What the CPU reports of a generated mesh (a value that is not a
+/// number, a triangle naming a point the mesh does not have) the GPU
+/// reports too, once the frame is back; the rest of the mesh is drawn.
+#[test]
+fn a_gpu_generated_mesh_reports_what_is_wrong_with_it() {
+    use lahza_motion_core::slang_mesh::Outputs;
+    let Some(mut gpu) = vis_gpu() else { return };
+    let out = Outputs::default();
+    let good = gpu.try_render_states(&wave_states(wave_shape(out, true, 0.0, None), 0.0)).unwrap();
+    assert!(gpu.dropped().is_empty(), "{:?}", gpu.dropped());
+    let bad = gpu.try_render_states(&wave_states(wave_shape(out, true, 0.5, Some(&wave_kernel(out, true))), 0.0)).unwrap();
+    let dropped = gpu.dropped();
+    let n = (WAVE_CELLS + 1) * (WAVE_CELLS + 1);
+    assert_eq!(
+        dropped,
+        [
+            "slang mesh 'wave': 1 of its points have a position, normal or UV that is not a number (the first is point 7); they are drawn at the origin".to_string(),
+            format!("slang mesh 'wave': 1 of its triangles name points it does not have (the first is wave_triangle(5), past the {n} vertices); they are not drawn"),
+        ]
+    );
+    let floor = bad.get_pixel(40, 200).0;
+    let drawn = |img: &image::RgbaImage| img.pixels().filter(|p| (0..3).any(|k| p.0[k].abs_diff(floor[k]) > 40)).count();
+    assert!(drawn(&bad) * 10 > drawn(&good) * 8, "{} pixels of the bad mesh, {} of the good", drawn(&bad), drawn(&good));
+}
+
+/// A kernel this GPU does not take as WGSL is not a lost mesh: the CPU
+/// generates it, and the render says so once.
+#[test]
+fn a_kernel_the_gpu_refuses_falls_back_to_the_cpu() {
+    use lahza_motion_core::slang_mesh::Outputs;
+    let (Some(mut gpu), Some(mut cpu)) = (vis_gpu(), vis_gpu()) else { return };
+    cpu.meshes.gpu_geometry = false;
+    let out = Outputs { normals: true, ..Default::default() };
+    for t in [0.0, 1.0] {
+        let states = wave_states(wave_shape(out, true, t, Some("fn lahza_mesh() { this is not WGSL }")), 0.0);
+        let (a, b) = (gpu.try_render_states(&states).unwrap(), cpu.try_render_states(&states).unwrap());
+        assert_eq!(difference(&a, &b), (0.0, 0), "at {t}");
+    }
+    assert_eq!(gpu.gpu.as_ref().unwrap().pool_counts().0, 0);
+    assert_eq!(gpu.warnings(), ["slang mesh 'wave': its GPU kernel is not WGSL this GPU takes (compilation failed); the CPU generates it"]);
+    assert!(gpu.dropped().is_empty(), "{:?}", gpu.dropped());
+}
+
+/// Which meshes the GPU generates: Slang generators whose layer gives
+/// `bounds`, with nothing moving their points afterwards. The others come
+/// from the CPU as before.
+#[test]
+fn only_meshes_the_cpu_need_not_see_are_generated_on_the_gpu() {
+    use lahza_motion_core::mesh::MeshShape;
+    let shape = wave_shape(Default::default(), true, 0.0, None);
+    let states = wave_states(shape.clone(), 0.0);
+    let lahza_motion_core::compile::Content::Mesh(m) = &states[0].layers.iter().find(|l| &*l.id == "wave").unwrap().content else { panic!() };
+    assert!(m.params.gpu_generator().is_some());
+    let with = |change: &dyn Fn(&mut lahza_motion_core::mesh::MeshParams)| {
+        let mut p = (*m.params).clone();
+        change(&mut p);
+        p.gpu_generator().is_some()
+    };
+    let slang = |p: &mut lahza_motion_core::mesh::MeshParams, change: &dyn Fn(&mut lahza_motion_core::slang_mesh::SlangShape)| {
+        if let MeshShape::Slang(s) = &mut p.shape {
+            change(s)
+        }
+    };
+    assert!(!with(&|p| slang(p, &|s| s.bounds = None)), "no bounds: the CPU measures the points");
+    assert!(!with(&|p| slang(p, &|s| s.gpu = None)), "no kernel");
+    assert!(!with(&|p| slang(p, &|s| s.triangles = 0)), "nothing to generate");
+    assert!(!with(&|p| slang(p, &|s| s.params = vec![0.0; 33])), "more params than the kernel's uniform holds");
+    assert!(!with(&|p| p.displace = Some((lahza_motion_core::mesh::Displacement::Image("h.png".into()), 4.0))), "displaced on the CPU");
+    assert!(!with(&|p| p.shape = MeshShape::Sphere { radius: 40.0 }), "not Slang");
+}
+
+/// With slangc: a project's own generators, run by the GPU as the kernel
+/// slangc makes of them, draw the meshes the CPU generates from the same
+/// functions (animated, with and without the author's normals, UVs and
+/// segments, open and closed).
+#[test]
+fn the_gpu_runs_the_projects_generators() {
+    if lahza_motion_core::slang::compiler().is_err() {
+        return;
+    }
+    let (Some(mut gpu), Some(mut cpu)) = (vis_gpu(), vis_gpu()) else { return };
+    cpu.meshes.gpu_geometry = false;
+    let mut p = scene(
+        640,
+        400,
+        json!({"lights": [{"type": "ambient", "intensity": 0.25}, {"type": "directional", "from": [-0.5, -0.7, -1.0], "intensity": 1.0, "shadow": true}],
+        "layers": [
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 700]}, "material": {"preset": "matte", "color": "#d8d2c6"}, "transform": {"position": [320, 200], "z": 60}},
+            {"id": "dome", "kind": "mesh", "colors": ["#ff3b5c", "#ffd23f", "#2ec4ff"], "material": {"preset": "plastic"},
+             "mesh": {"type": "slang", "function": "dome", "vertices": 1681, "triangles": 3200, "animated": true, "normals": true, "uvs": true, "segments": true, "one_sided": true,
+                      "params": {"size": 240, "height": 70}, "bounds": [[-120, -120, -140], [120, 120, 0]]},
+             "transform": {"position": [190, 200], "rotation_x": 20}},
+            {"id": "plain", "kind": "mesh", "material": {"preset": "plastic", "color": "#7b61ff"},
+             "mesh": {"type": "slang", "function": "dome", "vertices": 1681, "triangles": 3200, "animated": true,
+                      "params": {"size": 240}, "bounds": [[-120, -120, -140], [120, 120, 0]]},
+             "transform": {"position": [450, 200], "rotation_y": -25}}]}),
+    );
+    p.shaders.push(lahza_motion_core::slang::Shader {
+        name: "geo".into(),
+        source: "
+struct dome_params { float size = 200; float height = 90; }
+static const uint CELLS = 40;
+float2 dome_grid(uint i) { uint n = CELLS + 1; return float2(float(i % n), float(i / n)) / float(CELLS) * 2.0 - 1.0; }
+float3 dome_position(uint i, float t, dome_params p) {
+    float2 g = dome_grid(i);
+    return float3(g * p.size * 0.5, -p.height * (1.0 + 0.5 * t) * (1.0 - g.x * g.x) * (1.0 - g.y * g.y));
+}
+float3 dome_normal(uint i, float t, dome_params p) {
+    float2 g = dome_grid(i);
+    float h = -p.height * (1.0 + 0.5 * t);
+    return float3(float2(-2.0 * g.x * (1.0 - g.y * g.y), -2.0 * g.y * (1.0 - g.x * g.x)) * h / (p.size * 0.5), -1.0) * 3.0;
+}
+float2 dome_uv(uint i, float t, dome_params p) { return dome_grid(i) * 0.5 + 0.5; }
+uint3 dome_triangle(uint j, float t, dome_params p) {
+    uint n = CELLS + 1, q = j / 2;
+    uint a = (q / CELLS) * n + q % CELLS;
+    return (j % 2 == 0) ? uint3(a, a + n, a + 1) : uint3(a + 1, a + n, a + n + 1);
+}
+uint dome_segment(uint j, float t, dome_params p) { return ((j / 2) % CELLS) * 3 / CELLS; }
+"
+        .into(),
+    });
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    for t in [0.0, 0.5, 1.0] {
+        let (a, b) = (gpu.render(&c, t), cpu.render(&c, t));
+        let (mean, worst) = difference(&a, &b);
+        assert!(mean < 0.05 && worst <= 32, "at {t}: mean difference {mean:.4}, worst {worst}");
+        let floor = a.get_pixel(40, 380).0;
+        let shown = a.pixels().filter(|p| (0..3).any(|k| p.0[k].abs_diff(floor[k]) > 40)).count();
+        assert!(shown > 8000, "at {t}: {shown} pixels of the meshes");
+    }
+    let ((generated, _), (none, uploads)) = (gpu.gpu.as_ref().unwrap().pool_counts(), cpu.gpu.as_ref().unwrap().pool_counts());
+    assert_eq!((generated, none), (6, 0), "two meshes generated a frame on one, none on the other");
+    assert!(uploads >= 6, "{uploads} uploads");
+    assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
 }

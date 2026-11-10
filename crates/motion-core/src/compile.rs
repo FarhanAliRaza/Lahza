@@ -808,6 +808,9 @@ struct Compiler<'a> {
     surfaces: crate::surface::Surfaces,
     /// Shader layers' functions, by function and argument components.
     programs: HashMap<(String, Vec<(String, usize)>), Arc<crate::slang_layer::Program>>,
+    /// Slang meshes' GPU kernels, by function, param names and outputs
+    /// (None: the GPU cannot take that one).
+    mesh_kernels: HashMap<(String, Vec<String>, crate::slang_mesh::Outputs), Option<Arc<crate::slang_mesh::Kernel>>>,
     errors: Vec<String>,
     syncs: Vec<SyncRecord>,
     events: Vec<VisualEvent>,
@@ -1439,7 +1442,7 @@ impl Compiled {
             errors.push("settings.duration must be positive".into());
         }
         let windows = Windows::new(project, base, &mut errors);
-        let mut c = Compiler { windows, slang: Default::default(), surfaces: Default::default(), programs: HashMap::new(), errors, syncs: Vec::new(), events: Vec::new() };
+        let mut c = Compiler { windows, slang: Default::default(), surfaces: Default::default(), programs: HashMap::new(), mesh_kernels: HashMap::new(), errors, syncs: Vec::new(), events: Vec::new() };
         let mut scenes = Vec::new();
         for scene in &project.scenes {
             let id = scene.id.as_str();
@@ -1549,6 +1552,13 @@ impl Compiled {
                         if let Err(e) = p.build_gpu(&modules) {
                             c.errors.push(format!("shader '{}' (GPU): {e}", p.function));
                         }
+                    }
+                    // Slang meshes' GPU kernels, likewise. One that does
+                    // not build is no error: the CPU generates that mesh,
+                    // as it does for the CPU renderer and the path tracer.
+                    // (The kernel keeps why, for the renderer's warning.)
+                    for k in c.mesh_kernels.values().flatten() {
+                        k.build_gpu(&modules);
                     }
                 }
                 // An error in Lahza's generated callers: arguments that do

@@ -69,7 +69,7 @@ pub fn paint_cpu(pass: &ShaderPass, g: &Group, groups: &mut [[f32; 4]], threads:
 
 /// `wgsl` without Slang's `@binding(n) @group(n)` attributes: blade
 /// binds globals by name and lays out the groups itself.
-fn unbound(wgsl: &str) -> String {
+pub(crate) fn unbound(wgsl: &str) -> String {
     let mut out = String::with_capacity(wgsl.len());
     let mut rest = wgsl;
     while let Some(i) = rest.find('@') {

@@ -4,14 +4,19 @@
 //! `docs/slang/geometry.md` for the contract.
 //!
 //! Lahza exports one C function per use (`lahza_mesh_…`) that loops over
-//! points and triangles in native code; the CPU renderer, the GPU's mesh
-//! pool and the path tracer all take the mesh from that one generation.
-//! A mesh depends only on its parameters (the library's build, counts,
-//! param values and, when animated, the time), so it is cached by them
-//! like every other mesh.
+//! points and triangles in native code; the CPU renderer and the path
+//! tracer take the mesh from that generation. A mesh depends only on its
+//! parameters (the library's build, counts, param values and, when
+//! animated, the time), so it is cached by them like every other mesh.
+//!
+//! A generator is also a compute kernel (`Kernel`): the GPU renderer runs
+//! it to write the mesh straight into its mesh pool, where the layer gives
+//! `bounds` (the one thing the CPU needs from the points) and nothing else
+//! moves the points afterwards (`MeshParams::gpu_generator`).
 
 use crate::mesh::{self, Mesh, PART_FRONT, TWO_SIDED};
 use crate::slang::{valid_name, Linked, Linker};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 /// Most points and triangles one generated mesh may have (the GPU's mesh
@@ -47,9 +52,150 @@ pub struct SlangShape {
     pub outputs: Outputs,
     pub two_sided: bool,
     pub bounds: Option<[[f64; 3]; 2]>,
+    /// The generator as a GPU kernel (None: it has none, e.g. too many
+    /// params).
+    pub gpu: Option<Arc<Kernel>>,
     /// The mesh, generated once for these parameters: the bounds and the
     /// renderer share it.
     pub generated: Generated,
+}
+
+/// Most params a generator's GPU kernel takes (its uniform holds them four
+/// to a `float4`); a generator with more is generated on the CPU.
+pub const GPU_PARAMS: usize = 32;
+/// The GPU kernel's entry point.
+pub const ENTRY: &str = "lahza_mesh";
+/// Threads per group of the kernel (one point or triangle each).
+pub const GROUP: u32 = 64;
+
+/// The GPU kernel's Slang. Its uniform (`u_mesh_0` once Slang renames it):
+/// counts = [vertices, triangles, first row in the mesh pool, what to
+/// write (0: points, 1: triangles)], time = [t, 0, 0, 0], then the params,
+/// four to a `float4`. It writes the author's values as they are into
+/// `b_mesh_0`, the mesh pool as bits: per point [position, u] [normal, v]
+/// (zeros for what the author does not give), then per triangle [point
+/// ids, segment]. The renderer's own kernels finish the rows (normals,
+/// planar UVs, sides, values that are not numbers): `meshgen.wgsl`.
+const KERNEL: &str = "
+struct LahzaMeshPass { uint4 counts; float4 time; float4 params[$MAX$]; };
+ConstantBuffer<LahzaMeshPass> u_mesh;
+RWStructuredBuffer<uint4> b_mesh;
+
+[shader(\"compute\")]
+[numthreads($GROUP$, 1, 1)]
+void lahza_mesh(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    float t = u_mesh.time.x;
+$FILL$    if (u_mesh.counts.w == 0u) {
+        if (i >= u_mesh.counts.x) return;
+        float3 v = $POSITION$;
+        float3 n = $NORMAL$;
+        float2 w = $UV$;
+        uint at = u_mesh.counts.z + i * 2u;
+        b_mesh[at] = uint4(asuint(v), asuint(w.x));
+        b_mesh[at + 1u] = uint4(asuint(n), asuint(w.y));
+    } else {
+        if (i >= u_mesh.counts.y) return;
+        uint3 k = $TRIANGLE$;
+        uint s = $SEGMENT$;
+        b_mesh[u_mesh.counts.z + u_mesh.counts.x * 2u + i] = uint4(k, s);
+    }
+}
+";
+
+/// A generator as the GPU runs it: a compute kernel calling the author's
+/// functions, one thread per point or triangle. Layers calling a function
+/// the same way share one.
+pub struct Kernel {
+    pub function: String,
+    /// The kernel's Slang.
+    module: String,
+    /// Its WGSL, once the project links (`build_gpu`), or why it did not
+    /// build.
+    wgsl: OnceLock<Result<Arc<str>, String>>,
+    /// Content hash of the kernel and the project's modules.
+    pub key: u64,
+}
+
+impl Kernel {
+    /// The kernel for `function` called with these params and outputs
+    /// (as `generator` exports it for the CPU); None when the GPU cannot
+    /// take it (more than `GPU_PARAMS` params, names that are not Slang's).
+    pub fn new(shaders: &[crate::slang::Shader], function: &str, names: &[String], out: Outputs) -> Option<Self> {
+        if names.len() > GPU_PARAMS || !std::iter::once(function).chain(names.iter().map(String::as_str)).all(valid_name) {
+            return None;
+        }
+        let takes = crate::slang::declares_struct(shaders, &format!("{function}_params"));
+        if !takes && !names.is_empty() {
+            return None;
+        }
+        let (mut fill, mut p) = (String::new(), "");
+        if takes {
+            fill = format!("    {function}_params p = {{}};\n");
+            for (k, n) in names.iter().enumerate() {
+                fill.push_str(&format!("    p.{n} = u_mesh.params[{}].{};\n", k / 4, ["x", "y", "z", "w"][k % 4]));
+            }
+            p = ", p";
+        }
+        let call = |suffix: &str, wanted: bool, zero: &str| if wanted { format!("{function}_{suffix}(i, t{p})") } else { zero.to_string() };
+        let mut module = crate::slang::imports(shaders);
+        module.push_str(
+            &KERNEL
+                .replace("$MAX$", &GPU_PARAMS.div_ceil(4).to_string())
+                .replace("$GROUP$", &GROUP.to_string())
+                .replace("$FILL$", &fill)
+                .replace("$POSITION$", &call("position", true, ""))
+                .replace("$NORMAL$", &call("normal", out.normals, "float3(0.0, 0.0, 0.0)"))
+                .replace("$UV$", &call("uv", out.uvs, "float2(0.0, 0.0)"))
+                .replace("$TRIANGLE$", &call("triangle", true, ""))
+                .replace("$SEGMENT$", &call("segment", out.segments, "0u")),
+        );
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&module, shaders.iter().map(|m| (&m.name, &m.source)).collect::<Vec<_>>()).hash(&mut h);
+        Some(Kernel { function: function.into(), module, wgsl: OnceLock::new(), key: h.finish() })
+    }
+
+    /// A kernel that is this WGSL (tests: what slangc would have made).
+    #[doc(hidden)]
+    pub fn stand_in(function: &str, wgsl: &str) -> Self {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        wgsl.hash(&mut h);
+        Kernel { function: function.into(), module: String::new(), wgsl: OnceLock::from(Ok(Arc::<str>::from(wgsl))), key: h.finish() }
+    }
+
+    /// The kernel's Slang.
+    pub fn module(&self) -> &str {
+        &self.module
+    }
+
+    /// Compiles the kernel (once the project linked: the same sources
+    /// compile).
+    pub fn build_gpu(&self, shaders: &[crate::slang::Shader]) {
+        self.wgsl.get_or_init(|| crate::slang::wgsl(shaders, &self.module, ENTRY, "compute").map(Arc::from));
+    }
+
+    /// The kernel's WGSL; None when it did not build (the mesh is then
+    /// generated on the CPU).
+    pub fn wgsl(&self) -> Option<&Arc<str>> {
+        self.wgsl.get()?.as_ref().ok()
+    }
+
+    /// Why the kernel did not build, when it did not.
+    pub fn failure(&self) -> Option<&str> {
+        self.wgsl.get()?.as_ref().err().map(String::as_str)
+    }
+}
+
+impl std::fmt::Debug for Kernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mesh kernel {}", self.function)
+    }
+}
+
+impl PartialEq for Kernel {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
 }
 
 /// A deformer bound to its function (see `deformer`).
@@ -73,6 +219,14 @@ pub struct Generated(Arc<OnceLock<Result<Mesh, String>>>);
 impl PartialEq for Generated {
     fn eq(&self, _: &Self) -> bool {
         true
+    }
+}
+
+impl Generated {
+    /// A mesh already made (tests: a generator with no library to call).
+    #[doc(hidden)]
+    pub fn of(mesh: Mesh) -> Self {
+        Generated(Arc::new(OnceLock::from(Ok(mesh))))
     }
 }
 
@@ -254,13 +408,24 @@ impl SlangShape {
                 });
             }
         });
-        if let Some((i, v)) = not_finite(&pos, 3) {
+        self.assemble(&pos, &nor, &uv, &tri, &seg)
+    }
+
+    /// The mesh of what the author's functions returned (`pos` and `nor`
+    /// three floats a point, `uv` two, `tri` three ids a triangle, `seg`
+    /// one; `nor`, `uv` and `seg` empty where the author gives none):
+    /// checked, with unit normals (the faces' where there are none).
+    #[doc(hidden)]
+    pub fn assemble(&self, pos: &[f32], nor: &[f32], uv: &[f32], tri: &[u32], seg: &[u32]) -> Result<Mesh, String> {
+        let f = &self.function;
+        let (nv, nt) = (pos.len() / 3, tri.len() / 3);
+        if let Some((i, v)) = not_finite(pos, 3) {
             return Err(format!("slang mesh '{f}': {f}_position({i}) is not a number: {v:?}"));
         }
-        if let Some((i, v)) = not_finite(&nor, 3) {
+        if let Some((i, v)) = not_finite(nor, 3) {
             return Err(format!("slang mesh '{f}': {f}_normal({i}) is not a number: {v:?}"));
         }
-        if let Some((i, v)) = not_finite(&uv, 2) {
+        if let Some((i, v)) = not_finite(uv, 2) {
             return Err(format!("slang mesh '{f}': {f}_uv({i}) is not a number: {v:?}"));
         }
         if let Some((j, t)) = tri.chunks(3).enumerate().find(|(_, t)| t.iter().any(|&i| i as usize >= nv)) {
@@ -412,6 +577,57 @@ float3 lift(float3 p, float3 n, float t) { return p + float3(0, -5, 0) * (1 + t)
         super::deformer(&linker, &modules, "ring.deform", "lift", &[]);
         let e = linker.link(&modules).err().unwrap();
         assert_eq!(e, "no Slang function 'ring_position' in shaders/geo.slang (ring.mesh calls it); no Slang function 'ring_triangle' in shaders/geo.slang (ring.mesh calls it); no Slang function 'ring_normal' in shaders/geo.slang (ring.mesh calls it)");
+    }
+
+    /// A generator is also a compute kernel for the GPU: the same calls
+    /// as the CPU's export (the params struct filled by name, from the
+    /// uniform's `float4`s), a thread per point or triangle, the values
+    /// written into the mesh pool as bits; outputs the author does not
+    /// give are zeros (the renderer's kernels make the normals and UVs).
+    /// (The kernel's Slang as text: no compiler needed.)
+    #[test]
+    fn a_generator_is_a_kernel_for_the_gpu() {
+        use crate::slang::Shader;
+        let modules = vec![Shader { name: "geo".into(), source: SHADER.into() }];
+        let names: Vec<String> = ["a", "b", "c", "d", "size"].map(String::from).to_vec();
+        let k = super::Kernel::new(&modules, "quad", &names, super::Outputs { normals: true, ..Default::default() }).unwrap();
+        let code = k.module();
+        assert!(code.starts_with("import geo;"), "{code}");
+        assert!(code.contains("struct LahzaMeshPass { uint4 counts; float4 time; float4 params[8]; };"), "{code}");
+        assert!(code.contains("[numthreads(64, 1, 1)]\nvoid lahza_mesh(uint3 id : SV_DispatchThreadID) {"), "{code}");
+        assert!(code.contains("    quad_params p = {};\n    p.a = u_mesh.params[0].x;\n    p.b = u_mesh.params[0].y;\n    p.c = u_mesh.params[0].z;\n    p.d = u_mesh.params[0].w;\n    p.size = u_mesh.params[1].x;\n    if (u_mesh.counts.w == 0u) {"), "{code}");
+        assert!(code.contains("        float3 v = quad_position(i, t, p);\n        float3 n = quad_normal(i, t, p);\n        float2 w = float2(0.0, 0.0);\n"), "{code}");
+        assert!(code.contains("        b_mesh[at] = uint4(asuint(v), asuint(w.x));\n        b_mesh[at + 1u] = uint4(asuint(n), asuint(w.y));"), "{code}");
+        assert!(code.contains("        uint3 k = quad_triangle(i, t, p);\n        uint s = 0u;\n        b_mesh[u_mesh.counts.z + u_mesh.counts.x * 2u + i] = uint4(k, s);"), "{code}");
+        assert!(!code.contains('$'), "{code}");
+        assert!(k.wgsl().is_none() && k.failure().is_none(), "not built yet");
+        // Every output, no params struct: called without.
+        let all = super::Outputs { normals: true, uvs: true, segments: true };
+        let code = super::Kernel::new(&modules, "bad", &[], all).unwrap().module().to_string();
+        assert!(code.contains("float3 v = bad_position(i, t);") && code.contains("float2 w = bad_uv(i, t);") && code.contains("uint s = bad_segment(i, t);"), "{code}");
+        assert!(!code.contains("_params p"), "{code}");
+        // Another way of calling is another kernel; the same is the same.
+        assert_ne!(super::Kernel::new(&modules, "quad", &names, all).unwrap().key, k.key);
+        assert_eq!(super::Kernel::new(&modules, "quad", &names, super::Outputs { normals: true, ..Default::default() }).unwrap().key, k.key);
+        // What the GPU cannot take: more params than its uniform holds,
+        // params without a struct (the CPU's build says why).
+        let many: Vec<String> = (0..=super::GPU_PARAMS).map(|k| format!("p{k}")).collect();
+        assert!(super::Kernel::new(&modules, "quad", &many, all).is_none());
+        assert!(super::Kernel::new(&modules, "bad", &names, all).is_none());
+    }
+
+    /// With slangc: the kernel builds to WGSL with the globals the
+    /// renderer binds by name.
+    #[test]
+    fn the_kernel_builds_to_wgsl() {
+        let Some(c) = compiled(json!([{"id": "q", "kind": "mesh", "mesh": {"type": "slang", "function": "quad", "vertices": 4, "triangles": 2, "params": {"size": 20}, "bounds": [[0, 0, 0], [20, 20, 0]]}}])) else { return };
+        let m = mesh(&c, 0.0, "q");
+        let (s, wgsl) = m.params.gpu_generator().expect("a mesh the GPU generates");
+        assert_eq!(s.gpu.as_ref().unwrap().failure(), None);
+        assert!(wgsl.contains("u_mesh_0") && wgsl.contains("b_mesh_0") && wgsl.contains("fn lahza_mesh"), "{wgsl}");
+        // Without bounds the CPU generates it (it measures the points).
+        let c = compiled(json!([{"id": "q", "kind": "mesh", "mesh": {"type": "slang", "function": "quad", "vertices": 4, "triangles": 2}}])).unwrap();
+        assert!(mesh(&c, 0.0, "q").params.gpu_generator().is_none());
     }
 
     /// `vertices` and `triangles` can change over time: a mesh that grows

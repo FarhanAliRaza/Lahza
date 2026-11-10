@@ -47,6 +47,8 @@ pub struct Profile {
 pub struct PoolStats {
     pub uploads: u64,
     pub upload_bytes: u64,
+    /// Slang meshes the GPU generated in the pool (nothing uploaded).
+    pub generated: u64,
     pub evictions: u64,
     pub meshes: u64,
     pub bytes: u64,
@@ -98,6 +100,7 @@ impl Profile {
         let p = other.pool;
         self.pool.uploads += p.uploads;
         self.pool.upload_bytes += p.upload_bytes;
+        self.pool.generated += p.generated;
         self.pool.evictions += p.evictions;
         if p.capacity > 0 {
             (self.pool.meshes, self.pool.bytes, self.pool.capacity) = (p.meshes, p.bytes, p.capacity);
@@ -143,7 +146,7 @@ impl Profile {
             "tracer": {"ray_queries_per_frame": self.rays / self.frames.max(1), "candidates_per_ray": round(self.candidates as f64 / self.rays.max(1) as f64), "empty_lookup_share": round(self.density_empty as f64 / self.layers.values().map(|l| l.density).sum::<u64>().max(1) as f64), "lockstep_use": round(self.lane_lookups as f64 / self.lane_slots.max(1) as f64), "rays_by_volume_scatters": self.rays_by_scatter, "lookups_by_volume_scatters": self.lookups_by_scatter, "density_lookups_per_frame": density / self.frames.max(1),
                        "counted_on": format!("1 pixel in {COUNT_EVERY}, scaled"), "layers": layers},
             "mesh_pool": {"meshes": self.pool.meshes, "bytes": self.pool.bytes, "capacity": self.pool.capacity, "budget": crate::pool::MESH_POOL_BUDGET,
-                          "uploads": self.pool.uploads, "upload_bytes": self.pool.upload_bytes, "evictions": self.pool.evictions},
+                          "uploads": self.pool.uploads, "upload_bytes": self.pool.upload_bytes, "generated_on_gpu": self.pool.generated, "evictions": self.pool.evictions},
             "summary": self.summary(),
         })
     }
@@ -167,13 +170,14 @@ impl Profile {
             let mb = |b: u64| b as f64 / (1 << 20) as f64;
             let p = self.pool;
             out.push(format!(
-                "mesh pool: {} meshes, {:.1} MB in a {:.1} MB buffer (budget {:.0} MB); {} uploaded ({:.1} MB), {} evicted over the frames",
+                "mesh pool: {} meshes, {:.1} MB in a {:.1} MB buffer (budget {:.0} MB); {} uploaded ({:.1} MB), {} generated on the GPU, {} evicted over the frames",
                 p.meshes,
                 mb(p.bytes),
                 mb(p.capacity),
                 mb(crate::pool::MESH_POOL_BUDGET as u64),
                 p.uploads,
                 mb(p.upload_bytes),
+                p.generated,
                 p.evictions
             ));
         }

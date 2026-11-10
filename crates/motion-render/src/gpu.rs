@@ -937,6 +937,24 @@ impl Gpu {
         self.pool.warning.clone()
     }
 
+    /// What the Slang meshes the GPU generated got wrong (errors: they are
+    /// not drawn as written).
+    pub(crate) fn pool_errors(&self) -> &[String] {
+        &self.pool.errors
+    }
+
+    /// Tests: Slang meshes the GPU generated, and meshes uploaded, since
+    /// the profile last took the counts.
+    #[cfg(test)]
+    pub(crate) fn pool_counts(&self) -> (u64, u64) {
+        (self.pool.generators.generated, self.pool.uploads)
+    }
+
+    /// Why Slang meshes the GPU could have generated came from the CPU.
+    pub(crate) fn pool_notes(&self) -> &[String] {
+        &self.pool.notes
+    }
+
     /// Why traced frames used the built-in denoiser instead of OIDN, if so.
     pub(crate) fn denoise_warning(&self) -> Option<String> {
         self.tracer.as_ref().and_then(|t| t.denoise_warning())
@@ -1460,11 +1478,13 @@ impl Gpu {
         // Every frame before the oldest still in flight is done.
         self.completed = self.flights.iter().map(|f| f.id).min().unwrap_or(self.next) - 1;
         self.pool.after_frame(&self.context, self.completed);
+        self.pool.generators.end_frame(&self.context);
         self.shaders.end_frame(&self.context);
         if let Some(p) = self.profile.as_mut() {
             let (used, size) = self.pool.bytes();
             p.pool.uploads += std::mem::take(&mut self.pool.uploads);
             p.pool.upload_bytes += std::mem::take(&mut self.pool.upload_bytes);
+            p.pool.generated += std::mem::take(&mut self.pool.generators.generated);
             p.pool.evictions += std::mem::take(&mut self.pool.evictions);
             (p.pool.meshes, p.pool.bytes, p.pool.capacity) = (self.pool.meshes() as u64, used as u64, size as u64);
             p.stage("gpu frame › wait for GPU", waiting);

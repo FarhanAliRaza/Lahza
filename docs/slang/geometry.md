@@ -1,9 +1,13 @@
 # Slang geometry
 
 A project's Slang (`shaders/*.slang`) can generate meshes and move the
-points of any mesh. The functions run on the CPU, in native code built
-from the project's modules, so the GPU renderer, the CPU renderer
-(`--cpu`) and the path tracer all draw the same triangles.
+points of any mesh. The functions are built from the project's modules
+twice: into native code for the CPU, and (generators) into a compute
+kernel for the GPU. The CPU renderer (`--cpu`) and the path tracer take
+the mesh from the CPU. The GPU renderer generates a mesh itself, in its
+own memory, when the layer gives `bounds` (see
+[Where a mesh is generated](#where-a-mesh-is-generated)); the triangles
+are the same either way.
 
 Two forms:
 
@@ -35,7 +39,7 @@ from the viewer, centred on the layer's position.
 | `uvs` | the author wrote `<function>_uv`; default: planar UVs by the facing axis |
 | `segments` | the author wrote `<function>_segment`: per triangle, which of the layer's `colors` it takes |
 | `one_sided` | the mesh is closed: back faces are culled (a triangle's outside is where its normals point); default: seen from both sides |
-| `bounds` | `[[x, y, z], [x, y, z]]` local box in px; default: measured from the generated mesh |
+| `bounds` | `[[x, y, z], [x, y, z]]` local box in px that holds every point, at every time; default: measured from the generated mesh. With it the GPU renderer generates the mesh itself, and planar UVs spread over this box |
 
 The functions (`i` a point, `j` a triangle; where the module declares
 `struct <function>_params`, every function takes `<function>_params p` as
@@ -139,13 +143,57 @@ The deformer runs last: after the mesh is generated or loaded and after
 (their average), so they move together and the mesh does not crack.
 Normals are then recomputed from the moved faces; UVs are kept.
 
+## Where a mesh is generated
+
+On the CPU, Lahza calls the functions on every core, checks what they
+return, and hands the mesh to whoever draws it. The GPU renderer then
+uploads it: 32 bytes a point and 16 a triangle, every frame for an
+`animated` mesh.
+
+The GPU renderer skips all of that for a generator whose layer gives
+`bounds`. It runs the functions as a compute kernel, one thread per point
+and per triangle, and they write the mesh where the GPU draws it from. A
+frame of animated geometry costs the CPU a few numbers (the counts, `t`,
+the params), however many points the mesh has. The GPU also makes the
+smooth normals and planar UVs of a mesh whose author gives none.
+
+`bounds` is what makes this possible: the CPU no longer sees the points,
+and it still has to know where the mesh is (which part of the frame it
+covers, what it may hide, how far its shadow reaches). So with `bounds`:
+
+- The box must hold every point at every time. A point outside it may be
+  cut off, because the renderer draws the mesh only where the box is on
+  screen.
+- Planar UVs (a mesh without `uvs`) spread over the box, not over the
+  points' own extent at the moment, on every renderer. A picture mapped
+  on an animated mesh stays in place while the points move.
+
+The CPU still generates the mesh when:
+
+- the layer gives no `bounds`;
+- the layer has a `deform` or a `displace` (they work on the CPU's mesh);
+- the generator has more than 32 `params`;
+- the frame is path traced or rendered with `--cpu`;
+- the GPU has no hardware visibility pass (the renderer then draws meshes
+  from display lists the CPU builds).
+
+`LAHZA_SLANG_MESH_CPU=1` makes the CPU generate every mesh, to compare.
+`--profile` reports how many meshes the GPU generated and how many were
+uploaded.
+
+A mesh the GPU generates smooths its normals in f32 and in no fixed
+order, where the CPU sums in f64: normals without `normals: true` can
+differ in their last bits between the two and from run to run. Pictures
+differ by less than one 8-bit step.
+
 ## Time and caching
 
 A mesh is cached by its parameters: the built library (editing a shader
 makes new meshes), the counts, the `params` values and `t`. So:
 
-- **static** (`animated` false, constant params): generated once, uploaded
-  to the GPU once, however long the layer plays or the camera moves;
+- **static** (`animated` false, constant params): generated once (on the
+  CPU and uploaded once, or once on the GPU), however long the layer
+  plays or the camera moves;
 - **animated params** (keyframed `params`): a new mesh only on frames where
   a value changes;
 - **animated** (`animated` true): a new mesh every frame. The renderer
@@ -172,3 +220,11 @@ changing; use `animated` for motion that only `t` can express.
   that is not a number (NaN, infinity): the mesh is not drawn and the
   render warns, naming the function and index, e.g.
   `slang mesh 'terrain': terrain_triangle(19999) is [10200, 10301, 10201], past the 10201 vertices`.
+- The same mistakes in a mesh the GPU generates are errors too, reported
+  once the frame is back from the GPU, with counts. The rest of the mesh
+  is drawn: points that are not numbers sit at the origin, and triangles
+  naming points the mesh does not have are left out.
+  `slang mesh 'terrain': 3 of its triangles name points it does not have (the first is terrain_triangle(19999), past the 10201 vertices); they are not drawn`.
+- A generator whose GPU kernel does not build (Slang that the CPU target
+  takes and WGSL does not, such as `double`) is generated on the CPU, and
+  the render warns once.
