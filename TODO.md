@@ -11,16 +11,43 @@
   visibility pass draws meshes. Measure with
   `lahza motion snapshot cpu.lahza --at 9.0,10.4 --width 540 --profile`
   (stage "display lists › meshes (shadow maps)").
+  Not done yet: it runs only where meshes go through the hardware
+  visibility pass (8x MSAA), which Mesa's software Vulkan lacks, so it
+  could not be run where the rest of this list was worked through. A plan
+  that fits the code as it is:
+  - The list builder writes, per layer list, its casters as rows (object
+    → camera transform, the pooled mesh's place as `mesh3d::IROWS` row 13
+    has it, mirrored flag) for every mesh of the list, placed on a target
+    or not, and per shadow-casting light the map's six header rows without
+    texels; the display list names them as jobs (`merge` re-bases them).
+    Bounds come from each caster's box (and bounding sphere, exact for the
+    bubbles), not from every vertex.
+  - The GPU draws each job into a page of a depth atlas (one per frame
+    set, `Depth32Float`, compare greater, cleared to 0) with instanced
+    draws from the pool, as `vis_instance` does: directional maps write
+    (u, v) in texels and closeness scaled into 0..1 by the casters' extent
+    along the light; point maps write clip = (x − u0·z, y − v0·z, 1, z)
+    scaled to the page, so depth is 1 / z, the near plane is z = 1 and the
+    hardware clips where the CPU drops triangles. Faces are culled by the
+    pool's side bits against the light, as `ShadowMap::build` does.
+  - `shadow_texel` (motion.wgsl) reads a GPU map from the atlas (a flag
+    and the page's corner in the header, patched in before upload, as the
+    pool patches instance rows) and a CPU map from its rows as now, so
+    lists for the CPU and devices without the pass are untouched.
+  - To test it without such a device: let the visibility pass run at 4x
+    for tests (the raster then loads sample `s & 3`), which Mesa has.
 
-- **A frame whose images exceed the image pool is a hard error.** The pool
-  is 48 Mi texels (with mips). It used to leave the image that did not fit
-  undrawn and decode it again every frame (s01 of the CPU film went from
-  ~0.5 to ~6 s a frame, with only a warning at the end); now the frame fails
-  with `Images::overflow_report` (the images, their sizes, what to do).
-  Still open: `check` does not catch it before a render, and the budget is
-  fixed rather than sized from the GPU. A texture's size could also follow
-  its on-screen footprint (mip residency) so a 4K map seen small costs
-  little.
+- **Image memory: what is left.** Textures are held at the size they show
+  (`Images::get_sized`: the file halved while it still has the texels a
+  layer or a mesh's map needs on screen), the pool's budget follows the
+  GPU's memory (`images::budget_for`), and `check` counts a frame's needs
+  as the renderer holds them (`list::frame_image_texels`). Still open: a
+  texture is decoded in full each time it is loaded at a new size (a slow
+  zoom into a 4K map decodes it a few times), the whole pool is uploaded
+  again whenever one image changes, and a mesh's need is estimated from
+  its bounds on screen and its `uv` repeats (`list::map_want`), not from
+  its UVs: an atlas that gives a small part of the mesh most of its
+  texels shows that part softer than the file allows.
 - **Path-traced renders: what is left of the idle GPU.** Measured on s01
   of the CPU film (`~/Videos/cpu/work_a.lahza`, ~400 scanned-rock layers,
   4-sample motion blur, half size, 16 spp): 486 ms an output frame, of

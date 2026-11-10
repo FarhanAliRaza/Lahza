@@ -638,6 +638,39 @@ fn dropped_assets_are_errors_and_check_summarises_causes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `check` holds a frame's images against the image memory before a
+/// render: layers and meshes' maps, each at the size it shows. Large
+/// pictures shown small pass; the same pictures shown whole do not.
+#[test]
+fn check_counts_the_images_a_frame_needs_at_the_sizes_they_show() {
+    let (mut tb, dir) = toolbox("imageneeds");
+    tb.call("project_create", json!({"path": "p", "duration": 1, "width": 320, "height": 180})).unwrap();
+    for name in ["a", "b", "c", "d"] {
+        image::RgbaImage::from_pixel(4096, 4096, image::Rgba([90, 120, 200, 255])).save(dir.join(format!("p.lahza/assets/{name}.png"))).unwrap();
+    }
+    let layers = |size: f64| -> Vec<serde_json::Value> {
+        let mut ops = vec![json!({"op": "add_scene", "id": "s1"})];
+        for (i, name) in ["a", "b", "c"].iter().enumerate() {
+            ops.push(json!({"op": "add", "id": name, "kind": "image", "src": format!("assets/{name}.png"), "size": [size, size], "transform": {"position": [60 + 100 * i, 90]}}));
+        }
+        ops.push(json!({"op": "add", "id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": size / 2.0}, "material": {"preset": "matte", "map": "assets/d.png"}, "transform": {"position": [160, 90]}}));
+        ops
+    };
+    let overflow = |r: &serde_json::Value| r["issues"].as_array().unwrap().iter().find(|i| i["message"].as_str().unwrap().contains("image pool")).cloned();
+    // Four 4096² pictures (89 M texels whole, of 48 M) shown 80 px across.
+    tb.call("edit_apply", json!({"ops": layers(80.0)})).unwrap();
+    let r = tb.call("check", json!({})).unwrap().json;
+    assert!(overflow(&r).is_none(), "shown small they fit: {:#}", r["issues"]);
+    // Shown 4000 px across they need all of themselves.
+    tb.call("edit_apply", json!({"ops": [{"op": "remove", "id": "s1"}]})).unwrap();
+    tb.call("edit_apply", json!({"ops": layers(4000.0)})).unwrap();
+    let r = tb.call("check", json!({})).unwrap().json;
+    let issue = overflow(&r).unwrap_or_else(|| panic!("shown whole they do not: {:#}", r["issues"]));
+    assert_eq!(issue["severity"], "error");
+    assert!(issue["message"].as_str().unwrap().contains("89 M texels"), "{issue}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn sync_check_flags_hits_with_nothing_to_hit() {
     let (mut tb, dir) = toolbox("synccheck");

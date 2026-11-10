@@ -145,6 +145,12 @@ pub struct DeviceInformation {
     pub driver_name: String,
     /// Further information about the driver
     pub driver_info: String,
+    /// Bytes of the device's own memory (its largest device-local heap;
+    /// 0: unknown).
+    pub device_memory: u64,
+    /// The largest range a storage buffer binding may have, in bytes
+    /// (0: unknown).
+    pub max_storage_buffer_range: u64,
 }
 
 impl Context {

@@ -1394,16 +1394,17 @@ impl Toolbox {
         for w in &warnings {
             report.add(check::Severity::Error, "structure", None, None, w.clone());
         }
-        if let Some((t, need)) = image_overflow(&compiled, &dir) {
+        let budget = self.renderer(&dir).images.budget();
+        if let Some((t, need)) = image_overflow(&compiled, &dir, budget) {
             report.add(
                 check::Severity::Error,
                 "structure",
                 None,
                 Some(t),
                 format!(
-                    "the images on screen at {t:.2} s need {:.0} M texels; the image pool holds {:.0} M, so some would not be drawn (use smaller images)",
+                    "the images on screen at {t:.2} s (layers and meshes' maps, each at the size it shows) need {:.0} M texels; the image pool holds {:.0} M, so the frame would fail to render (show fewer or smaller images at once)",
                     need as f64 / 1e6,
-                    lahza_motion_render::images::MAX_TEXELS as f64 / 1e6
+                    budget as f64 / 1e6
                 ),
             );
         }
@@ -1425,7 +1426,16 @@ impl Toolbox {
         let options = renderer.options();
         renderer.set_scale(EMPTY_WIDTH / compiled.settings.width as f64);
         renderer.set_motion_blur(false);
-        let mut detail = |t: f64| crate::measure::drawn(&renderer.render(compiled, fps.time_of(fps.nearest_frame(t).clamp(0, last))));
+        // A frame that cannot be drawn is not an empty one: it is reported
+        // as what it is, below.
+        let failed = std::cell::RefCell::new(None::<String>);
+        let mut detail = |t: f64| match renderer.try_render(compiled, fps.time_of(fps.nearest_frame(t).clamp(0, last))) {
+            Ok(frame) => crate::measure::drawn(&frame),
+            Err(e) => {
+                failed.borrow_mut().get_or_insert(e);
+                1.0
+            }
+        };
         let d = detail(0.0);
         if d < EMPTY_DETAIL {
             report.add(
@@ -1455,6 +1465,10 @@ impl Toolbox {
                     format!("0.1–0.4 s after the cut to '{id}' at {start:.2} s the frame shows only the background (detail ≤ {:.2}%): dead air at the cut; bring the scene's first element on with the cut", most * 100.0),
                 );
             }
+        }
+        // (The image pool's overflow is reported with its numbers already.)
+        if let Some(e) = failed.into_inner().filter(|e| !(e.starts_with("image memory budget") && report.issues.iter().any(|i| i.message.contains("image pool")))) {
+            report.add(check::Severity::Error, "structure", None, None, format!("a frame does not render: {e}"));
         }
         let renderer = self.renderer(dir);
         renderer.set_scale(options.scale);
@@ -2479,46 +2493,20 @@ fn animated_paths(v: &Value, prefix: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Frames (sampled every half second) whose images together exceed the
-/// image pool, with the texels they need. Reported once, at the first.
-fn image_overflow(compiled: &Compiled, dir: &Path) -> Option<(f64, usize)> {
-    use lahza_motion_core::compile::{Content, LayerState};
-    let mut sizes: HashMap<String, usize> = HashMap::new();
-    fn walk(layers: &[LayerState], out: &mut Vec<String>) {
-        for l in layers {
-            match &l.content {
-                Content::Image { src, .. } => out.push(src.to_string()),
-                Content::Group(c) => walk(c, out),
-                _ => {}
-            }
-        }
-    }
-    let max_side = lahza_motion_render::images::MAX_SIDE as f64;
-    let mut t = 0.0;
-    while t < compiled.settings.duration {
-        let frame = compiled.frame(t);
-        let mut srcs = Vec::new();
-        walk(&frame.layers, &mut srcs);
-        srcs.sort();
-        srcs.dedup();
-        let need: usize = srcs
-            .iter()
-            .map(|s| {
-                *sizes.entry(s.clone()).or_insert_with(|| {
-                    image::image_dimensions(dir.join(s)).map(|(w, h)| {
-                        let k = (max_side / w.max(h) as f64).min(1.0);
-                        // With its mip chain: about a third more.
-                        ((w as f64 * k) * (h as f64 * k) * 4.0 / 3.0) as usize
-                    }).unwrap_or(0)
-                })
-            })
-            .sum();
-        if need > lahza_motion_render::images::MAX_TEXELS {
-            return Some((t, need));
-        }
-        t += 0.5;
-    }
-    None
+/// The first frame (sampled every half second, and where each scene
+/// starts) whose images together exceed the image pool's `budget`, with
+/// the texels they need: image layers and meshes' maps, each as the
+/// renderer holds it (at the size it shows, with its mips).
+fn image_overflow(compiled: &Compiled, dir: &Path, budget: usize) -> Option<(f64, usize)> {
+    let mut sizes: HashMap<String, Option<[u32; 2]>> = HashMap::new();
+    let mut natural = |src: &str| *sizes.entry(src.to_string()).or_insert_with(|| lahza_motion_render::images::natural_size(&dir.join(src)));
+    let mut times: Vec<f64> = (0..).map(|k| k as f64 * 0.5).take_while(|t| *t < compiled.settings.duration).collect();
+    times.extend(compiled.scenes.iter().map(|s| s.start).filter(|t| *t < compiled.settings.duration));
+    times.sort_by(f64::total_cmp);
+    times.into_iter().find_map(|t| {
+        let need = lahza_motion_render::list::frame_image_texels(&compiled.frame(t), 1.0, &mut natural);
+        (need > budget).then_some((t, need))
+    })
 }
 
 /// The reference to use for marker `i` of `track`: by name where that

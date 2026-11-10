@@ -785,6 +785,8 @@ impl EglContext {
             device_name: vendor,
             driver_name: renderer,
             driver_info: version,
+            device_memory: 0,
+            max_storage_buffer_range: 0,
         };
 
         let mut capabilities = super::Capabilities::empty();

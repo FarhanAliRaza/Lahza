@@ -490,20 +490,26 @@ impl Builder<'_> {
     /// A mesh item: a new batch, or `m` added to the batch of the item just
     /// before it (meshes next to each other share one depth buffer).
     /// Loads a mesh's image maps into the pool (once) for its material rows.
-    fn mesh_textures(&mut self, m: &lahza_motion_core::compile::MeshState) {
+    /// Each is held at the size the mesh shows it (`map_want`); a density
+    /// grid whole.
+    fn mesh_textures(&mut self, m: &lahza_motion_core::compile::MeshState, root: Proj) {
         for mat in &m.materials {
-            let grid = mat.volume_grid.as_ref().map(|g| g.0.clone());
-            for path in [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map, &mat.emissive_map, &grid].into_iter().flatten() {
-                if !self.meshes.textures.contains_key(path) {
-                    let t = self.images.get(path);
-                    self.meshes.textures.insert(path.clone(), t);
-                }
+            let want = map_want(m, mat, root);
+            for path in [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map, &mat.emissive_map].into_iter().flatten() {
+                // (A mesh that needs it larger than one before it loads a
+                // larger copy; the earlier rows keep the smaller.)
+                let t = self.images.get_sized(path, want);
+                self.meshes.textures.insert(path.clone(), t);
+            }
+            if let Some((grid, ..)) = &mat.volume_grid {
+                let t = self.images.get(grid);
+                self.meshes.textures.insert(grid.clone(), t);
             }
         }
     }
 
     fn mesh_item(&mut self, layer: &LayerState, m: &lahza_motion_core::compile::MeshState, root: Proj, prev: Option<&mut Item>) -> Option<Item> {
-        self.mesh_textures(m);
+        self.mesh_textures(m, root);
         let blend = blend_code(layer.blend);
         let see_through = crate::mesh3d::see_through(layer);
         let (list_serial, index) = self.meshes.member();
@@ -605,7 +611,7 @@ impl Builder<'_> {
             }
             at.get_or_insert(out.len());
             if let Content::Mesh(m) = &layer.content {
-                self.mesh_textures(m);
+                self.mesh_textures(m, root);
                 surfaces = surfaces.or_else(|| m.materials.iter().find_map(|x| x.slang.as_ref().and_then(|s| s.program())));
                 if let Some(i) = self.meshes.trace_instance(layer.id.clone(), m, layer.opacity, root.max_scale()) {
                     instances.push(i);
@@ -1407,14 +1413,21 @@ impl Builder<'_> {
                 }
             }
             Content::Image { src, size } => {
-                let Some(tex) = self.images.get(src) else { return items };
+                // Shown at its size as a picture, held at the size it
+                // shows on screen.
+                let Some(natural) = self.images.natural(src) else {
+                    // (Not readable: the pool says why.)
+                    self.images.get(src);
+                    return items;
+                };
                 let (dw, dh) = match size {
                     Some(s) => (s.x(), s.y()),
-                    None => (tex.width as f64, tex.height as f64),
+                    None => (natural[0] as f64, natural[1] as f64),
                 };
                 if dw <= 0.0 || dh <= 0.0 {
                     return items;
                 }
+                let Some(tex) = self.images.get_sized(src, image_want(natural, (dw, dh), matrix)) else { return items };
                 // Texel space → layer space: centred, scaled to display size.
                 let forward = matrix
                     .then(Affine::translate(-dw / 2.0, -dh / 2.0))
@@ -1483,6 +1496,96 @@ impl Builder<'_> {
 const SHADER_TEXELS: f64 = 3840.0 * 2160.0;
 
 /// A flat 3D layer the path tracer can place in its scene as a card.
+/// The texels along its longer side a picture of `natural` size needs to
+/// show sharp, drawn `dw × dh` (centred) through `matrix` to output
+/// pixels: a texel per pixel where it shows largest.
+pub fn image_want(natural: [u32; 2], (dw, dh): (f64, f64), matrix: Proj) -> u32 {
+    let corners = [(-dw / 2.0, -dh / 2.0), (dw / 2.0, -dh / 2.0), (dw / 2.0, dh / 2.0), (-dw / 2.0, dh / 2.0)];
+    // Output px per layer unit: along its edges, and at its corners (in
+    // perspective the near corner is larger than its edges on average).
+    let p = corners.map(|(x, y)| matrix.apply(x, y));
+    if p.iter().any(|q| !(q.0.is_finite() && q.1.is_finite())) {
+        // It crosses the camera: all it has.
+        return u32::MAX;
+    }
+    let len = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1);
+    let across = len(p[0], p[1]).max(len(p[3], p[2])) / dw.max(1e-9);
+    let down = len(p[0], p[3]).max(len(p[1], p[2])) / dh.max(1e-9);
+    let local = corners.iter().map(|(x, y)| matrix.local_scale(*x, *y)).fold(0.0, f64::max);
+    // Texels per layer unit times that, along the longer side.
+    let (tx, ty) = (natural[0] as f64 / dw.max(1e-9), natural[1] as f64 / dh.max(1e-9));
+    let scale = (across.max(local) / tx).max(down.max(local) / ty);
+    let want = natural[0].max(natural[1]) as f64 * scale;
+    if want.is_finite() { want.ceil().clamp(1.0, u32::MAX as f64) as u32 } else { u32::MAX }
+}
+
+/// Texels a mesh's image maps need along their longer side for each
+/// output pixel the mesh spans, at one repeat across it: a sphere shows
+/// half its map across its width (two texels a pixel), an unwrapped model
+/// about as much of its atlas, and half as much again for atlases packed
+/// loosely. (The copy held is the next halving above that: up to twice it.)
+const MAP_TEXELS_PER_PIXEL: f64 = 3.0;
+
+/// The texels along their longer side `mat`'s image maps need on mesh `m`
+/// drawn through `root`: from the mesh's size on screen and how often the
+/// maps repeat across it (`uv` scale). All they have when the mesh's size
+/// on screen is not known (it crosses the camera).
+pub fn map_want(m: &lahza_motion_core::compile::MeshState, mat: &lahza_motion_core::compile::MaterialState, root: Proj) -> u32 {
+    let Some(b) = m.screen_bounds() else { return u32::MAX };
+    let span = (b[2] - b[0]).max(b[3] - b[1]) * root.max_scale();
+    let repeats = mat.uv[0].abs().min(mat.uv[1].abs()).max(1e-3);
+    let want = span * MAP_TEXELS_PER_PIXEL / repeats;
+    if want.is_finite() { want.ceil().clamp(1.0, u32::MAX as f64) as u32 } else { u32::MAX }
+}
+
+/// Texels the images of `frame` need in the image pool at output scale
+/// `scale`, as the renderer holds them (each at the size it shows, with
+/// its mips): what `check` holds against the pool's budget before a
+/// render. `natural` gives a source's size as a picture (None: no such
+/// image, counted as nothing).
+pub fn frame_image_texels(frame: &FrameState, scale: f64, natural: &mut dyn FnMut(&str) -> Option<[u32; 2]>) -> usize {
+    type Wants = std::collections::BTreeMap<std::sync::Arc<str>, u32>;
+    fn want(wants: &mut Wants, src: &std::sync::Arc<str>, n: u32) {
+        let w = wants.entry(src.clone()).or_insert(0);
+        *w = (*w).max(n);
+    }
+    // As the list builder walks them: a group's children under its matrix,
+    // a matte's source beside its layer.
+    fn walk(layers: &[LayerState], root: Proj, natural: &mut dyn FnMut(&str) -> Option<[u32; 2]>, wants: &mut Wants) {
+        for l in layers {
+            match &l.content {
+                Content::Image { src, size } => {
+                    if let Some(n) = natural(src) {
+                        let (dw, dh) = size.map_or((n[0] as f64, n[1] as f64), |s| (s.x(), s.y()));
+                        if dw > 0.0 && dh > 0.0 {
+                            want(wants, src, image_want(n, (dw, dh), root.then(l.matrix)));
+                        }
+                    }
+                }
+                Content::Mesh(m) => {
+                    for mat in &m.materials {
+                        let n = map_want(m, mat, root);
+                        for path in [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map, &mat.emissive_map].into_iter().flatten() {
+                            want(wants, path, n);
+                        }
+                        if let Some((grid, ..)) = &mat.volume_grid {
+                            want(wants, grid, u32::MAX);
+                        }
+                    }
+                }
+                Content::Group(children) => walk(children, root.then(l.matrix), natural, wants),
+                _ => {}
+            }
+            if let Some(source) = l.matte.as_ref().and_then(|m| m.source.as_ref()) {
+                walk(std::slice::from_ref(source), root, natural, wants);
+            }
+        }
+    }
+    let mut wants = Wants::new();
+    walk(&frame.layers, Proj::from(Affine::scale(scale, scale)), natural, &mut wants);
+    wants.iter().filter_map(|(src, want)| natural(src).map(|n| crate::images::held_texels(n, *want))).sum()
+}
+
 fn trace_card_candidate(layer: &LayerState) -> bool {
     layer.view.is_some() && !matches!(layer.content, Content::Mesh(_) | Content::Group(_)) && plain(layer)
 }

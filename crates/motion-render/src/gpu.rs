@@ -280,6 +280,8 @@ struct Buffer {
     capacity: usize,
     host_memory: Option<gpu::Memory>,
     name: &'static str,
+    /// The most it may grow to, bytes.
+    limit: usize,
 }
 
 impl Buffer {
@@ -300,14 +302,16 @@ impl Buffer {
             capacity,
             host_memory: host,
             name,
+            limit: MAX_BUFFER,
         }
     }
     fn ensure(&mut self, context: &gpu::Context, size: usize) -> Result<(), String> {
-        if size > MAX_BUFFER {
+        if size > self.limit {
             return Err(format!("{} needs {size} bytes, over the GPU buffer limit", self.name));
         }
         if size > self.capacity {
-            let next = Self::with_host(context, self.name, size.next_power_of_two(), self.host_memory);
+            let mut next = Self::with_host(context, self.name, size.next_power_of_two().min(self.limit.max(size)), self.host_memory);
+            next.limit = self.limit;
             self.destroy(context);
             *self = next;
         }
@@ -559,6 +563,8 @@ pub struct Gpu {
     images: Buffer,
     atlas_generation: u64,
     images_generation: u64,
+    /// Texels the image pool may hold on this device (`images::budget_for`).
+    image_budget: usize,
     pub label: String,
     /// The path tracer, where the device has ray queries.
     tracer: Option<crate::pt::Tracer>,
@@ -755,15 +761,20 @@ impl Gpu {
         };
         // Every pipeline exists now: keep them for the next launch.
         context.save_pipeline_cache();
+        // (A software device's "own memory" is the machine's.)
+        let image_budget = if info.is_software_emulated { crate::images::MAX_TEXELS } else { crate::images::budget_for(info.device_memory, info.max_storage_buffer_range) };
+        let mut images = Buffer::new(&context, "motion images", 1 << 12, true);
+        images.limit = images.limit.max(image_budget * 4);
         Ok(Self {
             sets: vec![FrameSet::new(&context, vis.is_some())],
             flights: Vec::new(),
             next: 1,
             completed: 0,
             atlas: Buffer::new(&context, "motion atlas", (ATLAS_SIZE * ATLAS_SIZE) as usize, true),
-            images: Buffer::new(&context, "motion images", 1 << 12, true),
+            images,
             atlas_generation: 0,
             images_generation: 0,
+            image_budget,
             pool: crate::pool::MeshPool::new(&context),
             shaders: Default::default(),
             queue: Queue::new(),
@@ -785,6 +796,11 @@ impl Gpu {
     /// display lists then hold shared triangle records).
     pub fn has_vis(&self) -> bool {
         self.vis.is_some()
+    }
+
+    /// Texels the image pool may hold on this device.
+    pub fn image_budget(&self) -> usize {
+        self.image_budget
     }
 
     /// Whether this GPU can path-trace.

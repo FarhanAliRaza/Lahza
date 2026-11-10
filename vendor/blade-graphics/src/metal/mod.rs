@@ -477,6 +477,8 @@ impl Context {
             device_name: device.name().to_string(),
             driver_name: "Metal".to_string(),
             driver_info: "".to_string(),
+            device_memory: 0,
+            max_storage_buffer_range: 0,
         };
 
         let mut timestamp_counter_set = None;

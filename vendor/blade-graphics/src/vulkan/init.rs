@@ -282,6 +282,16 @@ unsafe fn inspect_adapter(
         driver_info: ffi::CStr::from_ptr(driver_properties.driver_info.as_ptr())
             .to_string_lossy()
             .to_string(),
+        device_memory: {
+            let memory = instance.core.get_physical_device_memory_properties(phd);
+            memory.memory_heaps[..memory.memory_heap_count as usize]
+                .iter()
+                .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|h| h.size)
+                .max()
+                .unwrap_or(0)
+        },
+        max_storage_buffer_range: properties.limits.max_storage_buffer_range as u64,
     };
 
     Some(AdapterCapabilities {

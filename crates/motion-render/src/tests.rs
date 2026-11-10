@@ -144,23 +144,99 @@ fn images_and_gradients() {
 
 #[test]
 fn a_film_shows_more_images_than_the_pool_holds_at_once() {
-    // Three 4096² images, one after another: two fill the pool.
+    // Three images, one after another, in a pool with room for two as
+    // they show (each fills the 320 px frame: held 512 x 512).
     let dir = std::env::temp_dir().join(format!("lahza-pool-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
     let mut layers = Vec::new();
     for (i, c) in colors.iter().enumerate() {
-        image::RgbaImage::from_pixel(4096, 4096, image::Rgba(*c)).save(dir.join(format!("big{i}.png"))).unwrap();
+        image::RgbaImage::from_pixel(1024, 1024, image::Rgba(*c)).save(dir.join(format!("big{i}.png"))).unwrap();
         layers.push(json!({"id": format!("i{i}"), "kind": "image", "src": format!("big{i}.png"), "size": [320, 180],
             "transform": {"position": [160, 90]}, "time": {"start": i as f64 * 0.5, "end": (i + 1) as f64 * 0.5}}));
     }
     let compiled = Compiled::new(&project(json!(layers)));
-    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, scale: 0.25, ..Default::default() });
+    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
+    r.images.set_budget(800_000);
     for (i, c) in colors.iter().enumerate() {
         let out = r.render(&compiled, i as f64 * 0.5 + 0.25);
-        assert_eq!(px(&out, 40, 22), *c, "image {i}");
+        assert_eq!(px(&out, 160, 90), *c, "image {i}");
     }
     assert!(r.dropped().is_empty(), "{:?}", r.dropped());
+    assert_eq!(r.images.texels.len(), images::held_texels([1024, 1024], 320), "the third alone is left, at the size it shows");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A large picture shown small costs what it shows: a film whose images
+/// would not fit whole renders, and looks as it would with them whole.
+/// One that really needs more than the pool holds is an error that says
+/// what and how much.
+#[test]
+fn images_are_held_at_the_size_they_show() {
+    let dir = std::env::temp_dir().join(format!("lahza-footprint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A picture with detail at every scale.
+    let mut img = image::RgbaImage::new(1024, 1024);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let v = |k: u32| if (x / k + y / k) % 2 == 0 { 255u8 } else { 40 };
+        *p = image::Rgba([v(128), v(32), v(8), 255]);
+    }
+    img.save(dir.join("map.png")).unwrap();
+    let small = |n: usize| {
+        let layers: Vec<_> = (0..n).map(|i| json!({"id": format!("i{i}"), "kind": "image", "src": "map.png", "size": [64, 64], "transform": {"position": [40 + 70 * i as i32, 90]}})).collect();
+        Compiled::new(&project(json!(layers)))
+    };
+    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
+    // A pool a tenth of the picture's own size.
+    r.images.set_budget(100_000);
+    let shown = r.render(&small(4), 0.0);
+    assert!(r.dropped().is_empty(), "{:?}", r.dropped());
+    assert_eq!(r.images.texels.len(), images::held_texels([1024, 1024], 64), "held 64 x 64 with its mips, once");
+    // The same frame with the picture held whole.
+    let mut whole = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
+    whole.images.get("map.png").unwrap();
+    let want = whole.render(&small(4), 0.0);
+    let (mut sum, mut worst) = (0u64, 0u8);
+    for (a, b) in shown.pixels().zip(want.pixels()) {
+        for k in 0..3 {
+            let d = a.0[k].abs_diff(b.0[k]);
+            sum += d as u64;
+            worst = worst.max(d);
+        }
+    }
+    let mean = sum as f64 / (shown.width() * shown.height() * 3) as f64;
+    assert!(mean < 0.5 && worst <= 24, "held at the size it shows it looks as held whole: mean difference {mean:.3}, worst {worst}");
+    // Shown at its full size it needs all of itself: more than the pool.
+    let big = Compiled::new(&project(json!([{"id": "i", "kind": "image", "src": "map.png", "transform": {"position": [160, 90]}}])));
+    let e = r.try_render(&big, 0.0).unwrap_err();
+    assert!(e.contains("image memory budget exceeded") && e.contains("map.png 1024×1024"), "{e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `check`'s count of what a frame's images need is what the renderer
+/// ends up holding: image layers and meshes' maps, at the sizes they show.
+#[test]
+fn a_frames_image_needs_are_counted_as_the_renderer_holds_them() {
+    let dir = std::env::temp_dir().join(format!("lahza-needs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    image::RgbaImage::from_pixel(1024, 512, image::Rgba([90, 120, 200, 255])).save(dir.join("pic.png")).unwrap();
+    image::RgbaImage::from_pixel(2048, 2048, image::Rgba([200, 120, 90, 255])).save(dir.join("rock.png")).unwrap();
+    let p = project(json!([
+        {"id": "i", "kind": "image", "src": "pic.png", "size": [200, 100], "transform": {"position": [110, 60]}},
+        {"id": "g", "kind": "comp", "transform": {"position": [0, 0]}, "layers": [
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"preset": "matte", "map": "rock.png", "bump_map": "rock.png"},
+             "transform": {"position": [240, 110]}}]}
+    ]));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
+    r.render(&c, 0.0);
+    assert!(r.dropped().is_empty(), "{:?}", r.dropped());
+    let need = list::frame_image_texels(&c.frame(0.0), 1.0, &mut |src| images::natural_size(&dir.join(src)));
+    assert_eq!(need, r.images.texels.len());
+    // A 200 px picture and a 60 px ball: far less than the files (2.7 M
+    // and 5.6 M texels with their mips).
+    assert!(need < 200_000, "{need}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

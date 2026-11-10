@@ -160,9 +160,13 @@ impl Renderer {
                 Err(e) => (None, Some(e)),
             },
         };
+        let mut images = Images::new(root);
+        if let Some(g) = &gpu {
+            images.set_budget(g.image_budget());
+        }
         Self {
             fonts: Fonts::new(root),
-            images: Images::new(root),
+            images,
             footage: footage::Footage::new(root),
             meshes: mesh3d::MeshCache::new(root),
             gpu,

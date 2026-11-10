@@ -375,7 +375,7 @@ Surface detail (raster and path tracer alike):
 | field | meaning |
 |---|---|
 | `noise` | procedural noise on the surface, no UVs needed: `{"type": "fbm" (default) \| "value" \| "cellular", "scale": px feature size (40), "octaves": 4, "seed": 0, "space": "object" (moves with the mesh) \| "world", "drift": [x, y, z] px/s the noise flows (ripples, boiling), "color": colour where the noise is high, "amount": 0..1 toward it (1), "roughness": ± roughness, "bump": px of apparent height}` (scale, colour, amount, roughness and bump animatable) |
-| `map` | an image (project path) over the UVs, multiplying `color` |
+| `map` | an image (project path) over the UVs, multiplying `color`. Image maps (and image layers) are held in memory at the size they show, not the size of their files: a 4K map on a small or distant object costs little, and is loaded larger when the object grows on screen. A frame whose images need more than the image memory holds even so (a sixteenth of the GPU's memory, at least 192 MB) fails with what they need; `check` says so before a render |
 | `normal_map` | a tangent-space normal map (green up) |
 | `bump_map`, `bump` | a height image (bright = raised) and its height in px (2) |
 | `roughness_map` | an image whose green channel scales `roughness` (glTF's metallic-roughness texture; a grey map works too): polished and dull patches on one surface |

@@ -439,7 +439,7 @@ fn place(pool: &mut Vec<u32>, img: &image::RgbaImage) -> Texture {
         lh = nh;
         levels += 1;
     }
-    Texture { offset, width: w, height: h, levels }
+    Texture { offset, width: w, height: h, levels, natural: [w, h] }
 }
 
 #[cfg(test)]
