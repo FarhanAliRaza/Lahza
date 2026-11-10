@@ -326,15 +326,57 @@ struct Work {
     texels: u64,
     guides: gpu::Buffer,
     hdr: [gpu::Buffer; 2],
-    /// Colour, albedo and normal packed for the denoiser (on the device),
-    /// its host copy, and the denoised colour to upload.
-    oidn: Option<[gpu::Buffer; 3]>,
+    oidn: Option<Denoising>,
+}
+
+/// How a traced list's picture gets to Open Image Denoise and back, for
+/// pictures of `size`.
+#[derive(Clone, Copy)]
+struct Denoising {
+    size: (u32, u32),
+    /// Colour, albedo and normal packed for the denoiser, on the device.
+    packed: gpu::Buffer,
+    way: Way,
+}
+
+#[derive(Clone, Copy)]
+enum Way {
+    /// Through the host: the packed picture's host copy, and the denoised
+    /// colour to upload (into `packed`).
+    Copied { down: gpu::Buffer, up: gpu::Buffer },
+    /// In place: `packed` and `output` are memories the denoiser imported
+    /// (its filter `id` reads one and writes the other on the device).
+    /// `up` takes a result that came the copied way after all (the first
+    /// shared picture is checked against it).
+    Shared { output: gpu::Buffer, id: u64, up: Option<gpu::Buffer> },
+}
+
+impl Denoising {
+    fn buffers(&self) -> impl Iterator<Item = gpu::Buffer> {
+        let rest = match self.way {
+            Way::Copied { down, up } => [Some(down), Some(up)],
+            Way::Shared { output, up, .. } => [Some(output), up],
+        };
+        std::iter::once(self.packed).chain(rest.into_iter().flatten())
+    }
 }
 
 impl Work {
     fn buffers(&self) -> impl Iterator<Item = gpu::Buffer> + '_ {
-        [self.guides, self.hdr[0], self.hdr[1]].into_iter().chain(self.oidn.into_iter().flatten())
+        [self.guides, self.hdr[0], self.hdr[1]].into_iter().chain(self.oidn.iter().flat_map(|d| d.buffers()))
     }
+}
+
+/// Whether the denoiser works on the tracer's own memory.
+#[derive(Clone, Debug, PartialEq)]
+enum Sharing {
+    /// Not tried yet: the first shared picture is checked against the
+    /// same picture denoised the copied way.
+    Untried,
+    /// Checked: pictures are denoised in place.
+    Checked,
+    /// Not possible here, or it failed (why): pictures are copied.
+    Off(String),
 }
 
 /// The buffers a traced list's passes bind (those of its last part).
@@ -366,6 +408,8 @@ struct Slot {
     current: usize,
     /// The lighting went to Open Image Denoise and came back.
     denoised: bool,
+    /// Its result is in the upload buffer (the copied way).
+    upload: bool,
 }
 
 /// What one frame in flight writes from the CPU.
@@ -445,6 +489,7 @@ pub struct Tracer {
     dummy: gpu::Buffer,
     /// Open Image Denoise, loaded on first use (None: not tried yet).
     oidn: Option<Result<crate::oidn::Denoiser, String>>,
+    sharing: Sharing,
 }
 
 /// Geometry not used for this many frames is dropped. Animated meshes
@@ -503,6 +548,7 @@ impl Tracer {
             set: 0,
             dummy,
             oidn: None,
+            sharing: Sharing::Untried,
         })
     }
 
@@ -683,6 +729,9 @@ impl Tracer {
         }
         if self.sets[self.set].work[s].as_ref().is_none_or(|w| w.texels < texels) {
             let old = self.sets[self.set].work[s].take();
+            if let Some(d) = old.as_ref().and_then(|w| w.oidn) {
+                self.release(d);
+            }
             for b in old.iter().flat_map(|w| w.buffers()) {
                 self.retire(Retired::Buffer(b));
             }
@@ -929,7 +978,7 @@ impl Tracer {
             band: [0, size.1, if profiling { density_repeat() } else { 0 }, part | parts.max(1) << 16],
         };
         let bind = Bindings { tlas, inst: inst_buf, attr, idx, tag, mat: mat_buf, light: light_buf, card: card_buf, env: env_buf, counts, bounds: bounds_buf, jobs: jobs_buf };
-        let state = Slot { size, uniforms, bind, temporal, denoise: t.options.denoise, hist, current: 0, denoised: false };
+        let state = Slot { size, uniforms, bind, temporal, denoise: t.options.denoise, hist, current: 0, denoised: false, upload: false };
         if !jobs.is_empty() {
             let mut pass = encoder.compute("volume bounds");
             let mut pc = pass.with(&self.bounds);
@@ -1038,56 +1087,137 @@ impl Tracer {
             state.current = 1;
         }
         if oidn && state.denoise {
-            let have = self.sets[set].work[slot as usize].as_ref().and_then(|w| w.oidn);
-            let [packed, down, _] = match have {
-                Some(b) => b,
-                None => {
-                    let make = |name, per: u64, memory| context.create_buffer(gpu::BufferDesc { name, size: (texels * per).max(16), memory });
-                    let b = [make("oidn packed", 36, gpu::Memory::Device), make("oidn input", 36, gpu::Memory::Download), make("oidn output", 12, gpu::Memory::Upload)];
-                    self.sets[set].work[slot as usize].as_mut().unwrap().oidn = Some(b);
-                    b
-                }
-            };
+            let d = self.denoising(context, slot, state.size);
             {
                 let mut pass = encoder.compute("oidn pack");
                 let mut pc = pass.with(&self.pack);
                 let mut data = state.data(state.uniforms, groups, images, guides, hdr[state.current], hdr[1 - state.current]);
-                data.b_bounds = packed.into();
+                data.b_bounds = d.packed.into();
                 pc.bind(0, &data);
                 pc.dispatch(groups_x);
             }
-            encoder.transfer("oidn readback").copy_buffer_to_buffer(packed.into(), down.into(), texels * 36);
+            if let Way::Copied { down, .. } = d.way {
+                encoder.transfer("oidn readback").copy_buffer_to_buffer(d.packed.into(), down.into(), texels * 36);
+            }
             state.denoised = true;
         }
         self.sets[set].slots[slot as usize] = Some(state);
+    }
+
+    /// Lets go of what the denoiser holds of `d` (before its buffers go).
+    fn release(&mut self, d: Denoising) {
+        if let (Way::Shared { id, .. }, Some(Ok(denoiser))) = (d.way, self.oidn.as_mut()) {
+            denoiser.release_shared(id);
+        }
+    }
+
+    /// The buffers traced list `slot`'s pictures of `size` go to the
+    /// denoiser through: shared with it where it and the device can
+    /// (nothing is copied then), else through the host.
+    fn denoising(&mut self, context: &gpu::Context, slot: u32, size: (u32, u32)) -> Denoising {
+        let (set, s) = (self.set, slot as usize);
+        let share = !matches!(self.sharing, Sharing::Off(_)) && context.has_external_memory() && matches!(&self.oidn, Some(Ok(d)) if d.shares_fd());
+        if let Some(d) = self.sets[set].work[s].as_ref().and_then(|w| w.oidn) {
+            if d.size == size && matches!(d.way, Way::Shared { .. }) == share {
+                return d;
+            }
+            // Another size, or the other way: these go.
+            self.release(d);
+            for b in d.buffers() {
+                self.retire(Retired::Buffer(b));
+            }
+            self.sets[set].work[s].as_mut().unwrap().oidn = None;
+        }
+        let texels = (size.0 * size.1) as u64;
+        let make = |name, per: u64, memory| context.create_buffer(gpu::BufferDesc { name, size: (texels * per).max(16), memory });
+        let mut made = None;
+        if share {
+            // Two memories the denoiser imports by file descriptor.
+            let exported = gpu::Memory::External(gpu::ExternalMemorySource::Fd(None));
+            let (packed, output) = (make("oidn shared input", 36, exported), make("oidn shared output", 12, exported));
+            let fd = |b: gpu::Buffer| match context.get_external_buffer_source(b) {
+                Some(gpu::ExternalMemorySource::Fd(Some(fd))) => Some(fd),
+                _ => None,
+            };
+            let shared = match (fd(packed), fd(output), self.oidn.as_mut()) {
+                (Some(a), Some(b), Some(Ok(denoiser))) => denoiser.share(size.0 as usize, size.1 as usize, a, b),
+                _ => Err("the device did not export the denoiser's memory".into()),
+            };
+            match shared {
+                Ok(id) => made = Some(Denoising { size, packed, way: Way::Shared { output, id, up: None } }),
+                Err(e) => {
+                    context.destroy_buffer(packed);
+                    context.destroy_buffer(output);
+                    self.sharing = Sharing::Off(e);
+                }
+            }
+        }
+        let d = made.unwrap_or_else(|| Denoising { size, packed: make("oidn packed", 36, gpu::Memory::Device), way: Way::Copied { down: make("oidn input", 36, gpu::Memory::Download), up: make("oidn output", 12, gpu::Memory::Upload) } });
+        self.sets[set].work[s].as_mut().unwrap().oidn = Some(d);
+        d
     }
 
     /// Runs Open Image Denoise on traced list `slot` of the frame in set
     /// `set`, whose `settle` has finished on the GPU. When it fails the
     /// built-in filter takes over (and a warning says why).
     pub(crate) fn denoise(&mut self, context: &gpu::Context, set: usize, slot: u32) {
-        let Some(state) = self.sets[set].slots.get_mut(slot as usize).and_then(|s| s.as_mut()) else { return };
+        let Some(state) = self.sets[set].slots.get(slot as usize).and_then(|s| s.as_ref()) else { return };
         if !state.denoised {
             return;
         }
         let size = state.size;
-        let run = |oidn: &mut Option<Result<crate::oidn::Denoiser, String>>, buffers: Option<[gpu::Buffer; 3]>| -> Result<(), String> {
-            let [_, down, up] = buffers.ok_or("no denoiser buffers")?;
-            let Some(Ok(denoiser)) = oidn.as_mut() else { return Err("Open Image Denoise is not loaded".into()) };
-            context.sync_buffer(down);
-            let n = (size.0 * size.1) as usize;
-            // SAFETY: the copy finished; the buffers hold n · 36 and n · 12
-            // bytes of f32, and no frame in flight touches this set's.
-            let (input, output) = unsafe { (std::slice::from_raw_parts(down.data() as *const f32, n * 9), std::slice::from_raw_parts_mut(up.data() as *mut f32, n * 3)) };
-            denoiser.denoise(size.0 as usize, size.1 as usize, input, output)?;
-            context.sync_buffer(up);
-            Ok(())
-        };
-        let buffers = self.sets[set].work[slot as usize].as_ref().and_then(|w| w.oidn);
-        if let Err(e) = run(&mut self.oidn, buffers) {
-            self.oidn = Some(Err(e));
-            if let Some(Some(state)) = self.sets[set].slots.get_mut(slot as usize) {
+        let n = (size.0 * size.1) as usize;
+        let Some(d) = self.sets[set].work[slot as usize].as_ref().and_then(|w| w.oidn) else { return };
+        // The denoised colour's way back: None in place, Some from the
+        // upload buffer.
+        let result: Result<bool, String> = (|| {
+            let Some(Ok(denoiser)) = self.oidn.as_mut() else { return Err("Open Image Denoise is not loaded".into()) };
+            match d.way {
+                Way::Copied { down, up } => {
+                    context.sync_buffer(down);
+                    // SAFETY: the copy finished; the buffers hold n · 36 and
+                    // n · 12 bytes of f32, and no frame in flight touches
+                    // this set's.
+                    let (input, output) = unsafe { (std::slice::from_raw_parts(down.data() as *const f32, n * 9), std::slice::from_raw_parts_mut(up.data() as *mut f32, n * 3)) };
+                    denoiser.denoise(size.0 as usize, size.1 as usize, input, output)?;
+                    context.sync_buffer(up);
+                    Ok(true)
+                }
+                Way::Shared { output, id, .. } => {
+                    let shared = denoiser.denoise_shared(id);
+                    if shared.is_ok() && self.sharing == Sharing::Checked {
+                        return Ok(false);
+                    }
+                    // The first shared picture (or one that failed): the
+                    // same picture the copied way, from the host. Equal,
+                    // and the shared way is trusted from here on; else it
+                    // is off, and this result is uploaded.
+                    let (mut input, mut theirs, mut ours) = (vec![0f32; n * 9], vec![0f32; n * 3], vec![0f32; n * 3]);
+                    denoiser.read_shared(id, &mut input, &mut theirs)?;
+                    denoiser.denoise(size.0 as usize, size.1 as usize, &input, &mut ours)?;
+                    let same = shared.is_ok() && theirs.iter().zip(&ours).all(|(a, b)| (a - b).abs() <= 2e-3 * (1.0 + b.abs()));
+                    if same {
+                        self.sharing = Sharing::Checked;
+                        return Ok(false);
+                    }
+                    self.sharing = Sharing::Off(shared.err().unwrap_or_else(|| "denoising the tracer's memory in place gave another picture than copying it".into()));
+                    let up = context.create_buffer(gpu::BufferDesc { name: "oidn output", size: (n as u64 * 12).max(16), memory: gpu::Memory::Upload });
+                    // SAFETY: a fresh mapped buffer of n · 12 bytes.
+                    unsafe { std::ptr::copy_nonoverlapping(ours.as_ptr() as *const u8, up.data(), n * 12) };
+                    context.sync_buffer(up);
+                    if let Some(w) = self.sets[set].work[slot as usize].as_mut() {
+                        w.oidn = Some(Denoising { way: Way::Shared { output, id, up: Some(up) }, ..d });
+                    }
+                    Ok(true)
+                }
+            }
+        })();
+        let state = self.sets[set].slots[slot as usize].as_mut().expect("the slot");
+        match result {
+            Ok(upload) => state.upload = upload,
+            Err(e) => {
                 state.denoised = false;
+                self.oidn = Some(Err(e));
             }
         }
     }
@@ -1116,12 +1246,20 @@ impl Tracer {
         if state.denoised {
             // Back as lighting over albedo: the resolve pass multiplies the
             // same albedo in again, which gives OIDN's colour exactly.
-            let [packed, _, up] = self.sets[set].work[slot as usize].as_ref().and_then(|w| w.oidn).expect("denoiser buffers");
-            encoder.transfer("oidn upload").copy_buffer_to_buffer(up.into(), packed.into(), texels * 12);
+            let d = self.sets[set].work[slot as usize].as_ref().and_then(|w| w.oidn).expect("denoiser buffers");
+            // Where the denoised colour is on the device: the shared
+            // output, or what the host's copy is uploaded into.
+            let (denoised, up) = match d.way {
+                Way::Copied { up, .. } => (d.packed, Some(up)),
+                Way::Shared { output, up, .. } => (output, up),
+            };
+            if let (true, Some(up)) = (state.upload, up) {
+                encoder.transfer("oidn upload").copy_buffer_to_buffer(up.into(), denoised.into(), texels * 12);
+            }
             let mut pass = encoder.compute("oidn unpack");
             let mut pc = pass.with(&self.unpack);
             let mut data = state.data(state.uniforms, groups, images, guides, hdr[state.current], hdr[1 - state.current]);
-            data.b_bounds = packed.into();
+            data.b_bounds = denoised.into();
             pc.bind(0, &data);
             pc.dispatch(groups_x);
             state.current = 1 - state.current;
@@ -1198,9 +1336,30 @@ impl Tracer {
 
     /// Why traced frames were not denoised with Open Image Denoise, if so.
     pub(crate) fn denoise_warning(&self) -> Option<String> {
-        match &self.oidn {
-            Some(Err(e)) => Some(format!("path tracing used the built-in denoiser: {e}")),
+        match (&self.oidn, &self.sharing) {
+            (Some(Err(e)), _) => Some(format!("path tracing used the built-in denoiser: {e}")),
+            // (Not a fault of the picture: only slower.)
+            (Some(Ok(d)), Sharing::Off(why)) if d.shares_fd() => Some(format!("Open Image Denoise's pictures are copied through the host: {why}")),
             _ => None,
+        }
+    }
+
+    /// Tests: the stand-in denoiser also takes the tracer's memory in
+    /// place; and whether pictures are denoised that way.
+    #[cfg(test)]
+    pub(crate) fn pass_through_oidn_shared(&mut self, badly: bool) {
+        let mut d = crate::oidn::Denoiser::pass_through();
+        d.stand_in_shares = true;
+        d.stand_in_shares_badly = badly;
+        self.oidn = Some(Ok(d));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_with_oidn(&self) -> Result<bool, String> {
+        match &self.sharing {
+            Sharing::Untried => Ok(false),
+            Sharing::Checked => Ok(true),
+            Sharing::Off(why) => Err(why.clone()),
         }
     }
 
@@ -1224,6 +1383,8 @@ impl Tracer {
         if let Some((_, _, b)) = self.env.take() {
             context.destroy_buffer(b);
         }
+        // (The denoiser lets go of the memories it shares before they go.)
+        self.oidn = None;
         for mut s in std::mem::take(&mut self.sets) {
             for u in &mut s.units {
                 u.destroy(context);
@@ -2472,6 +2633,56 @@ mod physics_tests {
         // its own 30 px.
         let covered = (0..160u32).filter(|&x| { let q = a.get_pixel(x, 60).0; q[0] > q[1].saturating_add(30) }).count();
         assert!((35..=48).contains(&covered), "the blurred ball covers {covered} px of the row");
+    }
+
+    /// Where the denoiser can work on the tracer's own memory (the device
+    /// exports it, the denoiser imports it) nothing is copied through the
+    /// host, the first picture is checked against the copied way, and the
+    /// frames are the same either way. (A stand-in for the denoiser, which
+    /// reads and writes the exported memory as files.)
+    #[test]
+    fn the_denoiser_works_on_the_tracers_memory_where_it_can() {
+        let (Some(mut copied), Some(mut shared)) = (sequence_renderer(true, true), sequence_renderer(true, true)) else { return };
+        if !shared.gpu.as_ref().unwrap().exports_memory() {
+            eprintln!("skipping: the device does not export memory");
+            return;
+        }
+        copied.gpu.as_mut().unwrap().tracer_for_tests().unwrap().pass_through_oidn();
+        shared.gpu.as_mut().unwrap().tracer_for_tests().unwrap().pass_through_oidn_shared(false);
+        let mut p = rolling();
+        p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 2 });
+        let c = Compiled::new(&p);
+        let times = [0.0, 0.1, 0.2, 0.3];
+        let want: Vec<image::RgbaImage> = times.iter().map(|t| copied.render(&c, *t)).collect();
+        // Pushed, so three frames (and three sets of shared memory) are in flight.
+        let mut got = Vec::new();
+        for t in times {
+            got.extend(shared.push(&c, t).unwrap());
+        }
+        while let Some(frame) = shared.pop().unwrap() {
+            got.push(frame);
+        }
+        let tracer = shared.gpu.as_mut().unwrap().tracer_for_tests().unwrap();
+        assert_eq!(tracer.shares_with_oidn(), Ok(true), "checked on the first picture, shared from then on");
+        // One run a picture, and the first picture once more to check it.
+        assert_eq!(tracer.oidn_runs(), times.len() as u64 + 1);
+        assert_eq!(got.len(), want.len());
+        for (k, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(a == b, "frame {k} differs from the copied way");
+        }
+        assert!(shared.warnings().is_empty(), "{:?}", shared.warnings());
+        // A denoiser whose shared pictures come out wrong (memory of
+        // another device, a driver that maps it otherwise): the check on
+        // the first picture catches it, that picture and the rest are
+        // copied, and the frames are right all the same.
+        let Some(mut bad) = sequence_renderer(true, true) else { return };
+        bad.gpu.as_mut().unwrap().tracer_for_tests().unwrap().pass_through_oidn_shared(true);
+        for (k, t) in times.iter().enumerate() {
+            assert!(bad.render(&c, *t) == want[k], "frame {k} differs after the shared way was refused");
+        }
+        let refused = bad.gpu.as_mut().unwrap().tracer_for_tests().unwrap().shares_with_oidn();
+        assert!(refused.as_ref().is_err_and(|why| why.contains("another picture")), "{refused:?}");
+        assert!(bad.warnings().iter().any(|w| w.contains("copied through the host")), "{:?}", bad.warnings());
     }
 
     /// The tracer keeps its tables and structures from frame to frame

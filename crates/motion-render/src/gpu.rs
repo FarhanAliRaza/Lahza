@@ -954,6 +954,12 @@ impl Gpu {
         self.tracer.as_mut()
     }
 
+    /// Tests: whether the device exports memory (the denoiser can share it).
+    #[cfg(test)]
+    pub(crate) fn exports_memory(&self) -> bool {
+        self.context.has_external_memory()
+    }
+
     /// Frames begun and not finished.
     pub fn in_flight(&self) -> usize {
         self.flights.len()

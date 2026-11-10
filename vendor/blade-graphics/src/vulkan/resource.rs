@@ -293,6 +293,12 @@ impl super::Context {
     ) -> Option<crate::ExternalMemorySource> {
         buffer.external
     }
+    /// Whether buffers and textures can be created with
+    /// `Memory::External` (the device has external memory by handle).
+    /// Creating one without it panics.
+    pub fn has_external_memory(&self) -> bool {
+        self.device.external_memory.is_some()
+    }
 }
 
 #[hidden_trait::expose]

@@ -33,7 +33,15 @@ struct Api {
     commit_filter: unsafe extern "C" fn(Handle),
     execute_filter: unsafe extern "C" fn(Handle),
     release_filter: unsafe extern "C" fn(Handle),
+    /// Sharing memory with the renderer's device (OIDN 2; absent in
+    /// older libraries): the device's supported handle types, and a
+    /// buffer over memory imported by file descriptor.
+    device_int: Option<unsafe extern "C" fn(Handle, *const c_char) -> i32>,
+    new_shared_from_fd: Option<unsafe extern "C" fn(Handle, i32, i32, usize) -> Handle>,
 }
+
+/// `OIDN_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD`: what Vulkan exports.
+const EXTERNAL_OPAQUE_FD: i32 = 1;
 
 /// Where to look for the library, in order.
 fn candidates() -> Vec<PathBuf> {
@@ -101,6 +109,8 @@ impl Api {
                     commit_filter: sym!("oidnCommitFilter"),
                     execute_filter: sym!("oidnExecuteFilter"),
                     release_filter: sym!("oidnReleaseFilter"),
+                    device_int: lib.get(b"oidnGetDeviceInt\0").ok().map(|s| *s),
+                    new_shared_from_fd: lib.get(b"oidnNewSharedBufferFromFD\0").ok().map(|s| *s),
                     _lib: lib,
                 });
             }
@@ -126,6 +136,27 @@ pub struct Denoiser {
     sized: Option<Sized>,
     /// Pictures denoised (tests: once per traced list and frame).
     pub(crate) runs: u64,
+    /// Filters over memory shared with the renderer's device (`share`).
+    shared: std::collections::HashMap<u64, Shared>,
+    next_shared: u64,
+    /// Tests: the stand-in takes shared memory too (it reads and writes
+    /// the descriptors as files, which Mesa's software Vulkan allows).
+    #[cfg(test)]
+    pub(crate) stand_in_shares: bool,
+    /// Tests: the stand-in's shared pictures come out wrong (as memory
+    /// imported from another device would).
+    #[cfg(test)]
+    pub(crate) stand_in_shares_badly: bool,
+}
+
+/// A filter whose input and output are the renderer's own device memory,
+/// imported by file descriptor: nothing is copied to denoise.
+struct Shared {
+    size: (usize, usize),
+    filter: Handle,
+    buffers: [Handle; 2],
+    /// The stand-in's view of the two memories (tests).
+    files: Option<[std::fs::File; 2]>,
 }
 
 // SAFETY: the handles are only used from the thread that owns the Denoiser
@@ -145,7 +176,18 @@ impl Denoiser {
                 return Err("Open Image Denoise: no device".into());
             }
             (api.commit_device)(device);
-            let d = Denoiser { api: Some(api), device, sized: None, runs: 0 };
+            let d = Denoiser {
+                api: Some(api),
+                device,
+                sized: None,
+                runs: 0,
+                shared: Default::default(),
+                next_shared: 0,
+                #[cfg(test)]
+                stand_in_shares: false,
+                #[cfg(test)]
+                stand_in_shares_badly: false,
+            };
             d.check()?;
             Ok(d)
         }
@@ -155,7 +197,7 @@ impl Denoiser {
     /// leads to it and back can be checked without OIDN.
     #[cfg(test)]
     pub(crate) fn pass_through() -> Self {
-        Denoiser { api: None, device: std::ptr::null_mut(), sized: None, runs: 0 }
+        Denoiser { api: None, device: std::ptr::null_mut(), sized: None, runs: 0, shared: Default::default(), next_shared: 0, stand_in_shares: false, stand_in_shares_badly: false }
     }
 
     fn check(&self) -> Result<(), String> {
@@ -237,8 +279,173 @@ impl Denoiser {
     }
 }
 
+impl Denoiser {
+    /// Whether the device can denoise memory the renderer exports by file
+    /// descriptor (OIDN on the GPU; its CPU device cannot).
+    pub fn shares_fd(&self) -> bool {
+        match &self.api {
+            // SAFETY: the device is live; the name is a C string.
+            Some(api) => api.new_shared_from_fd.is_some() && api.device_int.is_some_and(|f| unsafe { f(self.device, c"externalMemoryTypes".as_ptr()) } & EXTERNAL_OPAQUE_FD != 0),
+            #[cfg(test)]
+            None => self.stand_in_shares,
+            #[cfg(not(test))]
+            None => false,
+        }
+    }
+
+    /// A filter for `w × h` pictures over two memories the renderer
+    /// exported as file descriptors: `input` (colour, albedo and normal,
+    /// `INPUT_FLOATS` floats a pixel) and `output` (three). On success
+    /// the descriptors are the denoiser's; on failure they are closed.
+    /// Returns what `denoise_shared` and `release_shared` name it by.
+    pub fn share(&mut self, w: usize, h: usize, input: i32, output: i32) -> Result<u64, String> {
+        use std::os::fd::FromRawFd;
+        let n = w * h;
+        let (in_bytes, out_bytes) = (n * INPUT_FLOATS * 4, n * 12);
+        // SAFETY: descriptors the caller hands over, owned from here.
+        let close = |fd: i32| drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        let shared = match &self.api {
+            Some(api) => {
+                let Some(import) = api.new_shared_from_fd else {
+                    close(input);
+                    close(output);
+                    return Err("this Open Image Denoise cannot share memory".into());
+                };
+                // SAFETY: OIDN C API calls on this device; names are C strings.
+                unsafe {
+                    let a = import(self.device, EXTERNAL_OPAQUE_FD, input, in_bytes);
+                    if a.is_null() {
+                        close(input);
+                        close(output);
+                        return Err(self.check().err().unwrap_or_else(|| "Open Image Denoise did not take the shared input".into()));
+                    }
+                    let b = import(self.device, EXTERNAL_OPAQUE_FD, output, out_bytes);
+                    if b.is_null() {
+                        (api.release_buffer)(a);
+                        close(output);
+                        return Err(self.check().err().unwrap_or_else(|| "Open Image Denoise did not take the shared output".into()));
+                    }
+                    let filter = (api.new_filter)(self.device, c"RT".as_ptr());
+                    let stride = INPUT_FLOATS * 4;
+                    let image = |name: &CStr, buffer: Handle, offset: usize, stride: usize| (api.set_filter_image)(filter, name.as_ptr(), buffer, FORMAT_FLOAT3, w, h, offset, stride, stride * w);
+                    image(c"color", a, 0, stride);
+                    image(c"albedo", a, 12, stride);
+                    image(c"normal", a, 24, stride);
+                    image(c"output", b, 0, 12);
+                    (api.set_filter_bool)(filter, c"hdr".as_ptr(), true);
+                    (api.commit_filter)(filter);
+                    let shared = Shared { size: (w, h), filter, buffers: [a, b], files: None };
+                    if let Err(e) = self.check() {
+                        (api.release_filter)(filter);
+                        (api.release_buffer)(a);
+                        (api.release_buffer)(b);
+                        return Err(e);
+                    }
+                    shared
+                }
+            }
+            // SAFETY: as `close`: the files own the descriptors.
+            None => Shared { size: (w, h), filter: std::ptr::null_mut(), buffers: [std::ptr::null_mut(); 2], files: Some(unsafe { [std::fs::File::from_raw_fd(input), std::fs::File::from_raw_fd(output)] }) },
+        };
+        self.next_shared += 1;
+        self.shared.insert(self.next_shared, shared);
+        Ok(self.next_shared)
+    }
+
+    /// Denoises shared filter `id`'s input into its output, in place on
+    /// the device. The renderer's work on both memories must be done.
+    pub fn denoise_shared(&mut self, id: u64) -> Result<(), String> {
+        let s = self.shared.get(&id).ok_or("no such shared filter")?;
+        self.runs += 1;
+        match (&self.api, &s.files) {
+            (Some(api), _) => {
+                // SAFETY: a committed filter of this device.
+                unsafe { (api.execute_filter)(s.filter) };
+                self.check()
+            }
+            (None, Some(_)) => {
+                let (mut input, mut output) = (vec![0f32; s.size.0 * s.size.1 * INPUT_FLOATS], vec![0f32; s.size.0 * s.size.1 * 3]);
+                self.read_shared(id, &mut input, &mut [])?;
+                for (o, i) in output.chunks_exact_mut(3).zip(input.chunks_exact(INPUT_FLOATS)) {
+                    o.copy_from_slice(&i[..3]);
+                }
+                #[cfg(test)]
+                if self.stand_in_shares_badly {
+                    output.iter_mut().for_each(|v| *v = 1.0 - *v);
+                }
+                use std::os::unix::fs::FileExt;
+                let s = self.shared.get(&id).ok_or("no such shared filter")?;
+                let file = &s.files.as_ref().unwrap()[1];
+                file.write_all_at(bytemuck::cast_slice(&output), stand_in_offset(file, output.len() * 4)).map_err(|e| format!("shared output: {e}"))
+            }
+            (None, None) => Err("no denoiser".into()),
+        }
+    }
+
+    /// Copies shared filter `id`'s input and output to the host (either
+    /// may be empty: not read): to check the shared way against the
+    /// copied one.
+    pub fn read_shared(&self, id: u64, input: &mut [f32], output: &mut [f32]) -> Result<(), String> {
+        let s = self.shared.get(&id).ok_or("no such shared filter")?;
+        match (&self.api, &s.files) {
+            (Some(api), _) => {
+                // SAFETY: the buffers hold at least these many bytes (the
+                // slices are checked against the filter's size).
+                unsafe {
+                    if !input.is_empty() {
+                        assert_eq!(input.len(), s.size.0 * s.size.1 * INPUT_FLOATS);
+                        (api.read_buffer)(s.buffers[0], 0, input.len() * 4, input.as_mut_ptr() as *mut c_void);
+                    }
+                    if !output.is_empty() {
+                        assert_eq!(output.len(), s.size.0 * s.size.1 * 3);
+                        (api.read_buffer)(s.buffers[1], 0, output.len() * 4, output.as_mut_ptr() as *mut c_void);
+                    }
+                }
+                self.check()
+            }
+            (None, Some(files)) => {
+                use std::os::unix::fs::FileExt;
+                for (file, to) in files.iter().zip([input, output]) {
+                    if !to.is_empty() {
+                        let at = stand_in_offset(file, to.len() * 4);
+                        file.read_exact_at(bytemuck::cast_slice_mut(to), at).map_err(|e| format!("shared memory: {e}"))?;
+                    }
+                }
+                Ok(())
+            }
+            (None, None) => Err("no denoiser".into()),
+        }
+    }
+
+    /// Lets go of shared filter `id` (before its memories are freed).
+    pub fn release_shared(&mut self, id: u64) {
+        if let (Some(s), Some(api)) = (self.shared.remove(&id), &self.api) {
+            // SAFETY: handles from this device, not used after this.
+            unsafe {
+                (api.release_filter)(s.filter);
+                for b in s.buffers {
+                    (api.release_buffer)(b);
+                }
+            }
+        }
+    }
+}
+
+/// The stand-in's way into memory exported by Mesa's software Vulkan,
+/// the one device it is used with: the descriptor is a memory file whose
+/// first page (and a little more) is the allocator's own, the memory
+/// after it.
+fn stand_in_offset(file: &std::fs::File, bytes: usize) -> u64 {
+    let len = file.metadata().map_or(0, |m| m.len());
+    len.saturating_sub(bytes as u64) / 4096 * 4096
+}
+
 impl Drop for Denoiser {
     fn drop(&mut self) {
+        let ids: Vec<u64> = self.shared.keys().copied().collect();
+        for id in ids {
+            self.release_shared(id);
+        }
         self.release_sized();
         if let Some(api) = &self.api {
             // SAFETY: the device is not used after this.

@@ -57,11 +57,16 @@
     no per-texel work on the CPU; it was 96 down, 32 up and two passes
     over them on one thread).
   Still open:
-  - **OIDN's memory is still copied.** OIDN runs on CUDA, the tracer on
-    Vulkan: the packed picture goes through host memory both ways. Share
-    it instead (`VK_KHR_external_memory_fd` in the vendored blade,
-    `oidnNewSharedBufferFromFD`), with one sync point. Needs an NVIDIA
-    machine to write against.
+  - **OIDN on the tracer's memory: to run on NVIDIA.** Where the device
+    exports memory (`VK_KHR_external_memory_fd`) and OIDN's device
+    imports it (`externalMemoryTypes`, `oidnNewSharedBufferFromFD`), the
+    packed picture and the result are shared buffers and nothing goes
+    through the host. It has only run with a stand-in for OIDN on Mesa's
+    software Vulkan. On the real thing the first shared picture is
+    checked against the same picture denoised the copied way; a mismatch
+    or an error switches sharing off with a warning ("copied through the
+    host: ...") and the copied way carries on. If that warning shows on
+    the RTX, its reason is what to fix.
   - **Display lists are rebuilt per sub-frame** (31 ms on s01): each
     sub-frame evaluates the scene and builds every layer's instance and
     material rows again. Layers whose state did not change between
