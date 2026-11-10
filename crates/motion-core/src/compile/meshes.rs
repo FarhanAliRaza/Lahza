@@ -474,9 +474,9 @@ pub(super) struct CSlang {
     params: Vec<Prop<f64>>,
     animated: bool,
     start: f64,
-    /// Generators: counts, outputs, sides and given bounds.
-    vertices: u32,
-    triangles: u32,
+    /// Generators: counts (over time), outputs, sides and given bounds.
+    vertices: Prop<f64>,
+    triangles: Prop<f64>,
     outputs: crate::slang_mesh::Outputs,
     two_sided: bool,
     bounds: Option<[[f64; 3]; 2]>,
@@ -738,22 +738,24 @@ impl Compiler<'_> {
             },
             MeshDef::Slang { function, vertices, triangles, params, animated, normals, uvs, segments, one_sided, bounds } => {
                 use crate::slang_mesh::{MAX_TRIANGLES, MAX_VERTICES};
-                if !(1..=MAX_VERTICES).contains(vertices) {
-                    self.errors.push(format!("{id}.mesh.vertices: {vertices} must be 1 to {MAX_VERTICES}"));
-                }
-                if !(1..=MAX_TRIANGLES).contains(triangles) {
-                    self.errors.push(format!("{id}.mesh.triangles: {triangles} must be 1 to {MAX_TRIANGLES}"));
+                // (Counts that change are held to the range as they go.)
+                for (count, what, most) in [(vertices, "vertices", MAX_VERTICES), (triangles, "triangles", MAX_TRIANGLES)] {
+                    if let Property::Constant(n) = count {
+                        if !(1.0..=most as f64).contains(n) {
+                            self.errors.push(format!("{id}.mesh.{what}: {n} must be 1 to {most}"));
+                        }
+                    }
                 }
                 let outputs = crate::slang_mesh::Outputs { normals: *normals, uvs: *uvs, segments: *segments };
                 let names: Vec<String> = params.keys().cloned().collect();
                 CMeshShape::Slang(Box::new(CSlang {
-                    call: crate::slang_mesh::generator(&self.slang, &format!("{id}.mesh"), function, &names, outputs),
+                    call: crate::slang_mesh::generator(&self.slang, &self.windows.project.shaders, &format!("{id}.mesh"), function, &names, outputs),
                     function: function.clone(),
                     params: params.iter().map(|(k, v)| self.prop(v, id, &format!("mesh.params.{k}"), start, step, shift)).collect(),
                     animated: *animated,
                     start,
-                    vertices: (*vertices).min(MAX_VERTICES),
-                    triangles: (*triangles).min(MAX_TRIANGLES),
+                    vertices: self.prop(vertices, id, "mesh.vertices", start, step, shift),
+                    triangles: self.prop(triangles, id, "mesh.triangles", start, step, shift),
                     outputs,
                     two_sided: !*one_sided,
                     bounds: *bounds,
@@ -793,13 +795,13 @@ impl Compiler<'_> {
             }
             let names: Vec<String> = d.params.keys().cloned().collect();
             CSlang {
-                call: crate::slang_mesh::deformer(&self.slang, &format!("{id}.deform"), &d.function, &names),
+                call: crate::slang_mesh::deformer(&self.slang, &self.windows.project.shaders, &format!("{id}.deform"), &d.function, &names),
                 function: d.function.clone(),
                 params: d.params.iter().map(|(k, v)| self.prop(v, id, &format!("deform.params.{k}"), start, step, shift)).collect(),
                 animated: d.animated,
                 start,
-                vertices: 0,
-                triangles: 0,
+                vertices: Prop::constant(0.0),
+                triangles: Prop::constant(0.0),
                 outputs: Default::default(),
                 two_sided: false,
                 bounds: None,
@@ -1076,8 +1078,8 @@ impl CMesh {
             CMeshShape::Slang(s) => MeshShape::Slang(crate::slang_mesh::SlangShape {
                 function: s.function.clone(),
                 call: s.call.clone(),
-                vertices: s.vertices,
-                triangles: s.triangles,
+                vertices: s.vertices.at(t).round().clamp(0.0, crate::slang_mesh::MAX_VERTICES as f64) as u32,
+                triangles: s.triangles.at(t).round().clamp(0.0, crate::slang_mesh::MAX_TRIANGLES as f64) as u32,
                 params: s.params(t),
                 time: s.time(t),
                 animated: s.animated,

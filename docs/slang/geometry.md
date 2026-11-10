@@ -28,8 +28,8 @@ from the viewer, centred on the layer's position.
 | field | meaning |
 |---|---|
 | `function` | name prefix of the author's functions |
-| `vertices`, `triangles` | how many points and triangles (1–2,000,000 and 1–4,000,000) |
-| `params` | `{name: number or animatable property}`: fields of the author's `<function>_params` struct, passed as a last argument |
+| `vertices`, `triangles` | how many points and triangles (1–2,000,000 and 1–4,000,000). Animatable (rounded): key them, and a mesh that grows over time is asked only for the points and triangles it has so far; 0 at a moment is an empty mesh |
+| `params` | `{name: number or animatable property}`: fields of the author's `<function>_params` struct, passed as a last argument. Fields not given keep the struct's defaults; a function whose module declares the struct is always passed it |
 | `animated` | `t` is the layer's local seconds (since its start); default false: `t` is 0 and the mesh is made once |
 | `normals` | the author wrote `<function>_normal`; default: smooth normals from the triangles |
 | `uvs` | the author wrote `<function>_uv`; default: planar UVs by the facing axis |
@@ -37,8 +37,9 @@ from the viewer, centred on the layer's position.
 | `one_sided` | the mesh is closed: back faces are culled (a triangle's outside is where its normals point); default: seen from both sides |
 | `bounds` | `[[x, y, z], [x, y, z]]` local box in px; default: measured from the generated mesh |
 
-The functions (`i` a point, `j` a triangle; with `params`, every function
-takes `<function>_params p` as a last argument):
+The functions (`i` a point, `j` a triangle; where the module declares
+`struct <function>_params`, every function takes `<function>_params p` as
+a last argument):
 
 ```slang
 float3 terrain_position(uint i, float t);   // required
@@ -156,11 +157,17 @@ changing; use `animated` for motion that only `t` can express.
 
 ## Errors
 
-- The Slang does not build (a missing function, a wrong signature, a
-  `params` field the struct does not have): `check` and the render list
-  the compiler's errors as `shaders/<file>:<line>:<col>: <what>`.
-- `vertices` or `triangles` 0 or past the limits, `subdivide` past 4:
-  `check` errors.
+- A function the modules do not have is named with the layer that
+  calls it: `no Slang function 'ring_position' in shaders/geo.slang
+  (ring.mesh calls it)`. `params` given to a function without a
+  `<function>_params` struct are an error on the layer.
+- The Slang does not build (a wrong signature, a `params` field the
+  struct does not have): `check` and the render list the compiler's
+  errors as `shaders/<file>:<line>:<col>: <what>`, or, when the error is
+  in the call Lahza generates, with that call:
+  ``in Lahza's call `float3 v = quad_position(i, t, p);`: too many arguments``.
+- A fixed `vertices` or `triangles` of 0 or past the limits, `subdivide`
+  past 4: `check` errors. (Keyed counts are held to the limits.)
 - A triangle naming a point past `vertices`, or a position, normal or UV
   that is not a number (NaN, infinity): the mesh is not drawn and the
   render warns, naming the function and index, e.g.

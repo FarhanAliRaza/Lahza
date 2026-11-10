@@ -88,9 +88,11 @@ fn fnv(s: &str) -> u64 {
 }
 
 /// Code filling `<function>_params p` from `params` by field name, and
-/// the argument that passes it (nothing when there are no params).
-fn params_code(function: &str, names: &[String]) -> (String, &'static str) {
-    if names.is_empty() {
+/// the argument that passes it: where the author's modules declare the
+/// struct (`takes`), whether or not the layer gives params (fields it does
+/// not give keep the struct's defaults); nothing where they do not.
+fn params_code(function: &str, names: &[String], takes: bool) -> (String, &'static str) {
+    if !takes {
         return (String::new(), "");
     }
     let mut code = format!("    {function}_params p = {{}};\n");
@@ -119,14 +121,32 @@ type GenerateFn = unsafe extern "C" fn(u32, u32, u32, u32, f32, *const f32, *mut
 /// `deformer` exports it.
 type DeformFn = unsafe extern "C" fn(u32, u32, f32, *const f32, *mut f32, *const f32);
 
+/// Whether `function` takes a `<function>_params` struct (the modules
+/// declare one), reporting params given to a function that has none: the
+/// compiler would say so about Lahza's generated call, not the layer.
+fn takes_params(linker: &Linker, shaders: &[crate::slang::Shader], what: &str, function: &str, names: &[String]) -> bool {
+    let takes = crate::slang::declares_struct(shaders, &format!("{function}_params"));
+    if !takes && !names.is_empty() && !shaders.is_empty() {
+        linker.error(format!("{what}: params ({}) are given, but shaders/ has no `struct {function}_params` for them (the function takes it as its last argument)", names.join(", ")));
+    }
+    takes
+}
+
 /// Exports a generator: one function writing every output of a range of
 /// points and triangles. `names`: the params, in the order passed.
-pub fn generator(linker: &Linker, what: &str, function: &str, names: &[String], out: Outputs) -> Linked {
+/// `shaders`: the project's modules (which functions and structs exist).
+pub fn generator(linker: &Linker, shaders: &[crate::slang::Shader], what: &str, function: &str, names: &[String], out: Outputs) -> Linked {
     names_ok(linker, what, function, names);
-    let shape = format!("{names:?}{out:?}");
+    let takes = takes_params(linker, shaders, what, function, names);
+    for (wanted, suffix) in [(true, "position"), (true, "triangle"), (out.normals, "normal"), (out.uvs, "uv"), (out.segments, "segment")] {
+        if wanted {
+            linker.want(&format!("{function}_{suffix}"), what);
+        }
+    }
+    let shape = format!("{names:?}{out:?}{}", if takes { "" } else { "plain" });
     let symbol = format!("lahza_mesh_{function}_{:016x}", fnv(&shape));
     linker.export(&symbol, || {
-        let (fill, p) = params_code(function, names);
+        let (fill, p) = params_code(function, names, takes);
         let f = function;
         let mut code = format!(
             "export __extern_cpp void {symbol}(uint v0, uint v1, uint t0, uint t1, float t, float* params, float* pos, float* nor, float* uv, uint* tri, uint* seg) {{\n{fill}    for (uint i = v0; i < v1; i++) {{\n        float3 v = {f}_position(i, t{p});\n        pos[i * 3] = v.x; pos[i * 3 + 1] = v.y; pos[i * 3 + 2] = v.z;\n"
@@ -147,11 +167,13 @@ pub fn generator(linker: &Linker, what: &str, function: &str, names: &[String], 
 }
 
 /// Exports a deformer: `function(p, n, t[, params])` over a range of points.
-pub fn deformer(linker: &Linker, what: &str, function: &str, names: &[String]) -> Linked {
+pub fn deformer(linker: &Linker, shaders: &[crate::slang::Shader], what: &str, function: &str, names: &[String]) -> Linked {
     names_ok(linker, what, function, names);
-    let symbol = format!("lahza_mesh_deform_{function}_{:016x}", fnv(&format!("{names:?}")));
+    let takes = takes_params(linker, shaders, what, function, names);
+    linker.want(function, what);
+    let symbol = format!("lahza_mesh_deform_{function}_{:016x}", fnv(&format!("{names:?}{}", if takes { "" } else { "plain" })));
     linker.export(&symbol, || {
-        let (fill, p) = params_code(function, names);
+        let (fill, p) = params_code(function, names, takes);
         format!(
             "export __extern_cpp void {symbol}(uint i0, uint i1, float t, float* params, float* pos, float* nor) {{\n{fill}    for (uint i = i0; i < i1; i++) {{\n        float3 q = {function}(float3(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]), float3(nor[i * 3], nor[i * 3 + 1], nor[i * 3 + 2]), t{p});\n        pos[i * 3] = q.x; pos[i * 3 + 1] = q.y; pos[i * 3 + 2] = q.z;\n    }}\n}}\n"
         )
@@ -207,6 +229,10 @@ impl SlangShape {
         let f = &self.function;
         let address = self.call.address().ok_or_else(|| format!("slang mesh '{f}': the project's Slang did not build"))?;
         let (nv, nt) = (self.vertices as usize, self.triangles as usize);
+        if nv == 0 || nt == 0 {
+            // Nothing yet (counts that grow over time start here).
+            return Ok(Mesh::default());
+        }
         let mut pos = vec![0f32; nv * 3];
         let mut nor = vec![0f32; if self.outputs.normals { nv * 3 } else { 0 }];
         let mut uv = vec![0f32; if self.outputs.uvs { nv * 2 } else { 0 }];
@@ -351,6 +377,72 @@ float3 lift(float3 p, float3 n, float t) { return p + float3(0, -5, 0) * (1 + t)
                 _ => None,
             })
             .unwrap()
+    }
+
+    /// A generator whose modules declare `<function>_params` is passed
+    /// the struct whether or not the layer gives params (its defaults
+    /// then stand); one without is not, and params given to it are an
+    /// error that names the layer, not the generated call. A function no
+    /// module has is named with the files. (The generated Slang's text:
+    /// no compiler needed.)
+    #[test]
+    fn generated_calls_follow_what_the_modules_declare() {
+        use crate::slang::{Linker, Shader};
+        let modules = vec![Shader { name: "geo".into(), source: SHADER.into() }];
+        let linker = Linker::default();
+        super::generator(&linker, &modules, "wall.mesh", "quad", &[], Default::default());
+        let code = linker.exported("lahza_mesh_quad_").unwrap();
+        assert!(code.contains("    quad_params p = {};\n    for (uint i = v0; i < v1; i++) {\n        float3 v = quad_position(i, t, p);"), "{code}");
+        assert!(code.contains("uint3 k = quad_triangle(j, t, p);"), "{code}");
+        assert!(linker.errors().is_empty(), "{:?}", linker.errors());
+        // With a param: filled by name.
+        let linker = Linker::default();
+        super::generator(&linker, &modules, "wall.mesh", "quad", &["size".into()], Default::default());
+        assert!(linker.exported("lahza_mesh_quad_").unwrap().contains("    quad_params p = {};\n    p.size = params[0];\n"));
+        // `bad` has no struct: called without, and params for it are an error.
+        let linker = Linker::default();
+        super::generator(&linker, &modules, "blob.mesh", "bad", &[], Default::default());
+        assert!(linker.exported("lahza_mesh_bad_").unwrap().contains("float3 v = bad_position(i, t);"));
+        assert!(linker.errors().is_empty());
+        super::generator(&linker, &modules, "blob.mesh", "bad", &["size".into()], Default::default());
+        assert_eq!(linker.errors(), ["blob.mesh: params (size) are given, but shaders/ has no `struct bad_params` for them (the function takes it as its last argument)"]);
+        // Functions the modules lack: by name, with what calls them.
+        let linker = Linker::default();
+        super::generator(&linker, &modules, "ring.mesh", "ring", &[], super::Outputs { normals: true, ..Default::default() });
+        super::deformer(&linker, &modules, "ring.deform", "lift", &[]);
+        let e = linker.link(&modules).err().unwrap();
+        assert_eq!(e, "no Slang function 'ring_position' in shaders/geo.slang (ring.mesh calls it); no Slang function 'ring_triangle' in shaders/geo.slang (ring.mesh calls it); no Slang function 'ring_normal' in shaders/geo.slang (ring.mesh calls it)");
+    }
+
+    /// `vertices` and `triangles` can change over time: a mesh that grows
+    /// is asked for the points and triangles it has so far (none yet is
+    /// an empty mesh, not an error).
+    #[test]
+    fn counts_follow_their_keys() {
+        let mut p = Project::new(640, 360, Fps::whole(30), 2.0);
+        p.shaders.push(crate::slang::Shader { name: "geo".into(), source: SHADER.into() });
+        p.scenes.push(serde_json::from_value(json!({"id": "s1", "layers": [
+            {"id": "grow", "kind": "mesh", "mesh": {"type": "slang", "function": "quad",
+                "vertices": {"keys": [{"at": 0, "v": 0, "ease": "linear"}, {"at": 1, "v": 400}]},
+                "triangles": {"keys": [{"at": 0, "v": 0, "ease": "linear"}, {"at": 1, "v": 200}]}}},
+            {"id": "still", "kind": "mesh", "mesh": {"type": "slang", "function": "quad", "vertices": 4, "triangles": 2}}
+        ]})).unwrap());
+        // (Without slangc the project reports that it did not build; the
+        // counts are the layers' own.)
+        let c = Compiled::new(&p);
+        let counts = |t: f64, id: &str| match &mesh(&c, t, id).params.shape {
+            crate::mesh::MeshShape::Slang(s) => (s.vertices, s.triangles),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(counts(0.0, "grow"), (0, 0));
+        assert_eq!(counts(0.5, "grow"), (200, 100));
+        assert_eq!(counts(1.5, "grow"), (400, 200));
+        assert_eq!(counts(0.5, "still"), (4, 2));
+        assert_ne!(mesh(&c, 0.25, "grow").params.key(), mesh(&c, 0.5, "grow").params.key(), "another mesh as it grows");
+        // A constant count out of range is still an error.
+        let mut bad = Project::new(640, 360, Fps::whole(30), 2.0);
+        bad.scenes.push(serde_json::from_value(json!({"id": "s1", "layers": [{"id": "none", "kind": "mesh", "mesh": {"type": "slang", "function": "quad", "vertices": 0, "triangles": 2}}]})).unwrap());
+        assert!(Compiled::new(&bad).errors.iter().any(|e| e.contains("none.mesh.vertices: 0 must be 1 to")), "{:?}", Compiled::new(&bad).errors);
     }
 
     /// A static generator is one mesh for the whole layer (one cache key);

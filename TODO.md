@@ -80,19 +80,18 @@
 
 ## Slang
 
-- **Generator errors point at Lahza's wrapper.** A geometry generator whose
-  Slang has a `<fn>_params` struct but no `params` in the layer JSON fails
-  with `lahza_cpu.slang:11:33: not enough arguments to call (got 2,
-  expected 3)` and a hint that only mentions shader layers. Missing
-  functions (geometry functions and scene parameters) also point into the
-  generated wrapper's cache path instead of the author's file in
-  `shaders/`.
-- **Slang geometry runs on the CPU, at fixed sizes.** Generators and
-  deformers are evaluated on the CPU and uploaded; a GPU compute version
-  would keep large animated meshes off the CPU. Vertex and triangle counts
-  can't change over time, so particles that haven't appeared yet have to be
-  collapsed to zero size.
-- **Shader-layer params are passed in alphabetical order.** A layer's
-  `params` reach the author's function sorted by name, not as written, so a
-  mismatch shows up as a compile error in the generated caller. Pass them
-  by name instead (a params struct, as geometry generators do).
+- **To compile once with slangc.** These were written where slangc could
+  not be run, and are checked only as text (`cargo test -p
+  lahza-motion-core slang`): shader layers pass their params in a
+  `<function>_params` struct where the module declares one (by field
+  name; one by one in name order where it does not, as before);
+  generators and deformers are passed the struct whenever the module
+  declares it, params or not; the compiler's errors in Lahza's generated
+  calls are shown as the call. The generated Slang follows what the
+  geometry generators already compiled (`T p = {}; p.field = …;`), in a
+  compute kernel too for shader layers: run the Slang tests and a
+  project with a shader layer's params once.
+- **Slang geometry runs on the CPU.** Generators and deformers are
+  evaluated on the CPU and uploaded; a GPU compute version would keep
+  large animated meshes off the CPU. (Counts can change over time now:
+  `vertices` and `triangles` are animatable.)

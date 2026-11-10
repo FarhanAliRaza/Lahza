@@ -807,7 +807,7 @@ struct Compiler<'a> {
     /// Slang surface functions the project's materials use.
     surfaces: crate::surface::Surfaces,
     /// Shader layers' functions, by function and argument components.
-    programs: HashMap<(String, Vec<usize>), Arc<crate::slang_layer::Program>>,
+    programs: HashMap<(String, Vec<(String, usize)>), Arc<crate::slang_layer::Program>>,
     errors: Vec<String>,
     syncs: Vec<SyncRecord>,
     events: Vec<VisualEvent>,
@@ -1244,12 +1244,12 @@ impl<'a> Compiler<'a> {
                 ShaderParam::Float4(p) => CParam::Float4(self.prop(p, id, &what, start, step, shift)),
             });
         }
-        let components: Vec<usize> = s.params.values().map(ShaderParam::components).collect();
-        let key = (s.function.clone(), components);
+        let passed: Vec<(String, usize)> = s.params.iter().map(|(name, p)| (name.clone(), p.components())).collect();
+        let key = (s.function.clone(), passed);
         let program = match self.programs.get(&key) {
             Some(p) => p.clone(),
             None => {
-                let (program, check) = crate::slang_layer::Program::new(&self.slang, &self.windows.project.shaders, &key.0, key.1.clone());
+                let (program, check) = crate::slang_layer::Program::new(&self.slang, &self.windows.project.shaders, &key.0, &key.1);
                 if let Err(e) = check {
                     self.errors.push(format!("{id}: {e}"));
                 }

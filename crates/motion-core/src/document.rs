@@ -1825,7 +1825,8 @@ pub struct ShaderLayer {
     /// Picture size in pixels; default the frame's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<Property<Vec2>>,
-    /// The function's arguments after `t`, in name order.
+    /// The function's params: fields of its `<function>_params` struct by
+    /// name, or (without the struct) its arguments after `t` in name order.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub params: std::collections::BTreeMap<String, ShaderParam>,
 }
@@ -2487,11 +2488,13 @@ pub enum MeshDef {
     /// points and `uint3 <function>_triangle(uint j, float t)` for each of
     /// `triangles`; `normals`, `uvs` and `segments` add
     /// `<function>_normal`, `_uv` and `_segment`. Normals not given are
-    /// smoothed from the triangles.
+    /// smoothed from the triangles. `vertices` and `triangles` are
+    /// animatable (rounded): a mesh that grows over time is asked for the
+    /// points and triangles it has so far.
     Slang {
         function: String,
-        vertices: u32,
-        triangles: u32,
+        vertices: Property<f64>,
+        triangles: Property<f64>,
         /// Fields of the author's `<function>_params` struct (animatable),
         /// passed as a last argument.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

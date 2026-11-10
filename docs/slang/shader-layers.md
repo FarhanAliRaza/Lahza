@@ -19,15 +19,23 @@ It composites like any layer: transform, opacity, blend, effects, mattes,
 ## The function
 
 ```slang
-float4 name(float2 uv, float2 px, float t /*, params in name order */)
+struct name_params { float speed = 1; float3 tint = float3(1, 1, 1); }
+float4 name(float2 uv, float2 px, float t, name_params p)
 ```
+
+Declare a `<function>_params` struct for the layer's `params`: they fill
+its fields **by name**, and fields the layer does not give keep the
+struct's defaults. A function that takes no params has no struct and
+ends at `t`. (A function without the struct can still take its params one
+by one after `t`, in name order; the struct is clearer and its errors say
+which field.)
 
 | Argument | Meaning |
 |----------|---------|
 | `uv` | Position in the picture, 0..1. (0, 0) is the top-left corner and y points down. Each call gets a pixel centre, so `uv` is never exactly 0 or 1. |
 | `px` | The same position in layer pixels, 0..`size` (`px = uv * size`). The layer's size is `px / uv`. |
 | `t`  | Seconds since the layer started (the layer's own clock, so `step_fps` and comp time offsets apply). |
-| then the `params` | Passed in **name order (alphabetical)**, not the order you wrote them in. A number is a `float`. `[x, y]` is a `float2` and `[x, y, z]` is a `float3`. `[x, y, z, w]` or a colour (`"#ff8800"`, `"#ff880080"`) is a `float4`. A colour is passed as its 0..1 sRGB components. A keyed param takes its type from its first key's `v`. A param with only `add` tracks needs a `"base"`. You can pass at most 12 params. |
+| then the `params` | The `<function>_params` struct, each param in the field of its name. A number is a `float`. `[x, y]` is a `float2` and `[x, y, z]` is a `float3`. `[x, y, z, w]` or a colour (`"#ff8800"`, `"#ff880080"`) is a `float4`. A colour is passed as its 0..1 sRGB components. A keyed param takes its type from its first key's `v`. A param with only `add` tracks needs a `"base"`. You can pass at most 12 params. |
 
 The function returns **straight (not premultiplied) colour** in the
 display's 0..1 sRGB values, the same values a `"#rrggbb"` colour has:
@@ -101,8 +109,9 @@ float4 rings(float2 uv, float2 px, float t, float count, float4 tint) {
  "blend": "screen", "transform": {"opacity": 0.85, "rotation": 15, "position": [1400, 540]}}
 ```
 
-The params are passed in name order: `count`, then `tint`. That order
-matches the function's argument order.
+With `struct rings_params { float count; float4 tint; }` in the module
+they arrive as `p.count` and `p.tint`. Without the struct they are the
+function's arguments after `t` in name order: `count`, then `tint`.
 
 An opaque gradient (`float3`, no params):
 
@@ -119,11 +128,11 @@ float3 sky(float2 uv, float2 px, float t) {
 - An unknown function, with the layer: `bg: no Slang function 'plasm' in shaders/plasma.slang`.
 - A compile error in a module, with its place:
   `Slang: shaders/plasma.slang:4:12: undefined identifier 'spd'`.
-- Arguments that do not match the function: for example, a missing
-  param, or params given in another order than name order. The compiler
-  reports these errors against Lahza's generated caller (`lahza_cpu.slang`).
-  To fix one, compare the function's arguments after `t` with the layer's
-  params in name order.
+- Arguments that do not match the function: a param the struct has no
+  field for, a field of another type, or (without a struct) another
+  number of arguments. The compiler reports these in the call Lahza
+  generates, and the error shows that call:
+  ``Slang: in Lahza's call `q.tint = u_shader.params[1].xyz;`: no member 'tint' in 'sky_params'``.
 - A missing `slangc`.
 
 A layer whose function did not build is drawn transparent, and the error

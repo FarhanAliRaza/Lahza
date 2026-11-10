@@ -90,6 +90,44 @@ float4 lahza_widen(float3 v, float keep) { return float4(v, keep); }
 float4 lahza_widen(float4 v, float keep) { return v; }
 ";
 
+/// Whether `source` names `function` as a call or definition (`name(`): a
+/// clear error for a misspelt function, before the compiler's.
+pub fn mentions(source: &str, function: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    source.match_indices(function).any(|(i, _)| {
+        let before = source[..i].chars().next_back().is_none_or(|c| !ident(c));
+        let after = source[i + function.len()..].trim_start();
+        before && after.starts_with('(')
+    })
+}
+
+/// Whether the project's modules declare `struct <name>`: how Lahza
+/// tells that a function takes its params as a `<function>_params` struct
+/// (filled by field name) rather than not at all or one by one.
+pub fn declares_struct(shaders: &[Shader], name: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    shaders.iter().any(|m| {
+        m.source.match_indices(name).any(|(i, _)| {
+            let before = m.source[..i].trim_end();
+            let after = m.source[i + name.len()..].chars().next();
+            before.ends_with("struct") && before[..before.len() - 6].chars().next_back().is_none_or(|c| !ident(c)) && after.is_none_or(|c| !ident(c))
+        })
+    })
+}
+
+/// Why `function` cannot be called (no modules, or none names it), for an
+/// error before the compiler's; None when a module names it.
+pub fn missing(shaders: &[Shader], function: &str) -> Option<String> {
+    if shaders.is_empty() {
+        return Some(format!("no Slang function '{function}': the project has no shaders/*.slang"));
+    }
+    if shaders.iter().any(|m| mentions(&m.source, function)) {
+        return None;
+    }
+    let names: Vec<String> = shaders.iter().map(|m| format!("shaders/{}.slang", m.name)).collect();
+    Some(format!("no Slang function '{function}' in {}", names.join(", ")))
+}
+
 /// Whether `name` can be pasted into generated Slang as a function name.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -126,6 +164,10 @@ pub struct Linker {
     exports: Mutex<Vec<(String, String)>>,
     /// Uses that cannot be built (bad names), reported by `link`.
     errors: Mutex<Vec<String>>,
+    /// Functions uses call that `link` looks for in the modules first
+    /// (with what uses them), for an error that names the function and
+    /// the files rather than the compiler's in Lahza's generated call.
+    wanted: Mutex<Vec<(String, String)>>,
     runtime: Arc<OnceLock<Arc<Runtime>>>,
 }
 
@@ -145,12 +187,33 @@ impl Linker {
         self.errors.lock().unwrap().push(message);
     }
 
+    /// Notes that `what` calls `function`: `link` reports it by name when
+    /// no module has it.
+    pub fn want(&self, function: &str, what: &str) {
+        let mut wanted = self.wanted.lock().unwrap();
+        if !wanted.iter().any(|(f, _)| f == function) {
+            wanted.push((function.to_string(), what.to_string()));
+        }
+    }
+
+    /// Tests: the wrapper exported as `symbol`, and the errors so far.
+    #[cfg(test)]
+    pub(crate) fn exported(&self, symbol: &str) -> Option<String> {
+        self.exports.lock().unwrap().iter().find(|(s, _)| s.starts_with(symbol)).map(|(_, code)| code.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn errors(&self) -> Vec<String> {
+        self.errors.lock().unwrap().clone()
+    }
+
     /// A use of scene-parameter function `function`: `f(local seconds)`,
     /// added to the value or (`mul`) multiplying it.
     pub fn param(&self, function: &str, mul: bool) -> Param {
         if !valid_name(function) {
             self.error(format!("'{function}' is not a Slang function name"));
         }
+        self.want(function, "a scene parameter");
         let symbol = format!("lahza_param_{function}_{}", if mul { "mul" } else { "add" });
         let keep = if mul { "1.0" } else { "0.0" };
         Param(self.export(&symbol, || format!("export __extern_cpp void {symbol}(float t, float4* out) {{ *out = lahza_widen({function}(t), {keep}); }}\n")))
@@ -164,7 +227,8 @@ impl Linker {
     /// Builds (or reuses) the library for `shaders`; errors are the
     /// compiler's, with file and line.
     pub fn link(&self, shaders: &[Shader]) -> Result<Arc<Runtime>, String> {
-        let errors = self.errors.lock().unwrap().clone();
+        let mut errors = self.errors.lock().unwrap().clone();
+        errors.extend(self.wanted.lock().unwrap().iter().filter(|(f, _)| valid_name(f)).filter_map(|(f, what)| missing(shaders, f).map(|e| format!("{e} ({what} calls it)"))));
         if !errors.is_empty() {
             return Err(errors.join("; "));
         }
@@ -281,7 +345,7 @@ fn build(shaders: &[Shader], exports: &[(String, String)]) -> Result<Arc<Runtime
             .output()
             .map_err(|e| format!("{}: {e}", slangc.display()))?;
         if !out.status.success() || !tmp.is_file() {
-            return Err(diagnostics(&String::from_utf8_lossy(&out.stderr), &src));
+            return Err(diagnostics(&String::from_utf8_lossy(&out.stderr), &src, Some((&entry, &wrap))));
         }
         std::fs::rename(&tmp, &lib).map_err(|e| e.to_string())?;
     }
@@ -325,7 +389,7 @@ pub fn wgsl(shaders: &[Shader], module: &str, entry: &str, stage: &str) -> Resul
         .output()
         .map_err(|e| format!("{}: {e}", slangc.display()))?;
     if !out.status.success() || !tmp.is_file() {
-        return Err(diagnostics(&String::from_utf8_lossy(&out.stderr), &src));
+        return Err(diagnostics(&String::from_utf8_lossy(&out.stderr), &src, Some((&entry_file, module))));
     }
     std::fs::rename(&tmp, &out_path).map_err(|e| e.to_string())?;
     std::fs::read_to_string(&out_path).map_err(|e| e.to_string())
@@ -333,9 +397,19 @@ pub fn wgsl(shaders: &[Shader], module: &str, entry: &str, stage: &str) -> Resul
 
 /// The compiler's errors as `shaders/<file>:<line>:<col>: <what>`, one
 /// per error (the follow-on "import failed" lines and the C++ compiler's
-/// noise dropped).
-fn diagnostics(stderr: &str, src: &Path) -> String {
+/// noise dropped). An error in `generated` (the file Lahza wrote to call
+/// the author's functions, and its text) is given as the call it is in:
+/// its place in a cache folder says nothing to the author, the call says
+/// which function is used how.
+fn diagnostics(stderr: &str, src: &Path, generated: Option<(&Path, &str)>) -> String {
     let src = format!("{}/", src.display());
+    // `<generated file>:<line>:<col>` → the line Lahza wrote there.
+    let call = |at: &str| -> Option<String> {
+        let (file, text) = generated?;
+        let rest = at.strip_prefix(&*file.to_string_lossy())?.strip_prefix(':')?;
+        let line: usize = rest.split(':').next()?.trim().parse().ok()?;
+        Some(text.lines().nth(line.checked_sub(1)?)?.trim().to_string())
+    };
     let mut out: Vec<String> = Vec::new();
     let mut current: Option<(String, Option<String>, Option<String>)> = None;
     let flush = |c: Option<(String, Option<String>, Option<String>)>, out: &mut Vec<String>| {
@@ -345,7 +419,18 @@ fn diagnostics(stderr: &str, src: &Path) -> String {
             }
             let what = detail.unwrap_or(what);
             out.push(match at {
-                Some(at) => format!("{}: {what}", at.replace(&src, "shaders/")),
+                Some(at) => match call(&at) {
+                    Some(line) => {
+                        // What usually is behind it.
+                        let hint = if what.contains("arguments") || what.contains("argument") {
+                            ": the function's parameters are not what its use passes (see docs/slang for each use's signature; params go in a `<function>_params` struct)"
+                        } else {
+                            ""
+                        };
+                        format!("in Lahza's call `{line}`: {what}{hint}")
+                    }
+                    None => format!("{}: {what}", at.replace(&src, "shaders/")),
+                },
                 None => what,
             });
         }
@@ -403,6 +488,59 @@ pub fn check(shaders: &[Shader], name: &str) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(diagnostics(&String::from_utf8_lossy(&out.stderr), &src))
+        Err(diagnostics(&String::from_utf8_lossy(&out.stderr), &src, None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn module(source: &str) -> Vec<Shader> {
+        vec![Shader { name: "fx".into(), source: source.into() }]
+    }
+
+    #[test]
+    fn finds_functions_and_structs_by_name() {
+        assert!(mentions("float4 sky(float2 uv) {}", "sky"));
+        assert!(mentions("float4 sky (float2 uv) {}", "sky"));
+        assert!(!mentions("float4 skyline(float2 uv) {}", "sky"));
+        assert!(!mentions("float4 bluesky(float2 uv) {}", "sky"));
+        assert!(declares_struct(&module("struct sky_params { float3 tint; }"), "sky_params"));
+        assert!(declares_struct(&module("public struct\n  sky_params\n{ float3 tint; }"), "sky_params"));
+        assert!(!declares_struct(&module("struct sky_params2 { float a; }"), "sky_params"));
+        assert!(!declares_struct(&module("float4 sky(float2 uv, sky_params p) {}"), "sky_params"));
+        assert!(!declares_struct(&module("mystruct sky_params;"), "sky_params"));
+        assert_eq!(missing(&[], "sky").unwrap(), "no Slang function 'sky': the project has no shaders/*.slang");
+        assert_eq!(missing(&module("float4 dusk(float2 uv) {}"), "sky").unwrap(), "no Slang function 'sky' in shaders/fx.slang");
+        assert_eq!(missing(&module("float4 sky(float2 uv) {}"), "sky"), None);
+    }
+
+    /// A scene parameter whose function no module has is reported by name
+    /// with the files, before the compiler runs.
+    #[test]
+    fn a_missing_scene_parameter_function_is_named() {
+        let linker = Linker::default();
+        linker.param("orbit", false);
+        linker.param("breathe", true);
+        let e = linker.link(&module("float breathe(float t) { return 1.0; }")).err().unwrap();
+        assert_eq!(e, "no Slang function 'orbit' in shaders/fx.slang (a scene parameter calls it)");
+    }
+
+    /// Errors in the author's files keep their place as `shaders/…`;
+    /// errors in the call Lahza generated are shown as that call.
+    #[test]
+    fn errors_in_generated_calls_are_shown_as_the_call() {
+        let src = Path::new("/cache/abc/src");
+        let wrapper = Path::new("/cache/abc/lahza_cpu.slang");
+        let text = "import fx;\nfloat4 lahza_widen(float v, float keep) { return float4(v, v, v, v); }\nexport __extern_cpp void lahza_mesh_quad(uint v0, uint v1) {\n    for (uint i = v0; i < v1; i++) {\n        float3 v = quad_position(i, t);\n    }\n}\n";
+        let stderr = "error[E30043]: not enough arguments to call (got 2, expected 3)\n  --> /cache/abc/lahza_cpu.slang:5:33\n   |\n 5 |         float3 v = quad_position(i, t);\n   |                                 ^\nerror[E30015]: undefined identifier 'siz'.\n  --> /cache/abc/src/fx.slang:3:40\n   |\n 3 | float3 quad_position(uint i) { return siz; }\n   |                                        ^^^ undefined identifier\n";
+        let got = diagnostics(stderr, src, Some((wrapper, text)));
+        assert_eq!(
+            got,
+            "Slang: in Lahza's call `float3 v = quad_position(i, t);`: not enough arguments to call (got 2, expected 3): the function's parameters are not what its use passes (see docs/slang for each use's signature; params go in a `<function>_params` struct); shaders/fx.slang:3:40: undefined identifier"
+        );
+        // Without the generated file's text (a module checked on its own).
+        assert!(diagnostics(stderr, src, None).contains("/cache/abc/lahza_cpu.slang:5:33: not enough arguments"));
     }
 }
