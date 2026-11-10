@@ -255,8 +255,9 @@ fn shader_validates_and_layouts_match() {
     assert_eq!(size("Prim"), std::mem::size_of::<list::Prim>());
     assert_eq!(size("Pass"), 64);
     assert_eq!(size("BlurPass"), 32);
-    // raster, blur, resolve and the visibility pass's vertex and fragment.
-    assert_eq!(module.entry_points.len(), 5);
+    // raster, blur, resolve, the visibility pass's vertex and fragment and
+    // the shadow pass's vertex.
+    assert_eq!(module.entry_points.len(), 6);
 }
 
 /// GPU and CPU draw the same picture. Runs when a Vulkan device exists

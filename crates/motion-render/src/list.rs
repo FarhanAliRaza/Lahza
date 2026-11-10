@@ -164,6 +164,9 @@ pub struct DisplayList {
     /// Mesh instances' rows the GPU's mesh pool completes (where their
     /// meshes are), with the meshes.
     pub pool: Vec<crate::mesh3d::PoolRef>,
+    /// Shadow maps for the GPU to draw (lists for its visibility pass):
+    /// their headers and casters are rows of `mesh`.
+    pub shadows: Vec<crate::mesh3d::ShadowJob>,
     /// Triangle ids the mesh batches take (the visibility pass's).
     pub mesh_ids: u32,
     /// The project's Slang surfaces its meshes use (the GPU draws them with
@@ -481,7 +484,7 @@ impl Builder<'_> {
         let cache = &mut *self.meshes;
         let batch = cache.batches.get(item.prim.kind[1] as usize)?;
         let mut setup = std::time::Duration::ZERO;
-        let placed = batch.place(&mut list.mesh, &mut list.bins, &mut list.pool, &mut cache.placed, target, origin, factor, item.prim.kind[2], self.compact, &mut setup);
+        let placed = batch.place(&mut list.mesh, &mut list.bins, &mut list.pool, &mut list.shadows, &mut cache.placed, target, origin, factor, item.prim.kind[2], self.compact, &mut setup);
         cache.placing_setup += setup;
         cache.placing += started.elapsed();
         placed

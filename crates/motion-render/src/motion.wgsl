@@ -1292,10 +1292,42 @@ fn shadow_lit(s: f32, c: f32, bias: f32, point: bool) -> f32 {
     return 0.0;
 }
 
-fn shadow_texel(base: u32, size: i32, i: i32, j: i32, c: f32, bias: f32, point: bool) -> f32 {
-    if i < 0 || j < 0 || i >= size || j >= size { return 1.0; }
-    let k = u32(j * size + i);
-    return shadow_lit(b_mesh[base + 6u + k / 4u][k % 4u], c, bias, point);
+// Shadow maps the GPU draws (gpu.rs, from the mesh pool): pages of one
+// depth atlas. Depth 0 is no surface; a point map's depth is closeness
+// (1 / distance along its axis), a directional map's is closeness from
+// `near` over `range`.
+var t_shadow: texture_depth_2d;
+
+// What `shadow_texel` needs of a map: where its texels are and how to
+// read them.
+struct ShadowTexels {
+    base: u32,
+    size: i32,
+    point: bool,
+    // Drawn by the GPU: its page's corner in the atlas, and a directional
+    // map's closeness at depth 0 and over depth 1.
+    gpu: bool,
+    at: vec2<i32>,
+    near: f32,
+    range: f32,
+}
+
+fn shadow_texel(m: ShadowTexels, i: i32, j: i32, c: f32, bias: f32) -> f32 {
+    if i < 0 || j < 0 || i >= m.size || j >= m.size { return 1.0; }
+    var s: f32;
+    if m.gpu {
+        let d = textureLoad(t_shadow, m.at + vec2<i32>(i, j), 0);
+        if m.point {
+            s = d;
+        } else {
+            s = NO_SURFACE;
+            if d > 0.0 { s = m.near + d * m.range; }
+        }
+    } else {
+        let k = u32(j * m.size + i);
+        s = b_mesh[m.base + 6u + k / 4u][k % 4u];
+    }
+    return shadow_lit(s, c, bias, m.point);
 }
 
 // Mirrors `shadow` in mesh3d.rs.
@@ -1306,8 +1338,20 @@ fn shadow(base: u32, p: vec3<f32>, n_in: vec3<f32>) -> f32 {
     let v = b_mesh[base + 3u];
     let a = b_mesh[base + 4u];
     let pos = b_mesh[base + 5u];
-    let point = h0.x > 0.5;
+    // Kinds: 0 directional, 1 point; 2 and 3 the same, drawn by the GPU.
+    let kind = u32(h0.x);
+    let point = (kind & 1u) == 1u;
     let size = i32(h0.y);
+    var texels: ShadowTexels;
+    texels.base = base;
+    texels.size = size;
+    texels.point = point;
+    texels.gpu = kind >= 2u;
+    if texels.gpu {
+        texels.at = vec2<i32>(b_mesh[base + 6u].xy);
+        texels.near = v.w;
+        texels.range = a.w;
+    }
     var offset = u.w;
     if point { offset = offset * max(dot(p - pos.xyz, a.xyz), 1.0); }
     var tw = a.xyz;
@@ -1346,10 +1390,10 @@ fn shadow(base: u32, p: vec3<f32>, n_in: vec3<f32>) -> f32 {
         let ay = sy - fy;
         let i = i32(fx);
         let j = i32(fy);
-        let t00 = shadow_texel(base, size, i, j, c, bias, point);
-        let t10 = shadow_texel(base, size, i + 1, j, c, bias, point);
-        let t01 = shadow_texel(base, size, i, j + 1, c, bias, point);
-        let t11 = shadow_texel(base, size, i + 1, j + 1, c, bias, point);
+        let t00 = shadow_texel(texels, i, j, c, bias);
+        let t10 = shadow_texel(texels, i + 1, j, c, bias);
+        let t01 = shadow_texel(texels, i, j + 1, c, bias);
+        let t11 = shadow_texel(texels, i + 1, j + 1, c, bias);
         let top = t00 + (t10 - t00) * ax;
         let bottom = t01 + (t11 - t01) * ax;
         sum += top + (bottom - top) * ay;
@@ -2345,13 +2389,15 @@ fn shade_mesh_vis(prim: Prim, index: u32, p: vec2<f32>) -> vec4<f32> {
     var occ: array<f32, 8>;
     for (var s = 0u; s < 8u; s++) {
         best[s] = NO_TRI;
-        let id = textureLoad(t_vis_ids, px + page.xy, i32(s)).x;
+        // (dest.w: the pass's samples − 1; all eight on a device's own.)
+        let hs = i32(s & u_pass.dest.w);
+        let id = textureLoad(t_vis_ids, px + page.xy, hs).x;
         if id != 0u && id - 1u >= tb && id - 1u < end {
             best[s] = id - 1u - tb;
         }
         occ[s] = 0.0;
         if page.z != VIS_NONE {
-            occ[s] = textureLoad(t_vis_depth, px + page.zw, i32(s));
+            occ[s] = textureLoad(t_vis_depth, px + page.zw, hs);
         }
     }
     return shade_samples(prim, p, best, occ, true) * prim.inv_y.w;
@@ -2441,6 +2487,66 @@ fn vis_vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32
     out.pos = vec4<f32>(f.x * 2.0 - 1.0, 1.0 - f.y * 2.0, clamp(z, 0.0, 1.0), 1.0);
     out.row = bitcast<u32>(prim.geom.y) + vi / 3u + 1u;
     return out;
+}
+
+// The shadow pass (gpu.rs): a map's casters drawn from the mesh pool into
+// its page of the depth atlas, one caster per instance. rows.x: the map's
+// header row (mesh3d.rs `ShadowMap`), rows.y: its casters' first row
+// (`CROWS` each: object → camera, then where its mesh is in the pool).
+struct ShadowPass {
+    rows: vec4<u32>,
+}
+var<uniform> u_shadow: ShadowPass;
+const CROWS: u32 = 4u;
+
+@vertex
+fn shadow_vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> @builtin(position) vec4<f32> {
+    let hb = u_shadow.rows.x;
+    let c = u_shadow.rows.y + inst * CROWS;
+    let h = b_mesh[c + 3u];
+    let vb = bitcast<u32>(h.x);
+    let rec = b_pool[bitcast<u32>(h.y) + vi / 3u];
+    let q0 = inst_cam(c, b_pool[vb + bitcast<u32>(rec.x) * PROWS].xyz);
+    let q1 = inst_cam(c, b_pool[vb + bitcast<u32>(rec.y) * PROWS].xyz);
+    let q2 = inst_cam(c, b_pool[vb + bitcast<u32>(rec.z) * PROWS].xyz);
+    let h0 = b_mesh[hb];
+    let h1 = b_mesh[hb + 1u];
+    let u = b_mesh[hb + 2u];
+    let v = b_mesh[hb + 3u];
+    let a = b_mesh[hb + 4u];
+    let pos = b_mesh[hb + 5u];
+    let point = (u32(h0.x) & 1u) == 1u;
+    // Closed surfaces cast from the side that faces the light (as
+    // `ShadowMap::build` keeps them): the pool knows which winding faces
+    // out, a mirroring transform turns it over.
+    let packed = bitcast<u32>(rec.w);
+    let side = (packed >> 23u) & 3u;
+    if (packed & (1u << 22u)) == 0u && side != 0u {
+        var g = cross(q1 - q0, q2 - q0);
+        let mirrored = (bitcast<u32>(h.w) & 1u) != 0u;
+        if (side == 2u) != mirrored { g = -g; }
+        var toward = a.xyz;
+        if point { toward = pos.xyz - q0; }
+        // Past the far side of the depth range: clipped away.
+        if dot(g, toward) < 0.0 { return vec4<f32>(0.0, 0.0, 2.0, 1.0); }
+    }
+    var q = q0;
+    if vi % 3u == 1u { q = q1; } else if vi % 3u == 2u { q = q2; }
+    // Texels across the page to clip space (+y up: texel rows run down).
+    let k = 2.0 / h0.y;
+    if point {
+        // Closeness 1 / z is the depth: clip z = 1, w = z, so the hardware
+        // clips at z = 1 and interpolates 1 / z across the map.
+        let r = q - pos.xyz;
+        let z = dot(r, a.xyz);
+        let x = (dot(r, u.xyz) - h0.z * z) * h1.x;
+        let y = (dot(r, v.xyz) - h0.w * z) * h1.y;
+        return vec4<f32>(x * k - z, z - y * k, 1.0, z);
+    }
+    let x = (dot(q, u.xyz) - h0.z) * h1.x;
+    let y = (dot(q, v.xyz) - h0.w) * h1.y;
+    let d = (dot(q, a.xyz) - v.w) / a.w;
+    return vec4<f32>(x * k - 1.0, 1.0 - y * k, d, 1.0);
 }
 
 // Cards stand only where their picture is, wireframes on their wires

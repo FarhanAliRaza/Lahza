@@ -73,11 +73,102 @@ struct RasterData {
     t_vis_depth: gpu::TextureView,
     b_vis: gpu::BufferPiece,
     b_pool: gpu::BufferPiece,
+    t_shadow: gpu::TextureView,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShadowPass {
+    /// A map's header row and its casters' first row.
+    rows: [u32; 4],
+}
+
+#[derive(blade_macros::ShaderData)]
+struct ShadowData {
+    u_shadow: ShadowPass,
+    b_mesh: gpu::BufferPiece,
+    b_pool: gpu::BufferPiece,
+}
+
+/// The shadow maps a frame's lists ask the GPU for (`ShadowJob`), drawn
+/// from the mesh pool into pages of one depth atlas the raster reads.
+struct ShadowAtlas {
+    texture: gpu::Texture,
+    view: gpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+/// The atlas is this wide at most (maps are up to 2048 a side).
+const SHADOW_ATLAS_WIDTH: u32 = 4096;
+
+impl ShadowAtlas {
+    fn new(context: &gpu::Context, width: u32, height: u32) -> Self {
+        let (name, format) = ("shadow maps", gpu::TextureFormat::Depth32Float);
+        let texture = context.create_texture(gpu::TextureDesc {
+            name,
+            format,
+            size: gpu::Extent { width, height, depth: 1 },
+            array_layer_count: 1,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: gpu::TextureDimension::D2,
+            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::RESOURCE,
+            external: None,
+        });
+        let view = context.create_texture_view(texture, gpu::TextureViewDesc { name, format, dimension: gpu::ViewDimension::D2, subresources: &Default::default() });
+        Self { texture, view, width, height }
+    }
+    fn destroy(&mut self, context: &gpu::Context) {
+        context.destroy_texture_view(self.view);
+        context.destroy_texture(self.texture);
+    }
+}
+
+/// Where each job's page goes in an atlas `SHADOW_ATLAS_WIDTH` wide
+/// (shelves, tallest first), and the atlas's size for them.
+fn plan_shadows(jobs: &[crate::mesh3d::ShadowJob]) -> (Vec<[u32; 2]>, u32, u32) {
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by_key(|&k| std::cmp::Reverse(jobs[k].size));
+    let mut at = vec![[0u32; 2]; jobs.len()];
+    let (mut x, mut y, mut shelf, mut width) = (0u32, 0u32, 0u32, 16u32);
+    for k in order {
+        let n = jobs[k].size;
+        if x + n > SHADOW_ATLAS_WIDTH {
+            (x, y, shelf) = (0, y + shelf, 0);
+        }
+        at[k] = [x, y];
+        x += n;
+        width = width.max(x);
+        shelf = shelf.max(n);
+    }
+    (at, width, (y + shelf).max(16))
 }
 
 /// Samples per pixel of the hardware visibility pass: the rasteriser's own
 /// pattern is the standard 8x one.
 const VIS_SAMPLES: u32 = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: run the visibility pass at 4x where the device has no 8x
+    /// (Mesa's software Vulkan), so the pass, the mesh pool and what is
+    /// built on them run there too. The raster then reads sample `s & 3`
+    /// for its eight samples: edges are coarser, the rest is the same.
+    pub(crate) static TEST_VIS_AT_4X: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The visibility pass's samples on a device offering `mask` (0: no pass).
+fn vis_samples(mask: u32) -> u32 {
+    if mask & VIS_SAMPLES != 0 {
+        return VIS_SAMPLES;
+    }
+    #[cfg(test)]
+    if mask & 4 != 0 && TEST_VIS_AT_4X.with(|t| t.get()) {
+        return 4;
+    }
+    0
+}
 /// `b_vis` entry of a primitive without a page.
 const VIS_NONE: i32 = -2147483647;
 
@@ -456,10 +547,12 @@ struct FrameSet {
     output: Buffer,
     vis_pages: Buffer,
     vis_atlas: VisAtlas,
+    shadow_atlas: ShadowAtlas,
 }
 
 impl FrameSet {
-    fn new(context: &gpu::Context, vis: bool) -> Self {
+    /// `vis`: the visibility pass's samples (0: the device has none).
+    fn new(context: &gpu::Context, vis: u32) -> Self {
         Self {
             prims: Buffer::new(context, "motion prims", 1 << 16, true),
             ranges: Buffer::new(context, "motion ranges", 1 << 16, true),
@@ -476,7 +569,9 @@ impl FrameSet {
             output: Buffer::readback(context, "motion output", 1 << 12),
             vis_pages: Buffer::new(context, "motion visibility pages", 1 << 12, true),
             // Without the pass the raster shader still binds an atlas.
-            vis_atlas: VisAtlas::new(context, 16, 16, if vis { VIS_SAMPLES } else { 4 }, vis),
+            vis_atlas: VisAtlas::new(context, 16, 16, if vis > 0 { vis } else { 4 }, vis > 0),
+            // (Bound by every raster pass, drawn into only with jobs.)
+            shadow_atlas: ShadowAtlas::new(context, 16, 16),
         }
     }
 
@@ -500,6 +595,7 @@ impl FrameSet {
             b.destroy(context);
         }
         self.vis_atlas.destroy(context);
+        self.shadow_atlas.destroy(context);
     }
 }
 
@@ -543,8 +639,12 @@ pub struct Gpu {
     /// by program key: built when the program changes, the last destroyed.
     slang_raster: Option<(u64, gpu::ComputePipeline)>,
     /// Hardware mesh visibility, where the device has 8x MSAA (else the
-    /// raster shader finds the nearest triangles itself).
+    /// raster shader finds the nearest triangles itself), and its samples.
     vis: Option<VisPipelines>,
+    vis_samples: u32,
+    /// Draws shadow maps from the mesh pool (with the visibility pass:
+    /// lists for it name their maps as jobs).
+    shadow: Option<gpu::RenderPipeline>,
     /// Generated meshes kept on the device across frames.
     pool: crate::pool::MeshPool,
     /// Shader layers' kernels.
@@ -602,6 +702,7 @@ pub fn merge(samples: &[DisplayList], separate: bool) -> (DisplayList, Targets) 
         out.shaders.extend_from_slice(&list.shaders);
         let id_base = out.mesh_ids;
         out.mesh_ids += list.mesh_ids;
+        out.shadows.extend(list.shadows.iter().map(|j| crate::mesh3d::ShadowJob { header: j.header + mesh_base, casters: j.casters + mesh_base, ..*j }));
         out.pool.extend(list.pool.iter().map(|r| crate::mesh3d::PoolRef { row: r.row + mesh_base, ..r.clone() }));
         out.traces.extend(list.traces.iter().map(|t| {
             let mut t = t.clone();
@@ -713,7 +814,8 @@ impl Gpu {
             compute: shader.at("raster"),
         });
         let caps = context.capabilities();
-        let vis = (caps.sample_count_mask & VIS_SAMPLES != 0).then(|| {
+        let vis_samples = vis_samples(caps.sample_count_mask);
+        let vis = (vis_samples > 0).then(|| {
             let make = |name: &str, compare: gpu::CompareFunction| {
                 context.create_render_pipeline(gpu::RenderPipelineDesc {
                     name,
@@ -730,7 +832,7 @@ impl Gpu {
                     }),
                     fragment: Some(shader.at("vis_fragment")),
                     color_targets: &[gpu::TextureFormat::R32Uint.into()],
-                    multisample_state: gpu::MultisampleState { sample_count: VIS_SAMPLES, ..Default::default() },
+                    multisample_state: gpu::MultisampleState { sample_count: vis_samples, ..Default::default() },
                 })
             };
             VisPipelines {
@@ -738,6 +840,26 @@ impl Gpu {
                 opaque: make("mesh visibility opaque", gpu::CompareFunction::GreaterEqual),
                 see: make("mesh visibility see-through", gpu::CompareFunction::Greater),
             }
+        });
+        let shadow = vis.is_some().then(|| {
+            context.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: "shadow maps",
+                data_layouts: &[&ShadowData::layout()],
+                vertex: shader.at("shadow_vertex"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState { topology: gpu::PrimitiveTopology::TriangleList, ..Default::default() },
+                // The nearest surface to the light: the greatest closeness.
+                depth_stencil: Some(gpu::DepthStencilState {
+                    format: gpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: gpu::CompareFunction::Greater,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                fragment: None,
+                color_targets: &[],
+                multisample_state: Default::default(),
+            })
         });
         let blur = context.create_compute_pipeline(gpu::ComputePipelineDesc {
             name: "motion blur",
@@ -766,7 +888,7 @@ impl Gpu {
         let mut images = Buffer::new(&context, "motion images", 1 << 12, true);
         images.limit = images.limit.max(image_budget * 4);
         Ok(Self {
-            sets: vec![FrameSet::new(&context, vis.is_some())],
+            sets: vec![FrameSet::new(&context, vis_samples)],
             flights: Vec::new(),
             next: 1,
             completed: 0,
@@ -783,6 +905,8 @@ impl Gpu {
             raster,
             slang_raster: None,
             vis,
+            vis_samples,
+            shadow,
             blur,
             resolve,
             label,
@@ -855,7 +979,7 @@ impl Gpu {
     pub fn begin(&mut self, samples: &[DisplayList], fonts: &Fonts, images: &Images, footage: &[u32]) -> Result<u64, String> {
         let set = (0..FLIGHTS).find(|s| self.flights.iter().all(|f| f.set != *s)).ok_or("too many frames in flight")?;
         while self.sets.len() <= set {
-            self.sets.push(FrameSet::new(&self.context, self.vis.is_some()));
+            self.sets.push(FrameSet::new(&self.context, self.vis_samples));
         }
         let id = self.next;
         self.next += 1;
@@ -937,7 +1061,7 @@ impl Gpu {
             let atlas = &mut self.sets[set].vis_atlas;
             if atlas.width != atlas_width || need > atlas.height || need * 4 < atlas.height {
                 atlas.destroy(&self.context);
-                *atlas = VisAtlas::new(&self.context, atlas_width, need, VIS_SAMPLES, true);
+                *atlas = VisAtlas::new(&self.context, atlas_width, need, self.vis_samples, true);
             }
         }
         // What the frames in flight share is written only while the GPU
@@ -965,6 +1089,26 @@ impl Gpu {
         }
         if let Some(p) = self.profile.as_mut() {
             p.add("gpu frame › mesh pool", pooling.elapsed());
+        }
+        // Shadow maps the lists ask for: a page each in the frame's atlas
+        // (where it is goes into the map's header, before the upload).
+        let (shadow_at, shadow_w, shadow_h) = plan_shadows(&list.shadows);
+        if !list.shadows.is_empty() {
+            if self.shadow.is_none() {
+                return Err("a list with shadow maps for the GPU, but no shadow pass".into());
+            }
+            if shadow_h > 16384 {
+                return Err(format!("this frame's shadow maps need a {shadow_w} x {shadow_h} atlas, over the GPU texture limit"));
+            }
+            for (job, at) in list.shadows.iter().zip(&shadow_at) {
+                list.mesh[job.header as usize + 6] = [at[0] as f32, at[1] as f32, 0.0, 0.0];
+            }
+            // Grown as needed; let go of once far too big.
+            let atlas = &mut self.sets[set].shadow_atlas;
+            if shadow_w > atlas.width || shadow_h > atlas.height || shadow_w * shadow_h * 8 < atlas.width * atlas.height {
+                atlas.destroy(&self.context);
+                *atlas = ShadowAtlas::new(&self.context, shadow_w.next_multiple_of(256), shadow_h.next_multiple_of(256));
+            }
         }
         let uploading = std::time::Instant::now();
         let s = &mut self.sets[set];
@@ -999,6 +1143,7 @@ impl Gpu {
         if let Some(p) = self.profile.as_mut() {
             p.stage("gpu frame › record + upload › uploads", uploading);
         }
+        self.record_shadows(set, &list, &shadow_at);
         let (groups_buf, images_buf) = (self.sets[set].groups.device, self.images.device);
         // Paths traced this frame: how long the GPU may take.
         let mut paths = 0u64;
@@ -1104,7 +1249,7 @@ impl Gpu {
         let s = &self.sets[set];
         let data = self.raster_data(
             set,
-            Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, use_vis as u32, 0], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
+            Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, use_vis as u32, self.vis_samples.saturating_sub(1)], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
             // Outer groups sample inner ones in other regions of the same
             // buffer; regions never overlap.
             s.groups.device,
@@ -1149,7 +1294,7 @@ impl Gpu {
             set,
             Pass {
                 size: [main.width, main.height, main.tiles_x, main.range_base],
-                dest: [0, if i == 0 { 2 } else { 1 }, use_vis as u32, 0],
+                dest: [0, if i == 0 { 2 } else { 1 }, use_vis as u32, self.vis_samples.saturating_sub(1)],
                 background: main.background,
                 weight: [1.0 / targets.len() as f32, 0.0, 0.0, 0.0],
             },
@@ -1219,6 +1364,49 @@ impl Gpu {
             t_vis_depth: s.vis_atlas.depth_view,
             b_vis: s.vis_pages.device.into(),
             b_pool: self.pool.buffer.into(),
+            t_shadow: s.shadow_atlas.view,
+        }
+    }
+
+    /// Draws the frame's shadow maps: each map's casters, from the mesh
+    /// pool, into its page of the set's atlas (cleared to "nothing").
+    fn record_shadows(&mut self, set: usize, list: &DisplayList, at: &[[u32; 2]]) {
+        let Some(pipeline) = self.shadow.as_ref() else { return };
+        if list.shadows.is_empty() {
+            return;
+        }
+        let s = &self.sets[set];
+        let (mesh, pool) = (s.mesh.device, self.pool.buffer);
+        let mut pass = self.encoder.render(
+            "shadow maps",
+            gpu::RenderTargetSet {
+                colors: &[],
+                depth_stencil: Some(gpu::RenderTarget { view: s.shadow_atlas.view, init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack), finish_op: gpu::FinishOp::Store }),
+            },
+        );
+        for (job, at) in list.shadows.iter().zip(at) {
+            let mut pc = pass.with(pipeline);
+            pc.set_viewport(&gpu::Viewport { x: at[0] as f32, y: at[1] as f32, w: job.size as f32, h: job.size as f32, depth: 0.0..1.0 });
+            pc.set_scissor_rect(&gpu::ScissorRect { x: at[0] as i32, y: at[1] as i32, w: job.size, h: job.size });
+            pc.bind(0, &ShadowData { u_shadow: ShadowPass { rows: [job.header, job.casters, 0, 0] }, b_mesh: mesh.into(), b_pool: pool.into() });
+            // Runs of casters that are the same pooled mesh: one draw each.
+            let caster = |k: u32| {
+                let r = list.mesh[(job.casters + k * crate::mesh3d::CROWS as u32 + 3) as usize];
+                (r[0].to_bits(), r[2].to_bits())
+            };
+            let mut k = 0;
+            while k < job.count {
+                let (mesh_at, tris) = caster(k);
+                let mut n = 1;
+                while k + n < job.count && caster(k + n) == (mesh_at, tris) {
+                    n += 1;
+                }
+                // (No triangles: its mesh found no room in the pool.)
+                if tris > 0 {
+                    pc.draw(0, tris * 3, k, n);
+                }
+                k += n;
+            }
         }
     }
 
@@ -1442,6 +1630,9 @@ impl Drop for Gpu {
             for p in [&mut v.clear, &mut v.opaque, &mut v.see] {
                 self.context.destroy_render_pipeline(p);
             }
+        }
+        if let Some(mut p) = self.shadow.take() {
+            self.context.destroy_render_pipeline(&mut p);
         }
         self.context.destroy_compute_pipeline(&mut self.raster);
         if let Some((_, mut p)) = self.slang_raster.take() {

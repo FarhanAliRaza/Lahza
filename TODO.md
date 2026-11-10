@@ -2,44 +2,20 @@
 
 ## Motion renderer
 
-- **Shadow maps on the GPU.** `ShadowMap::build` (mesh3d.rs) still
-  transforms every shadow caster's vertices and rasterises the light's depth
-  map on the CPU, every frame. On the glass-bubble frames of
-  `~/Videos/cpu/cpu.lahza` (9.0 s and 10.4 s, 540 px wide) it is about 36 of
-  the 52 ms of display-list time, the largest CPU cost left. Draw the depth
-  maps on the GPU from the mesh pool (`pool.rs`) instead, the way the
-  visibility pass draws meshes. Measure with
-  `lahza motion snapshot cpu.lahza --at 9.0,10.4 --width 540 --profile`
-  (stage "display lists › meshes (shadow maps)").
-  Since then the maps are built on every core (300 bubbles under two
-  lights: about 40 ms became 17 on four cores,
-  `benchmark_shadow_maps_of_300_bubbles`); drawing them on the GPU is
-  not done yet: it runs only where meshes go through the hardware
-  visibility pass (8x MSAA), which Mesa's software Vulkan lacks, so it
-  could not be run where the rest of this list was worked through. A plan
-  that fits the code as it is:
-  - The list builder writes, per layer list, its casters as rows (object
-    → camera transform, the pooled mesh's place as `mesh3d::IROWS` row 13
-    has it, mirrored flag) for every mesh of the list, placed on a target
-    or not, and per shadow-casting light the map's six header rows without
-    texels; the display list names them as jobs (`merge` re-bases them).
-    Bounds come from each caster's box (and bounding sphere, exact for the
-    bubbles), not from every vertex.
-  - The GPU draws each job into a page of a depth atlas (one per frame
-    set, `Depth32Float`, compare greater, cleared to 0) with instanced
-    draws from the pool, as `vis_instance` does: directional maps write
-    (u, v) in texels and closeness scaled into 0..1 by the casters' extent
-    along the light; point maps write clip = (x − u0·z, y − v0·z, 1, z)
-    scaled to the page, so depth is 1 / z, the near plane is z = 1 and the
-    hardware clips where the CPU drops triangles. Faces are culled by the
-    pool's side bits against the light, as `ShadowMap::build` does.
-  - `shadow_texel` (motion.wgsl) reads a GPU map from the atlas (a flag
-    and the page's corner in the header, patched in before upload, as the
-    pool patches instance rows) and a CPU map from its rows as now, so
-    lists for the CPU and devices without the pass are untouched.
-  - To test it without such a device: let the visibility pass run at 4x
-    for tests (the raster then loads sample `s & 3`), which Mesa has.
-
+- **Shadow maps on the GPU: to measure on a real device.** Lists for the
+  hardware visibility pass now leave their shadow maps to the GPU: the
+  builder writes each list's casters (transform and pooled mesh) and each
+  map's frame, the GPU draws them from the mesh pool into pages of a depth
+  atlas (`record_shadows`, `shadow_vertex`) and `shadow_texel` reads them
+  there. On 300 glass bubbles under two lights the maps' share of list
+  building went from 17 ms (40 before they were built on every core) to
+  0.2 ms. It has only run on Mesa's software Vulkan, through the
+  visibility pass at 4x (a test mode: `TEST_VIS_AT_4X`); on a device's own
+  8x, run `lahza motion snapshot cpu.lahza --at 9.0,10.4 --width 540
+  --profile` and compare the frame against `--backend cpu`. A map's frame
+  comes from its casters' boxes, not from every vertex, so it is a little
+  wider than the CPU's (a single sphere's by up to 1.7 times: softer
+  texels); bounding spheres would tighten it.
 - **Motion blur: what is left.** A frame takes the sub-frames its motion
   needs (`motion_px` in motion-render's lib.rs), so slow passages are
   cheap; a fast one still draws everything once per sub-frame. What does

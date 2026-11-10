@@ -283,6 +283,40 @@ impl MeshCache {
         if !lighting.lights.iter().any(|l| l.shadow && l.color.iter().any(|c| *c > 0.0)) {
             return Arc::default();
         }
+        let view = first.state.camera.view;
+        let scale = first.root.max_scale().clamp(0.25, 2.0);
+        let size = ((1024.0 * scale / 4.0).round() as usize * 4).clamp(256, 2048);
+        if self.compact {
+            // The GPU draws the maps from its mesh pool: here only who
+            // casts (each mesh's transform and box) and the maps' frames.
+            let mut casters = Casters { rows: Vec::new(), meshes: Vec::new() };
+            let mut boxes: Vec<CasterBox> = Vec::new();
+            for rm in &run.meshes {
+                if rm.state.materials.iter().all(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some()) {
+                    continue;
+                }
+                let Some(pooled) = self.pooled(&rm.state) else { continue };
+                if pooled.mesh.tris.is_empty() {
+                    continue;
+                }
+                let mv = rm.state.camera.view.then(rm.state.world);
+                let a = mv.0;
+                let det = a[0] * (a[5] * a[10] - a[6] * a[9]) - a[1] * (a[4] * a[10] - a[6] * a[8]) + a[2] * (a[4] * a[9] - a[5] * a[8]);
+                for k in 0..3 {
+                    casters.rows.push([a[k * 4] as f32, a[k * 4 + 1] as f32, a[k * 4 + 2] as f32, a[k * 4 + 3] as f32]);
+                }
+                let b = f32::from_bits;
+                casters.rows.push([b(0), b(0), b(pooled.mesh.tris.len() as u32), b(if det < 0.0 { INST_MIRRORED } else { 0 })]);
+                let (lo, hi) = (pooled.lo, pooled.hi);
+                boxes.push(std::array::from_fn(|k| {
+                    let q = mv.apply(if k & 1 != 0 { hi[0] } else { lo[0] }, if k & 2 != 0 { hi[1] } else { lo[1] }, if k & 4 != 0 { hi[2] } else { lo[2] });
+                    [q[0], q[1], q[2]]
+                }));
+                casters.meshes.push(pooled);
+            }
+            let casters = Arc::new(casters);
+            return Arc::new(shadow_lights(&lighting, view, casters.meshes.is_empty(), |toward, softness| ShadowMap::gpu_directional(&casters, &boxes, toward, size, softness), |pos, softness| ShadowMap::gpu_point(&casters, &boxes, pos, size, softness)));
+        }
         // Camera-space geometry of every mesh, indexed; each closed
         // triangle's outward side (+1/−1 on its winding), 0 when open.
         // First what each mesh brings (its geometry and sides are cached),
@@ -369,37 +403,7 @@ impl MeshCache {
             }
         }
         let tris = &caster;
-        let view = first.state.camera.view;
-        let scale = first.root.max_scale().clamp(0.25, 2.0);
-        let size = ((1024.0 * scale / 4.0).round() as usize * 4).clamp(256, 2048);
-        let maps = lighting
-            .lights
-            .iter()
-            .map(|l| {
-                if !l.shadow || tris.tris.is_empty() {
-                    return None;
-                }
-                let v = view.0;
-                let r = [[v[0], v[1], v[2]], [v[4], v[5], v[6]], [v[8], v[9], v[10]]];
-                let rot = |d: [f64; 3]| [0, 1, 2].map(|k| r[k][0] * d[0] + r[k][1] * d[1] + r[k][2] * d[2]);
-                match l.kind {
-                    LightKind::Directional => ShadowMap::directional(&tris, rot(l.vector), size, l.softness),
-                    LightKind::Point => {
-                        let p = view.apply(l.vector[0], l.vector[1], l.vector[2]);
-                        ShadowMap::point(&tris, [p[0], p[1], p[2]], size, l.softness)
-                    }
-                    LightKind::Area => {
-                        // From its centre, softened by its size.
-                        let p = view.apply(l.vector[0], l.vector[1], l.vector[2]);
-                        let soft = ((len3(l.u) + len3(l.v)) / 150.0).clamp(0.1, 1.0).max(l.softness);
-                        ShadowMap::point(&tris, [p[0], p[1], p[2]], size, soft)
-                    }
-                    LightKind::Ambient => None,
-                }
-                .map(Arc::new)
-            })
-            .collect();
-        Arc::new(maps)
+        Arc::new(shadow_lights(&lighting, view, tris.tris.is_empty(), |toward, softness| ShadowMap::directional(tris, toward, size, softness), |pos, softness| ShadowMap::point(tris, pos, size, softness)))
     }
 
     /// A mesh layer as an instance for the path tracer: its geometry, its
@@ -870,9 +874,40 @@ pub(crate) fn refracts(m: &MeshState) -> bool {
 /// [texels per unit u, v, bias, filter radius in texels], [U, normal
 /// offset], [V, 0], [toward the light (directional) or axis (point), 0],
 /// [light position, 0], then the texels, 4 per row.
+///
+/// A map the GPU draws (lists for its visibility pass and mesh pool) has
+/// no texels here: kind is 2 or 3, [V, …] carries the closeness that depth
+/// 0 stands for and [toward / axis, …] the closeness range (directional),
+/// and a seventh row holds where its page is in the frame's shadow atlas
+/// (set by the GPU). `gpu` says what to draw into it.
 pub(crate) struct ShadowMap {
     rows: Vec<[f32; 4]>,
+    gpu: Option<(u32, Arc<Casters>)>,
 }
+
+/// Rows per caster of a GPU-drawn shadow map: object → camera (3 × 4),
+/// then [pool row of its vertices, of its triangles (both set by the GPU's
+/// pool), triangles, flags (1: mirrored)], as an instance's row 13.
+pub(crate) const CROWS: usize = 4;
+
+/// A layer list's meshes as the casters of its GPU-drawn shadow maps.
+pub(crate) struct Casters {
+    rows: Vec<[f32; 4]>,
+    meshes: Vec<Arc<Pooled>>,
+}
+
+/// A shadow map for the GPU to draw: its header's row in the list's mesh
+/// rows, its casters' rows and how many, and its size in texels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowJob {
+    pub header: u32,
+    pub casters: u32,
+    pub count: u32,
+    pub size: u32,
+}
+
+/// A caster's box for a GPU-drawn map's bounds: its corners in camera space.
+type CasterBox = [[f64; 3]; 8];
 
 const NO_SURFACE: f32 = -1.0e30;
 
@@ -913,6 +948,40 @@ fn basis(d: [f64; 3]) -> ([f64; 3], [f64; 3]) {
     let helper = if d[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
     let u = unit3(cross(helper, d));
     (u, cross(d, u))
+}
+
+/// One map per light of `lighting` that casts shadows (None for the
+/// others, and for every light when there are no casters): `directional`
+/// makes a map toward a light (camera space) and `point` one from a
+/// position, each with the light's softness.
+fn shadow_lights(lighting: &Lighting, view: lahza_motion_core::space::Mat4, empty: bool, directional: impl Fn([f64; 3], f64) -> Option<ShadowMap>, point: impl Fn([f64; 3], f64) -> Option<ShadowMap>) -> Vec<Option<Arc<ShadowMap>>> {
+    lighting
+        .lights
+        .iter()
+        .map(|l| {
+            if !l.shadow || empty {
+                return None;
+            }
+            let v = view.0;
+            let r = [[v[0], v[1], v[2]], [v[4], v[5], v[6]], [v[8], v[9], v[10]]];
+            let rot = |d: [f64; 3]| [0, 1, 2].map(|k| r[k][0] * d[0] + r[k][1] * d[1] + r[k][2] * d[2]);
+            match l.kind {
+                LightKind::Directional => directional(rot(l.vector), l.softness),
+                LightKind::Point => {
+                    let p = view.apply(l.vector[0], l.vector[1], l.vector[2]);
+                    point([p[0], p[1], p[2]], l.softness)
+                }
+                LightKind::Area => {
+                    // From its centre, softened by its size.
+                    let p = view.apply(l.vector[0], l.vector[1], l.vector[2]);
+                    let soft = ((len3(l.u) + len3(l.v)) / 150.0).clamp(0.1, 1.0).max(l.softness);
+                    point([p[0], p[1], p[2]], soft)
+                }
+                LightKind::Ambient => None,
+            }
+            .map(Arc::new)
+        })
+        .collect()
 }
 
 /// Threads for work over `n` items (triangles, vertices): one for little
@@ -1131,7 +1200,77 @@ impl ShadowMap {
         let radius = 1.0 + softness * 10.0;
         let f = |a: [f64; 3], w: f64| [a[0] as f32, a[1] as f32, a[2] as f32, w as f32];
         rows[..6].copy_from_slice(&[[kind as f32, size as f32, u0 as f32, v0 as f32], [su as f32, sv as f32, bias as f32, radius as f32], f(u, texel), f(v, 0.0), f(axis, 0.0), f(pos, 0.0)]);
-        Some(ShadowMap { rows })
+        Some(ShadowMap { rows, gpu: None })
+    }
+
+    /// The header of a map the GPU draws: bounds `b` (u0, v0, u1, v1) of
+    /// its casters in the light's frame, closeness `near` (what depth 0
+    /// stands for) and `range` (directional maps; a point map's depth is
+    /// 1 / distance along its axis as it is).
+    #[allow(clippy::too_many_arguments)]
+    fn gpu(casters: &Arc<Casters>, b: [f64; 4], near: f64, range: f64, size: usize, softness: f64, kind: u32, axis: [f64; 3], pos: [f64; 3], u: [f64; 3], v: [f64; 3]) -> Option<ShadowMap> {
+        if !(b[2] > b[0] && b[3] > b[1]) {
+            return None;
+        }
+        let n = size as f64;
+        // A two-texel margin all round (as `build`).
+        let (pu, pv) = ((b[2] - b[0]) * 2.0 / n, (b[3] - b[1]) * 2.0 / n);
+        let (u0, v0) = (b[0] - pu, b[1] - pv);
+        let (su, sv) = (n / (b[2] - b[0] + 2.0 * pu), n / (b[3] - b[1] + 2.0 * pv));
+        let texel = (1.0 / su).max(1.0 / sv);
+        let bias = if kind == 0 { 1.5 * texel + 0.5 } else { 1.5 * texel };
+        let radius = 1.0 + softness * 10.0;
+        let f = |a: [f64; 3], w: f64| [a[0] as f32, a[1] as f32, a[2] as f32, w as f32];
+        let rows = vec![[(kind + 2) as f32, size as f32, u0 as f32, v0 as f32], [su as f32, sv as f32, bias as f32, radius as f32], f(u, texel), f(v, near), f(axis, range), f(pos, 0.0), [0.0; 4]];
+        Some(ShadowMap { rows, gpu: Some((size as u32, casters.clone())) })
+    }
+
+    /// A directional light's map for the GPU: bounds from the casters'
+    /// boxes (a little wider than from every vertex, which the CPU's map
+    /// takes them from).
+    fn gpu_directional(casters: &Arc<Casters>, boxes: &[CasterBox], toward: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
+        let l = unit3(toward);
+        let (u, v) = basis(l);
+        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let (mut near, mut far) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in boxes.iter().flatten() {
+            let (x, y, c) = (dot(*p, u), dot(*p, v), dot(*p, l));
+            b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            (near, far) = (near.min(c), far.max(c));
+        }
+        // Depth 0 is "nothing here": the farthest caster stays above it.
+        let pad = (far - near) * 0.01 + 1.0;
+        Self::gpu(casters, b, near - pad, far - near + 2.0 * pad, size, softness, 0, l, [0.0; 3], u, v)
+    }
+
+    /// A point light's map for the GPU, aimed at the middle of the casters.
+    fn gpu_point(casters: &Arc<Casters>, boxes: &[CasterBox], pos: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
+        let mut m = [0.0; 3];
+        for p in boxes.iter().flatten() {
+            m = add(m, *p);
+        }
+        let n = (boxes.len() * 8).max(1) as f64;
+        let axis = unit3(sub([m[0] / n, m[1] / n, m[2] / n], pos));
+        let (u, v) = basis(axis);
+        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for corners in boxes {
+            let z: [f64; 8] = std::array::from_fn(|k| dot(sub(corners[k], pos), axis));
+            if z.iter().all(|z| *z < 1.0) {
+                // Behind the light.
+                continue;
+            }
+            if z.iter().any(|z| *z < 1.0) {
+                // Around the light: anywhere in its view.
+                b = [-3.0, -3.0, 3.0, 3.0];
+                continue;
+            }
+            for (p, z) in corners.iter().zip(z) {
+                let q = sub(*p, pos);
+                let (x, y) = ((dot(q, u) / z).clamp(-3.0, 3.0), (dot(q, v) / z).clamp(-3.0, 3.0));
+                b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+        }
+        Self::gpu(casters, b, 0.0, 1.0, size, softness, 1, axis, pos, u, v)
     }
 }
 
@@ -1750,7 +1889,7 @@ impl Batch {
     /// ids; material and real-edge mask), for targets that take them as
     /// they are (`place`), then the instances' rows (whose pooled meshes
     /// go to `pool`).
-    fn write_shared(&self, mesh_rows: &mut Vec<[f32; 4]>, pool: &mut Vec<PoolRef>, placed: &mut HashMap<usize, u32>, compact: bool) -> u32 {
+    fn write_shared(&self, mesh_rows: &mut Vec<[f32; 4]>, pool: &mut Vec<PoolRef>, shadows: &mut Vec<ShadowJob>, placed: &mut HashMap<usize, u32>, compact: bool) -> u32 {
         let vert_base = mesh_rows.len() as u32;
         for v in &self.verts {
             mesh_rows.push([v.pos[0], v.pos[1], v.pos[2], 1.0 / v.pos[2]]);
@@ -1787,11 +1926,32 @@ impl Batch {
         for (i, map) in self.shadows.iter().enumerate() {
             let Some(map) = map else { continue };
             let key = Arc::as_ptr(map) as usize;
-            let at = *placed.entry(key).or_insert_with(|| {
-                let at = mesh_rows.len() as u32;
-                mesh_rows.extend_from_slice(&map.rows);
-                at
-            });
+            let at = match placed.get(&key) {
+                Some(at) => *at,
+                None => {
+                    let at = mesh_rows.len() as u32;
+                    mesh_rows.extend_from_slice(&map.rows);
+                    placed.insert(key, at);
+                    if let Some((size, casters)) = &map.gpu {
+                        // A map the GPU draws: its casters' rows (once for
+                        // the list's maps, their meshes for the pool to
+                        // place) and the job.
+                        let ckey = Arc::as_ptr(casters) as usize;
+                        let rows = match placed.get(&ckey) {
+                            Some(rows) => *rows,
+                            None => {
+                                let rows = mesh_rows.len() as u32;
+                                mesh_rows.extend_from_slice(&casters.rows);
+                                pool.extend(casters.meshes.iter().enumerate().map(|(k, mesh)| PoolRef { row: rows + (k * CROWS + 3) as u32, mesh: mesh.clone() }));
+                                placed.insert(ckey, rows);
+                                rows
+                            }
+                        };
+                        shadows.push(ShadowJob { header: at, casters: rows, count: casters.meshes.len() as u32, size: *size });
+                    }
+                    at
+                }
+            };
             let row = light_base as usize + 7 + i * LROWS + 1;
             mesh_rows[row][3] = f32::from_bits((at as i64 - light_base as i64) as i32 as u32);
         }
@@ -1802,7 +1962,7 @@ impl Batch {
     /// `origin + factor·(x, y)`) into the list's mesh buffers and returns
     /// its primitive, or None when nothing lands on the target.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn place(&self, mesh_rows: &mut Vec<[f32; 4]>, bins: &mut Vec<u32>, pool: &mut Vec<PoolRef>, placed: &mut HashMap<usize, u32>, target: &Target, origin: [f64; 2], factor: [f64; 2], blend: u32, compact: bool, setup_time: &mut std::time::Duration) -> Option<(Prim, [f64; 4])> {
+    pub(crate) fn place(&self, mesh_rows: &mut Vec<[f32; 4]>, bins: &mut Vec<u32>, pool: &mut Vec<PoolRef>, shadows: &mut Vec<ShadowJob>, placed: &mut HashMap<usize, u32>, target: &Target, origin: [f64; 2], factor: [f64; 2], blend: u32, compact: bool, setup_time: &mut std::time::Duration) -> Option<(Prim, [f64; 4])> {
         let started = std::time::Instant::now();
         let (tw_px, th_px) = (target.width as f64, target.height as f64);
         if compact {
@@ -1815,7 +1975,7 @@ impl Batch {
             if count == 0 || !(r[2] >= 0.0 && r[3] >= 0.0 && r[0] < tw_px && r[1] < th_px) {
                 return None;
             }
-            let (vert_base, mat_base, light_base) = self.shared_rows(mesh_rows, pool, placed, true);
+            let (vert_base, mat_base, light_base) = self.shared_rows(mesh_rows, pool, shadows, placed, true);
             // Triangle records, then the instances.
             let rec_base = light_base + self.light_rows.len() as u32;
             // geom: [0, first triangle id, triangles with records, instances].
@@ -2003,7 +2163,7 @@ impl Batch {
         for t in &tris {
             mesh_rows.extend_from_slice(&t.rows);
         }
-        let (vert_base, mat_base, light_base) = self.shared_rows(mesh_rows, pool, placed, false);
+        let (vert_base, mat_base, light_base) = self.shared_rows(mesh_rows, pool, shadows, placed, false);
         let b = |v: u32| f32::from_bits(v);
         let prim = self.mesh_prim(target_origin, factor, blend, tris.len() as u32, [b(bins_base), b(tx0), b(ty0), b(tw)], [tri_base, vert_base, mat_base, light_base]);
         let bounds = [(tx0 * TILE) as f64, (ty0 * TILE) as f64, ((tx1 + 1) * TILE) as f64 - 1.0, ((ty1 + 1) * TILE) as f64 - 1.0];
@@ -2015,12 +2175,12 @@ impl Batch {
     /// jar of glass bubbles is hundreds of placements), so they are written
     /// once per list. Returns where the vertices, materials and lights
     /// start.
-    fn shared_rows(&self, mesh_rows: &mut Vec<[f32; 4]>, pool: &mut Vec<PoolRef>, placed: &mut HashMap<usize, u32>, compact: bool) -> (u32, u32, u32) {
+    fn shared_rows(&self, mesh_rows: &mut Vec<[f32; 4]>, pool: &mut Vec<PoolRef>, shadows: &mut Vec<ShadowJob>, placed: &mut HashMap<usize, u32>, compact: bool) -> (u32, u32, u32) {
         let shared = self as *const Self as usize;
         let vert_base = match placed.get(&shared) {
             Some(&at) => at,
             None => {
-                let at = self.write_shared(mesh_rows, pool, placed, compact);
+                let at = self.write_shared(mesh_rows, pool, shadows, placed, compact);
                 placed.insert(shared, at);
                 at
             }

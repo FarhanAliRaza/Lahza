@@ -1047,9 +1047,11 @@ fn a_wall_of_instanced_tiles_leaves_the_other_meshes_drawn() {
     let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, seed: 0, compact: true }.build(&state);
     let tiles = list.pool.iter().filter(|x| x.mesh.mesh.tris.len() == list.pool[0].mesh.mesh.tris.len()).count();
     let triangles: usize = list.pool.iter().map(|x| x.mesh.mesh.tris.len()).sum();
-    assert!(triangles > 4_000_000, "the wall is over four million triangles: {triangles}");
-    assert_eq!(tiles, 66 * 36, "every tile is an instance");
-    assert_eq!(list.pool.len(), 66 * 36 + 2, "and the pipe and the rock after them");
+    assert!(triangles > 2 * 4_000_000, "the wall is over four million triangles: {}", triangles / 2);
+    // (Each mesh twice: drawn, and as a caster of the list's shadow map.)
+    assert_eq!(tiles, 2 * 66 * 36, "every tile is an instance");
+    assert_eq!(list.pool.len(), 2 * (66 * 36 + 2), "and the pipe and the rock after them");
+    assert_eq!(list.shadows.iter().map(|j| j.count).collect::<Vec<_>>(), [66 * 36 + 2]);
     assert!(r.meshes.warnings.is_empty() && r.meshes.dropped.is_empty(), "{:?} {:?}", r.meshes.warnings, r.meshes.dropped);
 }
 
@@ -1070,9 +1072,122 @@ fn benchmark_shadow_maps_of_300_bubbles() {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     let state = c.frame(0.0);
     let mut r = cpu();
-    for _ in 0..5 {
+    // For the CPU's rasteriser (the maps built here, on every core) and
+    // for the GPU's passes (it draws them: here only their frames).
+    for compact in [false, false, false, true, true, true] {
         let t = std::time::Instant::now();
-        let _ = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 0.56, trace: None, seed: 0, compact: true }.build(&state);
-        eprintln!("lists {:?}, of which shadow maps {:?}", t.elapsed(), std::mem::take(&mut r.meshes.shadowing));
+        let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 0.56, trace: None, seed: 0, compact }.build(&state);
+        eprintln!("{}: lists {:?}, of which shadow maps {:?} ({} for the GPU to draw)", if compact { "gpu" } else { "cpu" }, t.elapsed(), std::mem::take(&mut r.meshes.shadowing), list.shadows.len());
     }
+}
+
+/// A GPU renderer whose meshes go through the hardware visibility pass
+/// and the mesh pool: on the device's 8x where it has it, else at 4x
+/// (Mesa's software Vulkan). None without a GPU or without either.
+fn vis_gpu() -> Option<Renderer> {
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    crate::gpu::TEST_VIS_AT_4X.with(|t| t.set(true));
+    let r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
+    crate::gpu::TEST_VIS_AT_4X.with(|t| t.set(false));
+    (r.is_gpu() && r.gpu.as_ref().is_some_and(|g| g.has_vis())).then_some(r)
+}
+
+/// Mean and largest difference over the pixels' channels.
+fn difference(a: &image::RgbaImage, b: &image::RgbaImage) -> (f64, u8) {
+    let (mut sum, mut worst) = (0u64, 0u8);
+    for (x, y) in a.pixels().zip(b.pixels()) {
+        for k in 0..4 {
+            let d = x.0[k].abs_diff(y.0[k]);
+            sum += d as u64;
+            worst = worst.max(d);
+        }
+    }
+    (sum as f64 / (a.width() * a.height() * 4) as f64, worst)
+}
+
+/// Meshes drawn through the hardware visibility pass and the mesh pool
+/// are the meshes the CPU draws (edges aside, where a device's samples
+/// are not the CPU's).
+#[test]
+fn the_visibility_pass_draws_the_showcase() {
+    let Some(mut gpu) = vis_gpu() else { return };
+    let c = Compiled::new(&showcase());
+    let (a, b) = (gpu.render(&c, 0.0), cpu().render(&c, 0.0));
+    let (mean, _) = difference(&a, &b);
+    assert!(mean < 1.0, "mean difference {mean:.3}");
+}
+
+/// Shadow maps drawn by the GPU from its mesh pool shade as the CPU's
+/// maps do: a directional and a point light, soft and hard, onto a floor
+/// and onto each other.
+#[test]
+fn gpu_drawn_shadow_maps_shade_as_the_cpus() {
+    let Some(mut gpu) = vis_gpu() else { return };
+    let mut cpu = cpu();
+    for softness in [0.0, 0.5] {
+        let mut p = shadow_scene(json!({"preset": "matte", "color": "#e8e2d6"}), softness);
+        p.scenes[0].lights.push(serde_json::from_value(json!({"type": "point", "position": [520, 80, -100], "intensity": 0.5, "softness": 0.1, "shadow": true})).unwrap());
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let (a, b) = (gpu.render(&c, 0.0), cpu.render(&c, 0.0));
+        // In the ball's shadow on the floor, and beside it in the light.
+        let lum = |img: &image::RgbaImage, x: u32, y: u32| img.get_pixel(x, y).0[..3].iter().map(|v| *v as f64).sum::<f64>() / 3.0;
+        let darkest = |img: &image::RgbaImage| (300..380u32).flat_map(|y| (60..600u32).map(move |x| (x, y))).map(|(x, y)| lum(img, x, y)).fold(f64::INFINITY, f64::min);
+        assert!(darkest(&b) < lum(&b, 600, 390) - 30.0, "the CPU's frame has a shadow on the floor");
+        assert!((darkest(&a) - darkest(&b)).abs() < 12.0, "softness {softness}: darkest floor {} on the GPU, {} on the CPU", darkest(&a), darkest(&b));
+        let (mean, _) = difference(&a, &b);
+        assert!(mean < 1.2, "softness {softness}: mean difference {mean:.3}");
+        // Where they differ by much is edges (of meshes at 4x, of shadows
+        // whose maps' frames differ a little): few pixels.
+        let off = a.pixels().zip(b.pixels()).filter(|(x, y)| (0..3).any(|k| x.0[k].abs_diff(y.0[k]) > 24)).count();
+        assert!(off < (640 * 400) / 50, "softness {softness}: {off} pixels differ by more than 24");
+    }
+    assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
+}
+
+/// With the hardware pass a wall of instanced tiles and the meshes after
+/// it are all drawn (the frame is the CPU's, edges aside).
+#[test]
+fn the_visibility_pass_draws_a_tile_wall_and_its_neighbours() {
+    let Some(mut gpu) = vis_gpu() else { return };
+    let p = scene(640, 360, json!({"lights": [{"from": [-0.4, -0.6, -1.0]}], "layers": [
+        {"id": "wall", "kind": "instancer", "transform": {"position": [320, 180], "z": 200},
+         "layout": {"type": "grid", "columns": 24, "rows": 12, "spacing": [30, 30]},
+         "layers": [{"id": "tile", "kind": "mesh", "mesh": {"type": "box", "size": [26, 26], "depth": 10, "bevel": 3}, "material": {"preset": "glossy", "color": "#e8e4dc"}}]},
+        {"id": "pipe", "kind": "mesh", "mesh": {"type": "torus", "radius": 60, "tube": 16}, "material": {"preset": "metal", "color": "#c08040"}, "transform": {"position": [180, 180]}},
+        {"id": "rock", "kind": "mesh", "mesh": {"type": "sphere", "radius": 40}, "material": {"preset": "plastic", "color": "#d03734"}, "transform": {"position": [460, 150]}}
+    ]}));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let (a, b) = (gpu.render(&c, 0.0), cpu().render(&c, 0.0));
+    let red = a.get_pixel(460, 150).0;
+    assert!(red[0] > red[2] + 60, "the rock is drawn: {red:?}");
+    let (mean, _) = difference(&a, &b);
+    assert!(mean < 1.5, "mean difference {mean:.3}");
+}
+
+/// Lists for the GPU's passes carry their shadow maps as jobs (a header
+/// and the casters' rows), not as texels rasterised here.
+#[test]
+fn lists_for_the_gpu_leave_their_shadow_maps_to_it() {
+    let mut p = shadow_scene(json!({"preset": "matte", "color": "#e8e2d6"}), 0.5);
+    p.scenes[0].lights.push(serde_json::from_value(json!({"type": "point", "position": [520, 80, -100], "intensity": 0.5, "shadow": true})).unwrap());
+    let c = Compiled::new(&p);
+    let state = c.frame(0.0);
+    let mut r = cpu();
+    let mut build = |compact: bool| Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, seed: 0, compact }.build(&state);
+    let (cpu_list, gpu_list) = (build(false), build(true));
+    assert!(cpu_list.shadows.is_empty());
+    assert_eq!(gpu_list.shadows.len(), 2, "a map per shadow-casting light");
+    for job in &gpu_list.shadows {
+        assert_eq!(job.count, 3, "the floor, the ball and the ring cast");
+        let kind = gpu_list.mesh[job.header as usize][0];
+        assert!(kind == 2.0 || kind == 3.0, "a map for the GPU: {kind}");
+    }
+    assert_eq!(gpu_list.shadows[0].casters, gpu_list.shadows[1].casters, "the list's maps share its casters' rows");
+    // Each caster's mesh is the pool's to place.
+    let first = gpu_list.shadows[0].casters;
+    assert_eq!(gpu_list.pool.iter().filter(|r| r.row >= first && r.row < first + 3 * crate::mesh3d::CROWS as u32).count(), 3);
+    // Two 1024² maps are half a million rows of texels the CPU's list holds.
+    assert!(cpu_list.mesh.len() > gpu_list.mesh.len() + 400_000, "{} rows for the CPU, {} for the GPU", cpu_list.mesh.len(), gpu_list.mesh.len());
 }

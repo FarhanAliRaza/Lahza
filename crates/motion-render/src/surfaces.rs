@@ -231,3 +231,22 @@ fn splice(base: &str, hooked: &str, hooks: &[(&str, &str)], glue: &str, program:
     naga::valid::Validator::new(flags, naga::valid::Capabilities::all()).validate(&module).map_err(|e| format!("Slang materials' WGSL: {}", e.emit_to_string(&source)))?;
     Ok(source)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lines the Slang variants change are still in the shaders, once
+    /// each (a shader edit that moves one would only show with a project
+    /// that uses Slang materials, and with slangc installed).
+    #[test]
+    fn the_hooks_fit_the_shaders() {
+        for (from, _) in HOOKS {
+            assert_eq!(crate::gpu::SHADER.matches(from).count(), 1, "motion.wgsl: {}", from.trim());
+        }
+        let trace = include_str!("pt.wgsl");
+        for (from, _) in TRACE_HOOKS {
+            assert_eq!(trace.matches(from).count(), 1, "pt.wgsl: {}", from.trim());
+        }
+    }
+}
