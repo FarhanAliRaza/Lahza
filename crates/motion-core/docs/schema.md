@@ -29,6 +29,12 @@ All times are **timeline seconds** unless written as a reference string
 ```
 
 `fps` is a number or a ratio string (`"30000/1001"`).
+`motion_blur` averages sub-frames across the shutter (`shutter` degrees:
+180 is half the frame's time). `samples` is the most a frame takes: it
+takes one for every 1.5 px anything on screen moves over the shutter (one
+when nothing changes, two for a fade or a crawl), so slow passages cost a
+fraction of fast ones; a shape, text or shader picture changing form takes
+them all.
 `renderer` picks how exports draw meshes: `raster` (default; what the
 preview shows) or `path` (path traced, see Path tracing under mesh);
 `samples` is the path tracer's paths per pixel (default 64; drafts trace a

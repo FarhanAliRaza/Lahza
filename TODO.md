@@ -11,7 +11,10 @@
   visibility pass draws meshes. Measure with
   `lahza motion snapshot cpu.lahza --at 9.0,10.4 --width 540 --profile`
   (stage "display lists › meshes (shadow maps)").
-  Not done yet: it runs only where meshes go through the hardware
+  Since then the maps are built on every core (300 bubbles under two
+  lights: about 40 ms became 17 on four cores,
+  `benchmark_shadow_maps_of_300_bubbles`); drawing them on the GPU is
+  not done yet: it runs only where meshes go through the hardware
   visibility pass (8x MSAA), which Mesa's software Vulkan lacks, so it
   could not be run where the rest of this list was worked through. A plan
   that fits the code as it is:
@@ -37,6 +40,14 @@
   - To test it without such a device: let the visibility pass run at 4x
     for tests (the raster then loads sample `s & 3`), which Mesa has.
 
+- **Motion blur: what is left.** A frame takes the sub-frames its motion
+  needs (`motion_px` in motion-render's lib.rs), so slow passages are
+  cheap; a fast one still draws everything once per sub-frame. What does
+  not change between sub-frames could be drawn once: groups whose
+  primitives (and the groups they read) are the same in every sub-frame
+  (a blurred backdrop, an effect on a still layer), and shadow maps whose
+  casters and lights did not move. Shapes, text and shader pictures that
+  change form are not measured and take every sample.
 - **Image memory: what is left.** Textures are held at the size they show
   (`Images::get_sized`: the file halved while it still has the texels a
   layer or a mesh's map needs on screen), the pool's budget follows the

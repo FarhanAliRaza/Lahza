@@ -1915,3 +1915,45 @@ fn motion_blur_sub_frames_share_their_group_texels() {
     // And the frame is the same picture on both paths.
     assert_gpu_matches_cpu(&p, &[2.4]);
 }
+
+/// Motion blur takes the sub-frames the motion on screen needs, up to
+/// the scene's: one for a still frame, two for a fade or a crawl, all of
+/// them for a fast move or for a change it cannot measure.
+#[test]
+fn motion_blur_takes_the_samples_the_motion_needs() {
+    let samples = |layers: serde_json::Value, scale: f64| {
+        let mut p = project(layers);
+        p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 8 });
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let mut r = Renderer::new(None, RenderOptions { backend: Backend::Cpu, scale, ..Default::default() });
+        r.sample_states(&c, 0.5).len()
+    };
+    // (At 30 fps a 180° shutter is open 1/60 s; the samples span 7/8 of it.)
+    let moving = |px_per_s: f64| json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [20, 40], "fill": "#ffffff",
+        "transform": {"position": {"keys": [{"at": 0, "v": [0, 90], "ease": "linear"}, {"at": 1, "v": [px_per_s, 90]}]}}}]);
+    assert_eq!(samples(moving(0.0), 1.0), 1, "still");
+    assert_eq!(samples(moving(60.0), 1.0), 2, "under a pixel");
+    assert_eq!(samples(moving(240.0), 1.0), 3, "3.5 px: a sample every 1.5");
+    assert_eq!(samples(moving(480.0), 1.0), 5, "7 px");
+    assert_eq!(samples(moving(480.0), 0.5), 3, "at half size, half the pixels");
+    assert_eq!(samples(moving(6000.0), 1.0), 8, "a fast move: all the scene asks for");
+    // A fade is not motion.
+    assert_eq!(samples(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [20, 40], "fill": "#ffffff",
+        "transform": {"position": [160, 90], "opacity": {"keys": [{"at": 0, "v": 0}, {"at": 1, "v": 1}]}}}]), 1.0), 2);
+    // A shape changing size moves its edges: not measured, so all of them.
+    assert_eq!(samples(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": {"keys": [{"at": 0, "v": [20, 40]}, {"at": 1, "v": [21, 40]}]}, "fill": "#ffffff",
+        "transform": {"position": [160, 90]}}]), 1.0), 8);
+    // A turning layer moves most far from its pivot: 90° a second about
+    // the frame's centre carries a corner of the frame 4.2 px.
+    assert_eq!(samples(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [200, 100], "fill": "#ffffff",
+        "transform": {"position": [160, 90], "rotation": {"keys": [{"at": 0, "v": 0, "ease": "linear"}, {"at": 1, "v": 90}]}}}]), 1.0), 3);
+    // A mesh: by where the camera puts its box's corners.
+    let ball = |px_per_s: f64| json!([{"id": "b", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30},
+        "transform": {"position": {"keys": [{"at": 0, "v": [60, 90], "ease": "linear"}, {"at": 1, "v": [60.0 + px_per_s, 90]}]}}}]);
+    assert_eq!(samples(ball(60.0), 1.0), 2);
+    assert_eq!(samples(ball(6000.0), 1.0), 8);
+    // In a comp that moves, its children move with it.
+    assert_eq!(samples(json!([{"id": "g", "kind": "comp", "transform": {"position": {"keys": [{"at": 0, "v": [0, 0], "ease": "linear"}, {"at": 1, "v": [480, 0]}]}},
+        "layers": [{"id": "r", "kind": "shape", "shape": "rect", "size": [20, 40], "fill": "#ffffff", "transform": {"position": [100, 90]}}]}]), 1.0), 5);
+}

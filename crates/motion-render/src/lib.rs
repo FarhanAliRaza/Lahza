@@ -300,13 +300,23 @@ impl Renderer {
             Some(mb) => {
                 let n = mb.samples.clamp(2, 64);
                 let open = mb.shutter.min(720.0) / 360.0 * compiled.fps().frame();
+                let at = |i: u32, of: u32| t + ((i as f64 + 0.5) / of as f64 - 0.5) * open;
                 for i in 0..n {
-                    let ts = t + ((i as f64 + 0.5) / n as f64 - 0.5) * open;
-                    states.push(compiled.frame(ts));
+                    states.push(compiled.frame(at(i, n)));
                 }
-                // A still picture needs one sample.
                 if states.windows(2).all(|w| w[0].layers == w[1].layers && w[0].scene == w[1].scene) {
+                    // A still picture needs one sample.
                     states.truncate(1);
+                } else {
+                    // A sample for every `MOTION_PX_PER_SAMPLE` output
+                    // pixels anything moves over the shutter, up to the
+                    // scene's: a slow move is as smooth with two as with
+                    // eight, at a quarter of the frame's cost.
+                    let moved = states.windows(2).map(|w| motion_px(&w[0], &w[1])).sum::<Option<f64>>();
+                    let need = moved.map_or(n, |d| ((d * self.options.scale / MOTION_PX_PER_SAMPLE).ceil() as u32).clamp(2, n));
+                    if need < n {
+                        states = (0..need).map(|i| compiled.frame(at(i, need))).collect();
+                    }
                 }
             }
             None => states.push(compiled.frame(t)),
@@ -621,6 +631,86 @@ impl Renderer {
         let Content::Text(text) = &layer.content else { return None };
         self.fonts.ink_bounds(text, layer.matrix)
     }
+}
+
+/// Output pixels something may move between two motion-blur samples: the
+/// samples of a frame are as many as its motion needs at this spacing (a
+/// streak's steps are then under two pixels), at most the scene's.
+const MOTION_PX_PER_SAMPLE: f64 = 1.5;
+
+/// How far, in canvas pixels, anything on screen moves between two
+/// moments, or None when that cannot be told from where the layers are:
+/// layers come or go, or a shape, text or shader picture changes form.
+/// (Motion blur then takes every sample the scene asks for.) Colours,
+/// opacities and effects changing are not motion.
+fn motion_px(a: &FrameState, b: &FrameState) -> Option<f64> {
+    use lahza_motion_core::space::Proj;
+    fn far(p: (f64, f64), q: (f64, f64)) -> Option<f64> {
+        let d = (p.0 - q.0).hypot(p.1 - q.1);
+        d.is_finite().then_some(d)
+    }
+    fn layers(a: &[LayerState], b: &[LayerState], ra: Proj, rb: Proj, canvas: (f64, f64)) -> Option<f64> {
+        if a.len() != b.len() {
+            return None;
+        }
+        let mut most = 0.0f64;
+        for (x, y) in a.iter().zip(b) {
+            if x.id != y.id {
+                return None;
+            }
+            let (ma, mb) = (ra.then(x.matrix), rb.then(y.matrix));
+            let d = match (&x.content, &y.content) {
+                (Content::Group(ca), Content::Group(cb)) => layers(ca, cb, ma, mb, canvas)?,
+                (Content::Mesh(p), Content::Mesh(q)) => {
+                    // Its box's corners, where the camera puts them.
+                    if p.params != q.params {
+                        return None;
+                    }
+                    let (lo, hi) = p.params.local_bounds()?;
+                    let (pa, pb) = (p.camera.project.then(p.world), q.camera.project.then(q.world));
+                    let mut most = 0.0f64;
+                    for k in 0..8 {
+                        let c = [if k & 1 == 0 { lo[0] } else { hi[0] }, if k & 2 == 0 { lo[1] } else { hi[1] }, if k & 4 == 0 { lo[2] } else { hi[2] }];
+                        let (s, e) = (pa.apply(c[0], c[1], c[2]), pb.apply(c[0], c[1], c[2]));
+                        if s[3] <= 1e-6 || e[3] <= 1e-6 {
+                            return None;
+                        }
+                        most = most.max(far(ra.apply(s[0] / s[3], s[1] / s[3]), rb.apply(e[0] / e[3], e[1] / e[3]))?);
+                    }
+                    most
+                }
+                // Footage steps from frame to frame where it stands.
+                (Content::Video(_), Content::Video(_)) => flat(ma, mb, canvas)?,
+                (p, q) if p == q => flat(ma, mb, canvas)?,
+                _ => return None,
+            };
+            most = most.max(d);
+            match (x.matte.as_deref().and_then(|m| m.source.as_ref()), y.matte.as_deref().and_then(|m| m.source.as_ref())) {
+                (Some(p), Some(q)) => most = most.max(layers(std::slice::from_ref(p), std::slice::from_ref(q), ra, rb, canvas)?),
+                (None, None) => {}
+                _ => return None,
+            }
+        }
+        Some(most)
+    }
+    /// A flat layer under `ma` then `mb`: how far the points it shows on
+    /// the canvas move (most at a corner of the canvas), either way.
+    fn flat(ma: Proj, mb: Proj, canvas: (f64, f64)) -> Option<f64> {
+        if ma == mb {
+            return Some(0.0);
+        }
+        let (ia, ib) = (ma.inverse()?, mb.inverse()?);
+        let mut most = 0.0f64;
+        for q in [(0.0, 0.0), (canvas.0, 0.0), (canvas.0, canvas.1), (0.0, canvas.1)] {
+            let (pa, pb) = (ia.apply(q.0, q.1), ib.apply(q.0, q.1));
+            most = most.max(far(mb.apply(pa.0, pa.1), q)?).max(far(ma.apply(pb.0, pb.1), q)?);
+        }
+        Some(most)
+    }
+    if a.scene != b.scene || (a.width, a.height) != (b.width, b.height) {
+        return None;
+    }
+    layers(&a.layers, &b.layers, Proj::IDENTITY, Proj::IDENTITY, (a.width as f64, a.height as f64))
 }
 
 /// Makes the GPU renderer, trying again on transient failures (a device
