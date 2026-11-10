@@ -1052,3 +1052,27 @@ fn a_wall_of_instanced_tiles_leaves_the_other_meshes_drawn() {
     assert_eq!(list.pool.len(), 66 * 36 + 2, "and the pipe and the rock after them");
     assert!(r.meshes.warnings.is_empty() && r.meshes.dropped.is_empty(), "{:?} {:?}", r.meshes.warnings, r.meshes.dropped);
 }
+
+/// A jar's worth of glass bubbles under two shadow-casting lights: what
+/// the shadow maps cost of building the frame's lists (run with
+/// `--ignored --nocapture`). They are built on every core.
+#[test]
+#[ignore]
+fn benchmark_shadow_maps_of_300_bubbles() {
+    let mut layers = vec![json!({"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [1800, 1000]}, "material": {"preset": "matte"}, "transform": {"position": [480, 400], "rotation_x": 80}})];
+    for i in 0..300 {
+        layers.push(json!({"id": format!("b{i}"), "kind": "mesh", "mesh": {"type": "sphere", "radius": 14}, "material": {"preset": "glass"},
+            "transform": {"position": [40 + (i % 30) * 30, 60 + (i / 30) * 40], "z": (i % 7) * 20}}));
+    }
+    let mut p = scene(960, 540, json!({"layers": layers}));
+    p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [-0.4, -0.6, -1.0], "shadow": true}, {"type": "point", "position": [200, 100, -600], "shadow": true}])).unwrap();
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let state = c.frame(0.0);
+    let mut r = cpu();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        let _ = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 0.56, trace: None, seed: 0, compact: true }.build(&state);
+        eprintln!("lists {:?}, of which shadow maps {:?}", t.elapsed(), std::mem::take(&mut r.meshes.shadowing));
+    }
+}

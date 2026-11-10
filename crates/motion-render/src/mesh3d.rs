@@ -285,7 +285,17 @@ impl MeshCache {
         }
         // Camera-space geometry of every mesh, indexed; each closed
         // triangle's outward side (+1/−1 on its winding), 0 when open.
-        let mut caster = Caster::default();
+        // First what each mesh brings (its geometry and sides are cached),
+        // then every mesh's vertices moved on every core.
+        struct Part {
+            mesh: Arc<Mesh>,
+            mv: lahza_motion_core::space::Mat4,
+            sides: Arc<Vec<f32>>,
+            flip: f32,
+            base: u32,
+        }
+        let mut parts: Vec<Part> = Vec::new();
+        let (mut verts, mut tris) = (0usize, 0usize);
         for rm in &run.meshes {
             if rm.state.materials.iter().all(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some()) {
                 continue;
@@ -294,11 +304,6 @@ impl MeshCache {
             let mv = rm.state.camera.view.then(rm.state.world);
             let m3 = mv.0;
             let det = m3[0] * (m3[5] * m3[10] - m3[6] * m3[9]) - m3[1] * (m3[4] * m3[10] - m3[6] * m3[8]) + m3[2] * (m3[4] * m3[9] - m3[5] * m3[8]);
-            let base = caster.verts.len() as u32;
-            caster.verts.extend(mesh.positions.iter().map(|p| {
-                let q = mv.apply(p[0] as f64, p[1] as f64, p[2] as f64);
-                [q[0], q[1], q[2]]
-            }));
             let sides = self
                 .sides
                 .entry(Arc::as_ptr(&mesh) as usize)
@@ -319,9 +324,49 @@ impl MeshCache {
                     )
                 })
                 .clone();
-            let flip = det.signum() as f32;
-            caster.tris.extend(mesh.tris.iter().map(|t| t.map(|i| i + base)));
-            caster.sides.extend(sides.iter().map(|s| s * flip));
+            let base = verts as u32;
+            verts += mesh.positions.len();
+            tris += mesh.tris.len();
+            parts.push(Part { mesh, mv, sides, flip: det.signum() as f32, base });
+        }
+        let mut caster = Caster { verts: vec![[0.0; 3]; verts], tris: vec![[0; 3]; tris], sides: vec![0.0; tris] };
+        {
+            // Each part's stretch of the three arrays, dealt out to the cores.
+            let threads = workers(tris);
+            let mut jobs: Vec<Vec<(&Part, &mut [[f64; 3]], &mut [[u32; 3]], &mut [f32])>> = (0..threads).map(|_| Vec::new()).collect();
+            let (mut v, mut t, mut s) = (&mut caster.verts[..], &mut caster.tris[..], &mut caster.sides[..]);
+            for (k, part) in parts.iter().enumerate() {
+                let (nv, nt) = (part.mesh.positions.len(), part.mesh.tris.len());
+                let (v0, v1) = std::mem::take(&mut v).split_at_mut(nv);
+                let (t0, t1) = std::mem::take(&mut t).split_at_mut(nt);
+                let (s0, s1) = std::mem::take(&mut s).split_at_mut(nt);
+                (v, t, s) = (v1, t1, s1);
+                jobs[k % threads].push((part, v0, t0, s0));
+            }
+            let fill = |jobs: Vec<(&Part, &mut [[f64; 3]], &mut [[u32; 3]], &mut [f32])>| {
+                for (part, v, t, s) in jobs {
+                    for (out, p) in v.iter_mut().zip(&part.mesh.positions) {
+                        let q = part.mv.apply(p[0] as f64, p[1] as f64, p[2] as f64);
+                        *out = [q[0], q[1], q[2]];
+                    }
+                    for (out, tri) in t.iter_mut().zip(&part.mesh.tris) {
+                        *out = tri.map(|i| i + part.base);
+                    }
+                    for (out, side) in s.iter_mut().zip(part.sides.iter()) {
+                        *out = side * part.flip;
+                    }
+                }
+            };
+            if threads == 1 {
+                jobs.into_iter().for_each(fill);
+            } else {
+                std::thread::scope(|scope| {
+                    for j in jobs {
+                        let fill = &fill;
+                        scope.spawn(move || fill(j));
+                    }
+                });
+            }
         }
         let tris = &caster;
         let view = first.state.camera.view;
@@ -870,6 +915,36 @@ fn basis(d: [f64; 3]) -> ([f64; 3], [f64; 3]) {
     (u, cross(d, u))
 }
 
+/// Threads for work over `n` items (triangles, vertices): one for little
+/// work, where starting threads costs more than they save.
+fn workers(n: usize) -> usize {
+    if n < 8192 {
+        return 1;
+    }
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16)
+}
+
+/// `f` of every item, on every core, in order.
+fn par_map<T: Sync, U: Send + Default + Clone>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
+    let threads = workers(items.len());
+    if threads == 1 {
+        return items.iter().map(f).collect();
+    }
+    let mut out = vec![U::default(); items.len()];
+    let chunk = items.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (src, dst) in items.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            let f = &f;
+            scope.spawn(move || {
+                for (a, b) in src.iter().zip(dst) {
+                    *b = f(a);
+                }
+            });
+        }
+    });
+    out
+}
+
 /// The meshes of a layer list as shadow casters (camera space).
 #[derive(Default)]
 struct Caster {
@@ -883,7 +958,7 @@ impl ShadowMap {
     fn directional(c: &Caster, toward: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
         let l = unit3(toward);
         let (u, v) = basis(l);
-        let proj: Vec<(f64, f64, f64)> = c.verts.iter().map(|&p| (dot(p, u), dot(p, v), dot(p, l))).collect();
+        let proj: Vec<(f64, f64, f64)> = par_map(&c.verts, |&p| (dot(p, u), dot(p, v), dot(p, l)));
         Self::build(c, &proj, &|_| l, size, softness, 0, l, [0.0; 3], u, v)
     }
 
@@ -896,19 +971,15 @@ impl ShadowMap {
         let n = c.verts.len().max(1) as f64;
         let axis = unit3(sub([m[0] / n, m[1] / n, m[2] / n], pos));
         let (u, v) = basis(axis);
-        let proj: Vec<(f64, f64, f64)> = c
-            .verts
-            .iter()
-            .map(|&p| {
-                let q = sub(p, pos);
-                let z = dot(q, axis);
-                if z < 1.0 {
-                    return (f64::NAN, f64::NAN, f64::NAN);
-                }
-                // Closeness 1/z interpolates linearly across the map.
-                ((dot(q, u) / z).clamp(-3.0, 3.0), (dot(q, v) / z).clamp(-3.0, 3.0), 1.0 / z)
-            })
-            .collect();
+        let proj: Vec<(f64, f64, f64)> = par_map(&c.verts, |&p| {
+            let q = sub(p, pos);
+            let z = dot(q, axis);
+            if z < 1.0 {
+                return (f64::NAN, f64::NAN, f64::NAN);
+            }
+            // Closeness 1/z interpolates linearly across the map.
+            ((dot(q, u) / z).clamp(-3.0, 3.0), (dot(q, v) / z).clamp(-3.0, 3.0), 1.0 / z)
+        });
         Self::build(c, &proj, &|p| sub(pos, p), size, softness, 1, axis, pos, u, v)
     }
 
@@ -929,20 +1000,35 @@ impl ShadowMap {
             let g = cross(sub(p[1], p[0]), sub(p[2], p[0]));
             dot(g, toward(p[0])) * c.sides[i] as f64 >= 0.0
         };
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+        // Every step runs on every core: with hundreds of casters (a jar
+        // of bubbles) the maps are most of a frame's list building.
+        let threads = workers(c.tris.len());
         let chunk = c.tris.len().div_ceil(threads).max(1);
-        let keep: Vec<usize> = std::thread::scope(|scope| {
-            let faces = &faces;
-            let jobs: Vec<_> = (0..c.tris.len()).step_by(chunk).map(|a| scope.spawn(move || (a..(a + chunk).min(c.tris.len())).filter(|&i| faces(i)).collect::<Vec<usize>>())).collect();
-            jobs.into_iter().flat_map(|j| j.join().expect("shadow casters")).collect()
-        });
-        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-        for &i in &keep {
-            for &k in &c.tris[i] {
-                let p = proj[k as usize];
-                b = [b[0].min(p.0), b[1].min(p.1), b[2].max(p.0), b[3].max(p.1)];
+        // The light-facing triangles of each stretch, and their bounds.
+        let stretch = |a: usize| {
+            let mut keep: Vec<u32> = Vec::new();
+            let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+            for i in a..(a + chunk).min(c.tris.len()) {
+                if faces(i) {
+                    keep.push(i as u32);
+                    for &k in &c.tris[i] {
+                        let p = proj[k as usize];
+                        b = [b[0].min(p.0), b[1].min(p.1), b[2].max(p.0), b[3].max(p.1)];
+                    }
+                }
             }
-        }
+            (keep, b)
+        };
+        let kept: Vec<(Vec<u32>, [f64; 4])> = if threads == 1 {
+            (0..c.tris.len()).step_by(chunk).map(stretch).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let stretch = &stretch;
+                let jobs: Vec<_> = (0..c.tris.len()).step_by(chunk).map(|a| scope.spawn(move || stretch(a))).collect();
+                jobs.into_iter().map(|j| j.join().expect("shadow casters")).collect()
+            })
+        };
+        let b = kept.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |b, (_, k)| [b[0].min(k[0]), b[1].min(k[1]), b[2].max(k[2]), b[3].max(k[3])]);
         if !(b[2] > b[0] && b[3] > b[1]) {
             return None;
         }
@@ -951,99 +1037,100 @@ impl ShadowMap {
         let (pu, pv) = ((b[2] - b[0]) * 2.0 / n, (b[3] - b[1]) * 2.0 / n);
         let (u0, v0) = (b[0] - pu, b[1] - pv);
         let (su, sv) = (n / (b[2] - b[0] + 2.0 * pu), n / (b[3] - b[1] + 2.0 * pv));
-        let mut texels = vec![NO_SURFACE; size * size];
-        // Triangles in texel space, sorted into the threads' bands of rows.
-        let tex: Vec<[(f64, f64, f64); 3]> = keep.iter().map(|&i| c.tris[i].map(|k| {
-            let q = proj[k as usize];
-            ((q.0 - u0) * su, (q.1 - v0) * sv, q.2)
-        })).collect();
-        // Many thin bands dealt out in turn, so busy regions spread over
-        // every thread.
-        let nbands = threads * 8;
-        let band = size.div_ceil(nbands);
+        // The map's rows: six of header (written last), then its texels,
+        // four to a row, rasterised in place.
+        let mut rows = vec![[NO_SURFACE; 4]; 6 + (size * size).div_ceil(4)];
+        let texels: &mut [f32] = &mut bytemuck::cast_slice_mut(&mut rows[6..])[..size * size];
+        // Many thin bands of rows dealt out in turn, so busy regions
+        // spread over every thread. Each thread goes through the kept
+        // triangles and draws the rows of its own bands.
+        let band = size.div_ceil(threads * 8);
         let nbands = size.div_ceil(band);
-        let mut bands: Vec<Vec<u32>> = vec![Vec::new(); nbands];
-        for (i, p) in tex.iter().enumerate() {
-            let lo = (p[0].1.min(p[1].1).min(p[2].1) - 0.5).ceil().max(0.0) as usize;
-            let hi = (p[0].1.max(p[1].1).max(p[2].1) - 0.5).floor().clamp(-1.0, n - 1.0);
-            if hi < lo as f64 {
-                continue;
-            }
-            for bi in lo / band..=(hi as usize / band).min(nbands - 1) {
-                bands[bi].push(i as u32);
-            }
+        let mut work: Vec<Vec<&mut [f32]>> = (0..threads).map(|_| Vec::new()).collect();
+        for (k, rows) in texels.chunks_mut(band * size).enumerate() {
+            work[k % threads].push(rows);
         }
-        let mut work: Vec<Vec<(usize, &mut [f32], &Vec<u32>)>> = (0..threads).map(|_| Vec::new()).collect();
-        for ((k, rows), list) in texels.chunks_mut(band * size).enumerate().zip(&bands) {
-            work[k % threads].push((k, rows, list));
-        }
-        std::thread::scope(|scope| {
-            for jobs in work {
-                let tex = &tex;
-                scope.spawn(move || {
-                  for (k, rows, list) in jobs {
+        let draw = |me: usize, mut mine: Vec<&mut [f32]>| {
+            for &ti in kept.iter().flat_map(|(keep, _)| keep) {
+                // In texel space.
+                let p = c.tris[ti as usize].map(|k| {
+                    let q = proj[k as usize];
+                    ((q.0 - u0) * su, (q.1 - v0) * sv, q.2)
+                });
+                let lo = (p[0].1.min(p[1].1).min(p[2].1) - 0.5).ceil().max(0.0) as usize;
+                let hi = (p[0].1.max(p[1].1).max(p[2].1) - 0.5).floor().clamp(-1.0, n - 1.0);
+                if hi < lo as f64 {
+                    continue;
+                }
+                // Its bands that are this thread's: me, me + threads, …
+                let (first, last) = (lo / band, (hi as usize / band).min(nbands - 1));
+                let mut k = first + (me + threads - first % threads) % threads;
+                if k > last {
+                    continue;
+                }
+                let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[1].1 - p[0].1) * (p[2].0 - p[0].0);
+                if area.abs() < 1e-12 {
+                    continue;
+                }
+                let xs = (p[0].0.min(p[1].0).min(p[2].0) - 0.5).ceil().max(0.0) as usize;
+                let xe = ((p[0].0.max(p[1].0).max(p[2].0) - 0.5).floor() + 1.0).min(n);
+                if xe <= xs as f64 {
+                    continue;
+                }
+                // Edge functions (weights of the opposite vertex) as
+                // planes: w = a·x + b·y + c; closeness likewise.
+                let plane = |a: (f64, f64, f64), b: (f64, f64, f64)| {
+                    let (ea, eb) = (-(b.1 - a.1) / area, (b.0 - a.0) / area);
+                    (ea, eb, -(ea * a.0 + eb * a.1))
+                };
+                let e = [plane(p[1], p[2]), plane(p[2], p[0]), plane(p[0], p[1])];
+                let cz = (
+                    e[0].0 * p[0].2 + e[1].0 * p[1].2 + e[2].0 * p[2].2,
+                    e[0].1 * p[0].2 + e[1].1 * p[1].2 + e[2].1 * p[2].2,
+                    e[0].2 * p[0].2 + e[1].2 * p[1].2 + e[2].2 * p[2].2,
+                );
+                let x0 = xs as f64 + 0.5;
+                while k <= last {
+                    let rows = &mut *mine[k / threads];
                     let (y_lo, y_hi) = (k * band, (k * band + rows.len() / size).min(size));
-                    for &ti in list {
-                        let p = tex[ti as usize];
-                        let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[1].1 - p[0].1) * (p[2].0 - p[0].0);
-                        if area.abs() < 1e-12 {
-                            continue;
-                        }
-                        let ys = (p[0].1.min(p[1].1).min(p[2].1) - 0.5).ceil().max(y_lo as f64) as usize;
-                        let ye = ((p[0].1.max(p[1].1).max(p[2].1) - 0.5).floor() + 1.0).min(y_hi as f64);
-                        let xs = (p[0].0.min(p[1].0).min(p[2].0) - 0.5).ceil().max(0.0) as usize;
-                        let xe = ((p[0].0.max(p[1].0).max(p[2].0) - 0.5).floor() + 1.0).min(n);
-                        if ye <= ys as f64 || xe <= xs as f64 {
-                            continue;
-                        }
-                        // Edge functions (weights of the opposite vertex) as
-                        // planes: w = a·x + b·y + c; closeness likewise.
-                        let plane = |a: (f64, f64, f64), b: (f64, f64, f64)| {
-                            let (ea, eb) = (-(b.1 - a.1) / area, (b.0 - a.0) / area);
-                            (ea, eb, -(ea * a.0 + eb * a.1))
-                        };
-                        let e = [plane(p[1], p[2]), plane(p[2], p[0]), plane(p[0], p[1])];
-                        let cz = (
-                            e[0].0 * p[0].2 + e[1].0 * p[1].2 + e[2].0 * p[2].2,
-                            e[0].1 * p[0].2 + e[1].1 * p[1].2 + e[2].1 * p[2].2,
-                            e[0].2 * p[0].2 + e[1].2 * p[1].2 + e[2].2 * p[2].2,
-                        );
-                        let x0 = xs as f64 + 0.5;
-                        for y in ys..ye as usize {
-                            let cy = y as f64 + 0.5;
-                            let row = &mut rows[(y - y_lo) * size..(y - y_lo + 1) * size];
-                            let mut w = [0, 1, 2].map(|k| e[k].0 * x0 + e[k].1 * cy + e[k].2);
-                            let mut c = cz.0 * x0 + cz.1 * cy + cz.2;
-                            for t in &mut row[xs..xe as usize] {
-                                if w[0] >= 0.0 && w[1] >= 0.0 && w[2] >= 0.0 && c as f32 > *t {
-                                    *t = c as f32;
-                                }
-                                w[0] += e[0].0;
-                                w[1] += e[1].0;
-                                w[2] += e[2].0;
-                                c += cz.0;
+                    let ys = (p[0].1.min(p[1].1).min(p[2].1) - 0.5).ceil().max(y_lo as f64) as usize;
+                    let ye = ((p[0].1.max(p[1].1).max(p[2].1) - 0.5).floor() + 1.0).min(y_hi as f64);
+                    for y in ys..ye.max(0.0) as usize {
+                        let cy = y as f64 + 0.5;
+                        let row = &mut rows[(y - y_lo) * size..(y - y_lo + 1) * size];
+                        let mut w = [0, 1, 2].map(|k| e[k].0 * x0 + e[k].1 * cy + e[k].2);
+                        let mut c = cz.0 * x0 + cz.1 * cy + cz.2;
+                        for t in &mut row[xs..xe as usize] {
+                            if w[0] >= 0.0 && w[1] >= 0.0 && w[2] >= 0.0 && c as f32 > *t {
+                                *t = c as f32;
                             }
+                            w[0] += e[0].0;
+                            w[1] += e[1].0;
+                            w[2] += e[2].0;
+                            c += cz.0;
                         }
                     }
-                  }
-                });
+                    k += threads;
+                }
             }
-        });
+        };
+        if threads == 1 {
+            draw(0, work.pop().unwrap_or_default());
+        } else {
+            std::thread::scope(|scope| {
+                for (me, mine) in work.into_iter().enumerate() {
+                    let draw = &draw;
+                    scope.spawn(move || draw(me, mine));
+                }
+            });
+        }
         // Bias: directional in px along the light; point as a fraction of
         // the distance (both about a texel and a half).
         let texel = (1.0 / su).max(1.0 / sv);
         let bias = if kind == 0 { 1.5 * texel + 0.5 } else { 1.5 * texel };
         let radius = 1.0 + softness * 10.0;
         let f = |a: [f64; 3], w: f64| [a[0] as f32, a[1] as f32, a[2] as f32, w as f32];
-        let mut rows = vec![
-            [kind as f32, size as f32, u0 as f32, v0 as f32],
-            [su as f32, sv as f32, bias as f32, radius as f32],
-            f(u, texel),
-            f(v, 0.0),
-            f(axis, 0.0),
-            f(pos, 0.0),
-        ];
-        rows.extend(texels.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]));
+        rows[..6].copy_from_slice(&[[kind as f32, size as f32, u0 as f32, v0 as f32], [su as f32, sv as f32, bias as f32, radius as f32], f(u, texel), f(v, 0.0), f(axis, 0.0), f(pos, 0.0)]);
         Some(ShadowMap { rows })
     }
 }
