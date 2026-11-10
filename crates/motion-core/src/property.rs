@@ -287,10 +287,8 @@ impl<T: Animatable> Prop<T> {
 fn apply_add<T: Animatable>(add: &CAdd<T>, v: T, t: f64) -> T {
     match add {
         CAdd::Slang { function, mul, from, until } => {
-            if t < *from || t > *until {
-                return v;
-            }
-            let r = function.at(t - from);
+            let Some(local) = slang_time(t, *from, *until) else { return v };
+            let r = function.at(local);
             let r = T::from_fn(|i| r.get(i).copied().unwrap_or(0.0));
             if *mul {
                 v.map2(&r, |a, b| a * b)
@@ -330,6 +328,16 @@ fn apply_add<T: Animatable>(add: &CAdd<T>, v: T, t: f64) -> T {
             v.add(&amp.scale(s))
         }
     }
+}
+
+/// The local time a Slang track's function is called with at timeline
+/// time `t`, or None where the track adds nothing (after `until`). Before
+/// `from` the track holds its first value, f(0): a function that starts
+/// away from rest does not pop in on the frame after `from`, and a cut
+/// that lands a fraction of a frame before the marker the track starts on
+/// already shows where the track starts.
+fn slang_time(t: f64, from: f64, until: f64) -> Option<f64> {
+    (t <= until).then_some((t - from).max(0.0))
 }
 
 /// Smooth seeded value noise in [-1, 1], zero-mean, C1-continuous.
@@ -517,6 +525,19 @@ mod tests {
         let mut m = Markers::default();
         m.insert(MarkerTrack::from_times("beat", (0..64).map(|i| 1.093 + i as f64 * 60.0 / 90.0)));
         m
+    }
+
+    #[test]
+    fn a_slang_track_holds_its_first_value_before_it_starts() {
+        // A track from 2 s to 5 s: its function is called with 0 until
+        // then (a cut a frame early already shows where it starts), with
+        // the seconds since 2 s after, and not at all past 5 s.
+        assert_eq!(slang_time(0.0, 2.0, 5.0), Some(0.0));
+        assert_eq!(slang_time(2.0 - 1.0 / 60.0, 2.0, 5.0), Some(0.0));
+        assert_eq!(slang_time(2.0, 2.0, 5.0), Some(0.0));
+        assert_eq!(slang_time(3.5, 2.0, 5.0), Some(1.5));
+        assert_eq!(slang_time(5.0, 2.0, 5.0), Some(3.0));
+        assert_eq!(slang_time(5.01, 2.0, 5.0), None);
     }
 
     #[test]

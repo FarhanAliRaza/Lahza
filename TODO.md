@@ -61,10 +61,6 @@
 
 ## Slang
 
-- **A Slang track adds nothing before its `from`.** A cut on a marker lands
-  a frame early, so a track starting on the beat shows the object at rest
-  on the cut's first frame. Decide whether a track should hold its first
-  value before `from`.
 - **Generator errors point at Lahza's wrapper.** A geometry generator whose
   Slang has a `<fn>_params` struct but no `params` in the layer JSON fails
   with `lahza_cpu.slang:11:33: not enough arguments to call (got 2,

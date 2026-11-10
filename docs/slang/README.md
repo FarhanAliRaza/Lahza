@@ -38,7 +38,11 @@ float  breathe(float t) { return 1.0 + 0.25 * sin(t * 6.2831853); }
 ```
 
 - `t` is local seconds since `from` (default: the layer start); `until`
-  ends the track.
+  ends the track (after it the track adds nothing). Before `from` the
+  track holds its first value, `f(0)`: a function that starts away from
+  rest does not pop in when the track starts, and a cut that lands a
+  fraction of a frame before the marker a track starts on already shows
+  where the track starts.
 - The function returns `float` … `float4`, one component per value
   component. A `float` applies to every component; missing components leave
   the value as it is (0 added, 1 multiplied).
