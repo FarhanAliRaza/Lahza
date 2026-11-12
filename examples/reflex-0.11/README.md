@@ -46,6 +46,12 @@ at 1080p on four cores).
 | 40–44 | montage | seven more changes, one per beat | slam, hard cuts |
 | 44–51 | end | the mark, `pip install --upgrade reflex` | instancer wave field |
 
-`shaders/reel.slang` holds two Slang functions for `--slang`: `aurora`, the
-block-grid backdrop of the 0.11 shot, and `circuit`, a material that cuts the
-numerals into the mark's grid with seams that light up.
+`shaders/reel.slang` (with `--slang`) holds the film's three Slang functions:
+`silk`, a shader layer of slowly flowing folds of colour behind every stage;
+`glaze`, a ceramic material with pigment pulled through it; and `pearl`, whose
+colour shifts toward grazing angles. Without `--slang` the stages fall back to
+soft fields and lit paper floors, and the ceramic to a speckle noise.
+
+Slang needs `slangc` on PATH or in `LAHZA_SLANGC`. The CPU build links
+`-lslang-rt`; the shaders here use nothing from it, so where only the compiler
+is installed an empty `libslang-rt.so` on `LIBRARY_PATH` is enough.

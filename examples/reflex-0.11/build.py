@@ -143,22 +143,53 @@ def rise(at, stagger="1f", dur="12f", y=40, unit="glyph", order="forward"):
     return [{"at": at, "unit": unit, "order": order, "stagger": stagger, "dur": dur, "ease": "glide", "from": {"opacity": 0, "y": y}}]
 
 
+def ceramic(color, gloss=0.3):
+    """Glazed ceramic: a soft sheen over a body with fine speckle and tooth, light bleeding a little into it."""
+    m = {"preset": "plastic", "color": color, "roughness": 0.42, "clearcoat": gloss, "clearcoat_roughness": 0.3,
+         "subsurface": 0.2, "subsurface_scale": 10}
+    if SLANG:
+        m["slang"] = {"function": "glaze", "params": [190, 0.38]}
+    else:
+        m["noise"] = {"type": "cellular", "scale": 6, "color": "#000000", "amount": 0.09, "bump": 0.3}
+    return m
+
+
+SILK = {"dark": ("#0b0914", "#241a52", "#6e56cf"), "light": ("#ffffff", "#e4dcfb", "#b9a8ff"), "violet": ("#5b43c4", "#6e56cf", "#9d8af5")}
+
+
+def silk(id, tone, seed=0):
+    """The backdrop: flowing folds of colour (Slang), or a soft field without it."""
+    a, b, c = SILK[tone]
+    if SLANG:
+        return {"id": id, "kind": "shader", "function": "silk", "size": [W, H], "space": "screen", "role": "background",
+                "transform": {"position": [W / 2, H / 2]}, "params": {"ground": a, "fold": b, "accent": c, "seed": seed}}
+    return {"id": id, "kind": "shape", "shape": "field", "size": [W + 40, H + 40], "transform": {"position": [W / 2, H / 2]},
+            "space": "screen", "softness": 1.4, "role": "background",
+            "points": [{"position": [200, 300], "color": b, "radius": 560}, {"position": [-900, -500], "color": a, "radius": 520},
+                       {"position": [900, -540], "color": a, "radius": 520}, {"position": [-960, 540], "color": a, "radius": 420}]}
+
+
 def box(id, x, y, w, h, depth, color, bevel=6, preset="glossy", z=0, **kw):
     layer = {"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [w, h], "depth": depth, "bevel": bevel},
-             "material": {"preset": preset, "color": color}, "transform": {"position": [x, y], "z": z}}
+             "material": ceramic(color), "transform": {"position": [x, y], "z": z}}
     for key, v in kw.items():
         if key in ("opacity", "scale", "rotation", "rotation_x", "rotation_y"):
             layer["transform"][key] = v
         elif key == "material":
-            layer["material"].update(v)
+            layer["material"].update({a: b for a, b in v.items() if a != "roughness"})
         else:
             layer[key] = v
     return layer
 
 
-def floor(id, y, color=None, **mat):
-    """A ground plane: a shadow catcher over a 2D background, or a lit surface with `color`."""
-    m = {"preset": "shadow", "color": "#000000", "opacity": 0.5} if color is None else {"preset": "matte", "color": color}
+def floor(id, y, tone="dark", **mat):
+    """The studio's seamless paper: a lit matte ground with a paper tooth, so light falls off across it."""
+    if SLANG:  # over the silk: only the shadows land
+        m = {"preset": "shadow", "color": "#05030c" if tone == "dark" else "#2a1c66", "opacity": 0.75 if tone == "dark" else 0.32}
+    else:
+        c, c2 = ("#1a1530", "#0d0a1c") if tone == "dark" else ("#dedaea", "#c9c3dc")
+        m = {"preset": "matte", "color": c, "roughness": 0.85,
+             "noise": {"type": "fbm", "scale": 5, "octaves": 3, "color": c2, "amount": 0.35, "bump": 0.5}}
     m.update(mat)
     return {"id": id, "kind": "mesh", "mesh": {"type": "plane", "size": [24000, 24000]}, "material": m, "role": "background",
             "transform": {"position": [W / 2, y], "rotation_x": 90}}
@@ -189,12 +220,8 @@ def s01():
     sid, start, end = "s01", 0.0, 4.0
     cx, ground = W / 2, 700
     L = []
-    L.append({"id": "o-bg", "kind": "shape", "shape": "field", "size": [W + 40, H + 40], "transform": {"position": [W / 2, H / 2]},
-              "space": "screen", "softness": 1.3, "role": "background",
-              "points": [{"position": [0, 120], "color": "#231c45", "radius": 520},
-                         {"position": [-900, -500], "color": "#09090c", "radius": 500}, {"position": [900, -500], "color": "#09090c", "radius": 500},
-                         {"position": [-900, 520], "color": "#0b0b10", "radius": 420}, {"position": [900, 520], "color": "#0b0b10", "radius": 420}]})
-    L.append(floor("o-floor", ground, opacity=0.8))
+    L.append(silk("o-bg", "dark", 1))
+    L.append(floor("o-floor", ground, "dark"))
     ticks = [0.0, 0.5, 1.0, 1.5] + [2.0 + i * 0.25 for i in range(8)]
     rot = [k(0.0, 35)]
     for i, t in enumerate(ticks[1:]):
@@ -228,17 +255,18 @@ def s02():
     mw, mh = MARK_W * unit / 48, MARK_H * unit / 48
     x0 = (W - (mw + gap + name_w)) / 2
     mx, cy = x0 + mw / 2, 470
+    L.append(silk("m-bg", "violet", 2))
     L.append({"id": "m-wall", "kind": "mesh", "mesh": {"type": "plane", "size": [9000, 9000]},
               "material": {"preset": "shadow", "color": "#1d1247", "opacity": 0.6}, "transform": {"position": [W / 2, H / 2], "z": 46}})
     fly = {"stem": (-1500, 0, -900), "bar": (200, -1100, -700), "bowl": (1700, -500, -1200), "mid": (900, 900, -600), "leg": (1500, 700, -1000)}
     for i, b in enumerate(mark_blocks("m", mx, cy, unit, 84, PAPER, "glossy", roughness=0.28)):
         dx, dy, dz = fly[b["id"][2:]]
         p = b["transform"]["position"]
-        t = 4.0 - f(3) + f(i) / 2
+        t = 4.0 - f(6) + f(i)
         b["role"] = "subject"
-        b["transform"]["position"] = keys(k(t, p, frm=[p[0] + dx * 0.6, p[1] + dy * 0.6], ease="slam", dur="6f", anchor="start"))
-        b["transform"]["z"] = keys(k(t, 0, frm=dz, ease="slam", dur="7f", anchor="start"))
-        b["transform"]["rotation_y"] = keys(k(t, 0, frm=70 if dx > 0 else -70, ease="slam", dur="7f", anchor="start"))
+        b["transform"]["position"] = keys(k(t, p, frm=[p[0] + dx * 0.6, p[1] + dy * 0.6], ease="settle", dur="16f", anchor="start"))
+        b["transform"]["z"] = keys(k(t, 0, frm=dz, ease="settle", dur="16f", anchor="start"))
+        b["transform"]["rotation_y"] = keys(k(t, 0, frm=70 if dx > 0 else -70, ease="settle", dur="16f", anchor="start"))
         L.append(b)
     L.append(text("m-name", "reflex", x0 + mw + gap + name_w / 2, cy - 18, name_size, F_BOLD, PAPER, tracking=-20, three_d=True, z=42,
                   animators=[{"at": 4.0 + f(5), "unit": "glyph", "order": "forward", "stagger": "1f", "dur": "8f", "ease": "glide",
@@ -261,16 +289,8 @@ def s04():
     sid, start, end = "s04", 16.0, 20.0
     cx, ground = W / 2, 760
     L = []
-    if SLANG:
-        L.append({"id": "v-bg", "kind": "shader", "function": "aurora", "size": [W, H], "space": "screen", "role": "background",
-                  "transform": {"position": [W / 2, H / 2]}, "params": {"tint": VIOLET, "energy": keys(k(16.0, 1.0, frm=2.4, ease="glide", dur="30f", anchor="start"))}})
-    else:
-        L.append({"id": "v-bg", "kind": "shape", "shape": "field", "size": [W + 40, H + 40], "transform": {"position": [W / 2, H / 2]},
-                  "space": "screen", "softness": 1.3, "role": "background",
-                  "points": [{"position": {"base": [0, 200], "add": [{"type": "wiggle", "hz": 0.25, "amp": [160, 40]}]}, "color": "#2b2060", "radius": 560},
-                             {"position": [-900, -500], "color": "#08080b", "radius": 520}, {"position": [900, -500], "color": "#08080b", "radius": 520},
-                             {"position": [-960, 540], "color": "#0b0a12", "radius": 420}, {"position": [960, 540], "color": "#0b0a12", "radius": 420}]})
-    L.append(floor("v-floor", ground, color="#07060d", preset="coated", roughness=0.3))
+    L.append(silk("v-bg", "dark", 4))
+    L.append(floor("v-floor", ground, "dark", preset="coated", color="#0a0814", roughness=0.4, opacity=1))
     size = 560
     glyphs = [glyph_path(c, F_BLACK, size) for c in "0.11"]
     track = -18
@@ -279,7 +299,7 @@ def s04():
     cap = max(g[3] for g in glyphs)
     mat = {"preset": "coated", "color": VIOLET, "roughness": 0.22, "clearcoat": 1.0}
     if SLANG:
-        mat["slang"] = {"function": "circuit", "params": [46, keys(k(16.0, 0.0), k(16.6, 1.0, ease="glide"))]}
+        mat["slang"] = {"function": "glaze", "params": [260, 0.6]}
     else:
         mat["noise"] = {"type": "fbm", "scale": 240, "color": "#9a84ff", "amount": 0.35}
     for i, (d, adv, gw, gh) in enumerate(glyphs):
@@ -289,14 +309,10 @@ def s04():
         L.append({"id": f"v-g{i}", "kind": "mesh", "role": "subject", "mesh": {"type": "extrude", "d": d, "depth": 150, "bevel": 9},
                   "material": dict(mat), "parts": {"side": {"preset": "chrome", "color": "#cfc6ff", "roughness": 0.12},
                                                     "bevel": {"preset": "chrome", "color": "#ffffff", "roughness": 0.05}},
-                  "transform": {"position": keys(k(t, [gx, gy], frm=[gx, gy - 1500], ease="bounce", anchor="land", dur="16f")),
+                  "transform": {"position": keys(k(t, [gx, gy], frm=[gx, gy - 1500], ease="settle", dur="16f", anchor="end")),
                                 "rotation_y": keys(k(t, 0, frm=-50 + 30 * i, ease="settle", dur="20f", anchor="start"))}})
         x += adv + track
     spin = lambda a, b: keys(k(16.0, a), k(20.0, b, ease="linear"))
-    L.append({"id": "v-ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 820, "tube": 9}, "segments": 44, "gap": 3,
-              "material": {"preset": "chrome"}, "role": "decoration",
-              "transform": {"position": [cx, ground - cap / 2], "rotation_x": 80, "rotation_y": -6, "rotation": spin(0, 60),
-                            "scale": enter(16.0, 1, 2.2, "settle", "26f")}})
     L.append({"id": "v-ring2", "kind": "mesh", "mesh": {"type": "torus", "radius": 930, "tube": 3.5}, "role": "decoration",
               "material": {"preset": "emissive", "color": LILAC, "emissive": LILAC, "emissive_strength": 2.2},
               "transform": {"position": [cx, ground - cap / 2], "rotation_x": 74, "rotation_y": 9, "rotation": spin(30, -30),
@@ -307,7 +323,7 @@ def s04():
               "dolly": keys(k(16.0, -240), k(19.4, 60, ease="linear"), k(20.0, 900, ease="zoom", dur="14f", anchor="end")),
               "aperture": 0.7, "focus": "v-g2"}
     lights = [{"type": "area", "position": [cx - 500, -500, -1500], "aim": [cx, ground - 250, 0], "size": [900, 500], "color": "#fff4ea", "intensity": 1.9, "softness": 0.55},
-              {"type": "directional", "from": [1.0, -0.35, 1.0], "color": "#8f78ff", "intensity": 1.3},
+              {"type": "directional", "from": [1.0, -0.6, 0.2], "color": "#8f78ff", "intensity": 0.7},
               {"type": "point", "position": [cx + 700, ground - 600, -500], "color": "#ffd9ff", "intensity": 0.5},
               {"type": "ambient", "intensity": 0.06}]
     return {"id": sid, "start": start, "end": end, "background": "#09090c", "layers": L, "camera": camera, "lights": lights,
@@ -420,6 +436,10 @@ def code_line(prefix, t, code, tone="dark", size=52, y=H - 128, align="left"):
 
 
 def stage_bg(id, tone):
+    return silk(id, tone, sum(map(ord, id)) % 7)
+
+
+def stage_bg_old(id, tone):
     if tone == "dark":
         pts = [{"position": [200, 300], "color": "#1c1540", "radius": 560}, {"position": [-900, -500], "color": "#09090c", "radius": 520},
                {"position": [900, -540], "color": "#0a0a0e", "radius": 520}, {"position": [-960, 540], "color": "#0b0a12", "radius": 420}]
@@ -431,13 +451,13 @@ def stage_bg(id, tone):
 
 
 DARK_LIGHTS = lambda cx, cy: [
-    {"type": "area", "position": [cx - 800, cy - 700, -800], "aim": [cx, cy, 0], "size": [800, 500], "color": "#fff4ea", "intensity": 1.6, "softness": 0.55},
-    {"type": "directional", "from": [1.0, -0.35, 1.0], "color": "#a996ff", "intensity": 1.0},
-    {"type": "ambient", "intensity": 0.07}]
+    {"type": "area", "position": [cx - 500, cy - 1100, -500], "aim": [cx, cy, 0], "size": [1500, 1000], "color": "#fff1e6", "intensity": 2.3},
+    {"type": "area", "position": [cx + 1300, cy - 300, 500], "aim": [cx, cy, 0], "size": [500, 900], "color": "#8f78ff", "intensity": 1.3, "shadow": False},
+    {"type": "ambient", "intensity": 0.05}]
 LIGHT_LIGHTS = lambda cx, cy: [
-    {"type": "area", "position": [cx - 700, cy - 800, -700], "aim": [cx, cy, 0], "size": [900, 600], "color": "#ffffff", "intensity": 1.5, "softness": 0.6},
-    {"type": "directional", "from": [1.0, -0.4, 0.6], "color": "#e3dcff", "intensity": 0.6},
-    {"type": "ambient", "intensity": 0.22}]
+    {"type": "area", "position": [cx - 600, cy - 1100, -600], "aim": [cx, cy, 0], "size": [1600, 1100], "color": "#fffaf4", "intensity": 1.25},
+    {"type": "area", "position": [cx + 1300, cy - 400, 300], "aim": [cx, cy, 0], "size": [600, 900], "color": "#d9d0ff", "intensity": 0.5, "shadow": False},
+    {"type": "ambient", "intensity": 0.1}]
 
 
 def label3d(id, s, x, y, z, size, color, **kw):
@@ -445,7 +465,9 @@ def label3d(id, s, x, y, z, size, color, **kw):
 
 
 def ball(id, x, y, z, r, color, emissive=0.0, **kw):
-    m = {"preset": "coated", "color": color, "roughness": 0.2}
+    m = ceramic(color, 0.6)
+    if SLANG:
+        m["slang"] = {"function": "pearl", "params": [0.8]}
     if emissive:
         m.update({"emissive": color, "emissive_strength": emissive})
     layer = {"id": id, "kind": "mesh", "mesh": {"type": "sphere", "radius": r}, "material": m, "role": "subject",
@@ -464,7 +486,7 @@ def s05():
     sid, start, end = "s05", 20.0, 24.0
     cx, ground = 1100, 720
     cy = ground - 80
-    L = [stage_bg("a-bg", "dark"), floor("a-floor", ground, color="#07060d", preset="coated", roughness=0.35)]
+    L = [stage_bg("a-bg", "dark"), floor("a-floor", ground, "dark")]
     # The state: a violet core that lights while a handler holds it.
     held = [(20.25, 21.25), (22.0, 23.6)]
     glow = [k(20.0, 0.0)]
@@ -534,7 +556,7 @@ def s06():
     state var lives in the browser, so a `.set` flips only the components that read it, at once, wire dark."""
     sid, start, end = "s06", 24.0, 28.0
     ground = 860
-    L = [stage_bg("c-bg", "light"), floor("c-floor", ground, color=None, opacity=0.3)]
+    L = [stage_bg("c-bg", "light"), floor("c-floor", ground, "light")]
     cols, rows, cell, pitch = 6, 4, 132, 150
     px, py = 620, 580  # the page's centre
     readers = {(1, 1), (4, 0), (3, 2), (0, 3)}
@@ -590,7 +612,7 @@ def s07():
     """SETVAR: two rings of members; each operation lifts and lights exactly its result."""
     sid, start, end = "s07", 28.0, 32.0
     cx, ground = W / 2, 720
-    L = [stage_bg("s-bg", "dark"), floor("s-floor", ground, opacity=0.85)]
+    L = [stage_bg("s-bg", "dark"), floor("s-floor", ground, "dark")]
     r, off = 330, 190
     for name, x, colr in (("a", cx - off, VIOLET), ("b", cx + off, "#e9e6f5")):
         L.append({"id": f"s-ring-{name}", "kind": "mesh", "role": "subject", "mesh": {"type": "torus", "radius": r, "tube": 13},
@@ -610,7 +632,7 @@ def s07():
             ykeys.append(k(tt, [cx + mx, ground - 44 - (70 if on else 0)], ease="pop" if on else "glide", **({"anchor": "start"} if on else {"dur": "6f", "anchor": "start"})))
             ckeys.append(k(tt, LILAC if on else "#3a3850", ease="snap", dur="3f", anchor="start"))
             skeys.append(k(tt, 1.0 if on else 0.62, ease="pop" if on else "glide", **({"anchor": "start"} if on else {"dur": "6f", "anchor": "start"})))
-        ykeys[0] = k(28.0 + f(i % 4), ykeys[0]["v"], frm=[cx + mx, ground - 44 - 900], ease="bounce", anchor="land", dur="14f")
+        ykeys[0] = k(28.0 + f(i % 4), ykeys[0]["v"], frm=[cx + mx, ground - 44 - 900], ease="settle", dur="16f", anchor="end")
         skeys[0] = k(28.0, 1.0)
         ckeys[0] = k(28.0, LILAC)
         L.append({"id": f"s-m{i}", "kind": "mesh", "role": "subject", "mesh": {"type": "sphere", "radius": 44},
@@ -629,7 +651,7 @@ def s08():
     """ALEMBIC: the schema as a table. Each revision adds a column; `alembic downgrade -1` takes the last one back out."""
     sid, start, end = "s08", 32.0, 36.0
     cx, ground = 1060, 740
-    L = [stage_bg("d-bg", "light"), floor("d-floor", ground, color=None, opacity=0.3)]
+    L = [stage_bg("d-bg", "light"), floor("d-floor", ground, "light")]
     cw, ch, cd, gx, gz, rows = 230, 54, 100, 250, 124, 5
     cols = [("id", None, None), ("name", None, None), ("email", 33.0, None), ("tags", 34.0, 35.0)]
     for c, (name, t_in, t_out) in enumerate(cols):
@@ -648,7 +670,7 @@ def s08():
                 b["transform"]["scale"] = keys(k(32.0 - f(3) + f(c + r) / 2, 1, frm=0, ease="pop", anchor="start"))
             else:
                 b["time"] = window(t_in - 0.45 + f(r))
-                pos.append(k(t_in + f(r), p, frm=[p[0], p[1] - 1000], ease="bounce", anchor="land", dur="14f"))
+                pos.append(k(t_in + f(r), p, frm=[p[0], p[1] - 1000], ease="settle", dur="16f", anchor="end"))
             if t_out is not None:
                 pos.append(k(t_out + f(rows - 1 - r), [p[0], p[1] + 160], ease="gesture", dur="7f", anchor="start"))
                 b["transform"]["scale"] = keys(k(t_in, 1), k(t_out + f(rows - 1 - r) + f(3), 0, ease="gesture", dur="5f", anchor="start"))
@@ -682,7 +704,7 @@ def s09():
     sid, start, end = "s09", 36.0, 40.0
     cx, ground = W / 2, 780
     R = 380
-    L = [stage_bg("b-bg", "dark"), floor("b-floor", ground, color="#07060d", preset="coated", roughness=0.35)]
+    L = [stage_bg("b-bg", "dark"), floor("b-floor", ground, "dark")]
     jam, free = 37.0, 38.75
     tint = keys(k(36.0, "#d8d2f5"), k(jam, RED, ease="snap", dur="3f", anchor="start"), k(free, "#d8d2f5", ease="glide", dur="10f", anchor="start"))
     L.append({"id": "b-loop", "kind": "mesh", "role": "subject", "mesh": {"type": "torus", "radius": R, "tube": 13},
@@ -702,7 +724,7 @@ def s09():
     by = ground - 40 - 120
     L.append(box("b-block", 0, 0, 190, 190, 190, RED, bevel=14, preset="coated", z=bz, role="subject", material={"roughness": 0.25}, time=window(jam - 0.4),
                  rotation_y=18))
-    L[-1]["transform"]["position"] = keys(k(jam, [bx, by], frm=[bx, by - 1100], ease="bounce", anchor="land", dur="12f"),
+    L[-1]["transform"]["position"] = keys(k(jam, [bx, by], frm=[bx, by - 1100], ease="settle", dur="16f", anchor="end"),
                                           k(free, [bx + 900, by - 260], ease="glide", dur="14f", anchor="start"))
     L[-1]["transform"]["z"] = keys(k(jam, bz), k(free, bz + 500, ease="glide", dur="14f", anchor="start"))
     L[-1]["material"]["color"] = keys(k(jam, RED), k(free + 0.3, "#5b5870", ease="glide", dur="10f", anchor="start"))
@@ -772,11 +794,11 @@ def s11():
     for i, b in enumerate(mark_blocks("e", mx, cy, unit, 76, VIOLET, "coated", roughness=0.22)):
         dx, dy, dz = fly[b["id"][2:]]
         p = b["transform"]["position"]
-        t = 44.0 - f(3) + f(i) / 2
+        t = 44.0 - f(6) + f(i)
         b["role"] = "subject"
-        b["transform"]["position"] = keys(k(t, p, frm=[p[0] + dx, p[1] + dy], ease="slam", dur="7f", anchor="start"))
-        b["transform"]["z"] = keys(k(t, 0, frm=dz, ease="slam", dur="7f", anchor="start"))
-        b["transform"]["rotation_y"] = keys(k(t, 0, frm=70 if dx > 0 else -70, ease="slam", dur="7f", anchor="start"))
+        b["transform"]["position"] = keys(k(t, p, frm=[p[0] + dx, p[1] + dy], ease="settle", dur="16f", anchor="start"))
+        b["transform"]["z"] = keys(k(t, 0, frm=dz, ease="settle", dur="16f", anchor="start"))
+        b["transform"]["rotation_y"] = keys(k(t, 0, frm=70 if dx > 0 else -70, ease="settle", dur="16f", anchor="start"))
         L.append(b)
     nx = x0 + mw + gap
     L.append(text("e-name", "reflex", nx + name_w / 2, cy - 16, name_size, F_BOLD, INK, tracking=-20, three_d=True, z=38,
@@ -827,6 +849,18 @@ def build(only=None):
     if only:
         scenes = [s for s in scenes if s["id"] in only]
     for s in scenes:
+        # The studio's back wall: the same paper as the floor, far behind, so the ground never ends in a void.
+        for i, l in enumerate(s["layers"]):
+            if l["id"].endswith("-floor") and l["id"] != "v-floor" and not SLANG:
+                wall = json.loads(json.dumps(l))
+                wall["id"] = l["id"][:-5] + "wall"
+                wall["transform"] = {"position": [W / 2, l["transform"]["position"][1] - 6000], "z": 2600}
+                s["layers"].insert(i, wall)
+                break
+        # The finish: one grey overlay carries a soft vignette and film grain over the whole picture.
+        s["layers"].append({"id": f"{s['id']}-finish", "kind": "shape", "shape": "rect", "size": [W, H], "fill": "#808080", "blend": "overlay",
+                            "space": "screen", "role": "decoration", "transform": {"position": [W / 2, H / 2]},
+                            "effects": [{"type": "vignette", "amount": 0.3, "softness": 0.8}, {"type": "grain", "amount": 0.05, "size": 1.3}]})
         json.dump(s, open(os.path.join(OUT, "scenes", f"{s['id']}.json"), "w"), ensure_ascii=False)
     assets = [{"path": "assets/track.wav", "source": "original", "licence": "original score, synthesized for this reel (music.py)"}]
     for fn in sorted(SYSTEM_FONTS):
