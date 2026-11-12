@@ -56,6 +56,9 @@ pub struct Fonts {
     pub atlas: Vec<u8>,
     /// Bumped whenever atlas texels change (GPU re-upload).
     pub generation: u64,
+    /// Counts the times a full atlas was started over: until the next,
+    /// glyphs are only added (those there stay where they are).
+    pub resets: u64,
     shelf: (u32, u32, u32),
     pub warnings: Vec<String>,
     layouts: HashMap<LayoutKey, Arc<Layout>>,
@@ -103,6 +106,7 @@ impl Fonts {
             glyphs: HashMap::new(),
             atlas: vec![0; (ATLAS_SIZE * ATLAS_SIZE) as usize],
             generation: 1,
+            resets: 0,
             shelf: (0, 0, 0),
             warnings: Vec::new(),
             layouts: HashMap::new(),
@@ -169,6 +173,7 @@ impl Fonts {
             // Atlas full: start over (glyphs are re-rasterised on demand).
             self.glyphs.clear();
             self.atlas.fill(0);
+            self.resets += 1;
             self.shelf = (0, 0, 0);
             self.layouts.clear();
             return self.rasterize(font, id);

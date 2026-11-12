@@ -272,7 +272,10 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
     fn material(ctx: &Ctx, m: gltf::Material, textures: &mut HashMap<usize, String>, report: &mut ImportReport) -> serde_json::Value {
         let pbr = m.pbr_metallic_roughness();
         let base = pbr.base_color_factor();
-        let mut out = json!({"color": hex([base[0], base[1], base[2]]), "metallic": round(pbr.metallic_factor() as f64), "roughness": round(pbr.roughness_factor() as f64)});
+        // (No clear coat: a material here starts from the glossy preset,
+        // whose lacquer over a scanned rock mirrors the sun at a few points
+        // of it, white specks that jump from frame to frame.)
+        let mut out = json!({"color": hex([base[0], base[1], base[2]]), "metallic": round(pbr.metallic_factor() as f64), "roughness": round(pbr.roughness_factor() as f64), "clearcoat": 0.0});
         if base[3] < 0.999 && m.alpha_mode() == gltf::material::AlphaMode::Blend {
             out["opacity"] = json!(round(base[3] as f64));
         }

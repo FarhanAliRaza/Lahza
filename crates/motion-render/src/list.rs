@@ -496,8 +496,11 @@ impl Builder<'_> {
     /// Each is held at the size the mesh shows it (`map_want`); a density
     /// grid whole.
     fn mesh_textures(&mut self, m: &lahza_motion_core::compile::MeshState, root: Proj) {
+        // (Measured on the mesh only where a map needs it.)
+        let mapped = |mat: &lahza_motion_core::compile::MaterialState| [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map, &mat.emissive_map].into_iter().any(|p| p.is_some());
+        let stretch = if m.materials.iter().any(mapped) { self.meshes.uv_stretch(m) } else { None };
         for mat in &m.materials {
-            let want = map_want(m, mat, root);
+            let want = map_want(m, mat, root, stretch);
             for path in [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map, &mat.emissive_map].into_iter().flatten() {
                 // (A mesh that needs it larger than one before it loads a
                 // larger copy; the earlier rows keep the smaller.)
@@ -1533,11 +1536,17 @@ const MAP_TEXELS_PER_PIXEL: f64 = 3.0;
 /// drawn through `root`: from the mesh's size on screen and how often the
 /// maps repeat across it (`uv` scale). All they have when the mesh's size
 /// on screen is not known (it crosses the camera).
-pub fn map_want(m: &lahza_motion_core::compile::MeshState, mat: &lahza_motion_core::compile::MaterialState, root: Proj) -> u32 {
+///
+/// `stretch` is the mesh's own measure of how far its UVs stretch a map
+/// (`Mesh::uv_stretch`), where it is known: an atlas that gives much of
+/// the mesh few of its texels needs more of them than
+/// `MAP_TEXELS_PER_PIXEL` allows for. (Never fewer: the measure leaves
+/// out a twentieth of the surface.)
+pub fn map_want(m: &lahza_motion_core::compile::MeshState, mat: &lahza_motion_core::compile::MaterialState, root: Proj, stretch: Option<f64>) -> u32 {
     let Some(b) = m.screen_bounds() else { return u32::MAX };
     let span = (b[2] - b[0]).max(b[3] - b[1]) * root.max_scale();
     let repeats = mat.uv[0].abs().min(mat.uv[1].abs()).max(1e-3);
-    let want = span * MAP_TEXELS_PER_PIXEL / repeats;
+    let want = span * stretch.map_or(MAP_TEXELS_PER_PIXEL, |s| s.max(MAP_TEXELS_PER_PIXEL)) / repeats;
     if want.is_finite() { want.ceil().clamp(1.0, u32::MAX as f64) as u32 } else { u32::MAX }
 }
 
@@ -1545,8 +1554,10 @@ pub fn map_want(m: &lahza_motion_core::compile::MeshState, mat: &lahza_motion_co
 /// `scale`, as the renderer holds them (each at the size it shows, with
 /// its mips): what `check` holds against the pool's budget before a
 /// render. `natural` gives a source's size as a picture (None: no such
-/// image, counted as nothing).
-pub fn frame_image_texels(frame: &FrameState, scale: f64, natural: &mut dyn FnMut(&str) -> Option<[u32; 2]>) -> usize {
+/// image, counted as nothing); `stretch` a mesh's `Mesh::uv_stretch`
+/// where it has maps (`MeshCache::uv_stretch`; None: by its size on
+/// screen alone).
+pub fn frame_image_texels(frame: &FrameState, scale: f64, natural: &mut dyn FnMut(&str) -> Option<[u32; 2]>, stretch: &mut dyn FnMut(&lahza_motion_core::compile::MeshState) -> Option<f64>) -> usize {
     type Wants = std::collections::BTreeMap<std::sync::Arc<str>, u32>;
     fn want(wants: &mut Wants, src: &std::sync::Arc<str>, n: u32) {
         let w = wants.entry(src.clone()).or_insert(0);
@@ -1554,7 +1565,7 @@ pub fn frame_image_texels(frame: &FrameState, scale: f64, natural: &mut dyn FnMu
     }
     // As the list builder walks them: a group's children under its matrix,
     // a matte's source beside its layer.
-    fn walk(layers: &[LayerState], root: Proj, natural: &mut dyn FnMut(&str) -> Option<[u32; 2]>, wants: &mut Wants) {
+    fn walk(layers: &[LayerState], root: Proj, natural: &mut dyn FnMut(&str) -> Option<[u32; 2]>, stretch: &mut dyn FnMut(&lahza_motion_core::compile::MeshState) -> Option<f64>, wants: &mut Wants) {
         for l in layers {
             match &l.content {
                 Content::Image { src, size } => {
@@ -1566,8 +1577,10 @@ pub fn frame_image_texels(frame: &FrameState, scale: f64, natural: &mut dyn FnMu
                     }
                 }
                 Content::Mesh(m) => {
+                    let mapped = |mat: &lahza_motion_core::compile::MaterialState| [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map, &mat.emissive_map].into_iter().any(|p| p.is_some());
+                    let s = if m.materials.iter().any(mapped) { stretch(m) } else { None };
                     for mat in &m.materials {
-                        let n = map_want(m, mat, root);
+                        let n = map_want(m, mat, root, s);
                         for path in [&mat.map, &mat.normal_map, &mat.bump_map, &mat.roughness_map, &mat.metallic_map, &mat.emissive_map].into_iter().flatten() {
                             want(wants, path, n);
                         }
@@ -1576,16 +1589,16 @@ pub fn frame_image_texels(frame: &FrameState, scale: f64, natural: &mut dyn FnMu
                         }
                     }
                 }
-                Content::Group(children) => walk(children, root.then(l.matrix), natural, wants),
+                Content::Group(children) => walk(children, root.then(l.matrix), natural, stretch, wants),
                 _ => {}
             }
             if let Some(source) = l.matte.as_ref().and_then(|m| m.source.as_ref()) {
-                walk(std::slice::from_ref(source), root, natural, wants);
+                walk(std::slice::from_ref(source), root, natural, stretch, wants);
             }
         }
     }
     let mut wants = Wants::new();
-    walk(&frame.layers, Proj::from(Affine::scale(scale, scale)), natural, &mut wants);
+    walk(&frame.layers, Proj::from(Affine::scale(scale, scale)), natural, stretch, &mut wants);
     wants.iter().filter_map(|(src, want)| natural(src).map(|n| crate::images::held_texels(n, *want))).sum()
 }
 

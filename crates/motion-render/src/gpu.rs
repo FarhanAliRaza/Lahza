@@ -145,6 +145,98 @@ fn plan_shadows(jobs: &[crate::mesh3d::ShadowJob]) -> (Vec<[u32; 2]>, u32, u32) 
     (at, width, (y + shelf).max(16))
 }
 
+/// For each job, the first job that is the same map: the same header and
+/// casters (their rows of `mesh`, once the pool has completed them). The
+/// sub-frames of a motion-blurred frame whose lights and casters did not
+/// move ask for one map each; it is drawn once.
+fn same_shadows(jobs: &[crate::mesh3d::ShadowJob], mesh: &[[f32; 4]]) -> Vec<usize> {
+    let mut first: std::collections::HashMap<(u32, &[u8], &[u8]), usize> = std::collections::HashMap::new();
+    jobs.iter()
+        .enumerate()
+        .map(|(k, j)| {
+            // (The header's seventh row is its page, not yet set.)
+            let header: &[u8] = bytemuck::cast_slice(&mesh[j.header as usize..j.header as usize + 6]);
+            let casters: &[u8] = bytemuck::cast_slice(&mesh[j.casters as usize..(j.casters + j.count * crate::mesh3d::CROWS as u32) as usize]);
+            *first.entry((j.size, header, casters)).or_insert(k)
+        })
+        .collect()
+}
+
+/// Which groups of sample `b` hold the picture the same group of sample
+/// `a` (the sub-frame drawn before it) does: the same primitives on the
+/// same tiles and texels, reading the same things. The samples of a frame
+/// draw their groups in the same texels, so such a group is not drawn
+/// again (a blurred backdrop, an effect on a layer that stands still).
+fn same_groups(a: &DisplayList, b: &DisplayList) -> Vec<bool> {
+    let mut same = vec![false; b.groups.len()];
+    // What primitives point into, compared whole: little of it, and
+    // seldom different where the primitives are not.
+    if a.prims.len() != b.prims.len() || a.stops != b.stops || a.segments != b.segments || a.ops != b.ops {
+        return same;
+    }
+    let meshes = a.mesh == b.mesh && a.bins == b.bins && a.pool == b.pool && a.shadows == b.shadows && a.mesh_ids == b.mesh_ids && a.mesh_draws == b.mesh_draws && a.surfaces.as_ref().map(|s| s.key) == b.surfaces.as_ref().map(|s| s.key);
+    // Per primitive: 0 different, 1 the same, 2 the same and reading
+    // other groups' texels (those must be the same too).
+    let prims: Vec<u8> = a
+        .prims
+        .iter()
+        .zip(&b.prims)
+        .map(|(p, q)| {
+            let reads = match p.kind[0] {
+                crate::list::PRIM_MESH => true,
+                crate::list::PRIM_MATTE => true,
+                crate::list::PRIM_IMAGE => p.kind[1] == crate::list::SOURCE_GROUP,
+                _ => false,
+            };
+            if bytemuck::bytes_of(p) != bytemuck::bytes_of(q) || (p.kind[0] == crate::list::PRIM_MESH && !meshes) {
+                0
+            } else {
+                1 + reads as u8
+            }
+        })
+        .collect();
+    // Groups read only groups before them.
+    let mut before = true;
+    for (gi, (ga, gb)) in a.groups.iter().zip(&b.groups).enumerate() {
+        let (ta, tb) = (ga.target, gb.target);
+        let shader = match (ga.shader, gb.shader) {
+            (None, None) => true,
+            (Some(x), Some(y)) => a.shaders[x as usize] == b.shaders[y as usize],
+            _ => false,
+        };
+        let alike = shader && ga.trace.is_none() && gb.trace.is_none() && (ta.width, ta.height, ga.offset, ga.sigma.to_bits(), ga.clamp) == (tb.width, tb.height, gb.offset, gb.sigma.to_bits(), gb.clamp) && ta.background == tb.background;
+        same[gi] = alike
+            && (0..ta.tiles() as usize).all(|tile| {
+                let (ra, rb) = (&a.ranges[(ta.range_base as usize + tile) * 2..][..2], &b.ranges[(tb.range_base as usize + tile) * 2..][..2]);
+                let (ia, ib) = (&a.indices[ra[0] as usize..][..ra[1] as usize], &b.indices[rb[0] as usize..][..rb[1] as usize]);
+                ia == ib && ia.iter().all(|&i| prims[i as usize] == 1 || prims[i as usize] == 2 && before)
+            });
+        before &= same[gi];
+    }
+    same
+}
+
+/// Whether group `g` of `list` reads other groups' texels: a group's
+/// picture, a matte, a glass mesh's backdrop or a card's picture among
+/// its primitives. (One that reads none may be drawn before, or along
+/// with, any other.)
+fn reads_groups(list: &DisplayList, g: &crate::list::Group) -> bool {
+    let t = g.target;
+    (0..t.tiles() as usize).any(|tile| {
+        let r = &list.ranges[(t.range_base as usize + tile) * 2..][..2];
+        list.indices[r[0] as usize..][..r[1] as usize].iter().any(|&i| {
+            let p = &list.prims[i as usize];
+            match p.kind[0] {
+                crate::list::PRIM_MATTE => true,
+                crate::list::PRIM_IMAGE => p.kind[1] == crate::list::SOURCE_GROUP,
+                // (Records are cards; `paint[3]`: a backdrop.)
+                crate::list::PRIM_MESH => p.paint[3] > 0.5 || p.geom[2].to_bits() > 0,
+                _ => false,
+            }
+        })
+    })
+}
+
 /// Samples per pixel of the hardware visibility pass: the rasteriser's own
 /// pattern is the standard 8x one.
 const VIS_SAMPLES: u32 = 8;
@@ -222,45 +314,148 @@ struct VisPipelines {
     see: gpu::RenderPipeline,
 }
 
-/// A page of the atlas: the target rect it covers and its atlas corner.
+/// A page of the atlas: its corner and size there, and what it covers in
+/// output px (x, y, w, h). A primitive is drawn on a page through its own
+/// target's mapping (`rect_for`), so one page takes the meshes of
+/// primitives placed on different targets.
 #[derive(Clone, Copy)]
 struct Page {
-    rect: [u32; 4],
     at: [u32; 2],
+    size: [u32; 2],
+    canvas: [f32; 4],
 }
 
-/// One target's visibility work: its pages, and per draw (index into the
-/// sample's draws) its page and its layer list's opaque page.
+impl Page {
+    /// The page's rect in the target px of `prim` (x, y, w, h).
+    fn rect_for(&self, prim: &Prim) -> [f32; 4] {
+        let ([ox, oy, fx, fy], c) = (prim.fill, self.canvas);
+        [(c[0] - ox) / fx, (c[1] - oy) / fy, c[2] / fx, c[3] / fy]
+    }
+
+    /// For a primitive whose target px are output px moved by whole px
+    /// (`aligned`): what takes its target px to the page's atlas px.
+    fn offset_for(&self, prim: &Prim) -> [i32; 2] {
+        [self.at[0] as i32 - (self.canvas[0] - prim.fill[0]) as i32, self.at[1] as i32 - (self.canvas[1] - prim.fill[1]) as i32]
+    }
+}
+
+/// Whether a primitive's target px are output px moved by whole px: it
+/// can read a page laid out in output px.
+fn aligned(prim: &Prim) -> bool {
+    let [ox, oy, fx, fy] = prim.fill;
+    fx == 1.0 && fy == 1.0 && ox.fract() == 0.0 && oy.fract() == 0.0
+}
+
+/// One target's visibility work: its pages and what is drawn on them.
+///
+/// An opaque page takes every opaque batch of its layer list, wherever
+/// each is placed (one primitive of each, `Batches`): a batch drawn in a
+/// picture of its own (an effect, depth of field's blur) is hidden where
+/// the list's other meshes are nearer, without a copy of each in it.
 #[derive(Default)]
 struct TargetVis {
     pages: Vec<Page>,
-    /// Opaque pages: (run tag, page, draws in order).
-    opaque: Vec<(u32, usize, Vec<usize>)>,
-    /// See-through draws: (draw, own page, opaque page of its list).
-    see: Vec<(usize, usize, Option<usize>)>,
-    /// The target's draws (what the indices above refer to).
-    draws: Vec<MeshDraw>,
+    /// Opaque pages: (run tag, page, the primitives drawn on it in order).
+    opaque: Vec<(u32, usize, Vec<u32>)>,
+    /// See-through primitives: (primitive, own page, the opaque
+    /// primitives of its list, drawn first).
+    see: Vec<(u32, usize, Vec<u32>)>,
+}
+
+/// Per opaque run tag of a sample: one primitive of each of the list's
+/// opaque batches, in the batches' order.
+type Batches = std::collections::HashMap<u32, Vec<u32>>;
+
+fn batches_of(draws: &[MeshDraw], prims: &[Prim]) -> Batches {
+    let mut out = Batches::new();
+    let mut seen = std::collections::HashSet::new();
+    for d in draws {
+        let p = &prims[d.prim as usize];
+        // (A batch's triangle ids are its own, on every target.)
+        if p.kind[3] & 1 == 1 && seen.insert((p.kind[3], p.geom[1].to_bits())) {
+            out.entry(p.kind[3]).or_default().push(d.prim);
+        }
+    }
+    for list in out.values_mut() {
+        list.sort_by_key(|&i| prims[i as usize].geom[1].to_bits());
+    }
+    out
+}
+
+/// The pages a sample's targets share: for a layer list whose opaque
+/// batches are on more than one target (each layer a picture of its own),
+/// one page in output px with all of them, drawn once and read by every
+/// primitive that can (`aligned`). Stacked from the top of the atlas.
+/// Returns the plan that draws them, each tag's page, and their height.
+fn plan_shared(draws: &[MeshDraw], prims: &[Prim], batches: &Batches, width: u32) -> (TargetVis, std::collections::HashMap<u32, Page>, u32) {
+    let mut out = TargetVis::default();
+    let mut pages = std::collections::HashMap::new();
+    let mut y = 0u32;
+    let mut tags: Vec<&u32> = batches.keys().collect();
+    tags.sort();
+    for &tag in tags {
+        let mine = || draws.iter().filter(|d| prims[d.prim as usize].kind[3] == tag);
+        let targets: std::collections::HashSet<u32> = mine().map(|d| d.target).collect();
+        if targets.len() < 2 {
+            continue;
+        }
+        // What its readers read of it, in output px.
+        let mut c = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        for d in mine().filter(|d| aligned(&prims[d.prim as usize])) {
+            let [ox, oy, ..] = prims[d.prim as usize].fill;
+            c = [c[0].min(ox + d.rect[0] as f32), c[1].min(oy + d.rect[1] as f32), c[2].max(ox + d.rect[2] as f32), c[3].max(oy + d.rect[3] as f32)];
+        }
+        let (w, h) = (c[2] - c[0], c[3] - c[1]);
+        if !(w >= 1.0 && h >= 1.0) || w > width as f32 || h > 8192.0 {
+            continue;
+        }
+        let page = Page { at: [0, y], size: [w as u32, h as u32], canvas: [c[0], c[1], w, h] };
+        y += h as u32;
+        out.pages.push(page);
+        out.opaque.push((tag, out.pages.len() - 1, batches[&tag].clone()));
+        pages.insert(tag, page);
+    }
+    (out, pages, y)
 }
 
 /// A mesh primitive's triangles for the visibility pass: those with
 /// records (cards), and its instances (pooled mesh row, triangles, canvas
-/// bounds) as the pool completed their rows.
+/// bounds, whether a depth-only occluder) as the pool completed their
+/// rows.
+///
+/// Occluders are drawn before the surfaces that are shaded. A mesh drawn
+/// in a picture of its own is also an occluder in the list's other
+/// batches, and both may land on one page at the same depth to the bit:
+/// drawn last, the surface that is shaded keeps the samples (the page
+/// takes the later of two at one depth).
 struct VisPrim {
-    records: u32,
-    instances: Vec<(u32, u32, [f32; 4])>,
+    /// Runs of triangles with records: (first, how many, occluders).
+    records: Vec<(u32, u32, bool)>,
+    instances: Vec<(u32, u32, [f32; 4], bool)>,
 }
 
 impl VisPrim {
     fn new(prim: &Prim, mesh: &[[f32; 4]]) -> Self {
         let (records, n) = (prim.geom[2].to_bits(), prim.geom[3].to_bits() as usize);
-        let base = (prim.geom2[0].to_bits() + records) as usize;
+        let (first, materials) = (prim.geom2[0].to_bits() as usize, prim.geom2[2].to_bits() as usize);
+        let mut runs: Vec<(u32, u32, bool)> = Vec::new();
+        for k in 0..records {
+            // (A record's material; its flags are row 2's w.)
+            let material = (mesh[first + k as usize][3].to_bits() & 0x00FF_FFFF) as usize;
+            let occluder = mesh[materials + material * crate::mesh3d::MAT_ROWS + 2][3] as u32 & crate::mesh3d::FLAG_OCCLUDER != 0;
+            match runs.last_mut() {
+                Some(r) if r.2 == occluder => r.1 += 1,
+                _ => runs.push((k, 1, occluder)),
+            }
+        }
+        let base = first + records as usize;
         let instances = (0..n)
             .map(|k| {
                 let r = &mesh[base + k * crate::mesh3d::IROWS..];
-                (r[13][0].to_bits(), r[13][2].to_bits(), r[19])
+                (r[13][0].to_bits(), r[13][2].to_bits(), r[19], r[14][2].to_bits() != 0)
             })
             .collect();
-        Self { records, instances }
+        Self { records: runs, instances }
     }
 
     /// The instanced draws (first instance, instances, vertices) that may
@@ -268,12 +463,14 @@ impl VisPrim {
     /// target): runs of consecutive instances of one pooled mesh, in the
     /// batch's order, so ties resolve as one draw of the batch would. A
     /// glass bead's small backdrop draws only the instances behind it.
-    fn draws(&self, prim: &Prim, rect: [u32; 4], out: &mut Vec<[u32; 3]>) {
+    /// `occluders`: those that are, or those that are not.
+    fn draws(&self, prim: &Prim, rect: [f32; 4], occluders: bool, out: &mut Vec<[u32; 3]>) {
         out.clear();
         let [ox, oy, fx, fy] = prim.fill;
-        let r = rect.map(|v| v as f32);
+        // (x, y, w, h) → its corners.
+        let r = [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]];
         let mut last: Option<(u32, u32, u32)> = None;
-        for (k, &(at, tris, b)) in self.instances.iter().enumerate() {
+        for (k, &(at, tris, b, _)) in self.instances.iter().enumerate().filter(|(_, i)| i.3 == occluders) {
             let k = k as u32;
             let (x0, x1) = ((b[0] - ox) / fx, (b[2] - ox) / fx);
             let (y0, y1) = ((b[1] - oy) / fy, (b[3] - oy) / fy);
@@ -293,59 +490,89 @@ impl VisPrim {
 
 /// Lays out one target's pages (shelves `width` wide) and fills `vis` (per
 /// primitive offsets). Returns the work and the atlas height it needs.
-fn plan_vis(draws: &[MeshDraw], prims: &[Prim], width: u32, vis: &mut [[i32; 4]]) -> (TargetVis, u32) {
+fn plan_vis(draws: &[MeshDraw], prims: &[Prim], width: u32, top: u32, batches: &Batches, shared: &std::collections::HashMap<u32, Page>, vis: &mut [[i32; 4]]) -> (TargetVis, u32) {
     let mut out = TargetVis::default();
+    // (Pages' rects in target px while they are laid out.)
+    let mut rects: Vec<[u32; 4]> = Vec::new();
     let union = |a: [u32; 4], b: [u32; 4]| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])];
-    for (i, d) in draws.iter().enumerate() {
-        let tag = prims[d.prim as usize].kind[3];
+    // Opaque primitives: on their list's shared page where they can read
+    // it, else on a page of this target's for the list.
+    let mut readers: Vec<(u32, usize)> = Vec::new();
+    for d in draws {
+        let p = &prims[d.prim as usize];
+        let tag = p.kind[3];
         if tag & 1 == 0 {
             continue;
         }
-        match out.opaque.iter_mut().find(|o| o.0 == tag) {
-            Some(o) => {
-                out.pages[o.1].rect = union(out.pages[o.1].rect, d.rect);
-                o.2.push(i);
+        if let Some(page) = shared.get(&tag).filter(|_| aligned(p)) {
+            let o = page.offset_for(p);
+            vis[d.prim as usize] = [o[0], o[1], o[0], o[1]];
+            continue;
+        }
+        let at = match out.opaque.iter().position(|o| o.0 == tag) {
+            Some(k) => {
+                rects[out.opaque[k].1] = union(rects[out.opaque[k].1], d.rect);
+                out.opaque[k].1
             }
             None => {
-                out.pages.push(Page { rect: d.rect, at: [0, 0] });
-                out.opaque.push((tag, out.pages.len() - 1, vec![i]));
+                rects.push(d.rect);
+                out.opaque.push((tag, rects.len() - 1, batches.get(&tag).cloned().unwrap_or_default()));
+                rects.len() - 1
             }
-        }
+        };
+        readers.push((d.prim, at));
     }
-    for (i, d) in draws.iter().enumerate() {
+    let mut see: Vec<(u32, usize, Option<usize>)> = Vec::new();
+    for d in draws {
         let tag = prims[d.prim as usize].kind[3];
         if tag & 1 != 0 {
             continue;
         }
-        out.pages.push(Page { rect: d.rect, at: [0, 0] });
+        rects.push(d.rect);
         let behind = out.opaque.iter().find(|o| o.0 == tag | 1).map(|o| o.1);
-        out.see.push((i, out.pages.len() - 1, behind));
+        see.push((d.prim, rects.len() - 1, behind));
+        out.see.push((d.prim, rects.len() - 1, batches.get(&(tag | 1)).cloned().unwrap_or_default()));
     }
-    // Shelves, tallest first.
-    let mut order: Vec<usize> = (0..out.pages.len()).collect();
-    order.sort_by_key(|&k| std::cmp::Reverse(out.pages[k].rect[3] - out.pages[k].rect[1]));
-    let (mut x, mut y, mut shelf) = (0u32, 0u32, 0u32);
+    // Shelves, tallest first, under the shared pages.
+    let mut order: Vec<usize> = (0..rects.len()).collect();
+    order.sort_by_key(|&k| std::cmp::Reverse(rects[k][3] - rects[k][1]));
+    let mut at = vec![[0u32; 2]; rects.len()];
+    let (mut x, mut y, mut shelf) = (0u32, top, 0u32);
     for k in order {
-        let r = out.pages[k].rect;
+        let r = rects[k];
         let (w, h) = (r[2] - r[0], r[3] - r[1]);
         if x + w > width {
             (x, y, shelf) = (0, y + shelf, 0);
         }
-        out.pages[k].at = [x, y];
+        at[k] = [x, y];
         x += w;
         shelf = shelf.max(h);
     }
-    let offset = |p: &Page| [p.at[0] as i32 - p.rect[0] as i32, p.at[1] as i32 - p.rect[1] as i32];
-    for (_, page, list) in &out.opaque {
-        for &i in list {
-            let o = offset(&out.pages[*page]);
-            vis[draws[i].prim as usize] = [o[0], o[1], o[0], o[1]];
-        }
+    // (Every primitive of a target has the target's mapping.)
+    let fill = draws.first().map_or([0.0, 0.0, 1.0, 1.0], |d| prims[d.prim as usize].fill);
+    out.pages = rects
+        .iter()
+        .zip(&at)
+        .map(|(r, at)| {
+            let (w, h) = (r[2] - r[0], r[3] - r[1]);
+            Page { at: *at, size: [w, h], canvas: [fill[0] + r[0] as f32 * fill[2], fill[1] + r[1] as f32 * fill[3], w as f32 * fill[2], h as f32 * fill[3]] }
+        })
+        .collect();
+    let offset = |k: usize| [at[k][0] as i32 - rects[k][0] as i32, at[k][1] as i32 - rects[k][1] as i32];
+    for (prim, page) in readers {
+        let o = offset(page);
+        vis[prim as usize] = [o[0], o[1], o[0], o[1]];
     }
-    for &(i, page, behind) in &out.see {
-        let o = offset(&out.pages[page]);
-        let b = behind.map_or([VIS_NONE, VIS_NONE], |b| offset(&out.pages[b]));
-        vis[draws[i].prim as usize] = [o[0], o[1], b[0], b[1]];
+    for (prim, page, behind) in see {
+        let o = offset(page);
+        let p = &prims[prim as usize];
+        // The depth behind it: its list's opaque page here, or the one
+        // the targets share.
+        let b = match behind {
+            Some(b) => offset(b),
+            None => shared.get(&(p.kind[3] | 1)).filter(|_| aligned(p)).map_or([VIS_NONE, VIS_NONE], |page| page.offset_for(p)),
+        };
+        vis[prim as usize] = [o[0], o[1], b[0], b[1]];
     }
     (out, y + shelf)
 }
@@ -429,10 +656,67 @@ impl Buffer {
     }
 }
 
+/// Host memory one frame's uploads of what frames share go through (new
+/// glyphs, new image texels, new pooled meshes). Each set of frame buffers
+/// has its own, so filling a frame's does not touch what the copies of a
+/// frame still on the GPU read.
+#[derive(Default)]
+pub(crate) struct Stage {
+    buffer: Option<(gpu::Buffer, usize)>,
+    used: usize,
+    /// Outgrown while the frame was recorded: its copies still read them.
+    old: Vec<gpu::Buffer>,
+}
+
+impl Stage {
+    /// Memory kept between frames that upload nothing.
+    const KEEP: usize = 16 << 20;
+
+    /// A new frame in this set: the copies of its last one are done.
+    fn begin(&mut self, context: &gpu::Context) {
+        for b in self.old.drain(..) {
+            context.destroy_buffer(b);
+        }
+        if self.used == 0 && self.buffer.as_ref().is_some_and(|b| b.1 > Self::KEEP) {
+            if let Some((b, _)) = self.buffer.take() {
+                context.destroy_buffer(b);
+            }
+        }
+        self.used = 0;
+    }
+
+    /// Copies `bytes` to host memory: the buffer and where in it.
+    pub(crate) fn put(&mut self, context: &gpu::Context, bytes: &[u8]) -> (gpu::Buffer, u64) {
+        let at = self.used.next_multiple_of(16);
+        if self.buffer.as_ref().is_none_or(|b| b.1 < at + bytes.len()) {
+            if let Some((b, _)) = self.buffer.take() {
+                self.old.push(b);
+            }
+            let size = bytes.len().max(1 << 16).next_power_of_two();
+            self.buffer = Some((context.create_buffer(gpu::BufferDesc { name: "motion shared staging", size: size as u64, memory: gpu::Memory::Upload }), size));
+            self.used = 0;
+            return self.put(context, bytes);
+        }
+        let host = self.buffer.as_ref().expect("made above").0;
+        // SAFETY: the mapping holds at least `at + bytes.len()`, and no
+        // copy still to run reads this part of it.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host.data().add(at), bytes.len()) };
+        context.sync_buffer(host);
+        self.used = at + bytes.len();
+        (host, at as u64)
+    }
+
+    fn destroy(&mut self, context: &gpu::Context) {
+        for b in self.old.drain(..).chain(self.buffer.take().map(|b| b.0)) {
+            context.destroy_buffer(b);
+        }
+    }
+}
+
 /// Frames that may be on the GPU at once: one being traced, one at Open
-/// Image Denoise, one being read back. Each has its own set of the
-/// buffers a frame writes.
-pub const FLIGHTS: usize = 3;
+/// Image Denoise, one whose denoised picture is being composited, one
+/// being read back. Each has its own set of the buffers a frame writes.
+pub const FLIGHTS: usize = 4;
 
 /// Command buffers the encoder cycles through: a traced frame is many
 /// submissions (a band of rows each) that queue up behind each other.
@@ -548,6 +832,7 @@ struct FrameSet {
     vis_pages: Buffer,
     vis_atlas: VisAtlas,
     shadow_atlas: ShadowAtlas,
+    stage: Stage,
 }
 
 impl FrameSet {
@@ -572,6 +857,7 @@ impl FrameSet {
             vis_atlas: VisAtlas::new(context, 16, 16, if vis > 0 { vis } else { 4 }, vis > 0),
             // (Bound by every raster pass, drawn into only with jobs.)
             shadow_atlas: ShadowAtlas::new(context, 16, 16),
+            stage: Stage::default(),
         }
     }
 
@@ -596,6 +882,7 @@ impl FrameSet {
         }
         self.vis_atlas.destroy(context);
         self.shadow_atlas.destroy(context);
+        self.stage.destroy(context);
     }
 }
 
@@ -615,6 +902,9 @@ struct Rest {
     /// Per traced list: the group texels its picture goes to (one place
     /// per sample).
     pictures: Vec<Vec<u32>>,
+    /// Groups (sample, index) that read a traced picture: drawn once it
+    /// is there.
+    later: Vec<(usize, usize)>,
 }
 
 /// A frame on the GPU.
@@ -628,6 +918,8 @@ struct Flight {
     paths: u64,
     /// Waiting for Open Image Denoise (`advance`).
     rest: Option<Rest>,
+    /// Open Image Denoise has begun on it (`start_denoise`).
+    denoising: bool,
 }
 
 pub struct Gpu {
@@ -663,6 +955,12 @@ pub struct Gpu {
     images: Buffer,
     atlas_generation: u64,
     images_generation: u64,
+    /// The font atlas's `resets` and the image pool's `packed` as last
+    /// uploaded, and the image texels the device holds: while they stand,
+    /// what is new is added to what the frames in flight read.
+    atlas_resets: u64,
+    images_packed: u64,
+    images_len: usize,
     /// Texels the image pool may hold on this device (`images::budget_for`).
     image_budget: usize,
     pub label: String,
@@ -885,19 +1183,22 @@ impl Gpu {
         context.save_pipeline_cache();
         // (A software device's "own memory" is the machine's.)
         let image_budget = if info.is_software_emulated { crate::images::MAX_TEXELS } else { crate::images::budget_for(info.device_memory, info.max_storage_buffer_range) };
-        let mut images = Buffer::new(&context, "motion images", 1 << 12, true);
+        let mut images = Buffer::new(&context, "motion images", 1 << 12, false);
         images.limit = images.limit.max(image_budget * 4);
         Ok(Self {
             sets: vec![FrameSet::new(&context, vis_samples)],
             flights: Vec::new(),
             next: 1,
             completed: 0,
-            atlas: Buffer::new(&context, "motion atlas", (ATLAS_SIZE * ATLAS_SIZE) as usize, true),
+            atlas: Buffer::new(&context, "motion atlas", (ATLAS_SIZE * ATLAS_SIZE) as usize, false),
             images,
             atlas_generation: 0,
             images_generation: 0,
+            atlas_resets: 0,
+            images_packed: 0,
+            images_len: 0,
             image_budget,
-            pool: crate::pool::MeshPool::new(&context),
+            pool: crate::pool::MeshPool::new(&context, if info.is_software_emulated { crate::pool::MESH_POOL_BUDGET } else { crate::pool::budget_for(info.device_memory, info.max_storage_buffer_range) }),
             shaders: Default::default(),
             queue: Queue::new(),
             context,
@@ -1019,11 +1320,17 @@ impl Gpu {
         }
     }
 
-    /// Waits for the frames in flight to leave the GPU (they stay to be
-    /// finished): before something they share is written again.
+    /// Has the frames in flight leave the GPU (they stay to be finished):
+    /// before something they read is moved or written over. Those waiting
+    /// for Open Image Denoise are taken through it first, since the rest
+    /// of their passes read it too.
     fn drain(&mut self, why: &str) -> Result<(), String> {
         if self.flights.is_empty() {
             return Ok(());
+        }
+        let waiting_rest: Vec<u64> = self.flights.iter().filter(|f| f.rest.is_some()).map(|f| f.id).collect();
+        for id in waiting_rest {
+            self.advance(id)?;
         }
         let waiting = std::time::Instant::now();
         let paths: u64 = self.flights.iter().map(|f| f.paths).sum();
@@ -1047,6 +1354,9 @@ impl Gpu {
         // Traced lists the samples share are traced sample after sample
         // into one picture; the samples' own groups then sit side by side.
         let shared = shares_traces(samples);
+        // Sub-frames drawn one after the other: the groups each has as the
+        // one before it left them.
+        let still: Vec<Vec<bool>> = if shared { Vec::new() } else { samples.windows(2).map(|w| same_groups(&w[0], &w[1])).collect() };
         let (mut list, targets) = merge(samples, shared);
         if let Some(p) = self.profile.as_mut() {
             p.stage("gpu frame › record + upload › merge samples", recording);
@@ -1061,16 +1371,28 @@ impl Gpu {
         let use_vis = self.vis.is_some();
         let mut vis_table = vec![[VIS_NONE; 4]; list.prims.len().max(1)];
         let mut plans: Vec<(Vec<TargetVis>, TargetVis)> = Vec::new();
+        // Per sample: the pages its targets share (drawn before them).
+        let mut shared_plans: Vec<TargetVis> = Vec::new();
         let mut atlas_height = 16u32;
         let atlas_width = targets.iter().flat_map(|(m, g, _)| std::iter::once(m.width).chain(g.iter().map(|g| g.target.width))).max().unwrap_or(16).clamp(16, 8192);
         if use_vis {
-            for (_, groups, draws) in &targets {
+            // Shared pages are a sample's own (the atlas is drawn sample
+            // after sample); samples that share traced pictures draw their
+            // main targets later, when another's pages are there: none.
+            let all: Vec<Batches> = targets.iter().map(|(_, _, draws)| batches_of(draws, &list.prims)).collect();
+            let mut shared_pages = Vec::new();
+            let mut top = 0u32;
+            for ((_, _, draws), batches) in targets.iter().zip(&all) {
+                let (plan, pages, h) = if shared { Default::default() } else { plan_shared(draws, &list.prims, batches, atlas_width) };
+                top = top.max(h);
+                shared_plans.push(plan);
+                shared_pages.push(pages);
+            }
+            for (k, (_, groups, draws)) in targets.iter().enumerate() {
                 let mut plan = |which: u32| {
                     let mine: Vec<MeshDraw> = draws.iter().filter(|d| d.target == which).copied().collect();
-                    let (mut p, h) = plan_vis(&mine, &list.prims, atlas_width, &mut vis_table);
+                    let (p, h) = plan_vis(&mine, &list.prims, atlas_width, top, &all[k], &shared_pages[k], &mut vis_table);
                     atlas_height = atlas_height.max(h);
-                    // Draw indices refer to `mine`: keep it with the plan.
-                    p.draws = mine;
                     p
                 };
                 let group_plans = (0..groups.len() as u32).map(&mut plan).collect();
@@ -1088,11 +1410,30 @@ impl Gpu {
                 *atlas = VisAtlas::new(&self.context, atlas_width, need, self.vis_samples, true);
             }
         }
-        // What the frames in flight share is written only while the GPU
-        // is idle: new glyphs, new images, new meshes in the pool.
-        if self.atlas_generation != fonts.generation || self.images_generation != images.generation || self.pool.changes(&list.pool) {
-            self.drain("shared uploads")?;
+        // New glyphs, images and pooled meshes are added to what the
+        // frames in flight read, through this frame's own staging. Only
+        // when what they read would move or be written over must they be
+        // off the GPU first: a font atlas started over, an image pool
+        // packed or outgrown, a mesh pool with no free rows left.
+        // Traced meshes the pool generates are found room with the rest:
+        // each on a row of its own after the mesh rows (taken off again
+        // once the pool has said where it is).
+        let (mesh_rows, pool_refs) = (list.mesh.len(), list.pool.len());
+        for t in &list.traces {
+            for i in &t.instances {
+                if let crate::pt::TraceMesh::Pool(p, _) = &i.mesh {
+                    list.pool.push(crate::mesh3d::PoolRef { row: list.mesh.len() as u32, mesh: p.clone() });
+                    list.mesh.push([0.0, 0.0, 1.0, 0.0]);
+                }
+            }
         }
+        let atlas_moved = self.atlas_resets != fonts.resets;
+        let images_moved = self.images_packed != images.packed || images.texels.len() < self.images_len || images.texels.len() * 4 > self.images.capacity;
+        if atlas_moved || images_moved || !self.pool.fits(&list.pool) {
+            self.drain("shared data moved")?;
+            self.pool.idle(id);
+        }
+        self.sets[set].stage.begin(&self.context);
         if let Some(t) = self.tracer.as_mut() {
             t.begin_frame(&self.context, id, self.completed, set);
         }
@@ -1102,7 +1443,20 @@ impl Gpu {
         // Instances' meshes into the pool (where they are goes into their
         // rows), then each mesh primitive's visibility draws.
         let pooling = std::time::Instant::now();
-        self.pool.resolve(ctx, &mut self.encoder, id, &list.pool, &mut list.mesh)?;
+        self.pool.resolve(ctx, &mut self.encoder, &mut self.sets[set].stage, id, &list.pool, &mut list.mesh)?;
+        let mut row = mesh_rows;
+        for t in &mut list.traces {
+            for i in &mut t.instances {
+                if let crate::pt::TraceMesh::Pool(_, at) = &mut i.mesh {
+                    // (No triangles: it found no room in the pool.)
+                    let r = list.mesh[row];
+                    *at = if r[2].to_bits() == 0 { u32::MAX } else { r[0].to_bits() };
+                    row += 1;
+                }
+            }
+        }
+        list.mesh.truncate(mesh_rows);
+        list.pool.truncate(pool_refs);
         let mut draws: std::collections::HashMap<u32, VisPrim> = std::collections::HashMap::new();
         if use_vis {
             for (_, _, ds) in &targets {
@@ -1115,8 +1469,12 @@ impl Gpu {
             p.add("gpu frame › mesh pool", pooling.elapsed());
         }
         // Shadow maps the lists ask for: a page each in the frame's atlas
-        // (where it is goes into the map's header, before the upload).
-        let (shadow_at, shadow_w, shadow_h) = plan_shadows(&list.shadows);
+        // (where it is goes into the map's header, before the upload),
+        // maps that are the same sharing one.
+        let firsts = same_shadows(&list.shadows, &list.mesh);
+        let drawn: Vec<crate::mesh3d::ShadowJob> = firsts.iter().enumerate().filter(|(k, f)| k == *f).map(|(k, _)| list.shadows[k]).collect();
+        let (drawn_at, shadow_w, shadow_h) = plan_shadows(&drawn);
+        let shadow_at: Vec<[u32; 2]> = firsts.iter().map(|f| drawn_at[firsts[..*f].iter().enumerate().filter(|(k, f)| k == *f).count()]).collect();
         if !list.shadows.is_empty() {
             if self.shadow.is_none() {
                 return Err("a list with shadow maps for the GPU, but no shadow pass".into());
@@ -1152,12 +1510,22 @@ impl Gpu {
         }
         s.vis_pages.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&vis_table))?;
         if self.atlas_generation != fonts.generation {
-            self.atlas.upload(ctx, &mut self.encoder, &fonts.atlas)?;
-            self.atlas_generation = fonts.generation;
+            // (4 MB: all of it, new glyphs and the same old ones.)
+            let (host, at) = s.stage.put(ctx, &fonts.atlas);
+            self.encoder.transfer("motion atlas").copy_buffer_to_buffer(host.at(at), self.atlas.device.into(), fonts.atlas.len() as u64);
+            (self.atlas_generation, self.atlas_resets) = (fonts.generation, fonts.resets);
         }
         if self.images_generation != images.generation {
-            self.images.upload(ctx, &mut self.encoder, bytemuck::cast_slice(&images.texels))?;
-            self.images_generation = images.generation;
+            // The texels added since the last upload; all of them when the
+            // pool was packed or its buffer made anew.
+            let bytes: &[u8] = bytemuck::cast_slice(&images.texels);
+            self.images.ensure(ctx, bytes.len().max(16))?;
+            let from = if images_moved { 0 } else { self.images_len * 4 };
+            if bytes.len() > from {
+                let (host, at) = s.stage.put(ctx, &bytes[from..]);
+                self.encoder.transfer("motion images").copy_buffer_to_buffer(host.at(at), self.images.device.at(from as u64), (bytes.len() - from) as u64);
+            }
+            (self.images_generation, self.images_packed, self.images_len) = (images.generation, images.packed, images.texels.len());
         }
         let group_bytes = list.group_texels as usize * 16;
         s.groups.ensure(ctx, group_bytes)?;
@@ -1167,7 +1535,7 @@ impl Gpu {
         if let Some(p) = self.profile.as_mut() {
             p.stage("gpu frame › record + upload › uploads", uploading);
         }
-        self.record_shadows(set, &list, &shadow_at);
+        self.record_shadows(set, &list, &drawn, &drawn_at);
         let (groups_buf, images_buf) = (self.sets[set].groups.device, self.images.device);
         // Paths traced this frame: how long the GPU may take.
         let mut paths = 0u64;
@@ -1175,18 +1543,39 @@ impl Gpu {
         // Per traced list: where its picture goes (one place per sample
         // that shares it; else it is drawn as soon as it is traced).
         let mut pictures: Vec<Vec<u32>> = Vec::new();
+        let mut later: Vec<(usize, usize)> = Vec::new();
         for (i, (_, groups, _)) in targets.iter().enumerate() {
+            // The pages this sample's targets share, before any of them.
+            if let Some(plan) = shared_plans.get(i) {
+                self.record_vis(set, plan, &draws, &list.prims);
+            }
+            // Pictures that read no other picture and draw on no page of
+            // their own (their meshes are on the page the targets share):
+            // all in one pass, and blurred in two.
+            let skipped = |gi: usize| i > 0 && still.get(i - 1).is_some_and(|s| s.get(gi) == Some(&true));
+            let together: Vec<bool> = groups
+                .iter()
+                .enumerate()
+                .map(|(gi, g)| g.trace.is_none() && g.shader.is_none() && !skipped(gi) && plans.get(i).is_none_or(|p| p.0[gi].pages.is_empty()) && !reads_groups(&list, g))
+                .collect();
+            let first: Vec<&crate::list::Group> = groups.iter().zip(&together).filter(|(_, t)| **t).map(|(g, _)| g).collect();
+            self.record_groups(set, &first, use_vis, slang);
             let mut slot = 0u32;
+            let mut traced = false;
             for (gi, g) in groups.iter().enumerate() {
+                if together[gi] {
+                    continue;
+                }
                 let t = g.target;
                 if let Some(ti) = g.trace {
+                    traced = true;
                     let trace = &list.traces[ti as usize];
                     paths += t.width as u64 * t.height as u64 * trace.options.spp.max(1) as u64;
                     let entered = std::time::Instant::now();
                     let waited_in = self.queue.waited;
                     let tracer = self.tracer.as_mut().ok_or("a traced group, but no path tracer")?;
                     if shared {
-                        tracer.part(&self.context, &mut self.encoder, &mut self.queue, trace, slot, i as u32, parts, (t.width, t.height), groups_buf, images_buf, self.profile.as_mut())?;
+                        tracer.part(&self.context, &mut self.encoder, &mut self.queue, trace, slot, i as u32, parts, (t.width, t.height), groups_buf, images_buf, self.pool.buffer, self.profile.as_mut())?;
                         if i == 0 {
                             pictures.push(Vec::new());
                         }
@@ -1194,11 +1583,15 @@ impl Gpu {
                         slot += 1;
                     } else {
                         // On its own, start to finish: the next trace
-                        // takes over its lighting and guides.
-                        tracer.part(&self.context, &mut self.encoder, &mut self.queue, trace, 0, 0, 1, (t.width, t.height), groups_buf, images_buf, self.profile.as_mut())?;
+                        // takes over its lighting and guides. (Not in the
+                        // fast mode: Ray Reconstruction keeps a history of
+                        // each traced list, so each has a slot of its own.)
+                        let own = if trace.options.fast { slot } else { 0 };
+                        slot += trace.options.fast as u32;
+                        tracer.part(&self.context, &mut self.encoder, &mut self.queue, trace, own, 0, 1, (t.width, t.height), groups_buf, images_buf, self.pool.buffer, self.profile.as_mut())?;
                         let oidn = tracer.wants_oidn();
-                        tracer.settle(&self.context, &mut self.encoder, 0, groups_buf, images_buf, oidn);
-                        if tracer.awaits_denoise(0) {
+                        tracer.settle(&self.context, &mut self.encoder, own, groups_buf, images_buf, oidn);
+                        if tracer.awaits_denoise(own) {
                             in_tracer += entered.elapsed().saturating_sub(self.queue.waited - waited_in);
                             let waiting = std::time::Instant::now();
                             let sync = self.queue.submit(&self.context, &mut self.encoder);
@@ -1212,18 +1605,30 @@ impl Gpu {
                                 p.add("gpu frame › wait for GPU (before OIDN)", denoising - waiting);
                             }
                             let tracer = self.tracer.as_mut().ok_or("no path tracer")?;
-                            tracer.denoise(&self.context, set, 0);
+                            tracer.denoise(&self.context, set, own);
                             if let Some(p) = self.profile.as_mut() {
                                 p.stage("gpu frame › OIDN denoise", denoising);
                             }
                         }
                         let entered = std::time::Instant::now();
                         let tracer = self.tracer.as_mut().ok_or("no path tracer")?;
-                        tracer.post(&self.context, &mut self.encoder, 0, &[g.offset], groups_buf, images_buf);
+                        tracer.post(&self.context, &mut self.encoder, own, &[g.offset], groups_buf, images_buf);
                         in_tracer += entered.elapsed();
                         continue;
                     }
                     in_tracer += entered.elapsed().saturating_sub(self.queue.waited - waited_in);
+                    continue;
+                }
+                // A picture over a shared trace's (an effect on a traced
+                // scene) waits for it: the trace's picture is only there
+                // after its filters, with the rest. Drawn here it read what
+                // the frame before this set's last left, at that frame's
+                // place in the buffer.
+                if shared && traced && reads_groups(&list, g) {
+                    later.push((i, gi));
+                    continue;
+                }
+                if i > 0 && still.get(i - 1).is_some_and(|s| s.get(gi) == Some(&true)) {
                     continue;
                 }
                 // A shader layer's kernel paints it; one that did not build
@@ -1242,7 +1647,7 @@ impl Gpu {
                 self.record_main(set, i, &targets, plans.get(i).map(|p| &p.1), &draws, &list.prims, use_vis, slang);
             }
         }
-        let mut rest = shared.then_some(Rest { list, targets, plans, draws, slang, pictures });
+        let mut rest = shared.then_some(Rest { list, targets, plans, draws, slang, pictures, later });
         let mut waits = false;
         if let Some(r) = &rest {
             // The lists' parts are all traced: on to their filters.
@@ -1264,46 +1669,71 @@ impl Gpu {
             p.add("gpu frame › record + upload", recording.elapsed().saturating_sub(in_tracer + (self.queue.waited - waited)));
         }
         let sync = self.queue.submit(&self.context, &mut self.encoder);
-        Ok(Flight { id, set, size: (w, h), sync, paths, rest })
+        Ok(Flight { id, set, size: (w, h), sync, paths, rest, denoising: false })
     }
 
     /// Rasterises group `g` of the frame in `set` (and blurs it).
     fn record_group(&mut self, set: usize, g: &crate::list::Group, use_vis: bool, slang: bool) {
-        let t = g.target;
-        let s = &self.sets[set];
-        let data = self.raster_data(
-            set,
-            Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, use_vis as u32, self.vis_samples.saturating_sub(1)], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
-            // Outer groups sample inner ones in other regions of the same
-            // buffer; regions never overlap.
-            s.groups.device,
-        );
-        {
-            let mut pass = self.encoder.compute("group raster");
-            let mut pc = pass.with(match &self.slang_raster {
-                Some((_, p)) if slang => p,
-                _ => &self.raster,
-            });
-            pc.bind(0, &data);
-            pc.dispatch([t.tiles_x, t.tiles_y, 1]);
-        }
-        if g.sigma <= 0.0 {
-            // Same as the CPU path: no blur pass (σ = 0 would make the
-            // Gaussian weights NaN).
+        self.record_groups(set, &[g], use_vis, slang);
+    }
+
+    /// Rasterises `groups` of the frame in `set` and blurs them: all of
+    /// them in one pass, then the blurs' two. None of them may read
+    /// another's texels (`reads_groups`), nor a visibility page drawn in
+    /// between. A pass costs the GPU a pause whatever is in it, and a
+    /// scene under depth of field has hundreds of small pictures a
+    /// sub-frame: one pass each, three times over, was most of its frame.
+    fn record_groups(&mut self, set: usize, groups: &[&crate::list::Group], use_vis: bool, slang: bool) {
+        if groups.is_empty() {
             return;
         }
-        let radius = (g.sigma * 3.0).ceil();
-        let norm: f32 = (-(radius as i32)..=radius as i32).map(|d| (-(d * d) as f32 / (2.0 * g.sigma * g.sigma)).exp()).sum();
+        let s = &self.sets[set];
+        let rasters: Vec<(RasterData, [u32; 3])> = groups
+            .iter()
+            .map(|g| {
+                let t = g.target;
+                let data = self.raster_data(
+                    set,
+                    Pass { size: [t.width, t.height, t.tiles_x, t.range_base], dest: [g.offset, 0, use_vis as u32, self.vis_samples.saturating_sub(1)], background: [0.0; 4], weight: [1.0, 0.0, 0.0, 0.0] },
+                    // Outer groups sample inner ones in other regions of the
+                    // same buffer; regions never overlap.
+                    s.groups.device,
+                );
+                (data, [t.tiles_x, t.tiles_y, 1])
+            })
+            .collect();
+        {
+            let mut pass = self.encoder.compute("group raster");
+            for (data, tiles) in &rasters {
+                let mut pc = pass.with(match &self.slang_raster {
+                    Some((_, p)) if slang => p,
+                    _ => &self.raster,
+                });
+                pc.bind(0, data);
+                pc.dispatch(*tiles);
+            }
+        }
+        // (As the CPU path: no blur pass at σ = 0, which would make the
+        // Gaussian weights NaN.)
+        let blurred: Vec<&&crate::list::Group> = groups.iter().filter(|g| g.sigma > 0.0).collect();
+        if blurred.is_empty() {
+            return;
+        }
         for (horizontal, src, dst) in [(1u32, s.groups.device, s.groups_tmp.device), (0, s.groups_tmp.device, s.groups.device)] {
-            let data = BlurData {
-                u_blur: BlurPass { size: [t.width, t.height, g.offset, horizontal], sigma: [g.sigma, radius, 1.0 / norm, if g.clamp { 1.0 } else { 0.0 }] },
-                b_blur_src: src.into(),
-                b_blur_dst: dst.into(),
-            };
             let mut pass = self.encoder.compute("group blur");
-            let mut pc = pass.with(&self.blur);
-            pc.bind(0, &data);
-            pc.dispatch([t.width.div_ceil(16), t.height.div_ceil(16), 1]);
+            for g in &blurred {
+                let t = g.target;
+                let radius = (g.sigma * 3.0).ceil();
+                let norm: f32 = (-(radius as i32)..=radius as i32).map(|d| (-(d * d) as f32 / (2.0 * g.sigma * g.sigma)).exp()).sum();
+                let data = BlurData {
+                    u_blur: BlurPass { size: [t.width, t.height, g.offset, horizontal], sigma: [g.sigma, radius, 1.0 / norm, if g.clamp { 1.0 } else { 0.0 }] },
+                    b_blur_src: src.into(),
+                    b_blur_dst: dst.into(),
+                };
+                let mut pc = pass.with(&self.blur);
+                pc.bind(0, &data);
+                pc.dispatch([t.width.div_ceil(16), t.height.div_ceil(16), 1]);
+            }
         }
     }
 
@@ -1344,6 +1774,12 @@ impl Gpu {
             }
         }
         let use_vis = self.vis.is_some();
+        for &(i, gi) in &r.later {
+            if let Some((group_plans, _)) = r.plans.get(i) {
+                self.record_vis(set, &group_plans[gi], &r.draws, &r.list.prims);
+            }
+            self.record_group(set, &r.targets[i].1[gi], use_vis, r.slang);
+        }
         for i in 0..r.targets.len() {
             self.record_main(set, i, &r.targets, r.plans.get(i).map(|p| &p.1), &r.draws, &r.list.prims, use_vis, r.slang);
         }
@@ -1394,9 +1830,9 @@ impl Gpu {
 
     /// Draws the frame's shadow maps: each map's casters, from the mesh
     /// pool, into its page of the set's atlas (cleared to "nothing").
-    fn record_shadows(&mut self, set: usize, list: &DisplayList, at: &[[u32; 2]]) {
+    fn record_shadows(&mut self, set: usize, list: &DisplayList, jobs: &[crate::mesh3d::ShadowJob], at: &[[u32; 2]]) {
         let Some(pipeline) = self.shadow.as_ref() else { return };
-        if list.shadows.is_empty() {
+        if jobs.is_empty() {
             return;
         }
         let s = &self.sets[set];
@@ -1408,7 +1844,7 @@ impl Gpu {
                 depth_stencil: Some(gpu::RenderTarget { view: s.shadow_atlas.view, init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack), finish_op: gpu::FinishOp::Store }),
             },
         );
-        for (job, at) in list.shadows.iter().zip(at) {
+        for (job, at) in jobs.iter().zip(at) {
             let mut pc = pass.with(pipeline);
             pc.set_viewport(&gpu::Viewport { x: at[0] as f32, y: at[1] as f32, w: job.size as f32, h: job.size as f32, depth: 0.0..1.0 });
             pc.set_scissor_rect(&gpu::ScissorRect { x: at[0] as i32, y: at[1] as i32, w: job.size, h: job.size });
@@ -1434,18 +1870,43 @@ impl Gpu {
         }
     }
 
-    /// Takes frame `id` through Open Image Denoise, if it waits for it:
-    /// waits for its traces, denoises, and hands the rest of the frame to
-    /// the GPU. Call it once the next frame has begun, so the GPU traces
-    /// that one meanwhile. (`finish` does it otherwise.)
-    pub fn advance(&mut self, id: u64) -> Result<(), String> {
+    /// Begins Open Image Denoise on frame `id`, if it waits for it: waits
+    /// for its traces and starts the denoiser without waiting for that.
+    /// Call it once the next frame has begun, so the GPU traces that one
+    /// meanwhile; `advance` takes the result. (It does this otherwise.)
+    pub fn start_denoise(&mut self, id: u64) -> Result<(), String> {
         let Some(at) = self.flights.iter().position(|f| f.id == id) else { return Err("no such frame in flight".into()) };
-        let Some(rest) = self.flights[at].rest.take() else { return Ok(()) };
-        let (set, size, sync, paths) = (self.flights[at].set, self.flights[at].size, self.flights[at].sync.clone(), self.flights[at].paths);
+        let f = &self.flights[at];
+        let Some(slots) = f.rest.as_ref().map(|r| r.pictures.len() as u32).filter(|_| !f.denoising) else { return Ok(()) };
+        let (set, sync, paths) = (f.set, f.sync.clone(), f.paths);
         let waiting = std::time::Instant::now();
         if !self.context.wait_for(&sync, frame_timeout_ms(paths)) {
             return Err("GPU timed out".into());
         }
+        let denoising = std::time::Instant::now();
+        if let Some(tracer) = self.tracer.as_mut() {
+            for slot in 0..slots {
+                tracer.denoise_start(&self.context, set, slot);
+            }
+        }
+        self.flights[at].denoising = true;
+        if let Some(p) = self.profile.as_mut() {
+            p.add("gpu frame › wait for GPU (before OIDN)", denoising - waiting);
+            p.stage("gpu frame › OIDN denoise", denoising);
+        }
+        Ok(())
+    }
+
+    /// Takes frame `id` through Open Image Denoise, if it waits for it:
+    /// waits for the denoiser (`start_denoise` began it, or it is begun
+    /// here) and hands the rest of the frame to the GPU. Call it once the
+    /// frames after it have begun, so the GPU works on those meanwhile.
+    /// (`finish` does it otherwise.)
+    pub fn advance(&mut self, id: u64) -> Result<(), String> {
+        self.start_denoise(id)?;
+        let Some(at) = self.flights.iter().position(|f| f.id == id) else { return Err("no such frame in flight".into()) };
+        let Some(rest) = self.flights[at].rest.take() else { return Ok(()) };
+        let (set, size) = (self.flights[at].set, self.flights[at].size);
         let denoising = std::time::Instant::now();
         if let Some(tracer) = self.tracer.as_mut() {
             for slot in 0..rest.pictures.len() as u32 {
@@ -1458,7 +1919,6 @@ impl Gpu {
         self.record_end(set, size, rest.targets.len() as u32);
         self.flights[at].sync = self.queue.submit(&self.context, &mut self.encoder);
         if let Some(p) = self.profile.as_mut() {
-            p.add("gpu frame › wait for GPU (before OIDN)", denoising - waiting);
             p.add("gpu frame › OIDN denoise", recording - denoising);
             p.stage("gpu frame › record + upload", recording);
         }
@@ -1478,7 +1938,7 @@ impl Gpu {
         // Every frame before the oldest still in flight is done.
         self.completed = self.flights.iter().map(|f| f.id).min().unwrap_or(self.next) - 1;
         self.pool.after_frame(&self.context, self.completed);
-        self.pool.generators.end_frame(&self.context);
+        self.pool.generators.end_frame(&self.context, self.completed);
         self.shaders.end_frame(&self.context);
         if let Some(p) = self.profile.as_mut() {
             let (used, size) = self.pool.bytes();
@@ -1486,7 +1946,7 @@ impl Gpu {
             p.pool.upload_bytes += std::mem::take(&mut self.pool.upload_bytes);
             p.pool.generated += std::mem::take(&mut self.pool.generators.generated);
             p.pool.evictions += std::mem::take(&mut self.pool.evictions);
-            (p.pool.meshes, p.pool.bytes, p.pool.capacity) = (self.pool.meshes() as u64, used as u64, size as u64);
+            (p.pool.meshes, p.pool.bytes, p.pool.capacity, p.pool.budget) = (self.pool.meshes() as u64, used as u64, size as u64, self.pool.budget as u64);
             p.stage("gpu frame › wait for GPU", waiting);
             if let Some(t) = self.tracer.as_mut() {
                 t.collect_profile(flight.set, p);
@@ -1553,6 +2013,7 @@ impl Gpu {
         let s = &self.sets[set];
         let atlas = &s.vis_atlas;
         let (mesh, prims_buf, groups, pool) = (s.mesh.device, s.prims.device, s.groups.device, self.pool.buffer);
+        let samples = self.vis_samples;
         let mut pass = self.encoder.render(
             "mesh visibility",
             gpu::RenderTargetSet {
@@ -1561,13 +2022,15 @@ impl Gpu {
             },
         );
         // Binds a pipeline on a page for primitive `prim` (what = 0: its
-        // triangles with records, 1: its instances), then draws
-        // [first instance, instances, vertices] each.
-        let mut draw = |pipeline: &gpu::RenderPipeline, page: &Page, prim: u32, mode: u32, what: u32, draws: &[[u32; 3]]| {
+        // triangles with records, from vertex `from`; 1: its instances),
+        // then draws [first instance, instances, vertices] each.
+        let mut draw = |pipeline: &gpu::RenderPipeline, page: &Page, prim: u32, mode: u32, what: u32, from: u32, draws: &[[u32; 3]]| {
             if draws.is_empty() {
                 return;
             }
-            let (w, h) = (page.rect[2] - page.rect[0], page.rect[3] - page.rect[1]);
+            let [w, h] = page.size;
+            // (The page's rect in the primitive's own target px.)
+            let rect = if mode == 0 { [0.0, 0.0, w as f32, h as f32] } else { page.rect_for(&prims[prim as usize]) };
             let mut pc = pass.with(pipeline);
             pc.set_viewport(&gpu::Viewport { x: page.at[0] as f32, y: page.at[1] as f32, w: w as f32, h: h as f32, depth: 0.0..1.0 });
             pc.set_scissor_rect(&gpu::ScissorRect { x: page.at[0] as i32, y: page.at[1] as i32, w, h });
@@ -1575,9 +2038,9 @@ impl Gpu {
                 0,
                 &VisData {
                     u_vis: VisPass {
-                        page: [page.rect[0] as f32, page.rect[1] as f32, w as f32, h as f32],
-                        atlas: [page.at[0] as f32, page.at[1] as f32, 0.0, 0.0],
-                        draw: [0, prim, mode, what],
+                        page: rect,
+                        atlas: [page.at[0] as f32, page.at[1] as f32, w as f32, h as f32],
+                        draw: [samples, prim, mode, what],
                     },
                     b_mesh: mesh.into(),
                     b_prims: prims_buf.into(),
@@ -1586,34 +2049,40 @@ impl Gpu {
                 },
             );
             for &[first, count, vertices] in draws {
-                pc.draw(0, vertices, first, count);
+                pc.draw(from, vertices, first, count);
             }
         };
         for page in &plan.pages {
-            draw(&vis.clear, page, 0, 0, 0, &[[0, 1, 3]]);
+            draw(&vis.clear, page, 0, 0, 0, 0, &[[0, 1, 3]]);
         }
-        // (pipeline, page, draw of the plan, mode) in order.
-        let mut order: Vec<(&gpu::RenderPipeline, usize, usize, u32)> = Vec::new();
+        // (pipeline, page, primitive, mode) in order.
+        let mut order: Vec<(&gpu::RenderPipeline, usize, u32, u32)> = Vec::new();
         for (_, page, list) in &plan.opaque {
             order.extend(list.iter().map(|&i| (&vis.opaque, *page, i, 1)));
         }
-        for &(i, page, behind) in &plan.see {
-            if let Some(b) = behind {
-                let list = plan.opaque.iter().find(|o| o.1 == b).map(|o| &o.2[..]).unwrap_or(&[]);
-                order.extend(list.iter().map(|&j| (&vis.opaque, page, j, 1)));
-            }
-            order.push((&vis.see, page, i, 2));
+        for (i, page, list) in &plan.see {
+            order.extend(list.iter().map(|&j| (&vis.opaque, *page, j, 1)));
+            order.push((&vis.see, *page, *i, 2));
         }
+        // What goes on one page with one pipeline: its occluders, then
+        // the surfaces that are shaded (see `VisPrim`).
         let mut runs = Vec::new();
-        for (pipeline, page, i, mode) in order {
-            let prim = plan.draws[i].prim;
-            let Some(vp) = vis_prims.get(&prim) else { continue };
-            let page = &plan.pages[page];
-            if vp.records > 0 {
-                draw(pipeline, page, prim, mode, 0, &[[0, 1, vp.records * 3]]);
+        let mut from = 0;
+        while from < order.len() {
+            let (pipeline, at, _, mode) = order[from];
+            let to = from + order[from..].iter().take_while(|o| std::ptr::eq(o.0, pipeline) && o.1 == at && o.3 == mode).count();
+            let page = &plan.pages[at];
+            for occluders in [true, false] {
+                for &(_, _, prim, _) in &order[from..to] {
+                    let Some(vp) = vis_prims.get(&prim) else { continue };
+                    for &(first, n, _) in vp.records.iter().filter(|r| r.2 == occluders) {
+                        draw(pipeline, page, prim, mode, 0, first * 3, &[[0, 1, n * 3]]);
+                    }
+                    vp.draws(&prims[prim as usize], page.rect_for(&prims[prim as usize]), occluders, &mut runs);
+                    draw(pipeline, page, prim, mode, 1, 0, &runs);
+                }
             }
-            vp.draws(&prims[prim as usize], page.rect, &mut runs);
-            draw(pipeline, page, prim, mode, 1, &runs);
+            from = to;
         }
     }
 }

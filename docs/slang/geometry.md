@@ -2,10 +2,11 @@
 
 A project's Slang (`shaders/*.slang`) can generate meshes and move the
 points of any mesh. The functions are built from the project's modules
-twice: into native code for the CPU, and (generators) into a compute
-kernel for the GPU. The CPU renderer (`--cpu`) and the path tracer take
-the mesh from the CPU. The GPU renderer generates a mesh itself, in its
-own memory, when the layer gives `bounds` (see
+twice: into native code for the CPU, and into a compute kernel for the
+GPU. The CPU renderer (`--cpu`) takes the mesh from the CPU. The GPU
+renderer and the path tracer generate a mesh on the GPU, in its own
+memory, when the layer gives `bounds`, and move a mesh's points there
+when it has a deformer (see
 [Where a mesh is generated](#where-a-mesh-is-generated)); the triangles
 are the same either way.
 
@@ -168,14 +169,40 @@ covers, what it may hide, how far its shadow reaches). So with `bounds`:
   points' own extent at the moment, on every renderer. A picture mapped
   on an animated mesh stays in place while the points move.
 
-The CPU still generates the mesh when:
+A deformer runs on the GPU too. The mesh before the move (generated or
+loaded, displaced, subdivided) is made on the CPU once and kept on the
+GPU with the normals its points move along; each frame the deformer runs
+there as a compute kernel, one thread per point, and the GPU shades the
+moved mesh from its faces. The CPU still runs the deformer over the
+points each frame, for their box alone: it places and culls the mesh and
+frames its shadow as the CPU's own mesh would, and a point moved to a
+value that is not a number has the mesh refused, as there.
 
-- the layer gives no `bounds`;
-- the layer has a `deform` or a `displace` (they work on the CPU's mesh);
-- the generator has more than 32 `params`;
-- the frame is path traced or rendered with `--cpu`;
-- the GPU has no hardware visibility pass (the renderer then draws meshes
-  from display lists the CPU builds).
+A generated mesh with a deformer is the GPU's all the way where the
+layer gives `bounds`: generated there, subdivided there as the deformer
+asks, readied for it there (copies of one point found and given their
+shared normal), and moved. The CPU has none of its points, so the layer's
+`bounds`, padded by `reach`, stand for the moved ones: `reach` must be as
+far as the function moves any point, or the mesh may be cut off. (The
+CPU cannot have the moved points' own box before the GPU has made them.)
+A point moved to a value that is not a number has the mesh refused there
+too: it is not drawn, and the render says so once the frame is back.
+
+The path tracer takes such meshes from the GPU's memory as they are
+(their acceleration structures are built there), so a traced frame of
+animated geometry costs the CPU no more than a rasterised one.
+
+The CPU still makes the mesh when:
+
+- a generator's layer gives no `bounds`, or has a `displace`: how far
+  displacement subdivides a mesh follows from the length of its edges,
+  which the CPU would not have, and it must say how many points the mesh
+  has before the GPU makes them (a deformer then moves, on the GPU, the
+  mesh the CPU generated);
+- the function has more than 32 `params`;
+- the frame is rendered with `--cpu`;
+- the frame is rasterised on a GPU with no hardware visibility pass (the
+  renderer then draws meshes from display lists the CPU builds).
 
 `LAHZA_SLANG_MESH_CPU=1` makes the CPU generate every mesh, to compare.
 `--profile` reports how many meshes the GPU generated and how many were

@@ -35,6 +35,7 @@ Usage:
                     [--frames N [--fps F] [--start K]]   a glTF model (Blender), or a baked sequence with {frame} in the name
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
                     [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
+                    [--fast]   path-trace fast: 2 paths a pixel at half size through NVIDIA Ray Reconstruction (`just ngx`)
                     [--profile]   where the time goes: CPU stages, GPU passes, path tracer work per layer
                     [--scale F] [--every N]   quick checks: output size ×F, every Nth frame only (played at fps/N)
 
@@ -90,6 +91,10 @@ fn renderer_flags(args: &[String], a: &mut Value) -> Result<(), String> {
     }
     if has(args, "--no-denoise") {
         a["denoise"] = json!(false);
+    }
+    if has(args, "--fast") {
+        a["pt"] = json!(true);
+        a["fast"] = json!(true);
     }
     if has(args, "--profile") {
         a["profile"] = json!(true);

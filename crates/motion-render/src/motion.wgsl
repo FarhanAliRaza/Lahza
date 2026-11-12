@@ -2406,9 +2406,9 @@ fn shade_mesh_vis(prim: Prim, index: u32, p: vec2<f32>) -> vec4<f32> {
 struct VisPass {
     // Target px of the page's corner, and its size.
     page: vec4<f32>,
-    // Atlas px of the page's corner.
+    // Atlas px of the page's corner, and its size there.
     atlas: vec4<f32>,
-    // 0, primitive index, mode (0 clear, 1 opaque, 2 see-through: strictly
+    // The pass's samples, primitive index, mode (0 clear, 1 opaque, 2 see-through: strictly
     // in front of what is there by TIE), what is drawn (0 the triangles
     // with records, 1 instances: one per draw instance).
     draw: vec4<u32>,
@@ -2480,7 +2480,13 @@ fn vis_vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32
     let ids = vec3<u32>(bitcast<u32>(rec.x), bitcast<u32>(rec.y), bitcast<u32>(rec.z));
     let vrow = bitcast<u32>(prim.geom2.y) + ids[vi % 3u] * VROWS;
     let v = (b_mesh[vrow + 3u].xy - prim.fill.xy) / prim.fill.zw;
-    var z = b_mesh[vrow].w;
+    // Cards on one plane (text on a panel) come out at depths that differ
+    // in their last bits, and the depth test would pick between them
+    // sample by sample. The later card is the one that shows, as where
+    // the raster finds the nearest itself (it takes the later of two
+    // within TIE): each card (two triangles) is drawn that much nearer
+    // than the one before it.
+    var z = b_mesh[vrow].w * (1.0 + TIE * f32(vi / 6u));
     if u_vis.draw.z == 2u { z = z * (1.0 - TIE); }
     // Clip space follows WebGPU: +y up (target y runs down).
     let f = (v - u_vis.page.xy) / u_vis.page.zw;
@@ -2549,13 +2555,26 @@ fn shadow_vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: 
     return vec4<f32>(x * k - 1.0, 1.0 - y * k, d, 1.0);
 }
 
-// Cards stand only where their picture is, wireframes on their wires
-// (tested at the pixel centre).
+struct VisFrag {
+    @location(0) id: u32,
+    // The samples the triangle stands on.
+    @builtin(sample_mask) mask: u32,
+}
+
+// Cards stand only where their picture is, wireframes on their wires:
+// tested at each of the pass's eight samples, as where the raster finds
+// the nearest triangles itself (at the pixel centre with another count:
+// only the eight are where `SAMPLE_X` and `SAMPLE_Y` say).
 @fragment
-fn vis_fragment(in: VisOut) -> @location(0) u32 {
+fn vis_fragment(in: VisOut) -> VisFrag {
+    var out: VisFrag;
+    out.id = in.row;
+    out.mask = 0xffffffffu;
     if in.row != 0u {
         let prim = b_prims[u_vis.draw.y];
-        let q = in.pos.xy - u_vis.atlas.xy + u_vis.page.xy;
+        // (The page's atlas px to the primitive's target px: they differ
+        // where the page is another target's.)
+        let q = (in.pos.xy - u_vis.atlas.xy) * (u_vis.page.zw / u_vis.atlas.zw) + u_vis.page.xy;
         let tri = in.row - 1u - bitcast<u32>(prim.geom.y);
         var t: TriRows;
         if u_vis.draw.w == 1u {
@@ -2563,7 +2582,7 @@ fn vis_fragment(in: VisOut) -> @location(0) u32 {
             let h = b_mesh[in.inst + 13u];
             let local = tri - bitcast<u32>(prim.geom.z) - bitcast<u32>(h.w);
             let material = inst_material(in.inst, bitcast<u32>(b_pool[bitcast<u32>(h.y) + local].w));
-            if (u32(b_mesh[bitcast<u32>(prim.geom2.z) + material * MAT_ROWS + 2u].w) & 32u) == 0u { return in.row; }
+            if (u32(b_mesh[bitcast<u32>(prim.geom2.z) + material * MAT_ROWS + 2u].w) & 32u) == 0u { return out; }
             t = instance_tri(prim, in.inst, local, q).t;
         } else {
             t = tri_rows(prim, tri, true);
@@ -2573,6 +2592,22 @@ fn vis_fragment(in: VisOut) -> @location(0) u32 {
             let r0 = t.r0;
             let r1 = t.r1;
             let material = bitcast<u32>(prim.geom2.z) + bitcast<u32>(r1.w) * MAT_ROWS;
+            if u_vis.draw.x == 8u {
+                var mask = 0u;
+                for (var s = 0u; s < 8u; s++) {
+                    let qs = vec2<f32>(q.x + SAMPLE_X[s] / 16.0, q.y + SAMPLE_Y[s] / 16.0);
+                    var stands = true;
+                    if (tf & 1u) != 0u {
+                        stands = card_sample(prim, material, qs).w >= 1.0 / 512.0; // CARD_STANDS
+                    } else {
+                        stands = wire_stands(material, r0, r1, tf, qs);
+                    }
+                    if stands { mask |= 1u << s; }
+                }
+                if mask == 0u { discard; }
+                out.mask = mask;
+                return out;
+            }
             var stands = true;
             if (tf & 1u) != 0u {
                 stands = card_sample(prim, material, q).w >= 1.0 / 512.0; // CARD_STANDS
@@ -2582,7 +2617,7 @@ fn vis_fragment(in: VisOut) -> @location(0) u32 {
             if !stands { discard; }
         }
     }
-    return in.row;
+    return out;
 }
 
 @compute @workgroup_size(16, 16, 1)

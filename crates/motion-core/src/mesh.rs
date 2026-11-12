@@ -81,6 +81,51 @@ fn norm(a: V3) -> V3 {
 }
 
 impl Mesh {
+    /// How far its texture coordinates stretch a map over it: the length
+    /// on the mesh one unit of UV covers, in units of the mesh's longest
+    /// side. 1 when a map lies once across that side, π around a sphere;
+    /// more where an atlas gives a part of the mesh few of its texels.
+    /// The value 95% of the surface is within (a few stretched triangles
+    /// do not decide it). None without UVs.
+    pub fn uv_stretch(&self) -> Option<f64> {
+        if self.uvs.len() != self.positions.len() || self.tris.is_empty() {
+            return None;
+        }
+        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        for p in &self.positions {
+            for k in 0..3 {
+                (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
+            }
+        }
+        let side = (0..3).map(|k| (hi[k] - lo[k]) as f64).fold(0.0, f64::max);
+        // Per triangle: (length per unit of UV, its area).
+        let mut ratios: Vec<(f64, f64)> = Vec::with_capacity(self.tris.len());
+        for t in &self.tris {
+            let [a, b, c] = t.map(|i| self.positions[i as usize].map(|v| v as f64));
+            let [ua, ub, uc] = t.map(|i| self.uvs[i as usize].map(|v| v as f64));
+            let (e, f) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+            let n = [e[1] * f[2] - e[2] * f[1], e[2] * f[0] - e[0] * f[2], e[0] * f[1] - e[1] * f[0]];
+            let area = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() / 2.0;
+            let uv = ((ub[0] - ua[0]) * (uc[1] - ua[1]) - (ub[1] - ua[1]) * (uc[0] - ua[0])).abs() / 2.0;
+            if area > 0.0 && uv > 1e-12 && area.is_finite() && uv.is_finite() {
+                ratios.push(((area / uv).sqrt(), area));
+            }
+        }
+        if ratios.is_empty() || !(side > 0.0) {
+            return None;
+        }
+        ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total: f64 = ratios.iter().map(|r| r.1).sum();
+        let mut seen = 0.0;
+        for (ratio, area) in &ratios {
+            seen += area;
+            if seen >= total * 0.95 {
+                return Some(ratio / side);
+            }
+        }
+        ratios.last().map(|r| r.0 / side)
+    }
+
     fn vertex(&mut self, p: V3, n: V3) -> u32 {
         self.positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
         let n = norm(n);
@@ -364,6 +409,25 @@ impl MeshParams {
     /// caches keep it only while it is drawn.
     pub fn animated(&self) -> bool {
         matches!(&self.shape, MeshShape::Slang(s) if s.animated) || self.deform.as_ref().is_some_and(|d| d.animated)
+    }
+
+    /// The deformer and its kernel's WGSL, when the GPU can move this
+    /// mesh's points itself, in its mesh pool: the kernel built.
+    pub fn gpu_deformer(&self) -> Option<(&crate::slang_mesh::Deform, &std::sync::Arc<str>)> {
+        let d = self.deform.as_ref()?;
+        let wgsl = d.gpu.as_ref()?.wgsl()?;
+        (d.params.len() <= crate::slang_mesh::GPU_PARAMS).then_some((d, wgsl))
+    }
+
+    /// This mesh without its deformer, when that is a mesh the GPU
+    /// generates itself (`gpu_generator`): the GPU then makes the mesh,
+    /// subdivides it as the deformer asks and moves it without the CPU
+    /// having its points, and the layer's `bounds`, padded by the
+    /// deformer's `reach`, stand for the moved ones.
+    pub fn gpu_deformed_generator(&self) -> Option<MeshParams> {
+        self.gpu_deformer()?;
+        let plain = MeshParams { deform: None, ..self.clone() };
+        (plain.gpu_generator().is_some() && self.local_bounds().is_some()).then_some(plain)
     }
 
     /// The Slang generator and its kernel's WGSL, when the GPU can make

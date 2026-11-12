@@ -329,6 +329,18 @@ impl super::CommandEncoder {
         }
     }
 
+    /// Lahza: a pass another library records (NVIDIA's NGX): `record` is
+    /// given the `VkCommandBuffer`. It may leave any pipeline or
+    /// descriptor state behind: every pass here binds its own.
+    pub fn foreign<R>(&mut self, label: &str, record: impl FnOnce(u64) -> R) -> R {
+        use ash::vk::Handle as _;
+        self.begin_pass(label);
+        let raw = self.buffers[0].raw;
+        let result = record(raw.as_raw());
+        end_pass(&self.device, raw);
+        result
+    }
+
     pub fn transfer(&mut self, label: &str) -> super::TransferCommandEncoder<'_> {
         self.begin_pass(label);
         super::TransferCommandEncoder {

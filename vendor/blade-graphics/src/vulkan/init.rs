@@ -62,8 +62,14 @@ struct AdapterCapabilities {
     timing: bool,
     /// Lahza: `LAHZA_PIPELINE_STATS` set and VK_KHR_pipeline_executable_properties available.
     pipeline_stats: bool,
+    /// Lahza: the extensions NVIDIA's NGX (DLSS Ray Reconstruction) asks for are available.
+    ngx: bool,
     bugs: SystemBugs,
 }
+
+/// Lahza: what `NVSDK_NGX_VULKAN_RequiredExtensions` lists for a device
+/// (besides buffer device addresses, which ray tracing already has).
+const NGX_DEVICE_EXTENSIONS: [&ffi::CStr; 3] = [c"VK_NVX_binary_import", c"VK_NVX_image_view_handle", c"VK_KHR_push_descriptor"];
 
 // See https://github.com/canonical/nvidia-prime/blob/587c5012be9dddcc17ab4d958f10a24fa3342b4d/prime-select#L56
 fn is_nvidia_prime_forced() -> bool {
@@ -271,6 +277,8 @@ unsafe fn inspect_adapter(
     let pipeline_stats = std::env::var_os("LAHZA_PIPELINE_STATS").is_some()
         && supported_extensions.contains(&vk::KHR_PIPELINE_EXECUTABLE_PROPERTIES_NAME);
 
+    let ngx = NGX_DEVICE_EXTENSIONS.iter().all(|e| supported_extensions.contains(e));
+
     let device_information = crate::DeviceInformation {
         is_software_emulated: properties.device_type == vk::PhysicalDeviceType::CPU,
         device_name: ffi::CStr::from_ptr(properties.device_name.as_ptr())
@@ -309,6 +317,7 @@ unsafe fn inspect_adapter(
         external_memory,
         timing,
         pipeline_stats,
+        ngx,
         bugs,
     })
 }
@@ -523,6 +532,9 @@ impl super::Context {
             }
             if capabilities.pipeline_stats {
                 device_extensions.push(vk::KHR_PIPELINE_EXECUTABLE_PROPERTIES_NAME);
+            }
+            if capabilities.ngx {
+                device_extensions.extend_from_slice(&NGX_DEVICE_EXTENSIONS);
             }
             if capabilities.external_memory {
                 device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME);
@@ -818,6 +830,7 @@ impl super::Context {
                 last_progress,
             }),
             physical_device,
+            ngx: capabilities.ngx,
             naga_flags,
             shader_debug_path,
             min_buffer_alignment,
@@ -879,6 +892,22 @@ impl super::Context {
             },
             sample_count_mask: self.sample_count_flags.as_raw(),
         }
+    }
+
+    /// Lahza: the Vulkan handles NVIDIA's NGX is initialised with, when
+    /// the device has its extensions: instance, physical device, device,
+    /// `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`.
+    pub fn ngx_handles(&self) -> Option<[u64; 5]> {
+        use ash::vk::Handle as _;
+        self.ngx.then(|| {
+            [
+                self.instance.core.handle().as_raw(),
+                self.physical_device.as_raw(),
+                self.device.core.handle().as_raw(),
+                self.entry.static_fn().get_instance_proc_addr as usize as u64,
+                self.instance.core.fp_v1_0().get_device_proc_addr as usize as u64,
+            ]
+        })
     }
 
     pub fn device_information(&self) -> &crate::DeviceInformation {

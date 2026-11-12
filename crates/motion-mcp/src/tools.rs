@@ -277,6 +277,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
                 "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"},
                 "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"},
+                "fast": {"type": "boolean", "description": "path tracing, fast: two paths a pixel at half size, made the full picture by NVIDIA Ray Reconstruction (needs its shim, `just ngx`; no motion blur or depth of field; default false)"},
                 "profile": {"type": "boolean", "description": "report where the time goes: CPU stages, GPU passes, path tracer work per layer (in the render report)"},
                 "scale": {"type": "number", "description": "output size relative to the project (default 1; e.g. 0.25 for a quick check)"},
                 "every": {"type": "integer", "description": "render every Nth frame only, played at fps/N (default 1): quick checks of long shots"}}), &[]),
@@ -2220,6 +2221,7 @@ impl Toolbox {
             renderer: renderer_arg(args)?,
             samples: samples_arg(args)?,
             denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true),
+            fast: args.get("fast").and_then(Value::as_bool).unwrap_or(false),
             scale: get_f64(args, "scale").unwrap_or(1.0),
             every: args.get("every").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1000) as u32,
         };
@@ -2500,11 +2502,15 @@ fn animated_paths(v: &Value, prefix: &str, out: &mut Vec<String>) {
 fn image_overflow(compiled: &Compiled, dir: &Path, budget: usize) -> Option<(f64, usize)> {
     let mut sizes: HashMap<String, Option<[u32; 2]>> = HashMap::new();
     let mut natural = |src: &str| *sizes.entry(src.to_string()).or_insert_with(|| lahza_motion_render::images::natural_size(&dir.join(src)));
+    // The meshes whose maps are counted, made as the renderer makes them:
+    // their UVs say how many texels a map needs across them.
+    let mut meshes = lahza_motion_render::mesh3d::MeshCache::new(Some(dir));
     let mut times: Vec<f64> = (0..).map(|k| k as f64 * 0.5).take_while(|t| *t < compiled.settings.duration).collect();
     times.extend(compiled.scenes.iter().map(|s| s.start).filter(|t| *t < compiled.settings.duration));
     times.sort_by(f64::total_cmp);
     times.into_iter().find_map(|t| {
-        let need = lahza_motion_render::list::frame_image_texels(&compiled.frame(t), 1.0, &mut natural);
+        meshes.begin(false);
+        let need = lahza_motion_render::list::frame_image_texels(&compiled.frame(t), 1.0, &mut natural, &mut |m| meshes.uv_stretch(m));
         (need > budget).then_some((t, need))
     })
 }

@@ -1516,3 +1516,219 @@ uint dome_segment(uint j, float t, dome_params p) { return ((j / 2) % CELLS) * 3
     assert!(uploads >= 6, "{uploads} uploads");
     assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
 }
+
+/// With slangc: a deformer the GPU runs as the kernel slangc makes of it
+/// moves a mesh as the CPU does (subdivided, along the normals its copies
+/// share, shaded from the moved faces), rasterised and path traced; the
+/// mesh before the move is uploaded once, and the tracer takes the moved
+/// one, and a generated one, from the GPU's mesh pool.
+#[test]
+fn the_gpu_runs_the_projects_deformers() {
+    if lahza_motion_core::slang::compiler().is_err() {
+        return;
+    }
+    let (Some(mut gpu), Some(mut cpu)) = (vis_gpu(), vis_gpu()) else { return };
+    cpu.meshes.gpu_geometry = false;
+    let mut p = scene(
+        640,
+        400,
+        json!({"lights": [{"type": "ambient", "intensity": 0.25}, {"type": "directional", "from": [-0.5, -0.7, -1.0], "intensity": 1.0, "shadow": true}],
+        "layers": [
+            {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 700]}, "material": {"preset": "matte", "color": "#d8d2c6"}, "transform": {"position": [320, 200], "z": 60}},
+            {"id": "blob", "kind": "mesh", "material": {"preset": "plastic", "color": "#ff3b5c"},
+             "mesh": {"type": "box", "size": [150, 150], "depth": 150, "bevel": 12},
+             "deform": {"function": "swell", "animated": true, "subdivide": 2, "reach": 40, "params": {"amount": 30}},
+             "transform": {"position": [190, 200], "rotation_x": 25, "rotation_y": 30}},
+            {"id": "ridge", "kind": "mesh", "material": {"preset": "plastic", "color": "#2ec4ff"},
+             "mesh": {"type": "slang", "function": "ridge", "vertices": 441, "triangles": 800, "animated": true, "bounds": [[-110, -110, -60], [110, 110, 0]]},
+             "transform": {"position": [460, 200], "rotation_x": 20}}]}),
+    );
+    p.shaders.push(lahza_motion_core::slang::Shader {
+        name: "geo".into(),
+        source: "
+struct swell_params { float amount = 10; }
+float3 swell(float3 p, float3 n, float t, swell_params q) { return p + n * q.amount * (0.6 + 0.4 * sin(p.x * 0.05 + t * 3.0)); }
+static const uint CELLS = 20;
+float3 ridge_position(uint i, float t) {
+    uint n = CELLS + 1;
+    float2 g = float2(float(i % n), float(i / n)) / float(CELLS) * 2.0 - 1.0;
+    return float3(g * 110.0, -50.0 * (1.0 + 0.2 * t) * (1.0 - g.x * g.x) * (1.0 - g.y * g.y));
+}
+uint3 ridge_triangle(uint j, float t) {
+    uint n = CELLS + 1, q = j / 2;
+    uint a = (q / CELLS) * n + q % CELLS;
+    return (j % 2 == 0) ? uint3(a, a + n, a + 1) : uint3(a + 1, a + n, a + n + 1);
+}
+"
+        .into(),
+    });
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    for t in [0.0, 0.5, 1.0] {
+        let (a, b) = (gpu.render(&c, t), cpu.render(&c, t));
+        let (mean, worst) = difference(&a, &b);
+        assert!(mean < 0.05 && worst <= 32, "at {t}: mean difference {mean:.4}, worst {worst}");
+        let floor = a.get_pixel(40, 380).0;
+        let shown = a.pixels().filter(|p| (0..3).any(|k| p.0[k].abs_diff(floor[k]) > 40)).count();
+        assert!(shown > 8000, "at {t}: {shown} pixels of the meshes");
+    }
+    // Two meshes made on the GPU a frame; the box before its move went
+    // up once, with the floor.
+    let ((generated, uploads), (none, _)) = (gpu.gpu.as_ref().unwrap().pool_counts(), cpu.gpu.as_ref().unwrap().pool_counts());
+    assert_eq!((generated, uploads, none), (6, 2, 0), "meshes the GPU made and meshes uploaded");
+    assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
+    // Path traced: the tracer takes both from the pool (the CPU never
+    // makes them), and the frames are the CPU's meshes' but for the noise
+    // a point's last bits move.
+    if !gpu.can_trace() {
+        return;
+    }
+    for r in [&mut gpu, &mut cpu] {
+        r.set_path(Some(crate::pt::TraceOptions { spp: 16, bounces: 3, ..Default::default() }));
+    }
+    let (a, b) = (gpu.render(&c, 0.5), cpu.render(&c, 0.5));
+    let (mean, _) = difference(&a, &b);
+    assert!(mean < 1.0, "traced: mean difference {mean:.4}");
+    let (generated, uploads) = gpu.gpu.as_ref().unwrap().pool_counts();
+    assert_eq!((generated, uploads), (8, 2), "the traced frame's two meshes were made in the pool too");
+    assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
+}
+
+/// With slangc: a generated mesh with a deformer is the GPU's all the way
+/// (generated in its pool, readied for the deformer there, moved), and is
+/// the mesh the CPU makes: copies of one point move along one normal, so
+/// a seam between two faces stays closed. And a deformer that moves a
+/// point to a value that is not a number has its mesh refused, as on the
+/// CPU.
+#[test]
+fn the_gpu_moves_the_meshes_it_generates() {
+    if lahza_motion_core::slang::compiler().is_err() {
+        return;
+    }
+    let (Some(mut gpu), Some(mut cpu)) = (vis_gpu(), vis_gpu()) else { return };
+    cpu.meshes.gpu_geometry = false;
+    let roof = |deform: serde_json::Value| {
+        json!({"id": "roof", "kind": "mesh", "material": {"preset": "plastic", "color": "#2ec4ff"},
+            "mesh": {"type": "slang", "function": "roof", "vertices": 8, "triangles": 4, "animated": true, "normals": true, "bounds": [[-120, -80, -80], [120, 80, 0]]},
+            "deform": deform, "transform": {"position": [320, 210], "rotation_x": 35, "rotation_y": 20}})
+    };
+    let project = |layer: serde_json::Value| {
+        let mut p = scene(
+            640,
+            400,
+            json!({"lights": [{"type": "ambient", "intensity": 0.3}, {"type": "directional", "from": [-0.5, -0.7, -1.0], "intensity": 1.0}],
+            "layers": [{"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 700]}, "material": {"preset": "matte", "color": "#d8d2c6"}, "transform": {"position": [320, 200], "z": 120}}, layer]}),
+        );
+        p.shaders.push(lahza_motion_core::slang::Shader {
+            name: "geo".into(),
+            source: "
+// Two faces meeting along the ridge x = 0, each with its own four points
+// and its own normal: the ridge's points are there twice.
+float3 roof_position(uint i, float t) {
+    uint k = i % 4;
+    float side = i < 4 ? -1.0 : 1.0;
+    float x = (k == 0 || k == 3) ? 0.0 : side * 110.0;
+    float y = (k < 2) ? -70.0 : 70.0;
+    return float3(x, y, x == 0.0 ? -60.0 - 10.0 * t : 0.0);
+}
+float3 roof_normal(uint i, float t) { return normalize(float3(i < 4 ? -60.0 : 60.0, 0.0, -110.0)); }
+uint3 roof_triangle(uint j, float t) {
+    uint b = (j / 2) * 4;
+    uint3 k = (j % 2 == 0) ? uint3(0, 1, 2) : uint3(0, 2, 3);
+    return (j < 2) ? uint3(b + k.x, b + k.y, b + k.z) : uint3(b + k.x, b + k.z, b + k.y);
+}
+struct puff_params { float amount = 10; }
+float3 puff(float3 p, float3 n, float t, puff_params q) { return p + n * q.amount * (1.0 + 0.5 * t); }
+// (Bends more where the points are further out: flat faces show it only
+// once they are subdivided.)
+struct bend_params { float amount = 10; }
+float3 bend(float3 p, float3 n, float t, bend_params q) { return p + n * q.amount * sin(p.x * 0.04 + t) * cos(p.y * 0.05); }
+// (The root of a negative number: not a number on the CPU and the GPU.)
+float3 broken(float3 p, float3 n, float t) { return p * sqrt(-1.0 - p.x * p.x); }
+"
+            .into(),
+        });
+        p
+    };
+    let c = Compiled::new(&project(roof(json!({"function": "puff", "animated": true, "reach": 40, "params": {"amount": 20}}))));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    for t in [0.0, 0.5, 1.0] {
+        let (a, b) = (gpu.render(&c, t), cpu.render(&c, t));
+        if let Ok(dir) = std::env::var("LAHZA_MOTION_DUMP") {
+            a.save(format!("{dir}/roof-gpu-{t}.png")).unwrap();
+            b.save(format!("{dir}/roof-cpu-{t}.png")).unwrap();
+        }
+        let (mean, worst) = difference(&a, &b);
+        assert!(mean < 0.05 && worst <= 32, "at {t}: mean difference {mean:.4}, worst {worst}");
+        let floor = a.get_pixel(40, 380).0;
+        let shown = a.pixels().filter(|p| (0..3).any(|k| p.0[k].abs_diff(floor[k]) > 40)).count();
+        assert!(shown > 8000, "at {t}: {shown} pixels of the roof");
+    }
+    // A frame: the roof generated, and moved; the floor went up once.
+    let ((generated, uploads), (none, _)) = (gpu.gpu.as_ref().unwrap().pool_counts(), cpu.gpu.as_ref().unwrap().pool_counts());
+    assert_eq!((generated, uploads, none), (6, 1, 0), "meshes the GPU made and meshes uploaded");
+    assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
+    // Subdivided for the deformer on the GPU too: every triangle in four,
+    // twice, with the midpoints two triangles share moved as one.
+    let fine = Compiled::new(&project(roof(json!({"function": "bend", "animated": true, "subdivide": 2, "reach": 40, "params": {"amount": 20}}))));
+    assert!(fine.errors.is_empty(), "{:?}", fine.errors);
+    let (Some(mut gpu), Some(mut cpu)) = (vis_gpu(), vis_gpu()) else { return };
+    cpu.meshes.gpu_geometry = false;
+    for t in [0.0, 0.7] {
+        let (a, b) = (gpu.render(&fine, t), cpu.render(&fine, t));
+        if let Ok(dir) = std::env::var("LAHZA_MOTION_DUMP") {
+            a.save(format!("{dir}/fine-gpu-{t}.png")).unwrap();
+            b.save(format!("{dir}/fine-cpu-{t}.png")).unwrap();
+        }
+        let (mean, worst) = difference(&a, &b);
+        assert!(mean < 0.05 && worst <= 32, "subdivided, at {t}: mean difference {mean:.4}, worst {worst}");
+    }
+    let (generated, uploads) = gpu.gpu.as_ref().unwrap().pool_counts();
+    assert_eq!((generated, uploads), (4, 1), "the subdivided roof was generated and moved on the GPU");
+    assert!(gpu.dropped().is_empty() && gpu.warnings().is_empty(), "{:?} {:?}", gpu.dropped(), gpu.warnings());
+    // A generated mesh whose deformer returns what is not a number: the GPU refuses it
+    // whole, and says so once the frame is back.
+    let broken = Compiled::new(&project(roof(json!({"function": "broken", "reach": 10}))));
+    assert!(broken.errors.is_empty(), "{:?}", broken.errors);
+    let a = gpu.render(&broken, 0.0);
+    let floor = a.get_pixel(40, 380).0;
+    assert!(a.pixels().filter(|p| (0..3).any(|k| p.0[k].abs_diff(floor[k]) > 40)).count() < 200, "the broken roof is not drawn");
+    gpu.render(&broken, 0.5);
+    assert!(gpu.dropped().iter().any(|e| e.contains("deform 'broken'") && e.contains("not a number") && e.contains("not drawn")), "{:?}", gpu.dropped());
+    // A box whose deformer returns what is not a number: refused whole, and said so.
+    let Some(mut gpu) = vis_gpu() else { return };
+    let bad = Compiled::new(&project(json!({"id": "bad", "kind": "mesh", "material": {"preset": "plastic", "color": "#ff3b5c"},
+        "mesh": {"type": "box", "size": [150, 150], "depth": 150}, "deform": {"function": "broken", "reach": 10}, "transform": {"position": [320, 200]}})));
+    assert!(bad.errors.is_empty(), "{:?}", bad.errors);
+    let a = gpu.render(&bad, 0.0);
+    let floor = a.get_pixel(40, 380).0;
+    assert!(a.pixels().filter(|p| (0..3).any(|k| p.0[k].abs_diff(floor[k]) > 40)).count() < 200, "the broken box is not drawn");
+    assert!(gpu.dropped().iter().any(|e| e.contains("broken") && e.contains("not a number")), "{:?}", gpu.dropped());
+}
+
+/// A ground plane that reaches behind the camera has no box on screen, and
+/// still hides what is behind it across pictures of their own: with depth
+/// of field every 3D layer is one (blurred by its depth), and a sky drawn
+/// as a card after the meshes must not show over the far ground.
+#[test]
+fn a_ground_that_crosses_the_camera_hides_the_sky_behind_it() {
+    let p = scene(320, 240, json!({"camera": {"fov": 40.0, "orbit": [0, 6], "aperture": 0.08},
+        "lights": [{"type": "ambient", "intensity": 1.0}],
+        "layers": [
+            {"id": "sky", "kind": "shape", "shape": "rect", "size": [40000, 8000], "fill": "#2050ff", "three_d": true, "transform": {"position": [160, 120], "z": 6000}},
+            {"id": "ground", "kind": "mesh", "mesh": {"type": "plane", "size": [20000, 6000]}, "material": {"preset": "flat", "color": "#c8a078"},
+             "transform": {"position": [160, 200], "z": 1500, "rotation_x": 90}}
+        ]}));
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let img = crate::tests::cpu().render(&c, 0.0);
+    // Every row from the horizon down is ground: none is the sky's blue.
+    let blue = |x: u32, y: u32| {
+        let q = img.get_pixel(x, y).0;
+        q[2] > q[0].saturating_add(40)
+    };
+    let horizon = (0..240).find(|&y| !blue(160, y)).expect("the ground shows");
+    assert!(horizon > 20 && horizon < 200, "the horizon is at row {horizon}");
+    let sky_below = (horizon..240).filter(|&y| blue(160, y) || blue(40, y) || blue(280, y)).count();
+    assert_eq!(sky_below, 0, "rows of sky under the horizon (row {horizon})");
+}

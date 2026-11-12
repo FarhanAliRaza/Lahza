@@ -66,7 +66,7 @@ impl Worker {
         let thread = std::thread::Builder::new()
             .name("lahza-motion-preview".into())
             .spawn(move || {
-                let mut renderer = Renderer::new(Some(&dir), RenderOptions::default());
+                let mut renderer = Renderer::new(Some(&dir), RenderOptions { backend: lahza_motion_render::Backend::Auto, ..Default::default() });
                 inner.0.lock().unwrap().label = renderer.backend_label();
                 loop {
                     let job = {

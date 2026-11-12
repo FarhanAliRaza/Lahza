@@ -103,6 +103,33 @@ $FILL$    if (u_mesh.counts.w == 0u) {
 }
 ";
 
+/// A deformer's GPU kernel, with the generator's uniform and buffer:
+/// counts = [points, the first row in the mesh pool of the mesh it moves,
+/// the first row of the moved mesh, 0]. The mesh it moves has three rows
+/// a point ([position, u] [the normal its copies share, v] [its own
+/// normal, 0]); the moved one gets its two ([position, u] [0, v]: the
+/// renderer's kernels make the normals from the moved faces,
+/// `meshgen.wgsl`).
+const DEFORM_KERNEL: &str = "
+struct LahzaMeshPass { uint4 counts; float4 time; float4 params[$MAX$]; };
+ConstantBuffer<LahzaMeshPass> u_mesh;
+RWStructuredBuffer<uint4> b_mesh;
+
+[shader(\"compute\")]
+[numthreads($GROUP$, 1, 1)]
+void lahza_mesh(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    float t = u_mesh.time.x;
+    if (i >= u_mesh.counts.x) return;
+$FILL$    uint4 a = b_mesh[u_mesh.counts.y + i * 3u];
+    uint4 b = b_mesh[u_mesh.counts.y + i * 3u + 1u];
+    float3 q = $FUNCTION$(asfloat(a.xyz), asfloat(b.xyz), t$P$);
+    uint at = u_mesh.counts.z + i * 2u;
+    b_mesh[at] = uint4(asuint(q), a.w);
+    b_mesh[at + 1u] = uint4(0u, 0u, 0u, b.w);
+}
+";
+
 /// A generator as the GPU runs it: a compute kernel calling the author's
 /// functions, one thread per point or triangle. Layers calling a function
 /// the same way share one.
@@ -150,6 +177,32 @@ impl Kernel {
                 .replace("$TRIANGLE$", &call("triangle", true, ""))
                 .replace("$SEGMENT$", &call("segment", out.segments, "0u")),
         );
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&module, shaders.iter().map(|m| (&m.name, &m.source)).collect::<Vec<_>>()).hash(&mut h);
+        Some(Kernel { function: function.into(), module, wgsl: OnceLock::new(), key: h.finish() })
+    }
+
+    /// The kernel for deformer `function` called with these params (as
+    /// `deformer` exports it for the CPU); None when the GPU cannot take
+    /// it, as for `new`.
+    pub fn deformer(shaders: &[crate::slang::Shader], function: &str, names: &[String]) -> Option<Self> {
+        if names.len() > GPU_PARAMS || !std::iter::once(function).chain(names.iter().map(String::as_str)).all(valid_name) {
+            return None;
+        }
+        let takes = crate::slang::declares_struct(shaders, &format!("{function}_params"));
+        if !takes && !names.is_empty() {
+            return None;
+        }
+        let (mut fill, mut p) = (String::new(), "");
+        if takes {
+            fill = format!("    {function}_params p = {{}};\n");
+            for (k, n) in names.iter().enumerate() {
+                fill.push_str(&format!("    p.{n} = u_mesh.params[{}].{};\n", k / 4, ["x", "y", "z", "w"][k % 4]));
+            }
+            p = ", p";
+        }
+        let mut module = crate::slang::imports(shaders);
+        module.push_str(&DEFORM_KERNEL.replace("$MAX$", &GPU_PARAMS.div_ceil(4).to_string()).replace("$GROUP$", &GROUP.to_string()).replace("$FILL$", &fill).replace("$FUNCTION$", function).replace("$P$", p));
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (&module, shaders.iter().map(|m| (&m.name, &m.source)).collect::<Vec<_>>()).hash(&mut h);
         Some(Kernel { function: function.into(), module, wgsl: OnceLock::new(), key: h.finish() })
@@ -209,6 +262,38 @@ pub struct Deform {
     pub subdivide: u32,
     /// px the function may move a point (pads the bounds).
     pub reach: f64,
+    /// The function as a kernel for the GPU (`Kernel::deformer`), where it
+    /// can be one: the GPU's mesh pool then moves the points itself
+    /// (`MeshParams::gpu_deformer`).
+    pub gpu: Option<Arc<Kernel>>,
+}
+
+/// The points and triangles a mesh of `verts` and `tris` has after each
+/// subdivision the GPU makes of it for a deformer that asks for `levels`
+/// (as many as `deform_base` makes: it stops near `MAX_DEFORM_TRIS`).
+/// The GPU keeps a midpoint for each of a triangle's three edges (the
+/// triangles use one of an edge's two), so the points grow by three a
+/// triangle, more than the CPU's mesh has.
+pub fn gpu_subdivided(verts: u32, tris: u32, levels: u32) -> Vec<(u32, u32)> {
+    let (mut v, mut t) = (verts as u64, tris as u64);
+    let mut out = Vec::new();
+    for _ in 0..levels.min(MAX_SUBDIVIDE) {
+        if t as usize * 4 > MAX_DEFORM_TRIS {
+            break;
+        }
+        v += 3 * t;
+        t *= 4;
+        out.push((v as u32, t as u32));
+    }
+    out
+}
+
+/// A mesh ready for a deformer: subdivided as it asks, with the normal
+/// each point is moved along (`welded`: the one its copies share).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeformBase {
+    pub mesh: Mesh,
+    pub welded: Vec<[f32; 3]>,
 }
 
 /// A generated mesh kept with its parameters. Not part of their identity:
@@ -460,29 +545,72 @@ impl SlangShape {
 /// edges, UV seams) get the same normal, the average of theirs, so they
 /// move together and nothing cracks.
 pub fn deform(mesh: &mut Mesh, d: &Deform) -> Result<(), String> {
-    let f = &d.function;
-    let address = d.call.address().ok_or_else(|| format!("deform '{f}': the project's Slang did not build"))?;
+    let base = deform_base(std::mem::take(mesh), d.subdivide);
+    *mesh = deform_prepared(&base, d)?;
+    Ok(())
+}
+
+/// The first half of `deform`: `mesh` subdivided `subdivide` times, and
+/// the normals its points are moved along.
+pub fn deform_base(mut mesh: Mesh, subdivide: u32) -> DeformBase {
     if mesh.uvs.len() != mesh.positions.len() {
         mesh.uvs.resize(mesh.positions.len(), [0.0; 2]);
     }
-    for _ in 0..d.subdivide.min(MAX_SUBDIVIDE) {
+    for _ in 0..subdivide.min(MAX_SUBDIVIDE) {
         if mesh.tris.len() * 4 > MAX_DEFORM_TRIS {
             break;
         }
-        mesh::subdivide(mesh);
+        mesh::subdivide(&mut mesh);
     }
     let key = |p: [f32; 3]| [(p[0] * 64.0).round() as i64, (p[1] * 64.0).round() as i64, (p[2] * 64.0).round() as i64];
-    let mut welded: std::collections::HashMap<[i64; 3], [f32; 3]> = std::collections::HashMap::new();
+    let mut sums: std::collections::HashMap<[i64; 3], [f32; 3]> = std::collections::HashMap::new();
     for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
-        let w = welded.entry(key(*p)).or_insert([0.0; 3]);
+        let w = sums.entry(key(*p)).or_insert([0.0; 3]);
         *w = [w[0] + n[0], w[1] + n[1], w[2] + n[2]];
     }
-    let mut nor: Vec<f32> = Vec::with_capacity(mesh.positions.len() * 3);
-    for p in &mesh.positions {
-        let w = welded[&key(*p)];
-        let l = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
-        nor.extend(if l > 1e-12 { [w[0] / l, w[1] / l, w[2] / l] } else { [0.0; 3] });
+    let welded = mesh
+        .positions
+        .iter()
+        .map(|p| {
+            let w = sums[&key(*p)];
+            let l = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+            if l > 1e-12 { [w[0] / l, w[1] / l, w[2] / l] } else { [0.0; 3] }
+        })
+        .collect();
+    DeformBase { mesh, welded }
+}
+
+/// The second half of `deform`: `base` with every point moved by the
+/// deformer and shaded from its new faces.
+pub fn deform_prepared(base: &DeformBase, d: &Deform) -> Result<Mesh, String> {
+    let pos = moved(base, d)?;
+    let mut mesh = base.mesh.clone();
+    mesh.positions = pos.chunks(3).map(|v| [v[0], v[1], v[2]]).collect();
+    mesh::face_normals(&mut mesh);
+    Ok(mesh)
+}
+
+/// The box of `base`'s points once the deformer has moved them, without
+/// making the moved mesh: what stands for it where the GPU moves the
+/// points (`MeshParams::gpu_deformer`). Refuses what `deform` refuses (a
+/// point moved to a value that is not a number).
+pub fn deform_extent(base: &DeformBase, d: &Deform) -> Result<([f64; 3], [f64; 3]), String> {
+    let pos = moved(base, d)?;
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for p in pos.chunks_exact(3) {
+        for k in 0..3 {
+            (lo[k], hi[k]) = (lo[k].min(p[k] as f64), hi[k].max(p[k] as f64));
+        }
     }
+    Ok((lo, hi))
+}
+
+/// `base`'s points moved by the deformer, three floats each.
+fn moved(base: &DeformBase, d: &Deform) -> Result<Vec<f32>, String> {
+    let f = &d.function;
+    let address = d.call.address().ok_or_else(|| format!("deform '{f}': the project's Slang did not build"))?;
+    let mesh = &base.mesh;
+    let nor: Vec<f32> = base.welded.iter().flatten().copied().collect();
     let mut pos: Vec<f32> = mesh.positions.iter().flatten().copied().collect();
     let n = mesh.positions.len();
     // SAFETY: `deformer` exported this symbol with exactly this signature,
@@ -501,9 +629,7 @@ pub fn deform(mesh: &mut Mesh, d: &Deform) -> Result<(), String> {
     if let Some((i, v)) = not_finite(&pos, 3) {
         return Err(format!("deform '{f}': point {i} moved to a value that is not a number: {v:?}"));
     }
-    mesh.positions = pos.chunks(3).map(|v| [v[0], v[1], v[2]]).collect();
-    mesh::face_normals(mesh);
-    Ok(())
+    Ok(pos)
 }
 
 #[cfg(test)]

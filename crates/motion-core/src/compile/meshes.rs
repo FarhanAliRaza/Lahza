@@ -802,6 +802,13 @@ impl Compiler<'_> {
                 self.errors.push(format!("{id}.deform.subdivide: {} is more than {}", d.subdivide, crate::slang_mesh::MAX_SUBDIVIDE));
             }
             let names: Vec<String> = d.params.keys().cloned().collect();
+            // Its kernel for the GPU, shared by the layers calling it the
+            // same way (beside the generators': no Slang name has a space).
+            let gpu = self
+                .mesh_kernels
+                .entry((format!("deform {}", d.function), names.clone(), Default::default()))
+                .or_insert_with(|| crate::slang_mesh::Kernel::deformer(&self.windows.project.shaders, &d.function, &names).map(Arc::new))
+                .clone();
             CSlang {
                 call: crate::slang_mesh::deformer(&self.slang, &self.windows.project.shaders, &format!("{id}.deform"), &d.function, &names),
                 function: d.function.clone(),
@@ -813,7 +820,7 @@ impl Compiler<'_> {
                 outputs: Default::default(),
                 two_sided: false,
                 bounds: None,
-                gpu: None,
+                gpu,
                 subdivide: d.subdivide.min(crate::slang_mesh::MAX_SUBDIVIDE),
                 reach: if d.reach.is_finite() { d.reach.abs() } else { 0.0 },
             }
@@ -1114,6 +1121,7 @@ impl CMesh {
             animated: d.animated,
             subdivide: d.subdivide,
             reach: d.reach,
+            gpu: d.gpu.clone(),
         });
         // A Slang mesh is the same at every drawn size (unless noise
         // subdivides it): one mesh however the camera moves.

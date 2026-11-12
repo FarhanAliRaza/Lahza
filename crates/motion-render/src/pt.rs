@@ -32,11 +32,17 @@ pub struct TraceOptions {
     /// Accumulate over consecutive frames (reprojected along each surface's
     /// motion): for sequences rendered in order, such as an export.
     pub temporal: bool,
+    /// The fast mode: few samples at half size, made a clean picture at
+    /// full size by NVIDIA's Ray Reconstruction (`ngx`); without motion
+    /// blur or depth of field. As usual where that is not at hand.
+    pub fast: bool,
+    /// The fast mode's motion blur: the shutter, in frames (0: none).
+    pub shutter: f32,
 }
 
 impl Default for TraceOptions {
     fn default() -> Self {
-        Self { spp: 64, bounces: 6, denoise: true, temporal: false }
+        Self { spp: 64, bounces: 6, denoise: true, temporal: false, fast: false, shutter: 0.0 }
     }
 }
 
@@ -54,12 +60,42 @@ fn band_rows(width: u32, spp: u32) -> u32 {
 /// À-trous passes (steps 1, 2, 4, … px).
 const DENOISE_PASSES: u32 = 5;
 
+/// Where a traced instance's geometry comes from.
+#[derive(Clone)]
+pub(crate) enum TraceMesh {
+    /// The CPU's mesh.
+    Cpu(Arc<Mesh>),
+    /// A mesh the GPU generates in its mesh pool (the project's Slang):
+    /// the tracer takes it from there. With the pool row of its points,
+    /// set by the GPU once it is there (`u32::MAX`: it is not).
+    Pool(Arc<crate::mesh3d::Pooled>, u32),
+}
+
+impl PartialEq for TraceMesh {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TraceMesh::Cpu(a), TraceMesh::Cpu(b)) => a == b,
+            (TraceMesh::Pool(a, _), TraceMesh::Pool(b, _)) => a.key == b.key,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for TraceMesh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TraceMesh::Cpu(m) => write!(f, "Cpu({} points)", m.positions.len()),
+            TraceMesh::Pool(p, at) => write!(f, "Pool({} points at {at})", p.verts),
+        }
+    }
+}
+
 /// One mesh layer in a traced list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TraceInstance {
     /// The layer (finds its transform on the previous frame).
     pub id: Arc<str>,
-    pub mesh: Arc<Mesh>,
+    pub(crate) mesh: TraceMesh,
     /// Identifies the geometry across frames (the mesh parameters).
     pub key: Vec<u8>,
     /// Object → camera space, row-major 3 × 4.
@@ -129,6 +165,8 @@ impl Trace {
         out.extend(self.options.bounces.to_le_bytes());
         out.push(self.options.denoise as u8);
         out.push(self.options.temporal as u8);
+        out.push(self.options.fast as u8);
+        out.extend(self.options.shutter.to_le_bytes());
         out.extend(self.seed.to_le_bytes());
         f(out, &self.lens);
         if let Some(e) = &self.env {
@@ -182,6 +220,21 @@ struct Uniforms {
     band: [u32; 4],
 }
 
+/// `FromPool` in pt_pool.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FromPool {
+    rows: [u32; 4],
+}
+
+#[derive(blade_macros::ShaderData)]
+struct FromPoolData {
+    u_from: FromPool,
+    b_pool: gpu::BufferPiece,
+    b_idx: gpu::BufferPiece,
+    b_tags: gpu::BufferPiece,
+}
+
 #[derive(blade_macros::ShaderData)]
 struct TraceData {
     u: Uniforms,
@@ -211,8 +264,10 @@ struct Geometry {
     blas: gpu::AccelerationStructure,
     /// Its device address (what instances refer to it by).
     address: u64,
-    positions: gpu::Buffer,
-    indices: gpu::Buffer,
+    /// What it was built from; None for a mesh taken from the GPU's mesh
+    /// pool, which is built from the shared arrays (they hold it only on
+    /// the GPU, `from_pool`).
+    built_from: Option<[gpu::Buffer; 2]>,
     /// Offsets (in vertices, indices and triangles) into the shared arrays,
     /// and how many of each it has there.
     attr_base: u32,
@@ -331,6 +386,38 @@ struct Work {
 
 /// How a traced list's picture gets to Open Image Denoise and back, for
 /// pictures of `size`.
+/// The fast mode's images (pt.wgsl `ngx_pack` writes the first six one
+/// after another): name, format, floats a texel, `VkFormat`.
+const FAST_IMAGES: [(&str, gpu::TextureFormat, u32, u32); 7] = [
+    ("ray reconstruction colour", gpu::TextureFormat::Rgba32Float, 4, 109),
+    ("ray reconstruction albedo", gpu::TextureFormat::Rgba32Float, 4, 109),
+    ("ray reconstruction specular", gpu::TextureFormat::Rgba32Float, 4, 109),
+    ("ray reconstruction normals", gpu::TextureFormat::Rgba32Float, 4, 109),
+    ("ray reconstruction depth", gpu::TextureFormat::R32Float, 1, 100),
+    ("ray reconstruction motion", gpu::TextureFormat::Rg32Float, 2, 103),
+    ("ray reconstruction output", gpu::TextureFormat::Rgba32Float, 4, 109),
+];
+
+/// Floats a texel in the fast mode's packed input.
+const FAST_FLOATS: u64 = 19;
+
+/// A traced list in the fast mode: its sizes, Ray Reconstruction's
+/// history of it, the images it reads and writes, the trace's texels
+/// packed for them and its picture for `resolve_fast`.
+#[derive(Clone, Copy)]
+struct Fast {
+    low: (u32, u32),
+    full: (u32, u32),
+    feature: Option<crate::ngx::Feature>,
+    textures: [(gpu::Texture, gpu::TextureView); 7],
+    packed: gpu::Buffer,
+    out: gpu::Buffer,
+    /// What `visible` saw of each texel of the full picture.
+    seen: gpu::Buffer,
+    /// The picture after depth of field (`dof_fast`).
+    dof: gpu::Buffer,
+}
+
 #[derive(Clone, Copy)]
 struct Denoising {
     size: (u32, u32),
@@ -410,6 +497,14 @@ struct Slot {
     denoised: bool,
     /// Its result is in the upload buffer (the copied way).
     upload: bool,
+    /// The fast mode: the picture's full size (the trace has half), and
+    /// its shutter.
+    fast: Option<(u32, u32)>,
+    shutter: f32,
+    /// And its lens for `dof_fast`: the circle of confusion's radius, in
+    /// texels of the full picture, of a point twice as far as the focus
+    /// (0: no lens), and the focus depth.
+    lens: [f32; 2],
 }
 
 /// What one frame in flight writes from the CPU.
@@ -449,9 +544,14 @@ pub struct Tracer {
     /// To and from Open Image Denoise (`oidn_pack`, `oidn_unpack`).
     pack: gpu::ComputePipeline,
     unpack: gpu::ComputePipeline,
-    /// Trace pipelines specialised to a scene's features (`specialise`), by
-    /// feature mask (None: that build failed); `pipeline` is the general
-    /// build (all features).
+    /// The fast mode: NVIDIA's Ray Reconstruction (loaded on first use, or
+    /// why not), its passes, and each traced list's images and history.
+    ngx: Option<Result<crate::ngx::Ngx, String>>,
+    ngx_pack: gpu::ComputePipeline,
+    resolve_fast: gpu::ComputePipeline,
+    dof_fast: gpu::ComputePipeline,
+    fast: HashMap<u32, Fast>,
+    fast_old: Vec<Fast>,
     specialised: HashMap<u32, Option<gpu::ComputePipeline>>,
     /// Trace pipelines with a project's Slang surfaces
     /// (`surfaces::trace_source`): the program's key and its builds by
@@ -461,11 +561,18 @@ pub struct Tracer {
     profile: bool,
     geometry: HashMap<Vec<u8>, Geometry>,
     /// Per-vertex [position, normal] rows, indices and triangle tags of every
-    /// cached mesh, uploaded again when a mesh is added.
+    /// cached mesh. A new mesh's are added at the end, here and in the
+    /// buffers (`shared`: what frames in flight read stays as it is).
     attrs: Vec<[f32; 4]>,
     idx: Vec<u32>,
     tags: Vec<u32>,
     shared: Option<[gpu::Buffer; 3]>,
+    /// Takes a mesh from the GPU's mesh pool into the shared arrays
+    /// (pt_pool.wgsl), made when a traced list first has one.
+    from_pool: Option<gpu::ComputePipeline>,
+    /// The buffers' sizes and the bytes of the arrays written to them.
+    shared_room: [usize; 3],
+    shared_held: [usize; 3],
     /// What frames in flight may still read, with the last frame that
     /// could: freed once that frame is done (`begin_frame`).
     retired: Vec<(u64, Retired)>,
@@ -494,8 +601,8 @@ pub struct Tracer {
 
 /// Geometry not used for this many frames is dropped. Animated meshes
 /// are new geometry every frame, so the cache must not outlive them.
-/// (The frames in flight, at most the two before the one being recorded,
-/// used theirs later than that.)
+/// (Of the frames in flight, only the two before the one being recorded
+/// may still be traced, and they used theirs later than that.)
 const GEOMETRY_FRAMES: u64 = 2;
 
 /// What a traced group looked like on the previous frame: its
@@ -528,6 +635,12 @@ impl Tracer {
             bounds: make("volume bounds", "bounds"),
             pack: make("oidn pack", "oidn_pack"),
             unpack: make("oidn unpack", "oidn_unpack"),
+            ngx: None,
+            ngx_pack: make("ray reconstruction pack", "ngx_pack"),
+            resolve_fast: make("trace resolve", "resolve_fast"),
+            dof_fast: make("fast depth of field", "dof_fast"),
+            fast: HashMap::new(),
+            fast_old: Vec::new(),
             specialised: HashMap::new(),
             slang: None,
             profile,
@@ -536,6 +649,9 @@ impl Tracer {
             idx: Vec::new(),
             tags: Vec::new(),
             shared: None,
+            from_pool: None,
+            shared_room: [0; 3],
+            shared_held: [0; 3],
             retired: Vec::new(),
             frame: 0,
             age: 0,
@@ -599,13 +715,28 @@ impl Tracer {
         for k in stale {
             if let Some(g) = self.geometry.remove(&k) {
                 context.destroy_acceleration_structure(g.blas);
-                context.destroy_buffer(g.positions);
-                context.destroy_buffer(g.indices);
+                for b in g.built_from.into_iter().flatten() {
+                    context.destroy_buffer(b);
+                }
             }
         }
-        // Pack the shared arrays down to the geometry that is left: they
-        // only ever grew, so an animated mesh filled the GPU.
-        let (mut attrs, mut idx, mut tags) = (Vec::new(), Vec::new(), Vec::new());
+        // Pack the shared arrays down to the geometry that is left once a
+        // fifth of them is not (they only ever grew, so an animated mesh
+        // filled the GPU). Not each time: packing moves every mesh and
+        // uploads them all again, and a film's meshes come and go.
+        let live = self.geometry.values().fold([0usize; 3], |n, g| [n[0] + g.counts[0] as usize * 2, n[1] + g.counts[1] as usize, n[2] + g.counts[2] as usize]);
+        if (self.attrs.len() + self.idx.len() + self.tags.len()) * 4 < 5 * (live[0] + live[1] + live[2]) {
+            return;
+        }
+        // Meshes taken from the GPU's mesh pool are in the buffers only:
+        // they are let go of here and taken again when next traced.
+        let pooled: Vec<Vec<u8>> = self.geometry.iter().filter(|(_, g)| g.built_from.is_none()).map(|(k, _)| k.clone()).collect();
+        for k in pooled {
+            if let Some(g) = self.geometry.remove(&k) {
+                self.retired.push((before, Retired::Structure(g.blas)));
+            }
+        }
+        let (mut attrs, mut idx, mut tags) = (Vec::with_capacity(live[0]), Vec::with_capacity(live[1]), Vec::with_capacity(live[2]));
         for g in self.geometry.values_mut() {
             let [nv, ni, nt] = g.counts.map(|c| c as usize);
             let (a, i, t) = (g.attr_base as usize * 2, g.idx_base as usize, g.tag_base as usize);
@@ -651,11 +782,15 @@ impl Tracer {
     /// Builds (once) the bottom-level structure of a mesh. Returns where
     /// its attributes, indices and tags start and its structure's address;
     /// None for a mesh without triangles.
-    fn geometry(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, key: &[u8], mesh: &Mesh) -> Option<([u32; 3], u64)> {
+    fn geometry(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, key: &[u8], mesh: &TraceMesh, pool: gpu::Buffer) -> Option<([u32; 3], u64)> {
         if let Some(g) = self.geometry.get_mut(key) {
             g.used = self.age;
             return Some(([g.attr_base, g.idx_base, g.tag_base], g.address));
         }
+        let mesh = match mesh {
+            TraceMesh::Cpu(mesh) => mesh,
+            TraceMesh::Pool(pooled, at) => return self.geometry_from_pool(context, encoder, key, pooled, *at, pool),
+        };
         if mesh.tris.is_empty() {
             return None;
         }
@@ -694,29 +829,103 @@ impl Tracer {
         self.idx.extend_from_slice(&indices);
         let tag_base = self.tags.len() as u32;
         self.tags.extend_from_slice(&mesh.tags);
-        // The shared arrays changed: upload them again (the old copies may
-        // still be read by work recorded earlier).
-        for b in self.shared.take().into_iter().flatten() {
-            self.retire(Retired::Buffer(b));
-        }
+        // (`shared` adds them to the buffers.)
         let address = context.acceleration_structure_address(blas);
-        self.geometry.insert(key.to_vec(), Geometry { blas, address, positions: pb, indices: ib, attr_base, idx_base, tag_base, counts: [mesh.positions.len() as u32, indices.len() as u32, mesh.tags.len() as u32], used: self.age });
+        self.geometry.insert(key.to_vec(), Geometry { blas, address, built_from: Some([pb, ib]), attr_base, idx_base, tag_base, counts: [mesh.positions.len() as u32, indices.len() as u32, mesh.tags.len() as u32], used: self.age });
         Some(([attr_base, idx_base, tag_base], address))
     }
 
-    fn shared(&mut self, context: &gpu::Context) -> [gpu::Buffer; 3] {
-        if let Some(s) = self.shared {
-            return s;
+    /// `geometry` for a mesh the GPU's mesh pool holds at row `at`
+    /// (`pool`): its rows are taken into the shared arrays on the GPU
+    /// (the points' as they are, the triangles' by `from_pool`) and its
+    /// structure is built from them there. None when the pool has not got
+    /// it (no room: the pool says so).
+    fn geometry_from_pool(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, key: &[u8], mesh: &crate::mesh3d::Pooled, at: u32, pool: gpu::Buffer) -> Option<([u32; 3], u64)> {
+        if at == u32::MAX || mesh.tris == 0 || mesh.verts == 0 {
+            return None;
         }
-        let make = |name: &str, bytes: &[u8]| {
-            let b = context.create_buffer(gpu::BufferDesc { name, size: bytes.len().max(16) as u64, memory: gpu::Memory::Shared });
-            // SAFETY: a fresh mapped buffer of at least bytes.len() bytes.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.data(), bytes.len()) };
-            context.sync_buffer(b);
-            b
+        let (verts, tris) = (mesh.verts as usize, mesh.tris as usize);
+        // Room in the arrays (nothing of it on the CPU: zeros stand there).
+        let (attr_base, idx_base, tag_base) = ((self.attrs.len() / 2) as u32, self.idx.len() as u32, self.tags.len() as u32);
+        self.attrs.resize(self.attrs.len() + verts * 2, [0.0; 4]);
+        self.idx.resize(self.idx.len() + tris * 3, 0);
+        self.tags.resize(self.tags.len() + tris, 0);
+        let [attrs, idx, tags] = self.shared(context, encoder);
+        encoder.transfer("trace mesh from pool").copy_buffer_to_buffer(pool.at(at as u64 * 16), attrs.at(attr_base as u64 * 32), verts as u64 * 32);
+        let pipeline = self.from_pool.get_or_insert_with(|| {
+            let shader = context.create_shader(gpu::ShaderDesc { source: include_str!("pt_pool.wgsl") });
+            context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace mesh from pool", data_layouts: &[&FromPoolData::layout()], compute: shader.at("from_pool") })
+        });
+        {
+            let mut pass = encoder.compute("trace mesh from pool");
+            let mut pc = pass.with(pipeline);
+            pc.bind(0, &FromPoolData { u_from: FromPool { rows: [at + mesh.verts * crate::mesh3d::PROWS as u32, mesh.tris, idx_base, tag_base] }, b_pool: pool.into(), b_idx: idx.into(), b_tags: tags.into() });
+            pc.dispatch([mesh.tris.div_ceil(64), 1, 1]);
+        }
+        let m = gpu::AccelerationStructureMesh {
+            vertex_data: attrs.at(attr_base as u64 * 32),
+            vertex_format: gpu::VertexFormat::F32Vec3,
+            vertex_stride: 32,
+            vertex_count: mesh.verts,
+            index_data: idx.at(idx_base as u64 * 4),
+            index_type: Some(gpu::IndexType::U32),
+            triangle_count: mesh.tris,
+            transform_data: gpu::Buffer::default().into(),
+            is_opaque: true,
         };
-        let s = [make("trace attrs", bytemuck::cast_slice(&self.attrs)), make("trace indices", bytemuck::cast_slice(&self.idx)), make("trace tags", bytemuck::cast_slice(&self.tags))];
-        self.shared = Some(s);
+        let sizes = context.get_bottom_level_acceleration_structure_sizes(std::slice::from_ref(&m));
+        let blas = context.create_acceleration_structure(gpu::AccelerationStructureDesc { name: "trace blas", ty: gpu::AccelerationStructureType::BottomLevel, size: sizes.data });
+        let scratch = self.scratch(context, sizes.scratch);
+        encoder.acceleration_structure("trace blas").build_bottom_level(blas, std::slice::from_ref(&m), scratch.into());
+        let address = context.acceleration_structure_address(blas);
+        self.geometry.insert(key.to_vec(), Geometry { blas, address, built_from: None, attr_base, idx_base, tag_base, counts: [mesh.verts, mesh.tris * 3, mesh.tris], used: self.age });
+        Some(([attr_base, idx_base, tag_base], address))
+    }
+
+    /// The shared arrays on the GPU. What was added to them since the
+    /// last call is written after what the buffers hold (work recorded
+    /// earlier reads only that); buffers they outgrew are made anew, half
+    /// as large again, and the old ones freed after the frames reading
+    /// them. (Meshes taken from the GPU's mesh pool are in the buffers
+    /// only: the GPU copies those from the old ones.)
+    fn shared(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder) -> [gpu::Buffer; 3] {
+        let bytes: [&[u8]; 3] = [bytemuck::cast_slice(&self.attrs), bytemuck::cast_slice(&self.idx), bytemuck::cast_slice(&self.tags)];
+        let mut outgrown = None;
+        if self.shared.is_some() && (0..3).any(|k| bytes[k].len() > self.shared_room[k]) {
+            outgrown = self.shared.take();
+            let frame = self.frame;
+            self.retired.extend(outgrown.into_iter().flatten().map(|b| (frame, Retired::Buffer(b))));
+        }
+        let s = match self.shared {
+            Some(s) => s,
+            None => {
+                self.shared_room = [0, 1, 2].map(|k| (bytes[k].len() + bytes[k].len() / 2).max(16));
+                self.shared_held = [0; 3];
+                let room = self.shared_room;
+                let s = [("trace attrs", room[0]), ("trace indices", room[1]), ("trace tags", room[2])].map(|(name, size)| context.create_buffer(gpu::BufferDesc { name, size: size as u64, memory: gpu::Memory::Shared }));
+                self.shared = Some(s);
+                s
+            }
+        };
+        for k in 0..3 {
+            let held = self.shared_held[k];
+            if bytes[k].len() > held {
+                // SAFETY: the mapping holds `shared_room[k]` ≥ bytes[k].len()
+                // bytes, and nothing recorded reads past `held`.
+                unsafe { std::ptr::copy_nonoverlapping(bytes[k].as_ptr().add(held), s[k].data().add(held), bytes[k].len() - held) };
+                context.sync_buffer(s[k]);
+                self.shared_held[k] = bytes[k].len();
+            }
+        }
+        if let Some(old) = outgrown {
+            let mut pass = encoder.transfer("trace arrays grow");
+            for g in self.geometry.values().filter(|g| g.built_from.is_none()) {
+                // (Rows of 32, 4 and 4 bytes; `counts` are of each.)
+                for (k, (at, n, size)) in [(g.attr_base, g.counts[0], 32u64), (g.idx_base, g.counts[1], 4), (g.tag_base, g.counts[2], 4)].into_iter().enumerate() {
+                    pass.copy_buffer_to_buffer(old[k].at(at as u64 * size), s[k].at(at as u64 * size), n as u64 * size);
+                }
+            }
+        }
         s
     }
 
@@ -747,7 +956,7 @@ impl Tracer {
     /// (`size` texels). With `profile`, times its stages and counts its
     /// work per layer. Fails only when `t`'s Slang surfaces do not build.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn part(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, queue: &mut crate::gpu::Queue, t: &Trace, slot: u32, part: u32, parts: u32, size: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer, mut profile: Option<&mut crate::profile::Profile>) -> Result<(), String> {
+    pub(crate) fn part(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, queue: &mut crate::gpu::Queue, t: &Trace, slot: u32, part: u32, parts: u32, size: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer, pool: gpu::Buffer, mut profile: Option<&mut crate::profile::Profile>) -> Result<(), String> {
         let entered = std::time::Instant::now();
         self.slots = self.slots.max(slot + 1);
         let mut owners: Vec<Arc<str>> = Vec::new();
@@ -758,12 +967,36 @@ impl Tracer {
         let b = |v: u32| f32::from_bits(v);
         // Temporal history (a frame of one part: sub-frames already
         // average over the shutter) follows each layer from frame to frame.
-        let temporal = t.options.temporal && parts == 1;
+        // The fast mode traces half the texels each way, through one
+        // point of each (Halton 2, 3 by frame: Ray Reconstruction is told
+        // which, and builds the full picture over the frames), with no
+        // lens: depth of field would have to come after it.
+        let full = size;
+        let fast = t.options.fast && parts == 1 && self.ngx.get_or_insert_with(|| crate::ngx::Ngx::load(context)).is_ok();
+        let size = if fast { (full.0.div_ceil(2), full.1.div_ceil(2)) } else { full };
+        let place = [t.origin[0], t.origin[1], t.factor[0] * full.0 as f32 / size.0 as f32, t.factor[1] * full.1 as f32 / size.1 as f32];
+        let lens = if fast {
+            let halton = |mut i: u64, b: u64| {
+                let (mut f, mut r) = (1.0f32, 0.0f32);
+                while i > 0 {
+                    f /= b as f32;
+                    r += f * (i % b) as f32;
+                    i /= b;
+                }
+                r.clamp(0.01, 0.99)
+            };
+            let k = self.frame % 64 + 1;
+            [0.0, 0.0, halton(k, 2), halton(k, 3)]
+        } else {
+            [t.lens[0], t.lens[1], 0.0, 0.0]
+        };
+        // (Its motion is the temporal history's.)
+        let temporal = (t.options.temporal || fast) && parts == 1;
         let profiling = profile.is_some();
         inst_rows.reserve(t.instances.len() * INST_ROWS);
         records.reserve(t.instances.len() + 1);
         for inst in &t.instances {
-            let Some(([attr_base, idx_base, tag_base], address)) = self.geometry(context, encoder, &inst.key, &inst.mesh) else { continue };
+            let Some(([attr_base, idx_base, tag_base], address)) = self.geometry(context, encoder, &inst.key, &inst.mesh, pool) else { continue };
             let mat_base = (mat_rows.len() / crate::mesh3d::MAT_ROWS) as u32;
             mat_rows.extend_from_slice(&inst.materials);
             if profiling {
@@ -904,7 +1137,7 @@ impl Tracer {
         // per 8 × 4 block [lookups summed, most], per material [hits, lookups].
         let counts = if profiling {
             let blocks = (size.0.div_ceil(8) * size.1.div_ceil(4)) as usize;
-            let b = unit.counts.write(context, "trace profile", &vec![0u8; (PROF_HEADER + blocks * 2 + owners.len() * 2) * 4], &mut retired);
+            let b = unit.counts.write(context, "trace profile", &vec![0u8; (PROF_HEADER + blocks * 2 + owners.len() * 2 + blocks * PROF_LANES * 2) * 4], &mut retired);
             self.sets[set].counts.push((b, owners, blocks));
             b
         } else {
@@ -914,7 +1147,7 @@ impl Tracer {
         for r in retired {
             self.retire(r);
         }
-        let [attr, idx, tag] = self.shared(context);
+        let [attr, idx, tag] = self.shared(context, encoder);
         // The environment image: uploaded once while it stays the same.
         let env_buf = match &t.env {
             Some(e) => {
@@ -957,7 +1190,7 @@ impl Tracer {
             let (read, write) = (h.buffers[h.current], h.buffers[1 - h.current]);
             h.current = 1 - h.current;
             h.cam = [t.focal, t.centre[0], t.centre[1], 1.0];
-            h.place = [t.origin[0], t.origin[1], t.factor[0], t.factor[1]];
+            h.place = place;
             h.root = r(&t.root);
             ((read, write), prev)
         } else {
@@ -967,18 +1200,18 @@ impl Tracer {
             size: [size.0, size.1, 0, t.options.spp.max(1)],
             opts: [t.options.bounces.max(1), t.seed, CARD_INSTANCE, t.cards.len() as u32],
             cam: [t.focal, t.centre[0], t.centre[1], 0.0],
-            place: [t.origin[0], t.origin[1], t.factor[0], t.factor[1]],
+            place,
             root: r(&t.root),
             inv_root: r(&t.inv_root),
-            lens: [t.lens[0], t.lens[1], 0.0, 0.0],
-            denoise: [0, temporal as u32, 0, 0],
+            lens,
+            denoise: [0, temporal as u32, fast as u32, 0],
             prev_cam: prev.0,
             prev_place: prev.1,
             prev_root: prev.2,
             band: [0, size.1, if profiling { density_repeat() } else { 0 }, part | parts.max(1) << 16],
         };
         let bind = Bindings { tlas, inst: inst_buf, attr, idx, tag, mat: mat_buf, light: light_buf, card: card_buf, env: env_buf, counts, bounds: bounds_buf, jobs: jobs_buf };
-        let state = Slot { size, uniforms, bind, temporal, denoise: t.options.denoise, hist, current: 0, denoised: false, upload: false };
+        let state = Slot { size, uniforms, bind, temporal, denoise: t.options.denoise, hist, current: 0, denoised: false, upload: false, fast: fast.then_some(full), shutter: t.options.shutter, lens: [t.focal * t.lens[0] / t.lens[1].max(1.0) / t.factor[0].max(1e-6) * 0.5, t.lens[1]] };
         if !jobs.is_empty() {
             let mut pass = encoder.compute("volume bounds");
             let mut pc = pass.with(&self.bounds);
@@ -988,6 +1221,7 @@ impl Tracer {
         if let Some(p) = profile.as_deref_mut() {
             p.stage("gpu frame › trace setup › tables and structures", building);
         }
+        let seen = fast.then(|| self.fast_slot(context, encoder, slot, size, full).seen);
         let compiling = std::time::Instant::now();
         {
             let profiled = self.profile;
@@ -998,6 +1232,7 @@ impl Tracer {
                         // A build with only this scene's features; the general one if it fails.
                         context
                             .try_create_shader(gpu::ShaderDesc { source: &specialise(features, profiled) })
+                            .map_err(|e| eprintln!("the trace kernel for features {features:#b} did not build (the general one is used): {e}"))
                             .ok()
                             .map(|shader| context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "trace", data_layouts: &[&TraceData::layout()], compute: shader.at("trace") }))
                     });
@@ -1027,6 +1262,24 @@ impl Tracer {
                 }
                 if k + 1 < bands {
                     queue.split(context, encoder, profile.as_deref_mut());
+                }
+            }
+            // The fast mode's visibility: four primary paths a texel of
+            // the full picture, through the same kernel (pt.wgsl `visible`).
+            if let Some(seen) = seen {
+                let u = Uniforms { size: [full.0, full.1, 0, 4], place: [t.origin[0], t.origin[1], t.factor[0], t.factor[1]], lens: [0.0; 4], denoise: [0, 0, 2, 0], ..uniforms };
+                // (In bands as the trace, four times as tall: a path here
+                // is mostly one ray. One dispatch of the whole picture
+                // tripped the driver's watchdog on a scene with volumes.)
+                let band = band_rows(full.0, 4).min(TRACE_BAND_ROWS * 4);
+                let bands = full.1.div_ceil(band);
+                for k in 0..bands {
+                    queue.split(context, encoder, profile.as_deref_mut());
+                    let rows = [k * band, ((k + 1) * band).min(full.1)];
+                    let mut pass = encoder.compute("trace visibility");
+                    let mut pc = pass.with(pipeline);
+                    pc.bind(0, &state.data(Uniforms { band: [rows[0], rows[1], u.band[2], u.band[3]], ..u }, groups, images, guides, hdr[0], seen));
+                    pc.dispatch([full.0.div_ceil(8), (rows[1] - rows[0]).div_ceil(8), 1]);
                 }
             }
         }
@@ -1079,6 +1332,11 @@ impl Tracer {
         let texels = (state.size.0 * state.size.1) as u64;
         let (guides, hdr) = self.work(context, slot, texels);
         let groups_x = [state.size.0.div_ceil(8), state.size.1.div_ceil(8), 1];
+        if let Some(full) = state.fast {
+            self.reconstruct(context, encoder, slot, &state, full, groups, images, guides, hdr);
+            self.sets[set].slots[slot as usize] = Some(state);
+            return;
+        }
         if state.temporal {
             let mut pass = encoder.compute("trace temporal");
             let mut pc = pass.with(&self.temporal);
@@ -1160,6 +1418,132 @@ impl Tracer {
     /// Runs Open Image Denoise on traced list `slot` of the frame in set
     /// `set`, whose `settle` has finished on the GPU. When it fails the
     /// built-in filter takes over (and a warning says why).
+    /// Begins Open Image Denoise on traced list `slot` of the frame in
+    /// `set` without waiting for it (its traces are done): `denoise` then
+    /// waits and takes the result, and the next frame is recorded
+    /// meanwhile. Where it cannot be begun (the first shared picture,
+    /// which is checked; another picture under way), `denoise` does all
+    /// of it.
+    pub(crate) fn denoise_start(&mut self, context: &gpu::Context, set: usize, slot: u32) {
+        let Some(state) = self.sets[set].slots.get(slot as usize).and_then(|s| s.as_ref()) else { return };
+        if !state.denoised {
+            return;
+        }
+        let size = state.size;
+        let n = (size.0 * size.1) as usize;
+        let Some(d) = self.sets[set].work[slot as usize].as_ref().and_then(|w| w.oidn) else { return };
+        let Some(Ok(denoiser)) = self.oidn.as_mut() else { return };
+        match d.way {
+            Way::Copied { down, .. } => {
+                context.sync_buffer(down);
+                // SAFETY: the copy finished; the buffer holds n · 36 bytes
+                // of f32, and no frame in flight touches this set's.
+                let input = unsafe { std::slice::from_raw_parts(down.data() as *const f32, n * 9) };
+                denoiser.start((set as u64) << 32 | slot as u64, size.0 as usize, size.1 as usize, input);
+            }
+            Way::Shared { id, .. } if self.sharing == Sharing::Checked => {
+                denoiser.start_shared(id);
+            }
+            Way::Shared { .. } => {}
+        }
+    }
+
+    /// Traced list `slot`'s images and buffers in the fast mode, for a
+    /// trace of `low` texels and a picture of `full` (made on first use,
+    /// and again when the sizes change).
+    fn fast_slot(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, slot: u32, low: (u32, u32), full: (u32, u32)) -> Fast {
+        if self.fast.get(&slot).is_some_and(|f| f.low != low || f.full != full) {
+            // (Kept until the tracer goes: frames in flight may read it.)
+            let old = self.fast.remove(&slot).unwrap();
+            self.fast_old.push(old);
+        }
+        if !self.fast.contains_key(&slot) {
+            let n = (low.0 * low.1) as u64;
+            let texels = full.0 as u64 * full.1 as u64;
+            let texture = |name, format, (width, height): (u32, u32)| {
+                let texture = context.create_texture(gpu::TextureDesc { name, format, size: gpu::Extent { width, height, depth: 1 }, array_layer_count: 1, mip_level_count: 1, sample_count: 1, dimension: gpu::TextureDimension::D2, usage: gpu::TextureUsage::COPY | gpu::TextureUsage::RESOURCE | gpu::TextureUsage::STORAGE, external: None });
+                let view = context.create_texture_view(texture, gpu::TextureViewDesc { name, format, dimension: gpu::ViewDimension::D2, subresources: &Default::default() });
+                (texture, view)
+            };
+            let buffer = |name, size: u64| context.create_buffer(gpu::BufferDesc { name, size, memory: gpu::Memory::Device });
+            let f = Fast {
+                low,
+                full,
+                feature: None,
+                textures: FAST_IMAGES.map(|(name, format, _, _)| texture(name, format, if name == "ray reconstruction output" { full } else { low })),
+                packed: buffer("ray reconstruction input", n * FAST_FLOATS * 4),
+                out: buffer("ray reconstruction output", texels * 16),
+                seen: buffer("fast mode visibility", texels * 32),
+                dof: buffer("fast mode depth of field", texels * 32),
+            };
+            for (t, _) in f.textures {
+                encoder.init_texture(t);
+            }
+            self.fast.insert(slot, f);
+        }
+        self.fast[&slot]
+    }
+
+    /// The fast mode's middle: the trace's texels packed into images, Ray
+    /// Reconstruction on them (its history is the list's, frame after
+    /// frame), and its picture, `full` texels, into a buffer for
+    /// `resolve_fast`. All on the GPU, in the frame's own commands.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, slot: u32, state: &Slot, full: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer, guides: gpu::Buffer, hdr: [gpu::Buffer; 2]) {
+        let low = state.size;
+        let n = (low.0 * low.1) as u64;
+        let f = self.fast_slot(context, encoder, slot, low, full);
+        {
+            let mut pass = encoder.compute("ray reconstruction pack");
+            let mut pc = pass.with(&self.ngx_pack);
+            let mut data = state.data(state.uniforms, groups, images, guides, hdr[0], hdr[1]);
+            data.b_bounds = f.packed.into();
+            pc.bind(0, &data);
+            pc.dispatch([low.0.div_ceil(8), low.1.div_ceil(8), 1]);
+        }
+        {
+            let mut copy = encoder.transfer("ray reconstruction images");
+            let mut at = 0u64;
+            for (k, (_, _, floats, _)) in FAST_IMAGES.iter().enumerate().take(6) {
+                copy.copy_buffer_to_texture(f.packed.at(at), low.0 * floats * 4, f.textures[k].0.into(), gpu::Extent { width: low.0, height: low.1, depth: 1 });
+                at += n * *floats as u64 * 4;
+            }
+        }
+        let image = |k: usize, (width, height): (u32, u32)| crate::ngx::Image { image: f.textures[k].0.raw_image(), view: f.textures[k].1.raw_view(), format: FAST_IMAGES[k].3, width, height, pad: 0 };
+        let frame = crate::ngx::Frame {
+            color: image(0, low),
+            diffuse: image(1, low),
+            specular: image(2, low),
+            normals: image(3, low),
+            depth: image(4, low),
+            motion: image(5, low),
+            output: image(6, full),
+            jitter: [state.uniforms.lens[2] - 0.5, state.uniforms.lens[3] - 0.5],
+            width: low.0,
+            height: low.1,
+            // (No frame before this one to go by.)
+            reset: (f.feature.is_none() || state.uniforms.prev_cam[3] < 0.5) as u32,
+            pad: 0,
+        };
+        let Some(Ok(ngx)) = self.ngx.as_ref() else { return };
+        let done = encoder.foreign("ray reconstruction", |cmd| {
+            let feature = f.feature.or_else(|| ngx.create(cmd, low, full));
+            (feature, feature.is_some_and(|feature| ngx.evaluate(cmd, feature, &frame)))
+        });
+        if let Some(entry) = self.fast.get_mut(&slot) {
+            entry.feature = done.0;
+        }
+        if !done.1 {
+            // (This frame's picture is lost; the next are traced as usual.)
+            self.ngx = Some(Err("NVIDIA Ray Reconstruction failed on a frame".into()));
+            return;
+        }
+        encoder.transfer("ray reconstruction picture").copy_texture_to_buffer(f.textures[6].0.into(), f.out.into(), full.0 * 16, gpu::Extent { width: full.0, height: full.1, depth: 1 });
+    }
+
+    /// Open Image Denoise on traced list `slot` of the frame in `set`
+    /// (waiting for it where `denoise_start` began it), and its result on
+    /// its way back to the tracer.
     pub(crate) fn denoise(&mut self, context: &gpu::Context, set: usize, slot: u32) {
         let Some(state) = self.sets[set].slots.get(slot as usize).and_then(|s| s.as_ref()) else { return };
         if !state.denoised {
@@ -1179,7 +1563,11 @@ impl Tracer {
                     // n · 12 bytes of f32, and no frame in flight touches
                     // this set's.
                     let (input, output) = unsafe { (std::slice::from_raw_parts(down.data() as *const f32, n * 9), std::slice::from_raw_parts_mut(up.data() as *mut f32, n * 3)) };
-                    denoiser.denoise(size.0 as usize, size.1 as usize, input, output)?;
+                    // (Begun by `denoise_start`, or all of it here.)
+                    match denoiser.take((set as u64) << 32 | slot as u64, output) {
+                        Some(taken) => taken?,
+                        None => denoiser.denoise(size.0 as usize, size.1 as usize, input, output)?,
+                    }
                     context.sync_buffer(up);
                     Ok(true)
                 }
@@ -1243,6 +1631,32 @@ impl Tracer {
         let texels = (state.size.0 * state.size.1) as u64;
         let (guides, hdr) = self.work(context, slot, texels);
         let groups_x = [state.size.0.div_ceil(8), state.size.1.div_ceil(8), 1];
+        if let (Some(full), Some(f)) = (state.fast, self.fast.get(&slot)) {
+            // Depth of field on Ray Reconstruction's picture, then the
+            // motion blur and the look.
+            let lens = state.lens[0] > 0.0;
+            if lens {
+                let u = Uniforms { denoise: [full.0, full.1, 0, 0], lens: [state.lens[0], state.lens[1], 0.0, 0.0], ..state.uniforms };
+                let mut pass = encoder.compute("fast depth of field");
+                let mut pc = pass.with(&self.dof_fast);
+                let mut data = state.data(u, groups, images, guides, f.dof, f.seen);
+                data.b_bounds = f.out.into();
+                pc.bind(0, &data);
+                pc.dispatch([full.0.div_ceil(8), full.1.div_ceil(8), 1]);
+            }
+            for &offset in offsets {
+                let l = state.uniforms.lens;
+                let u = Uniforms { size: [state.size.0, state.size.1, offset, state.uniforms.size[3]], denoise: [full.0, full.1, 0, 0], lens: [state.shutter, lens as u32 as f32, l[2], l[3]], ..state.uniforms };
+                let mut pass = encoder.compute("trace resolve");
+                let mut pc = pass.with(&self.resolve_fast);
+                let mut data = state.data(u, groups, images, guides, if lens { f.dof } else { hdr[0] }, f.seen);
+                data.b_bounds = f.out.into();
+                pc.bind(0, &data);
+                pc.dispatch([full.0.div_ceil(8), full.1.div_ceil(8), 1]);
+            }
+            self.sets[set].slots[slot as usize] = Some(state);
+            return;
+        }
         if state.denoised {
             // Back as lighting over albedo: the resolve pass multiplies the
             // same albedo in again, which gives OIDN's colour exactly.
@@ -1310,12 +1724,14 @@ impl Tracer {
         let k = crate::profile::COUNT_EVERY;
         let Some(s) = self.sets.get_mut(set) else { return };
         for (buffer, owners, blocks) in s.counts.drain(..) {
-            let n = PROF_HEADER + blocks * 2 + owners.len() * 2;
+            let lanes = PROF_HEADER + blocks * 2 + owners.len() * 2;
+            let n = lanes + blocks * PROF_LANES * 2;
             // SAFETY: a mapped buffer of n u32 counters; the GPU is done with it.
             let c = unsafe { std::slice::from_raw_parts(buffer.data() as *const u32, n) };
             profile.rays += c[0] as u64 * k;
             profile.candidates += c[1] as u64 * k;
             profile.density_empty += c[2] as u64 * k;
+            profile.shadows += c[3] as u64 * k;
             for d in 0..4 {
                 profile.rays_by_scatter[d] += c[4 + d] as u64 * k;
                 profile.lookups_by_scatter[d] += c[8 + d] as u64 * k;
@@ -1324,6 +1740,10 @@ impl Tracer {
                 let (sum, most) = (c[PROF_HEADER + b * 2] as u64, c[PROF_HEADER + 1 + b * 2] as u64);
                 profile.lane_lookups += sum;
                 profile.lane_slots += most * 32;
+            }
+            for b in 0..blocks * PROF_LANES {
+                profile.lane_rays += c[lanes + b * 2] as u64;
+                profile.lane_ray_slots += c[lanes + 1 + b * 2] as u64 * 32;
             }
             let m0 = PROF_HEADER + blocks * 2;
             for (m, id) in owners.iter().enumerate() {
@@ -1336,6 +1756,9 @@ impl Tracer {
 
     /// Why traced frames were not denoised with Open Image Denoise, if so.
     pub(crate) fn denoise_warning(&self) -> Option<String> {
+        if let Some(Err(e)) = &self.ngx {
+            return Some(format!("the fast mode was not used: {e}"));
+        }
         match (&self.oidn, &self.sharing) {
             (Some(Err(e)), _) => Some(format!("path tracing used the built-in denoiser: {e}")),
             // (Not a fault of the picture: only slower.)
@@ -1372,13 +1795,33 @@ impl Tracer {
         }
         self.slots = 0;
         self.begin_frame(context, u64::MAX, u64::MAX, 0);
+        for f in self.fast.drain().map(|(_, f)| f).chain(self.fast_old.drain(..)) {
+            if let (Some(feature), Some(Ok(ngx))) = (f.feature, self.ngx.as_ref()) {
+                ngx.release(feature);
+            }
+            for (t, v) in f.textures {
+                context.destroy_texture_view(v);
+                context.destroy_texture(t);
+            }
+            context.destroy_buffer(f.packed);
+            context.destroy_buffer(f.out);
+            context.destroy_buffer(f.seen);
+            context.destroy_buffer(f.dof);
+        }
+        if let Some(Ok(ngx)) = self.ngx.take() {
+            ngx.shutdown();
+        }
         for b in self.shared.take().into_iter().flatten() {
             context.destroy_buffer(b);
         }
+        if let Some(mut p) = self.from_pool.take() {
+            context.destroy_compute_pipeline(&mut p);
+        }
         for (_, g) in self.geometry.drain() {
             context.destroy_acceleration_structure(g.blas);
-            context.destroy_buffer(g.positions);
-            context.destroy_buffer(g.indices);
+            for b in g.built_from.into_iter().flatten() {
+                context.destroy_buffer(b);
+            }
         }
         if let Some((_, _, b)) = self.env.take() {
             context.destroy_buffer(b);
@@ -2579,7 +3022,7 @@ mod physics_tests {
     /// Frames pushed through the renderer (the next begun while the GPU
     /// draws this one) are the frames it draws one at a time, in order:
     /// plain, motion-blurred, and with the denoiser between the two halves
-    /// of each frame (three frames in flight).
+    /// of each frame (four frames in flight).
     #[test]
     fn frames_in_flight_are_the_frames_drawn_one_at_a_time() {
         for (blur, oidn) in [(0u32, false), (4, false), (0, true), (4, true)] {
@@ -2604,7 +3047,7 @@ mod physics_tests {
             while let Some(frame) = many.pop().unwrap() {
                 got.push(frame);
             }
-            assert_eq!(most, if oidn { 2 } else { 1 }, "frames left on the GPU when a push returns (blur {blur}, denoiser {oidn})");
+            assert_eq!(most, if oidn { 3 } else { 1 }, "frames left on the GPU when a push returns (blur {blur}, denoiser {oidn})");
             assert_eq!(got.len(), want.len());
             for (k, (a, b)) in got.iter().zip(&want).enumerate() {
                 assert!(a == b, "frame {k} differs (blur {blur}, denoiser between {oidn})");
@@ -2654,7 +3097,7 @@ mod physics_tests {
         let c = Compiled::new(&p);
         let times = [0.0, 0.1, 0.2, 0.3];
         let want: Vec<image::RgbaImage> = times.iter().map(|t| copied.render(&c, *t)).collect();
-        // Pushed, so three frames (and three sets of shared memory) are in flight.
+        // Pushed, so four frames (and four sets of shared memory) are in flight.
         let mut got = Vec::new();
         for t in times {
             got.extend(shared.push(&c, t).unwrap());
@@ -2796,6 +3239,9 @@ mod physics_tests {
 
 /// Counters before the per-block ones (pt.wgsl `PROF_HEADER`).
 const PROF_HEADER: usize = 12;
+
+/// Samples whose ray queries are counted by lockstep block (pt.wgsl `PROF_LANES`).
+const PROF_LANES: usize = 16;
 
 /// Cells of a volume's density bounds (pt.wgsl `BOUNDS_N`³).
 const BOUNDS_CELLS: usize = 32 * 32 * 32;

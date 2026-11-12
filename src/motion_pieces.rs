@@ -482,7 +482,9 @@ impl Drop for Worker {
 /// Renders one piece: straight RGBA, opacity applied; a full-frame piece
 /// sits on its opaque background (black when the background is clear).
 fn render_piece(renderers: &mut HashMap<PathBuf, Renderer>, job: &PieceJob) -> RgbaImage {
-    let renderer = renderers.entry(job.dir.clone()).or_insert_with(|| Renderer::new(Some(&job.dir), RenderOptions::default()));
+    // (The GPU when there is one, else the CPU: a machine without Vulkan
+    // still shows and exports its pieces.)
+    let renderer = renderers.entry(job.dir.clone()).or_insert_with(|| Renderer::new(Some(&job.dir), RenderOptions { backend: lahza_motion_render::Backend::Auto, ..Default::default() }));
     renderer.set_scale(job.scale);
     renderer.set_motion_blur(job.blur);
     renderer.set_path(job.path);

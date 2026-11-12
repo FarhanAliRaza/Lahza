@@ -232,7 +232,7 @@ fn a_frames_image_needs_are_counted_as_the_renderer_holds_them() {
     let mut r = Renderer::new(Some(&dir), RenderOptions { backend: Backend::Cpu, ..Default::default() });
     r.render(&c, 0.0);
     assert!(r.dropped().is_empty(), "{:?}", r.dropped());
-    let need = list::frame_image_texels(&c.frame(0.0), 1.0, &mut |src| images::natural_size(&dir.join(src)));
+    let need = list::frame_image_texels(&c.frame(0.0), 1.0, &mut |src| images::natural_size(&dir.join(src)), &mut |_| None);
     assert_eq!(need, r.images.texels.len());
     // A 200 px picture and a 60 px ball: far less than the files (2.7 M
     // and 5.6 M texels with their mips).

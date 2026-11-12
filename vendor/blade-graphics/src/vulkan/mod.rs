@@ -157,6 +157,8 @@ pub struct Context {
     queue_family_index: u32,
     queue: Mutex<Queue>,
     physical_device: vk::PhysicalDevice,
+    /// Lahza: the device was made with NVIDIA NGX's extensions.
+    ngx: bool,
     naga_flags: naga::back::spv::WriterFlags,
     shader_debug_path: Option<PathBuf>,
     min_buffer_alignment: u64,
@@ -202,6 +204,22 @@ pub struct Texture {
     target_size: [u16; 2],
     format: crate::TextureFormat,
     external: Option<crate::ExternalMemorySource>,
+}
+
+impl Texture {
+    /// Lahza: the `VkImage`, for NVIDIA's NGX.
+    pub fn raw_image(&self) -> u64 {
+        use ash::vk::Handle as _;
+        self.raw.as_raw()
+    }
+}
+
+impl TextureView {
+    /// Lahza: the `VkImageView`, for NVIDIA's NGX.
+    pub fn raw_view(&self) -> u64 {
+        use ash::vk::Handle as _;
+        self.raw.as_raw()
+    }
 }
 
 impl Default for Texture {

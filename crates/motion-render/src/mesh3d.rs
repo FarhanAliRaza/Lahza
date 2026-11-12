@@ -45,9 +45,19 @@ pub struct MeshCache {
     sides: HashMap<usize, Arc<Vec<f32>>>,
     /// Per generated mesh: the mesh as the GPU's mesh pool takes it.
     pooled: HashMap<usize, Arc<Pooled>>,
+    /// Per generated mesh: `Mesh::uv_stretch`, measured once.
+    stretch: HashMap<usize, Option<f64>>,
+    /// The key of the mesh parameters asked for last (by their address,
+    /// within one list's building: a layer's mesh is looked up for its
+    /// maps, then for its geometry).
+    last_key: Option<(usize, Vec<u8>)>,
     /// Slang meshes the GPU generates in its pool (`Pooled::generated`),
-    /// by key, with the frame that last drew each.
+    /// by key, with the frame that last drew each. Meshes it moves by a
+    /// deformer too (`Pooled::deformed`).
     generated: HashMap<Vec<u8>, (Arc<Pooled>, u64)>,
+    /// Meshes readied for deformers the GPU runs, by the key of the mesh
+    /// before the move, with the frame that last asked for each.
+    deform_bases: HashMap<Vec<u8>, (Arc<DeformBase>, u64)>,
     /// Whether the GPU generates the Slang meshes it can (not with
     /// `LAHZA_SLANG_MESH_CPU=1`: the CPU then generates them all, to
     /// compare).
@@ -100,6 +110,9 @@ struct RunMesh {
     occludes: bool,
     /// Drawn in a picture of its own (effects, matte), not with the list.
     isolated: bool,
+    /// It crosses the camera (`bounds` are everywhere). Such a mesh casts
+    /// no shadow: its box would stretch the maps' frames over it.
+    crosses: bool,
     bounds: [f64; 4],
 }
 
@@ -146,19 +159,22 @@ impl MeshCache {
         Self { root: root.map(std::path::Path::to_path_buf), gpu_geometry, ..Default::default() }
     }
 
-    pub(crate) fn begin(&mut self, compact: bool) {
+    /// A new frame's lists (or, for `check`, its meshes' measures).
+    pub fn begin(&mut self, compact: bool) {
         self.compact = compact;
         self.frame += 1;
         self.batches.clear();
         self.runs.clear();
         self.placed.clear();
         self.textures.clear();
+        self.last_key = None;
         self.surfaces = None;
         // Animated Slang geometry is new every frame: only the last frame's
         // is kept, however big it is.
         let frame = self.frame;
         // (Nothing to keep of a mesh the GPU makes but its parameters.)
         self.generated.retain(|_, (_, used)| *used + 2 > frame);
+        self.deform_bases.retain(|_, (_, used)| *used + 2 > frame);
         let gone = |used: u64, animated: bool| animated && used + 1 < frame;
         let full = self.meshes.len() > 96;
         if full || self.meshes.values().any(|(_, used, animated)| gone(*used, *animated)) {
@@ -167,6 +183,7 @@ impl MeshCache {
             let live: std::collections::HashSet<usize> = self.meshes.values().map(|(m, ..)| Arc::as_ptr(m) as usize).collect();
             self.sides.retain(|k, _| live.contains(k));
             self.pooled.retain(|k, _| live.contains(k));
+            self.stretch.retain(|k, _| live.contains(k));
         }
     }
 
@@ -202,15 +219,24 @@ impl MeshCache {
                 if let Some(p) = m.materials.iter().find_map(|x| x.slang.as_ref().and_then(|s| s.program())) {
                     self.surfaces = Some(p);
                 }
-                let b = m.screen_bounds()?;
-                let pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])].map(|(x, y)| root.apply(x, y));
-                let bounds = [
-                    pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
-                    pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
-                    pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
-                    pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
-                ];
-                Some(RunMesh { index, state: (**m).clone(), root, occludes: !see_through(l), isolated: l.is_isolated(), bounds })
+                // A mesh that crosses the camera (a ground plane reaching
+                // behind it) has no box on screen: it may be anywhere, and
+                // still hides the list's other batches and casts on them.
+                // (Each batch takes of it what is in front of the camera.)
+                let on_screen = m.screen_bounds();
+                let bounds = match on_screen {
+                    Some(b) => {
+                        let pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])].map(|(x, y)| root.apply(x, y));
+                        [
+                            pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                            pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                            pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+                            pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+                        ]
+                    }
+                    None => [f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY],
+                };
+                Some(RunMesh { index, state: (**m).clone(), root, occludes: !see_through(l), isolated: l.is_isolated(), bounds, crosses: on_screen.is_none() })
             })
             .collect();
         self.runs.push(Run { serial: self.serial, meshes, cards: Vec::new(), current: 0 });
@@ -264,11 +290,24 @@ impl MeshCache {
         // Cards are drawn after the opaque meshes and blend over them, so
         // they hide only other cards (in another cards' batch).
         let started = std::time::Instant::now();
+        // Each mesh as an instance, made when it first hides a batch:
+        // with every layer a picture of its own (depth of field), a mesh
+        // hides hundreds of them.
+        let mut placed: Vec<Option<Option<Placed>>> = run.meshes.iter().map(|_| None).collect();
         for b in batches.iter_mut().filter(|b| b.list == run.serial) {
-            for rm in &run.meshes {
+            // The GPU's visibility pass draws a list's opaque batches on
+            // one page, wherever each is placed (`gpu::TargetVis`): an
+            // opaque batch needs no copies of the others there. (Batches
+            // that are see-through, and cards, have pages of their own.)
+            let meshes: &[RunMesh] = if self.compact && !b.see_through && !b.cards_only { &[] } else { &run.meshes };
+            for (k, rm) in meshes.iter().enumerate() {
                 let overlaps = rm.bounds[2] >= b.bounds[0] && rm.bounds[0] <= b.bounds[2] && rm.bounds[3] >= b.bounds[1] && rm.bounds[1] <= b.bounds[3];
                 if rm.occludes && (rm.isolated || b.isolated) && overlaps && !b.members.contains(&rm.index) {
-                    b.add_occluder(self, &rm.state, rm.root);
+                    if !self.compact {
+                        b.add_occluder(self, &rm.state, rm.root, None);
+                    } else if let Some(p) = placed[k].get_or_insert_with(|| Placed::new(self, &rm.state, rm.root)) {
+                        b.add_occluder(self, &rm.state, rm.root, Some(p));
+                    }
                 }
             }
             if !b.cards_only {
@@ -301,7 +340,7 @@ impl MeshCache {
             // casts (each mesh's transform and box) and the maps' frames.
             let mut casters = Casters { rows: Vec::new(), meshes: Vec::new() };
             let mut boxes: Vec<CasterBox> = Vec::new();
-            for rm in &run.meshes {
+            for rm in run.meshes.iter().filter(|rm| !rm.crosses) {
                 if rm.state.materials.iter().all(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some()) {
                     continue;
                 }
@@ -340,7 +379,7 @@ impl MeshCache {
         }
         let mut parts: Vec<Part> = Vec::new();
         let (mut verts, mut tris) = (0usize, 0usize);
-        for rm in &run.meshes {
+        for rm in run.meshes.iter().filter(|rm| !rm.crosses) {
             if rm.state.materials.iter().all(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some()) {
                 continue;
             }
@@ -419,7 +458,9 @@ impl MeshCache {
     /// A mesh layer as an instance for the path tracer: its geometry, its
     /// object → camera transform and its materials by part and segment.
     pub(crate) fn trace_instance(&mut self, id: Arc<str>, m: &MeshState, opacity: f64, scale: f64) -> Option<crate::pt::TraceInstance> {
-        let mesh = self.get(m)?;
+        let key = self.key_of(m);
+        // A Slang mesh the GPU generates in its pool is traced from there.
+        let mesh = if self.gpu_geometry && (m.params.gpu_generator().is_some() || m.params.gpu_deformer().is_some()) { crate::pt::TraceMesh::Pool(self.pooled(m)?, u32::MAX) } else { crate::pt::TraceMesh::Cpu(self.get_keyed(m, &key)?) };
         let mv = m.camera.view.then(m.world).0;
         let transform = [0, 1, 2].map(|r| [mv[r * 4] as f32, mv[r * 4 + 1] as f32, mv[r * 4 + 2] as f32, mv[r * 4 + 3] as f32]);
         let w = m.world.0;
@@ -433,7 +474,18 @@ impl MeshCache {
                 materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale, &self.textures));
             }
         }
-        Some(crate::pt::TraceInstance { id, mesh, key: m.params.key(), transform, world, materials, parts })
+        Some(crate::pt::TraceInstance { id, mesh, key, transform, world, materials, parts })
+    }
+
+    /// How far `m`'s texture coordinates stretch its maps over it
+    /// (`Mesh::uv_stretch`). None where that is not known without making
+    /// the mesh for it: one the GPU generates, one new every frame.
+    pub fn uv_stretch(&mut self, m: &MeshState) -> Option<f64> {
+        if m.params.animated() || self.gpu_geometry && (m.params.gpu_generator().is_some() || m.params.gpu_deformer().is_some()) {
+            return None;
+        }
+        let mesh = self.get(m)?;
+        *self.stretch.entry(Arc::as_ptr(&mesh) as usize).or_insert_with(|| mesh.uv_stretch())
     }
 
     /// The environment image of these lights, loaded once.
@@ -497,6 +549,45 @@ impl MeshCache {
                 return Some(p);
             }
         }
+        // One the GPU moves by its deformer: the mesh before the move is
+        // readied once, and the moved one is the GPU's to make.
+        if self.gpu_geometry && m.params.gpu_deformer().is_some() {
+            let key = m.params.key();
+            if let Some((p, used)) = self.generated.get_mut(&key) {
+                *used = self.frame;
+                return Some(p.clone());
+            }
+            // A mesh the GPU generates too: made and moved there.
+            if let Some(plain) = m.params.gpu_deformed_generator() {
+                let made = self.pooled(&MeshState { params: Arc::new(plain), ..m.clone() }).and_then(|generated| Pooled::deformed_generated(key.clone().into(), generated, m.params.clone()));
+                if let Some(p) = made {
+                    let p = Arc::new(p);
+                    self.generated.insert(key, (p.clone(), self.frame));
+                    return Some(p);
+                }
+            }
+            if let Some(base) = self.deform_base(m) {
+                let started = std::time::Instant::now();
+                let made = Pooled::deformed(key.clone().into(), base, m.params.clone());
+                self.busy += started.elapsed();
+                match made {
+                    Ok(Some(p)) => {
+                        let p = Arc::new(p);
+                        self.generated.insert(key, (p.clone(), self.frame));
+                        return Some(p);
+                    }
+                    Ok(None) => {}
+                    // Not drawn as asked: an error, said once (a failing
+                    // mesh is tried again every frame).
+                    Err(e) => {
+                        if !self.dropped.contains(&e) {
+                            self.dropped.push(e);
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
         let mesh = self.get(m)?;
         let at = Arc::as_ptr(&mesh) as usize;
         if let Some(p) = self.pooled.get(&at) {
@@ -507,9 +598,46 @@ impl MeshCache {
         Some(p)
     }
 
+    /// `m`'s mesh before its deformer, readied for it (`DeformBase`).
+    fn deform_base(&mut self, m: &MeshState) -> Option<Arc<DeformBase>> {
+        let d = m.params.deform.as_ref()?;
+        let plain = Arc::new(mesh::MeshParams { deform: None, ..(*m.params).clone() });
+        let mut key = plain.key();
+        key.extend_from_slice(&d.subdivide.to_le_bytes());
+        key.extend_from_slice(b"before deform");
+        if let Some((base, used)) = self.deform_bases.get_mut(&key) {
+            *used = self.frame;
+            return Some(base.clone());
+        }
+        let mesh = self.get(&MeshState { params: plain, ..m.clone() })?;
+        let started = std::time::Instant::now();
+        let base = Arc::new(DeformBase { key: key.clone().into(), base: lahza_motion_core::slang_mesh::deform_base((*mesh).clone(), d.subdivide) });
+        self.busy += started.elapsed();
+        self.deform_bases.insert(key, (base.clone(), self.frame));
+        Some(base)
+    }
+
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
-        let key = m.params.key();
-        if let Some((mesh, used, _)) = self.meshes.get_mut(&key) {
+        let key = self.key_of(m);
+        self.get_keyed(m, &key)
+    }
+
+    /// `m.params.key()`, built once for lookups that follow each other.
+    fn key_of(&mut self, m: &MeshState) -> Vec<u8> {
+        let at = Arc::as_ptr(&m.params) as usize;
+        match &self.last_key {
+            Some((p, key)) if *p == at => key.clone(),
+            _ => {
+                let key = m.params.key();
+                self.last_key = Some((at, key.clone()));
+                key
+            }
+        }
+    }
+
+    /// `get`, with the mesh's `params.key()` already in hand.
+    fn get_keyed(&mut self, m: &MeshState, key: &[u8]) -> Option<Arc<Mesh>> {
+        if let Some((mesh, used, _)) = self.meshes.get_mut(key) {
             *used = self.frame;
             return Some(mesh.clone());
         }
@@ -532,7 +660,7 @@ impl MeshCache {
         match generated {
             Ok(mesh) => {
                 let mesh = Arc::new(mesh);
-                self.meshes.insert(key, (mesh.clone(), self.frame, m.params.animated()));
+                self.meshes.insert(key.to_vec(), (mesh.clone(), self.frame, m.params.animated()));
                 Some(mesh)
             }
             Err(e) => {
@@ -592,6 +720,49 @@ pub(crate) enum Source {
     /// The GPU generates it in the pool from the project's Slang
     /// (`mesh_gen.rs`): only its parameters are here.
     Generated(Arc<mesh::MeshParams>),
+    /// The GPU moves the points of `base` by the layer's deformer
+    /// (`MeshParams::gpu_deformer`): `base` is uploaded once and kept in
+    /// the pool, and a frame sends the deformer's time and params.
+    Deformed { base: Arc<DeformBase>, params: Arc<mesh::MeshParams> },
+    /// The GPU generates the mesh (`generated`, in the pool as any mesh
+    /// it generates) and moves it by the layer's deformer
+    /// (`MeshParams::gpu_deformed_generator`): the CPU has no points.
+    /// `levels`: its points and triangles after each subdivision the
+    /// deformer asks for (`slang_mesh::gpu_subdivided`; the last are the
+    /// moved mesh's).
+    DeformedGenerated { generated: Arc<Pooled>, params: Arc<mesh::MeshParams>, levels: Vec<(u32, u32)> },
+}
+
+/// A mesh readied for a deformer the GPU runs (subdivided, with the
+/// normals its points move along), as the pool holds it. Never drawn.
+pub(crate) struct DeformBase {
+    pub key: Arc<[u8]>,
+    pub base: lahza_motion_core::slang_mesh::DeformBase,
+}
+
+/// Pool rows per vertex of a `DeformBase`: [position, u], [the normal its
+/// copies share, v], [its own normal, 0].
+pub(crate) const BROWS: usize = 3;
+
+impl DeformBase {
+    /// Rows it takes in the pool.
+    pub(crate) fn rows(&self) -> usize {
+        self.base.mesh.positions.len() * BROWS + self.base.mesh.tris.len()
+    }
+
+    /// Its pool rows: the points', then the triangles' records as
+    /// `Pooled::write` makes them.
+    pub(crate) fn write(&self, out: &mut Vec<[f32; 4]>) {
+        let m = &self.base.mesh;
+        for (i, p) in m.positions.iter().enumerate() {
+            let (n, w) = (m.normals.get(i).copied().unwrap_or([0.0; 3]), self.base.welded.get(i).copied().unwrap_or([0.0; 3]));
+            let uv = m.uvs.get(i).copied().unwrap_or([0.0; 2]);
+            out.push([p[0], p[1], p[2], uv[0]]);
+            out.push([w[0], w[1], w[2], uv[1]]);
+            out.push([n[0], n[1], n[2], 0.0]);
+        }
+        Pooled::write_triangles(m, out);
+    }
 }
 
 /// Pool rows per vertex: [position, u], [normal, v].
@@ -630,6 +801,37 @@ impl Pooled {
         Some(Self { key, verts, tris, source: Source::Generated(params), lo, hi, segments, animated })
     }
 
+    /// A mesh whose points the GPU moves by the layer's deformer
+    /// (`MeshParams::gpu_deformer`): `base` has its points and triangles
+    /// before the move. The CPU runs the deformer over the points too, for
+    /// their box alone (what places and culls the mesh, and frames its
+    /// shadow) and to refuse a move to a value that is not a number, as
+    /// it does where it makes the mesh itself (Err).
+    fn deformed(key: Arc<[u8]>, base: Arc<DeformBase>, params: Arc<mesh::MeshParams>) -> Result<Option<Self>, String> {
+        let Some((d, _)) = params.gpu_deformer() else { return Ok(None) };
+        let (lo, hi) = lahza_motion_core::slang_mesh::deform_extent(&base.base, d)?;
+        let m = &base.base.mesh;
+        let mut segments = [0u32; PARTS];
+        for k in 0..m.tris.len() {
+            let tag = m.tags.get(k).copied().unwrap_or(0);
+            let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
+            segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
+        }
+        let (verts, tris, animated) = (m.positions.len() as u32, m.tris.len() as u32, params.animated());
+        Ok((verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Deformed { base, params }, lo, hi, segments, animated }))
+    }
+
+    /// A mesh the GPU generates (`generated`) and moves by the layer's
+    /// deformer: the layer's bounds, padded by the deformer's `reach`,
+    /// stand for the moved points.
+    fn deformed_generated(key: Arc<[u8]>, generated: Arc<Pooled>, params: Arc<mesh::MeshParams>) -> Option<Self> {
+        let (lo, hi) = params.local_bounds()?;
+        let levels = lahza_motion_core::slang_mesh::gpu_subdivided(generated.verts, generated.tris, params.deform.as_ref()?.subdivide);
+        let (verts, tris) = levels.last().copied().unwrap_or((generated.verts, generated.tris));
+        let (segments, animated) = (generated.segments, params.animated());
+        Some(Self { key, verts, tris, source: Source::DeformedGenerated { generated, params, levels }, lo, hi, segments, animated })
+    }
+
     /// Rows the mesh takes in the pool.
     pub(crate) fn rows(&self) -> usize {
         self.verts as usize * PROWS + self.tris as usize
@@ -641,13 +843,29 @@ impl Pooled {
     /// two-sided (22) and which winding faces out (23..25: 1 as wound, 2
     /// reversed), taken from the vertex normals once here rather than per
     /// frame. (meshgen.wgsl writes the same for a mesh the GPU generates.)
-    pub(crate) fn write(m: &Mesh, out: &mut Vec<[f32; 4]>) {
+    ///
+    /// With rows for `verts` points, where that is more than the mesh has
+    /// (those past its own are in no triangle): the CPU's mesh in the room
+    /// of one the GPU was to make with more points
+    /// (`slang_mesh::gpu_subdivided`).
+    pub(crate) fn write_padded(m: &Mesh, verts: usize, out: &mut Vec<[f32; 4]>) {
+        let end = out.len() + verts.max(m.positions.len()) * PROWS;
+        Self::write_points(m, out);
+        out.resize(end, [0.0; 4]);
+        Self::write_triangles(m, out);
+    }
+
+    fn write_points(m: &Mesh, out: &mut Vec<[f32; 4]>) {
         for (i, p) in m.positions.iter().enumerate() {
             let n = m.normals.get(i).copied().unwrap_or([0.0; 3]);
             let uv = m.uvs.get(i).copied().unwrap_or([0.0; 2]);
             out.push([p[0], p[1], p[2], uv[0]]);
             out.push([n[0], n[1], n[2], uv[1]]);
         }
+    }
+
+    /// The triangles' rows of `write`.
+    pub(crate) fn write_triangles(m: &Mesh, out: &mut Vec<[f32; 4]>) {
         let b = f32::from_bits;
         // One record per triangle, whatever the tags and edges hold (the
         // pool reserved `rows`).
@@ -667,13 +885,62 @@ impl Pooled {
     }
 }
 
+/// A mesh layer as an instance of its pooled mesh: what is the same in
+/// every batch that draws it or is hidden by it (its rows but for the
+/// batch's materials and its place among the batch's triangles). A list
+/// makes it once for a mesh that hides many of its other batches.
+pub(crate) struct Placed {
+    pooled: Arc<Pooled>,
+    /// Its box on screen (output px), and its nearest and farthest depth.
+    bounds: [f64; 4],
+    near: f64,
+    far: f64,
+    rows: [[f32; 4]; IROWS],
+}
+
+impl Placed {
+    /// None: nothing to draw (no mesh, no triangles, a transform that
+    /// flattens it, wholly behind the camera).
+    pub(crate) fn new(cache: &mut MeshCache, m: &MeshState, root: Proj) -> Option<Self> {
+        let pooled = cache.pooled(m)?;
+        if pooled.tris == 0 {
+            return None;
+        }
+        let mv = m.camera.view.then(m.world);
+        let nm = mv.normal_matrix()?;
+        let (focal, centre) = (m.camera.focal, m.camera.centre);
+        let (bounds, near, far) = box_bounds(pooled.lo, pooled.hi, mv, focal, centre, root)?;
+        // See-through wireframes show their back edges too.
+        let xray = (0..PARTS).filter(|&p| m.materials[p].wireframe > 0.0 && m.materials[p].wire_fill.is_none()).fold(0u32, |acc, p| acc | 1 << p);
+        let a = mv.0;
+        let det = a[0] * (a[5] * a[10] - a[6] * a[9]) - a[1] * (a[4] * a[10] - a[6] * a[8]) + a[2] * (a[4] * a[9] - a[5] * a[8]);
+        let world_noise = m.materials.iter().any(|x| x.noise.is_some_and(|n| n.world));
+        let noise = if world_noise { m.world.0 } else { lahza_motion_core::space::Mat4::IDENTITY.0 };
+        let (f, b) = (|v: f64| v as f32, f32::from_bits);
+        let r = root.0;
+        let mut rows = [[0.0f32; 4]; IROWS];
+        for k in 0..3 {
+            rows[k] = [f(a[k * 4]), f(a[k * 4 + 1]), f(a[k * 4 + 2]), f(a[k * 4 + 3])];
+            rows[3 + k] = [f(nm[k][0]), f(nm[k][1]), f(nm[k][2]), 0.0];
+            rows[6 + k] = [f(noise[k * 4]), f(noise[k * 4 + 1]), f(noise[k * 4 + 2]), f(noise[k * 4 + 3])];
+            rows[10 + k] = [f(r[k * 3]), f(r[k * 3 + 1]), f(r[k * 3 + 2]), 0.0];
+        }
+        rows[9] = [f(focal), f(centre.0), f(centre.1), b(if det < 0.0 { INST_MIRRORED } else { 0 })];
+        rows[13] = [b(0), b(0), b(pooled.tris), b(0)];
+        rows[14] = [b(0), b(xray), b(0), 0.0];
+        rows[19] = bounds.map(f);
+        Some(Self { pooled, bounds, near, far, rows })
+    }
+}
+
 /// Instance rows (one mesh layer drawing a pooled mesh): 0–2 object →
 /// camera (3 × 4), 3–5 the normal matrix, 6–8 object → noise space
 /// (identity, or the world transform when a part's noise asks), 9 [focal,
 /// centre x, y, flags (1: mirrored)], 10–12 `root` (canvas → output px),
 /// 13 [pool row of its vertices, of its triangles (both set by the GPU's
 /// pool), triangles, first triangle among the batch's instances], 14 [0,
-/// x-ray parts (bit per part: never culled), 0, 0], 15–16 per part its
+/// x-ray parts (bit per part: never culled), 1 for a depth-only occluder
+/// (the visibility pass draws those first), 0], 15–16 per part its
 /// first material, 17–18 per part its colours (a triangle's material is
 /// first + segment mod colours), 19 its bounds in output px (the GPU draws
 /// it only on visibility pages it may touch).
@@ -1646,19 +1913,22 @@ impl Batch {
 
     /// Adds one mesh layer drawn through `root` (canvas → output pixels).
     pub(crate) fn add(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64) {
-        self.add_mesh(cache, m, root, opacity, false);
+        self.add_mesh(cache, m, root, opacity, false, None);
     }
 
     /// Adds another layer's mesh as depth only: where it is nearer, this
     /// batch shows nothing.
-    pub(crate) fn add_occluder(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj) {
+    ///
+    /// `placed`: the mesh as an instance, where the list has made it
+    /// already (it is the same in every batch it hides).
+    pub(crate) fn add_occluder(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, placed: Option<&Placed>) {
         if self.occluder.is_none() {
             self.occluder = Some((self.materials.len() / MAT_ROWS) as u32);
             let mut rows = [[0.0; 4]; MAT_ROWS];
             rows[2][3] = FLAG_OCCLUDER as f32;
             self.materials.extend_from_slice(&rows);
         }
-        self.add_mesh(cache, m, root, 1.0, true);
+        self.add_mesh(cache, m, root, 1.0, true, placed);
     }
 
     /// Adds a card (a flat 3D layer's picture on its quad); as an occluder
@@ -1688,12 +1958,12 @@ impl Batch {
         self.tris.push(([base, base + 2, base + 3], material, 7));
     }
 
-    fn add_mesh(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
+    fn add_mesh(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool, placed: Option<&Placed>) {
         if self.env.is_none() {
             self.env = cache.env_map(&self.lighting);
         }
         if cache.compact {
-            self.add_instance(cache, m, root, opacity, occluder);
+            self.add_instance(cache, m, root, opacity, occluder, placed);
             return;
         }
         let Some(mesh) = cache.get(m) else { return };
@@ -1850,13 +2120,19 @@ impl Batch {
     /// triangles as `add_mesh` does on the CPU (`vis_instance`,
     /// `instance_tri` in motion.wgsl); the batch's bounds come from the
     /// mesh's box.
-    fn add_instance(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool) {
-        let Some(pooled) = cache.pooled(m) else { return };
+    fn add_instance(&mut self, cache: &mut MeshCache, m: &MeshState, root: Proj, opacity: f64, occluder: bool, placed: Option<&Placed>) {
+        let own;
+        let placed = match placed {
+            Some(p) => p,
+            None => {
+                let Some(p) = Placed::new(cache, m, root) else { return };
+                own = p;
+                &own
+            }
+        };
+        let (pooled, bounds, near, far) = (&placed.pooled, placed.bounds, placed.near, placed.far);
         self.layers += 1;
         let tris = pooled.tris as usize;
-        if tris == 0 {
-            return;
-        }
         // Instances cost a row each, not their triangles: a wall of 2376
         // finely bevelled tiles is five million triangles of one pooled
         // mesh. Only the triangle ids bound them.
@@ -1864,10 +2140,6 @@ impl Batch {
             cache.too_many_triangles(MAX_INSTANCED_TRIS);
             return;
         }
-        let mv = m.camera.view.then(m.world);
-        let Some(nm) = mv.normal_matrix() else { return };
-        let (focal, centre) = (m.camera.focal, m.camera.centre);
-        let Some((bounds, near, far)) = box_bounds(pooled.lo, pooled.hi, mv, focal, centre, root) else { return };
         if occluder {
             // An occluder only hides this batch where the batch draws, and
             // only when it is nearer than something the batch draws (a
@@ -1881,7 +2153,7 @@ impl Batch {
                 return;
             }
         } else {
-            self.focal = focal * root.max_scale();
+            self.focal = m.camera.focal * root.max_scale();
             self.volume |= m.materials.iter().any(|x| x.volume.is_some());
             self.bounds = [self.bounds[0].min(bounds[0]), self.bounds[1].min(bounds[1]), self.bounds[2].max(bounds[2]), self.bounds[3].max(bounds[3])];
             self.far = self.far.max(far);
@@ -1905,31 +2177,16 @@ impl Batch {
                 }
             }
         }
-        // See-through wireframes show their back edges too.
-        let xray = (0..PARTS).filter(|&p| m.materials[p].wireframe > 0.0 && m.materials[p].wire_fill.is_none()).fold(0u32, |acc, p| acc | 1 << p);
-        let a = mv.0;
-        let det = a[0] * (a[5] * a[10] - a[6] * a[9]) - a[1] * (a[4] * a[10] - a[6] * a[8]) + a[2] * (a[4] * a[9] - a[5] * a[8]);
-        let world_noise = m.materials.iter().any(|x| x.noise.is_some_and(|n| n.world));
-        let noise = if world_noise { m.world.0 } else { lahza_motion_core::space::Mat4::IDENTITY.0 };
-        let (f, b) = (|v: f64| v as f32, f32::from_bits);
-        let r = root.0;
-        let mut rows = [[0.0f32; 4]; IROWS];
-        for k in 0..3 {
-            rows[k] = [f(a[k * 4]), f(a[k * 4 + 1]), f(a[k * 4 + 2]), f(a[k * 4 + 3])];
-            rows[3 + k] = [f(nm[k][0]), f(nm[k][1]), f(nm[k][2]), 0.0];
-            rows[6 + k] = [f(noise[k * 4]), f(noise[k * 4 + 1]), f(noise[k * 4 + 2]), f(noise[k * 4 + 3])];
-            rows[10 + k] = [f(r[k * 3]), f(r[k * 3 + 1]), f(r[k * 3 + 2]), 0.0];
-        }
-        rows[9] = [f(focal), f(centre.0), f(centre.1), b(if det < 0.0 { INST_MIRRORED } else { 0 })];
-        rows[13] = [b(0), b(0), b(tris as u32), b(self.inst_tris)];
-        rows[14] = [b(0), b(xray), 0.0, 0.0];
-        rows[19] = bounds.map(f);
+        let b = f32::from_bits;
+        let mut rows = placed.rows;
+        rows[13][3] = b(self.inst_tris);
+        rows[14][2] = b(occluder as u32);
         for part in 0..PARTS {
             rows[15 + part / 4][part % 4] = b(first[part]);
             rows[17 + part / 4][part % 4] = b(colors[part]);
         }
         self.inst_tris += tris as u32;
-        self.instances.push(Instance { mesh: pooled, rows });
+        self.instances.push(Instance { mesh: pooled.clone(), rows });
     }
 
     /// Writes the vertex, material and light rows (with the environment

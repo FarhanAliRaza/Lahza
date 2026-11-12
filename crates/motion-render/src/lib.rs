@@ -22,6 +22,7 @@ pub mod mesh3d;
 pub mod profile;
 pub mod pt;
 pub mod model;
+mod ngx;
 mod oidn;
 mod mesh_gen;
 mod pool;
@@ -98,6 +99,8 @@ pub struct Stats {
 }
 
 pub struct Renderer {
+    /// The fast mode: the shutter of the frame being drawn, in frames (0: no motion blur).
+    shutter: f32,
     pub fonts: Fonts,
     pub images: Images,
     pub footage: footage::Footage,
@@ -180,6 +183,7 @@ impl Renderer {
             queue: Default::default(),
             device: 0,
             stats: Stats::default(),
+            shutter: 0.0,
             profile: options.profile.then(profile::Profile::default),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             scratch: Scratch::default(),
@@ -299,7 +303,12 @@ impl Renderer {
     fn sample_states(&mut self, compiled: &Compiled, t: f64) -> Vec<FrameState> {
         let started = Instant::now();
         let mut states = Vec::new();
-        match compiled.motion_blur_at(t).filter(|_| self.options.motion_blur) {
+        // The fast mode traces one moment (Ray Reconstruction takes no
+        // blurred picture) and blurs its picture along each texel's motion
+        // over the shutter instead.
+        let fast = self.options.path.is_some_and(|o| o.fast);
+        self.shutter = compiled.motion_blur_at(t).filter(|_| self.options.motion_blur && fast).map_or(0.0, |mb| (mb.shutter.min(720.0) / 360.0) as f32);
+        match compiled.motion_blur_at(t).filter(|_| self.options.motion_blur && !fast) {
             Some(mb) => {
                 let n = mb.samples.clamp(2, 64);
                 let open = mb.shutter.min(720.0) / 360.0 * compiled.fps().frame();
@@ -393,7 +402,7 @@ impl Renderer {
         let n = states.len().max(1) as u32;
         // Motion-blur sub-frames already average over the shutter; history
         // per sub-frame would hold a full-size buffer set for each of them.
-        let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), temporal: o.temporal && n == 1, ..o });
+        let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), temporal: o.temporal && n == 1, shutter: if o.fast { self.shutter } else { 0.0 }, ..o });
         self.images.begin_frame();
         let mut lists = self.build_lists(states, trace);
         if self.images.overflowed {
@@ -517,12 +526,22 @@ impl Renderer {
             },
             _ => Work::Later,
         };
-        // The frame begun before this one: through Open Image Denoise
-        // while the GPU traces this one.
-        if let (Some(Queued { work: Work::Gpu { id, device }, .. }), Some(g)) = (self.queue.back(), self.gpu.as_mut()) {
-            if *device == self.device {
-                // (A failure is met again, and handled, when it is taken.)
-                let _ = g.advance(*id);
+        // While the GPU traces this one: the frame two before it comes
+        // back from Open Image Denoise and has its picture composited,
+        // and the one before it goes there (not waited for: the next
+        // frame is built and recorded meanwhile).
+        let before = |k: usize| match self.queue.len().checked_sub(k).and_then(|i| self.queue.get(i)) {
+            Some(Queued { work: Work::Gpu { id, device }, .. }) if *device == self.device => Some(*id),
+            _ => None,
+        };
+        let (denoised, traced) = (before(2), before(1));
+        if let Some(g) = self.gpu.as_mut() {
+            // (A failure is met again, and handled, when it is taken.)
+            if let Some(id) = denoised {
+                let _ = g.advance(id);
+            }
+            if let Some(id) = traced {
+                let _ = g.start_denoise(id);
             }
         }
         self.queue.push_back(Queued { key, states, size: (main.width, main.height), work });

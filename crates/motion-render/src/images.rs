@@ -18,6 +18,58 @@ pub const MAX_TEXELS: usize = 48 * 1024 * 1024;
 /// The most the pool is given however large the GPU: its texels are also
 /// held, and built, on the CPU.
 pub const MOST_TEXELS: usize = 192 * 1024 * 1024;
+/// Bytes of pictures' mip chains kept for loading them again at another
+/// size (`Images::decoded`): three 4K maps.
+const DECODED_BYTES: usize = 256 << 20;
+
+/// A picture's whole mip chain as the pool holds texels (premultiplied
+/// RGBA8, packed): each level the 2×2 box of the one above, down to one
+/// texel. A copy of the picture at any size is a run of its levels.
+struct Chain {
+    /// Per level: its size and where its texels start.
+    levels: Vec<(u32, u32, usize)>,
+    texels: Vec<u32>,
+}
+
+impl Chain {
+    fn build(img: &image::RgbaImage) -> Self {
+        let (mut lw, mut lh) = img.dimensions();
+        let mut level: Vec<[f32; 4]> = img
+            .pixels()
+            .map(|p| {
+                let a = p.0[3] as f32 / 255.0;
+                [p.0[0] as f32 * a, p.0[1] as f32 * a, p.0[2] as f32 * a, p.0[3] as f32]
+            })
+            .collect();
+        let mut chain = Chain { levels: Vec::new(), texels: Vec::with_capacity(level.len() * 4 / 3 + 16) };
+        loop {
+            chain.levels.push((lw, lh, chain.texels.len()));
+            chain.texels.extend(level.iter().map(|c| pack(c.map(|v| v.round().clamp(0.0, 255.0) as u8))));
+            if lw <= 1 && lh <= 1 {
+                break;
+            }
+            let (nw, nh) = ((lw / 2).max(1), (lh / 2).max(1));
+            let mut next = vec![[0.0f32; 4]; (nw * nh) as usize];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let mut acc = [0.0; 4];
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let sx = (x * 2 + dx).min(lw - 1);
+                        let sy = (y * 2 + dy).min(lh - 1);
+                        let p = level[(sy * lw + sx) as usize];
+                        for k in 0..4 {
+                            acc[k] += p[k] * 0.25;
+                        }
+                    }
+                    next[(y * nw + x) as usize] = acc;
+                }
+            }
+            level = next;
+            (lw, lh) = (nw, nh);
+        }
+        chain
+    }
+}
 
 /// The pool's budget on a GPU with `device_memory` bytes of its own whose
 /// storage buffers may be `max_buffer` bytes (0: unknown): a sixteenth of
@@ -75,6 +127,9 @@ pub struct Images {
     pub texels: Vec<u32>,
     entries: HashMap<String, Option<Texture>>,
     pub generation: u64,
+    /// Counts `compact`s: until the next, texels are only added (what the
+    /// GPU holds of the pool stays where it is).
+    pub packed: u64,
     pub warnings: Vec<String>,
     /// Sources looked up since `begin_frame`; `compact` keeps only these.
     used: HashSet<String>,
@@ -94,6 +149,10 @@ pub struct Images {
     luts: HashMap<String, Option<std::sync::Arc<(usize, Vec<[f32; 4]>)>>>,
     /// Files' sizes as pictures, read once from their headers.
     naturals: HashMap<String, Option<[u32; 2]>>,
+    /// The mip chains of the pictures loaded last, newest last, up to
+    /// `DECODED_BYTES`: a map that grows on screen is loaded again larger
+    /// a few times, and decoded and halved once.
+    decoded: Vec<(String, Chain)>,
 }
 
 pub fn pack(c: [u8; 4]) -> u32 {
@@ -107,6 +166,7 @@ impl Images {
             texels: Vec::new(),
             entries: HashMap::new(),
             generation: 1,
+            packed: 0,
             warnings: Vec::new(),
             used: HashSet::new(),
             wanted: HashMap::new(),
@@ -116,6 +176,7 @@ impl Images {
             refused: Vec::new(),
             luts: HashMap::new(),
             naturals: HashMap::new(),
+            decoded: Vec::new(),
             busy: std::time::Duration::ZERO,
         }
     }
@@ -184,6 +245,7 @@ impl Images {
         });
         self.texels = texels;
         self.generation += 1;
+        self.packed += 1;
     }
 
     /// The image's size as a picture (`Texture::natural`), without
@@ -217,9 +279,18 @@ impl Images {
         if !self.used.contains(src) {
             self.used.insert(src.to_string());
         }
-        let most = self.wanted.entry(src.to_string()).or_insert(0);
-        *most = (*most).max(want);
-        let want = *most;
+        // (Asked for by every layer that shows it, every sub-frame: no
+        // new string where it is known.)
+        let want = match self.wanted.get_mut(src) {
+            Some(most) => {
+                *most = (*most).max(want);
+                *most
+            }
+            None => {
+                self.wanted.insert(src.to_string(), want);
+                want
+            }
+        };
         match self.entries.get(src) {
             Some(Some(t)) => {
                 let need = held_size(t.natural, want);
@@ -235,16 +306,22 @@ impl Images {
             Some(root) => root.join(src),
             None => PathBuf::from(src),
         };
-        let texture = match image::open(&path) {
-            Ok(img) => {
-                let mut img = img.to_rgba8();
-                let natural = {
-                    let k = (MAX_SIDE as f64 / img.width().max(img.height()) as f64).min(1.0);
-                    [((img.width() as f64 * k).round() as u32).max(1), ((img.height() as f64 * k).round() as u32).max(1)]
-                };
+        let decoded = match self.decoded.iter().position(|d| d.0 == src) {
+            Some(at) => Ok(self.decoded.remove(at).1),
+            None => image::open(&path).map(|img| {
+                let img = img.to_rgba8();
+                let k = (MAX_SIDE as f64 / img.width().max(img.height()) as f64).min(1.0);
+                let natural = [((img.width() as f64 * k).round() as u32).max(1), ((img.height() as f64 * k).round() as u32).max(1)];
                 if (natural[0], natural[1]) != img.dimensions() {
-                    img = image::imageops::resize(&img, natural[0], natural[1], image::imageops::FilterType::Triangle);
+                    Chain::build(&image::imageops::resize(&img, natural[0], natural[1], image::imageops::FilterType::Triangle))
+                } else {
+                    Chain::build(&img)
                 }
+            }),
+        };
+        let texture = match decoded {
+            Ok(img) => {
+                let natural = [img.levels[0].0, img.levels[0].1];
                 // Halved as its mips are, so the copy held is the mip of
                 // the whole picture at that size, texel for texel.
                 let [w, h] = held_size(natural, want);
@@ -252,7 +329,13 @@ impl Images {
                 while (natural[0] >> skip).max(1) > w || (natural[1] >> skip).max(1) > h {
                     skip += 1;
                 }
-                let texture = self.insert_from(&img, skip).map(|t| Texture { natural, ..t });
+                let texture = self.insert_chain(&img, skip).map(|t| Texture { natural, ..t });
+                // Kept for the next size it is asked for, the oldest making way.
+                self.decoded.push((src.to_string(), img));
+                let bytes = |d: &[(String, Chain)]| d.iter().map(|d| d.1.texels.len() * 4).sum::<usize>();
+                while self.decoded.len() > 1 && bytes(&self.decoded) > DECODED_BYTES {
+                    self.decoded.remove(0);
+                }
                 if texture.is_none() {
                     // Pool full: the entry stays as it was (not there, or
                     // held smaller), so it loads once there is room;
@@ -307,68 +390,28 @@ impl Images {
 
     /// Adds straight-alpha RGBA pixels; returns None when the pool is full.
     pub fn insert_rgba(&mut self, img: &image::RgbaImage) -> Option<Texture> {
-        self.insert_from(img, 0)
-    }
-
-    /// Adds `img` from its `skip`-th mip down (0: whole): the texture is
-    /// that mip and the mips below it. None when the pool is full.
-    fn insert_from(&mut self, img: &image::RgbaImage, skip: u32) -> Option<Texture> {
-        let (w0, h0) = img.dimensions();
-        if w0 == 0 || h0 == 0 {
+        if img.width() == 0 || img.height() == 0 {
             return None;
         }
-        let (w, h) = ((w0 >> skip).max(1), (h0 >> skip).max(1));
-        let levels = {
-            let (mut lw, mut lh, mut levels) = (w, h, 1);
-            while !(lw == 1 && lh == 1) && levels < 12 {
-                lw = (lw / 2).max(1);
-                lh = (lh / 2).max(1);
-                levels += 1;
-            }
-            levels
-        };
-        if self.texels.len() + mip_texels(w, h, levels) > self.budget {
+        self.insert_chain(&Chain::build(img), 0)
+    }
+
+    /// Adds a picture from its `skip`-th mip down (0: whole): the texture
+    /// is that mip and the mips below it (twelve levels at most). None
+    /// when the pool is full.
+    fn insert_chain(&mut self, chain: &Chain, skip: u32) -> Option<Texture> {
+        let first = (skip as usize).min(chain.levels.len() - 1);
+        let (w, h, from) = chain.levels[first];
+        let levels = (chain.levels.len() - first).min(12);
+        let to = chain.levels.get(first + levels).map_or(chain.texels.len(), |l| l.2);
+        if self.texels.len() + (to - from) > self.budget {
             self.overflowed = true;
             return None;
         }
-        let mut level: Vec<[f32; 4]> = img
-            .pixels()
-            .map(|p| {
-                let a = p.0[3] as f32 / 255.0;
-                [p.0[0] as f32 * a, p.0[1] as f32 * a, p.0[2] as f32 * a, p.0[3] as f32]
-            })
-            .collect();
         let offset = self.texels.len() as u32;
-        let (mut lw, mut lh) = (w0, h0);
-        for l in 0..skip + levels {
-            if l >= skip {
-                self.texels.extend(level.iter().map(|c| pack(c.map(|v| v.round().clamp(0.0, 255.0) as u8))));
-            }
-            if l + 1 == skip + levels {
-                break;
-            }
-            let (nw, nh) = ((lw / 2).max(1), (lh / 2).max(1));
-            let mut next = vec![[0.0f32; 4]; (nw * nh) as usize];
-            for y in 0..nh {
-                for x in 0..nw {
-                    let mut acc = [0.0; 4];
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let sx = (x * 2 + dx).min(lw - 1);
-                        let sy = (y * 2 + dy).min(lh - 1);
-                        let p = level[(sy * lw + sx) as usize];
-                        for k in 0..4 {
-                            acc[k] += p[k] * 0.25;
-                        }
-                    }
-                    next[(y * nw + x) as usize] = acc;
-                }
-            }
-            level = next;
-            lw = nw;
-            lh = nh;
-        }
+        self.texels.extend_from_slice(&chain.texels[from..to]);
         self.generation += 1;
-        Some(Texture { offset, width: w, height: h, levels, natural: [w0, h0] })
+        Some(Texture { offset, width: w, height: h, levels: levels as u32, natural: [chain.levels[0].0, chain.levels[0].1] })
     }
 }
 

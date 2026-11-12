@@ -27,12 +27,18 @@ pub struct Profile {
     /// Triangle candidates those queries handed back to the shader (every
     /// triangle a ray's traversal touches, not just the nearest).
     pub candidates: u64,
+    /// Of the ray queries' paths, the shadow tests (`occluded`).
+    pub shadows: u64,
     /// Density lookups that found no medium (one pixel in 64, scaled).
     pub density_empty: u64,
     /// Lockstep use in density work: every pixel's lookups, and the lane
     /// slots its 8 × 4 block spent (32 × the busiest pixel's lookups).
     pub lane_lookups: u64,
     pub lane_slots: u64,
+    /// The same for ray queries, by sample: a block's lanes' queries in one
+    /// sample, and 32 × the most any lane made in it.
+    pub lane_rays: u64,
+    pub lane_ray_slots: u64,
     /// Ray queries and density lookups by how many times the path had
     /// scattered inside a volume (0, 1, 2, 3 or more).
     pub rays_by_scatter: [u64; 4],
@@ -53,6 +59,8 @@ pub struct PoolStats {
     pub meshes: u64,
     pub bytes: u64,
     pub capacity: u64,
+    /// What it may grow to on this device.
+    pub budget: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -90,9 +98,12 @@ impl Profile {
         }
         self.rays += other.rays;
         self.candidates += other.candidates;
+        self.shadows += other.shadows;
         self.density_empty += other.density_empty;
         self.lane_lookups += other.lane_lookups;
         self.lane_slots += other.lane_slots;
+        self.lane_rays += other.lane_rays;
+        self.lane_ray_slots += other.lane_ray_slots;
         for d in 0..4 {
             self.rays_by_scatter[d] += other.rays_by_scatter[d];
             self.lookups_by_scatter[d] += other.lookups_by_scatter[d];
@@ -103,7 +114,7 @@ impl Profile {
         self.pool.generated += p.generated;
         self.pool.evictions += p.evictions;
         if p.capacity > 0 {
-            (self.pool.meshes, self.pool.bytes, self.pool.capacity) = (p.meshes, p.bytes, p.capacity);
+            (self.pool.meshes, self.pool.bytes, self.pool.capacity, self.pool.budget) = (p.meshes, p.bytes, p.capacity, p.budget);
         }
     }
 
@@ -143,9 +154,9 @@ impl Profile {
             "gpu_ms_per_frame": round(gpu_total / frames),
             "cpu": table(&self.cpu, cpu_total),
             "gpu": table(&self.gpu, gpu_total),
-            "tracer": {"ray_queries_per_frame": self.rays / self.frames.max(1), "candidates_per_ray": round(self.candidates as f64 / self.rays.max(1) as f64), "empty_lookup_share": round(self.density_empty as f64 / self.layers.values().map(|l| l.density).sum::<u64>().max(1) as f64), "lockstep_use": round(self.lane_lookups as f64 / self.lane_slots.max(1) as f64), "rays_by_volume_scatters": self.rays_by_scatter, "lookups_by_volume_scatters": self.lookups_by_scatter, "density_lookups_per_frame": density / self.frames.max(1),
+            "tracer": {"ray_queries_per_frame": self.rays / self.frames.max(1), "shadow_tests_per_frame": self.shadows / self.frames.max(1), "candidates_per_ray": round(self.candidates as f64 / self.rays.max(1) as f64), "empty_lookup_share": round(self.density_empty as f64 / self.layers.values().map(|l| l.density).sum::<u64>().max(1) as f64), "lockstep_use_rays": round(self.lane_rays as f64 / self.lane_ray_slots.max(1) as f64), "lockstep_use": round(self.lane_lookups as f64 / self.lane_slots.max(1) as f64), "rays_by_volume_scatters": self.rays_by_scatter, "lookups_by_volume_scatters": self.lookups_by_scatter, "density_lookups_per_frame": density / self.frames.max(1),
                        "counted_on": format!("1 pixel in {COUNT_EVERY}, scaled"), "layers": layers},
-            "mesh_pool": {"meshes": self.pool.meshes, "bytes": self.pool.bytes, "capacity": self.pool.capacity, "budget": crate::pool::MESH_POOL_BUDGET,
+            "mesh_pool": {"meshes": self.pool.meshes, "bytes": self.pool.bytes, "capacity": self.pool.capacity, "budget": self.pool.budget,
                           "uploads": self.pool.uploads, "upload_bytes": self.pool.upload_bytes, "generated_on_gpu": self.pool.generated, "evictions": self.pool.evictions},
             "summary": self.summary(),
         })
@@ -174,7 +185,7 @@ impl Profile {
                 p.meshes,
                 mb(p.bytes),
                 mb(p.capacity),
-                mb(crate::pool::MESH_POOL_BUDGET as u64),
+                mb(p.budget),
                 p.uploads,
                 mb(p.upload_bytes),
                 p.generated,
@@ -183,7 +194,8 @@ impl Profile {
         }
         if !self.layers.is_empty() {
             let density: u64 = self.layers.values().map(|l| l.density).sum::<u64>().max(1);
-            out.push(format!("tracer: {} ray queries/frame, {:.1} triangle candidates per ray, {} density lookups/frame", self.rays / self.frames.max(1), self.candidates as f64 / self.rays.max(1) as f64, density / self.frames.max(1)));
+            out.push(format!("tracer: {} ray queries/frame ({} shadow tests), {:.1} triangle candidates per ray, {} density lookups/frame", self.rays / self.frames.max(1), self.shadows / self.frames.max(1), self.candidates as f64 / self.rays.max(1) as f64, density / self.frames.max(1)));
+            out.push(format!("  lockstep use in ray work: {:.1}% (a sample's ray queries ÷ 32 × its busiest lane's, per 8×4 block)", self.lane_rays as f64 / self.lane_ray_slots.max(1) as f64 * 100.0));
             out.push(format!(
                 "  density lookups that found nothing: {:.1}%; lockstep use in density work: {:.1}% (lookups ÷ 32 × busiest pixel's, per 8×4 block)",
                 self.density_empty as f64 / density as f64 * 100.0,

@@ -20,8 +20,8 @@ struct Uniforms {
     inv0: vec4<f32>,
     inv1: vec4<f32>,
     inv2: vec4<f32>,
-    lens: vec4<f32>,      // aperture radius, focus depth (camera px)
-    denoise: vec4<u32>,   // denoiser: step (px), temporal (1), 0, 0
+    lens: vec4<f32>,      // aperture radius, focus depth (camera px); where in the texel the samples go (x > 0: Ray Reconstruction's jitter)
+    denoise: vec4<u32>,   // denoiser: step (px), temporal (1), 0, 0; the trace: 0, temporal, Ray Reconstruction (1), 0; `resolve_fast`: the full width and height
     prev_cam: vec4<f32>,  // previous frame: focal, centre x, y, valid
     prev_place: vec4<f32>,
     prev_root0: vec4<f32>,
@@ -86,6 +86,8 @@ const F_ENV_IMAGE: bool = true;     // an environment image
 const F_DETAIL: bool = true;        // surface noise and image maps
 // This pixel's density lookups (profiling, every pixel).
 var<private> px_lookups: u32;
+// This pixel's ray queries (profiling, every pixel).
+var<private> px_rays: u32;
 // Volume scattering events so far on this path (0..3, 3 = three or more):
 // header slots 4..7 count ray queries and 8..11 density lookups by it.
 var<private> vol_depth: u32;
@@ -409,6 +411,20 @@ struct Hit {
     bary: vec3<f32>,
 }
 
+// The fast mode's visibility pass: a path ends at the first lit surface
+// (only what is flat before it, and coverage, are wanted).
+var<private> primary_only: bool;
+// And there a card stands where its coverage is over this (each of the
+// texel's paths has its own, evenly apart: a soft edge comes out even,
+// not grainy); elsewhere by chance (below 0).
+var<private> card_cut: f32 = -1.0;
+
+fn card_stands(alpha: f32, rng: ptr<function, Rng>) -> bool {
+    if alpha <= 0.0 { return false; }
+    if card_cut >= 0.0 { return alpha > card_cut; }
+    return alpha >= rnd(rng);
+}
+
 // The triangle the next ray does not see (`pass_boundary`).
 var<private> skip_on: bool;
 var<private> skip_custom: u32;
@@ -446,6 +462,7 @@ fn card_picture(card: u32, p: vec3<f32>) -> vec4<f32> {
 }
 
 fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> Hit {
+    if PROFILE { px_rays += 1u; }
     prof_count(0u);
     prof_count(4u + vol_depth);
     var rq: ray_query;
@@ -478,7 +495,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
             // Cards are not opaque: a candidate stands where its picture
             // does (stochastically by its alpha, so soft edges average out).
             let pic = card_picture(c.primitive_index / 2u, o + d * c.t);
-            take = pic.w > 0.0 && pic.w >= rnd(rng);
+            take = card_stands(pic.w, rng);
         }
         if take {
             rayQueryConfirmIntersection(&rq);
@@ -563,8 +580,56 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
     return hit;
 }
 
+// Whether a surface blocks the ray, in a scene with no volume: the first
+// surface found that blocks ends the search (it need not be the nearest),
+// and only its material is read, not its triangle. A see-through surface
+// blocks by its opacity, a wire and a shadow catcher not at all, each on
+// its own, wherever it stands on the ray.
+fn blocked(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> bool {
+    if PROFILE { px_rays += 1u; }
+    prof_count(0u);
+    prof_count(4u + vol_depth);
+    var rq: ray_query;
+    // naga 25 writes no rayQueryTerminate for SPIR-V; the flag ends the
+    // query at the first confirmed candidate.
+    rayQueryInitialize(&rq, acc, RayDesc(RAY_FLAG_FORCE_NO_OPAQUE | RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0xFFu, 0.0, tmax, o, d));
+    var found = false;
+    while rayQueryProceed(&rq) {
+        let c = rayQueryGetCandidateIntersection(&rq);
+        prof_count(1u);
+        if c.kind != RAY_QUERY_INTERSECTION_TRIANGLE { continue; }
+        if F_CARDS && c.instance_custom_data == u.opts.z {
+            let pic = card_picture(c.primitive_index / 2u, o + d * c.t);
+            if !card_stands(pic.w, rng) { continue; }
+        } else {
+            // The material, as `cast_ray` finds it (every index checked).
+            let inst = c.instance_custom_data * INST_ROWS;
+            if inst + INST_ROWS - 1u >= arrayLength(&b_inst) { continue; }
+            let ti = bitcast<u32>(b_inst[inst].z) + c.primitive_index;
+            if ti >= arrayLength(&b_tag) { continue; }
+            let tag = b_tag[ti];
+            let part = tag & 0xffu;
+            let row = b_inst[inst + 1u + part / 2u];
+            var base: u32;
+            var count: u32;
+            if part % 2u == 0u { base = bitcast<u32>(row.x); count = bitcast<u32>(row.y); } else { base = bitcast<u32>(row.z); count = bitcast<u32>(row.w); }
+            let mat = (base + ((tag >> 8u) & 0xffffu) % max(count, 1u)) * MAT_ROWS;
+            if mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { continue; }
+            let flags = u32(b_mat[mat + 2u].w);
+            if (F_CATCHER && (flags & FLAG_SHADOW_CATCHER) != 0u) || (flags & FLAG_WIRE) != 0u { continue; }
+            let opacity = b_mat[mat].w * (1.0 - b_mat[mat + 3u].x);
+            if opacity < 1.0 && opacity < rnd(rng) { continue; }
+        }
+        rayQueryConfirmIntersection(&rq);
+        found = true;
+    }
+    return found;
+}
+
 // Whether anything blocks the segment from `o` along `d` up to `tmax`.
 fn occluded(o_in: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> bool {
+    prof_count(3u);
+    if !F_VOLUME { return blocked(o_in, d, tmax, rng); }
     var o = o_in;
     var left = tmax;
     // Volumes' boundaries let light through: look past them. A noise
@@ -1742,6 +1807,10 @@ struct Sample {
     normal: vec3<f32>,
     depth: f32,
     prev: vec3<f32>,
+    // The first surface's roughness and specular colour (Ray
+    // Reconstruction's guides).
+    rough: f32,
+    spec: vec3<f32>,
     // Flat colour (cards, unlit materials) the camera sees first (a shadow
     // catcher is looked through), premultiplied: it skips the look (tone
     // curve, exposure), as in the raster, so it is kept apart from `color`;
@@ -2256,9 +2325,10 @@ fn path(o_in: vec3<f32>, d_in: vec3<f32>, rng: ptr<function, Rng>) -> Sample {
             return out;
         }
         out.alpha = 1.0;
+        if primary_only { return out; }
         var s = surface(h, v);
         out.color += throughput * m2.xyz * s.emit;
-        if step == guide { out.albedo = s.albedo; }
+        if step == guide { out.albedo = s.albedo; out.rough = s.rough; out.spec = s.f0; }
         // Reflects and lets through nothing (black, no specular, coat or
         // sheen): the path ends here, as on an unlit surface.
         if s.trans <= 0.0 && s.coat <= 0.0 && s.f90 <= 0.0 && max3(s.kd) <= 0.0 && max3(s.f0) <= 0.0 && max3(s.sheen) <= 0.0 { return out; }
@@ -2398,6 +2468,57 @@ fn prof_block(id: vec3<u32>, w: u32) {
     }
 }
 
+// Profiling: one sample's ray queries in the lockstep block, summed and the
+// most any lane made (the buffer's last blocks × PROF_LANES × 2 counters):
+// a lane whose path ended waits for the block's longest.
+const PROF_LANES: u32 = 16u;
+fn prof_lane(id: vec3<u32>, w: u32, s: u32) {
+    let blocks = ((w + 7u) / 8u) * ((u.size.y + 3u) / 4u);
+    let n = arrayLength(&b_prof);
+    if s >= PROF_LANES || n < blocks * PROF_LANES * 2u { px_rays = 0u; return; }
+    let at = n - blocks * PROF_LANES * 2u + (((id.y / 4u) * ((w + 7u) / 8u) + id.x / 8u) * PROF_LANES + s) * 2u;
+    atomicAdd(&b_prof[at], px_rays);
+    atomicMax(&b_prof[at + 1u], px_rays);
+    px_rays = 0u;
+}
+
+// The fast mode's visibility, a texel of the full picture (the trace
+// itself has a quarter of them, each through one moving point, and Ray
+// Reconstruction makes its lit colour): four primary paths through fixed
+// points of the texel, the same every frame, so edges stand still. Into
+// `b_tmp`: the flat colour seen (times what shadow catchers let through)
+// with the lit coverage, and the whole coverage.
+fn visible(id: vec3<u32>, py: u32, w: u32) {
+    primary_only = true;
+    var rng: Rng;
+    rng.s = pcg(id.x + pcg(py + 0x51ed270bu));
+    let at = array<vec2<f32>, 4>(vec2<f32>(0.375, 0.125), vec2<f32>(0.875, 0.375), vec2<f32>(0.125, 0.625), vec2<f32>(0.625, 0.875));
+    var flat = vec3<f32>(0.0);
+    var lit = 0.0;
+    var alpha = 0.0;
+    // Camera depth of what is lit and of what is flat (summed, and of how many).
+    var deep = vec4<f32>(0.0);
+    for (var s = 0u; s < 4u; s++) {
+        let tp = vec3<f32>(u.place.x + u.place.z * (f32(id.x) + at[s].x), u.place.y + u.place.w * (f32(py) + at[s].y), 1.0);
+        let q = vec3<f32>(dot(u.inv0.xyz, tp), dot(u.inv1.xyz, tp), dot(u.inv2.xyz, tp));
+        let c = q.xy / q.z;
+        let dir = normalize(vec3<f32>((c.x - u.cam.y) / u.cam.x, (c.y - u.cam.z) / u.cam.x, 1.0));
+        card_cut = (f32(s) + 0.5) / 4.0;
+        let smp = path(vec3<f32>(0.0), dir, &rng);
+        flat += smp.flat * smp.vis;
+        alpha += smp.alpha;
+        let is_lit = max(smp.flat.x, max(smp.flat.y, smp.flat.z)) <= 0.0;
+        if is_lit { lit += smp.alpha; }
+        if smp.depth > 0.0 {
+            let z = dir.z * smp.depth;
+            if is_lit { deep += vec4<f32>(z, 1.0, 0.0, 0.0); } else { deep += vec4<f32>(0.0, 0.0, z, 1.0); }
+        }
+    }
+    let i = py * w + id.x;
+    b_tmp[i * 2u] = vec4<f32>(flat / 4.0, lit / 4.0);
+    b_tmp[i * 2u + 1u] = vec4<f32>(alpha / 4.0, deep.x / max(deep.y, 1.0), deep.z / max(deep.w, 1.0), 0.0);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
     let w = u.size.x;
@@ -2407,6 +2528,10 @@ fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
     let py = id_in.y + u.band.x;
     let id = vec3<u32>(id_in.x, py, id_in.z);
     if id.x >= w || py >= h || py >= u.band.y { return; }
+    if u.denoise.z == 2u {
+        visible(id, py, w);
+        return;
+    }
     prof_on = PROFILE && (id.x & 7u) == 0u && (py & 7u) == 0u;
     let spp = u.size.w;
     var rng: Rng;
@@ -2423,10 +2548,15 @@ fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
     var prev = vec4<f32>(0.0);
     var flat = vec3<f32>(0.0);
     var vis = 0.0;
+    var gloss = vec4<f32>(0.0);
     for (var s = 0u; s < spp; s++) {
         // A point in the texel (stratified jitter), target → canvas → ray.
-        let jx = (f32(s % 4u) + rnd(&rng)) / 4.0;
-        let jy = (f32((s / 4u) % 4u) + rnd(&rng)) / 4.0;
+        var jx = (f32(s % 4u) + rnd(&rng)) / 4.0;
+        var jy = (f32((s / 4u) % 4u) + rnd(&rng)) / 4.0;
+        if u.lens.z > 0.0 {
+            jx = u.lens.z;
+            jy = u.lens.w;
+        }
         let tp = vec3<f32>(u.place.x + u.place.z * (f32(id.x) + jx), u.place.y + u.place.w * (f32(py) + jy), 1.0);
         let q = vec3<f32>(dot(u.inv0.xyz, tp), dot(u.inv1.xyz, tp), dot(u.inv2.xyz, tp));
         let c = q.xy / q.z;
@@ -2442,6 +2572,7 @@ fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
             dir = normalize(focus - origin);
         }
         let smp = path(origin, dir, &rng);
+        if PROFILE { prof_lane(id, w, s); }
         color += smp.color;
         flat += smp.flat;
         vis += smp.vis;
@@ -2465,6 +2596,7 @@ fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
             normal += smp.normal;
             depth += smp.depth;
             hits += 1.0;
+            gloss += vec4<f32>(smp.spec, smp.rough);
         }
     }
     let i = py * w + id.x;
@@ -2508,6 +2640,9 @@ fn trace(@builtin(global_invocation_id) id_in: vec3<u32>) {
         return;
     }
     let n = f32(spp * parts);
+    // Ray Reconstruction's guides the filters have no use for: in their
+    // scratch (they do not run then).
+    if u.denoise.z == 1u { b_tmp[i * 2u] = gloss / max(hits, 1.0); }
     color /= n;
     flat /= n;
     vis /= n;
@@ -2715,6 +2850,12 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let color = c.xyz * b_guides[i * 4u].xyz * alpha;
     // Cards and unlit materials seen directly: not tone-mapped.
     let flat = b_guides[i * 4u + 2u].yzw * b_hdr[i * 2u + 1u].z;
+    b_groups[u.size.z + i] = graded(color, alpha, flat);
+}
+
+// A texel of the picture: its lit colour (linear, times coverage)
+// tone-mapped, its flat colour as it is, premultiplied sRGB.
+fn graded(color: vec3<f32>, alpha: f32, flat: vec3<f32>) -> vec4<f32> {
     // Highlights on glass over nothing still need coverage to show.
     let lit = color + flat;
     let peak = min(max(lit.x, max(lit.y, lit.z)), 1.0);
@@ -2726,5 +2867,224 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
         let tm = (tone_curve(color / a * e, u32(b_light[2].w)) * a + flat) / a;
         out = vec4<f32>(encode(tm.x) * a, encode(tm.y) * a, encode(tm.z) * a, a);
     }
-    b_groups[u.size.z + i] = out;
+    return out;
+}
+
+// To Ray Reconstruction (the fast mode): what the trace left of its
+// w × h texels, image after image in `b_bounds` (pt.rs `FAST_IMAGES`):
+// the colour (linear, times coverage) with the coverage, the albedo, the
+// specular colour, the normal with the roughness, the camera depth, and
+// the motion (to where the surface was on the frame before, in texels).
+// Where nothing was hit: as NVIDIA asks for sky.
+@compute @workgroup_size(8, 8, 1)
+fn ngx_pack(@builtin(global_invocation_id) id: vec3<u32>) {
+    let w = u.size.x;
+    if id.x >= w || id.y >= u.size.y { return; }
+    let i = id.y * w + id.x;
+    let n = w * u.size.y;
+    let g0 = b_guides[i * 4u];
+    let g1 = b_guides[i * 4u + 1u];
+    let prev = b_guides[i * 4u + 3u];
+    let h0 = b_hdr[i * 2u];
+    let gloss = b_tmp[i * 2u];
+    let surface = g1.w > 0.0;
+    let c = h0.xyz * g0.xyz * h0.w;
+    var albedo = vec3<f32>(0.5);
+    var spec = vec4<f32>(0.0);
+    var normal = vec3<f32>(0.0);
+    var depth = 1e7;
+    if surface {
+        albedo = g0.xyz;
+        spec = gloss;
+        normal = g1.xyz;
+        depth = g1.w;
+    }
+    var mv = vec2<f32>(0.0);
+    if prev.w > 0.5 { mv = prev.xy - (vec2<f32>(f32(id.x), f32(id.y)) + u.lens.zw - 0.5); }
+    let rows = array<vec4<f32>, 4>(vec4<f32>(c, h0.w), vec4<f32>(albedo, 1.0), vec4<f32>(spec.xyz, 1.0), vec4<f32>(normal, spec.w));
+    for (var k = 0u; k < 4u; k++) {
+        let o = (k * n + i) * 4u;
+        b_bounds[o] = rows[k].x;
+        b_bounds[o + 1u] = rows[k].y;
+        b_bounds[o + 2u] = rows[k].z;
+        b_bounds[o + 3u] = rows[k].w;
+    }
+    b_bounds[16u * n + i] = depth;
+    b_bounds[17u * n + i * 2u] = mv.x;
+    b_bounds[17u * n + i * 2u + 1u] = mv.y;
+}
+
+// Ray Reconstruction's lit colour (not times coverage) and its coverage
+// at texel (x, y) of the full picture (four floats a texel in `b_bounds`).
+fn fast_lit(x: i32, y: i32) -> vec4<f32> {
+    let i = (u32(clamp(y, 0, i32(u.denoise.y) - 1)) * u.denoise.x + u32(clamp(x, 0, i32(u.denoise.x) - 1))) * 4u;
+    let a = clamp(b_bounds[i + 3u], 0.0, 1.0);
+    return vec4<f32>(max(vec3<f32>(b_bounds[i], b_bounds[i + 1u], b_bounds[i + 2u]), vec3<f32>(0.0)) / max(a, 1e-3), a);
+}
+
+// The fast mode's picture at point `p` of its full size: the lit colour
+// Ray Reconstruction made, over the coverage `visible` found (its edges
+// stand still; where Ray Reconstruction has little of the surface, the
+// colour is the neighbour's that has most), and the flat colour and whole
+// coverage from there (`b_tmp`). Or, after `dof_fast` (`u.lens.y` 1), what
+// it left in `b_hdr`.
+struct FastTexel { color: vec4<f32>, flat: vec3<f32> }
+fn fast_at(p: vec2<f32>) -> FastTexel {
+    let x = i32(clamp(p.x, 0.0, f32(u.denoise.x) - 1.0));
+    let y = i32(clamp(p.y, 0.0, f32(u.denoise.y) - 1.0));
+    let i = u32(y) * u.denoise.x + u32(x);
+    if u.lens.y > 0.5 {
+        var d: FastTexel;
+        d.color = b_hdr[i * 2u];
+        d.flat = b_hdr[i * 2u + 1u].xyz;
+        return d;
+    }
+    return fast_raw(x, y);
+}
+
+fn fast_raw(x: i32, y: i32) -> FastTexel {
+    let i = u32(y) * u.denoise.x + u32(x);
+    let seen = b_tmp[i * 2u];
+    var lit = fast_lit(x, y);
+    if lit.w < 0.5 && seen.w > 0.0 {
+        for (var k = 0; k < 9; k++) {
+            let n = fast_lit(x + k % 3 - 1, y + k / 3 - 1);
+            if n.w > lit.w { lit = n; }
+        }
+    }
+    var t: FastTexel;
+    t.color = vec4<f32>(lit.xyz * seen.w, b_tmp[i * 2u + 1u].x);
+    t.flat = seen.xyz;
+    return t;
+}
+
+// The lens's circle of confusion (its radius in texels of the full
+// picture, at most DOF_MAX) at camera depth z: `u.lens` is the radius a
+// point twice as far as the focus has, and the focus depth.
+const DOF_MAX: f32 = 24.0;
+fn fast_coc(z: f32) -> f32 {
+    if z <= 0.0 { return 0.0; }
+    return min(u.lens.x * abs(z - u.lens.y) / z * 2.0, DOF_MAX);
+}
+
+// The fast mode's depth of field (Ray Reconstruction wants a sharp
+// picture, so it comes after): each texel of the full picture gathers the
+// texels around it whose circle of confusion reaches it. What is flat and
+// what is lit in a texel have their own depths (`visible`). A texel behind
+// the one gathering blurs no wider than that one does (what is in focus
+// keeps its edge against a blurred background); one in front blurs over
+// it. Into `b_hdr`: the lit colour (times coverage) with the whole
+// coverage, and the flat colour.
+@compute @workgroup_size(8, 8, 1)
+fn dof_fast(@builtin(global_invocation_id) id: vec3<u32>) {
+    let fw = u.denoise.x;
+    let fh = u.denoise.y;
+    if id.x >= fw || id.y >= fh { return; }
+    let i = id.y * fw + id.x;
+    let own = fast_raw(i32(id.x), i32(id.y));
+    let seen = b_tmp[i * 2u];
+    let depth = b_tmp[i * 2u + 1u];
+    // The texel's own depth: its lit surface's where that covers most of it.
+    var zc = depth.z;
+    if seen.w * 2.0 >= depth.x && depth.y > 0.0 { zc = depth.y; }
+    let cc = fast_coc(zc);
+    // How far to look: the widest circle here and around.
+    var reach = cc;
+    for (var k = 0; k < 8; k++) {
+        let a = f32(k) * 0.785398;
+        let qx = u32(clamp(i32(id.x) + i32(cos(a) * DOF_MAX * 0.6), 0, i32(fw) - 1));
+        let qy = u32(clamp(i32(id.y) + i32(sin(a) * DOF_MAX * 0.6), 0, i32(fh) - 1));
+        let d = b_tmp[(qy * fw + qx) * 2u + 1u];
+        reach = max(reach, max(fast_coc(d.y), fast_coc(d.z)));
+    }
+    if reach < 0.75 {
+        b_hdr[i * 2u] = own.color;
+        b_hdr[i * 2u + 1u] = vec4<f32>(own.flat, 0.0);
+        return;
+    }
+    let taps = clamp(u32(reach * reach * 0.3) + 8u, 12u, 64u);
+    let turn = f32(pcg(i) >> 8u) / 16777216.0 * 6.2831853;
+    var color = own.color;
+    var flat = own.flat;
+    var weight = 1.0;
+    for (var k = 0u; k < taps; k++) {
+        let r = reach * sqrt((f32(k) + 0.5) / f32(taps));
+        let a = f32(k) * 2.3999632 + turn;
+        let x = i32(clamp(f32(id.x) + 0.5 + r * cos(a), 0.0, f32(fw) - 1.0));
+        let y = i32(clamp(f32(id.y) + 0.5 + r * sin(a), 0.0, f32(fh) - 1.0));
+        let j = u32(y) * fw + u32(x);
+        let s = b_tmp[j * 2u];
+        let d = b_tmp[j * 2u + 1u];
+        let cover = d.x;
+        if cover <= 0.0 {
+            // Nothing there: the gathering texel's own blur shows it.
+            if cc >= r { weight += 1.0; }
+            continue;
+        }
+        var took = 0.0;
+        // What is lit there.
+        var e = fast_coc(d.y);
+        if d.y > zc { e = min(e, cc); }
+        let lit = s.w > 0.0 && e >= r;
+        // What is flat there.
+        var f = fast_coc(d.z);
+        if d.z > zc { f = min(f, cc); }
+        let flat_cover = max(cover - s.w, 0.0);
+        let flt = flat_cover > 0.0 && f >= r;
+        if !lit && !flt { continue; }
+        let t = fast_raw(x, y);
+        if lit {
+            color += vec4<f32>(t.color.xyz, s.w);
+            took += s.w;
+        }
+        if flt {
+            flat += t.flat;
+            color.w += flat_cover;
+            took += flat_cover;
+        }
+        weight += took / cover;
+    }
+    b_hdr[i * 2u] = color / weight;
+    b_hdr[i * 2u + 1u] = vec4<f32>(flat / weight, 0.0);
+}
+
+// The fast mode's picture, at its full size (`u.denoise.xy`). With a
+// shutter (`u.lens.x`, in frames): each texel is the picture along its
+// own motion over the shutter (where its surface was on the frame before,
+// from the trace), as game engines blur: a moving edge does not smear
+// over what stands still behind it.
+@compute @workgroup_size(8, 8, 1)
+fn resolve_fast(@builtin(global_invocation_id) id: vec3<u32>) {
+    let fw = u.denoise.x;
+    let fh = u.denoise.y;
+    if id.x >= fw || id.y >= fh { return; }
+    let i = id.y * fw + id.x;
+    let p = vec2<f32>(f32(id.x), f32(id.y)) + 0.5;
+    var t = fast_at(p);
+    if u.lens.x > 0.0 {
+        let scale = vec2<f32>(f32(fw) / f32(u.size.x), f32(fh) / f32(u.size.y));
+        let lx = min(u32(p.x / scale.x), u.size.x - 1u);
+        let ly = min(u32(p.y / scale.y), u.size.y - 1u);
+        let prev = b_guides[(ly * u.size.x + lx) * 4u + 3u];
+        if prev.w > 0.5 {
+            let mv = (prev.xy - (vec2<f32>(f32(lx), f32(ly)) + u.lens.zw - 0.5)) * scale * u.lens.x;
+            let len = length(mv);
+            if len > 1.0 {
+                // A tap every texel and a half or so, each off by the
+                // texel's own fraction so steps do not line up.
+                let taps = clamp(u32(ceil(len / 1.5)), 2u, 24u);
+                let r = f32(pcg(i + pcg(u.opts.y)) >> 8u) / 16777216.0;
+                var color = vec4<f32>(0.0);
+                var flat = vec3<f32>(0.0);
+                for (var k = 0u; k < taps; k++) {
+                    let s = fast_at(p + mv * ((f32(k) + r) / f32(taps) - 0.5));
+                    color += s.color;
+                    flat += s.flat;
+                }
+                t.color = color / f32(taps);
+                t.flat = flat / f32(taps);
+            }
+        }
+    }
+    b_groups[u.size.z + i] = graded(t.color.xyz, t.color.w, t.flat);
 }

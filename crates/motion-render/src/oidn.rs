@@ -38,6 +38,9 @@ struct Api {
     /// buffer over memory imported by file descriptor.
     device_int: Option<unsafe extern "C" fn(Handle, *const c_char) -> i32>,
     new_shared_from_fd: Option<unsafe extern "C" fn(Handle, i32, i32, usize) -> Handle>,
+    /// Denoising without waiting for it, and waiting for it later.
+    execute_async: Option<unsafe extern "C" fn(Handle)>,
+    sync_device: Option<unsafe extern "C" fn(Handle)>,
 }
 
 /// `OIDN_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD`: what Vulkan exports.
@@ -111,6 +114,8 @@ impl Api {
                     release_filter: sym!("oidnReleaseFilter"),
                     device_int: lib.get(b"oidnGetDeviceInt\0").ok().map(|s| *s),
                     new_shared_from_fd: lib.get(b"oidnNewSharedBufferFromFD\0").ok().map(|s| *s),
+                    execute_async: lib.get(b"oidnExecuteFilterAsync\0").ok().map(|s| *s),
+                    sync_device: lib.get(b"oidnSyncDevice\0").ok().map(|s| *s),
                     _lib: lib,
                 });
             }
@@ -139,6 +144,9 @@ pub struct Denoiser {
     /// Filters over memory shared with the renderer's device (`share`).
     shared: std::collections::HashMap<u64, Shared>,
     next_shared: u64,
+    /// The picture being denoised without being waited for (`start`,
+    /// `start_shared`): one at a time.
+    running: Option<Run>,
     /// Tests: the stand-in takes shared memory too (it reads and writes
     /// the descriptors as files, which Mesa's software Vulkan allows).
     #[cfg(test)]
@@ -147,6 +155,14 @@ pub struct Denoiser {
     /// imported from another device would).
     #[cfg(test)]
     pub(crate) stand_in_shares_badly: bool,
+}
+
+/// A picture `start` or `start_shared` began: the copied way's (the
+/// caller's name for it), or a shared filter.
+#[derive(Clone, Copy, PartialEq)]
+enum Run {
+    Copied(u64),
+    Shared(u64),
 }
 
 /// A filter whose input and output are the renderer's own device memory,
@@ -183,6 +199,7 @@ impl Denoiser {
                 runs: 0,
                 shared: Default::default(),
                 next_shared: 0,
+                running: None,
                 #[cfg(test)]
                 stand_in_shares: false,
                 #[cfg(test)]
@@ -197,7 +214,7 @@ impl Denoiser {
     /// leads to it and back can be checked without OIDN.
     #[cfg(test)]
     pub(crate) fn pass_through() -> Self {
-        Denoiser { api: None, device: std::ptr::null_mut(), sized: None, runs: 0, shared: Default::default(), next_shared: 0, stand_in_shares: false, stand_in_shares_badly: false }
+        Denoiser { api: None, device: std::ptr::null_mut(), sized: None, runs: 0, shared: Default::default(), next_shared: 0, running: None, stand_in_shares: false, stand_in_shares_badly: false }
     }
 
     fn check(&self) -> Result<(), String> {
@@ -213,7 +230,30 @@ impl Denoiser {
         Err(format!("Open Image Denoise error {code}: {text}"))
     }
 
+    /// Waits for the picture begun with `start` or `start_shared`.
+    fn wait(&mut self) {
+        if let (Some(_), Some(api)) = (self.running.take(), &self.api) {
+            if let Some(sync) = api.sync_device {
+                // SAFETY: the device is live.
+                unsafe { sync(self.device) };
+            }
+        }
+    }
+
+    /// Begins filter `filter` without waiting for it, where the library
+    /// can and nothing else is under way.
+    fn begin(&mut self, filter: Handle, run: Run) -> bool {
+        let Some(api) = &self.api else { return false };
+        let (Some(execute), Some(_), None) = (api.execute_async, api.sync_device, self.running) else { return false };
+        // SAFETY: a committed filter of this device; its images are not
+        // touched until `wait`.
+        unsafe { execute(filter) };
+        self.running = Some(run);
+        true
+    }
+
     fn release_sized(&mut self) {
+        self.wait();
         if let (Some(s), Some(api)) = (self.sized.take(), &self.api) {
             // SAFETY: handles from this device, not used after this.
             unsafe {
@@ -244,6 +284,67 @@ impl Denoiser {
             return Ok(());
         }
         let (in_bytes, out_bytes) = (n * INPUT_FLOATS * 4, n * 12);
+        // (A picture begun with `start` and not taken finishes first.)
+        self.wait();
+        self.size(w, h)?;
+        let api = self.api.as_ref().unwrap();
+        let s = self.sized.as_ref().unwrap();
+        // SAFETY: the buffers hold `in_bytes` and `out_bytes`; the slices
+        // are that long.
+        unsafe {
+            (api.write_buffer)(s.buffers[0], 0, in_bytes, input.as_ptr() as *const c_void);
+            (api.execute_filter)(s.filter);
+            (api.read_buffer)(s.buffers[1], 0, out_bytes, output.as_mut_ptr() as *mut c_void);
+        }
+        self.check()
+    }
+
+    /// Begins denoising a `w × h` picture (`input` as `denoise` takes it)
+    /// without waiting; `picture` names it for `take`. False when it was
+    /// not begun (`denoise` then does all of it): a library without the
+    /// calls, another picture under way, the stand-in.
+    pub fn start(&mut self, picture: u64, w: usize, h: usize, input: &[f32]) -> bool {
+        if self.api.is_none() || self.running.is_some() || input.len() != w * h * INPUT_FLOATS || self.size(w, h).is_err() {
+            return false;
+        }
+        let api = self.api.as_ref().unwrap();
+        let s = self.sized.as_ref().unwrap();
+        // SAFETY: the buffer holds the input's bytes; the slice is that long.
+        unsafe { (api.write_buffer)(s.buffers[0], 0, input.len() * 4, input.as_ptr() as *const c_void) };
+        let filter = s.filter;
+        self.begin(filter, Run::Copied(picture))
+    }
+
+    /// Waits for the picture `start` began as `picture` and takes its
+    /// colour (three floats a pixel). None when that picture is not the
+    /// one under way: `denoise` it instead.
+    pub fn take(&mut self, picture: u64, output: &mut [f32]) -> Option<Result<(), String>> {
+        if self.running != Some(Run::Copied(picture)) {
+            return None;
+        }
+        self.wait();
+        self.runs += 1;
+        let (api, s) = (self.api.as_ref()?, self.sized.as_ref()?);
+        if output.len() != s.size.0 * s.size.1 * 3 {
+            return Some(Err("denoise: image sizes differ".into()));
+        }
+        // SAFETY: the output buffer holds that many bytes; the slice is
+        // that long.
+        unsafe { (api.read_buffer)(s.buffers[1], 0, output.len() * 4, output.as_mut_ptr() as *mut c_void) };
+        Some(self.check())
+    }
+
+    /// `start` for shared filter `id` (`denoise_shared` then waits for it).
+    pub fn start_shared(&mut self, id: u64) -> bool {
+        match self.shared.get(&id).map(|s| s.filter) {
+            Some(filter) => self.begin(filter, Run::Shared(id)),
+            None => false,
+        }
+    }
+
+    /// Makes `sized` the filter and buffers for `w × h` pictures.
+    fn size(&mut self, w: usize, h: usize) -> Result<(), String> {
+        let (in_bytes, out_bytes) = (w * h * INPUT_FLOATS * 4, w * h * 12);
         if self.sized.as_ref().map(|s| s.size) != Some((w, h)) {
             self.release_sized();
             let api = self.api.as_ref().unwrap();
@@ -266,16 +367,7 @@ impl Denoiser {
             }
             self.check()?;
         }
-        let api = self.api.as_ref().unwrap();
-        let s = self.sized.as_ref().unwrap();
-        // SAFETY: the buffers hold `in_bytes` and `out_bytes`; the slices
-        // are that long.
-        unsafe {
-            (api.write_buffer)(s.buffers[0], 0, in_bytes, input.as_ptr() as *const c_void);
-            (api.execute_filter)(s.filter);
-            (api.read_buffer)(s.buffers[1], 0, out_bytes, output.as_mut_ptr() as *mut c_void);
-        }
-        self.check()
+        Ok(())
     }
 }
 
@@ -355,12 +447,17 @@ impl Denoiser {
     /// Denoises shared filter `id`'s input into its output, in place on
     /// the device. The renderer's work on both memories must be done.
     pub fn denoise_shared(&mut self, id: u64) -> Result<(), String> {
+        // Begun with `start_shared`: wait for it.
+        let started = self.running == Some(Run::Shared(id));
+        self.wait();
         let s = self.shared.get(&id).ok_or("no such shared filter")?;
         self.runs += 1;
         match (&self.api, &s.files) {
             (Some(api), _) => {
-                // SAFETY: a committed filter of this device.
-                unsafe { (api.execute_filter)(s.filter) };
+                if !started {
+                    // SAFETY: a committed filter of this device.
+                    unsafe { (api.execute_filter)(s.filter) };
+                }
                 self.check()
             }
             (None, Some(_)) => {
@@ -419,6 +516,7 @@ impl Denoiser {
 
     /// Lets go of shared filter `id` (before its memories are freed).
     pub fn release_shared(&mut self, id: u64) {
+        self.wait();
         if let (Some(s), Some(api)) = (self.shared.remove(&id), &self.api) {
             // SAFETY: handles from this device, not used after this.
             unsafe {
