@@ -32,6 +32,11 @@ mod launcher_recording;
 mod library;
 mod models;
 mod motion_ui;
+mod motion_editor;
+mod motion_piece_ui;
+mod motion_timeline;
+mod motion_pieces;
+mod motion_sound;
 mod motion_overview_ui;
 mod animation_ui;
 mod notifications;
@@ -543,6 +548,22 @@ struct Studio {
     /// never frees a `RenderImage` on its own.
     retired_images: Vec<Arc<RenderImage>>,
     captured_dimensions: Option<(u32, u32)>,
+    /// Motion designs placed on the open recording's timeline.
+    motion_pieces: Option<crate::motion_pieces::MotionPieces>,
+    /// Bumped to stop the motion pieces' polling task.
+    motion_pieces_loop: u64,
+    selected_motion_piece: Option<String>,
+    motion_piece_drag: Option<crate::motion_piece_ui::PieceDrag>,
+    /// A motion piece open for editing in place of the video timeline.
+    /// The piece open on the timeline in the Motion tab.
+    motion_doc: Option<crate::motion_timeline::MotionDoc>,
+    motion_layer_drag: Option<crate::motion_timeline::LayerDrag>,
+    /// The preview shows only the open motion piece.
+    motion_isolate: bool,
+    /// A motion project opened on its own (`lahza project.lahza`).
+    motion_project: Option<PathBuf>,
+    /// The motion project's ruler is being dragged.
+    motion_scrub: bool,
     effect_revision: u64,
     annotations: Vec<AnnotationMark>,
     undo_stack: Vec<Vec<AnnotationMark>>,
@@ -974,6 +995,15 @@ impl Studio {
             displayed_capture_image: None,
             retired_images: Vec::new(),
             captured_dimensions: None,
+            motion_pieces: None,
+            motion_pieces_loop: 0,
+            selected_motion_piece: None,
+            motion_piece_drag: None,
+            motion_doc: None,
+            motion_layer_drag: None,
+            motion_isolate: false,
+            motion_project: None,
+            motion_scrub: false,
             effect_revision: 0,
             annotations: Vec::new(),
             undo_stack: Vec::new(),
@@ -1301,6 +1331,7 @@ impl Studio {
                 }
             }
             MOTION_ZOOM_SLIDER => self.set_motion_zoom_slider(value),
+            crate::motion_piece_ui::PIECE_OPACITY_SLIDER => self.set_motion_piece_opacity(value),
             id if id >= 100 => {
                 self.set_scene_slider(id, value);
             }
@@ -1619,6 +1650,9 @@ impl Studio {
         if self.video_project.is_some() {
             return self.render_video(window, cx);
         }
+        if self.motion_project.is_some() {
+            return self.render_motion_project(window, cx);
+        }
         self.fit_timeline_to_window(window.viewport_size());
         let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
         let composited = if self.preview_needs_compositor() {
@@ -1847,7 +1881,32 @@ fn open_studio_window(
     )
 }
 
+/// Prints `log` records (GPUI's renderer and platform messages among them)
+/// to stderr when `LAHZA_LOG` is set: `LAHZA_LOG=debug lahza …`.
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record) {
+        eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
+    }
+    fn flush(&self) {}
+}
+
 fn main() {
+    if let Ok(level) = std::env::var("LAHZA_LOG") {
+        if log::set_logger(&StderrLog).is_ok() {
+            log::set_max_level(level.parse().unwrap_or(log::LevelFilter::Info));
+        }
+    }
+    // `lahza mcp` (agent interface) and `lahza motion …` (motion engine CLI)
+    // run headless and never open a window.
+    let words: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = lahza_motion_mcp::run_cli(&words) {
+        std::process::exit(code);
+    }
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     if arguments.iter().any(|argument| argument == "--version") {
         println!("Lahza {}", env!("CARGO_PKG_VERSION"));
@@ -1855,6 +1914,13 @@ fn main() {
     }
     // Read the desktop animation preference off the UI thread.
     std::thread::spawn(theme::animations_enabled);
+    // `lahza project.lahza` opens the motion editor.
+    let initial_motion = arguments
+        .iter()
+        .find(|path| path.join("project.json").is_file() && path.extension().and_then(|e| e.to_str()) != Some("lahzarec"))
+        // The editor's toolbox resolves paths against the project's parent,
+        // so a relative argument would be joined twice.
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()));
     let initial_recording = arguments
         .iter()
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("lahzarec"))
@@ -1891,6 +1957,23 @@ fn main() {
                 .expect("failed to load bundled Inter font");
             theme::load_theme_preference();
             theme::set_appearance(cx.window_appearance());
+            if let Some(dir) = initial_motion.clone() {
+                if let Err(e) = lahza_motion_core::io::load(&dir) {
+                    eprintln!("lahza: {}: {e}", dir.display());
+                    cx.quit();
+                    return;
+                }
+                open_studio_window(cx, true, move |window_handle, cx| {
+                    cx.new(|cx| {
+                        let mut studio = Studio::new(window_handle, None, None, cx);
+                        studio.open_motion_project(dir.clone());
+                        studio
+                    })
+                })
+                .expect("failed to open Lahza window");
+                cx.activate(true);
+                return;
+            }
             let starts_in_editor = initial_recording.is_some() || initial_image.is_some();
             open_studio_window(cx, starts_in_editor, move |window_handle, cx| {
                 cx.new(|cx| {

@@ -60,8 +60,16 @@ struct AdapterCapabilities {
     full_screen_exclusive: bool,
     external_memory: bool,
     timing: bool,
+    /// Lahza: `LAHZA_PIPELINE_STATS` set and VK_KHR_pipeline_executable_properties available.
+    pipeline_stats: bool,
+    /// Lahza: the extensions NVIDIA's NGX (DLSS Ray Reconstruction) asks for are available.
+    ngx: bool,
     bugs: SystemBugs,
 }
+
+/// Lahza: what `NVSDK_NGX_VULKAN_RequiredExtensions` lists for a device
+/// (besides buffer device addresses, which ray tracing already has).
+const NGX_DEVICE_EXTENSIONS: [&ffi::CStr; 3] = [c"VK_NVX_binary_import", c"VK_NVX_image_view_handle", c"VK_KHR_push_descriptor"];
 
 // See https://github.com/canonical/nvidia-prime/blob/587c5012be9dddcc17ab4d958f10a24fa3342b4d/prime-select#L56
 fn is_nvidia_prime_forced() -> bool {
@@ -266,6 +274,10 @@ unsafe fn inspect_adapter(
     let buffer_marker = supported_extensions.contains(&vk::AMD_BUFFER_MARKER_NAME);
     let shader_info = supported_extensions.contains(&vk::AMD_SHADER_INFO_NAME);
     let full_screen_exclusive = supported_extensions.contains(&vk::EXT_FULL_SCREEN_EXCLUSIVE_NAME);
+    let pipeline_stats = std::env::var_os("LAHZA_PIPELINE_STATS").is_some()
+        && supported_extensions.contains(&vk::KHR_PIPELINE_EXECUTABLE_PROPERTIES_NAME);
+
+    let ngx = NGX_DEVICE_EXTENSIONS.iter().all(|e| supported_extensions.contains(e));
 
     let device_information = crate::DeviceInformation {
         is_software_emulated: properties.device_type == vk::PhysicalDeviceType::CPU,
@@ -278,6 +290,16 @@ unsafe fn inspect_adapter(
         driver_info: ffi::CStr::from_ptr(driver_properties.driver_info.as_ptr())
             .to_string_lossy()
             .to_string(),
+        device_memory: {
+            let memory = instance.core.get_physical_device_memory_properties(phd);
+            memory.memory_heaps[..memory.memory_heap_count as usize]
+                .iter()
+                .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|h| h.size)
+                .max()
+                .unwrap_or(0)
+        },
+        max_storage_buffer_range: properties.limits.max_storage_buffer_range as u64,
     };
 
     Some(AdapterCapabilities {
@@ -294,6 +316,8 @@ unsafe fn inspect_adapter(
         full_screen_exclusive,
         external_memory,
         timing,
+        pipeline_stats,
+        ngx,
         bugs,
     })
 }
@@ -506,6 +530,12 @@ impl super::Context {
             if capabilities.full_screen_exclusive {
                 device_extensions.push(vk::EXT_FULL_SCREEN_EXCLUSIVE_NAME);
             }
+            if capabilities.pipeline_stats {
+                device_extensions.push(vk::KHR_PIPELINE_EXECUTABLE_PROPERTIES_NAME);
+            }
+            if capabilities.ngx {
+                device_extensions.extend_from_slice(&NGX_DEVICE_EXTENSIONS);
+            }
             if capabilities.external_memory {
                 device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME);
                 device_extensions.push(if cfg!(target_os = "windows") {
@@ -543,6 +573,12 @@ impl super::Context {
                 .shader_float16(capabilities.shader_f16);
             if capabilities.shader_f16 {
                 device_create_info = device_create_info.push_next(&mut float16_features);
+            }
+            let mut pipeline_stats_features =
+                vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+                    .pipeline_executable_info(true);
+            if capabilities.pipeline_stats {
+                device_create_info = device_create_info.push_next(&mut pipeline_stats_features);
             }
 
             let mut ext_descriptor_indexing;
@@ -612,6 +648,11 @@ impl super::Context {
             },
             shader_info: if capabilities.shader_info {
                 Some(amd::shader_info::Device::new(&instance.core, &device_core))
+            } else {
+                None
+            },
+            pipeline_stats: if capabilities.pipeline_stats {
+                Some(khr::pipeline_executable_properties::Device::new(&instance.core, &device_core))
             } else {
                 None
             },
@@ -750,6 +791,24 @@ impl super::Context {
             .create_semaphore(&timeline_semaphore_create_info, None)
             .unwrap();
 
+        let pipeline_cache_data = desc
+            .pipeline_cache
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .unwrap_or_default();
+        let pipeline_cache = device
+            .core
+            .create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default().initial_data(&pipeline_cache_data),
+                None,
+            )
+            .or_else(|_| {
+                device
+                    .core
+                    .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+            })
+            .unwrap_or(vk::PipelineCache::null());
+
         let mut naga_flags = spv::WriterFlags::FORCE_POINT_SIZE;
         let shader_debug_path = if desc.validation || desc.capture {
             use std::{env, fs};
@@ -771,6 +830,7 @@ impl super::Context {
                 last_progress,
             }),
             physical_device,
+            ngx: capabilities.ngx,
             naga_flags,
             shader_debug_path,
             min_buffer_alignment,
@@ -782,9 +842,33 @@ impl super::Context {
                     .properties
                     .limits
                     .framebuffer_depth_sample_counts,
+            pipeline_cache,
+            pipeline_cache_path: desc.pipeline_cache,
             instance,
             entry,
         })
+    }
+
+    /// Writes the compiled pipelines to `ContextDesc::pipeline_cache`
+    /// (nothing without one). Written to a temporary file and renamed, so
+    /// another process never reads half a cache.
+    pub fn save_pipeline_cache(&self) {
+        let Some(path) = &self.pipeline_cache_path else {
+            return;
+        };
+        if self.pipeline_cache == vk::PipelineCache::null() {
+            return;
+        }
+        let Ok(data) = (unsafe { self.device.core.get_pipeline_cache_data(self.pipeline_cache) }) else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, &data).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 
     pub(super) fn set_object_name<T: vk::Handle>(&self, object: T, name: &str) {
@@ -810,6 +894,22 @@ impl super::Context {
         }
     }
 
+    /// Lahza: the Vulkan handles NVIDIA's NGX is initialised with, when
+    /// the device has its extensions: instance, physical device, device,
+    /// `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`.
+    pub fn ngx_handles(&self) -> Option<[u64; 5]> {
+        use ash::vk::Handle as _;
+        self.ngx.then(|| {
+            [
+                self.instance.core.handle().as_raw(),
+                self.physical_device.as_raw(),
+                self.device.core.handle().as_raw(),
+                self.entry.static_fn().get_instance_proc_addr as usize as u64,
+                self.instance.core.fp_v1_0().get_device_proc_addr as usize as u64,
+            ]
+        })
+    }
+
     pub fn device_information(&self) -> &crate::DeviceInformation {
         &self.device.device_information
     }
@@ -827,6 +927,9 @@ impl Drop for super::Context {
                     .core
                     .destroy_semaphore(queue.timeline_semaphore, None);
             }
+            self.device
+                .core
+                .destroy_pipeline_cache(self.pipeline_cache, None);
             self.device.core.destroy_device(None);
             self.instance.core.destroy_instance(None);
         }

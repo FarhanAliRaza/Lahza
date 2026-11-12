@@ -80,6 +80,24 @@ energy and halo (output outside its source neighbourhood's range).
 
 v1 is sharper only through overshoot halos.
 
+An experimental 2× weight-edit study measures false color on grayscale text
+and compares a final-layer chroma correction with a short fine-tuning run.
+See [the experiment report](../../docs/upscaler-weight-edit.md) for the method,
+results, and reproduction commands. Its candidate is separate from these
+shipped models.
+
+A subsequent [teacher–student experiment](../../docs/upscaler-distillation.md)
+keeps the 2× model at 11,468 parameters. It reduces grayscale color fringes, but
+does not reproduce the teacher's reconstruction gains. Its exported candidates
+pass FP16/FP32 GPU parity checks and remain separate from the shipped weights.
+
+A [coverage-architecture experiment](../../docs/upscaler-coverage.md) compares
+separate coverage/color prediction, fusible edge training, and matched RGB
+controls. Edge training improves fresh outline-rendering tests at the original
+model size, but independent visual reviews find no consistent overall upgrade;
+the coverage heads also fail flat-gray and halo checks. These prototypes remain
+separate from the bundled models.
+
 ## Cost
 
 GPU time on an RTX 3060 for one enhanced region: 960×540 at 2× takes about

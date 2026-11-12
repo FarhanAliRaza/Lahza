@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "lahza": {
+      "type": "stdio",
+      "command": "/home/farhan/code/screendrop-rs/target/release/lahza-motion",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}

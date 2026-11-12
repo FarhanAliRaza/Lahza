@@ -59,6 +59,8 @@ struct Device {
     ray_tracing: Option<RayTracingDevice>,
     buffer_marker: Option<ash::amd::buffer_marker::Device>,
     shader_info: Option<ash::amd::shader_info::Device>,
+    /// Lahza: compiled pipelines' driver statistics (`LAHZA_PIPELINE_STATS`).
+    pipeline_stats: Option<khr::pipeline_executable_properties::Device>,
     full_screen_exclusive: Option<ash::ext::full_screen_exclusive::Device>,
     #[cfg(target_os = "windows")]
     external_memory: Option<ash::khr::external_memory_win32::Device>,
@@ -155,10 +157,14 @@ pub struct Context {
     queue_family_index: u32,
     queue: Mutex<Queue>,
     physical_device: vk::PhysicalDevice,
+    /// Lahza: the device was made with NVIDIA NGX's extensions.
+    ngx: bool,
     naga_flags: naga::back::spv::WriterFlags,
     shader_debug_path: Option<PathBuf>,
     min_buffer_alignment: u64,
     sample_count_flags: vk::SampleCountFlags,
+    pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<PathBuf>,
     instance: Instance,
     entry: ash::Entry,
 }
@@ -198,6 +204,22 @@ pub struct Texture {
     target_size: [u16; 2],
     format: crate::TextureFormat,
     external: Option<crate::ExternalMemorySource>,
+}
+
+impl Texture {
+    /// Lahza: the `VkImage`, for NVIDIA's NGX.
+    pub fn raw_image(&self) -> u64 {
+        use ash::vk::Handle as _;
+        self.raw.as_raw()
+    }
+}
+
+impl TextureView {
+    /// Lahza: the `VkImageView`, for NVIDIA's NGX.
+    pub fn raw_view(&self) -> u64 {
+        use ash::vk::Handle as _;
+        self.raw.as_raw()
+    }
 }
 
 impl Default for Texture {

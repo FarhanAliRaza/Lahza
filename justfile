@@ -1,6 +1,7 @@
 bin := env_var('HOME') / ".local/bin/lahza"
 apps := env_var('HOME') / ".local/share/applications"
 icons := env_var('HOME') / ".local/share/icons/hicolor"
+ngx := env_var('HOME') / ".local/lib/lahza"
 
 # List recipes
 default:
@@ -23,6 +24,15 @@ release-check *args:
 # Install/enable the GNOME capture helper without rebuilding Lahza
 install-helper:
     python3 packaging/install-gnome-helper.py
+
+# Build the optional NVIDIA Ray Reconstruction shim (the fast path-traced mode) from a DLSS SDK
+# checkout (github.com/NVIDIA/DLSS) and Vulkan headers, and install it with the SDK's snippet
+ngx sdk="ignore/DLSS" headers="ignore/Vulkan-Headers/include":
+    mkdir -p {{ngx}}
+    g++ -std=c++17 -O2 -fPIC -shared -I{{headers}} -I{{sdk}}/include packaging/ngx/lahza_ngx.cpp \
+      -o {{ngx}}/liblahza_ngx.so {{sdk}}/lib/Linux_x86_64/libnvsdk_ngx.a -l:libvulkan.so.1 -ldl -lpthread
+    cp {{sdk}}/lib/Linux_x86_64/rel/libnvidia-ngx-dlssd.so.* {{ngx}}/
+    @echo "Installed the Ray Reconstruction shim in {{ngx}}"
 
 # Build, replace the installed binary, and install the GNOME capture helper
 install: build

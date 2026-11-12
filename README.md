@@ -236,6 +236,18 @@ cargo test --release --locked benchmark_hardware_composition -- --ignored --noca
 LAHZA_EXPORT_PROJECT=/path/to/project.lahzarec cargo test --release --locked benchmark_saved_recording_export -- --ignored --nocapture
 ```
 
+### Motion engine and agent interface
+
+`lahza mcp` serves the motion engine to AI agents over MCP (`claude mcp add
+lahza -- lahza mcp`), and `lahza motion create|analyze|apply|check|snapshot|render`
+drives it from the shell. Projects are `*.lahza/` folders; music analysis
+gives beat, bar, hit, stop and drop markers that keyframes anchor to by their
+start, peak, landing or end. See [docs/motion-engine.md](docs/motion-engine.md).
+
+```bash
+cargo test --locked -p lahza-motion-core -p lahza-motion-audio -p lahza-motion-render -p lahza-motion-mcp
+```
+
 ## First-release scope
 
 Lahza is an early Linux release. Desktop portal behavior varies by compositor, and the presence of both display backends does not imply every capture feature has been validated on every desktop. Live webcam capture depends on camera permissions and a supported V4L2 device. Recovery can salvage usable recordings, but cannot guarantee recovery after every encoder or system failure.

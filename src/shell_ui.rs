@@ -174,7 +174,10 @@ impl Studio {
 
     /// The segment the mode switcher highlights. A recording keeps its
     /// motion controls in the Motion tab, so that tab reads as Motion.
-    fn displayed_mode(&self) -> EditorMode {
+    pub(crate) fn displayed_mode(&self) -> EditorMode {
+        if self.motion_project.is_some() {
+            return EditorMode::Motion;
+        }
         let mode = self.editor_mode();
         if mode == EditorMode::Video
             && self.inspector_visible
@@ -187,6 +190,13 @@ impl Studio {
     }
 
     pub(crate) fn switch_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
+        // Leaving a motion project for an image or a recording closes it.
+        if self.motion_project.is_some() {
+            if mode == EditorMode::Motion {
+                return;
+            }
+            self.close_motion_project();
+        }
         if mode == self.editor_mode() {
             // Video highlighted as Motion: Video returns to the general tab.
             if mode == EditorMode::Video && self.displayed_mode() == EditorMode::Motion {
@@ -239,6 +249,9 @@ impl Studio {
     }
 
     fn can_undo(&self) -> bool {
+        if self.motion_editing() && self.motion_doc.is_some() {
+            return true;
+        }
         match self.editor_mode() {
             EditorMode::Video => !self.video_undo_stack.is_empty() && !self.video_edit_busy,
             EditorMode::Motion => !self.video_undo_stack.is_empty() || !self.undo_stack.is_empty(),
@@ -250,6 +263,9 @@ impl Studio {
     }
 
     fn can_redo(&self) -> bool {
+        if self.motion_editing() && self.motion_doc.is_some() {
+            return true;
+        }
         match self.editor_mode() {
             EditorMode::Video => !self.video_redo_stack.is_empty() && !self.video_edit_busy,
             EditorMode::Motion => !self.video_redo_stack.is_empty() || !self.redo_stack.is_empty(),
@@ -261,6 +277,9 @@ impl Studio {
     }
 
     pub(crate) fn undo_current(&mut self, cx: &mut Context<Self>) {
+        if self.motion_editing() && self.undo_motion_doc(false, cx) {
+            return;
+        }
         match self.editor_mode() {
             EditorMode::Video => self.undo_video_edit(cx),
             EditorMode::Motion => {
@@ -281,6 +300,9 @@ impl Studio {
     }
 
     pub(crate) fn redo_current(&mut self, cx: &mut Context<Self>) {
+        if self.motion_editing() && self.undo_motion_doc(true, cx) {
+            return;
+        }
         match self.editor_mode() {
             EditorMode::Video => self.redo_video_edit(cx),
             EditorMode::Motion => {
@@ -703,7 +725,7 @@ impl Studio {
     pub(crate) fn effective_tab(&self) -> InspectorTab {
         let mode = self.editor_mode();
         let tab = if mode != EditorMode::Static
-            && (self.video_selected_zoom_cue.is_some() || self.walkthrough_mode)
+            && (self.video_selected_zoom_cue.is_some() || self.walkthrough_mode || self.selected_motion_piece.is_some())
         {
             InspectorTab::Motion
         } else if self.selected_annotation.is_some() || self.tool != Tool::Select {
@@ -729,6 +751,7 @@ impl Studio {
         self.selected_annotation = None;
         self.annotation_draft = None;
         self.video_selected_zoom_cue = None;
+        self.selected_motion_piece = None;
         self.scene_selection = SceneSelection::Scene;
         self.walkthrough_mode = false;
         if tab != InspectorTab::Annotate {
@@ -1415,6 +1438,12 @@ impl Studio {
     }
 
     fn motion_tab(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(layer) = self.motion_layer_inspector(cx) {
+            return layer;
+        }
+        if let Some(piece) = self.motion_piece_inspector(cx) {
+            return piece;
+        }
         if let Some(region) = self.motion_inspector(cx) {
             return region;
         }
@@ -1827,6 +1856,9 @@ impl Studio {
         ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
         let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
         let camera_lane = self.camera_region_lane(timeline_scroll, timeline_content_width, progress, cx);
+        let motion_piece_lane = self.motion_piece_lane(timeline_scroll, cx);
+        let motion_layer_lane = self.motion_layer_lane(timeline_scroll, cx);
+        let motion_layer_labels = self.motion_layer_labels(TRACK_LABEL_WIDTH, cx);
         let clip_lane: Vec<AnyElement> = if is_video {
             self.video_clip_lane(
                 timeline_duration,
@@ -1942,6 +1974,8 @@ impl Studio {
         };
         let tracks_height = 48.0
             + 4.0
+            + self.motion_piece_lane_height().map_or(0.0, |h| h + 4.0)
+            + self.motion_layer_lane_height(cx).map_or(0.0, |h| h + 4.0)
             + self.motion_lane_height()
             + audio_height
             + camera_height
@@ -2153,6 +2187,8 @@ impl Studio {
                                         if is_video { "Video" } else { "Image" },
                                         48.0,
                                     ))
+                                    .when_some(self.motion_piece_lane_height(), |d, h| d.child(Self::track_label("Motion", h)))
+                                    .when_some(motion_layer_labels, |d, labels| d.child(labels))
                                     .child(Self::track_label("Zooms", self.motion_lane_height()))
                                     .when(annotation_track.is_some(), |d| {
                                         d.child(Self::track_label(
@@ -2250,6 +2286,8 @@ impl Studio {
                                                 ),
                                             ),
                                     )
+                                    .when_some(motion_piece_lane, |d, lane| d.child(lane))
+                                    .when_some(motion_layer_lane, |d, lane| d.child(lane))
                                     .child(motion_track)
                                     .when_some(annotation_track, |d, lane| d.child(lane))
                                     .when_some(camera_lane, |d, lane| d.child(lane))
