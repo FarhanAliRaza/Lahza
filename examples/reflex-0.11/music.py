@@ -1,4 +1,4 @@
-"""Score for the Reflex 0.11 reel: 120 BPM, D minor, 23 bars + tail.
+"""Score for the Reflex 0.11 reel: 120 BPM, D minor, 25 bars + tail.
 
 Every event sits on the grid the edit uses (beat 0.5 s, bar 2 s), so the
 markers written alongside are exact. Synth voices come from synth.py (the
@@ -8,9 +8,9 @@ Lahza showreel's instruments).
   3-4   mark      impact on 4.0, half-time kick
   5-8   idea      four on the floor, bass, soft arp; bar 8 builds, last beat out
   9-10  0.11      impact on 16.0, wide chord, half-time
-  11-18 features  full groove, bright arp; a stab on every second bar (20, 24, 28, 32)
-  19-20 montage   a kick and a stab on every beat; last beat silent
-  21-23 end       impact on 40.0, the chord resolves; tail to 47 s
+  11-20 features  full groove, bright arp; a stab on every second bar (20 … 36)
+  21-22 montage   a kick and a stab on every beat; last beat silent
+  23-25 end       impact on 44.0, the chord resolves; tail to 51 s
 """
 import json
 import sys
@@ -49,24 +49,24 @@ for b in (3, 4, 9, 10):
         place(perc, tick(1.0 if q == 0 else 1.5), bar_t(b, 1 + q), 0.2 if q else 0.28, pan=-0.3 if q % 2 else 0.3)
         TICKS.append(bar_t(b, 1 + q))
 for i in range(9):
-    b, q = 21 + i // 4, i % 4
+    b, q = 23 + i // 4, i % 4
     place(perc, tick(1.0 if q == 0 else 1.5), bar_t(b, 1 + q), 0.3 * 0.82 ** i, pan=0.3 if i % 2 else -0.3)
     TICKS.append(bar_t(b, 1 + q))
 
 # Pads.
-for b in range(1, 19, 2):
+for b in range(1, 21, 2):
     gain = 0.7 if b < 3 else (0.95 if b < 9 else 0.85)
     place(music, pad_chord(CHORDS[chord_at(b)], 2 * BAR + 0.6, 1400 if b < 9 else 3000), bar_t(b), gain)
-place(music, pad_chord([38, 50, 57, 62, 64, 69, 76], 7.0, 1700), bar_t(21), 1.3)  # Dm(add9)
+place(music, pad_chord([38, 50, 57, 62, 64, 69, 76], 7.0, 1700), bar_t(23), 1.3)  # Dm(add9)
 
-IMPACTS = ((4.0, 1.0, "mark"), (16.0, 1.15, "version"), (40.0, 1.25, "end"))
-STABS = (20.0, 24.0, 28.0, 32.0)
+IMPACTS = ((4.0, 1.0, "mark"), (16.0, 1.15, "version"), (44.0, 1.25, "end"))
+STABS = (20.0, 24.0, 28.0, 32.0, 36.0)
 place(fx, riser(1.6), 4.0 - 1.6, 0.55)
 place(fx, reverse_cymbal(1.4), 4.0 - 1.4, 0.6)
 place(fx, riser(1.9), 16.0 - 1.9, 0.6)
 place(fx, reverse_cymbal(1.0), 16.0 - 1.0, 0.6)
-place(fx, riser(1.4), 40.0 - 1.9, 0.6)
-place(fx, reverse_cymbal(0.5), 40.0 - 0.5, 0.7)
+place(fx, riser(1.4), 44.0 - 1.9, 0.6)
+place(fx, reverse_cymbal(0.5), 44.0 - 0.5, 0.7)
 for t in STABS:
     place(fx, reverse_cymbal(0.5), t - 0.5, 0.3)
     place(fx, impact(0.55), t, 0.5)
@@ -111,22 +111,22 @@ for i, d in enumerate(np.cumsum([0.25] * 4 + [0.125] * 8 + [0.0625] * 8)):
     t = bar_t(8) + d - 0.25
     if t < bar_t(8, 4):
         place(drums, clap(), t, 0.12 + 0.3 * i / 20, pan=0.1)
-for b in range(11, 19):
+for b in range(11, 21):
     groove(b, hats16=True)
-for b in (19, 20):
+for b in (21, 22):
     for q in range(4):
         t = bar_t(b, 1 + q)
-        if t >= 39.5:
+        if t >= 43.5:
             continue
         place(drums, kick(), t, 1.0)
         kicks.append(t)
-        c = CHORDS[(q + 2 * (b - 19)) % 4]
+        c = CHORDS[(q + 2 * (b - 21)) % 4]
         place(music, stab(c), t, 1.0)
         place(send, stab(c), t, 0.6)
         place(perc, hat(True), t + BEAT / 2, 0.22, pan=0.3)
 
 # Bass.
-for b in list(range(4, 9)) + list(range(10, 19)):
+for b in list(range(4, 9)) + list(range(10, 21)):
     root = hz(ROOTS[chord_at(b)])
     if b in (4, 10):
         place(music, bass(root, BAR - 0.05), bar_t(b), 0.8)
@@ -137,10 +137,10 @@ for b in list(range(4, 9)) + list(range(10, 19)):
             continue
         f = root * (2 if s % 8 == 6 and fast else 1)
         place(music, bass(f, BEAT / 4 * 0.9 if fast else BEAT / 2 * 0.85), bar_t(b) + s * BEAT / 4, 0.75)
-place(music, bass(hz(26), 6.0), bar_t(21), 0.7)
+place(music, bass(hz(26), 6.0), bar_t(23), 0.7)
 
 # Arp.
-for b in list(range(6, 9)) + list(range(11, 19)):
+for b in list(range(6, 9)) + list(range(11, 21)):
     tones = [m + 12 for m in CHORDS[chord_at(b)]]
     pattern = [0, 2, 1, 3, 2, 1, 3, 0]
     for s in range(16):
@@ -154,8 +154,8 @@ for b, beat, m in [(9, 1, 74), (9, 3, 77), (10, 1, 81), (10, 2.5, 79), (10, 3.5,
     place(music, pluck(hz(m), 1.0, 2.0), bar_t(b, beat), 0.4, pan=0.2)
     place(send, pluck(hz(m), 1.0, 2.0), bar_t(b, beat), 0.5)
 for m, d in ((74, 0), (81, 0.02), (86, 0.04)):
-    place(music, pluck(hz(m), 3.0, 3.0), 40.0 + d, 0.3)
-    place(send, pluck(hz(m), 3.0, 3.0), 40.0 + d, 0.45)
+    place(music, pluck(hz(m), 3.0, 3.0), 44.0 + d, 0.3)
+    place(send, pluck(hz(m), 3.0, 3.0), 44.0 + d, 0.45)
 
 # Mix.
 wet = reverb(send + 0.25 * music + 0.15 * perc, reverb_ir(2.6))

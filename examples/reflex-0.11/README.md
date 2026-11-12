@@ -1,6 +1,6 @@
 # Reflex 0.11 release reel
 
-A 47-second film for the Reflex 0.11.0 release, built from code and rendered
+A 51-second film for the Reflex 0.11.0 release, built from code and rendered
 by the motion engine: score, type, 3D and path-traced lighting are one project.
 
 ```bash
@@ -30,7 +30,7 @@ at 1080p on four cores).
 - **Type**: Inter Display for headlines, JetBrains Mono for code. Every line
   of code on screen is real Reflex 0.11 code.
 - **Score**: `music.py` synthesises 120 BPM in D minor with impacts at 4, 16
-  and 40 s and a stab on each feature cut, so the markers are exact.
+  and 44 s and a stab on each feature cut, so the markers are exact.
 
 | s | scene | what it shows | engine features |
 |---|---|---|---|
@@ -38,12 +38,13 @@ at 1080p on four cores).
 | 4–8 | mark | the mark assembles: "Web apps in pure Python." | traced shadow catcher, 3D type cards, motion blur |
 | 8–16 | idea | a state class types on; the UI card counts with it | 2.5D comps, follow on a path, text animators |
 | 16–20 | 0.11 | the version on a glossy stage | extruded glyphs, chrome parts, depth of field, bloom |
-| 20–24 | await | `await State.add(amount)`: the call goes out, the value returns | sweeps with trim and head, emissive |
-| 24–28 | client state | `rx.client_state`: a switch flips, the server stays dark | keyed material colour, rack focus depth |
-| 28–32 | SetVar | `\|`, `&`, `-`, `^` lift exactly their members | 12 keyed spheres, tori |
-| 32–36 | Alembic | revisions drop onto the database | bounce anchored to the beat |
-| 36–40 | montage | seven more changes, one per beat | slam, hard cuts |
-| 40–47 | end | the mark, `pip install --upgrade reflex` | instancer wave field |
+| 20–24 | await | events queue for the state lock; a chained handler used to go to the back of the queue, an awaited one runs inside the lock and returns | torus segments with a keyed gap, parented orbit, emissive |
+| 24–28 | client state | a page of components: server state takes the wire there and back, `rx.client_state` flips only its readers, wire dark | 24 boxes, sweeps with trim and head, keyed colour |
+| 28–32 | SetVar | union, intersection, difference, symmetric difference lift exactly their members | 12 keyed spheres, tori |
+| 32–36 | Alembic | the schema as a table: revisions add columns, `alembic downgrade -1` takes one back | bounce anchored to the beat |
+| 36–40 | blocking | tasks circle the event loop; a blocking call stops it, Reflex names handler and line | parented rotation, keyed colour, screen-space callout |
+| 40–44 | montage | seven more changes, one per beat | slam, hard cuts |
+| 44–51 | end | the mark, `pip install --upgrade reflex` | instancer wave field |
 
 `shaders/reel.slang` holds two Slang functions for `--slang`: `aurora`, the
 block-grid backdrop of the 0.11 shot, and `circuit`, a material that cuts the

@@ -34,7 +34,7 @@ SYSTEM_FONTS = {
     "InterDisplay-Light.otf": INTER, "JetBrainsMono-Medium.ttf": MONO, "JetBrainsMono-Bold.ttf": MONO,
 }
 W, H, FPS = 1920, 1080, 30
-DURATION = 47.0
+DURATION = 51.0
 M = 110
 SLANG = False
 
@@ -421,7 +421,7 @@ def code_line(prefix, t, code, tone="dark", size=52, y=H - 128, align="left"):
 
 def stage_bg(id, tone):
     if tone == "dark":
-        pts = [{"position": [300, 260], "color": "#241b4d", "radius": 560}, {"position": [-900, -500], "color": "#09090c", "radius": 520},
+        pts = [{"position": [200, 300], "color": "#1c1540", "radius": 560}, {"position": [-900, -500], "color": "#09090c", "radius": 520},
                {"position": [900, -540], "color": "#0a0a0e", "radius": 520}, {"position": [-960, 540], "color": "#0b0a12", "radius": 420}]
     else:
         pts = [{"position": [-500, -300], "color": "#ffffff", "radius": 620}, {"position": [700, 380], "color": "#e4dbfb", "radius": 640},
@@ -444,68 +444,145 @@ def label3d(id, s, x, y, z, size, color, **kw):
     return text(id, s, x, y, size, F_MONOB, color, three_d=True, z=z, role="foreground", **kw)
 
 
+def ball(id, x, y, z, r, color, emissive=0.0, **kw):
+    m = {"preset": "coated", "color": color, "roughness": 0.2}
+    if emissive:
+        m.update({"emissive": color, "emissive_strength": emissive})
+    layer = {"id": id, "kind": "mesh", "mesh": {"type": "sphere", "radius": r}, "material": m, "role": "subject",
+             "transform": {"position": [x, y], "z": z}}
+    for key, v in kw.items():
+        if key in ("scale", "opacity"):
+            layer["transform"][key] = v
+        else:
+            layer[key] = v
+    return layer
+
+
 def s05():
-    """AWAIT: one handler calls another; the call runs out along a tube, the value comes back, twice."""
+    """AWAIT: events queue for one state lock. Before, a chained handler went to the back of the queue;
+    now `await` runs it inside the lock the caller already holds, and its value comes back."""
     sid, start, end = "s05", 20.0, 24.0
-    cx, ground = W / 2, 760
-    ax, bx, by = 520, 1400, ground - 110
-    L = [stage_bg("a-bg", "dark"), floor("a-floor", ground, opacity=0.85)]
-    pop = lambda t: keys(k(t, 1, frm=0, ease="pop", anchor="start"))
-    hit = lambda *ts: keys(k(20.0 - f(2), 1, frm=0.5, ease="pop", anchor="start"),
-                           *[x for t in ts for x in (k(t, 1.12, ease="snap", dur="2f", anchor="end"), k(t + f(1), 1.0, ease="pop", anchor="start"))])
-    L.append(box("a-caller", ax, by, 380, 220, 220, VIOLET, bevel=16, preset="coated", role="subject", rotation_y=-18,
-                 material={"roughness": 0.22}, scale=hit(22.0, 23.5)))
-    L.append(box("a-callee", bx, by, 300, 220, 220, PAPER, bevel=16, preset="glossy", role="subject", rotation_y=18,
-                 material={"roughness": 0.3}, scale=hit(21.0, 23.0)))
-    L.append(label3d("a-l1", "add_twice()", ax - 20, by - 190, -60, 44, PAPER, animators=rise(20.0 + f(4), "0.6f", "8f", 20)))
-    L.append(label3d("a-l2", "add()", bx + 20, by - 190, -60, 44, PAPER, animators=rise(20.0 + f(6), "0.6f", "8f", 20)))
-    out_d = f"M {ax + 150 - cx} -120 C {ax + 380 - cx} -430 {bx - 360 - cx} -430 {bx - 130 - cx} -120"
-    back_d = f"M {bx - 130 - cx} 60 C {bx - 360 - cx} 330 {ax + 380 - cx} 330 {ax + 150 - cx} 60"
-    trips = [(20.5, 21.0, 21.5, 22.0), (22.5, 23.0, 23.0 + f(3), 23.5)]
-    for i, (t0, t1, t2, t3) in enumerate(trips):
-        for name, d, a, b, col in (("out", out_d, t0, t1, LILAC), ("back", back_d, t2, t3, "#ffffff")):
-            L.append({"id": f"a-{name}{i}", "kind": "mesh", "role": "subject", "time": window(a, b + 0.45),
-                      "mesh": {"type": "sweep", "d": d, "radius": 7, "head": 26,
-                               "trim": keys(k(a, [0, 0]), k(b, [0, 1], ease="glide"), k(b + 0.4, [1, 1], ease="glide"))},
-                      "material": {"preset": "emissive", "color": col, "emissive": col, "emissive_strength": 2.4},
-                      "transform": {"position": [cx, by - 30], "z": 0}})
-    for i, (t, v) in enumerate(((22.0, "total = 1"), (23.5, "total = 2"))):
-        L.append(label3d(f"a-v{i}", v, ax - 20, by - 285, -60, 56, LILAC, time=window(t, 23.5 if i == 0 else None), allow=["line_unread"],
-                         scale=keys(k(t, 1, frm=0.4, ease="pop", anchor="start"))))
-    L.append(feature_head("a", 20.0, "Await your event handlers."))
-    L.append(code_line("a", 20.5, "total = await State.add(amount)"))
-    camera = {"fov": 32, "orbit": keys(k(20.0, [-10, 9]), k(24.0, [10, 12], ease="linear")), "dolly": keys(k(20.0, -120), k(24.0, 40, ease="linear"))}
-    return {"id": sid, "start": start, "end": end, "background": "#09090c", "layers": L, "camera": camera, "lights": DARK_LIGHTS(cx, by),
-            "environment": {"preset": "studio", "intensity": 0.45}, "look": {"tone": "agx", "bloom": {"threshold": 0.85, "radius": 22, "intensity": 0.7}}}
+    cx, ground = 1100, 720
+    cy = ground - 80
+    L = [stage_bg("a-bg", "dark"), floor("a-floor", ground, color="#07060d", preset="coated", roughness=0.35)]
+    # The state: a violet core that lights while a handler holds it.
+    held = [(20.25, 21.25), (22.0, 23.6)]
+    glow = [k(20.0, 0.0)]
+    for a, b in held:
+        glow += [k(a, 1.6, ease="snap", dur="3f", anchor="start"), k(b, 0.0, ease="glide", dur="8f", anchor="start")]
+    L.append(box("a-core", cx, cy - 20, 150, 150, 150, VIOLET, bevel=14, preset="coated", role="subject",
+                 material={"roughness": 0.2, "emissive": "#8e77f0", "emissive_strength": keys(*glow)},
+                 rotation_y=keys(k(20.0, 20), k(24.0, 110, ease="linear"))))
+    # The lock: two half rings that close around the state.
+    gap = [k(20.0, 70)]
+    lit = [k(20.0, "#4a4860")]
+    for a, b in held:
+        gap += [k(a, 0, ease="snap", dur="4f", anchor="end"), k(b, 70, ease="glide", dur="8f", anchor="start")]
+        lit += [k(a, PAPER, ease="snap", dur="3f", anchor="end"), k(b, "#4a4860", ease="glide", dur="8f", anchor="start")]
+    L.append({"id": "a-lock", "kind": "mesh", "role": "subject", "mesh": {"type": "torus", "radius": 300, "tube": 17}, "segments": 2,
+              "gap": keys(*gap), "material": {"preset": "coated", "roughness": 0.18, "color": keys(*lit)},
+              "transform": {"position": [cx, cy + 40], "rotation_x": 90, "rotation": 90}})
+    # The queue: a rail of waiting events leading to the lock.
+    L.append({"id": "a-rail", "kind": "mesh", "role": "decoration", "mesh": {"type": "sweep", "d": "M -1500 0 L -340 0", "radius": 5},
+              "material": {"preset": "metal", "color": "#3a3850", "roughness": 0.4}, "transform": {"position": [cx, ground - 8], "rotation_x": 90}})
+    slot = lambda i: cx - 470 - i * 120  # queue slot i; the lock's seat is cx - 170
+    seat = cx - 170
+    y0 = ground - 46
+    # Round one (before): the caller enters, its chained event is thrown to the back of the queue, the caller leaves.
+    L.append(ball("a-c1", 0, 0, 0, 46, LILAC, time=window(19.8, 21.8)))
+    L[-1]["transform"]["position"] = keys(k(20.0, [seat, y0], frm=[slot(0), y0], ease="glide", dur="7f", anchor="start"),
+                                          k(21.3, [cx + 1100, y0], ease="gesture", dur="12f", anchor="start"))
+    L.append(ball("a-q1", 0, 0, 0, 34, PAPER, time=window(20.5)))
+    arc = [k(20.5, [seat + 60, y0 - 60]), k(20.75, [(seat + slot(3)) / 2, y0 - 420], ease="glide"), k(21.0, [slot(3), y0 + 12], ease="gesture")]
+    # ... then waits its turn like any other event.
+    arc += [k(21.5, [slot(2), y0 + 12], ease="glide", dur="8f", anchor="start"), k(23.7, [slot(1), y0 + 12], ease="glide", dur="8f", anchor="start")]
+    L[-1]["transform"]["position"] = keys(*arc)
+    L[-1]["transform"]["scale"] = keys(k(20.5, 1, frm=0, ease="pop", anchor="start"))
+    # The events behind it.
+    for i, c in enumerate(("#8e77f0", "#5b5870", "#5b5870")):
+        x_at = [k(20.0, [slot(i), y0])] + [k(t, [slot(i - n), y0], ease="glide", dur="8f", anchor="start") for n, t in ((1, 21.5), (2, 23.7)) if i - n >= 0]
+        e = ball(f"a-e{i}", 0, 0, 0, 46, c)
+        if i == 0:  # the next caller: takes the seat on the second lock
+            x_at = [k(20.0, [slot(1), y0]), k(21.5, [slot(0), y0], ease="glide", dur="8f", anchor="start"),
+                    k(22.0, [seat, y0], ease="glide", dur="7f", anchor="end"), k(23.7, [cx + 1100, y0], ease="gesture", dur="12f", anchor="start")]
+            e["transform"]["scale"] = keys(k(20.0, 1), k(23.3, 1.3, ease="snap", dur="2f", anchor="end"), k(23.3 + f(1), 1.0, ease="pop", anchor="start"))
+        else:
+            x_at = [k(20.0, [slot(i + 1), y0]), k(21.5, [slot(i), y0], ease="glide", dur="8f", anchor="start"),
+                    k(23.7, [slot(i - 1), y0], ease="glide", dur="8f", anchor="start")]
+        e["transform"]["position"] = keys(*x_at)
+        L.append(e)
+    # Round two (0.11): the awaited handler runs inside the lock, once around the state, and returns into its caller.
+    L.append({"id": "a-hub", "kind": "mesh", "mesh": {"type": "sphere", "radius": 4}, "material": {"preset": "matte", "color": INK, "opacity": 0},
+              "time": window(22.4, 23.4), "transform": {"position": [cx, y0], "rotation_y": keys(k(22.5, 0), k(23.3, -360, ease="gesture"))}})
+    L.append({"id": "a-in", "kind": "mesh", "parent": "a-hub", "role": "subject", "time": window(22.5, 23.3 + f(1)), "mesh": {"type": "sphere", "radius": 34},
+              "material": {"preset": "emissive", "color": PAPER, "emissive": "#ffffff", "emissive_strength": 2.6},
+              "transform": {"position": [-170, 0], "z": 0, "scale": keys(k(22.5, 1, frm=0, ease="pop", anchor="start"), k(23.3, 0.2, ease="gesture", dur="4f", anchor="end"))}})
+    L.append(feature_head("a", 20.0, "Await a handler.\nIt runs inside the lock.", size=80, y=170))
+    L[-1]["line_height"] = 1.08
+    L.append(text("a-old", "yield State.add(1)   # back of the queue", M, H - 128, 46, F_MONO, GREY, "left", space="screen", role="decoration",
+                  time=window(20.4, 22.0), animators=typed(20.4, "0.5f"), allow=["line_unread", "persistent_chrome"]))
+    L.append(text("a-code", "total = await State.add(1)", M, H - 128, 52, F_MONO, LILAC, "left", space="screen", role="foreground",
+                  time=window(22.0), animators=typed(22.0, "0.7f")))
+    camera = {"fov": 32, "orbit": keys(k(20.0, [-16, 24]), k(24.0, [8, 28], ease="linear")), "dolly": keys(k(20.0, 120), k(24.0, 280, ease="linear")),
+              "aperture": 0.5, "focus": "a-core"}
+    return {"id": sid, "start": start, "end": end, "background": "#09090c", "layers": L, "camera": camera, "lights": DARK_LIGHTS(cx, cy),
+            "environment": {"preset": "night", "intensity": 0.5}, "look": {"tone": "filmic", "bloom": {"threshold": 0.9, "radius": 22, "intensity": 0.7}}}
 
 
 def s06():
-    """CLIENT STATE: a switch flips on every beat in the browser; the server behind it never wakes."""
+    """CLIENT STATE: a page of components. Server state makes the trip down the wire and back; a client
+    state var lives in the browser, so a `.set` flips only the components that read it, at once, wire dark."""
     sid, start, end = "s06", 24.0, 28.0
-    cx, ground = 1180, 800
-    cy = ground - 190
-    L = [stage_bg("c-bg", "light"), floor("c-floor", ground, color=None, opacity=0.32)]
-    on = [k(24.0, 0)]
-    for b in range(1, 8):
-        t = 24.0 + b * BEAT
-        on.append(k(t, b % 2, ease="snap", dur="5f", anchor="end"))
-    kx = [dict(q, v=[cx - 150 + 300 * q["v"], cy]) for q in on]
-    col = [dict(q, v=VIOLET if q["v"] else "#8d8a9e") for q in on]
-    L.append({"id": "c-track", "kind": "mesh", "role": "subject", "mesh": {"type": "capsule", "radius": 150, "height": 600},
-              "material": {"preset": "coated", "roughness": 0.3, "color": {"keys": col}},
-              "transform": {"position": [cx, cy], "rotation": 90, "scale": enter(24.0, 1, 0.6, "pop", "10f")}})
-    L.append({"id": "c-knob", "kind": "mesh", "role": "subject", "mesh": {"type": "sphere", "radius": 128},
-              "material": {"preset": "glossy", "color": "#ffffff", "roughness": 0.18},
-              "transform": {"position": {"keys": kx}, "z": -90, "scale": enter(24.0, 1, 0.6, "pop", "10f")}})
-    # The server: a dark rack far behind, out of focus, its lamp off.
+    ground = 860
+    L = [stage_bg("c-bg", "light"), floor("c-floor", ground, color=None, opacity=0.3)]
+    cols, rows, cell, pitch = 6, 4, 132, 150
+    px, py = 620, 580  # the page's centre
+    readers = {(1, 1), (4, 0), (3, 2), (0, 3)}
+    flips = [25.5] + [26.0 + i * BEAT for i in range(4)]  # one slow server update, then one per beat in the browser
+    for r in range(rows):
+        for c in range(cols):
+            x = px + (c - (cols - 1) / 2) * pitch
+            y = py + (r - (rows - 1) / 2) * pitch
+            reads = (c, r) in readers
+            b = box(f"c-t{r}{c}", x, y, cell, cell, 34, "#dcd8ea", bevel=10, preset="plastic", role="subject", material={"roughness": 0.45})
+            t0 = 24.0 - f(2) + f(c + r) / 2
+            b["transform"]["scale"] = keys(k(t0, 1, frm=0, ease="pop", anchor="start"))
+            if reads:
+                rot = [k(24.0, 0)]
+                colr = [k(24.0, "#b9a8ff")]
+                for i, t in enumerate(flips):
+                    rot.append(k(t, 180 * (i + 1), ease="snap", dur="7f", anchor="start"))
+                    colr.append(k(t + f(3), VIOLET if i % 2 == 0 else "#b9a8ff", ease="snap", dur="2f", anchor="start"))
+                b["transform"]["rotation_y"] = keys(*rot)
+                b["material"] = {"preset": "coated", "roughness": 0.22, "color": keys(*colr)}
+            L.append(b)
+    # The server, across the frame, and the wire to it.
+    sx, sy = 1640, ground - 70
     for i in range(3):
-        L.append(box(f"c-rack{i}", 330, ground - 60 - i * 124, 360, 104, 300, "#2a2838", bevel=10, preset="plastic", z=900,
-                     material={"roughness": 0.5}, role="background", rotation_y=24))
-    L.append(feature_head("c", 24.0, "State that stays in the browser.", "light", align="right"))
-    L.append(code_line("c", 24.5, 'dark = rx.client_state(False, name="dark")', "light", align="right"))
-    camera = {"fov": 32, "orbit": keys(k(24.0, [-10, 8]), k(28.0, [6, 10], ease="linear")), "dolly": keys(k(24.0, -80), k(28.0, 60, ease="linear")),
-              "aperture": 1.0, "focus": "c-track"}
-    return {"id": sid, "start": start, "end": end, "background": PAPER, "layers": L, "camera": camera, "lights": LIGHT_LIGHTS(cx, cy),
+        L.append(box(f"c-rack{i}", sx, sy - i * 128, 300, 108, 300, "#23212e", bevel=10, preset="plastic", z=260,
+                     material={"roughness": 0.5}, role="subject", rotation_y=-24))
+    lamp = keys(k(24.0, 0.0), k(25.0, 3.0, ease="snap", dur="2f", anchor="start"), k(25.3, 0.0, ease="glide", dur="10f", anchor="start"))
+    L.append({"id": "c-lamp", "kind": "mesh", "mesh": {"type": "sphere", "radius": 16}, "role": "subject",
+              "material": {"preset": "emissive", "color": "#3a3850", "emissive": GREEN, "emissive_strength": lamp},
+              "transform": {"position": [sx - 150, sy - 256], "z": 100}})
+    wire = "M -360 130 C -140 300 300 300 560 60"
+    L.append({"id": "c-wire", "kind": "mesh", "role": "decoration", "mesh": {"type": "sweep", "d": wire, "radius": 6},
+              "material": {"preset": "plastic", "roughness": 0.4, "color": keys(k(24.0, "#8d8a9e"), k(25.6, "#d9d6e4", ease="glide", dur="10f", anchor="start"))},
+              "transform": {"position": [1060, 660], "z": 60}})
+    for name, a, b, tr in (("go", 24.5, 25.0, ([0, 0], [0, 1])), ("back", 25.0, 25.5, ([1, 1], [0, 1]))):
+        head = keys(k(a, tr[0]), k(b, tr[1], ease="glide")) if name == "go" else keys(k(a, [1, 1]), k(b, [0, 1], ease="glide"))
+        L.append({"id": f"c-{name}", "kind": "mesh", "role": "subject", "time": window(a, b + f(1)),
+                  "mesh": {"type": "sweep", "d": wire if name == "go" else "M 560 60 C 300 300 -140 300 -360 130", "radius": 9, "head": 24,
+                           "trim": keys(k(a, [0, 0]), k(b, [0, 1], ease="glide"))},
+                  "material": {"preset": "emissive", "color": VIOLET, "emissive": VIOLET, "emissive_strength": 2.5},
+                  "transform": {"position": [1060, 660], "z": 60}})
+    L.append(feature_head("c", 24.0, "State that never leaves the browser.", "light", align="right", size=80, y=120))
+    L.append(text("c-old", "self.dark = not self.dark   # round trip", W - M, H - 118, 46, F_MONO, GREY, "right", space="screen", role="decoration",
+                  time=window(24.4, 26.0), animators=typed(24.4, "0.5f"), allow=["line_unread", "persistent_chrome"]))
+    L.append(text("c-code", 'dark = rx.client_state(False, name="dark")', W - M, H - 118, 50, F_MONO, VIOLET, "right", space="screen", role="foreground",
+                  time=window(26.0), animators=typed(26.0, "0.5f")))
+    camera = {"fov": 32, "orbit": keys(k(24.0, [-14, 6]), k(28.0, [4, 9], ease="linear")), "dolly": keys(k(24.0, -120), k(28.0, 40, ease="linear"))}
+    return {"id": sid, "start": start, "end": end, "background": PAPER, "layers": L, "camera": camera, "lights": LIGHT_LIGHTS(px, py),
             "environment": {"preset": "soft", "intensity": 0.85}}
 
 
@@ -524,7 +601,7 @@ def s07():
     members = [("a", -400, -110), ("a", -330, 90), ("a", -430, 30), ("a", -300, -40),
                ("ab", -60, -120), ("ab", 60, -40), ("ab", -50, 60), ("ab", 50, 150),
                ("b", 400, -110), ("b", 330, 90), ("b", 430, 30), ("b", 300, -40)]
-    ops = [(28.0, ("a", "ab", "b"), "tags | other"), (29.0, ("ab",), "tags & other"), (30.0, ("a",), "tags - other"), (31.0, ("a", "b"), "tags ^ other")]
+    ops = [(28.0, ("a", "ab", "b"), "tags.union(other)"), (29.0, ("ab",), "tags.intersection(other)"), (30.0, ("a",), "tags.difference(other)"), (31.0, ("a", "b"), "tags.symmetric_difference(other)")]
     for i, (grp, mx, mz) in enumerate(members):
         ykeys, ckeys, skeys = [], [], []
         for t, lit, _ in ops:
@@ -549,35 +626,106 @@ def s07():
 
 
 def s08():
-    """ALEMBIC: revisions drop onto the database one beat apart; the command underneath is plain Alembic."""
+    """ALEMBIC: the schema as a table. Each revision adds a column; `alembic downgrade -1` takes the last one back out."""
     sid, start, end = "s08", 32.0, 36.0
-    cx, ground = 1130, 880
-    L = [stage_bg("d-bg", "light"), floor("d-floor", ground, color=None, opacity=0.32)]
-    discs = [(31.6, VIOLET_D), (32.0 + f(3), VIOLET), (33.0, "#8e77f0"), (34.0, LILAC), (35.0, PALE)]
-    hh, gap = 92, 14
-    for i, (t, colr) in enumerate(discs):
-        y = ground - hh / 2 - i * (hh + gap)
-        pos = [cx, y] if i == 0 else keys(k(t, [cx, y], frm=[cx, y - 1100], ease="bounce", anchor="land", dur="14f"))
-        L.append({"id": f"d-disc{i}", "kind": "mesh", "role": "subject", "mesh": {"type": "cylinder", "radius": 250, "height": hh, "bevel": 14},
-                  "material": {"preset": "coated", "color": colr, "roughness": 0.25},
-                  "time": window(32.0 if i == 0 else t - 0.4), "transform": {"position": pos}})
-    revs = ["", "a41f users", "c2d9 tags", "e7b0 index", "head"]
-    for i, (t, _) in enumerate(discs[1:], 1):
-        y = ground - hh / 2 - i * (hh + gap)
-        L.append(text(f"d-rev{i}", revs[i], cx + 310, y - 4, 44, F_MONO, INK, "left", three_d=True, role="decoration", z=-40,
-                      time=window(t), animators=rise(t, "0.5f", "8f", 14), allow=["line_unread"]))
-    L.append(feature_head("d", 32.0, "Migrations are\nplain Alembic.", "light", 100, y=360))
-    L[-1]["line_height"] = 1.05
-    L.append(code_line("d", 32.5, "$ reflex db migrate", "light", 52, 640))
-    L.append(text("d-code2", "= alembic upgrade head", M, 716, 52, F_MONO, GREY, "left", space="screen", role="foreground",
-                  animators=typed(33.5, "0.8f")))
-    camera = {"fov": 30, "orbit": keys(k(32.0, [-14, 14]), k(36.0, [-2, 18], ease="linear")), "dolly": keys(k(32.0, -100), k(36.0, 60, ease="linear"))}
-    return {"id": sid, "start": start, "end": end, "background": PAPER, "layers": L, "camera": camera, "lights": LIGHT_LIGHTS(cx, ground - 300),
+    cx, ground = 1060, 740
+    L = [stage_bg("d-bg", "light"), floor("d-floor", ground, color=None, opacity=0.3)]
+    cw, ch, cd, gx, gz, rows = 230, 54, 100, 250, 124, 5
+    cols = [("id", None, None), ("name", None, None), ("email", 33.0, None), ("tags", 34.0, 35.0)]
+    for c, (name, t_in, t_out) in enumerate(cols):
+        x = cx + (c - 1.5) * gx
+        for r in range(rows):
+            z = (rows - 1 - r) * gz - 200  # header at the back, rows toward the camera
+            y = ground - ch / 2
+            head = r == 0
+            b = box(f"d-{name}{r}", x, y, cw, ch if not head else ch + 26, cd, VIOLET if head else ("#efeaff" if r % 2 else "#ffffff"), bevel=9,
+                    preset="coated" if head else "plastic", z=z, role="subject", material={"roughness": 0.25 if head else 0.5})
+            if head:
+                b["transform"]["position"] = [x, y - 13]
+            p = b["transform"]["position"]
+            pos = []
+            if t_in is None:
+                b["transform"]["scale"] = keys(k(32.0 - f(3) + f(c + r) / 2, 1, frm=0, ease="pop", anchor="start"))
+            else:
+                b["time"] = window(t_in - 0.45 + f(r))
+                pos.append(k(t_in + f(r), p, frm=[p[0], p[1] - 1000], ease="bounce", anchor="land", dur="14f"))
+            if t_out is not None:
+                pos.append(k(t_out + f(rows - 1 - r), [p[0], p[1] + 160], ease="gesture", dur="7f", anchor="start"))
+                b["transform"]["scale"] = keys(k(t_in, 1), k(t_out + f(rows - 1 - r) + f(3), 0, ease="gesture", dur="5f", anchor="start"))
+            if pos:
+                b["transform"]["position"] = keys(*pos)
+            L.append(b)
+    # The revision chain: beads on a rod; the head marker climbs with each upgrade and steps back down.
+    rx_, top, step = cx - 2.5 * gx - 60, ground - 520, 120
+    L.append({"id": "d-rod", "kind": "mesh", "role": "decoration", "mesh": {"type": "cylinder", "radius": 7, "height": 520},
+              "material": {"preset": "metal", "color": "#8d8a9e", "roughness": 0.35}, "transform": {"position": [rx_, ground - 260], "z": -200}})
+    for i in range(4):
+        L.append(ball(f"d-bead{i}", rx_, ground - 60 - i * step, -200, 26, "#c9c2e8" if i else VIOLET_D))
+    hy = lambda i: [rx_, ground - 60 - i * step]
+    L.append({"id": "d-mark", "kind": "mesh", "role": "decoration", "mesh": {"type": "torus", "radius": 46, "tube": 11},
+              "material": {"preset": "emissive", "color": VIOLET, "emissive": VIOLET, "emissive_strength": 1.6},
+              "transform": {"z": -200, "rotation_x": 90, "position": keys(k(32.0, hy(1)), k(33.0, hy(2), ease="snap", dur="6f", anchor="end"),
+                                                                           k(34.0, hy(3), ease="snap", dur="6f", anchor="end"),
+                                                                           k(35.0, hy(2), ease="snap", dur="6f", anchor="end"))}})
+    L.append(feature_head("d", 32.0, "Migrations are plain Alembic.", "light", size=84, y=140))
+    for i, (t, t1, code) in enumerate(((32.4, 35.0, "$ reflex db migrate"), (35.0, None, "$ alembic downgrade -1"))):
+        L.append(text(f"d-code{i}", code, W - M, H - 118, 52, F_MONO, VIOLET, "right", space="screen", role="foreground", allow=["line_unread"],
+                      time=window(t, t1), animators=typed(t, "0.6f")))
+    camera = {"fov": 30, "orbit": keys(k(32.0, [-22, 30]), k(36.0, [-6, 34], ease="linear")), "dolly": keys(k(32.0, 40), k(36.0, 180, ease="linear"))}
+    return {"id": sid, "start": start, "end": end, "background": PAPER, "layers": L, "camera": camera, "lights": LIGHT_LIGHTS(cx, ground - 200),
             "environment": {"preset": "soft", "intensity": 0.85}}
 
 
+def s09():
+    """BLOCKING: tasks circle the event loop. A blocking call lands on it and everything stops; 0.2 s later
+    Reflex points at the handler and the line. Moved to a thread, the loop runs again."""
+    sid, start, end = "s09", 36.0, 40.0
+    cx, ground = W / 2, 780
+    R = 380
+    L = [stage_bg("b-bg", "dark"), floor("b-floor", ground, color="#07060d", preset="coated", roughness=0.35)]
+    jam, free = 37.0, 38.75
+    tint = keys(k(36.0, "#d8d2f5"), k(jam, RED, ease="snap", dur="3f", anchor="start"), k(free, "#d8d2f5", ease="glide", dur="10f", anchor="start"))
+    L.append({"id": "b-loop", "kind": "mesh", "role": "subject", "mesh": {"type": "torus", "radius": R, "tube": 13},
+              "material": {"preset": "coated", "roughness": 0.2, "color": tint}, "transform": {"position": [cx, ground - 40], "rotation_x": 90}})
+    # Tasks ride the loop: one turn of the hub is one lap. It stops dead on the jam and spins up again after.
+    spin = keys(k(36.0, 0), k(jam, 200, ease="linear"), k(jam + f(3), 206, ease="glide"), k(free, 206), k(40.0, 206 + 260, ease="gesture"))
+    L.append({"id": "b-hub", "kind": "mesh", "mesh": {"type": "sphere", "radius": 4}, "material": {"preset": "matte", "color": INK, "opacity": 0},
+              "transform": {"position": [cx, ground - 40], "rotation_y": spin}})
+    import math
+    for i in range(9):
+        a = math.radians(i * 40)
+        L.append({"id": f"b-task{i}", "kind": "mesh", "parent": "b-hub", "role": "subject", "mesh": {"type": "sphere", "radius": 30},
+                  "material": {"preset": "coated", "roughness": 0.2, "color": LILAC if i % 3 else PAPER},
+                  "transform": {"position": [round(R * math.sin(a), 1), -26], "z": round(-R * math.cos(a), 1)}})
+    # The blocking call: a red slab drops onto the track.
+    bx, bz = cx + 10, -R
+    by = ground - 40 - 120
+    L.append(box("b-block", 0, 0, 190, 190, 190, RED, bevel=14, preset="coated", z=bz, role="subject", material={"roughness": 0.25}, time=window(jam - 0.4),
+                 rotation_y=18))
+    L[-1]["transform"]["position"] = keys(k(jam, [bx, by], frm=[bx, by - 1100], ease="bounce", anchor="land", dur="12f"),
+                                          k(free, [bx + 900, by - 260], ease="glide", dur="14f", anchor="start"))
+    L[-1]["transform"]["z"] = keys(k(jam, bz), k(free, bz + 500, ease="glide", dur="14f", anchor="start"))
+    L[-1]["material"]["color"] = keys(k(jam, RED), k(free + 0.3, "#5b5870", ease="glide", dur="10f", anchor="start"))
+    # The warning: a line from the slab to what Reflex logs, 0.2 s after the jam.
+    wt = jam + 0.2
+    L.append({"id": "b-lead", "kind": "shape", "shape": "path", "d": "M 1060 580 L 1200 330 L 1262 330", "space": "screen", "role": "foreground",
+              "time": window(wt, free + 0.2), "stroke": {"color": RED, "width": 4, "cap": "round", "join": "round"},
+              "trim": keys(k(wt, [0, 1], frm=[0, 0], ease="glide", dur="6f", anchor="start"))})
+    L.append(text("b-warn", "State.slow\napp.py:42", 1284, 350, 50, F_MONOB, "#ff8a8e", "left", space="screen", role="foreground", line_height=1.2,
+                  time=window(wt, free + 0.2), animators=typed(wt + f(3), "0.6f"), allow=["line_unread"]))
+    L.append(feature_head("b", 36.0, "Block the event loop,\nReflex names the line.", size=80, y=170))
+    L[-1]["line_height"] = 1.08
+    L.append(text("b-code", "time.sleep(2)", M, H - 128, 52, F_MONO, "#ff8a8e", "left", space="screen", role="foreground",
+                  time=window(jam, free), animators=typed(jam, "0.6f"), allow=["line_unread"]))
+    L.append(text("b-code2", "await asyncio.to_thread(time.sleep, 2)", M, H - 128, 52, F_MONO, LILAC, "left", space="screen", role="foreground",
+                  time=window(free), animators=typed(free, "0.5f"), allow=["line_unread"]))
+    camera = {"fov": 32, "orbit": keys(k(36.0, [-14, 30]), k(40.0, [12, 34], ease="linear")), "dolly": keys(k(36.0, -20), k(40.0, 120, ease="linear"))}
+    return {"id": sid, "start": start, "end": end, "background": "#09090c", "layers": L, "camera": camera, "lights": DARK_LIGHTS(cx, ground - 100),
+            "environment": {"preset": "night", "intensity": 0.5}, "look": {"tone": "filmic"}}
+
+
 MONTAGE = [  # two words each: half a second is enough for two
-    ("BLOCKING-CALL\nWARNINGS", INK, PAPER), ("REACT\nCOMPILER", VIOLET, PAPER), ("STRICTER\nCORS", PAPER, INK),
+    ("FOREACH\nWARNINGS", INK, PAPER), ("REACT\nCOMPILER", VIOLET, PAPER), ("STRICTER\nCORS", PAPER, INK),
     ("REPRODUCIBLE\nBUILDS", INK, LILAC), ("REDIS-PY\n8", VIOLET, PAPER), ("ASYNC\nSQLITE", PAPER, VIOLET), ("20+\nFIXES", INK, PAPER),
 ]
 
@@ -586,27 +734,27 @@ def montage():
     """One more thing per beat; the last beat is silent: one block, waiting."""
     out = []
     for i, (word, bg, ink) in enumerate(MONTAGE):
-        t = 36.0 + i * BEAT
-        sid = f"s09{chr(97 + i)}"
+        t = 40.0 + i * BEAT
+        sid = f"s10{chr(97 + i)}"
         size = 230 if max(len(w) for w in word.split("\n")) <= 9 else 170
         L = [text(f"g{i}-w", word, W / 2, H / 2 - 10, size, F_BLACK, ink, tracking=-24, line_height=0.95, role="subject",
                   scale=keys(k(t, 1, frm=1.5 if i % 2 == 0 else 0.7, ease="slam", dur="5f", anchor="start"),
                              add=[{"type": "drift", "rate": 0.002, "per": "frame", "mode": "mul"}]))]
         out.append({"id": sid, "start": t, "end": t + BEAT, "background": bg, "layers": L, "lead": 0})
-    t = 39.5
+    t = 43.5
     L = [{"id": "g-block", "kind": "shape", "shape": "rect", "size": [84, 84], "radius": 8, "fill": VIOLET, "role": "subject",
-          "transform": {"position": [W / 2, H / 2], "scale": keys(k(t, 1, frm=0.5, ease="pop", anchor="start"), k(40.0, 0.7, ease="gesture", dur="6f", anchor="end"))}}]
-    out.append({"id": "s09h", "start": t, "end": 40.0, "background": INK, "layers": L, "lead": 0})
+          "transform": {"position": [W / 2, H / 2], "scale": keys(k(t, 1, frm=0.5, ease="pop", anchor="start"), k(44.0, 0.7, ease="gesture", dur="6f", anchor="end"))}}]
+    out.append({"id": "s10h", "start": t, "end": 44.0, "background": INK, "layers": L, "lead": 0})
     return out
 
 
-def s10():
+def s11():
     """END: a field of blocks ripples on the impact, the mark assembles in violet, and the film says how to get it."""
-    sid, start, end = "s10", 40.0, DURATION
+    sid, start, end = "s11", 44.0, DURATION
     L = []
     L.append({"id": "e-grid", "kind": "instancer", "transform": {"position": [W / 2, H / 2]}, "role": "background",
               "layout": {"type": "grid", "columns": 41, "rows": 23, "spacing": [48, 48]},
-              "fields": [{"type": "wave", "center": [0, 0], "at": 40.0, "speed": 1500, "wavelength": 420, "scale": 3.2, "color": VIOLET, "ease": "gesture"},
+              "fields": [{"type": "wave", "center": [0, 0], "at": 44.0, "speed": 1500, "wavelength": 420, "scale": 3.2, "color": VIOLET, "ease": "gesture"},
                          {"type": "noise", "size": 380, "speed": 0.35, "seed": 5, "scale": 0.5}],
               "layers": [{"id": "e-cell", "kind": "shape", "shape": "rect", "size": [8, 8], "radius": 2, "fill": "#e9e3fa"}]})
     unit = 76
@@ -624,7 +772,7 @@ def s10():
     for i, b in enumerate(mark_blocks("e", mx, cy, unit, 76, VIOLET, "coated", roughness=0.22)):
         dx, dy, dz = fly[b["id"][2:]]
         p = b["transform"]["position"]
-        t = 40.0 - f(3) + f(i) / 2
+        t = 44.0 - f(3) + f(i) / 2
         b["role"] = "subject"
         b["transform"]["position"] = keys(k(t, p, frm=[p[0] + dx, p[1] + dy], ease="slam", dur="7f", anchor="start"))
         b["transform"]["z"] = keys(k(t, 0, frm=dz, ease="slam", dur="7f", anchor="start"))
@@ -632,27 +780,27 @@ def s10():
         L.append(b)
     nx = x0 + mw + gap
     L.append(text("e-name", "reflex", nx + name_w / 2, cy - 16, name_size, F_BOLD, INK, tracking=-20, three_d=True, z=38,
-                  animators=[{"at": 40.0 + f(5), "unit": "glyph", "order": "forward", "stagger": "1f", "dur": "8f", "ease": "glide", "from": {"opacity": 0, "x": 90}}]))
+                  animators=[{"at": 44.0 + f(5), "unit": "glyph", "order": "forward", "stagger": "1f", "dur": "8f", "ease": "glide", "from": {"opacity": 0, "x": 90}}]))
     vx = nx + name_w + 50 + ver_w / 2
     L.append({"id": "e-ver", "kind": "comp", "three_d": True, "role": "subject",
-              "transform": {"position": [vx, cy + 16], "z": 38, "scale": keys(k(40.5, 1, frm=0, ease="pop", anchor="start"))}, "layers": [
+              "transform": {"position": [vx, cy + 16], "z": 38, "scale": keys(k(44.5, 1, frm=0, ease="pop", anchor="start"))}, "layers": [
                   {"id": "e-ver-bg", "kind": "shape", "shape": "rect", "size": [ver_w, 190], "radius": 95, "fill": VIOLET},
                   text("e-ver-t", "0.11", 0, -8, 150, F_BOLD, PAPER, tracking=-6)]})
     pill_w = text_width("pip install --upgrade reflex", F_MONO, 54) + 120
-    L.append({"id": "e-pip", "kind": "comp", "three_d": True, "role": "subject", "time": window(42.0),
-              "transform": {"position": [W / 2, 720], "z": 38, "scale": keys(k(42.0, 1, frm=0.6, ease="pop", anchor="start")), "opacity": fade_in(42.0, "4f")},
+    L.append({"id": "e-pip", "kind": "comp", "three_d": True, "role": "subject", "time": window(46.0),
+              "transform": {"position": [W / 2, 720], "z": 38, "scale": keys(k(46.0, 1, frm=0.6, ease="pop", anchor="start")), "opacity": fade_in(46.0, "4f")},
               "layers": [{"id": "e-pip-bg", "kind": "shape", "shape": "rect", "size": [pill_w, 124], "radius": 30, "fill": INK2},
-                         text("e-pip-t", "pip install --upgrade reflex", 0, -4, 54, F_MONO, PAPER, animators=typed(42.0 + f(3), "0.7f"))]})
-    L.append(text("e-url", "reflex.dev", W / 2, 880, 56, F_MED, VIOLET, tracking=-4, three_d=True, z=38, animators=rise(43.0, "1f", "12f", 30)))
-    camera = {"fov": 30, "orbit": keys(k(40.0, [-8, 3]), k(DURATION, [6, 4], ease="linear")),
-              "dolly": keys(k(40.0, 100, frm=-500, ease="settle", dur="20f", anchor="start"), k(DURATION, 190, ease="linear"))}
+                         text("e-pip-t", "pip install --upgrade reflex", 0, -4, 54, F_MONO, PAPER, animators=typed(46.0 + f(3), "0.7f"))]})
+    L.append(text("e-url", "reflex.dev", W / 2, 880, 56, F_MED, VIOLET, tracking=-4, three_d=True, z=38, animators=rise(47.0, "1f", "12f", 30)))
+    camera = {"fov": 30, "orbit": keys(k(44.0, [-8, 3]), k(DURATION, [6, 4], ease="linear")),
+              "dolly": keys(k(44.0, 100, frm=-500, ease="settle", dur="20f", anchor="start"), k(DURATION, 190, ease="linear"))}
     lights = [{"type": "directional", "from": [-0.7, -1.0, -1.0], "color": "#ffffff", "intensity": 1.5, "shadow": True, "softness": 0.6},
               {"type": "directional", "from": [1.0, 0.2, -0.4], "color": "#d9d0ff", "intensity": 0.5}, {"type": "ambient", "intensity": 0.25}]
     return {"id": sid, "start": start, "end": end, "background": PAPER, "layers": L, "camera": camera, "lights": lights,
             "environment": {"preset": "soft", "intensity": 0.9}}
 
 
-SCENES = [s01, s02, s03, s04, s05, s06, s07, s08, montage, s10]
+SCENES = [s01, s02, s03, s04, s05, s06, s07, s08, s09, montage, s11]
 
 
 # ------------------------------------------------------------------ project

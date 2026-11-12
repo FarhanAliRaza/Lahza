@@ -7,7 +7,7 @@ SR = 48000
 BPM = 120.0
 BEAT = 60.0 / BPM
 BAR = 4 * BEAT
-LENGTH = 47.0
+LENGTH = 51.0
 N = int(LENGTH * SR)
 rng = np.random.default_rng(7)
 
