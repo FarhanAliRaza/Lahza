@@ -163,6 +163,48 @@ kernel costs the driver about a minute once.
   Such groups are now drawn with the rest (`Rest::later`).
 - Not run: `cargo test`; the editor's preview (only exports take `fast`).
 
+## Lighting between the raster and the traced picture
+
+Not started; nothing here is measured. The raster already lights from the
+environment as a sphere of light (`envmap.rs`: a diffuse level and levels
+blurred for roughness; motion.wgsl `env_diffuse`, `env_light`), with shadow
+maps for the lights. What it has not got, and the traced picture has:
+- **Occlusion of the environment's light.** Every point takes the whole
+  sphere, so creases and where things touch do not darken and things seem
+  to float. This is most of what is seen to differ.
+- **Light between things.** Nothing lights or mirrors anything else: a
+  reflection is the environment's only, and glass is screen space.
+
+To do, in this order:
+- **Sky visibility in the raster.** One or two rays a texel at half size
+  against the tracer's acceleration structures (pt.rs `geometry`), giving
+  how much of the sphere a point sees and from where (a bent normal);
+  `env_diffuse` is looked up along it and weighted by it, the specular
+  term by it too. Kept over frames along each surface's motion and
+  filtered as the tracer's lighting is (pt.wgsl `atrous`). To settle
+  first:
+  - The structures are built for traced lists only: a raster frame would
+    build them too (what that costs a frame, and in the editor's preview).
+  - The CPU path draws the raster's picture: it needs the same rays (its
+    own BVH), or the two no longer agree.
+  - Without hardware ray tracing the frame is drawn as today.
+  - It is a third lighting to keep close to the traced one: compare
+    against a traced frame of the same scene (`--pt`), as the lobes'
+    diffuse light was.
+- **One bounce of diffuse light**, from the same rays (what a ray hits,
+  lit by its shadow map and the environment): colour between things that
+  are close. Only if the visibility alone still looks flat.
+- **Elsewhere than NVIDIA**: few samples with temporal accumulation and
+  Open Image Denoise, as under the fast mode above. It is the tracer's
+  own picture, so there is nothing new to keep matching.
+- **The editor's preview takes `fast`** (only exports do), so what is
+  looked at while working is the traced picture where the card allows.
+
+Not to do: light probes placed through the scene (irradiance volumes,
+DDGI). They suit large scenes that stand still; these are small and
+everything in them moves, a grid would be relit every frame, and probes
+blur away the contact shadows that are what is missing.
+
 ## Slang
 
 - **To compile once with slangc.** These were written where slangc could
