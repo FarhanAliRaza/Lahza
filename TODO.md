@@ -9,7 +9,8 @@ the short of it.
 
 Done and run here (pictures looked at; on the merged tree, one thread,
 Mesa's software Vulkan: motion-render 181 tests pass and 19 are ignored
-(measures), motion-core 133, motion-sim 29, motion-mcp 37 and its
+(measures; 186 and 21 with the later session's, below, run there on its
+own branch with motion-mcp's 37), motion-core 133, motion-sim 29, motion-mcp 37 and its
 integration tests, the app 116 and its four window tests under Xvfb):
 - The editor: drags that stalled (a tick changes one layer and compiles
   one scene), the prompt bar and its two agent runners (Claude Code, or
@@ -165,7 +166,11 @@ Not done, and why:
   as drawn, even with every mesh still: a mesh primitive carries its
   layer list's number, which went on counting from one sub-frame's list
   to the next, so the primitives were never the same. The number now
-  starts again in every list (`MeshCache::begin`). Tested through the
+  starts again in every list (`MeshCache::begin`). With it two frames
+  of a scene with meshes in which nothing moves are the same lists, and
+  the second comes from the renderer's last frame as a scene without
+  meshes always did (the sky's measures drew 7 ms frames until they were
+  made to draw each one). Tested through the
   compute raster and the visibility pass at 4x
   (`a_still_mesh_group_is_not_drawn_again_beside_a_moving_mesh`: a comp
   with a mesh under a glow beside a mesh that moves is left as drawn,
@@ -650,7 +655,14 @@ What is left:
   front edge is a straight dark line. The room's numbers moved a little
   with it (the contact 0.74 of the plain raster's for 0.72, 29.7 dB
   from traced for 29.5). The group is half again as large (three rows
-  for two); its cost was not measured again.
+  for two). Its cost measured again with all four of this session's
+  changes in (software Vulkan and four cores, another container than
+  the numbers above; the measures now draw every frame, see "Motion
+  blur" for why a still scene's frames had come from the cache): at
+  480 x 270 a frame takes 124 ms against 62 without (it was 87 against
+  47: the same doubling, on a slower run); the CPU at 1080 x 608 329 ms
+  against 118, the rays 125 ms and the two filter passes 30 to 47 ms
+  (they were 129 and 22 to 29).
 - **The light's second return** is in, from the same rays and no more
   of them: where the picture shows the surface a ray ended on (the texel
   its end is seen in, at its depth), that texel's own first light back,
