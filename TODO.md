@@ -45,11 +45,12 @@ integration tests, the app 122 and its four window tests under Xvfb):
 
 To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
 in), since none of it can be seen from a container:
-1. Send one real request from the prompt bar, with each runner (Claude
-   Code signed in; an API key alone, which was only run against a stub
-   server here): whether the tools run without a permission refusal,
-   whether the picture is read, how long a scene takes ("Directing an
-   agent from the editor").
+1. Send a request from the prompt bar itself, and one with the API-key
+   runner. Two real requests went through Claude Code with the runner's
+   own command line in a container (28 s and 25 s, no permission
+   refused, the edits made), but not from the window, and the API
+   runner has only met a stub server ("Directing an agent from the
+   editor").
 2. Drag values in the inspector: whether the bars now move freely
    ("Drags that stall").
 3. The fast mode on the card: `fast_tests`, its measure, and Ray
@@ -1036,14 +1037,10 @@ What was run: the unit tests, and two windows under Xvfb with Mesa's
 software Vulkan (`cargo test --release -p lahza motion_prompt -- --ignored`,
 screenshots looked at; with `LAHZA_MOTION_SOFTWARE_GPU=1` the preview's
 first frame takes tens of seconds and the tests wait for it), with a runner of our own in Claude Code's place
-that makes real edits through a `Toolbox`. **No request was sent to
-Claude Code** (it costs money). Claude Code 2.1.329 was started once
-against an address nothing listens on: it took the flags, started
-`lahza mcp`, listed only its tools (`mcp__lahza__…`) and wrote the stream
-the reader expects, then failed to connect, at no cost. So not seen: a
-real agent calling the tools without being asked for permission
-(`--allowedTools mcp__lahza --permission-mode dontAsk`), reading the
-picture, or its wording when signed out.
+that makes real edits through a `Toolbox`. From the window no request
+was sent to Claude Code; two real ones were sent since with the runner's
+own command line, outside the window (see "A real request" below). Not
+seen: its wording when signed out.
 
 1. **A prompt box** (`motion_prompt_ui.rs`, the field from
    `text_field.rs`): under the preview on a motion project and on a
@@ -1081,10 +1078,11 @@ Settled:
   under it the writer loads what the other wrote, then writes. Two
   writers of 25 edits each lose none and take no number twice
   (`two_writers_do_not_lose_edits`). The editor stays usable.
-- **How long it takes**: not measured, since no real request was run. The
-  bar and the ghost clip say the step, the seconds so far, and the steps
-  and edits made. What is left is not known to the runner and is not
-  said.
+- **How long it takes**: two small requests took 28 s and 25 s (nine
+  turns each; see "A real request" below); a scene of five seconds was
+  not asked for. The bar and the ghost clip say the step, the seconds so
+  far, and the steps and edits made. What is left is not known to the
+  runner and is not said.
 
 The second runner (`ApiLoop`, `motion_agent_api.rs`) needs only an API
 key: our own loop on the Claude Messages API (raw HTTP through `ureq`,
@@ -1121,19 +1119,33 @@ words and picture and the same steps as the Claude Code runner.
   listening, a stop in the middle, and a second run of the app.
 
 Left, each with what it needs:
-- **A real request (the owner's word).** None was sent, by either
-  runner, in any of these sessions: the instruction this work was given
-  says real requests are not to be run because they cost money, and only
-  the owner can change that. `claude auth status` in the container says
-  it is signed in, so one request from the bar would answer what is
-  still unknown: whether the lahza tools run without a permission
-  refusal under `--allowedTools mcp__lahza --permission-mode dontAsk`,
-  whether the picture is read, how long a small request takes, and what
-  it costs. For the API runner the same, with a key: its version header,
+- **A real request: sent twice with Claude Code, not from the window,
+  and not with the API runner.** The runner's own command line
+  (`ClaudeCode::command`, the same flags, system prompt, server and
+  `LAHZA_REQUEST`), given by hand the text `compose` writes and the
+  frame's PNG, on a small project in a container (Claude Code 2.1.329,
+  signed in; the server on `lahza-motion mcp`):
+  - "make this one red" with the title selected: done in 28 s, nine
+    turns, $0.43; "make this one a circle and green" with the box
+    selected: 25 s, nine turns, $0.17. Each left one history entry with
+    its request id (`set title.color`; `set box.shape`, `box.size`,
+    `box.fill`), and the frame after shows it.
+  - No permission was refused (`permission_denials` empty) under
+    `--allowedTools mcp__lahza --permission-mode dontAsk`, and only the
+    lahza tools were there to call.
+  - The first request spent two calls on "no project is open": the
+    server starts with none. `compose` now says to open the project
+    first, and the second request did.
+  - Still wasted in both: a `set` without `target`, then a shape that
+    does not exist ("ellipse"): it guesses an op's form before reading
+    it. To try: the schema's ops named in the system prompt.
+  - Whether the picture was read was not shown either way (neither
+    request needed it).
+  Left for the owner's desktop: the same from the bar itself (the steps
+  in the bar, the ghost clip and the proposal with a real agent), and a
+  request to the API runner, which needs a key: its version header,
   model id and event shapes are from Anthropic's reference as read in
-  November 2026, not from an answer. To do it: open a project, select a
-  layer, type "make this red", Enter; the AI tab shows the steps, the
-  seconds and the cost.
+  November 2026, not from an answer.
 - **A real desktop.** Requests kept in `requests.json` read back after a
   real restart; whether closing the window while a request runs ends
   the agent (a dropped runner stops its child and sets the loop's stop

@@ -556,6 +556,11 @@ pub(crate) fn compose(about: &About, words: &str) -> String {
         )),
         (None, None) => {}
     }
+    // (The server starts with no project open: a real request spent its
+    // first two calls finding that out.)
+    if about.project.is_some() {
+        lines.push("Open it first (project_open with that path); the tools then work on it.".into());
+    }
     if let Some((t, frame)) = about.playhead {
         lines.push(format!("Playhead: {t:.2} s (frame {frame}){}.", about.scene.as_ref().map(|s| format!(", in scene \"{s}\"")).unwrap_or_default()));
     }
@@ -813,7 +818,7 @@ not json at all
         };
         assert_eq!(
             compose(&about, "  make this one bolder "),
-            "Motion project: /work/promo.lahza.\nPlayhead: 2.10 s (frame 63), in scene \"s1\".\nSelected layer (\"this one\"): title (text).\nMarked span (\"here\"): 2.10 s to 7.10 s (5.00 s).\nThe picture is the frame at the playhead as it is now.\n\nmake this one bolder"
+            "Motion project: /work/promo.lahza.\nOpen it first (project_open with that path); the tools then work on it.\nPlayhead: 2.10 s (frame 63), in scene \"s1\".\nSelected layer (\"this one\"): title (text).\nMarked span (\"here\"): 2.10 s to 7.10 s (5.00 s).\nThe picture is the frame at the playhead as it is now.\n\nmake this one bolder"
         );
         let recording = About { recording: Some("/work/talk.lahzarec".into()), span: Some((4.0, 9.0)), ..Default::default() };
         let text = compose(&recording, "five seconds of a map here");
