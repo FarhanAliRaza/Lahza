@@ -17,6 +17,8 @@ pub(super) struct CBody {
     /// Timeline seconds of each of `spec.pushes`.
     pub pushes: Vec<f64>,
     pub bake: Option<(Arc<Bake>, usize)>,
+    /// Inside an instancer: the bake's track of each copy (`<id>#<copy>`).
+    pub copies: Option<(Arc<Bake>, Vec<Option<usize>>)>,
     /// The layer has a `body` (else it is only placed by the bake: a
     /// ragdoll's bone).
     pub declared: bool,
@@ -33,9 +35,18 @@ impl CBody {
     }
 
     /// The layer's world matrix from the bake at content time `t`.
-    pub(super) fn baked(&self, t: f64) -> Option<Mat4> {
-        let (bake, track) = self.bake.as_ref()?;
-        bake.world(*track, t - self.shift)
+    pub(super) fn baked(&self, t: f64, copy: Option<(u32, f64)>) -> Option<Mat4> {
+        match copy {
+            // (A copy plays `delay` later: the bake's time is the timeline's.)
+            Some((k, delay)) => {
+                let (bake, tracks) = self.copies.as_ref()?;
+                bake.world((*tracks.get(k as usize)?)?, t + delay - self.shift)
+            }
+            None => {
+                let (bake, track) = self.bake.as_ref()?;
+                bake.world(*track, t - self.shift)
+            }
+        }
     }
 }
 
@@ -58,11 +69,24 @@ impl<'a> Compiler<'a> {
         let bake = self.bake.as_ref().and_then(|b| Some((b.clone(), b.track(id)?)));
         let Some(spec) = c.body.clone() else {
             // A layer the bake has a track for (a ragdoll's bone).
-            return bake.map(|bake| Box::new(CBody { spec: Body::default(), shift, release: None, pushes: Vec::new(), bake: Some(bake), declared: false }));
+            return bake.map(|bake| Box::new(CBody { spec: Body::default(), shift, release: None, pushes: Vec::new(), bake: Some(bake), copies: None, declared: false }));
         };
+        // Its copies' tracks, when it is inside an instancer.
+        let copies = self.bake.as_ref().and_then(|b| {
+            let prefix = format!("{id}#");
+            let mut tracks: Vec<Option<usize>> = Vec::new();
+            for (n, t) in b.tracks.iter().enumerate() {
+                let Some(k) = t.id.strip_prefix(&prefix).and_then(|k| k.parse::<usize>().ok()) else { continue };
+                if tracks.len() <= k {
+                    tracks.resize(k + 1, None);
+                }
+                tracks[k] = Some(n);
+            }
+            (!tracks.is_empty()).then(|| (b.clone(), tracks))
+        });
         let release = spec.release.as_ref().and_then(|r| self.time(r, id, "body.release")).map(|t| t - shift);
         let pushes = spec.pushes.iter().enumerate().map(|(i, p)| self.time(&p.at, id, &format!("body.pushes.{i}.at")).unwrap_or(0.0) - shift).collect();
-        Some(Box::new(CBody { spec, shift, release, pushes, bake, declared: true }))
+        Some(Box::new(CBody { spec, shift, release, pushes, bake, copies, declared: true }))
     }
 
     /// The scene's simulation settings (the defaults when it only has
@@ -103,13 +127,40 @@ pub(super) fn visit<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, 
     }
 }
 
-/// Bodies among an instancer's copies: `visit` does not reach them.
-fn copied_bodies(layers: &[CLayer], inside: bool, out: &mut Vec<String>) {
+/// `visit`, into instancers' copies too: `f` is also given the copy a
+/// layer is in (a body in copy 3 of an instancer is `<layer>#3`).
+pub(super) fn visit_copies<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, space: &Space, under: Option<usize>, f: &mut dyn FnMut(&'l CLayer, Mat4, f64, Option<usize>, Option<u32>) -> Option<usize>) {
+    let mut cache = vec![None; layers.len()];
+    for i in 0..layers.len() {
+        let l = &layers[i];
+        let world = space.world.then(layer_matrix(layers, i, tc, inherited, space, &mut cache));
+        let step = l.step.or(inherited);
+        let below = f(l, world, clock(step, tc), under, space.copy.map(|c| c.0));
+        match &l.kind {
+            CKind::Comp(children) => visit_copies(children, child_time(l, clock(step, tc), tc, space), step, &Space { world, ..*space }, below, f),
+            CKind::Instancer(n) => {
+                for (k, m, delay) in super::instancer::copy_places(n, layers, i, tc, clock(step, tc), inherited, space, &mut cache) {
+                    visit_copies(&n.layers, tc - delay, step, &Space { world: world.then(m), copy: Some((k as u32, delay)), ..*space }, below, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bodies in copies that cannot be told apart or do not last: inside an
+/// emitter (its particles come and go), or two instancers deep.
+fn copied_bodies(layers: &[CLayer], inside: u32, out: &mut Vec<String>) {
     for l in layers {
-        if inside && l.body.as_ref().is_some_and(|b| b.declared) {
+        if inside >= 2 && l.body.as_ref().is_some_and(|b| b.declared) {
             out.push(l.id.to_string());
         }
-        copied_bodies(l.children(), inside || matches!(l.kind, CKind::Instancer(_)), out);
+        let deeper = match &l.kind {
+            CKind::Instancer(n) if n.is_emitter() => 2,
+            CKind::Instancer(_) => 1,
+            _ => 0,
+        };
+        copied_bodies(l.children(), inside + deeper, out);
     }
 }
 
@@ -223,6 +274,8 @@ fn mesh_collider(params: &Arc<MeshParams>, m: Mat4, dynamic: bool, forced: Optio
 struct Found<'l> {
     layer: &'l CLayer,
     body: &'l CBody,
+    /// The instancer's copy it is in.
+    copy: Option<u32>,
     /// Keyed world matrices: index 0 is one sample before the start.
     worlds: Vec<Mat4>,
     /// The meshes that are its shape: each with its world at the release.
@@ -304,9 +357,9 @@ impl Compiled {
             files: Vec::new(),
         };
         let mut copied = Vec::new();
-        copied_bodies(&scene.layers, false, &mut copied);
+        copied_bodies(&scene.layers, 0, &mut copied);
         for id in copied {
-            errors.push(format!("{id}.body: a layer inside an instancer cannot be a body (its copies share one layer): make the bodies layers of their own"));
+            errors.push(format!("{id}.body: a layer inside an emitter, or inside an instancer in an instancer, cannot be a body (its copies come and go, or cannot be told apart): one instancer of a grid, a ring or a path can hold bodies"));
         }
         if !(set.unit > 0.0) {
             errors.push(format!("{}.simulation.unit must be positive", scene.id));
@@ -320,10 +373,10 @@ impl Compiled {
             let tc = t + scene.pre_roll;
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
-            visit(&scene.layers, tc, None, &space, None, &mut |l, world, _, under| {
+            visit_copies(&scene.layers, tc, None, &space, None, &mut |l, world, _, under, copy| {
                 let Some(body) = l.body.as_deref().filter(|b| b.declared) else { return under };
                 if k == 0 {
-                    found.push(Found { layer: l, body, worlds: Vec::with_capacity(samples as usize + 2), meshes: Vec::new() });
+                    found.push(Found { layer: l, body, copy, worlds: Vec::with_capacity(samples as usize + 2), meshes: Vec::new() });
                 }
                 found[n].worlds.push(world);
                 n += 1;
@@ -342,7 +395,7 @@ impl Compiled {
             let tc = t + scene.pre_roll;
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
-            visit(&scene.layers, tc, None, &space, None, &mut |l, world, clock, under| {
+            visit_copies(&scene.layers, tc, None, &space, None, &mut |l, world, clock, under, _| {
                 let own = l.body.as_ref().is_some_and(|b| b.declared).then(|| {
                     n += 1;
                     n - 1
@@ -358,7 +411,12 @@ impl Compiled {
         }
         let mut files: Vec<String> = Vec::new();
         for (f, &release) in found.iter().zip(&releases) {
-            let (spec, id) = (&f.body.spec, &*f.layer.id);
+            // (A copy's body is `<layer>#<copy>`.)
+            let id = match f.copy {
+                Some(k) => format!("{}#{k}", f.layer.id),
+                None => f.layer.id.to_string(),
+            };
+            let (spec, id) = (&f.body.spec, id.as_str());
             let dynamic = spec.kind == BodyKind::Dynamic;
             let world = f.worlds[release as usize + 1];
             let (pose, rest) = decompose(world);
@@ -448,6 +506,9 @@ impl Compiled {
                     }
                 },
             };
+            if let Some(wrong) = rope_layer(&scene.layers, j) {
+                errors.push(format!("{what}.draw: {wrong}"));
+            }
             let (pa, rest_a) = (start_pose(a), input.bodies[a].rest);
             let anchor_a = point3(&rest_a, j.anchor);
             let axis_a = unit3(dir3(&rest_a, j.axis));
@@ -500,6 +561,140 @@ impl Compiled {
             input.files = files.into_iter().map(|src| (src, 0)).collect();
         }
         (input, errors)
+    }
+}
+
+// ---------------------------------------------------------------- ropes
+
+/// A layer drawn as a rope or spring: the joint's two ends, and what is
+/// worked out once from where the bodies start.
+pub(super) struct CRope {
+    a: usize,
+    b: Option<usize>,
+    anchor: [f64; 3],
+    anchor_b: Option<[f64; 3]>,
+    length: Option<f64>,
+    /// A rope hangs; a spring is straight.
+    hangs: bool,
+    /// The way things fall (unit).
+    down: [f64; 3],
+    /// Content time of the simulation's start.
+    start: f64,
+    /// The world's end when there is no `b`, and the length at the start.
+    began: std::sync::OnceLock<([f64; 3], f64)>,
+}
+
+/// How many pieces a rope is drawn in.
+const PIECES: usize = 12;
+
+/// Binds the joints that are drawn to their layers (layers of the scene
+/// itself, as their bodies are).
+pub(super) fn bind_ropes(layers: &mut [CLayer], sim: &CSim, shift: f64) {
+    for j in &sim.settings.joints {
+        let Some(draw) = &j.draw else { continue };
+        let at = |id: &str| layers.iter().position(|l| &*l.id == id);
+        let (Some(rope), Some(a)) = (at(draw), at(&j.a)) else { continue };
+        let b = j.b.as_deref().and_then(at);
+        if j.b.is_some() != b.is_some() || !matches!(layers[rope].kind, CKind::Mesh(_)) {
+            continue;
+        }
+        let g = sim.settings.gravity;
+        let l = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        let down = if l > 1e-9 { g.map(|v| v / l) } else { [0.0, 1.0, 0.0] };
+        layers[rope].rope = Some(Box::new(CRope { a, b, anchor: j.anchor, anchor_b: j.anchor_b, length: j.length, hangs: j.kind == JointKind::Rope, down, start: sim.start + shift, began: std::sync::OnceLock::new() }));
+    }
+}
+
+/// What is wrong with a joint's `draw`, if anything.
+fn rope_layer(layers: &[CLayer], j: &crate::sim::Joint) -> Option<String> {
+    let draw = j.draw.as_ref()?;
+    if !matches!(j.kind, JointKind::Rope | JointKind::Spring) {
+        return Some("only ropes and springs are drawn".into());
+    }
+    for end in std::iter::once(&j.a).chain(&j.b) {
+        if !layers.iter().any(|l| &*l.id == end.as_str()) {
+            return Some(format!("'{end}' is inside another layer; a rope is drawn between layers of the scene itself"));
+        }
+    }
+    match layers.iter().find(|l| &*l.id == draw.as_str()) {
+        None => Some(format!("no layer '{draw}' in the scene itself (a mesh to draw the rope with)")),
+        Some(l) => match &l.kind {
+            CKind::Mesh(m) if m.long_way() => None,
+            _ => Some(format!("'{draw}' is no cylinder, capsule or box mesh (its length along y is the rope's)")),
+        },
+    }
+}
+
+impl CRope {
+    /// The world matrices of the rope's pieces at content time `tc`: the
+    /// layer `drawn`, stretched along each.
+    pub(super) fn pieces(&self, layers: &[CLayer], tc: f64, inherited: Option<Step>, space: &Space, cache: &mut [Option<Mat4>], drawn: &MeshState) -> Vec<Mat4> {
+        let long = match &drawn.params.shape {
+            crate::mesh::MeshShape::Cylinder { height, .. } | crate::mesh::MeshShape::Capsule { height, .. } => *height,
+            crate::mesh::MeshShape::Box { size, .. } => size[1],
+            _ => return Vec::new(),
+        };
+        if long <= 1e-9 {
+            return Vec::new();
+        }
+        let point = |m: Mat4, p: [f64; 3]| {
+            let v = m.apply(p[0], p[1], p[2]);
+            [v[0], v[1], v[2]]
+        };
+        let (began_b, began_len) = *self.began.get_or_init(|| {
+            // Where the bodies' keys have the ends at the simulation's start.
+            let keyed = Space { keyed: true, ..*space };
+            let mut fresh = vec![None; layers.len()];
+            let a = point(keyed.world.then(layer_matrix(layers, self.a, self.start, inherited, &keyed, &mut fresh)), self.anchor);
+            let b = match self.b {
+                Some(b) => point(keyed.world.then(layer_matrix(layers, b, self.start, inherited, &keyed, &mut fresh)), self.anchor_b.unwrap_or([0.0; 3])),
+                None => self.anchor_b.unwrap_or(a),
+            };
+            (b, (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f64>().sqrt())
+        });
+        let a = point(space.world.then(layer_matrix(layers, self.a, tc, inherited, space, cache)), self.anchor);
+        let b = match self.b {
+            Some(b) => point(space.world.then(layer_matrix(layers, b, tc, inherited, space, cache)), self.anchor_b.unwrap_or([0.0; 3])),
+            None => began_b,
+        };
+        let apart = (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f64>().sqrt();
+        // The sag of a parabola as long as the rope between ends this far
+        // apart (found by halving: its length grows with its sag).
+        let length = self.length.unwrap_or(began_len);
+        let long_with = |sag: f64| {
+            let a = 4.0 * sag / apart.max(1e-9);
+            if a < 1e-9 { apart } else { apart * (0.5 * (1.0 + a * a).sqrt() + crate::dm::ln(a + (1.0 + a * a).sqrt()) / (2.0 * a)) }
+        };
+        let sag = if self.hangs && length > apart {
+            let (mut lo, mut hi) = (0.0, length / 2.0);
+            for _ in 0..40 {
+                let mid = (lo + hi) / 2.0;
+                if long_with(mid) < length { lo = mid } else { hi = mid }
+            }
+            lo
+        } else {
+            0.0
+        };
+        let pieces = if sag > 0.5 { PIECES } else { 1 };
+        let at = |s: f64| -> [f64; 3] { std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s + self.down[k] * sag * 4.0 * s * (1.0 - s)) };
+        (0..pieces)
+            .filter_map(|i| {
+                let (p, q) = (at(i as f64 / pieces as f64), at((i + 1) as f64 / pieces as f64));
+                let d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if l < 1e-9 {
+                    return None;
+                }
+                // The layer's y along the piece, its x and z across it.
+                let y = d.map(|v| v / l);
+                let other = if y[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+                let x = unit3([other[1] * y[2] - other[2] * y[1], other[2] * y[0] - other[0] * y[2], other[0] * y[1] - other[1] * y[0]]);
+                let z = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+                let s = l / long;
+                let m = [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, (p[2] + q[2]) / 2.0];
+                Some(Mat4([x[0], y[0] * s, z[0], m[0], x[1], y[1] * s, z[1], m[1], x[2], y[2] * s, z[2], m[2], 0.0, 0.0, 0.0, 1.0]))
+            })
+            .collect()
     }
 }
 

@@ -136,7 +136,7 @@ pub fn point_at(subpaths: &[Poly], f: f64) -> Option<(Pt, Pt)> {
     let (p, q) = (line[si], line[si + 1]);
     let point = (p.0 + (q.0 - p.0) * k, p.1 + (q.1 - p.1) * k);
     let unit = |v: Pt| {
-        let n = v.0.hypot(v.1);
+        let n = crate::dm::hypot(v.0, v.1);
         if n > 0.0 { (v.0 / n, v.1 / n) } else { v }
     };
     let dir = unit((q.0 - p.0, q.1 - p.1));
@@ -233,7 +233,7 @@ pub fn flatten_cached(d: &std::sync::Arc<str>, tolerance: f64) -> Result<std::sy
     thread_local! {
         static CACHE: RefCell<Cache> = RefCell::new(HashMap::new());
     }
-    let bucket = tolerance.max(1e-9).log2().floor() as i32;
+    let bucket = crate::dm::log2(tolerance.max(1e-9)).floor() as i32;
     let key = (Arc::as_ptr(d) as *const u8 as usize, d.len(), bucket);
     if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).map(|e| e.1.clone())) {
         return Ok(hit);
@@ -292,13 +292,13 @@ mod tests {
             let end = *trim(&subpaths, 0.0, f).last().unwrap().last().unwrap();
             let (point, dir) = point_at(&subpaths, f).unwrap();
             assert_eq!(point, end, "at {f}");
-            assert!((dir.0.hypot(dir.1) - 1.0).abs() < 1e-9);
+            assert!((crate::dm::hypot(dir.0, dir.1) - 1.0).abs() < 1e-9);
         }
         assert_eq!(point_at(&subpaths, 0.0).unwrap().0, (0.0, 0.0));
         // The direction turns smoothly: nearby points have nearby directions.
         let angle = |f: f64| {
             let (_, d) = point_at(&subpaths, f).unwrap();
-            d.1.atan2(d.0).to_degrees()
+            crate::dm::atan2(d.1, d.0).to_degrees()
         };
         for i in 0..400 {
             let f = 0.1 + i as f64 * 0.0005;

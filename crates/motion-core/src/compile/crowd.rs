@@ -395,17 +395,17 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
             let d = unit([c[0] - eye[0], c[1] - eye[1], c[2] - eye[2]]);
             let step_angle = std::f64::consts::TAU / HEADINGS;
             let round = |a: f64| (a / step_angle).round().rem_euclid(HEADINGS) as i64;
-            let key = (phase * 8 / phases, round(turned), round(f64::atan2(d[0], d[2])), ((d[1].clamp(-1.0, 1.0).asin() / step_angle).round() as i64).clamp(-3, 3));
+            let key = (phase * 8 / phases, round(turned), round(crate::dm::atan2(d[0], d[2])), ((crate::dm::asin(d[1].clamp(-1.0, 1.0)) / step_angle).round() as i64).clamp(-3, 3));
             let (name, w, hgt) = cards.entry(key).or_insert_with(|| {
                 let (moment, turn, az, el) = key;
                 // The character at the origin, turned so; a camera far
                 // off along the way it is seen, and a picture as large
                 // as the character's box is from there.
                 let (ta, aa, ea) = (turn as f64 * step_angle, az as f64 * step_angle, el as f64 * step_angle);
-                let q = crate::sim::quat_mul([0.0, (ta / 2.0).sin(), 0.0, (ta / 2.0).cos()], herd.q);
+                let q = crate::sim::quat_mul([0.0, crate::dm::sin(ta / 2.0), 0.0, crate::dm::cos(ta / 2.0)], herd.q);
                 let stand = Pose { p: [0.0; 3], q }.matrix().then(herd.rest);
                 let at = stand.apply(palette.centre[0], palette.centre[1], palette.centre[2]);
-                let dir = [aa.sin() * ea.cos(), ea.sin(), aa.cos() * ea.cos()];
+                let dir = [crate::dm::sin(aa) * crate::dm::cos(ea), crate::dm::sin(ea), crate::dm::cos(aa) * crate::dm::cos(ea)];
                 let turned = look(dir).then(stand);
                 let mut reach = [0.0f64; 2];
                 for corner in 0..8 {

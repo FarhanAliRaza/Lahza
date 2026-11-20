@@ -711,7 +711,7 @@ fn set_uvs(mesh: &mut Mesh, shape: &MeshShape) {
     };
     let span = |k: usize| ((hi[k] - lo[k]) as f64).max(1e-6);
     let unit = |v: f64, k: usize| ((v - lo[k] as f64) / span(k)) as f32;
-    let around = |a: f64, b: f64| (0.5 + a.atan2(b) / TAU) as f32;
+    let around = |a: f64, b: f64| (0.5 + crate::dm::atan2(a, b) / TAU) as f32;
     let planar = |p: [f64; 3], n: [f64; 3]| -> [f32; 2] {
         let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
         if az >= ax && az >= ay {
@@ -732,7 +732,7 @@ fn set_uvs(mesh: &mut Mesh, shape: &MeshShape) {
             match shape {
                 MeshShape::Sphere { .. } => {
                     let d = norm(p);
-                    [around(d[0], -d[2]), ((-d[1]).clamp(-1.0, 1.0).acos() / PI) as f32]
+                    [around(d[0], -d[2]), (crate::dm::acos((-d[1]).clamp(-1.0, 1.0)) / PI) as f32]
                 }
                 MeshShape::Cylinder { .. } | MeshShape::Capsule { .. } | MeshShape::Revolve { axis_y: true, .. } => {
                     if n[1].abs() > 0.7 && !matches!(shape, MeshShape::Capsule { .. }) {
@@ -913,7 +913,7 @@ impl Profile {
         let pts = (0..=n)
             .map(|i| {
                 let a = a0 + (a1 - a0) * i as f64 / n as f64;
-                let (s, co) = a.sin_cos();
+                let (s, co) = crate::dm::sin_cos(a);
                 PV { r: c.0 + r * co, h: c.1 + r * s, nr: co, nh: s }
             })
             .collect();
@@ -926,7 +926,7 @@ impl Profile {
     /// A straight run from `a` to `b` with its normal on the right of the
     /// direction of travel when `right`, else on the left.
     fn line(a: (f64, f64), b: (f64, f64), outward: (f64, f64), part: u32) -> Profile {
-        let l = outward.0.hypot(outward.1).max(1e-12);
+        let l = crate::dm::hypot(outward.0, outward.1).max(1e-12);
         let (nr, nh) = (outward.0 / l, outward.1 / l);
         Profile { pts: vec![PV { r: a.0, h: a.1, nr, nh }, PV { r: b.0, h: b.1, nr, nh }], part }
     }
@@ -936,11 +936,11 @@ impl Profile {
     fn from_polyline(pts: &[(f64, f64)], closed: bool, part: u32) -> Vec<Profile> {
         let mut p: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
         for &q in pts {
-            if p.last().is_none_or(|l: &(f64, f64)| (l.0 - q.0).hypot(l.1 - q.1) > 1e-6) {
+            if p.last().is_none_or(|l: &(f64, f64)| crate::dm::hypot(l.0 - q.0, l.1 - q.1) > 1e-6) {
                 p.push(q);
             }
         }
-        if closed && p.len() > 2 && (p[0].0 - p[p.len() - 1].0).hypot(p[0].1 - p[p.len() - 1].1) <= 1e-6 {
+        if closed && p.len() > 2 && crate::dm::hypot(p[0].0 - p[p.len() - 1].0, p[0].1 - p[p.len() - 1].1) <= 1e-6 {
             p.pop();
         }
         if p.len() < 2 {
@@ -959,7 +959,7 @@ impl Profile {
         let edge_normal = |i: usize| {
             let (a, b) = (p[i % n], p[(i + 1) % n]);
             let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-            let l = dx.hypot(dy).max(1e-12);
+            let l = crate::dm::hypot(dx, dy).max(1e-12);
             (dy / l * flip, -dx / l * flip)
         };
         let sharp = |i: usize| -> bool {
@@ -993,7 +993,7 @@ impl Profile {
             } else {
                 let (a, b) = (edge_normal(ein), edge_normal(eout));
                 let m = (a.0 + b.0, a.1 + b.1);
-                let l = m.0.hypot(m.1).max(1e-12);
+                let l = crate::dm::hypot(m.0, m.1).max(1e-12);
                 cur.push(vertex(i, (m.0 / l, m.1 / l)));
             }
         }
@@ -1034,7 +1034,7 @@ fn cylinder_profile(rb: f64, rt: f64, height: f64, bevel: f64, detail: f64) -> V
 /// distance `r` from the axis, `h` along it. Axis z faces the camera;
 /// axis y stands up (h down the screen), angle 0 toward the viewer.
 fn around(axis_y: bool, a: f64, r: f64, h: f64) -> V3 {
-    let (s, c) = a.sin_cos();
+    let (s, c) = crate::dm::sin_cos(a);
     if axis_y {
         [r * s, h, -r * c]
     } else {
@@ -1048,7 +1048,7 @@ fn around_dir(axis_y: bool, a: f64, nr: f64, nh: f64) -> V3 {
 
 /// d(around)/da direction at angle `a` (unit, for caps).
 fn tangent_dir(axis_y: bool, a: f64) -> V3 {
-    let (s, c) = a.sin_cos();
+    let (s, c) = crate::dm::sin_cos(a);
     if axis_y {
         [c, 0.0, s]
     } else {
@@ -1130,7 +1130,7 @@ fn disc_cap(mesh: &mut Mesh, r: f64, t: f64, a: f64, dir: f64, steps: usize, seg
     let ring: Vec<u32> = (0..=steps)
         .map(|i| {
             let b = TAU * i as f64 / steps as f64;
-            mesh.vertex(around(false, a, r + t * b.cos(), t * b.sin()), normal)
+            mesh.vertex(around(false, a, r + t * crate::dm::cos(b), t * crate::dm::sin(b)), normal)
         })
         .collect();
     for w in ring.windows(2) {
@@ -1151,8 +1151,8 @@ fn round_cap(mesh: &mut Mesh, r: f64, t: f64, a: f64, dir: f64, steps: usize, se
         let ring: Vec<u32> = (0..=steps)
             .map(|i| {
                 let b = TAU * i as f64 / steps as f64;
-                let rim = add(mul(radial, b.cos()), mul(axis, b.sin()));
-                let n = add(mul(rim, phi.cos()), mul(out, phi.sin()));
+                let rim = add(mul(radial, crate::dm::cos(b)), mul(axis, crate::dm::sin(b)));
+                let n = add(mul(rim, crate::dm::cos(phi)), mul(out, crate::dm::sin(phi)));
                 mesh.vertex(add(centre, mul(n, t)), n)
             })
             .collect();
@@ -1207,11 +1207,11 @@ fn rounded_box(mesh: &mut Mesh, size: V3, bevel: f64, detail: f64) {
             return vec![(-half, false), (half, false)];
         }
         for k in 0..=n {
-            let t = (FRAC_PI_4 * (n - k) as f64 / n as f64).tan();
+            let t = crate::dm::tan(FRAC_PI_4 * (n - k) as f64 / n as f64);
             c.push((-(half - r) - r * t, k < n));
         }
         for k in 0..=n {
-            let t = (FRAC_PI_4 * k as f64 / n as f64).tan();
+            let t = crate::dm::tan(FRAC_PI_4 * k as f64 / n as f64);
             c.push(((half - r) + r * t, k > 0));
         }
         c
@@ -1283,11 +1283,11 @@ fn point_in(poly: &[(f64, f64)], q: (f64, f64)) -> bool {
 fn clean(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
     let mut p: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
     for &q in pts {
-        if p.last().is_none_or(|l: &(f64, f64)| (l.0 - q.0).hypot(l.1 - q.1) > 1e-6) {
+        if p.last().is_none_or(|l: &(f64, f64)| crate::dm::hypot(l.0 - q.0, l.1 - q.1) > 1e-6) {
             p.push(q);
         }
     }
-    while p.len() > 2 && (p[0].0 - p[p.len() - 1].0).hypot(p[0].1 - p[p.len() - 1].1) <= 1e-6 {
+    while p.len() > 2 && crate::dm::hypot(p[0].0 - p[p.len() - 1].0, p[0].1 - p[p.len() - 1].1) <= 1e-6 {
         p.pop();
     }
     // Drop collinear points.
@@ -1296,7 +1296,7 @@ fn clean(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
         let n = p.len();
         let (a, b, c) = (p[(i + n - 1) % n], p[i], p[(i + 1) % n]);
         let cr = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
-        let l = (b.0 - a.0).hypot(b.1 - a.1) * (c.0 - b.0).hypot(c.1 - b.1);
+        let l = crate::dm::hypot(b.0 - a.0, b.1 - a.1) * crate::dm::hypot(c.0 - b.0, c.1 - b.1);
         if cr.abs() <= 1e-9 * l.max(1e-12) && (b.0 - a.0) * (c.0 - b.0) + (b.1 - a.1) * (c.1 - b.1) > 0.0 {
             p.remove(i);
         } else {
@@ -1472,14 +1472,14 @@ fn walls(c: &[(f64, f64)]) -> Vec<Wall> {
     let en = |i: usize| {
         let (a, b) = (c[i % n], c[(i + 1) % n]);
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        let l = dx.hypot(dy).max(1e-12);
+        let l = crate::dm::hypot(dx, dy).max(1e-12);
         (dy / l, -dx / l)
     };
     (0..n)
         .map(|i| {
             let (a, b) = (en(i + n - 1), en(i));
             let m = (a.0 + b.0, a.1 + b.1);
-            let ml = m.0.hypot(m.1);
+            let ml = crate::dm::hypot(m.0, m.1);
             let cos = a.0 * b.0 + a.1 * b.1;
             let mu = if ml > 1e-9 { (m.0 / ml, m.1 / ml) } else { b };
             // Miter length 1/cos(half angle), limited.
@@ -1533,7 +1533,7 @@ fn extrude(mesh: &mut Mesh, path: &PathMorph, depth: f64, bevel: f64, detail: f6
             if segs == 0 {
                 break;
             }
-            rings.push((b * (1.0 - phi.sin()), -d + b - b * phi.cos(), phi.sin(), -phi.cos(), PART_BEVEL));
+            rings.push((b * (1.0 - crate::dm::sin(phi)), -d + b - b * crate::dm::cos(phi), crate::dm::sin(phi), -crate::dm::cos(phi), PART_BEVEL));
         }
         rings.push((0.0, -d + b, 1.0, 0.0, PART_SIDE));
         rings.push((0.0, d - b, 1.0, 0.0, PART_SIDE));
@@ -1542,7 +1542,7 @@ fn extrude(mesh: &mut Mesh, path: &PathMorph, depth: f64, bevel: f64, detail: f6
                 break;
             }
             let phi = FRAC_PI_2 * k as f64 / segs as f64;
-            rings.push((b * (1.0 - phi.cos()), d - b + b * phi.sin(), phi.cos(), phi.sin(), PART_BEVEL));
+            rings.push((b * (1.0 - crate::dm::cos(phi)), d - b + b * crate::dm::sin(phi), crate::dm::cos(phi), crate::dm::sin(phi), PART_BEVEL));
         }
         for wl in &all_walls {
             // Columns: one per shading normal; corners have two at one point.
@@ -1622,7 +1622,7 @@ fn sweep(mesh: &mut Mesh, path: &PathMorph, radius: f64, width: f64, profile: Sw
 fn tube(mesh: &mut Mesh, line: &[(f64, f64)], r: f64, width: f64, profile: SweepProfile, caps: Caps, segment: u32, detail: f64) {
     let mut pts: Vec<(f64, f64)> = Vec::with_capacity(line.len());
     for &q in line {
-        if pts.last().is_none_or(|l: &(f64, f64)| (l.0 - q.0).hypot(l.1 - q.1) > 1e-6) {
+        if pts.last().is_none_or(|l: &(f64, f64)| crate::dm::hypot(l.0 - q.0, l.1 - q.1) > 1e-6) {
             pts.push(q);
         }
     }
@@ -1632,7 +1632,7 @@ fn tube(mesh: &mut Mesh, line: &[(f64, f64)], r: f64, width: f64, profile: Sweep
     let n = pts.len();
     let dir = |i: usize, j: usize| {
         let (dx, dy) = (pts[j].0 - pts[i].0, pts[j].1 - pts[i].1);
-        let l = dx.hypot(dy).max(1e-12);
+        let l = crate::dm::hypot(dx, dy).max(1e-12);
         (dx / l, dy / l)
     };
     let tangents: Vec<(f64, f64)> = (0..n)
@@ -1640,7 +1640,7 @@ fn tube(mesh: &mut Mesh, line: &[(f64, f64)], r: f64, width: f64, profile: Sweep
             let a = if i > 0 { dir(i - 1, i) } else { dir(0, 1) };
             let b = if i + 1 < n { dir(i, i + 1) } else { dir(n - 2, n - 1) };
             let m = (a.0 + b.0, a.1 + b.1);
-            let l = m.0.hypot(m.1);
+            let l = crate::dm::hypot(m.0, m.1);
             if l > 1e-9 {
                 (m.0 / l, m.1 / l)
             } else {
@@ -1655,7 +1655,7 @@ fn tube(mesh: &mut Mesh, line: &[(f64, f64)], r: f64, width: f64, profile: Sweep
             (0..=s)
                 .map(|i| {
                     let a = TAU * i as f64 / s as f64;
-                    let (sn, c) = a.sin_cos();
+                    let (sn, c) = crate::dm::sin_cos(a);
                     ((r * c, r * sn), (c, sn))
                 })
                 .collect()
@@ -1714,7 +1714,7 @@ fn tube(mesh: &mut Mesh, line: &[(f64, f64)], r: f64, width: f64, profile: Sweep
                         .iter()
                         .map(|&(_, (nu, nv))| {
                             let rim = add(mul(nn, nu), mul([0.0, 0.0, 1.0], nv));
-                            let d = add(mul(rim, phi.cos()), mul(out, phi.sin()));
+                            let d = add(mul(rim, crate::dm::cos(phi)), mul(out, crate::dm::sin(phi)));
                             mesh.vertex(add(c, mul(d, r)), d)
                         })
                         .collect();
@@ -1944,7 +1944,7 @@ mod tests {
         let outer: Vec<(f64, f64)> = (0..40).map(|i| {
             let a = TAU * i as f64 / 40.0;
             let r = if i % 2 == 0 { 100.0 } else { 60.0 };
-            (r * a.cos(), r * a.sin())
+            (r * crate::dm::cos(a), r * crate::dm::sin(a))
         }).collect();
         let tris = triangulate(&[outer.clone()]);
         let area: f64 = tris.iter().map(|t| cross2(outer[t[0]], outer[t[1]], outer[t[2]]).abs() / 2.0).sum();
@@ -1994,7 +1994,7 @@ mod tests {
         let angle = |seg: u32| {
             let pts: Vec<f64> = t.tris.iter().zip(&t.tags).filter(|(_, g)| tag_segment(**g) == seg).flat_map(|(tri, _)| tri.iter().map(|&i| {
                 let p = t.positions[i as usize];
-                (p[0] as f64).atan2(-(p[1] as f64)).to_degrees().rem_euclid(360.0)
+                crate::dm::atan2(p[0] as f64, -(p[1] as f64)).to_degrees().rem_euclid(360.0)
             })).collect();
             pts.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - pts.iter().cloned().fold(f64::INFINITY, f64::min)
         };

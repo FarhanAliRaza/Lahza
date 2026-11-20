@@ -708,7 +708,7 @@ fn leaves<'a>(layers: &'a [LayerState], parent: Option<(Proj, f64, usize)>, keep
 /// Text height on screen: one em (`size`) through the layer's matrix.
 fn em_px(m: Proj, size: f64) -> f64 {
     let (a, b) = (m.apply(0.0, 0.0), m.apply(0.0, size));
-    (b.0 - a.0).hypot(b.1 - a.1)
+    crate::dm::hypot(b.0 - a.0, b.1 - a.1)
 }
 
 fn word_count(text: &str) -> usize {
@@ -1030,7 +1030,7 @@ impl<'a> Craft<'a> {
     fn track(&mut self, h: &Heading, n: u64, t: f64, m: Proj, world: Option<Option<Proj>>) {
         let by = &h.by;
         let o = m.apply(0.0, 0.0);
-        let (s, c) = h.degrees.to_radians().sin_cos();
+        let (s, c) = crate::dm::sin_cos(h.degrees.to_radians());
         let q = m.apply(c * 10.0, s * 10.0);
         let face = (q.0 - o.0, q.1 - o.1);
         let (fps, slow) = (self.fps, 0.03 * self.short);
@@ -1050,7 +1050,7 @@ impl<'a> Craft<'a> {
             };
             if pn + 1 == n && !tr.done && p.0.is_finite() && p.1.is_finite() {
                 let v = ((o.0 - p.0) * fps, (o.1 - p.1) * fps);
-                let (speed, fl) = (v.0.hypot(v.1), face.0.hypot(face.1));
+                let (speed, fl) = (crate::dm::hypot(v.0, v.1), crate::dm::hypot(face.0, face.1));
                 if speed > slow && fl > 1e-9 {
                     if (v.0 * face.0 + v.1 * face.1) / (speed * fl) < -0.3 {
                         let from = *tr.from.get_or_insert(t);

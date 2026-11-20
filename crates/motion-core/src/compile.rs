@@ -45,7 +45,7 @@ impl Affine {
     }
     /// Clockwise degrees in a y-down space.
     pub fn rotate(degrees: f64) -> Self {
-        let (s, c) = degrees.to_radians().sin_cos();
+        let (s, c) = crate::dm::sin_cos(degrees.to_radians());
         Affine([c, s, -s, c, 0.0, 0.0])
     }
     /// self ∘ other: apply `other` first.
@@ -556,6 +556,8 @@ pub struct CLayer {
     body: Option<Box<sim::CBody>>,
     /// A crowd's character: the bake places its instances.
     herd: Option<Box<crowd::CHerd>>,
+    /// Drawn as a rope or spring between two bodies.
+    rope: Option<Box<sim::CRope>>,
 }
 
 /// `follow`: placed on sibling `target`'s path.
@@ -1280,6 +1282,7 @@ impl<'a> Compiler<'a> {
             kind,
             body: self.body(c, id, shift),
             herd: None,
+            rope: None,
         }
     }
 
@@ -1540,6 +1543,7 @@ impl Compiler<'_> {
         let sim = self.simulation(scene, start, end, pre_roll);
         let mut layers = layers;
         crowd::bind_herds(&mut layers, &sim, pre_roll);
+        sim::bind_ropes(&mut layers, &sim, pre_roll);
         let skinned = sim::check_skins(&layers, &mut self.errors);
         let lighting = self.lighting(scene, pre_roll, start);
         let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
@@ -1852,7 +1856,7 @@ impl Compiled {
         let (fov, dolly) = (scene.camera_fov.at(tc), scene.camera_dolly.at(tc));
         let shift = scene.camera_shift.at(tc);
         let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, fov, (orbit.x(), orbit.y()), dolly).shifted((shift.x(), shift.y()));
-        let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None, keyed: false };
+        let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None, keyed: false, copy: None };
         let aperture = scene.camera_aperture.at(tc);
         if aperture > 0.0 {
             // Depths are view-space z; the point of interest sits at the
@@ -1948,9 +1952,9 @@ impl Compiled {
                 // The incoming scene grows from half size; its background
                 // is drawn large enough to fill the frame the whole time,
                 // so no hard-edged box or border shows around it.
-                let k = 0.5f64.powf(1.0 - p);
+                let k = crate::dm::powf(0.5f64, 1.0 - p);
                 vec![
-                    self.scene_group(a, ta, about_centre(4f64.powf(p)), (1.0 - p).clamp(0.0, 1.0)),
+                    self.scene_group(a, ta, about_centre(crate::dm::powf(4f64, p)), (1.0 - p).clamp(0.0, 1.0)),
                     self.scene_group_bg(b, tb, about_centre(k), p.clamp(0.0, 1.0), 1.0 / k + 0.02),
                 ]
             }
@@ -1964,7 +1968,7 @@ impl Compiled {
                     // list.rs). Snapping the offset to that grid puts the
                     // seam on a texel edge, so no partly covered texel lets
                     // a covered background bleed into the smear.
-                    let factor = if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
+                    let factor = if sigma <= 4.0 { 1.0 } else { crate::dm::powf(2f64, crate::dm::log2(sigma / 4.0).ceil()).min(16.0) };
                     let len = if dx != 0.0 { w } else { h };
                     let q = len / (len / factor).ceil();
                     let at = |k: f64| ((dx * k / q).round() * q, (dy * k / q).round() * q);
@@ -2049,6 +2053,9 @@ struct Space {
     /// Bodies stand where their keys put them (no bake): what a bake is
     /// made from.
     keyed: bool,
+    /// Inside an instancer's copy: which, and how much later it plays.
+    /// (A body in it is the bake's `<layer>#<copy>`.)
+    copy: Option<(u32, f64)>,
 }
 
 /// Depth of field: blur sigma = `per_px` × |view depth − `plane`| canvas px.
@@ -2084,7 +2091,7 @@ fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, s
     let t = clock(l.step.or(inherited), tc);
     // A body from its release on: where the bake has it (the scene's
     // space), in this layer list's.
-    if let (false, Some(w)) = (space.keyed, l.body.as_ref().and_then(|b| b.baked(t))) {
+    if let (false, Some(w)) = (space.keyed, l.body.as_ref().and_then(|b| b.baked(t, space.copy))) {
         let m = crate::sim::inverse(space.world).then(w);
         cache[i] = Some(m);
         return m;
@@ -2147,7 +2154,7 @@ fn follow_origin(layers: &[CLayer], f: &CFollow, t: f64, tc: f64, inherited: Opt
     let mut m = Mat4::translate(p[0], p[1], p[2]);
     if f.rotate {
         let q = tm.apply(x + dx, y + dy, 0.0);
-        m = m.then(Mat4::rotate_z((q[1] - p[1]).atan2(q[0] - p[0]).to_degrees()));
+        m = m.then(Mat4::rotate_z(crate::dm::atan2(q[1] - p[1], q[0] - p[0]).to_degrees()));
     }
     let o = f.offset.at(t);
     m.then(Mat4::translate(o.x(), o.y(), 0.0))
@@ -2286,12 +2293,12 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                         v[2] *= t;
                     }
                     PostKind::DirectionalBlur => {
-                        let (s, c) = v[0].to_radians().sin_cos();
+                        let (s, c) = crate::dm::sin_cos(v[0].to_radians());
                         let len = v[1] * scale;
                         v = [c * len, s * len, 0.0, 0.0, 0.0];
                     }
                     PostKind::RgbSplit => {
-                        let (s, c) = v[1].to_radians().sin_cos();
+                        let (s, c) = crate::dm::sin_cos(v[1].to_radians());
                         let len = v[0] * scale;
                         v = [c * len, s * len, 0.0, 0.0, 0.0];
                     }
@@ -2388,7 +2395,17 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             }),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
-        CKind::Mesh(m) => Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))),
+        CKind::Mesh(m) => match &l.rope {
+            // A rope's layer is drawn along the rope, not where it lies.
+            Some(rope) => {
+                for (k, world) in rope.pieces(layers, tc, inherited, space, cache, &m.state(t, world, space.cam, None)).into_iter().enumerate() {
+                    let matrix = space.screen(world, true);
+                    out.push(LayerState { id: if k == 0 { l.id.clone() } else { format!("{}#{k}", l.id).into() }, matrix, opacity: parent_opacity * own_opacity, blend: l.blend, effects: Vec::new(), matte: None, content: Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))), view: Some(space.cam.view.then(world)) });
+                }
+                return;
+            }
+            None => Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))),
+        },
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
         CKind::Shader(s) => Content::Shader(ShaderState {
             program: s.program.clone(),
@@ -2774,7 +2791,7 @@ mod tests {
         let (o, x) = placed(&c, 0.0, "arrow");
         assert!(near(o, (520.0, 560.0)), "{o:?}");
         // Path direction (down) plus its own 10°.
-        let (s, k) = 100f64.to_radians().sin_cos();
+        let (s, k) = crate::dm::sin_cos(100f64.to_radians());
         assert!(near(x, (k, s)), "{x:?}");
     }
 

@@ -297,3 +297,138 @@ fn a_motor_drives_a_hinge_to_its_keyed_target() {
     let end = yaw(at(&bake, "door", 90));
     assert!((end.abs() - 80.0).abs() < 2.0, "the door is at {end}°");
 }
+
+#[test]
+fn a_rope_is_drawn_from_end_to_end_and_hangs_by_its_slack() {
+    use lahza_motion_core::compile::Content;
+    // A ball let go beside the point its rope is tied to: 300 px of rope,
+    // 100 px apart. It falls till the rope is taut, and swings.
+    let scene = |draw: serde_json::Value, kind: &str| {
+        json!({"id": "s1", "simulation": {"joints": [{"type": kind, "a": "ball", "anchor_b": [600, 200, 0], "length": 300, "draw": draw}]}, "layers": [
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "transform": {"position": [700, 200]}, "body": {"mass": 5}},
+            {"id": "cord", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 3, "height": 50}, "transform": {"position": [100, 900]}},
+            {"id": "flat", "kind": "shape", "shape": "rect", "size": [10, 10], "fill": "#fff"}
+        ]})
+    };
+    let mut p = project(scene(json!("cord"), "rope"), 3.0);
+    let bake = baked(&mut p);
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    // The rope's pieces at a time: each a (middle, half its length along its y).
+    let pieces = |t: f64| -> Vec<([f64; 3], [f64; 3])> {
+        c.frame(t)
+            .layers
+            .iter()
+            .filter(|l| &*l.id == "cord" || l.id.starts_with("cord#"))
+            .map(|l| {
+                let Content::Mesh(m) = &l.content else { panic!() };
+                let w = m.world.0;
+                // (Its mesh is 50 long: its y column is the piece's length over 50.)
+                ([w[3], w[7], w[11]], [w[1] * 25.0, w[5] * 25.0, w[9] * 25.0])
+            })
+            .collect()
+    };
+    let ends = |ps: &[([f64; 3], [f64; 3])]| -> ([f64; 3], [f64; 3], f64) {
+        let (first, last) = (ps[0], ps[ps.len() - 1]);
+        let total = ps.iter().map(|p| 2.0 * (p.1[0] * p.1[0] + p.1[1] * p.1[1] + p.1[2] * p.1[2]).sqrt()).sum();
+        (std::array::from_fn(|k| first.0[k] - first.1[k]), std::array::from_fn(|k| last.0[k] + last.1[k]), total)
+    };
+    let near = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt();
+    let ball = |t: f64| {
+        let m = bake.world(bake.track("ball").unwrap(), t).unwrap().0;
+        [m[3], m[7], m[11]]
+    };
+    // At the start, slack: twelve pieces from the ball to the tie, as long
+    // together as the rope (the hang is a parabola: within a tenth), their
+    // lowest well below both ends. Its layer is not drawn where it lies.
+    let slack = pieces(0.0);
+    assert_eq!(slack.len(), 12);
+    let (from, to, long) = ends(&slack);
+    assert!(near(from, ball(0.0)) < 1e-6 && near(to, [600.0, 200.0, 0.0]) < 1e-6, "from {from:?} to {to:?}");
+    assert!((long - 300.0).abs() < 30.0, "its pieces are {long:.0} px together");
+    let lowest = slack.iter().map(|p| p.0[1]).fold(0.0, f64::max);
+    assert!(lowest > 200.0 + 90.0, "it hangs to y {lowest:.0}");
+    assert!(slack.iter().all(|p| p.0[1] < 600.0));
+    // Each piece begins where the last ended.
+    for w in slack.windows(2) {
+        let (end, begin): ([f64; 3], [f64; 3]) = (std::array::from_fn(|k| w[0].0[k] + w[0].1[k]), std::array::from_fn(|k| w[1].0[k] - w[1].1[k]));
+        assert!(near(end, begin) < 1e-6);
+    }
+    // Taut (the ball has fallen to the rope's end): one straight piece,
+    // the rope's length, from the ball to the tie.
+    let taut = (10..90).map(|k| k as f64 / 30.0).find(|t| near(ball(*t), [600.0, 200.0, 0.0]) > 299.0).expect("the rope never came taut");
+    let straight = pieces(taut);
+    let (from, to, long) = ends(&straight);
+    assert!(straight.len() == 1 && near(from, ball(taut)) < 1e-6 && near(to, [600.0, 200.0, 0.0]) < 1e-6 && (long - near(ball(taut), [600.0, 200.0, 0.0])).abs() < 1e-6, "{straight:?}");
+    // A spring is drawn straight whatever its length.
+    let mut spring = project(scene(json!("cord"), "spring"), 1.0);
+    baked(&mut spring);
+    assert_eq!(Compiled::new(&spring).frame(0.0).layers.iter().filter(|l| l.id.starts_with("cord")).count(), 1);
+    // What cannot be drawn is said.
+    let wrong = |draw: &str, kind: &str| Compiled::new(&project(scene(json!(draw), kind), 1.0)).sim_input(0, None).1.join("\n");
+    assert!(wrong("nothing", "rope").contains("joints.0.draw: no layer 'nothing'"));
+    assert!(wrong("flat", "rope").contains("'flat' is no cylinder, capsule or box mesh"));
+    assert!(wrong("cord", "hinge").contains("only ropes and springs are drawn"));
+}
+
+#[test]
+fn every_copy_of_an_instancer_is_a_body_of_its_own() {
+    use lahza_motion_core::compile::Content;
+    // Three by two bricks from one layer, the grid tipped 10° and hung over
+    // the ground; a ball beside them that is no copy.
+    let scene = |layout: serde_json::Value| {
+        json!({"id": "s1", "simulation": {"ground": {"y": 800}}, "layers": [
+            {"id": "wall", "kind": "instancer", "transform": {"position": [600, 300], "rotation": 10}, "layout": layout,
+             "layers": [{"id": "brick", "kind": "mesh", "mesh": {"type": "box", "size": [80, 40], "depth": 40}, "body": {"bounce": 0.1}}]},
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 20}, "transform": {"position": [200, 300]}, "body": {}}
+        ]})
+    };
+    let mut p = project(scene(json!({"type": "grid", "columns": 3, "rows": 2, "spacing": [100, 60]})), 4.0);
+    let bake = baked(&mut p);
+    let ids: Vec<&str> = bake.tracks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["brick#0", "brick#1", "brick#2", "brick#3", "brick#4", "brick#5", "ball"]);
+    let place = |id: &str, k: usize| {
+        let s = bake.tracks[bake.track(id).unwrap()].samples[k];
+        [s[0] as f64, s[1] as f64, s[2] as f64]
+    };
+    // They start where the grid has its copies (100 px apart along the
+    // tipped rows), each turned as the grid is, and fall as six bodies:
+    // all on the ground at the end, lying flat, none inside another.
+    let apart = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    assert!((apart(place("brick#0", 0), place("brick#1", 0)) - 100.0).abs() < 1e-3 && (apart(place("brick#0", 0), place("brick#3", 0)) - 60.0).abs() < 1e-3);
+    assert!((place("brick#1", 0)[1] - place("brick#0", 0)[1] - 100.0 * 10f64.to_radians().sin()).abs() < 1e-3);
+    let last = bake.tracks[0].samples.len() - 1;
+    for k in 0..6 {
+        let end = place(&format!("brick#{k}"), last);
+        assert!(end[1] > 740.0 && end[1] < 781.0, "brick#{k} ended at {end:?}");
+        assert!(apart(end, place(&format!("brick#{k}"), last - 15)) < 1.0);
+        for j in 0..k {
+            assert!(apart(end, place(&format!("brick#{j}"), last)) > 39.0, "brick#{j} and brick#{k} ended {:.0} px apart", apart(end, place(&format!("brick#{j}"), last)));
+        }
+    }
+    // Drawn: each copy where the bake has its body, at every time.
+    let c = Compiled::new(&p);
+    for t in [0.0, 0.7, 3.5] {
+        let frame = c.frame(t);
+        let drawn: Vec<[f64; 3]> = frame.layers.iter().filter(|l| &*l.id == "brick").map(|l| match &l.content {
+            Content::Mesh(m) => [m.world.0[3], m.world.0[7], m.world.0[11]],
+            _ => panic!(),
+        }).collect();
+        assert_eq!(drawn.len(), 6);
+        for k in 0..6 {
+            let w = bake.world(bake.track(&format!("brick#{k}")).unwrap(), t).unwrap().0;
+            assert!(drawn.iter().any(|d| apart(*d, [w[3], w[7], w[11]]) < 1e-6), "at {t}: brick#{k} is not drawn at {:?}", [w[3], w[7], w[11]]);
+        }
+    }
+    // A joint and a push can name a copy.
+    let mut tied = scene(json!({"type": "grid", "columns": 3, "rows": 2, "spacing": [100, 60]}));
+    tied["simulation"]["joints"] = json!([{"type": "fixed", "a": "brick#4"}]);
+    let mut tied = project(tied, 2.0);
+    let held = baked(&mut tied);
+    let s = &held.tracks[held.track("brick#4").unwrap()].samples;
+    assert!((s[s.len() - 1][1] - s[0][1]).abs() < 1.0 && held.tracks[held.track("brick#3").unwrap()].samples[s.len() - 1][1] > 700.0);
+    // An emitter's particles are no bodies.
+    let e = Compiled::new(&project(scene(json!({"type": "emitter", "rate": 10, "lifetime": 1})), 1.0)).sim_input(0, None).1.join("\n");
+    assert!(e.contains("brick.body: a layer inside an emitter"), "{e}");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (25353, 2539571057427851888), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}

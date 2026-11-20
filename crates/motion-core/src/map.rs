@@ -133,7 +133,7 @@ fn parse(b: &[u8]) -> Option<MapData> {
 pub fn project(lon: f64, lat: f64, w: f64) -> (f64, f64) {
     let lat = lat.clamp(-85.05, 85.05).to_radians();
     let x = (lon + 180.0) / 360.0 * w;
-    let y = (1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * w;
+    let y = (1.0 - crate::dm::ln(crate::dm::tan(lat) + 1.0 / crate::dm::cos(lat)) / std::f64::consts::PI) / 2.0 * w;
     (x, y)
 }
 
@@ -280,17 +280,17 @@ fn great_circle(a: (f64, f64), b: (f64, f64), world: f64) -> Vec<Vec<(f64, f64)>
     const LAT: f64 = 85.05;
     let to3 = |(lon, lat): (f64, f64)| {
         let (l, p) = (lon.to_radians(), lat.to_radians());
-        [p.cos() * l.cos(), p.cos() * l.sin(), p.sin()]
+        [crate::dm::cos(p) * crate::dm::cos(l), crate::dm::cos(p) * crate::dm::sin(l), crate::dm::sin(p)]
     };
     let (va, vb) = (to3(a), to3(b));
-    let omega = (va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]).clamp(-1.0, 1.0).acos();
+    let omega = crate::dm::acos((va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]).clamp(-1.0, 1.0));
     let n = ROUTE_SEGMENTS * 2;
     let samples: Vec<(f64, f64)> = (0..=n)
         .map(|k| {
             let t = k as f64 / n as f64;
-            let (sa, sb) = if omega < 1e-9 { (1.0 - t, t) } else { (((1.0 - t) * omega).sin() / omega.sin(), (t * omega).sin() / omega.sin()) };
+            let (sa, sb) = if omega < 1e-9 { (1.0 - t, t) } else { (crate::dm::sin((1.0 - t) * omega) / crate::dm::sin(omega), crate::dm::sin(t * omega) / crate::dm::sin(omega)) };
             let v = [sa * va[0] + sb * vb[0], sa * va[1] + sb * vb[1], sa * va[2] + sb * vb[2]];
-            (v[1].atan2(v[0]).to_degrees(), v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt()).to_degrees())
+            (crate::dm::atan2(v[1], v[0]).to_degrees(), crate::dm::atan2(v[2], (v[0] * v[0] + v[1] * v[1]).sqrt()).to_degrees())
         })
         .collect();
     let on = |lat: f64| lat.abs() <= LAT;
@@ -405,7 +405,7 @@ pub fn generate(p: &Value, width: f64, height: f64) -> Result<Vec<Value>, String
         });
     }
     let animated = cam.get("keys").is_some();
-    let scales: Vec<f64> = keys.iter().map(|k| 2f64.powf(k.zoom)).collect();
+    let scales: Vec<f64> = keys.iter().map(|k| crate::dm::powf(2f64, k.zoom)).collect();
     let smax = scales.iter().cloned().fold(1.0, f64::max);
     // Everything the camera shows, with a margin.
     let mut view = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn closed_rings_survive_simplification() {
-        let ring: Vec<(f64, f64)> = (0..=40).map(|i| { let a = i as f64 / 40.0 * std::f64::consts::TAU; (a.cos() * 10.0, a.sin() * 10.0) }).collect();
+        let ring: Vec<(f64, f64)> = (0..=40).map(|i| { let a = i as f64 / 40.0 * std::f64::consts::TAU; (crate::dm::cos(a) * 10.0, crate::dm::sin(a) * 10.0) }).collect();
         assert!(simplify(&ring, 0.1).len() > 10);
         let out = generate(&json!({"camera": {"center": [52, 28], "zoom": 2.2}}), 1080.0, 1920.0).unwrap();
         assert!(out.iter().any(|c| c["id"] == "IRN"), "Iran is in view");

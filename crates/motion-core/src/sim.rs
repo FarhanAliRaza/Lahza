@@ -335,6 +335,11 @@ pub struct Joint {
     /// The two bodies collide with each other (default: they do not).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub collide: bool,
+    /// Rope, spring: a layer of the scene (a cylinder, capsule or box
+    /// mesh, its length along y) that is drawn as it: from anchor to
+    /// anchor, a rope in pieces that hang by the slack it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<String>,
 }
 
 fn axis_z() -> [f64; 3] {
@@ -574,7 +579,8 @@ pub enum BehaviourKind {
     /// seconds it rolls onto its front, pushes up, draws its legs under
     /// it and stands, in `time` seconds. An outside force on its hips of
     /// at most `help` × its weight (and the torque that would make)
-    /// lifts and rights it. Params: `wait`, `time`, `help`.
+    /// lifts and rights it. Params: `wait`, `time`, `help`, `way`
+    /// ("front", "back": it sits up instead, or "near").
     GetUp,
 }
 
@@ -708,6 +714,9 @@ pub struct CrowdRagdoll {
     pub limits: Vec<BoneLimit>,
     #[serde(default)]
     pub shapes: Vec<BoneShape>,
+    /// How hard one knocked down holds the pose it fell in (0: limp).
+    #[serde(default)]
+    pub strength: f64,
     /// Instances: how many can be down as ragdolls at once in a take (the
     /// ones knocked after that stop where they stand).
     #[serde(default = "crowd_fallen")]
@@ -946,7 +955,7 @@ impl HerdTrack {
         let mut d = (b[2] - a[2]) as f64;
         d -= (d / std::f64::consts::TAU).round() * std::f64::consts::TAU;
         let turn = a[2] as f64 + d * f;
-        let q = quat_mul([0.0, (turn / 2.0).sin(), 0.0, (turn / 2.0).cos()], self.q);
+        let q = quat_mul([0.0, crate::dm::sin(turn / 2.0), 0.0, crate::dm::cos(turn / 2.0)], self.q);
         // A clip that wrapped between the samples is not run backwards.
         let clock = if b[3] < a[3] { a[3] as f64 } else { l(3) };
         Some((Pose { p: [l(0), self.y, l(1)], q }, clock, turn))
@@ -1707,7 +1716,7 @@ mod tests {
         // Before the release the keys stand; after the last sample it holds.
         assert!(bake.world(0, 1.0).is_none());
         let m = bake.world(0, 1.0 + 1.5 / 30.0).unwrap();
-        assert!((m.0[3] - 15.0).abs() < 1e-6 && (m.0[7] - 2.0).abs() < 1e-6 && (m.0[0].hypot(m.0[4]) - 2.0).abs() < 1e-6);
+        assert!((m.0[3] - 15.0).abs() < 1e-6 && (m.0[7] - 2.0).abs() < 1e-6 && (crate::dm::hypot(m.0[0], m.0[4]) - 2.0).abs() < 1e-6);
         let (held, last) = (bake.world(0, 9.0).unwrap(), bake.world(0, 1.0 + 2.0 / 30.0).unwrap());
         assert!((0..16).all(|k| (held.0[k] - last.0[k]).abs() < 1e-9));
     }

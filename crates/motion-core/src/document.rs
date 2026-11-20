@@ -1351,7 +1351,7 @@ fn primitive_path(p: &PathShape) -> String {
             pts(count, &|i| {
                 let a = std::f64::consts::TAU * i as f64 / count as f64;
                 let r = if i % 2 == 1 && p.shape == ShapeKind::Star { hw * inner } else { hw };
-                (r * a.sin(), -r * a.cos())
+                (r * crate::dm::sin(a), -r * crate::dm::cos(a))
             })
         }
         ShapeKind::Capsule => {

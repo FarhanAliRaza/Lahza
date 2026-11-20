@@ -109,7 +109,7 @@ pub(crate) fn velocity_between(a: &Pose, b: &Pose, dt: f64) -> ([f64; 3], [f64; 
         d = d.map(|x| -x);
     }
     let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    let w = if s < 1e-12 { [0.0; 3] } else { [0, 1, 2].map(|k| d[k] / s * 2.0 * s.atan2(d[3]) / dt) };
+    let w = if s < 1e-12 { [0.0; 3] } else { [0, 1, 2].map(|k| d[k] / s * 2.0 * libm::atan2(s, d[3]) / dt) };
     (v, w)
 }
 

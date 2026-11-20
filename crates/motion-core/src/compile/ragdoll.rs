@@ -104,6 +104,8 @@ impl Compiled {
         let set = &sim.settings;
         // The document's ragdolls, then a limp one per agent of a crowd
         // that has a `ragdoll` (let go when the agent is knocked down).
+        // (How hard each crowd's hold the pose they fell in.)
+        let holds: HashMap<&str, f64> = set.crowds.iter().filter_map(|c| Some((c.id.as_str(), c.ragdoll.as_ref()?.strength.clamp(0.0, 1.0)))).collect();
         let limp = CRagdoll { release: None, rest: None, strength: Prop::constant(0.0), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new() };
         let mut agents: Vec<crate::sim::Ragdoll> = set
             .crowds
@@ -371,13 +373,14 @@ impl Compiled {
                 });
             }
             if puppet {
+                let held = holds.get(r.id.split(['/', '#']).next().unwrap_or("")).copied().unwrap_or(0.0);
                 for b in &mut out.bones {
                     let body = &mut input.bodies[b.body];
                     body.keyed.truncate(1);
                     body.before = body.keyed[0];
                     body.release = u32::MAX;
                     b.clip = Vec::new();
-                    b.strength = vec![0.0];
+                    b.strength = vec![held];
                 }
                 out.release = u32::MAX;
             }

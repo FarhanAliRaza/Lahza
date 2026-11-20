@@ -11,6 +11,7 @@ pub mod camfit;
 pub mod catalog;
 pub mod check;
 pub mod compile;
+pub mod dm;
 pub mod components;
 pub mod curve;
 pub mod document;

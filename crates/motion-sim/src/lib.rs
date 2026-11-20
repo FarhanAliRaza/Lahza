@@ -43,16 +43,21 @@ pub struct Take {
     pub world: World,
     pub brains: Vec<behaviour::Brain>,
     pub turns: Vec<Option<Vec<Option<[f64; 4]>>>>,
+    /// What is moved, not pushed, and by something outside the take (a
+    /// crowd's agents): each with its speed (px/s). In a try ahead they
+    /// go on as they were going.
+    pub movers: Vec<(rapier3d::prelude::RigidBodyHandle, [f64; 3])>,
+    trial: bool,
 }
 
 impl Take {
     pub fn new(input: &SimInput, meshes: Meshes) -> Result<Take, String> {
-        Ok(Take { world: World::new(input, meshes)?, brains: input.ragdolls.iter().map(|r| behaviour::Brain::new(input, r)).collect(), turns: vec![None; input.ragdolls.len()] })
+        Ok(Take { world: World::new(input, meshes)?, brains: input.ragdolls.iter().map(|r| behaviour::Brain::new(input, r)).collect(), turns: vec![None; input.ragdolls.len()], movers: Vec::new(), trial: false })
     }
 
     /// A copy that goes its own way from here (a try ahead).
     pub fn fork(&self) -> Take {
-        Take { world: self.world.fork(), brains: self.brains.clone(), turns: self.turns.clone() }
+        Take { world: self.world.fork(), brains: self.brains.clone(), turns: self.turns.clone(), movers: self.movers.clone(), trial: true }
     }
 
     /// Lets go the bodies whose release is sample `k`, where their keys
@@ -72,6 +77,15 @@ impl Take {
         let x = k as f64 + (s + 1) as f64 / n as f64;
         self.world.drive(input, x);
         self.world.push(input, t);
+        if self.trial {
+            let step = self.world.dt / self.world.unit;
+            for (h, v) in &self.movers {
+                let body = &mut self.world.w.bodies[*h];
+                let mut at = *body.position();
+                at.translation += rapier3d::prelude::Vector::new((v[0] * step) as f32, (v[1] * step) as f32, (v[2] * step) as f32);
+                body.set_next_kinematic_position(at);
+            }
+        }
         for (rig, r) in input.ragdolls.iter().enumerate() {
             let drive = self.brains[rig].think(&mut self.world, input, r, x, t, self.turns[rig].as_deref());
             self.world.drive_ragdoll(r, rig, x, Some(&drive.targets), Some(&drive.scale));
@@ -134,6 +148,7 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
         take.release_due(input, k);
         record(&take.world, &mut tracks);
         herd.plan(input, &take.world);
+        take.movers = herd.movers(input.rate);
         // Once a frame, what sets the motors is asked.
         let t = input.start + k as f64 / input.rate;
         for (rig, mind) in minds.iter_mut().enumerate() {
@@ -163,7 +178,11 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
             }
             take.step(input, k, s);
             if !herd.is_empty() {
-                herd.knocks(input, &mut take.world, k, input.start + (k as f64 + (s + 1) as f64 / n as f64) / input.rate);
+                // (One knocked down holds, as far as its crowd's ragdolls
+                // do, the pose it fell in.)
+                for (rig, held) in herd.knocks(input, &mut take.world, k, input.start + (k as f64 + (s + 1) as f64 / n as f64) / input.rate) {
+                    take.turns[rig] = Some(held);
+                }
             }
             steps += 1;
         }

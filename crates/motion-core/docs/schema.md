@@ -645,6 +645,11 @@ bake is missing or stale (anything it was made from changed: a body, its
 shape or keys, a joint, a push, the settings); until it is baked again the
 old motion is what is drawn. A camera, material or light is not part of it.
 
+A layer with a `body` inside an instancer is a body per copy (a wall of
+bricks from one layer and a grid): copy `n`'s body is `<layer>#<n>`, the
+name a joint, an event and the bake know it by. Not inside an emitter,
+nor inside an instancer in an instancer.
+
 Space is the scene's: px, x right, y down, z away. The simulator works in
 metres, `unit` px to the metre (default 100: a 100 px box is a metre
 across and falls as one does).
@@ -714,9 +719,18 @@ each other unless `collide`. A `motor` drives a hinge (degrees) or slider
 "simulation": {"joints": [
   {"id": "hinge", "type": "hinge", "a": "door", "anchor": [-100, 0, 0], "axis": [0, 1, 0], "limits": [0, 100],
    "motor": {"target": {"keys": [{"at": "beat:3", "v": 0}, {"at": "beat:5", "v": 80, "ease": "glide"}]}, "stiffness": 400, "damping": 40}},
-  {"type": "rope", "a": "wrecker", "anchor_b": [900, 60, 0], "length": 440}
+  {"type": "rope", "a": "wrecker", "anchor_b": [900, 60, 0], "length": 440, "draw": "cord"}
 ]}
 ```
+
+A rope or spring is not seen unless it has `draw`: the id of a mesh
+layer of the scene itself (a `cylinder`, `capsule` or `box`: its length
+along y is the rope's, its radius the rope's thickness, its material the
+rope's). That layer is drawn from anchor to anchor instead of where it
+lies: a spring and a taut rope as one straight piece, a slack rope as
+twelve along the curve a rope of its `length` hangs in (a parabola, down
+the way gravity points; it does not swing of its own). Its bodies are
+layers of the scene itself too.
 
 #### Ragdolls
 
@@ -765,7 +779,7 @@ Behaviours set the motors' targets on top of the clip, from `from` to
 | `type` | what it does; `params` |
 |---|---|
 | `balance` | keeps its weight over its feet: leans at the ankles, and is helped by a force on the hips of at most `assist` (0.25) of its weight and the torque that would make. A push past that topples it; it then goes soft (to `limp`, 0.15, of its strength) and stays down (a `fall` event) unless it has `get_up`. `gain` (1): how far it leans. Needs feet (bones named `foot`) |
-| `get_up` | with `balance`: once fallen and still for `wait` seconds (0.8) it rolls onto its front, pushes its hands down under its shoulders, folds its hips and knees under it and stands, in `time` seconds (2.4), facing the way its head lay; then it balances and follows its clip again (`get_up` and `rise` events). Its motors shape this, but what lifts and rights it is a force on its hips of at most `help` (0.6) of its weight and the torque that would make: a `rise` event's `speed` is the percent of its weight that force carried over the rise (a fifth to two fifths on the test figure; with `help` 0.2 it mostly fails, with 0 always). Knees fold only where the shin's limit has a `hinge`. One that fails lies again and tries again |
+| `get_up` | with `balance`: once fallen and still for `wait` seconds (0.8) it rolls onto its front, pushes its hands down under its shoulders, folds its hips and knees under it and stands, in `time` seconds (2.4), facing the way its head lay; then it balances and follows its clip again (`get_up` and `rise` events). Its motors shape this, but what lifts and rights it is a force on its hips of at most `help` (0.6) of its weight and the torque that would make: a `rise` event's `speed` is the percent of its weight that force carried over the rise (a fifth to two fifths on the test figure; with `help` 0.2 it mostly fails, with 0 always). Knees fold only where the shin's limit has a `hinge`. `way`: `front` (the default: it rolls onto its front first), `back` (it sits up over its folded legs and stands facing the way its feet pointed; less sure: told so when it lies on its front it may not get over), `near` (whichever it lies nearer). One that fails lies again and tries again |
 | `step` | with `balance`: when its weight is headed past its feet by `trigger` px it steps the foot behind to where it is falling to, at most `length` px, in `time` seconds (0.28); a `step` event each. The foot is carried there by a force, its leg soft |
 | `guard` | the nearer hand (or `hand`: `left` \| `right`) to `target` (a body's layer id, or [x, y, z]) as it comes within `within` px |
 | `reach` | a hand to where it was last hit (a `hits` entry, or a body striking it at speed), for `hold` seconds (1.5) |
@@ -829,7 +843,7 @@ px a `cycle`), so feet do not slide and agents are out of step.
 | `knock` | px/s (300): a body striking an agent at this speed or more knocks it down (a `knock` event) |
 | `plan` | true: when the straight line to its goal is shut by what stands still, an agent takes the shortest way round it. false: it only steers off what is near, and a wall across its way holds it |
 | `dodge` | seconds (0.6) ahead an agent sees a body coming that would knock it down, and steps out of its line at up to 2.2 times its pace (a `dodge` event); 0: it does not look |
-| `ragdoll` | `{mass, thickness, friction, limits, shapes}` as a ragdoll's: an agent knocked down falls as a limp ragdoll of the bones under its comp, from the pose its clip had. Without it the agent stops where it stands |
+| `ragdoll` | `{mass, thickness, friction, limits, shapes}` as a ragdoll's: an agent knocked down falls as a ragdoll of the bones under its comp, from the pose its clip had, each bone moving and turning as it did in the clip. `strength` (0): how hard it holds the pose it fell in (0 limp, 1 goes down as it stood). Without `ragdoll` the agent stops where it stands |
 
 **Instances.** For hundreds or thousands, name one comp as the crowd's
 `character` instead of `agents`: every agent is an instance of it. The

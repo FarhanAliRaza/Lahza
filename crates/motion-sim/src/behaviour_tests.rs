@@ -279,6 +279,32 @@ fn it_gets_up_after_a_fall_whichever_way_it_fell() {
     assert!(little.last().unwrap().0 == "rise" && little.last().unwrap().1 > usual.last().unwrap().1 && little.last().unwrap().2 < usual.last().unwrap().2, "{little:?} {usual:?}");
     // Without the behaviour it stays down.
     assert_eq!(happened(&pushed([3200.0, 0.0, 0.0], json!([{"type": "balance"}]), 6.0)).iter().map(|e| e.0).collect::<Vec<_>>(), ["fall"]);
+    // From its back (`way: back`): it sits up over its folded legs, and
+    // stands facing the way its feet pointed; `near` takes whichever side
+    // it lies nearer.
+    for push in [[3200.0, 0.0, 0.0], [-3200.0, 0.0, 0.0], [0.0, 0.0, 3200.0], [0.0, 0.0, -3200.0]] {
+        // (Told to get up from its back when it fell on its front, it
+        // may not get over: `near` is the one for any fall.)
+        for way in if push[0] != 0.0 { vec!["back", "near"] } else { vec!["near"] } {
+            let bake = risen(push, json!({"way": way}), 10.0);
+            let events = happened(&bake);
+            assert_eq!(events.iter().map(|e| e.0).collect::<Vec<_>>(), ["fall", "get_up", "rise"], "push {push:?} {way}: {events:?}");
+            let n = bake.tracks[0].samples.len();
+            for k in ((events[2].1 * 30.0) as usize + 30..n).step_by(10) {
+                assert!((pose(&bake, "hips", k).p[1] - pose(&bake, "hips", 0).p[1]).abs() < 16.0, "push {push:?} {way}, sample {k}");
+            }
+        }
+    }
+    let (front, back) = (risen([3200.0, 0.0, 0.0], json!({}), 10.0), risen([3200.0, 0.0, 0.0], json!({"way": "back"}), 10.0));
+    let faces = |b: &Bake| {
+        let (l, r) = (pose(b, "foot_l", b.tracks[0].samples.len() - 1), pose(b, "foot_r", b.tracks[0].samples.len() - 1));
+        let toes = l.apply([0.0, 0.0, -40.0]);
+        let _ = r;
+        [toes[0] - l.p[0], toes[2] - l.p[2]]
+    };
+    let (f, b) = (faces(&front), faces(&back));
+    assert!(f[0] * b[0] + f[1] * b[1] < 0.0, "up from its front it faces {f:?}, from its back {b:?}");
+    assert_eq!(pin(&back), (140042, 13241493179829085736), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // `wait` and `time` are its own.
     let slow = risen([3200.0, 0.0, 0.0], json!({"wait": 2.0, "time": 3.5}), 12.0);
     let slow = happened(&slow);
@@ -293,11 +319,11 @@ fn it_gets_up_after_a_fall_whichever_way_it_fell() {
 #[ignore]
 fn explore_getting_up() {
     for push in [[3200.0, 0.0, 0.0], [-3200.0, 0.0, 0.0], [0.0, 0.0, 3200.0], [0.0, 0.0, -3200.0]] {
-        for help in [1.0, 0.6, 0.4, 0.2, 0.0] {
-            let bake = risen(push, json!({"help": help}), 12.0);
+        for (help, way) in [(1.0, "front"), (0.6, "front"), (0.4, "front"), (0.2, "front"), (0.0, "front"), (0.6, "back"), (0.6, "near"), (0.3, "back")] {
+            let bake = risen(push, json!({"help": help, "way": way}), 12.0);
             let n = bake.tracks[0].samples.len();
             let heights: Vec<String> = (0..n).step_by(30).map(|k| format!("{:.0}", pose(&bake, "hips", 0).p[1] - pose(&bake, "hips", k).p[1])).collect();
-            println!("push {push:?} help {help}: {:?}\n   hips rise by second: {}", happened(&bake), heights.join(" "));
+            println!("push {push:?} help {help} {way}: {:?}\n   hips rise by second: {}", happened(&bake), heights.join(" "));
         }
     }
 }

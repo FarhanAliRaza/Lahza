@@ -20,7 +20,7 @@ pub trait Animatable: Clone + Debug + PartialEq + Serialize + for<'de> Deseriali
     fn lerp_log(&self, other: &Self, p: f64) -> Self {
         self.map2(other, |a, b| {
             if a > 0.0 && b > 0.0 {
-                (a.ln() + (b.ln() - a.ln()) * p).exp()
+                crate::dm::exp(crate::dm::ln(a) + (crate::dm::ln(b) - crate::dm::ln(a)) * p)
             } else {
                 a + (b - a) * p
             }
@@ -183,7 +183,7 @@ impl Color {
 
     /// Relative luminance (WCAG).
     pub fn luminance(self) -> f64 {
-        let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { crate::dm::powf((c + 0.055) / 1.055, 2.4) };
         0.2126 * lin(self.0[0]) + 0.7152 * lin(self.0[1]) + 0.0722 * lin(self.0[2])
     }
 }
@@ -272,6 +272,6 @@ mod tests {
         assert_eq!(c.to_hex(), "#ff000080");
         let v: Vec2 = serde_json::from_str("1.5").unwrap();
         assert_eq!(v, Vec2([1.5, 1.5]));
-        assert_eq!(Vec2::new(1.0, 10.0).lerp_log(&Vec2::new(10.0, 1.0), 0.5).0[0], 10f64.sqrt());
+        assert!((Vec2::new(1.0, 10.0).lerp_log(&Vec2::new(10.0, 1.0), 0.5).0[0] - 10f64.sqrt()).abs() < 1e-12);
     }
 }

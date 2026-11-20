@@ -698,13 +698,22 @@ GPU, no trained policy): what each does, what was measured and what is
 left is below. Morph targets are still refused. Across all of it: a bake
 is the same bytes from debug and release builds and on two containers
 (both Intel Xeons with FMA and AVX-512; the hashes are pinned in
-`motion-sim`'s tests; the eight pinned since, for getting up, bones
-meeting, instances, a way round a wall, stepping aside and the search,
-were made on one of them and are to be confirmed on the other). Not checked on a CPU without FMA or on ARM:
-rapier's own maths is software (`enhanced-determinism`) and the
-behaviours use `libm`, but what `compile` feeds the simulator (layer
-rotations to matrices) uses the standard library's sines, which glibc
-picks by CPU. In the order built:
+`motion-sim`'s tests, those for getting up, bones meeting, instances,
+a way round a wall, stepping aside and the search confirmed on both;
+the four pinned last, for a knocked agent's swing and held pose, bodies
+in an instancer and getting up from its back, were made on one). Nothing a bake is made
+from goes through the C library now: rapier's maths is software
+(`enhanced-determinism`), the behaviours, crowds and search use `libm`,
+and everything `compile` works out (layer rotations, curves, cameras)
+goes through `core::dm` (`libm`'s sines, powers and logarithms; lengths
+by multiply and square root), which left every pin as it was. Run on
+other kinds of CPU by the coordinating session (before that last change,
+at fa1dfd7): on x86-64 with glibc kept off its FMA and AVX paths
+(`GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-AVX2,…`; a C program's sines
+do hash differently with and without) all 35 of `motion-sim`'s tests
+pass and every pin holds; on aarch64 under `qemu-user` 34 pass, every
+pinned bake among them, the one failure being the policy test, whose
+ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
@@ -750,10 +759,24 @@ picks by CPU. In the order built:
      a bake is missing or stale, and bakes in one click off the UI thread.
    - `snapshot` and `review` warn of a missing or stale bake and `render`
      refuses one unless given `unbaked`.
-   - Left: a box landing flat at speed tips a degree or
-     two before settling (rapier's contact solver; more iterations do not
-     change it). Ropes are not drawn. Bodies inside instancers are
-     refused. Slang-generated meshes cannot be colliders (give a shape).
+   - Also built since: a drawn rope (`joints[].draw`: a mesh layer
+     stretched from anchor to anchor, in twelve pieces along the parabola
+     a rope of its length hangs in when slack; tested end to end, looked
+     at in `tumble.py`'s wall), and bodies in instancers (a layer with a
+     `body` inside one is a body a copy, `<layer>#<n>` in the bake, in
+     joints and in events; tested: a tipped grid of six bricks falls as
+     six and is drawn where the bake has each; pinned).
+   - Left, needing what is not here: Slang-generated meshes as
+     colliders (their points come from `slangc`, which this machine has
+     not; the code path is the hull of a generated mesh, untried).
+   - Left, not done (nothing outside is needed, only the work): a box
+     landing flat at speed tips a degree or two before settling
+     (rapier's contact solver; more iterations do not change it, and
+     another solver was not tried). A drawn rope hangs still: its slack
+     does not swing or whip, and it passes through what is between its
+     ends (it is a curve drawn between two bodies, not a chain of them).
+     No bodies inside an emitter (its particles come and go) nor two
+     instancers deep; a ragdoll's or a crowd's layers cannot be copies.
 2. **Skeletons and skinning: done.**
    - `model_import` keeps a glTF skin: a joint node is a comp like any
      node, and the skinned mesh layer has `"skin": {"index", "joints":
@@ -773,20 +796,23 @@ picks by CPU. In the order built:
      the import and a joint keyed by an edit, through the tools.
    - Measured: 3.9 ms to skin 100 000 points with four joints each on
      one core. The GPU side is not timed (lavapipe is no measure).
-   - Left: four joints a point (glTF's JOINTS_1 is not read); no dual
-     quaternions (linear blend: elbows thin at sharp bends); the file's
-     rotations become three layer angles keyed linearly, not slerped;
-     `model_import` copies one file, so a `.gltf` must embed its buffer
-     (or be a `.glb`); a skinned mesh under a Slang deformer or
-     displacement is not deformed.
+   - Left, not done: four joints a point (glTF's JOINTS_1 is not
+     read); no dual quaternions (linear blend: elbows thin at sharp
+     bends); the file's rotations become three layer angles keyed
+     linearly, not slerped; `model_import` copies one file, so a `.gltf`
+     must embed its buffer (or be a `.glb`); a skinned mesh under a
+     Slang deformer or displacement is not deformed (the deformer side
+     needs `slangc` to try). Morph targets are refused. None of these
+     was asked for by a shot yet; each is renderer and importer work
+     whose GPU half cannot be looked at here (lavapipe draws it, slowly,
+     and the suite compares it with the CPU's).
 3. **A ragdoll that falls: done.** `simulation.ragdolls`: every bone
    under `root` (the joints' comps) is a body, a capsule along the bone
    toward its child (a given shape where that is wrong: box feet), mass
    shared by volume with no bone lighter than three quarters of what
    hangs from it. Joints are balls with swing and twist limits, or hinges
    (knees, elbows), measured from the pose at `rest`. Until `release` the
-   bones follow the clip; they leave it with its pose and speed. Bones of
-   one ragdoll do not collide with each other.
+   bones follow the clip; they leave it with its pose and speed.
    - Tested: a limp figure falls in one piece (every bone within 4 px of
      its joint at every sample) and comes to rest; limits hold under
      hard hits, knees bend one way about their axle; release with the
@@ -807,10 +833,12 @@ picks by CPU. In the order built:
      through the rest for those steps: arm targets are worked out
      without the body in the way, and stopped short of the head and of
      a hit when their arms met the chest on the way.
-   - Left: limits are per bone by hand (no defaults by bone name); a
-     limp figure with the default 40° limits falls like a plank,
-     slowly. Arms a behaviour aims do not go round the body, they go
-     through it.
+   - Left, not done: limits are per bone by hand (no defaults by bone
+     name: a table of human joint ranges keyed on names is guesswork
+     without characters to try it on); a limp figure with the default
+     40° limits falls like a plank, slowly. Arms a behaviour aims do not
+     go round the body, they go through it (going round is planning an
+     arm's path, which nothing here does).
 4. **A ragdoll that acts: done, with balance helped.**
    - Motors follow the clip: `strength` 0..1, keyed, per limb with
      `strengths`. A motor is a second joint beside the one with the
@@ -851,14 +879,22 @@ picks by CPU. In the order built:
      `examples/sim/ragdoll.py` (limp, held, braced, rise) was looked at:
      the rise reads as a get-up (on its back, over, hands and knees, up),
      with a sway as it comes upright.
-   - Left, and it is the hard part the plan names: balance is not
-     footwork, it is a bounded hand on the hips; a step is a foot carried
-     by a force, not a leg that swings; getting up is a pose sequence
-     under an outside force, not a body that finds its feet (its feet
-     stay where they lay and it is drawn over them; it does not step to
-     them), and it gets up the one way, front down;
-     no behaviour looks where it is going. Feet and hands are found by
-     bone name (`foot`, `hand`, `head`).
+   - Getting up has two ways (`way`): from its front, or from its back
+     (it sits up over its folded legs; from all four falls with `near`
+     on the standing test figure, pinned). From its back it is less
+     sure: in `ragdoll.py`'s `sit` scene, on the walking clip, it stands
+     at 5.2 s and falls backwards again at 7.0 s.
+   - Left, and it is the hard part the plan names; what would close it
+     is a controller that finds its own footing, which is part 6's
+     trained policy (a GPU farm, motion capture, days) or a far larger
+     search than a bake can pay for: balance is not footwork, it is a
+     bounded hand on the hips; a step is a foot carried by a force, not
+     a leg that swings; getting up is a pose sequence under an outside
+     force, not a body that finds its feet (its feet stay where they lay
+     and it is drawn over them; it does not step to them); no behaviour
+     looks where it is going.
+   - Left, not done: feet and hands are found by bone name (`foot`,
+     `hand`, `head`), not given in the document.
 5. **Directing it: done as far as the tools go.** Intent is written on
    the timeline in the document: `hits`, bodies thrown, `release`,
    `strength` keys per limb, behaviours over spans, all with time
@@ -872,11 +908,13 @@ picks by CPU. In the order built:
      push, arms up, steps, no fall; redirected to a harder push without
      steps, a fall reported at its time; a stale bake between; two seeds,
      two takes, the first again.
-   - Left: no LLM was put in the loop here (the test is the calls one
-     would make). A take is judged from events and a sheet; nothing
-     scores it against the intent. `snapshot` does not mark where on the
-     sheet the events fall. Variation by seed is in the blows and
-     releases only, not in how a body reacts.
+   - Left, needing what is not here: an LLM in the loop (the test is the
+     calls one would make; a model to make them is outside this
+     machine), and with it anything that scores a take against the
+     intent, which is that model's judgement of the sheet.
+   - Left, not done: `snapshot` does not mark where on the sheet the
+     events fall. Variation by seed is in the blows and releases only,
+     not in how a body reacts.
 6. **A network that sets the motors: the interface and the no-training
    route are built; no policy was trained.**
    - The interface (`motion-sim/src/policy.rs`): once a frame an
@@ -923,11 +961,13 @@ picks by CPU. In the order built:
      search now buys unhelped balance up to what the helped behaviour
      holds, at 30 to 45 times the bake on four cores. To decide: whether
      takes want the unhelped look enough to pay for it.
-   - Left: a step is the `step` behaviour's (a foot carried, not a leg
-     swung), one at a time, and only toward where it is falling; arms
-     only swing from the shoulder (no elbow, no reach for support); the
-     plan is ten numbers, not a pose; it does not get up. A search does
-     not see a crowd in its tries.
+   - Left, not done (each is more numbers in the plan, so more tries a
+     decision: time, not a missing machine): a step is the `step`
+     behaviour's (a foot carried, not a leg swung), one at a time, and
+     only toward where it is falling; arms only swing from the shoulder
+     (no elbow, no reach for support); the plan is ten numbers, not a
+     pose; it does not get up. In a try a crowd's agents walk on
+     straight at the speed they had (they do not steer in it).
 7. **Crowds: done, as layers or as instances with impostors.**
    `simulation.crowds`. Once a frame every agent steers: toward its goal
    at its own pace, off agents within three radii (found by a grid), off
@@ -982,7 +1022,12 @@ picks by CPU. In the order built:
      agents as layers do, are drawn where the bake has them at their own
      moment, are meshes for the nearest `full` and image layers with
      their pictures for the rest; one struck takes the pool's first
-     ragdoll; the bake survives its file; five bakes are pinned.
+     ragdoll, its bones turning as the clip had them (a leg swung 120°/s
+     in the clip leaves at 90 to 180°/s against its hips, the still leg
+     under 25) and, with `ragdoll.strength`, holding the pose it fell in
+     (its spine bends less than half what it does limp); a try ahead
+     moves the agents' capsules where their speed takes them and leaves
+     the take's alone; the bake survives its file; seven bakes are pinned.
      Rendered: 24 agents as 4 meshes and 20 pictures cover the same
      pixels as 24 meshes (within 12 %, under a third differing at all).
      `examples/sim/crowd.py` (12, 100) and `examples/sim/herd.py` (100,
@@ -1010,20 +1055,28 @@ picks by CPU. In the order built:
      5000 are drawn at all. Not measured: the GPU renderer and the path
      tracer (no GPU here), and a character of real size, where a picture
      should gain far more.
-   - Left: pictures cast and take no shadows from the scene, and are
-     drawn again whenever the lights change (every frame under an
-     animated light); an agent pops when it changes between mesh and
-     picture; the path tracer sees a card, not a body. A fallen agent
-     falls with the agent's speed only (its limbs' own swing is
-     dropped), is always limp, and past the pool stands frozen. A way
-     is planned round what stands still only (its level box: a wall at
-     an angle shuts its whole box), by each agent alone (no lanes, no
-     waiting for a gap: a doorway jams), and not round a body in
-     motion. An agent steps aside and does nothing else: no guard, no
-     duck, no look (it has one clip), and it does not get out of the
-     way of other agents' falls. A search controller does not see
-     crowds in its tries. `check` evaluates every agent at every
-     sample it takes, which is slow at thousands.
+   - Left, needing a GPU to do rightly: what is wrong with pictures is
+     the renderers' to mend, in the rasteriser's shader and the path
+     tracer, and only the CPU's half can be seen here. They cast and
+     take no shadows from the scene (cards would have to be drawn into
+     the shadow maps with their pictures' coverage); they are drawn
+     again whenever the lights change, every frame under an animated
+     light (lighting a picture needs its normals kept and lit in the
+     shader); an agent pops when it changes between mesh and picture (a
+     cross-fade is two see-through draws of it, sorted); the path tracer
+     sees a card, not a body. Not measured for the same want: the GPU
+     renderer and the path tracer on crowds, and a character of real
+     size (none here, and no licence read for one).
+   - Left, not done: an agent has one clip, so it steps aside and does
+     nothing else: no guard, no duck, no look (a second clip a
+     character and a blend an agent in the bake); none knocked down
+     gets up (a ragdoll of the pool has no brain), and past the pool one
+     stands frozen; it does not get out of the way of other agents'
+     falls. A way is planned round what stands still only (its level
+     box: a wall at an angle shuts its whole box), by each agent alone
+     (no lanes, no waiting for a gap: a doorway jams), and not round a
+     body in motion. `check` evaluates every agent at every sample it
+     takes, which is slow at thousands.
 
 ## Directing an agent from the editor
 

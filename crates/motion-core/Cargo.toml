@@ -8,6 +8,8 @@ description = "Motion engine document, time model, curves, markers and property 
 [dependencies]
 # Loads the CPU build of a project's Slang shaders (see slang.rs).
 libloading = "0.8"
+# The same bits on every machine (see dm.rs).
+libm = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 kurbo = { workspace = true }

@@ -172,3 +172,91 @@ fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
         assert!(a[..i].iter().all(|(o, _)| ((o[0] - at[0]).powi(2) + (o[1] - at[1]).powi(2)).sqrt() >= 60.0));
     }
 }
+
+/// `herd_scene` with a ball thrown at instance 3, not looked for, and the
+/// character's left leg swung in its clip: 30° forward and back a cycle.
+fn struck(ragdoll: Value) -> std::sync::Arc<Bake> {
+    let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
+    let mut p = herd_scene(vec![ball], json!({"ragdoll": ragdoll, "dodge": 0}), 1, 6.0);
+    let mut scene = serde_json::to_value(&p.scenes[0]).unwrap();
+    let leg = scene["layers"][1]["layers"][0]["layers"].as_array_mut().unwrap().iter_mut().find(|l| l["id"] == "a0-leg_l").unwrap();
+    leg["transform"]["rotation_x"] = json!({"keys": [{"at": 0, "v": -30}, {"at": 0.5, "v": 30, "ease": "linear"}, {"at": 1.0, "v": -30, "ease": "linear"}]});
+    p.scenes[0] = serde_json::from_value(scene).unwrap();
+    baked(&mut p)
+}
+
+#[test]
+fn one_knocked_down_keeps_its_limbs_swing_and_may_hold_its_pose() {
+    let limp = struck(json!({"mass": 60}));
+    let h = &limp.herds[0];
+    let down = h.down[3] as usize;
+    assert!(h.slot[3] == 0 && down < 10);
+    // The leg leaves the clip turning as it turned in it: 120° a second
+    // in the agent, times the 160/140 its walk runs the clip at, against
+    // its hips. (Over the first frame of the fall.)
+    let turned = |id: &str| {
+        let q = |id: &str, k: usize| crate::ragdoll_tests::track_pose(&limp, &format!("walkers#0/a0-{id}"), k).q;
+        let against = |k: usize| lahza_motion_core::sim::quat_mul({ let h = q("hips", k); [-h[0], -h[1], -h[2], h[3]] }, q(id, k));
+        let (a, b) = (against(down), against(down + 1));
+        (2.0 * (0..4).map(|i| a[i] * b[i]).sum::<f64>().abs().min(1.0).acos()).to_degrees() * 30.0
+    };
+    assert!(turned("leg_l") > 90.0 && turned("leg_l") < 180.0, "the swung leg turns at {:.0}°/s against its hips", turned("leg_l"));
+    assert!(turned("leg_r") < 25.0, "the other leg, still in the clip, at {:.0}°/s", turned("leg_r"));
+    // Limp, it crumples: a second on, its head is far from over its hips.
+    // Holding the pose it fell in (strength 0.9), it goes down as it stood.
+    let held = struck(json!({"mass": 60, "strength": 0.9}));
+    assert_eq!(held.herds[0].down[3] as usize, down);
+    let bend = |bake: &Bake, k: usize| {
+        // The angle at the spine: hips → spine against spine → head.
+        let (a, b, c) = (at(bake, "walkers#0/a0-hips", k), at(bake, "walkers#0/a0-spine", k), at(bake, "walkers#0/a0-head", k));
+        let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - b[0], c[1] - b[1], c[2] - b[2]]);
+        let dot: f64 = (0..3).map(|i| u[i] * v[i]).sum();
+        (dot / ((0..3).map(|i| u[i] * u[i]).sum::<f64>().sqrt() * (0..3).map(|i| v[i] * v[i]).sum::<f64>().sqrt())).clamp(-1.0, 1.0).acos().to_degrees()
+    };
+    let (soft, stiff) = ((down..down + 45).map(|k| bend(&limp, k)).fold(0.0, f64::max), (down..down + 45).map(|k| bend(&held, k)).fold(0.0, f64::max));
+    assert!(soft > 25.0 && stiff < 0.5 * soft, "its spine bends {soft:.0}° limp, {stiff:.0}° holding its pose");
+    assert_eq!((crate::behaviour_tests::pin(&limp), crate::behaviour_tests::pin(&held)), ((49850, 4585677346052108598), (51323, 784940492317639703)), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn a_try_ahead_has_the_agents_walk_on() {
+    let p = herd_scene(vec![], json!({}), 1, 2.0);
+    let (input, errors) = Compiled::new(&p).sim_input(0, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    let mut take = crate::Take::new(&input, &mut crate::core_meshes).unwrap();
+    let mut herd = crate::crowd::Herd::new(&input, &mut take.world);
+    // A second in, as the bake goes.
+    let n = input.substeps as u64;
+    for k in 0..30 {
+        herd.plan(&input, &take.world);
+        take.movers = herd.movers(input.rate);
+        for s in 0..n {
+            herd.drive(&mut take.world, (s + 1) as f64 / n as f64);
+            take.step(&input, k, s);
+        }
+    }
+    herd.plan(&input, &take.world);
+    take.movers = herd.movers(input.rate);
+    assert_eq!(take.movers.len(), 6);
+    let place = |t: &crate::Take, i: usize| {
+        let p = t.world.w.bodies[t.movers[i].0].position().translation;
+        [p.x as f64 * t.world.unit, p.y as f64 * t.world.unit, p.z as f64 * t.world.unit]
+    };
+    let before: Vec<[f64; 3]> = (0..6).map(|i| place(&take, i)).collect();
+    // Half a second of a try: each agent's capsule is where its speed
+    // takes it (they walk at 160 px/s, a fifth either way).
+    let mut trial = take.fork();
+    for k in 30..45 {
+        for s in 0..n {
+            trial.step(&input, k, s);
+        }
+    }
+    for i in 0..6 {
+        let v = take.movers[i].1;
+        let (now, want) = (place(&trial, i), [before[i][0] + v[0] * 0.5, before[i][1] + v[1] * 0.5, before[i][2] + v[2] * 0.5]);
+        let speed = (v[0] * v[0] + v[2] * v[2]).sqrt();
+        assert!(speed > 100.0 && speed < 200.0 && level(now, want) < 1.0 && level(now, before[i]) > 50.0, "agent {i} at {now:?}, was {:?}, going {v:?}", before[i]);
+        // The take itself is not moved by that: its agents are the crowd's to move.
+        assert!(level(place(&take, i), before[i]) < 1e-9);
+    }
+}

@@ -134,7 +134,7 @@ impl Mat4 {
 
     /// Clockwise on screen, like `Affine::rotate`.
     pub fn rotate_z(deg: f64) -> Mat4 {
-        let (s, c) = deg.to_radians().sin_cos();
+        let (s, c) = crate::dm::sin_cos(deg.to_radians());
         let mut m = Self::IDENTITY;
         m.0[0] = c;
         m.0[1] = -s;
@@ -145,7 +145,7 @@ impl Mat4 {
 
     /// Tilts the top away from the viewer for positive angles.
     pub fn rotate_x(deg: f64) -> Mat4 {
-        let (s, c) = deg.to_radians().sin_cos();
+        let (s, c) = crate::dm::sin_cos(deg.to_radians());
         let mut m = Self::IDENTITY;
         m.0[5] = c;
         m.0[6] = s;
@@ -156,7 +156,7 @@ impl Mat4 {
 
     /// Turns the right side away from the viewer for positive angles.
     pub fn rotate_y(deg: f64) -> Mat4 {
-        let (s, c) = deg.to_radians().sin_cos();
+        let (s, c) = crate::dm::sin_cos(deg.to_radians());
         let mut m = Self::IDENTITY;
         m.0[0] = c;
         m.0[2] = -s;
@@ -250,7 +250,7 @@ impl Camera3 {
 /// Focal length in px for a vertical field of view (AE's default camera
 /// is 39.6°: the z = 0 plane then maps 1:1).
 pub fn focal(height: f64, fov: f64) -> f64 {
-    height / 2.0 / (fov.clamp(1.0, 170.0).to_radians() / 2.0).tan()
+    height / 2.0 / crate::dm::tan(fov.clamp(1.0, 170.0).to_radians() / 2.0)
 }
 
 #[cfg(test)]
