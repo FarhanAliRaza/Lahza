@@ -3808,7 +3808,11 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         .then(|| {
             let off = prim.stroke[2].to_bits() as usize + m[lb + 3][3].to_bits() as usize;
             let c = [prim.fill[0] + prim.fill[2] * q[0], prim.fill[1] + prim.fill[3] * q[1]];
-            crate::sky_cpu::at(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16) as i32, c, p[2])
+            let mut g = fnorm(fcross(fsub(pos[1], pos[0]), fsub(pos[2], pos[0])));
+            if fdot(g, p) > 0.0 {
+                g = fmul(g, -1.0);
+            }
+            crate::sky_cpu::at(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16) as i32, c, p, g)
         })
         .flatten();
     let sky_part = sky.map_or(1.0, |s| s.1);

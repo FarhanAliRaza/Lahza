@@ -1718,16 +1718,20 @@ fn oct_decode(e: vec2<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(xy, z));
 }
 
-// How much of the sky the surface at target point q, camera depth z, sees
+// How much of the sky the surface at target point q, camera point p, sees
 // (`open.w`; below 0: not known, the whole sky as before), from where
 // (`open.xyz`, camera space), and the light that comes back from what it
 // sees instead (`back`): the list's sky visibility, which the path tracer's rays
 // found at half the target's size (pt.wgsl `sky`; its group is named in
 // the light block's two spare floats). Of the nine texels around q, those
-// that show a surface at about this depth, the nearer to q the more; at
-// an edge with none, the one nearest in depth.
+// that show this surface, the nearer to q the more: a texel's surface is
+// this one when p lies in its plane and it faces as the triangle does
+// (`gn`, its true normal toward the camera). Depth alone would not tell:
+// two surfaces at nearly one depth would mix (steps of a texel along the
+// edge between them), and a floor seen at a glancing angle is at many
+// depths. At an edge with none, the texel whose plane is nearest.
 struct Sky { open: vec4<f32>, back: vec3<f32> }
-fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, z: f32) -> Sky {
+fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky {
     var none: Sky;
     none.open = vec4<f32>(0.0, 0.0, 0.0, -1.0);
     let size = bitcast<u32>(b_mesh[lb + 6u].w);
@@ -1748,13 +1752,15 @@ fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, z: f32) -> Sky {
         let t = group_at(off, w, h, i32(at.x), i32(at.y));
         if t.w <= 0.0 { continue; }
         let b = group_at(off + w * h, w, h, i32(at.x), i32(at.y)).xyz;
-        let away = abs(t.w - z);
+        let plane = group_at(off + 2 * w * h, w, h, i32(at.x), i32(at.y));
+        let nt = oct_decode(plane.xy);
+        let away = abs(dot(nt, p) - plane.z) / (0.01 * p.z + 0.5) + max(0.9 - dot(nt, gn), 0.0) * 10.0;
         if away < near.w {
             near = vec4<f32>(t.xyz, away);
             near_back = b;
         }
         let d = abs(at - g);
-        let wt = max(1.5 - d.x, 0.0) * max(1.5 - d.y, 0.0) * max(1.0 - away / (0.05 * z + 1.0), 0.0);
+        let wt = max(1.5 - d.x, 0.0) * max(1.5 - d.y, 0.0) * max(1.0 - away, 0.0);
         sum += vec4<f32>(oct_decode(t.xy), t.z) * wt;
         back += b * wt;
         weight += wt;
@@ -2158,7 +2164,10 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
     // What the point sees of the sky: light from all around (ambient
     // lights, the environment) comes by that much, the environment's from
     // the open side.
-    let sky_seen = sky_at(prim, lb, q, p.z);
+    var sky_g = cross(pos[1] - pos[0], pos[2] - pos[0]);
+    sky_g = sky_g / max(sqrt(dot(sky_g, sky_g)), 1e-20);
+    if dot(sky_g, p) > 0.0 { sky_g = -sky_g; }
+    let sky_seen = sky_at(prim, lb, q, p, sky_g);
     let sky = sky_seen.open;
     var sky_part = 1.0;
     if sky.w >= 0.0 { sky_part = sky.w; }

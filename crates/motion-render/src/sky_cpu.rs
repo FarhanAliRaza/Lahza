@@ -375,10 +375,11 @@ struct Raw {
     ends: [(u32, f32); 4],
 }
 
-/// Fills traced list `t`'s sky group, `w` × `h` texels of visibility and
-/// as many after them of the light that comes back, at `out`.
+/// Fills traced list `t`'s sky group, `w` × `h` texels of visibility, as
+/// many after them of the light that comes back and as many of the
+/// surfaces' planes, at `out`.
 pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads: usize) {
-    if out.len() < w * h * 2 || w == 0 || h == 0 {
+    if out.len() < w * h * 3 || w == 0 || h == 0 {
         return;
     }
     // LAHZA_SKY_TIMES: where the time goes (the structure, the rays, the
@@ -587,6 +588,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         if c.open[3] <= 0.0 {
             out[i] = [0.0; 4];
             out[w * h + i] = [0.0; 4];
+            out[2 * w * h + i] = [0.0; 4];
             continue;
         }
         let m = [v.open[0], v.open[1], v.open[2]];
@@ -594,34 +596,38 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         let e = oct_encode(toward);
         out[i] = [e[0], e[1], v.open[3], c.open[3]];
         out[w * h + i] = [v.back[0], v.back[1], v.back[2], 0.0];
+        out[2 * w * h + i] = [c.plane[0], c.plane[1], c.plane[2], 0.0];
     }
 }
 
 /// motion.wgsl `sky_at`: of the sky group at `off` (`w` × `h` texels, a
 /// texel two target px each way), what the surface at canvas point `c`,
-/// camera depth `z`, sees of the sky: the open direction (camera space),
-/// the open part, and the light that comes back. None: no surface there.
-pub(crate) fn at(groups: &[[f32; 4]], off: usize, w: i32, h: i32, c: [f32; 2], z: f32) -> Option<(V3, f32, V3)> {
+/// camera point `p` on a triangle whose true normal toward the camera is
+/// `gn`, sees of the sky: the open direction (camera space), the open
+/// part, and the light that comes back. None: no surface there.
+pub(crate) fn at(groups: &[[f32; 4]], off: usize, w: i32, h: i32, c: [f32; 2], p: V3, gn: V3) -> Option<(V3, f32, V3)> {
     let g = [c[0] * 0.5 - 0.5, c[1] * 0.5 - 0.5];
     let g0 = [(g[0] + 0.5).floor(), (g[1] + 0.5).floor()];
     let texel = |base: usize, x: i32, y: i32| groups.get(base + (y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize).copied().unwrap_or([0.0; 4]);
     let (mut sum, mut back, mut weight) = ([0.0f32; 4], [0.0f32; 3], 0.0f32);
     let (mut near, mut near_back, mut nearest) = ([0.0f32; 4], [0.0f32; 3], 1e30f32);
     for k in 0..9 {
-        let p = [g0[0] + (k % 3 - 1) as f32, g0[1] + (k / 3 - 1) as f32];
-        let t = texel(off, p[0] as i32, p[1] as i32);
+        let a = [g0[0] + (k % 3 - 1) as f32, g0[1] + (k / 3 - 1) as f32];
+        let t = texel(off, a[0] as i32, a[1] as i32);
         if t[3] <= 0.0 {
             continue;
         }
-        let b = texel(off + (w * h) as usize, p[0] as i32, p[1] as i32);
-        let away = (t[3] - z).abs();
+        let b = texel(off + (w * h) as usize, a[0] as i32, a[1] as i32);
+        let plane = texel(off + 2 * (w * h) as usize, a[0] as i32, a[1] as i32);
+        let nt = oct_decode([plane[0], plane[1]]);
+        let away = (dot(nt, p) - plane[2]).abs() / (0.01 * p[2] + 0.5) + (0.9 - dot(nt, gn)).max(0.0) * 10.0;
         if away < nearest {
             nearest = away;
             near = t;
             near_back = [b[0], b[1], b[2]];
         }
-        let d = [(p[0] - g[0]).abs(), (p[1] - g[1]).abs()];
-        let wt = (1.5 - d[0]).max(0.0) * (1.5 - d[1]).max(0.0) * (1.0 - away / (0.05 * z + 1.0)).max(0.0);
+        let d = [(a[0] - g[0]).abs(), (a[1] - g[1]).abs()];
+        let wt = (1.5 - d[0]).max(0.0) * (1.5 - d[1]).max(0.0) * (1.0 - away).max(0.0);
         let dir = oct_decode([t[0], t[1]]);
         sum = [sum[0] + dir[0] * wt, sum[1] + dir[1] * wt, sum[2] + dir[2] * wt, sum[3] + t[2] * wt];
         back = add(back, mul([b[0], b[1], b[2]], wt));

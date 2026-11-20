@@ -2800,7 +2800,9 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
 // a second (`u.denoise.x` texels apart, the same tent on the same plane)
 // smooths them. Into the group: the mean open direction (as two numbers),
 // the open part, and the camera depth (0: no surface); and, in as many
-// texels after those, the light that comes back.
+// texels after those, the light that comes back; and in as many after
+// these the surface's own plane (its true normal as two numbers, and where
+// it lies), by which the raster's lookup tells surfaces apart (`sky_at`).
 @compute @workgroup_size(8, 8, 1)
 fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     let w = u.size.x;
@@ -2814,6 +2816,7 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         if step > 0 {
             b_groups[u.size.z + i] = vec4<f32>(0.0);
             b_groups[u.size.z + w * h + i] = vec4<f32>(0.0);
+            b_groups[u.size.z + 2u * w * h + i] = vec4<f32>(0.0);
         }
         return;
     }
@@ -2864,6 +2867,7 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     b_groups[u.size.z + w * h + i] = vec4<f32>(back / max(weight, 1e-6), 0.0);
+    b_groups[u.size.z + 2u * w * h + i] = vec4<f32>(g.xyz, 0.0);
     var toward = n0;
     if dot(sum.xyz, sum.xyz) > 1e-8 { toward = normalize(sum.xyz); }
     b_groups[u.size.z + i] = vec4<f32>(oct_encode(toward), sum.w / max(weight, 1e-6), c.w);

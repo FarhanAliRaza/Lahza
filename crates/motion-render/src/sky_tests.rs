@@ -269,3 +269,84 @@ fn the_light_back_is_an_environment_images_too() {
     assert!(wall > 0.7 && wall < 1.3, "{wall:.2}");
     assert!(apart < 0.01, "{apart}");
 }
+
+/// Steps in the sky's part of a picture: neighbours (across and down) on
+/// one flat face, which the plain raster draws alike (four px in a row
+/// within two levels), that sky visibility draws more than `over` levels
+/// apart. How many, and the widest. On one face what a point sees of the
+/// sky changes slowly; a jump there is another surface's texel taken.
+fn steps(sky: &RgbaImage, plain: &RgbaImage, over: f64) -> (usize, f64) {
+    let l = |img: &RgbaImage, x: i32, y: i32| {
+        let p = img.get_pixel(x as u32, y as u32).0;
+        (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.0
+    };
+    let (w, h) = (sky.width() as i32, sky.height() as i32);
+    let (mut n, mut worst) = (0, 0.0f64);
+    for (dx, dy) in [(1, 0), (0, 1)] {
+        for y in 1..h - 2 {
+            for x in 1..w - 2 {
+                let run: Vec<f64> = (-1..=2).map(|k| l(plain, x + dx * k, y + dy * k)).collect();
+                let (lo, hi) = run.iter().fold((f64::MAX, f64::MIN), |m, v| (m.0.min(*v), m.1.max(*v)));
+                if hi - lo > 2.0 {
+                    continue;
+                }
+                let jump = (l(sky, x, y) - l(sky, x + dx, y + dy)).abs();
+                if jump > over {
+                    n += 1;
+                    worst = worst.max(jump);
+                }
+            }
+        }
+    }
+    (n, worst)
+}
+
+/// A box with a slab over it, a gap between them, and a block standing
+/// against a wall: edges where two surfaces meet at one depth (the box's
+/// top and its front, the slab's front over the dark gap).
+fn edges() -> Project {
+    let mut p = project(json!([
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 900]}, "material": {"preset": "matte", "color": "#d8d0c0"},
+         "transform": {"position": [160, 130], "rotation_x": 90}},
+        {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 500]}, "material": {"preset": "matte", "color": "#c8d0d8"},
+         "transform": {"position": [160, 0], "z": 160}},
+        {"id": "box", "kind": "mesh", "mesh": {"type": "box", "size": [90, 50], "depth": 70}, "material": {"preset": "matte", "color": "#e8e8e8"},
+         "transform": {"position": [105, 105], "rotation_y": 25}},
+        {"id": "slab", "kind": "mesh", "mesh": {"type": "box", "size": [100, 8], "depth": 70}, "material": {"preset": "matte", "color": "#e8e8e8"},
+         "transform": {"position": [105, 70], "rotation_y": 25}},
+        {"id": "block", "kind": "mesh", "mesh": {"type": "box", "size": [80, 70], "depth": 50}, "material": {"preset": "matte", "color": "#e8e8e8"},
+         "transform": {"position": [235, 95], "rotation_y": -35}}
+    ]));
+    p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 20]})).unwrap();
+    p.scenes[0].lights = serde_json::from_value(json!([{"type": "ambient", "intensity": 0.2}])).unwrap();
+    p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+    p
+}
+
+/// At an edge between two surfaces at nearly one depth (a crease, a
+/// slab's front over the gap under it) each side keeps its own sky: the
+/// lookup tells surfaces apart by their planes, not by depth, so neither
+/// side takes the other's texels in steps of two px (by depth this scene
+/// had 53 such steps, up to 15 levels; one is left, at the end of the gap
+/// where three faces meet within a texel). On the GPU and on the CPU,
+/// which agree as before.
+#[test]
+fn an_edge_at_one_depth_has_no_steps() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let c = Compiled::new(&edges());
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let (a, b) = (raster(true, false).render(&c, 0.0), raster(false, false).render(&c, 0.0));
+    let ours = Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() }).render(&c, 0.0);
+    let plain = cpu().render(&c, 0.0);
+    keep("edges-with", &a);
+    keep("edges-without", &b);
+    keep("edges-cpu", &ours);
+    assert_ne!(a, b);
+    let (gpu, on_cpu) = (steps(&a, &b, 6.0), steps(&ours, &plain, 6.0));
+    let apart = a.pixels().zip(ours.pixels()).filter(|(p, q)| (0..4).any(|k| p.0[k].abs_diff(q.0[k]) > 3)).count() as f64 / (a.width() * a.height()) as f64;
+    eprintln!("steps over 6 levels on a flat face: the GPU {} (widest {:.0}), the CPU {} (widest {:.0}); GPU against CPU {:.2}% of px more than 3 levels apart", gpu.0, gpu.1, on_cpu.0, on_cpu.1, apart * 100.0);
+    assert!(gpu.0 <= 2 && on_cpu.0 <= 2, "steps: {gpu:?} on the GPU, {on_cpu:?} on the CPU");
+    assert!(apart < 0.01, "{apart}");
+}

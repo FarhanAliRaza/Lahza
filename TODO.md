@@ -513,9 +513,27 @@ What is left:
 - Only solid meshes are in the rays: what is see-through, cards, wires,
   volumes and shadow catchers neither hide the sky nor take it (they are
   lit as before).
-- At an edge between near and far the lookup takes the texel nearest in
-  depth, at half the picture's size: steps of two px show there (seen
-  under the slab's front edge).
+- **The two-px steps at an edge between two surfaces: done.** The
+  lookup told surfaces apart by depth alone, so two at nearly one depth
+  mixed, a texel at a time (a crease, a slab's front over the gap under
+  it). The group now has a third row of texels, each surface's own plane
+  (its true normal as two numbers, and where it lies: `sky` had it for
+  the filter), and `sky_at` takes a texel for the shaded point's surface
+  when the point lies in its plane (within 0.01 z + 0.5, the filter's
+  own rule) and it faces as the triangle does (the triangle's true
+  normal: 0.9 and over whole, none under 0.8); with none, the texel
+  whose plane is nearest. A floor seen at a glancing angle is in its
+  texels' plane at every depth, which a tighter depth test was not. The
+  same in `sky_cpu::at`. Measured on a box with a slab over a gap and a
+  block (`sky_tests::an_edge_at_one_depth_has_no_steps`, 320 x 180,
+  software Vulkan and the CPU alike): neighbours on one flat face more
+  than 6 levels apart, 53 before (up to 15 levels), 1 after (9 levels,
+  at the gap's end where three faces meet within a texel); GPU against
+  CPU no pixel over 3 levels. Seen: the staircase under the slab's
+  front edge is a straight dark line. The room's numbers moved a little
+  with it (the contact 0.74 of the plain raster's for 0.72, 29.7 dB
+  from traced for 29.5). The group is half again as large (three rows
+  for two); its cost was not measured again.
 - **The light's second return** is in, from the same rays and no more
   of them: where the picture shows the surface a ray ended on (the texel
   its end is seen in, at its depth), that texel's own first light back,
@@ -536,13 +554,6 @@ What is left:
     list has them) and in the CPU's BVH (the card's quad and its group's
     texels), and the batches of see-through meshes would read the group
     at their own depth. Volumes need the tracer's marching: left.
-  - *The two-px steps at an edge between near and far.* The lookup
-    tells surfaces apart by depth alone, and two surfaces at nearly one
-    depth (a slab's front over a box's) mix. It needs each texel's
-    plane against the shaded point's: either the target's focal length
-    in the light block (its two spare floats are used) or the texel's
-    normal in the group (a third row of texels). Tightening the depth
-    test instead makes a floor seen at a glancing angle blocky.
   - *Meshes the GPU generates in its pool* are not in the CPU's rays.
     Their bounds as a stand-in were not added: the CPU's frame does not
     draw such a mesh at all, and a box hiding the sky from the rest

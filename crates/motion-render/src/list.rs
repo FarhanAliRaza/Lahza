@@ -645,10 +645,11 @@ impl Builder<'_> {
             }
         }
         let inv = root.inverse().unwrap_or(root);
-        // (Twice the rows: after the texels' visibility, as many for the
-        // light that comes back from what is in the way.)
+        // (Three times the rows: after the texels' visibility, as many
+        // for the light that comes back from what is in the way, and as
+        // many for the plane each texel's surface lies in.)
         let (gw, gh) = (canvas.0.div_ceil(2).max(1), canvas.1.div_ceil(2).max(1));
-        let rect = [0.0, 0.0, gw as f64 * 2.0, gh as f64 * 4.0];
+        let rect = [0.0, 0.0, gw as f64 * 2.0, gh as f64 * 6.0];
         let (offset, _, _, _) = self.reserve(list, pending, Vec::new(), rect, 0.0, 2.0, false);
         if let Some(p) = pending.last_mut() {
             p.group.trace = Some(list.traces.len() as u32);

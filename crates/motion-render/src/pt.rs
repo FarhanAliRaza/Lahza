@@ -1073,9 +1073,10 @@ impl Tracer {
         let sky = t.options.sky;
         let fast = t.options.fast && parts == 1 && !sky;
         let rr = fast && self.reconstructs(context);
-        // (Sky visibility: the group's second half is for the light that
-        // comes back, a texel for each of the first half's.)
-        let size = if rr { (full.0.div_ceil(2), full.1.div_ceil(2)) } else if sky { (full.0, full.1 / 2) } else { full };
+        // (Sky visibility: the group's second third is for the light that
+        // comes back and its last for the surface's plane, a texel for
+        // each of the first third's.)
+        let size = if rr { (full.0.div_ceil(2), full.1.div_ceil(2)) } else if sky { (full.0, full.1 / 3) } else { full };
         let place = if sky { [t.origin[0], t.origin[1], t.factor[0], t.factor[1]] } else { [t.origin[0], t.origin[1], t.factor[0] * full.0 as f32 / size.0 as f32, t.factor[1] * full.1 as f32 / size.1 as f32] };
         let lens = if rr {
             let halton = |mut i: u64, b: u64| {
