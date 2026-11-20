@@ -673,8 +673,78 @@ impl Studio {
             // The words: shown as typed, saved when the field is left.
             panel = panel.child(self.text_fields.layer_text.clone());
         }
+        if let lahza_motion_core::document::LayerKind::Text(t) = &layer.kind {
+            // The font: the bundled ones and the project's font files.
+            let mut fonts = div().flex().flex_wrap().gap_1();
+            for (fi, font) in editor.fonts().iter().enumerate() {
+                let (target, value) = (format!("{id}.font"), font.clone());
+                let label = font.rsplit('/').next().unwrap_or(font).to_string();
+                fonts = fonts.child(
+                    button(("motion-layer-font", fi), label, ButtonKind::Secondary, ButtonSize::Sm)
+                        .selected(&t.font == font)
+                        .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![json!({"op": "set", "target": target, "value": value})], cx))),
+                );
+            }
+            panel = panel.child(fonts);
+        }
         let three_d = layer.common.three_d || layer.kind.name() == "mesh";
-        let (own, effect_fields) = crate::motion_editor::extra_fields(&layer);
+        let (own, effect_values) = crate::motion_editor::extra_values(&layer);
+        // A colour: what it is now (click to type another), and swatches.
+        let color_row = |ci: usize, label: &str, path: &str| {
+            let now = editor.color_state(&id, path);
+            let editing = self.motion_color_edit.as_ref().is_some_and(|(l, p)| l == &id && p == path);
+            let (lid, lpath) = (id.clone(), path.to_string());
+            let mut swatches = div().flex().flex_wrap().gap_1();
+            for (si, hex) in crate::motion_editor::SWATCHES.iter().enumerate() {
+                let (lid, lpath) = (id.clone(), path.to_string());
+                let fill = lahza_motion_core::value::Color::parse(hex).map(|c| gpui::rgba(u32::from_be_bytes(c.0.map(|v| (v * 255.0).round() as u8)))).unwrap_or(gpui::rgba(0));
+                swatches = swatches.child(
+                    div()
+                        .id(SharedString::from(format!("motion-color-{ci}-{si}")))
+                        .size(px(20.0))
+                        .rounded(px(5.0))
+                        .bg(fill)
+                        .border_2()
+                        .border_color(if now.eq_ignore_ascii_case(hex) { theme::accent() } else { theme::line() })
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(editor) = this.motion_doc.as_ref().map(|d| d.editor.clone()) {
+                                editor.update(cx, |e, _| e.set_color(&lid, &lpath, hex));
+                                this.show_motion_doc(cx);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("motion-color-value-{ci}")))
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
+                        .bg(theme::control_bg())
+                        .hover(|s| s.bg(theme::control_hover()))
+                        .cursor_pointer()
+                        .child(div().text_xs().text_color(theme::muted()).child(label.to_string()))
+                        .child(div().text_xs().child(now))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            let target = (lid.clone(), lpath.clone());
+                            this.motion_color_edit = (this.motion_color_edit.as_ref() != Some(&target)).then_some(target);
+                            cx.notify();
+                        })),
+                )
+                .when(editing, |d| d.child(self.text_fields.layer_color.clone()))
+                .child(swatches)
+        };
+        let mut colors = 0;
         let mut fields = div().flex().flex_col().gap_1();
         let scrub = |i: usize, field: &Field| {
             let (value, animated) = editor.field_state(&id, field);
@@ -703,7 +773,11 @@ impl Studio {
                     )
         };
         let mut n = 0;
-        for field in own.iter().chain(FIELDS) {
+        for (label, path) in &own.colors {
+            panel = panel.child(color_row(colors, label, path));
+            colors += 1;
+        }
+        for field in own.fields.iter().chain(FIELDS) {
             let depth_only = field.path.contains("_x") || field.path.contains("_y") || field.path.ends_with(".z");
             if depth_only && !three_d {
                 continue;
@@ -714,20 +788,24 @@ impl Studio {
         // Effects: each one's values, a way to take it off, and the ones
         // that can be added.
         let mut effects = div().flex().flex_col().gap_1().child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child("Effects"));
-        for (ei, (name, list)) in effect_fields.iter().enumerate() {
+        for (ei, values) in effect_values.iter().enumerate() {
             let target = format!("{id}.effects.{ei}");
             effects = effects.child(
-                div().flex().justify_between().items_center().child(div().text_xs().child(name.clone())).child(
+                div().flex().justify_between().items_center().child(div().text_xs().child(values.name.clone())).child(
                     button(SharedString::from(format!("motion-effect-remove-{ei}")), "Remove", ButtonKind::Ghost, ButtonSize::Sm)
                         .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![json!({"op": "set", "target": target})], cx))),
                 ),
             );
-            for field in list {
+            for field in &values.fields {
                 effects = effects.child(scrub(n, field));
                 n += 1;
             }
+            for (label, path) in &values.colors {
+                effects = effects.child(color_row(colors, label, path));
+                colors += 1;
+            }
         }
-        let count = effect_fields.len();
+        let count = effect_values.len();
         let mut add = div().flex().flex_wrap().gap_1();
         for (label, effect) in crate::motion_editor::EFFECTS {
             let effect: Value = serde_json::from_str(effect).unwrap_or_default();
@@ -1057,7 +1135,7 @@ impl Studio {
             .border_color(theme::line())
             .bg(theme::panel())
             .child(transport)
-            .child(div().flex().child(div().w(px(LABELS)).flex_none().pl_3().text_size(px(9.0)).text_color(theme::muted()).child("span")).child(span_band))
+            .child(div().flex().child(div().w(px(LABELS)).flex_none().pl_3().text_size(px(9.0)).text_color(theme::muted()).child("span")).child(span_band.tooltip(crate::timeline_ui::tooltip("Drag to mark a span to ask about; click to clear"))))
             .child(div().flex().child(div().w(px(LABELS)).flex_none()).child(ruler))
             .child(rows)
             .child(div().absolute().top(px(54.0)).bottom_0().left(px(playhead - 1.0)).w(px(2.0)).bg(theme::brand()))

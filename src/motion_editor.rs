@@ -20,7 +20,7 @@ use lahza_motion_core::compile::{Compiled, Content, LayerState};
 use lahza_motion_core::document::{Layer, Project};
 use lahza_motion_core::property::{compile as compile_prop, Ctx, Property};
 use lahza_motion_core::timeref::TimeRef;
-use lahza_motion_core::value::{Animatable, Vec2};
+use lahza_motion_core::value::{Animatable, Color, Vec2};
 use lahza_motion_core::{edit, io};
 use lahza_motion_mcp::tools::Toolbox;
 use lahza_motion_render::font::Fonts;
@@ -260,40 +260,91 @@ pub(crate) const FIELDS: &[Field] = &[
     field("transform.rotation_y", None, "Turn Y", 0.5, 0.0),
 ];
 
-/// Effects the inspector can add, with the values they start from.
+/// Effects the inspector can add, with the values they start from (what
+/// is not given takes the format's default). Not here: `gradient_map` and
+/// `lut`, which need a list of stops and a file.
 pub(crate) const EFFECTS: &[(&str, &str)] = &[
     ("Blur", r#"{"type": "blur", "radius": 8}"#),
-    ("Shadow", r#"{"type": "shadow", "radius": 12, "offset": [0, 8]}"#),
+    ("Shadow", r##"{"type": "shadow", "color": "#00000080", "radius": 12, "offset": [0, 8]}"##),
+    ("Glow", r#"{"type": "glow", "radius": 12, "intensity": 1}"#),
     ("Exposure", r#"{"type": "exposure", "stops": 0.5}"#),
     ("Contrast", r#"{"type": "brightness_contrast", "brightness": 0, "contrast": 0.2}"#),
+    ("Levels", r#"{"type": "levels"}"#),
     ("Colour", r#"{"type": "hue_saturation", "hue": 0, "saturation": 0.2, "lightness": 0}"#),
+    ("Tint", r#"{"type": "tint"}"#),
+    ("Fill", r##"{"type": "fill", "color": "#ffffff"}"##),
+    ("Invert", r#"{"type": "invert"}"#),
+    ("Motion blur", r#"{"type": "directional_blur"}"#),
+    ("RGB split", r#"{"type": "rgb_split"}"#),
+    ("Displace", r#"{"type": "displace"}"#),
+    ("Vignette", r#"{"type": "vignette"}"#),
+    ("Grain", r#"{"type": "grain"}"#),
 ];
 
-/// The scrubbable numbers of a layer's own kind and of its effects, read
-/// from its JSON: a text's size, and each effect's values (its name first).
-pub(crate) fn extra_fields(layer: &Layer) -> (Vec<Field>, Vec<(String, Vec<Field>)>) {
-    let number = |v: &Value| v.is_number() || v.get("keys").and_then(|k| k.get(0)).and_then(|k| k.get("v")).is_some_and(Value::is_number);
-    let mut own = Vec::new();
-    if let lahza_motion_core::document::LayerKind::Text(_) = &layer.kind {
-        own.push(Field { path: "size".into(), component: None, label: "Size".into(), step: 0.5, default: 96.0 });
-        own.push(Field { path: "tracking".into(), component: None, label: "Tracking".into(), step: 0.1, default: 0.0 });
-    }
-    let mut effects = Vec::new();
-    let json = serde_json::to_value(&layer.common.effects).unwrap_or_default();
-    for (i, effect) in json.as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
-        let name = effect.get("type").and_then(Value::as_str).unwrap_or("effect").replace('_', " ");
-        let mut fields = Vec::new();
-        for (key, _) in effect.as_object().into_iter().flatten().filter(|(k, v)| *k != "type" && number(v)) {
-            let step = match key.as_str() {
-                "radius" | "size" | "distance" | "width" => 0.25,
-                "hue" | "angle" => 1.0,
-                "stops" => 0.02,
-                _ => 0.01,
-            };
-            fields.push(Field { path: format!("effects.{i}.{key}").into(), component: None, label: key.replace('_', " ").into(), step, default: 0.0 });
+/// Colours offered for a colour value (any other is typed as #rrggbb).
+pub(crate) const SWATCHES: &[&str] = &["#ffffff", "#000000", "#8a8f98", "#ff3355", "#ffc928", "#22b45d", "#22bfc2", "#3678ef", "#8c4ce8", "#ec3d87"];
+
+/// Values of a layer's own kind or of one effect that the inspector edits:
+/// numbers (two-part values as two), and colours by their path.
+#[derive(Default)]
+pub(crate) struct Values {
+    pub name: String,
+    pub fields: Vec<Field>,
+    /// Label and path of each colour.
+    pub colors: Vec<(String, String)>,
+}
+
+/// Reads the editable values under `prefix` out of a JSON object: what is
+/// a number, a pair of numbers or a colour, constant or keyed.
+fn values_in(object: &Value, prefix: &str, name: String) -> Values {
+    // A keyed value is judged by its first key.
+    let shown = |v: &Value| v.get("keys").and_then(|k| k.get(0)).and_then(|k| k.get("v")).cloned().unwrap_or_else(|| v.clone());
+    let mut out = Values { name, ..Default::default() };
+    for (key, value) in object.as_object().into_iter().flatten() {
+        let (path, label) = (format!("{prefix}{key}"), key.replace('_', " "));
+        let step = match key.as_str() {
+            "radius" | "size" | "distance" | "width" | "length" | "offset" => 0.25,
+            "hue" | "angle" => 1.0,
+            "stops" => 0.02,
+            _ => 0.01,
+        };
+        match shown(value) {
+            Value::Number(_) if key != "seed" => out.fields.push(Field { path: path.into(), component: None, label: label.into(), step, default: 0.0 }),
+            Value::Array(pair) if pair.len() == 2 && pair.iter().all(Value::is_number) => {
+                for (c, axis) in ["X", "Y"].into_iter().enumerate() {
+                    out.fields.push(Field { path: path.clone().into(), component: Some(c), label: format!("{label} {axis}").into(), step, default: 0.0 });
+                }
+            }
+            Value::String(text) if text.starts_with('#') => out.colors.push((label, path)),
+            _ => {}
         }
-        effects.push((name, fields));
     }
+    out
+}
+
+/// What the inspector edits beyond the transform: a text's size, tracking
+/// and colour, and each effect's values.
+pub(crate) fn extra_values(layer: &Layer) -> (Values, Vec<Values>) {
+    let mut own = Values::default();
+    if let lahza_motion_core::document::LayerKind::Text(_) = &layer.kind {
+        own.fields.push(Field { path: "size".into(), component: None, label: "Size".into(), step: 0.5, default: 96.0 });
+        own.fields.push(Field { path: "tracking".into(), component: None, label: "Tracking".into(), step: 0.1, default: 0.0 });
+        own.colors.push(("Colour".into(), "color".into()));
+    }
+    let json = serde_json::to_value(&layer.common.effects).unwrap_or_default();
+    let effects = json
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, effect)| {
+            let name = effect.get("type").and_then(Value::as_str).unwrap_or("effect").replace('_', " ");
+            let mut values = values_in(effect, &format!("effects.{i}."), name);
+            values.fields.retain(|f| !f.path.ends_with(".type"));
+            values
+        })
+        .collect();
     (own, effects)
 }
 
@@ -338,6 +389,7 @@ pub(crate) struct MotionEditor {
     preview_project: Option<Project>,
     /// The preview shows a request's "before" (`compare`), not a drag.
     comparing: bool,
+    font_names: Vec<String>,
     /// The selected layer as JSON, saved and as the drag shows it: values
     /// are read from these, so a draw does not serialise the layer again.
     saved_json: RefCell<Option<(String, Value)>>,
@@ -375,6 +427,29 @@ pub(crate) fn stamp(dir: &Path) -> SystemTime {
         }
     }
     latest
+}
+
+/// The bundled fonts, then the project's font files (`assets/` and its
+/// folders), as a text's `font` names them.
+fn font_names(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = lahza_motion_render::font::BUNDLED.iter().map(|f| f.to_string()).collect();
+    let mut files = Vec::new();
+    let mut pending = vec![(dir.join("assets"), 0)];
+    while let Some((folder, depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth < 2 {
+                pending.push((path, depth + 1));
+            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf")) {
+                if let Ok(rel) = path.strip_prefix(dir) {
+                    files.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    files.sort();
+    out.extend(files);
+    out
 }
 
 fn round(v: f64) -> f64 {
@@ -506,6 +581,7 @@ impl MotionEditor {
             drag: None,
             preview_project: None,
             comparing: false,
+            font_names: Vec::new(),
             saved_json: RefCell::default(),
             preview_json: RefCell::default(),
             focus: cx.focus_handle(),
@@ -520,6 +596,7 @@ impl MotionEditor {
             peaks: PeakCache::default(),
         };
         let mut editor = editor;
+        editor.font_names = font_names(&editor.dir);
         editor.refresh_waves();
         Ok(editor)
     }
@@ -631,6 +708,7 @@ impl MotionEditor {
             Ok(p) => {
                 self.drop_preview();
                 *self.saved_json.borrow_mut() = None;
+                self.font_names = font_names(&self.dir);
                 self.project = p;
                 self.compiled = Arc::new(Compiled::new(&self.project));
                 self.rows = layer_rows(&self.project, &self.compiled);
@@ -1009,6 +1087,28 @@ impl MotionEditor {
         self.commit(ops);
     }
 
+    /// The colour at `path` of layer `id` at the playhead, as #rrggbb.
+    pub(crate) fn color_state(&self, id: &str, path: &str) -> String {
+        self.eval_in::<Color>(id, path, Color::WHITE, true).0.to_hex()
+    }
+
+    /// Saves a colour: a key at the playhead when it is animated.
+    pub(crate) fn set_color(&mut self, id: &str, path: &str, hex: &str) {
+        if Color::parse(hex).is_err() {
+            self.status = format!("'{hex}' is not a colour: use #rrggbb");
+            return;
+        }
+        let (_, animated) = self.eval::<Color>(id, path, Color::WHITE);
+        let ops = self.value_ops(id, path, json!(hex), animated);
+        self.commit(ops);
+    }
+
+    /// Fonts a text can take: the bundled ones and the font files in the
+    /// project's assets.
+    pub(crate) fn fonts(&self) -> &[String] {
+        &self.font_names
+    }
+
     /// Shows edit ops without saving them (text as it is typed).
     pub(crate) fn preview_ops(&mut self, ops: &[Value]) {
         self.preview(ops);
@@ -1359,6 +1459,27 @@ mod tests {
     }
 
     #[test]
+    fn every_effect_offered_is_one_the_format_takes() {
+        use lahza_motion_core::document::Effect;
+        for (label, json) in EFFECTS {
+            let effect: Effect = serde_json::from_str(json).unwrap_or_else(|e| panic!("{label}: {e}"));
+            // And each shows something to change.
+            let values = values_in(&serde_json::to_value(&effect).unwrap(), "effects.0.", label.to_string());
+            assert!(!values.fields.is_empty() || !values.colors.is_empty(), "{label} has no values");
+        }
+        // A shadow: its numbers, its offset as two, its colour by path.
+        let shadow: Effect = serde_json::from_str(EFFECTS[1].1).unwrap();
+        let values = values_in(&serde_json::to_value(&shadow).unwrap(), "effects.2.", "shadow".into());
+        let labels: Vec<(&str, Option<usize>)> = values.fields.iter().map(|f| (&*f.label, f.component)).collect();
+        assert_eq!(labels, [("offset X", Some(0)), ("offset Y", Some(1)), ("radius", None)]);
+        assert_eq!(values.fields[0].path, "effects.2.offset");
+        assert_eq!(values.colors, [("color".to_string(), "effects.2.color".to_string())]);
+        for hex in SWATCHES {
+            Color::parse(hex).unwrap();
+        }
+    }
+
+    #[test]
     fn trimming_an_anchored_sound_keeps_its_anchor() {
         assert_eq!(shift_time(&json!(1.0), 0.25, 30.0), json!(1.25));
         assert_eq!(shift_time(&json!("#card.start"), 0.12, 30.0), json!("#card.start + 0.120"));
@@ -1431,7 +1552,9 @@ mod tests {
                 let any: gpui::AnyWindowHandle = handle.into();
                 let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
                 let mut framed = false;
-                for _ in 0..200 {
+                // On a software GPU the first frame builds its
+                // pipelines: tens of seconds, cold.
+                for _ in 0..3600 {
                     wait(50).await;
                     draw(cx);
                     framed = handle.update(cx, |editor, _, _| editor.frame.is_some()).unwrap();

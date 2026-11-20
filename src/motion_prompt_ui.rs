@@ -411,6 +411,8 @@ impl Studio {
         let Some((about, key, cwd)) = self.motion_about(cx) else { return };
         let picture = self.motion_editor().and_then(|e| e.read(cx).frame_png());
         self.motion_agent.send(about, words, picture, key, cwd);
+        // The field is emptied even while it has the keys (Send clicked).
+        self.text_fields.prompt.update(cx, |field, cx| field.set_text("", cx));
         if let Some(index) = self.motion_agent.requests.len().checked_sub(1).filter(|_| !self.motion_agent.busy()) {
             // It could not start: say why.
             if let Outcome::Failed(why) = &self.motion_agent.requests[index].outcome {
@@ -592,6 +594,15 @@ impl Studio {
         let text = self.motion_text_layer(cx).filter(|_| visible && self.inspector_visible && !self.motion_agent.ai_tab);
         let (target, value) = text.map(|(_, text)| (Target::LayerText, text)).unwrap_or((Target::None, String::new()));
         self.text_fields.layer_text.update(cx, |field, cx| field.sync(target, &value, window, cx));
+        // The colour being typed: of the selected layer only.
+        let selected = self.motion_editor().and_then(|e| e.read(cx).selected().map(str::to_string));
+        if self.motion_color_edit.as_ref().is_some_and(|(layer, _)| selected.as_deref() != Some(layer.as_str())) {
+            self.motion_color_edit = None;
+        }
+        let color = self.motion_color_edit.clone().filter(|_| visible && self.inspector_visible && !self.motion_agent.ai_tab);
+        let now = color.as_ref().and_then(|(layer, path)| self.motion_editor().map(|e| e.read(cx).color_state(layer, path)));
+        let (target, value) = now.map(|hex| (Target::LayerColor, hex)).unwrap_or((Target::None, String::new()));
+        self.text_fields.layer_color.update(cx, |field, cx| field.sync(target, &value, window, cx));
     }
 
     /// The selected layer's id and words, when it is a text.
@@ -611,6 +622,17 @@ impl Studio {
             (Target::Prompt, EventKind::Submit) => {
                 self.motion_agent.draft = event.text.clone();
                 self.send_motion_prompt(&event.text, cx);
+            }
+            // A colour typed as #rrggbb (the # may be left out): saved on
+            // Enter or when the field is left, if it changed.
+            (Target::LayerColor, EventKind::Submit | EventKind::Commit) => {
+                let (Some((layer, path)), Some(editor)) = (self.motion_color_edit.clone(), self.motion_editor()) else { return };
+                let typed = event.text.trim().to_lowercase();
+                let hex = if typed.starts_with('#') { typed } else { format!("#{typed}") };
+                if hex != editor.read(cx).color_state(&layer, &path) {
+                    editor.update(cx, |e, _| e.set_color(&layer, &path, &hex));
+                    self.show_motion_doc(cx);
+                }
             }
             // The words show as they are typed and are saved when the
             // field is left.
@@ -793,7 +815,7 @@ impl Studio {
             };
             status = status.child(small(text));
         } else {
-            status = status.child(small("Select, type, Enter. Ctrl-click rows for more layers; drag the strip over the ruler (Shift-drag on a recording) to mark a span.".into()));
+            status = status.child(small("Select, type, Enter. Ctrl-click rows for more layers; drag the strip along the top of the ruler to mark a span.".into()));
         }
         div()
             .id("motion-prompt-bar")

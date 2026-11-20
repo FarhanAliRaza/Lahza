@@ -2146,6 +2146,30 @@ impl Studio {
                                     .h_full()
                                     .children(ruler_marks),
                             )
+                            // In the Motion tab the top of the ruler is the
+                            // strip where a drag marks a span to ask about,
+                            // as over a motion project's ruler.
+                            .when(self.motion_prompt_visible(), |this| {
+                                this.child(
+                                    div()
+                                        .id("timeline-span-strip")
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h(px(8.0))
+                                        .rounded(px(3.0))
+                                        .bg(crate::theme::control_bg())
+                                        .cursor_crosshair()
+                                        .tooltip(crate::timeline_ui::tooltip("Drag to mark a span to ask about; click to clear"))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.pause_video_playback();
+                                            this.begin_motion_span(event.position.x);
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .when(playhead_visible, |this| {
                                 this.child(
                                     div()

@@ -145,7 +145,7 @@ inside a recording open from the studio instead:
 - **Preview:** rendered on a worker thread (GPU when available), with a half-size proxy while playing or dragging.
 - **Timeline:** the ruler, beat/bar/hit and word markers, the sound's waveform, scenes, and layer bars with key diamonds.
 - **Sound:** music, narration, effects and footage sound play in sync while playing.
-- **Inspector:** two tabs. Properties: scrubbable transform values (3D values on 3D layers), a text layer's words, size and tracking, and each effect's values with buttons to add and remove effects. AI: what was asked about the layer and what came of it.
+- **Inspector:** two tabs. Properties: scrubbable transform values (3D values on 3D layers), a text layer's words, font, colour, size and tracking, and each effect's values (numbers, two-part values, colours) with buttons to add and remove effects. Colours are picked from swatches or typed as #rrggbb. AI: what was asked about the layer and what came of it.
 - **Prompt bar:** under the preview (see below).
 - **Shortcuts:** Space plays, arrows step frames, Home/End jump, Delete removes the selected layer, Ctrl+Z / Ctrl+Shift+Z undo and redo, `\` held compares a proposal with what was there before. Any other printable key begins a prompt.
 
@@ -157,7 +157,7 @@ Every edit goes through the same tools the MCP server uses, so a person and an a
 
 Select, type, Enter. The prompt bar is the same on a motion project and on a recording's Motion tab.
 
-- **What the words act on** shows as chips that can be removed: the selected layer (Ctrl- or Shift-click rows for more), a span of time (drag the strip over the ruler; on a recording, Shift-drag the ruler), and the conversation being continued. With them go the playhead, the scene and the frame as a picture.
+- **What the words act on** shows as chips that can be removed: the selected layer (Ctrl- or Shift-click rows for more), a span of time (drag along the strip at the top of the ruler), and the conversation being continued. With them go the playhead, the scene and the frame as a picture.
 - **The agent** is Claude Code without its terminal, started as a child process with `lahza mcp` as its only tools. It needs Claude Code installed and signed in; the bar says so when it is not. `src/motion_agent.rs` keeps this behind one trait (`Runner`), so another client can take its place.
 - **At work:** each step shows in the bar, as a ghost clip over the span being made, and in the AI tab; Stop ends it. The editor stays usable.
 - **What comes back is a proposal:** Keep, Undo (everything the request changed, as one history step), Again, and Hold to compare. The edits of a request carry its id in the history (`history` with `undo_request`, or `by_request` to count a request as one step of `undo`).

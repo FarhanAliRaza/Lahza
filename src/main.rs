@@ -560,6 +560,8 @@ struct Studio {
     /// The piece open on the timeline in the Motion tab.
     motion_doc: Option<crate::motion_timeline::MotionDoc>,
     motion_layer_drag: Option<crate::motion_timeline::LayerDrag>,
+    /// The colour being typed in the motion inspector: layer and path.
+    motion_color_edit: Option<(String, String)>,
     /// The agent directed from the prompt bar, and its requests.
     motion_agent: crate::motion_prompt_ui::MotionAgent,
     /// The preview shows only the open motion piece.
@@ -1005,6 +1007,7 @@ impl Studio {
             motion_piece_drag: None,
             motion_doc: None,
             motion_layer_drag: None,
+            motion_color_edit: None,
             motion_agent: Default::default(),
             motion_isolate: false,
             motion_project: None,

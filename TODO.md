@@ -316,7 +316,8 @@ something else to connect.
 
 What was run: the unit tests, and two windows under Xvfb with Mesa's
 software Vulkan (`cargo test --release -p lahza motion_prompt -- --ignored`,
-screenshots looked at), with a runner of our own in Claude Code's place
+screenshots looked at; with `LAHZA_MOTION_SOFTWARE_GPU=1` the preview's
+first frame takes tens of seconds and the tests wait for it), with a runner of our own in Claude Code's place
 that makes real edits through a `Toolbox`. **No request was sent to
 Claude Code** (it costs money). Claude Code 2.1.329 was started once
 against an address nothing listens on: it took the flags, started
@@ -446,9 +447,12 @@ with a mouse on a real desktop.
   project any printable key does, selected or not; on a recording only
   with a layer selected, because letters are shortcuts there. Space
   still plays.
-- **A span is marked** by a drag on a strip over the ruler; on a
-  recording by Shift-drag on the ruler, since a plain drag scrubs there.
-  A click clears it. Left: one gesture for both.
+- **A span is marked** by one gesture in both places: a drag along the
+  strip at the top of the ruler (over it on a motion project, its top
+  8 px on a recording; the rest of the ruler still scrubs). A click
+  clears it; Shift-drag anywhere on the ruler does the same. The strip on
+  a recording is seen in a screenshot; its drag was driven through the
+  code, not with a pointer.
 - **The inspector has two tabs**: Properties, and AI (what was asked
   about this layer, each step, what it said, keep / undo / again). With
   nothing selected the AI list shows every request.
@@ -460,10 +464,13 @@ with a mouse on a real desktop.
   inverses in the preview only; nothing is written.
 - **A drag never waits**: see "Drags that stall".
 - **By hand stays cheap**: the inspector edits a text layer's words (shown
-  as typed, saved when the field is left), its size and tracking, each
-  effect's numbers, and adds or removes blur, shadow, exposure, contrast
-  and colour. Left: a text's font and colour, colours and two-part values
-  of effects (a shadow's colour and offset), other effects' adding.
+  as typed, saved when the field is left), its font (the bundled ones and
+  the font files in the project's `assets/`), colour, size and tracking;
+  each effect's numbers, two-part values (a shadow's offset as X and Y)
+  and colours; and adds or removes every effect but `gradient_map` and
+  `lut` (a list of stops, a file). A colour is picked from ten swatches or
+  typed as #rrggbb. Left: those two effects, a text's stroke, edge, line
+  height and alignment, and a colour picker beyond the swatches.
 
 ## Slang
 

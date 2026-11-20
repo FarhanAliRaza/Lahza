@@ -114,7 +114,9 @@ fn prompt_bar_directs_an_agent_and_takes_its_request_back() {
             let editor = |cx: &mut gpui::AsyncApp| handle.update(cx, |s, _, _| s.motion_doc.as_ref().map(|d| d.editor.clone())).unwrap();
             // The first frame of the preview.
             let mut framed = false;
-            for _ in 0..200 {
+            // On a software GPU the first frame builds its pipelines:
+            // tens of seconds, cold.
+            for _ in 0..3600 {
                 wait(50).await;
                 draw(cx);
                 framed = editor(cx).is_some_and(|e| e.update(cx, |e, _| e.frame_png().is_some()).unwrap());
@@ -286,6 +288,52 @@ fn prompt_bar_directs_an_agent_and_takes_its_request_back() {
             draw(cx);
             wait(100).await;
             shot("prompt-5-properties.png");
+            // By hand: a text's font and colour, an effect's colour and
+            // two-part value, a colour typed.
+            handle
+                .update(cx, |studio, _, cx| {
+                    editor.update(cx, |e, _| {
+                        assert!(e.fonts().iter().any(|f| f == "Inter Medium"));
+                        e.commit_ops(vec![
+                            json!({"op": "set", "target": "title.font", "value": "Inter Medium"}),
+                            json!({"op": "set", "target": "title.effects.1", "value": serde_json::from_str::<serde_json::Value>(crate::motion_editor::EFFECTS[1].1).unwrap()}),
+                        ]);
+                        e.set_color("title", "color", "#ffc928");
+                        assert_eq!(e.color_state("title", "color"), "#ffc928");
+                        e.set_color("title", "effects.1.color", "#3678ef");
+                        assert_eq!(e.color_state("title", "effects.1.color"), "#3678ef");
+                        e.set_color("title", "color", "yellow");
+                        assert!(e.status().contains("not a colour") && e.color_state("title", "color") == "#ffc928");
+                        // The shadow's offset is two values to drag.
+                        let (_, effects) = crate::motion_editor::extra_values(e.layer("title").unwrap());
+                        let y = effects[1].fields.iter().find(|f| f.label == "offset Y").expect("offset Y").clone();
+                        assert_eq!(e.field_state("title", &y).0, 8.0);
+                        e.drag_value("title", &y, 20.0);
+                        e.drop_value("title", &y, 20.0);
+                        assert_eq!(e.field_state("title", &y).0, 20.0);
+                        assert_eq!(e.field_state("title", &effects[1].fields[0]).0, 0.0, "X stayed");
+                    });
+                    studio.show_motion_doc(cx);
+                    // Typed in the inspector, with or without the #.
+                    studio.motion_color_edit = Some(("title".into(), "color".into()));
+                    studio.text_fields.layer_color.update(cx, |_, cx| cx.emit(FieldEvent { target: Target::LayerColor, kind: EventKind::Submit, text: "22B45D".into() }));
+                    cx.notify();
+                })
+                .unwrap();
+            wait(400).await;
+            draw(cx);
+            handle
+                .update(cx, |_, _, cx| {
+                    let e = editor.read(cx);
+                    assert_eq!(e.color_state("title", "color"), "#22b45d");
+                    let layer = serde_json::to_value(e.layer("title").unwrap()).unwrap();
+                    assert_eq!((layer["font"].as_str(), layer["effects"][1]["offset"][1].as_f64()), (Some("Inter Medium"), Some(20.0)));
+                })
+                .unwrap();
+            wait(600).await;
+            draw(cx);
+            wait(100).await;
+            shot("prompt-7-by-hand.png");
             cx.update(|cx| cx.quit()).unwrap();
         })
         .detach();

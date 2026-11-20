@@ -13,6 +13,7 @@ pub(crate) struct TextFields {
     pub aspect_height: gpui::Entity<TextField>,
     pub prompt: gpui::Entity<TextField>,
     pub layer_text: gpui::Entity<TextField>,
+    pub layer_color: gpui::Entity<TextField>,
 }
 impl TextFields {
     pub fn new(parent: FocusHandle, cx: &mut Context<Studio>) -> Self {
@@ -35,6 +36,7 @@ impl TextFields {
             aspect_height: create("Height"),
             prompt: create("Say what you want here…"),
             layer_text: create("Text"),
+            layer_color: create("#rrggbb"),
         }
     }
 }
@@ -51,6 +53,7 @@ impl Studio {
             &self.text_fields.aspect_height,
             &self.text_fields.prompt,
             &self.text_fields.layer_text,
+            &self.text_fields.layer_color,
         ]
         .iter()
         .any(|field| field.read(cx).focus.is_focused(window))
@@ -251,7 +254,7 @@ impl Studio {
                 EventKind::Commit | EventKind::Cancel => self.set_cue_text(id, &event.text, true, cx),
                 EventKind::Submit => {}
             },
-            Target::Prompt | Target::LayerText => self.on_motion_field_event(event, cx),
+            Target::Prompt | Target::LayerText | Target::LayerColor => self.on_motion_field_event(event, cx),
             Target::Time(index, start) => {
                 if event.kind == EventKind::Focus {
                     self.stop_editing_text();

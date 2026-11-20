@@ -16,6 +16,8 @@ pub(crate) enum Target {
     Prompt,
     /// The selected motion text layer's words.
     LayerText,
+    /// A colour of the selected motion layer, as #rrggbb.
+    LayerColor,
     None,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,6 +471,17 @@ impl TextField {
 }
 
 impl TextField {
+    /// Replaces what is typed, focused or not (a sent prompt empties
+    /// its field).
+    pub(crate) fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.buffer.state.text = text.into();
+        self.buffer.select(text.len(), false);
+        self.initial = text.into();
+        self.marked = None;
+        self.scroll = px(0.);
+        cx.notify();
+    }
+
     /// Takes focus and types `text` at the caret: a key pressed elsewhere
     /// that begins an entry here.
     pub(crate) fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
