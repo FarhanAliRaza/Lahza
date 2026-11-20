@@ -103,7 +103,7 @@ impl Toolbox {
                         .collect();
                     out.push(json!({"scene": id, "status": "baked", "file": format!("sim/{id}.bake"), "bytes": bytes, "tracks": bake.tracks.len(), "agents": bake.herds.iter().map(|h| h.count as u64).sum::<u64>(),
                         "bodies": stats.bodies, "joints": stats.joints, "frames": stats.samples, "steps": stats.steps, "seconds": (stats.seconds * 1000.0).round() / 1000.0,
-                        "policy_runs": stats.policy_runs, "tried_steps": stats.tried_steps, "search_seconds": (stats.search_seconds * 1000.0).round() / 1000.0,
+                        "policy_runs": stats.policy_runs, "tried_steps": stats.tried_steps, "search_seconds": (stats.search_seconds * 1000.0).round() / 1000.0, "search_threads": stats.search_threads,
                         "from": bake.start, "seed": compiled.scenes[i].sim.settings.seed, "ragdolls": ragdolls, "events": shown, "events_total": bake.events.len()}));
                     baked.push((id, Arc::new(bake)));
                 }

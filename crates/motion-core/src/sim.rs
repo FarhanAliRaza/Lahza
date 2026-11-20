@@ -585,9 +585,10 @@ pub enum Controller {
     /// A network (ONNX, a project path): observation in, targets out
     /// (`lahza-motion-sim`'s `policy` module gives the layout).
     Policy { src: String },
-    /// No training: each `every` seconds it tries `samples` sets of
-    /// targets `horizon` seconds ahead in the simulator and keeps the best
-    /// (the one that stays up and nearest the clip).
+    /// No training: each `every` seconds it tries `samples` plans (leans,
+    /// arm swings, perhaps a step) `horizon` seconds ahead in the
+    /// simulator and keeps the best (the one that stays up and nearest
+    /// the clip).
     Search {
         #[serde(default = "search_samples")]
         samples: u32,
@@ -605,7 +606,7 @@ fn search_samples() -> u32 {
     16
 }
 fn search_horizon() -> f64 {
-    0.25
+    0.5
 }
 fn search_every() -> f64 {
     0.1

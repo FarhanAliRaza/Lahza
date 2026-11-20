@@ -30,9 +30,11 @@ pub struct Stats {
     /// A policy's runs and the seconds they took.
     pub policy_runs: u64,
     pub policy_seconds: f64,
-    /// Steps a search took in its tries ahead, and the seconds they took.
+    /// Steps a search took in its tries ahead, the seconds they took, and
+    /// how many tries ran at once.
     pub tried_steps: u64,
     pub search_seconds: f64,
+    pub search_threads: usize,
 }
 
 /// A take in progress: the world, and each ragdoll's brain and the turns
@@ -145,7 +147,13 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
                     let action = p.act(&policy::observe(&take.world, input, r, &feet, k as f64)).map_err(|e| format!("ragdoll '{}': {e}", r.id))?;
                     take.turns[rig] = Some(policy::turns(r, &action));
                 }
-                Some(Mind::Search(s)) => take.turns[rig] = Some(s.decide(&take, input, rig, k, t)),
+                Some(Mind::Search(s)) => {
+                    let (turns, stride) = s.decide(&take, input, rig, k, t);
+                    take.turns[rig] = Some(turns);
+                    if let Some(st) = stride {
+                        take.brains[rig].order_step(input, r, st.foot, st.from, st.to, st.lift, t);
+                    }
+                }
                 None => {}
             }
         }
@@ -183,7 +191,7 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
     for mind in minds.iter().flatten() {
         match mind {
             Mind::Policy(p) => (stats.policy_runs, stats.policy_seconds) = (stats.policy_runs + p.runs, stats.policy_seconds + p.seconds),
-            Mind::Search(s) => (stats.tried_steps, stats.search_seconds) = (stats.tried_steps + s.tried_steps, stats.search_seconds + s.seconds),
+            Mind::Search(s) => (stats.tried_steps, stats.search_seconds, stats.search_threads) = (stats.tried_steps + s.tried_steps, stats.search_seconds + s.seconds, s.threads),
         }
     }
     Ok((Bake { hash: input.hash(), start: input.start, rate: input.rate, tracks, events, herds }, stats))

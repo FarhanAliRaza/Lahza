@@ -774,13 +774,20 @@ Behaviours set the motors' targets on top of the clip, from `from` to
 A ragdoll's `controller` sets its motors' targets too, as turns made on
 top of the clip's (behaviours then act on the result):
 
-- `{"type": "search", "samples": 16, "horizon": 0.25, "every": 0.1,
+- `{"type": "search", "samples": 16, "horizon": 0.5, "every": 0.1,
   "spread": 12}`: no training. Every `every` seconds it tries `samples`
-  sets of leans (at the ankles, hips and spine, within `spread` degrees of
-  its last choice) `horizon` seconds ahead in a copy of the simulation and
-  keeps the one that leaves it most upright. It costs the steps of every
-  try: the defaults bake about 40 times slower (a 4 s take in 7 s);
-  `sim_bake` reports `tried_steps`.
+  plans `horizon` seconds ahead in copies of the simulation and keeps the
+  one that leaves it most upright. A plan is leans at the ankles, hips
+  and spine and a swing of each upper arm (within `spread` degrees of its
+  last choice; arms twice that) and, when its weight is headed off its
+  feet, perhaps a step of the foot behind to where it is falling to (a
+  `step` event; the foot is carried there as the `step` behaviour's is).
+  No force acts on its body. It costs the steps of every try: the
+  defaults try about 65 for each one taken (a 4 s take bakes in 6 s on
+  four cores; the tries run on every core, and the take is the same
+  however many); `sim_bake` reports `tried_steps`. A longer `horizon`
+  holds harder shoves (1 s: about as much as `balance` with its help)
+  for as much more time.
 - `{"type": "policy", "src": "assets/policy.onnx"}`: a network, run once
   a frame. Its input is `[1, 16 + 11·(B − 1) + F]` and its first output
   `[1, 3·(B − 1)]` f32 for a ragdoll of B bones and F feet: the layout is

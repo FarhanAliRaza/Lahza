@@ -448,7 +448,7 @@ impl Brain {
                         rb.apply_torque_impulse(v3(torque, dt), true);
                     }
                 }
-                if let Some((b, amount)) = find(BehaviourKind::Step) {
+                if let Some((b, _)) = find(BehaviourKind::Step) {
                     let trigger = param(b, "trigger", 0.12 * stand);
                     if self.step.is_none() && t >= self.step_ready && len(error) > trigger && self.feet.len() >= 2 {
                         // The foot behind, to past where it is falling to.
@@ -462,29 +462,32 @@ impl Brain {
                             self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "step".into(), a: input.bodies[r.bones[foot].body].id.clone(), b: String::new(), speed: len(vel).round() });
                         }
                     }
-                    if let Some(s) = &self.step {
-                        let f = ((t - s.start) / s.dur).clamp(0.0, 1.0);
-                        let ease = f * f * (3.0 - 2.0 * f);
-                        let want = add(add(s.from, mul(sub(s.to, s.from), ease)), mul(up, s.lift * libm::sin(std::f64::consts::PI * f)));
-                        // The foot is carried there; its leg follows, soft.
-                        let mut leg = vec![s.foot];
-                        while let (Some(p), true) = (r.bones[*leg.last().unwrap()].parent, leg.len() < 3) {
-                            leg.push(p);
-                        }
-                        let carried: f64 = leg.iter().map(|&b| r.bones[b].mass).sum();
-                        let rb = &mut world.w.bodies[world.handles[r.bones[s.foot].body]];
-                        let v = rb.linvel();
-                        let pull = capped(mul(sub(mul(sub(want, foot_at(s.foot)), 500.0), mul([v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], 40.0)), carried / u), 5.0 * carried * g * amount);
-                        rb.apply_impulse(v3(pull, dt), true);
-                        for &b in &leg {
-                            drive.scale[b] *= 0.3;
-                        }
-                        if f >= 1.0 {
-                            self.step = None;
-                            self.step_ready = t + 0.15;
-                        }
-                    }
                 }
+            }
+        }
+        // A step under way (a behaviour's, or one a controller ordered): the
+        // foot is carried to its place.
+        if let (Some(up), Some(s)) = (unit(mul(input.gravity, -1.0)), self.step.clone()) {
+            let amount = find(BehaviourKind::Step).map_or(1.0, |(_, a)| a);
+            let f = ((t - s.start) / s.dur).clamp(0.0, 1.0);
+            let ease = f * f * (3.0 - 2.0 * f);
+            let want = add(add(s.from, mul(sub(s.to, s.from), ease)), mul(up, s.lift * libm::sin(std::f64::consts::PI * f)));
+            // The foot is carried there; its leg follows, soft.
+            let mut leg = vec![s.foot];
+            while let (Some(p), true) = (r.bones[*leg.last().unwrap()].parent, leg.len() < 3) {
+                leg.push(p);
+            }
+            let carried: f64 = leg.iter().map(|&b| r.bones[b].mass).sum();
+            let rb = &mut world.w.bodies[world.handles[r.bones[s.foot].body]];
+            let v = rb.linvel();
+            let pull = capped(mul(sub(mul(sub(want, foot_at(s.foot)), 500.0), mul([v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], 40.0)), carried / u), 5.0 * carried * g * amount);
+            rb.apply_impulse(v3(pull, dt), true);
+            for &b in &leg {
+                drive.scale[b] *= 0.3;
+            }
+            if f >= 1.0 {
+                self.step = None;
+                self.step_ready = t + 0.15;
             }
         }
         // Arms: later behaviours take an arm over earlier ones.
@@ -600,6 +603,24 @@ impl Brain {
     pub fn feet(&self) -> &[usize] {
         &self.feet
     }
+
+    /// The upper arms: bones' indices.
+    pub fn upper_arms(&self) -> Vec<usize> {
+        self.arms.iter().map(|a| a.upper).collect()
+    }
+
+    /// Whether a step may begin at `t` (none is under way, and the last
+    /// has landed).
+    pub fn can_step(&self, t: f64) -> bool {
+        self.step.is_none() && t >= self.step_ready && self.fallen.is_none() && self.feet.len() >= 2
+    }
+
+    /// Has `foot` (a bone) stepped from `from` to `to` (px), from `t`, as
+    /// the `step` behaviour steps: carried there in 0.28 s, its leg soft.
+    pub fn order_step(&mut self, input: &SimInput, r: &RagdollInput, foot: usize, from: [f64; 3], to: [f64; 3], lift: f64, t: f64) {
+        self.step = Some(Step { foot, from, to, start: t, dur: 0.28, lift });
+        self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "step".into(), a: input.bodies[r.bones[foot].body].id.clone(), b: String::new(), speed: 0.0 });
+    }
 }
 
 /// How a ragdoll stands at one moment.
@@ -613,6 +634,10 @@ pub struct Stance {
     pub heading: f64,
     /// The way its trunk points (the scene's axes).
     pub trunk: [f64; 3],
+    /// The middle of its feet, and from there to where its weight is
+    /// headed, on the level (px).
+    pub support: [f64; 3],
+    pub toward: [f64; 3],
 }
 
 impl Stance {
@@ -639,13 +664,20 @@ impl Stance {
         let height = dot(sub(com, support), up);
         let fall_time = (height.max(1.0) / (len(input.gravity) * u).max(1e-9)).sqrt();
         let off = sub(add(com, mul(vel, fall_time)), support);
-        Some(Stance { height, heading: len(sub(off, mul(up, dot(off, up)))), trunk: quat_rotate(world.pose(r.bones[0].body).q, r.bones[0].along) })
+        let toward = sub(off, mul(up, dot(off, up)));
+        Some(Stance { height, heading: len(toward), trunk: quat_rotate(world.pose(r.bones[0].body).q, r.bones[0].along), support, toward })
     }
 
     /// Radians its trunk is over from how it pointed in `then`.
     pub fn tilt(&self, then: &Stance) -> f64 {
         libm::acos(dot(self.trunk, then.trunk).clamp(-1.0, 1.0))
     }
+}
+
+/// A bone's centre of mass (px).
+pub fn bone_origin(world: &World, r: &RagdollInput, bone: usize) -> [f64; 3] {
+    let c = world.w.bodies[world.handles[r.bones[bone].body]].center_of_mass();
+    [c.x as f64 * world.unit, c.y as f64 * world.unit, c.z as f64 * world.unit]
 }
 
 /// A bone's centre (px): halfway along it.

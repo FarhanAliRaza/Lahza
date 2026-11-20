@@ -727,24 +727,37 @@ picks by CPU. In the order built:
      MuJoCo) may not hold in rapier with these capsules and motors. If
      one is trained, this layout is what it must be trained to.
    - The no-training route (`search.rs`, `controller: {"type":
-     "search"}`): each 0.1 s, 16 tries 0.25 s ahead in a copy of the
-     world, each try three leans (ankles, hips, spine: six numbers; a
-     search over every joint would need far more tries), scored on
-     falling, weight past the feet, tilt, height and effort.
+     "search"}`): each 0.1 s, 16 tries 0.5 s ahead in copies of the
+     world. A try is a plan: three leans (ankles, hips, spine), a swing
+     of each upper arm (ten numbers; a search over every joint would
+     need far more tries), and for a third of them, when its weight is
+     headed off its feet, a step of the foot behind to where it is
+     falling to or up to 1.8 times as far. Scored on falling, weight past
+     the feet, tilt, height, effort and a little for a step. The tries
+     run on every core; the plans are drawn before any is tried and the
+     first of the least cost kept, so the take is the same on one core
+     as on four (tested to the byte, pinned).
    - Measured on the test figure, pushes at the chest in px/s, with no
-     helping force anywhere: motors holding the clip fall at 300; search
-     at the defaults holds 300 and falls at 450, and a 4 s take bakes in
-     7.4 s instead of 0.2 s (32 448 steps tried for 960 taken); 48 tries
-     do no better (21 s); a 0.5 s horizon holds 700 and falls at 1000
-     (14 s). Against part 4: `balance` without help holds 200; with its
-     help (a quarter of body weight on the hips) 1400, with steps 1800,
-     at no cost. So the search buys honest balance (no outside force)
-     over a narrow range at 40 to 70 times the bake; the helped
-     behaviours cover far more for nothing. To decide: whether takes
-     want the unhelped look enough to pay for it.
-   - Left: the search only leans; it does not step or use its arms.
-     Tries run one after the other on one core (they are independent:
-     four cores would cut the time by about four).
+     force on its body (a step's foot is carried by a force, as the
+     `step` behaviour's is): motors holding the clip fall at 300. Search
+     with a 0.25 s horizon (too short to see a step land) holds 300 and
+     falls at 450, as it did when it only leaned; at the default 0.5 s
+     it holds 1000 with one or two steps and falls at 1400; at 1 s it
+     holds 1400 and falls at 1800; 32 tries hold no more than 16.
+     Against part 4: `balance` with its help (a quarter of body weight
+     on the hips) holds 1400, with steps 1800, at no cost.
+   - What it costs, a 4 s take (0.2 s without): at the defaults 63 104
+     steps tried for 960 taken, 18.9 s on one core, 12.2 s on two, 6.3 s
+     on four (a try's copy of the world is made on its own core; four
+     cores give three times, not four); 1 s ahead, 9 s on four. So the
+     search now buys unhelped balance up to what the helped behaviour
+     holds, at 30 to 45 times the bake on four cores. To decide: whether
+     takes want the unhelped look enough to pay for it.
+   - Left: a step is the `step` behaviour's (a foot carried, not a leg
+     swung), one at a time, and only toward where it is falling; arms
+     only swing from the shoulder (no elbow, no reach for support); the
+     plan is ten numbers, not a pose; it does not get up. A search does
+     not see a crowd in its tries.
 7. **Crowds: done, as layers or as instances with impostors.**
    `simulation.crowds`. Once a frame every agent steers: toward its goal
    at its own pace, off agents within three radii (found by a grid), off
