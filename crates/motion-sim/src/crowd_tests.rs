@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 /// An agent: a comp at (x, 800) on the floor holding a five-bone figure
 /// (hips, spine, head, two legs) and a marker that its clip moves 100 px
 /// a second from the clip's start.
-fn agent(i: usize, x: f64, z: f64) -> Value {
+pub(crate) fn agent(i: usize, x: f64, z: f64) -> Value {
     let bone = |id: &str, at: [f64; 2], kids: Vec<Value>| json!({"id": format!("a{i}-{id}"), "kind": "comp", "three_d": true, "transform": {"position": at}, "layers": kids});
     let skeleton = bone("hips", [0.0, -90.0], vec![bone("spine", [0.0, -40.0], vec![bone("head", [0.0, -30.0], vec![])]), bone("leg_l", [-12.0, 5.0], vec![]), bone("leg_r", [12.0, 5.0], vec![])]);
     let marker = json!({"id": format!("a{i}-mark"), "kind": "mesh", "mesh": {"type": "sphere", "radius": 5},
@@ -16,11 +16,11 @@ fn agent(i: usize, x: f64, z: f64) -> Value {
     json!({"id": format!("a{i}"), "kind": "comp", "three_d": true, "transform": {"position": [x, 800], "z": z}, "layers": [skeleton, marker]})
 }
 
-fn floor() -> Value {
+pub(crate) fn floor() -> Value {
     json!({"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [6000, 40], "depth": 6000}, "transform": {"position": [960, 820]}, "body": {"type": "fixed"}})
 }
 
-fn crowd_scene(extra: Vec<Value>, crowd: Value, seed: u64, seconds: f64) -> Project {
+pub(crate) fn crowd_scene(extra: Vec<Value>, crowd: Value, seed: u64, seconds: f64) -> Project {
     let mut layers = vec![floor()];
     layers.extend((0..6).map(|i| agent(i, 300.0 + i as f64 * 80.0, 0.0)));
     layers.extend(extra);
@@ -31,12 +31,12 @@ fn crowd_scene(extra: Vec<Value>, crowd: Value, seed: u64, seconds: f64) -> Proj
     project(json!({"id": "s1", "simulation": {"seed": seed, "crowds": [c]}, "layers": layers}), seconds)
 }
 
-fn at(bake: &Bake, id: &str, k: usize) -> [f64; 3] {
+pub(crate) fn at(bake: &Bake, id: &str, k: usize) -> [f64; 3] {
     let s = bake.tracks[bake.track(id).unwrap_or_else(|| panic!("no track for {id}"))].samples[k];
     [s[0] as f64, s[1] as f64, s[2] as f64]
 }
 
-fn level(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn level(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 

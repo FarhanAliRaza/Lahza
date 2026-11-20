@@ -534,10 +534,16 @@ pub(super) fn check_skins(layers: &[CLayer], errors: &mut Vec<String>) -> bool {
 /// Gives every skinned mesh of a frame its joints' places: each joint
 /// layer's space → the mesh layer's, as keys, parents and bakes have them.
 pub(super) fn pose_skins(scene: &CScene, tc: f64, space: &Space, layers: &mut [LayerState]) {
+    pose_skins_in(&scene.layers, tc, None, space, layers)
+}
+
+/// `pose_skins` for the states of `under` (a scene's layers, or a comp's
+/// children with the comp's space). Skins already posed are left alone.
+pub(super) fn pose_skins_in(under: &[CLayer], tc: f64, inherited: Option<Step>, space: &Space, layers: &mut [LayerState]) {
     fn each(layers: &mut [LayerState], f: &mut dyn FnMut(&mut MeshState)) {
         for l in layers {
             match &mut l.content {
-                Content::Mesh(m) if m.skin.is_some() => f(m),
+                Content::Mesh(m) if m.skin.as_ref().is_some_and(|s| s.joints.is_empty()) => f(m),
                 Content::Group(children) => each(children, f),
                 _ => {}
             }
@@ -556,7 +562,7 @@ pub(super) fn pose_skins(scene: &CScene, tc: f64, space: &Space, layers: &mut [L
         return;
     }
     let mut worlds: HashMap<Arc<str>, Mat4> = HashMap::with_capacity(wanted.len());
-    visit(&scene.layers, tc, None, space, None, &mut |l, world, _, _| {
+    visit(under, tc, inherited, space, None, &mut |l, world, _, _| {
         if wanted.contains(&l.id) {
             worlds.insert(l.id.clone(), world);
         }

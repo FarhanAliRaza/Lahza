@@ -165,7 +165,7 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
     events.append(&mut herd.events);
     // A crowd's agents, and the bones of those knocked down from when
     // they were (the others' stay their agents').
-    let (agents, let_go) = herd.finish(input);
+    let (agents, let_go, herds) = herd.finish(input);
     for (body, at) in let_go {
         if let Some(track) = dynamic.iter().position(|&i| i == body) {
             tracks[track].from = at;
@@ -185,7 +185,7 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
             Mind::Search(s) => (stats.tried_steps, stats.search_seconds) = (stats.tried_steps + s.tried_steps, stats.search_seconds + s.seconds),
         }
     }
-    Ok((Bake { hash: input.hash(), start: input.start, rate: input.rate, tracks, events }, stats))
+    Ok((Bake { hash: input.hash(), start: input.start, rate: input.rate, tracks, events, herds }, stats))
 }
 
 /// Bakes scene `scene` of a compiled project. `dir` is the project's
@@ -208,6 +208,8 @@ mod behaviour_tests;
 mod controller_tests;
 #[cfg(test)]
 mod crowd_tests;
+#[cfg(test)]
+mod herd_tests;
 #[cfg(test)]
 mod ragdoll_tests;
 #[cfg(test)]

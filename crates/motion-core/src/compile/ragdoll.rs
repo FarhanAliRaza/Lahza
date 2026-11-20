@@ -105,11 +105,21 @@ impl Compiled {
         // The document's ragdolls, then a limp one per agent of a crowd
         // that has a `ragdoll` (let go when the agent is knocked down).
         let limp = CRagdoll { release: None, rest: None, strength: Prop::constant(0.0), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new() };
-        let agents: Vec<crate::sim::Ragdoll> = set
+        let mut agents: Vec<crate::sim::Ragdoll> = set
             .crowds
             .iter()
             .flat_map(|c| c.ragdoll.iter().flat_map(move |r| c.agents.iter().map(move |a| crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), ..crate::sim::Ragdoll::of(format!("{}/{a}", c.id), a.clone(), r.mass, r.thickness, r.friction) })))
             .collect();
+        // Then one for each crowd of instances, made as many times as may
+        // be down at once (its bones' bodies are `<crowd>#<n>/<layer>`).
+        let mut pools: Vec<Option<(&str, usize)>> = vec![None; agents.len()];
+        for c in &set.crowds {
+            if let (Some(character), Some(r)) = (&c.character, &c.ragdoll) {
+                let many = if c.starts.is_empty() { c.count.unwrap_or(0) as usize } else { c.starts.len() };
+                agents.push(crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), ..crate::sim::Ragdoll::of(format!("{}#0", c.id), character.clone(), r.mass, r.thickness, r.friction) });
+                pools.push(Some((&c.id, (r.max as usize).min(many).max(1))));
+            }
+        }
         let own = set.ragdolls.len();
         let specs: Vec<(&crate::sim::Ragdoll, &CRagdoll)> = set.ragdolls.iter().zip(&sim.ragdolls).chain(agents.iter().map(|a| (a, &limp))).collect();
         if specs.is_empty() {
@@ -370,6 +380,29 @@ impl Compiled {
                     b.strength = vec![0.0];
                 }
                 out.release = u32::MAX;
+            }
+            if let Some((crowd, many)) = pools.get(n.wrapping_sub(own)).copied().flatten() {
+                let (first, count) = (first_body, input.bodies.len() - first_body);
+                let names: Vec<String> = input.bodies[first..].iter().map(|b| b.id.clone()).collect();
+                for slot in 0..many {
+                    let base = if slot == 0 { first } else { input.bodies.len() };
+                    for k in 0..count {
+                        if slot > 0 {
+                            let body = input.bodies[first + k].clone();
+                            input.bodies.push(body);
+                        }
+                        let body = &mut input.bodies[base + k];
+                        body.id = format!("{crowd}#{slot}/{}", names[k]);
+                        body.group = input.ragdolls.len() as u32 + 1;
+                    }
+                    let mut copy = out.clone();
+                    copy.id = format!("{crowd}#{slot}");
+                    for b in &mut copy.bones {
+                        b.body = b.body - first + base;
+                    }
+                    input.ragdolls.push(copy);
+                }
+                continue;
             }
             input.ragdolls.push(out);
         }

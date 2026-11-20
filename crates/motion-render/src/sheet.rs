@@ -68,6 +68,6 @@ pub fn contact_sheet(frames: &[(String, RgbaImage)], columns: u32, thumb_width: 
             view: None,
         });
     }
-    let state = FrameState { t: 0.0, scene: None, background: Color::parse("#18181c").unwrap(), width, height, layers };
+    let state = FrameState { t: 0.0, scene: None, background: Color::parse("#18181c").unwrap(), width, height, layers, pictures: Vec::new() };
     renderer.render_states(&[state])
 }

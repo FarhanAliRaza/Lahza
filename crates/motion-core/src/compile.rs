@@ -14,6 +14,11 @@ use crate::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+thread_local! {
+    /// The pictures of the frame being put together (`FrameState::pictures`).
+    static PICTURES: std::cell::RefCell<Vec<Arc<Picture>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 mod crowd;
 mod instancer;
 mod meshes;
@@ -94,6 +99,21 @@ pub struct FrameState {
     pub t: f64,
     pub scene: Option<Arc<str>>,
     pub background: Color,
+    pub width: u32,
+    pub height: u32,
+    pub layers: Vec<LayerState>,
+    /// Pictures that image layers of the frame name (`Content::Image`'s
+    /// `src`): a renderer draws each once and keeps it.
+    pub pictures: Vec<Arc<Picture>>,
+}
+
+/// A picture made of layers (a crowd's far agents are pictures of its
+/// character): `layers` on a clear ground, `width` by `height` px.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Picture {
+    pub name: Arc<str>,
+    /// Changes when what the picture shows does.
+    pub key: u64,
     pub width: u32,
     pub height: u32,
     pub layers: Vec<LayerState>,
@@ -518,6 +538,8 @@ pub struct CLayer {
     kind: CKind,
     /// A body of the scene's simulation: the bake places it.
     body: Option<Box<sim::CBody>>,
+    /// A crowd's character: the bake places its instances.
+    herd: Option<Box<crowd::CHerd>>,
 }
 
 /// `follow`: placed on sibling `target`'s path.
@@ -1241,6 +1263,7 @@ impl<'a> Compiler<'a> {
             hidden: c.hidden,
             kind,
             body: self.body(c, id, shift),
+            herd: None,
         }
     }
 
@@ -1515,6 +1538,8 @@ impl Compiled {
             c.bake = project.bakes.get(id).cloned();
             let layers = c.layers(&scene.layers, step, pre_roll);
             let sim = c.simulation(scene, start, end, pre_roll);
+            let mut layers = layers;
+            crowd::bind_herds(&mut layers, &sim, pre_roll);
             let skinned = sim::check_skins(&layers, &mut c.errors);
             let lighting = c.lighting(scene, pre_roll, start);
             let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
@@ -1666,6 +1691,7 @@ impl Compiled {
             width: self.settings.width,
             height: self.settings.height,
             layers: Vec::new(),
+            pictures: Vec::new(),
         };
         // A transition centred on scene j's cut shows j−1 and j together.
         for j in (1..self.scenes.len()).rev() {
@@ -1683,12 +1709,14 @@ impl Compiled {
             frame.scene = Some(b.id.clone());
             frame.background = a.background.at(ta + a.pre_roll);
             frame.layers = self.transition(a, b, tr, p, ta, tb);
+            frame.pictures = PICTURES.with(|p| std::mem::take(&mut *p.borrow_mut()));
             return frame;
         }
         let Some(scene) = self.scene_at(t) else { return frame };
         frame.scene = Some(scene.id.clone());
         frame.background = scene.background.at(t + scene.pre_roll);
         self.scene_layers(scene, t, &mut frame.layers);
+        frame.pictures = PICTURES.with(|p| std::mem::take(&mut *p.borrow_mut()));
         frame
     }
 
@@ -1729,6 +1757,7 @@ impl Compiled {
         let tc = t + scene.pre_roll;
         let first = out.len();
         emit(&scene.layers, tc, None, &self.camera(scene, tc), 1.0, out);
+        PICTURES.with(|p| p.borrow_mut().extend(crowd::take_pictures(&|| Arc::new(scene.lighting.at(tc)))));
         if has_meshes(&out[first..]) {
             let lighting = Arc::new(scene.lighting.at(tc));
             meshes::light_meshes(&mut out[first..], &lighting);
@@ -2191,7 +2220,10 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             let (target, opacity) = if group { (&mut kids, 1.0) } else { (&mut *out, parent_opacity * own_opacity) };
             match &l.kind {
                 CKind::Instancer(n) => instancer::emit_copies(n, layers, i, tc, t, step, inherited, space, &inner, opacity, cache, target),
-                _ => emit(l.children(), sim::child_time(l, t, tc, space), step, &inner, opacity, target),
+                _ => match &l.herd {
+                    Some(h) if !space.keyed => crowd::emit_agents(l, h, t, step, space, opacity, target),
+                    _ => emit(l.children(), sim::child_time(l, t, tc, space), step, &inner, opacity, target),
+                },
             }
             if !group {
                 return;

@@ -9,7 +9,8 @@
 //! is a capsule that is moved, not pushed: bodies bounce off it.
 
 use crate::world::{pose, v3, Rng, World};
-use lahza_motion_core::sim::{CrowdInput, Pose, SimEvent, SimInput, Track};
+use lahza_motion_core::sim::{CrowdInput, HerdTrack, Pose, SimEvent, SimInput, Track};
+use std::collections::HashMap;
 use rapier3d::prelude::*;
 
 struct Agent {
@@ -33,6 +34,13 @@ struct Agent {
 pub struct Herd {
     agents: Vec<Vec<Agent>>,
     pub events: Vec<SimEvent>,
+    /// Per crowd of instances: its samples so far, each agent's ragdoll
+    /// of the pool, and how many of the pool are taken.
+    rows: Vec<Vec<[f32; 4]>>,
+    slots: Vec<Vec<u32>>,
+    taken: Vec<usize>,
+    /// Whose capsule a body is.
+    proxies: HashMap<RigidBodyHandle, (usize, usize)>,
 }
 
 fn len2(v: [f64; 2]) -> f64 {
@@ -43,11 +51,16 @@ fn len2(v: [f64; 2]) -> f64 {
 /// to face `heading`.
 fn place(c: &CrowdInput, k: usize, at: [f64; 2], heading: [f64; 2]) -> Pose {
     let a = &c.agents[k];
-    let f = lahza_motion_core::sim::quat_rotate(a.start.q, [c.facing[0], 0.0, c.facing[1]]);
-    // A turn about y takes the level angle down by its own.
-    let turn = libm::atan2(f[2], f[0]) - libm::atan2(heading[1], heading[0]);
+    let turn = turn(c, k, heading);
     let q = lahza_motion_core::sim::quat_mul([0.0, libm::sin(turn / 2.0), 0.0, libm::cos(turn / 2.0)], a.start.q);
     Pose { p: [at[0], a.start.p[1], at[1]], q }
+}
+
+/// The turn about y that has agent `k` face `heading`.
+fn turn(c: &CrowdInput, k: usize, heading: [f64; 2]) -> f64 {
+    let f = lahza_motion_core::sim::quat_rotate(c.agents[k].start.q, [c.facing[0], 0.0, c.facing[1]]);
+    // A turn about y takes the level angle down by its own.
+    libm::atan2(f[2], f[0]) - libm::atan2(heading[1], heading[0])
 }
 
 fn sample(p: &Pose) -> [f32; 7] {
@@ -58,6 +71,7 @@ impl Herd {
     pub fn new(input: &SimInput, world: &mut World) -> Herd {
         let m = 1.0 / world.unit;
         let mut agents = Vec::new();
+        let mut proxies = HashMap::new();
         for (n, c) in input.crowds.iter().enumerate() {
             let mut herd = Vec::with_capacity(c.agents.len());
             for (k, a) in c.agents.iter().enumerate() {
@@ -71,6 +85,8 @@ impl Herd {
                 let half = (c.height / 2.0 - c.radius).max(0.0);
                 let proxy = world.w.insert_body(RigidBodyBuilder::kinematic_position_based().pose(pose(&now, world.unit)));
                 world.w.insert_collider(ColliderBuilder::capsule_y((half * m) as f32, (c.radius * m) as f32).translation(v3([0.0, -c.height / 2.0, 0.0], m)).friction(0.6), Some(proxy));
+                proxies.insert(proxy, (n, k));
+                let room = if c.instanced { 0 } else { input.samples as usize + 1 };
                 herd.push(Agent {
                     at,
                     vel: [0.0; 2],
@@ -82,12 +98,19 @@ impl Herd {
                     proxy,
                     now,
                     next: now,
-                    track: Track { id: a.id.clone(), from: 0, rest: a.rest, samples: Vec::with_capacity(input.samples as usize + 1), clock: Vec::with_capacity(input.samples as usize + 1) },
+                    track: Track { id: a.id.clone(), from: 0, rest: a.rest, samples: Vec::with_capacity(room), clock: Vec::with_capacity(room) },
                 });
             }
             agents.push(herd);
         }
-        Herd { agents, events: Vec::new() }
+        Herd {
+            agents,
+            events: Vec::new(),
+            rows: input.crowds.iter().map(|c| Vec::with_capacity(if c.instanced { c.agents.len() * (input.samples as usize + 1) } else { 0 })).collect(),
+            slots: input.crowds.iter().map(|c| vec![u32::MAX; if c.instanced { c.agents.len() } else { 0 }]).collect(),
+            taken: vec![0; input.crowds.len()],
+            proxies,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -123,11 +146,24 @@ impl Herd {
             }
         }
         for (n, c) in input.crowds.iter().enumerate() {
-            let places: Vec<([f64; 2], bool)> = self.agents[n].iter().map(|a| (a.at, a.down.is_some())).collect();
+            let places: Vec<[f64; 2]> = self.agents[n].iter().map(|a| a.at).collect();
+            // Who is near whom: the agents by the square they stand in
+            // (three radii a side, as far as one pushes another).
+            let reach = 3.0 * c.radius;
+            let square = |at: [f64; 2]| ((at[0] / reach).floor() as i64, (at[1] / reach).floor() as i64);
+            let mut squares: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+            for (j, at) in places.iter().enumerate() {
+                squares.entry(square(*at)).or_default().push(j as u32);
+            }
+            let mut near: Vec<u32> = Vec::new();
             for (k, a) in self.agents[n].iter_mut().enumerate() {
                 a.now = a.next;
-                a.track.samples.push(sample(&a.now));
-                a.track.clock.push(Self::clock(c, a) as f32);
+                if c.instanced {
+                    self.rows[n].push([a.now.p[0] as f32, a.now.p[2] as f32, turn(c, k, a.heading) as f32, Self::clock(c, a) as f32]);
+                } else {
+                    a.track.samples.push(sample(&a.now));
+                    a.track.clock.push(Self::clock(c, a) as f32);
+                }
                 if a.down.is_some() {
                     continue;
                 }
@@ -152,9 +188,18 @@ impl Herd {
                     want[1] += away[1] * f + side[1] * s * f * 0.6;
                 };
                 if !arrived {
-                    for (j, (other, _)) in places.iter().enumerate() {
-                        if j != k {
-                            push(*other, 3.0 * c.radius, 1.6);
+                    // (In the agents' order, whatever the squares': the sum is the same sum.)
+                    let (sx, sz) = square(a.at);
+                    near.clear();
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            near.extend(squares.get(&(sx + dx, sz + dz)).into_iter().flatten());
+                        }
+                    }
+                    near.sort_unstable();
+                    for &j in &near {
+                        if j as usize != k {
+                            push(places[j as usize], reach, 1.6);
                         }
                     }
                     let feet = c.agents[k].start.p[1];
@@ -206,7 +251,7 @@ impl Herd {
             }
             let (b1, b2) = (world.w.colliders[pair.collider1].parent(), world.w.colliders[pair.collider2].parent());
             for (mine, other) in [(b1, b2), (b2, b1)] {
-                let Some((n, a)) = self.agents.iter().enumerate().find_map(|(n, herd)| herd.iter().position(|a| Some(a.proxy) == mine && a.down.is_none()).map(|a| (n, a))) else { continue };
+                let Some((n, a)) = mine.and_then(|h| self.proxies.get(&h).copied()).filter(|&(n, a)| self.agents[n][a].down.is_none()) else { continue };
                 let Some(body) = other.and_then(|h| world.handles.iter().position(|x| *x == h)) else { continue };
                 if !world.released[body] {
                     continue;
@@ -227,19 +272,31 @@ impl Herd {
             let agent = &mut self.agents[n][a];
             agent.down = Some(k + 1);
             agent.next = agent.now;
-            self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "knock".into(), a: agent.track.id.clone(), b: input.bodies[body].id.clone(), speed: speed.round() });
+            let who = if c.instanced { format!("{}#{a}", c.id) } else { agent.track.id.clone() };
+            self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "knock".into(), a: who, b: input.bodies[body].id.clone(), speed: speed.round() });
             // Its capsule is gone; its bones take over where the clip has them.
             let colliders: Vec<ColliderHandle> = world.w.bodies[agent.proxy].colliders().to_vec();
             for h in colliders {
                 world.w.colliders[h].set_enabled(false);
             }
-            let Some(r) = c.agents[a].ragdoll else { continue };
-            let cycle = c.agents[a].local.first().map_or(1, |l| l.len().max(2) - 1) as f64;
+            // Its own ragdoll, or the next of the pool while there is one.
+            let (ragdoll, local) = if c.instanced {
+                let slot = self.taken[n];
+                if slot < c.pool.len() {
+                    self.taken[n] += 1;
+                    self.slots[n][a] = slot as u32;
+                }
+                (c.pool.get(slot).copied(), &c.local)
+            } else {
+                (c.agents[a].ragdoll, &c.agents[a].local)
+            };
+            let Some(r) = ragdoll else { continue };
+            let cycle = local.first().map_or(1, |l| l.len().max(2) - 1) as f64;
             let turns = agent.walked / c.stride + agent.phase;
             let at = (turns - turns.floor()) * cycle;
             let root = world.w.bodies[agent.proxy].position();
             let root = Pose { p: [root.translation.x as f64 * u, root.translation.y as f64 * u, root.translation.z as f64 * u], q: [root.rotation.x as f64, root.rotation.y as f64, root.rotation.z as f64, root.rotation.w as f64] };
-            for (bone, local) in input.ragdolls[r].bones.iter().zip(&c.agents[a].local) {
+            for (bone, local) in input.ragdolls[r].bones.iter().zip(local) {
                 let i = (at.floor() as usize).min(local.len() - 1);
                 let j = (i + 1).min(local.len() - 1);
                 let f = at - i as f64;
@@ -268,17 +325,38 @@ impl Herd {
 
     /// The agents' tracks (after the last `plan`), and for each bone body
     /// let go the sample it was let go at.
-    pub fn finish(self, input: &SimInput) -> (Vec<Track>, Vec<(usize, u32)>) {
+    pub fn finish(mut self, input: &SimInput) -> (Vec<Track>, Vec<(usize, u32)>, Vec<HerdTrack>) {
         let mut tracks = Vec::new();
         let mut released = Vec::new();
+        let mut herds = Vec::new();
         for (n, herd) in self.agents.into_iter().enumerate() {
+            let c = &input.crowds[n];
+            if c.instanced {
+                for (k, a) in herd.iter().enumerate() {
+                    if let (Some(at), Some(&r)) = (a.down, c.pool.get(self.slots[n][k] as usize)) {
+                        released.extend(input.ragdolls[r].bones.iter().map(|b| (b.body, at)));
+                    }
+                }
+                let Some(first) = c.agents.first() else { continue };
+                herds.push(HerdTrack {
+                    id: c.id.clone(),
+                    count: c.agents.len() as u32,
+                    rest: first.rest,
+                    y: first.start.p[1],
+                    q: first.start.q,
+                    samples: std::mem::take(&mut self.rows[n]),
+                    down: herd.iter().map(|a| a.down.unwrap_or(u32::MAX)).collect(),
+                    slot: std::mem::take(&mut self.slots[n]),
+                });
+                continue;
+            }
             for (k, a) in herd.into_iter().enumerate() {
-                if let (Some(at), Some(r)) = (a.down, input.crowds[n].agents[k].ragdoll) {
+                if let (Some(at), Some(r)) = (a.down, c.agents[k].ragdoll) {
                     released.extend(input.ragdolls[r].bones.iter().map(|b| (b.body, at)));
                 }
                 tracks.push(a.track);
             }
         }
-        (tracks, released)
+        (tracks, released, herds)
     }
 }
