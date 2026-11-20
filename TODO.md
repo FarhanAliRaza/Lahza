@@ -85,10 +85,38 @@ Not done, and why:
   less, so a round caster no longer widens it. On the shadow test scene
   the frame is the floor's and nothing changes (456 and 472 pixels off
   the CPU's by more than 24 at 4x, before and after): the gain is for
-  round casters with no floor under the light. Still as before: a point
-  light's map (its frame is from the boxes, and a caster with corners on
-  both sides of the light gives the whole view), and meshes the GPU
-  generates (the CPU has no points: their boxes).
+  round casters with no floor under the light.
+  Since, a point light's map (`ShadowMap::gpu_point`,
+  `CasterBox::seen_from`; an area light's is one too): it is aimed as
+  the CPU's is, at the mean of the casters' points (each pooled mesh
+  keeps its own mean; it was the middle of the boxes' corners, another
+  axis and so another frame), and a caster in front of the light is seen
+  no wider than its ball is (the planes through the light that touch its
+  ellipsoid). One with corners on both sides of the light's plane no
+  longer gives the whole view ([-3, 3] each way): it is framed from its
+  triangles wholly in front, as the CPU leaves out one with a point
+  behind the light, where its points are at hand and few (4096
+  triangles: a floor, a wall); else from its box cut at that plane.
+  `gpu_matches_cpu_area_lights` on software Vulkan through the
+  visibility pass at 4x (`LAHZA_MOTION_VIS_REPORT=1`,
+  `LAHZA_SHADOW_FRAMES=1` prints both frames): the CPU's frame is
+  [-0.1350, -0.1964, 0.3989, 0.1300]; the GPU's was [-0.352, -0.164,
+  0.219, 0.292] (1.07 and 1.40 times as wide, about another axis) and is
+  [-0.1351, -0.1964, 0.3989, 0.1302]. Pixels over 3 levels: 699 before,
+  609 after (the rest are the 4x pass's edges); away from edges 13
+  (worst 5) and 7 (worst 4). Seen in the difference picture: the dotted
+  ring along the ball's and the cube's shadows is gone. What that test
+  showed was this, not a caster around the light: its floor crosses the
+  camera and casts nothing, so no caster there is on both sides. That
+  case is tested on its own
+  (`a_point_lights_frame_holds_its_casters_and_little_more`: a floor
+  around the light framed as the CPU frames it; a ball's frame within 5%
+  of its points', its box's a third larger). Not run on the card: the
+  118 pixels there are to be counted again. Still as before: meshes the
+  GPU generates (the CPU has no points: their boxes, and the boxes'
+  middle for the aim as soon as one caster has none), and a closed
+  caster around the light is framed with its faces turned from the light
+  (the CPU leaves those out).
 - **Motion blur: what is left.** A frame takes the sub-frames its motion
   needs (`motion_px` in motion-render's lib.rs), and a sub-frame does not
   draw again what the one before it left as it needs it: a group whose
@@ -108,6 +136,36 @@ Not done, and why:
   against 112: within the noise there, where the time is the passes that
   draw the frame itself. To run on the RTX 3060 (its profile gives the
   passes' times) before any of the "not done" is worth doing.
+  Since, groups with a mesh: per group. `same_groups` goes by what each
+  mesh primitive reads (`list::MeshRead`, written as the batch is
+  placed: its own rows, the environment's, its lights' shadow maps and
+  their casters, its triangles on the target, its tile bins; and the
+  pooled meshes and shadow jobs in those rows), not by the list's mesh
+  rows whole. And it found that no group with a mesh had ever been left
+  as drawn, even with every mesh still: a mesh primitive carries its
+  layer list's number, which went on counting from one sub-frame's list
+  to the next, so the primitives were never the same. The number now
+  starts again in every list (`MeshCache::begin`). Tested through the
+  compute raster and the visibility pass at 4x
+  (`a_still_mesh_group_is_not_drawn_again_beside_a_moving_mesh`: a comp
+  with a mesh under a glow beside a mesh that moves is left as drawn,
+  the frame is bit for bit the one with every group drawn, and a comp
+  whose mesh turns is drawn each time). A mesh under an effect in the
+  same layer list as the moving mesh is still drawn each time, rightly:
+  it reads the list's shadow maps and has the mover as an occluder.
+  `benchmark_motion_blur_with_a_still_mesh_group` (`--ignored`, 960 x
+  540, 8 sub-frames) on Mesa's software Vulkan, the compute raster: 677
+  ms a frame with the group left as drawn (4 groups a frame), 679 with
+  every group drawn, 682 with the comp's mesh turning (657, 676 and 650
+  in another run): within the noise. The wait for the GPU is 10 to 18 ms
+  shorter and telling the stretches apart costs 8 ms of CPU (the two
+  512 x 512 CPU-drawn shadow maps are rows of the list and are compared
+  whole; a list for the visibility pass has no such rows). Nothing is
+  claimed for a card: to run there. Not done: traced frames' groups (a
+  traced group is never the same: its picture is new each sub-frame, and
+  where samples share traces nothing is compared at all), and a mesh
+  primitive still counts as reading the groups before it, so one
+  earlier group that moved has it drawn again.
 - **Image memory: what is left.** Textures are held at the size they show
   (`Images::get_sized`), the pool's budget follows the GPU's memory, and
   new texels are added to the GPU's copy (all of it again only after

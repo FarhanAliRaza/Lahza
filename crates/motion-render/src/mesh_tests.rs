@@ -1796,3 +1796,142 @@ fn a_casters_span_holds_its_points_and_is_no_wider_than_its_box() {
     assert!((with - 100.0).abs() < 1.0, "a ball of 100 across spans {with}");
     assert!(boxed > 170.0, "its box alone spans {boxed}");
 }
+
+/// A point light's GPU-drawn map frames its casters nearly as the CPU's
+/// does from their points (`CasterBox::seen_from`): a caster in front of
+/// the light by its box and no wider than its ball is seen; one around
+/// the light by its triangles wholly in front, as the CPU leaves out one
+/// with a point behind the light; one whose points are not at hand by its
+/// box cut at the light's plane, not by the whole view.
+#[test]
+fn a_point_lights_frame_holds_its_casters_and_little_more() {
+    use crate::mesh3d::CasterBox;
+    use lahza_motion_core::mesh::Mesh;
+    use lahza_motion_core::space::Mat4;
+    use std::sync::Arc;
+    let mut seed = 0x9e3779b9u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as f64 / u32::MAX as f64
+    };
+    let (pos, axis, u, v) = ([10.0, -20.0, 5.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+    // What the CPU's map takes: the points of the triangles (here: all
+    // points, or those of `tris`) wholly in front, as x / z and y / z.
+    let seen = |pts: &[[f64; 3]], tris: Option<&[[u32; 3]]>| {
+        let q: Vec<[f64; 3]> = pts.iter().map(|p| [p[0] - pos[0], p[1] - pos[1], p[2] - pos[2]]).collect();
+        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let mut take = |q: [f64; 3]| b = [b[0].min((q[0] / q[2]).clamp(-3.0, 3.0)), b[1].min((q[1] / q[2]).clamp(-3.0, 3.0)), b[2].max((q[0] / q[2]).clamp(-3.0, 3.0)), b[3].max((q[1] / q[2]).clamp(-3.0, 3.0))];
+        match tris {
+            None => q.iter().for_each(|q| take(*q)),
+            Some(tris) => tris.iter().filter(|t| t.iter().all(|k| q[*k as usize][2] >= 1.0)).for_each(|t| t.iter().for_each(|k| take(q[*k as usize]))),
+        }
+        b
+    };
+    let caster = |pts: &[[f64; 3]], round: bool| {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for p in pts {
+            for k in 0..3 {
+                (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
+            }
+        }
+        let reach = pts.iter().map(|p| (0..3).map(|k| (p[k] - (lo[k] + hi[k]) * 0.5).powi(2)).sum::<f64>()).fold(0.0, f64::max).sqrt();
+        CasterBox::new(lo, hi, round.then_some(reach), &Mat4::IDENTITY)
+    };
+    let holds = |frame: [f64; 4], truth: [f64; 4]| frame[0] <= truth[0] + 1e-9 && frame[1] <= truth[1] + 1e-9 && frame[2] >= truth[2] - 1e-9 && frame[3] >= truth[3] - 1e-9;
+    let area = |b: [f64; 4]| (b[2] - b[0]) * (b[3] - b[1]);
+    // In front of the light: clouds of points anywhere there.
+    for _ in 0..200 {
+        let c = [next() * 400.0 - 200.0, next() * 400.0 - 200.0, 150.0 + next() * 400.0];
+        let pts: Vec<[f64; 3]> = (0..40).map(|_| [c[0] + next() * 120.0 - 60.0, c[1] + next() * 40.0 - 20.0, c[2] + next() * 90.0 - 45.0]).collect();
+        let (truth, with, boxed) = (seen(&pts, None), caster(&pts, true).seen_from(pos, axis, u, v).unwrap(), caster(&pts, false).seen_from(pos, axis, u, v).unwrap());
+        assert!(holds(with, truth), "the frame {with:?} leaves out points of {truth:?}");
+        assert!(holds(boxed, with), "the frame {with:?} is wider than the box's {boxed:?}");
+    }
+    // A ball of radius 50 off to one side: seen as wide as it is, where
+    // its box is seen half again as large.
+    let ball: Vec<[f64; 3]> = (0..4000)
+        .map(|_| {
+            let (z, a) = (next() * 2.0 - 1.0, next() * std::f64::consts::TAU);
+            let r = (1.0 - z * z).sqrt();
+            [150.0 + 50.0 * r * a.cos(), 90.0 + 50.0 * r * a.sin(), 200.0 + 50.0 * z]
+        })
+        .collect();
+    let (truth, with, boxed) = (seen(&ball, None), caster(&ball, true).seen_from(pos, axis, u, v).unwrap(), caster(&ball, false).seen_from(pos, axis, u, v).unwrap());
+    assert!(holds(with, truth) && area(with) < area(truth) * 1.05, "a ball's frame {with:?} for {truth:?}");
+    assert!(area(boxed) > area(truth) * 1.3, "its box alone: {boxed:?}");
+    // A floor around the light (the light over its middle, looking along
+    // it): a grid of 8 x 8 quads from z = -400 to 400.
+    let n = 9u32;
+    let floor: Vec<[f64; 3]> = (0..n * n).map(|k| [(k % n) as f64 * 100.0 - 400.0, 60.0, (k / n) as f64 * 100.0 - 400.0]).collect();
+    let tris: Vec<[u32; 3]> = (0..(n - 1) * (n - 1)).flat_map(|k| { let i = k / (n - 1) * n + k % (n - 1); [[i, i + 1, i + n], [i + 1, i + n + 1, i + n]] }).collect();
+    let truth = seen(&floor, Some(&tris));
+    let mut with = caster(&floor, false);
+    with.points = Some((Arc::new(Mesh { positions: floor.iter().map(|p| p.map(|x| x as f32)).collect(), tris: tris.clone(), ..Default::default() }), Mat4::IDENTITY));
+    let with = with.seen_from(pos, axis, u, v).unwrap();
+    assert!((0..4).all(|k| (with[k] - truth[k]).abs() < 1e-6), "a floor around the light: {with:?}, the CPU's {truth:?}");
+    assert!(area(with) < 36.0 * 0.9, "and not the whole view: {with:?}");
+    // The same without its points: its box cut at the light's plane,
+    // which holds what the CPU frames and is within the view.
+    let cut = caster(&floor, false).seen_from(pos, axis, u, v).unwrap();
+    assert!(holds(cut, truth) && cut.iter().all(|x| x.abs() <= 3.0), "{cut:?} for {truth:?}");
+    // A small thing beside the light, across its plane: a corner of the
+    // view, where it was all of it.
+    let beside: Vec<[f64; 3]> = (0..8).map(|k| [pos[0] + 300.0 + (k & 1) as f64 * 40.0, pos[1] + (k >> 1 & 1) as f64 * 40.0, pos[2] - 20.0 + (k >> 2) as f64 * 220.0]).collect();
+    let cut = caster(&beside, false).seen_from(pos, axis, u, v).unwrap();
+    assert!(area(cut) < 36.0 * 0.2 && cut[0] > 1.0, "{cut:?}");
+    // Behind the light: not in the map.
+    let behind: Vec<[f64; 3]> = beside.iter().map(|p| [p[0], p[1], p[2] - 400.0]).collect();
+    assert!(caster(&behind, true).seen_from(pos, axis, u, v).is_none());
+}
+
+/// A comp with a mesh under a glow, beside a mesh that moves across the
+/// frame (`turn`: the comp's mesh turns too), with motion blur.
+pub(crate) fn still_mesh_beside_a_mover(w: u32, h: u32, samples: u32, turn: f64) -> Project {
+    let k = w as f64 / 320.0;
+    let mut p = scene(w, h, json!({"layers": [
+        {"id": "sign", "kind": "comp", "effects": [{"type": "glow", "color": "#ffd23f", "radius": 6.0 * k, "intensity": 0.8}], "layers": [
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "torus", "radius": 34.0 * k, "tube": 12.0 * k}, "material": {"preset": "plastic", "color": "#ffd23f"},
+             "transform": {"position": [100.0 * k, 90.0 * k], "rotation_x": 50, "rotation_y": {"keys": [{"at": 0, "v": 0}, {"at": 2, "v": turn}]}}}]},
+        {"id": "mover", "kind": "mesh", "mesh": {"type": "box", "size": [36.0 * k, 36.0 * k], "depth": 36.0 * k}, "material": {"preset": "plastic", "color": "#3070e0"},
+         "transform": {"position": {"keys": [{"at": 0, "v": [40.0 * k, 130.0 * k]}, {"at": 2, "v": [300.0 * k, 130.0 * k]}]}, "rotation_y": 30}}
+    ]}));
+    p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples });
+    p
+}
+
+/// A mesh that stands still in a picture of its own (a comp under a
+/// glow) is not drawn again by a motion-blurred frame's sub-frames
+/// because another mesh moved (`gpu::same_groups` goes by what each mesh
+/// primitive reads, not by the list's mesh rows whole), and the frame is
+/// the one drawn with every group drawn in every sub-frame. One whose
+/// own mesh turns is drawn each time. Through the compute raster and
+/// through the visibility pass and the mesh pool.
+#[test]
+fn a_still_mesh_group_is_not_drawn_again_beside_a_moving_mesh() {
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let plain = || Some(Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() })).filter(|r| r.is_gpu());
+    for (name, make) in [("the compute raster", &plain as &dyn Fn() -> Option<Renderer>), ("the visibility pass", &vis_gpu)] {
+        let frame = |turn: f64, off: bool| {
+            let c = Compiled::new(&still_mesh_beside_a_mover(320, 180, 4, turn));
+            assert!(c.errors.is_empty(), "{:?}", c.errors);
+            let mut r = make()?;
+            crate::gpu::TEST_STILL.with(|t| t.set((off, 0)));
+            let img = r.render(&c, 1.0);
+            let reused = crate::gpu::TEST_STILL.with(|t| t.replace((false, 0))).1;
+            Some((img, reused))
+        };
+        let Some((with, reused)) = frame(0.0, false) else {
+            eprintln!("skipping {name}: no such GPU");
+            continue;
+        };
+        let (without, none) = frame(0.0, true).unwrap();
+        eprintln!("{name}: {reused} groups left as the sub-frame before drew them");
+        assert!(reused >= 1, "{name}: the still mesh's group is left as drawn in each later sub-frame ({reused})");
+        assert_eq!(none, 0);
+        assert!(with == without, "{name}: the frame is the one with every group drawn");
+        let (_, turning) = frame(90.0, false).unwrap();
+        assert_eq!(turning, 0, "{name}: a group whose mesh turns is drawn in every sub-frame");
+    }
+}

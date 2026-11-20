@@ -167,28 +167,93 @@ fn same_shadows(jobs: &[crate::mesh3d::ShadowJob], mesh: &[[f32; 4]]) -> Vec<usi
 /// same tiles and texels, reading the same things. The samples of a frame
 /// draw their groups in the same texels, so such a group is not drawn
 /// again (a blurred backdrop, an effect on a layer that stands still).
+/// A mesh primitive reads the same things when the rows it reads are the
+/// same (`list::MeshRead`: its batch, its lights' maps and their casters,
+/// its meshes in the pool), whatever the list's other meshes did: a mesh
+/// that stands still in a picture of its own is not drawn again because
+/// another moved.
 fn same_groups(a: &DisplayList, b: &DisplayList) -> Vec<bool> {
+    use std::collections::HashMap;
     let mut same = vec![false; b.groups.len()];
+    #[cfg(test)]
+    if TEST_STILL.with(|t| t.get().0) {
+        return same;
+    }
     // What primitives point into, compared whole: little of it, and
     // seldom different where the primitives are not.
     if a.prims.len() != b.prims.len() || a.stops != b.stops || a.segments != b.segments || a.ops != b.ops {
         return same;
     }
-    let meshes = a.mesh == b.mesh && a.bins == b.bins && a.pool == b.pool && a.shadows == b.shadows && a.mesh_ids == b.mesh_ids && a.mesh_draws == b.mesh_draws && a.surfaces.as_ref().map(|s| s.key) == b.surfaces.as_ref().map(|s| s.key);
+    let surfaces = a.surfaces.as_ref().map(|s| s.key) == b.surfaces.as_ref().map(|s| s.key);
+    // Every mesh at once (a frame whose meshes all stand still), or each
+    // primitive by what it reads.
+    let whole = bytemuck::cast_slice::<_, u8>(&a.mesh) == bytemuck::cast_slice::<_, u8>(&b.mesh) && a.bins == b.bins && a.pool == b.pool && a.shadows == b.shadows && a.mesh_ids == b.mesh_ids && a.mesh_draws == b.mesh_draws;
+    fn reads(l: &DisplayList) -> HashMap<u32, &crate::list::MeshRead> {
+        l.mesh_reads.iter().map(|r| (r.key, r)).collect()
+    }
+    let draws = |l: &DisplayList| {
+        let mut by: HashMap<u32, Vec<(u32, [u32; 4])>> = HashMap::new();
+        for d in &l.mesh_draws {
+            by.entry(d.prim).or_default().push((d.target, d.rect));
+        }
+        by
+    };
+    let (reads_a, reads_b, draws_a, draws_b) = if whole || !surfaces { Default::default() } else { (reads(a), reads(b), draws(a), draws(b)) };
+    // A stretch of rows, with the pooled meshes and the shadow maps'
+    // jobs in it (bit for bit: rows hold indices too).
+    // (One within a stretch found the same is the same: a batch's first
+    // placement reads from its first row to its last, maps and all.)
+    let mut stretches: HashMap<[u32; 2], bool> = HashMap::new();
+    let mut alike: Vec<[u32; 2]> = Vec::new();
+    let mut stretch = |r: [u32; 2]| {
+        if alike.iter().any(|s| s[0] <= r[0] && r[1] <= s[1]) {
+            return true;
+        }
+        let same = *stretches.entry(r).or_insert_with(|| {
+            fn stretch_of(l: &DisplayList, r: [u32; 2]) -> Option<&[u8]> {
+                l.mesh.get(r[0] as usize..r[1] as usize).map(bytemuck::cast_slice::<_, u8>)
+            }
+            let rows = |l| stretch_of(l, r);
+            let within = |x: u32| x >= r[0] && x < r[1];
+            rows(a).is_some()
+                && rows(a) == rows(b)
+                && a.pool.iter().filter(|p| within(p.row)).eq(b.pool.iter().filter(|p| within(p.row)))
+                && a.shadows.iter().filter(|j| within(j.header)).eq(b.shadows.iter().filter(|j| within(j.header)))
+        });
+        if same {
+            alike.push(r);
+        }
+        same
+    };
     // Per primitive: 0 different, 1 the same, 2 the same and reading
     // other groups' texels (those must be the same too).
     let prims: Vec<u8> = a
         .prims
         .iter()
         .zip(&b.prims)
-        .map(|(p, q)| {
+        .enumerate()
+        .map(|(i, (p, q))| {
             let reads = match p.kind[0] {
                 crate::list::PRIM_MESH => true,
                 crate::list::PRIM_MATTE => true,
                 crate::list::PRIM_IMAGE => p.kind[1] == crate::list::SOURCE_GROUP,
                 _ => false,
             };
-            if bytemuck::bytes_of(p) != bytemuck::bytes_of(q) || (p.kind[0] == crate::list::PRIM_MESH && !meshes) {
+            let mesh = p.kind[0] != crate::list::PRIM_MESH
+                || surfaces
+                    && (whole || {
+                        let key = p.geom2[0].to_bits();
+                        match (reads_a.get(&key), reads_b.get(&key)) {
+                            (Some(x), Some(y)) => {
+                                x == y
+                                    && x.rows.iter().all(|r| stretch(*r))
+                                    && a.bins.get(x.bins[0] as usize..x.bins[1] as usize).is_some_and(|bins| Some(bins) == b.bins.get(x.bins[0] as usize..x.bins[1] as usize))
+                                    && draws_a.get(&(i as u32)) == draws_b.get(&(i as u32))
+                            }
+                            _ => false,
+                        }
+                    });
+            if bytemuck::bytes_of(p) != bytemuck::bytes_of(q) || !mesh {
                 0
             } else {
                 1 + reads as u8
@@ -213,6 +278,8 @@ fn same_groups(a: &DisplayList, b: &DisplayList) -> Vec<bool> {
             });
         before &= same[gi];
     }
+    #[cfg(test)]
+    TEST_STILL.with(|t| t.set((false, t.get().1 + same.iter().filter(|s| **s).count() as u32)));
     same
 }
 
@@ -249,6 +316,9 @@ thread_local! {
     /// built on them run there too. The raster then reads sample `s & 3`
     /// for its eight samples: edges are coarser, the rest is the same.
     pub(crate) static TEST_VIS_AT_4X: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests of `same_groups`: no group counts as left by the sub-frame
+    /// before (so each is drawn), and how many did count.
+    pub(crate) static TEST_STILL: std::cell::Cell<(bool, u32)> = const { std::cell::Cell::new((false, 0)) };
 }
 
 /// The visibility pass's samples on a device offering `mask` (0: no pass).

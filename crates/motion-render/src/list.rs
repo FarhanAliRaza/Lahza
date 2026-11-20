@@ -161,6 +161,9 @@ pub struct DisplayList {
     /// Where each mesh primitive is drawn, for the GPU's hardware
     /// visibility pass.
     pub mesh_draws: Vec<MeshDraw>,
+    /// What each mesh primitive reads of `mesh` and `bins` (a sample's
+    /// own list only: not kept through `gpu::merge`).
+    pub mesh_reads: Vec<MeshRead>,
     /// Mesh instances' rows the GPU's mesh pool completes (where their
     /// meshes are), with the meshes.
     pub pool: Vec<crate::mesh3d::PoolRef>,
@@ -174,6 +177,22 @@ pub struct DisplayList {
     pub surfaces: Option<std::sync::Arc<lahza_motion_core::surface::Program>>,
     /// Shader layers' pictures, by group.
     pub shaders: Vec<crate::shader::ShaderPass>,
+}
+
+/// What a mesh primitive reads of its list's `mesh` rows and tile `bins`:
+/// its batch's vertices, materials, lights, records and instances, the
+/// environment and shadow maps those link to, and its own triangles on
+/// its target. By these two lists' primitives are told alike where the
+/// lists' rows are not alike whole (`gpu::same_groups`: a mesh that
+/// stands still beside one that moves).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshRead {
+    /// The primitive's `geom2[0]` (the row its triangles start at).
+    pub key: u32,
+    /// Stretches of `mesh`, from and to.
+    pub rows: Vec<[u32; 2]>,
+    /// Its stretch of `bins`.
+    pub bins: [u32; 2],
 }
 
 /// A mesh primitive placed on a target.
@@ -487,7 +506,14 @@ impl Builder<'_> {
         let cache = &mut *self.meshes;
         let batch = cache.batches.get(item.prim.kind[1] as usize)?;
         let mut setup = std::time::Duration::ZERO;
+        let (rows, bins) = (list.mesh.len() as u32, list.bins.len() as u32);
         let placed = batch.place(&mut list.mesh, &mut list.bins, &mut list.pool, &mut list.shadows, &mut cache.placed, target, origin, factor, item.prim.kind[2], self.compact, &mut setup);
+        if let Some((prim, _)) = &placed {
+            let mut read = batch.reads(&cache.placed, self.compact);
+            // (The longest first: the others are often within it.)
+            read.insert(0, [rows, list.mesh.len() as u32]);
+            list.mesh_reads.push(MeshRead { key: prim.geom2[0].to_bits(), rows: read, bins: [bins, list.bins.len() as u32] });
+        }
         cache.placing_setup += setup;
         cache.placing += started.elapsed();
         placed
