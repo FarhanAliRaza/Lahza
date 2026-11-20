@@ -532,6 +532,178 @@ fn a_real_request_from_the_prompt_bar() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// By hand: a text's rim light, a `lut` with its table, a gradient's
+/// stops added, moved and taken out, and a colour dragged in the picker.
+#[test]
+#[ignore = "requires a display (can run under Xvfb)"]
+fn by_hand_a_rim_light_a_lut_gradient_stops_and_the_picker() {
+    use crate::motion_timeline::LayerDrag;
+    let dir = std::env::temp_dir().join(format!("lahza-motion-by-hand-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots = std::env::var_os("LAHZA_WORKFLOW_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|| dir.clone());
+    std::fs::create_dir_all(&shots).unwrap();
+    let project = sample(&dir);
+    std::env::set_var("LAHZA_CONFIG_DIR", dir.join("config"));
+    // A table that swaps red and blue, outside the project.
+    let table = dir.join("swap.cube");
+    let mut cube = String::from("LUT_3D_SIZE 2\n");
+    for b in 0..2 {
+        for g in 0..2 {
+            for r in 0..2 {
+                cube += &format!("{b} {g} {r}\n");
+            }
+        }
+    }
+    std::fs::write(&table, cube).unwrap();
+    let open = project.clone();
+    Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+        let handle = open_studio_window(cx, true, |handle, cx| {
+            cx.new(|cx| {
+                let mut studio = Studio::new(handle, None, None, cx);
+                studio.open_motion_project(open.clone());
+                studio
+            })
+        })
+        .unwrap();
+        cx.activate(true);
+        cx.spawn(async move |cx| {
+            let wait = |ms| Timer::after(Duration::from_millis(ms));
+            let any: AnyWindowHandle = handle.into();
+            let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+            let shot = |name: &str| studio_workflow_tests::save_display(&shots.join(name), false);
+            wait(300).await;
+            any.update(cx, |_, window, _| {
+                window.activate_window();
+                window.refresh();
+            })
+            .unwrap();
+            wait(1200).await;
+            let editor = |cx: &mut gpui::AsyncApp| handle.update(cx, |s, _, _| s.motion_doc.as_ref().map(|d| d.editor.clone())).unwrap();
+            let mut framed = false;
+            for _ in 0..3600 {
+                wait(50).await;
+                draw(cx);
+                framed = editor(cx).is_some_and(|e| e.update(cx, |e, _| e.frame_png().is_some()).unwrap());
+                if framed {
+                    break;
+                }
+            }
+            assert!(framed, "the preview rendered a frame");
+            let editor = editor(cx).unwrap();
+            let entries = |cx: &mut gpui::AsyncApp| editor.update(cx, |e, _| lahza_motion_core::io::read_history(e.dir()).unwrap().len()).unwrap();
+            handle
+                .update(cx, |studio, _, cx| {
+                    editor.update(cx, |e, _| {
+                        e.seek(0.5);
+                        e.select(Some("title".into()));
+                        // The rim light: on, then its angle dragged.
+                        e.commit_ops(vec![json!({"op": "set", "target": "title.edge", "value": {"color": "#ffffff", "width": 3, "angle": 45}})]);
+                        let (own, _) = crate::motion_editor::extra_values(e.layer("title").unwrap());
+                        let angle = own.fields.iter().find(|f| f.label == "Rim angle").expect("the rim's angle").clone();
+                        assert_eq!(e.field_state("title", &angle).0, 45.0);
+                        e.drop_value("title", &angle, 120.0);
+                        assert_eq!(e.field_state("title", &angle).0, 120.0);
+                        e.set_color("title", "edge.color", "#ffc928");
+                        assert_eq!(e.color_state("title", "edge.color"), "#ffc928");
+                        // A gradient map on the box: a third stop lands in
+                        // the middle, between its neighbours' colours.
+                        let ops = e.add_effect_ops("box", serde_json::from_str(crate::motion_editor::EFFECTS[7].1).unwrap());
+                        e.commit_ops(ops);
+                        let ops = e.add_stop_ops("box", "effects.0.stops");
+                        e.commit_ops(ops);
+                        let stops = |e: &crate::motion_editor::MotionEditor| serde_json::to_value(e.layer("box").unwrap()).unwrap()["effects"][0]["stops"].clone();
+                        assert_eq!(stops(e), json!([[0.0, "#101030"], [0.5, "#887155"], [1.0, "#ffd27a"]]));
+                        // Moved: it stays between its neighbours.
+                        let (_, effects) = crate::motion_editor::extra_values(e.layer("box").unwrap());
+                        let place = effects[0].fields.iter().find(|f| f.label == "stop 2 at").expect("the stop's place").clone();
+                        e.drag_value("box", &place, 0.25);
+                        assert_eq!(e.field_state("box", &place).0, 0.25);
+                        e.drop_value("box", &place, 0.25);
+                        e.drop_value("box", &place, 7.0);
+                        assert_eq!(stops(e)[1][0], json!(1.0), "not past the next stop");
+                        e.drop_value("box", &place, 0.3);
+                        // A fourth, then the first taken out; two always stay.
+                        let ops = e.add_stop_ops("box", "effects.0.stops");
+                        e.commit_ops(ops);
+                        assert_eq!(stops(e).as_array().unwrap().len(), 4);
+                        assert_eq!(stops(e)[2][0], json!(0.65), "in the widest gap");
+                        let ops = e.remove_stop_ops("box", "effects.0.stops", 0);
+                        e.commit_ops(ops);
+                        assert_eq!(stops(e).as_array().unwrap().iter().map(|s| s[0].as_f64().unwrap()).collect::<Vec<_>>(), [0.3, 0.65, 1.0]);
+                        let ops = e.remove_stop_ops("box", "effects.0.stops", 0);
+                        e.commit_ops(ops);
+                        assert!(e.remove_stop_ops("box", "effects.0.stops", 0).is_empty(), "two stops stay");
+                    });
+                    // A lut: the table is copied into the project and named.
+                    studio.add_motion_lut("title", &table, cx);
+                    let e = editor.read(cx);
+                    assert!(e.dir().join("assets/swap.cube").is_file());
+                    assert_eq!(e.luts(), ["assets/swap.cube"]);
+                    let title = serde_json::to_value(e.layer("title").unwrap()).unwrap();
+                    assert_eq!(title["effects"][1], json!({"type": "lut", "path": "assets/swap.cube", "amount": 1.0}), "{title}");
+                    assert!(e.compiled().errors.is_empty(), "{:?}", e.compiled().errors);
+                    studio.add_motion_lut("title", std::path::Path::new("/nowhere/x.png"), cx);
+                    assert!(editor.read(cx).status().contains("not a .cube table"));
+                    // The picker opens under the colour that is clicked.
+                    studio.motion_color_edit = Some(("title".into(), "color".into()));
+                    cx.notify();
+                })
+                .unwrap();
+            wait(400).await;
+            draw(cx);
+            wait(100).await;
+            draw(cx);
+            let before = entries(cx);
+            // A drag on the square to its top right corner (the full
+            // tone of the hue), then along the strip to a third (green).
+            handle
+                .update(cx, |studio, _, cx| {
+                    let [square, strip] = *studio.motion_picker_bounds.lock().unwrap();
+                    let (square, strip) = (square.expect("the square was laid out"), strip.expect("the strip was laid out"));
+                    let (hsv, alpha) = crate::motion_editor::hsv_of(&editor.read(cx).color_state("title", "color"));
+                    studio.motion_layer_drag = Some(LayerDrag::Colour { layer: "title".into(), path: "color".into(), strip: false, hsv, alpha });
+                    let middle = gpui::point(square.origin.x + square.size.width / 2.0, square.origin.y + square.size.height / 2.0);
+                    assert!(studio.update_motion_layer_drag(middle, cx));
+                    assert_eq!(editor.read(cx).color_state("title", "color"), "#804040", "shown as it is dragged");
+                    assert!(editor.read(cx).dragging(), "unsaved: the proxy draws");
+                    let corner = gpui::point(square.origin.x + square.size.width + px(40.0), square.origin.y - px(40.0));
+                    assert!(studio.finish_motion_layer_drag(corner, false, cx));
+                    assert_eq!(editor.read(cx).color_state("title", "color"), "#ff0000");
+                    let (hsv, alpha) = crate::motion_editor::hsv_of("#ff0000");
+                    studio.motion_layer_drag = Some(LayerDrag::Colour { layer: "title".into(), path: "color".into(), strip: true, hsv, alpha });
+                    let third = gpui::point(strip.origin.x + strip.size.width / 3.0, strip.origin.y + px(2.0));
+                    assert!(studio.finish_motion_layer_drag(third, false, cx));
+                    assert_eq!(editor.read(cx).color_state("title", "color"), "#00ff00");
+                    // A shadow keeps its alpha when its colour is picked.
+                    assert_eq!(crate::motion_timeline::picked([10.0, 0.2, 0.3], true, strip, gpui::point(strip.origin.x - px(9.0), strip.origin.y)), [0.0, 0.2, 0.3]);
+                    cx.notify();
+                })
+                .unwrap();
+            assert_eq!(entries(cx), before + 2, "a drag is one edit");
+            wait(2500).await;
+            draw(cx);
+            wait(100).await;
+            shot("by-hand-1-picker.png");
+            // The box's effects, further down the inspector.
+            handle
+                .update(cx, |studio, _, cx| {
+                    studio.motion_color_edit = None;
+                    editor.update(cx, |e, _| e.select(Some("box".into())));
+                    cx.notify();
+                })
+                .unwrap();
+            wait(2500).await;
+            draw(cx);
+            wait(100).await;
+            shot("by-hand-2-box.png");
+            cx.update(|cx| cx.quit()).unwrap();
+        })
+        .detach();
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Answers at once and changes nothing.
 struct Answering(Arc<Mutex<Vec<Request>>>);
 

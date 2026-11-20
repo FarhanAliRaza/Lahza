@@ -564,6 +564,10 @@ struct Studio {
     motion_layer_drag: Option<crate::motion_timeline::LayerDrag>,
     /// The colour being typed in the motion inspector: layer and path.
     motion_color_edit: Option<(String, String)>,
+    /// Where the colour picker's square and hue strip were laid out.
+    motion_picker_bounds: Arc<Mutex<[Option<Bounds<Pixels>>; 2]>>,
+    /// The picker's hue (a grey or a black has none of its own).
+    motion_picker_hue: Option<f64>,
     /// The agent directed from the prompt bar, and its requests.
     motion_agent: crate::motion_prompt_ui::MotionAgent,
     /// The preview shows only the open motion piece.
@@ -1010,6 +1014,8 @@ impl Studio {
             motion_doc: None,
             motion_layer_drag: None,
             motion_color_edit: None,
+            motion_picker_bounds: Arc::default(),
+            motion_picker_hue: None,
             motion_agent: Default::default(),
             motion_isolate: false,
             motion_project: None,

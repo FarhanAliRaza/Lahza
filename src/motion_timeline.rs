@@ -38,9 +38,120 @@ pub(crate) enum LayerDrag {
     /// A span of time marked on the ruler for a prompt, from `anchor`
     /// (timeline seconds).
     Span { anchor: f64 },
+    /// A colour dragged in the picker: on its square (saturation and
+    /// value) or along its hue strip. `hsv` is the colour so far, `alpha`
+    /// the two hex digits it keeps.
+    Colour { layer: String, path: String, strip: bool, hsv: [f64; 3], alpha: String },
+}
+
+/// The colour under `position` in the picker: on the square, saturation
+/// across and value up; on the strip, the hue across.
+pub(crate) fn picked(hsv: [f64; 3], strip: bool, bounds: Bounds<Pixels>, position: Point<Pixels>) -> [f64; 3] {
+    let x = f64::from((position.x - bounds.origin.x) / bounds.size.width.max(px(1.0))).clamp(0.0, 1.0);
+    let y = f64::from((position.y - bounds.origin.y) / bounds.size.height.max(px(1.0))).clamp(0.0, 1.0);
+    if strip { [x * 360.0, hsv[1], hsv[2]] } else { [hsv[0], x, 1.0 - y] }
+}
+
+/// The picker's hue for the colour `now`: the one it was left at while
+/// that still gives this colour (a grey has no hue of its own).
+fn picker_hsv(now: &str, kept: Option<f64>) -> ([f64; 3], String) {
+    let (hsv, alpha) = crate::motion_editor::hsv_of(now);
+    match kept {
+        Some(h) if crate::motion_editor::hex_of([h, hsv[1], hsv[2]]) == crate::motion_editor::hex_of(hsv) => ([h, hsv[1], hsv[2]], alpha),
+        _ => (hsv, alpha),
+    }
 }
 
 impl Studio {
+    /// A hue and tone picker for the colour at `path` of `layer`: a square
+    /// of saturation and value over a strip of hues, both dragged. The
+    /// drag shows in the preview and is saved as one edit on release.
+    fn motion_color_picker(&self, layer: &str, path: &str, now: &str, cx: &Context<Self>) -> AnyElement {
+        use gpui::{linear_color_stop, linear_gradient, relative};
+        let (hsv, _) = picker_hsv(now, self.motion_picker_hue);
+        let tone = |h: f64| lahza_motion_core::value::Color::parse(&crate::motion_editor::hex_of([h, 1.0, 1.0])).map(|c| gpui::Rgba { r: c.0[0] as f32, g: c.0[1] as f32, b: c.0[2] as f32, a: 1.0 }).unwrap_or(gpui::rgba(0xffffffff));
+        let keep = |slot: usize| {
+            let store = self.motion_picker_bounds.clone();
+            canvas(
+                move |bounds, _, _| {
+                    if let Ok(mut stored) = store.lock() {
+                        stored[slot] = Some(bounds);
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        };
+        let begin = |strip: bool| {
+            let (layer, path, now) = (layer.to_string(), path.to_string(), now.to_string());
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.pause_video_playback();
+                let (hsv, alpha) = picker_hsv(&now, this.motion_picker_hue);
+                this.motion_layer_drag = Some(LayerDrag::Colour { layer: layer.clone(), path: path.clone(), strip, hsv, alpha });
+                this.update_motion_layer_drag(e.position, cx);
+                cx.notify();
+            })
+        };
+        let dot = |x: f64, y: f64| div().absolute().left(relative(x as f32)).top(relative(y as f32)).ml(px(-6.0)).mt(px(-6.0)).size(px(12.0)).rounded_full().border_2().border_color(gpui::white()).shadow_sm();
+        let mut strip = div().id("motion-picker-hue").relative().flex().w_full().h(px(14.0)).rounded(px(4.0)).overflow_hidden().cursor_pointer();
+        for i in 0..6 {
+            let (a, b) = (tone(i as f64 * 60.0), tone((i + 1) as f64 * 60.0));
+            strip = strip.child(div().flex_1().h_full().bg(linear_gradient(90.0, linear_color_stop(a, 0.0), linear_color_stop(b, 1.0))));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .id("motion-picker-square")
+                    .relative()
+                    .w_full()
+                    .h(px(110.0))
+                    .rounded(px(6.0))
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .bg(linear_gradient(90.0, linear_color_stop(gpui::white(), 0.0), linear_color_stop(tone(hsv[0]), 1.0)))
+                    .child(div().absolute().size_full().bg(linear_gradient(180.0, linear_color_stop(gpui::rgba(0x00000000), 0.0), linear_color_stop(gpui::black(), 1.0))))
+                    .child(dot(hsv[1], 1.0 - hsv[2]))
+                    .child(keep(0))
+                    .on_mouse_down(MouseButton::Left, begin(false)),
+            )
+            .child(strip.child(div().absolute().left(relative((hsv[0] / 360.0) as f32)).ml(px(-2.0)).w(px(4.0)).h_full().bg(gpui::white()).border_1().border_color(gpui::black())).child(keep(1)).on_mouse_down(MouseButton::Left, begin(true)))
+            .into_any_element()
+    }
+
+    /// Picks a `.cube` table and puts a `lut` effect with it on `layer`
+    /// (the table is copied into the project's assets).
+    pub(crate) fn add_motion_lut_dialog(&mut self, layer: String, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Choose a .cube table".into()) });
+        cx.spawn(async move |weak, cx| {
+            let selected = match prompt.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(file) = selected else { return };
+            let _ = weak.update(cx, |this, cx| this.add_motion_lut(&layer, &file, cx));
+        })
+        .detach();
+    }
+
+    /// Puts a `lut` effect reading `file` on `layer`.
+    pub(crate) fn add_motion_lut(&mut self, layer: &str, file: &std::path::Path, cx: &mut Context<Self>) {
+        let Some(editor) = self.motion_doc.as_ref().map(|d| d.editor.clone()) else { return };
+        editor.update(cx, |e, _| match e.import_lut(file) {
+            Ok(path) => {
+                let ops = e.add_effect_ops(layer, json!({"type": "lut", "path": path, "amount": 1}));
+                e.commit_ops(ops);
+            }
+            Err(error) => e.say(error),
+        });
+        self.show_motion_doc(cx);
+        cx.notify();
+    }
+
     /// The Motion tab of a recording, or a motion project of its own:
     /// the timeline edits motion.
     pub(crate) fn motion_editing(&self) -> bool {
@@ -486,6 +597,15 @@ impl Studio {
             self.show_motion_doc(cx);
             return true;
         }
+        if let Some(LayerDrag::Colour { layer, path, strip, hsv, alpha }) = &mut self.motion_layer_drag {
+            let Some(bounds) = self.motion_picker_bounds.lock().ok().and_then(|b| b[usize::from(*strip)]) else { return false };
+            *hsv = picked(*hsv, *strip, bounds, position);
+            let (layer, path, hex) = (layer.clone(), path.clone(), format!("{}{alpha}", crate::motion_editor::hex_of(*hsv)));
+            self.motion_picker_hue = Some(hsv[0]);
+            editor.update(cx, |e, _| e.preview_color(&layer, &path, &hex));
+            self.show_motion_doc(cx);
+            return true;
+        }
         if let Some(LayerDrag::Value { layer, field, start_x, origin }) = &self.motion_layer_drag {
             let (layer, field) = (layer.clone(), field.clone());
             let value = origin + f64::from((x - *start_x) / px(1.0)) * field.step;
@@ -506,7 +626,7 @@ impl Studio {
                 *preview = Some(orig.dragged(*part, t - *grab));
                 true
             }
-            Some(LayerDrag::Value { .. } | LayerDrag::Move { .. } | LayerDrag::Span { .. }) | None => false,
+            Some(LayerDrag::Value { .. } | LayerDrag::Move { .. } | LayerDrag::Span { .. } | LayerDrag::Colour { .. }) | None => false,
         }
     }
 
@@ -534,6 +654,17 @@ impl Studio {
         }
         let t = self.motion_timeline_time_at(x);
         let Some(editor) = self.motion_doc.as_ref().map(|d| d.editor.clone()) else { return true };
+        // The colour as the picker was left: one edit for the whole drag.
+        if let LayerDrag::Colour { layer, path, strip, hsv, alpha } = &drag {
+            let bounds = self.motion_picker_bounds.lock().ok().and_then(|b| b[usize::from(*strip)]);
+            let hsv = bounds.map_or(*hsv, |b| picked(*hsv, *strip, b, position));
+            self.motion_picker_hue = Some(hsv[0]);
+            let hex = format!("{}{alpha}", crate::motion_editor::hex_of(hsv));
+            editor.update(cx, |e, _| e.set_color(layer, path, &hex));
+            self.show_motion_doc(cx);
+            cx.notify();
+            return true;
+        }
         if let LayerDrag::Value { layer, field, start_x, origin } = &drag {
             let moved = (x - *start_x).abs() > px(0.5);
             let value = origin + f64::from((x - *start_x) / px(1.0)) * field.step;
@@ -555,7 +686,7 @@ impl Studio {
                     editor.update(cx, |e, _| e.drop_sound(&id, part, orig, t - grab, moved, 8.0 * spp, shift));
                 }
             }
-            LayerDrag::Value { .. } | LayerDrag::Move { .. } | LayerDrag::Span { .. } => {}
+            LayerDrag::Value { .. } | LayerDrag::Move { .. } | LayerDrag::Span { .. } | LayerDrag::Colour { .. } => {}
         }
         self.show_motion_doc(cx);
         cx.notify();
@@ -703,6 +834,12 @@ impl Studio {
                 button("motion-layer-outline", if t.stroke.is_some() { "Remove outline" } else { "+ Outline" }, ButtonKind::Secondary, ButtonSize::Sm)
                     .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![outline.clone()], cx))),
             );
+            let target = format!("{id}.edge");
+            let rim = if t.edge.is_some() { json!({"op": "set", "target": target}) } else { json!({"op": "set", "target": target, "value": {"color": "#ffffff", "width": 3, "angle": 45}}) };
+            row = row.child(
+                button("motion-layer-rim", if t.edge.is_some() { "Remove rim light" } else { "+ Rim light" }, ButtonKind::Secondary, ButtonSize::Sm)
+                    .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![rim.clone()], cx))),
+            );
             panel = panel.child(row);
         }
         let three_d = layer.common.three_d || layer.kind.name() == "mesh";
@@ -712,6 +849,7 @@ impl Studio {
             let now = editor.color_state(&id, path);
             let editing = self.motion_color_edit.as_ref().is_some_and(|(l, p)| l == &id && p == path);
             let (lid, lpath) = (id.clone(), path.to_string());
+            let picker = if editing { self.motion_color_picker(&id, path, &now, cx) } else { div().into_any_element() };
             let mut swatches = div().flex().flex_wrap().gap_1();
             for (si, hex) in crate::motion_editor::SWATCHES.iter().enumerate() {
                 let (lid, lpath) = (id.clone(), path.to_string());
@@ -759,7 +897,7 @@ impl Studio {
                             cx.notify();
                         })),
                 )
-                .when(editing, |d| d.child(self.text_fields.layer_color.clone()))
+                .when(editing, |d| d.child(self.text_fields.layer_color.clone()).child(picker))
                 .child(swatches)
         };
         let mut colors = 0;
@@ -814,6 +952,20 @@ impl Studio {
                         .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![json!({"op": "set", "target": target})], cx))),
                 ),
             );
+            // A lut's table: the file it reads, and the project's others.
+            if let Some(file) = &values.file {
+                effects = effects.child(note(format!("Table: {file}")));
+                let mut others = div().flex().flex_wrap().gap_1();
+                for (li, lut) in editor.luts().iter().enumerate() {
+                    let (target, value) = (format!("{id}.effects.{ei}.path"), lut.clone());
+                    others = others.child(
+                        button(SharedString::from(format!("motion-lut-{ei}-{li}")), lut.rsplit('/').next().unwrap_or(lut).to_string(), ButtonKind::Secondary, ButtonSize::Sm)
+                            .selected(lut == file)
+                            .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![json!({"op": "set", "target": target, "value": value})], cx))),
+                    );
+                }
+                effects = effects.child(others);
+            }
             for field in &values.fields {
                 effects = effects.child(scrub(n, field));
                 n += 1;
@@ -821,6 +973,22 @@ impl Studio {
             for (label, path) in &values.colors {
                 effects = effects.child(color_row(colors, label, path));
                 colors += 1;
+            }
+            // A gradient's stops: one more, or one fewer (two stay).
+            if let Some((path, stops)) = &values.stops {
+                let mut row = div().flex().flex_wrap().gap_1();
+                let add = editor.add_stop_ops(&id, path);
+                row = row.child(button(SharedString::from(format!("motion-stop-add-{ei}")), "+ Stop", ButtonKind::Secondary, ButtonSize::Sm).on_click(cx.listener(move |this, _, _, cx| this.motion_commit(add.clone(), cx))));
+                if *stops > 2 {
+                    for si in 0..*stops {
+                        let remove = editor.remove_stop_ops(&id, path, si);
+                        row = row.child(
+                            button(SharedString::from(format!("motion-stop-remove-{ei}-{si}")), format!("− Stop {}", si + 1), ButtonKind::Ghost, ButtonSize::Sm)
+                                .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(remove.clone(), cx))),
+                        );
+                    }
+                }
+                effects = effects.child(row);
             }
         }
         let count = effect_values.len();
@@ -834,6 +1002,16 @@ impl Studio {
                     .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![op.clone()], cx))),
             );
         }
+        // A lut is added with its table: one of the project's, or a file.
+        for (li, lut) in editor.luts().iter().enumerate() {
+            let ops = editor.add_effect_ops(&id, json!({"type": "lut", "path": lut, "amount": 1}));
+            add = add.child(
+                button(SharedString::from(format!("motion-effect-add-lut-{li}")), format!("+ LUT {}", lut.rsplit('/').next().unwrap_or(lut)), ButtonKind::Secondary, ButtonSize::Sm)
+                    .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(ops.clone(), cx))),
+            );
+        }
+        let lut_layer = id.clone();
+        add = add.child(button("motion-effect-add-lut-file", "+ LUT file…", ButtonKind::Secondary, ButtonSize::Sm).on_click(cx.listener(move |this, _, _, cx| this.add_motion_lut_dialog(lut_layer.clone(), cx))));
         let effects = effects.child(add);
         let keys = editor.rows().iter().find(|r| r.id == id).map_or(0, |r| r.keys.len());
         let remove = id.clone();

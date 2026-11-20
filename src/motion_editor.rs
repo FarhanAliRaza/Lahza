@@ -271,8 +271,8 @@ pub(crate) const FIELDS: &[Field] = &[
 ];
 
 /// Effects the inspector can add, with the values they start from (what
-/// is not given takes the format's default). Not here:
-/// `lut`, which needs a file.
+/// is not given takes the format's default). Not here: `lut`, which
+/// is added with its file (`MotionEditor::luts`, `import_lut`).
 pub(crate) const EFFECTS: &[(&str, &str)] = &[
     ("Blur", r#"{"type": "blur", "radius": 8}"#),
     ("Shadow", r##"{"type": "shadow", "color": "#00000080", "radius": 12, "offset": [0, 8]}"##),
@@ -303,6 +303,10 @@ pub(crate) struct Values {
     pub fields: Vec<Field>,
     /// Label and path of each colour.
     pub colors: Vec<(String, String)>,
+    /// The file it reads (a `lut`'s table).
+    pub file: Option<String>,
+    /// A gradient's stops: their path and how many there are.
+    pub stops: Option<(String, usize)>,
 }
 
 /// Reads the editable values under `prefix` out of a JSON object: what is
@@ -327,13 +331,17 @@ fn values_in(object: &Value, prefix: &str, name: String) -> Values {
                 }
             }
             Value::String(text) if text.starts_with('#') => out.colors.push((label, path)),
-            // A gradient's stops: each one's colour.
+            Value::String(text) if key == "path" => out.file = Some(text),
+            // A gradient's stops: each one's place (dragged between its
+            // neighbours) and colour.
             Value::Array(stops) if key == "stops" => {
                 for (i, stop) in stops.iter().enumerate() {
                     if stop.get(1).and_then(Value::as_str).is_some_and(|c| c.starts_with('#')) {
+                        out.fields.push(Field { path: format!("{path}.{i}.0").into(), component: None, label: format!("stop {} at", i + 1).into(), step: 0.005, default: 0.0 });
                         out.colors.push((format!("stop {} (at {})", i + 1, stop.get(0).and_then(Value::as_f64).unwrap_or(0.0)), format!("{path}.{i}.1")));
                     }
                 }
+                out.stops = Some((path, stops.len()));
             }
             _ => {}
         }
@@ -356,6 +364,15 @@ pub(crate) fn extra_values(layer: &Layer) -> (Values, Vec<Values>) {
             let outline = values_in(&stroke, "stroke.", String::new());
             own.fields.extend(outline.fields.into_iter().map(|f| Field { label: format!("Outline {}", f.label).into(), ..f }));
             own.colors.extend(outline.colors.into_iter().map(|(label, path)| (format!("Outline {label}"), path)));
+        }
+        // The rim light, when it has one: its width, where it comes from
+        // and its colour (what the file leaves out is the default).
+        if let lahza_motion_core::document::LayerKind::Text(t) = &layer.kind {
+            if t.edge.is_some() {
+                own.fields.push(Field { path: "edge.width".into(), component: None, label: "Rim width".into(), step: 0.05, default: 3.0 });
+                own.fields.push(Field { path: "edge.angle".into(), component: None, label: "Rim angle".into(), step: 1.0, default: 0.0 });
+                own.colors.push(("Rim colour".into(), "edge.color".into()));
+            }
         }
     }
     let json = serde_json::to_value(&layer.common.effects).unwrap_or_default();
@@ -439,6 +456,8 @@ pub(crate) struct MotionEditor {
     /// How far the running bake is, and its stop.
     bake_progress: Arc<BakeProgress>,
     font_names: Vec<String>,
+    /// The project's `.cube` tables.
+    lut_names: Vec<String>,
     /// The selected layer as JSON, saved and as the drag shows it: values
     /// are read from these, so a draw does not serialise the layer again.
     saved_json: RefCell<Option<(String, Value)>>,
@@ -482,6 +501,63 @@ pub(crate) fn stamp(dir: &Path) -> SystemTime {
 
 /// The bundled fonts, then the project's font files (`assets/` and its
 /// folders), as a text's `font` names them.
+/// The `.cube` tables in a project (its folder, `assets/` and `luts/`,
+/// two folders deep), as the paths a `lut` effect names.
+fn lut_files(dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut pending = vec![(dir.to_path_buf(), 2), (dir.join("assets"), 0), (dir.join("luts"), 0)];
+    while let Some((folder, depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth < 2 {
+                pending.push((path, depth + 1));
+            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("cube")) {
+                if let Ok(rel) = path.strip_prefix(dir) {
+                    files.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// A colour as hue (0 to 360), saturation and value (0 to 1), and its
+/// alpha as the two hex digits it was written with ("" when opaque).
+pub(crate) fn hsv_of(hex: &str) -> ([f64; 3], String) {
+    let Ok(Color([r, g, b, _])) = Color::parse(hex) else { return ([0.0, 0.0, 1.0], String::new()) };
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let d = max - min;
+    let h = if d < 1e-9 {
+        0.0
+    } else if max == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    let alpha = if hex.len() == 9 { hex[7..].to_string() } else { String::new() };
+    ([h, if max < 1e-9 { 0.0 } else { d / max }, max], alpha)
+}
+
+/// #rrggbb of a hue, saturation and value.
+pub(crate) fn hex_of([h, s, v]: [f64; 3]) -> String {
+    let h = h.rem_euclid(360.0) / 60.0;
+    let c = v * s;
+    let (x, m) = (c * (1.0 - (h % 2.0 - 1.0).abs()), v - c);
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    Color([r + m, g + m, b + m, 1.0]).to_hex()
+}
+
 fn font_names(dir: &Path) -> Vec<String> {
     let mut out: Vec<String> = lahza_motion_render::font::BUNDLED.iter().map(|f| f.to_string()).collect();
     let mut files = Vec::new();
@@ -746,6 +822,7 @@ impl MotionEditor {
             bake_inbox: Arc::default(),
             bake_progress: Arc::default(),
             font_names: Vec::new(),
+            lut_names: Vec::new(),
             saved_json: RefCell::default(),
             preview_json: RefCell::default(),
             focus: cx.focus_handle(),
@@ -761,6 +838,7 @@ impl MotionEditor {
         };
         let mut editor = editor;
         editor.font_names = font_names(&editor.dir);
+        editor.lut_names = lut_files(&editor.dir);
         editor.refresh_waves();
         editor.refresh_sim();
         Ok(editor)
@@ -967,6 +1045,7 @@ impl MotionEditor {
                 self.drop_preview();
                 *self.saved_json.borrow_mut() = None;
                 self.font_names = font_names(&self.dir);
+                self.lut_names = lut_files(&self.dir);
                 self.project = p;
                 self.compiled = Arc::new(Compiled::new(&self.project));
                 self.saved_compiled = self.compiled.clone();
@@ -1147,9 +1226,82 @@ impl MotionEditor {
             }
             None => {
                 let (_, animated) = self.eval::<f64>(id, &field.path, field.default);
-                self.value_ops(id, &field.path, json!(round(value)), animated)
+                self.value_ops(id, &field.path, json!(round(self.stop_between(id, &field.path, value))), animated)
             }
         }
+    }
+
+    /// A gradient stop's place stays between its neighbours' (and in 0 to
+    /// 1), so the stops keep their order; any other value is as given.
+    fn stop_between(&self, id: &str, path: &str, value: f64) -> f64 {
+        let Some((stops, index)) = path.strip_suffix(".0").and_then(|p| p.rsplit_once('.')).filter(|(stops, _)| stops.ends_with(".stops")) else { return value };
+        let (Ok(index), Some(Value::Array(list))) = (index.parse::<usize>(), self.layer_value(id, stops, false)) else { return value };
+        let at = |i: usize| list.get(i).and_then(|s| s.get(0)).and_then(Value::as_f64);
+        let low = index.checked_sub(1).and_then(at).unwrap_or(0.0);
+        let high = at(index + 1).unwrap_or(1.0);
+        value.clamp(low, high.max(low))
+    }
+
+    /// Ops that add a stop to the gradient at `path`: in the middle of its
+    /// widest gap, the colour between its neighbours'.
+    pub(crate) fn add_stop_ops(&self, id: &str, path: &str) -> Vec<Value> {
+        let Some(Value::Array(mut list)) = self.layer_value(id, path, false) else { return Vec::new() };
+        let at = |s: &Value| s.get(0).and_then(Value::as_f64).unwrap_or(0.0);
+        let color = |s: &Value| s.get(1).and_then(Value::as_str).and_then(|c| Color::parse(c).ok()).unwrap_or(Color::WHITE);
+        let Some(i) = (1..list.len()).max_by(|a, b| (at(&list[*a]) - at(&list[*a - 1])).total_cmp(&(at(&list[*b]) - at(&list[*b - 1])))) else { return Vec::new() };
+        let (a, b) = (color(&list[i - 1]).0, color(&list[i]).0);
+        let mid = Color([0, 1, 2, 3].map(|k| (a[k] + b[k]) / 2.0)).to_hex();
+        list.insert(i, json!([round((at(&list[i - 1]) + at(&list[i])) / 2.0), mid]));
+        vec![json!({"op": "set", "target": format!("{id}.{path}"), "value": list})]
+    }
+
+    /// Ops that take stop `index` out of the gradient at `path` (two stay).
+    pub(crate) fn remove_stop_ops(&self, id: &str, path: &str, index: usize) -> Vec<Value> {
+        match self.layer_value(id, path, false) {
+            Some(Value::Array(mut list)) if list.len() > 2 && index < list.len() => {
+                list.remove(index);
+                vec![json!({"op": "set", "target": format!("{id}.{path}"), "value": list})]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The project's `.cube` tables, as a `lut` effect names them.
+    pub(crate) fn luts(&self) -> &[String] {
+        &self.lut_names
+    }
+
+    /// Brings a `.cube` table into the project (a copy in `assets/`,
+    /// unless it is already inside) and gives the path a `lut` names.
+    pub(crate) fn import_lut(&mut self, file: &Path) -> Result<String, String> {
+        if !file.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("cube")) {
+            return Err(format!("{} is not a .cube table", file.display()));
+        }
+        let rel = match file.strip_prefix(&self.dir) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => {
+                let name = file.file_name().ok_or("no file name")?.to_string_lossy().to_string();
+                std::fs::create_dir_all(self.dir.join("assets")).map_err(|e| e.to_string())?;
+                std::fs::copy(file, self.dir.join("assets").join(&name)).map_err(|e| format!("{}: {e}", file.display()))?;
+                format!("assets/{name}")
+            }
+        };
+        self.lut_names = lut_files(&self.dir);
+        Ok(rel)
+    }
+
+    /// Ops that put one more effect on a layer: the first makes the list,
+    /// the rest are appended.
+    pub(crate) fn add_effect_ops(&self, id: &str, effect: Value) -> Vec<Value> {
+        let count = self.layer(id).map_or(0, |l| l.common.effects.len());
+        vec![if count == 0 { json!({"op": "set", "target": format!("{id}.effects"), "value": [effect]}) } else { json!({"op": "set", "target": format!("{id}.effects.{count}"), "value": effect}) }]
+    }
+
+    /// Shows a colour without saving it (the picker, dragged).
+    pub(crate) fn preview_color(&mut self, id: &str, path: &str, hex: &str) {
+        let (_, animated) = self.eval::<Color>(id, path, Color::WHITE);
+        let ops = self.value_ops(id, path, json!(hex), animated);
+        self.preview(&ops);
     }
 
     fn hit(&mut self, x: f64, y: f64) -> Option<String> {
@@ -1457,6 +1609,11 @@ impl MotionEditor {
     /// Saves edit ops through the piece's history.
     pub(crate) fn commit_ops(&mut self, ops: Vec<Value>) {
         self.commit(ops);
+    }
+
+    /// Says something in the status line.
+    pub(crate) fn say(&mut self, what: String) {
+        self.status = what;
     }
 
     pub(crate) fn status(&self) -> &str {
@@ -1807,6 +1964,38 @@ mod tests {
         let (own, _) = extra_values(&outlined);
         assert!(own.fields.iter().any(|f| f.label == "Outline width" && f.path == "stroke.width"), "{:?}", own.fields.iter().map(|f| &*f.label).collect::<Vec<_>>());
         assert!(own.colors.contains(&("Outline color".to_string(), "stroke.color".to_string())));
+    }
+
+    /// The picker's colours, a gradient's stops, a lut's table, a text's
+    /// rim light and the project's tables, as the inspector reads them.
+    #[test]
+    fn the_picker_stops_tables_and_rim_light_are_read() {
+        for hex in ["#ff0000", "#00ff00", "#0000ff", "#ffc928", "#22b45d", "#8c4ce8", "#808080", "#000000", "#ffffff", "#123456"] {
+            assert_eq!(hex_of(hsv_of(hex).0), hex);
+        }
+        assert_eq!(hsv_of("#ff0000"), ([0.0, 1.0, 1.0], String::new()));
+        assert_eq!(hsv_of("#00000080"), ([0.0, 0.0, 0.0], "80".to_string()));
+        assert_eq!((hex_of([120.0, 1.0, 1.0]), hex_of([240.0, 1.0, 0.5]), hex_of([360.0, 1.0, 1.0])), ("#00ff00".into(), "#000080".into(), "#ff0000".into()));
+        let map = values_in(&json!({"type": "gradient_map", "stops": [[0, "#101030"], [0.4, "#ff0000"], [1, "#ffd27a"]]}), "effects.0.", "gradient map".into());
+        assert_eq!(map.stops, Some(("effects.0.stops".to_string(), 3)));
+        assert_eq!(map.fields.iter().map(|f| (f.path.to_string(), f.label.to_string())).collect::<Vec<_>>(), [("effects.0.stops.0.0".into(), "stop 1 at".into()), ("effects.0.stops.1.0".into(), "stop 2 at".into()), ("effects.0.stops.2.0".into(), "stop 3 at".into())]);
+        assert_eq!(map.colors[1], ("stop 2 (at 0.4)".to_string(), "effects.0.stops.1.1".to_string()));
+        let lut = values_in(&json!({"type": "lut", "path": "assets/warm.cube", "amount": 0.5}), "effects.1.", "lut".into());
+        assert_eq!((lut.file.as_deref(), lut.fields.len(), lut.fields[0].path.as_ref()), (Some("assets/warm.cube"), 1, "effects.1.amount"));
+        let lit: Layer = serde_json::from_value(json!({"id": "t", "kind": "text", "text": "Hi", "edge": {"color": "#ffeecc"}})).unwrap();
+        let (own, _) = extra_values(&lit);
+        assert!(own.fields.iter().any(|f| f.path == "edge.width" && f.default == 3.0) && own.fields.iter().any(|f| f.path == "edge.angle"));
+        assert!(own.colors.contains(&("Rim colour".to_string(), "edge.color".to_string())));
+        let plain: Layer = serde_json::from_value(json!({"id": "t", "kind": "text", "text": "Hi"})).unwrap();
+        assert!(!extra_values(&plain).0.fields.iter().any(|f| f.path.starts_with("edge.")));
+        let dir = std::env::temp_dir().join(format!("lahza-motion-editor-luts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets/looks")).unwrap();
+        for file in ["b.cube", "assets/a.CUBE", "assets/looks/c.cube", "assets/not.txt"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        assert_eq!(lut_files(&dir), ["assets/a.CUBE", "assets/looks/c.cube", "b.cube"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
