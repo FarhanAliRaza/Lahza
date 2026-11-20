@@ -27,8 +27,8 @@ const INSPECTOR_WIDTH_WIDE: f32 = 440.0;
 const WIDE_WINDOW: f32 = 1800.0;
 pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
 /// Canvas well padding; less vertical so the canvas keeps its height.
-const CANVAS_PADDING_X: f32 = 40.0;
-const CANVAS_PADDING_Y: f32 = 24.0;
+pub(crate) const CANVAS_PADDING_X: f32 = 40.0;
+pub(crate) const CANVAS_PADDING_Y: f32 = 24.0;
 /// Default lane area height; it grows on tall windows until resized by hand.
 pub(crate) const DEFAULT_LANE_HEIGHT: f32 = 176.0;
 const MAX_LANE_HEIGHT: f32 = 340.0;
@@ -414,7 +414,7 @@ impl Studio {
         let width = (viewport.width.max(px(EDITOR_MIN_WIDTH))
             - px(CANVAS_PADDING_X * 2.0 + inspector)).max(px(1.0));
         let height = (viewport.height.max(px(EDITOR_MIN_HEIGHT))
-            - px(TOP_BAR_HEIGHT + CANVAS_PADDING_Y * 2.0 + self.timeline_bar_height()))
+            - px(TOP_BAR_HEIGHT + CANVAS_PADDING_Y * 2.0 + self.timeline_bar_height() + self.motion_prompt_height()))
         .max(px(1.0));
         self.preview_canvas_size(width, height)
     }
@@ -1441,6 +1441,15 @@ impl Studio {
         if let Some(layer) = self.motion_layer_inspector(cx) {
             return layer;
         }
+        // With no layer selected: what the agent was asked here, above
+        // the rest of the tab.
+        if self.motion_prompt_visible() && !self.motion_agent.requests.is_empty() {
+            return div().flex().flex_col().gap_4().child(self.motion_agent_log(None, cx)).child(self.motion_tab_rest(cx)).into_any_element();
+        }
+        self.motion_tab_rest(cx)
+    }
+
+    fn motion_tab_rest(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(piece) = self.motion_piece_inspector(cx) {
             return piece;
         }
@@ -1723,6 +1732,12 @@ impl Studio {
         self.pause_video_playback();
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
+        // In the Motion tab, Shift marks a span to prompt about.
+        if event.modifiers.shift && self.motion_prompt_visible() {
+            self.begin_motion_span(event.position.x);
+            cx.notify();
+            return;
+        }
         let target = self.motion_timeline_time_at(event.position.x)
             .unwrap_or(self.video_position);
         self.scrub_video_to(target, cx);

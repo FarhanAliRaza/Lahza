@@ -26,6 +26,7 @@ use lahza_motion_mcp::tools::Toolbox;
 use lahza_motion_render::font::Fonts;
 use lahza_motion_render::{RenderOptions, Renderer};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,26 +233,69 @@ fn split_offset(text: &str, fps: f64) -> (String, f64) {
 }
 
 /// A scrubbable inspector value: property path and vector component.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct Field {
-    pub path: &'static str,
+    pub path: Cow<'static, str>,
     pub component: Option<usize>,
-    pub label: &'static str,
+    pub label: Cow<'static, str>,
     /// Value change per dragged pixel.
     pub step: f64,
+    /// The value when the layer's JSON has none.
+    pub default: f64,
+}
+
+const fn field(path: &'static str, component: Option<usize>, label: &'static str, step: f64, default: f64) -> Field {
+    Field { path: Cow::Borrowed(path), component, label: Cow::Borrowed(label), step, default }
 }
 
 pub(crate) const FIELDS: &[Field] = &[
-    Field { path: "transform.position", component: Some(0), label: "X", step: 1.0 },
-    Field { path: "transform.position", component: Some(1), label: "Y", step: 1.0 },
-    Field { path: "transform.scale", component: Some(0), label: "Scale X", step: 0.005 },
-    Field { path: "transform.scale", component: Some(1), label: "Scale Y", step: 0.005 },
-    Field { path: "transform.rotation", component: None, label: "Rotation", step: 0.5 },
-    Field { path: "transform.opacity", component: None, label: "Opacity", step: 0.005 },
-    Field { path: "transform.z", component: None, label: "Z", step: 2.0 },
-    Field { path: "transform.rotation_x", component: None, label: "Tilt X", step: 0.5 },
-    Field { path: "transform.rotation_y", component: None, label: "Turn Y", step: 0.5 },
+    field("transform.position", Some(0), "X", 1.0, 0.0),
+    field("transform.position", Some(1), "Y", 1.0, 0.0),
+    field("transform.scale", Some(0), "Scale X", 0.005, 1.0),
+    field("transform.scale", Some(1), "Scale Y", 0.005, 1.0),
+    field("transform.rotation", None, "Rotation", 0.5, 0.0),
+    field("transform.opacity", None, "Opacity", 0.005, 1.0),
+    field("transform.z", None, "Z", 2.0, 0.0),
+    field("transform.rotation_x", None, "Tilt X", 0.5, 0.0),
+    field("transform.rotation_y", None, "Turn Y", 0.5, 0.0),
 ];
+
+/// Effects the inspector can add, with the values they start from.
+pub(crate) const EFFECTS: &[(&str, &str)] = &[
+    ("Blur", r#"{"type": "blur", "radius": 8}"#),
+    ("Shadow", r#"{"type": "shadow", "radius": 12, "offset": [0, 8]}"#),
+    ("Exposure", r#"{"type": "exposure", "stops": 0.5}"#),
+    ("Contrast", r#"{"type": "brightness_contrast", "brightness": 0, "contrast": 0.2}"#),
+    ("Colour", r#"{"type": "hue_saturation", "hue": 0, "saturation": 0.2, "lightness": 0}"#),
+];
+
+/// The scrubbable numbers of a layer's own kind and of its effects, read
+/// from its JSON: a text's size, and each effect's values (its name first).
+pub(crate) fn extra_fields(layer: &Layer) -> (Vec<Field>, Vec<(String, Vec<Field>)>) {
+    let number = |v: &Value| v.is_number() || v.get("keys").and_then(|k| k.get(0)).and_then(|k| k.get("v")).is_some_and(Value::is_number);
+    let mut own = Vec::new();
+    if let lahza_motion_core::document::LayerKind::Text(_) = &layer.kind {
+        own.push(Field { path: "size".into(), component: None, label: "Size".into(), step: 0.5, default: 96.0 });
+        own.push(Field { path: "tracking".into(), component: None, label: "Tracking".into(), step: 0.1, default: 0.0 });
+    }
+    let mut effects = Vec::new();
+    let json = serde_json::to_value(&layer.common.effects).unwrap_or_default();
+    for (i, effect) in json.as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
+        let name = effect.get("type").and_then(Value::as_str).unwrap_or("effect").replace('_', " ");
+        let mut fields = Vec::new();
+        for (key, _) in effect.as_object().into_iter().flatten().filter(|(k, v)| *k != "type" && number(v)) {
+            let step = match key.as_str() {
+                "radius" | "size" | "distance" | "width" => 0.25,
+                "hue" | "angle" => 1.0,
+                "stops" => 0.02,
+                _ => 0.01,
+            };
+            fields.push(Field { path: format!("effects.{i}.{key}").into(), component: None, label: key.replace('_', " ").into(), step, default: 0.0 });
+        }
+        effects.push((name, fields));
+    }
+    (own, effects)
+}
 
 pub(crate) struct KeyMark {
     pub path: String,
@@ -292,6 +336,8 @@ pub(crate) struct MotionEditor {
     /// The project as a drag shows it (unsaved): a copy made at the drag's
     /// first tick, in which each tick replaces the one layer it changes.
     preview_project: Option<Project>,
+    /// The preview shows a request's "before" (`compare`), not a drag.
+    comparing: bool,
     /// The selected layer as JSON, saved and as the drag shows it: values
     /// are read from these, so a draw does not serialise the layer again.
     saved_json: RefCell<Option<(String, Value)>>,
@@ -459,6 +505,7 @@ impl MotionEditor {
             canvas_bounds: Arc::default(),
             drag: None,
             preview_project: None,
+            comparing: false,
             saved_json: RefCell::default(),
             preview_json: RefCell::default(),
             focus: cx.focus_handle(),
@@ -565,7 +612,7 @@ impl MotionEditor {
     /// Whether anything is being dragged: on the canvas, or a value, a
     /// layer or a key from the studio (an unsaved preview shows).
     pub(crate) fn dragging(&self) -> bool {
-        self.drag.is_some() || self.preview_project.is_some()
+        self.drag.is_some() || (self.preview_project.is_some() && !self.comparing)
     }
 
     /// The project as it shows now: a drag's unsaved copy, or the saved one.
@@ -574,6 +621,7 @@ impl MotionEditor {
     }
 
     fn drop_preview(&mut self) {
+        self.comparing = false;
         self.preview_project = None;
         *self.preview_json.borrow_mut() = None;
     }
@@ -636,7 +684,8 @@ impl MotionEditor {
     }
 
     fn undo(&mut self, redo: bool) {
-        let args = if redo { json!({"project": self.dir, "redo": true}) } else { json!({"project": self.dir, "undo": 1}) };
+        // An agent's request is one step.
+        let args = if redo { json!({"project": self.dir, "redo": true}) } else { json!({"project": self.dir, "undo": 1, "by_request": true}) };
         match self.toolbox.call("history", args) {
             Ok(_) => self.status = if redo { "Redone".into() } else { "Undone".into() },
             Err(e) => self.status = e,
@@ -740,17 +789,16 @@ impl MotionEditor {
         }
     }
 
-    fn field_ops(&self, id: &str, field: Field, value: f64) -> Vec<Value> {
+    fn field_ops(&self, id: &str, field: &Field, value: f64) -> Vec<Value> {
         match field.component {
             Some(c) => {
-                let default = if field.path == "transform.scale" { Vec2::ONE } else { Vec2::ZERO };
-                let (mut v, animated) = self.eval::<Vec2>(id, field.path, default);
+                let (mut v, animated) = self.eval::<Vec2>(id, &field.path, Vec2([field.default; 2]));
                 v.0[c] = value;
-                self.value_ops(id, field.path, json!([round(v.0[0]), round(v.0[1])]), animated)
+                self.value_ops(id, &field.path, json!([round(v.0[0]), round(v.0[1])]), animated)
             }
             None => {
-                let (_, animated) = self.eval::<f64>(id, field.path, 0.0);
-                self.value_ops(id, field.path, json!(round(value)), animated)
+                let (_, animated) = self.eval::<f64>(id, &field.path, field.default);
+                self.value_ops(id, &field.path, json!(round(value)), animated)
             }
         }
     }
@@ -938,28 +986,89 @@ impl MotionEditor {
 
     /// `field` of layer `id` at the playhead, and whether it is keyed.
     /// One evaluation; during a drag, the value the drag shows.
-    pub(crate) fn field_state(&self, id: &str, field: Field) -> (f64, bool) {
+    pub(crate) fn field_state(&self, id: &str, field: &Field) -> (f64, bool) {
         match field.component {
             Some(c) => {
-                let default = if field.path == "transform.scale" { Vec2::ONE } else { Vec2::ZERO };
-                let (v, animated) = self.eval_in::<Vec2>(id, field.path, default, true);
+                let (v, animated) = self.eval_in::<Vec2>(id, &field.path, Vec2([field.default; 2]), true);
                 (v.0[c], animated)
             }
-            None => self.eval_in::<f64>(id, field.path, if field.path == "transform.opacity" { 1.0 } else { 0.0 }, true),
+            None => self.eval_in::<f64>(id, &field.path, field.default, true),
         }
     }
 
     /// Shows `field` of `layer` at `value` (unsaved).
-    pub(crate) fn drag_value(&mut self, layer: &str, field: Field, value: f64) {
+    pub(crate) fn drag_value(&mut self, layer: &str, field: &Field, value: f64) {
         let ops = self.field_ops(layer, field, value);
         self.preview(&ops);
     }
 
     /// Saves `field` of `layer` at `value`: a key at the playhead when the
     /// property is animated, otherwise a plain value.
-    pub(crate) fn drop_value(&mut self, layer: &str, field: Field, value: f64) {
+    pub(crate) fn drop_value(&mut self, layer: &str, field: &Field, value: f64) {
         let ops = self.field_ops(layer, field, value);
         self.commit(ops);
+    }
+
+    /// Shows edit ops without saving them (text as it is typed).
+    pub(crate) fn preview_ops(&mut self, ops: &[Value]) {
+        self.preview(ops);
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The scene at the playhead.
+    pub(crate) fn scene_at_playhead(&self) -> Option<String> {
+        self.compiled.scene_at(self.time).map(|s| s.id.to_string())
+    }
+
+    /// The frame showing now, as a PNG (what an agent is sent to look at).
+    pub(crate) fn frame_png(&self) -> Option<Vec<u8>> {
+        let frame = self.frame.as_ref()?;
+        let size = frame.size(0);
+        let (w, h) = (size.width.0 as u32, size.height.0 as u32);
+        // The frame is BGRA (GPUI's upload order).
+        let mut pixels = frame.as_bytes(0)?.to_vec();
+        for p in pixels.chunks_exact_mut(4) {
+            p.swap(0, 2);
+        }
+        let mut png = Vec::new();
+        image::RgbaImage::from_raw(w, h, pixels)?.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+        Some(png)
+    }
+
+    /// Takes back every edit made for `request` (one undo; redo puts them
+    /// back).
+    pub(crate) fn undo_request(&mut self, request: &str) -> Result<(), String> {
+        let result = self.toolbox.call("history", json!({"project": self.dir, "undo_request": request})).map(|_| ());
+        self.status = match &result {
+            Ok(()) => "Undone".into(),
+            Err(e) => e.clone(),
+        };
+        self.reload();
+        result
+    }
+
+    /// Before and after: while `request` is given the preview shows the
+    /// project without that request's edits (nothing is saved); None
+    /// shows it as it is.
+    pub(crate) fn compare(&mut self, request: Option<&str>) {
+        let Some(request) = request else {
+            if std::mem::take(&mut self.comparing) {
+                self.cancel_preview();
+            }
+            return;
+        };
+        let Ok(history) = io::read_history(&self.dir) else { return };
+        let ops: Vec<Value> = history.iter().rev().filter(|e| e.request.as_deref() == Some(request) && !e.undone).flat_map(|e| e.inverse.iter().cloned()).collect();
+        if let Ok(before) = edit::apply(&self.project, &ops) {
+            self.preview_project = Some(before.project);
+            *self.preview_json.borrow_mut() = None;
+            self.comparing = true;
+            self.compiled = Arc::new(Compiled::new(self.shown()));
+            self.dirty = true;
+        }
     }
 
     /// Drops any unsaved drag preview.
@@ -1338,7 +1447,7 @@ mod tests {
                         assert_eq!(editor.hit_at(200.0, 180.0).as_deref(), Some("box"));
                         assert_eq!(editor.hit_at(10.0, 10.0), None);
                         // Scrub the title's opacity (constant → set).
-                        let field = FIELDS[5];
+                        let field = &FIELDS[5];
                         editor.drag_value("title", field, 0.25);
                         // Mid-drag: the proxy is on and the number follows.
                         assert!(editor.dragging(), "a value drag is a drag");
