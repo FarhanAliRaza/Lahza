@@ -702,9 +702,14 @@ from goes through the C library now: rapier's maths is software
 (`enhanced-determinism`), the behaviours, crowds and search use `libm`,
 and everything `compile` works out (layer rotations, curves, cameras)
 goes through `core::dm` (`libm`'s sines, powers and logarithms; lengths
-by multiply and square root), which left every pin as it was. Whether
-the pins hold on a CPU without FMA and on ARM is being run by the
-coordinating session. In the order built:
+by multiply and square root), which left every pin as it was. Run on
+other kinds of CPU by the coordinating session (before that last change,
+at fa1dfd7): on x86-64 with glibc kept off its FMA and AVX paths
+(`GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-AVX2,…`; a C program's sines
+do hash differently with and without) all 35 of `motion-sim`'s tests
+pass and every pin holds; on aarch64 under `qemu-user` 34 pass, every
+pinned bake among them, the one failure being the policy test, whose
+ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
