@@ -107,10 +107,17 @@ fn drop(bake: &Bake) -> f64 {
 #[test]
 #[ignore]
 fn probe_search() {
-    for (name, controller) in [("search 16 0.5s", json!({"type": "search", "horizon": 0.5})), ("search 8 0.5s", json!({"type": "search", "horizon": 0.5, "samples": 8}))] {
-        for speed in [1000.0, 1400.0, 1800.0] {
+    for threads in ["1", "2", "4"] {
+        std::env::set_var("LAHZA_SIM_THREADS", threads);
+        let (bake, stats) = pushed(700.0, json!({"type": "search", "horizon": 0.5}), json!([]), 4.0);
+        println!("{threads} threads: hips drop {:.1} px; bake {:.2} s ({:.2} s in tries on {} threads), {:x}", drop(&bake), stats.seconds, stats.search_seconds, stats.search_threads, crate::behaviour_tests::pin(&bake).1);
+    }
+    std::env::remove_var("LAHZA_SIM_THREADS");
+    for (name, controller) in [("search 0.25s", json!({"type": "search", "horizon": 0.25})), ("search", json!({"type": "search"})), ("search 32", json!({"type": "search", "samples": 32})), ("search 1s", json!({"type": "search", "horizon": 1.0}))] {
+        for speed in [300.0, 450.0, 700.0, 1000.0, 1400.0, 1800.0] {
             let (bake, stats) = pushed(speed, controller.clone(), json!([]), 4.0);
-            println!("{name:16} push {speed:4}: hips drop {:6.1} px; bake {:.2} s ({} steps, {} tried, {:.2} s in tries)", drop(&bake), stats.seconds, stats.steps, stats.tried_steps, stats.search_seconds);
+            let strides = bake.events.iter().filter(|e| e.kind == "step").count();
+            println!("{name:12} push {speed:4}: hips drop {:6.1} px, {strides} steps; bake {:.2} s ({} steps, {} tried, {:.2} s in tries on {} threads)", drop(&bake), stats.seconds, stats.steps, stats.tried_steps, stats.search_seconds, stats.search_threads);
         }
     }
 }
@@ -118,19 +125,45 @@ fn probe_search() {
 #[test]
 fn trying_ahead_keeps_it_up_where_holding_the_clip_does_not() {
     // Motors holding the clip and nothing else: a 300 px/s shove at the
-    // chest topples it. Trying sixteen sets of leans a quarter second
-    // ahead, ten times a second, it stays up, with no force helping.
+    // chest topples it. Trying sixteen plans half a second ahead, ten
+    // times a second, it stays up, with no force on its body.
     let (statue, plain) = pushed(300.0, Value::Null, json!([]), 4.0);
     assert!(drop(&statue) > 150.0, "holding the clip, its hips came down {:.0} px", drop(&statue));
     let (kept, stats) = pushed(300.0, json!({"type": "search"}), json!([]), 4.0);
     assert!(drop(&kept) < 10.0, "trying ahead, its hips came down {:.0} px", drop(&kept));
     // What it costs: the steps of every try, on top of the take's own.
     assert_eq!(stats.steps, plain.steps);
-    assert!(stats.tried_steps > 20 * stats.steps, "{} steps tried for {} taken", stats.tried_steps, stats.steps);
-    // The same take again (its tries are seeded).
-    let (again, _) = pushed(300.0, json!({"type": "search"}), json!([]), 4.0);
-    assert!(again.to_bytes() == kept.to_bytes());
+    assert!(stats.tried_steps > 40 * stats.steps, "{} steps tried for {} taken", stats.tried_steps, stats.steps);
+    // Three times as hard a shove: it steps (a plan may have the foot
+    // behind carried to where it is falling to), swings its arms, and
+    // stands at the end, 60 px and more from where it stood.
+    let (stepped, _) = pushed(1000.0, json!({"type": "search"}), json!([]), 4.0);
+    let strides: Vec<&str> = stepped.events.iter().filter(|e| e.kind == "step").map(|e| e.a.as_str()).collect();
+    assert!(drop(&stepped) < 10.0 && !strides.is_empty() && strides.iter().all(|f| f.starts_with("foot")), "its hips came down {:.0} px, steps {strides:?}", drop(&stepped));
+    let n = stepped.tracks[0].samples.len();
+    let moved = pose(&stepped, "hips", n - 1).p[0] - pose(&stepped, "hips", 0).p[0];
+    assert!(moved > 60.0, "it ended {moved:.0} px along");
+    let swing = |bake: &Bake, k: usize| {
+        let (chest, arm) = (pose(bake, "chest", k).q, pose(bake, "upper_l", k).q);
+        let d = lahza_motion_core::sim::quat_mul([-chest[0], -chest[1], -chest[2], chest[3]], arm);
+        let rest = {
+            let (c, a) = (pose(bake, "chest", 0).q, pose(bake, "upper_l", 0).q);
+            lahza_motion_core::sim::quat_mul([-c[0], -c[1], -c[2], c[3]], a)
+        };
+        (2.0 * (0..4).map(|i| d[i] * rest[i]).sum::<f64>().abs().min(1.0).acos()).to_degrees()
+    };
+    let most = (0..n).map(|k| swing(&stepped, k)).fold(0.0, f64::max);
+    assert!(most > 25.0, "its upper arm swung {most:.0}° from where it hung at most");
+    // The same take again (its tries are seeded), and the same on one
+    // core as on all of them.
+    let (again, on_all) = pushed(1000.0, json!({"type": "search"}), json!([]), 4.0);
+    assert!(again.to_bytes() == stepped.to_bytes());
+    std::env::set_var("LAHZA_SIM_THREADS", "1");
+    let (alone, on_one) = pushed(1000.0, json!({"type": "search"}), json!([]), 4.0);
+    std::env::remove_var("LAHZA_SIM_THREADS");
+    assert!(alone.to_bytes() == stepped.to_bytes() && on_one.search_threads == 1 && on_one.tried_steps == on_all.tried_steps);
+    assert_eq!(crate::behaviour_tests::pin(&stepped), (56950, 17133235751400427189), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // It has its limit too.
-    let (lost, _) = pushed(700.0, json!({"type": "search"}), json!([]), 4.0);
+    let (lost, _) = pushed(1800.0, json!({"type": "search"}), json!([]), 4.0);
     assert!(drop(&lost) > 150.0);
 }

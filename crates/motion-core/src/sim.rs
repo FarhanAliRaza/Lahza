@@ -425,6 +425,11 @@ pub struct Ragdoll {
     pub strength: Property<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strengths: Vec<BoneStrength>,
+    /// Its limbs meet its body and each other (true by default; false:
+    /// they pass through, as bones jointed together and bones whose
+    /// shapes overlap at rest always do).
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub self_collide: bool,
     /// What sets the motors' targets on top of the clip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behaviours: Vec<Behaviour>,
@@ -439,8 +444,15 @@ pub struct Ragdoll {
 impl Ragdoll {
     /// A limp ragdoll of the skeleton under `root`.
     pub fn of(id: String, root: String, mass: f64, thickness: f64, friction: f64) -> Ragdoll {
-        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), controller: None }
+        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None }
     }
+}
+
+fn yes() -> bool {
+    true
+}
+fn is_yes(v: &bool) -> bool {
+    *v
 }
 
 fn ragdoll_mass() -> f64 {
@@ -558,6 +570,12 @@ pub enum BehaviourKind {
     Reach,
     /// Both arms up about the head. No params.
     Protect,
+    /// With `balance`: once it has fallen and lain still for `wait`
+    /// seconds it rolls onto its front, pushes up, draws its legs under
+    /// it and stands, in `time` seconds. An outside force on its hips of
+    /// at most `help` × its weight (and the torque that would make)
+    /// lifts and rights it. Params: `wait`, `time`, `help`.
+    GetUp,
 }
 
 /// What sets a ragdoll's motors instead of the clip and behaviours.
@@ -567,9 +585,10 @@ pub enum Controller {
     /// A network (ONNX, a project path): observation in, targets out
     /// (`lahza-motion-sim`'s `policy` module gives the layout).
     Policy { src: String },
-    /// No training: each `every` seconds it tries `samples` sets of
-    /// targets `horizon` seconds ahead in the simulator and keeps the best
-    /// (the one that stays up and nearest the clip).
+    /// No training: each `every` seconds it tries `samples` plans (leans,
+    /// arm swings, perhaps a step) `horizon` seconds ahead in the
+    /// simulator and keeps the best (the one that stays up and nearest
+    /// the clip).
     Search {
         #[serde(default = "search_samples")]
         samples: u32,
@@ -587,7 +606,7 @@ fn search_samples() -> u32 {
     16
 }
 fn search_horizon() -> f64 {
-    0.25
+    0.5
 }
 fn search_every() -> f64 {
     0.1
@@ -608,9 +627,34 @@ pub struct Crowd {
     pub id: String,
     /// The agents' layers (comps), each walking on the level (x, z) from
     /// where its keys have it at the simulation's start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
+    /// Instead of `agents`: one comp (a character) that every agent is an
+    /// instance of. The layer itself is not drawn; the bake places its
+    /// copies, at the level, turn and scale its keys give it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character: Option<String>,
+    /// Where the instances start, [x, z] px; or `count` of them spread
+    /// over `area` ([x0, z0, x1, z1]) by the seed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub starts: Vec<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<[f64; 4]>,
     /// Where they go, [x, z] px: one for all, or one per agent in turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub goals: Vec<[f64; 2]>,
+    /// Instead of `goals`: each agent goes this far from where it starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub march: Option<[f64; 2]>,
+    /// Instances: how many are drawn as the character itself, nearest the
+    /// camera first; the rest are pictures of it (impostors). And a
+    /// distance from the camera (px) past which every one is a picture.
+    #[serde(default = "crowd_full")]
+    pub full: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near: Option<f64>,
     /// px/s, and how much it differs between agents (0..1).
     #[serde(default = "crowd_speed")]
     pub speed: f64,
@@ -636,6 +680,14 @@ pub struct Crowd {
     /// px/s of a body's speed into an agent that knocks it down.
     #[serde(default = "crowd_knock")]
     pub knock: f64,
+    /// Agents find their way round what stands across it (false: they
+    /// only steer off what is near, and a wall holds them).
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub plan: bool,
+    /// Seconds ahead an agent sees a body coming that would knock it
+    /// down, and steps out of its line (0: it does not look).
+    #[serde(default = "crowd_dodge")]
+    pub dodge: f64,
     /// Agents knocked down fall as ragdolls made like this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ragdoll: Option<CrowdRagdoll>,
@@ -656,8 +708,21 @@ pub struct CrowdRagdoll {
     pub limits: Vec<BoneLimit>,
     #[serde(default)]
     pub shapes: Vec<BoneShape>,
+    /// Instances: how many can be down as ragdolls at once in a take (the
+    /// ones knocked after that stop where they stand).
+    #[serde(default = "crowd_fallen")]
+    pub max: u32,
 }
 
+fn crowd_dodge() -> f64 {
+    0.6
+}
+fn crowd_full() -> u32 {
+    150
+}
+fn crowd_fallen() -> u32 {
+    24
+}
 fn crowd_facing() -> [f64; 2] {
     [0.0, -1.0]
 }
@@ -831,6 +896,61 @@ pub struct Bake {
     pub tracks: Vec<Track>,
     /// What happened, for directing: (seconds, kind, who, whom, how hard).
     pub events: Vec<SimEvent>,
+    /// Crowds of instances.
+    pub herds: Vec<HerdTrack>,
+}
+
+/// A crowd of instances, baked: every agent walks on the level, so a
+/// sample of one is four numbers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HerdTrack {
+    /// The crowd's id. A fallen agent's bones are tracks `<id>#<slot>/<bone layer>`.
+    pub id: String,
+    pub count: u32,
+    /// As `Track::rest`: the character's scale and anchor.
+    pub rest: Mat4,
+    /// The level the agents walk on, and how the character is turned
+    /// before an agent's own turn.
+    pub y: f64,
+    pub q: [f64; 4],
+    /// Per sample, per agent (`sample · count + agent`): x, z, its turn
+    /// about y (radians), and the timeline seconds its clip is shown at.
+    pub samples: Vec<[f32; 4]>,
+    /// Per agent: the sample from which it is down (`u32::MAX`: never),
+    /// and the ragdoll of the pool it fell as (`u32::MAX`: none).
+    pub down: Vec<u32>,
+    pub slot: Vec<u32>,
+}
+
+impl HerdTrack {
+    pub fn len(&self) -> usize {
+        if self.count == 0 { 0 } else { self.samples.len() / self.count as usize }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Agent `k` at sample position `x`: where it stands, its clip's
+    /// time, and its turn about y (radians).
+    pub fn agent(&self, k: usize, x: f64) -> Option<(Pose, f64, f64)> {
+        let last = self.len().checked_sub(1)?;
+        let n = self.count as usize;
+        let x = x.clamp(0.0, last as f64);
+        let i = (x.floor() as usize).min(last);
+        let j = (i + 1).min(last);
+        let f = x - i as f64;
+        let (a, b) = (self.samples[i * n + k], self.samples[j * n + k]);
+        let l = |c: usize| a[c] as f64 + (b[c] as f64 - a[c] as f64) * f;
+        // The turn the short way round.
+        let mut d = (b[2] - a[2]) as f64;
+        d -= (d / std::f64::consts::TAU).round() * std::f64::consts::TAU;
+        let turn = a[2] as f64 + d * f;
+        let q = quat_mul([0.0, (turn / 2.0).sin(), 0.0, (turn / 2.0).cos()], self.q);
+        // A clip that wrapped between the samples is not run backwards.
+        let clock = if b[3] < a[3] { a[3] as f64 } else { l(3) };
+        Some((Pose { p: [l(0), self.y, l(1)], q }, clock, turn))
+    }
 }
 
 /// Something that happened in a take: a first touch between two bodies
@@ -930,6 +1050,27 @@ impl Bake {
         let events = serde_json::to_vec(&self.events).unwrap_or_default();
         o.extend_from_slice(&(events.len() as u32).to_le_bytes());
         o.extend_from_slice(&events);
+        // (A bake without crowds of instances ends here.)
+        if !self.herds.is_empty() {
+            o.extend_from_slice(&(self.herds.len() as u32).to_le_bytes());
+        }
+        for h in &self.herds {
+            o.extend_from_slice(&(h.id.len() as u32).to_le_bytes());
+            o.extend_from_slice(h.id.as_bytes());
+            o.extend_from_slice(&h.count.to_le_bytes());
+            for v in h.rest.0.iter().chain([h.y].iter()).chain(h.q.iter()) {
+                o.extend_from_slice(&v.to_le_bytes());
+            }
+            o.extend_from_slice(&(h.samples.len() as u32).to_le_bytes());
+            for s in &h.samples {
+                for v in s {
+                    o.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            for v in h.down.iter().chain(&h.slot) {
+                o.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         o
     }
 
@@ -984,7 +1125,29 @@ impl Bake {
         }
         let len = r.u32()? as usize;
         let events = serde_json::from_slice(r.take(len)?).map_err(|e| format!("the bake's events: {e}"))?;
-        Ok(Bake { hash, start, rate, tracks, events })
+        let mut herds = Vec::new();
+        if !r.0.is_empty() {
+            for _ in 0..r.u32()? {
+                let len = r.u32()? as usize;
+                let id = String::from_utf8(r.take(len)?.to_vec()).map_err(|_| "the bake has a bad id".to_string())?;
+                let count = r.u32()?;
+                let mut f = [0.0; 21];
+                for v in &mut f {
+                    *v = r.f64()?;
+                }
+                let n = r.u32()? as usize;
+                let raw = r.take(n.checked_mul(16).ok_or("the bake is cut short")?)?;
+                let samples = raw.chunks_exact(16).map(|c| std::array::from_fn(|k| f32::from_le_bytes(c[k * 4..k * 4 + 4].try_into().unwrap()))).collect();
+                let mut marks = [Vec::new(), Vec::new()];
+                for m in &mut marks {
+                    let raw = r.take(count as usize * 4)?;
+                    *m = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                }
+                let [down, slot] = marks;
+                herds.push(HerdTrack { id, count, rest: Mat4(f[..16].try_into().unwrap()), y: f[16], q: f[17..21].try_into().unwrap(), samples, down, slot });
+            }
+        }
+        Ok(Bake { hash, start, rate, tracks, events, herds })
     }
 }
 
@@ -1168,6 +1331,9 @@ pub struct BehaviourInput {
 pub struct RagdollInput {
     pub id: String,
     pub bones: Vec<BoneInput>,
+    /// Its bones collide with each other (but for the jointed and the
+    /// ones that overlap at rest).
+    pub self_collide: bool,
     pub release: u32,
     pub behaviours: Vec<BehaviourInput>,
     /// (seconds, bone index, px/s, seconds it lasts).
@@ -1194,6 +1360,13 @@ pub struct AgentInput {
 pub struct CrowdInput {
     pub id: String,
     pub agents: Vec<AgentInput>,
+    /// The agents are instances of one character: the bake keeps them as
+    /// a `HerdTrack`, and those knocked down take a ragdoll of `pool`
+    /// (indices into `SimInput::ragdolls`) placed by `local` (as
+    /// `AgentInput::local`).
+    pub instanced: bool,
+    pub pool: Vec<usize>,
+    pub local: Vec<Vec<Pose>>,
     pub speed: f64,
     pub vary: f64,
     pub radius: f64,
@@ -1204,6 +1377,8 @@ pub struct CrowdInput {
     pub clip_at: f64,
     pub facing: [f64; 2],
     pub knock: f64,
+    pub plan: bool,
+    pub dodge: f64,
 }
 
 /// Everything a bake is made from: the document's simulation resolved to
@@ -1405,6 +1580,7 @@ impl SimInput {
                 h.str(&serde_json::to_string(&b.params).unwrap_or_default());
                 h.u64(b.target_body.map(|p| p as u64 + 1).unwrap_or(0));
             }
+            h.u64(r.self_collide as u64);
             h.u64(r.hits.len() as u64);
             for (t, bone, v, dur) in &r.hits {
                 h.fs(&[*t, *bone as f64, *dur]);
@@ -1415,8 +1591,19 @@ impl SimInput {
         h.u64(self.crowds.len() as u64);
         for c in &self.crowds {
             h.str(&c.id);
-            h.fs(&[c.speed, c.vary, c.radius, c.height, c.stride, c.cycle, c.clip_at, c.knock]);
+            h.fs(&[c.speed, c.vary, c.radius, c.height, c.stride, c.cycle, c.clip_at, c.knock, c.dodge, c.plan as u8 as f64]);
             h.fs(&c.facing);
+            h.u64(c.instanced as u64);
+            h.u64(c.pool.len() as u64);
+            for r in &c.pool {
+                h.u64(*r as u64);
+            }
+            for bone in &c.local {
+                h.u64(bone.len() as u64);
+                for p in bone {
+                    h.pose(p);
+                }
+            }
             h.u64(c.agents.len() as u64);
             for a in &c.agents {
                 h.str(&a.id);
@@ -1496,9 +1683,26 @@ mod tests {
             rate: 30.0,
             tracks: vec![Track { id: "box".into(), from: 1, rest: Mat4::scale(2.0, 2.0, 2.0), samples: vec![[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [20.0, 4.0, 0.0, 0.0, 0.0, half, half]], clock: vec![0.0, 0.5, 1.0] }],
             events: vec![SimEvent { t: 1.2, kind: "touch".into(), a: "box".into(), b: "floor".into(), speed: 120.0 }],
+            herds: Vec::new(),
         };
         let back = Bake::from_bytes(&bake.to_bytes()).unwrap();
         assert_eq!(back, bake);
+        // A crowd of instances comes after the rest, when there is one:
+        // two agents, three samples; the second turns the short way
+        // round through ±π, and its clip wraps without running back.
+        let (pi, y) = (std::f32::consts::PI, 800.0);
+        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0] };
+        let with = Bake { herds: vec![herd], ..bake.clone() };
+        let bytes = with.to_bytes();
+        assert_eq!(Bake::from_bytes(&bytes).unwrap(), with);
+        assert!(bytes.len() > bake.to_bytes().len() && Bake::from_bytes(&bytes[..bytes.len() - 3]).is_err());
+        let h = &with.herds[0];
+        assert_eq!(h.len(), 3);
+        let (pose, clock, turn) = h.agent(0, 0.5).unwrap();
+        assert!(pose.p == [5.0, 800.0, 0.0] && (clock - 0.25).abs() < 1e-6 && turn == 0.0);
+        let (pose, clock, turn) = h.agent(1, 0.5).unwrap();
+        assert!((pose.p[2] - 7.0).abs() < 1e-9 && (clock - 0.9).abs() < 1e-6 && (turn.abs() - std::f64::consts::PI).abs() < 1e-6, "{pose:?} {clock} {turn}");
+        assert!(h.agent(1, 9.0).unwrap().0.p[2] == 13.0);
         assert!(Bake::from_bytes(&bake.to_bytes()[..40]).is_err());
         // Before the release the keys stand; after the last sample it holds.
         assert!(bake.world(0, 1.0).is_none());

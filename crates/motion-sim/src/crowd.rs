@@ -9,7 +9,8 @@
 //! is a capsule that is moved, not pushed: bodies bounce off it.
 
 use crate::world::{pose, v3, Rng, World};
-use lahza_motion_core::sim::{CrowdInput, Pose, SimEvent, SimInput, Track};
+use lahza_motion_core::sim::{CrowdInput, HerdTrack, Pose, SimEvent, SimInput, Track};
+use std::collections::HashMap;
 use rapier3d::prelude::*;
 
 struct Agent {
@@ -24,6 +25,10 @@ struct Agent {
     /// The sample from which it is down.
     down: Option<u32>,
     proxy: RigidBodyHandle,
+    /// The corners of its way round what stands between it and its goal
+    /// (none: straight there), and the body it last stepped aside from.
+    path: Vec<[f64; 2]>,
+    dodged: Option<usize>,
     /// Its place at this sample and the next.
     now: Pose,
     next: Pose,
@@ -33,6 +38,196 @@ struct Agent {
 pub struct Herd {
     agents: Vec<Vec<Agent>>,
     pub events: Vec<SimEvent>,
+    /// Per crowd of instances: its samples so far, each agent's ragdoll
+    /// of the pool, and how many of the pool are taken.
+    rows: Vec<Vec<[f32; 4]>>,
+    slots: Vec<Vec<u32>>,
+    taken: Vec<usize>,
+    /// Samples planned so far.
+    sample: u32,
+    /// Whose capsule a body is.
+    proxies: HashMap<RigidBodyHandle, (usize, usize)>,
+}
+
+/// A body as agents see it: its box (px), how it moves (px/s).
+struct Block {
+    body: usize,
+    lo: [f64; 3],
+    hi: [f64; 3],
+    vel: [f64; 3],
+    fixed: bool,
+}
+
+fn self_places(places: &[[f64; 2]]) -> ([f64; 2], [f64; 2]) {
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for p in places {
+        for k in 0..2 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    (lo, hi)
+}
+
+/// Where a crowd's agents may walk this sample: the level in squares,
+/// those within an agent's radius of something that stands still shut.
+struct Ground {
+    origin: [f64; 2],
+    cell: f64,
+    w: usize,
+    h: usize,
+    shut: Vec<bool>,
+    /// What shuts them, each as [x0, z0, x1, z1] with the room round it.
+    walls: Vec<[f64; 4]>,
+}
+
+impl Ground {
+    /// Covers the agents, their goals and what stands, with room round them.
+    fn new(c: &CrowdInput, places: &([f64; 2], [f64; 2]), standing: &[&Block]) -> Ground {
+        let (mut lo, mut hi) = *places;
+        let cover = |lo: &mut [f64; 2], hi: &mut [f64; 2], p: [f64; 2]| {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        };
+        c.agents.iter().for_each(|a| cover(&mut lo, &mut hi, a.goal));
+        // (What moves is no wall: it is stepped aside from, or pushed off.)
+        let still: Vec<&&Block> = standing.iter().filter(|b| b.fixed || (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt() < 20.0).collect();
+        // (A floor-sized thing does not make the ground floor-sized.)
+        let (walked_lo, walked_hi) = (lo, hi);
+        for b in &still {
+            cover(&mut lo, &mut hi, [b.lo[0].max(walked_lo[0] - 40.0 * c.radius), b.lo[2].max(walked_lo[1] - 40.0 * c.radius)]);
+            cover(&mut lo, &mut hi, [b.hi[0].min(walked_hi[0] + 40.0 * c.radius), b.hi[2].min(walked_hi[1] + 40.0 * c.radius)]);
+        }
+        let margin = 6.0 * c.radius;
+        let (lo, hi) = ([lo[0] - margin, lo[1] - margin], [hi[0] + margin, hi[1] + margin]);
+        let cell = (1.5 * c.radius).max((hi[0] - lo[0]).max(hi[1] - lo[1]) / 192.0);
+        let (w, h) = ((((hi[0] - lo[0]) / cell).ceil() as usize).max(1), (((hi[1] - lo[1]) / cell).ceil() as usize).max(1));
+        let mut shut = vec![false; w * h];
+        let grow = c.radius + 0.35 * cell;
+        for b in &still {
+            let x = (((b.lo[0] - grow - lo[0]) / cell).floor().max(0.0) as usize, (((b.hi[0] + grow - lo[0]) / cell).floor().max(-1.0) as isize).min(w as isize - 1));
+            let z = (((b.lo[2] - grow - lo[1]) / cell).floor().max(0.0) as usize, (((b.hi[2] + grow - lo[1]) / cell).floor().max(-1.0) as isize).min(h as isize - 1));
+            for j in z.0 as isize..=z.1 {
+                for i in x.0 as isize..=x.1 {
+                    // (By the square's middle.)
+                    let (cx, cz) = (lo[0] + (i as f64 + 0.5) * cell, lo[1] + (j as f64 + 0.5) * cell);
+                    if cx > b.lo[0] - grow && cx < b.hi[0] + grow && cz > b.lo[2] - grow && cz < b.hi[2] + grow {
+                        shut[j as usize * w + i as usize] = true;
+                    }
+                }
+            }
+        }
+        let walls = still.iter().map(|b| [b.lo[0] - grow - cell, b.lo[2] - grow - cell, b.hi[0] + grow + cell, b.hi[2] + grow + cell]).collect();
+        Ground { origin: lo, cell, w, h, shut, walls }
+    }
+
+    fn square(&self, p: [f64; 2]) -> Option<usize> {
+        let (i, j) = (((p[0] - self.origin[0]) / self.cell).floor(), ((p[1] - self.origin[1]) / self.cell).floor());
+        (i >= 0.0 && j >= 0.0 && (i as usize) < self.w && (j as usize) < self.h).then(|| j as usize * self.w + i as usize)
+    }
+
+    fn middle(&self, i: usize) -> [f64; 2] {
+        [self.origin[0] + ((i % self.w) as f64 + 0.5) * self.cell, self.origin[1] + ((i / self.w) as f64 + 0.5) * self.cell]
+    }
+
+    /// Whether the straight line from `a` to `b` is open (past where `a`
+    /// itself stands: an agent pushed up against a wall still sees).
+    fn sight(&self, a: [f64; 2], b: [f64; 2]) -> bool {
+        // (Most lines pass nothing at all.)
+        let (lo, hi) = ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]);
+        if !self.walls.iter().any(|w| lo[0] < w[2] && hi[0] > w[0] && lo[1] < w[3] && hi[1] > w[1]) {
+            return true;
+        }
+        let l = len2([b[0] - a[0], b[1] - a[1]]);
+        let steps = (l / (0.5 * self.cell)).ceil().max(1.0) as usize;
+        (0..=steps).all(|s| {
+            let f = s as f64 / steps as f64;
+            f * l < 1.5 * self.cell || self.square([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]).is_none_or(|i| !self.shut[i])
+        })
+    }
+
+    /// The open square nearest `p`.
+    fn open(&self, p: [f64; 2]) -> Option<usize> {
+        let at = self.square([p[0].clamp(self.origin[0], self.origin[0] + self.w as f64 * self.cell - 1e-6), p[1].clamp(self.origin[1], self.origin[1] + self.h as f64 * self.cell - 1e-6)])?;
+        if !self.shut[at] {
+            return Some(at);
+        }
+        let (ci, cj) = ((at % self.w) as isize, (at / self.w) as isize);
+        (1..(self.w.max(self.h) as isize)).find_map(|ring| {
+            let mut best: Option<(f64, usize)> = None;
+            for j in cj - ring..=cj + ring {
+                for i in ci - ring..=ci + ring {
+                    if (i - ci).abs().max((j - cj).abs()) != ring || i < 0 || j < 0 || i >= self.w as isize || j >= self.h as isize {
+                        continue;
+                    }
+                    let k = j as usize * self.w + i as usize;
+                    let m = self.middle(k);
+                    let d = len2([m[0] - p[0], m[1] - p[1]]);
+                    if !self.shut[k] && best.is_none_or(|b| d < b.0) {
+                        best = Some((d, k));
+                    }
+                }
+            }
+            best.map(|b| b.1)
+        })
+    }
+
+    /// The corners of the shortest open way from `from` to `to` (the
+    /// squares' middles, then `to` itself); none when there is no way.
+    fn route(&self, from: [f64; 2], to: [f64; 2]) -> Vec<[f64; 2]> {
+        let (Some(start), Some(end)) = (self.open(from), self.open(to)) else { return Vec::new() };
+        let (w, h) = (self.w as isize, self.h as isize);
+        // A*, costs in tenths of a square (10 straight, 14 across).
+        let far = |i: usize| {
+            let (dx, dy) = (((i % self.w) as isize - (end % self.w) as isize).unsigned_abs() as u32, ((i / self.w) as isize - (end / self.w) as isize).unsigned_abs() as u32);
+            10 * dx.max(dy) + 4 * dx.min(dy)
+        };
+        let mut cost = vec![u32::MAX; self.shut.len()];
+        let mut came = vec![u32::MAX; self.shut.len()];
+        let mut heap = std::collections::BinaryHeap::new();
+        cost[start] = 0;
+        heap.push(std::cmp::Reverse((far(start), start as u32)));
+        while let Some(std::cmp::Reverse((f, at))) = heap.pop() {
+            let at = at as usize;
+            if at == end {
+                break;
+            }
+            if f > cost[at] + far(at) {
+                continue;
+            }
+            let (i, j) = ((at % self.w) as isize, (at / self.w) as isize);
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                let (x, y) = (i + dx, j + dy);
+                if x < 0 || y < 0 || x >= w || y >= h {
+                    continue;
+                }
+                let next = y as usize * self.w + x as usize;
+                // (No way between two shut squares that touch at a corner.)
+                if self.shut[next] || (dx != 0 && dy != 0 && (self.shut[j as usize * self.w + x as usize] || self.shut[y as usize * self.w + i as usize])) {
+                    continue;
+                }
+                let g = cost[at] + if dx != 0 && dy != 0 { 14 } else { 10 };
+                if g < cost[next] {
+                    cost[next] = g;
+                    came[next] = at as u32;
+                    heap.push(std::cmp::Reverse((g + far(next), next as u32)));
+                }
+            }
+        }
+        if cost[end] == u32::MAX {
+            return Vec::new();
+        }
+        let mut way = vec![if self.square(to) == Some(end) { to } else { self.middle(end) }];
+        let mut at = end;
+        while came[at] != u32::MAX {
+            at = came[at] as usize;
+            way.push(self.middle(at));
+        }
+        way.reverse();
+        way
+    }
 }
 
 fn len2(v: [f64; 2]) -> f64 {
@@ -43,14 +238,19 @@ fn len2(v: [f64; 2]) -> f64 {
 /// to face `heading`.
 fn place(c: &CrowdInput, k: usize, at: [f64; 2], heading: [f64; 2]) -> Pose {
     let a = &c.agents[k];
-    let f = lahza_motion_core::sim::quat_rotate(a.start.q, [c.facing[0], 0.0, c.facing[1]]);
-    // A turn about y takes the level angle down by its own.
-    let turn = libm::atan2(f[2], f[0]) - libm::atan2(heading[1], heading[0]);
+    let turn = turn(c, k, heading);
     let q = lahza_motion_core::sim::quat_mul([0.0, libm::sin(turn / 2.0), 0.0, libm::cos(turn / 2.0)], a.start.q);
     Pose { p: [at[0], a.start.p[1], at[1]], q }
 }
 
-fn sample(p: &Pose) -> [f32; 7] {
+/// The turn about y that has agent `k` face `heading`.
+fn turn(c: &CrowdInput, k: usize, heading: [f64; 2]) -> f64 {
+    let f = lahza_motion_core::sim::quat_rotate(c.agents[k].start.q, [c.facing[0], 0.0, c.facing[1]]);
+    // A turn about y takes the level angle down by its own.
+    libm::atan2(f[2], f[0]) - libm::atan2(heading[1], heading[0])
+}
+
+fn sample_of(p: &Pose) -> [f32; 7] {
     [p.p[0] as f32, p.p[1] as f32, p.p[2] as f32, p.q[0] as f32, p.q[1] as f32, p.q[2] as f32, p.q[3] as f32]
 }
 
@@ -58,6 +258,7 @@ impl Herd {
     pub fn new(input: &SimInput, world: &mut World) -> Herd {
         let m = 1.0 / world.unit;
         let mut agents = Vec::new();
+        let mut proxies = HashMap::new();
         for (n, c) in input.crowds.iter().enumerate() {
             let mut herd = Vec::with_capacity(c.agents.len());
             for (k, a) in c.agents.iter().enumerate() {
@@ -71,6 +272,8 @@ impl Herd {
                 let half = (c.height / 2.0 - c.radius).max(0.0);
                 let proxy = world.w.insert_body(RigidBodyBuilder::kinematic_position_based().pose(pose(&now, world.unit)));
                 world.w.insert_collider(ColliderBuilder::capsule_y((half * m) as f32, (c.radius * m) as f32).translation(v3([0.0, -c.height / 2.0, 0.0], m)).friction(0.6), Some(proxy));
+                proxies.insert(proxy, (n, k));
+                let room = if c.instanced { 0 } else { input.samples as usize + 1 };
                 herd.push(Agent {
                     at,
                     vel: [0.0; 2],
@@ -80,14 +283,24 @@ impl Herd {
                     phase: (rng.signed() + 1.0) / 2.0,
                     down: None,
                     proxy,
+                    path: Vec::new(),
+                    dodged: None,
                     now,
                     next: now,
-                    track: Track { id: a.id.clone(), from: 0, rest: a.rest, samples: Vec::with_capacity(input.samples as usize + 1), clock: Vec::with_capacity(input.samples as usize + 1) },
+                    track: Track { id: a.id.clone(), from: 0, rest: a.rest, samples: Vec::with_capacity(room), clock: Vec::with_capacity(room) },
                 });
             }
             agents.push(herd);
         }
-        Herd { agents, events: Vec::new() }
+        Herd {
+            agents,
+            events: Vec::new(),
+            rows: input.crowds.iter().map(|c| Vec::with_capacity(if c.instanced { c.agents.len() * (input.samples as usize + 1) } else { 0 })).collect(),
+            slots: input.crowds.iter().map(|c| vec![u32::MAX; if c.instanced { c.agents.len() } else { 0 }]).collect(),
+            taken: vec![0; input.crowds.len()],
+            sample: 0,
+            proxies,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -103,15 +316,19 @@ impl Herd {
     pub fn plan(&mut self, input: &SimInput, world: &World) {
         let u = world.unit;
         let dt = 1.0 / input.rate;
-        // What stands in the way: the level outline of every body that is
-        // no agent's own, with the heights it spans.
-        let mut blocks: Vec<([f64; 2], f64, f64, f64)> = Vec::new();
+        let sample = self.sample;
+        self.sample += 1;
+        let t = input.start + sample as f64 * dt;
+        // What stands in the way or comes flying: every body that is no
+        // agent's own, as its box.
+        let mut blocks: Vec<Block> = Vec::new();
         for (b, body) in input.bodies.iter().enumerate() {
             if body.release == u32::MAX {
                 continue;
             }
+            let rb = &world.w.bodies[world.handles[b]];
             let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-            for &c in world.w.bodies[world.handles[b]].colliders() {
+            for &c in rb.colliders() {
                 let aabb = world.w.colliders[c].compute_aabb();
                 for k in 0..3 {
                     lo[k] = lo[k].min(aabb.mins[k] as f64 * u);
@@ -119,26 +336,66 @@ impl Herd {
                 }
             }
             if lo[0] <= hi[0] {
-                blocks.push(([(lo[0] + hi[0]) / 2.0, (lo[2] + hi[2]) / 2.0], (hi[0] - lo[0]).max(hi[2] - lo[2]) / 2.0, lo[1], hi[1]));
+                let v = rb.linvel();
+                blocks.push(Block { body: b, lo, hi, vel: [v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], fixed: body.kind == lahza_motion_core::sim::BodyKind::Fixed });
             }
         }
         for (n, c) in input.crowds.iter().enumerate() {
-            let places: Vec<([f64; 2], bool)> = self.agents[n].iter().map(|a| (a.at, a.down.is_some())).collect();
+            let places: Vec<[f64; 2]> = self.agents[n].iter().map(|a| a.at).collect();
+            // Who is near whom: the agents by the square they stand in
+            // (three radii a side, as far as one pushes another).
+            let reach = 3.0 * c.radius;
+            let square = |at: [f64; 2]| ((at[0] / reach).floor() as i64, (at[1] / reach).floor() as i64);
+            let mut squares: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+            for (j, at) in places.iter().enumerate() {
+                squares.entry(square(*at)).or_default().push(j as u32);
+            }
+            let mut near: Vec<u32> = Vec::new();
+            // What stands in these agents' height, and where they may
+            // walk (worked out when the first of them needs it).
+            let Some(feet) = c.agents.first().map(|a| a.start.p[1]) else { continue };
+            // (y is down: a head is at feet − height.)
+            let standing: Vec<&Block> = blocks.iter().filter(|b| b.hi[1] > feet - c.height && b.lo[1] < feet - 0.2 * c.height).collect();
+            let mut ground: Option<Ground> = None;
+            let gravity = input.gravity[1] * u;
             for (k, a) in self.agents[n].iter_mut().enumerate() {
                 a.now = a.next;
-                a.track.samples.push(sample(&a.now));
-                a.track.clock.push(Self::clock(c, a) as f32);
+                if c.instanced {
+                    self.rows[n].push([a.now.p[0] as f32, a.now.p[2] as f32, turn(c, k, a.heading) as f32, Self::clock(c, a) as f32]);
+                } else {
+                    a.track.samples.push(sample_of(&a.now));
+                    a.track.clock.push(Self::clock(c, a) as f32);
+                }
                 if a.down.is_some() {
                     continue;
                 }
                 let goal = c.agents[k].goal;
-                let to = [goal[0] - a.at[0], goal[1] - a.at[1]];
-                let far = len2(to);
-                // Slowing over its last two radii.
-                let mut want = if far > c.radius * 0.25 { [to[0] / far * a.speed * (far / (2.0 * c.radius)).min(1.0), to[1] / far * a.speed * (far / (2.0 * c.radius)).min(1.0)] } else { [0.0; 2] };
+                let far = len2([goal[0] - a.at[0], goal[1] - a.at[1]]);
                 let arrived = far <= c.radius * 0.25;
-                let mut push = |from: [f64; 2], reach: f64, hard: f64| {
-                    let d = [a.at[0] - from[0], a.at[1] - from[1]];
+                // Where to head: the goal, or round what stands across the way.
+                let mut toward = goal;
+                if c.plan && !arrived && !standing.is_empty() {
+                    let ground = ground.get_or_insert_with(|| Ground::new(c, &self_places(&places), &standing));
+                    if ground.sight(a.at, goal) {
+                        a.path.clear();
+                    } else {
+                        // A way is kept while its next corner is in sight, and looked for again every second.
+                        let stale = (sample as usize + k) % (input.rate.round().max(1.0) as usize) == 0;
+                        if a.path.is_empty() || stale || !a.path.iter().any(|p| ground.sight(a.at, *p)) {
+                            a.path = ground.route(a.at, goal);
+                        }
+                        // (The farthest of its corners in sight.)
+                        if let Some(p) = a.path.iter().rev().find(|p| ground.sight(a.at, **p)).or(a.path.first()) {
+                            toward = *p;
+                        }
+                    }
+                }
+                let to = [toward[0] - a.at[0], toward[1] - a.at[1]];
+                let way = len2(to);
+                // Slowing over its last two radii.
+                let slow = (far / (2.0 * c.radius)).min(1.0);
+                let mut want = if !arrived && way > 1e-9 { [to[0] / way * a.speed * slow, to[1] / way * a.speed * slow] } else { [0.0; 2] };
+                let mut push = |d: [f64; 2], reach: f64, hard: f64| {
                     let l = len2(d);
                     if l >= reach {
                         return;
@@ -152,24 +409,79 @@ impl Herd {
                     want[1] += away[1] * f + side[1] * s * f * 0.6;
                 };
                 if !arrived {
-                    for (j, (other, _)) in places.iter().enumerate() {
-                        if j != k {
-                            push(*other, 3.0 * c.radius, 1.6);
+                    // (In the agents' order, whatever the squares': the sum is the same sum.)
+                    let (sx, sz) = square(a.at);
+                    near.clear();
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            near.extend(squares.get(&(sx + dx, sz + dz)).into_iter().flatten());
                         }
                     }
-                    let feet = c.agents[k].start.p[1];
-                    for (centre, half, top, bottom) in &blocks {
-                        // (y is down: its head is at feet − height.)
-                        if *bottom > feet - c.height && *top < feet - 0.2 * c.height {
-                            push(*centre, half + 3.0 * c.radius, 4.0);
+                    near.sort_unstable();
+                    for &j in &near {
+                        if j as usize != k {
+                            push([a.at[0] - places[j as usize][0], a.at[1] - places[j as usize][1]], reach, 1.6);
+                        }
+                    }
+                    // Off the nearest point of each thing's outline (its
+                    // middle, from inside it).
+                    for b in &standing {
+                        let nearest = [a.at[0].clamp(b.lo[0], b.hi[0]), a.at[1].clamp(b.lo[2], b.hi[2])];
+                        let mut d = [a.at[0] - nearest[0], a.at[1] - nearest[1]];
+                        if len2(d) < 1e-6 {
+                            d = [a.at[0] - (b.lo[0] + b.hi[0]) / 2.0, a.at[1] - (b.lo[2] + b.hi[2]) / 2.0];
+                            let l = len2(d).max(1e-6);
+                            d = [d[0] / l * 1e-3, d[1] / l * 1e-3];
+                        }
+                        push(d, 3.0 * c.radius, 4.0);
+                    }
+                }
+                // What is coming at it: a body that, as it flies, will be
+                // on it within `dodge` seconds at a speed that would
+                // knock it down. It steps out of its line.
+                let mut dodging = false;
+                if c.dodge > 0.0 {
+                    for b in blocks.iter().filter(|b| !b.fixed) {
+                        let rel = [b.vel[0] - a.vel[0], b.vel[1], b.vel[2] - a.vel[1]];
+                        if (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt() < c.knock {
+                            continue;
+                        }
+                        let (p, v) = ([(b.lo[0] + b.hi[0]) / 2.0 - a.at[0], (b.lo[2] + b.hi[2]) / 2.0 - a.at[1]], [rel[0], rel[2]]);
+                        let (vv, closing) = (v[0] * v[0] + v[1] * v[1], -(p[0] * v[0] + p[1] * v[1]));
+                        if vv < 1.0 || closing <= 0.0 {
+                            continue;
+                        }
+                        let when = (closing / vv).min(c.dodge);
+                        if closing / vv > c.dodge {
+                            continue;
+                        }
+                        let miss = [p[0] + v[0] * when, p[1] + v[1] * when];
+                        let size = ((b.hi[0] - b.lo[0]).max(b.hi[2] - b.lo[2]) / 2.0).min((b.hi[1] - b.lo[1]) / 2.0 * 4.0);
+                        let y = (b.lo[1] + b.hi[1]) / 2.0 + b.vel[1] * when + 0.5 * gravity * when * when;
+                        let tall = (b.hi[1] - b.lo[1]) / 2.0;
+                        if len2(miss) >= 1.5 * c.radius + size || y + tall < feet - c.height || y - tall > feet {
+                            continue;
+                        }
+                        // Away from its line, to the side it already is.
+                        let l = len2(miss);
+                        let out = if l > 1e-6 { [-miss[0] / l, -miss[1] / l] } else { [-v[1] / vv.sqrt(), v[0] / vv.sqrt()] };
+                        want[0] += out[0] * a.speed * 3.0;
+                        want[1] += out[1] * a.speed * 3.0;
+                        dodging = true;
+                        if a.dodged != Some(b.body) {
+                            a.dodged = Some(b.body);
+                            let who = if c.instanced { format!("{}#{k}", c.id) } else { a.track.id.clone() };
+                            self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "dodge".into(), a: who, b: input.bodies[b.body].id.clone(), speed: (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt().round() });
                         }
                     }
                 }
+                // (A dodge is a lunge: twice its pace, taken up at once.)
+                let (most, take) = if dodging { (2.2 * a.speed, 0.6) } else { (a.speed, 0.25) };
                 let l = len2(want);
-                if l > a.speed {
-                    want = [want[0] / l * a.speed, want[1] / l * a.speed];
+                if l > most {
+                    want = [want[0] / l * most, want[1] / l * most];
                 }
-                a.vel = [a.vel[0] + (want[0] - a.vel[0]) * 0.25, a.vel[1] + (want[1] - a.vel[1]) * 0.25];
+                a.vel = [a.vel[0] + (want[0] - a.vel[0]) * take, a.vel[1] + (want[1] - a.vel[1]) * take];
                 let moved = len2(a.vel) * dt;
                 a.at = [a.at[0] + a.vel[0] * dt, a.at[1] + a.vel[1] * dt];
                 a.walked += moved;
@@ -206,7 +518,7 @@ impl Herd {
             }
             let (b1, b2) = (world.w.colliders[pair.collider1].parent(), world.w.colliders[pair.collider2].parent());
             for (mine, other) in [(b1, b2), (b2, b1)] {
-                let Some((n, a)) = self.agents.iter().enumerate().find_map(|(n, herd)| herd.iter().position(|a| Some(a.proxy) == mine && a.down.is_none()).map(|a| (n, a))) else { continue };
+                let Some((n, a)) = mine.and_then(|h| self.proxies.get(&h).copied()).filter(|&(n, a)| self.agents[n][a].down.is_none()) else { continue };
                 let Some(body) = other.and_then(|h| world.handles.iter().position(|x| *x == h)) else { continue };
                 if !world.released[body] {
                     continue;
@@ -227,19 +539,31 @@ impl Herd {
             let agent = &mut self.agents[n][a];
             agent.down = Some(k + 1);
             agent.next = agent.now;
-            self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "knock".into(), a: agent.track.id.clone(), b: input.bodies[body].id.clone(), speed: speed.round() });
+            let who = if c.instanced { format!("{}#{a}", c.id) } else { agent.track.id.clone() };
+            self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "knock".into(), a: who, b: input.bodies[body].id.clone(), speed: speed.round() });
             // Its capsule is gone; its bones take over where the clip has them.
             let colliders: Vec<ColliderHandle> = world.w.bodies[agent.proxy].colliders().to_vec();
             for h in colliders {
                 world.w.colliders[h].set_enabled(false);
             }
-            let Some(r) = c.agents[a].ragdoll else { continue };
-            let cycle = c.agents[a].local.first().map_or(1, |l| l.len().max(2) - 1) as f64;
+            // Its own ragdoll, or the next of the pool while there is one.
+            let (ragdoll, local) = if c.instanced {
+                let slot = self.taken[n];
+                if slot < c.pool.len() {
+                    self.taken[n] += 1;
+                    self.slots[n][a] = slot as u32;
+                }
+                (c.pool.get(slot).copied(), &c.local)
+            } else {
+                (c.agents[a].ragdoll, &c.agents[a].local)
+            };
+            let Some(r) = ragdoll else { continue };
+            let cycle = local.first().map_or(1, |l| l.len().max(2) - 1) as f64;
             let turns = agent.walked / c.stride + agent.phase;
             let at = (turns - turns.floor()) * cycle;
             let root = world.w.bodies[agent.proxy].position();
             let root = Pose { p: [root.translation.x as f64 * u, root.translation.y as f64 * u, root.translation.z as f64 * u], q: [root.rotation.x as f64, root.rotation.y as f64, root.rotation.z as f64, root.rotation.w as f64] };
-            for (bone, local) in input.ragdolls[r].bones.iter().zip(&c.agents[a].local) {
+            for (bone, local) in input.ragdolls[r].bones.iter().zip(local) {
                 let i = (at.floor() as usize).min(local.len() - 1);
                 let j = (i + 1).min(local.len() - 1);
                 let f = at - i as f64;
@@ -268,17 +592,38 @@ impl Herd {
 
     /// The agents' tracks (after the last `plan`), and for each bone body
     /// let go the sample it was let go at.
-    pub fn finish(self, input: &SimInput) -> (Vec<Track>, Vec<(usize, u32)>) {
+    pub fn finish(mut self, input: &SimInput) -> (Vec<Track>, Vec<(usize, u32)>, Vec<HerdTrack>) {
         let mut tracks = Vec::new();
         let mut released = Vec::new();
+        let mut herds = Vec::new();
         for (n, herd) in self.agents.into_iter().enumerate() {
+            let c = &input.crowds[n];
+            if c.instanced {
+                for (k, a) in herd.iter().enumerate() {
+                    if let (Some(at), Some(&r)) = (a.down, c.pool.get(self.slots[n][k] as usize)) {
+                        released.extend(input.ragdolls[r].bones.iter().map(|b| (b.body, at)));
+                    }
+                }
+                let Some(first) = c.agents.first() else { continue };
+                herds.push(HerdTrack {
+                    id: c.id.clone(),
+                    count: c.agents.len() as u32,
+                    rest: first.rest,
+                    y: first.start.p[1],
+                    q: first.start.q,
+                    samples: std::mem::take(&mut self.rows[n]),
+                    down: herd.iter().map(|a| a.down.unwrap_or(u32::MAX)).collect(),
+                    slot: std::mem::take(&mut self.slots[n]),
+                });
+                continue;
+            }
             for (k, a) in herd.into_iter().enumerate() {
-                if let (Some(at), Some(r)) = (a.down, input.crowds[n].agents[k].ragdoll) {
+                if let (Some(at), Some(r)) = (a.down, c.agents[k].ragdoll) {
                     released.extend(input.ragdolls[r].bones.iter().map(|b| (b.body, at)));
                 }
                 tracks.push(a.track);
             }
         }
-        (tracks, released)
+        (tracks, released, herds)
     }
 }

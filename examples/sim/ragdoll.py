@@ -11,6 +11,8 @@ it walking on the spot until a ball strikes it at 0.87 s:
            knocked over stiff, like a statue
   brace  — the same, with behaviours: balance, a step to keep it, arms
            about the head as the ball comes
+  rise   — balance and get_up: knocked flat by a blow to the chest, it
+           lies still, rolls onto its front, pushes up and stands
 
 then bakes, checks, and writes a contact sheet per scene (the CPU renderer
 unless GPU=1). RENDER=1 writes an MP4 too.
@@ -60,11 +62,11 @@ LIMITS = [
 ]
 
 
-def scene(name, start, ragdoll):
+def scene(name, start, ragdoll, length):
     hero = f"{name}-hero"
     doll = dict({"id": "doll", "root": f"{hero}-hips", "release": start + 0.8, "rest": start + 0.0, "limits": LIMITS, "mass": 70}, **ragdoll)
     return {
-        "id": name, "start": start, "end": start + LEN, "background": "#eef0f4",
+        "id": name, "start": start, "end": start + length, "background": "#eef0f4",
         "camera": {"fov": 38, "orbit": [-28, 10]},
         "lights": [{"from": [-0.5, -1, -0.8], "intensity": 1.3}, {"type": "ambient", "intensity": 0.35}],
         "simulation": {"unit": UNIT, "ragdolls": [doll]},
@@ -83,13 +85,17 @@ def scene(name, start, ragdoll):
     }, hero
 
 
+SHEET = (0.5, 0.9, 1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.8)
 SCENES = [
-    ("limp", {}),
-    ("hold", {"strength": 1}),
+    ("limp", {}, LEN, SHEET),
+    ("hold", {"strength": 1}, LEN, SHEET),
     ("brace", {"strength": 1, "behaviours": [
         {"type": "balance"}, {"type": "step"},
         {"type": "protect", "from": 0.55, "to": 1.6},
-    ]}),
+    ]}, LEN, SHEET),
+    ("rise", {"strength": 1, "behaviours": [{"type": "balance"}, {"type": "get_up"}],
+              "hits": [{"at": 1.05, "bone": "chest", "velocity": [-1400, 0, 0]}]},
+     9.0, (0.9, 1.3, 1.8, 3.0, 3.6, 4.0, 4.4, 4.8, 5.2, 5.6, 6.2, 8.5)),
 ]
 
 os.makedirs(OUT, exist_ok=True)
@@ -97,33 +103,37 @@ model = character.write(os.path.join(OUT, "figure.gltf"))
 if os.path.isdir(PROJECT):
     import shutil
     shutil.rmtree(PROJECT)
-run("motion", "create", PROJECT, "--size", f"{W}x{H}", "--fps", "30", "--duration", str(LEN * len(SCENES)))
+run("motion", "create", PROJECT, "--size", f"{W}x{H}", "--fps", "30", "--duration", str(sum(s[2] for s in SCENES)))
 only = os.environ.get("ONLY")
 made = []
-for k, (name, ragdoll) in enumerate(SCENES):
+start = 0.0
+for k, (name, ragdoll, length, times) in enumerate(SCENES):
     if only and name not in only.split(","):
         continue
-    start = len(made) * LEN
     # (Behaviours' times are the scene's.)
     for b in ragdoll.get("behaviours", []):
         for key in ("from", "to"):
             if key in b:
                 b[key] += start
-    s, hero = scene(name, start, ragdoll)
+    for h in ragdoll.get("hits", []):
+        h["at"] += start
+    s, hero = scene(name, start, ragdoll, length)
     apply([{"op": "add_scene", "scene": s}])
     run("motion", "model-import", PROJECT, model, "--scene", name, "--id", hero, "--unit", str(UNIT), "--at", str(start),
         "--position", f"{W / 2},{FLOOR - 0.02 * UNIT}")
-    made.append((name, start))
-apply([{"op": "set", "target": "project.settings.duration", "value": LEN * len(made)}])
+    made.append((name, start, times))
+    start += length
+apply([{"op": "set", "target": "project.settings.duration", "value": start}])
 
 baked = json.loads(run("motion", "bake", PROJECT))
 for s in baked["scenes"]:
     print(f"{s['scene']}: {s['status']}, {s.get('bodies')} bodies, {s.get('steps')} steps in {s.get('seconds')} s; "
-          + ", ".join(f"{e['a']}×{e['b']} {e['t']} s" for e in s.get("events", []) if e["speed"] >= 250)[:300])
+          + ", ".join(f"{e['a']}×{e['b']} {e['t']} s" for e in s.get("events", []) if e["speed"] >= 250 and e["kind"] == "touch")[:300]
+          + "; " + ", ".join(f"{e['kind']} {e['t']} s ({e['speed']:.0f})" for e in s.get("events", []) if e["kind"] in ("fall", "get_up", "rise")))
 print(run("motion", "check", PROJECT, BACKEND))
-for name, start in made:
+for name, start, times in made:
     sheet = os.path.join(OUT, f"{name}.png")
-    times = [start + t for t in (0.5, 0.9, 1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.8)]
+    times = [start + t for t in times]
     run("motion", "snapshot", PROJECT, BACKEND, "--sheet", "--at", ",".join(f"{t:.2f}" for t in times), "-o", sheet)
     print("wrote", sheet)
 if os.environ.get("RENDER"):

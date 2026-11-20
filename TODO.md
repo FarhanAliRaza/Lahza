@@ -608,8 +608,8 @@ picks by CPU. In the order built:
    - In the editor (done; seen under Xvfb, see "How it should be used"):
      it reloads when only `sim/` changes, says beside the prompt bar when
      a bake is missing or stale, and bakes in one click off the UI thread.
-   - `snapshot` warns of a missing or stale bake and `render` refuses one
-     unless given `unbaked`; `review` says nothing.
+   - `snapshot` and `review` warn of a missing or stale bake and `render`
+     refuses one unless given `unbaked`.
    - Left: a box landing flat at speed tips a degree or
      two before settling (rapier's contact solver; more iterations do not
      change it). Ropes are not drawn. Bodies inside instancers are
@@ -655,9 +655,22 @@ picks by CPU. In the order built:
    - Found on the way: a pelvis far lighter than the legs it joins tore
      its joint (162° past a 40° limit), hence the mass rule and 12 solver
      iterations for scenes with ragdolls.
-   - Left: no self-collision (an arm passes through the trunk); limits
-     are per bone by hand (no defaults by bone name); a limp figure with
-     the default 40° limits falls like a plank, slowly.
+   - Its bones meet each other (`self_collide`, true by default): all
+     but those jointed together and those whose shapes are within 2 cm
+     of each other as the skeleton stands at rest (worked out once from
+     the bind pose: a chest's capsule holds its shoulders, a hip's its
+     thighs). Tested: the limp figure with a hand thrown across it has
+     its forearm 21 px and its hand 24 px inside its chest without, and
+     no bone more than 2 px inside another with (the forearm lies on the
+     chest), through the fall and at rest; pinned. A bone a behaviour is
+     placing (an aimed arm, the whole body while it gets up) passes
+     through the rest for those steps: arm targets are worked out
+     without the body in the way, and stopped short of the head and of
+     a hit when their arms met the chest on the way.
+   - Left: limits are per bone by hand (no defaults by bone name); a
+     limp figure with the default 40° limits falls like a plank,
+     slowly. Arms a behaviour aims do not go round the body, they go
+     through it.
 4. **A ragdoll that acts: done, with balance helped.**
    - Motors follow the clip: `strength` 0..1, keyed, per limb with
      `strengths`. A motor is a second joint beside the one with the
@@ -670,20 +683,40 @@ picks by CPU. In the order built:
      torque on the hips capped at `assist` of its weight; past that it
      falls, says so and goes soft), `step` (the foot behind is carried to
      where the body is falling to), `guard`, `reach`, `protect` (two-bone
-     arm aim toward a body, the last hit, the head).
-   - Measured on the test figure (70 kg, pushes at the chest, px/s): a
-     statue (motors only) falls at 200; ankle lean alone holds 200 and
-     falls at 300; with the default help balance holds 1400 and falls at
-     1800; with steps it holds 1800 (four steps, 320 px) and falls at
-     2400. Steps without the help do not recover it (it falls at 700).
+     arm aim toward a body, the last hit, the head), `get_up` (after a
+     fall and 0.8 s still: a roll onto its front, hands pushed down
+     under the shoulders, hips and knees folded, then up to the clip in
+     2.4 s, facing the way its head lay; then balance again).
+   - Getting up is helped, more than balance is. The motors shape it;
+     what lifts and rights the body is a force on the hips capped at
+     `help` (0.6) of its weight, and a torque capped at what that force
+     would make at hip height. The `rise` event carries the percent of
+     its weight the force bore over the rise: 23 to 35 on the test
+     figure by the way it fell. With `help` 0.2 it still rises from all
+     four falls (the force bearing 15 %; one of them on its second
+     try), with 0 from none (it folds, pushes, and lies again).
+   - Measured on the test figure (70 kg, pushes at the chest, px/s; its
+     bones meeting each other, which made it sturdier: its legs no
+     longer cross): a statue (motors only) holds 120 and falls at 200;
+     ankle lean alone holds 300 and falls at 400; with the default help
+     balance holds 1400 and falls at 1800; with steps it holds 1800 (six
+     steps, 370 px) and falls at 2400. Steps without the help hold 700
+     (eleven steps) and fall at 1000.
    - Tested: each of those thresholds, soft after a fall, hands at the
      head within 48 px and down again, a hand on the hit within 25 px in
      half a second and the other arm for a hit arm, a hand up to a ball
-     that comes. `examples/sim/ragdoll.py` (limp, held, braced) was
-     looked at.
+     that comes; knocked flat from four sides it is up
+     again (hips within 16 px of where they stood, chest over them) and
+     stays up, not without the force, the same bytes twice (pinned).
+     `examples/sim/ragdoll.py` (limp, held, braced, rise) was looked at:
+     the rise reads as a get-up (on its back, over, hands and knees, up),
+     with a sway as it comes upright.
    - Left, and it is the hard part the plan names: balance is not
      footwork, it is a bounded hand on the hips; a step is a foot carried
-     by a force, not a leg that swings; nothing gets up after a fall;
+     by a force, not a leg that swings; getting up is a pose sequence
+     under an outside force, not a body that finds its feet (its feet
+     stay where they lay and it is drawn over them; it does not step to
+     them), and it gets up the one way, front down;
      no behaviour looks where it is going. Feet and hands are found by
      bone name (`foot`, `hand`, `head`).
 5. **Directing it: done as far as the tools go.** Intent is written on
@@ -724,59 +757,133 @@ picks by CPU. In the order built:
      MuJoCo) may not hold in rapier with these capsules and motors. If
      one is trained, this layout is what it must be trained to.
    - The no-training route (`search.rs`, `controller: {"type":
-     "search"}`): each 0.1 s, 16 tries 0.25 s ahead in a copy of the
-     world, each try three leans (ankles, hips, spine: six numbers; a
-     search over every joint would need far more tries), scored on
-     falling, weight past the feet, tilt, height and effort.
+     "search"}`): each 0.1 s, 16 tries 0.5 s ahead in copies of the
+     world. A try is a plan: three leans (ankles, hips, spine), a swing
+     of each upper arm (ten numbers; a search over every joint would
+     need far more tries), and for a third of them, when its weight is
+     headed off its feet, a step of the foot behind to where it is
+     falling to or up to 1.8 times as far. Scored on falling, weight past
+     the feet, tilt, height, effort and a little for a step. The tries
+     run on every core; the plans are drawn before any is tried and the
+     first of the least cost kept, so the take is the same on one core
+     as on four (tested to the byte, pinned).
    - Measured on the test figure, pushes at the chest in px/s, with no
-     helping force anywhere: motors holding the clip fall at 300; search
-     at the defaults holds 300 and falls at 450, and a 4 s take bakes in
-     7.4 s instead of 0.2 s (32 448 steps tried for 960 taken); 48 tries
-     do no better (21 s); a 0.5 s horizon holds 700 and falls at 1000
-     (14 s). Against part 4: `balance` without help holds 200; with its
-     help (a quarter of body weight on the hips) 1400, with steps 1800,
-     at no cost. So the search buys honest balance (no outside force)
-     over a narrow range at 40 to 70 times the bake; the helped
-     behaviours cover far more for nothing. To decide: whether takes
-     want the unhelped look enough to pay for it.
-   - Left: the search only leans; it does not step or use its arms.
-     Tries run one after the other on one core (they are independent:
-     four cores would cut the time by about four).
-7. **Crowds: done as layers; impostors not started.**
-   `simulation.crowds`: each agent is a comp with a character (imported
-   once per agent). Once a frame every agent steers: toward its goal at
-   its own pace, off agents within three radii, off and round the level
-   outline of any body that stands in its height. The bake keeps each
-   agent's place and the time its clip is shown at, which runs by the
-   distance walked (`compile` shows a comp's children at that time). In
-   the world an agent is a moved capsule; one struck at `knock` px/s or
-   more goes down, and with a `ragdoll` for the crowd its bones are put
-   where the clip had them and let go limp. Bones of agents still
-   standing are out of the solver.
+     force on its body (a step's foot is carried by a force, as the
+     `step` behaviour's is): motors holding the clip fall at 300. Search
+     with a 0.25 s horizon (too short to see a step land) holds 300 and
+     falls at 450, as it did when it only leaned; at the default 0.5 s
+     it holds 1000 with one or two steps and falls at 1400; at 1 s it
+     holds 1400 and falls at 1800; 32 tries hold no more than 16.
+     Against part 4: `balance` with its help (a quarter of body weight
+     on the hips) holds 1400, with steps 1800, at no cost.
+   - What it costs, a 4 s take (0.2 s without): at the defaults 63 104
+     steps tried for 960 taken, 18.9 s on one core, 12.2 s on two, 6.3 s
+     on four (a try's copy of the world is made on its own core; four
+     cores give three times, not four); 1 s ahead, 9 s on four. So the
+     search now buys unhelped balance up to what the helped behaviour
+     holds, at 30 to 45 times the bake on four cores. To decide: whether
+     takes want the unhelped look enough to pay for it.
+   - Left: a step is the `step` behaviour's (a foot carried, not a leg
+     swung), one at a time, and only toward where it is falling; arms
+     only swing from the shoulder (no elbow, no reach for support); the
+     plan is ten numbers, not a pose; it does not get up. A search does
+     not see a crowd in its tries.
+7. **Crowds: done, as layers or as instances with impostors.**
+   `simulation.crowds`. Once a frame every agent steers: toward its goal
+   at its own pace, off agents within three radii (found by a grid), off
+   and round the nearest point of the level box of any body that stands
+   in its height. Its clip runs by the distance walked.
+   - **A way round** (`plan`, true): when the straight line to its goal
+     is shut, an agent takes the shortest open way (A* over the level in
+     squares of 1.5 radii or more, 192 across at most; shut within a
+     radius of what stands still) and heads for the farthest of its
+     corners it can see. The ground is made again each frame, a way
+     looked for again each second or when its corners are out of sight.
+   - **Stepping aside** (`dodge`, 0.6 s): a body that, flying as it
+     flies, would be on an agent within that time at a speed that would
+     knock it down is stepped out of the line of, at up to 2.2 times the
+     agent's pace (a `dodge` event). One too fast to clear still knocks
+     it down. In the world an agent is a
+   moved capsule; one struck at `knock` px/s or more goes down as a limp
+   ragdoll placed where the clip had its bones.
+   - **As layers** (`agents`): each agent is a comp with a character
+     imported for it; the bake keeps a track per agent (`compile` shows
+     a comp's children at the bake's clip time).
+   - **As instances** (`character`, with `starts` or `count` and `area`,
+     `goals` or `march`): one character, imported once and not drawn
+     itself. The bake keeps four numbers an agent a frame (x, z, turn,
+     the clip's moment) in a `HerdTrack` after the tracks. `compile`
+     poses the character at up to 128 moments of its cycle once
+     (`compile/crowd.rs`), and an agent is those meshes with its own
+     world matrix and the pose shared (one `Arc<SkinPose>` a moment: the
+     CPU skins it once, the mesh pool holds one mesh a moment, however
+     many agents). Agents knocked down take a ragdoll from a pool
+     (`ragdoll.max`, 24) whose bones are tracks `<crowd>#<n>/<bone>`;
+     past the pool they stop where they stand.
+   - **Impostors**: all but the nearest `full` (150), and all past
+     `near`, are image layers on cards across the line of sight. Their
+     pictures are in the frame (`FrameState::pictures`: layers, a camera
+     far off along the way the agent is seen, the scene's lights); the
+     renderer draws each once on the CPU and keeps it in the image pool
+     (`Renderer::draw_pictures`). A picture is one of 8 moments, 16
+     turns, 16 directions round and 7 up and down, sized to the
+     character's box as seen from there (160 px corner to corner). It is
+     named by those, so a frame is the same whenever it is drawn.
    - Tested: six agents reach their goals round a pillar and never
-     closer than 40 px to each other; the clip turns one cycle a stride
-     and the drawn child is at that time; a thrown ball knocks one down,
-     whose five bones are baked from that sample and end on the floor
-     while the rest arrive; the same bytes twice, another seed another
-     pace. `examples/sim/crowd.py` was looked at with 12 and 100.
-   - Measured (four cores; 1280×720; the test character: 16 bones, four
-     skinned meshes, 624 points): an 8 s bake of 12 agents 0.33 s, of 50
-     0.45 s, of 100 0.75 s. A second of export on the CPU renderer: 12
-     agents 11.6 s, 50 agents 24.5 s, 100 agents 29.1 s (0.4 to 1 s a
-     frame). Importing is the slow step: 100 characters one
-     `model-import` at a time took 48 s. Not measured: the GPU renderer
-     and the path tracer (no GPU here; in the tracer each agent's mesh
-     is an acceleration structure built every frame), and a character of
-     real size (tens of thousands of points).
-   - Left: an agent is a copy of the document's layers (100 agents are
-     1700 comps), not an instance, so thousands are out of reach this
-     way: that needs agents as instances with a pose each, and beyond
-     that impostors (pictures of agents), neither started. Steering is
-     local (no path planning: a wall across the way holds an agent);
-     agents do not react to what is thrown, and one knocked down falls
-     with the agent's speed only (its limbs' own swing is dropped).
-     Knocked ragdolls are always limp. A search controller does not see
-     crowds in its tries.
+     closer than 40 px to each other; the clip turns one cycle a stride;
+     a thrown ball knocks one down, whose bones are baked from that
+     sample and end on the floor; six agents round a wall
+     700 px long across their way, by both ends, none in it, where
+     without a plan the wall holds them, and in a pen with no way out
+     they stay; an agent a ball is thrown at from 900 px is 56 px and
+     more off its line when it passes and walks back, is knocked down by
+     one at 9000 px/s, and does not flinch at one going over or wide.
+     Instances walk bit for bit as the same
+     agents as layers do, are drawn where the bake has them at their own
+     moment, are meshes for the nearest `full` and image layers with
+     their pictures for the rest; one struck takes the pool's first
+     ragdoll; the bake survives its file; five bakes are pinned.
+     Rendered: 24 agents as 4 meshes and 20 pictures cover the same
+     pixels as 24 meshes (within 12 %, under a third differing at all).
+     `examples/sim/crowd.py` (12, 100) and `examples/sim/herd.py` (100,
+     1000, 5000) were looked at.
+   - Measured (four cores, CPU renderer, 1280×720, the test character:
+     16 bones, four skinned meshes, 624 points; an 8 s take):
+
+     | agents | as | bake | bake file | a second of export |
+     |---|---|---|---|---|
+     | 100 | layers (1700 comps; 48 s to import) | 0.75 s | | 29.1 s |
+     | 1 | instances | | | 11.8 s (the field alone) |
+     | 100 | instances, all meshes | 1.3 s | 0.8 MB | 24.9 s |
+     | 1000 | instances, all meshes | 1.3 s | 4.0 MB | 65.7 s |
+     | 1000 | 150 meshes, 850 pictures | 1.3 s | 4.0 MB | 39.9 s |
+     | 5000 | 150 meshes, 4850 pictures | 6.5 s | 19.6 MB | 56.7 s |
+
+     (The bakes with instances include a pool of 12 ragdolls, which is
+     most of the 1.3 s. Those were before agents looked for what is
+     thrown and for a way: 5000 now bake in 7.9 s, in 11.9 s with a wall
+     a third of the field long across their way.) A frame of 1000: 24 ms to evaluate, 40 ms of
+     display lists, 0.8 s to rasterise; the pictures a frame first needs
+     take 1.4 to 2.4 s once. On this character a
+     picture is not much cheaper than its 624 points on the CPU (a card
+     is a blended image layer): the gain is two fifths at 1000, and
+     5000 are drawn at all. Not measured: the GPU renderer and the path
+     tracer (no GPU here), and a character of real size, where a picture
+     should gain far more.
+   - Left: pictures cast and take no shadows from the scene, and are
+     drawn again whenever the lights change (every frame under an
+     animated light); an agent pops when it changes between mesh and
+     picture; the path tracer sees a card, not a body. A fallen agent
+     falls with the agent's speed only (its limbs' own swing is
+     dropped), is always limp, and past the pool stands frozen. A way
+     is planned round what stands still only (its level box: a wall at
+     an angle shuts its whole box), by each agent alone (no lanes, no
+     waiting for a gap: a doorway jams), and not round a body in
+     motion. An agent steps aside and does nothing else: no guard, no
+     duck, no look (it has one clip), and it does not get out of the
+     way of other agents' falls. A search controller does not see
+     crowds in its tries. `check` evaluates every agent at every
+     sample it takes, which is slow at thousands.
 
 ## Directing an agent from the editor
 

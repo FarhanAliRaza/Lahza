@@ -368,7 +368,7 @@ swing on a rope, do not key it: give the layers a `"body"` and bake.
    sound effect or a cut on one.
 5. **Look**: `snapshot` at a few times, as for any shot. Change a body, a
    key, a joint or `seed` and bake again; `check` fails while a bake is
-   missing or stale, `snapshot` warns of it, and `render` refuses it
+   missing or stale, `snapshot` and `review` warn of it, and `render` refuses it
    (`"unbaked": true`, shell `--unbaked`, renders it as it is).
 
 Sizes are real: 100 px is a metre by default (`simulation.unit`), so a
@@ -404,14 +404,23 @@ footwork a real body does, not a model of it.
 
 ## Crowds
 
-For many walkers, import the character once per agent (`model_import`
-with ids `p0`, `p1`, …, each at its starting place), then name them in
-`simulation.crowds` with their goals and bake. Set `stride` to what one
-cycle of the walk covers at the model's size (measure the feet in a
-snapshot of the clip) and `speed` near `stride / cycle`. Throw a body at
-them and give the crowd a `ragdoll` for the ones it hits. A hundred
-agents bake in under a second; drawing them is what costs (each is a
-skinned mesh a frame: about a second a frame at 720p on four CPU cores).
+For a dozen walkers that must each be their own layers, import the
+character once per agent (`model_import` with ids `p0`, `p1`, …, each at
+its starting place) and name them in `simulation.crowds` as `agents`.
+
+For hundreds or thousands, import it once and name it as the crowd's
+`character`, with a `count` over an `area` (or `starts`) and `goals` or a
+`march`. The layer is the template: it is not drawn, and its level, turn
+and scale are every agent's. The nearest `full` (150) are drawn as the
+character, the rest as pictures of it; raise `full` for a close shot of a
+small crowd, lower it when frames are slow.
+
+Either way set `stride` to what one cycle of the walk covers at the
+model's size (measure the feet in a snapshot of the clip) and `speed`
+near `stride / cycle`. Throw a body at them and give the crowd a
+`ragdoll` for the ones it hits. Five thousand instances bake in under
+ten seconds; drawing is what costs (on four CPU cores at 720p, one to two
+seconds a frame for a thousand or five thousand).
 
 ## Footage and Blender
 

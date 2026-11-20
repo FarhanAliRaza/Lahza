@@ -388,6 +388,20 @@ impl Images {
         texture
     }
 
+    /// Registers pixels made from a frame's layers (`FrameState::pictures`)
+    /// under `name`. Kept while frames show it; let go of with the rest
+    /// when the pool is packed, to be made again.
+    pub fn insert_picture(&mut self, name: &str, img: &image::RgbaImage) -> Option<Texture> {
+        let texture = self.insert_rgba(img);
+        self.entries.insert(name.to_string(), texture);
+        texture
+    }
+
+    /// Whether pixels are held under `src`.
+    pub fn holds(&self, src: &str) -> bool {
+        matches!(self.entries.get(src), Some(Some(_)))
+    }
+
     /// Adds straight-alpha RGBA pixels; returns None when the pool is full.
     pub fn insert_rgba(&mut self, img: &image::RgbaImage) -> Option<Texture> {
         if img.width() == 0 || img.height() == 0 {

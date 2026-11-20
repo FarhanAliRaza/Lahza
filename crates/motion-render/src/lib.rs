@@ -38,6 +38,7 @@ use images::Images;
 use lahza_motion_core::compile::{Compiled, Content, FrameState, LayerState};
 use list::{Builder, DisplayList};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +104,8 @@ pub struct Stats {
     pub cached: u64,
     pub build_ms: f64,
     pub raster_ms: f64,
+    /// Pictures drawn (`FrameState::pictures`).
+    pub pictures: u64,
 }
 
 pub struct Renderer {
@@ -133,6 +136,12 @@ pub struct Renderer {
     /// CPU frame buffers, kept between frames: a fresh 33 MB buffer per
     /// 1080p frame costs more in page faults than drawing into it.
     scratch: Scratch,
+    root: Option<std::path::PathBuf>,
+    /// The key of each picture drawn (`FrameState::pictures`), and the
+    /// renderer that draws them (on the CPU: a picture is the same
+    /// whatever draws the frame).
+    pictures: std::collections::HashMap<Arc<str>, u64>,
+    painter: Option<Box<Renderer>>,
 }
 
 /// A frame between `Renderer::push` and `pop`.
@@ -194,6 +203,30 @@ impl Renderer {
             profile: options.profile.then(profile::Profile::default),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             scratch: Scratch::default(),
+            root: root.map(Path::to_path_buf),
+            pictures: Default::default(),
+            painter: None,
+        }
+    }
+
+    /// Draws the pictures the frame's image layers name that are not held
+    /// (or are no longer what they were).
+    fn draw_pictures(&mut self, states: &[FrameState]) {
+        for picture in states.iter().flat_map(|s| &s.pictures) {
+            if self.images.holds(&picture.name) && self.pictures.get(&picture.name) == Some(&picture.key) {
+                continue;
+            }
+            let started = Instant::now();
+            let root = self.root.clone();
+            let painter = self.painter.get_or_insert_with(|| Box::new(Renderer::new(root.as_deref(), RenderOptions { backend: Backend::Cpu, motion_blur: false, path: None, profile: false, sky: false, scale: 1.0, allow_software_gpu: false })));
+            let state = FrameState { t: 0.0, scene: None, background: lahza_motion_core::value::Color::TRANSPARENT, width: picture.width, height: picture.height, layers: picture.layers.clone(), pictures: Vec::new() };
+            let image = painter.render_states(&[state]);
+            self.images.insert_picture(&picture.name, &image);
+            self.pictures.insert(picture.name.clone(), picture.key);
+            self.stats.pictures += 1;
+            if let Some(p) = self.profile.as_mut() {
+                p.add("pictures (a crowd's far agents)", started.elapsed());
+            }
         }
     }
 
@@ -457,11 +490,13 @@ impl Renderer {
         });
         let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), temporal: o.temporal && n == 1, shutter: if o.fast { self.shutter } else { 0.0 }, ..o });
         self.images.begin_frame();
+        self.draw_pictures(states);
         let mut lists = self.build_lists(states, trace);
         if self.images.overflowed {
             // The image pool is full: keep only this frame's images and build again.
             self.images.compact();
             self.images.begin_frame();
+            self.draw_pictures(states);
             lists = self.build_lists(states, trace);
             // This frame's images alone do not fit: an error, not a frame
             // with images missing (and decoded again every frame).

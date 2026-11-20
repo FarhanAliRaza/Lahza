@@ -96,12 +96,14 @@ impl Toolbox {
                         .into_iter()
                         .map(|doll| {
                             let fell = bake.events.iter().find(|e| e.kind == "fall" && e.a == doll).map(|e| e.t);
-                            json!({"id": doll, "fell": fell, "steps": bake.events.iter().filter(|e| e.kind == "step").count()})
+                            // (A rise's `speed` is the percent of its weight the outside force carried.)
+                            let rose = bake.events.iter().find(|e| e.kind == "rise" && e.a == doll);
+                            json!({"id": doll, "fell": fell, "rose": rose.map(|e| e.t), "lifted_percent": rose.map(|e| e.speed), "steps": bake.events.iter().filter(|e| e.kind == "step").count()})
                         })
                         .collect();
-                    out.push(json!({"scene": id, "status": "baked", "file": format!("sim/{id}.bake"), "bytes": bytes, "tracks": bake.tracks.len(),
+                    out.push(json!({"scene": id, "status": "baked", "file": format!("sim/{id}.bake"), "bytes": bytes, "tracks": bake.tracks.len(), "agents": bake.herds.iter().map(|h| h.count as u64).sum::<u64>(),
                         "bodies": stats.bodies, "joints": stats.joints, "frames": stats.samples, "steps": stats.steps, "seconds": (stats.seconds * 1000.0).round() / 1000.0,
-                        "policy_runs": stats.policy_runs, "tried_steps": stats.tried_steps, "search_seconds": (stats.search_seconds * 1000.0).round() / 1000.0,
+                        "policy_runs": stats.policy_runs, "tried_steps": stats.tried_steps, "search_seconds": (stats.search_seconds * 1000.0).round() / 1000.0, "search_threads": stats.search_threads,
                         "from": bake.start, "seed": compiled.scenes[i].sim.settings.seed, "ragdolls": ragdolls, "events": shown, "events_total": bake.events.len()}));
                     baked.push((id, Arc::new(bake)));
                 }

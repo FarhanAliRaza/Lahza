@@ -30,9 +30,11 @@ pub struct Stats {
     /// A policy's runs and the seconds they took.
     pub policy_runs: u64,
     pub policy_seconds: f64,
-    /// Steps a search took in its tries ahead, and the seconds they took.
+    /// Steps a search took in its tries ahead, the seconds they took, and
+    /// how many tries ran at once.
     pub tried_steps: u64,
     pub search_seconds: f64,
+    pub search_threads: usize,
 }
 
 /// A take in progress: the world, and each ragdoll's brain and the turns
@@ -73,6 +75,7 @@ impl Take {
         for (rig, r) in input.ragdolls.iter().enumerate() {
             let drive = self.brains[rig].think(&mut self.world, input, r, x, t, self.turns[rig].as_deref());
             self.world.drive_ragdoll(r, rig, x, Some(&drive.targets), Some(&drive.scale));
+            self.world.free[rig] = drive.pass;
             self.world.hit_ragdoll(input, r, t);
         }
         self.world.step(input, t);
@@ -144,7 +147,13 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
                     let action = p.act(&policy::observe(&take.world, input, r, &feet, k as f64)).map_err(|e| format!("ragdoll '{}': {e}", r.id))?;
                     take.turns[rig] = Some(policy::turns(r, &action));
                 }
-                Some(Mind::Search(s)) => take.turns[rig] = Some(s.decide(&take, input, rig, k, t)),
+                Some(Mind::Search(s)) => {
+                    let (turns, stride) = s.decide(&take, input, rig, k, t);
+                    take.turns[rig] = Some(turns);
+                    if let Some(st) = stride {
+                        take.brains[rig].order_step(input, r, st.foot, st.from, st.to, st.lift, t);
+                    }
+                }
                 None => {}
             }
         }
@@ -165,7 +174,7 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
     events.append(&mut herd.events);
     // A crowd's agents, and the bones of those knocked down from when
     // they were (the others' stay their agents').
-    let (agents, let_go) = herd.finish(input);
+    let (agents, let_go, herds) = herd.finish(input);
     for (body, at) in let_go {
         if let Some(track) = dynamic.iter().position(|&i| i == body) {
             tracks[track].from = at;
@@ -182,10 +191,10 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
     for mind in minds.iter().flatten() {
         match mind {
             Mind::Policy(p) => (stats.policy_runs, stats.policy_seconds) = (stats.policy_runs + p.runs, stats.policy_seconds + p.seconds),
-            Mind::Search(s) => (stats.tried_steps, stats.search_seconds) = (stats.tried_steps + s.tried_steps, stats.search_seconds + s.seconds),
+            Mind::Search(s) => (stats.tried_steps, stats.search_seconds, stats.search_threads) = (stats.tried_steps + s.tried_steps, stats.search_seconds + s.seconds, s.threads),
         }
     }
-    Ok((Bake { hash: input.hash(), start: input.start, rate: input.rate, tracks, events }, stats))
+    Ok((Bake { hash: input.hash(), start: input.start, rate: input.rate, tracks, events, herds }, stats))
 }
 
 /// Bakes scene `scene` of a compiled project. `dir` is the project's
@@ -208,6 +217,8 @@ mod behaviour_tests;
 mod controller_tests;
 #[cfg(test)]
 mod crowd_tests;
+#[cfg(test)]
+mod herd_tests;
 #[cfg(test)]
 mod ragdoll_tests;
 #[cfg(test)]

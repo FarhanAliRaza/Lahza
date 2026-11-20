@@ -1848,6 +1848,12 @@ impl Toolbox {
             out["ok"] = json!(false);
             out["errors"] = json!(dropped);
         }
+        // A simulation drawn without its bake, or from a stale one, is
+        // not what the film will be: said, as a snapshot says it.
+        let unbaked = self.sim_warnings(&dir);
+        if !unbaked.is_empty() {
+            out["warnings"] = json!(unbaked);
+        }
         Ok(Output { json: out, images })
     }
 

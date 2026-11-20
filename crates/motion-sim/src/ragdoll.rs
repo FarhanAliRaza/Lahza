@@ -39,14 +39,32 @@ pub struct Rig {
     last: Vec<Option<[f64; 4]>>,
 }
 
-/// Bodies of one group (a ragdoll's bones) do not collide with each
-/// other: their capsules overlap where they join.
-pub(crate) struct Groups;
+/// Which bodies of one group (a ragdoll's bones) collide with each
+/// other: per group, bone by bone (`World::touch`). Not the ones jointed
+/// together, nor the ones whose shapes overlap as the skeleton stands at
+/// rest (a hip's capsule and a thigh's, a chest's and a shoulder's): a
+/// hand does meet the trunk. Nor, for the step, a bone a behaviour is
+/// placing (`World::free`): an arm aimed at its own head is worked out
+/// without the body in its way, and goes as it did before bones met. A
+/// collider's `user_data` is its group, and above 32 bits its bone's
+/// index plus one.
+pub(crate) struct Groups<'a>(pub &'a [Vec<bool>], pub &'a [Vec<bool>]);
 
-impl PhysicsHooks for Groups {
+impl PhysicsHooks for Groups<'_> {
     fn filter_contact_pair(&self, c: &PairFilterContext) -> Option<SolverFlags> {
         let (a, b) = (c.colliders[c.collider1].user_data, c.colliders[c.collider2].user_data);
-        (a == 0 || a != b).then_some(SolverFlags::default())
+        let (ga, gb) = (a as u32, b as u32);
+        if ga == 0 || ga != gb {
+            return Some(SolverFlags::default());
+        }
+        let (ia, ib) = ((a >> 32) as usize, (b >> 32) as usize);
+        let may = self.0.get(ga as usize - 1)?;
+        let n = (may.len() as f64).sqrt() as usize;
+        if ia == 0 || ib == 0 || !may.get((ia - 1) * n + ib - 1).copied().unwrap_or(false) {
+            return None;
+        }
+        let free = |i: usize| self.1.get(ga as usize - 1).and_then(|f| f.get(i - 1)).copied().unwrap_or(false);
+        (!free(ia) && !free(ib)).then_some(SolverFlags::default())
     }
 }
 
@@ -132,6 +150,40 @@ impl World {
                 rig.joints.push(Some((h, hm)));
             }
             self.rigs.push(rig);
+            // Which of its bones may touch.
+            let n = r.bones.len();
+            let mut may = vec![false; if r.self_collide { n * n } else { 0 }];
+            // (Every bone as the skeleton stands at rest, from its root.)
+            let mut rest: Vec<Pose> = Vec::with_capacity(n);
+            for b in &r.bones {
+                rest.push(match b.parent {
+                    Some(p) if p < rest.len() => rest[p] * Pose::from_parts(v3(b.anchor_parent, m), quat(b.bind)),
+                    _ => Pose::identity(),
+                });
+            }
+            for (i, b) in r.bones.iter().enumerate() {
+                let colliders: Vec<ColliderHandle> = self.w.bodies[self.handles[b.body]].colliders().to_vec();
+                for h in colliders {
+                    let c = &mut self.w.colliders[h];
+                    c.user_data = (c.user_data as u32) as u128 | ((i as u128 + 1) << 32);
+                }
+            }
+            if r.self_collide {
+                let shapes = |i: usize| -> Vec<(Pose, SharedShape)> {
+                    self.w.bodies[self.handles[r.bones[i].body]].colliders().iter().map(|h| (rest[i] * self.w.colliders[*h].position_wrt_parent().copied().unwrap_or(Pose::identity()), self.w.colliders[*h].shared_shape().clone())).collect()
+                };
+                let all: Vec<Vec<(Pose, SharedShape)>> = (0..n).map(shapes).collect();
+                for i in 0..n {
+                    for j in 0..i {
+                        let jointed = r.bones[i].parent == Some(j) || r.bones[j].parent == Some(i);
+                        // (A hand's breadth of the scene's metre between them at rest, or they are one flesh.)
+                        let close = all[i].iter().any(|(pa, a)| all[j].iter().any(|(pb, b)| rapier3d::parry::query::distance(pa, &**a, pb, &**b).map_or(true, |d| d.distance < 0.02)));
+                        (may[i * n + j], may[j * n + i]) = (!jointed && !close, !jointed && !close);
+                    }
+                }
+            }
+            self.touch.push(may);
+            self.free.push(vec![false; n]);
         }
     }
 
