@@ -2835,14 +2835,34 @@ impl Toolbox {
                 .collect(),
             None => vec![(source.to_string_lossy().into_owned(), file_name.clone())],
         };
+        // (And the files a .gltf keeps its buffers in, beside it. Pictures
+        // it names are read from its own folder by the import.)
+        let mut buffers: Vec<String> = Vec::new();
         for (src, name) in &files {
             let dest = model_dir.join(name);
             if Path::new(src) != dest {
                 std::fs::copy(src, &dest).map_err(|e| format!("{src}: {e}"))?;
             }
+            let (beside, not) = model::buffer_files(Path::new(src))?;
+            if let Some(uri) = not.first() {
+                return Err(format!("{src}: its buffer '{uri}' is not a file in the model's folder (a link, or a path out of it): put it beside the model, or export GLB"));
+            }
+            for b in beside {
+                let from = Path::new(src).parent().unwrap_or(Path::new("")).join(&b);
+                let to = model_dir.join(&b);
+                if from != to {
+                    if let Some(parent) = to.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    std::fs::copy(&from, &to).map_err(|e| format!("{}: {e} (the buffer {name} names)", from.display()))?;
+                }
+                if !buffers.contains(&b) {
+                    buffers.push(b);
+                }
+            }
         }
-        let first = model_dir.join(&files[0].1);
-        let file = model::open(&first)?;
+        // (Opened where it came from: pictures beside it are there.)
+        let file = model::open(Path::new(&files[0].0))?;
         let src = format!("{rel_dir}/{file_name}");
         let options = model::Import { id: &id, src: &src, unit, at, texture_dir: &model_dir, texture_src: &rel_dir, sequence };
         let (mut layer, report) = model::to_layers(&file, &options)?;
@@ -2867,10 +2887,13 @@ impl Toolbox {
         for (_, name) in &files {
             self.register_asset(&dir, &format!("{rel_dir}/{name}"), args)?;
         }
+        for b in &buffers {
+            self.register_asset(&dir, &format!("{rel_dir}/{b}"), args)?;
+        }
         for t in &report.textures {
             self.register_asset(&dir, t, args)?;
         }
-        let mut out = json!({"id": id, "src": src, "files": files.len(), "report": report});
+        let mut out = json!({"id": id, "src": src, "files": files.len() + buffers.len(), "report": report});
         if !report.cameras.is_empty() || !report.lights.is_empty() {
             out["note"] = json!("cameras and lights in the file are listed, not imported: set the scene's camera and lights to match");
         }

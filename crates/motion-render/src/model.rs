@@ -15,6 +15,8 @@ use std::sync::Arc;
 pub struct File {
     pub document: gltf::Document,
     pub buffers: Vec<gltf::buffer::Data>,
+    /// The folder it was read from (what its files' paths are relative to).
+    pub dir: Option<PathBuf>,
 }
 
 /// Parsed files by path (a sequence's frames come and go: the cache keeps
@@ -37,7 +39,52 @@ pub fn open(path: &Path) -> Result<File, String> {
     let gltf = gltf::Gltf::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let base = path.parent();
     let buffers = gltf::import_buffers(&gltf.document, base, gltf.blob.clone()).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(File { document: gltf.document, buffers })
+    Ok(File { document: gltf.document, buffers, dir: base.map(Path::to_path_buf) })
+}
+
+/// A file's path as its URI says it (`%20` and the like undone), when it
+/// is a path beside the model: not data, not a link, not out of its folder.
+fn beside(uri: &str) -> Option<String> {
+    if uri.starts_with("data:") || uri.contains("://") {
+        return None;
+    }
+    let mut out = Vec::with_capacity(uri.len());
+    let b = uri.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(c)) => {
+                out.push(c);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    let path = String::from_utf8(out).ok()?;
+    let p = Path::new(&path);
+    (p.is_relative() && p.components().all(|c| matches!(c, std::path::Component::Normal(_)))).then_some(path)
+}
+
+/// The files a `.gltf` keeps its buffers in beside itself (their paths
+/// from its folder), and those it names that cannot be copied with it (a
+/// link, or a path out of its folder). A `.glb` has none.
+pub fn buffer_files(path: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+    let gltf = gltf::Gltf::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (mut beside_it, mut not) = (Vec::new(), Vec::new());
+    for b in gltf.document.buffers() {
+        if let gltf::buffer::Source::Uri(uri) = b.source() {
+            match beside(uri) {
+                Some(p) if !beside_it.contains(&p) => beside_it.push(p),
+                Some(_) => {}
+                None if uri.starts_with("data:") => {}
+                None => not.push(uri.to_string()),
+            }
+        }
+    }
+    Ok((beside_it, not))
 }
 
 impl Files {
@@ -210,6 +257,84 @@ pub fn euler(q: [f32; 4]) -> [f64; 3] {
     [-alpha.to_degrees(), -beta.to_degrees(), gamma.to_degrees()]
 }
 
+/// The layer's rotation for three angles (`euler`'s), as the engine makes it.
+fn euler_matrix(e: [f64; 3]) -> lahza_motion_core::space::Mat4 {
+    use lahza_motion_core::space::Mat4;
+    Mat4::rotate_y(e[1]).then(Mat4::rotate_x(e[0])).then(Mat4::rotate_z(e[2]))
+}
+
+/// Degrees between two rotations.
+fn turn_between(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let (a, b) = (euler_matrix(a).0, euler_matrix(b).0);
+    let trace: f64 = (0..3).map(|r| (0..3).map(|c| a[r * 4 + c] * b[r * 4 + c]).sum::<f64>()).sum();
+    ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// The three angles of `q` nearest to `prev`: a rotation has two sets of
+/// them (and each angle any number of whole turns), and keys that jump
+/// from one to the other swing the layer round between them.
+fn euler_near(q: [f32; 4], prev: Option<[f64; 3]>) -> [f64; 3] {
+    let e = euler(q);
+    let Some(prev) = prev else { return e };
+    let unwrap = |mut e: [f64; 3]| {
+        for a in 0..3 {
+            e[a] -= ((e[a] - prev[a]) / 360.0).round() * 360.0;
+        }
+        e
+    };
+    let (a, b) = (unwrap(e), unwrap([-180.0 - e[0], e[1] - 180.0, e[2] + 180.0]));
+    let far = |e: [f64; 3]| (0..3).map(|k| (e[k] - prev[k]).abs()).sum::<f64>();
+    if far(b) < far(a) { b } else { a }
+}
+
+fn slerp(a: [f32; 4], b: [f32; 4], f: f64) -> [f32; 4] {
+    let (a, mut b) = (a.map(|v| v as f64), b.map(|v| v as f64));
+    let mut dot: f64 = (0..4).map(|k| a[k] * b[k]).sum();
+    if dot < 0.0 {
+        b = b.map(|v| -v);
+        dot = -dot;
+    }
+    let angle = dot.clamp(-1.0, 1.0).acos();
+    let (wa, wb) = if angle < 1e-6 { (1.0 - f, f) } else { (((1.0 - f) * angle).sin() / angle.sin(), (f * angle).sin() / angle.sin()) };
+    std::array::from_fn(|k| (wa * a[k] + wb * b[k]) as f32)
+}
+
+/// A rotation channel as keys of a layer's three angles. glTF turns from
+/// key to key the short way at an even speed (slerp); a layer's angles
+/// each go linearly between their keys, which is another path wherever
+/// more than one of them changes. So keys are added between the file's
+/// until the angles' straight lines are within a quarter of a degree of
+/// the file's turn. Stepped channels keep their keys.
+pub fn rotation_keys(times: &[f32], values: &[Vec<f32>], step: bool) -> (Vec<f32>, Vec<[f64; 3]>) {
+    const NEAR: f64 = 0.25;
+    let quat = |k: usize| -> [f32; 4] { std::array::from_fn(|i| values[k].get(i).copied().unwrap_or(if i == 3 { 1.0 } else { 0.0 })) };
+    let (mut ts, mut es): (Vec<f32>, Vec<[f64; 3]>) = (Vec::new(), Vec::new());
+    // The keys strictly between (ta, qa) and (tb, qb), in order.
+    fn between(ta: f64, qa: [f32; 4], tb: f64, qb: [f32; 4], depth: u32, ts: &mut Vec<f32>, es: &mut Vec<[f64; 3]>) {
+        let ea = *es.last().unwrap();
+        let eb = euler_near(qb, Some(ea));
+        let off = [0.25, 0.5, 0.75].iter().map(|&f| turn_between(std::array::from_fn(|k| ea[k] + (eb[k] - ea[k]) * f), euler_near(slerp(qa, qb, f), Some(ea)))).fold(0.0, f64::max);
+        if off <= NEAR || depth >= 7 || tb - ta < 1.0 / 240.0 {
+            return;
+        }
+        let (tm, qm) = ((ta + tb) / 2.0, slerp(qa, qb, 0.5));
+        between(ta, qa, tm, qm, depth + 1, ts, es);
+        let em = euler_near(qm, es.last().copied());
+        ts.push(tm as f32);
+        es.push(em);
+        between(tm, qm, tb, qb, depth + 1, ts, es);
+    }
+    for k in 0..times.len().min(values.len()) {
+        if k > 0 && !step {
+            between(times[k - 1] as f64, quat(k - 1), times[k] as f64, quat(k), 0, &mut ts, &mut es);
+        }
+        let e = euler_near(quat(k), es.last().copied());
+        ts.push(times[k]);
+        es.push(e);
+    }
+    (ts, es)
+}
+
 fn round(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
@@ -324,9 +449,15 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
                 let bytes = data.0.get(view.offset()..view.offset() + view.length())?.to_vec();
                 (bytes, if mime_type.contains("jpeg") { "jpg" } else { "png" })
             }
+            // A picture beside the model: copied like the ones inside it.
             gltf::image::Source::Uri { uri, .. } => {
-                report.warnings.push(format!("texture {uri}: external textures are not copied; embed them (export GLB)"));
-                return None;
+                let read = beside(uri).zip(ctx.file.dir.as_ref()).and_then(|(p, dir)| std::fs::read(dir.join(p)).ok());
+                let Some(bytes) = read else {
+                    report.warnings.push(format!("texture {uri}: not found beside the model (a picture is copied from the model's folder; or embed it: export GLB)"));
+                    return None;
+                };
+                let lower = uri.to_ascii_lowercase();
+                (bytes, if lower.ends_with(".jpg") || lower.ends_with(".jpeg") { "jpg" } else if lower.ends_with(".webp") { "webp" } else { "png" })
             }
         };
         std::fs::create_dir_all(ctx.o.texture_dir).ok()?;
@@ -415,20 +546,10 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
             tr.insert("z".into(), json!(depth(&t)));
         }
         if let Some((times, values, step)) = anim("rotation") {
-            // Unwrap so a turn keeps going instead of jumping back 360°.
-            let mut eul: Vec<[f64; 3]> = values.iter().map(|q| rot(q)).collect();
-            for k in 1..eul.len() {
-                for a in 0..3 {
-                    while eul[k][a] - eul[k - 1][a] > 180.0 {
-                        eul[k][a] -= 360.0;
-                    }
-                    while eul[k][a] - eul[k - 1][a] < -180.0 {
-                        eul[k][a] += 360.0;
-                    }
-                }
-            }
+            // Keys of the three angles that follow the file's slerp.
+            let (times, eul) = rotation_keys(times, values, *step);
             for (a, name) in ["rotation_x", "rotation_y", "rotation"].iter().enumerate() {
-                tr.insert((*name).into(), keys(o.at, times, *step, |k| round(eul[k][a])));
+                tr.insert((*name).into(), keys(o.at, &times, *step, |k| round(eul[k][a])));
             }
         } else {
             let e = rot(&r);
@@ -522,6 +643,56 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
 mod tests {
     use super::*;
     use lahza_motion_core::space::Mat4;
+
+    /// The engine's rotation for the angles the keys have at time `t`
+    /// (each angle straight between its keys).
+    fn keyed(ts: &[f32], es: &[[f64; 3]], t: f64) -> [f64; 3] {
+        let k = ts.iter().rposition(|x| *x as f64 <= t).unwrap_or(0).min(ts.len() - 2);
+        let f = ((t - ts[k] as f64) / (ts[k + 1] - ts[k]) as f64).clamp(0.0, 1.0);
+        std::array::from_fn(|a| es[k][a] + (es[k + 1][a] - es[k][a]) * f)
+    }
+
+    #[test]
+    fn imported_rotations_follow_the_files_slerp() {
+        // From upright to 170° about an axis between x and y, in a second;
+        // then on to a turn about z, through where the angles' two sets meet.
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let (s, c) = (85f32.to_radians().sin(), 85f32.to_radians().cos());
+        let quats = vec![vec![0.0, 0.0, 0.0, 1.0], vec![h * s, h * s, 0.0, c], vec![0.0, 0.0, h, h], vec![0.6, 0.0, 0.0, 0.8]];
+        let times = [0.0f32, 1.0, 1.5, 3.0];
+        let (ts, es) = rotation_keys(&times, &quats, false);
+        assert!(ts.len() > 8 && ts.len() < 200, "{} keys", ts.len());
+        assert!(ts.windows(2).all(|w| w[0] < w[1]) && times.iter().all(|t| ts.contains(t)));
+        // At every hundredth of a second the keyed angles are the file's
+        // turn (slerp) within a third of a degree.
+        let q = |k: usize| -> [f32; 4] { std::array::from_fn(|i| quats[k][i]) };
+        let file = |t: f64| {
+            let k = times.iter().rposition(|x| *x as f64 <= t).unwrap_or(0).min(times.len() - 2);
+            euler(slerp(q(k), q(k + 1), (t - times[k] as f64) / (times[k + 1] - times[k]) as f64))
+        };
+        let worst = (0..=300).map(|i| i as f64 / 100.0).map(|t| turn_between(keyed(&ts, &es, t), file(t))).fold(0.0, f64::max);
+        assert!(worst < 0.34, "the keys leave the file's turn by {worst:.2}°");
+        // With the file's keys alone (three angles, each straight between
+        // them) the layer is tens of degrees from it on the way.
+        let plain: Vec<[f64; 3]> = { let mut prev = None; (0..4).map(|k| { let e = euler_near(q(k), prev); prev = Some(e); e }).collect() };
+        let worst = (0..=300).map(|i| i as f64 / 100.0).map(|t| turn_between(keyed(&times, &plain, t), file(t))).fold(0.0, f64::max);
+        assert!(worst > 10.0, "{worst:.2}");
+        // No key jumps: an angle never changes faster than the turn does
+        // (600° a second here would be a jump to the other set of angles).
+        for k in 1..ts.len() {
+            let dt = (ts[k] - ts[k - 1]) as f64;
+            assert!((0..3).all(|a| (es[k][a] - es[k - 1][a]).abs() / dt < 600.0), "between {} s and {} s: {:?} → {:?}", ts[k - 1], ts[k], es[k - 1], es[k]);
+        }
+        // A turn about one axis needs no more keys than the file has, and
+        // a stepped channel keeps its own.
+        let about_z: Vec<Vec<f32>> = [0.0f32, 80.0, 160.0].iter().map(|d| vec![0.0, 0.0, (d.to_radians() / 2.0).sin(), (d.to_radians() / 2.0).cos()]).collect();
+        assert_eq!(rotation_keys(&[0.0, 1.0, 2.0], &about_z, false).0.len(), 3);
+        assert_eq!(rotation_keys(&times, &quats, true).0.len(), 4);
+        // The other set of angles is the same rotation.
+        for e in [[20.0, 30.0, 40.0], [-70.0, 110.0, 5.0]] {
+            assert!(turn_between(e, [-180.0 - e[0], e[1] - 180.0, e[2] + 180.0]) < 1e-4);
+        }
+    }
 
     /// The layer's rotation from `euler` turns points as the glTF rotation
     /// does, once both are in the layer's axes.

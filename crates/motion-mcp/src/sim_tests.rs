@@ -152,6 +152,42 @@ fn a_skinned_model_is_imported_with_its_joints_and_bends_with_them() {
 }
 
 #[test]
+fn a_gltf_is_imported_with_the_buffer_and_the_picture_beside_it() {
+    let (mut tb, dir) = toolbox("apart");
+    // The arm as a .gltf whose buffer is `arm.bin` beside it, with a
+    // picture beside it too for its colour.
+    let src = dir.join("src");
+    let model = lahza_motion_render::model::write_test_arm_as(&src, false, true).unwrap();
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255])).save(src.join("skin colour.png")).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&model).unwrap()).unwrap();
+    doc["images"] = json!([{"uri": "skin%20colour.png"}]);
+    doc["textures"] = json!([{"source": 0}]);
+    doc["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"] = json!({"index": 0});
+    std::fs::write(&model, serde_json::to_vec(&doc).unwrap()).unwrap();
+    tb.call("project_create", json!({"path": "arm", "duration": 2, "width": 480, "height": 360})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1", "background": "#101014"}]})).unwrap();
+    let out = tb.call("model_import", json!({"path": model.display().to_string(), "scene": "s1", "position": [240, 320]})).unwrap().json;
+    assert_eq!((out["files"].as_u64(), out["report"]["skinned"].as_u64(), out["report"]["textures"].as_array().map(Vec::len)), (Some(2), Some(1), Some(1)), "{out:#}");
+    assert!(out["report"]["warnings"].as_array().unwrap().is_empty(), "{out:#}");
+    let project = dir.join("arm.lahza");
+    let project = if project.is_dir() { project } else { dir.join("arm") };
+    assert!(project.join("assets/models/arm/arm.bin").is_file() && project.join("assets/models/arm/tex0.png").is_file(), "{:?}", std::fs::read_dir(project.join("assets/models/arm")).map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>()));
+    // The project stands by itself: with what it was imported from gone,
+    // it checks and draws.
+    std::fs::remove_dir_all(&src).unwrap();
+    let report = tb.call("check", json!({})).unwrap().json;
+    assert_eq!(report["errors"], 0, "{report:#}");
+    let shot = image::load_from_memory(&tb.call("snapshot", json!({"at": [1.0], "width": 480})).unwrap().images[0]).unwrap().to_rgba8();
+    assert!(shot.pixels().filter(|p| p.0[0] > 120).count() > 1500, "the arm is drawn");
+    // A buffer that is not there is named.
+    let lone = lahza_motion_render::model::write_test_arm_as(&dir.join("lone"), false, true).unwrap();
+    std::fs::remove_file(dir.join("lone/arm.bin")).unwrap();
+    let e = tb.call("model_import", json!({"path": lone.display().to_string(), "scene": "s1", "id": "lone"})).unwrap_err();
+    assert!(e.contains("arm.bin"), "{e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_skinned_model_falls_as_a_ragdoll_and_its_mesh_goes_with_it() {
     let (mut tb, dir) = toolbox("ragdoll");
     let model = lahza_motion_render::model::write_test_arm(&dir.join("src")).unwrap();

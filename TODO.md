@@ -843,18 +843,55 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      unskinned mesh; the GPU's pool skinning against the CPU's on six
      frames and one path-traced frame (lavapipe, pool counts checked);
      the import and a joint keyed by an edit, through the tools.
-   - Measured: 3.9 ms to skin 100 000 points with four joints each on
-     one core. The GPU side is not timed (lavapipe is no measure).
-   - Left, not done: four joints a point (glTF's JOINTS_1 is not
-     read); no dual quaternions (linear blend: elbows thin at sharp
-     bends); the file's rotations become three layer angles keyed
-     linearly, not slerped; `model_import` copies one file, so a `.gltf`
-     must embed its buffer (or be a `.glb`); a skinned mesh under a
-     Slang deformer or displacement is not deformed (the deformer side
-     needs `slangc` to try). Morph targets are refused. None of these
-     was asked for by a shot yet; each is renderer and importer work
-     whose GPU half cannot be looked at here (lavapipe draws it, slowly,
-     and the suite compares it with the CPU's).
+   - Eight joints a point: glTF's JOINTS_1 and WEIGHTS_1 are read
+     (`SkinData::more`; weights are made to sum to one over the eight;
+     JOINTS_2 is refused). The CPU sums them in order and the pool's
+     bind mesh has six rows a point for such a skin. Tested: the test
+     arm with each point's second joint moved to JOINTS_1 skins to the
+     same points, to the bit, as the arm said with four; drawn the same.
+   - Dual quaternions beside linear blend: a skin's `"blend": "dual"`
+     (`skin::Posed`, `skin_point_dual`, and the second half of
+     `meshskin.wgsl`: five rows a joint, the real and the dual
+     quaternion and what is left of J · B, its scale, which is blended
+     as matrices first). Each joint's quaternion is taken on the side
+     of the point's first. Tested: a ring half on a joint twisted 180°
+     is a point blended as matrices and as wide as it was as dual
+     quaternions, turned a quarter; one joint alone is its matrix
+     either way, scale and all; across the test arm's quarter bend the
+     ring between the joints is within 1 % of its width at rest, and
+     more than 5 % thinner blended as matrices (looked at: the elbow's
+     outside is round, not cut). The GPU against the CPU on software
+     Vulkan: dual quaternions with eight joints a point over four
+     frames, and in the pool dual, eight, and both, three frames each
+     (pool counts checked).
+   - Imported rotations follow the file's slerp: glTF turns from key to
+     key the short way at an even speed, a layer's three angles each go
+     straight between their keys. `model::rotation_keys` adds keys
+     between the file's until the angles' lines are within a quarter of
+     a degree of the file's turn, and takes of a rotation's two sets of
+     angles the one nearer the key before. Tested: a 170° turn about a
+     skew axis and on through where the two sets meet stays within a
+     third of a degree of slerp at every hundredth of a second (tens of
+     degrees off with the file's keys alone); a turn about one axis
+     gets no more keys than the file has.
+   - A `.gltf` is imported with what is beside it: the files its buffers
+     are in are copied with it (kept at their paths under
+     `assets/models/<id>/`, registered as assets), and pictures it names
+     by path are read from its folder and copied like embedded ones. A
+     buffer that is a link or a path out of the folder is refused with
+     its name. Tested through the tools: the arm with `arm.bin` and a
+     picture beside it, imported, its source folder deleted, checks and
+     draws.
+   - Measured, one core, 100 000 points: 5.2 ms with four joints each
+     (linear), 9.8 ms with dual quaternions, 5.7 ms with eight a point
+     of which four have no weight. The GPU side is not timed (lavapipe
+     is no measure).
+   - Left, needing what is not here: a skinned mesh under a Slang
+     deformer or a Slang displacement is not deformed (both need
+     `slangc` to try). Morph targets are refused (a model that has them
+     to try on: none here, and they are a second kernel in the pool,
+     whose GPU half wants a card to look at). What the pool's kernel
+     costs on a card, with a character of real size.
 3. **A ragdoll that falls: done.** `simulation.ragdolls`: every bone
    under `root` (the joints' comps) is a body, a capsule along the bone
    toward its child (a given shape where that is wrong: box feet), mass
