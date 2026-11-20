@@ -8,10 +8,9 @@ section says what was done, what was measured and what is left; this is
 the short of it.
 
 Done and run here (pictures looked at; on the merged tree, one thread,
-Mesa's software Vulkan: motion-render 181 tests pass and 19 are ignored
-(measures; 186 and 21 with the later session's, below, run there on its
-own branch with motion-mcp's 37), motion-core 133, motion-sim 29, motion-mcp 37 and its
-integration tests, the app 116 and its four window tests under Xvfb):
+Mesa's software Vulkan: motion-render 186 tests pass and 21 are ignored
+(measures), motion-core 135, motion-sim 35, motion-mcp 38 and its
+integration tests, the app 122 and its four window tests under Xvfb):
 - The editor: drags that stalled (a tick changes one layer and compiles
   one scene), the prompt bar and its two agent runners (Claude Code, or
   an API key alone), undo of a whole request, guarded writes, the
