@@ -68,6 +68,7 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
     next.narration = project.narration.clone();
     // Not in the JSON either (`shaders/` on disk).
     next.shaders = project.shaders.clone();
+    next.bakes = project.bakes.clone();
     let markers_changed = !ripples.is_empty();
     for (at, d) in ripples {
         ripple_markers(&mut next, project, at, d);

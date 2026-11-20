@@ -240,22 +240,55 @@ blur away the contact shadows that are what is missing.
 
 ## Simulation: rigid bodies, ragdolls, crowds
 
-Not started; nothing here is measured. The engine has no physics and no
-skeletons or skinning (`model_import` reads the animation of nodes; morph
-targets are refused), so every part below is new. In the order to build:
+Part 1 is built; the rest is not started. The engine has no skeletons or
+skinning yet (`model_import` reads the animation of nodes; morph targets
+are refused). In the order to build:
 
-1. **Rigid bodies and joints.** `rapier3d`, built to give the same result
-   everywhere (`enhanced-determinism`); it has joint limits and motors.
-   - A simulation has state, and a frame here is drawn from its time
-     alone. So it is baked: stepped at a fixed rate from its start, each
-     body's transform kept per frame in the project's folder, and baked
-     again when what it depends on changes. Drawing reads the bake, so
-     scrubbing, the CPU and GPU pictures and exports stay as they are.
-   - In the document: which mesh layers are bodies (shape, mass,
-     friction, bounce), what stands still, and pushes at times (time
-     references as keys take them).
-   - Of use by itself: letters that tumble, things that drop, stack and
-     knock into each other.
+1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
+   `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
+   - A layer with `"body"` is a body; the scene's `"simulation"` has the
+     settings, a ground, joints (fixed, hinge, ball, slider, rope, spring;
+     hinges and sliders with a keyed motor) and blasts. Pushes, releases
+     and blasts take time references. Shapes come from the mesh (sphere,
+     box, capsule, cylinder, plane as such; else the hull, convex pieces
+     on request, or the triangles for what does not move), from a comp's
+     meshes as one body, or are given. A body follows its keys until its
+     `release` and leaves them with their speed.
+   - Baked: `sim_bake` / `lahza motion bake` step at 240 Hz (a whole
+     number of steps per frame) and write `sim/<scene>.bake` (a pose per
+     frame per body, f32, plus the take's first touches with their
+     closing speeds). `compile` places a body's layer from the bake
+     (`layer_matrix`), between samples by interpolation, so scrubbing,
+     motion blur's sub-frames, both renderers and exports read it like
+     keys. The simulation is in the scene's space; bodies inside comps
+     are placed through the comp's inverse.
+   - Stale bakes: the bake carries a hash of what it was made from (the
+     bodies' shapes, keyed poses per frame, joints, motor targets, pushes,
+     settings, the bytes of glTF files colliders come from). `check`
+     fails with `simulation` when a scene's bake is missing or its hash
+     differs. A camera, material or light does not change the hash.
+   - Deterministic: two bakes of a project are the same bytes, and the
+     debug and release builds give the same bake (its hash is pinned in
+     `motion-sim`'s tests). Not checked on another CPU architecture.
+   - Measured (4 cores, one used): 32 bodies for 4.5 s, 1080 steps, in
+     0.044 s; 501 boxes piling up for 5 s, 1200 steps, in 1.36 s (2.4 MB
+     of bake); convex pieces of five extruded letters add 0.45 s. `check`
+     re-gathers the input each call: 0.34 s in all for the 501 bodies.
+   - Tests: free fall against ½gt², rest on the ground, a stack of six
+     at rest, a hinge's limits and anchor held under pushes, a motor
+     reaching its keyed target, release with the keys' speed, drawing
+     through comps, parents and scale, flat (2D) bodies, kinematic
+     pushers and blasts, seeds, stale-bake detection, and the tool end to
+     end (unbaked, baked, stale, undo, reopened). `examples/sim/tumble.py`
+     builds letters that tumble and a wall hit by a ball on a rope; its
+     contact sheets were looked at (CPU renderer).
+   - Left: the motion editor does not reload when only `sim/` changes
+     (its own stamp list, `src/motion_editor.rs`), and has no bake
+     button. `snapshot` and `render` draw a stale bake without saying so
+     (only `check` does). A box landing flat at speed tips a degree or
+     two before settling (rapier's contact solver; more iterations do not
+     change it). Ropes are not drawn. Bodies inside instancers are
+     refused. Slang-generated meshes cannot be colliders (give a shape).
 2. **Skeletons and skinning.** glTF skins (joints, weights, inverse bind
    matrices); skinning as a deformer in the GPU's mesh pool, with the
    CPU's the same. Needed for any character.

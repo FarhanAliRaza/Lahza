@@ -34,6 +34,9 @@ pub struct Project {
     /// Slang modules; `shaders/<name>.slang` on disk.
     #[serde(skip)]
     pub shaders: Vec<crate::slang::Shader>,
+    /// Baked simulations by scene id; `sim/<scene>.bake` on disk.
+    #[serde(skip)]
+    pub bakes: std::collections::BTreeMap<String, std::sync::Arc<crate::sim::Bake>>,
 }
 
 fn version() -> u32 {
@@ -51,6 +54,7 @@ impl Project {
             markers: Markers::default(),
             narration: None,
             shaders: Vec::new(),
+            bakes: Default::default(),
         }
     }
 }
@@ -296,6 +300,10 @@ pub struct Scene {
     /// Check kinds this scene breaks on purpose (`world_crossfade`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    /// Settings of the scene's simulation (layers with a `body`), its
+    /// joints and blasts; baked by `sim_bake`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation: Option<crate::sim::Simulation>,
     #[serde(default)]
     pub layers: Vec<Layer>,
 }
@@ -319,6 +327,7 @@ impl Scene {
             motion_blur: None,
             step_fps: None,
             allow: Vec::new(),
+            simulation: None,
             layers: Vec::new(),
         }
     }
@@ -883,6 +892,10 @@ pub struct Common {
     /// Check kinds this layer (and its children) breaks on purpose.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    /// The layer is a body of the scene's simulation: placed by the bake
+    /// from its release on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<crate::sim::Body>,
 }
 
 /// What a layer is in the picture.
@@ -972,7 +985,7 @@ fn is_normal(b: &Blend) -> bool {
     *b == Blend::Normal
 }
 
-const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "follow", "three_d", "hidden", "space", "role", "facing", "allow"];
+const COMMON_FIELDS: &[&str] = &["name", "transform", "time", "blend", "effects", "parent", "matte", "follow", "three_d", "hidden", "space", "role", "facing", "allow", "body"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]

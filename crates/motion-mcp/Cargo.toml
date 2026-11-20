@@ -13,6 +13,7 @@ path = "src/bin/lahza-motion.rs"
 lahza-motion-audio = { path = "../motion-audio" }
 lahza-motion-core = { path = "../motion-core" }
 lahza-motion-render = { path = "../motion-render" }
+lahza-motion-sim = { path = "../motion-sim" }
 lahza-audio-mode = { path = "../audio-mode" }
 lahza-clips = { path = "../clips" }
 lahza-model = { path = "../model" }

@@ -33,6 +33,7 @@ Usage:
                     marks.json: {\"frames\": [{\"at\": REF, \"marks\": [{\"world\": [x, y, z], \"image\": [x, y]}]}], \"start\": {camera}}
   lahza motion model-import <project> <file.glb> --scene ID [--id ID] [--parent COMP] [--unit PX_PER_M] [--at S] [--position x,y] [--z Z] [--time START,END] [--source S] [--licence L]
                     [--frames N [--fps F] [--start K]]   a glTF model (Blender), or a baked sequence with {frame} in the name
+  lahza motion bake <project> [--scene ID] [--seed N] [--force]   step the simulation (layers with \"body\") and keep it in sim/<scene>.bake
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
                     [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
                     [--fast]   path-trace fast: 2 paths a pixel at half size through NVIDIA Ray Reconstruction (`just ngx`)
@@ -415,6 +416,16 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             }
             print(&tb.call("model_import", a)?.json);
         }
+        "bake" => {
+            let mut a = json!({"project": need()?, "force": has(args, "--force")});
+            if let Some(v) = flag(args, "--scene") {
+                a["scene"] = json!(v);
+            }
+            if let Some(v) = flag(args, "--seed") {
+                a["seed"] = json!(v.parse::<u64>().map_err(|e| format!("--seed: {e}"))?);
+            }
+            print(&tb.call("sim_bake", a)?.json);
+        }
         "render" => {
             let mut a = json!({"project": need()?, "wait": false});
             if let Some(o) = flag(args, "-o") {
@@ -521,3 +532,5 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod sim_tests;

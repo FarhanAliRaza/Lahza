@@ -336,6 +336,36 @@ reference.
                "rotation": {"keys": [{"at": 0, "v": 0}, {"at": 4, "v": 90}]}}}
 ```
 
+## Simulation: things that fall, collide and hang
+
+When something should drop, tumble, stack, knock into something else or
+swing on a rope, do not key it: give the layers a `"body"` and bake.
+
+1. **Bodies.** `"body": {}` on a mesh makes it fall and collide by its
+   shape. What stands still is `"type": "fixed"` (a floor mesh, or the
+   scene's `"simulation": {"ground": {"y": 900}}`). What you key and that
+   pushes other things is `"type": "kinematic"`.
+2. **Start from animation.** A body follows its keys until its `release`
+   and leaves them with the speed they gave it: key a ball in from the
+   side, `"release": "beat:9"`, and it flies on from there. `velocity` and
+   `spin` add to that. `pushes` and the scene's `blasts` kick bodies at
+   times (time references, as keys take them).
+3. **Joints.** `hinge`, `ball`, `slider`, `rope`, `spring`, `fixed` in the
+   scene's `simulation.joints`; leave `b` out to hold a body to the world.
+4. **Bake**: `sim_bake` (shell: `lahza motion bake project.lahza`). It
+   returns the take's events (who touched whom, when, how fast): put a
+   sound effect or a cut on one.
+5. **Look**: `snapshot` at a few times, as for any shot. Change a body, a
+   key, a joint or `seed` and bake again; `check` fails while a bake is
+   missing or stale.
+
+Sizes are real: 100 px is a metre by default (`simulation.unit`), so a
+100 px box falls like a metre-wide crate and a 20 px one like a die. If
+motion reads as slow and heavy, the things are big: raise `unit` or
+`gravity`. Letters and logos with holes or notches collide by their hull
+unless `"shape": {"type": "pieces"}`. Thin fast things that pass through
+each other want `"ccd": true`.
+
 ## Footage and Blender
 
 - Footage: `media_import` a clip or image sequence, then add a

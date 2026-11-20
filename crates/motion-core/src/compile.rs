@@ -16,6 +16,9 @@ use std::sync::Arc;
 
 mod instancer;
 mod meshes;
+mod sim;
+
+pub use sim::{CSim, SimStatus};
 pub use meshes::frame_path;
 use instancer::CInstancer;
 pub use meshes::{srgb_to_linear, EnvState, LightState, Lighting, Lobe, MaterialState, MeshState};
@@ -441,6 +444,8 @@ pub struct CScene {
     bloom: Option<(Prop<f64>, Prop<f64>, Prop<f64>)>,
     transition: Option<CTransition>,
     pub layers: Vec<CLayer>,
+    /// The scene's simulation (the defaults when it has none).
+    pub sim: CSim,
 }
 
 enum CFocus {
@@ -507,6 +512,8 @@ pub struct CLayer {
     follow: Option<CFollow>,
     hidden: bool,
     kind: CKind,
+    /// A body of the scene's simulation: the bake places it.
+    body: Option<Box<sim::CBody>>,
 }
 
 /// `follow`: placed on sibling `target`'s path.
@@ -814,6 +821,8 @@ struct Compiler<'a> {
     errors: Vec<String>,
     syncs: Vec<SyncRecord>,
     events: Vec<VisualEvent>,
+    /// The bake of the scene being compiled.
+    bake: Option<Arc<crate::sim::Bake>>,
 }
 
 impl<'a> Compiler<'a> {
@@ -1227,6 +1236,7 @@ impl<'a> Compiler<'a> {
             follow,
             hidden: c.hidden,
             kind,
+            body: self.body(c, id, shift),
         }
     }
 
@@ -1442,7 +1452,7 @@ impl Compiled {
             errors.push("settings.duration must be positive".into());
         }
         let windows = Windows::new(project, base, &mut errors);
-        let mut c = Compiler { windows, slang: Default::default(), surfaces: Default::default(), programs: HashMap::new(), mesh_kernels: HashMap::new(), errors, syncs: Vec::new(), events: Vec::new() };
+        let mut c = Compiler { windows, slang: Default::default(), surfaces: Default::default(), programs: HashMap::new(), mesh_kernels: HashMap::new(), errors, syncs: Vec::new(), events: Vec::new(), bake: None };
         let mut scenes = Vec::new();
         for scene in &project.scenes {
             let id = scene.id.as_str();
@@ -1498,7 +1508,9 @@ impl Compiled {
                     }
                 },
             };
+            c.bake = project.bakes.get(id).cloned();
             let layers = c.layers(&scene.layers, step, pre_roll);
+            let sim = c.simulation(scene, start, end, pre_roll);
             let lighting = c.lighting(scene, pre_roll, start);
             let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
                 (c.prop(&b.threshold, id, "look.bloom.threshold", start, None, pre_roll), c.prop(&b.radius, id, "look.bloom.radius", start, None, pre_roll), c.prop(&b.intensity, id, "look.bloom.intensity", start, None, pre_roll))
@@ -1529,6 +1541,7 @@ impl Compiled {
                 bloom,
                 transition,
                 layers,
+                sim,
             });
         }
         // The Slang functions the properties asked for, built into one
@@ -1686,7 +1699,7 @@ impl Compiled {
         let (fov, dolly) = (scene.camera_fov.at(tc), scene.camera_dolly.at(tc));
         let shift = scene.camera_shift.at(tc);
         let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, fov, (orbit.x(), orbit.y()), dolly).shifted((shift.x(), shift.y()));
-        let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None };
+        let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None, keyed: false };
         let aperture = scene.camera_aperture.at(tc);
         if aperture > 0.0 {
             // Depths are view-space z; the point of interest sits at the
@@ -1876,6 +1889,9 @@ struct Space {
     three_d: bool,
     /// Depth of field for 3D layers.
     dof: Option<Dof>,
+    /// Bodies stand where their keys put them (no bake): what a bake is
+    /// made from.
+    keyed: bool,
 }
 
 /// Depth of field: blur sigma = `per_px` × |view depth − `plane`| canvas px.
@@ -1909,6 +1925,13 @@ fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, s
     }
     let l = &layers[i];
     let t = clock(l.step.or(inherited), tc);
+    // A body from its release on: where the bake has it (the scene's
+    // space), in this layer list's.
+    if let (false, Some(w)) = (space.keyed, l.body.as_ref().and_then(|b| b.baked(t))) {
+        let m = crate::sim::inverse(space.world).then(w);
+        cache[i] = Some(m);
+        return m;
+    }
     let s = l.scale.at(t);
     let a = l.anchor.at(t);
     // Depth scale: meshes scale uniformly with x unless told otherwise.

@@ -30,6 +30,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
+mod sim;
+
 pub type ToolResult = Result<Output, String>;
 
 #[derive(Default, Debug)]
@@ -290,6 +292,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
             schema: obj(json!({"limit": {"type": "integer", "default": 20}, "undo": {"type": "integer"}, "undo_to": {"type": "integer"}, "redo": {"type": "boolean"}}), &[]),
             read_only: false,
         },
+        sim::def(),
         ToolDef {
             name: "model_import",
             description: "Import a glTF model (.glb, e.g. Blender's export) into a scene as ordinary layers: one three_d comp per node (its transform, keyed when the file animates it, e.g. a rigid-body simulation baked to keyframes) holding one mesh layer per part with its material (colour, metallic, roughness, emission, transmission; colour, normal and metallic-roughness textures). The file is copied to assets/models/<id>/. A baked simulation that changes shape (a liquid, cloth) is a sequence: a path with {frame} or {frame:04} plus frames (and fps, default the project's; start, default 1): its meshes show frame start + (t - at)·fps. Rendered by the rasteriser and the path tracer like any mesh. Units: unit px per metre (default 100); glTF's y up becomes the layer's y down.",
@@ -402,7 +405,7 @@ fn stamp(dir: &Path) -> SystemTime {
         }
     };
     look(&dir.join("project.json"));
-    for sub in ["scenes", "markers", "shaders"] {
+    for sub in ["scenes", "markers", "shaders", "sim"] {
         look(&dir.join(sub));
         if let Ok(rd) = std::fs::read_dir(dir.join(sub)) {
             for e in rd.flatten() {
@@ -506,6 +509,7 @@ impl Toolbox {
             "audio_analyze" => self.audio_analyze(&args),
             "media_import" => self.media_import(&args),
             "model_import" => self.model_import(&args),
+            "sim_bake" => self.sim_bake(&args),
             "blender_run" => self.blender_run(&args),
             "track" => self.track(&args),
             "fit_curve" => self.fit_curve(&args),

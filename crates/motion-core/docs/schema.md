@@ -62,6 +62,7 @@ Common fields: `id`, `kind`, `name`, `transform` (`position`, `anchor`,
 `scale`, `rotation`, `opacity`), `time` (`start`, `end`, `duration`,
 `step_fps`, `step_phase`, `offset`), `blend`, `effects` (`blur`, `shadow`,
 `glow`), `matte` (`{"layer": "<sibling>", "mode": "alpha"}`), `parent`, `follow`, `hidden`,
+`body` (the layer falls and collides: see [Simulation](#simulation)),
 `space` (`"world"`, the default, or `"screen"`: the layer ignores the scene
 camera's zoom, orbit and dolly and stays where its transform puts it on
 screen, drawn in layer order above a moving 3D camera; use it for titles,
@@ -619,6 +620,94 @@ take its light, and the path tracer samples its bright parts directly, so
 a small sun in it gives clean light and sharp shadows. It lights and is
 reflected but is not drawn behind the scene (the 2D layers are). A
 missing image is reported and leaves the environment dark.
+
+## Simulation
+
+Layers with a `body` are bodies of their scene's simulation: they fall,
+collide, stack and are held by joints. A simulation has state and a frame
+is drawn from its time alone, so it is **baked**: `sim_bake` (or `lahza
+motion bake`) steps it at a fixed rate from its start and keeps every
+body's place per frame in `sim/<scene>.bake`. Drawing reads the bake, so
+snapshots, scrubbing, both renderers and exports work as for any layer.
+The same project bakes to the same bytes. `check` reports a scene whose
+bake is missing or stale (anything it was made from changed: a body, its
+shape or keys, a joint, a push, the settings); until it is baked again the
+old motion is what is drawn. A camera, material or light is not part of it.
+
+Space is the scene's: px, x right, y down, z away. The simulator works in
+metres, `unit` px to the metre (default 100: a 100 px box is a metre
+across and falls as one does).
+
+```json
+{"id": "crate", "kind": "mesh", "mesh": {"type": "box", "size": [100, 100], "depth": 100},
+ "transform": {"position": [960, 200], "rotation": 12},
+ "body": {"bounce": 0.3, "pushes": [{"at": "beat:5", "velocity": [600, -300, 0]}]}}
+```
+
+`body` on a layer:
+
+| field | meaning |
+|---|---|
+| `type` | `dynamic` (default: the simulation moves it), `fixed` (stands where its keys put it at the start: floors, walls), `kinematic` (follows its keys and pushes what it meets: a paddle, a door on keys) |
+| `shape` | what collides. Default: from the layer's mesh — a sphere, box, capsule, cylinder or plane as such, anything else by its convex hull (its own triangles when the body is `fixed` or `kinematic`); a comp: the meshes inside it, as one body; a `rect` or `circle` shape layer: a thin slab or a ball. Given: `{"type": "box", "size": [w, h, d]}`, `{"type": "sphere", "radius": r}`, `{"type": "capsule" \| "cylinder", "radius": r, "height": h, "axis": "y"}` (px, the layer's space, with `offset` [x, y, z]), `{"type": "hull"}`, `{"type": "pieces"}` (the mesh cut into convex pieces: a letter's counter, a cup's hollow stay open; slower to bake), `{"type": "mesh"}` (the triangles; not for `dynamic`) |
+| `mass` | kg (default: from `density` and the shape's volume) |
+| `density` | 1 is water (default 1) |
+| `friction`, `bounce` | 0.6 and 0.1 by default |
+| `damping`, `spin_damping` | drag on moving and turning, per second (0) |
+| `velocity`, `spin` | px/s [x, y, z] and degrees/s about x, y, z at release, added to what the layer's keys gave it |
+| `release` | a time (reference): a dynamic body follows its keys until then (default: the simulation's start), then keeps the pose and speed they left it with |
+| `pushes` | `[{"at": time, "velocity": [x, y, z], "spin": [x, y, z], "point": [x, y, z], "dur": seconds}]`: a change of speed (px/s, degrees/s) at a time, whatever the mass; at `point` (px, the layer's space) it also turns the body; over `dur` seconds when given |
+| `ccd` | `true` for small fast bodies (tests the path between steps) |
+
+A layer's own `scale` and `anchor` hold from its release; `parent` and
+`follow` do not apply to a body once released (layers parented *to* a body
+ride it). A body may be inside comps: the simulation is in the scene's
+space whatever the comp's transform. A layer inside an instancer cannot be
+a body.
+
+The scene's `simulation` (all optional; a scene with bodies and none uses
+the defaults):
+
+| field | meaning |
+|---|---|
+| `unit` | px per metre (100) |
+| `gravity` | m/s², [x, y, z] ([0, 9.81, 0]: down) |
+| `start`, `end` | when stepping starts and stops (default: the scene's); bodies hold their last pose after `end` |
+| `rate` | steps per second (240), rounded up to a whole number per frame |
+| `ground` | `{"y": px, "friction": 0.6, "bounce": 0.1}`: a floor at that height |
+| `flat` | `true`: bodies stay in the picture plane and turn about z only (flat layers as bodies) |
+| `seed`, `jitter` | `jitter` px/s of random speed (and degrees/s of spin) for each body at its release; another `seed` is another take |
+| `joints` | below |
+| `blasts` | `[{"at": time, "origin": [x, y, z], "speed": px/s, "radius": px}]`: every body within `radius` is thrown away from `origin`, less the farther it is |
+
+Joints hold body `a` to body `b`, or to the world when `b` is left out:
+
+| `type` | fields |
+|---|---|
+| `fixed` | welded as they stand at the start |
+| `hinge` | turns about `axis` ([0, 0, 1]) through `anchor`; `limits` [from, to] degrees from the starting pose; `motor` |
+| `ball` | turns any way about `anchor`; `swing` (degrees it may bend), `twist` [from, to] degrees about `axis` |
+| `slider` | slides along `axis`; `limits` [from, to] px; `motor` |
+| `rope` | no farther apart than `length` px (default: as far as they start) |
+| `spring` | pulled toward `length` apart by `stiffness` (100 N/m), calmed by `damping` (1) |
+
+`anchor` and `axis` are in `a`'s layer space (px); `anchor_b` in `b`'s
+(default: the same point at the start; for ropes and springs `b`'s origin,
+or with no `b` a point of the scene). Jointed bodies do not collide with
+each other unless `collide`. A `motor` drives a hinge (degrees) or slider
+(px) toward a keyed target:
+
+```json
+"simulation": {"joints": [
+  {"id": "hinge", "type": "hinge", "a": "door", "anchor": [-100, 0, 0], "axis": [0, 1, 0], "limits": [0, 100],
+   "motor": {"target": {"keys": [{"at": "beat:3", "v": 0}, {"at": "beat:5", "v": 80, "ease": "glide"}]}, "stiffness": 400, "damping": 40}},
+  {"type": "rope", "a": "wrecker", "anchor_b": [900, 60, 0], "length": 440}
+]}
+```
+
+A bake also lists what happened, for timing sound and cuts to it: the
+first touches between bodies with their closing speed in px/s (`sim_bake`
+returns them).
 
 ## Properties
 
