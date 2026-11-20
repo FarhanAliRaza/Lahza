@@ -86,7 +86,9 @@ impl Toolbox {
                 SimStatus::Broken(errors) => return Err(format!("scene '{id}': {}", errors.join("; "))),
                 SimStatus::Fresh { bodies } if !force => out.push(json!({"scene": id, "status": "up to date", "bodies": bodies})),
                 _ => {
-                    let (bake, stats) = lahza_motion_sim::bake_scene(&compiled, i, Some(&dir), &mut meshes).map_err(|e| format!("scene '{id}': {e}"))?;
+                    let watch = self.bake_watch.clone();
+                    let watched = |share: f64| watch.as_ref().is_none_or(|w| w(&id, share));
+                    let (bake, stats) = lahza_motion_sim::bake_scene_watched(&compiled, i, Some(&dir), &mut meshes, &watched).map_err(|e| format!("scene '{id}': {e}"))?;
                     let bytes = bake.to_bytes().len();
                     lahza_motion_core::sim::save_bake(&dir, &id, &bake).map_err(|e| e.to_string())?;
                     // Falls and steps first: they are what a take is judged by.

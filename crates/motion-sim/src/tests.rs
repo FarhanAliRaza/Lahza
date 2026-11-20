@@ -73,6 +73,31 @@ fn a_box_falls_and_rests_on_the_ground() {
     assert!(touch[0].speed > 300.0 && (touch[0].t - 1.15).abs() < 0.1, "{:?}", touch[0]);
 }
 
+/// A watched bake says how far it is before each sample, stops where it
+/// is told to, and is otherwise the bake it was.
+#[test]
+fn a_bake_says_its_share_and_stops_when_told() {
+    let p = project(json!({"id": "s1", "simulation": {"ground": {"y": 900}}, "layers": [boxed("b", 960.0, 200.0, json!({}))]}), 3.0);
+    let compiled = Compiled::new(&p);
+    let shares = std::cell::RefCell::new(Vec::new());
+    let (whole, _) = bake_scene_watched(&compiled, 0, None, &mut core_meshes, &|share| {
+        shares.borrow_mut().push(share);
+        true
+    })
+    .unwrap();
+    let shares = shares.into_inner();
+    assert_eq!((shares.len(), shares[0], shares[45]), (90, 0.0, 0.5));
+    assert!(shares.windows(2).all(|w| w[1] > w[0]) && shares[89] < 1.0);
+    assert_eq!(whole.to_bytes(), bake_scene(&compiled, 0, None, &mut core_meshes).unwrap().0.to_bytes());
+    let asked = std::cell::Cell::new(0);
+    let stopped = bake_scene_watched(&compiled, 0, None, &mut core_meshes, &|share| {
+        asked.set(asked.get() + 1);
+        share < 0.3
+    });
+    assert_eq!(stopped.err().as_deref(), Some(STOPPED));
+    assert_eq!(asked.get(), 28, "nothing was stepped after the stop");
+}
+
 fn chaos(seed: u64, jitter: f64) -> Project {
     let mut layers = vec![json!({"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [1600, 40], "depth": 800}, "transform": {"position": [960, 920]}, "body": {"type": "fixed"}})];
     for i in 0..12 {

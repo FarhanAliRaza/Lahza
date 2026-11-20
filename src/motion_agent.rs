@@ -253,11 +253,23 @@ impl Default for ClaudeCode {
 pub(crate) const SYSTEM: &str = "You are working inside the Lahza motion editor, for the person using it. They see each edit you make appear in their preview as you make it, and they can undo everything you do for this request in one step. \
 Work only with the lahza tools, on the project named in the message. Do what was asked and no more: when it is about one layer, change that layer. \
 Look before and after (snapshot, review, check) rather than guessing. Do not render a video unless asked. \
+Do not guess an edit's form. Every edit is edit_apply with \"ops\": a list of objects, each with \"op\". The common ones, exactly: \
+{\"op\": \"set\", \"target\": \"<layer id>.<field path>\", \"value\": …} (\"target\" is one string, the id and the path joined by a dot: \"title.color\", \"box.fill\", \"box.transform.position\"; there is no separate \"id\" or \"field\"); \
+{\"op\": \"key\", \"target\": \"<layer id>.<field path>\", \"at\": <seconds or a time reference>, \"v\": …}; \
+{\"op\": \"add\", \"scene\": \"<scene id>\", \"id\": …, \"kind\": \"shape\" | \"text\" | …, …the layer's fields}; {\"op\": \"remove\", \"id\": …}. \
+A shape layer's \"shape\" is one of circle, rect, capsule, ring, arc, polygon, star, line, path, field (an ellipse is a circle whose \"size\" has a width and a height that differ). Colours are \"#rrggbb\": a text's is \"color\", a shape's is \"fill\". \
+Before changing a layer read it as it is (timeline_get with full: true shows the JSON that edit_apply edits) rather than trying a form; lahza://schema and lahza://catalog have every field, op and kind, where you can read resources. \
 End with one or two plain sentences saying what you changed.";
 
 impl ClaudeCode {
     fn command(&self, request: &Request) -> Command {
-        let servers = json!({"mcpServers": {"lahza": {"command": self.server, "args": ["mcp"], "env": {"LAHZA_REQUEST": request.id}}}});
+        let mut env = json!({"LAHZA_REQUEST": request.id});
+        // A machine without a GPU: the server draws its snapshots as this
+        // app draws its preview.
+        if let Ok(software) = std::env::var("LAHZA_MOTION_SOFTWARE_GPU") {
+            env["LAHZA_MOTION_SOFTWARE_GPU"] = json!(software);
+        }
+        let servers = json!({"mcpServers": {"lahza": {"command": self.server, "args": ["mcp"], "env": env}}});
         let mut c = Command::new(&self.program);
         c.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
             // Only our server, none of Claude Code's own tools (no shell, no
@@ -361,7 +373,13 @@ impl Runner for ClaudeCode {
             .name("lahza-agent".into())
             .spawn(move || {
                 let mut ended = false;
+                // `LAHZA_AGENT_LOG=<file>` keeps the stream as it came
+                // (turns, refusals, the tools it was given), to read after.
+                let mut log = std::env::var_os("LAHZA_AGENT_LOG").and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Some(log) = &mut log {
+                        let _ = writeln!(log, "{line}");
+                    }
                     for event in parse_line(&line) {
                         ended |= matches!(event, Event::Done { .. } | Event::Failed(_));
                         if events.send(event).is_err() {
@@ -473,7 +491,14 @@ fn first_line(text: &str) -> String {
 /// A tool call in the editor's words: what was added, what was checked,
 /// what is being drawn.
 pub(crate) fn describe(tool: &str, input: &Value) -> String {
-    let text = |key: &str| input.get(key).map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
+    // (A list of times reads as "0.5, 2": not as JSON.)
+    let text = |key: &str| {
+        input.get(key).map(|v| match v {
+            Value::String(s) => s.clone(),
+            Value::Array(list) => list.iter().map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())).collect::<Vec<_>>().join(", "),
+            other => other.to_string(),
+        })
+    };
     match tool {
         "edit_apply" => {
             let ops = input.get("ops").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -678,7 +703,8 @@ not json at all
         let args: Vec<String> = std::fs::read_to_string(program.with_extension("args")).unwrap().lines().map(String::from).collect();
         let after = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].clone()).unwrap_or_else(|| panic!("{flag} in {args:?}"));
         let servers: Value = serde_json::from_str(&after("--mcp-config")).unwrap();
-        assert_eq!(servers["mcpServers"]["lahza"], json!({"command": "/opt/lahza", "args": ["mcp"], "env": {"LAHZA_REQUEST": "r7"}}));
+        let server = &servers["mcpServers"]["lahza"];
+        assert_eq!((&server["command"], &server["args"], &server["env"]["LAHZA_REQUEST"]), (&json!("/opt/lahza"), &json!(["mcp"]), &json!("r7")));
         assert!(args.contains(&"--strict-mcp-config".to_string()) && args.contains(&"-p".to_string()));
         assert_eq!((after("--output-format"), after("--input-format"), after("--resume")), ("stream-json".into(), "stream-json".into(), "earlier".into()));
         assert_eq!((after("--tools"), after("--allowedTools"), after("--permission-mode")), (String::new(), "mcp__lahza".into(), "dontAsk".into()));

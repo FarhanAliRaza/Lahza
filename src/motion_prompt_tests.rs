@@ -379,6 +379,159 @@ fn prompt_bar_directs_an_agent_and_takes_its_request_back() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// One small request to the real Claude Code from the bar itself. It
+/// costs money (about $0.2 to $0.4): run it once, by name, signed in:
+/// `LAHZA_MOTION_SOFTWARE_GPU=1 xvfb-run -a cargo test --release -p lahza
+/// -- --ignored a_real_request_from_the_prompt_bar`. `LAHZA_AGENT_LOG`
+/// keeps Claude Code's stream.
+#[test]
+#[ignore = "sends a real request to Claude Code (costs money); requires a display"]
+fn a_real_request_from_the_prompt_bar() {
+    let dir = std::env::temp_dir().join(format!("lahza-motion-prompt-real-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots = std::env::var_os("LAHZA_WORKFLOW_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|| dir.clone());
+    std::fs::create_dir_all(&shots).unwrap();
+    let project = sample(&dir);
+    std::env::set_var("LAHZA_CONFIG_DIR", dir.join("config"));
+    // The server is the app itself, built beside this test (`LAHZA_BIN`
+    // names another).
+    let server = std::env::var_os("LAHZA_BIN").map(PathBuf::from).unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("lahza"));
+    assert!(server.is_file(), "the app is built: {}", server.display());
+    let runner = Arc::new(crate::motion_agent::ClaudeCode { program: "claude".into(), server });
+    assert_eq!(runner.available(), Availability::Ready, "Claude Code is installed and signed in");
+    let open = project.clone();
+    Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+        let handle = open_studio_window(cx, true, |handle, cx| {
+            cx.new(|cx| {
+                let mut studio = Studio::new(handle, None, None, cx);
+                studio.open_motion_project(open.clone());
+                studio.motion_agent = MotionAgent::new(runner.clone());
+                studio
+            })
+        })
+        .unwrap();
+        cx.activate(true);
+        cx.spawn(async move |cx| {
+            let wait = |ms| Timer::after(Duration::from_millis(ms));
+            let any: AnyWindowHandle = handle.into();
+            let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+            let shot = |name: &str| studio_workflow_tests::save_display(&shots.join(name), false);
+            wait(300).await;
+            any.update(cx, |_, window, _| {
+                window.activate_window();
+                window.refresh();
+            })
+            .unwrap();
+            wait(1200).await;
+            let editor = |cx: &mut gpui::AsyncApp| handle.update(cx, |s, _, _| s.motion_doc.as_ref().map(|d| d.editor.clone())).unwrap();
+            let mut framed = false;
+            for _ in 0..3600 {
+                wait(50).await;
+                draw(cx);
+                framed = editor(cx).is_some_and(|e| e.update(cx, |e, _| e.frame_png().is_some()).unwrap()) && handle.update(cx, |s, _, _| s.motion_agent.missing().is_none() && s.motion_agent.runner_name() == "Claude Code").unwrap();
+                if framed {
+                    break;
+                }
+            }
+            assert!(framed, "the preview rendered a frame and the runner is ready");
+            let editor = editor(cx).unwrap();
+            let words = "make this one red";
+            let before = handle
+                .update(cx, |studio, _, cx| {
+                    editor.update(cx, |e, _| {
+                        e.seek(0.5);
+                        e.select(Some("title".into()));
+                    });
+                    studio.text_fields.prompt.update(cx, |_, cx| cx.emit(FieldEvent { target: Target::Prompt, kind: EventKind::Change, text: words.into() }));
+                    cx.notify();
+                    editor.read(cx).color_state("title", "color")
+                })
+                .unwrap();
+            wait(300).await;
+            draw(cx);
+            wait(100).await;
+            shot("real-1-typed.png");
+            // Enter: the one request.
+            handle.update(cx, |studio, _, cx| studio.text_fields.prompt.update(cx, |_, cx| cx.emit(FieldEvent { target: Target::Prompt, kind: EventKind::Submit, text: words.into() }))).unwrap();
+            let (mut seen, mut ended) = (0, false);
+            // Ten minutes at most.
+            for _ in 0..6000 {
+                wait(100).await;
+                draw(cx);
+                let (steps, busy) = handle.update(cx, |s, _, _| (s.motion_agent.requests.last().map_or(0, |r| r.steps.len()), s.motion_agent.busy())).unwrap();
+                // The bar as each of the first steps shows.
+                if steps > seen && steps <= 4 {
+                    wait(200).await;
+                    draw(cx);
+                    wait(100).await;
+                    shot(&format!("real-2-at-work-step-{steps}.png"));
+                }
+                seen = steps;
+                if !busy && handle.update(cx, |s, _, _| s.motion_agent.requests.len()).unwrap() == 1 {
+                    ended = true;
+                    break;
+                }
+            }
+            assert!(ended, "the request ended");
+            wait(1500).await;
+            draw(cx);
+            wait(100).await;
+            shot("real-3-proposal.png");
+            let id = handle
+                .update(cx, |studio, _, cx| {
+                    let request = &studio.motion_agent.requests[0];
+                    // What it took, for whoever runs this.
+                    println!("real request: {:.1} s, {} steps, {} edits{}, outcome {:?}", request.seconds(), request.steps.len(), request.edits, request.spent(), request.outcome);
+                    for step in &request.steps {
+                        println!("  step: {}{}", step.text, step.error.as_ref().map(|e| format!("  FAILED: {e}")).unwrap_or_default());
+                    }
+                    println!("  said: {}", request.said);
+                    assert_eq!(request.outcome, Outcome::Proposal, "what came back is a proposal");
+                    assert!(studio.motion_agent.proposal().is_some_and(|p| p.id == request.id));
+                    assert!(!request.steps.is_empty() && request.steps.iter().all(|s| s.done), "its steps showed and ended");
+                    assert!(request.steps.iter().any(|s| s.text.starts_with("Editing")), "an edit among them");
+                    assert!(request.edits >= 1 && request.cost.is_some() && !request.said.is_empty());
+                    // The history's entries for it carry its id, and the
+                    // title is red.
+                    let history = lahza_motion_core::io::read_history(editor.read(cx).dir()).unwrap();
+                    let ours: Vec<_> = history.iter().filter(|e| e.request.as_deref() == Some(request.id.as_str())).collect();
+                    assert_eq!(ours.len(), request.edits, "{history:?}");
+                    assert!(history.iter().skip(1).all(|e| e.request.as_deref() == Some(request.id.as_str())), "nothing else was written");
+                    let color = editor.read(cx).color_state("title", "color");
+                    let part = |i: usize| u8::from_str_radix(&color[i..i + 2], 16).unwrap();
+                    assert!(color != before && part(1) > 150 && part(3) < 110 && part(5) < 110, "the title is red: {color} (was {before})");
+                    studio.motion_agent.ai_tab = true;
+                    cx.notify();
+                    request.id.clone()
+                })
+                .unwrap();
+            wait(400).await;
+            draw(cx);
+            wait(100).await;
+            shot("real-4-ai-tab.png");
+            // One Undo takes the whole request back.
+            handle
+                .update(cx, |studio, _, cx| {
+                    assert!(studio.undo_motion_request(&id, cx));
+                    assert_eq!(editor.read(cx).color_state("title", "color"), before);
+                    assert_eq!(studio.motion_agent.requests[0].outcome, Outcome::Undone);
+                    assert!(studio.motion_agent.proposal().is_none());
+                    cx.notify();
+                })
+                .unwrap();
+            // The preview draws the title as it was.
+            wait(3000).await;
+            draw(cx);
+            wait(100).await;
+            shot("real-5-undone.png");
+            cx.update(|cx| cx.quit()).unwrap();
+        })
+        .detach();
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Answers at once and changes nothing.
 struct Answering(Arc<Mutex<Vec<Request>>>);
 

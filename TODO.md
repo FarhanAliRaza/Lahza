@@ -45,12 +45,11 @@ integration tests, the app 122 and its four window tests under Xvfb):
 
 To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
 in), since none of it can be seen from a container:
-1. Send a request from the prompt bar itself, and one with the API-key
-   runner. Two real requests went through Claude Code with the runner's
-   own command line in a container (28 s and 25 s, no permission
-   refused, the edits made), but not from the window, and the API
-   runner has only met a stub server ("Directing an agent from the
-   editor").
+1. Send a request with the API-key runner (it needs a key; it has only
+   met a stub server). A real request was sent from the prompt bar to
+   Claude Code under Xvfb (18 s, five turns, $0.139, the edit made and
+   undone as one): the same on the desktop is worth a look, with a
+   mouse ("Directing an agent from the editor").
 2. Drag values in the inspector: whether the bars now move freely
    ("Drags that stall").
 3. The fast mode on the card: `fast_tests`, its measure, and Ray
@@ -1037,10 +1036,10 @@ What was run: the unit tests, and two windows under Xvfb with Mesa's
 software Vulkan (`cargo test --release -p lahza motion_prompt -- --ignored`,
 screenshots looked at; with `LAHZA_MOTION_SOFTWARE_GPU=1` the preview's
 first frame takes tens of seconds and the tests wait for it), with a runner of our own in Claude Code's place
-that makes real edits through a `Toolbox`. From the window no request
-was sent to Claude Code; two real ones were sent since with the runner's
-own command line, outside the window (see "A real request" below). Not
-seen: its wording when signed out.
+that makes real edits through a `Toolbox`. Then real requests to Claude
+Code: two with the runner's own command line, and one from the prompt
+bar itself (see "A real request" below). Not seen: its wording when
+signed out.
 
 1. **A prompt box** (`motion_prompt_ui.rs`, the field from
    `text_field.rs`): under the preview on a motion project and on a
@@ -1078,8 +1077,8 @@ Settled:
   under it the writer loads what the other wrote, then writes. Two
   writers of 25 edits each lose none and take no number twice
   (`two_writers_do_not_lose_edits`). The editor stays usable.
-- **How long it takes**: two small requests took 28 s and 25 s (nine
-  turns each; see "A real request" below); a scene of five seconds was
+- **How long it takes**: three small requests took 28 s, 25 s and 18 s
+  (see "A real request" below); a scene of five seconds was
   not asked for. The bar and the ghost clip say the step, the seconds so
   far, and the steps and edits made. What is left is not known to the
   runner and is not said.
@@ -1118,34 +1117,44 @@ words and picture and the same steps as the Claude Code runner.
   in the stream, bad tool JSON, 401/400/404/429/500/529, nothing
   listening, a stop in the middle, and a second run of the app.
 
+**A real request** (Claude Code 2.1.329, signed in, a small project in a
+container; the server is the app's own `mcp`):
+- With the runner's own command line, outside the window (`compose`'s
+  text and the frame's PNG given by hand): "make this one red" with the
+  title selected took 28 s, nine turns, $0.43; "make this one a circle
+  and green" with the box selected 25 s, nine turns, $0.17. The first
+  spent two calls on "no project is open" (`compose` now says to open
+  it first); both wasted a `set` without `target`, and one a shape that
+  does not exist ("ellipse").
+- From the prompt bar (`a_real_request_from_the_prompt_bar`, an ignored
+  window test that costs money: under Xvfb, once): the title selected,
+  "make this one red" typed, Enter. 18 s, five turns, four calls
+  (`project_open`, `timeline_get` with `full`, `edit_apply` with
+  `set title.color`, `snapshot`), $0.139, no call failed and no
+  permission was refused. Each step showed in the bar and on the ghost
+  clip as it came, the proposal row came back with Keep, Undo, Again
+  and Hold to compare, the AI tab listed the steps and the cost, the
+  history has one entry with the request's id, and one Undo put the
+  title back to white (screenshots looked at).
+- Before that run the system prompt (`SYSTEM`, both runners) was given
+  the exact form of `set`, `key`, `add` and `remove`, the shapes there
+  are and where a colour lives, and told to read the layer
+  (`timeline_get` with `full`) before changing it. The run made no
+  wrong guess; one run does not prove it never will. Claude Code is
+  given no tool to read the server's resources (`--tools ""`), so the
+  schema is not something it can read: the forms are in the prompt.
+- `LAHZA_AGENT_LOG=<file>` keeps Claude Code's stream (turns, refusals,
+  the tools it had). `LAHZA_MOTION_SOFTWARE_GPU`, when the app has it,
+  is passed to the server so its snapshots draw where there is no GPU.
+- Whether the picture sent with the words was read was not shown (no
+  request needed it).
+
 Left, each with what it needs:
-- **A real request: sent twice with Claude Code, not from the window,
-  and not with the API runner.** The runner's own command line
-  (`ClaudeCode::command`, the same flags, system prompt, server and
-  `LAHZA_REQUEST`), given by hand the text `compose` writes and the
-  frame's PNG, on a small project in a container (Claude Code 2.1.329,
-  signed in; the server on `lahza-motion mcp`):
-  - "make this one red" with the title selected: done in 28 s, nine
-    turns, $0.43; "make this one a circle and green" with the box
-    selected: 25 s, nine turns, $0.17. Each left one history entry with
-    its request id (`set title.color`; `set box.shape`, `box.size`,
-    `box.fill`), and the frame after shows it.
-  - No permission was refused (`permission_denials` empty) under
-    `--allowedTools mcp__lahza --permission-mode dontAsk`, and only the
-    lahza tools were there to call.
-  - The first request spent two calls on "no project is open": the
-    server starts with none. `compose` now says to open the project
-    first, and the second request did.
-  - Still wasted in both: a `set` without `target`, then a shape that
-    does not exist ("ellipse"): it guesses an op's form before reading
-    it. To try: the schema's ops named in the system prompt.
-  - Whether the picture was read was not shown either way (neither
-    request needed it).
-  Left for the owner's desktop: the same from the bar itself (the steps
-  in the bar, the ghost clip and the proposal with a real agent), and a
-  request to the API runner, which needs a key: its version header,
-  model id and event shapes are from Anthropic's reference as read in
-  November 2026, not from an answer.
+- **A request with the API runner.** It needs a key (none was set in any
+  container, and none was looked for): its version header, model id and
+  event shapes are from Anthropic's reference as read in November 2026,
+  not from an answer. With `ANTHROPIC_API_KEY` set: choose "API key" in
+  the AI tab and send one request.
 - **A real desktop.** Requests kept in `requests.json` read back after a
   real restart; whether closing the window while a request runs ends
   the agent (a dropped runner stops its child and sets the loop's stop
@@ -1282,10 +1291,13 @@ with a mouse on a real desktop.
   afterwards brings the pill back. A scene that cannot be baked shows in
   red with the engine's reason. Seen under Xvfb
   (`a_simulation_is_baked_from_the_bar_and_goes_stale_when_a_body_moves`).
-  While it bakes the pill counts the seconds. Left: no way to stop a
-  bake, and no share done (`lahza_motion_sim::bake_scene` takes neither a
-  flag to stop on nor a progress callback: both are a change to its step
-  loop, then a Stop on the pill).
+  While it bakes the pill says the scene, the share done and the
+  seconds, with a Stop beside it: `lahza_motion_sim::bake_scene_watched`
+  tells a `Watch` the share before each frame and stops when it answers
+  no (`a_bake_says_its_share_and_stops_when_told`; `Toolbox::bake_watch`
+  passes it through `sim_bake`). A stopped bake writes nothing: the
+  simulation stays as it was. Not seen: the pill mid-bake in a
+  screenshot (the test scene bakes in a few milliseconds).
 - **By hand stays cheap**: the inspector edits a text layer's words (shown
   as typed, saved when the field is left), its font (the bundled ones and
   the font files in the project's `assets/`), colour, size and tracking;

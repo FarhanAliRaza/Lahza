@@ -436,6 +436,8 @@ pub(crate) struct MotionEditor {
     /// Whole seconds of the bake last shown.
     bake_shown: u64,
     bake_inbox: Arc<Mutex<Option<Result<String, String>>>>,
+    /// How far the running bake is, and its stop.
+    bake_progress: Arc<BakeProgress>,
     font_names: Vec<String>,
     /// The selected layer as JSON, saved and as the drag shows it: values
     /// are read from these, so a draw does not serialise the layer again.
@@ -549,8 +551,49 @@ pub(crate) fn sim_needs(compiled: &Compiled, dir: &Path) -> Vec<SimNeed> {
 /// Bakes every scene that needs it, through the `sim_bake` tool (a
 /// toolbox of its own, so it can run off the UI thread). Says what was
 /// baked.
+#[cfg(test)]
 pub(crate) fn bake_simulations(dir: &Path) -> Result<String, String> {
-    let out = Toolbox::new().call("sim_bake", json!({"project": dir}))?.json;
+    bake_simulations_watched(dir, None)
+}
+
+/// A running bake as the window sees it: the scene it is at and the share
+/// of that scene done, and whether it was asked to stop.
+#[derive(Default)]
+pub(crate) struct BakeProgress {
+    at: Mutex<(String, f64)>,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl BakeProgress {
+    /// The scene being baked and the share of it done (0 to 1).
+    pub(crate) fn at(&self) -> (String, f64) {
+        self.at.lock().unwrap().clone()
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `bake_simulations`, heard and stoppable through `progress`. A stopped
+/// bake writes nothing: what was baked before stays.
+pub(crate) fn bake_simulations_watched(dir: &Path, progress: Option<Arc<BakeProgress>>) -> Result<String, String> {
+    let mut tb = Toolbox::new();
+    if let Some(progress) = progress {
+        tb.bake_watch = Some(Arc::new(move |scene: &str, share: f64| {
+            let mut at = progress.at.lock().unwrap();
+            if at.0 != scene {
+                at.0 = scene.to_string();
+            }
+            at.1 = share;
+            !progress.stopping()
+        }));
+    }
+    let out = tb.call("sim_bake", json!({"project": dir}))?.json;
     let baked: Vec<String> = out["scenes"]
         .as_array()
         .into_iter()
@@ -701,6 +744,7 @@ impl MotionEditor {
             bake_started: None,
             bake_shown: 0,
             bake_inbox: Arc::default(),
+            bake_progress: Arc::default(),
             font_names: Vec::new(),
             saved_json: RefCell::default(),
             preview_json: RefCell::default(),
@@ -785,7 +829,11 @@ impl MotionEditor {
             self.baking = false;
             self.bake_started = None;
             self.reload();
-            self.status = result.unwrap_or_else(|e| format!("The simulation could not be baked: {e}"));
+            self.status = match result {
+                Ok(said) => said,
+                Err(_) if self.bake_progress.stopping() => "The bake was stopped: the simulation is as it was".into(),
+                Err(e) => format!("The simulation could not be baked: {e}"),
+            };
             changed = true;
         }
         self.poll_ticks += 1;
@@ -874,11 +922,25 @@ impl MotionEditor {
         self.status = "Baking the simulation…".into();
         self.bake_started = Some(Instant::now());
         self.bake_shown = 0;
-        let (dir, inbox) = (self.dir.clone(), self.bake_inbox.clone());
+        self.bake_progress = Arc::default();
+        let (dir, inbox, progress) = (self.dir.clone(), self.bake_inbox.clone(), self.bake_progress.clone());
         std::thread::spawn(move || {
-            let result = bake_simulations(&dir);
+            let result = bake_simulations_watched(&dir, Some(progress));
             *inbox.lock().unwrap() = Some(result);
         });
+    }
+
+    /// The scene the running bake is at and the share of it done.
+    pub(crate) fn bake_share(&self) -> (String, f64) {
+        self.bake_progress.at()
+    }
+
+    /// Ends the running bake at its next frame; nothing of it is kept.
+    pub(crate) fn stop_bake(&mut self) {
+        if self.baking {
+            self.bake_progress.stop();
+            self.status = "Stopping the bake…".into();
+        }
     }
 
     /// Whether anything is being dragged: on the canvas, or a value, a
@@ -1691,6 +1753,13 @@ mod tests {
         let needs = |project: &Path| sim_needs(&Compiled::new(&io::load(project).unwrap()), project);
         assert_eq!(needs(&project), [SimNeed::Unbaked { scene: "s1".into(), bodies: 1 }]);
         assert!(needs(&project)[0].bakeable() && needs(&project)[0].message().contains("not simulated yet"));
+        // A bake stopped on the way leaves nothing behind and says so.
+        let progress = Arc::new(BakeProgress::default());
+        progress.stop();
+        let stopped = bake_simulations_watched(&project, Some(progress.clone()));
+        assert!(stopped.is_err_and(|e| e.contains("stopped")));
+        assert_eq!(progress.at(), ("s1".to_string(), 0.0));
+        assert!(!lahza_motion_core::sim::bake_path(&project, "s1").is_file());
         // A bake made elsewhere changes what the editor polls.
         let before = stamp(&project);
         std::thread::sleep(Duration::from_millis(20));
