@@ -366,6 +366,7 @@ impl MeshCache {
             // casts (each mesh's transform and box) and the maps' frames.
             let mut casters = Casters { rows: Vec::new(), meshes: Vec::new() };
             let mut boxes: Vec<CasterBox> = Vec::new();
+            let mut budget = FRAME_POINTS;
             for rm in run.meshes.iter().filter(|rm| !rm.crosses) {
                 if rm.state.materials.iter().all(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some()) {
                     continue;
@@ -384,7 +385,10 @@ impl MeshCache {
                 casters.rows.push([b(0), b(0), b(pooled.tris), b(if det < 0.0 { INST_MIRRORED } else { 0 })]);
                 let mut caster = CasterBox::new(pooled.lo, pooled.hi, pooled.reach, &mv);
                 if let Source::Mesh(mesh) = &pooled.source {
-                    caster.points = (mesh.tris.len() <= FRAME_TRIS).then(|| (mesh.clone(), mv));
+                    if mesh.tris.len() <= FRAME_TRIS && mesh.positions.len() <= budget {
+                        budget -= mesh.positions.len();
+                        caster.points = Some((mesh.clone(), mv));
+                    }
                 }
                 caster.mean = pooled.mean.map(|m| {
                     let q = mv.apply(m[0], m[1], m[2]);
@@ -1410,18 +1414,24 @@ pub(crate) struct CasterBox {
     pub corners: [[f64; 3]; 8],
     pub round: Option<([f64; 3], [[f64; 3]; 3])>,
     /// Its points, where the CPU has them and they are few
-    /// (`FRAME_TRIS`), with what places them: a point light's map frames
-    /// a caster that is around the light from these (`seen_from`).
+    /// (`FRAME_TRIS`), with what places them: a directional light's map
+    /// is framed from these (`spans`), and a point light's frames a
+    /// caster that is around the light from them (`seen_from`).
     pub points: Option<(Arc<Mesh>, lahza_motion_core::space::Mat4)>,
     /// The mean of its points (camera space) and how many they are
     /// (None where the CPU has none): where a point light's map is aimed.
     pub mean: Option<([f64; 3], f64)>,
 }
 
-/// The most triangles of a caster around a point light that its map's
-/// frame is taken from one by one (a floor, a wall, a room's box: few);
-/// one with more is framed by its box cut at the light's plane.
-pub(crate) const FRAME_TRIS: usize = 4096;
+/// The most triangles of a caster whose points a GPU-drawn map's frame is
+/// taken from one by one, every frame (two thousand points, three
+/// products each, a light: microseconds); one with more is framed by its
+/// box and ball (a scanned rock of a hundred thousand, four hundred of
+/// them in a scene: the cost the GPU's maps were made to shed). And the
+/// most points a list's casters give so in all (`FRAME_POINTS`: about a
+/// millisecond a light); the casters past that by their boxes.
+pub(crate) const FRAME_TRIS: usize = 16384;
+pub(crate) const FRAME_POINTS: usize = 200_000;
 
 impl CasterBox {
     /// Of a mesh with box `lo`..`hi` and `reach`, placed by `mv`.
@@ -1434,6 +1444,24 @@ impl CasterBox {
         let a = mv.0;
         let round = reach.filter(|r| r.is_finite()).map(|r| (at(std::array::from_fn(|k| (lo[k] + hi[k]) * 0.5)), std::array::from_fn(|i| std::array::from_fn(|j| a[i * 4 + j] * r))));
         Self { corners, round, points: None, mean: None }
+    }
+
+    /// How far it reaches along each of three unit directions: from its
+    /// points where they are at hand (`points`: exactly), else `span`.
+    pub(crate) fn spans(&self, d: [[f64; 3]; 3]) -> [(f64, f64); 3] {
+        let Some((mesh, mv)) = &self.points else { return d.map(|d| self.span(d)) };
+        let mut out = [(f64::INFINITY, f64::NEG_INFINITY); 3];
+        for p in &mesh.positions {
+            let q = mv.apply(p[0] as f64, p[1] as f64, p[2] as f64);
+            for (o, d) in out.iter_mut().zip(&d) {
+                let x = q[0] * d[0] + q[1] * d[1] + q[2] * d[2];
+                *o = (o.0.min(x), o.1.max(x));
+            }
+        }
+        if mesh.positions.is_empty() {
+            return d.map(|d| self.span(d));
+        }
+        out
     }
 
     /// Its bounds in a point light's view: x / z and y / z along `u` and
@@ -1724,8 +1752,8 @@ impl ShadowMap {
         if !(b[2] > b[0] && b[3] > b[1]) {
             return None;
         }
-        if kind == 1 && std::env::var_os("LAHZA_SHADOW_FRAMES").is_some() {
-            eprintln!("shadow frame (CPU, point): {b:?}");
+        if std::env::var_os("LAHZA_SHADOW_FRAMES").is_some() {
+            eprintln!("shadow frame (CPU, {}): {b:?}", if kind == 1 { "point" } else { "directional" });
         }
         let n = size as f64;
         // A two-texel margin all round.
@@ -1852,18 +1880,23 @@ impl ShadowMap {
     }
 
     /// A directional light's map for the GPU: bounds from the casters'
-    /// boxes and the balls their points are in (`CasterBox::span`: a
-    /// little wider than from every vertex, which the CPU's map takes
-    /// them from).
+    /// points where they are at hand and few (`CasterBox::spans`: the
+    /// CPU's own frame, which is from the points of the triangles that
+    /// face the light, and a closed caster's outline is among those),
+    /// else from their boxes and the balls their points are in
+    /// (`CasterBox::span`: a little wider).
     fn gpu_directional(casters: &Arc<Casters>, boxes: &[CasterBox], toward: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
         let l = unit3(toward);
         let (u, v) = basis(l);
         let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         let (mut near, mut far) = (f64::INFINITY, f64::NEG_INFINITY);
         for caster in boxes {
-            let (x, y, c) = (caster.span(u), caster.span(v), caster.span(l));
+            let [x, y, c] = caster.spans([u, v, l]);
             b = [b[0].min(x.0), b[1].min(y.0), b[2].max(x.1), b[3].max(y.1)];
             (near, far) = (near.min(c.0), far.max(c.1));
+        }
+        if std::env::var_os("LAHZA_SHADOW_FRAMES").is_some() {
+            eprintln!("shadow frame (GPU, directional): {b:?}");
         }
         // Depth 0 is "nothing here": the farthest caster stays above it.
         let pad = (far - near) * 0.01 + 1.0;

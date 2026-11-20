@@ -1863,22 +1863,25 @@ fn defocused_cards_keep_their_depth() {
     assert_gpu_matches_cpu(&p, &[0.0]);
 }
 
+/// A floor with an instancer's pegs under it (`defocused_instancer_copies_keep_their_depth`).
+pub(crate) fn pegs(aperture: f64) -> Project {
+    let mut p = project(json!([
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [240, 10], "depth": 240},
+         "material": {"preset": "matte", "color": "#40a060"}, "transform": {"position": [160, 80]}},
+        {"id": "pegs", "kind": "instancer", "three_d": true, "transform": {"position": [160, 112], "z": -60},
+         "layout": {"type": "line", "count": 3, "from": [-80, 0], "to": [80, 0]},
+         "layers": [{"id": "peg", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 8, "height": 40},
+                     "material": {"preset": "matte", "color": "#ffffff"}}]}
+    ]));
+    p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 35], "aperture": aperture, "focus": 0})).unwrap();
+    p
+}
+
 /// An instancer's mesh copies keep the depth test under depth of field:
 /// pegs under a floor stay hidden by it, as they are with a sharp lens.
 #[test]
 fn defocused_instancer_copies_keep_their_depth() {
-    let build = |aperture: f64| {
-        let mut p = project(json!([
-            {"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [240, 10], "depth": 240},
-             "material": {"preset": "matte", "color": "#40a060"}, "transform": {"position": [160, 80]}},
-            {"id": "pegs", "kind": "instancer", "three_d": true, "transform": {"position": [160, 112], "z": -60},
-             "layout": {"type": "line", "count": 3, "from": [-80, 0], "to": [80, 0]},
-             "layers": [{"id": "peg", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 8, "height": 40},
-                         "material": {"preset": "matte", "color": "#ffffff"}}]}
-        ]));
-        p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 35], "aperture": aperture, "focus": 0})).unwrap();
-        p
-    };
+    let build = pegs;
     let sharp = cpu().render(&Compiled::new(&build(0.0)), 0.0);
     let p = build(0.3);
     let soft = cpu().render(&Compiled::new(&p), 0.0);
