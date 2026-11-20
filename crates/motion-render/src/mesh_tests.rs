@@ -874,13 +874,13 @@ fn displacement_changes_the_silhouette() {
     assert!(spread(&rock) >= 8.0, "rocky: {rock:?}");
 }
 
-#[test]
-fn gpu_matches_cpu_surface_detail() {
-    let dir = detail_dir("parity");
+/// The scene of `gpu_matches_cpu_surface_detail`: bumps, maps and
+/// displacement on a ball, a box, a can and a ring.
+fn detailed(dir: &std::path::Path) -> Project {
     let (tex, nrm) = (dir.join("check.png"), dir.join("normal.png"));
     checker_png(&tex, 32, 32, 8, [255, 200, 120, 255], [40, 60, 200, 255]);
     image::RgbaImage::from_fn(32, 32, |x, y| image::Rgba([(128.0 + 90.0 * ((x as f64) * 0.6).sin()) as u8, (128.0 + 90.0 * ((y as f64) * 0.6).cos()) as u8, 220, 255])).save(&nrm).unwrap();
-    let p = scene(640, 240, json!({"layers": [
+    scene(640, 240, json!({"layers": [
         {"id": "rock", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "displace": {"type": "cellular", "scale": 30, "amount": 8},
          "material": {"preset": "matte", "color": "#a08060", "noise": {"type": "fbm", "scale": 15, "color": "#403020", "roughness": 0.3, "bump": 3}}, "transform": {"position": [90, 120]}},
         {"id": "tile", "kind": "mesh", "mesh": {"type": "box", "size": [110, 110], "depth": 110}, "material": {"preset": "plastic", "map": tex.to_str().unwrap(), "normal_map": nrm.to_str().unwrap(), "uv": {"scale": [2, 2], "rotation": 15}},
@@ -889,8 +889,52 @@ fn gpu_matches_cpu_surface_detail() {
             "roughness_map": tex.to_str().unwrap(), "metallic_map": tex.to_str().unwrap()},
          "transform": {"position": [440, 120], "rotation_x": 20}},
         {"id": "ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 50, "tube": 16}, "material": {"preset": "glossy", "color": "#ffffff", "map": tex.to_str().unwrap()}, "transform": {"position": [580, 120], "rotation_x": 50}}
-    ]}));
-    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0], 0.0005);
+    ]}))
+}
+
+#[test]
+fn gpu_matches_cpu_surface_detail() {
+    let dir = detail_dir("parity");
+    crate::tests::assert_gpu_matches_cpu_within(&detailed(&dir), &[0.0], 0.0005);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Not a test (`--ignored --nocapture`): the seams between triangles in
+/// the GPU's frame against the CPU's, measured on the CPU alone. A
+/// hardware rasteriser has a triangle's corners on a grid of 1 / 256 of a
+/// pixel, the CPU has them as they are; a sample that near an edge goes
+/// to the other triangle, and each of a pixel's triangles is shaded at
+/// the middle of the samples it won, so both are shaded elsewhere. How
+/// many pixels of that scene differ by more than 3 levels between the
+/// CPU's frame and the CPU's frame with its corners on such a grid; and
+/// the same with every triangle of a pixel shaded at the pixel's middle,
+/// where a sample changing hands moves no shading point.
+#[test]
+#[ignore]
+fn measure_seams() {
+    let dir = detail_dir("seams");
+    let c = Compiled::new(&detailed(&dir));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let frame = |steps: f64, middle: bool| {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::mesh3d::TEST_SEAMS.0.store(steps as u32, Relaxed);
+        crate::mesh3d::TEST_SEAMS.1.store(middle, Relaxed);
+        let img = crate::tests::cpu().render(&c, 0.0);
+        crate::mesh3d::TEST_SEAMS.0.store(0, Relaxed);
+        crate::mesh3d::TEST_SEAMS.1.store(false, Relaxed);
+        img
+    };
+    let apart = |a: &image::RgbaImage, b: &image::RgbaImage| {
+        let over = |x0: u32, x1: u32| (0..a.height()).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|(x, y)| (0..4).any(|k| a.get_pixel(*x, *y).0[k].abs_diff(b.get_pixel(*x, *y).0[k]) > 3)).count();
+        (over(0, 640), [over(0, 165), over(165, 370), over(370, 515), over(515, 640)])
+    };
+    for middle in [false, true] {
+        let exact = frame(0.0, middle);
+        for steps in [256.0, 16.0] {
+            let (all, each) = apart(&exact, &frame(steps, middle));
+            eprintln!("corners on 1/{steps} px, shaded at {}: {all} px over 3 levels (the ball {}, the box {}, the can {}, the ring {})", if middle { "the pixel's middle" } else { "the middle of the samples won" }, each[0], each[1], each[2], each[3]);
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1934,4 +1978,50 @@ fn a_still_mesh_group_is_not_drawn_again_beside_a_moving_mesh() {
         let (_, turning) = frame(90.0, false).unwrap();
         assert_eq!(turning, 0, "{name}: a group whose mesh turns is drawn in every sub-frame");
     }
+}
+
+/// A flat face with a normal map does not shadow itself. Shadow maps are
+/// asked along the surface's own normal, not along the one its detail
+/// bends: along that, wherever the map turned the normal from the light
+/// the lookup was moved into the face, which then shadowed itself in a
+/// patch a period of the map (and by other amounts on the GPU and on the
+/// CPU, their maps being drawn otherwise: the spots of the two's
+/// comparison). The face under a light that casts shadows is the face
+/// under the same light casting none.
+#[test]
+fn a_normal_mapped_face_does_not_shadow_itself() {
+    let dir = detail_dir("self-shadow");
+    let (tex, nrm) = (dir.join("check.png"), dir.join("normal.png"));
+    checker_png(&tex, 32, 32, 8, [255, 200, 120, 255], [40, 60, 200, 255]);
+    image::RgbaImage::from_fn(32, 32, |x, y| image::Rgba([(128.0 + 90.0 * ((x as f64) * 0.6).sin()) as u8, (128.0 + 90.0 * ((y as f64) * 0.6).cos()) as u8, 220, 255])).save(&nrm).unwrap();
+    // (Other things beside it: the light's map is as wide as they are,
+    // and its texels, by which the lookup is moved, that much larger.)
+    let build = |shadow: bool| {
+        scene(640, 240, json!({"layers": [
+            {"id": "rock", "kind": "mesh", "mesh": {"type": "sphere", "radius": 60}, "material": {"preset": "matte", "color": "#a08060"}, "transform": {"position": [90, 120]}},
+            {"id": "tile", "kind": "mesh", "mesh": {"type": "box", "size": [110, 110], "depth": 110},
+             "material": {"preset": "plastic", "map": tex.to_str().unwrap(), "normal_map": nrm.to_str().unwrap(), "uv": {"scale": [2, 2], "rotation": 15}},
+             "transform": {"position": [260, 120], "rotation_y": 30, "rotation_x": 20}},
+            {"id": "can", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 50, "height": 120}, "material": {"preset": "metal", "color": "#d0d0d0"}, "transform": {"position": [440, 120], "rotation_x": 20}},
+            {"id": "ring", "kind": "mesh", "mesh": {"type": "torus", "radius": 50, "tube": 16}, "material": {"preset": "glossy", "color": "#ffffff"}, "transform": {"position": [580, 120], "rotation_x": 50}}
+        ], "lights": [{"type": "directional", "from": [-200, -300, -400], "intensity": 1.0, "shadow": shadow}]}))
+    };
+    // The middle of the box's front face, which nothing else shadows.
+    let darker = |lit: &image::RgbaImage, shadowed: &image::RgbaImage| {
+        let l = |img: &image::RgbaImage, x: u32, y: u32| img.get_pixel(x, y).0[..3].iter().map(|v| *v as f64).sum::<f64>() / 3.0;
+        let d: Vec<f64> = (60..148u32).flat_map(|y| (230..310u32).map(move |x| (x, y))).map(|(x, y)| l(lit, x, y) - l(shadowed, x, y)).collect();
+        (d.iter().cloned().fold(0.0, f64::max), d.iter().filter(|v| **v > 2.0).count())
+    };
+    let (lit, shadowed) = (Compiled::new(&build(false)), Compiled::new(&build(true)));
+    assert!(lit.errors.is_empty() && shadowed.errors.is_empty(), "{:?} {:?}", lit.errors, shadowed.errors);
+    let on_cpu = darker(&crate::tests::cpu().render(&lit, 0.0), &crate::tests::cpu().render(&shadowed, 0.0));
+    eprintln!("the face's own shadow on the CPU: darker by up to {:.0} levels, {} px of 7040 by more than 2", on_cpu.0, on_cpu.1);
+    assert!(on_cpu.0 <= 2.0, "the CPU: {on_cpu:?}");
+    if let Some(mut gpu) = vis_gpu() {
+        let through = darker(&gpu.render(&lit, 0.0), &gpu.render(&shadowed, 0.0));
+        eprintln!("through the visibility pass and the GPU's own map: up to {:.0} levels, {} px", through.0, through.1);
+        assert!(through.0 <= 2.0, "the visibility pass: {through:?}");
+    }
+    crate::tests::assert_gpu_matches_cpu_within(&build(true), &[0.0], 0.0005);
+    let _ = std::fs::remove_dir_all(&dir);
 }
