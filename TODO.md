@@ -480,18 +480,19 @@ it). What follows is for a card where it is not quick enough.
   - Lit by the environment only: where the ball stands the floor is 0.72
     of the plain raster's (traced: 0.62; the second filter pass softens
     it, 0.69 before), the open floor 0.94 (0.99); the whole picture
-    27.6 dB from the traced one (26.0 dB without sky visibility), 4%
-    darker than traced, one bounce being less than all of them.
+    29.5 dB from the traced one (26.0 dB without sky visibility), 3%
+    darker than traced (27.6 dB and 4% before the light's second
+    return, below).
   - With the default lights: 33.6 dB from the traced picture, 27.3 dB
     without (480 x 270, with the first rule for the light back; at
     1080 x 608 with `sky_lit`, 38.4 dB and 32.5 dB). Seen: the wall takes the floor's light, the ball's underside
     is lit from below, the gap under the slab is dark, as traced.
   - Under a table (a top on four legs, the default lights;
     `sky_tests::measure_under_a_table`): the floor between the legs is
-    170 of 255 where the traced picture has 184 and the plain raster
-    226: 8% darker than traced, the light that comes back a second time
+    173 of 255 where the traced picture has 184 and the plain raster
+    226: 6% darker than traced (170 and 8% before the second return), the light that comes back a second time
     off the floor, the legs and the top's underside missing. The whole
-    picture: 31.1 dB from the traced one, 25.6 dB without.
+    picture: 32.5 dB from the traced one, 25.6 dB without.
 - **One bounce of diffuse light** was to come only if visibility alone
   still looked flat. It did worse than that: every face that looks at
   another lost the light the environment's ground and horizon stood for
@@ -515,8 +516,37 @@ What is left:
 - At an edge between near and far the lookup takes the texel nearest in
   depth, at half the picture's size: steps of two px show there (seen
   under the slab's front edge).
-- A second bounce (the 6%, and 8% under a table), and anything mirrored
-  of other things: not done. The fast mode has them.
+- **The light's second return** is in, from the same rays and no more
+  of them: where the picture shows the surface a ray ended on (the texel
+  its end is seen in, at its depth), that texel's own first light back,
+  times the mean base colour of what the rays hit, is added (pt.wgsl
+  `sky_second`, the same in `sky_cpu.rs`; GPU and CPU still within a
+  level). It closes about a third of the gap (4% to 3%, 8% to 6% under
+  the table). What is left: surfaces the picture does not show send
+  nothing back a second time, the environment at what a ray hits is
+  taken whole (not by what that point sees of it), and there is no
+  third return. Anything mirrored of other things: not done. The fast
+  mode has all of it.
+- Not done, with what each needs:
+  - *What is see-through, cards, wires and shadow catchers hiding the
+    sky by their coverage and taking it.* The rays would have to meet
+    cards' pictures and opacities without drawing lots (a fixed
+    threshold, or coverage as a weight on the ray), on the GPU (the
+    cards' structure and pictures given to the sky's list, as a traced
+    list has them) and in the CPU's BVH (the card's quad and its group's
+    texels), and the batches of see-through meshes would read the group
+    at their own depth. Volumes need the tracer's marching: left.
+  - *The two-px steps at an edge between near and far.* The lookup
+    tells surfaces apart by depth alone, and two surfaces at nearly one
+    depth (a slab's front over a box's) mix. It needs each texel's
+    plane against the shaded point's: either the target's focal length
+    in the light block (its two spare floats are used) or the texel's
+    normal in the group (a third row of texels). Tightening the depth
+    test instead makes a floor seen at a glancing angle blocky.
+  - *Meshes the GPU generates in its pool* are not in the CPU's rays.
+    Their bounds as a stand-in were not added: the CPU's frame does not
+    draw such a mesh at all, and a box hiding the sky from the rest
+    where nothing is drawn would be wrong another way.
 
 Not to do: light probes placed through the scene (irradiance volumes,
 DDGI). They suit large scenes that stand still; these are small and
@@ -882,8 +912,10 @@ picture, or its wording when signed out.
    `text_field.rs`): under the preview on a motion project and on a
    recording's Motion tab.
 2. **Starting an agent** (`motion_agent.rs`): `Runner` is the one small
-   interface (available, start, and a `Running` to stop); `ClaudeCode` is
-   the first: `claude -p` with stream-json in and out, `lahza mcp` as its
+   interface (available, start, and a `Running` to stop), with two
+   runners behind it and a choice between them (`Chosen`; the second,
+   `ApiLoop`, is under "Left" below for what was not run). `ClaudeCode`
+   is the first: `claude -p` with stream-json in and out, `lahza mcp` as its
    only server and no tools of its own, its lines read as they come.
    Tested with a stub program that writes the same stream. Not installed
    (the program is missing) and not signed in (`claude auth status`, or
@@ -933,8 +965,34 @@ Left:
   piece placed there comes back" is not seen.
 - **Undo after later edits** to the same things fails with the engine's
   message ("the project changed in a conflicting way").
-- **Another runner** (an API key and the `Toolbox` in process): the
-  interface is there, the second runner is not.
+- **The second runner, against the real API.** `ApiLoop`
+  (`motion_agent_api.rs`) needs only an API key: our own loop on the
+  Claude Messages API (raw HTTP through `ureq`, the one new dependency;
+  there is no official Rust SDK) with the `Toolbox` in process: its own
+  tool definitions, plus `read_doc` for the guide, schema and catalog an
+  MCP client reads as resources. `claude-opus-5-5` (or
+  `LAHZA_AGENT_MODEL`), one request a turn, not streamed, with
+  `fallbacks: "default"`; the same `compose`d words and picture and the
+  same steps as the Claude Code runner; every result of a turn goes back
+  in one message; a refusal or a cut-off answer runs none of its tools;
+  no connection, 429 and 5xx are tried three times; Stop is looked at
+  between calls (a request already sent is waited for and then dropped).
+  The key is `ANTHROPIC_API_KEY` or one line in
+  `<config>/anthropic-api-key`, read when a request starts, sent in the
+  `x-api-key` header and nowhere else (a test looks for it in the
+  project's files and in what is reported). The runner is a choice in
+  the AI tab (Auto, Claude Code, API key), kept with the settings: Auto
+  is Claude Code where installed and signed in, else the API loop where
+  a key is set, and the bar names the one in use. Tested against a local
+  stub server that replays a tool-use conversation, a refusal, a cut-off
+  answer, 401/400/404/429/500/529, nothing listening, and a stop in the
+  middle. **No request was sent to the API**: the version header, the
+  model id and the request's shape are from Anthropic's reference as
+  read in November 2026, not from an answer. Left: nowhere in the app to
+  type the key (the field has no masked input: the environment or the
+  file); the loop's conversations are kept in memory only, so after a
+  restart a follow-up starts a new one; `cost` is not reported; no
+  streaming, so a long turn shows nothing until it ends.
 
 ## The motion editor: drags that stall, and how it should be used
 
@@ -970,18 +1028,40 @@ and whether the bars now move freely, is not confirmed on a real card.
   | 480 | 3.4 ms | 0.013 ms | 0.66 ms |
   | 1 200 | 22 ms | 0.014 ms | 1.7 ms |
 
-  Left out on purpose: the tick still compiles every scene
-  (`Compiled::new`, 1.7 ms at 1 200 plain layers; more with an imported
-  model of many parts, not timed). Compiling only the scene that changed
-  was looked at once `compile.rs` was free and not done: one `Compiler`
-  carries what scenes share (every element's window, which `#id.end`
-  references and anchors read across scenes; the Slang linker and the
-  surface program; errors, syncs and events in scene order), so a scene
-  compiled alone is only right when nothing outside it refers into it,
-  and telling that costs a pass of its own. The gain is at most the
-  1.7 ms, and nothing when the layers are in the scene being edited,
-  which is the usual case. To take up again if a project is found where
-  the compile, not the render, holds a drag.
+  **A tick compiles one scene.** `Compiled::with_layer_changed`
+  (compile.rs) compiles only the dragged layer's scene and shares the
+  others (`scenes` is now `Vec<Arc<CScene>>`). It is right by
+  construction rather than by a guess: a scene's compile
+  (`Compiler::scene`) reads, outside itself, only other elements'
+  windows, so the result is returned only when every window in the
+  changed scene is what it was, and nothing else is shared: no
+  components (expanded project-wide), no Slang (one library), the same
+  settings, time base, scene count and project-wide errors. Anything
+  else is `None` and the editor compiles in full, as before. Tested:
+  equal to `Compiled::new` in every list and every frame for seven kinds
+  of local edit, with the other scenes the same `Arc`s
+  (`one_scene_compiled_again_equals_the_whole_compile`), and `None` for
+  each case that could reach outside
+  (`what_could_reach_another_scene_takes_the_whole_compile`). Timed
+  (`drag_tick_timing`, a cloud container, milliseconds a tick):
+
+  | layers | scenes, and where the drag is | whole compile | one scene |
+  |---|---|---|---|
+  | 480 | 1 | 1.0 | 1.0 (not tried: the whole compile) |
+  | 480 | 12 equal | 1.4 | 0.16 |
+  | 480 | 12, the first holds 3/4: in the first | 0.9 | 0.6 |
+  | 480 | 12, the first holds 3/4: in a small one | 1.2 | 0.15 |
+  | 1 200 | 1 | 2.1 | 2.1 (not tried) |
+  | 1 200 | 12 equal | 2.2 | 0.41 |
+  | 1 200 | 12, the first holds 3/4: in the first | 2.6 | 2.0 |
+  | 1 200 | 12, the first holds 3/4: in a small one | 2.2 | 0.27 |
+
+  So: five to eight times less where the layers are spread over scenes,
+  about a fifth less in a scene that holds most of them, nothing in a
+  project of one scene (where it is not tried: trying cost a tenth
+  more). What a tick still does for every layer: the windows' table and
+  the roles (`check::intents`). Not timed: an imported model of many
+  parts. The numbers move by a third between runs on this machine.
 - **The drop no longer reads the history.** `next_history_number` takes
   the highest file name: 0.6 ms at 2 000 entries, where reading them all
   takes 14 ms (`history_numbers_come_from_file_names -- --nocapture`).

@@ -965,41 +965,79 @@ mod tests {
         assert_eq!(apply_to_layer(&p, &bad).unwrap().unwrap_err().to_string(), apply(&p, &bad).unwrap_err().to_string());
     }
 
-    /// What one tick of a drag costs, the old way and the new. Run with
+    /// `n` layers over `scenes` scenes, the first holding `first` of them
+    /// (the rest shared evenly): scenes one after another, a second each.
+    fn spread(n: usize, scenes: usize, first: usize) -> Project {
+        let mut ops = Vec::new();
+        let mut made = 0;
+        for s in 0..scenes {
+            let count = if s == 0 { first } else { (n - first) / (scenes - 1).max(1) };
+            ops.push(json!({"op": "add_scene", "id": format!("c{s}"), "start": s}));
+            for i in 0..count {
+                let id = format!("{}{s}_{i}", if i % 3 == 0 { "t" } else { "r" });
+                ops.push(match i % 3 {
+                    0 => json!({"op": "add", "scene": format!("c{s}"), "id": id, "kind": "text", "text": "Hello there", "size": 48, "transform": {"position": [i, 80]}}),
+                    _ if i % 5 == 0 => json!({"op": "add", "scene": format!("c{s}"), "id": id, "kind": "shape", "shape": "rect", "size": [120, 80], "fill": "#ff3355",
+                        "transform": {"position": {"keys": [{"at": s, "v": [200, 180]}, {"at": s as f64 + 0.5, "v": [440, 180], "ease": "glide"}]}}}),
+                    _ => json!({"op": "add", "scene": format!("c{s}"), "id": id, "kind": "shape", "shape": "rect", "size": [120, 80], "fill": "#ff3355", "transform": {"position": [i, 200]}}),
+                });
+                made += 1;
+            }
+        }
+        assert!(made <= n);
+        let mut p = Project::new(1920, 1080, Fps::whole(30), scenes as f64);
+        p = apply(&p, &ops).unwrap().project;
+        p
+    }
+
+    /// What one tick of a drag costs: the project through JSON (`apply`,
+    /// as it was), one layer through JSON (`apply_to_layer`), and the
+    /// compile, whole and of the one scene (`with_layer_changed`), with
+    /// the layers in one scene, in twelve equal ones, and in twelve of
+    /// which the first holds three quarters. Run with
     /// `cargo test --release -p lahza-motion-core drag_tick_timing -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing, prints a table"]
     fn drag_tick_timing() {
         use crate::compile::Compiled;
         use std::time::Instant;
-        println!("layers | apply | apply_to_layer + replace | project clone | compile");
+        let rounds = 50;
+        let time = |f: &mut dyn FnMut()| {
+            let t = Instant::now();
+            for _ in 0..rounds {
+                f();
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / rounds as f64
+        };
+        println!("layers | scenes (dragged in)      | apply    | one layer | compile  | one scene");
         for n in [30, 480, 1200] {
-            let p = many(n);
-            let ops = [json!({"op": "set", "target": "r4.transform.position", "value": [10.5, 20]})];
-            let rounds = 50;
-            let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
-            let t = Instant::now();
-            for _ in 0..rounds {
-                std::hint::black_box(apply(&p, &ops).unwrap());
+            for (shape, scenes, first, in_scene) in [("1", 1, n, 0), ("12 equal", 12, n / 12, 5), ("12, first has 3/4: first", 12, n * 3 / 4, 0), ("12, first has 3/4: a small one", 12, n * 3 / 4, 5)] {
+                let p = spread(n, scenes, first);
+                let layer = format!("r{in_scene}_1");
+                // (At 30 layers the small scenes of the last shape are empty.)
+                if !p.scenes[in_scene].layers.iter().any(|l| l.id == layer) {
+                    continue;
+                }
+                let ops = [json!({"op": "set", "target": format!("{layer}.transform.position"), "value": [10.5, 20]})];
+                let whole = time(&mut || {
+                    std::hint::black_box(apply(&p, &ops).unwrap());
+                });
+                let mut copy = p.clone();
+                let fast = time(&mut || {
+                    let (_, layer) = apply_to_layer(&p, &ops).unwrap().unwrap();
+                    replace_layer(&mut copy, layer);
+                });
+                let saved = Compiled::new(&p);
+                let compile = time(&mut || {
+                    std::hint::black_box(Compiled::new(&copy));
+                });
+                assert_eq!(saved.with_layer_changed(&copy, &layer).is_some(), scenes > 1, "{n} {shape}: one scene of several");
+                // (What the editor does: the whole compile when it gives up.)
+                let one = time(&mut || {
+                    std::hint::black_box(saved.with_layer_changed(&copy, &layer).unwrap_or_else(|| Compiled::new(&copy)));
+                });
+                println!("{n:>6} | {shape:<24} | {whole:>5.2} ms | {fast:.4} ms | {compile:>5.2} ms | {one:>5.2} ms");
             }
-            let whole = ms(t);
-            let mut copy = p.clone();
-            let t = Instant::now();
-            for _ in 0..rounds {
-                let (_, layer) = apply_to_layer(&p, &ops).unwrap().unwrap();
-                replace_layer(&mut copy, layer);
-            }
-            let fast = ms(t);
-            let t = Instant::now();
-            for _ in 0..rounds {
-                std::hint::black_box(p.clone());
-            }
-            let clone = ms(t);
-            let t = Instant::now();
-            for _ in 0..rounds {
-                std::hint::black_box(Compiled::new(&copy));
-            }
-            println!("{n:>6} | {whole:.3} ms | {fast:.4} ms | {clone:.3} ms | {:.3} ms", ms(t));
         }
     }
 

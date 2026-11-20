@@ -367,6 +367,12 @@ struct Raw {
     /// The true normal (two numbers), its plane, the open part.
     plane: [f32; 4],
     back: V3,
+    /// For the light that comes back a second time (pt.wgsl
+    /// `sky_second`): the mean base colour of what the rays ended on, and
+    /// for each ray the texel its end is seen in (and one; 0: none) with
+    /// the end's depth.
+    kd: V3,
+    ends: [(u32, f32); 4],
 }
 
 /// Fills traced list `t`'s sky group, `w` × `h` texels of visibility and
@@ -394,6 +400,20 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         norm([(q[0] / q[2] - t.centre[0]) / t.focal, (q[1] / q[2] - t.centre[1]) / t.focal, 1.0])
     };
     let rays = t.options.spp.max(1);
+    // pt.wgsl `sky_texel`.
+    let root = t.root;
+    let seen_in = |p: V3| -> u32 {
+        if p[2] <= 1e-3 {
+            return 0;
+        }
+        let c = [t.focal * p[0] / p[2] + t.centre[0], t.focal * p[1] / p[2] + t.centre[1], 1.0];
+        let tq = [dot([root[0], root[1], root[2]], c), dot([root[3], root[4], root[5]], c), dot([root[6], root[7], root[8]], c)];
+        let (x, y) = (((tq[0] / tq[2] - t.origin[0]) / t.factor[0]).floor(), ((tq[1] / tq[2] - t.origin[1]) / t.factor[1]).floor());
+        if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
+            return 0;
+        }
+        y as u32 * w as u32 + x as u32 + 1
+    };
     let texel = |x: usize, y: usize| -> Raw {
         let d = dir(x as f32, y as f32);
         let mut raw = Raw::default();
@@ -406,6 +426,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         let frame = basis(hit.n);
         let o = offset(&hit, hit.g);
         let (mut sum, mut n, mut back) = ([0.0f32; 3], 0.0f32, [0.0f32; 3]);
+        let (mut kd, mut hits) = ([0.0f32; 3], 0.0f32);
         for k in 0..rays {
             let j = (k * 16 + place) as f32;
             let u1 = (j + 0.5) / total;
@@ -421,13 +442,23 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
                     sum = add(sum, ray);
                     n += 1.0;
                 }
-                Some(far) => back = add(back, sky_lit(&scene, t, &far)),
+                Some(far) => {
+                    back = add(back, sky_lit(&scene, t, &far));
+                    kd = add(kd, far.mat.kd);
+                    hits += 1.0;
+                    if k < 4 {
+                        raw.ends[k as usize] = (seen_in(far.p), far.p[2]);
+                    }
+                }
             }
         }
         let e = oct_encode(hit.g);
         raw.open = [sum[0] / rays as f32, sum[1] / rays as f32, sum[2] / rays as f32, d[2] * hit.t];
         raw.plane = [e[0], e[1], dot(hit.g, hit.p), n / rays as f32];
         raw.back = mul(back, 1.0 / rays as f32);
+        if hits > 0.0 {
+            raw.kd = mul(kd, 1.0 / hits);
+        }
         raw
     };
     let rows = |f: &(dyn Fn(usize, &mut [Raw]) + Sync), into: &mut [Raw]| {
@@ -456,6 +487,24 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
     // numbers the filter would work out.)
     let dirs: Vec<V3> = (0..w * h).map(|i| dir((i % w) as f32, (i / w) as f32)).collect();
     let normals: Vec<V3> = raw.iter().map(|r| if r.open[3] > 0.0 { oct_decode([r.plane[0], r.plane[1]]) } else { [0.0; 3] }).collect();
+    // pt.wgsl `sky_second`, once a texel.
+    let second: Vec<V3> = raw
+        .iter()
+        .map(|r| {
+            let mut sum = [0.0f32; 3];
+            for (at, deep) in r.ends {
+                if at == 0 {
+                    continue;
+                }
+                let there = &raw[at as usize - 1];
+                if (there.open[3] - deep).abs() > 0.02 * deep + 0.5 {
+                    continue;
+                }
+                sum = add(sum, there.back);
+            }
+            mul([r.kd[0] * sum[0], r.kd[1] * sum[1], r.kd[2] * sum[2]], 1.0 / rays as f32)
+        })
+        .collect();
     // pt.wgsl `sky_filter`: the tile's sixteen places as one value (step
     // 0), then smoothed two texels apart.
     let filter = |from: &[Raw], values: Option<&[Raw]>, step: i32, x: usize, y: usize| -> Raw {
@@ -490,7 +539,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
                 }
                 let (place, value, back) = match values {
                     Some(v) => (0, v[j].open, v[j].back),
-                    None => ((py as usize % 4) * 4 + px as usize % 4, [cj.open[0], cj.open[1], cj.open[2], cj.plane[3]], cj.back),
+                    None => ((py as usize % 4) * 4 + px as usize % 4, [cj.open[0], cj.open[1], cj.open[2], cj.plane[3]], add(cj.back, second[j])),
                 };
                 for a in 0..4 {
                     sums[place][a] += value[a] * wt;
@@ -512,7 +561,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         let weight = weight.max(1e-6);
         // (As the filter's passes hand on: the summed direction with the
         // open part, and the light back.)
-        Raw { open: [sum[0] / weight, sum[1] / weight, sum[2] / weight, sum[3] / weight], plane: c.plane, back: mul(back, 1.0 / weight) }
+        Raw { open: [sum[0] / weight, sum[1] / weight, sum[2] / weight, sum[3] / weight], plane: c.plane, back: mul(back, 1.0 / weight), ..Raw::default() }
     };
     let mut once = vec![Raw::default(); w * h];
     rows(

@@ -391,7 +391,7 @@ impl GlyphState {
 pub struct Compiled {
     pub settings: Settings,
     pub base: TimeBase,
-    pub scenes: Vec<CScene>,
+    pub scenes: Vec<Arc<CScene>>,
     /// Every requested sync point, for `check`.
     pub syncs: Vec<SyncRecord>,
     /// Cuts, layers appearing and keys landing, for `sync_check`.
@@ -402,6 +402,22 @@ pub struct Compiled {
     /// Declared roles, facings and allowed checks by layer id (components
     /// expanded), for `check`.
     pub intents: HashMap<Arc<str>, crate::check::Intent>,
+    /// What lets one scene be compiled again by itself; None when the
+    /// project's scenes share more than their windows (components, Slang).
+    local: Option<Local>,
+}
+
+/// What one scene's compile added, in the order it was added.
+struct ScenePart {
+    errors: Vec<String>,
+    syncs: Vec<SyncRecord>,
+    events: Vec<VisualEvent>,
+}
+
+struct Local {
+    /// The errors found before any scene (settings, ids).
+    head: Vec<String>,
+    parts: Vec<Arc<ScenePart>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1461,6 +1477,106 @@ impl<'a> Compiler<'a> {
     }
 }
 
+impl Compiler<'_> {
+    /// One scene, compiled. Besides the scene itself it reads only the
+    /// windows (other elements' starts and ends) and what the project
+    /// holds for every scene (settings, bakes).
+    fn scene(&mut self, project: &Project, scene: &Scene) -> CScene {
+        let id = scene.id.as_str();
+        if !valid_id(id) {
+            self.errors.push(format!("bad scene id '{id}'"));
+        }
+        let start = self.windows.window(id, false).unwrap_or_else(|e| {
+            self.errors.push(format!("{id}.start: {e}"));
+            0.0
+        });
+        let end = self.windows.window(id, true).unwrap_or_else(|e| {
+            self.errors.push(format!("{id}.end: {e}"));
+            start
+        });
+        if end <= start {
+            self.errors.push(format!("{id}: scene ends ({end:.3}s) before it starts ({start:.3}s)"));
+        }
+        let reference = scene.start.is_marker().then(|| scene.start.text());
+        self.events.push(VisualEvent { element: id.into(), what: "cut".into(), kind: EventKind::Cut, t: start, reference });
+        if scene.start.is_marker() {
+            self.syncs.push(SyncRecord {
+                element: id.into(),
+                what: "cut".into(),
+                reference: scene.start.text(),
+                anchor: Anchor::Start,
+                requested: start,
+                kind: SyncKind::Edge,
+            });
+        }
+        let pre_roll = scene.pre_roll.map(|d| self.seconds(d, id, "pre_roll")).unwrap_or(0.0);
+        let step = scene.step_fps.map(|fps| Step { fps, phase: 0.0 });
+        // Content time = timeline time + pre_roll.
+        let camera_position = scene.camera.position.as_ref().map(|p| self.prop(p, id, "camera.position", start, None, pre_roll));
+        let camera_zoom = self.prop(&scene.camera.zoom, id, "camera.zoom", start, None, pre_roll);
+        let camera_rotation = self.prop(&scene.camera.rotation, id, "camera.rotation", start, None, pre_roll);
+        let camera_fov = self.prop(&scene.camera.fov, id, "camera.fov", start, None, pre_roll);
+        let camera_orbit = self.prop(&scene.camera.orbit, id, "camera.orbit", start, None, pre_roll);
+        let camera_dolly = self.prop(&scene.camera.dolly, id, "camera.dolly", start, None, pre_roll);
+        let camera_shift = self.prop(&scene.camera.shift, id, "camera.shift", start, None, pre_roll);
+        let camera_aperture = self.prop(&scene.camera.aperture, id, "camera.aperture", start, None, pre_roll);
+        let background = match &scene.background {
+            Some(b) => self.prop(b, id, "background", start, None, pre_roll),
+            None => Prop::constant(project.settings.background),
+        };
+        let camera_focus = match &scene.camera.focus {
+            None => None,
+            Some(Focus::Depth(p)) => Some(CFocus::Depth(self.prop(p, id, "camera.focus", start, None, pre_roll))),
+            Some(Focus::Layer(layer)) => match scene.layers.iter().position(|l| l.id == *layer) {
+                Some(i) => Some(CFocus::Layer(i)),
+                None => {
+                    self.errors.push(format!("{id}.camera.focus: no top-level layer '{layer}' in the scene"));
+                    None
+                }
+            },
+        };
+        self.bake = project.bakes.get(id).cloned();
+        let layers = self.layers(&scene.layers, step, pre_roll);
+        let sim = self.simulation(scene, start, end, pre_roll);
+        let mut layers = layers;
+        crowd::bind_herds(&mut layers, &sim, pre_roll);
+        let skinned = sim::check_skins(&layers, &mut self.errors);
+        let lighting = self.lighting(scene, pre_roll, start);
+        let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
+            (self.prop(&b.threshold, id, "look.bloom.threshold", start, None, pre_roll), self.prop(&b.radius, id, "look.bloom.radius", start, None, pre_roll), self.prop(&b.intensity, id, "look.bloom.intensity", start, None, pre_roll))
+        });
+        let transition = scene.transition.as_ref().map(|t| CTransition {
+            kind: t.kind,
+            dur: t.dur.seconds(&self.windows.base).unwrap_or(0.0).max(0.0),
+            curve: Curve::compile(&t.ease, &self.windows.base).unwrap_or(Curve::Linear),
+            direction: t.direction,
+        });
+        CScene {
+            id: id.into(),
+            start,
+            end,
+            pre_roll,
+            background,
+            motion_blur: scene.motion_blur.or(project.settings.motion_blur),
+            camera_position,
+            camera_zoom,
+            camera_rotation,
+            camera_fov,
+            camera_orbit,
+            camera_dolly,
+            camera_shift,
+            camera_focus,
+            camera_aperture,
+            lighting,
+            bloom,
+            transition,
+            layers,
+            sim,
+            skinned,
+        }
+    }
+}
+
 impl Compiled {
     pub fn new(project: &Project) -> Compiled {
         // Components become comps of their generated layers first, so every
@@ -1481,99 +1597,14 @@ impl Compiled {
         let windows = Windows::new(project, base, &mut errors);
         let mut c = Compiler { windows, slang: Default::default(), surfaces: Default::default(), programs: HashMap::new(), mesh_kernels: HashMap::new(), errors, syncs: Vec::new(), events: Vec::new(), bake: None };
         let mut scenes = Vec::new();
+        // What each scene added to the errors, syncs and events: kept so
+        // one scene can be compiled again by itself (`with_layer_changed`).
+        let head = c.errors.len();
+        let mut parts = Vec::new();
         for scene in &project.scenes {
-            let id = scene.id.as_str();
-            if !valid_id(id) {
-                c.errors.push(format!("bad scene id '{id}'"));
-            }
-            let start = c.windows.window(id, false).unwrap_or_else(|e| {
-                c.errors.push(format!("{id}.start: {e}"));
-                0.0
-            });
-            let end = c.windows.window(id, true).unwrap_or_else(|e| {
-                c.errors.push(format!("{id}.end: {e}"));
-                start
-            });
-            if end <= start {
-                c.errors.push(format!("{id}: scene ends ({end:.3}s) before it starts ({start:.3}s)"));
-            }
-            let reference = scene.start.is_marker().then(|| scene.start.text());
-            c.events.push(VisualEvent { element: id.into(), what: "cut".into(), kind: EventKind::Cut, t: start, reference });
-            if scene.start.is_marker() {
-                c.syncs.push(SyncRecord {
-                    element: id.into(),
-                    what: "cut".into(),
-                    reference: scene.start.text(),
-                    anchor: Anchor::Start,
-                    requested: start,
-                    kind: SyncKind::Edge,
-                });
-            }
-            let pre_roll = scene.pre_roll.map(|d| c.seconds(d, id, "pre_roll")).unwrap_or(0.0);
-            let step = scene.step_fps.map(|fps| Step { fps, phase: 0.0 });
-            // Content time = timeline time + pre_roll.
-            let camera_position = scene.camera.position.as_ref().map(|p| c.prop(p, id, "camera.position", start, None, pre_roll));
-            let camera_zoom = c.prop(&scene.camera.zoom, id, "camera.zoom", start, None, pre_roll);
-            let camera_rotation = c.prop(&scene.camera.rotation, id, "camera.rotation", start, None, pre_roll);
-            let camera_fov = c.prop(&scene.camera.fov, id, "camera.fov", start, None, pre_roll);
-            let camera_orbit = c.prop(&scene.camera.orbit, id, "camera.orbit", start, None, pre_roll);
-            let camera_dolly = c.prop(&scene.camera.dolly, id, "camera.dolly", start, None, pre_roll);
-            let camera_shift = c.prop(&scene.camera.shift, id, "camera.shift", start, None, pre_roll);
-            let camera_aperture = c.prop(&scene.camera.aperture, id, "camera.aperture", start, None, pre_roll);
-            let background = match &scene.background {
-                Some(b) => c.prop(b, id, "background", start, None, pre_roll),
-                None => Prop::constant(project.settings.background),
-            };
-            let camera_focus = match &scene.camera.focus {
-                None => None,
-                Some(Focus::Depth(p)) => Some(CFocus::Depth(c.prop(p, id, "camera.focus", start, None, pre_roll))),
-                Some(Focus::Layer(layer)) => match scene.layers.iter().position(|l| l.id == *layer) {
-                    Some(i) => Some(CFocus::Layer(i)),
-                    None => {
-                        c.errors.push(format!("{id}.camera.focus: no top-level layer '{layer}' in the scene"));
-                        None
-                    }
-                },
-            };
-            c.bake = project.bakes.get(id).cloned();
-            let layers = c.layers(&scene.layers, step, pre_roll);
-            let sim = c.simulation(scene, start, end, pre_roll);
-            let mut layers = layers;
-            crowd::bind_herds(&mut layers, &sim, pre_roll);
-            let skinned = sim::check_skins(&layers, &mut c.errors);
-            let lighting = c.lighting(scene, pre_roll, start);
-            let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
-                (c.prop(&b.threshold, id, "look.bloom.threshold", start, None, pre_roll), c.prop(&b.radius, id, "look.bloom.radius", start, None, pre_roll), c.prop(&b.intensity, id, "look.bloom.intensity", start, None, pre_roll))
-            });
-            let transition = scene.transition.as_ref().map(|t| CTransition {
-                kind: t.kind,
-                dur: t.dur.seconds(&c.windows.base).unwrap_or(0.0).max(0.0),
-                curve: Curve::compile(&t.ease, &c.windows.base).unwrap_or(Curve::Linear),
-                direction: t.direction,
-            });
-            scenes.push(CScene {
-                id: id.into(),
-                start,
-                end,
-                pre_roll,
-                background,
-                motion_blur: scene.motion_blur.or(project.settings.motion_blur),
-                camera_position,
-                camera_zoom,
-                camera_rotation,
-                camera_fov,
-                camera_orbit,
-                camera_dolly,
-                camera_shift,
-                camera_focus,
-                camera_aperture,
-                lighting,
-                bloom,
-                transition,
-                layers,
-                sim,
-                skinned,
-            });
+            let (e, s, v) = (c.errors.len(), c.syncs.len(), c.events.len());
+            scenes.push(Arc::new(c.scene(project, scene)));
+            parts.push(Arc::new(ScenePart { errors: c.errors[e..].to_vec(), syncs: c.syncs[s..].to_vec(), events: c.events[v..].to_vec() }));
         }
         // The Slang functions the properties asked for, built into one
         // library they read from (an error, never a silent zero).
@@ -1613,10 +1644,98 @@ impl Compiled {
                 Err(e) => c.errors.push(e),
             }
         }
+        // Scenes that share nothing but windows: no components (they
+        // are expanded project-wide) and no Slang (one library for all).
+        let alone = expanded.is_none() && c.slang.is_empty() && c.surfaces.is_empty() && c.programs.is_empty() && c.mesh_kernels.is_empty();
         let Compiler { errors, syncs, mut events, .. } = c;
+        let local = alone.then(|| Local { head: errors[..head].to_vec(), parts });
         events.sort_by(|a, b| a.t.total_cmp(&b.t));
         let intents = crate::check::intents(&project.scenes);
-        Compiled { settings: project.settings.clone(), base, scenes, syncs, events, errors, intents }
+        Compiled { settings: project.settings.clone(), base, scenes, syncs, events, errors, intents, local }
+    }
+
+    /// `self` compiled again for `project`, which differs from the project
+    /// `self` was compiled from only in the fields of layer `layer` (a
+    /// drag's tick): only that layer's scene is compiled, the others are
+    /// shared. `None` whenever that cannot be shown to equal
+    /// `Compiled::new(project)`; the caller then compiles in full.
+    ///
+    /// A scene's compile reads, outside itself, only other elements'
+    /// windows (`Compiler::scene`), so the other scenes stay as they are
+    /// when every window in the changed scene is what it was. Returned
+    /// only then, and only when nothing is shared across scenes besides:
+    /// no components, no Slang, the same settings, time base and
+    /// project-wide errors.
+    pub fn with_layer_changed(&self, project: &Project, layer: &str) -> Option<Compiled> {
+        let local = self.local.as_ref()?;
+        // (One scene: compiling it again is compiling everything.)
+        if self.scenes.len() < 2 {
+            return None;
+        }
+        fn holds(layers: &[Layer], id: &str) -> bool {
+            layers.iter().any(|l| l.id == id || holds(l.children(), id))
+        }
+        fn components(layers: &[Layer]) -> bool {
+            layers.iter().any(|l| matches!(l.kind, LayerKind::Component(_)) || components(l.children()))
+        }
+        let index = project.scenes.iter().position(|s| holds(&s.layers, layer))?;
+        if project.scenes.len() != self.scenes.len() || project.settings != self.settings || components(&project.scenes[index].layers) {
+            return None;
+        }
+        // A scene with a simulation reads its bake, binds its crowds and
+        // makes their pictures: not shown to be local, so the whole compile.
+        if project.scenes[index].simulation.is_some() {
+            return None;
+        }
+        let mut base = TimeBase::new(project.settings.fps);
+        base.beat = project.markers.get("beat").and_then(|t| t.median_interval());
+        base.bar = project.markers.get("bar").and_then(|t| t.median_interval());
+        if base.beat != self.base.beat || base.bar != self.base.bar {
+            return None;
+        }
+        // The checks every compile makes before its scenes: the same
+        // errors as before, or this is not the project it was.
+        let mut errors = Vec::new();
+        if project.settings.width == 0 || project.settings.height == 0 || project.settings.width > 8192 || project.settings.height > 8192 {
+            errors.push("settings: width and height must be 1..8192".into());
+        }
+        if !(project.settings.duration > 0.0) {
+            errors.push("settings.duration must be positive".into());
+        }
+        let windows = Windows::new(project, base, &mut errors);
+        if errors != local.head {
+            return None;
+        }
+        let mut c = Compiler { windows, slang: Default::default(), surfaces: Default::default(), programs: HashMap::new(), mesh_kernels: HashMap::new(), errors: Vec::new(), syncs: Vec::new(), events: Vec::new(), bake: None };
+        let scene = c.scene(project, &project.scenes[index]);
+        if !(c.slang.is_empty() && c.surfaces.is_empty() && c.programs.is_empty() && c.mesh_kernels.is_empty()) {
+            return None;
+        }
+        // Every window of the scene is what it was: nothing another scene
+        // reads of this one moved.
+        fn same(a: &[CLayer], b: &[CLayer]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.id == b.id && a.start == b.start && a.end == b.end && same(a.children(), b.children()))
+        }
+        let was = &self.scenes[index];
+        if scene.id != was.id || scene.start != was.start || scene.end != was.end || scene.pre_roll != was.pre_roll || !same(&scene.layers, &was.layers) {
+            return None;
+        }
+        let mut scenes = self.scenes.clone();
+        scenes[index] = Arc::new(scene);
+        let mut parts = local.parts.clone();
+        let Compiler { errors, syncs, events, .. } = c;
+        parts[index] = Arc::new(ScenePart { errors, syncs, events });
+        // Put together as `new` does: in scene order, the events by time.
+        let mut errors = local.head.clone();
+        let (mut syncs, mut events) = (Vec::new(), Vec::new());
+        for part in &parts {
+            errors.extend(part.errors.iter().cloned());
+            syncs.extend(part.syncs.iter().cloned());
+            events.extend(part.events.iter().cloned());
+        }
+        events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let intents = crate::check::intents(&project.scenes);
+        Some(Compiled { settings: project.settings.clone(), base, scenes, syncs, events, errors, intents, local: Some(Local { head: local.head.clone(), parts }) })
     }
 
     pub fn fps(&self) -> Fps {
@@ -1672,7 +1791,7 @@ impl Compiled {
 
     /// The scene shown at timeline time `t` (the last one that covers it).
     pub fn scene_at(&self, t: f64) -> Option<&CScene> {
-        self.scenes.iter().rev().find(|s| s.start <= t + 1e-9 && t < s.end - 1e-9)
+        self.scenes.iter().rev().find(|s| s.start <= t + 1e-9 && t < s.end - 1e-9).map(|s| &**s)
     }
 
     /// Motion-blur settings in effect at `t`.
@@ -2384,6 +2503,119 @@ mod tests {
         .unwrap();
         p.scenes.push(scene);
         p
+    }
+
+    /// Three scenes: the second reads the first's `box` for its start and
+    /// has a reference that cannot resolve (an error in its own part).
+    fn three_scenes() -> Project {
+        let mut p = project();
+        for scene in [
+            serde_json::json!({"id": "s2", "start": 3, "layers": [
+                {"id": "late", "kind": "shape", "shape": "rect", "size": [50, 50], "fill": "#00ff00", "time": {"start": "#box.end - 1"},
+                 "transform": {"position": {"keys": [{"at": 3, "v": [0, 0]}, {"at": "beat:9", "v": [100, 0]}]}}},
+                {"id": "lost", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff", "time": {"start": "#nobody.start"}}
+            ]}),
+            serde_json::json!({"id": "s3", "start": 6, "layers": [
+                {"id": "last", "kind": "text", "text": "END", "transform": {"position": [960, 540], "opacity": {"keys": [{"at": 6, "v": 0}, {"at": 7, "v": 1}]}}}
+            ]}),
+        ] {
+            p.scenes.push(serde_json::from_value(scene).unwrap());
+        }
+        p
+    }
+
+    /// `project` after `ops` on one layer, by `edit::apply`.
+    fn edited(project: &Project, ops: serde_json::Value) -> Project {
+        crate::edit::apply(project, ops.as_array().unwrap()).unwrap().project
+    }
+
+    /// Everything a `Compiled` shows: its lists, and every frame.
+    fn assert_same(a: &Compiled, b: &Compiled, what: &str) {
+        assert_eq!(a.errors, b.errors, "{what}: errors");
+        assert_eq!(format!("{:?}", a.syncs), format!("{:?}", b.syncs), "{what}: syncs");
+        assert_eq!(format!("{:?}", a.events), format!("{:?}", b.events), "{what}: events");
+        assert_eq!(a.intents, b.intents, "{what}: intents");
+        assert_eq!(a.settings, b.settings);
+        for n in 0..a.frame_count() {
+            let t = a.fps().time_of(n as i64);
+            assert_eq!(a.frame(t), b.frame(t), "{what}: frame {n}");
+        }
+        for id in ["s1", "s2", "s3", "box", "title", "group", "dot", "late", "lost", "last"] {
+            assert_eq!(a.element_window(id), b.element_window(id), "{what}: {id}");
+        }
+    }
+
+    #[test]
+    fn one_scene_compiled_again_equals_the_whole_compile() {
+        let p = three_scenes();
+        let whole = Compiled::new(&p);
+        assert!(whole.errors.iter().any(|e| e.contains("nobody")), "{:?}", whole.errors);
+        // Edits of one layer that move no window: a value, a key, an
+        // effect, a keyed value's key, a child in a comp, the last scene.
+        for (layer, ops) in [
+            ("title", serde_json::json!([{"op": "set", "target": "title.transform.position", "value": [100, 200]}])),
+            ("title", serde_json::json!([{"op": "set", "target": "title.text", "value": "BYE"}, {"op": "set", "target": "title.role", "value": "caption"}])),
+            ("box", serde_json::json!([{"op": "key", "target": "box.transform.position", "at": 1.0, "v": [300, 300]}])),
+            ("box", serde_json::json!([{"op": "set", "target": "box.effects", "value": [{"type": "blur", "radius": 4}]}])),
+            ("dot", serde_json::json!([{"op": "set", "target": "dot.transform.scale", "value": [2, 2]}])),
+            ("late", serde_json::json!([{"op": "anchor", "target": "late.transform.position", "key": 2, "at": "beat:10"}])),
+            ("last", serde_json::json!([{"op": "key", "target": "last.transform.opacity", "at": 6.5, "v": 0.2}])),
+        ] {
+            let next = edited(&p, ops.clone());
+            let one = whole.with_layer_changed(&next, layer).unwrap_or_else(|| panic!("{layer} {ops}: only its scene changed"));
+            assert_same(&one, &Compiled::new(&next), &format!("{layer} {ops}"));
+            // The other scenes are the same ones, not copies.
+            let changed = next.scenes.iter().position(|s| s.layers.iter().any(|l| l.id == layer || l.children().iter().any(|c| c.id == layer))).unwrap();
+            for i in 0..3 {
+                assert_eq!(Arc::ptr_eq(&one.scenes[i], &whole.scenes[i]), i != changed, "{layer}: scene {i}");
+            }
+            // And a tick after a tick: from the one-scene result too.
+            let again = edited(&next, serde_json::json!([{"op": "set", "target": format!("{layer}.transform.rotation"), "value": 15}]));
+            assert_same(&one.with_layer_changed(&again, layer).unwrap(), &Compiled::new(&again), &format!("{layer}: a second tick"));
+        }
+    }
+
+    #[test]
+    fn what_could_reach_another_scene_takes_the_whole_compile() {
+        let p = three_scenes();
+        let whole = Compiled::new(&p);
+        let none = |next: &Project, layer: &str, why: &str| assert!(whole.with_layer_changed(next, layer).is_none(), "{why}");
+        // A window moves: `late` in the next scene starts by `#box.end`.
+        none(&edited(&p, serde_json::json!([{"op": "set", "target": "box.time.end", "value": 2.0}])), "box", "box ends earlier");
+        none(&edited(&p, serde_json::json!([{"op": "set", "target": "box.time.start", "value": "beat:2"}])), "box", "box starts later (title follows it)");
+        // Even with no one reading it: a window is what other scenes may read.
+        none(&edited(&p, serde_json::json!([{"op": "set", "target": "last.time.start", "value": 6.5}])), "last", "a window nobody reads");
+        // A child added or taken (the layers are not the ones compiled).
+        none(&edited(&p, serde_json::json!([{"op": "set", "target": "group.layers", "value": []}])), "group", "the comp lost its child");
+        // Not this project: other settings, a scene more, a layer unknown.
+        let mut other = p.clone();
+        other.settings.duration = 9.0;
+        none(&other, "title", "another duration");
+        let mut other = p.clone();
+        other.scenes.pop();
+        none(&other, "title", "a scene fewer");
+        none(&p, "nobody", "no such layer");
+        let mut other = p.clone();
+        other.markers.insert(MarkerTrack::from_times("beat", (0..16).map(|i| 0.4 + i as f64 * 0.4)));
+        none(&other, "title", "another beat");
+        // Project-wide errors changed (a second layer with a taken id).
+        let twice = edited(&p, serde_json::json!([{"op": "set", "target": "group.layers", "value": [{"id": "dot", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff"}, {"id": "last", "kind": "shape", "shape": "circle", "size": 10, "fill": "#fff"}]}]));
+        none(&twice, "group", "an id taken twice");
+        // Components are expanded for the whole project, and Slang is one
+        // library for every scene: neither is compiled a scene at a time.
+        let with_component = edited(&p, serde_json::json!([{"op": "add", "scene": "s3", "id": "count", "kind": "component", "component": "counter", "params": {"from": 0, "to": 30, "at": 6.2, "dur": 1.0}}]));
+        let c = Compiled::new(&with_component);
+        let moved = edited(&with_component, serde_json::json!([{"op": "set", "target": "title.transform.position", "value": [1, 2]}]));
+        assert!(c.with_layer_changed(&moved, "title").is_none(), "a project with a component");
+        // The component arriving by the edit itself.
+        let becomes = edited(&p, serde_json::json!([{"op": "set", "target": "group.layers", "value": [{"id": "dot", "kind": "component", "component": "counter", "params": {"from": 0, "to": 3, "at": 1.0, "dur": 1.0}}]}]));
+        none(&becomes, "group", "a component in the changed scene");
+        let with_shader = edited(&p, serde_json::json!([{"op": "add", "scene": "s3", "id": "fx", "kind": "shader", "function": "plasma"}]));
+        let c = Compiled::new(&with_shader);
+        let moved = edited(&with_shader, serde_json::json!([{"op": "set", "target": "title.transform.position", "value": [1, 2]}]));
+        assert!(c.with_layer_changed(&moved, "title").is_none(), "a project with a shader layer");
+        let becomes = edited(&p, serde_json::json!([{"op": "set", "target": "group.layers", "value": [{"id": "dot", "kind": "shader", "function": "plasma"}]}]));
+        none(&becomes, "group", "Slang in the changed scene");
     }
 
     #[test]
