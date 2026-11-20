@@ -1863,22 +1863,25 @@ fn defocused_cards_keep_their_depth() {
     assert_gpu_matches_cpu(&p, &[0.0]);
 }
 
+/// A floor with an instancer's pegs under it (`defocused_instancer_copies_keep_their_depth`).
+pub(crate) fn pegs(aperture: f64) -> Project {
+    let mut p = project(json!([
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [240, 10], "depth": 240},
+         "material": {"preset": "matte", "color": "#40a060"}, "transform": {"position": [160, 80]}},
+        {"id": "pegs", "kind": "instancer", "three_d": true, "transform": {"position": [160, 112], "z": -60},
+         "layout": {"type": "line", "count": 3, "from": [-80, 0], "to": [80, 0]},
+         "layers": [{"id": "peg", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 8, "height": 40},
+                     "material": {"preset": "matte", "color": "#ffffff"}}]}
+    ]));
+    p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 35], "aperture": aperture, "focus": 0})).unwrap();
+    p
+}
+
 /// An instancer's mesh copies keep the depth test under depth of field:
 /// pegs under a floor stay hidden by it, as they are with a sharp lens.
 #[test]
 fn defocused_instancer_copies_keep_their_depth() {
-    let build = |aperture: f64| {
-        let mut p = project(json!([
-            {"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [240, 10], "depth": 240},
-             "material": {"preset": "matte", "color": "#40a060"}, "transform": {"position": [160, 80]}},
-            {"id": "pegs", "kind": "instancer", "three_d": true, "transform": {"position": [160, 112], "z": -60},
-             "layout": {"type": "line", "count": 3, "from": [-80, 0], "to": [80, 0]},
-             "layers": [{"id": "peg", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 8, "height": 40},
-                         "material": {"preset": "matte", "color": "#ffffff"}}]}
-        ]));
-        p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 35], "aperture": aperture, "focus": 0})).unwrap();
-        p
-    };
+    let build = pegs;
     let sharp = cpu().render(&Compiled::new(&build(0.0)), 0.0);
     let p = build(0.3);
     let soft = cpu().render(&Compiled::new(&p), 0.0);
@@ -2081,9 +2084,15 @@ fn motion_blur_takes_the_samples_the_motion_needs() {
     // A fade is not motion.
     assert_eq!(samples(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [20, 40], "fill": "#ffffff",
         "transform": {"position": [160, 90], "opacity": {"keys": [{"at": 0, "v": 0}, {"at": 1, "v": 1}]}}}]), 1.0), 2);
-    // A shape changing size moves its edges: not measured, so all of them.
-    assert_eq!(samples(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": {"keys": [{"at": 0, "v": [20, 40]}, {"at": 1, "v": [21, 40]}]}, "fill": "#ffffff",
-        "transform": {"position": [160, 90]}}]), 1.0), 8);
+    // A shape changing size moves its edges as far as its box's corners
+    // (`motion_px`'s `shape`): a crawl takes two, a quick growth all.
+    let growing = |to: f64| json!([{"id": "r", "kind": "shape", "shape": "rect", "size": {"keys": [{"at": 0, "v": [20, 40], "ease": "linear"}, {"at": 1, "v": [to, 40]}]}, "fill": "#ffffff",
+        "transform": {"position": [160, 90]}}]);
+    assert_eq!(samples(growing(21.0), 1.0), 2);
+    assert_eq!(samples(growing(980.0), 1.0), 5, "480 px a second each way: 7 px");
+    assert_eq!(samples(growing(12020.0), 1.0), 8);
+    // A path that morphs: not measured, so all of them.
+    assert_eq!(samples(json!([{"id": "r", "kind": "shape", "shape": "path", "d": {"keys": [{"at": 0, "v": "M 0 0 L 50 0 L 50 50 Z"}, {"at": 1, "v": "M 0 0 L 51 0 L 50 50 Z"}]}, "fill": "#ffffff"}]), 1.0), 8);
     // A turning layer moves most far from its pivot: 90° a second about
     // the frame's centre carries a corner of the frame 4.2 px.
     assert_eq!(samples(json!([{"id": "r", "kind": "shape", "shape": "rect", "size": [200, 100], "fill": "#ffffff",

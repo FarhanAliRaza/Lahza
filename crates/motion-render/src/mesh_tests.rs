@@ -57,6 +57,11 @@ fn dump_showcase() {
 
 #[test]
 fn gpu_matches_cpu_meshes() {
+    crate::tests::assert_gpu_matches_cpu_within(&showcase_and_more(), &[0.0, 0.5], 0.0002);
+}
+
+/// The scene of `gpu_matches_cpu_meshes`.
+fn showcase_and_more() -> Project {
     let mut p = showcase();
     // Every kind, part materials, faceted and unlit, glass, emissive, a
     // revolve, motion blur and depth of field (a blurred mesh group).
@@ -81,7 +86,7 @@ fn gpu_matches_cpu_meshes() {
     p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "night", "rotation": 30})).unwrap());
     p.scenes[0].camera.aperture = lahza_motion_core::property::Property::Constant(0.6);
     p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 3 });
-    crate::tests::assert_gpu_matches_cpu_within(&p, &[0.0, 0.5], 0.0002);
+    p
 }
 
 fn render(p: &Project, t: f64) -> image::RgbaImage {
@@ -1916,6 +1921,19 @@ fn a_point_lights_frame_holds_its_casters_and_little_more() {
     let with = with.seen_from(pos, axis, u, v).unwrap();
     assert!((0..4).all(|k| (with[k] - truth[k]).abs() < 1e-6), "a floor around the light: {with:?}, the CPU's {truth:?}");
     assert!(area(with) < 36.0 * 0.9, "and not the whole view: {with:?}");
+    // A directional light's frame from the same points is theirs exactly.
+    {
+        let mut c = caster(&ball, true);
+        let d = [[0.6, 0.0, 0.8], [0.0, 1.0, 0.0], [-0.8, 0.0, 0.6]];
+        let boxed = c.spans(d);
+        c.points = Some((Arc::new(Mesh { positions: ball.iter().map(|p| p.map(|x| x as f32)).collect(), ..Default::default() }), Mat4::IDENTITY));
+        let exact = c.spans(d);
+        for k in 0..3 {
+            let truth = ball.iter().map(|p| p[0] * d[k][0] + p[1] * d[k][1] + p[2] * d[k][2]).fold((f64::INFINITY, f64::NEG_INFINITY), |m, x| (m.0.min(x), m.1.max(x)));
+            assert!((exact[k].0 - truth.0).abs() < 1e-3 && (exact[k].1 - truth.1).abs() < 1e-3, "{:?} for {truth:?}", exact[k]);
+            assert!(boxed[k].0 <= exact[k].0 + 1e-3 && boxed[k].1 >= exact[k].1 - 1e-3);
+        }
+    }
     // The same without its points: its box cut at the light's plane,
     // which holds what the CPU frames and is within the view.
     let cut = caster(&floor, false).seen_from(pos, axis, u, v).unwrap();
@@ -1935,6 +1953,9 @@ fn a_point_lights_frame_holds_its_casters_and_little_more() {
 pub(crate) fn still_mesh_beside_a_mover(w: u32, h: u32, samples: u32, turn: f64) -> Project {
     let k = w as f64 / 320.0;
     let mut p = scene(w, h, json!({"layers": [
+        // (A picture before the comp's that changes in every sub-frame.)
+        {"id": "haze", "kind": "shape", "shape": "circle", "size": [60.0 * k, 60.0 * k], "fill": "#7b61ff", "effects": [{"type": "blur", "radius": 6.0 * k}],
+         "transform": {"position": {"keys": [{"at": 0, "v": [40.0 * k, 40.0 * k]}, {"at": 2, "v": [280.0 * k, 40.0 * k]}]}}},
         {"id": "sign", "kind": "comp", "effects": [{"type": "glow", "color": "#ffd23f", "radius": 6.0 * k, "intensity": 0.8}], "layers": [
             {"id": "ball", "kind": "mesh", "mesh": {"type": "torus", "radius": 34.0 * k, "tube": 12.0 * k}, "material": {"preset": "plastic", "color": "#ffd23f"},
              "transform": {"position": [100.0 * k, 90.0 * k], "rotation_x": 50, "rotation_y": {"keys": [{"at": 0, "v": 0}, {"at": 2, "v": turn}]}}}]},
@@ -1949,8 +1970,9 @@ pub(crate) fn still_mesh_beside_a_mover(w: u32, h: u32, samples: u32, turn: f64)
 /// glow) is not drawn again by a motion-blurred frame's sub-frames
 /// because another mesh moved (`gpu::same_groups` goes by what each mesh
 /// primitive reads, not by the list's mesh rows whole), and the frame is
-/// the one drawn with every group drawn in every sub-frame. One whose
-/// own mesh turns is drawn each time. Through the compute raster and
+/// the one drawn with every group drawn in every sub-frame; a blurred
+/// shape that moves, drawn in a group before it, does not have it drawn
+/// again either. One whose own mesh turns is drawn each time. Through the compute raster and
 /// through the visibility pass and the mesh pool.
 #[test]
 fn a_still_mesh_group_is_not_drawn_again_beside_a_moving_mesh() {
@@ -1976,7 +1998,9 @@ fn a_still_mesh_group_is_not_drawn_again_beside_a_moving_mesh() {
         assert_eq!(none, 0);
         assert!(with == without, "{name}: the frame is the one with every group drawn");
         let (_, turning) = frame(90.0, false).unwrap();
-        assert_eq!(turning, 0, "{name}: a group whose mesh turns is drawn in every sub-frame");
+        // (The moving shape's own blurred picture may be left as drawn
+        // either way: it moves whole.)
+        assert!(turning < reused, "{name}: a group whose mesh turns is drawn in every sub-frame ({turning} left of {reused})");
     }
 }
 
@@ -2024,4 +2048,65 @@ fn a_normal_mapped_face_does_not_shadow_itself() {
     }
     crate::tests::assert_gpu_matches_cpu_within(&build(true), &[0.0], 0.0005);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Not a test (`--ignored --nocapture`): what a hardware rasteriser's
+/// grid alone does to the two other frames that leave the CPU's on the
+/// card (`gpu_matches_cpu_meshes`, 215 pixels there;
+/// `defocused_instancer_copies_keep_their_depth`, 3): the CPU's frame
+/// against the CPU's frame with its triangles' corners on 1 / 256 of a
+/// pixel (`mesh3d::TEST_SEAMS`), pixels more than 3 levels apart.
+#[test]
+#[ignore]
+fn measure_snapping_in_the_cards_other_tests() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for (name, p, times) in [("meshes", showcase_and_more(), vec![0.0, 0.5]), ("the instancer's copies", crate::tests::pegs(0.3), vec![0.0])] {
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        for t in times {
+            let exact = crate::tests::cpu().render(&c, t);
+            for steps in [256u32, 16] {
+                crate::mesh3d::TEST_SEAMS.0.store(steps, Relaxed);
+                let snapped = crate::tests::cpu().render(&c, t);
+                crate::mesh3d::TEST_SEAMS.0.store(0, Relaxed);
+                let d: Vec<u8> = exact.pixels().zip(snapped.pixels()).map(|(a, b)| (0..4).map(|k| a.0[k].abs_diff(b.0[k])).max().unwrap()).collect();
+                eprintln!("{name} at {t}: corners on 1/{steps} px, {} px over 3 levels (most {}), {} px that differ at all", d.iter().filter(|v| **v > 3).count(), d.iter().max().unwrap(), d.iter().filter(|v| **v > 0).count());
+            }
+        }
+    }
+}
+
+/// Four hundred mesh layers that drift, for a traced frame's lists.
+fn four_hundred() -> Project {
+    let mut layers = Vec::new();
+    for i in 0..400 {
+        let (x, y) = (40 + (i % 25) * 36, 40 + (i / 25) * 30);
+        let mesh = if i % 3 == 0 { json!({"type": "box", "size": [20, 20], "depth": 20}) } else { json!({"type": "sphere", "radius": 12}) };
+        let (preset, color) = (["plastic", "metal", "matte", "glossy"][i % 4], ["#c03030", "#30a0c0", "#d0c040"][i % 3]);
+        layers.push(json!({"id": format!("m{i}"), "kind": "mesh", "mesh": mesh,
+            "material": {"preset": preset, "color": color, "roughness": 0.2 + (i % 5) as f64 * 0.1},
+            "transform": {"position": {"keys": [{"at": 0, "v": [x, y]}, {"at": 2, "v": [x + 40, y]}]}, "z": (i % 7) * 20}}));
+    }
+    scene(960, 540, json!({"layers": layers}))
+}
+
+/// Not a test (`--ignored --nocapture`): what a traced frame's display
+/// lists cost the CPU, four sub-frames of four hundred mesh layers that
+/// move (the film's s01 has about that many): ms a list, and how many of
+/// the lists' material rows were made anew.
+#[test]
+#[ignore]
+fn benchmark_traced_lists_of_400_layers() {
+    let c = Compiled::new(&four_hundred());
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let states: Vec<_> = (0..4).map(|k| c.frame(0.5 + k as f64 / 240.0)).collect();
+    let mut r = cpu();
+    let options = crate::pt::TraceOptions { spp: 4, ..Default::default() };
+    for round in 0..4 {
+        let t = std::time::Instant::now();
+        let made = r.meshes.material_rows_made;
+        let lists: Vec<_> = states.iter().map(|s| Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: Some(options), sky: false, seed: 0, compact: false }.build(s)).collect();
+        let rows: usize = lists.iter().flat_map(|l| &l.traces).flat_map(|t| &t.instances).map(|i| i.materials.len()).sum();
+        eprintln!("round {round}: {:.2} ms a list; {} material rows in the lists, {} made anew", t.elapsed().as_secs_f64() * 250.0, rows, r.meshes.material_rows_made - made);
+    }
 }

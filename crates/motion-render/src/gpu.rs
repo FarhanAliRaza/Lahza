@@ -171,7 +171,8 @@ fn same_shadows(jobs: &[crate::mesh3d::ShadowJob], mesh: &[[f32; 4]]) -> Vec<usi
 /// same (`list::MeshRead`: its batch, its lights' maps and their casters,
 /// its meshes in the pool), whatever the list's other meshes did: a mesh
 /// that stands still in a picture of its own is not drawn again because
-/// another moved.
+/// another moved. Nor because a group before it changed, unless it reads
+/// groups (a card's picture, a backdrop, the sky's).
 fn same_groups(a: &DisplayList, b: &DisplayList) -> Vec<bool> {
     use std::collections::HashMap;
     let mut same = vec![false; b.groups.len()];
@@ -234,7 +235,7 @@ fn same_groups(a: &DisplayList, b: &DisplayList) -> Vec<bool> {
         .enumerate()
         .map(|(i, (p, q))| {
             let reads = match p.kind[0] {
-                crate::list::PRIM_MESH => true,
+                crate::list::PRIM_MESH => mesh_reads_groups(a, p),
                 crate::list::PRIM_MATTE => true,
                 crate::list::PRIM_IMAGE => p.kind[1] == crate::list::SOURCE_GROUP,
                 _ => false,
@@ -283,6 +284,13 @@ fn same_groups(a: &DisplayList, b: &DisplayList) -> Vec<bool> {
     same
 }
 
+/// Whether mesh primitive `p` of `list` reads groups' texels: records
+/// are cards (their pictures), `paint[3]` a glass mesh's backdrop, the
+/// light block's last spare float the list's sky visibility.
+fn mesh_reads_groups(list: &DisplayList, p: &Prim) -> bool {
+    p.paint[3] > 0.5 || p.geom[2].to_bits() > 0 || list.mesh.get(p.geom2[3].to_bits() as usize + 6).is_some_and(|r| r[3].to_bits() != 0)
+}
+
 /// Whether group `g` of `list` reads other groups' texels: a group's
 /// picture, a matte, a glass mesh's backdrop or a card's picture among
 /// its primitives. (One that reads none may be drawn before, or along
@@ -296,9 +304,7 @@ fn reads_groups(list: &DisplayList, g: &crate::list::Group) -> bool {
             match p.kind[0] {
                 crate::list::PRIM_MATTE => true,
                 crate::list::PRIM_IMAGE => p.kind[1] == crate::list::SOURCE_GROUP,
-                // (Records are cards; `paint[3]`: a backdrop; the light
-                // block's last spare float: the list's sky visibility.)
-                crate::list::PRIM_MESH => p.paint[3] > 0.5 || p.geom[2].to_bits() > 0 || list.mesh.get(p.geom2[3].to_bits() as usize + 6).is_some_and(|r| r[3].to_bits() != 0),
+                crate::list::PRIM_MESH => mesh_reads_groups(list, p),
                 _ => false,
             }
         })
