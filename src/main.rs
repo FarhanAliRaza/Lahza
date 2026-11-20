@@ -33,6 +33,7 @@ mod library;
 mod models;
 mod motion_ui;
 mod motion_agent;
+mod motion_agent_api;
 mod motion_editor;
 mod motion_piece_ui;
 mod motion_preview;
@@ -1966,6 +1967,7 @@ fn main() {
                 .expect("failed to load bundled Inter font");
             theme::load_theme_preference();
             motion_preview::load_quality();
+            motion_agent::load_choice();
             theme::set_appearance(cx.window_appearance());
             if let Some(dir) = initial_motion.clone() {
                 if let Err(e) = lahza_motion_core::io::load(&dir) {

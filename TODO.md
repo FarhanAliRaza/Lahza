@@ -803,8 +803,10 @@ picture, or its wording when signed out.
    `text_field.rs`): under the preview on a motion project and on a
    recording's Motion tab.
 2. **Starting an agent** (`motion_agent.rs`): `Runner` is the one small
-   interface (available, start, and a `Running` to stop); `ClaudeCode` is
-   the first: `claude -p` with stream-json in and out, `lahza mcp` as its
+   interface (available, start, and a `Running` to stop), with two
+   runners behind it and a choice between them (`Chosen`; the second,
+   `ApiLoop`, is under "Left" below for what was not run). `ClaudeCode`
+   is the first: `claude -p` with stream-json in and out, `lahza mcp` as its
    only server and no tools of its own, its lines read as they come.
    Tested with a stub program that writes the same stream. Not installed
    (the program is missing) and not signed in (`claude auth status`, or
@@ -854,8 +856,34 @@ Left:
   piece placed there comes back" is not seen.
 - **Undo after later edits** to the same things fails with the engine's
   message ("the project changed in a conflicting way").
-- **Another runner** (an API key and the `Toolbox` in process): the
-  interface is there, the second runner is not.
+- **The second runner, against the real API.** `ApiLoop`
+  (`motion_agent_api.rs`) needs only an API key: our own loop on the
+  Claude Messages API (raw HTTP through `ureq`, the one new dependency;
+  there is no official Rust SDK) with the `Toolbox` in process: its own
+  tool definitions, plus `read_doc` for the guide, schema and catalog an
+  MCP client reads as resources. `claude-opus-5-5` (or
+  `LAHZA_AGENT_MODEL`), one request a turn, not streamed, with
+  `fallbacks: "default"`; the same `compose`d words and picture and the
+  same steps as the Claude Code runner; every result of a turn goes back
+  in one message; a refusal or a cut-off answer runs none of its tools;
+  no connection, 429 and 5xx are tried three times; Stop is looked at
+  between calls (a request already sent is waited for and then dropped).
+  The key is `ANTHROPIC_API_KEY` or one line in
+  `<config>/anthropic-api-key`, read when a request starts, sent in the
+  `x-api-key` header and nowhere else (a test looks for it in the
+  project's files and in what is reported). The runner is a choice in
+  the AI tab (Auto, Claude Code, API key), kept with the settings: Auto
+  is Claude Code where installed and signed in, else the API loop where
+  a key is set, and the bar names the one in use. Tested against a local
+  stub server that replays a tool-use conversation, a refusal, a cut-off
+  answer, 401/400/404/429/500/529, nothing listening, and a stop in the
+  middle. **No request was sent to the API**: the version header, the
+  model id and the request's shape are from Anthropic's reference as
+  read in November 2026, not from an answer. Left: nowhere in the app to
+  type the key (the field has no masked input: the environment or the
+  file); the loop's conversations are kept in memory only, so after a
+  restart a follow-up starts a new one; `cost` is not reported; no
+  streaming, so a long turn shows nothing until it ends.
 
 ## The motion editor: drags that stall, and how it should be used
 
@@ -891,18 +919,40 @@ and whether the bars now move freely, is not confirmed on a real card.
   | 480 | 3.4 ms | 0.013 ms | 0.66 ms |
   | 1 200 | 22 ms | 0.014 ms | 1.7 ms |
 
-  Left out on purpose: the tick still compiles every scene
-  (`Compiled::new`, 1.7 ms at 1 200 plain layers; more with an imported
-  model of many parts, not timed). Compiling only the scene that changed
-  was looked at once `compile.rs` was free and not done: one `Compiler`
-  carries what scenes share (every element's window, which `#id.end`
-  references and anchors read across scenes; the Slang linker and the
-  surface program; errors, syncs and events in scene order), so a scene
-  compiled alone is only right when nothing outside it refers into it,
-  and telling that costs a pass of its own. The gain is at most the
-  1.7 ms, and nothing when the layers are in the scene being edited,
-  which is the usual case. To take up again if a project is found where
-  the compile, not the render, holds a drag.
+  **A tick compiles one scene.** `Compiled::with_layer_changed`
+  (compile.rs) compiles only the dragged layer's scene and shares the
+  others (`scenes` is now `Vec<Arc<CScene>>`). It is right by
+  construction rather than by a guess: a scene's compile
+  (`Compiler::scene`) reads, outside itself, only other elements'
+  windows, so the result is returned only when every window in the
+  changed scene is what it was, and nothing else is shared: no
+  components (expanded project-wide), no Slang (one library), the same
+  settings, time base, scene count and project-wide errors. Anything
+  else is `None` and the editor compiles in full, as before. Tested:
+  equal to `Compiled::new` in every list and every frame for seven kinds
+  of local edit, with the other scenes the same `Arc`s
+  (`one_scene_compiled_again_equals_the_whole_compile`), and `None` for
+  each case that could reach outside
+  (`what_could_reach_another_scene_takes_the_whole_compile`). Timed
+  (`drag_tick_timing`, a cloud container, milliseconds a tick):
+
+  | layers | scenes, and where the drag is | whole compile | one scene |
+  |---|---|---|---|
+  | 480 | 1 | 1.0 | 1.0 (not tried: the whole compile) |
+  | 480 | 12 equal | 1.4 | 0.16 |
+  | 480 | 12, the first holds 3/4: in the first | 0.9 | 0.6 |
+  | 480 | 12, the first holds 3/4: in a small one | 1.2 | 0.15 |
+  | 1 200 | 1 | 2.1 | 2.1 (not tried) |
+  | 1 200 | 12 equal | 2.2 | 0.41 |
+  | 1 200 | 12, the first holds 3/4: in the first | 2.6 | 2.0 |
+  | 1 200 | 12, the first holds 3/4: in a small one | 2.2 | 0.27 |
+
+  So: five to eight times less where the layers are spread over scenes,
+  about a fifth less in a scene that holds most of them, nothing in a
+  project of one scene (where it is not tried: trying cost a tenth
+  more). What a tick still does for every layer: the windows' table and
+  the roles (`check::intents`). Not timed: an imported model of many
+  parts. The numbers move by a third between runs on this machine.
 - **The drop no longer reads the history.** `next_history_number` takes
   the highest file name: 0.6 ms at 2 000 entries, where reading them all
   takes 14 ms (`history_numbers_come_from_file_names -- --nocapture`).

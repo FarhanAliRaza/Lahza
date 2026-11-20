@@ -47,7 +47,10 @@ const SLANG: [&str; 4] = [
     include_str!("../../../docs/slang/materials.md"),
 ];
 
-fn read_doc(uri: &str) -> Option<(String, &'static str)> {
+/// A document of the server (`lahza://guide`, `.../schema`, `.../catalog`,
+/// `.../styles`, `.../slang`) and its type: what an MCP client reads as a
+/// resource, for a client in process.
+pub fn read_doc(uri: &str) -> Option<(String, &'static str)> {
     Some(match uri {
         "lahza://guide" => (catalog::GUIDE.to_string(), "text/markdown"),
         "lahza://guide/breakdown" => (breakdown_section().to_string(), "text/markdown"),
