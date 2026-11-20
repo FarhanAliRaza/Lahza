@@ -258,13 +258,14 @@ blur away the contact shadows that are what is missing.
 
 All seven parts are built as far as this machine could take them (no
 GPU, no trained policy): what each does, what was measured and what is
-left is below. Morph targets are still refused. Across all of it: bakes
-are the same bytes on this machine from debug and release builds (pinned
-in tests), not checked on another architecture; the renderer's own test
-build is broken on this branch's base (`pt.rs` and `tests.rs` name
-`TraceOptions` and `ExportOptions` without their new `fast` and `shutter`
-fields), so its suite was run with those two files patched locally and
-not committed. In the order built:
+left is below. Morph targets are still refused. Across all of it: a bake
+is the same bytes from debug and release builds and on two containers
+(both Intel Xeons with FMA and AVX-512; the hashes are pinned in
+`motion-sim`'s tests). Not checked on a CPU without FMA or on ARM:
+rapier's own maths is software (`enhanced-determinism`) and the
+behaviours use `libm`, but what `compile` feeds the simulator (layer
+rotations to matrices) uses the standard library's sines, which glibc
+picks by CPU. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
@@ -291,7 +292,8 @@ not committed. In the order built:
      differs. A camera, material or light does not change the hash.
    - Deterministic: two bakes of a project are the same bytes, and the
      debug and release builds give the same bake (its hash is pinned in
-     `motion-sim`'s tests). Not checked on another CPU architecture.
+     `motion-sim`'s tests; a second container baked the same). See the
+     note above for what is not checked.
    - Measured (4 cores, one used): 32 bodies for 4.5 s, 1080 steps, in
      0.044 s; 501 boxes piling up for 5 s, 1200 steps, in 1.36 s (2.4 MB
      of bake); convex pieces of five extruded letters add 0.45 s. `check`

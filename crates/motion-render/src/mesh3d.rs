@@ -956,7 +956,7 @@ impl Pooled {
             segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
         }
         let (verts, tris) = (m.positions.len() as u32, m.tris.len() as u32);
-        (verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Skinned { base, matrices }, lo, hi, segments, animated: true })
+        (verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Skinned { base, matrices }, lo, hi, reach: None, segments, animated: true })
     }
 
     /// A mesh the GPU generates (`generated`) and moves by the layer's
