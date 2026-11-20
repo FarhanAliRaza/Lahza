@@ -872,6 +872,16 @@ impl super::Context {
     }
 
     pub(super) fn set_object_name<T: vk::Handle>(&self, object: T, name: &str) {
+        // Lahza: names are for validation and capture tools, and giving
+        // one goes through the Vulkan loader's lists of instances and
+        // devices, which it does not guard: with another device being
+        // made or destroyed on another thread (a renderer per preview, a
+        // device per test) it crashed there. So only where a tool reads
+        // them (`validation`, `capture`), or LAHZA_VK_NAMES is set.
+        static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.shader_debug_path.is_none() && !*WANTED.get_or_init(|| std::env::var_os("LAHZA_VK_NAMES").is_some()) {
+            return;
+        }
         let name_cstr = ffi::CString::new(name).unwrap();
         let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
             .object_handle(object)
