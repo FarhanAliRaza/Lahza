@@ -11,21 +11,30 @@ Done and run here (pictures looked at; on the merged tree, one thread,
 Mesa's software Vulkan: motion-render 181 tests pass and 19 are ignored
 (measures), motion-core 133, motion-sim 29, motion-mcp 37 and its
 integration tests, the app 116 and its four window tests under Xvfb):
-- The editor: drags that stalled, the prompt bar and its agent runner,
-  undo of a whole request, guarded writes, the inspector's tabs and hand
-  edits, the preview's choice of raster, sky or traced, the bake pill.
+- The editor: drags that stalled (a tick changes one layer and compiles
+  one scene), the prompt bar and its two agent runners (Claude Code, or
+  an API key alone), undo of a whole request, guarded writes, the
+  inspector's tabs and hand edits, the preview's choice of raster, sky or
+  traced, the bake pill.
 - Simulation: baked rigid bodies and joints, glTF skinning on the CPU and
-  in the GPU's mesh pool, ragdolls that fall and act, directing takes, a
-  policy's interface and a search controller, crowds.
+  in the GPU's mesh pool, ragdolls that fall, act, get up and do not
+  pass through themselves, directing takes, a policy's interface and a
+  search controller that steps, crowds of instances of one character
+  with far agents as pictures (5 000 baked and drawn), that plan round
+  walls and step aside.
 - The fast mode: a fast path without NVIDIA, its tests through a stand-in
   for Ray Reconstruction, `snapshot --fast`, history at cuts, jumps and
   transitions.
-- Lighting: sky visibility with one bounce in the raster, the same rays
-  on the CPU (the two agree), off unless asked for.
+- Lighting: sky visibility in the raster with the light that comes back
+  once and again, cards and see-through things in it, surfaces told
+  apart at edges, the same rays on the CPU (the two agree), off unless
+  asked for.
 - The renderer and its tests: a GPU shadow map's frame from its casters'
-  balls, debug names only where a tool reads them, a report of where the
-  GPU's frame leaves the CPU's, a benchmark for motion blur over still
-  groups.
+  balls and, for a point light, as the CPU frames it; a still mesh group
+  not redrawn under motion blur; shadow maps asked along the surface's
+  own normal; debug names only where a tool reads them; a report of
+  where the GPU's frame leaves the CPU's; a benchmark for motion blur
+  over still groups.
 - Since (a later session, the same kind of container): sky visibility
   tells surfaces apart by their planes (no steps along an edge), cards
   and see-through meshes hide the sky; a point light's GPU-drawn shadow
@@ -36,9 +45,11 @@ integration tests, the app 116 and its four window tests under Xvfb):
 
 To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
 in), since none of it can be seen from a container:
-1. Send one real request from the prompt bar: whether the tools run
-   without a permission refusal, whether the picture is read, how long a
-   scene takes ("Directing an agent from the editor").
+1. Send one real request from the prompt bar, with each runner (Claude
+   Code signed in; an API key alone, which was only run against a stub
+   server here): whether the tools run without a permission refusal,
+   whether the picture is read, how long a scene takes ("Directing an
+   agent from the editor").
 2. Drag values in the inspector: whether the bars now move freely
    ("Drags that stall").
 3. The fast mode on the card: `fast_tests`, its measure, and Ray
@@ -52,9 +63,10 @@ in), since none of it can be seen from a container:
    `LAHZA_MOTION_VIS_REPORT=1`): whether surface detail and area lights
    now pass, as the changes made since should have them, the two tracer
    tests that took whatever denoiser was installed.
-6. Simulation on the card: what skinning and crowds cost the GPU and the
-   tracer, with a character of real size; a bake on another kind of CPU
-   (both containers were Xeons with FMA).
+6. Simulation on the card: what skinning and crowds (instances and
+   pictures were never drawn by the GPU or the tracer) cost there, with a
+   character of real size; a bake on another kind of CPU (both
+   containers were Xeons with FMA).
 7. Slang: both of its points need slangc, which a cloud session cannot
    fetch.
 8. The motion blur benchmarks (shapes, and a still mesh group) and the
@@ -65,13 +77,11 @@ in), since none of it can be seen from a container:
 Not done, and why:
 - A trained policy for ragdolls: a GPU simulator, motion capture and
   days of training. Its interface and the no-training search are there.
-- Compiling only the edited scene on a drag tick: scenes share a
-  compiler (references across scenes, the Slang linker), for at most
-  1.7 ms at 1 200 layers.
-- A second agent runner (an API key, the tools in process): the
-  interface only.
-- Crowds as instances or impostors, a second bounce of sky light,
-  ragdolls that get up: each named in its section.
+- What each section names as left after its own work (for example
+  volumes in the sky's rays, a third return of its light, a place in the
+  app to type an API key, pictures of far agents taking the scene's
+  shadows, a ragdoll that gets up from its back): smaller than the
+  points above, each with its reason where it is named.
 
 ## Motion renderer
 
