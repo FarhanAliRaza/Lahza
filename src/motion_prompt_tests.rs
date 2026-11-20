@@ -380,13 +380,19 @@ fn prompt_bar_directs_an_agent_and_takes_its_request_back() {
 }
 
 /// One small request to the real Claude Code from the bar itself. It
-/// costs money (about $0.2 to $0.4): run it once, by name, signed in:
-/// `LAHZA_MOTION_SOFTWARE_GPU=1 xvfb-run -a cargo test --release -p lahza
-/// -- --ignored a_real_request_from_the_prompt_bar`. `LAHZA_AGENT_LOG`
+/// costs money (about $0.15), so it runs only when asked for by
+/// `LAHZA_REAL_AGENT=1` as well as by name (its name shares no word with
+/// the other window tests' filters): `LAHZA_REAL_AGENT=1
+/// LAHZA_MOTION_SOFTWARE_GPU=1 xvfb-run -a cargo test --release -p lahza
+/// -- --ignored a_real_request_is_sent_from_the_bar`. `LAHZA_AGENT_LOG`
 /// keeps Claude Code's stream.
 #[test]
-#[ignore = "sends a real request to Claude Code (costs money); requires a display"]
-fn a_real_request_from_the_prompt_bar() {
+#[ignore = "sends a real request to Claude Code (costs money: needs LAHZA_REAL_AGENT=1); requires a display"]
+fn a_real_request_is_sent_from_the_bar() {
+    if std::env::var_os("LAHZA_REAL_AGENT").is_none_or(|v| v != "1") {
+        println!("not run: a real request costs money; set LAHZA_REAL_AGENT=1 to send it");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("lahza-motion-prompt-real-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -697,6 +703,227 @@ fn by_hand_a_rim_light_a_lut_gradient_stops_and_the_picker() {
             draw(cx);
             wait(100).await;
             shot("by-hand-2-box.png");
+            cx.update(|cx| cx.quit()).unwrap();
+        })
+        .detach();
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Never answers; says when it is let go of.
+struct Lingering(Arc<std::sync::atomic::AtomicBool>);
+
+struct Held(Arc<std::sync::atomic::AtomicBool>);
+
+impl Running for Held {
+    fn stop(&mut self) {}
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Runner for Lingering {
+    fn name(&self) -> &'static str {
+        "Lingering"
+    }
+    fn available(&self) -> Availability {
+        Availability::Ready
+    }
+    fn start(&self, _: Request, events: Sender<Event>) -> Result<Box<dyn Running>, Failure> {
+        events.send(Event::Started { conversation: "c4".into() }).unwrap();
+        // (The sender is kept so the request stays open.)
+        std::mem::forget(events);
+        Ok(Box::new(Held(self.0.clone())))
+    }
+}
+
+/// With the pointer's own events: the picker is pressed, dragged and let
+/// go. Then a long bake shows its share and is stopped, and closing the
+/// window lets go of a request that is still running.
+#[test]
+#[ignore = "requires an X display and xdotool (can run under Xvfb)"]
+fn a_pointer_on_the_picker_a_bake_stopped_and_the_window_closed() {
+    let dir = std::env::temp_dir().join(format!("lahza-motion-pointer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots = std::env::var_os("LAHZA_WORKFLOW_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|| dir.clone());
+    std::fs::create_dir_all(&shots).unwrap();
+    std::env::set_var("LAHZA_CONFIG_DIR", dir.join("config"));
+    // A title, and enough boxes falling for long enough that the bake
+    // takes seconds.
+    let mut tb = Toolbox::new();
+    tb.cwd = dir.clone();
+    tb.call("project_create", json!({"path": "heap", "duration": 20, "width": 640, "height": 360})).unwrap();
+    let mut ops = vec![json!({"op": "add_scene", "id": "s1", "simulation": {"ground": {"y": 340}}}), json!({"op": "add", "id": "title", "kind": "text", "text": "Heap", "size": 40, "transform": {"position": [320, 40]}})];
+    for i in 0..150 {
+        ops.push(json!({"op": "add", "id": format!("b{i}"), "kind": "mesh", "mesh": {"type": "box", "size": [16, 16], "depth": 16}, "transform": {"position": [200 + (i % 15) * 17, 300 - (i / 15) * 30], "rotation": i * 7}, "body": {}}));
+    }
+    tb.call("edit_apply", json!({"ops": ops})).unwrap();
+    let project = dir.join("heap.lahza");
+    let open = project.clone();
+    let let_go: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    let runner = Arc::new(Lingering(let_go.clone()));
+    Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+        let handle = open_studio_window(cx, true, |handle, cx| {
+            cx.new(|cx| {
+                let mut studio = Studio::new(handle, None, None, cx);
+                studio.open_motion_project(open.clone());
+                studio.motion_agent = MotionAgent::new(runner.clone());
+                studio
+            })
+        })
+        .unwrap();
+        cx.activate(true);
+        cx.spawn(async move |cx| {
+            let wait = |ms| Timer::after(Duration::from_millis(ms));
+            let any: AnyWindowHandle = handle.into();
+            let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+            let shot = |name: &str| studio_workflow_tests::save_display(&shots.join(name), false);
+            wait(300).await;
+            any.update(cx, |_, window, _| {
+                window.activate_window();
+                window.refresh();
+            })
+            .unwrap();
+            wait(1200).await;
+            let editor = |cx: &mut gpui::AsyncApp| handle.update(cx, |s, _, _| s.motion_doc.as_ref().map(|d| d.editor.clone())).unwrap();
+            let mut framed = false;
+            for _ in 0..3600 {
+                wait(50).await;
+                draw(cx);
+                framed = editor(cx).is_some_and(|e| e.update(cx, |e, _| e.frame_png().is_some() && !e.sim_needs().is_empty()).unwrap());
+                if framed {
+                    break;
+                }
+            }
+            assert!(framed, "the preview rendered a frame and the missing bake was found");
+            let editor = editor(cx).unwrap();
+            // The picker, opened under the title's colour.
+            handle
+                .update(cx, |studio, _, cx| {
+                    editor.update(cx, |e, _| e.select(Some("title".into())));
+                    studio.motion_color_edit = Some(("title".into(), "color".into()));
+                    cx.notify();
+                })
+                .unwrap();
+            wait(400).await;
+            draw(cx);
+            wait(100).await;
+            draw(cx);
+            let square = handle.update(cx, |s, _, _| s.motion_picker_bounds.lock().unwrap()[0]).unwrap().expect("the square was laid out");
+            let entries = |cx: &mut gpui::AsyncApp| editor.update(cx, |e, _| lahza_motion_core::io::read_history(e.dir()).unwrap().len()).unwrap();
+            let before = entries(cx);
+            let colour = |cx: &mut gpui::AsyncApp| editor.update(cx, |e, _| e.color_state("title", "color")).unwrap();
+            // The X server's own pointer (xdotool), at the window's place
+            // on the screen.
+            let origin = any.update(cx, |_, window, _| window.bounds().origin).unwrap();
+            let pointer = |args: &[&str], at: Option<gpui::Point<gpui::Pixels>>| {
+                let mut command = std::process::Command::new("xdotool");
+                if let Some(at) = at {
+                    command.args(["mousemove", &format!("{:.0}", f32::from(origin.x + at.x)), &format!("{:.0}", f32::from(origin.y + at.y))]);
+                }
+                assert!(command.args(args).status().expect("xdotool is installed").success());
+            };
+            let middle = gpui::point(square.origin.x + square.size.width / 2.0, square.origin.y + square.size.height / 2.0);
+            let corner = gpui::point(square.origin.x + square.size.width - px(2.0), square.origin.y + px(2.0));
+            pointer(&["mousedown", "1"], Some(middle));
+            wait(300).await;
+            draw(cx);
+            let pressed = colour(cx);
+            let part = |hex: &str, i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap();
+            assert!((part(&pressed, 1) as i32 - 0x80).abs() < 6 && (part(&pressed, 3) as i32 - 0x40).abs() < 6, "the press shows the colour under it: {pressed}");
+            assert_eq!(entries(cx), before, "unsaved while held");
+            pointer(&[], Some(gpui::point(middle.x + px(30.0), middle.y - px(20.0))));
+            wait(100).await;
+            pointer(&[], Some(corner));
+            wait(300).await;
+            draw(cx);
+            let dragged = colour(cx);
+            assert!(part(&dragged, 1) > 0xf0 && part(&dragged, 3) < 0x10, "the drag follows the pointer: {dragged}");
+            pointer(&["mouseup", "1"], None);
+            wait(300).await;
+            draw(cx);
+            assert_eq!((colour(cx), entries(cx)), (dragged, before + 1), "let go: saved as one edit");
+            // The strip over the ruler, dragged from 4 s to 10 s.
+            let (ruler, spp, scroll) = handle
+                .update(cx, |s, _, _| {
+                    // (Its own statement: the next call locks the bounds too.)
+                    let ruler = s.video_timeline_bounds.lock().unwrap().expect("the ruler was laid out");
+                    (ruler, s.video_timeline_seconds_per_pixel(), s.video_timeline_scroll)
+                })
+                .unwrap();
+            let on_strip = |t: f64| gpui::point(ruler.origin.x + px((t / spp - scroll) as f32), ruler.origin.y - px(7.0));
+            pointer(&["mousedown", "1"], Some(on_strip(4.0)));
+            wait(200).await;
+            pointer(&[], Some(on_strip(7.0)));
+            wait(100).await;
+            pointer(&[], Some(on_strip(10.0)));
+            wait(200).await;
+            pointer(&["mouseup", "1"], None);
+            wait(300).await;
+            draw(cx);
+            let (a, b) = handle.update(cx, |s, _, _| s.motion_agent.span).unwrap().expect("the pointer marked a span");
+            assert!((a - 4.0).abs() < 0.2 && (b - 10.0).abs() < 0.2, "{a} to {b}");
+            wait(200).await;
+            shot("pointer-0-picker-and-span.png");
+            // A bake that takes a while: its share shows, and Stop ends it.
+            handle
+                .update(cx, |studio, _, cx| {
+                    studio.motion_color_edit = None;
+                    studio.bake_motion_simulation(cx);
+                })
+                .unwrap();
+            let began = std::time::Instant::now();
+            let mut share = 0.0;
+            for _ in 0..12000 {
+                wait(5).await;
+                share = editor.update(cx, |e, _| if e.baking() { e.bake_share().1 } else { -1.0 }).unwrap();
+                if share > 0.03 || share < 0.0 {
+                    break;
+                }
+            }
+            assert!(share > 0.03, "the bake said how far it was (it ended first: make the scene heavier)");
+            draw(cx);
+            wait(50).await;
+            shot("pointer-1-baking.png");
+            handle.update(cx, |studio, _, cx| studio.stop_motion_bake(cx)).unwrap();
+            let mut ended = false;
+            for _ in 0..2000 {
+                wait(10).await;
+                draw(cx);
+                ended = editor.update(cx, |e, _| !e.baking()).unwrap();
+                if ended {
+                    break;
+                }
+            }
+            println!("bake: {:.0}% after {:.2} s, stopped", share * 100.0, began.elapsed().as_secs_f64());
+            assert!(ended, "the bake stopped");
+            let said = editor.update(cx, |e, _| e.status().to_string()).unwrap();
+            assert!(said.contains("stopped"), "{said}");
+            assert!(!lahza_motion_core::sim::bake_path(&project, "s1").is_file(), "nothing was written");
+            assert!(began.elapsed() < Duration::from_secs(60));
+            draw(cx);
+            wait(100).await;
+            shot("pointer-2-stopped.png");
+            // A request still running when the window closes is let go of
+            // (a real runner's child ends when it is).
+            handle.update(cx, |studio, _, cx| studio.send_motion_prompt("anything", cx)).unwrap();
+            wait(200).await;
+            assert!(handle.update(cx, |s, _, _| s.motion_agent.busy()).unwrap());
+            assert!(!let_go.load(std::sync::atomic::Ordering::SeqCst));
+            any.update(cx, |_, window, _| window.remove_window()).unwrap();
+            let mut gone = false;
+            for _ in 0..100 {
+                wait(50).await;
+                gone = let_go.load(std::sync::atomic::Ordering::SeqCst);
+                if gone {
+                    break;
+                }
+            }
+            assert!(gone, "closing the window ends the request");
             cx.update(|cx| cx.quit()).unwrap();
         })
         .detach();

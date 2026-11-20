@@ -10,7 +10,11 @@ the short of it.
 Done and run here (pictures looked at; on the merged tree, one thread,
 Mesa's software Vulkan: motion-render 186 tests pass and 21 are ignored
 (measures), motion-core 135, motion-sim 35, motion-mcp 38 and its
-integration tests, the app 122 and its four window tests under Xvfb):
+integration tests, the app 122 and its four window tests under Xvfb;
+since, the editor's own later session: motion-sim 36, motion-mcp 39,
+the app 125 with three of `timeline_preview`'s failing in that
+container as before its changes (no `avenc_ffv1`: GStreamer's libav
+plugins were not installed), and seven window tests under Xvfb):
 - The editor: drags that stalled (a tick changes one layer and compiles
   one scene), the prompt bar and its two agent runners (Claude Code, or
   an API key alone), undo of a whole request, guarded writes, the
@@ -78,8 +82,8 @@ Not done, and why:
 - A trained policy for ragdolls: a GPU simulator, motion capture and
   days of training. Its interface and the no-training search are there.
 - What each section names as left after its own work (for example
-  volumes in the sky's rays, a third return of its light, a place in the
-  app to type an API key, pictures of far agents taking the scene's
+  volumes in the sky's rays, a third return of its light, pictures of
+  far agents taking the scene's
   shadows, a ragdoll that gets up from its back): smaller than the
   points above, each with its reason where it is named.
 
@@ -1126,8 +1130,9 @@ container; the server is the app's own `mcp`):
   spent two calls on "no project is open" (`compose` now says to open
   it first); both wasted a `set` without `target`, and one a shape that
   does not exist ("ellipse").
-- From the prompt bar (`a_real_request_from_the_prompt_bar`, an ignored
-  window test that costs money: under Xvfb, once): the title selected,
+- From the prompt bar (`a_real_request_is_sent_from_the_bar`, an ignored
+  window test that costs money and so also needs `LAHZA_REAL_AGENT=1`;
+  under Xvfb): the title selected,
   "make this one red" typed, Enter. 18 s, five turns, four calls
   (`project_open`, `timeline_get` with `full`, `edit_apply` with
   `set title.color`, `snapshot`), $0.139, no call failed and no
@@ -1135,7 +1140,10 @@ container; the server is the app's own `mcp`):
   clip as it came, the proposal row came back with Keep, Undo, Again
   and Hold to compare, the AI tab listed the steps and the cost, the
   history has one entry with the request's id, and one Undo put the
-  title back to white (screenshots looked at).
+  title back to white (screenshots looked at). It was sent a second
+  time by mistake (a test filter, `prompt_bar`, matched its old name:
+  hence the new name and the variable) and passed again; that run's
+  turns and cost were not kept.
 - Before that run the system prompt (`SYSTEM`, both runners) was given
   the exact form of `set`, `key`, `add` and `remove`, the shapes there
   are and where a colour lives, and told to read the layer
@@ -1156,10 +1164,14 @@ Left, each with what it needs:
   not from an answer. With `ANTHROPIC_API_KEY` set: choose "API key" in
   the AI tab and send one request.
 - **A real desktop.** Requests kept in `requests.json` read back after a
-  real restart; whether closing the window while a request runs ends
-  the agent (a dropped runner stops its child and sets the loop's stop
-  flag: whether GPUI drops the studio on close was not checked); the
-  whole of "How it should be used" with a mouse.
+  real restart (keeping and reading them is tested; a restart of the
+  app is not); the whole of "How it should be used" with a mouse in a
+  hand. Checked since under Xvfb
+  (`a_pointer_on_the_picker_a_bake_stopped_and_the_window_closed`):
+  closing the window while a request runs lets go of its runner (GPUI
+  drops the studio; a real runner's `Drop` ends its child), and the X
+  server's own pointer (xdotool) presses, drags and lets go of the
+  colour picker and drags a span on the strip over the ruler.
 - **A piece made on a recording, by a real agent.** With no piece open
   the words ask for a new one on the span; a stand-in that makes the
   real tool calls (`project_create` with the recording, `edit_apply`,
@@ -1272,9 +1284,10 @@ with a mouse on a real desktop.
 - **A span is marked** by one gesture in both places: a drag along the
   strip at the top of the ruler (over it on a motion project, its top
   8 px on a recording; the rest of the ruler still scrubs). A click
-  clears it; Shift-drag anywhere on the ruler does the same. The strip on
-  a recording is seen in a screenshot; its drag was driven through the
-  code, not with a pointer.
+  clears it; Shift-drag anywhere on the ruler does the same. On a motion
+  project the strip was dragged by the X server's pointer under Xvfb
+  (xdotool: 4 s to 10 s marked); on a recording it is seen in a
+  screenshot and its drag was driven through the code.
 - **The inspector has two tabs**: Properties, and AI (what was asked
   about this layer, each step, what it said, keep / undo / again). With
   nothing selected the AI list shows every request.
@@ -1302,8 +1315,9 @@ with a mouse on a real desktop.
   tells a `Watch` the share before each frame and stops when it answers
   no (`a_bake_says_its_share_and_stops_when_told`; `Toolbox::bake_watch`
   passes it through `sim_bake`). A stopped bake writes nothing: the
-  simulation stays as it was. Not seen: the pill mid-bake in a
-  screenshot (the test scene bakes in a few milliseconds).
+  simulation stays as it was. Seen under Xvfb with 150 boxes over
+  twenty seconds: the pill at 4% and its Stop, and the bake ended
+  0.3 s after it began with no file written.
 - **By hand stays cheap**: the inspector edits a text layer's words (shown
   as typed, saved when the field is left), its font (the bundled ones and
   the font files in the project's `assets/`), colour, size and tracking;
@@ -1325,8 +1339,8 @@ with a mouse on a real desktop.
   project's. Seen under Xvfb
   (`by_hand_a_rim_light_a_lut_gradient_stops_and_the_picker`). Left for
   a desktop: the file chooser itself (a portal dialog: `add_motion_lut`
-  behind it was run with a path), and the picker under a real pointer
-  (its drag was driven through the code with the laid-out bounds).
+  behind it was run with a path). The picker was dragged by the X
+  server's pointer under Xvfb (xdotool), not by a hand.
 
 ## Slang
 

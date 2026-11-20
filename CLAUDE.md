@@ -64,9 +64,14 @@ run on Mesa's software Vulkan:
 sudo apt install -y mesa-vulkan-drivers libvulkan-dev xvfb \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good
 LAHZA_MOTION_SOFTWARE_GPU=1 cargo test --release -p lahza-motion-render -- --test-threads=1
-xvfb-run -a cargo test --release -p lahza -- --ignored --test-threads=1 prompt_bar editor_window
+xvfb-run -a cargo test --release -p lahza -- --ignored --test-threads=1 motion_prompt_tests editor_window
 ```
 
+- The window tests are the ignored ones of `motion_prompt_tests` and
+  `editor_window_edits_and_reloads`; one of them drives the X pointer and
+  needs `xdotool`. `a_real_request_is_sent_from_the_bar` sends a request
+  to Claude Code, which costs money: it does nothing unless
+  `LAHZA_REAL_AGENT=1` is set, and no other test's filter matches it.
 - Without `LAHZA_MOTION_SOFTWARE_GPU=1` the GPU tests return early and
   pass without testing anything.
 - Keep `--test-threads=1`: several software devices at once exhaust a
