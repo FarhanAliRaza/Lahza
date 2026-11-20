@@ -1889,13 +1889,28 @@ impl ShadowMap {
     fn gpu_directional(casters: &Arc<Casters>, boxes: &[CasterBox], toward: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
         let l = unit3(toward);
         let (u, v) = basis(l);
-        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-        let (mut near, mut far) = (f64::INFINITY, f64::NEG_INFINITY);
-        for caster in boxes {
-            let [x, y, c] = caster.spans([u, v, l]);
-            b = [b[0].min(x.0), b[1].min(y.0), b[2].max(x.1), b[3].max(y.1)];
-            (near, far) = (near.min(c.0), far.max(c.1));
-        }
+        // By box and ball first (cheap), which no caster reaches past;
+        // then each side of the frame from the points of the few casters
+        // that could be its outermost: the widest by its box first, until
+        // the next one's box is within what the points have given. (A jar
+        // of 300 bubbles: a handful of them are walked, not all.)
+        let loose: Vec<[(f64, f64); 3]> = boxes.iter().map(|c| [c.span(u), c.span(v), c.span(l)]).collect();
+        let mut exact: Vec<Option<[(f64, f64); 3]>> = vec![None; boxes.len()];
+        let mut side = |k: usize, upper: bool| {
+            let at = |s: &[(f64, f64); 3]| if upper { s[k].1 } else { -s[k].0 };
+            let mut order: Vec<usize> = (0..boxes.len()).collect();
+            order.sort_by(|i, j| at(&loose[*j]).total_cmp(&at(&loose[*i])));
+            let mut best = f64::NEG_INFINITY;
+            for i in order {
+                if at(&loose[i]) <= best {
+                    break;
+                }
+                best = best.max(at(exact[i].get_or_insert_with(|| boxes[i].spans([u, v, l]))));
+            }
+            if upper { best } else { -best }
+        };
+        let b = [side(0, false), side(1, false), side(0, true), side(1, true)];
+        let (near, far) = loose.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |m, s| (m.0.min(s[2].0), m.1.max(s[2].1)));
         if std::env::var_os("LAHZA_SHADOW_FRAMES").is_some() {
             eprintln!("shadow frame (GPU, directional): {b:?}");
         }

@@ -132,11 +132,31 @@ Not done, and why:
   (`a_point_lights_frame_holds_its_casters_and_little_more`: a floor
   around the light framed as the CPU frames it; a ball's frame within 5%
   of its points', its box's a third larger). Not run on the card: the
-  118 pixels there are to be counted again. Still as before: meshes the
-  GPU generates (the CPU has no points: their boxes, and the boxes'
-  middle for the aim as soon as one caster has none), and a closed
-  caster around the light is framed with its faces turned from the light
-  (the CPU leaves those out).
+  118 pixels there are to be counted again.
+  Since, a directional light's map too (`gpu_directional`): each side
+  of its frame is taken from the points of the casters that could be its
+  outermost (the widest by box and ball first, until the next one's box
+  is within what the points have given; a caster of up to 16384
+  triangles, 200000 points a list: `FRAME_TRIS`, `FRAME_POINTS`), which
+  is the CPU's frame: that one is from the points of the triangles
+  facing the light, and a closed caster's outline is among them. With
+  `LAHZA_SHADOW_FRAMES=1` the two frames are the same to the last digit
+  in `gpu_matches_cpu_meshes`, `gpu_matches_cpu_shadows_and_occluders`
+  and `gpu_matches_cpu_surface_detail` (in the first the GPU's was 13
+  and 15 units wider on two sides). The 300 bubbles' maps still cost
+  the list 0.24 ms (2.1 ms with every caster's points walked, which is
+  why only the outermost are).
+  As before, and why: a mesh the GPU generates in its pool is framed by
+  its box (the CPU has no points of it, and draws no such mesh: there is
+  no CPU frame to be like; its true bounds would have to be read back
+  from the GPU, a frame late), and the aim of a point light's map is the
+  middle of the boxes as soon as one caster is such a mesh. A caster of
+  more than 16384 triangles is framed by its box and ball. A closed
+  caster around a point light is framed with its faces turned from the
+  light too. To run on the RTX 3060: `LAHZA_SHADOW_FRAMES=1
+  LAHZA_MOTION_VIS_REPORT=1 cargo test --release -p lahza-motion-render
+  gpu_matches_cpu_area_lights -- --nocapture --test-threads=1`, then the
+  same test without the two variables: whether it passes.
 - **Motion blur: what is left.** A frame takes the sub-frames its motion
   needs (`motion_px` in motion-render's lib.rs), and a sub-frame does not
   draw again what the one before it left as it needs it: a group whose
@@ -185,11 +205,32 @@ Not done, and why:
   shorter and telling the stretches apart costs 8 ms of CPU (the two
   512 x 512 CPU-drawn shadow maps are rows of the list and are compared
   whole; a list for the visibility pass has no such rows). Nothing is
-  claimed for a card: to run there. Not done: traced frames' groups (a
-  traced group is never the same: its picture is new each sub-frame, and
-  where samples share traces nothing is compared at all), and a mesh
-  primitive still counts as reading the groups before it, so one
-  earlier group that moved has it drawn again.
+  claimed for a card: to run there (`LAHZA_MOTION_SOFTWARE_GPU` unset:
+  `cargo test --release -p lahza-motion-render -- --ignored --nocapture
+  --test-threads=1 benchmark_motion_blur`; its profile has the passes'
+  times).
+  Since: a mesh primitive counts as reading groups only when it does (a
+  card's picture, a glass mesh's backdrop, the sky's:
+  `gpu::mesh_reads_groups`), so a group before it that moved no longer
+  has it drawn again (the test's scene has such a group now). And *a
+  shape that changes form* no longer takes every sample when its points'
+  way can be bounded (`motion_px`'s `shape`): its paint alone is no
+  motion; its size, corner radius or thickness, for the kinds drawn in
+  their box, moves no point farther than the box's corners. A circle
+  growing a pixel a second takes two samples where it took eight
+  (`motion_blur_takes_the_samples_the_motion_needs`,
+  `a_shape_changing_form_moves_as_far_as_its_box`).
+  Still every sample, and why: a path that morphs or is trimmed and a
+  field's points (how far a point goes along a path is not in the
+  layer's state), text whose glyphs are animated (their places are laid
+  out by the fonts, which the estimate does not have), a shader picture
+  (what its function paints cannot be bounded from outside).
+  Not to do, traced frames' groups: a traced picture is new in every
+  sub-frame by its rays, and the 2D groups beside it sit side by side
+  for the samples that share the trace (`merge`'s `separate`), so
+  leaving one as drawn would mean reading another sample's texels; a
+  traced frame's time is its rays (486 ms on s01, below) and a 2D
+  group's pass is under the noise even in a raster frame (above).
 - **Image memory: what is left.** Textures are held at the size they show
   (`Images::get_sized`), the pool's budget follows the GPU's memory, and
   new texels are added to the GPU's copy (all of it again only after
@@ -626,14 +667,40 @@ What is left:
   206, 224 without). GPU against CPU: no pixel over 3 levels in the
   three. Seen: the card's shadow on the floor against the traced one
   (the traced is grainier at its edge, the same size and tint).
-  Left, lit as before and hiding nothing: volumes (they need the
-  tracer's marching), wires and shadow catchers (now gone through by
-  every ray: before, one that met a catcher first counted as open),
-  meshes that blend otherwise than over what is behind them, meshes
-  whose coverage a Slang surface works out, opacity from a map (the rule
-  reads the material's own), and flat layers under 0.999 opaque (they
-  are not cards). The cost of cards in the rays (their pictures read at
-  each crossing) was not measured.
+  Since:
+  - *Volumes* hide the sky by their density: every crossing of a
+    volume's faces along a ray is found, the density between them is
+    marched in eight even steps a crossing (pt.wgsl `sky_through`, the
+    tracer's own density lookup; its walk through a volume is by lot,
+    this is not), and that much less of the ray goes on: less of the
+    open sky, less of the light back from what it ends on. The same on
+    the CPU with its own density lookup (`sky_cpu.rs` `through`). What
+    ends in a volume sends nothing back (its scattered light is not
+    worked out), and a volume itself is lit by its own march as before.
+  - *A filled wireframe* hides the sky by its faces' fill (at least half
+    opaque) and sends its fill's colour back as it is; *an unlit
+    surface* sends its own colour back (it was lit like any other).
+  `sky_tests::a_volume_hides_the_sky_by_its_density` (320 x 180, the
+  floor in front of a slab hanging over it, of 255): nothing there 213,
+  thin haze 209, thick haze 190, a cloud of the thick haze's density
+  210, a filled wireframe 183; GPU against CPU no pixel over 3 levels in
+  any. Seen: the slab of haze's soft shadow on the floor, the cloud's
+  fainter one, the wireframe box's as a solid's.
+  - *The cost of cards in the rays*
+    (`sky_tests::measure_cards_in_the_rays`, `--ignored`, 480 x 270,
+    software Vulkan): sky visibility adds 26 ms a frame to the scene
+    without a card (35 to 61) and 46 ms with one (41 to 87): a card's
+    picture is read at every crossing. On the CPU 55 ms and 66 ms.
+  Hiding nothing, and meant to: a shadow catcher (it is not there but
+  for the shadows on it), a wireframe's lines without a fill (a px or
+  two of the screen, whatever the distance: nothing a ray can meet), a
+  mesh that blends otherwise than over what is behind it (a glow adds
+  light), a flat layer under 0.999 opaque (it is drawn flat, not as a
+  card in the depth). There is no opacity from a map (materials have
+  none: that line was a guess). Needs slangc, which a container cannot
+  fetch: a mesh whose coverage a Slang surface works out (`in_sky`
+  leaves it out; with slangc, its coverage would be asked of the
+  surface's function at each crossing).
 - **The two-px steps at an edge between two surfaces: done.** The
   lookup told surfaces apart by depth alone, so two at nearly one depth
   mixed, a texel at a time (a crease, a slab's front over the gap under
@@ -668,19 +735,26 @@ What is left:
   times the mean base colour of what the rays hit, is added (pt.wgsl
   `sky_second`, the same in `sky_cpu.rs`; GPU and CPU still within a
   level). It closes about a third of the gap (4% to 3%, 8% to 6% under
-  the table). What is left: surfaces the picture does not show send
-  nothing back a second time, the environment at what a ray hits is
-  taken whole (not by what that point sees of it), and there is no
-  third return. Anything mirrored of other things: not done. The fast
-  mode has all of it.
-- Not done, with what each needs:
-  - *Wires, shadow catchers and volumes hiding the sky and taking it,
-    and coverage as a ray's weight* in place of the step at one half
-    (above). Volumes need the tracer's marching.
-  - *Meshes the GPU generates in its pool* are not in the CPU's rays.
-    Their bounds as a stand-in were not added: the CPU's frame does not
-    draw such a mesh at all, and a box hiding the sky from the rest
-    where nothing is drawn would be wrong another way.
+  the table).
+  *A third return: measured, not to be added.* The traced picture with
+  one bounce more each time (`sky_tests::measure_a_third_return`,
+  `--ignored`, 256 paths; the room lit by the environment, the table
+  under the default lights; levels of 255 over the whole picture and at
+  the darkest floor): from 2 bounces to 3, +3.9 and +6.0 (the room),
+  +1.1 and +7.0 (the table); from 3 to 4, +1.0 and +1.7, +0.3 and +1.7;
+  from 4 to 5, +0.3 and +1.4, +0.1 and +0.8; from 5 to 6 under half a
+  level. Whichever of these a third return is, it is a level over the
+  picture and under two at the darkest place, where sky visibility is
+  already 14 levels off the traced picture the other way (148 for 134
+  under the ball: what a ray ends on is lit as if it saw the whole
+  environment; 180 for 194 under the table).
+  The method's limits, which more rays in the picture's plane do not
+  lift (the fast mode has none of them): a surface the picture does not
+  show sends nothing back a second time; the environment at what a ray
+  ends on is taken whole; a surface or a card hides all of a ray or none
+  (the step at one half: only volumes take a share); nothing is
+  mirrored of other things. A mesh the GPU generates in its pool is not
+  in the CPU's rays, as it is not in the CPU's frame at all.
 
 Not to do: light probes placed through the scene (irradiance volumes,
 DDGI). They suit large scenes that stand still; these are small and
@@ -1427,6 +1501,24 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
     alone the fix took about 1090 pixels out of the 4x report), since
     the card draws its own shadow maps where the test's usual run on
     software Vulkan gives the GPU the CPU's: to be counted again there.
-    The same holds for a shadow's edge in the other three tests: the
-    GPU's directional map is still framed by boxes and balls, a little
-    wider than the CPU's from every point.
+  - *The other two, `gpu_matches_cpu_meshes` (215 on the card, 103
+    allowed) and `defocused_instancer_copies_keep_their_depth` (3, none
+    allowed).* The grid alone, measured on the CPU
+    (`mesh_tests::measure_snapping_in_the_cards_other_tests`,
+    `--ignored`): the instancer's copies 3 pixels over 3 levels, the
+    card's own count, so that test fails there by the rasteriser's grid
+    and nothing else; meshes 32 and 40 pixels at its two moments, of the
+    card's 215. For the rest of those: at 4x here the report has 158 and
+    153 pixels away from edges, all of them looked at and all on faint
+    edges the report does not take for edges (the star's dark side, the
+    glass cone), none on a face; and the GPU's directional shadow map
+    was framed 13 and 15 units wider than the CPU's on two sides in that
+    scene, now the same (see "Shadow maps on the GPU"), which moves a
+    shadow's edge by a part of a texel. So what is left of the 215
+    should be within the 103; not known until run there.
+    To run on the RTX 3060: `cargo test --release -p lahza-motion-render
+    -- --test-threads=1 gpu_matches_cpu defocused_instancer`, and for
+    any that still fails the same with `LAHZA_MOTION_VIS_REPORT=1
+    LAHZA_MOTION_DUMP=<dir> -- --nocapture`. If only the instancer's 3
+    remain, allow them: `assert_gpu_matches_cpu_within(&p, &[0.0],
+    0.0001)` in that test (the grid is the device's, not a fault).
