@@ -3710,6 +3710,7 @@ version = "0.1.0"
 dependencies = [
  "kurbo",
  "libloading 0.8.9",
+ "libm",
  "serde",
  "serde_json",
 ]

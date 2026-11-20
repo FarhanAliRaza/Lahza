@@ -303,7 +303,7 @@ impl Curve {
             Ease::Exp { r, tau } => {
                 let tau = match (tau, r) {
                     (Some(tau), _) => tau.seconds(base)?,
-                    (None, Some(r)) => -base.fps.frame() / r.ln(),
+                    (None, Some(r)) => -base.fps.frame() / crate::dm::ln(*r),
                     (None, None) => bail!("exp ease needs r or tau"),
                 };
                 if !(tau > 0.0) {
@@ -327,7 +327,7 @@ impl Curve {
     pub fn raw(&self, t: f64) -> f64 {
         let t = t.max(0.0);
         match *self {
-            Curve::Exp { tau } => 1.0 - (-t / tau).exp(),
+            Curve::Exp { tau } => 1.0 - crate::dm::exp(-t / tau),
             Curve::Spring { zeta, omega } => spring(zeta, omega, t),
             _ => self.shape(t.min(1.0)),
         }
@@ -347,17 +347,17 @@ impl Curve {
             }
             Curve::Bezier(p) => bezier(p, u),
             Curve::Power { n, mode } => match mode {
-                PowerMode::In => u.powf(n),
-                PowerMode::Out => 1.0 - (1.0 - u).powf(n),
+                PowerMode::In => crate::dm::powf(u, n),
+                PowerMode::Out => 1.0 - crate::dm::powf(1.0 - u, n),
                 PowerMode::InOut => {
                     if u < 0.5 {
-                        0.5 * (2.0 * u).powf(n)
+                        0.5 * crate::dm::powf(2.0 * u, n)
                     } else {
-                        1.0 - 0.5 * (2.0 - 2.0 * u).powf(n)
+                        1.0 - 0.5 * crate::dm::powf(2.0 - 2.0 * u, n)
                     }
                 }
             },
-            Curve::Slam { n } => u.powf(n),
+            Curve::Slam { n } => crate::dm::powf(u, n),
             Curve::Bounce { bounces, ratio, exponent } => bounce(u, bounces, ratio, exponent),
             Curve::Exp { .. } | Curve::Spring { .. } => u,
         }
@@ -386,7 +386,7 @@ impl Curve {
     /// of 1 (uncorrected). Shape curves report 1.0 (their unit duration).
     pub fn settle_time(&self, tolerance: f64) -> f64 {
         match *self {
-            Curve::Exp { tau } => -tau * tolerance.ln(),
+            Curve::Exp { tau } => -tau * crate::dm::ln(tolerance),
             Curve::Spring { .. } => {
                 let mut t = 6.0;
                 let dt = 1.0 / 2000.0;
@@ -456,16 +456,16 @@ impl Curve {
 fn spring(zeta: f64, omega: f64, t: f64) -> f64 {
     if zeta < 1.0 {
         let wd = omega * (1.0 - zeta * zeta).sqrt();
-        let decay = (-zeta * omega * t).exp();
-        1.0 - decay * ((wd * t).cos() + zeta * omega / wd * (wd * t).sin())
+        let decay = crate::dm::exp(-zeta * omega * t);
+        1.0 - decay * (crate::dm::cos(wd * t) + zeta * omega / wd * crate::dm::sin(wd * t))
     } else if (zeta - 1.0).abs() < 1e-9 {
-        1.0 - (-omega * t).exp() * (1.0 + omega * t)
+        1.0 - crate::dm::exp(-omega * t) * (1.0 + omega * t)
     } else {
         let s = (zeta * zeta - 1.0).sqrt();
         let r1 = -omega * (zeta - s);
         let r2 = -omega * (zeta + s);
         // x(0)=0, x'(0)=0 for the displacement from target.
-        1.0 - (r2 * (r1 * t).exp() - r1 * (r2 * t).exp()) / (r2 - r1)
+        1.0 - (r2 * crate::dm::exp(r1 * t) - r1 * crate::dm::exp(r2 * t)) / (r2 - r1)
     }
 }
 
@@ -513,7 +513,7 @@ fn bounce(u: f64, bounces: u32, ratio: f64, exponent: f64) -> f64 {
     }
     let mut t = u * total;
     if t <= 1.0 {
-        return t.powf(exponent);
+        return crate::dm::powf(t, exponent);
     }
     t -= 1.0;
     for k in 1..=bounces {
@@ -521,7 +521,7 @@ fn bounce(u: f64, bounces: u32, ratio: f64, exponent: f64) -> f64 {
         let height = ratio.powi(2 * k as i32);
         if t <= 2.0 * half {
             let s = (t - half) / half;
-            return 1.0 - height * (1.0 - s.abs().powf(exponent));
+            return 1.0 - height * (1.0 - crate::dm::powf(s.abs(), exponent));
         }
         t -= 2.0 * half;
     }

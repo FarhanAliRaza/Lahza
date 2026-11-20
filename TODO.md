@@ -696,11 +696,14 @@ is the same bytes from debug and release builds and on two containers
 (both Intel Xeons with FMA and AVX-512; the hashes are pinned in
 `motion-sim`'s tests; the eight pinned since, for getting up, bones
 meeting, instances, a way round a wall, stepping aside and the search,
-were made on one of them and are to be confirmed on the other). Not checked on a CPU without FMA or on ARM:
-rapier's own maths is software (`enhanced-determinism`) and the
-behaviours use `libm`, but what `compile` feeds the simulator (layer
-rotations to matrices) uses the standard library's sines, which glibc
-picks by CPU. In the order built:
+were made on one of them and are to be confirmed on the other). Nothing a bake is made
+from goes through the C library now: rapier's maths is software
+(`enhanced-determinism`), the behaviours, crowds and search use `libm`,
+and everything `compile` works out (layer rotations, curves, cameras)
+goes through `core::dm` (`libm`'s sines, powers and logarithms; lengths
+by multiply and square root), which left every pin as it was. Whether
+the pins hold on a CPU without FMA and on ARM is being run by the
+coordinating session. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).

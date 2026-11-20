@@ -299,7 +299,7 @@ fn apply_add<T: Animatable>(add: &CAdd<T>, v: T, t: f64) -> T {
         CAdd::Drift { rate, mul, from, until } => {
             let elapsed = (t.min(*until) - from).max(0.0);
             if *mul {
-                v.map2(rate, |x, r| x * (1.0 + r).max(1e-6).powf(elapsed))
+                v.map2(rate, |x, r| x * crate::dm::powf((1.0 + r).max(1e-6), elapsed))
             } else {
                 v.add(&rate.scale(elapsed))
             }
@@ -324,7 +324,7 @@ fn apply_add<T: Animatable>(add: &CAdd<T>, v: T, t: f64) -> T {
             if t < *from || t > *until {
                 return v;
             }
-            let s = (std::f64::consts::TAU * ((t - from) * hz + phase)).sin();
+            let s = crate::dm::sin(std::f64::consts::TAU * ((t - from) * hz + phase));
             v.add(&amp.scale(s))
         }
     }
@@ -484,7 +484,7 @@ pub fn compile<T: Animatable>(prop: &Property<T>, ctx: &mut Ctx) -> Result<Prop<
                 // Rates are stored per second.
                 let rate = match mode {
                     Mode::Add => rate.scale(k),
-                    Mode::Mul => T::from_fn(|i| (1.0 + rate.get(i)).max(1e-6).powf(k) - 1.0),
+                    Mode::Mul => T::from_fn(|i| crate::dm::powf((1.0 + rate.get(i)).max(1e-6), k) - 1.0),
                 };
                 CAdd::Drift { rate, mul: *mode == Mode::Mul, from, until }
             }

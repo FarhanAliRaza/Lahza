@@ -45,7 +45,7 @@ impl Affine {
     }
     /// Clockwise degrees in a y-down space.
     pub fn rotate(degrees: f64) -> Self {
-        let (s, c) = degrees.to_radians().sin_cos();
+        let (s, c) = crate::dm::sin_cos(degrees.to_radians());
         Affine([c, s, -s, c, 0.0, 0.0])
     }
     /// self ∘ other: apply `other` first.
@@ -1948,9 +1948,9 @@ impl Compiled {
                 // The incoming scene grows from half size; its background
                 // is drawn large enough to fill the frame the whole time,
                 // so no hard-edged box or border shows around it.
-                let k = 0.5f64.powf(1.0 - p);
+                let k = crate::dm::powf(0.5f64, 1.0 - p);
                 vec![
-                    self.scene_group(a, ta, about_centre(4f64.powf(p)), (1.0 - p).clamp(0.0, 1.0)),
+                    self.scene_group(a, ta, about_centre(crate::dm::powf(4f64, p)), (1.0 - p).clamp(0.0, 1.0)),
                     self.scene_group_bg(b, tb, about_centre(k), p.clamp(0.0, 1.0), 1.0 / k + 0.02),
                 ]
             }
@@ -1964,7 +1964,7 @@ impl Compiled {
                     // list.rs). Snapping the offset to that grid puts the
                     // seam on a texel edge, so no partly covered texel lets
                     // a covered background bleed into the smear.
-                    let factor = if sigma <= 4.0 { 1.0 } else { 2f64.powf((sigma / 4.0).log2().ceil()).min(16.0) };
+                    let factor = if sigma <= 4.0 { 1.0 } else { crate::dm::powf(2f64, crate::dm::log2(sigma / 4.0).ceil()).min(16.0) };
                     let len = if dx != 0.0 { w } else { h };
                     let q = len / (len / factor).ceil();
                     let at = |k: f64| ((dx * k / q).round() * q, (dy * k / q).round() * q);
@@ -2147,7 +2147,7 @@ fn follow_origin(layers: &[CLayer], f: &CFollow, t: f64, tc: f64, inherited: Opt
     let mut m = Mat4::translate(p[0], p[1], p[2]);
     if f.rotate {
         let q = tm.apply(x + dx, y + dy, 0.0);
-        m = m.then(Mat4::rotate_z((q[1] - p[1]).atan2(q[0] - p[0]).to_degrees()));
+        m = m.then(Mat4::rotate_z(crate::dm::atan2(q[1] - p[1], q[0] - p[0]).to_degrees()));
     }
     let o = f.offset.at(t);
     m.then(Mat4::translate(o.x(), o.y(), 0.0))
@@ -2286,12 +2286,12 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                         v[2] *= t;
                     }
                     PostKind::DirectionalBlur => {
-                        let (s, c) = v[0].to_radians().sin_cos();
+                        let (s, c) = crate::dm::sin_cos(v[0].to_radians());
                         let len = v[1] * scale;
                         v = [c * len, s * len, 0.0, 0.0, 0.0];
                     }
                     PostKind::RgbSplit => {
-                        let (s, c) = v[1].to_radians().sin_cos();
+                        let (s, c) = crate::dm::sin_cos(v[1].to_radians());
                         let len = v[0] * scale;
                         v = [c * len, s * len, 0.0, 0.0, 0.0];
                     }
@@ -2774,7 +2774,7 @@ mod tests {
         let (o, x) = placed(&c, 0.0, "arrow");
         assert!(near(o, (520.0, 560.0)), "{o:?}");
         // Path direction (down) plus its own 10°.
-        let (s, k) = 100f64.to_radians().sin_cos();
+        let (s, k) = crate::dm::sin_cos(100f64.to_radians());
         assert!(near(x, (k, s)), "{x:?}");
     }
 

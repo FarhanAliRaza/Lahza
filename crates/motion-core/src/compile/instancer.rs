@@ -134,7 +134,7 @@ impl Compiler<'_> {
                             // Uniform over the disc.
                             Area::Circle => {
                                 let (r, a) = (u.sqrt() / 2.0, v * std::f64::consts::TAU);
-                                (r * a.cos(), r * a.sin())
+                                (r * crate::dm::cos(a), r * crate::dm::sin(a))
                             }
                         }
                     })
@@ -323,7 +323,7 @@ fn ranks(structure: &[(f64, f64)], order: Order, seed: u32) -> Vec<f64> {
             ranks
         }
         Order::Center | Order::Edges => {
-            let d: Vec<f64> = structure.iter().map(|p| p.0.hypot(p.1)).collect();
+            let d: Vec<f64> = structure.iter().map(|p| crate::dm::hypot(p.0, p.1)).collect();
             let mut rings = d.clone();
             rings.sort_by(f64::total_cmp);
             rings.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
@@ -391,7 +391,7 @@ impl CField {
                 Shape::Radial { radius, falloff: self.falloff.as_ref().map(|p| p.at(t)).unwrap_or(radius).max(0.0) }
             }
             FieldKind::Linear => {
-                let (s, k) = self.angle.at(t).to_radians().sin_cos();
+                let (s, k) = crate::dm::sin_cos(self.angle.at(t).to_radians());
                 Shape::Linear { dir: (k, s), range: self.range.at(t) }
             }
             FieldKind::Noise => Shape::Noise { inv: 1.0 / self.size.at(t).max(1e-6), z: t * self.speed.at(t) },
@@ -417,7 +417,7 @@ impl FieldNow<'_> {
         let (dx, dy) = (x - self.center.0, y - self.center.1);
         let mut v = match self.shape {
             Shape::Radial { radius, falloff } => {
-                let d = dx.hypot(dy);
+                let d = crate::dm::hypot(dx, dy);
                 if falloff > 0.0 { ((radius - d) / falloff).clamp(0.0, 1.0) } else { (d <= radius) as u8 as f64 }
             }
             Shape::Linear { dir, range } => {
@@ -428,13 +428,13 @@ impl FieldNow<'_> {
             Shape::Wave { front, wavelength } => match front {
                 None => 0.0,
                 Some(front) => {
-                    let d = dx.hypot(dy);
+                    let d = crate::dm::hypot(dx, dy);
                     let u = (front - d) / wavelength;
                     if u < 0.0 || (self.f.cycles > 0.0 && u > self.f.cycles) {
                         0.0
                     } else {
-                        let s = (std::f64::consts::PI * u).sin();
-                        s * s * if self.f.decay > 0.0 { (-d / self.f.decay).exp() } else { 1.0 }
+                        let s = crate::dm::sin(std::f64::consts::PI * u);
+                        s * s * if self.f.decay > 0.0 { crate::dm::exp(-d / self.f.decay) } else { 1.0 }
                     }
                 }
             },
@@ -504,14 +504,14 @@ fn points(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, inherite
             (0..count)
                 .map(|k| {
                     let a = a0 + step * k as f64;
-                    let (s, c) = a.to_radians().sin_cos();
+                    let (s, c) = crate::dm::sin_cos(a.to_radians());
                     (r * s, -r * c, if *align { a } else { 0.0 })
                 })
                 .collect()
         }
         CLayout::Line { from, to, align } => {
             let (a, b) = (from.at(t), to.at(t));
-            let angle = if *align { (b.y() - a.y()).atan2(b.x() - a.x()).to_degrees() } else { 0.0 };
+            let angle = if *align { crate::dm::atan2(b.y() - a.y(), b.x() - a.x()).to_degrees() } else { 0.0 };
             (0..count).map(|k| (a.x() + (b.x() - a.x()) * along(k), a.y() + (b.y() - a.y()) * along(k), angle)).collect()
         }
         CLayout::Random { unit, size } => {
@@ -537,7 +537,7 @@ fn points(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, inherite
                     let ((x, y), (dx, dy)) = crate::path::point_at(&subpaths, f)?;
                     let p = to_local.apply(x, y);
                     let q = to_local.apply(x + dx, y + dy);
-                    Some((p.0, p.1, if *align { (q.1 - p.1).atan2(q.0 - p.0).to_degrees() } else { 0.0 }))
+                    Some((p.0, p.1, if *align { crate::dm::atan2(q.1 - p.1, q.0 - p.0).to_degrees() } else { 0.0 }))
                 })
                 .collect()
         }
@@ -615,17 +615,17 @@ pub(super) fn particle(e: &crate::document::Emitter, slots: usize, j: usize, tau
         Area::Box => ((u - 0.5) * e.size.x(), (v - 0.5) * e.size.y()),
         Area::Circle => {
             let (rr, a) = (u.sqrt() / 2.0, v * std::f64::consts::TAU);
-            (rr * a.cos() * e.size.x(), rr * a.sin() * e.size.y())
+            (rr * crate::dm::cos(a) * e.size.x(), rr * crate::dm::sin(a) * e.size.y())
         }
     };
     let a = (e.direction + e.spread * (r(3) - 0.5)).to_radians();
     let speed = e.speed * (1.0 + e.speed_jitter.clamp(0.0, 1.0) * (2.0 * r(4) - 1.0));
-    let (vx, vy) = (speed * a.sin(), -speed * a.cos());
+    let (vx, vy) = (speed * crate::dm::sin(a), -speed * crate::dm::cos(a));
     let (gx, gy) = (e.gravity.x(), e.gravity.y());
     // Ballistic flight with linear drag k: x = v(1 − e^(−kt))/k + g(t/k − (1 − e^(−kt))/k²).
     let k = e.drag.max(0.0);
     let (fv, fg) = if k > 1e-6 {
-        let d = (1.0 - (-k * age).exp()) / k;
+        let d = (1.0 - crate::dm::exp(-k * age)) / k;
         (d, (age - d) / k)
     } else {
         (age, age * age / 2.0)
@@ -738,7 +738,7 @@ mod tests {
             .map(|l| {
                 let (o, x) = (l.matrix.apply(0.0, 0.0), l.matrix.apply(1.0, 0.0));
                 let (dx, dy) = (x.0 - o.0, x.1 - o.1);
-                (o.0, o.1, dx.hypot(dy), dy.atan2(dx).to_degrees())
+                (o.0, o.1, crate::dm::hypot(dx, dy), crate::dm::atan2(dy, dx).to_degrees())
             })
             .collect()
     }
@@ -1007,7 +1007,7 @@ mod tests {
         ]}));
         let c = compiled(json!([l]));
         let v: Vec<f64> = copies(&c.frame(4.5), "dot").iter().map(|q| q.2 - 1.0).collect();
-        let want = [1.0, 0.0, (-0.5f64).exp(), 0.0, (-1.0f64).exp()];
+        let want = [1.0, 0.0, crate::dm::exp(-0.5f64), 0.0, crate::dm::exp(-1.0f64)];
         assert!(v.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6), "{v:?}");
     }
 
@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(f.layers.len(), 16);
         // Every petal ends 200 px out along its own angle.
         let centres: Vec<(f64, f64)> = f.layers.iter().filter(|l| &*l.id == "a").map(|l| l.matrix.apply(0.0, 0.0)).collect();
-        assert!(centres.iter().all(|p| ((p.0 - 500.0).hypot(p.1 - 500.0) - 200.0).abs() < 1e-6), "{centres:?}");
+        assert!(centres.iter().all(|p| (crate::dm::hypot(p.0 - 500.0, p.1 - 500.0) - 200.0).abs() < 1e-6), "{centres:?}");
         assert_eq!(Compiled::new(&project(json!([l]))).frame(2.0), f);
         // With opacity below 1 the copies are drawn as one picture.
         let mut g = dots(json!({"type": "line", "count": 3}), json!({}));

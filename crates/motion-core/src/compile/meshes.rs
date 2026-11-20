@@ -269,7 +269,7 @@ pub fn srgb_to_linear(v: f64) -> f64 {
     if v <= 0.04045 {
         v / 12.92
     } else {
-        ((v + 0.055) / 1.055).powf(2.4)
+        crate::dm::powf((v + 0.055) / 1.055, 2.4)
     }
 }
 
@@ -1043,7 +1043,7 @@ impl CLighting {
             EnvironmentPreset::None => (g(0.0), g(0.0), g(0.0), Vec::new()),
         };
         let turn = |d: [f64; 3]| {
-            let (s, c) = rot.sin_cos();
+            let (s, c) = crate::dm::sin_cos(rot);
             unit([d[0] * c - d[2] * s, d[1], d[0] * s + d[2] * c])
         };
         let env = if self.image.is_some() {
@@ -1060,7 +1060,7 @@ impl CLighting {
                 image_rotation: 0.0,
             }
         };
-        Lighting { lights, env, tone: self.tone, exposure: self.exposure.at(tc).clamp(-16.0, 16.0).exp2() }
+        Lighting { lights, env, tone: self.tone, exposure: crate::dm::exp2(self.exposure.at(tc).clamp(-16.0, 16.0)) }
     }
 }
 
@@ -1075,7 +1075,7 @@ fn screen_scale(world: Mat4, camera: &Camera3) -> f64 {
     if !(k.is_finite() && k > 0.0) {
         return 1.0;
     }
-    (k.log2() * 2.0).round().exp2().sqrt().clamp(1.0 / 16.0, 32.0)
+    crate::dm::exp2((crate::dm::log2(k) * 2.0).round()).sqrt().clamp(1.0 / 16.0, 32.0)
 }
 
 impl CMesh {
