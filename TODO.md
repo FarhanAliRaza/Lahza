@@ -351,9 +351,13 @@ Settled:
 Left:
 - **A real request, on a real desktop.** The first thing to do: send one
   from the bar and watch for a permission refusal in the stream.
-- **Requests are this session's.** The AI tab and the conversation to
-  continue are lost when the app closes (the history keeps each entry's
-  request id; nothing reads the words back).
+- **Requests are kept beside the project** (`requests.json` in the
+  project's or the recording's folder: the words, the steps, the outcome
+  and the conversation to continue), so the AI tab and a follow-up
+  survive the app. Read and written in a unit test; not seen across a
+  real restart. A request running when the app closes reads back as
+  stopped, and the agent is not ended with the app unless the window's
+  close drops the studio (not checked).
 - **A piece made on a recording.** With no piece open the words ask for
   a new one on the span. Undo then takes back the edits inside it, not
   the piece or its place on the video; compare needs the piece open; and

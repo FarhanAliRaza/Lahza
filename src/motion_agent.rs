@@ -379,7 +379,7 @@ pub(crate) fn describe(tool: &str, input: &Value) -> String {
 // ---------------------------------------------------------------- context
 
 /// What the words are about.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct About {
     /// The motion project's folder; None on a recording with no piece open.
     pub project: Option<PathBuf>,
@@ -479,9 +479,24 @@ not json at all
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("claude");
-        std::fs::write(&path, format!("#!/bin/sh\nif [ \"$1\" = auth ]; then echo \"$AUTH\"; exit 0; fi\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.args\"\ncat > \"$0.stdin\"\n{body}\n")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\nif [ \"$1\" = auth ]; then cat \"$0.auth\" 2>/dev/null; exit 0; fi\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.args\"\ncat > \"$0.stdin\"\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// Starts a stub. Tests run side by side: another one forking while
+    /// this one's script was still open for writing makes the kernel
+    /// refuse to run it for a moment ("Text file busy").
+    fn start(runner: &ClaudeCode, request: Request) -> (Box<dyn Running>, std::sync::mpsc::Receiver<Event>) {
+        for _ in 0..200 {
+            let (tx, rx) = channel();
+            match runner.start(request.clone(), tx) {
+                Ok(running) => return (running, rx),
+                Err(Failure::Other(e)) if e.contains("Text file busy") => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        panic!("the stub never became runnable");
     }
 
     fn collect(rx: &std::sync::mpsc::Receiver<Event>) -> Vec<Event> {
@@ -501,8 +516,7 @@ not json at all
         let program = stub("run", &format!("cat <<'LAHZA_EOF'\n{STREAM}LAHZA_EOF"));
         let runner = ClaudeCode { program: program.clone(), server: "/opt/lahza".into() };
         let request = Request { id: "r7".into(), text: "Selected layer: title\n\nmove it up".into(), picture: Some(vec![1, 2, 3]), cwd: std::env::temp_dir(), conversation: Some("earlier".into()) };
-        let (tx, rx) = channel();
-        let _running = runner.start(request, tx).unwrap();
+        let (_running, rx) = start(&runner, request);
         let events = collect(&rx);
         assert_eq!(events.first(), Some(&Event::Started { conversation: "c0ffee".into() }));
         assert_eq!(events.last(), Some(&Event::Done { text: "Moved the title up and faded it in.".into(), failed: false, cost: Some(0.0123) }));
@@ -527,8 +541,7 @@ not json at all
     fn stop_ends_the_child() {
         let program = stub("stop", "echo $$ > \"$0.pid\"\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}'\nsleep 600");
         let runner = ClaudeCode { program: program.clone(), server: "lahza".into() };
-        let (tx, rx) = channel();
-        let mut running = runner.start(Request { id: "r".into(), cwd: std::env::temp_dir(), ..Default::default() }, tx).unwrap();
+        let (mut running, rx) = start(&runner, Request { id: "r".into(), cwd: std::env::temp_dir(), ..Default::default() });
         assert_eq!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Event::Started { conversation: "s".into() });
         let pid: i32 = std::fs::read_to_string(program.with_extension("pid")).unwrap().trim().parse().unwrap();
         running.stop();
@@ -549,17 +562,23 @@ not json at all
         // `claude auth status` answers whether it is signed in.
         let program = stub("auth", "echo 'Invalid API key · Please run /login' >&2\nexit 1");
         let runner = ClaudeCode { program: program.clone(), server: "lahza".into() };
-        let check = |auth: &str| {
-            // The stub answers `auth status` with $AUTH.
-            let out = Command::new(&program).args(["auth", "status", "--json"]).env("AUTH", auth).output().unwrap();
-            serde_json::from_slice::<Value>(&out.stdout).ok().and_then(|v| v.get("loggedIn").and_then(Value::as_bool))
+        // The stub answers `auth status` with the file beside it.
+        let available = || loop {
+            match runner.available() {
+                Availability::Missing(Failure::Other(e)) if e.contains("Text file busy") => std::thread::sleep(Duration::from_millis(10)),
+                answer => break answer,
+            }
         };
-        assert_eq!(check(r#"{"loggedIn": false}"#), Some(false));
-        // With no answer it is taken as ready, and the request itself says
-        // what is wrong: here, that it is not signed in.
-        assert_eq!(runner.available(), Availability::Ready);
-        let (tx, rx) = channel();
-        let _running = runner.start(Request { id: "r".into(), cwd: std::env::temp_dir(), ..Default::default() }, tx).unwrap();
+        std::fs::write(program.with_extension("auth"), r#"{"loggedIn": false, "authMethod": "none"}"#).unwrap();
+        assert_eq!(available(), Availability::Missing(Failure::NotSignedIn));
+        std::fs::write(program.with_extension("auth"), r#"{"loggedIn": true, "authMethod": "oauth_token"}"#).unwrap();
+        assert_eq!(available(), Availability::Ready);
+        // With no answer (an older Claude Code) it is taken as ready, and
+        // the request itself says what is wrong: here, that it is not
+        // signed in.
+        std::fs::remove_file(program.with_extension("auth")).unwrap();
+        assert_eq!(available(), Availability::Ready);
+        let (_running, rx) = start(&runner, Request { id: "r".into(), cwd: std::env::temp_dir(), ..Default::default() });
         assert_eq!(collect(&rx), vec![Event::Failed(Failure::NotSignedIn)]);
         std::fs::remove_dir_all(program.parent().unwrap()).ok();
     }

@@ -26,8 +26,12 @@ use std::time::{Duration, Instant};
 /// Height of the prompt bar: chips, the field, and a line of status.
 pub(crate) const PROMPT_BAR_HEIGHT: f32 = 112.0;
 
+/// Where a project's (or a recording's) requests are kept between runs
+/// of the app.
+const REQUESTS_FILE: &str = "requests.json";
+
 /// One thing the agent did.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Step {
     id: String,
     pub text: String,
@@ -35,7 +39,7 @@ pub(crate) struct Step {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Outcome {
     Running,
     /// Done, with edits to keep or undo.
@@ -44,6 +48,26 @@ pub(crate) enum Outcome {
     Undone,
     Stopped,
     Failed(String),
+}
+
+/// A request as it is kept on disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    id: String,
+    words: String,
+    about: About,
+    steps: Vec<Step>,
+    said: String,
+    outcome: Outcome,
+    edits: usize,
+    seconds: f64,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct KeptRequests {
+    /// The conversation a follow-up continues.
+    conversation: Option<String>,
+    requests: Vec<Kept>,
 }
 
 /// One prompt and what came of it.
@@ -142,6 +166,8 @@ pub(crate) struct MotionAgent {
     comparing: Option<String>,
     /// The inspector shows the AI tab.
     pub ai_tab: bool,
+    /// Folders whose kept requests were read.
+    loaded: Vec<PathBuf>,
 }
 
 impl Default for MotionAgent {
@@ -165,6 +191,60 @@ impl MotionAgent {
             fresh: false,
             comparing: None,
             ai_tab: false,
+            loaded: Vec::new(),
+        }
+    }
+
+    /// Reads the requests kept in `key` (a project's or a recording's
+    /// folder), once: the AI tab and the conversation survive the app.
+    pub(crate) fn load(&mut self, key: &Path) {
+        if self.loaded.iter().any(|k| k == key) {
+            return;
+        }
+        self.loaded.push(key.to_path_buf());
+        let Some(kept) = std::fs::read(key.join(REQUESTS_FILE)).ok().and_then(|b| serde_json::from_slice::<KeptRequests>(&b).ok()) else { return };
+        if let Some(conversation) = kept.conversation {
+            self.conversations.entry(key.to_path_buf()).or_insert(conversation);
+        }
+        let at = self.requests.len().saturating_sub(usize::from(self.busy()));
+        let old = kept.requests.into_iter().filter(|k| !self.requests.iter().any(|r| r.id == k.id)).map(|k| AgentRequest {
+            id: k.id,
+            words: k.words,
+            about: k.about,
+            key: key.to_path_buf(),
+            steps: k.steps,
+            said: k.said,
+            // The app closed while it ran.
+            outcome: if k.outcome == Outcome::Running { Outcome::Stopped } else { k.outcome },
+            edits: k.edits,
+            started: Instant::now(),
+            seconds: Some(k.seconds),
+        });
+        // Before a request that is running now, which stays the last.
+        self.requests.splice(at..at, old.collect::<Vec<_>>());
+    }
+
+    /// Writes the requests of `key` beside it. A failure to write only
+    /// loses the record.
+    pub(crate) fn save(&self, key: &Path) {
+        let kept = KeptRequests {
+            conversation: self.conversations.get(key).cloned(),
+            requests: self
+                .requests
+                .iter()
+                .filter(|r| r.key == key)
+                .map(|r| Kept { id: r.id.clone(), words: r.words.clone(), about: r.about.clone(), steps: r.steps.clone(), said: r.said.clone(), outcome: r.outcome.clone(), edits: r.edits, seconds: r.seconds() })
+                .collect(),
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&kept) {
+            let _ = lahza_motion_core::io::write_atomic(&key.join(REQUESTS_FILE), text.as_bytes());
+        }
+    }
+
+    /// Saves the record of the request with `id`.
+    fn save_request(&self, id: &str) {
+        if let Some(r) = self.requests.iter().find(|r| r.id == id) {
+            self.save(&r.key);
         }
     }
 
@@ -375,6 +455,8 @@ impl Studio {
         if request.outcome == Outcome::Proposal && request.edits == 0 {
             request.outcome = Outcome::Kept;
         }
+        let key = request.key.clone();
+        self.motion_agent.save(&key);
     }
 
     pub(crate) fn stop_motion_agent(&mut self, cx: &mut Context<Self>) {
@@ -389,6 +471,7 @@ impl Studio {
         if let Some(r) = self.motion_agent.requests.iter_mut().find(|r| r.id == id) {
             r.outcome = Outcome::Kept;
         }
+        self.motion_agent.save_request(id);
         cx.notify();
     }
 
@@ -411,6 +494,7 @@ impl Studio {
                     r.outcome = Outcome::Undone;
                     r.edits = 0;
                 }
+                self.motion_agent.save_request(id);
             }
             Err(ref e) => self.toast = Some(crate::Notification::error(format!("Could not undo the request: {e}"))),
         }
@@ -499,6 +583,9 @@ impl Studio {
         let visible = self.motion_prompt_visible();
         if visible {
             self.motion_agent.ask_available();
+            if let Some((_, key, _)) = self.motion_about(cx) {
+                self.motion_agent.load(&key);
+            }
         }
         let draft = self.motion_agent.draft.clone();
         self.text_fields.prompt.update(cx, |field, cx| field.sync(if visible { Target::Prompt } else { Target::None }, &draft, window, cx));
@@ -929,6 +1016,39 @@ mod tests {
         assert!(runner.asked.lock().unwrap()[2].conversation.is_none() && !agent.fresh);
         let ids: Vec<&str> = agent.requests.iter().map(|r| r.id.as_str()).collect();
         assert!(ids[0] != ids[1] && ids[1] != ids[2], "each request has its own id");
+    }
+
+    #[test]
+    fn requests_are_kept_with_the_project() {
+        let dir = std::env::temp_dir().join(format!("lahza-agent-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = || Arc::new(Scripted { events: vec![Event::Started { conversation: "c7".into() }, step("t", "Editing: add dot (shape)"), Event::Done { text: "Added a dot.".into(), failed: false, cost: None }], asked: Mutex::default(), stopped: Arc::default() });
+        let mut agent = MotionAgent::new(script());
+        let about = About { project: Some(dir.clone()), layers: vec![("title".into(), "text".into())], span: Some((1.0, 2.0)), ..Default::default() };
+        agent.send(about.clone(), "a dot", None, dir.clone(), dir.clone());
+        agent.poll();
+        agent.requests[0].edits = 1;
+        agent.save(&dir);
+        // The app again: the AI tab has it, and a follow-up continues.
+        let runner = script();
+        let mut again = MotionAgent::new(runner.clone());
+        again.load(&dir);
+        again.load(&dir);
+        assert_eq!(again.requests.len(), 1, "read once");
+        let r = &again.requests[0];
+        assert_eq!((r.words.as_str(), r.said.as_str(), r.outcome.clone(), r.edits), ("a dot", "Added a dot.", Outcome::Proposal, 1));
+        assert_eq!((r.about.clone(), r.steps.len()), (about.clone(), 1));
+        assert!(again.proposal().is_some(), "still to keep or undo");
+        again.send(about, "bigger", None, dir.clone(), dir.clone());
+        assert_eq!(runner.asked.lock().unwrap()[0].conversation.as_deref(), Some("c7"));
+        // Nothing kept, or something unreadable: nothing happens.
+        let mut none = MotionAgent::new(script());
+        none.load(Path::new("/nonexistent/project.lahza"));
+        std::fs::write(dir.join(REQUESTS_FILE), "not json").unwrap();
+        none.load(&dir);
+        assert!(none.requests.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
