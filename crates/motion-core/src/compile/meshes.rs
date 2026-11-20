@@ -32,6 +32,8 @@ pub struct MeshState {
 pub struct SkinPose {
     /// Which of the file's skins.
     pub index: u32,
+    /// Matrices or dual quaternions.
+    pub blend: crate::document::SkinBlend,
     /// The joints' layers, in the skin's order.
     pub ids: Arc<[Arc<str>]>,
     /// Per joint: its layer's space → the mesh layer's. Empty until the
@@ -528,7 +530,7 @@ pub(super) struct CMesh {
     displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>, [f64; 3], Option<String>)>,
     deform: Option<CSlang>,
     /// The skin's index in its file and its joints' layers.
-    pub(super) skin: Option<(u32, Arc<[Arc<str>]>)>,
+    pub(super) skin: Option<(u32, Arc<[Arc<str>]>, crate::document::SkinBlend)>,
     /// Last parameters, so unchanged frames share one `Arc` (and one
     /// cached mesh in the renderer).
     last: std::sync::Mutex<Option<Arc<MeshParams>>>,
@@ -846,7 +848,7 @@ impl Compiler<'_> {
             self.errors.push(format!("{id}.skin: only a glTF mesh has a skin"));
         }
         CMesh {
-            skin: m.skin.as_ref().filter(|_| matches!(m.mesh, MeshDef::Gltf { .. })).map(|s| (s.index, s.joints.iter().map(|j| Arc::<str>::from(j.as_str())).collect())),
+            skin: m.skin.as_ref().filter(|_| matches!(m.mesh, MeshDef::Gltf { .. })).map(|s| (s.index, s.joints.iter().map(|j| Arc::<str>::from(j.as_str())).collect(), s.blend)),
             displace,
             deform,
             shape,
@@ -1185,7 +1187,7 @@ impl CMesh {
             own_color: self.own_color,
             part_colors: std::array::from_fn(|i| self.part_colors[i].iter().map(|c| clamp_color(c.at(t))).collect()),
             lighting: None,
-            skin: self.skin.as_ref().map(|(index, ids)| Arc::new(SkinPose { index: *index, ids: ids.clone(), joints: Vec::new() })),
+            skin: self.skin.as_ref().map(|(index, ids, blend)| Arc::new(SkinPose { index: *index, blend: *blend, ids: ids.clone(), joints: Vec::new() })),
         }
     }
 }

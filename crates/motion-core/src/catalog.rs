@@ -318,8 +318,8 @@ pub fn catalog_json() -> Value {
         "draws_off_frame": "a stroke drawn on with trim whose head lands off the frame while its start is on it"
     });
     catalog["skin"] = json!({
-        "what": "a glTF mesh layer's \"skin\": {index: which of the file's skins (0), joints: [layer ids, in the skin's joint order]}: its points follow the joints' layers (comps model_import makes of the joint nodes) by the file's weights; key, parent or simulate a joint and the mesh follows; the mesh layer's own transform does not place it",
-        "tools": "model_import writes it (report.skinned); only glTF meshes have skins; morph targets are not read"
+        "what": "a glTF mesh layer's \"skin\": {index: which of the file's skins (0), joints: [layer ids, in the skin's joint order], blend: \"linear\" (default) or \"dual\" (dual quaternions: a twisted or sharply bent joint keeps its girth; about twice the skinning time)}: its points follow the joints' layers (comps model_import makes of the joint nodes) by the file's weights; key, parent or simulate a joint and the mesh follows; the mesh layer's own transform does not place it",
+        "tools": "model_import writes it (report.skinned); only glTF meshes have skins; up to eight joints a point (JOINTS_0 and JOINTS_1); morph targets are not read"
     });
     catalog["simulation"] = json!({
         "what": "layers with \"body\" fall, collide, stack and hang from joints; `sim_bake` steps the scene's simulation and keeps each body's place per frame (sim/<scene>.bake), which drawing reads; `check` reports a missing or stale bake",

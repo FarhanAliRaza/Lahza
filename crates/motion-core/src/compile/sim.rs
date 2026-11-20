@@ -892,7 +892,7 @@ fn skinned_meshes<'l>(layers: &'l [CLayer], out: &mut Vec<(&'l CLayer, &'l [Arc<
     for l in layers {
         ids.insert(&l.id);
         if let CKind::Mesh(m) = &l.kind {
-            if let Some((_, joints)) = &m.skin {
+            if let Some((_, joints, _)) = &m.skin {
                 out.push((l, joints));
             }
         }
@@ -955,6 +955,6 @@ pub(super) fn pose_skins_in(under: &[CLayer], tc: f64, inherited: Option<Step>, 
         let Some(s) = &m.skin else { return };
         let to_mesh = inverse(m.world);
         let joints = s.ids.iter().map(|id| worlds.get(id).map(|w| to_mesh.then(*w)).unwrap_or(Mat4::IDENTITY)).collect();
-        m.skin = Some(Arc::new(SkinPose { index: s.index, ids: s.ids.clone(), joints }));
+        m.skin = Some(Arc::new(SkinPose { index: s.index, blend: s.blend, ids: s.ids.clone(), joints }));
     });
 }

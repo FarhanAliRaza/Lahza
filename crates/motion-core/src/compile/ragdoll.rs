@@ -61,7 +61,7 @@ pub(super) fn tree<'l>(layers: &'l [CLayer], inside: Option<usize>, out: &mut Ve
 fn skin_joints<'l>(layers: &'l [CLayer], out: &mut HashSet<&'l str>) {
     for l in layers {
         if let CKind::Mesh(m) = &l.kind {
-            if let Some((_, joints)) = &m.skin {
+            if let Some((_, joints, _)) = &m.skin {
                 out.extend(joints.iter().map(|j| &**j));
             }
         }

@@ -2387,6 +2387,24 @@ pub struct Skin {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub index: u32,
     pub joints: Vec<String>,
+    /// How a point between joints is placed: "linear" (the joints'
+    /// matrices blended: cheap, and a twisted or sharply bent joint
+    /// thins) or "dual" (dual quaternions: it keeps its girth, and bulges
+    /// a little on the inside of a bend).
+    #[serde(default, skip_serializing_if = "is_default_blend")]
+    pub blend: SkinBlend,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkinBlend {
+    #[default]
+    Linear,
+    Dual,
+}
+
+fn is_default_blend(b: &SkinBlend) -> bool {
+    *b == SkinBlend::Linear
 }
 
 /// A Slang deformer: `float3 <function>(float3 p, float3 n, float t)`

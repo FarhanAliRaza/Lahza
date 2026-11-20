@@ -447,7 +447,7 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
                 // Down: its joints are where the bake has its bones.
                 let to_mesh = crate::sim::inverse(w);
                 let joints = skin.ids.iter().zip(&skin.joints).map(|(id, j)| tracks.get(&**id).and_then(|&tr| h.bake.world(tr, t - h.shift)).map_or(*j, |b| to_mesh.then(b))).collect();
-                m.skin = Some(Arc::new(SkinPose { index: skin.index, ids: skin.ids.clone(), joints }));
+                m.skin = Some(Arc::new(SkinPose { index: skin.index, blend: skin.blend, ids: skin.ids.clone(), joints }));
             }
             m.world = w;
             m.camera = space.cam;

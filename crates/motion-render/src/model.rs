@@ -104,10 +104,30 @@ pub fn load_skin(files: &mut Files, root: Option<&Path>, src: &str, mesh: u32, p
     let reader = p.reader(|b| file.buffers.get(b.index()).map(|d| &d.0[..]));
     let joints: Vec<[u16; 4]> = reader.read_joints(0).ok_or_else(|| format!("{src}: mesh {mesh} has no joints (JOINTS_0): it is not skinned"))?.into_u16().collect();
     let mut weights: Vec<[f32; 4]> = reader.read_weights(0).ok_or_else(|| format!("{src}: mesh {mesh} has no weights (WEIGHTS_0)"))?.into_f32().collect();
-    for w in &mut weights {
-        let sum: f32 = w.iter().sum();
+    // A second four a point, when the file has them (both or neither).
+    let mut more = match (reader.read_joints(1), reader.read_weights(1)) {
+        (Some(j), Some(w)) => Some((j.into_u16().collect::<Vec<[u16; 4]>>(), w.into_f32().collect::<Vec<[f32; 4]>>())),
+        (None, None) => None,
+        _ => return Err(format!("{src}: mesh {mesh} has one of JOINTS_1 and WEIGHTS_1 without the other")),
+    };
+    if more.as_ref().is_some_and(|(j, w)| j.len() != joints.len() || w.len() != joints.len()) {
+        return Err(format!("{src}: mesh {mesh}'s JOINTS_1 are not as many as its JOINTS_0"));
+    }
+    // (Nothing weighted in it: four a point after all.)
+    if more.as_ref().is_some_and(|(_, w)| w.iter().all(|w| w.iter().all(|v| *v == 0.0))) {
+        more = None;
+    }
+    if p.get(&gltf::Semantic::Joints(2)).is_some() {
+        return Err(format!("{src}: mesh {mesh} has more than eight joints a point (JOINTS_2): export with eight or fewer"));
+    }
+    for (i, w) in weights.iter_mut().enumerate() {
+        let second = more.as_mut().map(|(_, w)| &mut w[i]);
+        let sum: f32 = w.iter().sum::<f32>() + second.as_ref().map_or(0.0, |w| w.iter().sum());
         if sum > 0.0 {
             *w = w.map(|v| v / sum);
+            if let Some(w) = second {
+                *w = w.map(|v| v / sum);
+            }
         }
     }
     let s = file.document.skins().nth(skin as usize).ok_or_else(|| format!("{src}: no skin {skin}"))?;
@@ -133,7 +153,7 @@ pub fn load_skin(files: &mut Files, root: Option<&Path>, src: &str, mesh: u32, p
     if inverse_bind.len() != count {
         return Err(format!("{src}: skin {skin} has {count} joints and {} inverse bind matrices", inverse_bind.len()));
     }
-    Ok(lahza_motion_core::skin::SkinData { joints, weights, inverse_bind })
+    Ok(lahza_motion_core::skin::SkinData { joints, weights, more, inverse_bind })
 }
 
 /// Per-vertex normals from the faces around each vertex.
@@ -537,6 +557,14 @@ mod tests {
 /// is nothing to download.
 #[doc(hidden)]
 pub fn write_test_arm(dir: &Path) -> Result<PathBuf, String> {
+    write_test_arm_as(dir, false, false)
+}
+
+/// `write_test_arm`, and: `eight`: a point's second joint and weight are
+/// in JOINTS_1 and WEIGHTS_1 (the same skin, said with eight joints a
+/// point); `apart`: its buffer is a file beside it, `arm.bin`.
+#[doc(hidden)]
+pub fn write_test_arm_as(dir: &Path, eight: bool, apart: bool) -> Result<PathBuf, String> {
     use serde_json::json;
     let (root, half, rings) = ([0.5f32, 0.2, 0.0], 0.15f32, 17usize);
     let mut pos: Vec<[f32; 3]> = Vec::new();
@@ -573,11 +601,14 @@ pub fn write_test_arm(dir: &Path) -> Result<PathBuf, String> {
     // next over the half metre around the joint between them.
     let mut joints: Vec<[u16; 4]> = Vec::new();
     let mut weights: Vec<[f32; 4]> = Vec::new();
+    let (mut joints1, mut weights1): (Vec<[u16; 4]>, Vec<[f32; 4]>) = (Vec::new(), Vec::new());
     for p in &pos {
         let y = p[1] - root[1];
         let (j, t) = if y < 1.5 { (0u16, ((y - 0.75) / 0.5).clamp(0.0, 1.0)) } else { (1u16, ((y - 1.75) / 0.25).clamp(0.0, 1.0)) };
-        joints.push([j, j + 1, 0, 0]);
-        weights.push([1.0 - t, t, 0.0, 0.0]);
+        joints.push([j, if eight { 0 } else { j + 1 }, 0, 0]);
+        weights.push([1.0 - t, if eight { 0.0 } else { t }, 0.0, 0.0]);
+        joints1.push([j + 1, 0, 0, 0]);
+        weights1.push([t, 0.0, 0.0, 0.0]);
     }
     // Inverse binds (columns): each joint's world is a translation.
     let ibm: Vec<[f32; 16]> = (0..3).map(|j| [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -root[0], -(root[1] + j as f32), -root[2], 1.0]).collect();
@@ -602,9 +633,23 @@ pub fn write_test_arm(dir: &Path) -> Result<PathBuf, String> {
     let v_ibm = view(&f32s(&ibm.concat()), &mut bin);
     let v_times = view(&f32s(&times), &mut bin);
     let v_turns = view(&f32s(&turns.concat()), &mut bin);
+    let v_joints1 = view(&joints1.concat().iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(), &mut bin);
+    let v_weights1 = view(&f32s(&weights1.concat()), &mut bin);
     let n = pos.len();
     let lo: Vec<f32> = (0..3).map(|k| pos.iter().map(|p| p[k]).fold(f32::INFINITY, f32::min)).collect();
     let hi: Vec<f32> = (0..3).map(|k| pos.iter().map(|p| p[k]).fold(f32::NEG_INFINITY, f32::max)).collect();
+    let mut attributes = json!({"POSITION": 0, "NORMAL": 1, "JOINTS_0": 2, "WEIGHTS_0": 3});
+    if eight {
+        attributes["JOINTS_1"] = json!(8);
+        attributes["WEIGHTS_1"] = json!(9);
+    }
+    let buffer = if apart {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("arm.bin"), &bin).map_err(|e| e.to_string())?;
+        json!({"uri": "arm.bin", "byteLength": bin.len()})
+    } else {
+        json!({"uri": format!("data:application/octet-stream;base64,{}", base64(&bin)), "byteLength": bin.len()})
+    };
     let doc = json!({
         "asset": {"version": "2.0", "generator": "lahza test arm"},
         "scene": 0,
@@ -616,10 +661,10 @@ pub fn write_test_arm(dir: &Path) -> Result<PathBuf, String> {
             {"name": "arm", "mesh": 0, "skin": 0, "translation": [0.3, 0, 0]}
         ],
         "skins": [{"joints": [0, 1, 2], "inverseBindMatrices": 5, "skeleton": 0}],
-        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "JOINTS_0": 2, "WEIGHTS_0": 3}, "indices": 4, "material": 0}]}],
+        "meshes": [{"primitives": [{"attributes": attributes, "indices": 4, "material": 0}]}],
         "materials": [{"name": "skin", "pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.55, 0.35, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.6}}],
         "animations": [{"name": "bend", "samplers": [{"input": 6, "output": 7, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 1, "path": "rotation"}}]}],
-        "buffers": [{"uri": format!("data:application/octet-stream;base64,{}", base64(&bin)), "byteLength": bin.len()}],
+        "buffers": [buffer],
         "bufferViews": views,
         "accessors": [
             {"bufferView": v_pos, "componentType": 5126, "count": n, "type": "VEC3", "min": lo, "max": hi},
@@ -629,7 +674,9 @@ pub fn write_test_arm(dir: &Path) -> Result<PathBuf, String> {
             {"bufferView": v_idx, "componentType": 5125, "count": idx.len(), "type": "SCALAR"},
             {"bufferView": v_ibm, "componentType": 5126, "count": 3, "type": "MAT4"},
             {"bufferView": v_times, "componentType": 5126, "count": 3, "type": "SCALAR", "min": [0.0], "max": [1.0]},
-            {"bufferView": v_turns, "componentType": 5126, "count": 3, "type": "VEC4"}
+            {"bufferView": v_turns, "componentType": 5126, "count": 3, "type": "VEC4"},
+            {"bufferView": v_joints1, "componentType": 5123, "count": n, "type": "VEC4"},
+            {"bufferView": v_weights1, "componentType": 5126, "count": n, "type": "VEC4"}
         ]
     });
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
