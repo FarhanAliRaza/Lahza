@@ -65,19 +65,27 @@ pub(crate) fn oct_decode(e: [f32; 2]) -> V3 {
     norm([(1.0 - e[1].abs()) * sign(e[0]), (1.0 - e[0].abs()) * sign(e[1]), z])
 }
 
+const FLAG_UNLIT: u32 = 1;
 const FLAG_FACETED: u32 = 2;
-/// Shadow catchers, wires and volumes: not in the sky's rays.
-const NOT_SOLID: u32 = 8 | 32 | 64;
+const FLAG_SHADOW_CATCHER: u32 = 8;
+const FLAG_WIRE: u32 = 32;
+const FLAG_VOLUME: u32 = 64;
 
 /// What the rays need of a material.
 #[derive(Clone, Copy)]
 struct Mat {
     flags: u32,
-    /// Blocks a shadow ray (at least half opaque, and none of `NOT_SOLID`).
+    /// Hides the sky (pt.wgsl `sky_blocks`): at least half opaque; a
+    /// wireframe by its faces' fill; no shadow catcher, no volume.
     blocks: bool,
     /// Base colour less what is metal, and the emission.
     kd: V3,
     emit: V3,
+    /// Not lit (pt.wgsl `sky_flat`): the colour that comes back as it is.
+    flat: Option<V3>,
+    /// A volume: its instance and its material's first row there, and
+    /// its sigma (pt.wgsl `sky_through`).
+    volume: Option<(usize, usize, f32)>,
 }
 
 /// A triangle in camera space with its corners' normals. `mat`: its
@@ -125,6 +133,11 @@ struct Scene<'a> {
     cards: Vec<Card>,
     /// The groups drawn before the sky's (the cards' pictures).
     groups: &'a [[f32; 4]],
+    /// Each instance's material rows and the image pool (a volume's
+    /// density, as the CPU's own shading looks it up).
+    rows: Vec<&'a [[f32; 4]]>,
+    images: &'a [u32],
+    volumes: bool,
     /// The camera, for where a point of a card is in its picture.
     focal: f32,
     centre: [f32; 2],
@@ -142,21 +155,39 @@ struct Hit {
 }
 
 impl<'a> Scene<'a> {
-    fn new(t: &Trace, groups: &'a [[f32; 4]]) -> Scene<'a> {
+    fn new(t: &'a Trace, groups: &'a [[f32; 4]], images: &'a [u32]) -> Scene<'a> {
         let (mut tris, mut mats) = (Vec::new(), Vec::new());
+        let mut rows = Vec::new();
         for inst in &t.instances {
             // (A mesh the GPU makes in its pool is not here to cast at.)
             let TraceMesh::Cpu(mesh) = &inst.mesh else { continue };
             let mat_base = mats.len() as u32;
-            for m in inst.materials.chunks_exact(MAT_ROWS) {
+            for (k, m) in inst.materials.chunks_exact(MAT_ROWS).enumerate() {
                 let flags = m[2][3] as u32;
+                let blocks = if flags & (FLAG_SHADOW_CATCHER | FLAG_VOLUME) != 0 {
+                    false
+                } else if flags & FLAG_WIRE != 0 {
+                    m[1][3] >= 0.5
+                } else {
+                    m[0][3] * (1.0 - m[3][0]) >= 0.5
+                };
+                let flat = if flags & FLAG_WIRE != 0 {
+                    Some([m[1][0], m[1][1], m[1][2]])
+                } else if flags & FLAG_UNLIT != 0 {
+                    Some([m[0][0] + m[2][0], m[0][1] + m[2][1], m[0][2] + m[2][2]])
+                } else {
+                    None
+                };
                 mats.push(Mat {
                     flags,
-                    blocks: flags & NOT_SOLID == 0 && m[0][3] * (1.0 - m[3][0]) >= 0.5,
+                    blocks,
                     kd: mul([m[0][0], m[0][1], m[0][2]], 1.0 - m[1][0]),
                     emit: [m[2][0], m[2][1], m[2][2]],
+                    flat,
+                    volume: (flags & FLAG_VOLUME != 0).then(|| (rows.len(), k * MAT_ROWS, m[18][0])),
                 });
             }
+            rows.push(&inst.materials[..]);
             let r = inst.transform;
             let rows = [[r[0][0], r[0][1], r[0][2]], [r[1][0], r[1][1], r[1][2]], [r[2][0], r[2][1], r[2][2]]];
             let place = |p: [f32; 3]| [dot(rows[0], p) + r[0][3], dot(rows[1], p) + r[1][3], dot(rows[2], p) + r[2][3]];
@@ -187,7 +218,8 @@ impl<'a> Scene<'a> {
             let b = c.picture;
             cards.push(Card { origin: [b.origin[0] as f32, b.origin[1] as f32], factor: [b.factor[0] as f32, b.factor[1] as f32], offset: b.offset as usize, size: (b.size.0 as i32, b.size.1 as i32) });
         }
-        let mut scene = Scene { tris, mats, nodes: Vec::new(), cards, groups, focal: t.focal, centre: t.centre, root: t.root };
+        let volumes = mats.iter().any(|m| m.volume.is_some());
+        let mut scene = Scene { tris, mats, nodes: Vec::new(), cards, groups, rows, images, volumes, focal: t.focal, centre: t.centre, root: t.root };
         let n = scene.tris.len();
         if n > 0 {
             let mut centres: Vec<V3> = scene.tris.iter().map(|t| mul(add(add(t.p[0], t.p[1]), t.p[2]), 1.0 / 3.0)).collect();
@@ -317,23 +349,7 @@ impl<'a> Scene<'a> {
                 if if card { ray == Ray::Camera } else { !self.mats[tri.mat as usize].blocks } {
                     continue;
                 }
-                let (e1, e2) = (sub(tri.p[1], tri.p[0]), sub(tri.p[2], tri.p[0]));
-                let pv = cross(d, e2);
-                let det = dot(e1, pv);
-                if det.abs() < 1e-20 {
-                    continue;
-                }
-                let tv = sub(o, tri.p[0]);
-                let u = dot(tv, pv) / det;
-                if !(0.0..=1.0).contains(&u) {
-                    continue;
-                }
-                let qv = cross(tv, e1);
-                let v = dot(d, qv) / det;
-                if v < 0.0 || u + v > 1.0 {
-                    continue;
-                }
-                let t = dot(e2, qv) / det;
+                let Some((t, [u, v])) = meet(tri, o, d) else { continue };
                 if t > 0.0 && t < far {
                     if card && self.card_picture((tri.mat & !CARD) as usize, add(o, mul(d, t)))[3] <= 0.5 {
                         continue;
@@ -349,6 +365,86 @@ impl<'a> Scene<'a> {
         best
     }
 
+    /// pt.wgsl `sky_through`: how much of a ray gets through the volumes
+    /// between `o` and `tmax` along `d`, their density marched in eight
+    /// even steps a crossing.
+    fn through(&self, o: V3, d: V3, tmax: f32) -> f32 {
+        if !self.volumes || self.nodes.is_empty() {
+            return 1.0;
+        }
+        // Every crossing of a volume's faces along the whole ray, in
+        // order (at most eight).
+        let mut found: Vec<(f32, u32)> = Vec::new();
+        let inv = [1.0 / d[0], 1.0 / d[1], 1.0 / d[2]];
+        let mut stack = [0u32; 64];
+        let mut top = 1;
+        while top > 0 {
+            top -= 1;
+            let index = stack[top];
+            let node = &self.nodes[index as usize];
+            let (mut t0, mut t1) = (0.0f32, 1e30f32);
+            for a in 0..3 {
+                let (x, y) = ((node.lo[a] - o[a]) * inv[a], (node.hi[a] - o[a]) * inv[a]);
+                t0 = t0.max(x.min(y));
+                t1 = t1.min(x.max(y));
+            }
+            if t0 > t1 {
+                continue;
+            }
+            if node.count == 0 {
+                if top + 2 <= stack.len() {
+                    stack[top] = node.at;
+                    stack[top + 1] = index + 1;
+                    top += 2;
+                }
+                continue;
+            }
+            for k in node.at as usize..(node.at + node.count) as usize {
+                let tri = &self.tris[k];
+                if tri.mat & CARD != 0 || self.mats[tri.mat as usize].volume.is_none() {
+                    continue;
+                }
+                if let Some((t, _)) = meet(tri, o, d) {
+                    if t > 0.0 && t < 1e30 {
+                        found.push((t, tri.mat));
+                    }
+                }
+            }
+        }
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.truncate(8);
+        let mut tau = 0.0f32;
+        for i in 0..found.len() {
+            let me = found[i].1;
+            if found[..i].iter().any(|f| f.1 == me) {
+                continue;
+            }
+            let Some((inst, row, sigma)) = self.mats[me as usize].volume else { continue };
+            let mut inside = found.iter().filter(|f| f.1 == me).count() % 2 == 1;
+            let mut from = 0.0f32;
+            for j in 0..=found.len() {
+                let to = match found.get(j) {
+                    Some(f) if f.1 != me => continue,
+                    Some(f) => f.0.min(tmax),
+                    None => tmax,
+                };
+                if inside && to > from && to < 1e29 {
+                    let dt = (to - from) / 8.0;
+                    for s in 0..8 {
+                        let p = add(o, mul(d, from + (s as f32 + 0.5) * dt));
+                        tau += sigma * crate::mesh3d::volume_density(self.rows[inst], self.images, row, p) * dt;
+                    }
+                }
+                inside = !inside;
+                from = to;
+                if to >= tmax {
+                    break;
+                }
+            }
+        }
+        (-tau).exp()
+    }
+
     /// pt.wgsl `cast_ray` for the sky's rays: the nearest surface and its
     /// normals facing the ray, or a card with its picture's colour.
     fn hit(&self, o: V3, d: V3, ray: Ray) -> Option<Hit> {
@@ -357,7 +453,7 @@ impl<'a> Scene<'a> {
         if tri.mat & CARD != 0 {
             let p = add(o, mul(d, t));
             let back = mul(d, -1.0);
-            return Some(Hit { t, p, n: back, g: back, mat: Mat { flags: 0, blocks: true, kd: [0.0; 3], emit: [0.0; 3] }, card: Some(self.card_picture((tri.mat & !CARD) as usize, p)) });
+            return Some(Hit { t, p, n: back, g: back, mat: Mat { flags: 0, blocks: true, kd: [0.0; 3], emit: [0.0; 3], flat: None, volume: None }, card: Some(self.card_picture((tri.mat & !CARD) as usize, p)) });
         }
         let mat = self.mats[tri.mat as usize];
         let w = [1.0 - uv[0] - uv[1], uv[0], uv[1]];
@@ -374,6 +470,28 @@ impl<'a> Scene<'a> {
         }
         Some(Hit { t, p: add(o, mul(d, t)), n, g, mat, card: None })
     }
+}
+
+/// Where `o + t d` meets a triangle: t and the weights of its second and
+/// third corners.
+fn meet(tri: &Tri, o: V3, d: V3) -> Option<(f32, [f32; 2])> {
+    let (e1, e2) = (sub(tri.p[1], tri.p[0]), sub(tri.p[2], tri.p[0]));
+    let pv = cross(d, e2);
+    let det = dot(e1, pv);
+    if det.abs() < 1e-20 {
+        return None;
+    }
+    let tv = sub(o, tri.p[0]);
+    let u = dot(tv, pv) / det;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let qv = cross(tv, e1);
+    let v = dot(d, qv) / det;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    Some((dot(e2, qv) / det, [u, v]))
 }
 
 /// pt.wgsl `offset`.
@@ -456,8 +574,8 @@ struct Raw {
 /// Fills traced list `t`'s sky group, `w` × `h` texels of visibility, as
 /// many after them of the light that comes back and as many of the
 /// surfaces' planes, at `out`. `groups`: the list's groups before it (its
-/// cards' pictures).
-pub(crate) fn fill(t: &Trace, groups: &[[f32; 4]], w: usize, h: usize, out: &mut [[f32; 4]], threads: usize) {
+/// cards' pictures); `images`: the image pool's texels (a volume's grid).
+pub(crate) fn fill(t: &Trace, groups: &[[f32; 4]], images: &[u32], w: usize, h: usize, out: &mut [[f32; 4]], threads: usize) {
     if out.len() < w * h * 3 || w == 0 || h == 0 {
         return;
     }
@@ -471,7 +589,7 @@ pub(crate) fn fill(t: &Trace, groups: &[[f32; 4]], w: usize, h: usize, out: &mut
         }
         clock = std::time::Instant::now();
     };
-    let scene = Scene::new(t, groups);
+    let scene = Scene::new(t, groups, images);
     lap(&format!("a BVH over {} triangles", scene.tris.len()));
     let inv = t.inv_root;
     let dir = |x: f32, y: f32| {
@@ -514,15 +632,20 @@ pub(crate) fn fill(t: &Trace, groups: &[[f32; 4]], w: usize, h: usize, out: &mut
             if dot(ray, hit.g) <= 0.02 {
                 continue;
             }
-            match scene.hit(o, ray, Ray::Sky) {
+            let far = scene.hit(o, ray, Ray::Sky);
+            // (What the volumes on its way let through.)
+            let through = scene.through(o, ray, far.as_ref().map_or(1e30, |f| f.t));
+            match far {
                 None => {
-                    sum = add(sum, ray);
-                    n += 1.0;
+                    sum = add(sum, mul(ray, through));
+                    n += through;
                 }
                 // (A card's colour comes back as it is.)
-                Some(Hit { card: Some(c), .. }) => back = add(back, [c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(crate::mesh3d::srgb_decode)),
+                Some(Hit { card: Some(c), .. }) => back = add(back, mul([c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(crate::mesh3d::srgb_decode), through)),
+                // (And what is not lit.)
+                Some(Hit { mat: Mat { flat: Some(c), .. }, .. }) => back = add(back, mul(c, through)),
                 Some(far) => {
-                    back = add(back, sky_lit(&scene, t, &far));
+                    back = add(back, mul(sky_lit(&scene, t, &far), through));
                     kd = add(kd, far.mat.kd);
                     hits += 1.0;
                     if k < 4 {

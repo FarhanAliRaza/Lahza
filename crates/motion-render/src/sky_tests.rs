@@ -439,3 +439,119 @@ fn cards_and_see_through_meshes_hide_the_sky() {
     // And the same frame is the same picture.
     assert_eq!(render(&with_card, true), a1);
 }
+
+/// Not a test (`--ignored --nocapture`): what a third return of the
+/// light would add. Sky visibility has the environment's light, what
+/// comes back from the surfaces a point sees (lit as if open) and what
+/// those take back in turn; the traced picture at 2, 3, 4 and 6 bounces
+/// has one return more each time. The room lit by the environment and
+/// the table under the default lights: the whole picture's brightness
+/// and the darkest floor (under the ball; under the table), in levels.
+#[test]
+#[ignore]
+fn measure_a_third_return() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let leg = |id: &str, x: i32, z: i32| json!({"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [8, 50], "depth": 8}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [x, 105], "z": z}});
+    let mut table = project(json!([
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 900]}, "material": {"preset": "matte", "color": "#d8d0c0"}, "transform": {"position": [160, 130], "rotation_x": 90}},
+        {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 500]}, "material": {"preset": "matte", "color": "#c8d0d8"}, "transform": {"position": [160, 0], "z": 160}},
+        {"id": "top", "kind": "mesh", "mesh": {"type": "box", "size": [150, 8], "depth": 90}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [160, 76]}},
+        leg("a", 92, -38), leg("b", 228, -38), leg("c", 92, 38), leg("d", 228, 38)
+    ]));
+    table.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12]})).unwrap();
+    table.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mean = |img: &RgbaImage| img.pixels().map(|p| p.0[0] as f64 + p.0[1] as f64 + p.0[2] as f64).sum::<f64>() / (img.width() * img.height() * 3) as f64;
+    for (name, p, spot) in [("the room", room(Some(json!([{"type": "ambient", "intensity": 0.2}]))), (99, 129)), ("the table", table, (160, 125))] {
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let sky = raster(true, false).render(&c, 0.0);
+        eprintln!("{name}: sky visibility {:.1} over the picture, {:.1} at the dark floor", mean(&sky), around(&sky, spot.0, spot.1, 4));
+        let mut before: Option<RgbaImage> = None;
+        for bounces in [2u32, 3, 4, 5, 6] {
+            let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, path: Some(crate::pt::TraceOptions { spp: 256, bounces, ..Default::default() }), ..Default::default() });
+            let img = r.render(&c, 0.0);
+            let more = before.as_ref().map(|b| (mean(&img) - mean(b), around(&img, spot.0, spot.1, 4) - around(b, spot.0, spot.1, 4)));
+            eprintln!("    traced, {bounces} bounces: {:.1} over the picture, {:.1} at the dark floor{}", mean(&img), around(&img, spot.0, spot.1, 4), more.map_or(String::new(), |m| format!(" ({:+.1} and {:+.1} on the one before)", m.0, m.1)));
+            before = Some(img);
+        }
+    }
+}
+
+/// Not a test (`--ignored --nocapture`): what cards in the sky's rays
+/// cost. The floor and wall with and without a card over the floor, with
+/// sky visibility and without (the card's own drawing is in both): ms a
+/// frame on the GPU and on the CPU. $LAHZA_MEASURE: "width,height".
+#[test]
+#[ignore]
+fn measure_cards_in_the_rays() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let v: Vec<u32> = std::env::var("LAHZA_MEASURE").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    for card in [false, true] {
+        let mut p = canopy(card, Some(1.0));
+        p.settings.width = *v.first().unwrap_or(&480);
+        p.settings.height = *v.get(1).unwrap_or(&270);
+        let c = Compiled::new(&p);
+        for sky in [false, true] {
+            let time = |r: &mut Renderer| {
+                r.render(&c, 0.0);
+                r.render(&c, 0.0);
+                let started = std::time::Instant::now();
+                for _ in 0..6 {
+                    r.last_invalidate();
+                    r.render(&c, 0.0);
+                }
+                started.elapsed().as_secs_f64() * 1000.0 / 6.0
+            };
+            let (gpu, on_cpu) = (time(&mut raster(sky, false)), time(&mut Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky, ..Default::default() })));
+            eprintln!("a card {card}, sky visibility {sky}: the GPU {gpu:.0} ms a frame, the CPU {on_cpu:.0} ms");
+        }
+    }
+}
+
+/// A volume hides the sky by its density along each ray, marched in even
+/// steps (nothing drawn by lot): the floor under a slab of haze is darker
+/// the denser the haze, on the GPU and on the CPU alike; and a filled
+/// wireframe hides it as the solid thing it looks.
+#[test]
+fn a_volume_hides_the_sky_by_its_density() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let build = |over: Option<serde_json::Value>| {
+        let mut p = canopy(false, None);
+        if let Some(material) = over {
+            p.scenes[0].layers.push(serde_json::from_value(json!({"id": "over", "kind": "mesh", "mesh": {"type": "box", "size": [120, 16], "depth": 100}, "material": material,
+                "transform": {"position": [95, 98]}})).unwrap());
+        }
+        Compiled::new(&p)
+    };
+    let scenes = [
+        ("nothing", build(None)),
+        ("thin haze", build(Some(json!({"volume": {"density": 0.3}})))),
+        ("thick haze", build(Some(json!({"volume": {"density": 5}})))),
+        ("a cloud", build(Some(json!({"volume": {"density": 5}, "noise": {"type": "fbm", "scale": 30}})))),
+        ("a filled wireframe", build(Some(json!({"preset": "wireframe", "color": "#ffb020", "fill": "#404040"})))),
+    ];
+    let spot = (95, 158);
+    let mut seen = Vec::new();
+    for (name, c) in &scenes {
+        assert!(c.errors.is_empty(), "{name}: {:?}", c.errors);
+        let mut r = raster(true, false);
+        let a = r.render(c, 0.0);
+        assert!(r.warnings().is_empty(), "{name}: {:?}", r.warnings());
+        let ours = Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() }).render(c, 0.0);
+        keep(&format!("over-{}", name.replace(' ', "-")), &a);
+        let apart = a.pixels().zip(ours.pixels()).filter(|(p, q)| (0..4).any(|k| p.0[k].abs_diff(q.0[k]) > 3)).count() as f64 / (a.width() * a.height()) as f64;
+        eprintln!("{name}: the floor in front of it {:.0}; GPU against CPU {:.2}% of px more than 3 levels apart", around(&a, spot.0, spot.1, 2), apart * 100.0);
+        assert!(apart < 0.01, "{name}: {apart}");
+        seen.push(around(&a, spot.0, spot.1, 2));
+    }
+    assert!(seen[1] < seen[0] - 1.0 && seen[2] < seen[1] - 4.0, "the denser, the darker: {seen:?}");
+    assert!(seen[3] < seen[0] - 2.0 && seen[3] > seen[2], "a cloud's holes let more through: {seen:?}");
+    assert!(seen[4] < seen[0] - 8.0, "a filled wireframe hides the sky: {seen:?}");
+}

@@ -167,11 +167,12 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
 /// `sky_list`): not one that blends otherwise than over what is behind it
 /// (a glow hides nothing), a volume (it needs the tracer's marching) or
 /// one whose coverage a Slang surface works out. What is in them hides
-/// the sky where it is at least half opaque (pt.wgsl `sky_blocks`).
+/// the sky where it is at least half opaque (pt.wgsl `sky_blocks`), and
+/// a volume by its density along the ray (`sky_through`).
 pub(crate) fn in_sky(layer: &lahza_motion_core::compile::LayerState) -> bool {
     use lahza_motion_core::compile::Content;
     let Content::Mesh(m) = &layer.content else { return false };
-    layer.blend == lahza_motion_core::document::Blend::Normal && !m.materials.iter().any(|x| x.volume.is_some() || x.slang.as_ref().is_some_and(|s| s.see_through))
+    layer.blend == lahza_motion_core::document::Blend::Normal && !m.materials.iter().any(|x| x.slang.as_ref().is_some_and(|s| s.see_through))
 }
 
 impl MeshCache {
@@ -3573,7 +3574,7 @@ fn grid_slice(images: &[u32], r31: [f32; 4], n: [f32; 4], k: f32, x: f32, y: f32
 }
 
 /// Mirrors `volume_density` in motion.wgsl.
-fn volume_density(m: &[[f32; 4]], images: &[u32], row: usize, p: F3) -> f32 {
+pub(crate) fn volume_density(m: &[[f32; 4]], images: &[u32], row: usize, p: F3) -> f32 {
     let r30 = m[row + 30];
     if r30[2] < 0.5 {
         return 1.0;

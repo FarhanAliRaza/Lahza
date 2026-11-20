@@ -728,7 +728,7 @@ impl Renderer {
                     let at = (g.offset as usize).min(groups.len());
                     let (before, rest) = groups.split_at_mut(at);
                     if let Some(out) = rest.get_mut(..w * h * 3) {
-                        sky_cpu::fill(t, before, w, h, out, self.threads);
+                        sky_cpu::fill(t, before, &self.images.texels, w, h, out, self.threads);
                     }
                     continue;
                 }
@@ -765,9 +765,10 @@ const MOTION_PX_PER_SAMPLE: f64 = 1.5;
 
 /// How far, in canvas pixels, anything on screen moves between two
 /// moments, or None when that cannot be told from where the layers are:
-/// layers come or go, or a shape, text or shader picture changes form.
-/// (Motion blur then takes every sample the scene asks for.) Colours,
-/// opacities and effects changing are not motion.
+/// layers come or go, or a text or shader picture changes form, or a
+/// shape in a way `shape` cannot bound. (Motion blur then takes every
+/// sample the scene asks for.) Colours, opacities and effects changing
+/// are not motion.
 fn motion_px(a: &FrameState, b: &FrameState) -> Option<f64> {
     use lahza_motion_core::space::Proj;
     fn far(p: (f64, f64), q: (f64, f64)) -> Option<f64> {
@@ -807,6 +808,7 @@ fn motion_px(a: &FrameState, b: &FrameState) -> Option<f64> {
                 // Footage steps from frame to frame where it stands.
                 (Content::Video(_), Content::Video(_)) => flat(ma, mb, canvas)?,
                 (p, q) if p == q => flat(ma, mb, canvas)?,
+                (Content::Shape(p), Content::Shape(q)) => shape(p, q, ma, mb, canvas)?,
                 _ => return None,
             };
             most = most.max(d);
@@ -818,6 +820,45 @@ fn motion_px(a: &FrameState, b: &FrameState) -> Option<f64> {
         }
         Some(most)
     }
+    /// A shape that is not the same at the two moments: how far its
+    /// points move at most, where that can be told. Its paint alone (a
+    /// colour, a gradient's stops): no farther than the layer does. Its
+    /// size, corner radius or thickness, for the kinds that are drawn in
+    /// their box: no farther than the box's corners, and by the change of
+    /// the radius and the thickness. A path that morphs or is trimmed, a
+    /// field's points, other sides or angles: not told (None).
+    fn shape(p: &lahza_motion_core::compile::ShapeState, q: &lahza_motion_core::compile::ShapeState, ma: Proj, mb: Proj, canvas: (f64, f64)) -> Option<f64> {
+        use lahza_motion_core::document::ShapeKind;
+        let mut same = p.clone();
+        (same.fill, same.stroke, same.stroke_gradient) = (q.fill.clone(), q.stroke.map(|(c, _)| c).zip(p.stroke.map(|(_, w)| w)).or(p.stroke), q.stroke_gradient.clone());
+        if p.stroke.is_some() != q.stroke.is_some() {
+            return None;
+        }
+        if same == *q {
+            return flat(ma, mb, canvas);
+        }
+        if !matches!(p.shape, ShapeKind::Circle | ShapeKind::Rect | ShapeKind::Capsule | ShapeKind::Ring | ShapeKind::Polygon | ShapeKind::Star) {
+            return None;
+        }
+        let stroke = |s: &lahza_motion_core::compile::ShapeState| s.stroke.map_or(0.0, |(_, w)| w);
+        (same.size, same.radius, same.thickness) = (q.size, q.radius, q.thickness);
+        if let (Some(s), Some(t)) = (&mut same.stroke, q.stroke) {
+            s.1 = t.1;
+        }
+        if same != *q {
+            return None;
+        }
+        let mut most = 0.0f64;
+        for k in 0..4 {
+            let at = |s: &lahza_motion_core::compile::ShapeState, m: Proj| {
+                let half = [s.size.0[0] * 0.5 + stroke(s), s.size.0[1] * 0.5 + stroke(s)];
+                m.apply(if k & 1 == 0 { -half[0] } else { half[0] }, if k & 2 == 0 { -half[1] } else { half[1] })
+            };
+            most = most.max(far(at(p, ma), at(q, mb))?);
+        }
+        Some(most + ((p.radius - q.radius).abs() + (p.thickness - q.thickness).abs()) * ma.max_scale().max(mb.max_scale()))
+    }
+
     /// A flat layer under `ma` then `mb`: how far the points it shows on
     /// the canvas move (most at a corner of the canvas), either way.
     fn flat(ma: Proj, mb: Proj, canvas: (f64, f64)) -> Option<f64> {
@@ -871,3 +912,35 @@ mod sky_tests;
 
 #[cfg(test)]
 mod skin_tests;
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn moved(layer: serde_json::Value) -> Option<f64> {
+        let c = Compiled::new(&crate::tests::project(json!([layer])));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        motion_px(&c.frame(0.5), &c.frame(0.6))
+    }
+
+    /// A shape that changes form is not taken for motion of unknown
+    /// length where its points' way can be bounded: a colour changing is
+    /// no motion, a circle growing moves its points as far as its box's
+    /// corners; a path that morphs is still not told.
+    #[test]
+    fn a_shape_changing_form_moves_as_far_as_its_box() {
+        let key = |a: serde_json::Value, b: serde_json::Value| json!({"keys": [{"at": 0, "v": a, "ease": "linear"}, {"at": 1, "v": b, "ease": "linear"}]});
+        let colour = moved(json!({"id": "a", "kind": "shape", "shape": "circle", "size": [80, 80], "fill": key(json!("#ff0000"), json!("#0000ff")), "transform": {"position": [160, 90]}}));
+        assert_eq!(colour, Some(0.0), "a colour changing is not motion");
+        // 80 to 180 px across in a second: a tenth of a second grows it by
+        // 10, its box's corners move 5 each way.
+        let grows = moved(json!({"id": "a", "kind": "shape", "shape": "circle", "size": key(json!([80, 80]), json!([180, 180])), "fill": "#ffffff", "transform": {"position": [160, 90]}})).expect("a growing circle's motion is told");
+        assert!((grows - 5.0 * 2f64.sqrt()).abs() < 0.01, "{grows}");
+        // And moving meanwhile: the two add up along x.
+        let both = moved(json!({"id": "a", "kind": "shape", "shape": "rect", "size": key(json!([80, 40]), json!([180, 40])), "fill": "#ffffff", "transform": {"position": key(json!([100, 90]), json!([200, 90]))}})).unwrap();
+        assert!((both - 15.0).abs() < 0.01, "{both}");
+        let morph = moved(json!({"id": "a", "kind": "shape", "shape": "path", "d": {"keys": [{"at": 0, "v": "M 0 0 L 50 0 L 50 50 Z"}, {"at": 1, "v": "M 0 0 L 90 0 L 20 80 Z"}]}, "fill": "#ffffff"}));
+        assert_eq!(morph, None, "a morphing path is not told");
+    }
+}

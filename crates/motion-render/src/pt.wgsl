@@ -432,13 +432,14 @@ fn card_stands(alpha: f32, rng: ptr<function, Rng>) -> bool {
 // (`sky_blocks`, and a card where its picture covers more than half).
 var<private> sky_mode: u32 = 0u;
 
-// Whether triangle `prim` of instance `custom` hides the sky: a surface
-// (no shadow catcher, wire or volume) at least half opaque.
-fn sky_blocks(custom: u32, prim: u32) -> bool {
+// The material row of triangle `prim` of instance `custom` (every index
+// checked), or SKY_NONE.
+const SKY_NONE: u32 = 0xffffffffu;
+fn sky_material(custom: u32, prim: u32) -> u32 {
     let inst = custom * INST_ROWS;
-    if inst + INST_ROWS - 1u >= arrayLength(&b_inst) { return false; }
+    if inst + INST_ROWS - 1u >= arrayLength(&b_inst) { return SKY_NONE; }
     let ti = bitcast<u32>(b_inst[inst].z) + prim;
-    if ti >= arrayLength(&b_tag) { return false; }
+    if ti >= arrayLength(&b_tag) { return SKY_NONE; }
     let tag = b_tag[ti];
     let part = tag & 0xffu;
     let row = b_inst[inst + 1u + part / 2u];
@@ -446,10 +447,90 @@ fn sky_blocks(custom: u32, prim: u32) -> bool {
     var count: u32;
     if part % 2u == 0u { base = bitcast<u32>(row.x); count = bitcast<u32>(row.y); } else { base = bitcast<u32>(row.z); count = bitcast<u32>(row.w); }
     let mat = (base + ((tag >> 8u) & 0xffffu) % max(count, 1u)) * MAT_ROWS;
-    if mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { return false; }
+    if mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { return SKY_NONE; }
+    return mat;
+}
+
+// Whether triangle `prim` of instance `custom` hides the sky: a surface
+// at least half opaque. A wireframe by its faces' fill (its lines are a
+// px or two of the screen: nothing to a ray); a shadow catcher never (it
+// is not there but for the shadows on it); a volume not as a surface
+// (`sky_through`).
+fn sky_blocks(custom: u32, prim: u32) -> bool {
+    let mat = sky_material(custom, prim);
+    if mat == SKY_NONE { return false; }
     let flags = u32(b_mat[mat + 2u].w);
-    if (flags & (FLAG_SHADOW_CATCHER | FLAG_WIRE | FLAG_VOLUME)) != 0u { return false; }
+    if (flags & (FLAG_SHADOW_CATCHER | FLAG_VOLUME)) != 0u { return false; }
+    if (flags & FLAG_WIRE) != 0u { return b_mat[mat + 1u].w >= 0.5; }
     return b_mat[mat].w * (1.0 - b_mat[mat + 3u].x) >= 0.5;
+}
+
+// How much of a sky's ray gets through the list's volumes between `o`
+// and `tmax` along `d`: by their density marched in eight even steps a
+// crossing, nothing drawn by lot (the tracer's own walk through a volume
+// is by lot). Every crossing of a volume's faces along the whole ray is
+// found first: an odd number of them says the ray starts inside.
+fn sky_through(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
+    var ts: array<f32, 8>;
+    var ms: array<u32, 8>;
+    var n = 0u;
+    var rq: ray_query;
+    rayQueryInitialize(&rq, acc, RayDesc(RAY_FLAG_FORCE_NO_OPAQUE, 0xFFu, 0.0, 1e30, o, d));
+    while rayQueryProceed(&rq) {
+        let c = rayQueryGetCandidateIntersection(&rq);
+        if c.kind != RAY_QUERY_INTERSECTION_TRIANGLE || c.instance_custom_data == u.opts.z { continue; }
+        let mat = sky_material(c.instance_custom_data, c.primitive_index);
+        if mat == SKY_NONE || (u32(b_mat[mat + 2u].w) & FLAG_VOLUME) == 0u || n >= 8u { continue; }
+        // Kept in order along the ray.
+        var k = n;
+        while k > 0u && ts[k - 1u] > c.t {
+            ts[k] = ts[k - 1u];
+            ms[k] = ms[k - 1u];
+            k -= 1u;
+        }
+        ts[k] = c.t;
+        ms[k] = mat;
+        n += 1u;
+    }
+    var tau = 0.0;
+    for (var i = 0u; i < n; i++) {
+        // Each volume once, at its first crossing: its stretches.
+        var first = true;
+        var count = 0u;
+        for (var j = 0u; j < n; j++) {
+            if ms[j] == ms[i] {
+                if j < i { first = false; }
+                count += 1u;
+            }
+        }
+        if !first { continue; }
+        var inside = count % 2u == 1u;
+        var since = 0.0;
+        let sigma = b_mat[ms[i] + 18u].x;
+        for (var j = 0u; j <= n; j++) {
+            var until = tmax;
+            if j < n {
+                if ms[j] != ms[i] { continue; }
+                until = min(ts[j], tmax);
+            }
+            if inside && until > since && until < 1e29 {
+                let dt = (until - since) / 8.0;
+                for (var s = 0u; s < 8u; s++) {
+                    tau += sigma * density_at_or_even(ms[i], o + d * (since + (f32(s) + 0.5) * dt)) * dt;
+                }
+            }
+            inside = !inside;
+            since = until;
+            if until >= tmax { break; }
+        }
+    }
+    return exp(-tau);
+}
+
+// (An even volume has no density to look up.)
+fn density_at_or_even(row: u32, p: vec3<f32>) -> f32 {
+    if b_mat[row + 30u].z < 0.5 { return 1.0; }
+    return density_at(row, p);
 }
 
 // The triangle the next ray does not see (`pass_boundary`).
@@ -2678,6 +2759,15 @@ fn sky_lit(h: Hit) -> vec3<f32> {
     return b_mat[h.mat].xyz * (1.0 - b_mat[h.mat + 1u].x) * l + b_mat[h.mat + 2u].xyz;
 }
 
+// The same for what is not lit: an unlit surface's colour and a filled
+// wireframe's faces come back as they are.
+fn sky_flat(h: Hit) -> vec4<f32> {
+    let flags = u32(b_mat[h.mat + 2u].w);
+    if (flags & FLAG_WIRE) != 0u { return vec4<f32>(b_mat[h.mat + 1u].xyz, 1.0); }
+    if (flags & 1u) != 0u { return vec4<f32>(b_mat[h.mat].xyz + b_mat[h.mat + 2u].xyz, 1.0); }
+    return vec4<f32>(0.0);
+}
+
 // The texel of the sky's group that camera-space point p is seen in, and
 // one more (0: outside the picture, or behind the camera).
 fn sky_texel(p: vec3<f32>) -> u32 {
@@ -2786,19 +2876,32 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
                 // (Under the true surface: the shading normal leans.)
                 if dot(d, h.g) <= 0.02 { continue; }
                 let far = cast_ray(o, d, 1e30, &rng);
+                // What the volumes on its way let through: the rest of
+                // the ray ends in them, and nothing comes back of it.
+                var through = 1.0;
+                if F_VOLUME {
+                    var reach = 1e30;
+                    if far.found { reach = far.t; }
+                    through = sky_through(o, d, reach);
+                }
                 if !far.found {
-                    sum += d;
-                    n += 1.0;
+                    sum += d * through;
+                    n += through;
                     continue;
                 }
                 if far.card {
                     // A card is a flat picture: its colour comes back as
                     // it is (not lit, so nothing a second time).
                     let c = far.card_color;
-                    back += vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
+                    back += vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w)) * through;
                     continue;
                 }
-                back += sky_lit(far);
+                let flat = sky_flat(far);
+                if flat.w > 0.5 {
+                    back += flat.xyz * through;
+                    continue;
+                }
+                back += sky_lit(far) * through;
                 // (For the second time the light comes back: `sky_second`.)
                 kd += vec4<f32>(b_mat[far.mat].xyz * (1.0 - b_mat[far.mat + 1u].x), 1.0);
                 if k < 4u {
