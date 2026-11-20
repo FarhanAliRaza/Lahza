@@ -746,6 +746,43 @@ impl Studio {
         chips
     }
 
+    /// How the preview is drawn: Raster, Raster + sky or Traced, one
+    /// choice for the app; with a note when this GPU cannot do it.
+    fn motion_preview_quality(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::motion_preview::{quality, set_quality, Quality, CANNOT_TRACE};
+        let now = quality();
+        let cannot = now.traces() && (self.motion_editor().is_some_and(|e| e.read(cx).cannot_trace()) || self.motion_pieces.as_ref().is_some_and(|p| p.cannot_trace));
+        let mut row = div().flex().flex_none().items_center().gap_1().text_xs();
+        if cannot {
+            row = row.child(div().text_color(theme::danger()).child(CANNOT_TRACE));
+        }
+        row = row.child(div().text_color(theme::muted()).child("Preview"));
+        for (i, q) in Quality::ALL.into_iter().enumerate() {
+            row = row.child(
+                div()
+                    .id(("motion-preview-quality", i))
+                    .h(px(22.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if q == now { theme::accent() } else { theme::line() })
+                    .bg(if q == now { theme::control_selected() } else { theme::control_bg() })
+                    .hover(|s| s.bg(theme::control_hover()))
+                    .cursor_pointer()
+                    .tooltip(crate::timeline_ui::tooltip(q.hint()))
+                    .child(q.label())
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        set_quality(q);
+                        cx.notify();
+                    })),
+            );
+        }
+        row.into_any_element()
+    }
+
     /// The prompt bar, under the preview.
     pub(crate) fn motion_prompt_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let agent = &self.motion_agent;
@@ -829,7 +866,15 @@ impl Studio {
             .border_t_1()
             .border_color(theme::line())
             .bg(theme::panel())
-            .child(div().h(px(22.0)).flex().items_center().gap_1().overflow_hidden().children(self.motion_prompt_chips(cx)))
+            .child(
+                div()
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().flex().items_center().gap_1().overflow_hidden().children(self.motion_prompt_chips(cx)))
+                    .child(self.motion_preview_quality(cx)),
+            )
             .child(div().flex().items_center().gap_2().child(div().flex_1().min_w_0().child(self.text_fields.prompt.clone())).child(action))
             .child(status)
             .into_any_element()

@@ -298,10 +298,26 @@ To run again on the RTX 3060 (nothing above was):
   second a film for the depth of field before).
 
 What is missing:
-- **The editor's preview takes `fast`.** Only `render` and `snapshot` do.
-  What it needs is there (`Renderer::set_path` with `fast`,
-  `try_render_warm` after a scrub); src/* is to call it. To settle there:
-  the preview's own size and pacing.
+- **The editor's preview takes `fast` (wired; not seen on a card).** A
+  choice beside the prompt bar, kept with the app's settings: Raster,
+  Raster + sky (`set_sky`), Traced (`fast`). Both preview workers go
+  through `src/motion_preview.rs`: playing builds on the frames before
+  (up to 8 dropped frames still follow), a still frame after a scrub, an
+  edit or a change of size is warmed up with 8 frames
+  (`try_render_warm`), a jump while playing starts afresh
+  (`forget_history`), and a drag always draws the raster proxy. Run on
+  Mesa's software Vulkan at 160 x 90
+  (`a_traced_preview_warms_up_builds_on_and_gives_way_to_a_drag`,
+  `--ignored`, `LAHZA_MOTION_SOFTWARE_GPU=1`): the first still frame
+  17 s with its pipelines cold, the next 0.03 s, a warmed frame after a
+  drag 0.25 s, with the sky 0.23 s, the raster 0.02 s; the three
+  pictures looked at and they differ as they should. Not run: the
+  window with Traced chosen, any size a person would use, a real card,
+  Ray Reconstruction. Not settled: the pacing (a warm-up of 8 frames
+  blocks the worker for as long as they take; at the 24 ms measured on
+  the RTX 3060 that is a fifth of a second), the fast mode's own motion
+  blur (not asked for: `shutter` stays 0), and whether 8 dropped frames
+  is the right reach for the history while playing.
 - **Transitions and camera jumps** keep or lose the history as above.
 - **Ray Reconstruction's picture** of all that changed here.
 
@@ -796,7 +812,10 @@ with a mouse on a real desktop.
 - **What comes back is a proposal**: Keep, Undo, Again, and Hold to
   compare (the button, or `\` held). Compare applies the request's
   inverses in the preview only; nothing is written.
-- **A drag never waits**: see "Drags that stall".
+- **A drag never waits**: see "Drags that stall". This holds with the
+  preview set to Traced or Raster + sky too: a drag's frames are the
+  raster proxy (`motion_preview::ask`), and the traced picture comes back
+  warmed up on release.
 - **By hand stays cheap**: the inspector edits a text layer's words (shown
   as typed, saved when the field is left), its font (the bundled ones and
   the font files in the project's `assets/`), colour, size and tracking;
