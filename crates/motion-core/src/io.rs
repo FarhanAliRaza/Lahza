@@ -142,6 +142,25 @@ pub struct HistoryEntry {
     /// For undo entries: the entries they reverted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub undoes: Vec<u64>,
+    /// The request this edit belongs to (one prompt to an agent makes
+    /// many edits): undone and put back together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+}
+
+/// A project folder held for one read-change-write. The editor and an
+/// agent's server each keep the project in memory and number history
+/// entries from what is on disk: whoever writes takes this first, loads
+/// what the other wrote, then writes. Released when dropped, or when the
+/// process ends (`flock` on `<project>/.lock`).
+pub struct Lock(#[allow(dead_code)] fs::File);
+
+/// Waits for the folder's lock.
+pub fn lock(dir: &Path) -> Result<Lock> {
+    let path = dir.join(".lock");
+    let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|e| err(&path, e))?;
+    file.lock().map_err(|e| err(&path, e))?;
+    Ok(Lock(file))
 }
 
 fn history_dir(dir: &Path) -> PathBuf {
@@ -195,7 +214,7 @@ mod tests {
     use crate::time::Fps;
 
     fn entry(n: u64) -> HistoryEntry {
-        HistoryEntry { n, time: 0, author: "agent".into(), summary: vec!["set a.b".into()], ops: vec![serde_json::json!({"op": "set", "target": "a.b", "value": 1})], inverse: Vec::new(), undone: false, undoes: Vec::new() }
+        HistoryEntry { n, time: 0, author: "agent".into(), summary: vec!["set a.b".into()], ops: vec![serde_json::json!({"op": "set", "target": "a.b", "value": 1})], inverse: Vec::new(), undone: false, undoes: Vec::new(), request: None }
     }
 
     /// The next number comes from the file names; prints what reading every
@@ -216,6 +235,24 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(read_history(&dir).unwrap().len(), 2000);
         println!("2000 entries: next number {:.2} ms from names, {:.2} ms reading them all", names.as_secs_f64() * 1000.0, t.elapsed().as_secs_f64() * 1000.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_folder_lock_is_held_by_one_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("lahza-motion-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let held = lock(&dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = dir.clone();
+        let waiter = std::thread::spawn(move || {
+            let _lock = lock(&other).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(150)).is_err(), "the second waits");
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("and gets it when the first lets go");
+        waiter.join().unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

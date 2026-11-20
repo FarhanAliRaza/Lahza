@@ -91,6 +91,80 @@ fn undo_and_redo_through_history() {
 }
 
 #[test]
+fn a_request_is_undone_and_put_back_as_one() {
+    let (mut person, dir) = toolbox("request");
+    person.call("project_create", json!({"path": "p", "duration": 2})).unwrap();
+    person.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}], "author": "person"})).unwrap();
+    // An agent's server, started for one request: its edits carry the id.
+    let mut agent = Toolbox::new();
+    agent.cwd = dir.clone();
+    agent.request = Some("r1".into());
+    for id in ["a", "b", "c"] {
+        agent.call("edit_apply", json!({"project": "p.lahza", "ops": [{"op": "add", "scene": "s1", "id": id, "kind": "shape", "shape": "rect"}]})).unwrap();
+    }
+    // The person's toolbox loads what the agent wrote before it writes.
+    person.call("edit_apply", json!({"ops": [{"op": "add", "scene": "s1", "id": "mine", "kind": "shape", "shape": "rect"}], "author": "person"})).unwrap();
+    let ids = |tb: &mut Toolbox| -> Vec<String> {
+        tb.call("timeline_get", json!({"project": "p.lahza"})).unwrap().json["scenes"][0]["layers"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(ids(&mut person), ["a", "b", "c", "mine"]);
+    let list = person.call("history", json!({})).unwrap().json;
+    let numbers: Vec<u64> = list["entries"].as_array().unwrap().iter().map(|e| e["n"].as_u64().unwrap()).collect();
+    assert_eq!(numbers, [5, 4, 3, 2, 1], "two writers, no number taken twice");
+    assert_eq!(list["entries"][1]["request"], "r1");
+    assert!(list["entries"][0]["request"].is_null());
+    // The whole request, leaving the person's later edit.
+    let out = person.call("history", json!({"undo_request": "r1"})).unwrap().json;
+    assert_eq!(out["undone"], json!([4, 3, 2]));
+    assert_eq!(ids(&mut person), ["mine"]);
+    // Before and after: redo puts all of it back.
+    person.call("history", json!({"redo": true})).unwrap();
+    assert_eq!(ids(&mut agent), ["a", "b", "c", "mine"]);
+    // Step by step, a request counts as one step: the person's edit, then
+    // the request.
+    person.call("history", json!({"undo": 1, "by_request": true})).unwrap();
+    assert_eq!(ids(&mut person), ["a", "b", "c"]);
+    person.call("history", json!({"undo": 1, "by_request": true})).unwrap();
+    assert!(ids(&mut person).is_empty());
+    // Without by_request an entry is a step, as before.
+    person.call("history", json!({"redo": true})).unwrap();
+    agent.call("history", json!({"project": "p.lahza", "undo": 1})).unwrap();
+    assert_eq!(ids(&mut person), ["a", "b"]);
+    assert!(person.call("history", json!({"undo_request": "nothing"})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two writers at once (the editor and an agent's server): every edit
+/// lands and every history entry has its own number.
+#[test]
+fn two_writers_do_not_lose_edits() {
+    let (mut tb, dir) = toolbox("writers");
+    tb.call("project_create", json!({"path": "p", "duration": 2})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
+    let writers: Vec<_> = ["x", "y"]
+        .into_iter()
+        .map(|who| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let mut tb = Toolbox::new();
+                tb.cwd = dir;
+                for i in 0..25 {
+                    tb.call("edit_apply", json!({"project": "p.lahza", "ops": [{"op": "add", "scene": "s1", "id": format!("{who}{i}"), "kind": "shape", "shape": "rect"}]})).unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    let layers = tb.call("timeline_get", json!({})).unwrap().json["scenes"][0]["layers"].as_array().unwrap().len();
+    assert_eq!(layers, 50);
+    let entries = lahza_motion_core::io::read_history(&dir.join("p.lahza")).unwrap();
+    assert_eq!(entries.iter().map(|e| e.n).collect::<Vec<_>>(), (1..=51).collect::<Vec<_>>());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_motion_piece_lives_inside_a_recording_and_shares_its_files() {
     let (mut tb, dir) = toolbox("recording");
     let rec = dir.join("demo.lahzarec");
