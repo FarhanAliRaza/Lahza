@@ -3666,11 +3666,11 @@ fn hg_phase(g: f32, c: f32) -> f32 {
 }
 
 /// Mirrors `volume_shade` in motion.wgsl.
-fn volume_shade(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, opacity: f32, occ: f32) -> [f32; 4] {
+fn volume_shade(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, opacity: f32, occ: f32, sky: f32) -> [f32; 4] {
     let (span0, span1) = volume_span(m, row, p);
     let end = span1.min(volume_stop(p, occ));
     if m[row + 30][2] > 0.5 {
-        return volume_march(m, images, row, lb, p, opacity, (span0, end));
+        return volume_march(m, images, row, lb, p, opacity, (span0, end), sky);
     }
     let v18 = m[row + 18];
     let chord = (end - span0.max(0.0)).max(0.0);
@@ -3679,13 +3679,13 @@ fn volume_shade(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, op
         return [0.0; 4];
     }
     let d = fnorm(p);
-    let straight = fadd(fmul3(f3(m[row + 19]), volume_lights(m, images, row, lb, p, d, 0.0)), f3(m[row + 20]));
+    let straight = fadd(fmul3(f3(m[row + 19]), volume_lights(m, images, row, lb, p, d, 0.0, sky)), f3(m[row + 20]));
     let t = tone_map(m, lb, straight).map(encode);
     [t[0] * a, t[1] * a, t[2] * a, a]
 }
 
 /// Mirrors `volume_march` in motion.wgsl.
-fn volume_march(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, opacity: f32, (span0, span1): (f32, f32)) -> [f32; 4] {
+fn volume_march(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, opacity: f32, (span0, span1): (f32, f32), sky: f32) -> [f32; 4] {
     let t0 = span0.max(0.0);
     if span1 <= t0 {
         return [0.0; 4];
@@ -3705,7 +3705,7 @@ fn volume_march(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, op
             continue;
         }
         let a = 1.0 - (-sigma * rho * dt).exp();
-        let c = fadd(fmul3(f3(m[row + 19]), volume_lights(m, images, row, lb, q, d, reach)), f3(m[row + 20]));
+        let c = fadd(fmul3(f3(m[row + 19]), volume_lights(m, images, row, lb, q, d, reach, sky)), f3(m[row + 20]));
         lit = fadd(lit, fmul(c, tr * a));
         tr *= 1.0 - a;
     }
@@ -3728,7 +3728,9 @@ fn volume_stop(p: F3, occ: f32) -> f32 {
 }
 
 /// Mirrors `volume_lights` in motion.wgsl.
-fn volume_lights(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, d: F3, reach: f32) -> F3 {
+/// `sky`: how much of the sky the volume has there (sky visibility; 1
+/// without): the ambient lights and the environment come by that much.
+fn volume_lights(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, d: F3, reach: f32, sky: f32) -> F3 {
     let v18 = m[row + 18];
     let pi = std::f32::consts::PI;
     let mut sc = [0.0f32; 3];
@@ -3737,7 +3739,7 @@ fn volume_lights(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, d
         let mut col = f3(m[lb + 7 + i * LROWS + 1]);
         let kind = row_l[3] as u32;
         if kind == 2 {
-            sc = fadd(sc, col);
+            sc = fadd(sc, fmul(col, sky));
             continue;
         }
         let mut l = f3(row_l);
@@ -3764,7 +3766,7 @@ fn volume_lights(m: &[[f32; 4]], images: &[u32], row: usize, lb: usize, p: F3, d
         }
         sc = fadd(sc, fmul(col, pi * hg_phase(v18[1], fdot(l, d))));
     }
-    fadd(sc, fmul(fadd(env_diffuse(m, lb, [0.0, -1.0, 0.0]), env_diffuse(m, lb, [0.0, 1.0, 0.0])), 0.5))
+    fadd(sc, fmul(fadd(env_diffuse(m, lb, [0.0, -1.0, 0.0]), env_diffuse(m, lb, [0.0, 1.0, 0.0])), 0.5 * sky))
 }
 
 /// A point light's fade to its range (0: none). Mirrors motion.wgsl.
@@ -3993,7 +3995,15 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         (base, n, metal, rough, emissive, opacity)
     };
     if flags & FLAG_VOLUME != 0 {
-        return volume_shade(m, images, mb + mat * MAT_ROWS, lb, p, opacity, occ);
+        // (What the volume has of the sky: motion.wgsl `sky_volume`.)
+        let sky_size = m[lb + 6][3].to_bits();
+        let sky = if sky_size != 0 {
+            let off = prim.stroke[2].to_bits() as usize + m[lb + 3][3].to_bits() as usize;
+            crate::sky_cpu::at_volume(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16 & 0x7fff) as i32, [prim.fill[0] + prim.fill[2] * q[0], prim.fill[1] + prim.fill[3] * q[1]])
+        } else {
+            1.0
+        };
+        return volume_shade(m, images, mb + mat * MAT_ROWS, lb, p, opacity, occ, sky);
     }
     if flags & FLAG_SHADOW_CATCHER != 0 {
         // Only the shadows: how much of the shadowing light is blocked.

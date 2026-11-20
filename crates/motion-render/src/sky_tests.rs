@@ -388,10 +388,11 @@ fn canopy(card: bool, pane: Option<f64>) -> Project {
 }
 
 /// Cards and see-through meshes hide the sky by a fixed rule (nothing
-/// drawn by lot): a card where its picture covers more than half, a mesh
-/// where it is at least half opaque; and a see-through mesh that is takes
-/// the sky itself. One that is less than half opaque hides nothing and is
-/// lit as before. On the GPU and on the CPU alike.
+/// drawn by lot): each takes of a ray what it covers (a card its
+/// picture's coverage, a mesh its opacity) and the rest goes on, so a box
+/// 0.3 opaque darkens the floor beside it less than one 0.7 opaque and
+/// about as much as traced; and a see-through mesh that is at least half
+/// opaque takes the sky itself. On the GPU and on the CPU alike.
 #[test]
 fn cards_and_see_through_meshes_hide_the_sky() {
     if tracer(1).is_none() {
@@ -415,10 +416,11 @@ fn cards_and_see_through_meshes_hide_the_sky() {
     keep("canopy-pane", &a2);
     keep("canopy-pane-plain", &p2);
     keep("canopy-ghost", &a3);
-    if let Some(mut t) = tracer(64) {
-        keep("canopy-card-traced", &t.render(&Compiled::new(&with_card), 0.0));
-        keep("canopy-pane-traced", &t.render(&Compiled::new(&solid), 0.0));
-    }
+    let mut t = tracer(64).unwrap();
+    let (t0, t2, t3) = (t.render(&Compiled::new(&bare), 0.0), t.render(&Compiled::new(&solid), 0.0), t.render(&Compiled::new(&ghost), 0.0));
+    keep("canopy-card-traced", &t.render(&Compiled::new(&with_card), 0.0));
+    keep("canopy-pane-traced", &t2);
+    keep("canopy-ghost-traced", &t3);
     // The floor under the card's front edge, and beside the box's foot
     // (left of it, where the 0.7 opaque box darkens the floor most).
     let l = |img: &RgbaImage, at: (i32, i32)| around(img, at.0, at.1, 2);
@@ -427,7 +429,13 @@ fn cards_and_see_through_meshes_hide_the_sky() {
     eprintln!("the floor under the card: {:.0} with it, {:.0} without; beside the box: {:.0} at 0.7 opaque, {:.0} at 0.3, {:.0} without; the open floor {:.0}, {:.0}, {:.0}, {:.0}", l(&a1, under), l(&a0, under), l(&a2, beside), l(&a3, beside), l(&a0, beside), l(&a0, open), l(&a1, open), l(&a2, open), l(&a3, open));
     assert!(l(&a1, under) < l(&a0, under) * 0.9, "a card hides the sky from the floor under it");
     assert!(l(&a2, beside) < l(&a0, beside) * 0.95, "a mesh that is 0.7 opaque hides the sky");
-    assert!((l(&a3, beside) - l(&a0, beside)).abs() < 2.0, "a mesh that is 0.3 opaque hides nothing");
+    assert!(l(&a3, beside) < l(&a0, beside) - 4.0 && l(&a3, beside) > l(&a2, beside) + 4.0, "a mesh that is 0.3 opaque hides some of the sky, less than one 0.7 opaque");
+    // As the traced picture has it: the floor beside the box as a share
+    // of the floor without the box (with a step at one half the 0.3
+    // opaque box hid nothing, 1.00 here).
+    let share = |with: &RgbaImage, without: &RgbaImage| l(with, beside) / l(without, beside);
+    eprintln!("beside the box, of the floor without it: 0.7 opaque {:.2} (traced {:.2}), 0.3 opaque {:.2} (traced {:.2})", share(&a2, &a0), share(&t2, &t0), share(&a3, &a0), share(&t3, &t0));
+    assert!((share(&a3, &a0) - share(&t3, &t0)).abs() < 0.05 && (share(&a2, &a0) - share(&t2, &t0)).abs() < 0.05, "as traced");
     // The box itself takes the sky where it is at least half opaque: one
     // that is 0.99 opaque (see-through, to the builder) is lit as a solid
     // one is, where sky visibility darkens that most.
@@ -513,9 +521,11 @@ fn measure_cards_in_the_rays() {
 }
 
 /// A volume hides the sky by its density along each ray, marched in even
-/// steps (nothing drawn by lot): the floor under a slab of haze is darker
-/// the denser the haze, on the GPU and on the CPU alike; and a filled
-/// wireframe hides it as the solid thing it looks.
+/// steps (nothing drawn by lot): the floor before a slab of haze hanging
+/// over it is darker the denser the haze (a little: the haze sends light
+/// back too, and the traced picture has as little), on the GPU and on the
+/// CPU alike; and a filled wireframe hides it as the solid thing it
+/// looks.
 #[test]
 fn a_volume_hides_the_sky_by_its_density() {
     if tracer(1).is_none() {
@@ -550,8 +560,13 @@ fn a_volume_hides_the_sky_by_its_density() {
         assert!(apart < 0.01, "{name}: {apart}");
         seen.push(around(&a, spot.0, spot.1, 2));
     }
-    assert!(seen[1] < seen[0] - 1.0 && seen[2] < seen[1] - 4.0, "the denser, the darker: {seen:?}");
-    assert!(seen[3] < seen[0] - 2.0 && seen[3] > seen[2], "a cloud's holes let more through: {seen:?}");
+    assert!(seen[1] < seen[0] && seen[2] < seen[1] - 2.0, "the denser, the darker: {seen:?}");
+    assert!(seen[3] < seen[0] && seen[3] > seen[2], "a cloud's holes let more through: {seen:?}");
+    // As traced: the floor before the slab of thick haze.
+    let t = tracer(64).unwrap().render(&scenes[2].1, 0.0);
+    keep("over-thick-haze-traced", &t);
+    eprintln!("thick haze, traced: {:.0}", around(&t, spot.0, spot.1, 2));
+    assert!((seen[2] - around(&t, spot.0, spot.1, 2)).abs() < 7.0, "{:.0} for the traced {:.0}", seen[2], around(&t, spot.0, spot.1, 2));
     assert!(seen[4] < seen[0] - 8.0, "a filled wireframe hides the sky: {seen:?}");
 }
 
@@ -630,4 +645,77 @@ fn measure_against_traced() {
             eprintln!("    {which}: {:.1} dB, {:.1} over the picture, {:.0} at the dark floor, {:.0} at the open floor", psnr(img, &t), mean(img), around(img, dark.0, dark.1, 4), around(img, 40, 165, 4));
         }
     }
+}
+
+/// A volume scatters back what it takes of the sky's rays (the floor
+/// beside a slab of red haze is redder than beside a black one, as
+/// traced), and takes the sky itself: haze under a roof has less of the
+/// environment's light than the same haze in the open. On the GPU and on
+/// the CPU alike.
+#[test]
+fn a_volume_scatters_light_back_and_takes_the_sky() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let on_cpu = |c: &Compiled| Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() }).render(c, 0.0);
+    let apart = |a: &RgbaImage, b: &RgbaImage| a.pixels().zip(b.pixels()).filter(|(p, q)| (0..4).any(|k| p.0[k].abs_diff(q.0[k]) > 3)).count() as f64 / (a.width() * a.height()) as f64;
+    let rgb = |img: &RgbaImage, at: (i32, i32)| -> [f64; 3] {
+        let mut sum = [0.0; 3];
+        for (dx, dy) in (-2..=2).flat_map(|dy| (-2..=2).map(move |dx| (dx, dy))) {
+            let p = img.get_pixel((at.0 + dx) as u32, (at.1 + dy) as u32).0;
+            for k in 0..3 {
+                sum[k] += p[k] as f64 / 25.0;
+            }
+        }
+        sum
+    };
+    // The light back: a slab of thick haze hanging over the floor, red or black.
+    let haze = |color: &str| {
+        let mut p = canopy(false, None);
+        p.scenes[0].layers.push(serde_json::from_value(json!({"id": "over", "kind": "mesh", "mesh": {"type": "box", "size": [120, 16], "depth": 100}, "material": {"volume": {"density": 5, "color": color}},
+            "transform": {"position": [95, 98]}})).unwrap());
+        Compiled::new(&p)
+    };
+    let (red, black) = (haze("#ff2010"), haze("#000000"));
+    assert!(red.errors.is_empty(), "{:?}", red.errors);
+    let spot = (95, 158);
+    let (a, b) = (raster(true, false).render(&red, 0.0), raster(true, false).render(&black, 0.0));
+    let (ta, tb) = (tracer(64).unwrap().render(&red, 0.0), tracer(64).unwrap().render(&black, 0.0));
+    keep("haze-red", &a);
+    keep("haze-black", &b);
+    keep("haze-red-traced", &ta);
+    keep("haze-black-traced", &tb);
+    let (ours, traced) = ((rgb(&a, spot), rgb(&b, spot)), (rgb(&ta, spot), rgb(&tb, spot)));
+    eprintln!("the floor before a slab of haze: red haze {:.0?}, black {:.0?}; traced {:.0?}, {:.0?}; GPU against CPU {:.2}% and {:.2}%", ours.0, ours.1, traced.0, traced.1, apart(&a, &on_cpu(&red)) * 100.0, apart(&b, &on_cpu(&black)) * 100.0);
+    // Red comes back from the red haze, and as much more of it as traced.
+    let more = |v: ([f64; 3], [f64; 3])| v.0[0] - v.1[0];
+    assert!(more(ours) > 3.0 && ours.0[0] - ours.0[2] > ours.1[0] - ours.1[2] + 2.0, "{ours:?}");
+    assert!((more(ours) - more(traced)).abs() < 0.6 * more(traced).max(4.0), "{:.1} more red for the traced {:.1}", more(ours), more(traced));
+    assert!(apart(&a, &on_cpu(&red)) < 0.01 && apart(&b, &on_cpu(&black)) < 0.01);
+    // Its own sky: a long box of haze, the right half of it under a roof.
+    let build = |roof: bool| {
+        let mut p = canopy(false, None);
+        p.scenes[0].layers.push(serde_json::from_value(json!({"id": "haze", "kind": "mesh", "mesh": {"type": "box", "size": [260, 30], "depth": 80}, "material": {"volume": {"density": 3, "color": "#ffffff"}},
+            "transform": {"position": [160, 112]}})).unwrap());
+        if roof {
+            p.scenes[0].layers.push(serde_json::from_value(json!({"id": "roof", "kind": "mesh", "mesh": {"type": "box", "size": [130, 5], "depth": 150}, "material": {"preset": "matte", "color": "#404040"},
+                "transform": {"position": [228, 88]}})).unwrap());
+        }
+        Compiled::new(&p)
+    };
+    let (with, without) = (build(true), build(false));
+    assert!(with.errors.is_empty(), "{:?}", with.errors);
+    let (a, plain, bare, t) = (raster(true, false).render(&with, 0.0), raster(false, false).render(&with, 0.0), raster(true, false).render(&without, 0.0), tracer(64).unwrap().render(&with, 0.0));
+    keep("roof-with", &a);
+    keep("roof-plain", &plain);
+    keep("roof-bare", &bare);
+    keep("roof-traced", &t);
+    let ours = on_cpu(&with);
+    let (open, under) = ((60, 110), (230, 130));
+    let l = |img: &RgbaImage, at: (i32, i32)| around(img, at.0, at.1, 2);
+    eprintln!("haze in the open and under the roof: {:.0} and {:.0} with sky visibility, {:.0} and {:.0} without, {:.0} and {:.0} traced; without the roof {:.0} and {:.0}; GPU against CPU {:.2}%", l(&a, open), l(&a, under), l(&plain, open), l(&plain, under), l(&t, open), l(&t, under), l(&bare, open), l(&bare, under), apart(&a, &ours) * 100.0);
+    assert!(l(&a, under) < l(&a, open) * 0.8 && l(&a, under) > l(&t, under) - 10.0, "the haze under the roof is darker, and no darker than traced");
+    assert!((l(&plain, under) - l(&plain, open)).abs() < 6.0, "and was not, without sky visibility");
+    assert!(l(&bare, under) > l(&bare, open) * 0.9, "nor is it without the roof");
+    assert!(apart(&a, &ours) < 0.01);
 }

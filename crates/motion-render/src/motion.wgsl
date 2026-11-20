@@ -1188,16 +1188,16 @@ fn hg_phase(g: f32, c: f32) -> f32 {
 
 // A volume's front face at p: the light it scatters toward the camera and
 // gives off over its chord, and how much it covers (1 − transmittance).
-fn volume_shade(row: u32, lb: u32, p: vec3<f32>, opacity: f32, occ: f32) -> vec4<f32> {
+fn volume_shade(row: u32, lb: u32, p: vec3<f32>, opacity: f32, occ: f32, sky: f32) -> vec4<f32> {
     let span = volume_span(row, p);
     let end = min(span.y, volume_stop(p, occ));
-    if b_mesh[row + 30u].z > 0.5 { return volume_march(row, lb, p, opacity, vec2<f32>(span.x, end)); }
+    if b_mesh[row + 30u].z > 0.5 { return volume_march(row, lb, p, opacity, vec2<f32>(span.x, end), sky); }
     let v18 = b_mesh[row + 18u];
     let chord = max(end - max(span.x, 0.0), 0.0);
     let a = (1.0 - exp(-v18.x * chord)) * opacity;
     if a <= 0.0 { return vec4<f32>(0.0); }
     let d = normalize(p);
-    let straight = b_mesh[row + 19u].xyz * volume_lights(row, lb, p, d, 0.0) + b_mesh[row + 20u].xyz;
+    let straight = b_mesh[row + 19u].xyz * volume_lights(row, lb, p, d, 0.0, sky) + b_mesh[row + 20u].xyz;
     let t = tone_map(lb, straight);
     return vec4<f32>(encode(t.x) * a, encode(t.y) * a, encode(t.z) * a, a);
 }
@@ -1205,7 +1205,7 @@ fn volume_shade(row: u32, lb: u32, p: vec3<f32>, opacity: f32, occ: f32) -> vec4
 // A noise volume in the preview (mirrors mesh3d.rs): 16 steps through it
 // along the view ray, each lit with one density tap toward every light for
 // its self-shadow. The path tracer walks it exactly.
-fn volume_march(row: u32, lb: u32, p: vec3<f32>, opacity: f32, span: vec2<f32>) -> vec4<f32> {
+fn volume_march(row: u32, lb: u32, p: vec3<f32>, opacity: f32, span: vec2<f32>, sky: f32) -> vec4<f32> {
     let t0 = max(span.x, 0.0);
     if span.y <= t0 { return vec4<f32>(0.0); }
     let sigma = b_mesh[row + 18u].x;
@@ -1222,7 +1222,7 @@ fn volume_march(row: u32, lb: u32, p: vec3<f32>, opacity: f32, span: vec2<f32>) 
         let rho = volume_density(row, q);
         if rho <= 0.0 { continue; }
         let a = 1.0 - exp(-sigma * rho * dt);
-        lit += tr * a * (b_mesh[row + 19u].xyz * volume_lights(row, lb, q, d, reach) + b_mesh[row + 20u].xyz);
+        lit += tr * a * (b_mesh[row + 19u].xyz * volume_lights(row, lb, q, d, reach, sky) + b_mesh[row + 20u].xyz);
         tr *= 1.0 - a;
     }
     let cover = 1.0 - tr;
@@ -1245,8 +1245,10 @@ fn volume_stop(p: vec3<f32>, occ: f32) -> f32 {
 // (noise volumes) each light is dimmed by the medium one tap toward it,
 // and light scattered many times is estimated in three octaves, each
 // shadowed half as much with half the anisotropy (Wrenninge): the bright,
-// soft look of clouds that the path tracer gets by walking.
-fn volume_lights(row: u32, lb: u32, p: vec3<f32>, d: vec3<f32>, reach: f32) -> vec3<f32> {
+// soft look of clouds that the path tracer gets by walking. `sky`: how
+// much of the sky the volume has there (sky visibility; 1 without): the
+// ambient lights and the environment come by that much.
+fn volume_lights(row: u32, lb: u32, p: vec3<f32>, d: vec3<f32>, reach: f32, sky: f32) -> vec3<f32> {
     let v18 = b_mesh[row + 18u];
     var sc = vec3<f32>(0.0);
     let lights = u32(b_mesh[lb].x);
@@ -1254,7 +1256,7 @@ fn volume_lights(row: u32, lb: u32, p: vec3<f32>, d: vec3<f32>, reach: f32) -> v
         let row_l = b_mesh[lb + 7u + i * LROWS];
         var col = b_mesh[lb + 7u + i * LROWS + 1u].xyz;
         let kind = u32(row_l.w);
-        if kind == 2u { sc += col; continue; }
+        if kind == 2u { sc += col * sky; continue; }
         var l = row_l.xyz;
         if kind == 1u || kind == 3u {
             let dl = row_l.xyz - p;
@@ -1282,7 +1284,7 @@ fn volume_lights(row: u32, lb: u32, p: vec3<f32>, d: vec3<f32>, reach: f32) -> v
         sc += col * (PI * hg_phase(v18.y, dot(l, d)));
     }
     // The environment, evenly (its mean light from above and below).
-    sc += (env_diffuse(lb, vec3<f32>(0.0, -1.0, 0.0)) + env_diffuse(lb, vec3<f32>(0.0, 1.0, 0.0))) * 0.5;
+    sc += (env_diffuse(lb, vec3<f32>(0.0, -1.0, 0.0)) + env_diffuse(lb, vec3<f32>(0.0, 1.0, 0.0))) * (0.5 * sky);
     return sc;
 }
 
@@ -1792,6 +1794,36 @@ fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky
     return s;
 }
 
+// How much of the sky a volume at target point q has (of the
+// environment's mean light from above and below, which is what the
+// raster lights a volume by; 1: not known): of
+// the list's sky visibility, its third row's last number (a volume's sky
+// and one), between the four texels around q that have a volume.
+fn sky_volume(prim: Prim, lb: u32, q: vec2<f32>) -> f32 {
+    let size = bitcast<u32>(b_mesh[lb + 6u].w);
+    if size == 0u { return 1.0; }
+    let w = i32(size & 0xffffu);
+    let h = i32((size >> 16u) & 0x7fffu);
+    let off = i32(bitcast<u32>(prim.stroke.z) + bitcast<u32>(b_mesh[lb + 3u].w)) + 2 * w * h;
+    let c = vec2<f32>(prim.fill.x + prim.fill.z * q.x, prim.fill.y + prim.fill.w * q.y);
+    let g = c * 0.5 - 0.5;
+    let g0 = floor(g);
+    let f = g - g0;
+    var sum = 0.0;
+    var weight = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let v = group_at(off, w, h, i32(g0.x) + (k & 1), i32(g0.y) + (k >> 1u)).w;
+        if v <= 0.0 { continue; }
+        var wt = 1.0 - f.x;
+        if (k & 1) == 1 { wt = f.x; }
+        if (k >> 1u) == 1 { wt *= f.y; } else { wt *= 1.0 - f.y; }
+        sum += (v - 1.0) * wt;
+        weight += wt;
+    }
+    if weight <= 1e-3 { return 1.0; }
+    return clamp(sum / weight, 0.0, 2.0);
+}
+
 // Mirrors `card_sample` in mesh3d.rs: a card's picture at target point q.
 fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
     let r0 = b_mesh[material];
@@ -2109,7 +2141,7 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
     let opacity = m0.w;
     let emissive = m2.xyz * det.emit;
     if (flags & 64u) != 0u {
-        return volume_shade(mb + mat * MAT_ROWS, lb, p, opacity, occ);
+        return volume_shade(mb + mat * MAT_ROWS, lb, p, opacity, occ, sky_volume(prim, lb, q));
     }
     if (flags & 8u) != 0u {
         var blocked = 0.0;

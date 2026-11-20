@@ -690,14 +690,22 @@ What is left:
   through the raster's hardware visibility pass, which software Vulkan
   does not have (only the compute raster's shading was run with it).
 - **Cards and see-through meshes hide the sky, and see-through meshes
-  take it: done**, by a fixed rule, nothing drawn by lot. A ray ends on
-  a surface that is at least half opaque (its material's opacity times
-  what it does not let through: pt.wgsl `sky_blocks`, the rule the
-  light's shadow rays had) and on a card where its picture covers more
-  than half; anything less it goes through. So a mesh 0.7 opaque hides
-  the sky as a solid one and one 0.3 opaque hides none of it: a step at
-  one half, where coverage as a ray's weight would be even (a ray going
-  on through each thing it meets: not done, it costs rays).
+  take it: done**, by a fixed rule, nothing drawn by lot. At first with
+  a step at one half (a ray ended on a surface at least half opaque and
+  on a card where its picture covered more than half, and went through
+  anything less). Since, *coverage is a ray's weight*: a surface takes
+  of a ray what it covers (its material's opacity times what it does
+  not let through: pt.wgsl `sky_cover`; a card its picture's coverage
+  there), its light comes back by that much, and the rest of the ray
+  goes on to the next thing, four things at most, until under 0.004 of
+  it is left (`SKY_LEAST`; the loop in `sky`, the same in
+  `sky_cpu.rs`). The shadow rays (a light's at a ray's end, and the last
+  ray) are what every thing on their way leaves of them (`sky_shade`).
+  It costs a ray only where something covers in part: a scene of solid
+  things casts what it cast. Still a step at one half, and why: the
+  camera's ray (it says whose texel it is, and a texel has one surface)
+  and the ray that goes on from a ray's end (a share of a share: it
+  would be a ray more for each thing met).
   - The sky's list has the list's cards as a traced list has them (the
     flat 3D layers `emit_run` draws among the meshes; `list.rs`
     `sky_list` makes their pictures before the group the rays fill, and
@@ -716,13 +724,16 @@ What is left:
     the groups drawn before the sky's (`sky_cpu.rs`).
   Measured (`sky_tests::cards_and_see_through_meshes_hide_the_sky`,
   320 x 180, lit by the environment, software Vulkan): the floor under a
-  card lying over it 182 of 255 where it is 212 without the card, and it
+  card lying over it 192 of 255 where it is 219 without the card, and it
   takes the card's blue as the traced picture does; beside a box 0.7
-  opaque 195 for 208, beside one 0.3 opaque 208; a box 0.99 opaque is
-  lit as a solid one where sky visibility darkens that most (206 and
-  206, 224 without). GPU against CPU: no pixel over 3 levels in the
-  three. Seen: the card's shadow on the floor against the traced one
-  (the traced is grainier at its edge, the same size and tint).
+  opaque 195, beside one 0.3 opaque 204, without the box 215: 0.91 and
+  0.95 of the floor without it, for the traced picture's 0.90 and 0.96
+  (with the step at one half the 0.3 opaque box hid nothing: 1.00, and
+  the test asked for that); a box 0.99 opaque is lit as a solid one
+  where sky visibility darkens that most (205 and 205, 223 without).
+  GPU against CPU: no pixel over 3 levels in the three. Seen: the card's
+  shadow on the floor against the traced one (the traced is grainier at
+  its edge, the same size and tint).
   Since:
   - *Volumes* hide the sky by their density: every crossing of a
     volume's faces along a ray is found, the density between them is
@@ -730,9 +741,49 @@ What is left:
     tracer's own density lookup; its walk through a volume is by lot,
     this is not), and that much less of the ray goes on: less of the
     open sky, less of the light back from what it ends on. The same on
-    the CPU with its own density lookup (`sky_cpu.rs` `through`). What
-    ends in a volume sends nothing back (its scattered light is not
-    worked out), and a volume itself is lit by its own march as before.
+    the CPU with its own density lookup (`sky_cpu.rs` `through`).
+    Since, found while a volume was given its own sky: the march told
+    volumes apart by their material row, and a box's faces each have a
+    row of their own, so every ray counted one crossing of each face's
+    "volume" and was taken to start inside it (the density from the
+    ray's start to each face, not between the faces). They are told
+    apart by instance now, on both sides. The floor before the slab of
+    thick haze was 199 for 220 with nothing there; it is 216, and the
+    traced picture has 221.
+  - *What a volume takes of a ray, it scatters back: done* (it sent
+    nothing back). By the raster's own rule for a volume's light
+    (`volume_lights` without its tap toward the lights: every light by
+    its phase, the environment and the ambient lights evenly), where the
+    volume takes most of the ray, the middle of what it takes (pt.wgsl
+    `sky_volume_light`, `vol_at`); the even part by what one ray from
+    there finds, any way round: open, the sky's light along it, else the
+    light of what it ends on (lit as a ray's second end is: `SKY_REST`).
+    Without that ray a haze under a roof sent back the open sky's light.
+    Where several volumes share a ray, the one that takes most of it
+    stands for all. `sky_tests::a_volume_scatters_light_back_and_takes_the_sky`:
+    the floor before a slab of red haze has 12 levels more red than
+    before a black one (226 and 214 of 255; traced 17 more, 233 and
+    216).
+  - *A volume takes the sky itself: done* (it was lit by its own march
+    as if open). The camera's ray finds the volume before its surface
+    (or before nothing) and where it takes the ray; from there four
+    rays all round, of the fixed set, an open one bringing the sky's
+    light and another the light of what it ends on (the floor under a
+    haze lights it from below, where the ground's light was). As one
+    number, how much of the environment's mean light from above and
+    below that is, which is what the raster lights a volume by: the
+    group's third row's fourth number, filtered as the rest over the
+    texels that have a volume, read by the volume's shading
+    (motion.wgsl `sky_volume`; `volume_lights` takes the ambient lights
+    and the environment by it; the same in mesh3d.rs and `sky_cpu.rs`).
+    One number, so the colour of what lights it from below is lost; and
+    the lights themselves are not shadowed on a volume, with or without
+    sky visibility (the raster's volume has no shadow maps). The same
+    test: a long box of haze, half of it under a dark roof, of 255: 233
+    in the open and 148 under the roof (230 without sky visibility;
+    traced 216 and 108, where the roof also shadows the lobe overhead
+    as a light). Seen: the roof's shadow on the floor and the darker
+    haze under it, as traced.
   - *A filled wireframe* hides the sky by its faces' fill (at least half
     opaque) and sends its fill's colour back as it is; *an unlit
     surface* sends its own colour back (it was lit like any other).
@@ -740,13 +791,17 @@ What is left:
   floor in front of a slab hanging over it, of 255): nothing there 213,
   thin haze 209, thick haze 190, a cloud of the thick haze's density
   210, a filled wireframe 183; GPU against CPU no pixel over 3 levels in
-  any. Seen: the slab of haze's soft shadow on the floor, the cloud's
+  any (those with the march's fault, below; now 220, 219, 216, 219 and
+  194, the thick haze's 216 for the traced 221). Seen: the slab of haze's soft shadow on the floor, the cloud's
   fainter one, the wireframe box's as a solid's.
   - *The cost of cards in the rays*
     (`sky_tests::measure_cards_in_the_rays`, `--ignored`, 480 x 270,
-    software Vulkan): sky visibility adds 26 ms a frame to the scene
+    software Vulkan): sky visibility added 26 ms a frame to the scene
     without a card (35 to 61) and 46 ms with one (41 to 87): a card's
     picture is read at every crossing. On the CPU 55 ms and 66 ms.
+    With the rays' ends lit by their own rays and coverage as a ray's
+    weight, in another container: 46 ms without a card (41 to 87) and
+    35 ms with one (59 to 94); on the CPU 67 ms and 80 ms.
   Hiding nothing, and meant to: a shadow catcher (it is not there but
   for the shadows on it), a wireframe's lines without a fill (a px or
   two of the screen, whatever the distance: nothing a ray can meet), a
@@ -862,10 +917,9 @@ What is left:
   have the third (the last ray, where open) and `SKY_REST` stands for
   the rest.
   The method's limits, which more rays in the picture's plane do not
-  lift (the fast mode has none of them): a surface or a card hides all
-  of a ray or none (the step at one half: only volumes take a share);
-  nothing is mirrored of other things; an environment image's light is
-  its diffuse level about the mean open direction. A mesh the GPU
+  lift (the fast mode has none of them): nothing is mirrored of other
+  things; an environment image's light is its diffuse level about the
+  mean open direction; a volume's sky is one number. A mesh the GPU
   generates in its pool is not in the CPU's rays, as it is not in the
   CPU's frame at all.
 
