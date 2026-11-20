@@ -287,6 +287,19 @@ Not done, and why:
     `MeshCache::trace_instance`, once per layer per sub-frame). The frame
     is now bound by the GPU (trace 55 ms, OIDN beside it), so reusing
     unchanged layers' rows would not shorten it; not done.
+    Measured since without the film
+    (`mesh_tests::benchmark_traced_lists_of_400_layers`, `--ignored`:
+    four sub-frames of 400 mesh layers that move, no image maps, four
+    cores of a Xeon): 1.4 ms a list, 204 material rows a layer, all made
+    anew in every list. So the rows are 5.6 ms of a frame there, and the
+    film's 20 ms is mostly its scans' maps (`Images::get_sized`). Not to
+    do without the film: a layer's rows hold where its maps are in the
+    image pool, which may move between lists, so keeping them across
+    sub-frames needs that checked against the film's own scenes. Needs
+    the owner's machine (the film is in ~/Videos/cpu): `perf record -g
+    lahza motion render ~/Videos/cpu/work_a.lahza --from 4 --to 7 --pt
+    --spp 4 --scale 0.5`, and only if the CPU, not the GPU, is then what
+    a frame waits for.
   - If the desktop stutters now that bands are not waited for, see
     `LAHZA_TRACE_YIELD` (and say so here).
   Measured at the film's own settings (s01, 1080 x 1920, 64 spp, 4
@@ -309,8 +322,13 @@ Not done, and why:
   - *Removed again:* a Kronecker sequence for a path's first 32 numbers:
     +0.9 dB at 64 spp, -1.2 at 32.
   - 32 spp is 1.4 dB under 64 spp at half the trace's time.
-  - Not done: one shadow test a vertex (the film's scenes have one or two
-    lights that cast shadows).
+  - Not to do: one shadow test a vertex. With the film's one or two
+    lights that cast shadows it saves at most half the shadow tests (a
+    fifth of the rays) for twice the direct light's spread in each
+    path, the trade adaptive sampling lost above; it would pay in a
+    scene of many lights, which no project has. To settle on the card,
+    should one come: the same PSNR against 1024 spp as above, at equal
+    time, on `~/Videos/cpu/work_a.lahza`.
 
 - **White specks on imported rocks (fixed).** A material that names no
   preset starts from "glossy", which has a clear coat of 0.35 at
@@ -467,9 +485,16 @@ nothing below was run on that card.)
     in a row and nine in a column (`fast_catcher`): less grain than 256
     paths not denoised (0.8 and 0.6 levels against 1.1). A catcher's
     shadow over nothing (it is the coverage there) is still four paths'.
-    Seen on the way: the usual trace's filter widens a catcher's soft
-    shadow a good deal (against the same scene not denoised); not
-    changed.
+    Not done, and it needs no card: `visible` keeps four numbers a texel
+    in each of `b_tmp`'s two rows and none of them says which part of
+    the coverage is a catcher's; it needs that share kept apart (a
+    number more a texel, or the lit depth's place where nothing lit was
+    hit) and `fast_catcher` to smooth it as it does the share over flat
+    things, with `pt_fast_tests`' catcher test given a catcher over
+    nothing. Seen on the way: the usual trace's filter widens a
+    catcher's soft shadow a good deal (against the same scene not
+    denoised); not changed (it is the export's look, and narrowing it
+    changes every exported shadow: for the owner to see on a film).
   - The specular guide was the surface's F0. It is now what the surface
     mirrors of an even light from where it is seen (the environment BRDF
     of F0 and roughness, by the raster's fit `env_brdf`), which is what

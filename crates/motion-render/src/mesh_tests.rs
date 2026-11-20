@@ -2075,3 +2075,38 @@ fn measure_snapping_in_the_cards_other_tests() {
         }
     }
 }
+
+/// Four hundred mesh layers that drift, for a traced frame's lists.
+fn four_hundred() -> Project {
+    let mut layers = Vec::new();
+    for i in 0..400 {
+        let (x, y) = (40 + (i % 25) * 36, 40 + (i / 25) * 30);
+        let mesh = if i % 3 == 0 { json!({"type": "box", "size": [20, 20], "depth": 20}) } else { json!({"type": "sphere", "radius": 12}) };
+        let (preset, color) = (["plastic", "metal", "matte", "glossy"][i % 4], ["#c03030", "#30a0c0", "#d0c040"][i % 3]);
+        layers.push(json!({"id": format!("m{i}"), "kind": "mesh", "mesh": mesh,
+            "material": {"preset": preset, "color": color, "roughness": 0.2 + (i % 5) as f64 * 0.1},
+            "transform": {"position": {"keys": [{"at": 0, "v": [x, y]}, {"at": 2, "v": [x + 40, y]}]}, "z": (i % 7) * 20}}));
+    }
+    scene(960, 540, json!({"layers": layers}))
+}
+
+/// Not a test (`--ignored --nocapture`): what a traced frame's display
+/// lists cost the CPU, four sub-frames of four hundred mesh layers that
+/// move (the film's s01 has about that many): ms a list, and how many of
+/// the lists' material rows were made anew.
+#[test]
+#[ignore]
+fn benchmark_traced_lists_of_400_layers() {
+    let c = Compiled::new(&four_hundred());
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let states: Vec<_> = (0..4).map(|k| c.frame(0.5 + k as f64 / 240.0)).collect();
+    let mut r = cpu();
+    let options = crate::pt::TraceOptions { spp: 4, ..Default::default() };
+    for round in 0..4 {
+        let t = std::time::Instant::now();
+        let made = r.meshes.material_rows_made;
+        let lists: Vec<_> = states.iter().map(|s| Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: Some(options), sky: false, seed: 0, compact: false }.build(s)).collect();
+        let rows: usize = lists.iter().flat_map(|l| &l.traces).flat_map(|t| &t.instances).map(|i| i.materials.len()).sum();
+        eprintln!("round {round}: {:.2} ms a list; {} material rows in the lists, {} made anew", t.elapsed().as_secs_f64() * 250.0, rows, r.meshes.material_rows_made - made);
+    }
+}

@@ -44,6 +44,9 @@ pub struct MeshCache {
     /// made (by their layers' places in the list): `card_item` takes them
     /// instead of drawing each picture a second time.
     pub(crate) sky_cards: Vec<(usize, CardPicture)>,
+    /// Material rows written for traced instances (a measure:
+    /// `mesh_tests::benchmark_traced_lists_of_400_layers`).
+    pub(crate) material_rows_made: usize,
     /// Parsed glTF files (meshes from Blender).
     gltf_files: crate::model::Files,
     /// By key: the mesh, the frame that last used it, and whether it is
@@ -507,6 +510,7 @@ impl MeshCache {
             *slot = ((materials.len() / MAT_ROWS) as u32, colors as u32);
             for segment in 0..colors as u32 {
                 materials.extend_from_slice(&material_rows(m, part, segment, opacity, scale, &self.textures));
+                self.material_rows_made += MAT_ROWS;
             }
         }
         Some(crate::pt::TraceInstance { id, mesh, key, transform, world, materials, parts })
