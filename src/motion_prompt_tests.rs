@@ -84,6 +84,11 @@ fn prompt_bar_directs_an_agent_and_takes_its_request_back() {
     let shots = std::env::var_os("LAHZA_WORKFLOW_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|| dir.clone());
     std::fs::create_dir_all(&shots).unwrap();
     let project = sample(&dir);
+    // The app's settings for this test are a folder of its own (the key
+    // typed below must not reach the real one).
+    let config = dir.join("config");
+    std::env::set_var("LAHZA_CONFIG_DIR", &config);
+    let project_dir = project.clone();
     let (open, asked) = (project.clone(), Arc::new(Mutex::new(Vec::new())));
     let (release, gate) = std::sync::mpsc::channel();
     let runner = Arc::new(Acting { project: project.clone(), gate: Mutex::new(Some(gate)), asked: asked.clone() });
@@ -334,6 +339,39 @@ fn prompt_bar_directs_an_agent_and_takes_its_request_back() {
             draw(cx);
             wait(100).await;
             shot("prompt-7-by-hand.png");
+            // The API key: typed masked in the AI tab, kept for the owner
+            // only, and not shown again.
+            handle
+                .update(cx, |studio, window, cx| {
+                    crate::motion_agent::set_choice(crate::motion_agent::Choice::Api);
+                    studio.motion_agent.ai_tab = true;
+                    studio.text_fields.api_key.update(cx, |field, cx| {
+                        assert!(field.masked);
+                        field.type_text("sk-ant-window-test-9876", window, cx);
+                    });
+                    cx.notify();
+                })
+                .unwrap();
+            wait(400).await;
+            draw(cx);
+            wait(100).await;
+            shot("prompt-8-api-key-typed.png");
+            handle.update(cx, |studio, _, cx| studio.text_fields.api_key.update(cx, |_, cx| cx.emit(FieldEvent { target: Target::ApiKey, kind: EventKind::Submit, text: "sk-ant-window-test-9876".into() }))).unwrap();
+            wait(400).await;
+            draw(cx);
+            wait(100).await;
+            shot("prompt-9-api-key-kept.png");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let file = crate::motion_agent_api::key_file();
+                assert!(file.starts_with(&config), "the test's own settings folder: {}", file.display());
+                assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), "sk-ant-window-test-9876");
+                assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(crate::motion_agent_api::key_hint(None, &file).as_deref(), Some("A key from the app's settings is set (ends …9876)."));
+                // Not in the project, and not in what the app keeps of requests.
+                assert!(!std::fs::read_to_string(project_dir.join("requests.json")).unwrap_or_default().contains("window-test"));
+            }
+            crate::motion_agent::set_choice(crate::motion_agent::Choice::Auto);
             cx.update(|cx| cx.quit()).unwrap();
         })
         .detach();

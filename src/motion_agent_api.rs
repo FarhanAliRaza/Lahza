@@ -45,6 +45,33 @@ pub(crate) fn key_file() -> PathBuf {
     crate::recording::presets::config_root().join("anthropic-api-key")
 }
 
+/// Keeps a key typed in the app: one line in `file`, readable by the
+/// owner only.
+pub(crate) fn save_key(file: &std::path::Path, key: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let key = key.trim();
+    if key.is_empty() || key.chars().any(char::is_whitespace) {
+        return Err("That is not an API key.".into());
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Made anew with its mode, so it is never readable by others.
+    let _ = std::fs::remove_file(file);
+    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(file).map_err(|e| e.to_string())?;
+    writeln!(out, "{key}").map_err(|e| e.to_string())
+}
+
+/// Where the key in use comes from and its last four characters, for the
+/// person to tell keys apart; the rest is never shown.
+pub(crate) fn key_hint(env: Option<String>, file: &std::path::Path) -> Option<String> {
+    let from = if env.as_ref().is_some_and(|k| !k.trim().is_empty()) { "ANTHROPIC_API_KEY" } else { "the app's settings" };
+    let key = key_from(env, file)?;
+    let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    Some(format!("A key from {from} is set (ends …{tail})."))
+}
+
 /// The API key: `ANTHROPIC_API_KEY`, else the settings file.
 fn key_from(env: Option<String>, file: &std::path::Path) -> Option<String> {
     env.or_else(|| std::fs::read_to_string(file).ok()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
@@ -874,6 +901,15 @@ mod tests {
         assert_eq!(key_from(Some("sk-from-env".into()), &file).as_deref(), Some("sk-from-env"));
         std::fs::write(&file, "\n").unwrap();
         assert_eq!(key_from(None, &file), None);
+        // Typed in the app: kept for the owner only, told apart by its end.
+        save_key(&file, " sk-ant-typed-0000-wxyz \n").unwrap();
+        assert_eq!(key_from(None, &file).as_deref(), Some("sk-ant-typed-0000-wxyz"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(key_hint(None, &file).as_deref(), Some("A key from the app's settings is set (ends …wxyz)."));
+        assert_eq!(key_hint(Some("sk-env-abcd".into()), &file).as_deref(), Some("A key from ANTHROPIC_API_KEY is set (ends …abcd)."));
+        assert!(save_key(&file, "two words").is_err() && save_key(&file, "  ").is_err());
+        assert_eq!(key_from(None, &file).as_deref(), Some("sk-ant-typed-0000-wxyz"), "a refused key leaves the kept one");
         let none = ApiLoop::new("http://127.0.0.1:1".into(), Arc::new(|| None));
         assert_eq!(none.available(), Availability::Missing(Failure::NoKey));
         let (tx, _rx) = channel();

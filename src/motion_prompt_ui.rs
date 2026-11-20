@@ -629,6 +629,9 @@ impl Studio {
         let text = self.motion_text_layer(cx).filter(|_| visible && self.inspector_visible && !self.motion_agent.ai_tab);
         let (target, value) = text.map(|(_, text)| (Target::LayerText, text)).unwrap_or((Target::None, String::new()));
         self.text_fields.layer_text.update(cx, |field, cx| field.sync(target, &value, window, cx));
+        // The key field shows with the AI list; it never holds a kept key.
+        let key = visible && self.inspector_visible && crate::motion_agent::choice() != crate::motion_agent::Choice::ClaudeCode;
+        self.text_fields.api_key.update(cx, |field, cx| field.sync(if key { Target::ApiKey } else { Target::None }, "", window, cx));
         // The colour being typed: of the selected layer only.
         let selected = self.motion_editor().and_then(|e| e.read(cx).selected().map(str::to_string));
         if self.motion_color_edit.as_ref().is_some_and(|(layer, _)| selected.as_deref() != Some(layer.as_str())) {
@@ -657,6 +660,15 @@ impl Studio {
             (Target::Prompt, EventKind::Submit) => {
                 self.motion_agent.draft = event.text.clone();
                 self.send_motion_prompt(&event.text, cx);
+            }
+            // A key typed and entered: kept in the settings, the field
+            // emptied, and the runner asked again whether it can run.
+            (Target::ApiKey, EventKind::Submit) => {
+                match crate::motion_agent_api::save_key(&crate::motion_agent_api::key_file(), &event.text) {
+                    Ok(()) => self.motion_agent.reask(),
+                    Err(e) => self.toast = Some(crate::Notification::error(e)),
+                }
+                self.text_fields.api_key.update(cx, |field, cx| field.set_text("", cx));
             }
             // A colour typed as #rrggbb (the # may be left out): saved on
             // Enter or when the field is left, if it changed.
@@ -991,6 +1003,12 @@ impl Studio {
             );
         }
         list = list.child(runners);
+        // The API key: where it is from and how it ends; typed masked, and
+        // not shown again.
+        if chosen != crate::motion_agent::Choice::ClaudeCode {
+            let hint = crate::motion_agent_api::key_hint(std::env::var("ANTHROPIC_API_KEY").ok(), &crate::motion_agent_api::key_file());
+            list = list.child(note(hint.unwrap_or_else(|| "No API key is set.".into()))).child(self.text_fields.api_key.clone());
+        }
         match self.motion_agent.missing() {
             Some(why) => list = list.child(div().text_xs().text_color(theme::danger()).child(why)),
             None => list = list.child(note(format!("Using {}.", self.motion_agent.runner_name()))),

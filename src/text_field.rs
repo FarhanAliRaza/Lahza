@@ -18,6 +18,8 @@ pub(crate) enum Target {
     LayerText,
     /// A colour of the selected motion layer, as #rrggbb.
     LayerColor,
+    /// The agent's API key (typed masked, never shown back).
+    ApiKey,
     None,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +176,9 @@ pub(crate) struct TextField {
     pub focus: FocusHandle,
     parent_focus: FocusHandle,
     pub target: Target,
+    /// Shows a star for each byte typed, and gives nothing to the
+    /// clipboard: for a secret.
+    pub masked: bool,
     buffer: Buffer,
     initial: String,
     placeholder: SharedString,
@@ -212,6 +217,7 @@ impl TextField {
             focus,
             parent_focus,
             target: Target::None,
+            masked: false,
             buffer: Buffer::default(),
             initial: String::new(),
             placeholder: placeholder.to_owned().into(),
@@ -395,7 +401,7 @@ impl TextField {
             }
             "c" | "x" if command => {
                 let range = self.buffer.range();
-                if !range.is_empty() {
+                if !range.is_empty() && !self.masked {
                     cx.write_to_clipboard(ClipboardItem::new_string(
                         self.buffer.state.text[range.clone()].into(),
                     ));
@@ -468,6 +474,13 @@ impl TextField {
         }
         cx.stop_propagation();
     }
+}
+
+/// What a one-line field draws for `text`: a star for each byte when it
+/// is masked, so every offset into the text is the same offset into what
+/// is drawn.
+fn shown(text: &str, masked: bool) -> String {
+    if masked { "*".repeat(text.len()) } else { text.replace(['\r', '\n'], " ") }
 }
 
 impl TextField {
@@ -817,7 +830,7 @@ impl Render for TextField {
                         let text: SharedString = if empty {
                             input.placeholder.clone()
                         } else {
-                            input.buffer.state.text.replace(['\r', '\n'], " ").into()
+                            shown(&input.buffer.state.text, input.masked).into()
                         };
                         let color = if empty {
                             crate::muted()
@@ -983,5 +996,18 @@ mod tests {
         b.select(0, false);
         b.delete(false, false);
         assert_eq!(b.state.text, "one ");
+    }
+}
+
+#[cfg(test)]
+mod masked_tests {
+    use super::shown;
+
+    #[test]
+    fn a_masked_field_draws_stars_and_keeps_every_offset() {
+        assert_eq!(shown("sk-ant-secret", true), "*************");
+        assert_eq!(shown("clé", true).len(), "clé".len(), "a star a byte: offsets stay");
+        assert!(!shown("sk-ant-secret", true).contains("secret"));
+        assert_eq!(shown("two\nlines", false), "two lines");
     }
 }
