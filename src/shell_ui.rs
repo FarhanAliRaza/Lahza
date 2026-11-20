@@ -1869,6 +1869,24 @@ impl Studio {
             ruler_tick += ruler_step;
         }
         ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
+        // The span marked for a prompt (Shift-drag on the ruler).
+        if let Some((a, b)) = self.motion_agent.span.filter(|_| self.motion_prompt_visible()) {
+            let x = |t: f64| (t / timeline_duration * timeline_content_width) as f32;
+            ruler_marks.push(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(x(a)))
+                    .w(px((x(b) - x(a)).max(2.0)))
+                    .rounded(px(3.0))
+                    .bg(crate::theme::accent().opacity(0.22))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(crate::theme::accent())
+                    .into_any_element(),
+            );
+        }
         let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
         let camera_lane = self.camera_region_lane(timeline_scroll, timeline_content_width, progress, cx);
         let motion_piece_lane = self.motion_piece_lane(timeline_scroll, cx);

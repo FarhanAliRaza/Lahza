@@ -145,12 +145,23 @@ inside a recording open from the studio instead:
 - **Preview:** rendered on a worker thread (GPU when available), with a half-size proxy while playing or dragging.
 - **Timeline:** the ruler, beat/bar/hit and word markers, the sound's waveform, scenes, and layer bars with key diamonds.
 - **Sound:** music, narration, effects and footage sound play in sync while playing.
-- **Inspector:** scrubbable transform values (3D values on 3D layers).
-- **Shortcuts:** Space plays, arrows step frames, Home/End jump, Delete removes the selected layer, Ctrl+Z / Ctrl+Shift+Z undo and redo.
+- **Inspector:** two tabs. Properties: scrubbable transform values (3D values on 3D layers), a text layer's words, size and tracking, and each effect's values with buttons to add and remove effects. AI: what was asked about the layer and what came of it.
+- **Prompt bar:** under the preview (see below).
+- **Shortcuts:** Space plays, arrows step frames, Home/End jump, Delete removes the selected layer, Ctrl+Z / Ctrl+Shift+Z undo and redo, `\` held compares a proposal with what was there before. Any other printable key begins a prompt.
 
-Click a layer in the preview or the timeline and drag it to move it. Drag a value to change it; on an animated property this adds a key at the playhead. Drag a key diamond to retime it; hold Shift to snap it to the nearest beat, which writes `beat:N` so the key stays in sync.
+Click a layer in the preview or the timeline and drag it to move it. Drag a value to change it; on an animated property this adds a key at the playhead. Drag a key diamond to retime it; hold Shift to snap it to the nearest beat, which writes `beat:N` so the key stays in sync. Every drag draws the half-size proxy and changes only the dragged layer in a copy of the project; it is saved on release.
 
-Every edit goes through the same tools the MCP server uses, so a person and an agent share one history and undo stack. Edits an agent makes over MCP appear live.
+Every edit goes through the same tools the MCP server uses, so a person and an agent share one history and undo stack. Edits an agent makes over MCP appear live. Both may write at once: whoever writes takes the project's lock (`<project>/.lock`), loads what the other wrote, then writes.
+
+### Directing an agent from the editor
+
+Select, type, Enter. The prompt bar is the same on a motion project and on a recording's Motion tab.
+
+- **What the words act on** shows as chips that can be removed: the selected layer (Ctrl- or Shift-click rows for more), a span of time (drag the strip over the ruler; on a recording, Shift-drag the ruler), and the conversation being continued. With them go the playhead, the scene and the frame as a picture.
+- **The agent** is Claude Code without its terminal, started as a child process with `lahza mcp` as its only tools. It needs Claude Code installed and signed in; the bar says so when it is not. `src/motion_agent.rs` keeps this behind one trait (`Runner`), so another client can take its place.
+- **At work:** each step shows in the bar, as a ghost clip over the span being made, and in the AI tab; Stop ends it. The editor stays usable.
+- **What comes back is a proposal:** Keep, Undo (everything the request changed, as one history step), Again, and Hold to compare. The edits of a request carry its id in the history (`history` with `undo_request`, or `by_request` to count a request as one step of `undo`).
+- On a recording with no piece open, the words ask for a new piece placed on the span.
 
 ## 3D objects in the engine
 

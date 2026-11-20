@@ -92,3 +92,33 @@ fn mcp_server_lists_tools_reads_resources_and_runs_tools() {
     let _ = c.child.wait();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A server started for one request from the editor (LAHZA_REQUEST): the
+/// edits it makes carry the request's id in the history.
+#[test]
+fn a_server_started_for_a_request_marks_its_edits() {
+    let dir = std::env::temp_dir().join(format!("lahza-mcp-request-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lahza-motion"))
+        .args(["mcp", "--cpu"])
+        .env("LAHZA_REQUEST", "r9")
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let out = BufReader::new(child.stdout.take().unwrap());
+    let mut c = Client { child, out, id: 0 };
+    c.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}));
+    c.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    c.request("tools/call", json!({"name": "project_create", "arguments": {"path": "demo", "duration": 2}}));
+    let edit = c.request("tools/call", json!({"name": "edit_apply", "arguments": {"ops": [{"op": "add_scene", "id": "s1"}]}}));
+    assert_eq!(edit["result"]["isError"], false, "{edit}");
+    drop(c.child.stdin.take());
+    let _ = c.child.wait();
+    let history = lahza_motion_core::io::read_history(&dir.join("demo.lahza")).unwrap();
+    assert_eq!(history.iter().map(|e| e.request.as_deref()).collect::<Vec<_>>(), [Some("r9")]);
+    std::fs::remove_dir_all(&dir).ok();
+}

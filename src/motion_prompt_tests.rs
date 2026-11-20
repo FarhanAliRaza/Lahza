@@ -292,3 +292,112 @@ fn prompt_bar_directs_an_agent_and_takes_its_request_back() {
     });
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Answers at once and changes nothing.
+struct Answering(Arc<Mutex<Vec<Request>>>);
+
+impl Runner for Answering {
+    fn name(&self) -> &'static str {
+        "Answering"
+    }
+    fn available(&self) -> Availability {
+        Availability::Ready
+    }
+    fn start(&self, request: Request, events: Sender<Event>) -> Result<Box<dyn Running>, Failure> {
+        self.0.lock().unwrap().push(request);
+        events.send(Event::Started { conversation: "c2".into() }).unwrap();
+        events.send(Event::Done { text: "Nothing to change.".into(), failed: false, cost: None }).unwrap();
+        Ok(Box::new(Nothing))
+    }
+}
+
+/// The same bar on a recording's Motion tab: with no piece open the words
+/// ask for a new piece on the span marked with Shift on the ruler.
+#[test]
+#[ignore = "requires a display and FFmpeg (can run under Xvfb)"]
+fn prompt_bar_on_a_recording_asks_for_a_piece_on_the_span() {
+    let dir = std::env::temp_dir().join(format!("lahza-motion-prompt-rec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots = std::env::var_os("LAHZA_WORKFLOW_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|| dir.clone());
+    std::fs::create_dir_all(&shots).unwrap();
+    let recording = studio_workflow_tests::fixture(&dir).directory.clone();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let runner = Arc::new(Answering(asked.clone()));
+    let open = recording.clone();
+    Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+        let handle = open_studio_window(cx, true, |handle, cx| cx.new(|cx| Studio::new(handle, None, None, cx))).unwrap();
+        handle
+            .update(cx, |studio, _, _| {
+                studio.launcher_window = false;
+                studio.load_generation = studio.load_generation.wrapping_add(1);
+                studio.loading = None;
+                studio.open_video_project(open.clone()).unwrap();
+                studio.launcher_active = false;
+                studio.inspector_visible = true;
+                studio.select_inspector_tab(shell_ui::InspectorTab::Motion);
+                studio.motion_agent = MotionAgent::new(runner.clone());
+            })
+            .unwrap();
+        cx.activate(true);
+        cx.spawn(async move |cx| {
+            let wait = |ms| Timer::after(Duration::from_millis(ms));
+            let any: AnyWindowHandle = handle.into();
+            let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+            wait(300).await;
+            any.update(cx, |_, window, _| {
+                window.activate_window();
+                window.refresh();
+            })
+            .unwrap();
+            wait(1500).await;
+            draw(cx);
+            handle
+                .update(cx, |studio, _, cx| {
+                    assert!(studio.motion_prompt_visible(), "the bar shows in the Motion tab");
+                    // Shift on the ruler marks a span instead of seeking.
+                    let bounds = studio.video_timeline_bounds.lock().unwrap().expect("the ruler was laid out");
+                    let (spp, scroll) = (studio.video_timeline_seconds_per_pixel(), studio.video_timeline_scroll);
+                    let at = |t: f64| gpui::point(bounds.origin.x + px((t / spp - scroll) as f32), bounds.origin.y);
+                    let before = studio.video_position;
+                    let press = gpui::MouseDownEvent { button: MouseButton::Left, position: at(2.0), modifiers: gpui::Modifiers { shift: true, ..Default::default() }, click_count: 1, first_mouse: false };
+                    studio.timeline_seek_down(&press, cx);
+                    assert!(studio.update_motion_layer_drag(at(5.0), cx));
+                    assert!(studio.finish_motion_layer_drag(at(7.0), true, cx));
+                    assert_eq!(studio.video_position, before, "the playhead stayed");
+                    let (a, b) = studio.motion_agent.span.expect("a span is marked");
+                    assert!((a - 2.0).abs() < 0.05 && (b - 7.0).abs() < 0.05, "{a} to {b}");
+                    studio.text_fields.prompt.update(cx, |_, cx| cx.emit(FieldEvent { target: Target::Prompt, kind: EventKind::Change, text: "five seconds of a map here".into() }));
+                    cx.notify();
+                })
+                .unwrap();
+            wait(400).await;
+            draw(cx);
+            wait(100).await;
+            studio_workflow_tests::save_display(&shots.join("prompt-6-recording.png"), false);
+            handle.update(cx, |studio, _, cx| studio.send_motion_prompt("five seconds of a map here", cx)).unwrap();
+            for _ in 0..100 {
+                wait(50).await;
+                if !handle.update(cx, |s, _, _| s.motion_agent.busy()).unwrap() {
+                    break;
+                }
+            }
+            handle
+                .update(cx, |studio, _, _| {
+                    let asked = asked.lock().unwrap();
+                    let text = &asked[0].text;
+                    assert!(text.starts_with(&format!("Recording: {}. No motion piece is open", recording.display())), "{text}");
+                    assert!(text.contains("recording_place at start 2.0") && text.contains("Marked span"), "{text}");
+                    assert_eq!(asked[0].cwd, recording.parent().unwrap());
+                    // It changed nothing: there is nothing to keep or undo.
+                    let request = &studio.motion_agent.requests[0];
+                    assert_eq!((request.outcome.clone(), request.edits), (Outcome::Kept, 0));
+                    assert!(studio.motion_agent.proposal().is_none());
+                })
+                .unwrap();
+            cx.update(|cx| cx.quit()).unwrap();
+        })
+        .detach();
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}

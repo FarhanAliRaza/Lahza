@@ -292,51 +292,77 @@ targets are refused), so every part below is new. In the order to build:
 
 ## Directing an agent from the editor
 
-Not started. To say in the editor what is wanted ("add five seconds of …
-here", "this one should look like …", "something is wrong with this one"),
-see the agent at work, and scrub what it made. "Generated" here is motion
-the agent builds with the engine's tools; a clip from a video model would
-be something else to connect.
+Built: to say in the editor what is wanted ("add five seconds of … here",
+"this one should look like …", "something is wrong with this one"), see
+the agent at work, and scrub what it made. "Generated" here is motion the
+agent builds with the engine's tools; a clip from a video model would be
+something else to connect.
 
-Already here:
-- An agent's edits appear live: the editor polls the project's folder
-  (`motion_editor.rs`, every 30 ticks) and reloads.
-- One history: each edit is an entry with its author and its inverse
-  (`io.rs` `HistoryEntry`), so undo works on what an agent did.
-- The editor knows what is pointed at: the selected layer (`selected`),
-  its box (`selection_bounds`) and the playhead.
-- The agent can look: `snapshot`, `review`.
+What was run: the unit tests, and two windows under Xvfb with Mesa's
+software Vulkan (`cargo test --release -p lahza motion_prompt -- --ignored`,
+screenshots looked at), with a runner of our own in Claude Code's place
+that makes real edits through a `Toolbox`. **No request was sent to
+Claude Code** (it costs money). Claude Code 2.1.329 was started once
+against an address nothing listens on: it took the flags, started
+`lahza mcp`, listed only its tools (`mcp__lahza__…`) and wrote the stream
+the reader expects, then failed to connect, at no cost. So not seen: a
+real agent calling the tools without being asked for permission
+(`--allowedTools mcp__lahza --permission-mode dontAsk`), reading the
+picture, or its wording when signed out.
 
-To build, in this order (1 to 4 with one selected layer already cover
-"fix this one"):
-1. **A prompt box in the motion editor.** It has no text input; the app
-   has one elsewhere (`text_field.rs`).
-2. **Starting an agent from the app.** First: Claude Code without its
-   terminal, as a child process on `lahza mcp`, its steps read as they
-   come (a stream of JSON). Behind one small interface, so another client
-   or a loop of our own (an API key, the `Toolbox` in process) can take
-   its place. It needs Claude Code installed and signed in: say so where
-   it is not.
-3. **What goes with the words.** The selected layer's id, the playhead,
-   the scene, and a snapshot of the frame as it is, so "this one" needs no
-   describing. A follow-up continues the same conversation.
-4. **A panel for the agent at work.** Each step as it happens (what was
-   added, what was checked, what is being drawn), what it said at the end,
-   and a stop button that ends the child.
-5. **Undo for a whole request.** An agent makes many edits a request and
-   each is its own entry: entries need the request they belong to, and
-   one undo takes them all back.
-6. **More than one thing selected.** A span of time ("five seconds from
-   here") and several layers; the editor holds one layer.
+1. **A prompt box** (`motion_prompt_ui.rs`, the field from
+   `text_field.rs`): under the preview on a motion project and on a
+   recording's Motion tab.
+2. **Starting an agent** (`motion_agent.rs`): `Runner` is the one small
+   interface (available, start, and a `Running` to stop); `ClaudeCode` is
+   the first: `claude -p` with stream-json in and out, `lahza mcp` as its
+   only server and no tools of its own, its lines read as they come.
+   Tested with a stub program that writes the same stream. Not installed
+   (the program is missing) and not signed in (`claude auth status`, or
+   what a failed request says) are said in the bar and in the AI tab.
+3. **What goes with the words** (`compose`): the project, the selected
+   layers and their kinds, the marked span, the playhead and its frame,
+   the scene, and the frame showing as a PNG. A follow-up continues the
+   conversation (`--resume`); a chip that can be removed says so.
+4. **The agent at work**: each step in the bar, in the AI tab and as a
+   ghost clip; what it said at the end; Stop ends the child and the
+   server it started (its process group).
+5. **Undo for a whole request**: `HistoryEntry.request` (the server takes
+   it from `LAHZA_REQUEST`); `history` has `undo_request`, and
+   `by_request` makes a request one step of `undo`, which is what Ctrl+Z
+   in the editor does. Redo puts it all back.
+6. **More than one thing selected**: Ctrl- or Shift-click adds rows to
+   what a prompt is about (the editor still holds one layer, the one the
+   inspector shows); a span is marked on a strip over the ruler, or with
+   Shift on a recording's ruler.
 
-To settle first:
-- **Editing while the agent works.** Nothing was found that keeps the
-  editor and the server from writing the folder at once (both number
-  history entries from what is there). Either the editor only reads while
-  a request runs, or the writes are guarded.
-- **How long it takes.** A scene of five seconds is many calls: tens of
-  seconds to minutes (not measured). The live reload shows it being put
-  together; the panel should say what is left where that is known.
+Settled:
+- **Editing while the agent works: guarded writes.** `io::lock` (`flock`
+  on `<project>/.lock`) is taken by `edit_apply` and by undo and redo;
+  under it the writer loads what the other wrote, then writes. Two
+  writers of 25 edits each lose none and take no number twice
+  (`two_writers_do_not_lose_edits`). The editor stays usable. Not under
+  the lock: tools that write other files (markers, shaders, narration).
+- **How long it takes**: not measured, since no real request was run. The
+  bar and the ghost clip say the step, the seconds so far, and the steps
+  and edits made. What is left is not known to the runner and is not
+  said.
+
+Left:
+- **A real request, on a real desktop.** The first thing to do: send one
+  from the bar and watch for a permission refusal in the stream.
+- **Requests are this session's.** The AI tab and the conversation to
+  continue are lost when the app closes (the history keeps each entry's
+  request id; nothing reads the words back).
+- **A piece made on a recording.** With no piece open the words ask for
+  a new one on the span. Undo then takes back the edits inside it, not
+  the piece or its place on the video; compare needs the piece open; and
+  no ghost clip shows, only the bar. Not run with a real agent, so "a
+  piece placed there comes back" is not seen.
+- **Undo after later edits** to the same things fails with the engine's
+  message ("the project changed in a conflicting way").
+- **Another runner** (an API key and the `Toolbox` in process): the
+  interface is there, the second runner is not.
 
 ## The motion editor: drags that stall, and how it should be used
 
@@ -389,29 +415,35 @@ and whether the bars now move freely, is not confirmed on a real card.
 
 The rule: select, type, Enter; everything else is by choice. The fewest
 clicks for the common things, the same in the motion editor and on a
-recording's timeline. This is how the parts under "Directing an agent
-from the editor" look.
+recording's timeline. Built as below and seen in screenshots under Xvfb
+(see "Directing an agent from the editor" for what was run); not used
+with a mouse on a real desktop.
 
-- **One prompt bar, the same everywhere**, under the preview. It shows
-  what it will act on as chips that can be removed ("Layer: title",
-  "2.1 s to 7.1 s"). Not a modal: that covers what is being talked about.
-- **Typing with something selected begins a prompt** with it attached:
-  "fix this one" is a click, the words, Enter.
-- **A drag on the ruler marks a span**: mark five seconds, type what
-  should be there, Enter. On a recording's timeline what comes back is a
-  motion piece placed there, as pieces already are.
-- **The inspector has two tabs**: Properties (by hand), and AI (what was
-  asked about this layer, and what came of it).
-- **The agent's work is seen and does not block**: a ghost clip over the
-  span being made, with the step it is at; the rest of the editor stays
-  usable (see "Editing while the agent works" above).
-- **What comes back is a proposal**: keep, undo, again, and a key held to
-  compare before and after (the request's entries taken back and put
-  back).
-- **A drag never waits**: the proxy on every drag, the number at once,
-  saved on release.
-- **By hand stays cheap**: a nudge or a retime is quicker than a prompt,
-  so the inspector has to edit text and effects, which it does not.
+- **One prompt bar, the same everywhere**, under the preview, with chips
+  that can be removed ("Layer: title", "0.5 s to 2.0 s", "Continues the
+  conversation"). Not a modal.
+- **Typing with something selected begins a prompt.** On a motion
+  project any printable key does, selected or not; on a recording only
+  with a layer selected, because letters are shortcuts there. Space
+  still plays.
+- **A span is marked** by a drag on a strip over the ruler; on a
+  recording by Shift-drag on the ruler, since a plain drag scrubs there.
+  A click clears it. Left: one gesture for both.
+- **The inspector has two tabs**: Properties, and AI (what was asked
+  about this layer, each step, what it said, keep / undo / again). With
+  nothing selected the AI list shows every request.
+- **The agent's work is seen and does not block**: the ghost clip over
+  the span (the whole length without one) with the step it is at; the
+  editor edits meanwhile.
+- **What comes back is a proposal**: Keep, Undo, Again, and Hold to
+  compare (the button, or `\` held). Compare applies the request's
+  inverses in the preview only; nothing is written.
+- **A drag never waits**: see "Drags that stall".
+- **By hand stays cheap**: the inspector edits a text layer's words (shown
+  as typed, saved when the field is left), its size and tracking, each
+  effect's numbers, and adds or removes blur, shadow, exposure, contrast
+  and colour. Left: a text's font and colour, colours and two-part values
+  of effects (a shadow's colour and offset), other effects' adding.
 
 ## Slang
 
