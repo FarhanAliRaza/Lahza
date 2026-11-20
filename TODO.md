@@ -43,6 +43,16 @@ integration tests, the app 122 and its four window tests under Xvfb):
   normal-mapped face no longer shadows itself, which was the spots in
   the GPU-against-CPU comparison.
 
+- Since, in the simulation (its own section has each with its test): a
+  rope of links, bodies two instancers deep and as an emitter's
+  particles; eight joints a point, dual quaternions beside linear blend
+  on the CPU and in the pool's kernel, imported rotations that follow
+  the file's slerp, a `.gltf` with its buffer and pictures; a ragdoll's
+  limits from its bones' names, aimed arms led round the body; a take's
+  events on its sheet, reactions that differ by seed; the search with
+  elbows and getting up; a crowd's guard pose, far agents that come in
+  over their pictures, pictures lit by stepped lights.
+
 To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
 in), since none of it can be seen from a container:
 1. Send a request from the prompt bar itself, and one with the API-key
@@ -713,7 +723,30 @@ at fa1dfd7): on x86-64 with glibc kept off its FMA and AVX paths
 do hash differently with and without) all 35 of `motion-sim`'s tests
 pass and every pin holds; on aarch64 under `qemu-user` 34 pass, every
 pinned bake among them, the one failure being the policy test, whose
-ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
+ONNX Runtime is x86-64 only. Not run: a real ARM machine.
+
+A later round (one container, a Xeon with FMA; `motion-sim` 50 tests
+with 7 ignored measures, debug and release) took the lines each part had
+left. Pinned new, in `motion-sim`'s tests: a rope of links wound round a
+bar (61580 bytes, FNV 11416658259355396517), bodies two instancers deep
+(16679, 7626806709829618763), an emitter's particles (23075,
+9110451255763848001), a human's limits from bone names (57712,
+16705265968754114252), six takes of arms led round the body (36621,
+11581137727660598137; 36488, 947309298340335586; 36488,
+17833138615412773368; 36488, 16887651574034388283; 36552,
+8588104402154634968; 36552, 7065585522355567997), a take varied by
+its seed (57021, 6885115440864738725), getting up under the search
+(126115, 13679216537685136859), a crowd with its guard (18476,
+11403343376360516901). Changed, and why: getting up from four falls
+(139438, 3354145111831044034 → 10638684219171540933: an arm on its
+way back to the clip now meets the body) and the search's take (56950,
+17133235751400427189 → 56831, 7627719729510559245: the same, and an
+elbow's bend an arm in its plan). Every other pin is as it was: what
+was added to a bake's input (a rope's links, a particle's lives,
+`vary`, a guard, named feet) is hashed only where a scene has it, and
+the takes pinned with 40° joints say them outright now that names give
+a human's. These pins were made on one machine and not yet on a
+second. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
@@ -1215,16 +1248,36 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      5000 are drawn at all. Not measured: the GPU renderer and the path
      tracer (no GPU here), and a character of real size, where a picture
      should gain far more.
-   - Left, needing a GPU to do rightly: what is wrong with pictures is
-     the renderers' to mend, in the rasteriser's shader and the path
-     tracer, and only the CPU's half can be seen here. They cast and
-     take no shadows from the scene (cards would have to be drawn into
-     the shadow maps with their pictures' coverage); they are drawn
-     again whenever the lights change, every frame under an animated
-     light (lighting a picture needs its normals kept and lit in the
-     shader); an agent pops when it changes between mesh and picture (a
-     cross-fade is two see-through draws of it, sorted); the path tracer
-     sees a card, not a body. Not measured for the same want: the GPU
+   - No pop at the switch: the farthest of the agents drawn as the
+     character (an eighth of `full`, twelve at most) and those in the
+     last tenth of `near` are drawn as the character, part see-through,
+     over their picture, more of the character the nearer; a crowd
+     whose `full` is under eight is as it was. Tested (states: with
+     `near` just past the six, each is the character between none and
+     all of it over its own picture; nearer all character, farther all
+     picture). Looked at on the CPU renderer with 1000 (`herd.py`).
+   - A picture's lights are stepped: it is lit by the scene's lights to
+     the nearest step (a direction to under four degrees, a colour, the
+     sky and the exposure to a sixteenth of a stop, a lamp's place to a
+     sixteenth of how far off it is), and its key is of those. So a
+     light that drifts makes a new picture a step, not a frame, and a
+     frame's pictures are still the same whenever it is asked for.
+     Tested: six pictures under a sun that drifts eight degrees and
+     brightens a tenth in a second are made 30 times over its 150
+     showings (every showing before: 150); under a still light 5; a sun
+     that swings a quarter round in a second still makes one nearly
+     every frame (120).
+   - Measured again (four cores, CPU renderer, 1280×720, with the guard
+     and the band): 1000 agents, 150 of them meshes, bake 1.1 s, a
+     second of export 33.9 s (39.9 s before).
+   - Left, needing what is not here: pictures cast and take no shadows
+     from the scene, and are lit again (by steps now) when lights
+     change. Both are the renderers' to mend, in the rasteriser's
+     shader, its shadow maps and the path tracer (cards drawn into the
+     shadow maps with their pictures' coverage; a picture's normals
+     kept and lit in the shader; the tracer sees a card, not a body),
+     which are another session's files this round and whose GPU half
+     wants a card to look at. Not measured for the same want: the GPU
      renderer and the path tracer on crowds, and a character of real
      size (none here, and no licence read for one).
    - A guard (`crowds[].guard`: `pose`, a moment of the scene at which
