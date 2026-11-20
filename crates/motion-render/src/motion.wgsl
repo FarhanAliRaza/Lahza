@@ -1729,7 +1729,9 @@ fn oct_decode(e: vec2<f32>) -> vec3<f32> {
 // (`gn`, its true normal toward the camera). Depth alone would not tell:
 // two surfaces at nearly one depth would mix (steps of a texel along the
 // edge between them), and a floor seen at a glancing angle is at many
-// depths. At an edge with none, the texel whose plane is nearest.
+// depths. At an edge with none, the texel whose plane is nearest; but a
+// see-through batch then has the whole sky as before (the texels behind
+// it are of other things).
 struct Sky { open: vec4<f32>, back: vec3<f32> }
 fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky {
     var none: Sky;
@@ -1737,7 +1739,9 @@ fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky
     let size = bitcast<u32>(b_mesh[lb + 6u].w);
     if size == 0u { return none; }
     let w = i32(size & 0xffffu);
-    let h = i32(size >> 16u);
+    let h = i32((size >> 16u) & 0x7fffu);
+    // (A see-through batch: only its own texels, see `Batch::set_sky`.)
+    let own = (size >> 31u) != 0u;
     let off = i32(bitcast<u32>(prim.stroke.z) + bitcast<u32>(b_mesh[lb + 3u].w));
     let c = vec2<f32>(prim.fill.x + prim.fill.z * q.x, prim.fill.y + prim.fill.w * q.y);
     let g = c * 0.5 - 0.5;
@@ -1768,6 +1772,7 @@ fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky
     if near.w > 1e29 { return none; }
     var s: Sky;
     if weight <= 1e-3 {
+        if own { return none; }
         s.open = vec4<f32>(oct_decode(near.xy), clamp(near.z, 0.0, 1.0));
         s.back = near_back;
         return s;

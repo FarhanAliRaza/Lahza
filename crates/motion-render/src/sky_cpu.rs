@@ -6,6 +6,9 @@
 //! (`sky_lit`), the same two filter passes, in the same f32 arithmetic;
 //! `at` is motion.wgsl's `sky_at`. The two differ where a ray grazes an
 //! edge (two ways of meeting a triangle).
+//! What hides the sky, as there: a surface at least half opaque, and a
+//! card (a flat 3D layer's quad) where its picture, a group drawn before
+//! this one, covers more than half.
 
 use crate::mesh3d::{LROWS, MAT_ROWS};
 use crate::pt::{Trace, TraceMesh};
@@ -77,11 +80,33 @@ struct Mat {
     emit: V3,
 }
 
-/// A triangle in camera space with its corners' normals.
+/// A triangle in camera space with its corners' normals. `mat`: its
+/// material, or `CARD` and the card it is half of.
 struct Tri {
     p: [V3; 3],
     n: [V3; 3],
     mat: u32,
+}
+
+const CARD: u32 = 1 << 31;
+
+/// A card's picture (pt.wgsl's `b_card` rows): target px to its texels,
+/// and where they are.
+struct Card {
+    origin: [f32; 2],
+    factor: [f32; 2],
+    offset: usize,
+    size: (i32, i32),
+}
+
+/// Which ray: the camera's (it goes through cards, which take no sky), a
+/// ray from the surface it found, or a shadow ray (the first thing in the
+/// way will do).
+#[derive(Clone, Copy, PartialEq)]
+enum Ray {
+    Camera,
+    Sky,
+    Shadow,
 }
 
 struct Node {
@@ -93,10 +118,17 @@ struct Node {
     count: u32,
 }
 
-struct Scene {
+struct Scene<'a> {
     tris: Vec<Tri>,
     mats: Vec<Mat>,
     nodes: Vec<Node>,
+    cards: Vec<Card>,
+    /// The groups drawn before the sky's (the cards' pictures).
+    groups: &'a [[f32; 4]],
+    /// The camera, for where a point of a card is in its picture.
+    focal: f32,
+    centre: [f32; 2],
+    root: [f32; 9],
 }
 
 struct Hit {
@@ -105,10 +137,12 @@ struct Hit {
     n: V3,
     g: V3,
     mat: Mat,
+    /// A card: its picture's colour there (premultiplied sRGB).
+    card: Option<[f32; 4]>,
 }
 
-impl Scene {
-    fn new(t: &Trace) -> Scene {
+impl<'a> Scene<'a> {
+    fn new(t: &Trace, groups: &'a [[f32; 4]]) -> Scene<'a> {
         let (mut tris, mut mats) = (Vec::new(), Vec::new());
         for inst in &t.instances {
             // (A mesh the GPU makes in its pool is not here to cast at.)
@@ -143,7 +177,17 @@ impl Scene {
                 tris.push(Tri { p: [p[a], p[b], p[c]], n: [n[a], n[b], n[c]], mat });
             }
         }
-        let mut scene = Scene { tris, mats, nodes: Vec::new() };
+        // Cards: two triangles each, as the tracer's structure has them.
+        let mut cards = Vec::new();
+        for c in &t.cards {
+            let k = CARD | cards.len() as u32;
+            let v = c.view;
+            tris.push(Tri { p: [v[0], v[1], v[2]], n: [[0.0; 3]; 3], mat: k });
+            tris.push(Tri { p: [v[0], v[2], v[3]], n: [[0.0; 3]; 3], mat: k });
+            let b = c.picture;
+            cards.push(Card { origin: [b.origin[0] as f32, b.origin[1] as f32], factor: [b.factor[0] as f32, b.factor[1] as f32], offset: b.offset as usize, size: (b.size.0 as i32, b.size.1 as i32) });
+        }
+        let mut scene = Scene { tris, mats, nodes: Vec::new(), cards, groups, focal: t.focal, centre: t.centre, root: t.root };
         let n = scene.tris.len();
         if n > 0 {
             let mut centres: Vec<V3> = scene.tris.iter().map(|t| mul(add(add(t.p[0], t.p[1]), t.p[2]), 1.0 / 3.0)).collect();
@@ -206,10 +250,35 @@ impl Scene {
         me as u32
     }
 
-    /// The nearest triangle along `o + t d`, 0 < t < `tmax` (`any`: the
-    /// first found that blocks a shadow ray): t, the triangle and where
+    /// pt.wgsl `card_picture`: card `k`'s picture (premultiplied sRGB) at
+    /// camera-space point `p`.
+    fn card_picture(&self, k: usize, p: V3) -> [f32; 4] {
+        let Some(c) = self.cards.get(k) else { return [0.0; 4] };
+        let r = &self.root;
+        let s = [self.focal * p[0] / p[2] + self.centre[0], self.focal * p[1] / p[2] + self.centre[1], 1.0];
+        let q = [dot([r[0], r[1], r[2]], s), dot([r[3], r[4], r[5]], s), dot([r[6], r[7], r[8]], s)];
+        let g = [(q[0] / q[2] - c.origin[0]) / c.factor[0] - 0.5, (q[1] / q[2] - c.origin[1]) / c.factor[1] - 0.5];
+        let (x0, y0) = (g[0].floor(), g[1].floor());
+        let (fx, fy) = (g[0] - x0, g[1] - y0);
+        let at = |x: i32, y: i32| {
+            if x < 0 || y < 0 || x >= c.size.0 || y >= c.size.1 {
+                return [0.0; 4];
+            }
+            self.groups.get(c.offset + (y * c.size.0 + x) as usize).copied().unwrap_or([0.0; 4])
+        };
+        let (xi, yi) = (x0 as i32, y0 as i32);
+        let (a, b, cc, dd) = (at(xi, yi), at(xi + 1, yi), at(xi, yi + 1), at(xi + 1, yi + 1));
+        std::array::from_fn(|i| {
+            let (top, bottom) = (a[i] + (b[i] - a[i]) * fx, cc[i] + (dd[i] - cc[i]) * fx);
+            top + (bottom - top) * fy
+        })
+    }
+
+    /// The nearest thing that hides the sky along `o + t d`, 0 < t <
+    /// `tmax` (a shadow ray: the first found): t, the triangle and where
     /// in it (the weights of its second and third corners).
-    fn cast(&self, o: V3, d: V3, tmax: f32, any: bool) -> Option<(f32, usize, [f32; 2])> {
+    fn cast(&self, o: V3, d: V3, tmax: f32, ray: Ray) -> Option<(f32, usize, [f32; 2])> {
+        let any = ray == Ray::Shadow;
         if self.nodes.is_empty() {
             return None;
         }
@@ -244,7 +313,8 @@ impl Scene {
             }
             for k in node.at as usize..(node.at + node.count) as usize {
                 let tri = &self.tris[k];
-                if any && !self.mats[tri.mat as usize].blocks {
+                let card = tri.mat & CARD != 0;
+                if if card { ray == Ray::Camera } else { !self.mats[tri.mat as usize].blocks } {
                     continue;
                 }
                 let (e1, e2) = (sub(tri.p[1], tri.p[0]), sub(tri.p[2], tri.p[0]));
@@ -265,6 +335,9 @@ impl Scene {
                 }
                 let t = dot(e2, qv) / det;
                 if t > 0.0 && t < far {
+                    if card && self.card_picture((tri.mat & !CARD) as usize, add(o, mul(d, t)))[3] <= 0.5 {
+                        continue;
+                    }
                     far = t;
                     best = Some((t, k, [u, v]));
                     if any {
@@ -276,11 +349,16 @@ impl Scene {
         best
     }
 
-    /// pt.wgsl `cast_ray`, for meshes: the nearest surface and its normals
-    /// facing the ray.
-    fn hit(&self, o: V3, d: V3) -> Option<Hit> {
-        let (t, k, uv) = self.cast(o, d, 1e30, false)?;
+    /// pt.wgsl `cast_ray` for the sky's rays: the nearest surface and its
+    /// normals facing the ray, or a card with its picture's colour.
+    fn hit(&self, o: V3, d: V3, ray: Ray) -> Option<Hit> {
+        let (t, k, uv) = self.cast(o, d, 1e30, ray)?;
         let tri = &self.tris[k];
+        if tri.mat & CARD != 0 {
+            let p = add(o, mul(d, t));
+            let back = mul(d, -1.0);
+            return Some(Hit { t, p, n: back, g: back, mat: Mat { flags: 0, blocks: true, kd: [0.0; 3], emit: [0.0; 3] }, card: Some(self.card_picture((tri.mat & !CARD) as usize, p)) });
+        }
         let mat = self.mats[tri.mat as usize];
         let w = [1.0 - uv[0] - uv[1], uv[0], uv[1]];
         let mut g = norm(cross(sub(tri.p[1], tri.p[0]), sub(tri.p[2], tri.p[0])));
@@ -294,7 +372,7 @@ impl Scene {
         if dot(n, g) < 0.0 {
             n = mul(n, -1.0);
         }
-        Some(Hit { t, p: add(o, mul(d, t)), n, g, mat })
+        Some(Hit { t, p: add(o, mul(d, t)), n, g, mat, card: None })
     }
 }
 
@@ -349,7 +427,7 @@ fn sky_lit(scene: &Scene, t: &Trace, h: &Hit) -> V3 {
         if facing <= 0.0 {
             continue;
         }
-        if col[3] > 0.5 && scene.cast(offset(h, to), to, dist * 0.999, true).is_some() {
+        if col[3] > 0.5 && scene.cast(offset(h, to), to, dist * 0.999, Ray::Shadow).is_some() {
             continue;
         }
         l = add(l, mul(xyz(col), facing * window));
@@ -377,8 +455,9 @@ struct Raw {
 
 /// Fills traced list `t`'s sky group, `w` × `h` texels of visibility, as
 /// many after them of the light that comes back and as many of the
-/// surfaces' planes, at `out`.
-pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads: usize) {
+/// surfaces' planes, at `out`. `groups`: the list's groups before it (its
+/// cards' pictures).
+pub(crate) fn fill(t: &Trace, groups: &[[f32; 4]], w: usize, h: usize, out: &mut [[f32; 4]], threads: usize) {
     if out.len() < w * h * 3 || w == 0 || h == 0 {
         return;
     }
@@ -392,7 +471,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         }
         clock = std::time::Instant::now();
     };
-    let scene = Scene::new(t);
+    let scene = Scene::new(t, groups);
     lap(&format!("a BVH over {} triangles", scene.tris.len()));
     let inv = t.inv_root;
     let dir = |x: f32, y: f32| {
@@ -418,10 +497,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
     let texel = |x: usize, y: usize| -> Raw {
         let d = dir(x as f32, y as f32);
         let mut raw = Raw::default();
-        let Some(hit) = scene.hit([0.0; 3], d) else { return raw };
-        if hit.mat.flags & NOT_SOLID != 0 {
-            return raw;
-        }
+        let Some(hit) = scene.hit([0.0; 3], d, Ray::Camera) else { return raw };
         let total = (rays * 16) as f32;
         let place = SKY_ORDER[(y % 4) * 4 + x % 4];
         let frame = basis(hit.n);
@@ -438,11 +514,13 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
             if dot(ray, hit.g) <= 0.02 {
                 continue;
             }
-            match scene.hit(o, ray).filter(|far| far.mat.flags & NOT_SOLID == 0) {
+            match scene.hit(o, ray, Ray::Sky) {
                 None => {
                     sum = add(sum, ray);
                     n += 1.0;
                 }
+                // (A card's colour comes back as it is.)
+                Some(Hit { card: Some(c), .. }) => back = add(back, [c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(crate::mesh3d::srgb_decode)),
                 Some(far) => {
                     back = add(back, sky_lit(&scene, t, &far));
                     kd = add(kd, far.mat.kd);
@@ -604,8 +682,9 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
 /// texel two target px each way), what the surface at canvas point `c`,
 /// camera point `p` on a triangle whose true normal toward the camera is
 /// `gn`, sees of the sky: the open direction (camera space), the open
-/// part, and the light that comes back. None: no surface there.
-pub(crate) fn at(groups: &[[f32; 4]], off: usize, w: i32, h: i32, c: [f32; 2], p: V3, gn: V3) -> Option<(V3, f32, V3)> {
+/// part, and the light that comes back. None: no surface there (`own`,
+/// a see-through batch: none of its own).
+pub(crate) fn at(groups: &[[f32; 4]], off: usize, w: i32, h: i32, own: bool, c: [f32; 2], p: V3, gn: V3) -> Option<(V3, f32, V3)> {
     let g = [c[0] * 0.5 - 0.5, c[1] * 0.5 - 0.5];
     let g0 = [(g[0] + 0.5).floor(), (g[1] + 0.5).floor()];
     let texel = |base: usize, x: i32, y: i32| groups.get(base + (y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize).copied().unwrap_or([0.0; 4]);
@@ -637,6 +716,9 @@ pub(crate) fn at(groups: &[[f32; 4]], off: usize, w: i32, h: i32, c: [f32; 2], p
         return None;
     }
     if weight <= 1e-3 {
+        if own {
+            return None;
+        }
         return Some((oct_decode([near[0], near[1]]), near[2].clamp(0.0, 1.0), near_back));
     }
     Some((norm([sum[0], sum[1], sum[2]]), (sum[3] / weight).clamp(0.0, 1.0), mul(back, 1.0 / weight)))

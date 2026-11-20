@@ -40,6 +40,10 @@ pub struct MeshCache {
     /// group (from the list's texel base) and the group's size. The
     /// list's batches take it (`Batch::set_sky`).
     pub(crate) sky: Option<(u32, u32, u32)>,
+    /// The cards of that list whose pictures its sky visibility already
+    /// made (by their layers' places in the list): `card_item` takes them
+    /// instead of drawing each picture a second time.
+    pub(crate) sky_cards: Vec<(usize, CardPicture)>,
     /// Parsed glTF files (meshes from Blender).
     gltf_files: crate::model::Files,
     /// By key: the mesh, the frame that last used it, and whether it is
@@ -157,6 +161,17 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
         || m.colors.iter().any(|c| c.0[3] < 1.0)
         || m.materials.iter().any(|x| (x.wireframe > 0.0 && x.wire_fill.is_none()) || x.volume.is_some())
         || m.materials.iter().any(|x| x.slang.as_ref().is_some_and(|s| s.see_through))
+}
+
+/// Whether a mesh layer is in the sky visibility's rays (`list.rs`
+/// `sky_list`): not one that blends otherwise than over what is behind it
+/// (a glow hides nothing), a volume (it needs the tracer's marching) or
+/// one whose coverage a Slang surface works out. What is in them hides
+/// the sky where it is at least half opaque (pt.wgsl `sky_blocks`).
+pub(crate) fn in_sky(layer: &lahza_motion_core::compile::LayerState) -> bool {
+    use lahza_motion_core::compile::Content;
+    let Content::Mesh(m) = &layer.content else { return false };
+    layer.blend == lahza_motion_core::document::Blend::Normal && !m.materials.iter().any(|x| x.volume.is_some() || x.slang.as_ref().is_some_and(|s| s.see_through))
 }
 
 impl MeshCache {
@@ -1326,6 +1341,12 @@ pub struct Backdrop {
 pub(crate) fn refracts(m: &MeshState) -> bool {
     m.materials.iter().any(|x| x.transmission > 0.0 && !x.unlit && !x.shadow_catcher)
 }
+/// A flat 3D layer's picture and the quad it lies on (`list.rs`
+/// `card_picture`): the quad in camera space and on the canvas, the
+/// picture's group, its rect. Err: it can't be a card; Ok(None): nothing
+/// to draw.
+pub(crate) type CardPicture = Result<Option<([[f64; 3]; 4], [[f64; 2]; 4], Backdrop, [f64; 4])>, ()>;
+
 
 /// A light-space depth map: how close to the light the nearest surface is
 /// at each texel. Rows: [kind (0 directional, 1 point), size, u0, v0],
@@ -2065,11 +2086,14 @@ impl Batch {
     /// Where the batch's lighting finds how much of the sky a point sees
     /// (motion.wgsl `sky_at`): in the light block's two spare floats, the
     /// group's offset from the list's texel base and its width and height
-    /// (16 bits each; 0: none, the whole sky as before).
-    pub(crate) fn set_sky(&mut self, sky: Option<(u32, u32, u32)>) {
+    /// (16 and 15 bits; 0: none, the whole sky as before). `own` (the top
+    /// bit), for a see-through batch: only texels of its own surfaces,
+    /// which it has where it is at least half opaque; where the texels
+    /// are of what is behind it, the whole sky as before.
+    pub(crate) fn set_sky(&mut self, sky: Option<(u32, u32, u32)>, own: bool) {
         if let (Some((offset, w, h)), true) = (sky, self.light_rows.len() > 6) {
             self.light_rows[3][3] = f32::from_bits(offset);
-            self.light_rows[6][3] = f32::from_bits(w.min(0xffff) | h.min(0xffff) << 16);
+            self.light_rows[6][3] = f32::from_bits(w.min(0xffff) | h.min(0x7fff) << 16 | (own as u32) << 31);
         }
     }
 
@@ -3603,7 +3627,7 @@ fn encode(x: f32) -> f32 {
 }
 
 /// Premultiplied sRGB colour of triangle `tri` at target point `q`.
-fn srgb_decode(x: f32) -> f32 {
+pub(crate) fn srgb_decode(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     if x <= 0.04045 {
         x / 12.92
@@ -3812,7 +3836,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
             if fdot(g, p) > 0.0 {
                 g = fmul(g, -1.0);
             }
-            crate::sky_cpu::at(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16) as i32, c, p, g)
+            crate::sky_cpu::at(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16 & 0x7fff) as i32, sky_size >> 31 != 0, c, p, g)
         })
         .flatten();
     let sky_part = sky.map_or(1.0, |s| s.1);

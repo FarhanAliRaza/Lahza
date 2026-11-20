@@ -526,7 +526,7 @@ impl Builder<'_> {
             let i = prev.prim.kind[1] as usize;
             if prev.prim.kind[0] == PRIM_MESH && prev.prim.kind[2] == blend && blend == blend_code(Blend::Normal) && self.meshes.batches[i].can_join(m) && self.meshes.batches[i].list == list_serial {
                 let mut batch = std::mem::replace(&mut self.meshes.batches[i], crate::mesh3d::Batch::new(m)?);
-                batch.set_sky(self.meshes.sky);
+                batch.set_sky(self.meshes.sky, false);
                 batch.add(self.meshes, m, root, layer.opacity);
                 batch.members.push(index);
                 prev.bounds = batch.bounds;
@@ -535,9 +535,10 @@ impl Builder<'_> {
             }
         }
         let mut batch = crate::mesh3d::Batch::new(m)?;
-        // (What lets the rest show is not in the sky visibility's rays:
-        // the texels behind it are of other things.)
-        batch.set_sky(self.meshes.sky.filter(|_| !see_through));
+        // (What lets the rest show takes the sky where the texels are its
+        // own: where it is at least half opaque. A glow, a volume: not in
+        // the rays at all.)
+        batch.set_sky(self.meshes.sky.filter(|_| !see_through || crate::mesh3d::in_sky(layer)), see_through);
         batch.list = list_serial;
         batch.members.push(index);
         batch.see_through = see_through;
@@ -574,10 +575,12 @@ impl Builder<'_> {
                 }
             }
         }
+        let outer_cards = std::mem::take(&mut self.meshes.sky_cards);
         let sky = if self.sky { self.sky_list(layers, root, canvas, list, pending) } else { None };
         let outer = std::mem::replace(&mut self.meshes.sky, sky);
         self.emit_run(layers, root, canvas, list, pending, out);
         self.meshes.sky = outer;
+        self.meshes.sky_cards = outer_cards;
     }
 
     fn emit_run(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
@@ -614,7 +617,11 @@ impl Builder<'_> {
     }
 
     /// Sky visibility for a rasterised list (`TraceOptions::sky`): its
-    /// solid meshes as the tracer takes them, and a group of half the
+    /// meshes as the tracer takes them (`mesh3d::in_sky`: the see-through
+    /// ones too, which hide the sky where they are at least half opaque),
+    /// its cards (the flat 3D layers `emit_run` draws among the meshes:
+    /// their pictures are made here, before the group the rays fill, and
+    /// kept for `card_item`), and a group of half the
     /// target's size (a texel is two target px each way, from its corner)
     /// that the tracer fills with what each texel's surface sees of the
     /// sky, and with the light that comes back from what it sees instead. Returns where the list's batches find it (`Batch::set_sky`).
@@ -623,7 +630,7 @@ impl Builder<'_> {
         let mut first: Option<lahza_motion_core::compile::MeshState> = None;
         for layer in layers {
             let Content::Mesh(m) = &layer.content else { continue };
-            if crate::mesh3d::see_through(layer) {
+            if !crate::mesh3d::in_sky(layer) {
                 continue;
             }
             if let Some(i) = self.meshes.trace_instance(layer.id.clone(), m, layer.opacity, root.max_scale()) {
@@ -632,6 +639,17 @@ impl Builder<'_> {
             first.get_or_insert_with(|| (**m).clone());
         }
         let m = first.filter(|_| !instances.is_empty())?;
+        let mut cards = Vec::new();
+        for (j, layer) in layers.iter().enumerate() {
+            if !card_candidate(layer) {
+                continue;
+            }
+            let picture = self.card_picture(layer, root, canvas, list, pending, true);
+            if let Ok(Some((view, _, picture, _))) = &picture {
+                cards.push(crate::pt::TraceCard { view: view.map(|v| v.map(|x| x as f32)), picture: *picture });
+            }
+            self.meshes.sky_cards.push((j, picture));
+        }
         let mut lights = m.lighting.as_ref().map(|l| crate::mesh3d::light_rows(l, &m)).unwrap_or_default();
         let env = m.lighting.as_ref().and_then(|l| self.meshes.env_map(l));
         if let (Some(l), false) = (&m.lighting, lights.is_empty()) {
@@ -657,7 +675,7 @@ impl Builder<'_> {
         let f = |v: [f64; 9]| v.map(|x| x as f32);
         list.traces.push(crate::pt::Trace {
             instances,
-            cards: Vec::new(),
+            cards,
             lights,
             focal: m.camera.focal as f32,
             centre: [m.camera.centre.0 as f32, m.camera.centre.1 as f32],
@@ -757,7 +775,8 @@ impl Builder<'_> {
     fn flush_deferred(&mut self, layers: &[LayerState], cards: &mut Vec<usize>, deferred: &mut Vec<usize>, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         for j in cards.drain(..) {
             self.meshes.set_current(j);
-            if !self.card_item(&layers[j], root, canvas, list, pending, out) {
+            let made = self.meshes.sky_cards.iter().position(|(at, _)| *at == j).map(|k| self.meshes.sky_cards.swap_remove(k).1);
+            if !self.card_item(&layers[j], made, root, canvas, list, pending, out) {
                 self.emit(&layers[j], root, canvas, list, pending, out);
             }
         }
@@ -826,8 +845,10 @@ impl Builder<'_> {
         Ok(Some((corners, screen, crate::mesh3d::Backdrop { offset, size, origin, factor }, rect)))
     }
 
-    fn card_item(&mut self, layer: &LayerState, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) -> bool {
-        let (corners, screen, picture, rect) = match self.card_picture(layer, root, canvas, list, pending, true) {
+    /// `made`: its picture, where the list's sky visibility made it.
+    #[allow(clippy::too_many_arguments)]
+    fn card_item(&mut self, layer: &LayerState, made: Option<crate::mesh3d::CardPicture>, root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) -> bool {
+        let (corners, screen, picture, rect) = match made.unwrap_or_else(|| self.card_picture(layer, root, canvas, list, pending, true)) {
             Err(()) => return false,
             Ok(None) => return true,
             Ok(Some(c)) => c,

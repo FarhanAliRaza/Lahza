@@ -510,9 +510,48 @@ What is left:
   are what keeps flat things even), and the picture
   through the raster's hardware visibility pass, which software Vulkan
   does not have (only the compute raster's shading was run with it).
-- Only solid meshes are in the rays: what is see-through, cards, wires,
-  volumes and shadow catchers neither hide the sky nor take it (they are
-  lit as before).
+- **Cards and see-through meshes hide the sky, and see-through meshes
+  take it: done**, by a fixed rule, nothing drawn by lot. A ray ends on
+  a surface that is at least half opaque (its material's opacity times
+  what it does not let through: pt.wgsl `sky_blocks`, the rule the
+  light's shadow rays had) and on a card where its picture covers more
+  than half; anything less it goes through. So a mesh 0.7 opaque hides
+  the sky as a solid one and one 0.3 opaque hides none of it: a step at
+  one half, where coverage as a ray's weight would be even (a ray going
+  on through each thing it meets: not done, it costs rays).
+  - The sky's list has the list's cards as a traced list has them (the
+    flat 3D layers `emit_run` draws among the meshes; `list.rs`
+    `sky_list` makes their pictures before the group the rays fill, and
+    `card_item` takes those instead of drawing each a second time) and
+    its see-through meshes (`mesh3d::in_sky`).
+  - A card's colour comes back as it is (a card is a flat picture, not
+    lit, in the raster and traced alike: so it has no sky to take, and
+    the camera's ray goes through cards to the surface behind, which
+    keeps its texel).
+  - A see-through batch reads the group for its own surfaces only: it
+    has texels where it is at least half opaque (the camera's ray stops
+    there); where the texels are of what is behind it, it is lit as
+    before (`Batch::set_sky`'s `own`). What is behind a see-through mesh
+    that took the texel reads the nearest plane, as at an edge.
+  - The CPU's BVH has the cards' quads, and reads their pictures from
+    the groups drawn before the sky's (`sky_cpu.rs`).
+  Measured (`sky_tests::cards_and_see_through_meshes_hide_the_sky`,
+  320 x 180, lit by the environment, software Vulkan): the floor under a
+  card lying over it 182 of 255 where it is 212 without the card, and it
+  takes the card's blue as the traced picture does; beside a box 0.7
+  opaque 195 for 208, beside one 0.3 opaque 208; a box 0.99 opaque is
+  lit as a solid one where sky visibility darkens that most (206 and
+  206, 224 without). GPU against CPU: no pixel over 3 levels in the
+  three. Seen: the card's shadow on the floor against the traced one
+  (the traced is grainier at its edge, the same size and tint).
+  Left, lit as before and hiding nothing: volumes (they need the
+  tracer's marching), wires and shadow catchers (now gone through by
+  every ray: before, one that met a catcher first counted as open),
+  meshes that blend otherwise than over what is behind them, meshes
+  whose coverage a Slang surface works out, opacity from a map (the rule
+  reads the material's own), and flat layers under 0.999 opaque (they
+  are not cards). The cost of cards in the rays (their pictures read at
+  each crossing) was not measured.
 - **The two-px steps at an edge between two surfaces: done.** The
   lookup told surfaces apart by depth alone, so two at nearly one depth
   mixed, a texel at a time (a crease, a slab's front over the gap under
@@ -546,14 +585,9 @@ What is left:
   third return. Anything mirrored of other things: not done. The fast
   mode has all of it.
 - Not done, with what each needs:
-  - *What is see-through, cards, wires and shadow catchers hiding the
-    sky by their coverage and taking it.* The rays would have to meet
-    cards' pictures and opacities without drawing lots (a fixed
-    threshold, or coverage as a weight on the ray), on the GPU (the
-    cards' structure and pictures given to the sky's list, as a traced
-    list has them) and in the CPU's BVH (the card's quad and its group's
-    texels), and the batches of see-through meshes would read the group
-    at their own depth. Volumes need the tracer's marching: left.
+  - *Wires, shadow catchers and volumes hiding the sky and taking it,
+    and coverage as a ray's weight* in place of the step at one half
+    (above). Volumes need the tracer's marching.
   - *Meshes the GPU generates in its pool* are not in the CPU's rays.
     Their bounds as a stand-in were not added: the CPU's frame does not
     draw such a mesh at all, and a box hiding the sky from the rest

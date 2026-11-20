@@ -425,6 +425,33 @@ fn card_stands(alpha: f32, rng: ptr<function, Rng>) -> bool {
     return alpha >= rnd(rng);
 }
 
+// Sky visibility's rays (`sky`): 0 not those; 1 the ray from the camera,
+// which finds the surface that takes the sky (cards are flat pictures and
+// take none: it goes through them); 2 a ray from that surface. Both meet
+// only what hides the sky by a fixed rule, nothing drawn by lot
+// (`sky_blocks`, and a card where its picture covers more than half).
+var<private> sky_mode: u32 = 0u;
+
+// Whether triangle `prim` of instance `custom` hides the sky: a surface
+// (no shadow catcher, wire or volume) at least half opaque.
+fn sky_blocks(custom: u32, prim: u32) -> bool {
+    let inst = custom * INST_ROWS;
+    if inst + INST_ROWS - 1u >= arrayLength(&b_inst) { return false; }
+    let ti = bitcast<u32>(b_inst[inst].z) + prim;
+    if ti >= arrayLength(&b_tag) { return false; }
+    let tag = b_tag[ti];
+    let part = tag & 0xffu;
+    let row = b_inst[inst + 1u + part / 2u];
+    var base: u32;
+    var count: u32;
+    if part % 2u == 0u { base = bitcast<u32>(row.x); count = bitcast<u32>(row.y); } else { base = bitcast<u32>(row.z); count = bitcast<u32>(row.w); }
+    let mat = (base + ((tag >> 8u) & 0xffffu) % max(count, 1u)) * MAT_ROWS;
+    if mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { return false; }
+    let flags = u32(b_mat[mat + 2u].w);
+    if (flags & (FLAG_SHADOW_CATCHER | FLAG_WIRE | FLAG_VOLUME)) != 0u { return false; }
+    return b_mat[mat].w * (1.0 - b_mat[mat + 3u].x) >= 0.5;
+}
+
 // The triangle the next ray does not see (`pass_boundary`).
 var<private> skip_on: bool;
 var<private> skip_custom: u32;
@@ -494,8 +521,13 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, tmax: f32, rng: ptr<function, Rng>) -> H
         if F_CARDS && c.instance_custom_data == u.opts.z {
             // Cards are not opaque: a candidate stands where its picture
             // does (stochastically by its alpha, so soft edges average out).
-            let pic = card_picture(c.primitive_index / 2u, o + d * c.t);
-            take = card_stands(pic.w, rng);
+            take = sky_mode != 1u;
+            if take {
+                let pic = card_picture(c.primitive_index / 2u, o + d * c.t);
+                take = card_stands(pic.w, rng);
+            }
+        } else if sky_mode != 0u {
+            take = sky_blocks(c.instance_custom_data, c.primitive_index);
         }
         if take {
             rayQueryConfirmIntersection(&rq);
@@ -2591,8 +2623,10 @@ fn sky_diffuse(n: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
-// Whether a solid mesh stands between `o` and `tmax` along `d`, for the
-// sky's light back (nothing drawn by lot: at least half opaque blocks).
+// Whether something that hides the sky stands between `o` and `tmax`
+// along `d`, for the sky's light back (nothing drawn by lot: a surface at
+// least half opaque blocks, and a card where its picture covers more
+// than half).
 fn sky_shadowed(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> bool {
     var rq: ray_query;
     rayQueryInitialize(&rq, acc, RayDesc(RAY_FLAG_FORCE_NO_OPAQUE | RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0xFFu, 0.0, tmax, o, d));
@@ -2600,22 +2634,11 @@ fn sky_shadowed(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> bool {
     while rayQueryProceed(&rq) {
         let c = rayQueryGetCandidateIntersection(&rq);
         if c.kind != RAY_QUERY_INTERSECTION_TRIANGLE { continue; }
-        if c.instance_custom_data == u.opts.z { continue; }
-        let inst = c.instance_custom_data * INST_ROWS;
-        if inst + INST_ROWS - 1u >= arrayLength(&b_inst) { continue; }
-        let ti = bitcast<u32>(b_inst[inst].z) + c.primitive_index;
-        if ti >= arrayLength(&b_tag) { continue; }
-        let tag = b_tag[ti];
-        let part = tag & 0xffu;
-        let row = b_inst[inst + 1u + part / 2u];
-        var base: u32;
-        var count: u32;
-        if part % 2u == 0u { base = bitcast<u32>(row.x); count = bitcast<u32>(row.y); } else { base = bitcast<u32>(row.z); count = bitcast<u32>(row.w); }
-        let mat = (base + ((tag >> 8u) & 0xffffu) % max(count, 1u)) * MAT_ROWS;
-        if mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { continue; }
-        let flags = u32(b_mat[mat + 2u].w);
-        if (flags & (FLAG_SHADOW_CATCHER | FLAG_WIRE | FLAG_VOLUME)) != 0u { continue; }
-        if b_mat[mat].w * (1.0 - b_mat[mat + 3u].x) < 0.5 { continue; }
+        if c.instance_custom_data == u.opts.z {
+            if !F_CARDS || card_picture(c.primitive_index / 2u, o + d * c.t).w <= 0.5 { continue; }
+        } else if !sky_blocks(c.instance_custom_data, c.primitive_index) {
+            continue;
+        }
         rayQueryConfirmIntersection(&rq);
         found = true;
     }
@@ -2702,6 +2725,9 @@ fn texel_dir(x: f32, y: f32) -> vec3<f32> {
 // and `sky_filter` makes them one value. Nothing is drawn by lot and
 // nothing is kept from the frame before: the same frame gives the same
 // picture, whatever was drawn before it, as the raster must.
+// What ends a ray: a surface at least half opaque (see-through meshes by
+// that rule, shadow catchers, wires and volumes never) or a card where
+// its picture covers more than half.
 // A ray that is not open ends on a surface, and that surface sends light
 // back: its own colour under the lights (their shadows by rays) and under
 // the environment (`sky_lit`). One bounce: without it
@@ -2732,7 +2758,9 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
     primary_only = true;
     card_cut = 0.5;
     let dir = texel_dir(f32(id.x), f32(py));
+    sky_mode = 1u;
     let h = cast_ray(vec3<f32>(0.0), dir, 1e30, &rng);
+    sky_mode = 2u;
     var open = vec4<f32>(0.0);
     var plane = vec4<f32>(0.0);
     var back = vec3<f32>(0.0);
@@ -2740,8 +2768,7 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
     var ends = vec4<f32>(0.0);
     var deep = vec4<f32>(0.0);
     if h.found && !h.card {
-        let flags = u32(b_mat[h.mat + 2u].w);
-        if (flags & (FLAG_SHADOW_CATCHER | FLAG_WIRE | FLAG_VOLUME)) == 0u {
+        {
             let rays = max(u.size.w, 1u);
             let total = f32(rays * 16u);
             let place = SKY_ORDER[(py % 4u) * 4u + id.x % 4u];
@@ -2759,11 +2786,16 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
                 // (Under the true surface: the shading normal leans.)
                 if dot(d, h.g) <= 0.02 { continue; }
                 let far = cast_ray(o, d, 1e30, &rng);
-                var solid = far.found && !far.card;
-                if solid { solid = (u32(b_mat[far.mat + 2u].w) & (FLAG_SHADOW_CATCHER | FLAG_WIRE | FLAG_VOLUME)) == 0u; }
-                if !solid {
+                if !far.found {
                     sum += d;
                     n += 1.0;
+                    continue;
+                }
+                if far.card {
+                    // A card is a flat picture: its colour comes back as
+                    // it is (not lit, so nothing a second time).
+                    let c = far.card_color;
+                    back += vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w));
                     continue;
                 }
                 back += sky_lit(far);

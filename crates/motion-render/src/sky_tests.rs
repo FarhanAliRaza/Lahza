@@ -350,3 +350,88 @@ fn an_edge_at_one_depth_has_no_steps() {
     assert!(gpu.0 <= 2 && on_cpu.0 <= 2, "steps: {gpu:?} on the GPU, {on_cpu:?} on the CPU");
     assert!(apart < 0.01, "{apart}");
 }
+
+/// A floor and a wall with, as asked: a card lying flat over the floor (a
+/// flat 3D layer, a canopy), and a box of the given opacity standing on
+/// the floor.
+fn canopy(card: bool, pane: Option<f64>) -> Project {
+    let mut layers = vec![
+        json!({"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 900]}, "material": {"preset": "matte", "color": "#d8d0c0"},
+         "transform": {"position": [160, 130], "rotation_x": 90}}),
+        json!({"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 500]}, "material": {"preset": "matte", "color": "#c8d0d8"},
+         "transform": {"position": [160, 0], "z": 160}}),
+    ];
+    if card {
+        layers.push(json!({"id": "card", "kind": "shape", "shape": "rect", "size": [110, 90], "fill": "#3050c0", "three_d": true,
+         "transform": {"position": [95, 105], "rotation_x": 90}}));
+    }
+    if let Some(opacity) = pane {
+        layers.push(json!({"id": "pane", "kind": "mesh", "mesh": {"type": "box", "size": [70, 60], "depth": 50}, "material": {"preset": "matte", "color": "#e8e8e8", "opacity": opacity},
+         "transform": {"position": [235, 100], "rotation_y": -30}}));
+    }
+    let mut p = project(serde_json::Value::Array(layers));
+    p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 20]})).unwrap();
+    p.scenes[0].lights = serde_json::from_value(json!([{"type": "ambient", "intensity": 0.2}])).unwrap();
+    p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+    p
+}
+
+/// Cards and see-through meshes hide the sky by a fixed rule (nothing
+/// drawn by lot): a card where its picture covers more than half, a mesh
+/// where it is at least half opaque; and a see-through mesh that is takes
+/// the sky itself. One that is less than half opaque hides nothing and is
+/// lit as before. On the GPU and on the CPU alike.
+#[test]
+fn cards_and_see_through_meshes_hide_the_sky() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let render = |p: &Project, sky: bool| {
+        let c = Compiled::new(p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let mut r = raster(sky, false);
+        let img = r.render(&c, 0.0);
+        assert!(r.warnings().is_empty(), "{:?}", r.warnings());
+        img
+    };
+    let on_cpu = |p: &Project| Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() }).render(&Compiled::new(p), 0.0);
+    let apart = |a: &RgbaImage, b: &RgbaImage| a.pixels().zip(b.pixels()).filter(|(p, q)| (0..4).any(|k| p.0[k].abs_diff(q.0[k]) > 3)).count() as f64 / (a.width() * a.height()) as f64;
+    let (bare, with_card, solid, ghost) = (canopy(false, None), canopy(true, None), canopy(false, Some(0.7)), canopy(false, Some(0.3)));
+    let (a0, a1, a2, a3) = (render(&bare, true), render(&with_card, true), render(&solid, true), render(&ghost, true));
+    let p2 = render(&solid, false);
+    keep("canopy-bare", &a0);
+    keep("canopy-card", &a1);
+    keep("canopy-pane", &a2);
+    keep("canopy-pane-plain", &p2);
+    keep("canopy-ghost", &a3);
+    if let Some(mut t) = tracer(64) {
+        keep("canopy-card-traced", &t.render(&Compiled::new(&with_card), 0.0));
+        keep("canopy-pane-traced", &t.render(&Compiled::new(&solid), 0.0));
+    }
+    // The floor under the card's front edge, and beside the box's foot
+    // (left of it, where the 0.7 opaque box darkens the floor most).
+    let l = |img: &RgbaImage, at: (i32, i32)| around(img, at.0, at.1, 2);
+    let (beside, _) = (168..190i32).flat_map(|x| (108..136i32).map(move |y| (x, y))).map(|at| (at, l(&a2, at) / l(&a0, at))).fold(((0, 0), f64::MAX), |m, v| if v.1 < m.1 { v } else { m });
+    let (under, open) = ((95, 150), (40, 170));
+    eprintln!("the floor under the card: {:.0} with it, {:.0} without; beside the box: {:.0} at 0.7 opaque, {:.0} at 0.3, {:.0} without; the open floor {:.0}, {:.0}, {:.0}, {:.0}", l(&a1, under), l(&a0, under), l(&a2, beside), l(&a3, beside), l(&a0, beside), l(&a0, open), l(&a1, open), l(&a2, open), l(&a3, open));
+    assert!(l(&a1, under) < l(&a0, under) * 0.9, "a card hides the sky from the floor under it");
+    assert!(l(&a2, beside) < l(&a0, beside) * 0.95, "a mesh that is 0.7 opaque hides the sky");
+    assert!((l(&a3, beside) - l(&a0, beside)).abs() < 2.0, "a mesh that is 0.3 opaque hides nothing");
+    // The box itself takes the sky where it is at least half opaque: one
+    // that is 0.99 opaque (see-through, to the builder) is lit as a solid
+    // one is, where sky visibility darkens that most.
+    let (whole, nearly) = (canopy(false, Some(1.0)), canopy(false, Some(0.99)));
+    let (w1, w0, n1) = (render(&whole, true), render(&whole, false), render(&nearly, true));
+    keep("canopy-nearly", &n1);
+    let (on_box, _) = (200..270i32).flat_map(|x| (95..135i32).map(move |y| (x, y))).map(|at| (at, l(&w1, at) / l(&w0, at))).fold(((0, 0), f64::MAX), |m, v| if v.1 < m.1 { v } else { m });
+    eprintln!("the box at {on_box:?}: {:.0} solid, {:.0} at 0.99 opaque, {:.0} without sky visibility", l(&w1, on_box), l(&n1, on_box), l(&w0, on_box));
+    assert!(l(&w1, on_box) < l(&w0, on_box) - 4.0, "sky visibility darkens the box somewhere");
+    assert!((l(&n1, on_box) - l(&w1, on_box)).abs() < 3.0, "what is see-through takes the sky as what is solid does");
+    // The CPU's rays meet the same things.
+    let (c1, c2, c3) = (on_cpu(&with_card), on_cpu(&solid), on_cpu(&ghost));
+    keep("canopy-card-cpu", &c1);
+    eprintln!("GPU against CPU, px more than 3 levels apart: the card {:.2}%, 0.7 opaque {:.2}%, 0.3 opaque {:.2}%", apart(&a1, &c1) * 100.0, apart(&a2, &c2) * 100.0, apart(&a3, &c3) * 100.0);
+    assert!(apart(&a1, &c1) < 0.01 && apart(&a2, &c2) < 0.01 && apart(&a3, &c3) < 0.01);
+    // And the same frame is the same picture.
+    assert_eq!(render(&with_card, true), a1);
+}
