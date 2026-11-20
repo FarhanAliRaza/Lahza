@@ -342,6 +342,54 @@ fn a_shadow_catchers_soft_shadow_is_smooth() {
     }
 }
 
+/// A shadow catcher over nothing: its shadow is the picture's coverage
+/// there, four paths a texel, and it is smoothed like the shadow on a
+/// card: as dark as the usual trace has it and no grainier.
+#[test]
+fn a_shadow_catchers_shadow_over_nothing_is_smooth() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mut usual = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(TraceOptions { spp: 256, denoise: false, ..Default::default() }), ..Default::default() });
+    let mut p = project(json!([
+        {"id": "catch", "kind": "mesh", "mesh": {"type": "plane", "size": [300, 170]}, "material": {"preset": "shadow", "opacity": 0.8},
+         "transform": {"position": [160, 90], "z": -2}},
+        {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"preset": "matte", "color": "#ffffff"},
+         "transform": {"position": [90, 90], "z": -120}}
+    ]));
+    p.settings.background = lahza_motion_core::value::Color([0.0; 4]);
+    p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0, 0, -1], "softness": 0.6, "shadow": true}])).unwrap();
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    // Grain of the coverage: what is left of it after a 3 × 3 mean, over
+    // the shadow and its soft edge right of the ball (px 96 to 124).
+    let grain = |img: &RgbaImage| {
+        let l = |x: u32, y: u32| img.get_pixel(x, y).0[3] as f64;
+        let (mut sum, mut n) = (0.0, 0.0);
+        for y in 75..105u32 {
+            for x in 96..124u32 {
+                let mean = (0..9u32).map(|k| l(x + k % 3 - 1, y + k / 3 - 1)).sum::<f64>() / 9.0;
+                sum += (l(x, y) - mean).abs();
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    let cover = |img: &RgbaImage, x: u32| (80..100u32).map(|y| img.get_pixel(x, y).0[3] as f64).sum::<f64>() / 20.0;
+    let reference = usual.render(&c, 0.0);
+    keep("bare-catcher-reference", &reference);
+    for way in [Way::StandIn, Way::Own] {
+        let Some(mut r) = fast(way, 4, false) else { return };
+        let img = r.render(&c, 0.0);
+        keep(&format!("bare-catcher-{way:?}"), &img);
+        eprintln!("{way:?}: the shadow's coverage {:.0} at its edge and {:.0} beside it (the usual trace: {:.0} and {:.0}); grain {:.2} (the usual trace at 256 spp, not denoised: {:.2})", cover(&img, 116), cover(&img, 250), cover(&reference, 116), cover(&reference, 250), grain(&img), grain(&reference));
+        assert!(cover(&reference, 116) > 20.0, "the reference has a shadow there: {:.0}", cover(&reference, 116));
+        assert!((cover(&img, 116) - cover(&reference, 116)).abs() < 14.0 && cover(&img, 250) < 3.0, "{way:?}: the shadow: {:.0} for {:.0}", cover(&img, 116), cover(&reference, 116));
+        assert!(grain(&img) < grain(&reference) + 1.0, "{way:?}: grain {:.2} (the usual trace: {:.2})", grain(&img), grain(&reference));
+    }
+}
+
 /// Two scenes, the second from half a second: other layers, another look.
 fn two_scenes() -> Project {
     let mut p = rolling();

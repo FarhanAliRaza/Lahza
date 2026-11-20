@@ -41,7 +41,15 @@ integration tests, the app 122 and its four window tests under Xvfb):
   map is framed as the CPU's; a mesh group that stands still is left as
   drawn by a motion-blurred frame's later sub-frames (none ever was); a
   normal-mapped face no longer shadows itself, which was the spots in
-  the GPU-against-CPU comparison.
+  the GPU-against-CPU comparison. And a second round: volumes, filled
+  wireframes and unlit surfaces in the sky's rays; a directional
+  light's GPU-drawn shadow map framed as the CPU's; a shape that changes
+  size or paint takes the sub-frames its motion needs; the fast mode's
+  catcher shadow over nothing smoothed; measures of a third return, of
+  cards in the rays, of a rasteriser's grid in the two other tests that
+  fail on the card, of a traced frame's lists. (motion-render on that
+  branch: 188 pass and 25 are ignored, the whole suite, before the
+  catcher change; its 13 fast-mode and catcher tests after it.)
 
 To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
 in), since none of it can be seen from a container:
@@ -484,14 +492,16 @@ nothing below was run on that card.)
     smoothed across the texels around that show the same flat thing, nine
     in a row and nine in a column (`fast_catcher`): less grain than 256
     paths not denoised (0.8 and 0.6 levels against 1.1). A catcher's
-    shadow over nothing (it is the coverage there) is still four paths'.
-    Not done, and it needs no card: `visible` keeps four numbers a texel
-    in each of `b_tmp`'s two rows and none of them says which part of
-    the coverage is a catcher's; it needs that share kept apart (a
-    number more a texel, or the lit depth's place where nothing lit was
-    hit) and `fast_catcher` to smooth it as it does the share over flat
-    things, with `pt_fast_tests`' catcher test given a catcher over
-    nothing. Seen on the way: the usual trace's filter widens a
+    shadow over nothing (it is the coverage there) was still four
+    paths'. Since: `visible` marks a texel all of whose coverage is
+    under a catcher's shadow with nothing flat behind, and
+    `fast_catcher` smooths that coverage the same way, across the
+    marked texels and the empty ones around (which take their share: in
+    a soft edge most texels have no shadowed path of their four).
+    `a_shadow_catchers_shadow_over_nothing_is_smooth`, with the stand-in
+    and without Ray Reconstruction: grain of the coverage 0.5 levels
+    where it was 14.9 and 256 paths not denoised have 1.9; the shadow's
+    edge 135 of 255 for the usual trace's 141. Seen on the way: the usual trace's filter widens a
     catcher's soft shadow a good deal (against the same scene not
     denoised); not changed (it is the export's look, and narrowing it
     changes every exported shadow: for the owner to see on a film).

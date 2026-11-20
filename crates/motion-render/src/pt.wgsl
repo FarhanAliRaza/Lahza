@@ -2623,6 +2623,7 @@ fn visible(id: vec3<u32>, py: u32, w: u32) {
     // Camera depth of what is lit and of what is flat (summed, and of how many).
     var deep = vec4<f32>(0.0);
     var through = vec2<f32>(0.0);
+    var bare = vec2<f32>(0.0);
     for (var s = 0u; s < 4u; s++) {
         let tp = vec3<f32>(u.place.x + u.place.z * (f32(id.x) + at[s].x), u.place.y + u.place.w * (f32(py) + at[s].y), 1.0);
         let q = vec3<f32>(dot(u.inv0.xyz, tp), dot(u.inv1.xyz, tp), dot(u.inv2.xyz, tp));
@@ -2635,6 +2636,10 @@ fn visible(id: vec3<u32>, py: u32, w: u32) {
         let is_lit = max(smp.flat.x, max(smp.flat.y, smp.flat.z)) <= 0.0;
         if !is_lit { through += vec2<f32>(smp.vis, 1.0); }
         if is_lit { lit += smp.alpha; }
+        // (Coverage that is under a catcher's shadow, and all coverage.)
+        if is_lit && smp.alpha > 0.0 {
+            bare += vec2<f32>(f32(smp.vis < 1.0), 1.0);
+        }
         if smp.depth > 0.0 {
             let z = dir.z * smp.depth;
             if is_lit { deep += vec4<f32>(z, 1.0, 0.0, 0.0); } else { deep += vec4<f32>(0.0, 0.0, z, 1.0); }
@@ -2644,6 +2649,11 @@ fn visible(id: vec3<u32>, py: u32, w: u32) {
     b_tmp[i * 2u] = vec4<f32>(flat / 4.0, lit / 4.0);
     var vis = 1.0;
     if through.y > 0.0 { vis = through.x / through.y; }
+    // Below 0: nothing here but a catcher's shadow (all that covers the
+    // texel is under one, and nothing flat is behind): over nothing it is
+    // the coverage, which `fast_catcher` smooths as it does a shadow on
+    // what is flat.
+    if through.y <= 0.0 && bare.x > 0.0 && bare.x == bare.y { vis = -1.0; }
     b_tmp[i * 2u + 1u] = vec4<f32>(alpha / 4.0, deep.x / max(deep.y, 1.0), deep.z / max(deep.w, 1.0), vis);
 }
 
@@ -3525,7 +3535,8 @@ fn fast_coc(z: f32) -> f32 {
 // paths' in each texel of `visible`: grain. Smoothed here across the
 // texels around that show the same flat thing (their depths agree), nine
 // in a row (`u.denoise.z` 0, into the scratch `b_hdr`) and then nine in a
-// column (1, back into `b_tmp`).
+// column (1, back into `b_tmp`). And a catcher's shadow over nothing,
+// which is the texel's coverage, likewise.
 @compute @workgroup_size(8, 8, 1)
 fn fast_catcher(@builtin(global_invocation_id) id: vec3<u32>) {
     let fw = u.denoise.x;
@@ -3534,11 +3545,25 @@ fn fast_catcher(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.y * fw + id.x;
     let down = u.denoise.z == 1u;
     let own = b_tmp[i * 2u + 1u];
+    // A catcher's shadow over nothing is the coverage itself (`visible`
+    // marked the texel): smoothed across the texels around that are
+    // such, or empty (an empty texel beside the shadow takes its share:
+    // in a soft edge few of a texel's four paths are shadowed, many
+    // texels none).
+    // (Empty: no coverage. A catcher that no path found shadowed is
+    // there with its depth and covers nothing.)
+    let bare = own.w < 0.0 || (own.x <= 0.0 && own.z <= 0.0);
     var mine = own.w;
+    if bare { mine = own.x; }
     if down { mine = b_hdr[i * 2u].x; }
     var sum = mine;
     var weight = 1.0;
-    if own.x - b_tmp[i * 2u].w > 0.0 && own.z > 0.0 {
+    // (An empty texel that takes a share of the shadow takes the depth
+    // it lies at too: the passes after this one go by it.)
+    var deep = vec2<f32>(0.0);
+    if own.y > 0.0 { deep = vec2<f32>(own.y, 1.0); }
+    if down && b_hdr[i * 2u].y > 0.0 { deep = vec2<f32>(b_hdr[i * 2u].y, 1.0); }
+    if bare || (own.x - b_tmp[i * 2u].w > 0.0 && own.z > 0.0) {
         for (var k = -4; k <= 4; k++) {
             if k == 0 { continue; }
             var x = i32(id.x);
@@ -3547,18 +3572,40 @@ fn fast_catcher(@builtin(global_invocation_id) id: vec3<u32>) {
             if x < 0 || y < 0 || x >= i32(fw) || y >= i32(fh) { continue; }
             let j = u32(y) * fw + u32(x);
             let d = b_tmp[j * 2u + 1u];
-            if d.x - b_tmp[j * 2u].w <= 0.0 || abs(d.z - own.z) > 0.02 * own.z + 0.5 { continue; }
             let w = 1.0 - abs(f32(k)) / 5.0;
+            if bare {
+                if d.w < 0.0 || (d.x <= 0.0 && d.z <= 0.0) {
+                    var theirs = d.x;
+                    var z = d.y;
+                    if down {
+                        theirs = b_hdr[j * 2u].x;
+                        z = b_hdr[j * 2u].y;
+                    }
+                    sum += theirs * w;
+                    weight += w;
+                    if own.y <= 0.0 && z > 0.0 { deep += vec2<f32>(z * w, w); }
+                }
+                continue;
+            }
+            if d.w < 0.0 || d.x - b_tmp[j * 2u].w <= 0.0 || abs(d.z - own.z) > 0.02 * own.z + 0.5 { continue; }
             var theirs = d.w;
             if down { theirs = b_hdr[j * 2u].x; }
             sum += theirs * w;
             weight += w;
         }
     }
-    if down {
-        b_tmp[i * 2u + 1u] = vec4<f32>(own.xyz, sum / weight);
+    if !down {
+        b_hdr[i * 2u] = vec4<f32>(sum / weight, deep.x / max(deep.y, 1e-6), 0.0, 0.0);
+    } else if bare {
+        // (Lit and whole coverage are the same there: nothing is flat.)
+        // (An empty texel that took none stays as it was.)
+        if own.w >= 0.0 && sum <= 0.0 { return; }
+        // (Marked, as `visible` marks: a texel written here is read as
+        // one of these by the others of this pass, whenever they run.)
+        b_tmp[i * 2u + 1u] = vec4<f32>(sum / weight, deep.x / max(deep.y, 1e-6), own.z, -1.0);
+        b_tmp[i * 2u] = vec4<f32>(b_tmp[i * 2u].xyz, sum / weight);
     } else {
-        b_hdr[i * 2u] = vec4<f32>(sum / weight, 0.0, 0.0, 0.0);
+        b_tmp[i * 2u + 1u] = vec4<f32>(own.xyz, sum / weight);
     }
 }
 
