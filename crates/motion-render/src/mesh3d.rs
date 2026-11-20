@@ -359,11 +359,7 @@ impl MeshCache {
                 }
                 let b = f32::from_bits;
                 casters.rows.push([b(0), b(0), b(pooled.tris), b(if det < 0.0 { INST_MIRRORED } else { 0 })]);
-                let (lo, hi) = (pooled.lo, pooled.hi);
-                boxes.push(std::array::from_fn(|k| {
-                    let q = mv.apply(if k & 1 != 0 { hi[0] } else { lo[0] }, if k & 2 != 0 { hi[1] } else { lo[1] }, if k & 4 != 0 { hi[2] } else { lo[2] });
-                    [q[0], q[1], q[2]]
-                }));
+                boxes.push(CasterBox::new(pooled.lo, pooled.hi, pooled.reach, &mv));
                 casters.meshes.push(pooled);
             }
             let casters = Arc::new(casters);
@@ -786,6 +782,10 @@ pub(crate) struct Pooled {
     /// Object-space bounding box (placement bounds without the vertices).
     lo: [f64; 3],
     hi: [f64; 3],
+    /// The farthest a point is from the box's middle (a ball's box is up
+    /// to √3 times the ball: a shadow map's frame takes the lesser). None
+    /// where the CPU has no points.
+    reach: Option<f64>,
     /// Per part: the segments its triangles use (highest + 1; 0: none), so
     /// a layer writes materials only for the parts and colours it shows.
     segments: [u32; PARTS],
@@ -904,7 +904,9 @@ impl Pooled {
             let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
             segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
         }
-        Self { key, verts: mesh.positions.len() as u32, tris: mesh.tris.len() as u32, source: Source::Mesh(mesh), lo, hi, segments, animated }
+        let mid: [f64; 3] = std::array::from_fn(|k| (lo[k] + hi[k]) * 0.5);
+        let reach = mesh.positions.iter().map(|p| (0..3).map(|k| (p[k] as f64 - mid[k]).powi(2)).sum::<f64>()).fold(0.0, f64::max).sqrt();
+        Self { key, verts: mesh.positions.len() as u32, tris: mesh.tris.len() as u32, source: Source::Mesh(mesh), lo, hi, reach: Some(reach), segments, animated }
     }
 
     /// A Slang mesh the GPU generates (`MeshParams::gpu_generator`): its
@@ -918,7 +920,7 @@ impl Pooled {
         // `_segment` picks is the GPU's to know: all the layer has.
         segments[mesh::PART_FRONT as usize] = if s.outputs.segments { 1 << 16 } else { 1 };
         let (verts, tris, animated) = (s.vertices, s.triangles, params.animated());
-        Some(Self { key, verts, tris, source: Source::Generated(params), lo, hi, segments, animated })
+        Some(Self { key, verts, tris, source: Source::Generated(params), lo, hi, reach: None, segments, animated })
     }
 
     /// A mesh whose points the GPU moves by the layer's deformer
@@ -938,7 +940,7 @@ impl Pooled {
             segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
         }
         let (verts, tris, animated) = (m.positions.len() as u32, m.tris.len() as u32, params.animated());
-        Ok((verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Deformed { base, params }, lo, hi, segments, animated }))
+        Ok((verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Deformed { base, params }, lo, hi, reach: None, segments, animated }))
     }
 
     /// A mesh whose points the GPU moves by its joints: `base` has its
@@ -965,7 +967,7 @@ impl Pooled {
         let levels = lahza_motion_core::slang_mesh::gpu_subdivided(generated.verts, generated.tris, params.deform.as_ref()?.subdivide);
         let (verts, tris) = levels.last().copied().unwrap_or((generated.verts, generated.tris));
         let (segments, animated) = (generated.segments, params.animated());
-        Some(Self { key, verts, tris, source: Source::DeformedGenerated { generated, params, levels }, lo, hi, segments, animated })
+        Some(Self { key, verts, tris, source: Source::DeformedGenerated { generated, params, levels }, lo, hi, reach: None, segments, animated })
     }
 
     /// Rows the mesh takes in the pool.
@@ -1358,8 +1360,46 @@ pub struct ShadowJob {
     pub size: u32,
 }
 
-/// A caster's box for a GPU-drawn map's bounds: its corners in camera space.
-type CasterBox = [[f64; 3]; 8];
+/// A caster for a GPU-drawn map's bounds, in camera space: its box's
+/// corners, and what its transform makes of the ball its points are in
+/// (`Pooled::reach`): the middle, and the transform's 3 × 3 times the
+/// reach (None where the CPU has no points).
+pub(crate) struct CasterBox {
+    pub corners: [[f64; 3]; 8],
+    pub round: Option<([f64; 3], [[f64; 3]; 3])>,
+}
+
+impl CasterBox {
+    /// Of a mesh with box `lo`..`hi` and `reach`, placed by `mv`.
+    pub(crate) fn new(lo: [f64; 3], hi: [f64; 3], reach: Option<f64>, mv: &lahza_motion_core::space::Mat4) -> Self {
+        let at = |p: [f64; 3]| {
+            let q = mv.apply(p[0], p[1], p[2]);
+            [q[0], q[1], q[2]]
+        };
+        let corners = std::array::from_fn(|k| at([if k & 1 != 0 { hi[0] } else { lo[0] }, if k & 2 != 0 { hi[1] } else { lo[1] }, if k & 4 != 0 { hi[2] } else { lo[2] }]));
+        let a = mv.0;
+        let round = reach.filter(|r| r.is_finite()).map(|r| (at(std::array::from_fn(|k| (lo[k] + hi[k]) * 0.5)), std::array::from_fn(|i| std::array::from_fn(|j| a[i * 4 + j] * r))));
+        Self { corners, round }
+    }
+
+    /// How far it reaches along the unit direction `d`, from and to: its
+    /// box's corners, and no wider than its ellipsoid (a ball's box is up
+    /// to √3 times the ball across a diagonal).
+    pub(crate) fn span(&self, d: [f64; 3]) -> (f64, f64) {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in &self.corners {
+            let x = dot(*p, d);
+            (lo, hi) = (lo.min(x), hi.max(x));
+        }
+        if let Some((mid, a)) = &self.round {
+            // The ellipsoid's half width along d is |Aᵀ d|.
+            let r = len3(std::array::from_fn(|j| a[0][j] * d[0] + a[1][j] * d[1] + a[2][j] * d[2]));
+            let m = dot(*mid, d);
+            (lo, hi) = (lo.max(m - r), hi.min(m + r));
+        }
+        (lo, hi)
+    }
+}
 
 const NO_SURFACE: f32 = -1.0e30;
 
@@ -1678,17 +1718,18 @@ impl ShadowMap {
     }
 
     /// A directional light's map for the GPU: bounds from the casters'
-    /// boxes (a little wider than from every vertex, which the CPU's map
-    /// takes them from).
+    /// boxes and the balls their points are in (`CasterBox::span`: a
+    /// little wider than from every vertex, which the CPU's map takes
+    /// them from).
     fn gpu_directional(casters: &Arc<Casters>, boxes: &[CasterBox], toward: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
         let l = unit3(toward);
         let (u, v) = basis(l);
         let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         let (mut near, mut far) = (f64::INFINITY, f64::NEG_INFINITY);
-        for p in boxes.iter().flatten() {
-            let (x, y, c) = (dot(*p, u), dot(*p, v), dot(*p, l));
-            b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
-            (near, far) = (near.min(c), far.max(c));
+        for caster in boxes {
+            let (x, y, c) = (caster.span(u), caster.span(v), caster.span(l));
+            b = [b[0].min(x.0), b[1].min(y.0), b[2].max(x.1), b[3].max(y.1)];
+            (near, far) = (near.min(c.0), far.max(c.1));
         }
         // Depth 0 is "nothing here": the farthest caster stays above it.
         let pad = (far - near) * 0.01 + 1.0;
@@ -1698,14 +1739,14 @@ impl ShadowMap {
     /// A point light's map for the GPU, aimed at the middle of the casters.
     fn gpu_point(casters: &Arc<Casters>, boxes: &[CasterBox], pos: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
         let mut m = [0.0; 3];
-        for p in boxes.iter().flatten() {
+        for p in boxes.iter().flat_map(|b| &b.corners) {
             m = add(m, *p);
         }
         let n = (boxes.len() * 8).max(1) as f64;
         let axis = unit3(sub([m[0] / n, m[1] / n, m[2] / n], pos));
         let (u, v) = basis(axis);
         let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-        for corners in boxes {
+        for corners in boxes.iter().map(|b| &b.corners) {
             let z: [f64; 8] = std::array::from_fn(|k| dot(sub(corners[k], pos), axis));
             if z.iter().all(|z| *z < 1.0) {
                 // Behind the light.

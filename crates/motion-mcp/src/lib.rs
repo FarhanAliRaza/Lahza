@@ -55,6 +55,8 @@ pub fn run_cli(args: &[String]) -> Option<i32> {
         toolbox.backend = Backend::Gpu;
     }
     if first == "mcp" {
+        // A request sent from the editor: its edits carry the id.
+        toolbox.request = std::env::var("LAHZA_REQUEST").ok().filter(|r| !r.is_empty());
         return Some(match server::serve(toolbox) {
             Ok(()) => 0,
             Err(e) => {

@@ -70,7 +70,7 @@ impl Studio {
                     if this.motion_pieces_loop != token {
                         return false;
                     }
-                    let dragging = this.motion_piece_drag.is_some();
+                    let dragging = this.motion_piece_drag.is_some() || this.motion_layer_drag.is_some();
                     let Some(pieces) = this.motion_pieces.as_mut() else { return false };
                     let mut changed = pieces.frames_ready();
                     if tick % 30 == 0 && !dragging && pieces.poll() {
@@ -178,7 +178,9 @@ impl Studio {
     /// Returns the full-screen frames to draw over the canvas.
     pub(crate) fn motion_piece_frames(&mut self, canvas: (f64, f64)) -> Vec<(Arc<RenderImage>, Placement)> {
         let time = self.timeline_display_time();
-        let proxy = self.video_playing || self.motion_piece_drag.is_some();
+        // One question for every drag: a piece on the timeline, or a value,
+        // a layer or a key of the open piece.
+        let proxy = self.video_playing || self.motion_piece_drag.is_some() || self.motion_layer_drag.is_some();
         let media = self.media_dimensions().map(|(w, h)| {
             let s = (canvas.0 / w as f64).min(canvas.1 / h as f64).min(1.0) * if proxy { 0.5 } else { 1.0 };
             (((w as f64 * s).round() as u32).max(2), ((h as f64 * s).round() as u32).max(2))

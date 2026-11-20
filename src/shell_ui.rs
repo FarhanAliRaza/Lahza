@@ -27,8 +27,8 @@ const INSPECTOR_WIDTH_WIDE: f32 = 440.0;
 const WIDE_WINDOW: f32 = 1800.0;
 pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
 /// Canvas well padding; less vertical so the canvas keeps its height.
-const CANVAS_PADDING_X: f32 = 40.0;
-const CANVAS_PADDING_Y: f32 = 24.0;
+pub(crate) const CANVAS_PADDING_X: f32 = 40.0;
+pub(crate) const CANVAS_PADDING_Y: f32 = 24.0;
 /// Default lane area height; it grows on tall windows until resized by hand.
 pub(crate) const DEFAULT_LANE_HEIGHT: f32 = 176.0;
 const MAX_LANE_HEIGHT: f32 = 340.0;
@@ -414,7 +414,7 @@ impl Studio {
         let width = (viewport.width.max(px(EDITOR_MIN_WIDTH))
             - px(CANVAS_PADDING_X * 2.0 + inspector)).max(px(1.0));
         let height = (viewport.height.max(px(EDITOR_MIN_HEIGHT))
-            - px(TOP_BAR_HEIGHT + CANVAS_PADDING_Y * 2.0 + self.timeline_bar_height()))
+            - px(TOP_BAR_HEIGHT + CANVAS_PADDING_Y * 2.0 + self.timeline_bar_height() + self.motion_prompt_height()))
         .max(px(1.0));
         self.preview_canvas_size(width, height)
     }
@@ -1441,6 +1441,15 @@ impl Studio {
         if let Some(layer) = self.motion_layer_inspector(cx) {
             return layer;
         }
+        // With no layer selected: what the agent was asked here, above
+        // the rest of the tab.
+        if self.motion_prompt_visible() && !self.motion_agent.requests.is_empty() {
+            return div().flex().flex_col().gap_4().child(self.motion_agent_log(None, cx)).child(self.motion_tab_rest(cx)).into_any_element();
+        }
+        self.motion_tab_rest(cx)
+    }
+
+    fn motion_tab_rest(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(piece) = self.motion_piece_inspector(cx) {
             return piece;
         }
@@ -1723,6 +1732,12 @@ impl Studio {
         self.pause_video_playback();
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
+        // In the Motion tab, Shift marks a span to prompt about.
+        if event.modifiers.shift && self.motion_prompt_visible() {
+            self.begin_motion_span(event.position.x);
+            cx.notify();
+            return;
+        }
         let target = self.motion_timeline_time_at(event.position.x)
             .unwrap_or(self.video_position);
         self.scrub_video_to(target, cx);
@@ -1854,6 +1869,24 @@ impl Studio {
             ruler_tick += ruler_step;
         }
         ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
+        // The span marked for a prompt (Shift-drag on the ruler).
+        if let Some((a, b)) = self.motion_agent.span.filter(|_| self.motion_prompt_visible()) {
+            let x = |t: f64| (t / timeline_duration * timeline_content_width) as f32;
+            ruler_marks.push(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(x(a)))
+                    .w(px((x(b) - x(a)).max(2.0)))
+                    .rounded(px(3.0))
+                    .bg(crate::theme::accent().opacity(0.22))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(crate::theme::accent())
+                    .into_any_element(),
+            );
+        }
         let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
         let camera_lane = self.camera_region_lane(timeline_scroll, timeline_content_width, progress, cx);
         let motion_piece_lane = self.motion_piece_lane(timeline_scroll, cx);
@@ -2113,6 +2146,30 @@ impl Studio {
                                     .h_full()
                                     .children(ruler_marks),
                             )
+                            // In the Motion tab the top of the ruler is the
+                            // strip where a drag marks a span to ask about,
+                            // as over a motion project's ruler.
+                            .when(self.motion_prompt_visible(), |this| {
+                                this.child(
+                                    div()
+                                        .id("timeline-span-strip")
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h(px(8.0))
+                                        .rounded(px(3.0))
+                                        .bg(crate::theme::control_bg())
+                                        .cursor_crosshair()
+                                        .tooltip(crate::timeline_ui::tooltip("Drag to mark a span to ask about; click to clear"))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.pause_video_playback();
+                                            this.begin_motion_span(event.position.x);
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .when(playhead_visible, |this| {
                                 this.child(
                                     div()

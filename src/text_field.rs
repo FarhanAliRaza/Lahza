@@ -12,6 +12,12 @@ pub(crate) enum Target {
     Time(usize, bool),
     /// A subtitle cue's text, by cue id.
     Cue(uuid::Uuid),
+    /// The motion prompt bar.
+    Prompt,
+    /// The selected motion text layer's words.
+    LayerText,
+    /// A colour of the selected motion layer, as #rrggbb.
+    LayerColor,
     None,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +26,8 @@ pub(crate) enum EventKind {
     Change,
     Commit,
     Cancel,
+    /// Enter in a one-line field (a `Commit` follows as focus leaves).
+    Submit,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct FieldEvent {
@@ -429,9 +437,7 @@ impl TextField {
                 self.marked = None;
             }
             "enter" => {
-                if self.buffer.multiline {
-                    self.emit(EventKind::Commit, cx);
-                }
+                self.emit(if self.buffer.multiline { EventKind::Commit } else { EventKind::Submit }, cx);
                 self.parent_focus.focus(window);
             }
             "escape" => {
@@ -465,6 +471,25 @@ impl TextField {
 }
 
 impl TextField {
+    /// Replaces what is typed, focused or not (a sent prompt empties
+    /// its field).
+    pub(crate) fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.buffer.state.text = text.into();
+        self.buffer.select(text.len(), false);
+        self.initial = text.into();
+        self.marked = None;
+        self.scroll = px(0.);
+        cx.notify();
+    }
+
+    /// Takes focus and types `text` at the caret: a key pressed elsewhere
+    /// that begins an entry here.
+    pub(crate) fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window);
+        self.buffer.replace(self.buffer.range(), text);
+        self.changed(cx);
+    }
+
     pub(crate) fn canvas_hit(&self, p: Point<Pixels>) -> bool {
         self.bounds.is_some_and(|b| b.contains(&p))
     }

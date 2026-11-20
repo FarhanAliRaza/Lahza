@@ -80,6 +80,66 @@ pub fn apply(project: &Project, ops: &[Value]) -> Result<Applied> {
 
 type OpResult = Result<(Vec<Value>, Vec<String>, String)>;
 
+/// A drag's fast path. When every op is a `set`, `key` or `anchor` on the
+/// fields of one layer, returns that layer's id and the layer as the ops
+/// leave it: only that layer goes through JSON, not the project. `None`
+/// when the batch is anything else (use `apply`). The layer equals the one
+/// `apply` produces; nothing is validated beyond it and no inverse is made,
+/// so the drop still goes through `apply`.
+pub fn apply_to_layer(project: &Project, ops: &[Value]) -> Option<Result<(String, crate::document::Layer)>> {
+    let mut id: Option<&str> = None;
+    for op in ops {
+        if !matches!(op.get("op").and_then(Value::as_str), Some("set" | "key" | "anchor")) || child_target(op).is_some() {
+            return None;
+        }
+        let (target, _) = op.get("target").and_then(Value::as_str)?.split_once('.')?;
+        if id.is_some_and(|id| id != target) {
+            return None;
+        }
+        id = Some(target);
+    }
+    let id = id?;
+    fn walk<'a>(layers: &'a [crate::document::Layer], id: &str) -> Option<&'a crate::document::Layer> {
+        layers.iter().find_map(|l| if l.id == id { Some(l) } else { walk(l.children(), id) })
+    }
+    // A scene's id is found before a layer's (`find`): leave those to `apply`.
+    if id == "project" || project.scenes.iter().any(|s| s.id == id) {
+        return None;
+    }
+    let layer = project.scenes.iter().find_map(|s| walk(&s.layers, id))?;
+    Some((|| {
+        let mut doc = json!({
+            "settings": serde_json::to_value(&project.settings).map_err(|e| e.to_string())?,
+            "scenes": [{"id": "", "layers": [serde_json::to_value(layer).map_err(|e| e.to_string())?]}],
+        });
+        let base = time_base(project);
+        for (i, op) in ops.iter().enumerate() {
+            let name = op.get("op").and_then(Value::as_str).unwrap_or("");
+            dispatch(&mut doc, op, &base, &project.markers, &mut Vec::new(), &mut Vec::new()).map_err(|e| format!("op {} ({name}): {e}", i + 1))?;
+        }
+        let layer = serde_json::from_value(doc["scenes"][0]["layers"][0].take()).map_err(|e| format!("result is not a valid layer: {e}"))?;
+        Ok((id.to_string(), layer))
+    })())
+}
+
+/// Puts `layer` in place of the layer with its id; false when there is none.
+pub fn replace_layer(project: &mut Project, layer: crate::document::Layer) -> bool {
+    fn walk(layers: &mut [crate::document::Layer], layer: &mut Option<crate::document::Layer>) -> bool {
+        for l in layers {
+            if layer.as_ref().is_some_and(|n| n.id == l.id) {
+                *l = layer.take().unwrap();
+                return true;
+            }
+            if l.children_mut().is_some_and(|c| walk(c, layer)) {
+                return true;
+            }
+        }
+        false
+    }
+    let mut layer = Some(layer);
+    project.scenes.iter_mut().any(|s| walk(&mut s.layers, &mut layer))
+}
+
 fn dispatch(doc: &mut Value, op: &Value, base: &crate::time::TimeBase, markers: &crate::markers::Markers, ripples: &mut Vec<(f64, f64)>, created: &mut Vec<String>) -> OpResult {
     match op.get("op").and_then(Value::as_str).unwrap_or("") {
         "add" => op_add(doc, op, created),
@@ -856,6 +916,91 @@ mod tests {
         let mut p = Project::new(1920, 1080, Fps::whole(30), 10.0);
         p.scenes.push(crate::document::Scene::new("s1"));
         p
+    }
+
+    /// `n` layers: rects, with a text every third and a keyed position
+    /// every fifth.
+    fn many(n: usize) -> Project {
+        let ops: Vec<Value> = (0..n)
+            .map(|i| match i % 3 {
+                0 => json!({"op": "add", "scene": "s1", "id": format!("t{i}"), "kind": "text", "text": "Hello there", "size": 48, "transform": {"position": [i, 80]}}),
+                _ if i % 5 == 0 => json!({"op": "add", "scene": "s1", "id": format!("r{i}"), "kind": "shape", "shape": "rect", "size": [120, 80], "fill": "#ff3355",
+                    "transform": {"position": {"keys": [{"at": 0, "v": [200, 180]}, {"at": 2, "v": [440, 180], "ease": "glide"}]}}}),
+                _ => json!({"op": "add", "scene": "s1", "id": format!("r{i}"), "kind": "shape", "shape": "rect", "size": [120, 80], "fill": "#ff3355", "transform": {"position": [i, 200]}}),
+            })
+            .collect();
+        apply(&base(), &ops).unwrap().project
+    }
+
+    #[test]
+    fn a_drag_on_one_layer_equals_apply() {
+        let mut p = many(12);
+        p = apply(&p, &[json!({"op": "group", "ids": ["r1", "r2"], "id": "pair"})]).unwrap().project;
+        let batches = [
+            vec![json!({"op": "set", "target": "r4.transform.position", "value": [10.5, 20]})],
+            vec![json!({"op": "set", "target": "r4.transform.opacity", "value": 0.5}), json!({"op": "set", "target": "r4.transform.rotation", "value": 12})],
+            // Keyed: a key at the playhead; constant: its first key.
+            vec![json!({"op": "key", "target": "r5.transform.position", "at": 1.2, "v": [300, 100]})],
+            vec![json!({"op": "key", "target": "r4.transform.scale", "at": 1.2, "v": [2, 2]})],
+            vec![json!({"op": "anchor", "target": "r5.transform.position", "key": 2, "at": 1.5})],
+            // Inside a group, and the group itself.
+            vec![json!({"op": "set", "target": "r2.transform.position", "value": [1, 2]})],
+            vec![json!({"op": "set", "target": "pair.transform.rotation", "value": 30})],
+            vec![json!({"op": "set", "target": "t3.text", "value": "Changed"})],
+        ];
+        for ops in &batches {
+            let whole = apply(&p, ops).unwrap().project;
+            let (id, layer) = apply_to_layer(&p, ops).expect("one layer's fields").unwrap();
+            let mut fast = p.clone();
+            assert!(replace_layer(&mut fast, layer), "{id} replaced");
+            assert_eq!(fast, whole, "{ops:?}");
+        }
+        // Not one layer's fields: left to `apply`.
+        assert!(apply_to_layer(&p, &[json!({"op": "set", "target": "project.settings.duration", "value": 20})]).is_none());
+        assert!(apply_to_layer(&p, &[json!({"op": "set", "target": "s1.name", "value": "x"})]).is_none());
+        assert!(apply_to_layer(&p, &[json!({"op": "remove", "id": "r4"})]).is_none());
+        assert!(apply_to_layer(&p, &[json!({"op": "set", "target": "r4.transform.opacity", "value": 1}), json!({"op": "set", "target": "r5.transform.opacity", "value": 1})]).is_none());
+        // The same errors as `apply`.
+        let bad = [json!({"op": "anchor", "target": "r4.transform.position", "key": 3, "at": 1})];
+        assert_eq!(apply_to_layer(&p, &bad).unwrap().unwrap_err().to_string(), apply(&p, &bad).unwrap_err().to_string());
+    }
+
+    /// What one tick of a drag costs, the old way and the new. Run with
+    /// `cargo test --release -p lahza-motion-core drag_tick_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing, prints a table"]
+    fn drag_tick_timing() {
+        use crate::compile::Compiled;
+        use std::time::Instant;
+        println!("layers | apply | apply_to_layer + replace | project clone | compile");
+        for n in [30, 480, 1200] {
+            let p = many(n);
+            let ops = [json!({"op": "set", "target": "r4.transform.position", "value": [10.5, 20]})];
+            let rounds = 50;
+            let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+            let t = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(apply(&p, &ops).unwrap());
+            }
+            let whole = ms(t);
+            let mut copy = p.clone();
+            let t = Instant::now();
+            for _ in 0..rounds {
+                let (_, layer) = apply_to_layer(&p, &ops).unwrap().unwrap();
+                replace_layer(&mut copy, layer);
+            }
+            let fast = ms(t);
+            let t = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(p.clone());
+            }
+            let clone = ms(t);
+            let t = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(Compiled::new(&copy));
+            }
+            println!("{n:>6} | {whole:.3} ms | {fast:.4} ms | {clone:.3} ms | {:.3} ms", ms(t));
+        }
     }
 
     #[test]

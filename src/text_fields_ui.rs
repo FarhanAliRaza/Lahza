@@ -11,6 +11,9 @@ pub(crate) struct TextFields {
     pub cue: gpui::Entity<TextField>,
     pub aspect_width: gpui::Entity<TextField>,
     pub aspect_height: gpui::Entity<TextField>,
+    pub prompt: gpui::Entity<TextField>,
+    pub layer_text: gpui::Entity<TextField>,
+    pub layer_color: gpui::Entity<TextField>,
 }
 impl TextFields {
     pub fn new(parent: FocusHandle, cx: &mut Context<Studio>) -> Self {
@@ -31,6 +34,9 @@ impl TextFields {
             cue: create("Caption text"),
             aspect_width: create("Width"),
             aspect_height: create("Height"),
+            prompt: create("Say what you want here…"),
+            layer_text: create("Text"),
+            layer_color: create("#rrggbb"),
         }
     }
 }
@@ -45,6 +51,9 @@ impl Studio {
             &self.text_fields.cue,
             &self.text_fields.aspect_width,
             &self.text_fields.aspect_height,
+            &self.text_fields.prompt,
+            &self.text_fields.layer_text,
+            &self.text_fields.layer_color,
         ]
         .iter()
         .any(|field| field.read(cx).focus.is_focused(window))
@@ -157,6 +166,7 @@ impl Studio {
             let target = if custom_aspect_visible { Target::CanvasAspect(width) } else { Target::None };
             field.update(cx, |field, cx| field.sync(target, &value.to_string(), window, cx));
         }
+        self.sync_motion_fields(window, cx);
         if projected_edit.is_some_and(|i| target == Target::Annotation(i)) {
             self.text_fields.annotation.read(cx).focus.focus(window);
         }
@@ -205,7 +215,7 @@ impl Studio {
                     EventKind::Commit => {
                         self.stop_editing_text();
                     }
-                    EventKind::Cancel => {}
+                    EventKind::Cancel | EventKind::Submit => {}
                 }
             }
             Target::Annotation(index)
@@ -230,6 +240,7 @@ impl Studio {
                             self.selected_annotation = None;
                         }
                     }
+                    EventKind::Submit => {}
                 }
             }
             Target::Watermark => {
@@ -241,7 +252,9 @@ impl Studio {
                 EventKind::Focus => self.begin_cue_text_edit(),
                 EventKind::Change => self.set_cue_text(id, &event.text, false, cx),
                 EventKind::Commit | EventKind::Cancel => self.set_cue_text(id, &event.text, true, cx),
+                EventKind::Submit => {}
             },
+            Target::Prompt | Target::LayerText | Target::LayerColor => self.on_motion_field_event(event, cx),
             Target::Time(index, start) => {
                 if event.kind == EventKind::Focus {
                     self.stop_editing_text();
