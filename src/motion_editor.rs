@@ -379,6 +379,12 @@ pub(crate) struct MotionEditor {
     toolbox: Toolbox,
     project: Project,
     compiled: Arc<Compiled>,
+    /// The saved project compiled: what a drag's tick compiles one scene
+    /// again from, and what a cancelled drag goes back to.
+    saved_compiled: Arc<Compiled>,
+    /// The one layer this drag's ticks have changed in `preview_project`
+    /// (None once they changed anything else).
+    preview_layer: Option<String>,
     rows: Vec<Row>,
     stamp: SystemTime,
     time: f64,
@@ -649,6 +655,8 @@ impl MotionEditor {
             dir,
             toolbox,
             project,
+            saved_compiled: compiled.clone(),
+            preview_layer: None,
             compiled,
             rows,
             time: 0.0,
@@ -851,6 +859,7 @@ impl MotionEditor {
 
     fn drop_preview(&mut self) {
         self.comparing = false;
+        self.preview_layer = None;
         self.preview_project = None;
         *self.preview_json.borrow_mut() = None;
     }
@@ -863,6 +872,7 @@ impl MotionEditor {
                 self.font_names = font_names(&self.dir);
                 self.project = p;
                 self.compiled = Arc::new(Compiled::new(&self.project));
+                self.saved_compiled = self.compiled.clone();
                 self.rows = layer_rows(&self.project, &self.compiled);
                 self.stamp = stamp(&self.dir);
                 self.dirty = true;
@@ -898,10 +908,19 @@ impl MotionEditor {
     /// through JSON (`edit::apply_to_layer`), into a copy of the project
     /// made once a drag. Anything else takes `edit::apply`.
     fn preview(&mut self, ops: &[Value]) {
+        // The layer the copy differs from the saved project in, when it is
+        // one layer: then only its scene is compiled again
+        // (`with_layer_changed`, which gives up whenever that could differ
+        // from compiling everything).
+        let mut one = None;
         match edit::apply_to_layer(&self.project, ops) {
-            Some(Ok((_, layer))) => {
+            Some(Ok((id, layer))) => {
+                let first = self.preview_project.is_none();
                 let copy = self.preview_project.get_or_insert_with(|| self.project.clone());
                 edit::replace_layer(copy, layer);
+                if first || self.preview_layer.as_deref() == Some(id.as_str()) {
+                    one = Some(id);
+                }
             }
             Some(Err(_)) => return,
             None => match edit::apply(&self.project, ops) {
@@ -909,8 +928,10 @@ impl MotionEditor {
                 Err(_) => return,
             },
         }
+        self.preview_layer = one.clone();
         *self.preview_json.borrow_mut() = None;
-        self.compiled = Arc::new(Compiled::new(self.shown()));
+        let compiled = one.and_then(|id| self.saved_compiled.with_layer_changed(self.shown(), &id)).unwrap_or_else(|| Compiled::new(self.shown()));
+        self.compiled = Arc::new(compiled);
         self.dirty = true;
     }
 
@@ -1332,7 +1353,7 @@ impl MotionEditor {
     /// Drops any unsaved drag preview.
     pub(crate) fn cancel_preview(&mut self) {
         self.drop_preview();
-        self.compiled = Arc::new(Compiled::new(&self.project));
+        self.compiled = self.saved_compiled.clone();
         self.dirty = true;
     }
 
