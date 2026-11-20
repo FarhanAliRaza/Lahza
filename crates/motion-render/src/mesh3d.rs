@@ -168,10 +168,10 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
 
 /// Whether a mesh layer is in the sky visibility's rays (`list.rs`
 /// `sky_list`): not one that blends otherwise than over what is behind it
-/// (a glow hides nothing), a volume (it needs the tracer's marching) or
-/// one whose coverage a Slang surface works out. What is in them hides
-/// the sky where it is at least half opaque (pt.wgsl `sky_blocks`), and
-/// a volume by its density along the ray (`sky_through`).
+/// (a glow hides nothing) or one whose coverage a Slang surface works
+/// out. What is in them hides the sky by what it covers of a ray
+/// (pt.wgsl `sky_cover`), and a volume by its density along the ray
+/// (`sky_through`).
 pub(crate) fn in_sky(layer: &lahza_motion_core::compile::LayerState) -> bool {
     use lahza_motion_core::compile::Content;
     let Content::Mesh(m) = &layer.content else { return false };

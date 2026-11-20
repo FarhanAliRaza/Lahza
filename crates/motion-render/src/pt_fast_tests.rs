@@ -264,6 +264,110 @@ fn the_fast_mode_streaks_over_nothing() {
     }
 }
 
+/// A streak has no outline of the thing in it: a texel at the ball's edge
+/// that shows the ball moves as the ball does, whatever the trace's one
+/// sample in it hit (its motion is that of the surface it shows most of).
+/// Along the streak's rows no texel stands out from the two beside it.
+#[test]
+fn a_streak_has_no_outline() {
+    let mut p = project(json!([
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"color": "#202020", "unlit": true}, "transform": {"position": [160, 120], "z": 200}},
+        {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"color": "#ff0000", "unlit": true},
+         "transform": {"position": {"keys": [{"at": 0, "v": [60, 120]}, {"at": 1, "v": [260, 120]}]}}}
+    ]));
+    p.settings.width = 320;
+    p.settings.height = 240;
+    p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 360.0, samples: 8 });
+    p.settings.fps = lahza_motion_core::time::Fps::whole(4);
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    for way in [Way::StandIn, Way::Own] {
+        let Some(mut r) = fast(way, 8, true) else { return };
+        r.render(&c, 0.25);
+        let img = r.render(&c, 0.5);
+        keep(&format!("outline-{way:?}"), &img);
+        let red = |x: u32, y: u32| img.get_pixel(x, y).0[0] as f64;
+        // (The rows through the ball but for its top and bottom, where
+        // the streak's own edge runs along them, and between the
+        // streak's two ends, which are steep: the ball's outline was at
+        // 130 and 190.)
+        let (mut dots, mut worst) = (0, 0.0f64);
+        for y in 100..141 {
+            for x in 118..203 {
+                let d = (red(x, y) - (red(x - 2, y) + red(x + 2, y)) / 2.0).abs();
+                worst = worst.max(d);
+                dots += (d > 10.0) as u32;
+            }
+        }
+        eprintln!("{way:?}: {dots} texels of the streak more than 10 levels off the two beside them (most {worst:.0})");
+        // (With the trace's motion as it came: 134 and 93 texels, up to
+        // 66 levels.)
+        assert!(dots < 10 && worst < 20.0, "{way:?}: {dots} texels, most {worst:.0}");
+    }
+}
+
+/// A motion longer than the 64 texels the fast mode's blur once followed:
+/// a ball that goes 130 px in a frame is a streak as long as the usual
+/// trace's sub-frames make it (the tiles around a texel say how far to
+/// look for what moves: up to 256 texels a shutter).
+#[test]
+fn a_long_motion_is_a_long_streak() {
+    let Some(mut usual) = tracer(32) else { return };
+    let mut p = project(json!([{"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"color": "#ff0000", "unlit": true},
+        "transform": {"position": {"keys": [{"at": 0, "v": [60, 120]}, {"at": 1, "v": [580, 120]}]}}}]));
+    p.settings.width = 640;
+    p.settings.height = 240;
+    p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 360.0, samples: 16 });
+    p.settings.fps = lahza_motion_core::time::Fps::whole(4);
+    let c = Compiled::new(&p);
+    let covered = |img: &RgbaImage| (0..640u32).filter(|&x| img.get_pixel(x, 120).0[0] as u32 * img.get_pixel(x, 120).0[3] as u32 / 255 > 20).count();
+    let reference = covered(&usual.render(&c, 0.5));
+    for way in [Way::StandIn, Way::Own] {
+        let Some(mut r) = fast(way, 8, true) else { return };
+        r.render(&c, 0.25);
+        let img = r.render(&c, 0.5);
+        keep(&format!("long-streak-{way:?}"), &img);
+        let ours = covered(&img);
+        eprintln!("{way:?}: the streak covers {ours} px (the usual trace: {reference}; still: 60; followed for 64 texels: about 124)");
+        assert!(ours > 160 && (ours as i32 - reference as i32).abs() < 30, "{way:?}: {ours} px for {reference}");
+    }
+}
+
+/// A circle of confusion wider than the 24 texels the fast mode's depth
+/// of field once reached: a bead far in front of a sharp wall blurs as
+/// wide as the lens blurs it in the usual trace.
+#[test]
+fn a_wide_circle_of_confusion_is_as_wide_as_the_lens() {
+    let Some(mut usual) = tracer(64) else { return };
+    let mut p = project(json!([
+        {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [1200, 800]}, "material": {"color": "#202020", "unlit": true}, "transform": {"position": [320, 240]}},
+        {"id": "bead", "kind": "mesh", "mesh": {"type": "sphere", "radius": 10}, "material": {"color": "#ff0000", "unlit": true}, "transform": {"position": [334, 262], "z": -240}}
+    ]));
+    p.settings.width = 640;
+    p.settings.height = 480;
+    p.scenes[0].camera = serde_json::from_value(json!({"aperture": 3.0, "focus": "wall"})).unwrap();
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    // How many px of the picture have some of the bead's red, and how
+    // wide the row through its middle with the most of them is.
+    let spread = |img: &RgbaImage| img.pixels().filter(|p| p.0[0] > 44).count();
+    let width = |img: &RgbaImage| (0..480u32).map(|y| (0..640u32).filter(|&x| img.get_pixel(x, y).0[0] > 44).count()).max().unwrap();
+    let reference = usual.render(&c, 0.0);
+    keep("wide-reference", &reference);
+    let (lens, across) = (spread(&reference), width(&reference));
+    for way in [Way::StandIn, Way::Own] {
+        let Some(mut r) = fast(way, 8, false) else { return };
+        let img = r.render(&c, 0.0);
+        keep(&format!("wide-{way:?}"), &img);
+        let (ours, ours_across) = (spread(&img), width(&img));
+        let light = |img: &RgbaImage| img.pixels().map(|p| (p.0[0] as f64 - 32.0).max(0.0)).sum::<f64>();
+        eprintln!("{way:?}: the bead's blur covers {ours} px, {ours_across} across (the lens: {lens}, {across} across), with {:.2} of the lens's light", light(&img) / light(&reference));
+        assert!((light(&img) / light(&reference) - 1.0).abs() < 0.15, "{way:?}: {:.2} of the lens's light", light(&img) / light(&reference));
+        assert!(across > 70, "the lens blurs it wider than 24 texels each way: {across} px across");
+        assert!((ours as f64) > 0.6 * lens as f64 && (ours as f64) < 1.5 * lens as f64 && (ours_across as f64) > 0.75 * across as f64, "{way:?}: {ours} px, {ours_across} across (the lens: {lens}, {across})");
+    }
+}
+
 /// A small thing far out of focus in front of a sharp wall blurs over the
 /// wall around it, as wide as the lens blurs it in the usual trace: it is
 /// found from every texel its circle of confusion reaches.
@@ -290,6 +394,12 @@ fn a_small_defocused_thing_blurs_over_what_is_sharp() {
         keep(&format!("bead-{way:?}"), &img);
         let ours = spread(&img);
         assert!(lens > 150 && (ours as f64) > 0.6 * lens as f64 && (ours as f64) < 1.5 * lens as f64, "{way:?}: the bead's blur covers {ours} px (the lens: {lens})");
+        // And it is as much light as the lens gives: the red over the
+        // wall's, summed. (Every tap that reached once counted alike, and
+        // the blur was a bright disc: 2.5 times the light.)
+        let light = |img: &RgbaImage| img.pixels().map(|p| (p.0[0] as f64 - 32.0).max(0.0)).sum::<f64>();
+        eprintln!("{way:?}: the bead's blur covers {ours} px (the lens: {lens}) and has {:.2} of the lens's light", light(&img) / light(&reference));
+        assert!((light(&img) / light(&reference) - 1.0).abs() < 0.15, "{way:?}: {:.2} of the lens's light", light(&img) / light(&reference));
     }
 }
 
@@ -391,6 +501,100 @@ fn a_shadow_catchers_shadow_over_nothing_is_smooth() {
 }
 
 /// Two scenes, the second from half a second: other layers, another look.
+/// Not a test (`--ignored --nocapture`): how much the usual trace's
+/// filter widens a shadow catcher's soft shadow. The catcher over
+/// nothing, 256 paths not denoised against 64 paths denoised (the
+/// export's own; Open Image Denoise where $LAHZA_OIDN has it, else the
+/// built-in filter): how many px of the row through the ball's shadow
+/// are between a tenth and nine tenths of its darkest, and the coverage
+/// along the edge.
+#[test]
+#[ignore]
+fn measure_a_catchers_shadow_denoised() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mut p = project(json!([
+        {"id": "catch", "kind": "mesh", "mesh": {"type": "plane", "size": [300, 170]}, "material": {"preset": "shadow", "opacity": 0.8},
+         "transform": {"position": [160, 90], "z": -2}},
+        {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "material": {"preset": "matte", "color": "#ffffff"},
+         "transform": {"position": [90, 90], "z": -120}}
+    ]));
+    p.settings.background = lahza_motion_core::value::Color([0.0; 4]);
+    p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0, 0, -1], "softness": 0.6, "shadow": true}])).unwrap();
+    let c = Compiled::new(&p);
+    for (name, spp, denoise) in [("256 paths, not denoised", 256, false), ("64 paths, denoised", 64, true)] {
+        let mut r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(TraceOptions { spp, denoise, ..Default::default() }), ..Default::default() });
+        let img = r.render(&c, 0.0);
+        keep(&format!("catcher-edge-{}", if denoise { "denoised" } else { "plain" }), &img);
+        // (Rows 80 to 100, right of the ball, which hides the shadow's middle.)
+        let cover: Vec<f64> = (96..240u32).map(|x| (80..100u32).map(|y| img.get_pixel(x, y).0[3] as f64).sum::<f64>() / 20.0).collect();
+        let most = cover.iter().cloned().fold(0.0, f64::max);
+        let edge = cover.iter().filter(|c| **c > 0.1 * most && **c < 0.9 * most).count();
+        let at = |x: usize| cover[x - 96];
+        eprintln!("{name}: the edge is {edge} px wide (darkest {most:.0}); coverage at 100, 110, 120, 130, 140, 160: {:.0} {:.0} {:.0} {:.0} {:.0} {:.0}", at(100), at(110), at(120), at(130), at(140), at(160));
+    }
+}
+
+/// Not a test (`--ignored --nocapture`): what the fast mode's passes for
+/// motion blur and depth of field cost a frame: the same scene without
+/// them, with a shutter and nothing moving, with a ball crossing 50 and
+/// 130 px a frame, and with a lens that blurs a bead 37 texels each way.
+/// ms a frame after the first two, without Ray Reconstruction.
+/// $LAHZA_MEASURE: "width,height" (default 640 x 480).
+#[test]
+#[ignore]
+fn measure_the_fast_passes() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let v: Vec<u32> = std::env::var("LAHZA_MEASURE").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let (w, h) = (*v.first().unwrap_or(&640), *v.get(1).unwrap_or(&480));
+    let k = w as f64 / 640.0;
+    let build = |speed: f64, lens: bool, shutter: bool| {
+        let mut p = project(json!([
+            {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [4000, 3000]}, "material": {"color": "#202020", "unlit": true}, "transform": {"position": [320.0 * k, 240.0 * k]}},
+            {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 20.0 * k}, "material": {"color": "#ff0000", "unlit": true},
+             "transform": {"position": {"keys": [{"at": 0, "v": [60.0 * k, 262.0 * k]}, {"at": 1, "v": [(60.0 + speed * 8.0) * k, 262.0 * k]}]}, "z": -240.0 * k}}
+        ]));
+        p.settings.width = w;
+        p.settings.height = h;
+        p.settings.fps = lahza_motion_core::time::Fps::whole(8);
+        if shutter {
+            p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 360.0, samples: 8 });
+        }
+        if lens {
+            p.scenes[0].camera = serde_json::from_value(json!({"aperture": 3.0, "focus": "wall"})).unwrap();
+        }
+        Compiled::new(&p)
+    };
+    for (name, speed, lens, shutter) in [("neither", 0.0, false, false), ("a shutter, nothing moving", 0.0, false, true), ("a shutter, 50 px a frame", 50.0, false, true), ("a shutter, 130 px a frame", 130.0, false, true), ("a lens", 0.0, true, false)] {
+        let c = build(speed, lens, shutter);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+        let path = Some(TraceOptions { spp: 4, bounces: 4, fast: true, temporal: true, ..Default::default() });
+        let mut r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, motion_blur: shutter, path, profile: true, ..Default::default() });
+        r.gpu.as_mut().unwrap().tracer_for_tests().unwrap().without_ngx();
+        r.render(&c, 0.0);
+        r.render(&c, 0.125);
+        let started = std::time::Instant::now();
+        for f in 2..6 {
+            r.last_invalidate();
+            r.render(&c, f as f64 * 0.125);
+        }
+        eprintln!("{name}: {:.0} ms a frame at {w} x {h} ({})", started.elapsed().as_secs_f64() * 250.0, r.backend_label());
+        // (The profile's rows for the passes: ms over the six frames.)
+        r.flush_profile();
+        if let Some(report) = r.profile.as_ref().map(|p| p.report()) {
+            let text = serde_json::to_string_pretty(&report).unwrap();
+            for line in text.lines().filter(|l| l.contains(" ms ") && (l.contains("fast") || l.contains("resolve") || l.contains("trace\""))) {
+                eprintln!("    {}", line.trim());
+            }
+        }
+    }
+}
+
 fn two_scenes() -> Project {
     let mut p = rolling();
     p.settings.width = 160;

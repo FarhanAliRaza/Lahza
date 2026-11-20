@@ -1614,6 +1614,18 @@ impl Tracer {
             }
             self.sets[set].work[s].as_mut().unwrap().oidn = None;
         }
+        // LAHZA_OIDN_WAY: which way, on stderr (no warning tells a
+        // denoiser whose device takes no memory from one that shares).
+        if std::env::var_os("LAHZA_OIDN_WAY").is_some() {
+            let why = match (&self.oidn, &self.sharing) {
+                _ if share => "shared with the tracer (nothing copied)".to_string(),
+                (Some(Ok(d)), _) if !d.shares_fd() => "copied through the host: its device imports no memory by file descriptor".to_string(),
+                (_, Sharing::Off(why)) => format!("copied through the host: {why}"),
+                _ if !context.has_external_memory() => "copied through the host: the GPU exports no memory".to_string(),
+                _ => "copied through the host".to_string(),
+            };
+            eprintln!("Open Image Denoise, {} x {}: its pictures are {why}", size.0, size.1);
+        }
         let texels = (size.0 * size.1) as u64;
         let make = |name, per: u64, memory| context.create_buffer(gpu::BufferDesc { name, size: (texels * per).max(16), memory });
         let mut made = None;
@@ -1705,7 +1717,8 @@ impl Tracer {
                 out: buffer("ray reconstruction output", texels * 16),
                 seen: buffer("fast mode visibility", texels * 32),
                 dof: buffer("fast mode depth of field", texels * 32),
-                tiles: buffer("fast mode tiles", (full.0.div_ceil(FAST_TILE) as u64 * full.1.div_ceil(FAST_TILE) as u64 * 16).max(16)),
+                // (A row a tile, and a second: how far to look from it.)
+                tiles: buffer("fast mode tiles", (full.0.div_ceil(FAST_TILE) as u64 * full.1.div_ceil(FAST_TILE) as u64 * 32).max(32)),
             };
             for (t, _) in f.textures.into_iter().flatten() {
                 encoder.init_texture(t);
@@ -1938,14 +1951,18 @@ impl Tracer {
                 }
             }
             if lens || state.shutter > 0.0 {
-                // What may reach each texel from around it.
-                let u = Uniforms { denoise: [full.0, full.1, 0, state.shutter.to_bits()], lens: [state.lens[0], state.lens[1], l[2], l[3]], ..state.uniforms };
-                let mut pass = encoder.compute("fast mode tiles");
-                let mut pc = pass.with(&self.fast_tiles);
-                let mut data = state.data(u, groups, images, guides, hdr[0], f.seen);
-                data.b_next = f.tiles.into();
-                pc.bind(0, &data);
-                pc.dispatch([full.0.div_ceil(FAST_TILE * 8), full.1.div_ceil(FAST_TILE * 8), 1]);
+                // What may reach each texel from around it: each tile's
+                // longest motion and widest circle, then how far round
+                // a tile's texels have to look for those.
+                for round in 0..2 {
+                    let u = Uniforms { denoise: [full.0, full.1, round, state.shutter.to_bits()], lens: [state.lens[0], state.lens[1], l[2], l[3]], ..state.uniforms };
+                    let mut pass = encoder.compute("fast mode tiles");
+                    let mut pc = pass.with(&self.fast_tiles);
+                    let mut data = state.data(u, groups, images, guides, hdr[0], f.seen);
+                    data.b_next = f.tiles.into();
+                    pc.bind(0, &data);
+                    pc.dispatch([full.0.div_ceil(FAST_TILE * 8), full.1.div_ceil(FAST_TILE * 8), 1]);
+                }
             }
             if lens {
                 let u = Uniforms { denoise: [full.0, full.1, 0, 0], lens: [state.lens[0], state.lens[1], 0.0, 0.0], ..state.uniforms };

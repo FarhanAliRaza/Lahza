@@ -614,6 +614,21 @@ fn a_rays_end_is_lit_by_what_it_sees() {
     assert!(apart(&a, &ours_cpu) < 0.01);
 }
 
+/// Not a test (`--ignored`): the room under the default lights as a
+/// project in $LAHZA_PT_OUT/room, for the CLI (`lahza motion snapshot
+/// $LAHZA_PT_OUT/room --sky`, `--pt`, `--fast`: what each takes).
+#[test]
+#[ignore]
+fn keep_the_room_as_a_project() {
+    let Some(dir) = std::env::var_os("LAHZA_PT_OUT") else { return };
+    let dir = std::path::Path::new(&dir).join("room");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut p = room(None);
+    p.settings.width = 480;
+    p.settings.height = 270;
+    std::fs::write(dir.join("project.json"), serde_json::to_string_pretty(&p).unwrap()).unwrap();
+}
+
 /// Not a test (`--ignored --nocapture`): sky visibility on the GPU and on
 /// the CPU against the traced frame (64 paths), in four scenes: the room
 /// lit by the soft environment (a lobe overhead), by one without lobes,

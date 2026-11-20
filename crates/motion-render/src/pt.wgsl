@@ -3838,7 +3838,10 @@ fn fast_raw(x: i32, y: i32) -> FastTexel {
 // The lens's circle of confusion (its radius in texels of the full
 // picture, at most DOF_MAX) at camera depth z: `u.lens` is the radius a
 // point twice as far as the focus has, and the focus depth.
-const DOF_MAX: f32 = 24.0;
+// (DOF_MAX and MB_MAX are what FAST_REACH tiles around a texel hold, and
+// what the taps of `dof_fast` and `resolve_fast` still cover closely
+// enough; they were 24 and 64 while every texel looked two tiles round.)
+const DOF_MAX: f32 = 64.0;
 fn fast_coc(z: f32) -> f32 {
     if z <= 0.0 { return 0.0; }
     return min(u.lens.x * abs(z - u.lens.y) / z * 2.0, DOF_MAX);
@@ -3926,7 +3929,7 @@ fn fast_catcher(@builtin(global_invocation_id) id: vec3<u32>) {
 // point p of it moves over `shutter` frames: from where its surface was
 // on the frame before (the trace's motion; none where nothing was hit),
 // at most MB_MAX.
-const MB_MAX: f32 = 64.0;
+const MB_MAX: f32 = 256.0;
 fn fast_motion(p: vec2<f32>, shutter: f32) -> vec2<f32> {
     let scale = vec2<f32>(f32(u.denoise.x) / f32(u.size.x), f32(u.denoise.y) / f32(u.size.y));
     let lx = min(u32(max(p.x, 0.0) / scale.x), u.size.x - 1u);
@@ -3937,6 +3940,35 @@ fn fast_motion(p: vec2<f32>, shutter: f32) -> vec2<f32> {
     let len = length(mv);
     if len > MB_MAX { return mv * (MB_MAX / len); }
     return mv;
+}
+
+// The same for the surface that texel p shows most of, at camera depth z
+// (`fast_depth`). The trace's motion is of whatever its one sample in
+// the texel hit, and at an edge that may be the other surface: a texel
+// that shows the moving ball but whose sample went past it stood still
+// in a streak (the ball's outline, in dots), and one that shows the
+// floor moved. Then the motion is that of a texel beside it whose
+// sample did hit a surface at this depth; with none (a texel that shows
+// both, at a depth between), the longest around.
+fn fast_motion_of(p: vec2<f32>, shutter: f32, z: f32) -> vec2<f32> {
+    if z > 1e29 { return vec2<f32>(0.0); }
+    let scale = vec2<f32>(f32(u.denoise.x) / f32(u.size.x), f32(u.denoise.y) / f32(u.size.y));
+    let lx = i32(min(u32(max(p.x, 0.0) / scale.x), u.size.x - 1u));
+    let ly = i32(min(u32(max(p.y, 0.0) / scale.y), u.size.y - 1u));
+    let near = 0.02 * z + 0.5;
+    if abs(b_guides[u32(ly * i32(u.size.x) + lx) * 4u + 1u].w - z) <= near { return fast_motion(p, shutter); }
+    var longest = vec2<f32>(0.0);
+    for (var k = 0; k < 9; k++) {
+        let x = lx + k % 3 - 1;
+        let y = ly + k / 3 - 1;
+        if x < 0 || y < 0 || x >= i32(u.size.x) || y >= i32(u.size.y) { continue; }
+        let mv = fast_motion((vec2<f32>(f32(x), f32(y)) + 0.5) * scale, shutter);
+        if abs(b_guides[u32(y * i32(u.size.x) + x) * 4u + 1u].w - z) <= near { return mv; }
+        if dot(mv, mv) > dot(longest, longest) { longest = mv; }
+    }
+    // (None at this depth: the texel shows two surfaces, and its depth
+    // is between theirs. What moves in it is the faster of them.)
+    return longest;
 }
 
 // The camera depth of what texel (x, y) of the full picture shows most
@@ -3955,14 +3987,40 @@ fn fast_depth(x: i32, y: i32) -> f32 {
 // that small and thin things are found too, the picture is cut in tiles of
 // FAST_TILE texels, and each tile's row in `b_next` has the longest motion
 // in it over the shutter (`u.denoise.w`, a float's bits) and the widest
-// circle of confusion (`u.lens.xy`: 0 without a lens).
+// circle of confusion (`u.lens.xy`: 0 without a lens). A second pass
+// (`u.denoise.z` 1) then says, in as many rows after those, how many
+// tiles round a texel of each tile has to look: as far as the farthest
+// tile within FAST_REACH whose motion (half of it each way) or circle
+// reaches this one. So a texel with nothing fast or blurred near it reads
+// its own tile's row and no other, and a long streak or a wide circle is
+// found from as far as it goes.
 const FAST_TILE: u32 = 16u;
+const FAST_REACH: i32 = 8;
 @compute @workgroup_size(8, 8, 1)
 fn fast_tiles(@builtin(global_invocation_id) id: vec3<u32>) {
     let fw = u.denoise.x;
     let fh = u.denoise.y;
     let tw = (fw + FAST_TILE - 1u) / FAST_TILE;
     if id.x >= tw || id.y * FAST_TILE >= fh { return; }
+    if u.denoise.z == 1u {
+        let th = (fh + FAST_TILE - 1u) / FAST_TILE;
+        var look = vec2<f32>(0.0);
+        for (var dy = -FAST_REACH; dy <= FAST_REACH; dy++) {
+            for (var dx = -FAST_REACH; dx <= FAST_REACH; dx++) {
+                let tx = i32(id.x) + dx;
+                let ty = i32(id.y) + dy;
+                if tx < 0 || ty < 0 || tx >= i32(tw) || ty >= i32(th) { continue; }
+                let v = b_next[u32(ty) * tw + u32(tx)];
+                // (Tiles this far apart have at least this between them.)
+                let away = f32(max(abs(dx), abs(dy)));
+                let gap = max(away - 1.0, 0.0) * f32(FAST_TILE);
+                if length(v.xy) * 0.5 > gap { look.x = max(look.x, away); }
+                if v.z > gap { look.y = max(look.y, away); }
+            }
+        }
+        b_next[tw * th + id.y * tw + id.x] = vec4<f32>(look, 0.0, 0.0);
+        return;
+    }
     let shutter = bitcast<f32>(u.denoise.w);
     var motion = vec2<f32>(0.0);
     var most = 0.0;
@@ -4022,23 +4080,44 @@ fn dof_fast(@builtin(global_invocation_id) id: vec3<u32>) {
     let tw = i32((fw + FAST_TILE - 1u) / FAST_TILE);
     let th = i32((fh + FAST_TILE - 1u) / FAST_TILE);
     let here = vec2<f32>(f32(id.x), f32(id.y)) + 0.5;
-    for (var k = 0; k < 25; k++) {
-        let tx = i32(id.x / FAST_TILE) + k % 5 - 2;
-        let ty = i32(id.y / FAST_TILE) + k / 5 - 2;
-        if tx < 0 || ty < 0 || tx >= tw || ty >= th { continue; }
-        let widest = b_hist[ty * tw + tx].z;
-        if widest > reach && tile_away(here, tx, ty) <= widest { reach = widest; }
+    let look = i32(b_hist[tw * th + i32(id.y / FAST_TILE) * tw + i32(id.x / FAST_TILE)].y);
+    for (var dy = -look; dy <= look; dy++) {
+        for (var dx = -look; dx <= look; dx++) {
+            let tx = i32(id.x / FAST_TILE) + dx;
+            let ty = i32(id.y / FAST_TILE) + dy;
+            if tx < 0 || ty < 0 || tx >= tw || ty >= th { continue; }
+            let widest = b_hist[ty * tw + tx].z;
+            if widest > reach && tile_away(here, tx, ty) <= widest { reach = widest; }
+        }
     }
     if reach < 0.75 {
         b_hdr[i * 2u] = own.color;
         b_hdr[i * 2u + 1u] = vec4<f32>(own.flat, 0.0);
         return;
     }
-    let taps = clamp(u32(reach * reach * 0.3) + 8u, 12u, 64u);
+    // (As close together at 48 texels as 64 taps are at 26: a wide
+    // circle costs its area.)
+    let taps = clamp(u32(reach * reach * 0.3) + 8u, 12u, 64u + u32(max(reach - 24.0, 0.0) * 4.0));
     let turn = f32(pcg(i) >> 8u) / 16777216.0 * 6.2831853;
-    var color = own.color;
-    var flat = own.flat;
-    var weight = 1.0;
+    // Each tap stands for as much of the picture as the taps share of
+    // the reach's disc, and what is there spreads its light over its own
+    // circle: it gives this texel that share over its circle's area.
+    // (Every tap that reached counted alike at first: a small bead far
+    // out of focus came out as a bright disc of its circle's size, with
+    // two and a half times the light the lens gives it.) The texel's own
+    // surface gives as one texel of its own circle. What all that leaves
+    // of the texel is what lies behind its surface, seen through the
+    // blur: the mean of the taps behind it (the wall round a bead, or
+    // nothing); with none behind, more of the same.
+    let share = reach * reach / f32(taps);
+    let mine = min(1.0 / max(3.14159265 * cc * cc, 1.0), 1.0);
+    var color = own.color * mine;
+    var flat = own.flat * mine;
+    var weight = mine;
+    var behind = vec4<f32>(0.0);
+    var behind_flat = vec3<f32>(0.0);
+    var behind_n = 0.0;
+    let back = zc * 1.02 + 0.5;
     for (var k = 0u; k < taps; k++) {
         let r = reach * sqrt((f32(k) + 0.5) / f32(taps));
         let a = f32(k) * 2.3999632 + turn;
@@ -4047,37 +4126,55 @@ fn dof_fast(@builtin(global_invocation_id) id: vec3<u32>) {
         let j = u32(y) * fw + u32(x);
         let s = b_tmp[j * 2u];
         let d = b_tmp[j * 2u + 1u];
-        let cover = d.x;
-        if cover <= 0.0 {
-            // Nothing there: the gathering texel's own blur shows it.
-            if cc >= r { weight += 1.0; }
-            continue;
-        }
-        var took = 0.0;
+        let cover = clamp(d.x, 0.0, 1.0);
+        // Where nothing is, the gathering texel's own blur shows it.
+        if cc >= r { weight += (1.0 - cover) * share / max(cc * cc, 0.25); }
+        if zc < 1e29 { behind_n += 1.0 - cover; }
+        if cover <= 0.0 { continue; }
         // What is lit there.
         var e = fast_coc(d.y);
         if d.y > zc { e = min(e, cc); }
         let lit = s.w > 0.0 && e >= r;
+        let lit_behind = s.w > 0.0 && d.y > back;
         // What is flat there.
         var f = fast_coc(d.z);
         if d.z > zc { f = min(f, cc); }
         let flat_cover = max(cover - s.w, 0.0);
         let flt = flat_cover > 0.0 && f >= r;
-        if !lit && !flt { continue; }
+        let flat_behind = flat_cover > 0.0 && d.z > back;
+        if !lit && !flt && !lit_behind && !flat_behind { continue; }
         let t = fast_raw(x, y);
         if lit {
-            color += vec4<f32>(t.color.xyz, s.w);
-            took += s.w;
+            let w = share / max(e * e, 0.25);
+            color += vec4<f32>(t.color.xyz, s.w) * w;
+            weight += s.w * w;
         }
         if flt {
-            flat += t.flat;
-            color.w += flat_cover;
-            took += flat_cover;
+            let w = share / max(f * f, 0.25);
+            flat += t.flat * w;
+            color.w += flat_cover * w;
+            weight += flat_cover * w;
         }
-        weight += took / cover;
+        if lit_behind {
+            behind += vec4<f32>(t.color.xyz, s.w);
+            behind_n += s.w;
+        }
+        if flat_behind {
+            behind_flat += t.flat;
+            behind.w += flat_cover;
+            behind_n += flat_cover;
+        }
     }
-    b_hdr[i * 2u] = color / weight;
-    b_hdr[i * 2u + 1u] = vec4<f32>(flat / weight, 0.0);
+    if weight < 1.0 && behind_n > 0.0 {
+        let k = (1.0 - weight) / behind_n;
+        color += behind * k;
+        flat += behind_flat * k;
+    } else {
+        color = color / weight;
+        flat = flat / weight;
+    }
+    b_hdr[i * 2u] = color;
+    b_hdr[i * 2u + 1u] = vec4<f32>(flat, 0.0);
 }
 
 // The fast mode's picture, at its full size (`u.denoise.xy`). With a
@@ -4102,24 +4199,28 @@ fn resolve_fast(@builtin(global_invocation_id) id: vec3<u32>) {
         let th = i32((fh + FAST_TILE - 1u) / FAST_TILE);
         var mv = vec2<f32>(0.0);
         var most = 1.0;
-        for (var k = 0; k < 25; k++) {
-            let tx = i32(id.x / FAST_TILE) + k % 5 - 2;
-            let ty = i32(id.y / FAST_TILE) + k / 5 - 2;
-            if tx < 0 || ty < 0 || tx >= tw || ty >= th { continue; }
-            let m = b_hist[ty * tw + tx].xy;
-            let l = dot(m, m);
-            if l > most && tile_away(p, tx, ty) <= sqrt(l) * 0.5 {
-                most = l;
-                mv = m;
+        let look = i32(b_hist[tw * th + i32(id.y / FAST_TILE) * tw + i32(id.x / FAST_TILE)].x);
+        for (var dy = -look; dy <= look; dy++) {
+            for (var dx = -look; dx <= look; dx++) {
+                let tx = i32(id.x / FAST_TILE) + dx;
+                let ty = i32(id.y / FAST_TILE) + dy;
+                if tx < 0 || ty < 0 || tx >= tw || ty >= th { continue; }
+                let m = b_hist[ty * tw + tx].xy;
+                let l = dot(m, m);
+                if l > most && tile_away(p, tx, ty) <= sqrt(l) * 0.5 {
+                    most = l;
+                    mv = m;
+                }
             }
         }
         if most > 1.0 {
             let len = sqrt(most);
-            let own = length(fast_motion(p, u.lens.x)) * 0.5;
             let zc = fast_depth(i32(id.x), i32(id.y));
-            // A tap every texel and a half or so, each off by the
-            // texel's own fraction so steps do not line up.
-            let taps = clamp(u32(ceil(len / 1.5)), 2u, 32u);
+            let own = length(fast_motion_of(p, u.lens.x, zc)) * 0.5;
+            // A tap every texel and a half or so (every four at the
+            // longest), each off by the texel's own fraction so steps do
+            // not line up.
+            let taps = clamp(u32(ceil(len / 1.5)), 2u, 64u);
             let r = f32(pcg(i + pcg(u.opts.y)) >> 8u) / 16777216.0;
             var color = vec4<f32>(0.0);
             var flat = vec3<f32>(0.0);
@@ -4128,7 +4229,7 @@ fn resolve_fast(@builtin(global_invocation_id) id: vec3<u32>) {
                 let q = p + off;
                 let d = length(off);
                 let zs = fast_depth(i32(q.x), i32(q.y));
-                let passes = length(fast_motion(q, u.lens.x)) * 0.5 >= d && zs <= zc * 1.02 + 0.5;
+                let passes = length(fast_motion_of(q, u.lens.x, zs)) * 0.5 >= d && zs <= zc * 1.02 + 0.5;
                 let shows = own >= d && zs >= zc * 0.98 - 0.5;
                 var s = t;
                 if passes || shows { s = fast_at(q); }
