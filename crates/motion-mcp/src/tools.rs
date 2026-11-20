@@ -397,7 +397,12 @@ pub struct Toolbox {
     pub cwd: PathBuf,
     /// The request edits made here belong to (see `HistoryEntry::request`).
     pub request: Option<String>,
+    /// Hears each bake of `sim_bake` as it goes (the scene and the share
+    /// done, 0 to 1); `false` stops it.
+    pub bake_watch: Option<BakeWatch>,
 }
+
+pub type BakeWatch = Arc<dyn Fn(&str, f64) -> bool + Send + Sync>;
 
 impl Default for Toolbox {
     fn default() -> Self {
@@ -479,6 +484,7 @@ impl Toolbox {
             backend: Backend::Gpu,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             request: None,
+            bake_watch: None,
         }
     }
 

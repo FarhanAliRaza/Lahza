@@ -658,7 +658,7 @@ mod tests {
         assert!(conversation.starts_with("api-"));
         assert_eq!(events[1], Event::Said("I'll move it and look.".into()));
         let steps: Vec<(&str, &str)> = events.iter().filter_map(|e| if let Event::Step { tool, text, .. } = e { Some((tool.as_str(), text.as_str())) } else { None }).collect();
-        assert_eq!(steps, [("edit_apply", "Editing: set title.transform.position"), ("snapshot", "Looking at the frame at [0.5]"), ("read_doc", "Read doc"), ("edit_apply", "Editing: remove nope")]);
+        assert_eq!(steps, [("edit_apply", "Editing: set title.transform.position"), ("snapshot", "Looking at the frame at 0.5"), ("read_doc", "Read doc"), ("edit_apply", "Editing: remove nope")]);
         let ended: Vec<Option<&str>> = events.iter().filter_map(|e| if let Event::StepDone { error, .. } = e { Some(error.as_deref()) } else { None }).collect();
         assert_eq!(ended.len(), 4);
         assert!(ended[..3].iter().all(Option::is_none) && ended[3].is_some_and(|e| e.contains("nope")), "{ended:?}");

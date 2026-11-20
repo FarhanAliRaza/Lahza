@@ -113,6 +113,18 @@ pub fn bake(input: &SimInput, meshes: Meshes) -> Result<(Bake, Stats), String> {
 
 /// `bake`, with the files controllers name read by `files`.
 pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake, Stats), String> {
+    bake_watched(input, meshes, files, &|_| true)
+}
+
+/// Told the share of a bake done (0 to 1) before each sample; `false`
+/// stops the bake there.
+pub type Watch<'a> = &'a dyn Fn(f64) -> bool;
+
+/// The error of a bake its `Watch` stopped.
+pub const STOPPED: &str = "the bake was stopped";
+
+/// `bake_with`, watched: `watch` hears how far it is and can stop it.
+pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch) -> Result<(Bake, Stats), String> {
     use lahza_motion_core::sim::Controller;
     let began = std::time::Instant::now();
     let mut take = Take::new(input, meshes)?;
@@ -145,6 +157,9 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
     let n = input.substeps as u64;
     let mut steps = 0u64;
     for k in 0..input.samples {
+        if !watch(k as f64 / input.samples.max(1) as f64) {
+            return Err(STOPPED.into());
+        }
         take.release_due(input, k);
         record(&take.world, &mut tracks);
         herd.plan(input, &take.world);
@@ -220,14 +235,20 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
 /// folder (collider files are hashed from it). Problems in the scene's
 /// simulation (a joint to no body, a layer with no shape) are the error.
 pub fn bake_scene(compiled: &Compiled, scene: usize, dir: Option<&std::path::Path>, meshes: Meshes) -> Result<(Bake, Stats), String> {
+    bake_scene_watched(compiled, scene, dir, meshes, &|_| true)
+}
+
+/// `bake_scene`, watched (see `Watch`).
+pub fn bake_scene_watched(compiled: &Compiled, scene: usize, dir: Option<&std::path::Path>, meshes: Meshes, watch: Watch) -> Result<(Bake, Stats), String> {
     let (input, errors) = compiled.sim_input(scene, dir);
     if !errors.is_empty() {
         return Err(errors.join("\n"));
     }
-    bake_with(&input, meshes, &|src| match dir {
+    let files = |src: &str| match dir {
         Some(dir) => std::fs::read(dir.join(src)).map_err(|e| format!("{src}: {e}")),
         None => Err(format!("{src}: no project folder to read it from")),
-    })
+    };
+    bake_watched(&input, meshes, &files, watch)
 }
 
 #[cfg(test)]

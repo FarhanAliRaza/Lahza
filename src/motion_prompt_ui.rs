@@ -26,6 +26,11 @@ use std::time::{Duration, Instant};
 /// Height of the prompt bar: chips, the field, and a line of status.
 pub(crate) const PROMPT_BAR_HEIGHT: f32 = 112.0;
 
+/// "1 edit", "2 edits".
+fn count(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
 /// Where a project's (or a recording's) requests are kept between runs
 /// of the app.
 const REQUESTS_FILE: &str = "requests.json";
@@ -833,7 +838,29 @@ impl Studio {
         }
         let pill = |label: String, fill: gpui::Hsla| div().h(px(22.0)).px_2().flex().flex_none().items_center().rounded_full().text_xs().text_color(gpui::white()).bg(fill).child(label);
         if baking {
-            return Some(pill(format!("Baking the simulation… {seconds} s"), theme::accent()).into_any_element());
+            // The scene it is at and how far, and a way out.
+            let (scene, share) = editor.read(cx).bake_share();
+            let label = if scene.is_empty() { format!("Baking the simulation… {seconds} s") } else { format!("Baking {scene} · {:.0}% · {seconds} s", share * 100.0) };
+            return Some(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .child(pill(label, theme::accent()))
+                    .child(
+                        pill("Stop".into(), theme::danger())
+                            .id("motion-sim-stop")
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .tooltip(crate::timeline_ui::tooltip("Stop the bake: the simulation stays as it was".to_string()))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.stop_motion_bake(cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
         }
         let detail = needs.iter().map(|n| n.message()).collect::<Vec<_>>().join(" ");
         if !needs.iter().any(|n| n.bakeable()) {
@@ -859,6 +886,14 @@ impl Studio {
     pub(crate) fn bake_motion_simulation(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = self.motion_editor() {
             editor.update(cx, |e, _| e.bake_simulation());
+        }
+        cx.notify();
+    }
+
+    /// Stops the running bake (the pill's Stop).
+    pub(crate) fn stop_motion_bake(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.motion_editor() {
+            editor.update(cx, |e, _| e.stop_bake());
         }
         cx.notify();
     }
@@ -924,7 +959,7 @@ impl Studio {
             let edits = request.steps.iter().filter(|s| s.done && s.error.is_none() && s.text.starts_with("Editing")).count();
             status = status
                 .child(div().size(px(8.0)).flex_none().rounded_full().bg(theme::accent()))
-                .child(small(format!("{} · {} · {:.0} s · {} steps, {edits} edits so far. You can keep editing.", agent.runner_name(), request.now(), request.seconds(), request.steps.len())));
+                .child(small(format!("{} · {} · {:.0} s · {}, {} so far. You can keep editing.", agent.runner_name(), request.now(), request.seconds(), count(request.steps.len(), "step"), count(edits, "edit"))));
         } else if let Some(request) = agent.proposal() {
             let comparing = agent.comparing.is_some();
             let (keep, undo, again, held) = (request.id.clone(), request.id.clone(), request.id.clone(), request.id.clone());
@@ -934,7 +969,7 @@ impl Studio {
                 _ => format!("Done in {:.0} s", request.seconds()),
             };
             status = status
-                .child(small(format!("{head} · {} edits · {}", request.edits, if comparing { "showing it before".to_string() } else { request.said.replace('\n', " ") })))
+                .child(small(format!("{head} · {} · {}", count(request.edits, "edit"), if comparing { "showing it before".to_string() } else { request.said.replace('\n', " ") })))
                 .child(button("motion-prompt-keep", "Keep", ButtonKind::Primary, ButtonSize::Sm).on_click(cx.listener(move |this, _, _, cx| this.keep_motion_request(&keep, cx))))
                 .child(button("motion-prompt-undo", "Undo", ButtonKind::Secondary, ButtonSize::Sm).tooltip("Take back everything this request changed").on_click(cx.listener(move |this, _, _, cx| {
                     this.undo_motion_request(&undo, cx);
@@ -1046,8 +1081,8 @@ impl Studio {
         for request in shown {
             let state = match &request.outcome {
                 Outcome::Running => format!("Working · {:.0} s", request.seconds()),
-                Outcome::Proposal => format!("Proposed · {} edits{}", request.edits, request.spent()),
-                Outcome::Kept if request.edits > 0 => format!("Kept · {} edits{}", request.edits, request.spent()),
+                Outcome::Proposal => format!("Proposed · {}{}", count(request.edits, "edit"), request.spent()),
+                Outcome::Kept if request.edits > 0 => format!("Kept · {}{}", count(request.edits, "edit"), request.spent()),
                 Outcome::Kept => "Answered".into(),
                 Outcome::Undone => "Undone".into(),
                 Outcome::Stopped => "Stopped".into(),
