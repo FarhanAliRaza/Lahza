@@ -62,7 +62,7 @@ run on Mesa's software Vulkan:
 
 ```bash
 sudo apt install -y mesa-vulkan-drivers libvulkan-dev xvfb \
-  gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav xdotool
 LAHZA_MOTION_SOFTWARE_GPU=1 cargo test --release -p lahza-motion-render -- --test-threads=1
 xvfb-run -a cargo test --release -p lahza -- --ignored --test-threads=1 motion_prompt_tests editor_window
 ```

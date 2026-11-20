@@ -7,14 +7,11 @@ no GPU: Mesa's software Vulkan, Xvfb, a stand-in for the agent). Each
 section says what was done, what was measured and what is left; this is
 the short of it.
 
-Done and run here (pictures looked at; on the merged tree, one thread,
-Mesa's software Vulkan: motion-render 186 tests pass and 21 are ignored
-(measures), motion-core 135, motion-sim 35, motion-mcp 38 and its
-integration tests, the app 122 and its four window tests under Xvfb;
-since, the editor's own later session: motion-sim 36, motion-mcp 39,
-the app 125 with three of `timeline_preview`'s failing in that
-container as before its changes (no `avenc_ffv1`: GStreamer's libav
-plugins were not installed), and seven window tests under Xvfb):
+Done and run here (pictures looked at; on the final merged tree, one
+thread, Mesa's software Vulkan: motion-render 198 tests pass and 29 are
+ignored (measures), motion-core 138, motion-sim 51, motion-mcp 40 and
+its integration tests, the app 128 and its eight window tests under
+Xvfb, which need `xdotool` for the pointer):
 - The editor: drags that stalled (a tick changes one layer and compiles
   one scene), the prompt bar and its two agent runners (Claude Code, or
   an API key alone), undo of a whole request, guarded writes, the
@@ -67,7 +64,7 @@ plugins were not installed), and seven window tests under Xvfb):
   it, and a bead out of focus has the lens's light (it had two and a
   half times as much); `LAHZA_OIDN_WAY` says which way the denoiser's
   pictures go. The four sections were read through for what each still
-  calls left. (motion-render: XXX_PASS pass and XXX_IGN are ignored, the
+  calls left. (motion-render: 198 pass and 29 are ignored, the
   whole suite, one thread, Mesa's software Vulkan.)
 
 - Since, in the simulation (its own section has each with its test): a
