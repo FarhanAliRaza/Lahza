@@ -130,108 +130,255 @@
 Two paths a texel at half size each way, through one jittered point of
 the texel, made the full picture by NVIDIA's DLSS Ray Reconstruction on the
 GPU (`pt.rs` `reconstruct`, `ngx.rs`, the shim in packaging/ngx: `just ngx`
-builds it from a DLSS SDK checkout into ~/.local/lib/lahza). Motion blur is
-a blur of that picture along each texel's motion (`resolve_fast`). On the
+builds it from a DLSS SDK checkout into ~/.local/lib/lahza). On the
 RTX 3060, 1080 x 1920: s01 of the CPU film 24 ms a frame (1.5 s as usual),
 work_e's scenes 18 ms; the reconstruction itself 6 ms. A changed trace
-kernel costs the driver about a minute once.
-- Depth of field is a gather on Ray Reconstruction's picture by each
-  texel's circle of confusion (`dof_fast`; what is lit and what is flat
-  in a texel have their own depths, from `visible`), before the motion
-  blur. A circle is at most 24 texels; a blurred thing in front of a sharp
-  one is only found within reach of eight probes. It cost under a second
-  on s01's 449 frames, 8 s on work_e's 964.
-- **Elsewhere than NVIDIA** (or without the shim) the frames are traced as
-  usual, with a warning, and without motion blur. To do: few samples with
-  temporal accumulation and Open Image Denoise.
-- What is flat (unlit cards and pictures seen directly) and every
-  coverage come from a pass of four primary paths a texel of the full
-  picture, through fixed points (pt.wgsl `visible`), so edges and
-  backdrops stand still and are sharp; Ray Reconstruction's lit colour is
-  laid under that coverage. It costs about 7 ms a frame on s01. A shadow
-  catcher's shadow there is those four paths' (grainy).
-- Motion blur follows a texel's own motion only (a moving edge does not
-  smear over what is still), and what nothing was hit behind has none.
-- The specular guide is the surface's F0, the albedo guide the denoiser's
-  (a metal's is its colour); not compared against NVIDIA's formula.
-- The whole CPU film (5 856 frames) in 2 min 46 s, loading included.
-- Fixed on the way, in the usual path-traced export too (it was there
-  before this branch): a picture over a traced one (an effect on a traced
-  scene) was drawn before the trace's picture was resolved, so it showed
-  what its buffers held some frames before, at that frame's place in the
-  buffer: the scene jumped sideways and its first frames were empty.
-  Such groups are now drawn with the rest (`Rest::later`).
-- Not run: `cargo test`; the editor's preview (only exports take `fast`).
+kernel costs the driver about a minute once. The whole CPU film (5 856
+frames) in 2 min 46 s, loading included. (Measured before what follows;
+nothing below was run on that card.)
 
-What is missing, most wanted first:
-- **The editor's preview takes `fast`.** Only `render` does (`export.rs`),
-  so what is looked at while working is the raster. Where the card allows,
-  the preview would be the traced picture with no new lighting to write.
-  To settle: scrubbing breaks Ray Reconstruction's history (a frame with
-  none before it is its worst), and the preview's own size and pacing.
-- **Elsewhere than NVIDIA.** As above: few samples with temporal
-  accumulation and Open Image Denoise, in place of 1.5 s a frame. Motion
-  blur and depth of field as the fast mode's passes (`resolve_fast`,
-  `dof_fast`), which do not need Ray Reconstruction.
-- **`snapshot` takes `fast`.** An agent cannot look at a frame as a fast
-  export will draw it without rendering the film. A frame alone has no
-  history: a snapshot would trace some frames before `at` first.
-- **Tests.** There are none for the fast mode, and `cargo test` was not
-  run with it. A stand-in for Ray Reconstruction as Open Image Denoise has
-  (`pass_through_oidn`) would let the packing, the visibility pass, the
-  depth of field and the motion blur be checked without the shim.
-- **The shim is built by hand** (`just ngx`, from a DLSS SDK checkout in
-  ignore/); neither `just install` nor the snap has it. Whether NVIDIA's
-  library may be shipped is to be read in its licence.
-- **What is said of it is old.** `render`'s `fast` (tools.rs) and
-  `TraceOptions::fast` (pt.rs) say there is no motion blur or depth of
-  field; there are both.
-- **The picture**, from the notes above:
-  - motion blur follows a texel's own motion: a moving edge does not
-    smear over what is still, and what nothing was hit behind has none;
-  - a circle of confusion is at most 24 texels, and a blurred thing in
-    front of a sharp one is found only within reach of eight probes;
-  - a shadow catcher's shadow is the visibility pass's four paths
-    (grainy);
-  - the specular guide is not compared against NVIDIA's formula;
-  - to look at: the first frames after a cut (whether the history is
-    reset there, and how soon the picture is clean).
+- **Elsewhere than NVIDIA**, or without the shim, the fast mode makes the
+  picture itself (`TraceOptions::fast` without `rr` in pt.rs): four paths
+  a texel at full size (`FAST_SPP_OWN`; a frame with none before it, the
+  first or the first after a cut, sixteen), accumulated over the frames
+  along each surface's motion and denoised (Open Image Denoise, else the
+  built-in filter), then the same passes as with Ray Reconstruction: the
+  visibility pass's coverage and flat colours over it, depth of field,
+  motion blur. A warning says Ray Reconstruction was not used.
+  `LAHZA_FAST=own` leaves Ray Reconstruction out where it is at hand, to
+  compare.
+  - With so few paths their own spread says little of the noise (at one
+    path, nothing), so the built-in filter left the grain. The lighting's
+    spread over the frames (its luminance's two moments, kept with the
+    history) and, for the first four frames, over the texels around tell
+    it instead (pt.wgsl `temporal`, this mode only).
+  - Measured on Mesa's software Vulkan (llvmpipe, LLVM 20, four cores;
+    its numbers, not a card's): 320 x 180, eight frames of a ball rolling
+    past a metal box and a glass ball while the camera turns, the last
+    frame against 512 paths not denoised
+    (`pt::fast_tests::measure_the_fast_mode_against_the_usual_trace`,
+    `--ignored`). Seconds a frame after the first, and dB:
+
+    | | built-in filter | Open Image Denoise 2.3.3 (CPU) |
+    |---|---|---|
+    | usual, 64 paths | 3.95 s, 33.9 dB | 4.04 s, 34.3 dB |
+    | usual, 16 | 1.31 s, 33.4 dB | 1.39 s, 33.9 dB |
+    | usual, 4 | 0.36 s, 27.5 dB | 0.43 s, 27.7 dB |
+    | fast, 8 | 0.51 s, 31.8 dB | 0.52 s, 32.3 dB |
+    | fast, 4 | 0.25 s, 31.0 dB | 0.28 s, 31.4 dB |
+    | fast, 2 | 0.16 s, 30.6 dB | 0.23 s, 31.1 dB |
+    | fast, 1 | 0.11 s, 29.8 dB | 0.13 s, 30.2 dB |
+
+    Four paths: a sixteenth of the usual trace's time for 2.9 dB less, and
+    3.5 dB over the usual trace at the same four paths. (Other test runs
+    shared the machine: the times are within a tenth or so; the dB are
+    not touched by that.) Looked at: the fast picture is close to the
+    usual one; the glass ball is the blotchiest part of both.
+  - Open Image Denoise is not in Ubuntu 24.04's packages (`apt-cache
+    search` has no `libopenimagedenoise`). The release from
+    github.com/RenderKit/oidn (2.3.3, x86_64 linux) works unpacked
+    anywhere with `LAHZA_OIDN=<it>/lib/libOpenImageDenoise.so.2`.
+  - After a cut (160 x 120, a cube before a wall, against 256 paths not
+    denoised): the first frame 44.5 dB (its sixteen paths), the second and
+    third 35.4 and 35.6 dB (four paths each, accumulating).
+- **Cuts.** The history was never reset: a traced list's accumulated
+  lighting, and Ray Reconstruction's own history, went on into the next
+  scene (kept by the list's order in the frame, and `reset` was only set
+  on a tracer's first frame). Now a frame none of whose mesh layers were
+  traced in that list the frame before starts again: the tracer's own
+  accumulation (the usual trace's too) and, through `reset`, Ray
+  Reconstruction's. `Renderer::forget_history` does the same on demand.
+  Not covered: a camera that jumps within a scene (the layers are the
+  same; what was accumulated is tested texel by texel against depth and
+  normal, as before), and a transition between two scenes, during which
+  the two are traced lists 0 and 1 and after which the second becomes
+  list 0 and starts again though it had a history.
+- **`snapshot` takes `fast`** (and the CLI's `snapshot --fast [--warm N]`).
+  A frame alone has no history, so up to `warm` frames before it (default
+  8; only those of its scene) are traced first and thrown away:
+  `Renderer::try_render_warm`, which the editor's preview can call after
+  a scrub (`forget_history` and consecutive `try_render`s while playing).
+  Run through the CLI here: a 480 x 270 frame with four frames before it
+  in 22 s, the usual trace's single frame at 64 paths in 24 s, the raster
+  in 14 s (all three mostly the process's start and its pipelines).
+- **Tests** (`pt_fast_tests.rs`), with a stand-in for Ray Reconstruction
+  as Open Image Denoise has one (`Tracer::pass_through_ngx`: the six
+  images are read back from their textures, and the picture is the colour
+  image enlarged between the trace's jittered samples, put where Ray
+  Reconstruction's would be), and without Ray Reconstruction:
+  what Ray Reconstruction is handed (the images' sizes and contents, the
+  motion against how far the ball's texels moved, the jitter, `reset`);
+  the picture against the usual trace; flat things' exact colours and
+  edges; depth of field lit and unlit; motion blur over a floor, over
+  nothing and past a thing that stands still; a shadow catcher's shadow;
+  a cut; a frame alone and warmed up. All pass on software Vulkan, with
+  the tracer's 40 other tests. The stand-in's picture is noisy and blocky
+  (it is not a denoiser): what Ray Reconstruction makes of the same
+  images is not tested by it.
+- **The shim** is still built by hand (`just ngx`); what it needs, and a
+  reading of NVIDIA's licence, are in packaging/ngx/README.md
+  (`packaging/ngx/check.sh` lists what is missing of the SDK). In short:
+  NVIDIA's library may be shipped inside the application as object code,
+  under terms as protective as theirs and never under an open-source
+  licence (Lahza is MIT: their files need their own notice and stay out
+  of the repository), for NVIDIA GPUs only, with NVIDIA told before a
+  commercial release, their marks in the about box, and not in a cloud
+  service. Left for the owner: whether to ship it, the application id
+  (the shim passes a made-up one), the notice and about-box line, and
+  where the snap's build gets the SDK.
+- **The picture.** Changed, and checked with the stand-in and without
+  Ray Reconstruction (not with it):
+  - Motion blur looked along each texel's own motion only, so a moving
+    edge did not smear over what stood still and nothing smeared over
+    where nothing was hit. Now the picture is cut in tiles of 16 texels
+    with each tile's longest motion (`fast_tiles`), a texel takes the
+    longest that reaches it from the tiles around, and each tap along it
+    is what is there if that passes over the texel in the shutter's time
+    and is not behind it, or if the texel's own surface is away by then
+    and that is behind it (`resolve_fast`). A ball crossing a floor is a
+    streak of its width and its way; alone over nothing its streak is as
+    long as the usual trace's sub-frames make it; a post in front of it
+    keeps its edge. A motion is followed up to 64 texels a shutter. With
+    the stand-in the ball's outline shows faintly inside the streak (the
+    motion has half the picture's size there).
+  - Depth of field found a blurred thing in front of a sharp one only
+    within reach of eight probes. The tiles hold their widest circle of
+    confusion too, and a texel looks as far as the widest that reaches
+    it: a bead of five px far in front of a sharp wall blurs over the
+    wall as wide as the lens blurs it in the usual trace. A circle is
+    still at most 24 texels.
+  - A shadow catcher's shadow on what is flat (footage, a card) was the
+    visibility pass's four paths a texel: grain. The pass now keeps the
+    flat colour and what the catchers let through apart, and that is
+    smoothed across the texels around that show the same flat thing, nine
+    in a row and nine in a column (`fast_catcher`): less grain than 256
+    paths not denoised (0.8 and 0.6 levels against 1.1). A catcher's
+    shadow over nothing (it is the coverage there) is still four paths'.
+    Seen on the way: the usual trace's filter widens a catcher's soft
+    shadow a good deal (against the same scene not denoised); not
+    changed.
+  - The specular guide was the surface's F0. It is now what the surface
+    mirrors of an even light from where it is seen (the environment BRDF
+    of F0 and roughness, by the raster's fit `env_brdf`), which is what
+    NVIDIA's integration guide asks for; their own polynomial
+    (`EnvBRDFApprox2`) is in the SDK's doc/ folder, which was not at
+    hand, so the two fits are not compared number by number.
+
+To run again on the RTX 3060 (nothing above was):
+- `cargo test -p lahza-motion-render fast_tests -- --test-threads=1`, and
+  the measure (`-- --ignored measure_the_fast --nocapture`,
+  `LAHZA_MEASURE=1080,1920,8,256`), with and without `LAHZA_FAST=own`:
+  the table above for a card, and Ray Reconstruction beside it.
+- With Ray Reconstruction itself, looking at: the new specular guide
+  (mirrors and rough metals), the motion blur's streaks at half-size
+  motion, the first frames after a cut now that `reset` is sent there,
+  and a transition between two traced scenes.
+- The time of `fast_tiles`, `fast_catcher` and the new `resolve_fast` at
+  1080 x 1920 (they were about 7 ms for the visibility pass and under a
+  second a film for the depth of field before).
+
+What is missing:
+- **The editor's preview takes `fast`.** Only `render` and `snapshot` do.
+  What it needs is there (`Renderer::set_path` with `fast`,
+  `try_render_warm` after a scrub); src/* is to call it. To settle there:
+  the preview's own size and pacing.
+- **Transitions and camera jumps** keep or lose the history as above.
+- **Ray Reconstruction's picture** of all that changed here.
 
 ## Lighting between the raster and the traced picture
 
-Not started; nothing here is measured. The raster already lights from the
-environment as a sphere of light (`envmap.rs`: a diffuse level and levels
-blurred for roughness; motion.wgsl `env_diffuse`, `env_light`), with shadow
-maps for the lights. What it has not got, and the traced picture has:
-- **Occlusion of the environment's light.** Every point takes the whole
-  sphere, so creases and where things touch do not darken and things seem
-  to float. This is most of what is seen to differ.
-- **Light between things.** Nothing lights or mirrors anything else: a
-  reflection is the environment's only, and glass is screen space.
+The raster lights from the environment as a sphere of light (`envmap.rs`:
+a diffuse level and levels blurred for roughness; motion.wgsl
+`env_diffuse`, `env_light`), with shadow maps for the lights. What it had
+not got, and the traced picture has: the environment's light is not
+hidden by anything (creases and where things touch do not darken, things
+seem to float), and nothing lights or mirrors anything else.
 
-First what is missing of the fast mode above (the preview takes it; a
-fast mode elsewhere than NVIDIA). Where it runs it is all of the traced
-picture for about the rays the visibility below would take (an estimate),
-and there is nothing new to keep matching. What follows is for the
-preview on a card where neither is quick enough, in this order:
-- **Sky visibility in the raster.** One or two rays a texel at half size
-  against the tracer's acceleration structures (pt.rs `geometry`), giving
-  how much of the sphere a point sees and from where (a bent normal);
-  `env_diffuse` is looked up along it and weighted by it, the specular
-  term by it too. Kept over frames along each surface's motion and
-  filtered as the tracer's lighting is (pt.wgsl `atrous`). To settle
-  first:
-  - The structures are built for traced lists only: a raster frame would
-    build them too (what that costs a frame, and in the editor's preview).
-  - The CPU path draws the raster's picture: it needs the same rays (its
-    own BVH), or the two no longer agree.
-  - Without hardware ray tracing the frame is drawn as today.
-  - It is a third lighting to keep close to the traced one: compare
-    against a traced frame of the same scene (`--pt`), as the lobes'
-    diffuse light was.
-- **One bounce of diffuse light**, from the same rays (what a ray hits,
-  lit by its shadow map and the environment): colour between things that
-  are close. Only if the visibility alone still looks flat.
+The fast mode is the first answer where it runs (above: it now runs
+without NVIDIA too, and `snapshot` and the preview's renderer can take
+it). What follows is for a card where it is not quick enough.
+
+- **Sky visibility in the raster, with the light that comes back**
+  (`RenderOptions::sky`, `snapshot` and `render` take `sky`, the CLI
+  `--sky`; off unless asked). A rasterised list with meshes also gives
+  its solid meshes to the tracer (`list.rs` `sky_list`: a `Trace` with
+  `TraceOptions::sky`, and a group of half the target's size). For each
+  texel the tracer finds the surface it shows and sends two rays from it
+  (`SKY_RAYS`), spread by the cosine, toward points of one fixed set: a
+  texel has those of its place in a 4 x 4 tile, so sixteen texels
+  together have 32 directions (pt.wgsl `sky`). An open ray adds its
+  direction; one that ends on a surface adds that surface's light: its
+  colour under the lights (shadows by rays) and under the sky, horizon
+  and ground. `sky_filter` makes the sixteen one value over the texels on
+  the same plane, each place of the tile weighing the same. The group
+  holds, a texel, the mean open direction, the open part and the depth,
+  and the light that comes back. The raster's shading reads it by depth
+  (motion.wgsl `sky_at`): `env_diffuse` along the open direction times
+  the open part, ambient lights times it, what is mirrored of the
+  environment less by it (Lagarde's fit), and the light that comes back
+  added to the diffuse light.
+  Nothing is drawn by lot from frame to frame and nothing is kept from
+  the frame before: a raster frame is cached by its lists and drawn in
+  any order, so the same frame has to be the same picture (tested).
+  The three points:
+  - *The structures for a raster frame.* Built by the tracer as for a
+    traced list: a mesh's structure once (kept by its parameters; a mesh
+    that changes every frame is built every frame, as traced), the
+    list's top structure every frame. On software Vulkan, 480 x 270,
+    five meshes (`sky_tests::measure_sky_visibility`, `--ignored`): the
+    meshes' structures 5 ms once, the top one 0.1 ms a frame, the tables
+    7 ms a frame on the CPU, the kernel's pipeline 1.1 s once. The frame
+    itself: 142 ms against 90 ms without (by the GPU's own clock, over
+    five frames, the rays 430 ms and the filter 58 ms). Software Vulkan's
+    numbers. In the editor's preview: not run.
+    With motion blur each sub-frame has its own rays (they are not
+    shared as a traced picture's are).
+  - *The CPU path.* Not done: the CPU draws as without (tested), so with
+    `sky` on the GPU's and the CPU's pictures differ, which is why it is
+    off unless asked and the tests that compare the two run without it.
+    A GPU that fails in the middle of an export falls back to the CPU
+    and the lighting changes there. The rays are a fixed set with no
+    history so that the CPU can cast the same: it needs a BVH over the
+    list's triangles in camera space, the same directions, the hit's
+    lighting (its shadow maps would stand in for the shadow rays, so not
+    quite the same) and the same filter.
+  - *Without hardware ray tracing* the frame is drawn as today: the
+    builder only asks for sky visibility where the GPU traces.
+  Against a traced frame of the same scene (a ball, a box with a slab
+  over it, a floor and a wall; 320 x 180 and 480 x 270, 64 paths):
+  - Lit by the environment only: where the ball stands the floor is 0.69
+    of the plain raster's (traced: 0.62), the open floor 0.94 (0.99); the
+    whole picture 25.4 dB from the traced one (26.0 dB without sky
+    visibility: the contacts are there now, but the picture is 6% darker
+    than traced, one bounce being less than all of them, and the light
+    that comes back is blotchy at two rays a texel).
+  - With the default lights: 33.6 dB from the traced picture, 27.3 dB
+    without. Seen: the wall takes the floor's light, the ball's underside
+    is lit from below, the gap under the slab is dark, as traced.
+- **One bounce of diffuse light** was to come only if visibility alone
+  still looked flat. It did worse than that: every face that looks at
+  another lost the light the environment's ground and horizon stood for
+  (the wall and the box's sides plainly darker), and the picture was 16.1 dB
+  from the traced one where the plain raster is 26.0 dB. So the bounce
+  is in, from the same rays, as above.
+
+What is left:
+- The CPU's rays, as above; until then `sky` stays off by default.
+- The editor's preview does not ask for it (src/*: `Renderer::set_sky`).
+- Run on the RTX 3060: `cargo test -p lahza-motion-render sky_tests --
+  --test-threads=1` and its measure (`--ignored`,
+  `LAHZA_MEASURE=1080,1920`): the cost there (rays, filter, the
+  structures of a film's scenes), whether four rays a texel (`SKY_RAYS`)
+  are affordable (they would halve the blotches), and the picture
+  through the raster's hardware visibility pass, which software Vulkan
+  does not have (only the compute raster's shading was run with it).
+- Only solid meshes are in the rays: what is see-through, cards, wires,
+  volumes and shadow catchers neither hide the sky nor take it (they are
+  lit as before).
+- With an environment image the light that comes back is the lights'
+  only (the image is not looked up at what the rays hit).
+- A second bounce (the 6%), and anything mirrored of other things: not
+  done. The fast mode has them.
 
 Not to do: light probes placed through the scene (irradiance volumes,
 DDGI). They suit large scenes that stand still; these are small and
