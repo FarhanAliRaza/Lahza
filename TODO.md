@@ -163,6 +163,40 @@ kernel costs the driver about a minute once.
   Such groups are now drawn with the rest (`Rest::later`).
 - Not run: `cargo test`; the editor's preview (only exports take `fast`).
 
+What is missing, most wanted first:
+- **The editor's preview takes `fast`.** Only `render` does (`export.rs`),
+  so what is looked at while working is the raster. Where the card allows,
+  the preview would be the traced picture with no new lighting to write.
+  To settle: scrubbing breaks Ray Reconstruction's history (a frame with
+  none before it is its worst), and the preview's own size and pacing.
+- **Elsewhere than NVIDIA.** As above: few samples with temporal
+  accumulation and Open Image Denoise, in place of 1.5 s a frame. Motion
+  blur and depth of field as the fast mode's passes (`resolve_fast`,
+  `dof_fast`), which do not need Ray Reconstruction.
+- **`snapshot` takes `fast`.** An agent cannot look at a frame as a fast
+  export will draw it without rendering the film. A frame alone has no
+  history: a snapshot would trace some frames before `at` first.
+- **Tests.** There are none for the fast mode, and `cargo test` was not
+  run with it. A stand-in for Ray Reconstruction as Open Image Denoise has
+  (`pass_through_oidn`) would let the packing, the visibility pass, the
+  depth of field and the motion blur be checked without the shim.
+- **The shim is built by hand** (`just ngx`, from a DLSS SDK checkout in
+  ignore/); neither `just install` nor the snap has it. Whether NVIDIA's
+  library may be shipped is to be read in its licence.
+- **What is said of it is old.** `render`'s `fast` (tools.rs) and
+  `TraceOptions::fast` (pt.rs) say there is no motion blur or depth of
+  field; there are both.
+- **The picture**, from the notes above:
+  - motion blur follows a texel's own motion: a moving edge does not
+    smear over what is still, and what nothing was hit behind has none;
+  - a circle of confusion is at most 24 texels, and a blurred thing in
+    front of a sharp one is found only within reach of eight probes;
+  - a shadow catcher's shadow is the visibility pass's four paths
+    (grainy);
+  - the specular guide is not compared against NVIDIA's formula;
+  - to look at: the first frames after a cut (whether the history is
+    reset there, and how soon the picture is clean).
+
 ## Lighting between the raster and the traced picture
 
 Not started; nothing here is measured. The raster already lights from the
@@ -175,7 +209,11 @@ maps for the lights. What it has not got, and the traced picture has:
 - **Light between things.** Nothing lights or mirrors anything else: a
   reflection is the environment's only, and glass is screen space.
 
-To do, in this order:
+First what is missing of the fast mode above (the preview takes it; a
+fast mode elsewhere than NVIDIA). Where it runs it is all of the traced
+picture for about the rays the visibility below would take (an estimate),
+and there is nothing new to keep matching. What follows is for the
+preview on a card where neither is quick enough, in this order:
 - **Sky visibility in the raster.** One or two rays a texel at half size
   against the tracer's acceleration structures (pt.rs `geometry`), giving
   how much of the sphere a point sees and from where (a bent normal);
@@ -194,16 +232,63 @@ To do, in this order:
 - **One bounce of diffuse light**, from the same rays (what a ray hits,
   lit by its shadow map and the environment): colour between things that
   are close. Only if the visibility alone still looks flat.
-- **Elsewhere than NVIDIA**: few samples with temporal accumulation and
-  Open Image Denoise, as under the fast mode above. It is the tracer's
-  own picture, so there is nothing new to keep matching.
-- **The editor's preview takes `fast`** (only exports do), so what is
-  looked at while working is the traced picture where the card allows.
 
 Not to do: light probes placed through the scene (irradiance volumes,
 DDGI). They suit large scenes that stand still; these are small and
 everything in them moves, a grid would be relit every frame, and probes
 blur away the contact shadows that are what is missing.
+
+## Simulation: rigid bodies, ragdolls, crowds
+
+Not started; nothing here is measured. The engine has no physics and no
+skeletons or skinning (`model_import` reads the animation of nodes; morph
+targets are refused), so every part below is new. In the order to build:
+
+1. **Rigid bodies and joints.** `rapier3d`, built to give the same result
+   everywhere (`enhanced-determinism`); it has joint limits and motors.
+   - A simulation has state, and a frame here is drawn from its time
+     alone. So it is baked: stepped at a fixed rate from its start, each
+     body's transform kept per frame in the project's folder, and baked
+     again when what it depends on changes. Drawing reads the bake, so
+     scrubbing, the CPU and GPU pictures and exports stay as they are.
+   - In the document: which mesh layers are bodies (shape, mass,
+     friction, bounce), what stands still, and pushes at times (time
+     references as keys take them).
+   - Of use by itself: letters that tumble, things that drop, stack and
+     knock into each other.
+2. **Skeletons and skinning.** glTF skins (joints, weights, inverse bind
+   matrices); skinning as a deformer in the GPU's mesh pool, with the
+   CPU's the same. Needed for any character.
+3. **A ragdoll that falls.** A capsule per bone and joint limits from the
+   skeleton; it takes the pose and speed an animation left it with.
+4. **A ragdoll that acts.** Motors follow a clip; a limb's strength is
+   keyed (a leg that was hit bears no weight); behaviours with params set
+   the motors' targets: balance, a step to keep it, a hand toward what is
+   coming, a reach for where it was hit, arms about the head. Balance and
+   stepping are the hard part, and what stops a motor pressing into a
+   wall.
+5. **Directing it.** What writes the film (an LLM) writes intent on the
+   timeline ("pushed from the left at 2.1 s, tries to stop it with the
+   right hand, stumbles, recovers") as events and behaviours; the bake
+   runs; `snapshot` and `review` look at the take, and another seed is
+   another take. Nothing is in real time, so takes cost only time. This
+   stays the same whatever sets the motors.
+6. **A network that sets the motors**, behind 5: each step it reads the
+   body's state and what it touches or is about to, and gives the
+   motors' targets. Running one is `ort`, already here. Getting one:
+   - a policy trained by reinforcement learning: a simulator run many
+     thousands of times at once on a GPU, motion capture to learn from
+     (its licences to be read), days of training; a policy holds for the
+     simulator and the body it was trained with, so one trained elsewhere
+     may not hold in rapier;
+   - or no training: each step, try many targets a little way ahead in
+     the simulator and keep the best. No data; it costs time a shot.
+   To decide after 4, against what 4's behaviours already do.
+7. **Crowds.** Steering for where each one goes, a clip played per agent,
+   a ragdoll only for the ones hit. A skinned agent is a mesh of its own
+   every frame (in the tracer an acceleration structure each): how many an
+   export bears is to be measured; thousands would be pictures of agents
+   (impostors), not meshes.
 
 ## Slang
 
