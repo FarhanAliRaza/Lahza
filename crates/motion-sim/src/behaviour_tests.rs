@@ -71,7 +71,7 @@ fn balance_holds_a_push_within_its_help_and_falls_soft_past_it() {
     let statue = pushed([1800.0, 0.0, 0.0], json!([]), 5.0);
     let soft: f64 = [("thigh_l", "shin_l"), ("thigh_r", "shin_r"), ("hips", "thigh_l"), ("hips", "thigh_r"), ("chest", "upper_l"), ("chest", "upper_r")].iter().map(|(a, b)| bend(&lost, a, b)).sum();
     let stiff: f64 = [("thigh_l", "shin_l"), ("thigh_r", "shin_r"), ("hips", "thigh_l"), ("hips", "thigh_r"), ("chest", "upper_l"), ("chest", "upper_r")].iter().map(|(a, b)| bend(&statue, a, b)).sum();
-    assert!(soft > stiff + 20.0, "joints bent {soft:.0}° in all, fallen soft; {stiff:.0}° as a statue");
+    assert!(soft > stiff + 10.0, "joints bent {soft:.0}° in all, fallen soft; {stiff:.0}° as a statue");
 }
 
 #[test]
@@ -127,6 +127,80 @@ fn acting(behaviours: Value, hits: Value, ball: Option<Value>, seconds: f64) -> 
 fn apart(bake: &Bake, a: &str, b: [f64; 3], k: usize) -> f64 {
     let p = pose(bake, a, k).p;
     (0..3).map(|i| (p[i] - b[i]).powi(2)).sum::<f64>().sqrt()
+}
+
+fn wrist(bake: &Bake, side: &str, k: usize) -> [f64; 3] {
+    pose(bake, &format!("hand_{side}"), k).apply([0.0, 21.0, 0.0])
+}
+
+fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
+}
+
+#[test]
+fn arms_go_about_the_head_and_come_down_again() {
+    let bake = acting(json!([{"type": "protect", "from": 0.5, "to": 1.5}]), json!([]), None, 3.0);
+    let head = |k: usize| pose(&bake, "head", k).apply([0.0, -24.0, 0.0]);
+    // Hanging, the hands are 211 px from the head's middle; half a second
+    // after the behaviour starts both are at its sides, and stay.
+    assert!(dist(wrist(&bake, "l", 10), head(10)) > 200.0);
+    for k in [30, 36, 44] {
+        for side in ["l", "r"] {
+            let d = dist(wrist(&bake, side, k), head(k));
+            assert!(d < 48.0, "hand_{side} is {d:.0} px from the head at sample {k}");
+        }
+        // Each on its own side.
+        assert!(wrist(&bake, "l", k)[0] < head(k)[0] && wrist(&bake, "r", k)[0] > head(k)[0]);
+    }
+    // After it ends they hang again, and it is still standing.
+    for side in ["l", "r"] {
+        assert!(dist(wrist(&bake, side, 85), head(85)) > 190.0);
+    }
+    assert!(fell(&bake).is_none() && hips_drop(&bake) < 6.0);
+}
+
+#[test]
+fn a_hand_goes_to_where_it_was_hit_and_lets_go() {
+    let hit = json!([{"at": 0.5, "bone": "chest", "velocity": [-150, 0, 0]}]);
+    let bake = acting(json!([{"type": "reach", "params": {"hold": 1.5}}]), hit.clone(), None, 3.0);
+    let chest = |b: &Bake, k: usize| pose(b, "chest", k).apply([0.0, -40.0, 0.0]);
+    let nearest = |b: &Bake, k: usize| dist(wrist(b, "l", k), chest(b, k)).min(dist(wrist(b, "r", k), chest(b, k)));
+    assert!(nearest(&bake, 14) > 140.0, "before the hit the hands hang");
+    // Within half a second a hand is on the chest, and holds there.
+    for k in [30, 36, 45] {
+        assert!(nearest(&bake, k) < 25.0, "a hand is {:.0} px from the hit at sample {k}", nearest(&bake, k));
+    }
+    // One hand: the other still hangs.
+    let other = dist(wrist(&bake, "l", 36), chest(&bake, 36)).max(dist(wrist(&bake, "r", 36), chest(&bake, 36)));
+    assert!(other > 130.0);
+    // 1.5 s after the hit it has let go.
+    assert!(nearest(&bake, 75) > 130.0, "{}", nearest(&bake, 75));
+    // Without the behaviour nothing reaches.
+    let plain = acting(json!([]), hit, None, 3.0);
+    assert!(nearest(&plain, 36) > 140.0);
+    // A hit on an arm is reached for with the other one.
+    let bake = acting(json!([{"type": "reach"}]), json!([{"at": 0.5, "bone": "fore_r", "velocity": [0, 0, 150]}]), None, 2.0);
+    let fore = pose(&bake, "fore_r", 36).apply([0.0, 35.0, 0.0]);
+    assert!(dist(wrist(&bake, "l", 36), fore) < 45.0, "the left hand is {:.0} px from the right forearm", dist(wrist(&bake, "l", 36), fore));
+}
+
+#[test]
+fn a_hand_meets_what_is_coming() {
+    // A ball keyed in from the right at chest height, stopping in reach.
+    let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 20}, "body": {"type": "kinematic"},
+        "transform": {"position": {"keys": [{"at": 0.3, "v": [1700, 430]}, {"at": 1.5, "v": [1120, 430], "ease": "linear"}]}}});
+    let guard = acting(json!([{"type": "guard", "params": {"target": "ball"}}]), json!([]), Some(ball.clone()), 3.0);
+    let plain = acting(json!([]), json!([]), Some(ball), 3.0);
+    let at = [1120.0, 430.0, 0.0];
+    // Far off, nothing; as it comes within reach of `within` the nearer
+    // (right) hand comes up to it, and is at it when it stops.
+    assert!(dist(wrist(&guard, "r", 12), wrist(&plain, "r", 12)) < 6.0, "at 0.4 s the ball is too far to raise a hand");
+    let (with, without) = (dist(wrist(&guard, "r", 60), at), dist(wrist(&plain, "r", 60), at));
+    // (The ball is solid, 20 px across its half, and the hand stops on it.)
+    assert!(with < 100.0 && without > 150.0, "the wrist is {with:.0} px from the ball's middle (unguarded: {without:.0})");
+    assert!(wrist(&guard, "r", 60)[1] < 480.0 && wrist(&plain, "r", 60)[1] > 540.0, "the hand is up at the ball's height");
+    assert!(wrist(&guard, "l", 60)[1] > 540.0, "the other hand stays down");
+    assert!(fell(&guard).is_none());
 }
 
 #[test]

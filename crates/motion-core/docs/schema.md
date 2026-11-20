@@ -689,6 +689,7 @@ the defaults):
 | `flat` | `true`: bodies stay in the picture plane and turn about z only (flat layers as bodies) |
 | `seed`, `jitter` | `jitter` px/s of random speed (and degrees/s of spin) for each body at its release; another `seed` is another take |
 | `joints` | below |
+| `ragdolls` | skeletons simulated bone by bone (below) |
 | `blasts` | `[{"at": time, "origin": [x, y, z], "speed": px/s, "radius": px}]`: every body within `radius` is thrown away from `origin`, less the farther it is |
 
 Joints hold body `a` to body `b`, or to the world when `b` is left out:
@@ -715,6 +716,61 @@ each other unless `collide`. A `motor` drives a hinge (degrees) or slider
   {"type": "rope", "a": "wrecker", "anchor_b": [900, 60, 0], "length": 440}
 ]}
 ```
+
+#### Ragdolls
+
+`simulation.ragdolls` makes a skeleton a body of many parts: every bone
+(the comps `model_import` makes of a skin's joints) becomes a capsule
+along it, held to its parent bone by a joint with limits. Until `release`
+the bones follow their keys (the file's animation); from then the
+simulation has them, starting with the pose and speed the animation left.
+The skinned mesh follows the bones as always.
+
+```json
+"simulation": {"unit": 240, "ragdolls": [{
+  "id": "doll", "root": "hero-hips", "release": "hit:3", "strength": 1,
+  "limits": [{"bone": "shin", "swing": 140, "hinge": [-1, 0, 0]}, {"bone": "upper", "swing": 100, "twist": 60}],
+  "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [24, 14, 60], "offset": [0, 7, -12]}}],
+  "strengths": [{"bone": "thigh_l", "strength": {"keys": [{"at": "hit:3", "v": 0}]}}],
+  "hits": [{"at": "hit:3", "bone": "chest", "velocity": [600, 0, 0]}],
+  "behaviours": [{"type": "balance"}, {"type": "step"}, {"type": "protect", "from": "hit:3 - 0.4", "to": "hit:3 + 0.6"}]
+}]}
+```
+
+| field | meaning |
+|---|---|
+| `root` | the layer the skeleton hangs from (its first bone) |
+| `bones` | the bones' layer ids (default: every comp under `root` that a skin names as a joint; with no skin, every comp under it) |
+| `release` | a time: its keys until then (default: the simulation's start) |
+| `rest` | the time whose pose is the joints' zero, from which `limits` are measured (default: the simulation's start; pick a moment it stands straight) |
+| `mass` | kg (70), shared among the bones by volume |
+| `thickness` | a capsule's radius as a fraction of its bone's length (0.22) |
+| `limits` | per bone (its id, or text its id contains; the first that matches): `swing` degrees it may bend (40) and `twist` degrees about its length (20); with `hinge` [x, y, z] (an axis in the bone's space) it bends about that axis only, 0 to `swing` (knees, elbows: flip the axis to bend the other way). The limits must allow what the clip does |
+| `shapes` | per bone, a collider in place of the capsule (`box`, `sphere`, `capsule`, `cylinder`, px in the bone's space): a foot is a box that stands flat |
+| `strength` | 0..1, animatable: how hard the motors hold the pose the clip has at each moment. 0 is limp (it only falls); 1 holds the pose like a statue, which topples as one unless a behaviour keeps it up |
+| `strengths` | per bone and what hangs from it, a strength (animatable) times the body's: a leg that was hit bears no weight |
+| `hits` | `[{"at": time, "bone": id, "velocity": [x, y, z] px/s, "dur": seconds}]`: a blow on a bone |
+| `behaviours` | below |
+
+A ragdoll's bones do not collide with each other (they collide with
+everything else). A motor never gives more torque than a set acceleration
+of what hangs from its joint needs, so a limb held against a wall presses
+with that and no harder.
+
+Behaviours set the motors' targets on top of the clip, from `from` to
+`to` (times; default the whole simulation), by `amount` (0..1, animatable):
+
+| `type` | what it does; `params` |
+|---|---|
+| `balance` | keeps its weight over its feet: leans at the ankles, and is helped by a force on the hips of at most `assist` (0.25) of its weight and the torque that would make. A push past that topples it; it then goes soft (to `limp`, 0.15, of its strength) and stays down (a `fall` event). `gain` (1): how far it leans. Needs feet (bones named `foot`) |
+| `step` | with `balance`: when its weight is headed past its feet by `trigger` px it steps the foot behind to where it is falling to, at most `length` px, in `time` seconds (0.28); a `step` event each. The foot is carried there by a force, its leg soft |
+| `guard` | the nearer hand (or `hand`: `left` \| `right`) to `target` (a body's layer id, or [x, y, z]) as it comes within `within` px |
+| `reach` | a hand to where it was last hit (a `hits` entry, or a body striking it at speed), for `hold` seconds (1.5) |
+| `protect` | both hands to the sides of the head |
+
+Arms are bones named `hand` with the two above them; the head is the bone
+named `head`. Bakes with ragdolls list `fall` and `step` events with the
+touches.
 
 A bake also lists what happened, for timing sound and cuts to it: the
 first touches between bodies with their closing speed in px/s (`sim_bake`

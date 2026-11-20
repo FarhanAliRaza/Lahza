@@ -187,7 +187,7 @@ fn a_ragdoll_bakes_to_the_same_bytes() {
     assert!(a == b, "two bakes of one ragdoll differ");
     let mut h = lahza_motion_core::sim::Fnv::default();
     h.bytes(&a);
-    assert_eq!((a.len(), h.0), (30563, 0xc7a41c567af8da84), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!((a.len(), h.0), (30237, 0xf179add661f3dd20), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
 #[test]

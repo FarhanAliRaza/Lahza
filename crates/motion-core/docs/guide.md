@@ -377,6 +377,30 @@ motion reads as slow and heavy, the things are big: raise `unit` or
 unless `"shape": {"type": "pieces"}`. Thin fast things that pass through
 each other want `"ccd": true`.
 
+## Directing a body: ragdolls
+
+A character that is hit, falls, stumbles or braces is not keyed: its
+skeleton is a ragdoll (`simulation.ragdolls`, see the schema) and you
+write what happens to it and what it tries to do, on the timeline:
+
+- **What happens**: `hits` on bones at times, bodies thrown at it, the
+  floor. `release` is when physics takes over from the clip.
+- **What it does**: `strength` (0 limp, 1 holding the clip's pose), keyed
+  over time and per limb (`strengths`: the struck leg gives way), and
+  `behaviours` over spans: `balance`, `step`, `guard`, `reach`, `protect`.
+  "Pushed from the left at 2.1 s, raises its arms, stumbles, recovers" is
+  a hit at 2.1, `protect` from 1.8 to 2.6, `balance` and `step` throughout.
+- **A take**: `sim_bake`, then `snapshot` a sheet across the action.
+  The bake's events say what happened (`fall` at 2.9 s, `step` ×3, who
+  touched whom): if it fell and should not have, raise `balance`'s
+  `assist` or soften the hit; if it stood like a post, lower `strength`.
+  `sim_bake {"seed": n}` is another take.
+
+Give knees and elbows `hinge` limits, feet a box `shape`, and set
+`simulation.unit` to the model's px per metre so it weighs what it looks.
+Balance is helped by a bounded force on the hips: it is a stand-in for the
+footwork a real body does, not a model of it.
+
 ## Footage and Blender
 
 - Footage: `media_import` a clip or image sequence, then add a

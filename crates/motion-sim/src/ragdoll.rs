@@ -10,21 +10,32 @@ use rapier3d::prelude::*;
 /// (acceleration-based: the same whatever the bone weighs). Set by trial:
 /// at these a joint follows a clip that turns it 450° a second within a
 /// few degrees and settles without swinging; at a tenth of the pull it
-/// trails by a quarter second and swings. A limp joint keeps `LIMP` of
+/// trails by a quarter second and swings.
+///
+/// The motor is a joint of its own beside the one that holds the bone
+/// and limits it, and its frame on the parent is turned to the target
+/// each step: rapier takes a turn apart by axis, which is right near
+/// zero and swings a joint far from it (a raised arm is 150° from where
+/// it hangs). So the motor always aims for zero.
+///
+/// No motor gives more torque than `MOST` (radians per second²) would
+/// need on the inertia of what hangs from its joint: a limb held against
+/// a wall presses with that and no harder. A limp joint keeps `LIMP` of
 /// damping: flesh, not a hinge on a bearing.
 pub const PULL: f64 = 9000.0;
 pub const CALM: f64 = 190.0;
+pub const MOST: f64 = 600.0;
 pub const LIMP: f64 = 4.0;
 
 /// A ragdoll's joints in the world.
 pub struct Rig {
-    /// Per bone: its joint to its parent, and the joint's frame on the
-    /// parent and on the bone (rotations).
-    pub joints: Vec<Option<(ImpulseJointHandle, Rotation, Rotation)>>,
-    /// Per bone: the motor's target at the last step (its speed is the
-    /// change: a motor that only knew where to be would trail a moving
-    /// target).
-    last: Vec<Option<[f32; 3]>>,
+    /// Per bone: its joint to its parent, and its motor.
+    pub joints: Vec<Option<(ImpulseJointHandle, ImpulseJointHandle)>>,
+    /// Per bone: the inertia about its joint of what hangs from it (kg·m²).
+    inertia: Vec<f64>,
+    /// Per bone: the clip's target at the last step (its speed is the
+    /// change: a motor that only knew where to be would trail it).
+    last: Vec<Option<[f64; 4]>>,
 }
 
 /// Bodies of one group (a ragdoll's bones) do not collide with each
@@ -64,7 +75,31 @@ impl World {
     pub(crate) fn add_ragdolls(&mut self, input: &SimInput) {
         let m = 1.0 / self.unit;
         for r in &input.ragdolls {
-            let mut rig = Rig { joints: Vec::with_capacity(r.bones.len()), last: vec![None; r.bones.len()] };
+            // What hangs from each joint, and how far out.
+            let place = |b: &lahza_motion_core::sim::BoneInput| {
+                let p = &input.bodies[b.body].keyed[0];
+                (p.p, p.apply(b.along.map(|v| v * b.length * 0.5)))
+            };
+            let inertia: Vec<f64> = (0..r.bones.len())
+                .map(|k| {
+                    let joint = place(&r.bones[k]).0;
+                    let mut sum = 0.0;
+                    for (d, bone) in r.bones.iter().enumerate() {
+                        let mut cur = Some(d);
+                        while let Some(c) = cur {
+                            if c == k {
+                                let centre = place(bone).1;
+                                let far: f64 = (0..3).map(|a| ((centre[a] - joint[a]) * m).powi(2)).sum();
+                                sum += bone.mass * (far + (bone.length * m).powi(2) / 12.0);
+                                break;
+                            }
+                            cur = r.bones[c].parent;
+                        }
+                    }
+                    sum.max(1e-4)
+                })
+                .collect();
+            let mut rig = Rig { joints: Vec::with_capacity(r.bones.len()), inertia, last: vec![None; r.bones.len()] };
             for b in &r.bones {
                 let Some(p) = b.parent else {
                     rig.joints.push(None);
@@ -82,8 +117,18 @@ impl World {
                 };
                 data.set_local_frame1(Pose::from_parts(v3(b.anchor_parent, m), on_parent)).set_local_frame2(Pose::from_parts(Vector::ZERO, on_child));
                 data.set_contacts_enabled(false);
+                // (The limp damping is this joint's.)
+                let axes: &[JointAxis] = if b.hinge.is_some() { &[JointAxis::AngX] } else { &[JointAxis::AngX, JointAxis::AngY, JointAxis::AngZ] };
+                for axis in axes {
+                    data.set_motor(*axis, 0.0, 0.0, 0.0, LIMP as f32);
+                }
                 let h = self.w.insert_impulse_joint(parent, child, data);
-                rig.joints.push(Some((h, on_parent, on_child)));
+                // The motor: nothing held, three turning axes driven.
+                let mut motor = GenericJointBuilder::new(JointAxesMask::empty()).build();
+                motor.set_local_frame1(Pose::from_parts(v3(b.anchor_parent, m), quat(b.bind))).set_local_frame2(Pose::identity());
+                motor.set_contacts_enabled(false);
+                let hm = self.w.insert_impulse_joint(parent, child, motor);
+                rig.joints.push(Some((h, hm)));
             }
             self.rigs.push(rig);
         }
@@ -93,35 +138,33 @@ impl World {
     /// ends at sample position `x`. `targets`: per bone, a turn against
     /// its parent that stands for the clip's (a behaviour's, a search's).
     pub fn drive_ragdoll(&mut self, r: &RagdollInput, rig: usize, x: f64, targets: Option<&[Option<[f64; 4]>]>, scale: Option<&[f64]>) {
+        let dt = self.dt;
+        let m = 1.0 / self.unit;
         for (k, b) in r.bones.iter().enumerate() {
-            let Some((h, on_parent, on_child)) = self.rigs[rig].joints[k] else { continue };
+            let Some((_, motor)) = self.rigs[rig].joints[k] else { continue };
             let strength = (sampled(&b.strength, x) * scale.and_then(|s| s.get(k).copied()).unwrap_or(1.0)).clamp(0.0, 1.0);
             let given = targets.and_then(|t| t.get(k).copied().flatten());
-            let want = given.or_else(|| clip_at(&b.clip, x)).unwrap_or(b.bind);
-            // In the joint's frames: nothing at the rest pose.
-            let mut q = on_parent.inverse() * quat(want) * on_child;
-            if q.w < 0.0 {
-                q = -q;
-            }
-            let Some(joint) = self.w.impulse_joints.get_mut(h, strength > 0.0) else { continue };
-            let (pull, calm) = ((PULL * strength) as f32, (LIMP + CALM * strength) as f32);
-            // (A motor's place on an axis is twice the arc sine of the
-            // turn's part about it.)
-            let turn = [q.x, q.y, q.z].map(|v| 2.0 * v.clamp(-1.0, 1.0).asin());
-            let dt = self.dt as f32;
-            // (The clip's speed only: a behaviour's target is worked out
-            // from the body's own state each step, and its change is not
-            // a speed to follow.)
-            let speed: [f32; 3] = match (self.rigs[rig].last[k], given) {
-                (Some(was), None) => std::array::from_fn(|a| (turn[a] - was[a]) / dt),
+            let clip = clip_at(&b.clip, x);
+            let want = given.or(clip).unwrap_or(b.bind);
+            // The clip's own turning, in the target's frame (a behaviour's
+            // target is worked out from the body each step: its change is
+            // no speed to follow).
+            let was = std::mem::replace(&mut self.rigs[rig].last[k], clip);
+            let follow = match (given, was, clip) {
+                (None, Some(a), Some(c)) => {
+                    let d = quat_mul([-a[0], -a[1], -a[2], a[3]], c);
+                    let d = if d[3] < 0.0 { d.map(|v| -v) } else { d };
+                    let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    if s < 1e-12 { [0.0; 3] } else { [0, 1, 2].map(|a| d[a] / s * 2.0 * libm::atan2(s, d[3]) / dt) }
+                }
                 _ => [0.0; 3],
             };
-            self.rigs[rig].last[k] = Some(turn);
-            let axes: &[(JointAxis, usize)] = if b.hinge.is_some() { &[(JointAxis::AngX, 0)] } else { &[(JointAxis::AngX, 0), (JointAxis::AngY, 1), (JointAxis::AngZ, 2)] };
-            for (axis, a) in axes {
-                // (The limp part of the damping is against any turning,
-                // the motor's toward the target's speed.)
-                joint.data.set_motor(*axis, turn[*a], speed[*a] * (calm - LIMP as f32) / calm, pull, calm);
+            let most = (MOST * strength * self.rigs[rig].inertia[k]) as f32;
+            let Some(joint) = self.w.impulse_joints.get_mut(motor, strength > 0.0) else { continue };
+            joint.data.set_local_frame1(Pose::from_parts(v3(b.anchor_parent, m), quat(want)));
+            for (a, axis) in [JointAxis::AngX, JointAxis::AngY, JointAxis::AngZ].into_iter().enumerate() {
+                joint.data.set_motor(axis, 0.0, follow[a] as f32, (PULL * strength) as f32, (CALM * strength) as f32);
+                joint.data.set_motor_max_force(axis, most);
             }
         }
     }

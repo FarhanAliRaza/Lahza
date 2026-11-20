@@ -4,7 +4,7 @@
 
 Writes the test character (character.py), imports it (`model-import`: its
 joints become layers, its mesh a skinned mesh) and makes three scenes of
-it walking on the spot until a ball strikes it at 1 s:
+it walking on the spot until a ball strikes it at 0.87 s:
 
   limp   — every motor off from the hit: it drops as it was
   hold   — motors at full strength hold the walk's last pose: it is
@@ -62,7 +62,7 @@ LIMITS = [
 
 def scene(name, start, ragdoll):
     hero = f"{name}-hero"
-    doll = dict({"id": "doll", "root": f"{hero}-hips", "release": start + 1.0, "rest": start + 0.0, "limits": LIMITS, "mass": 70}, **ragdoll)
+    doll = dict({"id": "doll", "root": f"{hero}-hips", "release": start + 0.8, "rest": start + 0.0, "limits": LIMITS, "mass": 70}, **ragdoll)
     return {
         "id": name, "start": start, "end": start + LEN, "background": "#eef0f4",
         "camera": {"fov": 38, "orbit": [-28, 10]},

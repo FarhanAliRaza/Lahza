@@ -132,3 +132,27 @@ fn a_skinned_model_is_imported_with_its_joints_and_bends_with_them() {
     assert_eq!(left(&shot(&mut tb, 1.0)), left(&rest));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_skinned_model_falls_as_a_ragdoll_and_its_mesh_goes_with_it() {
+    let (mut tb, dir) = toolbox("ragdoll");
+    let model = lahza_motion_render::model::write_test_arm(&dir.join("src")).unwrap();
+    tb.call("project_create", json!({"path": "arm", "duration": 3, "width": 480, "height": 360})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1", "background": "#101014"}]})).unwrap();
+    tb.call("model_import", json!({"path": model.display().to_string(), "scene": "s1", "position": [240, 200]})).unwrap();
+    // The arm's three joints as a ragdoll, let go at 1 s (the end of its
+    // bend), limp, over a floor.
+    tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "s1.simulation", "value": {"ground": {"y": 330}, "ragdolls": [{"id": "doll", "root": "arm-root", "release": 1.0, "rest": 0.0, "limits": [{"bone": "mid", "swing": 120}]}]}}]})).unwrap();
+    let report = tb.call("check", json!({})).unwrap().json;
+    assert!(sim_issues(&report)[0].contains("no bake"), "{report:#}");
+    let baked = tb.call("sim_bake", json!({})).unwrap().json;
+    assert_eq!((baked["scenes"][0]["bodies"].as_u64(), baked["scenes"][0]["tracks"].as_u64()), (Some(3), Some(3)), "{baked:#}");
+    assert_eq!(tb.call("check", json!({})).unwrap().json["errors"], 0);
+    let shot = |tb: &mut Toolbox, t: f64| image::load_from_memory(&tb.call("snapshot", json!({"at": [t], "width": 480})).unwrap().images[0]).unwrap().to_rgba8();
+    let top = |img: &image::RgbaImage| img.enumerate_pixels().filter(|(_, _, p)| p.0[0] > 120).map(|(_, y, _)| y).min().unwrap();
+    // Until its release it is the file's animation; two seconds on, the
+    // skinned mesh lies on the floor with its bones.
+    let (standing, fallen) = (shot(&mut tb, 0.9), shot(&mut tb, 2.9));
+    assert!(top(&fallen) > top(&standing) + 100, "the mesh's top went from row {} to {}", top(&standing), top(&fallen));
+    std::fs::remove_dir_all(&dir).ok();
+}

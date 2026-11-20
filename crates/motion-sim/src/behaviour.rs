@@ -119,6 +119,9 @@ pub struct Brain {
     /// moves toward what is asked over `EASE` seconds: one worked out
     /// anew each step from a body that is itself moving would shake it.
     aimed: Vec<Option<[f64; 4]>>,
+    /// Per behaviour: the arm it took, kept while it uses one (the
+    /// nearer shoulder changes as the body sways).
+    taken: Vec<Option<usize>>,
     pub events: Vec<SimEvent>,
 }
 
@@ -139,7 +142,7 @@ impl Brain {
             let left = n.ends_with("_l") || n.ends_with(".l") || n.contains("left");
             arms.push(Arm { hand, fore, upper, left });
         }
-        Brain { feet, arms, head: (0..r.bones.len()).find(|&b| has(b, "head")), stand: None, fallen: None, down_since: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], events: Vec::new() }
+        Brain { feet, arms, head: (0..r.bones.len()).find(|&b| has(b, "head")), stand: None, fallen: None, down_since: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
     }
 
     /// A bone's joint targets that point arm `arm` at `target` (px): the
@@ -176,6 +179,8 @@ impl Brain {
         let u = world.unit;
         let dt = world.dt;
         let active: Vec<(&BehaviourInput, f64)> = r.behaviours.iter().filter(|b| t >= b.from - 1e-9 && t < b.to).map(|b| (b, sampled(&b.amount, x))).filter(|(_, a)| *a > 0.0).collect();
+        let index_of = |b: &BehaviourInput| r.behaviours.iter().position(|x| std::ptr::eq(x, b)).unwrap_or(0);
+        let mut using = vec![false; r.behaviours.len()];
         let find = |kind: BehaviourKind| active.iter().find(|(b, _)| b.kind == kind).copied();
         // What hit it: its own `hits`, and other bodies at speed.
         for (at, bone, _, _) in &r.hits {
@@ -333,7 +338,8 @@ impl Brain {
                         _ => None,
                     };
                     let Some(target) = target else { continue };
-                    let Some(k) = pick(b, target, None) else { continue };
+                    let i = index_of(b);
+                    let Some(k) = self.taken[i].or_else(|| pick(b, target, None)) else { continue };
                     let arm = &self.arms[k];
                     let reach = r.bones[arm.upper].length + r.bones[arm.fore].length;
                     let away = len(sub(target, world.pose(r.bones[arm.upper].body).p));
@@ -342,6 +348,7 @@ impl Brain {
                     let near = ((within - away) / (0.3 * within).max(1.0)).clamp(0.0, 1.0);
                     if near > 0.0 {
                         arms[k] = Some((target, amount * near));
+                        (self.taken[i], using[i]) = (Some(k), true);
                     }
                 }
                 BehaviourKind::Reach => {
@@ -351,7 +358,9 @@ impl Brain {
                         continue;
                     }
                     let target = world.pose(r.bones[bone].body).apply(mul(r.bones[bone].along, r.bones[bone].length * 0.5));
-                    let Some(k) = pick(b, target, Some(bone)) else { continue };
+                    let i = index_of(b);
+                    let Some(k) = self.taken[i].or_else(|| pick(b, target, Some(bone))) else { continue };
+                    (self.taken[i], using[i]) = (Some(k), true);
                     // (Up in a fifth of a second, down over the last third.)
                     let f = ((t - at) / 0.2).clamp(0.0, 1.0) * ((hold - (t - at)) / (hold / 3.0).max(1e-9)).clamp(0.0, 1.0);
                     arms[k] = Some((target, amount * f));
@@ -369,6 +378,11 @@ impl Brain {
                     }
                 }
                 BehaviourKind::Balance | BehaviourKind::Step => {}
+            }
+        }
+        for (i, used) in using.iter().enumerate() {
+            if !used {
+                self.taken[i] = None;
             }
         }
         for (k, wanted) in arms.iter().enumerate() {

@@ -240,9 +240,8 @@ blur away the contact shadows that are what is missing.
 
 ## Simulation: rigid bodies, ragdolls, crowds
 
-Part 1 is built; the rest is not started. The engine has no skeletons or
-skinning yet (`model_import` reads the animation of nodes; morph targets
-are refused). In the order to build:
+Parts 1 to 4 are built; 5 to 7 are below as they stand. Morph targets
+are still refused. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
@@ -289,17 +288,78 @@ are refused). In the order to build:
      two before settling (rapier's contact solver; more iterations do not
      change it). Ropes are not drawn. Bodies inside instancers are
      refused. Slang-generated meshes cannot be colliders (give a shape).
-2. **Skeletons and skinning.** glTF skins (joints, weights, inverse bind
-   matrices); skinning as a deformer in the GPU's mesh pool, with the
-   CPU's the same. Needed for any character.
-3. **A ragdoll that falls.** A capsule per bone and joint limits from the
-   skeleton; it takes the pose and speed an animation left it with.
-4. **A ragdoll that acts.** Motors follow a clip; a limb's strength is
-   keyed (a leg that was hit bears no weight); behaviours with params set
-   the motors' targets: balance, a step to keep it, a hand toward what is
-   coming, a reach for where it was hit, arms about the head. Balance and
-   stepping are the hard part, and what stops a motor pressing into a
-   wall.
+2. **Skeletons and skinning: done.**
+   - `model_import` keeps a glTF skin: a joint node is a comp like any
+     node, and the skinned mesh layer has `"skin": {"index", "joints":
+     [layer ids]}`. Joints are ordinary layers, so keys, parents and
+     bakes pose the mesh; `compile` gives every skinned mesh of a frame
+     its joints' matrices (`MeshState::skin`).
+   - CPU and GPU skin from the same f32 matrices (`core::skin`): the CPU
+     in the mesh cache (a mesh per pose, kept while drawn), the GPU in
+     its mesh pool (`meshskin.wgsl`: the bind mesh with joints and
+     weights uploaded once, three rows a joint per pose, a mesh per
+     pose). The path tracer takes the skinned mesh from the pool. A
+     skinned mesh's bounds are a box per joint carried by the joint.
+   - Tested: points and normals against a pose worked by hand; the test
+     arm's corner against its glTF by hand; rest pose equals the
+     unskinned mesh; the GPU's pool skinning against the CPU's on six
+     frames and one path-traced frame (lavapipe, pool counts checked);
+     the import and a joint keyed by an edit, through the tools.
+   - Measured: 3.9 ms to skin 100 000 points with four joints each on
+     one core. The GPU side is not timed (lavapipe is no measure).
+   - Left: four joints a point (glTF's JOINTS_1 is not read); no dual
+     quaternions (linear blend: elbows thin at sharp bends); the file's
+     rotations become three layer angles keyed linearly, not slerped;
+     `model_import` copies one file, so a `.gltf` must embed its buffer
+     (or be a `.glb`); a skinned mesh under a Slang deformer or
+     displacement is not deformed.
+3. **A ragdoll that falls: done.** `simulation.ragdolls`: every bone
+   under `root` (the joints' comps) is a body, a capsule along the bone
+   toward its child (a given shape where that is wrong: box feet), mass
+   shared by volume with no bone lighter than three quarters of what
+   hangs from it. Joints are balls with swing and twist limits, or hinges
+   (knees, elbows), measured from the pose at `rest`. Until `release` the
+   bones follow the clip; they leave it with its pose and speed. Bones of
+   one ragdoll do not collide with each other.
+   - Tested: a limp figure falls in one piece (every bone within 4 px of
+     its joint at every sample) and comes to rest; limits hold under
+     hard hits, knees bend one way about their axle; release with the
+     clip's speed and a raised arm; the same bytes twice, and from debug
+     and release builds; a skinned model through the tools.
+   - Found on the way: a pelvis far lighter than the legs it joins tore
+     its joint (162° past a 40° limit), hence the mass rule and 12 solver
+     iterations for scenes with ragdolls.
+   - Left: no self-collision (an arm passes through the trunk); limits
+     are per bone by hand (no defaults by bone name); a limp figure with
+     the default 40° limits falls like a plank, slowly.
+4. **A ragdoll that acts: done, with balance helped.**
+   - Motors follow the clip: `strength` 0..1, keyed, per limb with
+     `strengths`. A motor is a second joint beside the one with the
+     limits, its frame turned to the target each step (rapier's motors
+     take a turn apart by axis and swung a raised arm; explicit torques
+     blew up the spine). Its torque is capped by what hangs from the
+     joint, which is what stops it pressing into a wall harder.
+   - Behaviours with params (`core::sim::BehaviourKind`,
+     `motion-sim/behaviour.rs`): `balance` (ankle lean, and a force and
+     torque on the hips capped at `assist` of its weight; past that it
+     falls, says so and goes soft), `step` (the foot behind is carried to
+     where the body is falling to), `guard`, `reach`, `protect` (two-bone
+     arm aim toward a body, the last hit, the head).
+   - Measured on the test figure (70 kg, pushes at the chest, px/s): a
+     statue (motors only) falls at 200; ankle lean alone holds 200 and
+     falls at 300; with the default help balance holds 1400 and falls at
+     1800; with steps it holds 1800 (four steps, 320 px) and falls at
+     2400. Steps without the help do not recover it (it falls at 700).
+   - Tested: each of those thresholds, soft after a fall, hands at the
+     head within 48 px and down again, a hand on the hit within 25 px in
+     half a second and the other arm for a hit arm, a hand up to a ball
+     that comes. `examples/sim/ragdoll.py` (limp, held, braced) was
+     looked at.
+   - Left, and it is the hard part the plan names: balance is not
+     footwork, it is a bounded hand on the hips; a step is a foot carried
+     by a force, not a leg that swings; nothing gets up after a fall;
+     no behaviour looks where it is going. Feet and hands are found by
+     bone name (`foot`, `hand`, `head`).
 5. **Directing it.** What writes the film (an LLM) writes intent on the
    timeline ("pushed from the left at 2.1 s, tries to stop it with the
    right hand, stumbles, recovers") as events and behaviours; the bake
