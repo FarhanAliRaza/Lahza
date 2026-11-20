@@ -75,6 +75,11 @@ pub struct RenderOptions {
     /// Record where the time goes (`Renderer::profile`): CPU stages, GPU
     /// pass timestamps and the path tracer's work per layer.
     pub profile: bool,
+    /// Rasterised meshes take the environment's light by how much of the
+    /// sky each point sees (rays against the path tracer's structures,
+    /// `pt::TraceOptions::sky`). Only on a GPU with ray queries: elsewhere,
+    /// and on the CPU, the frame is drawn as without it.
+    pub sky: bool,
 }
 
 impl Default for RenderOptions {
@@ -86,6 +91,7 @@ impl Default for RenderOptions {
             allow_software_gpu: std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some(),
             path: None,
             profile: false,
+            sky: false,
         }
     }
 }
@@ -222,6 +228,15 @@ impl Renderer {
         self.fallbacks.clear();
     }
 
+    /// Sky visibility for rasterised meshes from the next frame
+    /// (`RenderOptions::sky`).
+    pub fn set_sky(&mut self, sky: bool) {
+        if self.options.sky != sky {
+            self.options.sky = sky;
+            self.last = None;
+        }
+    }
+
     /// Path-trace meshes from the next frame (`None`: rasterise them).
     pub fn set_path(&mut self, path: Option<pt::TraceOptions>) {
         if self.options.path != path {
@@ -235,6 +250,7 @@ impl Renderer {
     pub fn backend_label(&self) -> String {
         match (&self.gpu, &self.gpu_error) {
             (Some(g), _) => match self.options.path {
+                Some(o) if g.can_trace() && o.fast => format!("{} · path traced, fast", g.label),
                 Some(o) if g.can_trace() => format!("{} · path traced, {} spp", g.label, o.spp),
                 _ => g.label.clone(),
             },
@@ -296,6 +312,38 @@ impl Renderer {
     pub fn try_render(&mut self, compiled: &Compiled, t: f64) -> Result<RgbaImage, String> {
         let states = self.sample_states(compiled, t);
         self.try_render_states(&states)
+    }
+
+    /// Forgets what the path tracer accumulated over the frames before:
+    /// the next frame is drawn as the first of a sequence. For a frame
+    /// that does not follow the last one drawn (a scrub in the editor).
+    pub fn forget_history(&mut self) {
+        if let Some(g) = self.gpu.as_mut() {
+            g.forget_trace_history();
+        }
+        self.last = None;
+    }
+
+    /// The frame at `t` as a sequence would draw it. A traced frame that
+    /// builds on those before it (the fast mode; `TraceOptions::temporal`)
+    /// has none when it is drawn alone: up to `frames` frames before `t`,
+    /// of its scene, are drawn first and thrown away. `try_render` for
+    /// every other frame.
+    pub fn try_render_warm(&mut self, compiled: &Compiled, t: f64, frames: u32) -> Result<RgbaImage, String> {
+        if !self.options.path.is_some_and(|o| o.fast || o.temporal) || !self.can_trace() {
+            return self.try_render(compiled, t);
+        }
+        self.forget_history();
+        let fps = compiled.fps();
+        let n = fps.nearest_frame(t);
+        let scene = compiled.scene_at(t).map(|s| s.id.clone());
+        for k in (1..=frames as i64).rev() {
+            let at = fps.time_of(n - k);
+            if n - k >= 0 && compiled.scene_at(at).map(|s| s.id.clone()) == scene {
+                self.try_render(compiled, at)?;
+            }
+        }
+        self.try_render(compiled, t)
     }
 
     /// The scene at the moments frame `t` samples: one, or with motion
@@ -402,6 +450,10 @@ impl Renderer {
         let n = states.len().max(1) as u32;
         // Motion-blur sub-frames already average over the shutter; history
         // per sub-frame would hold a full-size buffer set for each of them.
+        let trace = trace.map(|o| match o.fast && o.spp == 0 {
+            true => pt::TraceOptions { spp: if self.gpu.as_mut().is_some_and(|g| g.reconstructs()) { pt::FAST_SPP } else { pt::FAST_SPP_OWN }, ..o },
+            false => o,
+        });
         let trace = trace.map(|o| pt::TraceOptions { spp: o.spp.div_ceil(n).max(1), temporal: o.temporal && n == 1, shutter: if o.fast { self.shutter } else { 0.0 }, ..o });
         self.images.begin_frame();
         let mut lists = self.build_lists(states, trace);
@@ -601,12 +653,13 @@ impl Renderer {
     fn build_lists(&mut self, states: &[FrameState], trace: Option<pt::TraceOptions>) -> Vec<DisplayList> {
         let scale = self.options.scale;
         let compact = self.gpu.as_ref().is_some_and(|g| g.has_vis());
+        let sky = self.options.sky && self.gpu.as_ref().is_some_and(|g| g.can_trace());
         states
             .iter()
             .map(|s| {
                 // Seeded by the frame's time: the same frame traces the same.
                 let seed = ((s.t * 1000.0).round() as i64 as u64).wrapping_mul(0x9E37_79B9) as u32;
-                Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, meshes: &mut self.meshes, scale, trace, seed, compact }.build(s)
+                Builder { fonts: &mut self.fonts, images: &mut self.images, footage: &mut self.footage, meshes: &mut self.meshes, scale, trace, sky, seed, compact }.build(s)
             })
             .collect()
     }
@@ -762,3 +815,6 @@ mod tests;
 
 #[cfg(test)]
 mod mesh_tests;
+
+#[cfg(test)]
+mod sky_tests;

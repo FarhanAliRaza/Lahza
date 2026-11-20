@@ -727,6 +727,39 @@ fn a_path_traced_snapshot_without_ray_queries_warns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `snapshot fast=true` draws a frame as a fast export does, the frames
+/// before it traced first (`warm`); without ray queries it is the
+/// raster's, and says so. (Traced with LAHZA_MOTION_SOFTWARE_GPU set.)
+#[test]
+fn a_fast_snapshot_is_the_fast_exports_frame() {
+    let (mut tb, dir) = toolbox("fast");
+    let traces = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    if traces {
+        tb.backend = Backend::Gpu;
+    }
+    tb.call("project_create", json!({"path": "still", "duration": 1, "width": 160, "height": 90})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "scene": "s1", "layer": {"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "transform": {"position": [80, 45]}}}
+    ]})).unwrap();
+    let raster = tb.call("snapshot", json!({"at": [0.5], "width": 160})).unwrap();
+    let fast = tb.call("snapshot", json!({"at": [0.5], "width": 160, "fast": true, "warm": 2})).unwrap();
+    let warnings = fast.json["warnings"].to_string();
+    if warnings.contains("path tracing needs a GPU with ray queries") {
+        assert!(!traces, "{}", fast.json);
+        assert_eq!(fast.images, raster.images);
+    } else {
+        assert!(fast.json["renderer"].as_str().is_some_and(|r| r.ends_with("path traced, fast")), "{}", fast.json);
+        assert_ne!(fast.images, raster.images);
+        // The same frame again: the frames before it are traced again too.
+        let again = tb.call("snapshot", json!({"at": [0.5], "width": 160, "fast": true, "warm": 2})).unwrap();
+        assert_eq!(again.images, fast.images);
+        // (Software Vulkan has no Ray Reconstruction.)
+        assert!(!traces || warnings.contains("without NVIDIA Ray Reconstruction"), "{}", fast.json);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// fit_camera: marks seen through a known camera give that camera back,
 /// as `set` ops that, applied, put the scene's camera there.
 #[test]

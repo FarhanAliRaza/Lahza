@@ -40,7 +40,11 @@ pub(crate) struct Frame {
 }
 
 pub(crate) struct Ngx {
-    _lib: libloading::Library,
+    /// None: the tests' stand-in (`stand_in`), which calls nothing.
+    _lib: Option<libloading::Library>,
+    /// Tests: each frame the stand-in was given (its jitter and `reset`).
+    #[cfg(test)]
+    pub(crate) seen: Vec<([f32; 2], bool)>,
     device: u64,
     create: unsafe extern "C" fn(u64, u64, u32, u32, u32, u32) -> *mut c_void,
     evaluate: unsafe extern "C" fn(u64, *mut c_void, *const Frame) -> i32,
@@ -76,12 +80,43 @@ impl Ngx {
                 };
             }
             let init: unsafe extern "C" fn(u64, u64, u64, *const c_void, *const c_void, *const c_char) -> i32 = sym!(b"lahza_ngx_init\0");
-            let ngx = Ngx { device: handles[2], create: sym!(b"lahza_ngx_create\0"), evaluate: sym!(b"lahza_ngx_evaluate\0"), release: sym!(b"lahza_ngx_release\0"), shutdown: sym!(b"lahza_ngx_shutdown\0"), _lib: lib };
+            let ngx = Ngx {
+                device: handles[2],
+                create: sym!(b"lahza_ngx_create\0"),
+                evaluate: sym!(b"lahza_ngx_evaluate\0"),
+                release: sym!(b"lahza_ngx_release\0"),
+                shutdown: sym!(b"lahza_ngx_shutdown\0"),
+                _lib: Some(lib),
+                #[cfg(test)]
+                seen: Vec::new(),
+            };
             match init(handles[0], handles[1], handles[2], handles[3] as *const c_void, handles[4] as *const c_void, dir.as_ptr()) {
                 0 => Ok(ngx),
                 code => Err(format!("NVIDIA Ray Reconstruction is not available here (code {code})")),
             }
         }
+    }
+
+    /// Tests: no shim and no SDK. The tracer makes the picture itself of
+    /// the images it would have handed over (pt.wgsl `ngx_stand_in`), so
+    /// the way to Ray Reconstruction and back is checked without it; the
+    /// functions here are never called.
+    #[cfg(test)]
+    pub(crate) fn stand_in() -> Self {
+        unsafe extern "C" fn create(_: u64, _: u64, _: u32, _: u32, _: u32, _: u32) -> *mut c_void {
+            std::ptr::NonNull::<u8>::dangling().as_ptr() as *mut c_void
+        }
+        unsafe extern "C" fn evaluate(_: u64, _: *mut c_void, _: *const Frame) -> i32 {
+            0
+        }
+        unsafe extern "C" fn release(_: *mut c_void) {}
+        unsafe extern "C" fn shutdown(_: u64) {}
+        Ngx { _lib: None, seen: Vec::new(), device: 0, create, evaluate, release, shutdown }
+    }
+
+    /// Whether this is the tests' stand-in.
+    pub(crate) fn is_stand_in(&self) -> bool {
+        self._lib.is_none()
     }
 
     /// A reconstruction from `low` to `full` texels, recorded into `cmd`.

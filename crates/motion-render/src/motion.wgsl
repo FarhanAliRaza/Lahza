@@ -1705,6 +1705,72 @@ const PROWS: u32 = 2u;
 // The camera's near plane (mesh3d::NEAR).
 const MESH_NEAR: f32 = 1.0;
 
+// A unit direction as two numbers (octahedral), and back.
+fn oct_encode(n: vec3<f32>) -> vec2<f32> {
+    let o = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+    if n.z >= 0.0 { return o; }
+    return (vec2<f32>(1.0) - abs(o.yx)) * vec2<f32>(select(-1.0, 1.0, o.x >= 0.0), select(-1.0, 1.0, o.y >= 0.0));
+}
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    let z = 1.0 - abs(e.x) - abs(e.y);
+    if z >= 0.0 { return normalize(vec3<f32>(e, z)); }
+    let xy = (vec2<f32>(1.0) - abs(e.yx)) * vec2<f32>(select(-1.0, 1.0, e.x >= 0.0), select(-1.0, 1.0, e.y >= 0.0));
+    return normalize(vec3<f32>(xy, z));
+}
+
+// How much of the sky the surface at target point q, camera depth z, sees
+// (`open.w`; below 0: not known, the whole sky as before), from where
+// (`open.xyz`, camera space), and the light that comes back from what it
+// sees instead (`back`): the list's sky visibility, which the path tracer's rays
+// found at half the target's size (pt.wgsl `sky`; its group is named in
+// the light block's two spare floats). Of the nine texels around q, those
+// that show a surface at about this depth, the nearer to q the more; at
+// an edge with none, the one nearest in depth.
+struct Sky { open: vec4<f32>, back: vec3<f32> }
+fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, z: f32) -> Sky {
+    var none: Sky;
+    none.open = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+    let size = bitcast<u32>(b_mesh[lb + 6u].w);
+    if size == 0u { return none; }
+    let w = i32(size & 0xffffu);
+    let h = i32(size >> 16u);
+    let off = i32(bitcast<u32>(prim.stroke.z) + bitcast<u32>(b_mesh[lb + 3u].w));
+    let c = vec2<f32>(prim.fill.x + prim.fill.z * q.x, prim.fill.y + prim.fill.w * q.y);
+    let g = c * 0.5 - 0.5;
+    let g0 = floor(g + 0.5);
+    var sum = vec4<f32>(0.0);
+    var back = vec3<f32>(0.0);
+    var weight = 0.0;
+    var near = vec4<f32>(0.0, 0.0, 0.0, 1e30);
+    var near_back = vec3<f32>(0.0);
+    for (var k = 0; k < 9; k++) {
+        let at = g0 + vec2<f32>(f32(k % 3 - 1), f32(k / 3 - 1));
+        let t = group_at(off, w, h, i32(at.x), i32(at.y));
+        if t.w <= 0.0 { continue; }
+        let b = group_at(off + w * h, w, h, i32(at.x), i32(at.y)).xyz;
+        let away = abs(t.w - z);
+        if away < near.w {
+            near = vec4<f32>(t.xyz, away);
+            near_back = b;
+        }
+        let d = abs(at - g);
+        let wt = max(1.5 - d.x, 0.0) * max(1.5 - d.y, 0.0) * max(1.0 - away / (0.05 * z + 1.0), 0.0);
+        sum += vec4<f32>(oct_decode(t.xy), t.z) * wt;
+        back += b * wt;
+        weight += wt;
+    }
+    if near.w > 1e29 { return none; }
+    var s: Sky;
+    if weight <= 1e-3 {
+        s.open = vec4<f32>(oct_decode(near.xy), clamp(near.z, 0.0, 1.0));
+        s.back = near_back;
+        return s;
+    }
+    s.open = vec4<f32>(normalize(sum.xyz), clamp(sum.w / weight, 0.0, 1.0));
+    s.back = back / weight;
+    return s;
+}
+
 // Mirrors `card_sample` in mesh3d.rs: a card's picture at target point q.
 fn card_sample(prim: Prim, material: u32, q: vec2<f32>) -> vec4<f32> {
     let r0 = b_mesh[material];
@@ -2089,6 +2155,13 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
     var d_light = vec3<f32>(0.0);
     var s_light = vec3<f32>(0.0);
     var c_light = vec3<f32>(0.0);
+    // What the point sees of the sky: light from all around (ambient
+    // lights, the environment) comes by that much, the environment's from
+    // the open side.
+    let sky_seen = sky_at(prim, lb, q, p.z);
+    let sky = sky_seen.open;
+    var sky_part = 1.0;
+    if sky.w >= 0.0 { sky_part = sky.w; }
     let lights = u32(b_mesh[lb].x);
     for (var i = 0u; i < lights; i++) {
         let row = b_mesh[lb + 7u + i * LROWS];
@@ -2096,7 +2169,7 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
         let extra = b_mesh[lb + 7u + i * LROWS + 2u];
         let kind = u32(row.w);
         if kind == 2u {
-            d_light = d_light + diffuse * col;
+            d_light = d_light + diffuse * col * sky_part;
             continue;
         }
         var l = row.xyz;
@@ -2159,16 +2232,24 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
     }
     let r_view = rn * (2.0 * dot(rn, v)) - v;
     let rw = to_world(lb, r_view);
-    let env_d = env_diffuse(lb, nw);
-    d_light = d_light + (diffuse * env_d) * coat;
-    let spec_env = env_light(lb, rw, rough) * (f0 * ab.x + f82 * (f90 * ab.y)) * comp;
+    var env_d = env_diffuse(lb, nw);
+    // What is mirrored of the environment goes with what is seen of it,
+    // the more so the rougher the surface and the more it is seen head-on
+    // (Lagarde and de Rousiers' fit).
+    var sky_spec = 1.0;
+    if sky.w >= 0.0 {
+        env_d = env_diffuse(lb, to_world(lb, normalize(mix(sky.xyz, n, sky_part)))) * sky_part;
+        sky_spec = clamp(pow(n_v + sky_part, exp2(-16.0 * rough - 1.0)) - 1.0 + sky_part, 0.0, 1.0);
+    }
+    d_light = d_light + (diffuse * (env_d + sky_seen.back)) * coat;
+    let spec_env = env_light(lb, rw, rough) * (f0 * ab.x + f82 * (f90 * ab.y)) * comp * sky_spec;
     s_light = s_light + spec_env * coat;
     if e_sheen > 0.0 {
         s_light = s_light + sheen * env_d * (sheen_albedo(n_v, sheen_r) * coat);
     }
     if cc > 0.0 {
         let cr = n * (2.0 * dot(n, v)) - v;
-        c_light = c_light + env_light(lb, to_world(lb, cr), ccr) * (fc_v * cc);
+        c_light = c_light + env_light(lb, to_world(lb, cr), ccr) * (fc_v * cc) * sky_spec;
     }
     // What is under the coat is seen through its colour.
     d_light = d_light * coat_tint;

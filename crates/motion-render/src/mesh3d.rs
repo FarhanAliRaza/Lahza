@@ -36,6 +36,10 @@ use std::sync::Arc;
 /// Generated meshes by parameters; entries unused for a while are dropped.
 #[derive(Default)]
 pub struct MeshCache {
+    /// The sky visibility of the layer list being built (`pt` `sky`): its
+    /// group (from the list's texel base) and the group's size. The
+    /// list's batches take it (`Batch::set_sky`).
+    pub(crate) sky: Option<(u32, u32, u32)>,
     /// Parsed glTF files (meshes from Blender).
     gltf_files: crate::model::Files,
     /// By key: the mesh, the frame that last used it, and whether it is
@@ -1878,6 +1882,17 @@ impl Batch {
             instances: Vec::new(),
             inst_tris: 0,
             id_base: 0,
+        }
+    }
+
+    /// Where the batch's lighting finds how much of the sky a point sees
+    /// (motion.wgsl `sky_at`): in the light block's two spare floats, the
+    /// group's offset from the list's texel base and its width and height
+    /// (16 bits each; 0: none, the whole sky as before).
+    pub(crate) fn set_sky(&mut self, sky: Option<(u32, u32, u32)>) {
+        if let (Some((offset, w, h)), true) = (sky, self.light_rows.len() > 6) {
+            self.light_rows[3][3] = f32::from_bits(offset);
+            self.light_rows[6][3] = f32::from_bits(w.min(0xffff) | h.min(0xffff) << 16);
         }
     }
 

@@ -1045,7 +1045,7 @@ fn a_wall_of_instanced_tiles_leaves_the_other_meshes_drawn() {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     let state = c.frame(0.0);
     let mut r = cpu();
-    let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, seed: 0, compact: true }.build(&state);
+    let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, sky: false, seed: 0, compact: true }.build(&state);
     let tiles = list.pool.iter().filter(|x| x.mesh.tris as usize == list.pool[0].mesh.tris as usize).count();
     let triangles: usize = list.pool.iter().map(|x| x.mesh.tris as usize).sum();
     assert!(triangles > 2 * 4_000_000, "the wall is over four million triangles: {}", triangles / 2);
@@ -1077,7 +1077,7 @@ fn benchmark_shadow_maps_of_300_bubbles() {
     // for the GPU's passes (it draws them: here only their frames).
     for compact in [false, false, false, true, true, true] {
         let t = std::time::Instant::now();
-        let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 0.56, trace: None, seed: 0, compact }.build(&state);
+        let list = Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 0.56, trace: None, sky: false, seed: 0, compact }.build(&state);
         eprintln!("{}: lists {:?}, of which shadow maps {:?} ({} for the GPU to draw)", if compact { "gpu" } else { "cpu" }, t.elapsed(), std::mem::take(&mut r.meshes.shadowing), list.shadows.len());
     }
 }
@@ -1176,7 +1176,7 @@ fn lists_for_the_gpu_leave_their_shadow_maps_to_it() {
     let c = Compiled::new(&p);
     let state = c.frame(0.0);
     let mut r = cpu();
-    let mut build = |compact: bool| Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, seed: 0, compact }.build(&state);
+    let mut build = |compact: bool| Builder { fonts: &mut r.fonts, images: &mut r.images, footage: &mut r.footage, meshes: &mut r.meshes, scale: 1.0, trace: None, sky: false, seed: 0, compact }.build(&state);
     let (cpu_list, gpu_list) = (build(false), build(true));
     assert!(cpu_list.shadows.is_empty());
     assert_eq!(gpu_list.shadows.len(), 2, "a map per shadow-casting light");

@@ -290,8 +290,8 @@ pub fn export(project: &Project, compiled: &Compiled, dir: &Path, options: &Expo
     // Frames go out in order: each builds on the last one's samples.
     render.path = render.path.map(|o| TraceOptions { temporal: true, denoise: o.denoise && options.denoise, ..o });
     if options.fast {
-        // Two paths a texel unless told: Ray Reconstruction makes the picture of them.
-        render.path = render.path.map(|o| TraceOptions { fast: true, spp: options.samples.unwrap_or(2), ..o });
+        // Its own few paths a texel unless told (`pt::FAST_SPP`).
+        render.path = render.path.map(|o| TraceOptions { fast: true, spp: options.samples.unwrap_or(0), ..o });
     }
     if options.quality == Quality::Draft {
         render.scale *= 0.5;

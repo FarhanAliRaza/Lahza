@@ -18,7 +18,7 @@ Usage:
   lahza motion apply <project> <ops.json>
   lahza motion check <project> [--json]
   lahza motion sync-check <project> [--frames N] [--tracks a,b] [--all] [--json]
-  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N] [--no-denoise]] [--profile] [-o out.png]
+  lahza motion snapshot <project> [--at REF,REF,...] [--sheet] [--width PX] [--pt [--spp N] [--no-denoise]] [--fast [--warm N]] [--sky] [--profile] [-o out.png]
   lahza motion review <project> [-o DIR]  the whole film: scenes, cuts and phone-width sheets (default DIR review/)
   lahza motion compare <project> --against REF.mp4 [--at REF,...] [--from S] [--to S] [--offset S] [--width PX] [--drawn x,y,w,h]
                     [--video side_by_side.mp4] [-o compare.png]
@@ -35,7 +35,9 @@ Usage:
                     [--frames N [--fps F] [--start K]]   a glTF model (Blender), or a baked sequence with {frame} in the name
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
                     [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
-                    [--fast]   path-trace fast: 2 paths a pixel at half size through NVIDIA Ray Reconstruction (`just ngx`)
+                    [--fast]   path-trace fast: 2 paths a pixel at half size through NVIDIA Ray Reconstruction (`just ngx`),
+                               elsewhere 4 paths a pixel accumulated over the frames and denoised
+                    [--sky]    rasterised meshes: the environment's light by how much of the sky each point sees (a GPU with ray queries)
                     [--profile]   where the time goes: CPU stages, GPU passes, path tracer work per layer
                     [--scale F] [--every N]   quick checks: output size ×F, every Nth frame only (played at fps/N)
 
@@ -95,6 +97,9 @@ fn renderer_flags(args: &[String], a: &mut Value) -> Result<(), String> {
     if has(args, "--fast") {
         a["pt"] = json!(true);
         a["fast"] = json!(true);
+    }
+    if has(args, "--sky") {
+        a["sky"] = json!(true);
     }
     if has(args, "--profile") {
         a["profile"] = json!(true);
@@ -286,6 +291,9 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 a["width"] = json!(w.parse::<u32>().map_err(|e| e.to_string())?);
             }
             renderer_flags(args, &mut a)?;
+            if let Some(n) = flag(args, "--warm") {
+                a["warm"] = json!(n.parse::<u32>().map_err(|e| format!("--warm: {e}"))?);
+            }
             let out = tb.call("snapshot", a)?;
             let base = flag(args, "-o").unwrap_or_else(|| "snapshot.png".into());
             for (i, png) in out.images.iter().enumerate() {

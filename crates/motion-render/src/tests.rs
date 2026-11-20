@@ -754,7 +754,7 @@ fn export_mixes_footage_audio() {
     assert_eq!(clips.len(), 1);
     assert_eq!((clips[0].start, clips[0].trim, clips[0].speed), (0.5, 0.5, 1.5));
     let out = dir.join("out.mp4");
-    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, scale: 1.0, every: 1 };
+    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, fast: false, scale: 1.0, every: 1 };
     let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
     assert_eq!(report.frames, 60);
     let info = crate::footage::probe(&out).unwrap();
@@ -778,7 +778,7 @@ fn quick_exports_skip_frames_and_shrink() {
     let c = Compiled::new(&p);
     let out = dir.join("quick.mp4");
     let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Final, range: None, audio: false,
-        render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, scale: 0.5, every: 4 };
+        render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, fast: false, scale: 0.5, every: 4 };
     let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
     assert_eq!(report.frames, 15, "60 frames, every 4th");
     let info = crate::footage::probe(&out).unwrap();
@@ -1039,7 +1039,7 @@ fn instancer_2000_copies_at_1080p() {
         let started = Instant::now();
         let f = c.frame(times(n));
         let evaluated = Instant::now();
-        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, meshes: &mut Default::default(), scale: 1.0, trace: None, seed: 0, compact: false }.build(&f);
+        let list = Builder { fonts: &mut fonts, images: &mut images, footage: &mut footage, meshes: &mut Default::default(), scale: 1.0, trace: None, sky: false, seed: 0, compact: false }.build(&f);
         build += evaluated.elapsed().as_secs_f64() * 1000.0;
         eval += (evaluated - started).as_secs_f64() * 1000.0;
         assert_eq!(list.prims.len(), 2000);

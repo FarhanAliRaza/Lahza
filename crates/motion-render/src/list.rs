@@ -343,6 +343,9 @@ pub struct Builder<'a> {
     pub scale: f64,
     /// Path-trace layer lists with meshes instead of rasterising them.
     pub trace: Option<crate::pt::TraceOptions>,
+    /// Rasterised lists with meshes light them by how much of the sky
+    /// each point sees (`sky_list`): only where the GPU traces rays.
+    pub sky: bool,
     /// Seeds the tracer's samples (the frame's time), so a frame renders
     /// the same every time.
     pub seed: u32,
@@ -523,6 +526,7 @@ impl Builder<'_> {
             let i = prev.prim.kind[1] as usize;
             if prev.prim.kind[0] == PRIM_MESH && prev.prim.kind[2] == blend && blend == blend_code(Blend::Normal) && self.meshes.batches[i].can_join(m) && self.meshes.batches[i].list == list_serial {
                 let mut batch = std::mem::replace(&mut self.meshes.batches[i], crate::mesh3d::Batch::new(m)?);
+                batch.set_sky(self.meshes.sky);
                 batch.add(self.meshes, m, root, layer.opacity);
                 batch.members.push(index);
                 prev.bounds = batch.bounds;
@@ -531,6 +535,9 @@ impl Builder<'_> {
             }
         }
         let mut batch = crate::mesh3d::Batch::new(m)?;
+        // (What lets the rest show is not in the sky visibility's rays:
+        // the texels behind it are of other things.)
+        batch.set_sky(self.meshes.sky.filter(|_| !see_through));
         batch.list = list_serial;
         batch.members.push(index);
         batch.see_through = see_through;
@@ -567,6 +574,13 @@ impl Builder<'_> {
                 }
             }
         }
+        let sky = if self.sky { self.sky_list(layers, root, canvas, list, pending) } else { None };
+        let outer = std::mem::replace(&mut self.meshes.sky, sky);
+        self.emit_run(layers, root, canvas, list, pending, out);
+        self.meshes.sky = outer;
+    }
+
+    fn emit_run(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>, out: &mut Vec<Item>) {
         self.meshes.open_run(layers, root);
         // With meshes in the list, flat 3D layers join their depth buffer;
         // so do tilted 3D layers that could cut through each other.
@@ -597,6 +611,63 @@ impl Builder<'_> {
         }
         self.flush_deferred(layers, &mut cards, &mut deferred, root, canvas, list, pending, out);
         self.meshes.close_run();
+    }
+
+    /// Sky visibility for a rasterised list (`TraceOptions::sky`): its
+    /// solid meshes as the tracer takes them, and a group of half the
+    /// target's size (a texel is two target px each way, from its corner)
+    /// that the tracer fills with what each texel's surface sees of the
+    /// sky, and with the light that comes back from what it sees instead. Returns where the list's batches find it (`Batch::set_sky`).
+    fn sky_list(&mut self, layers: &[LayerState], root: Proj, canvas: (u32, u32), list: &mut DisplayList, pending: &mut Vec<Pending>) -> Option<(u32, u32, u32)> {
+        let mut instances = Vec::new();
+        let mut first: Option<lahza_motion_core::compile::MeshState> = None;
+        for layer in layers {
+            let Content::Mesh(m) = &layer.content else { continue };
+            if crate::mesh3d::see_through(layer) {
+                continue;
+            }
+            if let Some(i) = self.meshes.trace_instance(layer.id.clone(), m, layer.opacity, root.max_scale()) {
+                instances.push(i);
+            }
+            first.get_or_insert_with(|| (**m).clone());
+        }
+        let m = first.filter(|_| !instances.is_empty())?;
+        let mut lights = m.lighting.as_ref().map(|l| crate::mesh3d::light_rows(l, &m)).unwrap_or_default();
+        if let (Some(l), false) = (&m.lighting, lights.is_empty()) {
+            // (No environment image here: the sky, horizon and ground.)
+            lights[0][2] = 0.0;
+            // Which lights cast shadows on what the rays hit.
+            for (i, light) in l.lights.iter().enumerate() {
+                lights[7 + i * crate::mesh3d::LROWS + 1][3] = if light.shadow { 1.0 } else { 0.0 };
+            }
+        }
+        let inv = root.inverse().unwrap_or(root);
+        // (Twice the rows: after the texels' visibility, as many for the
+        // light that comes back from what is in the way.)
+        let (gw, gh) = (canvas.0.div_ceil(2).max(1), canvas.1.div_ceil(2).max(1));
+        let rect = [0.0, 0.0, gw as f64 * 2.0, gh as f64 * 4.0];
+        let (offset, _, _, _) = self.reserve(list, pending, Vec::new(), rect, 0.0, 2.0, false);
+        if let Some(p) = pending.last_mut() {
+            p.group.trace = Some(list.traces.len() as u32);
+        }
+        let f = |v: [f64; 9]| v.map(|x| x as f32);
+        list.traces.push(crate::pt::Trace {
+            instances,
+            cards: Vec::new(),
+            lights,
+            focal: m.camera.focal as f32,
+            centre: [m.camera.centre.0 as f32, m.camera.centre.1 as f32],
+            root: f(root.0),
+            inv_root: f(inv.0),
+            origin: [0.0, 0.0],
+            factor: [2.0, 2.0],
+            options: crate::pt::TraceOptions { spp: crate::pt::SKY_RAYS, bounces: 1, denoise: false, temporal: false, fast: false, shutter: 0.0, sky: true },
+            seed: 0,
+            env: None,
+            lens: [0.0; 2],
+            surfaces: None,
+        });
+        Some((offset, gw, gh))
     }
 
     /// Path tracing (export): the list's meshes and flat 3D layers become

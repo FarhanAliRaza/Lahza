@@ -231,6 +231,9 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "sheet": {"type": "boolean"}, "width": {"type": "integer", "description": "px per frame (default 960, 360 in sheets)"}, "save": {"type": "string", "description": "also write the PNG here"},
                 "pt": {"type": "boolean", "description": "path-trace meshes, as a path-traced export draws them (default false: the preview's raster)"}, "samples": {"type": "integer", "description": "with pt: paths per pixel (default the project's samples, else 64)"},
                 "denoise": {"type": "boolean", "description": "with pt: filter the noise (default true)"},
+                "fast": {"type": "boolean", "description": "path-trace as a fast export draws the frame (render's fast; implies pt). A frame alone has nothing before it to build on, so the frames before it are traced first (warm)"},
+                "warm": {"type": "integer", "description": "with fast: frames of the scene traced before each time and thrown away (default 8, at most 32)"},
+                "sky": {"type": "boolean", "description": "rasterised meshes take the environment's light by how much of the sky each point sees (rays on a GPU with ray queries; elsewhere drawn as without; default false)"},
                 "profile": {"type": "boolean", "description": "report where the time goes: CPU stages, GPU passes, path tracer work per layer"}}), &[]),
             read_only: true,
         },
@@ -277,7 +280,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
                 "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"},
                 "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"},
-                "fast": {"type": "boolean", "description": "path tracing, fast: two paths a pixel at half size, made the full picture by NVIDIA Ray Reconstruction (needs its shim, `just ngx`), with depth of field and motion blur as passes on that picture; default false"},
+                "fast": {"type": "boolean", "description": "path tracing, fast (default false): with NVIDIA Ray Reconstruction (its shim, `just ngx`) two paths a pixel at half size made the full picture; elsewhere four paths a pixel accumulated over the frames and denoised (a warning says so). Depth of field and motion blur are passes on that picture. samples overrides the paths"},
+                "sky": {"type": "boolean", "description": "rasterised meshes take the environment's light by how much of the sky each point sees (rays on a GPU with ray queries; elsewhere drawn as without; default false)"},
                 "profile": {"type": "boolean", "description": "report where the time goes: CPU stages, GPU passes, path tracer work per layer (in the render report)"},
                 "scale": {"type": "number", "description": "output size relative to the project (default 1; e.g. 0.25 for a quick check)"},
                 "every": {"type": "integer", "description": "render every Nth frame only, played at fps/N (default 1): quick checks of long shots"}}), &[]),
@@ -1653,10 +1657,20 @@ impl Toolbox {
         let pw = compiled.settings.width as f64;
         // Render at the size we return (sheets render at 2× thumbnail size).
         let scale = ((if sheet { width * 2.0 } else { width }) / pw).clamp(0.05, 1.0);
+        // The fast mode as an export draws it: frames that build on each
+        // other, so each time is drawn after `warm` frames before it.
+        let fast = args.get("fast").and_then(Value::as_bool).unwrap_or(false);
+        let warm = args.get("warm").and_then(Value::as_u64).unwrap_or(8).min(32) as u32;
         let path = match renderer_arg(args)? {
             Some(RendererKind::Path) => export::trace_options(&compiled.settings, Quality::Final, Some(RendererKind::Path), samples_arg(args)?)
                 .map(|o| lahza_motion_render::pt::TraceOptions { denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true), ..o }),
+            _ if fast => Some(Default::default()),
             _ => None,
+        };
+        let samples = samples_arg(args)?;
+        let path = match fast {
+            true => path.map(|o| lahza_motion_render::pt::TraceOptions { fast: true, temporal: true, spp: samples.unwrap_or(0), ..o }),
+            false => path,
         };
         // Profiling needs GPU timestamps from the start: a renderer of its own.
         let mut profiled = args
@@ -1670,6 +1684,7 @@ impl Toolbox {
         };
         renderer.set_scale(scale);
         renderer.set_path(path);
+        renderer.set_sky(args.get("sky").and_then(Value::as_bool).unwrap_or(false));
         renderer.clear_fallbacks();
         let mut frames = Vec::new();
         let mut listed = Vec::new();
@@ -1677,7 +1692,7 @@ impl Toolbox {
             // The frame nearest the reference: where a cut or anchor on it lands.
             let n = fps.nearest_frame(*t).clamp(0, compiled.frame_count().saturating_sub(1) as i64);
             let ft = fps.time_of(n);
-            let image = renderer.try_render(&compiled, ft)?;
+            let image = if fast { renderer.try_render_warm(&compiled, ft, warm)? } else { renderer.try_render(&compiled, ft)? };
             listed.push(json!({"at": label, "t": round(ft), "frame": n}));
             frames.push((format!("{label} · {ft:.2}s · f{n}"), image));
         }
@@ -1686,9 +1701,10 @@ impl Toolbox {
         let backend = renderer.backend_label();
         let dropped = renderer.dropped();
         // Every path tracing note too: a list drawn by the rasteriser instead must not pass as traced.
-        let fell_back: Vec<String> = renderer.warnings().into_iter().filter(|w| w.starts_with("GPU failed") || w.starts_with("path tracing")).collect();
+        let fell_back: Vec<String> = renderer.warnings().into_iter().filter(|w| w.starts_with("GPU failed") || w.starts_with("path tracing") || w.starts_with("the fast mode")).collect();
         renderer.set_scale(1.0);
         renderer.set_path(None);
+        renderer.set_sky(false);
         let images: Vec<Vec<u8>> = if sheet {
             let columns = (frames.len() as f64).sqrt().ceil().max(1.0) as u32;
             vec![lahza_motion_render::encode_png(&sheet::contact_sheet(&frames, columns.min(4).max(1), width as u32))]
@@ -2217,7 +2233,7 @@ impl Toolbox {
             quality,
             range,
             audio: args.get("audio").and_then(Value::as_bool).unwrap_or(true),
-            render: RenderOptions { backend: self.backend, profile: args.get("profile").and_then(Value::as_bool).unwrap_or(false), ..Default::default() },
+            render: RenderOptions { backend: self.backend, profile: args.get("profile").and_then(Value::as_bool).unwrap_or(false), sky: args.get("sky").and_then(Value::as_bool).unwrap_or(false), ..Default::default() },
             renderer: renderer_arg(args)?,
             samples: samples_arg(args)?,
             denoise: args.get("denoise").and_then(Value::as_bool).unwrap_or(true),

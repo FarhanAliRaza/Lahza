@@ -23,7 +23,8 @@ use std::sync::Arc;
 /// Samples and bounces: the quality knob.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TraceOptions {
-    /// Paths per pixel.
+    /// Paths per pixel (the fast mode: 0 for its own, `FAST_SPP` or
+    /// `FAST_SPP_OWN`).
     pub spp: u32,
     /// Surface interactions per path.
     pub bounces: u32,
@@ -35,15 +36,22 @@ pub struct TraceOptions {
     /// The fast mode: few samples at half size, made a clean picture at
     /// full size by NVIDIA's Ray Reconstruction (`ngx`). Depth of field
     /// and motion blur are passes on that picture (`dof_fast`,
-    /// `resolve_fast`), not samples. As usual where that is not at hand.
+    /// `resolve_fast`), not samples. Where Ray Reconstruction is not at
+    /// hand: few samples at full size, accumulated over the frames and
+    /// denoised here, with the same passes after.
     pub fast: bool,
     /// The fast mode's motion blur: the shutter, in frames (0: none).
     pub shutter: f32,
+    /// Not a traced picture: the list's meshes are rasterised, and the
+    /// tracer only finds how much of the sky each texel's surface sees
+    /// (`spp` rays a texel at half size; pt.wgsl `sky`), which the
+    /// raster's lighting takes its environment by.
+    pub sky: bool,
 }
 
 impl Default for TraceOptions {
     fn default() -> Self {
-        Self { spp: 64, bounces: 6, denoise: true, temporal: false, fast: false, shutter: 0.0 }
+        Self { spp: 64, bounces: 6, denoise: true, temporal: false, fast: false, shutter: 0.0, sky: false }
     }
 }
 
@@ -57,6 +65,19 @@ fn band_rows(width: u32, spp: u32) -> u32 {
     let per_row = width.max(1) as u64 * spp.max(1) as u64;
     ((PATHS_PER_DISPATCH / per_row) as u32 / 8 * 8).max(8)
 }
+
+/// Rays a texel of the raster's sky visibility (`TraceOptions::sky`):
+/// sixteen texels together have sixteen times as many directions.
+pub const SKY_RAYS: u32 = 2;
+
+/// The fast mode's paths a texel where none are asked for (`spp` 0): with
+/// Ray Reconstruction (of a quarter of the texels), and without.
+pub const FAST_SPP: u32 = 2;
+pub const FAST_SPP_OWN: u32 = 4;
+
+/// The fast mode without Ray Reconstruction: a frame with none before it
+/// (the first, or the first after a cut) traces this many times its paths.
+const FAST_FIRST: u32 = 4;
 
 /// À-trous passes (steps 1, 2, 4, … px).
 const DENOISE_PASSES: u32 = 5;
@@ -166,7 +187,7 @@ impl Trace {
         out.extend(self.options.bounces.to_le_bytes());
         out.push(self.options.denoise as u8);
         out.push(self.options.temporal as u8);
-        out.push(self.options.fast as u8);
+        out.push(self.options.fast as u8 | (self.options.sky as u8) << 1);
         out.extend(self.options.shutter.to_le_bytes());
         out.extend(self.seed.to_le_bytes());
         f(out, &self.lens);
@@ -399,24 +420,33 @@ const FAST_IMAGES: [(&str, gpu::TextureFormat, u32, u32); 7] = [
     ("ray reconstruction output", gpu::TextureFormat::Rgba32Float, 4, 109),
 ];
 
+/// The fast mode's tiles, in texels (pt.wgsl `FAST_TILE`).
+const FAST_TILE: u32 = 16;
+
 /// Floats a texel in the fast mode's packed input.
 const FAST_FLOATS: u64 = 19;
 
 /// A traced list in the fast mode: its sizes, Ray Reconstruction's
 /// history of it, the images it reads and writes, the trace's texels
-/// packed for them and its picture for `resolve_fast`.
+/// packed for them and its picture for `resolve_fast`. Without Ray
+/// Reconstruction (the trace has the picture's size, and is accumulated
+/// and denoised here) there are no images, and `packed` is not used.
 #[derive(Clone, Copy)]
 struct Fast {
     low: (u32, u32),
     full: (u32, u32),
     feature: Option<crate::ngx::Feature>,
-    textures: [(gpu::Texture, gpu::TextureView); 7],
+    textures: Option<[(gpu::Texture, gpu::TextureView); 7]>,
+    /// Tests: the six images read back for the stand-in, on the host.
+    host: Option<gpu::Buffer>,
     packed: gpu::Buffer,
     out: gpu::Buffer,
     /// What `visible` saw of each texel of the full picture.
     seen: gpu::Buffer,
     /// The picture after depth of field (`dof_fast`).
     dof: gpu::Buffer,
+    /// What may reach a texel from around it (`fast_tiles`).
+    tiles: gpu::Buffer,
 }
 
 #[derive(Clone, Copy)]
@@ -498,9 +528,15 @@ struct Slot {
     denoised: bool,
     /// Its result is in the upload buffer (the copied way).
     upload: bool,
-    /// The fast mode: the picture's full size (the trace has half), and
-    /// its shutter.
+    /// The fast mode: the picture's full size, whether Ray Reconstruction
+    /// makes it (of a trace of half the size; else the trace has it all
+    /// and is accumulated and denoised here), and its shutter.
     fast: Option<(u32, u32)>,
+    rr: bool,
+    /// And whether a shadow catcher is in it (`fast_catcher`).
+    catcher: bool,
+    /// The raster's sky visibility, not a picture (`TraceOptions::sky`).
+    sky: bool,
     shutter: f32,
     /// And its lens for `dof_fast`: the circle of confusion's radius, in
     /// texels of the full picture, of a point twice as far as the focus
@@ -549,8 +585,17 @@ pub struct Tracer {
     /// why not), its passes, and each traced list's images and history.
     ngx: Option<Result<crate::ngx::Ngx, String>>,
     ngx_pack: gpu::ComputePipeline,
+    /// Without it: the denoised lighting as its picture (`fast_pack`).
+    fast_pack: gpu::ComputePipeline,
     resolve_fast: gpu::ComputePipeline,
     dof_fast: gpu::ComputePipeline,
+    fast_tiles: gpu::ComputePipeline,
+    fast_catcher: gpu::ComputePipeline,
+    /// The raster's sky visibility (`TraceOptions::sky`): its filter.
+    sky_filter: gpu::ComputePipeline,
+    /// Tests: the stand-in for Ray Reconstruction (`ngx_stand_in`).
+    #[cfg(test)]
+    stand_in: Option<gpu::ComputePipeline>,
     fast: HashMap<u32, Fast>,
     fast_old: Vec<Fast>,
     specialised: HashMap<u32, Option<gpu::ComputePipeline>>,
@@ -613,6 +658,9 @@ struct History {
     size: (u32, u32),
     buffers: [gpu::Buffer; 2],
     current: usize,
+    /// The list's mesh layers then: a frame with none of them is another
+    /// scene (a cut), and starts again without history.
+    ids: Vec<Arc<str>>,
     cam: [f32; 4],
     place: [f32; 4],
     root: [[f32; 4]; 3],
@@ -638,8 +686,14 @@ impl Tracer {
             unpack: make("oidn unpack", "oidn_unpack"),
             ngx: None,
             ngx_pack: make("ray reconstruction pack", "ngx_pack"),
+            fast_pack: make("fast lit picture", "fast_pack"),
+            #[cfg(test)]
+            stand_in: None,
             resolve_fast: make("trace resolve", "resolve_fast"),
             dof_fast: make("fast depth of field", "dof_fast"),
+            fast_tiles: make("fast mode tiles", "fast_tiles"),
+            fast_catcher: make("fast shadow catcher", "fast_catcher"),
+            sky_filter: make("sky visibility filter", "sky_filter"),
             fast: HashMap::new(),
             fast_old: Vec::new(),
             specialised: HashMap::new(),
@@ -972,11 +1026,19 @@ impl Tracer {
         // point of each (Halton 2, 3 by frame: Ray Reconstruction is told
         // which, and builds the full picture over the frames), with no
         // lens: depth of field would have to come after it.
+        // Without Ray Reconstruction the fast mode traces every texel
+        // (`fast` without `rr`): few paths, accumulated over the frames and
+        // denoised as an export's are, with the same passes after it for
+        // depth of field and motion blur (so no lens here either).
         let full = size;
-        let fast = t.options.fast && parts == 1 && self.ngx.get_or_insert_with(|| crate::ngx::Ngx::load(context)).is_ok();
-        let size = if fast { (full.0.div_ceil(2), full.1.div_ceil(2)) } else { full };
-        let place = [t.origin[0], t.origin[1], t.factor[0] * full.0 as f32 / size.0 as f32, t.factor[1] * full.1 as f32 / size.1 as f32];
-        let lens = if fast {
+        let sky = t.options.sky;
+        let fast = t.options.fast && parts == 1 && !sky;
+        let rr = fast && self.reconstructs(context);
+        // (Sky visibility: the group's second half is for the light that
+        // comes back, a texel for each of the first half's.)
+        let size = if rr { (full.0.div_ceil(2), full.1.div_ceil(2)) } else if sky { (full.0, full.1 / 2) } else { full };
+        let place = if sky { [t.origin[0], t.origin[1], t.factor[0], t.factor[1]] } else { [t.origin[0], t.origin[1], t.factor[0] * full.0 as f32 / size.0 as f32, t.factor[1] * full.1 as f32 / size.1 as f32] };
+        let lens = if rr {
             let halton = |mut i: u64, b: u64| {
                 let (mut f, mut r) = (1.0f32, 0.0f32);
                 while i > 0 {
@@ -988,11 +1050,13 @@ impl Tracer {
             };
             let k = self.frame % 64 + 1;
             [0.0, 0.0, halton(k, 2), halton(k, 3)]
+        } else if fast {
+            [0.0; 4]
         } else {
             [t.lens[0], t.lens[1], 0.0, 0.0]
         };
         // (Its motion is the temporal history's.)
-        let temporal = (t.options.temporal || fast) && parts == 1;
+        let temporal = (t.options.temporal || fast) && parts == 1 && !sky;
         let profiling = profile.is_some();
         inst_rows.reserve(t.instances.len() * INST_ROWS);
         records.reserve(t.instances.len() + 1);
@@ -1184,10 +1248,19 @@ impl Tracer {
                 }
                 let hist_size = ((size.0 * size.1) as u64 * 48).max(16);
                 let make = || context.create_buffer(gpu::BufferDesc { name: "trace history", size: hist_size, memory: gpu::Memory::Device });
-                self.history.insert(slot, History { size, buffers: [make(), make()], current: 0, cam: [0.0; 4], place: [0.0; 4], root: [[0.0; 4]; 3] });
+                self.history.insert(slot, History { size, buffers: [make(), make()], current: 0, ids: Vec::new(), cam: [0.0; 4], place: [0.0; 4], root: [[0.0; 4]; 3] });
             }
             let h = self.history.get_mut(&slot).unwrap();
-            let prev = (h.cam, h.place, h.root);
+            let mut prev = (h.cam, h.place, h.root);
+            // A cut: none of the layers traced here last frame. What was
+            // accumulated is another scene's (the passes take a camera
+            // with w 0 for no frame before this one, and Ray
+            // Reconstruction is told to start again).
+            let ids: Vec<Arc<str>> = t.instances.iter().map(|i| i.id.clone()).collect();
+            if !h.ids.is_empty() && !ids.is_empty() && !ids.iter().any(|i| h.ids.contains(i)) {
+                prev.0[3] = 0.0;
+            }
+            h.ids = ids;
             let (read, write) = (h.buffers[h.current], h.buffers[1 - h.current]);
             h.current = 1 - h.current;
             h.cam = [t.focal, t.centre[0], t.centre[1], 1.0];
@@ -1197,22 +1270,27 @@ impl Tracer {
         } else {
             ((self.dummy, self.dummy), ([0.0; 4], [0.0; 4], [[0.0; 4]; 3]))
         };
+        // Without Ray Reconstruction, a frame with none before it has
+        // only its own paths: it takes four times as many.
+        let spp = t.options.spp.max(1) * if fast && !rr && prev.0[3] < 0.5 { FAST_FIRST } else { 1 };
         let uniforms = Uniforms {
-            size: [size.0, size.1, 0, t.options.spp.max(1)],
+            size: [size.0, size.1, 0, spp],
             opts: [t.options.bounces.max(1), t.seed, CARD_INSTANCE, t.cards.len() as u32],
             cam: [t.focal, t.centre[0], t.centre[1], 0.0],
             place,
             root: r(&t.root),
             inv_root: r(&t.inv_root),
             lens,
-            denoise: [0, temporal as u32, fast as u32, 0],
+            // (z: 1 with Ray Reconstruction, 3 the fast mode without it,
+            // 4 the raster's sky visibility.)
+            denoise: [0, temporal as u32, if sky { 4 } else if rr { 1 } else if fast { 3 } else { 0 }, 0],
             prev_cam: prev.0,
             prev_place: prev.1,
             prev_root: prev.2,
             band: [0, size.1, if profiling { density_repeat() } else { 0 }, part | parts.max(1) << 16],
         };
         let bind = Bindings { tlas, inst: inst_buf, attr, idx, tag, mat: mat_buf, light: light_buf, card: card_buf, env: env_buf, counts, bounds: bounds_buf, jobs: jobs_buf };
-        let state = Slot { size, uniforms, bind, temporal, denoise: t.options.denoise, hist, current: 0, denoised: false, upload: false, fast: fast.then_some(full), shutter: t.options.shutter, lens: [t.focal * t.lens[0] / t.lens[1].max(1.0) / t.factor[0].max(1e-6) * 0.5, t.lens[1]] };
+        let state = Slot { size, uniforms, bind, temporal, denoise: t.options.denoise, hist, current: 0, denoised: false, upload: false, fast: fast.then_some(full), rr, catcher: features & F_CATCHER != 0, sky, shutter: t.options.shutter, lens: [t.focal * t.lens[0] / t.lens[1].max(1.0) / t.factor[0].max(1e-6) * 0.5, t.lens[1]] };
         if !jobs.is_empty() {
             let mut pass = encoder.compute("volume bounds");
             let mut pc = pass.with(&self.bounds);
@@ -1222,7 +1300,7 @@ impl Tracer {
         if let Some(p) = profile.as_deref_mut() {
             p.stage("gpu frame › trace setup › tables and structures", building);
         }
-        let seen = fast.then(|| self.fast_slot(context, encoder, slot, size, full).seen);
+        let seen = fast.then(|| self.fast_slot(context, encoder, slot, size, full, rr).seen);
         let compiling = std::time::Instant::now();
         {
             let profiled = self.profile;
@@ -1251,7 +1329,7 @@ impl Tracer {
             // watchdog; a submission each also lets the GPU turn to the
             // desktop between bands, so it keeps drawing. The bands queue
             // up behind each other: nothing waits for them here.
-            let band = band_rows(size.0, t.options.spp.max(1)).min(TRACE_BAND_ROWS);
+            let band = band_rows(size.0, spp).min(TRACE_BAND_ROWS);
             let bands = size.1.div_ceil(band);
             for k in 0..bands {
                 let rows = [k * band, ((k + 1) * band).min(size.1)];
@@ -1305,6 +1383,57 @@ impl Tracer {
         matches!(self.oidn, Some(Ok(_)))
     }
 
+    /// Whether the fast mode has NVIDIA's Ray Reconstruction (loading
+    /// the shim on first use). Without it the tracer accumulates and
+    /// denoises few paths a texel itself.
+    pub(crate) fn reconstructs(&mut self, context: &gpu::Context) -> bool {
+        // LAHZA_FAST=own leaves Ray Reconstruction out (to compare).
+        if self.ngx.is_none() && std::env::var("LAHZA_FAST").is_ok_and(|v| v == "own") {
+            self.ngx = Some(Err("LAHZA_FAST=own".into()));
+        }
+        self.ngx.get_or_insert_with(|| crate::ngx::Ngx::load(context)).is_ok()
+    }
+
+    /// Forgets what was accumulated over the frames before (and where
+    /// every layer was): the next frame is the first of a sequence, as
+    /// after a cut. For a frame that does not follow the last one drawn.
+    pub(crate) fn forget(&mut self) {
+        self.prev_transforms.clear();
+        for h in self.history.values_mut() {
+            h.cam[3] = 0.0;
+            h.ids.clear();
+        }
+    }
+
+    /// Tests: a stand-in for Ray Reconstruction (`ngx::Ngx::stand_in`,
+    /// pt.wgsl `ngx_stand_in`), so the fast mode is checked without it.
+    #[cfg(test)]
+    pub(crate) fn pass_through_ngx(&mut self, context: &gpu::Context) {
+        let shader = context.try_create_shader(gpu::ShaderDesc { source: &specialise(ALL_FEATURES, self.profile) }).expect("the trace shader");
+        self.stand_in = Some(context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "ray reconstruction stand-in", data_layouts: &[&TraceData::layout()], compute: shader.at("ngx_stand_in") }));
+        self.ngx = Some(Ok(crate::ngx::Ngx::stand_in()));
+    }
+
+    /// Tests: the fast mode without Ray Reconstruction, wherever run.
+    #[cfg(test)]
+    pub(crate) fn without_ngx(&mut self) {
+        self.ngx = Some(Err("left out (a test)".into()));
+    }
+
+    /// Tests: what the stand-in was given, frame after frame, and the
+    /// six images of traced list `slot`'s last frame as it read them
+    /// back (`FAST_IMAGES`, one after another) with their size.
+    #[cfg(test)]
+    pub(crate) fn stand_in_saw(&self, context: &gpu::Context, slot: u32) -> (Vec<([f32; 2], bool)>, Vec<f32>, (u32, u32)) {
+        let Some(Ok(ngx)) = &self.ngx else { return Default::default() };
+        let Some((f, host)) = self.fast.get(&slot).and_then(|f| f.host.map(|h| (f, h))) else { return (ngx.seen.clone(), Vec::new(), (0, 0)) };
+        context.sync_buffer(host);
+        let n = (f.low.0 * f.low.1) as usize * FAST_FLOATS as usize;
+        // SAFETY: the buffer holds n floats, and the GPU is done with it.
+        let floats = unsafe { std::slice::from_raw_parts(host.data() as *const f32, n) }.to_vec();
+        (ngx.seen.clone(), floats, f.low)
+    }
+
     /// Tests: a stand-in for Open Image Denoise that returns the colour
     /// it is given, so the way there and back is checked without it.
     #[cfg(test)]
@@ -1333,7 +1462,11 @@ impl Tracer {
         let texels = (state.size.0 * state.size.1) as u64;
         let (guides, hdr) = self.work(context, slot, texels);
         let groups_x = [state.size.0.div_ceil(8), state.size.1.div_ceil(8), 1];
-        if let Some(full) = state.fast {
+        if state.sky {
+            self.sets[set].slots[slot as usize] = Some(state);
+            return;
+        }
+        if let (Some(full), true) = (state.fast, state.rr) {
             self.reconstruct(context, encoder, slot, &state, full, groups, images, guides, hdr);
             self.sets[set].slots[slot as usize] = Some(state);
             return;
@@ -1452,8 +1585,8 @@ impl Tracer {
     /// Traced list `slot`'s images and buffers in the fast mode, for a
     /// trace of `low` texels and a picture of `full` (made on first use,
     /// and again when the sizes change).
-    fn fast_slot(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, slot: u32, low: (u32, u32), full: (u32, u32)) -> Fast {
-        if self.fast.get(&slot).is_some_and(|f| f.low != low || f.full != full) {
+    fn fast_slot(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, slot: u32, low: (u32, u32), full: (u32, u32), rr: bool) -> Fast {
+        if self.fast.get(&slot).is_some_and(|f| f.low != low || f.full != full || f.textures.is_some() != rr) {
             // (Kept until the tracer goes: frames in flight may read it.)
             let old = self.fast.remove(&slot).unwrap();
             self.fast_old.push(old);
@@ -1467,17 +1600,20 @@ impl Tracer {
                 (texture, view)
             };
             let buffer = |name, size: u64| context.create_buffer(gpu::BufferDesc { name, size, memory: gpu::Memory::Device });
+            let stand_in = matches!(&self.ngx, Some(Ok(ngx)) if ngx.is_stand_in());
             let f = Fast {
                 low,
                 full,
                 feature: None,
-                textures: FAST_IMAGES.map(|(name, format, _, _)| texture(name, format, if name == "ray reconstruction output" { full } else { low })),
-                packed: buffer("ray reconstruction input", n * FAST_FLOATS * 4),
+                textures: rr.then(|| FAST_IMAGES.map(|(name, format, _, _)| texture(name, format, if name == "ray reconstruction output" { full } else { low }))),
+                host: (rr && stand_in).then(|| context.create_buffer(gpu::BufferDesc { name: "ray reconstruction stand-in", size: n * FAST_FLOATS * 4, memory: gpu::Memory::Shared })),
+                packed: buffer("ray reconstruction input", if rr { n * FAST_FLOATS * 4 } else { 16 }),
                 out: buffer("ray reconstruction output", texels * 16),
                 seen: buffer("fast mode visibility", texels * 32),
                 dof: buffer("fast mode depth of field", texels * 32),
+                tiles: buffer("fast mode tiles", (full.0.div_ceil(FAST_TILE) as u64 * full.1.div_ceil(FAST_TILE) as u64 * 16).max(16)),
             };
-            for (t, _) in f.textures {
+            for (t, _) in f.textures.into_iter().flatten() {
                 encoder.init_texture(t);
             }
             self.fast.insert(slot, f);
@@ -1493,7 +1629,8 @@ impl Tracer {
     fn reconstruct(&mut self, context: &gpu::Context, encoder: &mut gpu::CommandEncoder, slot: u32, state: &Slot, full: (u32, u32), groups: gpu::Buffer, images: gpu::Buffer, guides: gpu::Buffer, hdr: [gpu::Buffer; 2]) {
         let low = state.size;
         let n = (low.0 * low.1) as u64;
-        let f = self.fast_slot(context, encoder, slot, low, full);
+        let f = self.fast_slot(context, encoder, slot, low, full, true);
+        let Some(textures) = f.textures else { return };
         {
             let mut pass = encoder.compute("ray reconstruction pack");
             let mut pc = pass.with(&self.ngx_pack);
@@ -1506,11 +1643,11 @@ impl Tracer {
             let mut copy = encoder.transfer("ray reconstruction images");
             let mut at = 0u64;
             for (k, (_, _, floats, _)) in FAST_IMAGES.iter().enumerate().take(6) {
-                copy.copy_buffer_to_texture(f.packed.at(at), low.0 * floats * 4, f.textures[k].0.into(), gpu::Extent { width: low.0, height: low.1, depth: 1 });
+                copy.copy_buffer_to_texture(f.packed.at(at), low.0 * floats * 4, textures[k].0.into(), gpu::Extent { width: low.0, height: low.1, depth: 1 });
                 at += n * *floats as u64 * 4;
             }
         }
-        let image = |k: usize, (width, height): (u32, u32)| crate::ngx::Image { image: f.textures[k].0.raw_image(), view: f.textures[k].1.raw_view(), format: FAST_IMAGES[k].3, width, height, pad: 0 };
+        let image = |k: usize, (width, height): (u32, u32)| crate::ngx::Image { image: textures[k].0.raw_image(), view: textures[k].1.raw_view(), format: FAST_IMAGES[k].3, width, height, pad: 0 };
         let frame = crate::ngx::Frame {
             color: image(0, low),
             diffuse: image(1, low),
@@ -1526,6 +1663,36 @@ impl Tracer {
             reset: (f.feature.is_none() || state.uniforms.prev_cam[3] < 0.5) as u32,
             pad: 0,
         };
+        // Tests: the stand-in reads the six images back and makes the
+        // picture of them here, then puts it where Ray Reconstruction
+        // would have (its output image).
+        #[cfg(test)]
+        if let (Some(Ok(ngx)), Some(host), Some(pipeline)) = (self.ngx.as_mut().filter(|n| n.as_ref().is_ok_and(|n| n.is_stand_in())), f.host, self.stand_in.as_ref()) {
+            ngx.seen.push((frame.jitter, frame.reset != 0));
+            {
+                let mut copy = encoder.transfer("ray reconstruction stand-in images");
+                let mut at = 0u64;
+                for (k, (_, _, floats, _)) in FAST_IMAGES.iter().enumerate().take(6) {
+                    copy.copy_texture_to_buffer(textures[k].0.into(), host.at(at), low.0 * floats * 4, gpu::Extent { width: low.0, height: low.1, depth: 1 });
+                    at += n * *floats as u64 * 4;
+                }
+            }
+            {
+                let mut pass = encoder.compute("ray reconstruction stand-in");
+                let mut pc = pass.with(pipeline);
+                let mut data = state.data(Uniforms { denoise: [full.0, full.1, 1, 0], ..state.uniforms }, groups, images, guides, hdr[0], f.dof);
+                data.b_bounds = host.into();
+                pc.bind(0, &data);
+                pc.dispatch([full.0.div_ceil(8), full.1.div_ceil(8), 1]);
+            }
+            let mut copy = encoder.transfer("ray reconstruction stand-in picture");
+            copy.copy_buffer_to_texture(f.dof.into(), full.0 * 16, textures[6].0.into(), gpu::Extent { width: full.0, height: full.1, depth: 1 });
+            copy.copy_texture_to_buffer(textures[6].0.into(), f.out.into(), full.0 * 16, gpu::Extent { width: full.0, height: full.1, depth: 1 });
+            if let Some(entry) = self.fast.get_mut(&slot) {
+                entry.feature = entry.feature.or_else(|| ngx.create(0, low, full));
+            }
+            return;
+        }
         let Some(Ok(ngx)) = self.ngx.as_ref() else { return };
         let done = encoder.foreign("ray reconstruction", |cmd| {
             let feature = f.feature.or_else(|| ngx.create(cmd, low, full));
@@ -1539,7 +1706,7 @@ impl Tracer {
             self.ngx = Some(Err("NVIDIA Ray Reconstruction failed on a frame".into()));
             return;
         }
-        encoder.transfer("ray reconstruction picture").copy_texture_to_buffer(f.textures[6].0.into(), f.out.into(), full.0 * 16, gpu::Extent { width: full.0, height: full.1, depth: 1 });
+        encoder.transfer("ray reconstruction picture").copy_texture_to_buffer(textures[6].0.into(), f.out.into(), full.0 * 16, gpu::Extent { width: full.0, height: full.1, depth: 1 });
     }
 
     /// Open Image Denoise on traced list `slot` of the frame in `set`
@@ -1632,32 +1799,95 @@ impl Tracer {
         let texels = (state.size.0 * state.size.1) as u64;
         let (guides, hdr) = self.work(context, slot, texels);
         let groups_x = [state.size.0.div_ceil(8), state.size.1.div_ceil(8), 1];
-        if let (Some(full), Some(f)) = (state.fast, self.fast.get(&slot)) {
-            // Depth of field on Ray Reconstruction's picture, then the
-            // motion blur and the look.
+        if state.sky {
+            // The texels' rays as one value each, into the group.
+            for &offset in offsets {
+                state.uniforms.size[2] = offset;
+                let mut pass = encoder.compute("sky visibility filter");
+                let mut pc = pass.with(&self.sky_filter);
+                pc.bind(0, &state.data(state.uniforms, groups, images, guides, hdr[0], hdr[1]));
+                pc.dispatch(groups_x);
+            }
+            return;
+        }
+        let fast = state.fast.and_then(|full| self.fast.get(&slot).map(|f| (full, *f)));
+        if fast.is_none() || !state.rr {
+            self.filter(encoder, set, slot, &mut state, groups, images);
+        }
+        if let Some((full, f)) = fast {
+            if !state.rr {
+                // The lighting as Ray Reconstruction would have left it.
+                let mut pass = encoder.compute("fast lit picture");
+                let mut pc = pass.with(&self.fast_pack);
+                let mut data = state.data(state.uniforms, groups, images, guides, hdr[state.current], hdr[1 - state.current]);
+                data.b_bounds = f.out.into();
+                pc.bind(0, &data);
+                pc.dispatch(groups_x);
+            }
+            // Depth of field on that picture, then the motion blur and
+            // the look.
             let lens = state.lens[0] > 0.0;
+            let l = state.uniforms.lens;
+            if state.catcher {
+                // The shadow catchers' shadows on what is flat, smoothed
+                // (rows into the depth of field's buffer, columns back).
+                for down in 0..2 {
+                    let u = Uniforms { denoise: [full.0, full.1, down, 0], ..state.uniforms };
+                    let mut pass = encoder.compute("fast shadow catcher");
+                    let mut pc = pass.with(&self.fast_catcher);
+                    pc.bind(0, &state.data(u, groups, images, guides, f.dof, f.seen));
+                    pc.dispatch([full.0.div_ceil(8), full.1.div_ceil(8), 1]);
+                }
+            }
+            if lens || state.shutter > 0.0 {
+                // What may reach each texel from around it.
+                let u = Uniforms { denoise: [full.0, full.1, 0, state.shutter.to_bits()], lens: [state.lens[0], state.lens[1], l[2], l[3]], ..state.uniforms };
+                let mut pass = encoder.compute("fast mode tiles");
+                let mut pc = pass.with(&self.fast_tiles);
+                let mut data = state.data(u, groups, images, guides, hdr[0], f.seen);
+                data.b_next = f.tiles.into();
+                pc.bind(0, &data);
+                pc.dispatch([full.0.div_ceil(FAST_TILE * 8), full.1.div_ceil(FAST_TILE * 8), 1]);
+            }
             if lens {
                 let u = Uniforms { denoise: [full.0, full.1, 0, 0], lens: [state.lens[0], state.lens[1], 0.0, 0.0], ..state.uniforms };
                 let mut pass = encoder.compute("fast depth of field");
                 let mut pc = pass.with(&self.dof_fast);
                 let mut data = state.data(u, groups, images, guides, f.dof, f.seen);
                 data.b_bounds = f.out.into();
+                data.b_hist = f.tiles.into();
                 pc.bind(0, &data);
                 pc.dispatch([full.0.div_ceil(8), full.1.div_ceil(8), 1]);
             }
             for &offset in offsets {
-                let l = state.uniforms.lens;
                 let u = Uniforms { size: [state.size.0, state.size.1, offset, state.uniforms.size[3]], denoise: [full.0, full.1, 0, 0], lens: [state.shutter, lens as u32 as f32, l[2], l[3]], ..state.uniforms };
                 let mut pass = encoder.compute("trace resolve");
                 let mut pc = pass.with(&self.resolve_fast);
                 let mut data = state.data(u, groups, images, guides, if lens { f.dof } else { hdr[0] }, f.seen);
                 data.b_bounds = f.out.into();
+                data.b_hist = f.tiles.into();
                 pc.bind(0, &data);
                 pc.dispatch([full.0.div_ceil(8), full.1.div_ceil(8), 1]);
             }
             self.sets[set].slots[slot as usize] = Some(state);
             return;
         }
+        for &offset in offsets {
+            state.uniforms.size[2] = offset;
+            let mut pass = encoder.compute("trace resolve");
+            let mut pc = pass.with(&self.resolve);
+            pc.bind(0, &state.data(state.uniforms, groups, images, guides, hdr[state.current], hdr[1 - state.current]));
+            pc.dispatch(groups_x);
+        }
+    }
+
+    /// Traced list `slot`'s lighting through the filters: back from Open
+    /// Image Denoise where it went there, and the à-trous passes.
+    fn filter(&mut self, encoder: &mut gpu::CommandEncoder, set: usize, slot: u32, state: &mut Slot, groups: gpu::Buffer, images: gpu::Buffer) {
+        let texels = (state.size.0 * state.size.1) as u64;
+        let Some(w) = self.sets[set].work[slot as usize].as_ref() else { return };
+        let (guides, hdr) = (w.guides, w.hdr);
+        let groups_x = [state.size.0.div_ceil(8), state.size.1.div_ceil(8), 1];
         if state.denoised {
             // Back as lighting over albedo: the resolve pass multiplies the
             // same albedo in again, which gives OIDN's colour exactly.
@@ -1690,13 +1920,6 @@ impl Tracer {
                 pc.dispatch(groups_x);
                 state.current = 1 - state.current;
             }
-        }
-        for &offset in offsets {
-            state.uniforms.size[2] = offset;
-            let mut pass = encoder.compute("trace resolve");
-            let mut pc = pass.with(&self.resolve);
-            pc.bind(0, &state.data(state.uniforms, groups, images, guides, hdr[state.current], hdr[1 - state.current]));
-            pc.dispatch(groups_x);
         }
     }
 
@@ -1758,7 +1981,7 @@ impl Tracer {
     /// Why traced frames were not denoised with Open Image Denoise, if so.
     pub(crate) fn denoise_warning(&self) -> Option<String> {
         if let Some(Err(e)) = &self.ngx {
-            return Some(format!("the fast mode was not used: {e}"));
+            return Some(format!("the fast mode ran without NVIDIA Ray Reconstruction ({e}): few paths a pixel, accumulated over the frames and denoised here"));
         }
         match (&self.oidn, &self.sharing) {
             (Some(Err(e)), _) => Some(format!("path tracing used the built-in denoiser: {e}")),
@@ -1800,14 +2023,18 @@ impl Tracer {
             if let (Some(feature), Some(Ok(ngx))) = (f.feature, self.ngx.as_ref()) {
                 ngx.release(feature);
             }
-            for (t, v) in f.textures {
+            for (t, v) in f.textures.into_iter().flatten() {
                 context.destroy_texture_view(v);
                 context.destroy_texture(t);
+            }
+            if let Some(b) = f.host {
+                context.destroy_buffer(b);
             }
             context.destroy_buffer(f.packed);
             context.destroy_buffer(f.out);
             context.destroy_buffer(f.seen);
             context.destroy_buffer(f.dof);
+            context.destroy_buffer(f.tiles);
         }
         if let Some(Ok(ngx)) = self.ngx.take() {
             ngx.shutdown();
@@ -1850,8 +2077,12 @@ impl Tracer {
             }
         }
         context.destroy_buffer(self.dummy);
-        for p in [&mut self.pipeline, &mut self.temporal, &mut self.atrous, &mut self.resolve, &mut self.bounds, &mut self.pack, &mut self.unpack] {
+        for p in [&mut self.pipeline, &mut self.temporal, &mut self.atrous, &mut self.resolve, &mut self.bounds, &mut self.pack, &mut self.unpack, &mut self.ngx_pack, &mut self.fast_pack, &mut self.resolve_fast, &mut self.dof_fast, &mut self.fast_tiles, &mut self.fast_catcher, &mut self.sky_filter] {
             context.destroy_compute_pipeline(p);
+        }
+        #[cfg(test)]
+        if let Some(mut p) = self.stand_in.take() {
+            context.destroy_compute_pipeline(&mut p);
         }
         for mut p in self.specialised.drain().filter_map(|(_, p)| p) {
             context.destroy_compute_pipeline(&mut p);
@@ -2046,7 +2277,11 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 #[cfg(test)]
-mod scene_tests {
+#[path = "pt_fast_tests.rs"]
+mod fast_tests;
+
+#[cfg(test)]
+pub(crate) mod scene_tests {
     use crate::tests::{cpu, project};
     use crate::{Backend, RenderOptions, Renderer};
     use lahza_motion_core::compile::Compiled;
@@ -2088,7 +2323,7 @@ mod scene_tests {
         let spp = std::env::var("LAHZA_PT_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let Some(mut r) = tracer(spp) else { return };
         if std::env::var_os("LAHZA_PT_RAW").is_some() {
-            r.options.path = Some(super::TraceOptions { spp, bounces: 4, denoise: false, temporal: false });
+            r.options.path = Some(super::TraceOptions { spp, bounces: 4, denoise: false, temporal: false, ..Default::default() });
         }
         let mut p = project(json!([
             {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#c8c2b8"}, "transform": {"position": [480, 235], "rotation_x": 90}},
@@ -2612,7 +2847,7 @@ mod physics_tests {
     fn the_denoiser_smooths_without_blurring_edges() {
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
         let with = |denoise: bool| {
-            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 4, bounces: 4, denoise, temporal: false }), ..Default::default() });
+            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 4, bounces: 4, denoise, temporal: false, ..Default::default() }), ..Default::default() });
             r.can_trace().then_some(r)
         };
         let (Some(mut on), Some(mut off)) = (with(true), with(false)) else { return };
@@ -2648,7 +2883,7 @@ mod physics_tests {
     fn sequences_accumulate_without_ghosts() {
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
         let make = |temporal: bool| {
-            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, motion_blur: false, path: Some(super::TraceOptions { spp: 2, bounces: 3, denoise: true, temporal }), ..Default::default() });
+            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, motion_blur: false, path: Some(super::TraceOptions { spp: 2, bounces: 3, denoise: true, temporal, ..Default::default() }), ..Default::default() });
             r.can_trace().then_some(r)
         };
         let (Some(mut on), Some(mut off)) = (make(true), make(false)) else { return };
@@ -2884,7 +3119,7 @@ mod physics_tests {
         }
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
         let mut r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow,
-            path: Some(super::TraceOptions { spp: 8, bounces: 4, denoise: false, temporal: false }), ..Default::default() });
+            path: Some(super::TraceOptions { spp: 8, bounces: 4, denoise: false, temporal: false, ..Default::default() }), ..Default::default() });
         let mut p = project(json!([{"id": "v", "kind": "mesh", "mesh": {"type": "box", "size": [300, 170], "depth": 400},
             "material": {"volume": {"density": 0.15, "color": "#ffffff", "anisotropy": 0.3}}, "transform": {"position": [160, 90]}}]));
         p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0.3, -1, 0.2], "intensity": 2, "shadow": true}])).unwrap();
@@ -3017,7 +3252,7 @@ mod physics_tests {
     fn sequence_renderer(denoise: bool, temporal: bool) -> Option<Renderer> {
         tracer(1)?;
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
-        Some(Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 8, bounces: 3, denoise, temporal }), ..Default::default() }))
+        Some(Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 8, bounces: 3, denoise, temporal, ..Default::default() }), ..Default::default() }))
     }
 
     /// Frames pushed through the renderer (the next begun while the GPU
@@ -3261,6 +3496,7 @@ const FEATURES: [(u32, &str); 9] = [
     (1 << 8, "F_DETAIL"),
 ];
 const ALL_FEATURES: u32 = (1 << 9) - 1;
+const F_CATCHER: u32 = 1 << 5;
 
 /// The tracer's source with only `features` on (and counting with `profile`).
 fn specialise(features: u32, profile: bool) -> String {

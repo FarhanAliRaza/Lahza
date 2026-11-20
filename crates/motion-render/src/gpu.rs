@@ -229,8 +229,9 @@ fn reads_groups(list: &DisplayList, g: &crate::list::Group) -> bool {
             match p.kind[0] {
                 crate::list::PRIM_MATTE => true,
                 crate::list::PRIM_IMAGE => p.kind[1] == crate::list::SOURCE_GROUP,
-                // (Records are cards; `paint[3]`: a backdrop.)
-                crate::list::PRIM_MESH => p.paint[3] > 0.5 || p.geom[2].to_bits() > 0,
+                // (Records are cards; `paint[3]`: a backdrop; the light
+                // block's last spare float: the list's sky visibility.)
+                crate::list::PRIM_MESH => p.paint[3] > 0.5 || p.geom[2].to_bits() > 0 || list.mesh.get(p.geom2[3].to_bits() as usize + 6).is_some_and(|r| r[3].to_bits() != 0),
                 _ => false,
             }
         })
@@ -1084,6 +1085,11 @@ pub fn merge(samples: &[DisplayList], separate: bool) -> (DisplayList, Targets) 
 /// buffer side by side. Each traced list is then traced sample after
 /// sample into one picture and filtered once. (One sample always can.)
 fn shares_traces(samples: &[DisplayList]) -> bool {
+    // (Sky visibility is each sample's own: its meshes are where they
+    // are at that moment.)
+    if samples.iter().any(|s| s.traces.iter().any(|t| t.options.sky)) {
+        return false;
+    }
     let traced = |s: &DisplayList| -> Vec<(u32, u32, [f32; 2], [f32; 2], [f32; 9], bool)> {
         s.groups.iter().filter_map(|g| g.trace.map(|i| (g, &s.traces[i as usize]))).map(|(g, t)| (g.target.width, g.target.height, t.origin, t.factor, t.root, t.options.denoise)).collect()
     };
@@ -1282,6 +1288,33 @@ impl Gpu {
     /// Frames begun and not finished.
     pub fn in_flight(&self) -> usize {
         self.flights.len()
+    }
+
+    /// Whether the fast mode has NVIDIA's Ray Reconstruction here.
+    pub(crate) fn reconstructs(&mut self) -> bool {
+        let context = &self.context;
+        self.tracer.as_mut().is_some_and(|t| t.reconstructs(context))
+    }
+
+    /// Forgets the traced lists' history (`pt::Tracer::forget`).
+    pub(crate) fn forget_trace_history(&mut self) {
+        if let Some(t) = self.tracer.as_mut() {
+            t.forget();
+        }
+    }
+
+    /// Tests: a stand-in for Ray Reconstruction, and what it was given.
+    #[cfg(test)]
+    pub(crate) fn pass_through_ngx(&mut self) {
+        let context = &self.context;
+        if let Some(t) = self.tracer.as_mut() {
+            t.pass_through_ngx(context);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stand_in_saw(&self, slot: u32) -> (Vec<([f32; 2], bool)>, Vec<f32>, (u32, u32)) {
+        self.tracer.as_ref().map(|t| t.stand_in_saw(&self.context, slot)).unwrap_or_default()
     }
 
     /// Whether traced frames wait for Open Image Denoise between `begin`
@@ -1589,7 +1622,8 @@ impl Gpu {
                         let own = if trace.options.fast { slot } else { 0 };
                         slot += trace.options.fast as u32;
                         tracer.part(&self.context, &mut self.encoder, &mut self.queue, trace, own, 0, 1, (t.width, t.height), groups_buf, images_buf, self.pool.buffer, self.profile.as_mut())?;
-                        let oidn = tracer.wants_oidn();
+                        // (Sky visibility is not a picture to denoise.)
+                        let oidn = !trace.options.sky && tracer.wants_oidn();
                         tracer.settle(&self.context, &mut self.encoder, own, groups_buf, images_buf, oidn);
                         if tracer.awaits_denoise(own) {
                             in_tracer += entered.elapsed().saturating_sub(self.queue.waited - waited_in);

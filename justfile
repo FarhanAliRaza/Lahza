@@ -27,7 +27,9 @@ install-helper:
 
 # Build the optional NVIDIA Ray Reconstruction shim (the fast path-traced mode) from a DLSS SDK
 # checkout (github.com/NVIDIA/DLSS) and Vulkan headers, and install it with the SDK's snippet
+# (what it needs, and NVIDIA's licence: packaging/ngx/README.md)
 ngx sdk="ignore/DLSS" headers="ignore/Vulkan-Headers/include":
+    sh packaging/ngx/check.sh {{sdk}} {{headers}}
     mkdir -p {{ngx}}
     g++ -std=c++17 -O2 -fPIC -shared -I{{headers}} -I{{sdk}}/include packaging/ngx/lahza_ngx.cpp \
       -o {{ngx}}/liblahza_ngx.so {{sdk}}/lib/Linux_x86_64/libnvsdk_ngx.a -l:libvulkan.so.1 -ldl -lpthread
