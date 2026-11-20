@@ -96,6 +96,7 @@ fn a_bake_says_its_share_and_stops_when_told() {
     });
     assert_eq!(stopped.err().as_deref(), Some(STOPPED));
     assert_eq!(asked.get(), 28, "nothing was stepped after the stop");
+}
 
 #[test]
 fn a_flat_landing_without_bounce_does_not_tip() {
