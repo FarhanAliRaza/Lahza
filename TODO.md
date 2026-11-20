@@ -578,8 +578,8 @@ picks by CPU. In the order built:
    - In the editor (done; seen under Xvfb, see "How it should be used"):
      it reloads when only `sim/` changes, says beside the prompt bar when
      a bake is missing or stale, and bakes in one click off the UI thread.
-   - `snapshot` warns of a missing or stale bake and `render` refuses one
-     unless given `unbaked`; `review` says nothing.
+   - `snapshot` and `review` warn of a missing or stale bake and `render`
+     refuses one unless given `unbaked`.
    - Left: a box landing flat at speed tips a degree or
      two before settling (rapier's contact solver; more iterations do not
      change it). Ropes are not drawn. Bodies inside instancers are

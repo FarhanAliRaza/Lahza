@@ -32,6 +32,8 @@ fn check_names_a_missing_and_a_stale_bake_and_bake_clears_them() {
     assert!(report["ok"] == false && issues.len() == 1 && issues[0].contains("2 bodies and no bake"), "{report:#}");
     let shot = tb.call("snapshot", json!({"at": [0.5], "width": 160})).unwrap().json;
     assert!(shot["warnings"][0].as_str().unwrap().contains("is not baked"), "{shot:#}");
+    let sheets = tb.call("review", json!({})).unwrap().json;
+    assert!(sheets["warnings"].as_array().unwrap().len() == 1 && sheets["warnings"][0].as_str().unwrap().contains("scene 's1'") && sheets["warnings"][0].as_str().unwrap().contains("is not baked"), "{:#}", sheets["warnings"]);
     assert!(tb.call("render", json!({"quality": "draft", "audio": false})).unwrap_err().contains("not baked"));
     let baked = tb.call("sim_bake", json!({})).unwrap().json;
     let s = &baked["scenes"][0];
@@ -42,6 +44,7 @@ fn check_names_a_missing_and_a_stale_bake_and_bake_clears_them() {
     assert!(sim_issues(&tb.call("check", json!({})).unwrap().json).is_empty());
     // Fresh, a snapshot has nothing to say about the simulation and a render goes ahead.
     assert!(tb.call("snapshot", json!({"at": [0.5], "width": 160})).unwrap().json.get("warnings").is_none());
+    assert!(tb.call("review", json!({})).unwrap().json.get("warnings").is_none());
     // Asked again, nothing is stepped; forced, the same bytes come out.
     assert_eq!(tb.call("sim_bake", json!({})).unwrap().json["scenes"][0]["status"], "up to date");
     tb.call("sim_bake", json!({"force": true})).unwrap();
@@ -56,6 +59,8 @@ fn check_names_a_missing_and_a_stale_bake_and_bake_clears_them() {
     // A snapshot of it says so, and a render is refused unless asked for as it is.
     let shot = tb.call("snapshot", json!({"at": [0.5], "width": 160})).unwrap().json;
     assert!(shot["warnings"][0].as_str().unwrap().contains("bake is stale"), "{shot:#}");
+    let sheets = tb.call("review", json!({})).unwrap().json;
+    assert!(sheets["warnings"][0].as_str().unwrap().contains("bake is stale") && sheets["warnings"][0].as_str().unwrap().contains("sim_bake"), "{:#}", sheets["warnings"]);
     let refused = tb.call("render", json!({"quality": "draft", "audio": false, "wait": true})).unwrap_err();
     assert!(refused.contains("scene 's1'") && refused.contains("stale") && refused.contains("sim_bake"), "{refused}");
     let out = dir.join("stale.mp4");
