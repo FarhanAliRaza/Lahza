@@ -783,14 +783,31 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      a little by its own weight while held, bends on the brick it meets
      and whips after the hit); 16 links add nothing that shows to the
      bake's time (48 bodies, 0.25 s).
+   - Bodies two instancers deep (`<layer>#<copy>#<copy>`; tested: two
+     stacks of three bricks from an instancer in an instancer fall as
+     six and are drawn where the bake has each; pinned), and three deep
+     refused with the reason. Bodies as an emitter's particles: a body a
+     slot (`<layer>#<slot>`), out of the world but while the slot holds
+     a particle; at each birth it is put where the emitter has the
+     particle, with the speed of its flight, and from then it is the
+     simulation's (the emitter's own gravity and drag are not; it keeps
+     the size it was born with, and its opacity and tint over life).
+     Before a life's first sample it is drawn where the emitter has it;
+     the bake's sample before a later life is where that particle came
+     from. Tested: a slot's lives against the emitter's rate, the speed
+     it leaves with, that it lands on a floor a particle falls through,
+     drawn where the bake has it while it lives; pinned. `tumble.py`'s
+     `pour` (blocks thrown onto a tilted plank, sliding into a heap; 33
+     slots for 5 s bake in 0.05 s) was looked at. An emitter inside an
+     instancer, or holding one, with bodies is refused.
    - Left, needing what is not here: Slang-generated meshes as
      colliders (their points come from `slangc`, which this machine has
      not; the code path is the hull of a generated mesh, untried).
    - Left, not done (nothing outside is needed, only the work): a box
      landing flat at speed tips a degree or two before settling
      (rapier's contact solver; more iterations do not change it, and
-     another solver was not tried). No bodies inside an emitter (its particles come and go) nor two
-     instancers deep; a ragdoll's or a crowd's layers cannot be copies.
+     another solver was not tried). A ragdoll's or a crowd's layers
+     cannot be copies of an instancer.
 2. **Skeletons and skinning: done.**
    - `model_import` keeps a glTF skin: a joint node is a comp like any
      node, and the skinned mesh layer has `"skin": {"index", "joints":

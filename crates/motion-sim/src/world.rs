@@ -257,6 +257,44 @@ impl World {
         self.released[i] = true;
     }
 
+    /// Puts body `i` in the world as a particle just born: where it is,
+    /// with the speed of its flight (and the body's own, and the jitter).
+    pub(crate) fn born(&mut self, input: &SimInput, i: usize, b: &BodyInput, life: &lahza_motion_core::sim::LifeInput) {
+        let (mut v, mut spin) = velocity_between(&life.pose, &life.next, 1.0 / input.rate);
+        let mut rng = Rng(input.seed ^ (i as u64 + 1).wrapping_mul(0xa24baed4963ee407) ^ (life.from as u64) << 32);
+        for k in 0..3 {
+            v[k] += b.velocity[k] + input.jitter * rng.signed();
+            spin[k] += (b.spin[k] + input.jitter * rng.signed()).to_radians();
+        }
+        if input.flat {
+            v[2] = 0.0;
+            spin[0] = 0.0;
+            spin[1] = 0.0;
+        }
+        let h = self.handles[i];
+        let rb = &mut self.w.bodies[h];
+        rb.set_enabled(true);
+        rb.set_body_type(RigidBodyType::Dynamic, true);
+        rb.set_position(pose(&life.pose, self.unit), true);
+        rb.set_linvel(v3(v, 1.0 / self.unit), true);
+        rb.set_angvel(v3(spin, 1.0), true);
+        for c in rb.colliders().to_vec() {
+            self.w.colliders[c].set_enabled(true);
+        }
+        self.released[i] = true;
+    }
+
+    /// Takes body `i` out of the world (its particle's life is over).
+    pub(crate) fn gone(&mut self, i: usize) {
+        let h = self.handles[i];
+        let rb = &mut self.w.bodies[h];
+        rb.set_enabled(false);
+        for c in rb.colliders().to_vec() {
+            self.w.colliders[c].set_enabled(false);
+        }
+        self.released[i] = false;
+    }
+
     fn joint(&mut self, input: &SimInput, j: &lahza_motion_core::sim::JointInput) -> ImpulseJointHandle {
         let m = 1.0 / self.unit;
         let (h1, h2) = (self.handles[j.a], j.b.map(|b| self.handles[b]).unwrap_or(self.anchor));

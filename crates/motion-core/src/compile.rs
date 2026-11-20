@@ -2053,9 +2053,11 @@ struct Space {
     /// Bodies stand where their keys put them (no bake): what a bake is
     /// made from.
     keyed: bool,
-    /// Inside an instancer's copy: which, and how much later it plays.
-    /// (A body in it is the bake's `<layer>#<copy>`.)
-    copy: Option<(u32, f64)>,
+    /// Inside an instancer's copy: which (of the outer instancer, then of
+    /// one inside it, `u32::MAX` when there is none), and how much later
+    /// it plays. (A body in it is the bake's `<layer>#<copy>`, or
+    /// `<layer>#<copy>#<copy>`.)
+    copy: Option<([u32; 2], f64)>,
 }
 
 /// Depth of field: blur sigma = `per_px` × |view depth − `plane`| canvas px.
@@ -2081,6 +2083,14 @@ impl Space {
             Proj::from(self.flat.then(world.to_affine()))
         }
     }
+}
+
+/// The copy a layer is in, one instancer further in.
+fn copy_in(outer: Option<([u32; 2], f64)>, k: u32, delay: f64) -> Option<([u32; 2], f64)> {
+    Some(match outer {
+        Some(([a, _], d)) => ([a, k], d + delay),
+        None => ([k, u32::MAX], delay),
+    })
 }
 
 fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &Space, cache: &mut [Option<Mat4>]) -> Mat4 {

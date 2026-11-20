@@ -17,8 +17,9 @@ pub(super) struct CBody {
     /// Timeline seconds of each of `spec.pushes`.
     pub pushes: Vec<f64>,
     pub bake: Option<(Arc<Bake>, usize)>,
-    /// Inside an instancer: the bake's track of each copy (`<id>#<copy>`).
-    pub copies: Option<(Arc<Bake>, Vec<Option<usize>>)>,
+    /// Inside an instancer: the bake's track of each copy (`<id>#<copy>`,
+    /// two instancers deep `<id>#<copy>#<copy>`).
+    pub copies: Option<(Arc<Bake>, HashMap<[u32; 2], usize>)>,
     /// The layer has a `body` (else it is only placed by the bake: a
     /// ragdoll's bone).
     pub declared: bool,
@@ -35,12 +36,12 @@ impl CBody {
     }
 
     /// The layer's world matrix from the bake at content time `t`.
-    pub(super) fn baked(&self, t: f64, copy: Option<(u32, f64)>) -> Option<Mat4> {
+    pub(super) fn baked(&self, t: f64, copy: Option<([u32; 2], f64)>) -> Option<Mat4> {
         match copy {
             // (A copy plays `delay` later: the bake's time is the timeline's.)
             Some((k, delay)) => {
                 let (bake, tracks) = self.copies.as_ref()?;
-                bake.world((*tracks.get(k as usize)?)?, t + delay - self.shift)
+                bake.world(*tracks.get(&k)?, t + delay - self.shift)
             }
             None => {
                 let (bake, track) = self.bake.as_ref()?;
@@ -74,13 +75,16 @@ impl<'a> Compiler<'a> {
         // Its copies' tracks, when it is inside an instancer.
         let copies = self.bake.as_ref().and_then(|b| {
             let prefix = format!("{id}#");
-            let mut tracks: Vec<Option<usize>> = Vec::new();
+            let mut tracks: HashMap<[u32; 2], usize> = HashMap::new();
             for (n, t) in b.tracks.iter().enumerate() {
-                let Some(k) = t.id.strip_prefix(&prefix).and_then(|k| k.parse::<usize>().ok()) else { continue };
-                if tracks.len() <= k {
-                    tracks.resize(k + 1, None);
-                }
-                tracks[k] = Some(n);
+                let Some(rest) = t.id.strip_prefix(&prefix) else { continue };
+                let mut parts = rest.split('#').map(|k| k.parse::<u32>().ok());
+                let key = match (parts.next().flatten(), parts.next(), parts.next()) {
+                    (Some(a), None, _) => [a, u32::MAX],
+                    (Some(a), Some(Some(b)), None) => [a, b],
+                    _ => continue,
+                };
+                tracks.insert(key, n);
             }
             (!tracks.is_empty()).then(|| (b.clone(), tracks))
         });
@@ -127,20 +131,44 @@ pub(super) fn visit<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, 
     }
 }
 
+/// The copy of an instancer a layer is seen in: which, and for an
+/// emitter's particle its age (None while its slot is empty: the layer is
+/// still visited, where the emitter is).
+#[derive(Clone, Copy)]
+pub(super) struct Seen {
+    pub path: [u32; 2],
+    pub particle: bool,
+    pub age: Option<f64>,
+}
+
 /// `visit`, into instancers' copies too: `f` is also given the copy a
 /// layer is in (a body in copy 3 of an instancer is `<layer>#3`).
-pub(super) fn visit_copies<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, space: &Space, under: Option<usize>, f: &mut dyn FnMut(&'l CLayer, Mat4, f64, Option<usize>, Option<u32>) -> Option<usize>) {
+pub(super) fn visit_copies<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, space: &Space, under: Option<usize>, seen: Option<Seen>, f: &mut dyn FnMut(&'l CLayer, Mat4, f64, Option<usize>, Option<Seen>) -> Option<usize>) {
     let mut cache = vec![None; layers.len()];
     for i in 0..layers.len() {
         let l = &layers[i];
         let world = space.world.then(layer_matrix(layers, i, tc, inherited, space, &mut cache));
         let step = l.step.or(inherited);
-        let below = f(l, world, clock(step, tc), under, space.copy.map(|c| c.0));
+        let below = f(l, world, clock(step, tc), under, seen);
         match &l.kind {
-            CKind::Comp(children) => visit_copies(children, child_time(l, clock(step, tc), tc, space), step, &Space { world, ..*space }, below, f),
+            CKind::Comp(children) => visit_copies(children, child_time(l, clock(step, tc), tc, space), step, &Space { world, ..*space }, below, seen, f),
+            CKind::Instancer(n) if n.is_emitter() => {
+                // Every slot, whether it holds a particle now or not (a
+                // body is found at every sample, in the same order).
+                for (j, p) in n.particles(clock(step, tc)).into_iter().enumerate() {
+                    let (m, age) = match p {
+                        Some((m, age)) => (m, Some(age)),
+                        None => (Mat4::IDENTITY, None),
+                    };
+                    let seen = Seen { path: [j as u32, u32::MAX], particle: true, age };
+                    visit_copies(&n.layers, age.unwrap_or(0.0), step, &Space { world: world.then(m), copy: Some((seen.path, 0.0)), ..*space }, below, Some(seen), f);
+                }
+            }
             CKind::Instancer(n) => {
                 for (k, m, delay) in super::instancer::copy_places(n, layers, i, tc, clock(step, tc), inherited, space, &mut cache) {
-                    visit_copies(&n.layers, tc - delay, step, &Space { world: world.then(m), copy: Some((k as u32, delay)), ..*space }, below, f);
+                    let copy = super::copy_in(space.copy, k as u32, delay);
+                    let seen = Seen { path: copy.map(|c| c.0).unwrap_or([k as u32, u32::MAX]), particle: false, age: None };
+                    visit_copies(&n.layers, tc - delay, step, &Space { world: world.then(m), copy, ..*space }, below, Some(seen), f);
                 }
             }
             _ => {}
@@ -148,19 +176,18 @@ pub(super) fn visit_copies<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<
     }
 }
 
-/// Bodies in copies that cannot be told apart or do not last: inside an
-/// emitter (its particles come and go), or two instancers deep.
-fn copied_bodies(layers: &[CLayer], inside: u32, out: &mut Vec<String>) {
+/// Bodies in copies that cannot be told apart: three instancers deep, or
+/// in an emitter that is itself inside an instancer (or holds one).
+fn copied_bodies(layers: &[CLayer], inside: u32, emitter: bool, out: &mut Vec<String>) {
     for l in layers {
-        if inside >= 2 && l.body.as_ref().is_some_and(|b| b.declared) {
+        if (inside >= 3 || emitter && inside >= 2) && l.body.as_ref().is_some_and(|b| b.declared) {
             out.push(l.id.to_string());
         }
-        let deeper = match &l.kind {
-            CKind::Instancer(n) if n.is_emitter() => 2,
-            CKind::Instancer(_) => 1,
-            _ => 0,
+        let (deeper, emits) = match &l.kind {
+            CKind::Instancer(n) => (1, n.is_emitter()),
+            _ => (0, false),
         };
-        copied_bodies(l.children(), inside + deeper, out);
+        copied_bodies(l.children(), inside + deeper, emitter || emits, out);
     }
 }
 
@@ -275,7 +302,9 @@ struct Found<'l> {
     layer: &'l CLayer,
     body: &'l CBody,
     /// The instancer's copy it is in.
-    copy: Option<u32>,
+    copy: Option<Seen>,
+    /// A particle's age at each of `worlds` (None: its slot is empty).
+    ages: Vec<Option<f64>>,
     /// Keyed world matrices: index 0 is one sample before the start.
     worlds: Vec<Mat4>,
     /// The meshes that are its shape: each with its world at the release.
@@ -357,9 +386,9 @@ impl Compiled {
             files: Vec::new(),
         };
         let mut copied = Vec::new();
-        copied_bodies(&scene.layers, 0, &mut copied);
+        copied_bodies(&scene.layers, 0, false, &mut copied);
         for id in copied {
-            errors.push(format!("{id}.body: a layer inside an emitter, or inside an instancer in an instancer, cannot be a body (its copies come and go, or cannot be told apart): one instancer of a grid, a ring or a path can hold bodies"));
+            errors.push(format!("{id}.body: a layer three instancers deep, or in an emitter that is inside an instancer or holds one, cannot be a body (the bake names a copy `<layer>#<copy>` or `<layer>#<copy>#<copy>`, and a particle by its slot): an instancer, an instancer in an instancer, or an emitter by itself can hold bodies"));
         }
         if !(set.unit > 0.0) {
             errors.push(format!("{}.simulation.unit must be positive", scene.id));
@@ -373,18 +402,38 @@ impl Compiled {
             let tc = t + scene.pre_roll;
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
-            visit_copies(&scene.layers, tc, None, &space, None, &mut |l, world, _, under, copy| {
+            visit_copies(&scene.layers, tc, None, &space, None, None, &mut |l, world, _, under, copy| {
                 let Some(body) = l.body.as_deref().filter(|b| b.declared) else { return under };
                 if k == 0 {
-                    found.push(Found { layer: l, body, copy, worlds: Vec::with_capacity(samples as usize + 2), meshes: Vec::new() });
+                    found.push(Found { layer: l, body, copy, worlds: Vec::with_capacity(samples as usize + 2), ages: Vec::new(), meshes: Vec::new() });
                 }
                 found[n].worlds.push(world);
+                if let Some(Seen { particle: true, age, .. }) = copy {
+                    found[n].ages.push(age);
+                }
                 n += 1;
                 Some(n - 1)
             });
         }
         let sample_of = |t: f64| (((t - sim.start) * rate).round().max(0.0) as u32).min(samples);
-        let releases: Vec<u32> = found.iter().map(|f| if f.body.spec.kind == BodyKind::Dynamic { f.body.release.map(sample_of).unwrap_or(0) } else { 0 }).collect();
+        // A particle's lives: from the sample it is first seen at (its
+        // age less than at the sample before) to the one it is gone at.
+        let lives: Vec<Vec<(u32, u32)>> = found
+            .iter()
+            .map(|f| {
+                let mut out: Vec<(u32, u32)> = Vec::new();
+                // (`ages[k + 1]` is sample k's.)
+                for k in 0..=samples as usize {
+                    let (Some(Some(age)), was) = (f.ages.get(k + 1).copied(), f.ages.get(k).copied().flatten()) else { continue };
+                    match out.last_mut() {
+                        Some(last) if last.1 == k as u32 && was.is_some_and(|w| w < age) => last.1 = k as u32 + 1,
+                        _ => out.push((k as u32, k as u32 + 1)),
+                    }
+                }
+                out
+            })
+            .collect();
+        let releases: Vec<u32> = found.iter().zip(&lives).map(|(f, lives)| if !f.ages.is_empty() { lives.first().map(|l| l.0).unwrap_or(0) } else if f.body.spec.kind == BodyKind::Dynamic { f.body.release.map(sample_of).unwrap_or(0) } else { 0 }).collect();
         // Each body's meshes (its own, or those under it that are no body
         // of their own), as they are at its release.
         let mut by_release: Vec<u32> = releases.clone();
@@ -395,7 +444,7 @@ impl Compiled {
             let tc = t + scene.pre_roll;
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
-            visit_copies(&scene.layers, tc, None, &space, None, &mut |l, world, clock, under, _| {
+            visit_copies(&scene.layers, tc, None, &space, None, None, &mut |l, world, clock, under, _| {
                 let own = l.body.as_ref().is_some_and(|b| b.declared).then(|| {
                     n += 1;
                     n - 1
@@ -410,12 +459,17 @@ impl Compiled {
             });
         }
         let mut files: Vec<String> = Vec::new();
-        for (f, &release) in found.iter().zip(&releases) {
+        for ((f, &release), lives) in found.iter().zip(&releases).zip(&lives) {
             // (A copy's body is `<layer>#<copy>`.)
-            let id = match f.copy {
-                Some(k) => format!("{}#{k}", f.layer.id),
+            let id = match f.copy.map(|c| c.path) {
+                Some([a, u32::MAX]) => format!("{}#{a}", f.layer.id),
+                Some([a, b]) => format!("{}#{a}#{b}", f.layer.id),
                 None => f.layer.id.to_string(),
             };
+            let particle = !f.ages.is_empty();
+            if particle && f.body.spec.kind != BodyKind::Dynamic {
+                errors.push(format!("{id}.body.type: an emitter's particle is a body the simulation moves (leave \"type\" out)"));
+            }
             let (spec, id) = (&f.body.spec, id.as_str());
             let dynamic = spec.kind == BodyKind::Dynamic;
             let world = f.worlds[release as usize + 1];
@@ -458,8 +512,15 @@ impl Compiled {
                 BodyKind::Fixed => vec![poses[1]],
                 BodyKind::Kinematic if !moves => vec![poses[1]],
                 BodyKind::Kinematic => poses[1..].to_vec(),
+                BodyKind::Dynamic if particle => vec![poses[release as usize + 1]],
                 BodyKind::Dynamic => poses[1..=release as usize + 1].to_vec(),
             };
+            let lives: Vec<crate::sim::LifeInput> = lives.iter().map(|&(from, to)| {
+                let pose = poses[from as usize + 1];
+                // (A sample on by its own flight, while it is the same particle.)
+                let next = if to > from + 1 || f.ages.get(from as usize + 2).copied().flatten().zip(f.ages[from as usize + 1]).is_some_and(|(n, a)| n > a) { poses[(from as usize + 2).min(poses.len() - 1)] } else { pose };
+                crate::sim::LifeInput { from, to, pose, next }
+            }).collect();
             let pushes = spec.pushes.iter().zip(&f.body.pushes).map(|(p, at)| PushInput { at: *at, dur: p.dur.max(0.0), velocity: p.velocity, spin: p.spin, point: p.point.map(|v| point3(&rest, v)) }).collect();
             input.bodies.push(BodyInput {
                 id: id.to_string(),
@@ -474,13 +535,14 @@ impl Compiled {
                 velocity: spec.velocity,
                 spin: spec.spin,
                 ccd: spec.ccd,
-                release,
+                release: if particle { u32::MAX } else { release },
                 keyed,
-                before: poses[release as usize],
+                before: poses[if particle { release as usize + 1 } else { release as usize }],
                 rest,
                 pushes,
                 group: 0,
                 apart: Vec::new(),
+                lives,
             });
         }
         // Joints.
@@ -593,6 +655,7 @@ impl Compiled {
                     pushes: Vec::new(),
                     group: 0,
                     apart: std::iter::once(a).chain(b).collect(),
+                    lives: Vec::new(),
                 });
                 let half = [0.0, l / 2.0, 0.0];
                 let top = [0.0, -l / 2.0, 0.0];

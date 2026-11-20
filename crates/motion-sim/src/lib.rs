@@ -68,6 +68,17 @@ impl Take {
                 self.world.release(input, i, b);
             }
         }
+        // An emitter's particles: born into the world, and taken out.
+        for (i, b) in input.bodies.iter().enumerate() {
+            for life in &b.lives {
+                if life.to == k && life.from < k {
+                    self.world.gone(i);
+                }
+                if life.from == k {
+                    self.world.born(input, i, b, life);
+                }
+            }
+        }
     }
 
     /// Step `s` of the steps between samples `k` and `k + 1`.
@@ -197,6 +208,23 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
     for (body, at) in let_go {
         if let Some(track) = dynamic.iter().position(|&i| i == body) {
             tracks[track].from = at;
+        }
+    }
+    // A particle's track begins with its first life. The sample before a
+    // later one is where it came from (drawing between the two is along
+    // its way in, not from where the last one died).
+    for (track, &i) in tracks.iter_mut().zip(&dynamic) {
+        let lives = &input.bodies[i].lives;
+        if let Some(first) = lives.first() {
+            track.from = first.from;
+        }
+        for (n, life) in lives.iter().enumerate() {
+            if life.from == 0 || n > 0 && lives[n - 1].to >= life.from {
+                continue;
+            }
+            let (p, q) = (life.pose, life.next);
+            let back = lahza_motion_core::sim::quat_mul(lahza_motion_core::sim::quat_mul(p.q, [-q.q[0], -q.q[1], -q.q[2], q.q[3]]), p.q);
+            track.samples[life.from as usize - 1] = [(2.0 * p.p[0] - q.p[0]) as f32, (2.0 * p.p[1] - q.p[1]) as f32, (2.0 * p.p[2] - q.p[2]) as f32, back[0] as f32, back[1] as f32, back[2] as f32, back[3] as f32];
         }
     }
     // (Bones never let go have nothing to say: their agents place them.)

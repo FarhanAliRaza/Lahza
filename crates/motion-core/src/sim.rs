@@ -1304,6 +1304,22 @@ pub struct BodyInput {
     pub group: u32,
     /// Bodies it never touches (a rope's link: the two it is tied to).
     pub apart: Vec<usize>,
+    /// An emitter's particle: the body is out of the world but for these
+    /// spans (`release` is `u32::MAX`), put at each one's start where the
+    /// particle is born.
+    pub lives: Vec<LifeInput>,
+}
+
+/// One particle of an emitter's slot as a body: in the world from sample
+/// `from` until `to`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LifeInput {
+    pub from: u32,
+    pub to: u32,
+    /// Where the particle is at `from`, and a sample later by its own
+    /// flight (its speed as it becomes a body).
+    pub pose: Pose,
+    pub next: Pose,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1585,6 +1601,14 @@ impl SimInput {
             if !b.apart.is_empty() {
                 h.str("apart");
                 h.fs(&b.apart.iter().map(|&i| i as f64).collect::<Vec<_>>());
+            }
+            if !b.lives.is_empty() {
+                h.str("lives");
+                for l in &b.lives {
+                    h.fs(&[l.from as f64, l.to as f64]);
+                    h.pose(&l.pose);
+                    h.pose(&l.next);
+                }
             }
         }
         h.u64(self.joints.len() as u64);

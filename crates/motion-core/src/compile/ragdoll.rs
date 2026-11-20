@@ -313,6 +313,7 @@ impl Compiled {
                     pushes: Vec::new(),
                     group: n as u32 + 1,
                     apart: Vec::new(),
+                    lives: Vec::new(),
                 });
                 let (bind, anchor_parent, clip) = match parent[b] {
                     Some(p) => {

@@ -427,9 +427,6 @@ fn every_copy_of_an_instancer_is_a_body_of_its_own() {
     let held = baked(&mut tied);
     let s = &held.tracks[held.track("brick#4").unwrap()].samples;
     assert!((s[s.len() - 1][1] - s[0][1]).abs() < 1.0 && held.tracks[held.track("brick#3").unwrap()].samples[s.len() - 1][1] > 700.0);
-    // An emitter's particles are no bodies.
-    let e = Compiled::new(&project(scene(json!({"type": "emitter", "rate": 10, "lifetime": 1})), 1.0)).sim_input(0, None).1.join("\n");
-    assert!(e.contains("brick.body: a layer inside an emitter"), "{e}");
     assert_eq!(crate::behaviour_tests::pin(&bake), (25353, 2539571057427851888), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
@@ -527,4 +524,110 @@ fn a_rope_of_links_swings_and_lies_on_what_it_meets() {
     spring["simulation"]["joints"][0]["type"] = json!("spring");
     assert!(Compiled::new(&project(spring, 1.0)).sim_input(0, None).1.join("\n").contains("joints.0.links: only a rope is made of links"));
     assert_eq!(crate::behaviour_tests::pin(&wound), (61580, 11416658259355396517), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn copies_two_instancers_deep_are_bodies_and_three_are_refused() {
+    use lahza_motion_core::compile::Content;
+    // Two stacks of three bricks: an instancer of bricks in an instancer.
+    let scene = |deep: bool| {
+        let stack = json!({"id": "stack", "kind": "instancer", "layout": {"type": "grid", "columns": 1, "rows": 3, "spacing": [0, 60]},
+            "layers": [{"id": "brick", "kind": "mesh", "mesh": {"type": "box", "size": [80, 40], "depth": 40}, "body": {}}]});
+        let stacks = json!({"id": "stacks", "kind": "instancer", "transform": {"position": [600, 300], "rotation": 8}, "layout": {"type": "grid", "columns": 2, "rows": 1, "spacing": [200, 0]}, "layers": [stack]});
+        let top = if deep { json!({"id": "more", "kind": "instancer", "layout": {"type": "grid", "columns": 2, "rows": 1, "spacing": [600, 0]}, "layers": [stacks]}) } else { stacks };
+        json!({"id": "s1", "simulation": {"ground": {"y": 800}}, "layers": [top]})
+    };
+    let mut p = project(scene(false), 3.0);
+    let bake = baked(&mut p);
+    let ids: Vec<&str> = bake.tracks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["brick#0#0", "brick#0#1", "brick#0#2", "brick#1#0", "brick#1#1", "brick#1#2"]);
+    let place = |id: &str, k: usize| {
+        let s = bake.tracks[bake.track(id).unwrap()].samples[k];
+        [s[0] as f64, s[1] as f64, s[2] as f64]
+    };
+    let apart = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    // They start where the two grids have them, and fall as six bodies.
+    assert!((apart(place("brick#0#0", 0), place("brick#1#0", 0)) - 200.0).abs() < 1e-3 && (apart(place("brick#0#0", 0), place("brick#0#2", 0)) - 120.0).abs() < 1e-3);
+    let last = bake.tracks[0].samples.len() - 1;
+    for id in &ids {
+        let end = place(id, last);
+        assert!(end[1] > 690.0 && end[1] < 781.0, "{id} ended at {end:?}");
+        for other in ids.iter().filter(|o| *o != id) {
+            assert!(apart(end, place(other, last)) > 39.0, "{id} and {other}");
+        }
+    }
+    // Drawn: each copy where the bake has its body.
+    let c = Compiled::new(&p);
+    for t in [0.0, 0.6, 2.5] {
+        let frame = c.frame(t);
+        let drawn: Vec<[f64; 3]> = frame.layers.iter().filter(|l| &*l.id == "brick").map(|l| match &l.content {
+            Content::Mesh(m) => [m.world.0[3], m.world.0[7], m.world.0[11]],
+            _ => panic!(),
+        }).collect();
+        assert_eq!(drawn.len(), 6);
+        for id in &ids {
+            let w = bake.world(bake.track(id).unwrap(), t).unwrap().0;
+            assert!(drawn.iter().any(|d| apart(*d, [w[3], w[7], w[11]]) < 1e-6), "at {t}: {id} is not drawn at {:?}", [w[3], w[7], w[11]]);
+        }
+    }
+    assert_eq!(crate::behaviour_tests::pin(&bake), (16679, 7626806709829618763), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    // Three deep is refused, and why.
+    let e = Compiled::new(&project(scene(true), 1.0)).sim_input(0, None).1.join("\n");
+    assert!(e.contains("brick.body: a layer three instancers deep"), "{e}");
+}
+
+#[test]
+fn an_emitters_particles_are_bodies_while_they_live() {
+    use lahza_motion_core::compile::Content;
+    // Four pebbles a second thrown up and to the right from (400, 600),
+    // each living 1.5 s; a floor 100 px under the emitter.
+    let scene = json!({"id": "s1", "simulation": {"ground": {"y": 700}}, "layers": [
+        {"id": "spout", "kind": "instancer", "transform": {"position": [400, 600]},
+         "layout": {"type": "emitter", "rate": 4, "lifetime": 1.5, "lifetime_jitter": 0, "direction": 45, "spread": 0, "speed": 400, "speed_jitter": 0, "gravity": [0, 981], "seed": 7},
+         "layers": [{"id": "pebble", "kind": "mesh", "mesh": {"type": "sphere", "radius": 12}, "body": {"bounce": 0.3}}]}
+    ]});
+    let mut p = project(scene, 4.0);
+    let (input, errors) = Compiled::new(&p).sim_input(0, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    // A body a slot (six: a life and a half of births), each with the
+    // lives of the particles the slot holds in turn.
+    let slots = input.bodies.len();
+    assert!(slots >= 6 && input.bodies.iter().all(|b| b.id.starts_with("pebble#") && b.release == u32::MAX), "{:?}", input.bodies.iter().map(|b| &b.id).collect::<Vec<_>>());
+    let lives: Vec<(u32, u32)> = input.bodies[0].lives.iter().map(|l| (l.from, l.to)).collect();
+    // (Slot 0: born at 0 s, and again every `slots` quarters of a second.)
+    assert_eq!(lives[0], (0, 45), "{lives:?}");
+    assert!(lives.len() >= 2 && lives[1].0 as usize == slots * 30 / 4 + usize::from(slots * 30 % 4 != 0), "{lives:?} of {slots} slots");
+    let bake = baked(&mut p);
+    let tr = &bake.tracks[bake.track("pebble#1").unwrap()];
+    assert_eq!(tr.from, 8, "slot 1's first is born at 0.25 s: the first sample after is 8");
+    let at = |k: usize| [tr.samples[k][0] as f64, tr.samples[k][1] as f64];
+    // It leaves as the emitter throws it (283 px/s each way), comes down
+    // on the floor instead of falling through it as a particle does, and
+    // bounces on.
+    let (a, b) = (at(8), at(11));
+    assert!(((b[0] - a[0]) / 0.1 - 283.0).abs() < 15.0 && b[1] < a[1], "it leaves at {:?} px/s", [(b[0] - a[0]) / 0.1, (b[1] - a[1]) / 0.1]);
+    let lowest = (8..8 + 45).map(|k| at(k)[1]).fold(0.0, f64::max);
+    assert!(lowest > 680.0 && lowest < 689.5, "its lowest is y {lowest:.1} (the floor is at 700, less its radius)");
+    assert!(bake.events.iter().any(|e| e.kind == "touch" && e.a == "pebble#1" && e.b == "ground"), "{:?}", bake.events);
+    // Drawn: while it lives, where the bake has it; not after.
+    let c = Compiled::new(&p);
+    let drawn = |t: f64| -> Vec<[f64; 2]> {
+        c.frame(t).layers.iter().filter(|l| &*l.id == "pebble").map(|l| match &l.content {
+            Content::Mesh(m) => [m.world.0[3], m.world.0[7]],
+            _ => panic!(),
+        }).collect()
+    };
+    let near = |ps: &[[f64; 2]], q: [f64; 2]| ps.iter().any(|p| (p[0] - q[0]).hypot(p[1] - q[1]) < 1e-3);
+    assert!(near(&drawn(1.0), at(30)) && near(&drawn(1.5), at(45)), "{:?} vs {:?}", drawn(1.0), at(30));
+    assert_eq!(drawn(0.1).len(), 1);
+    assert_eq!(drawn(0.9).len(), 4);
+    // Between its birth and the first sample after, it is where the
+    // emitter has it (the bake does not stand for it yet).
+    let early = drawn(0.26);
+    assert!(early.iter().any(|p| (p[0] - 402.83).abs() < 0.5), "{early:?}");
+    // A particle is a body the simulation moves.
+    let mut fixed = serde_json::to_value(&p.scenes[0]).unwrap();
+    fixed["layers"][0]["layers"][0]["body"]["type"] = json!("fixed");
+    assert!(Compiled::new(&project(fixed, 1.0)).sim_input(0, None).1.join("\n").contains("an emitter's particle is a body the simulation moves"));
+    assert_eq!(crate::behaviour_tests::pin(&bake), (23075, 9110451255763848001), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }

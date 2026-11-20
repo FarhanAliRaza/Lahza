@@ -676,6 +676,18 @@ impl CInstancer {
     pub(super) fn is_emitter(&self) -> bool {
         matches!(self.layout, CLayout::Emitter(_))
     }
+
+    /// An emitter's slots at its clock `t`: the particle each holds (its
+    /// place in the emitter's space and its age), or None while empty.
+    pub(super) fn particles(&self, t: f64) -> Vec<Option<(Mat4, f64)>> {
+        let CLayout::Emitter(e) = &self.layout else { return Vec::new() };
+        (0..self.copies.len())
+            .map(|j| {
+                let (x, y, rotation, scale, _, _, age) = particle(e, self.copies.len(), j, t - e.start)?;
+                (scale > 0.0).then(|| (Mat4::translate(x, y, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, scale.abs())), age))
+            })
+            .collect()
+    }
 }
 
 pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, step: Option<Step>, inherited: Option<Step>, space: &Space, inner: &Space, opacity: f64, cache: &mut [Option<Mat4>], out: &mut Vec<LayerState>) {
@@ -689,7 +701,9 @@ pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, 
                 continue;
             }
             let m = Mat4::translate(x, y, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, scale.abs()));
-            let copy = Space { world: inner.world.then(m), ..*inner };
+            // (A particle that is a body: the bake's `<layer>#<slot>`,
+            // at the timeline's time, not its age.)
+            let copy = Space { world: inner.world.then(m), copy: Some(([j as u32, u32::MAX], t - age)), ..*inner };
             let first = out.len();
             emit(&n.layers, age, step, &copy, opacity * alpha, out);
             if let Some(c) = colour {
@@ -726,7 +740,7 @@ pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, 
             continue;
         }
         let m = Mat4::translate(x + dx, y + dy, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, scale.abs()));
-        let copy = Space { world: inner.world.then(m), copy: Some((k as u32, base.delay)), ..*inner };
+        let copy = Space { world: inner.world.then(m), copy: super::copy_in(inner.copy, k as u32, base.delay), ..*inner };
         let first = out.len();
         emit(&n.layers, tc - base.delay, step, &copy, opacity * alpha, out);
         if let Some((c, a)) = colour {
