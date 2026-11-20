@@ -26,6 +26,13 @@ integration tests, the app 116 and its four window tests under Xvfb):
   balls, debug names only where a tool reads them, a report of where the
   GPU's frame leaves the CPU's, a benchmark for motion blur over still
   groups.
+- Since (a later session, the same kind of container): sky visibility
+  tells surfaces apart by their planes (no steps along an edge), cards
+  and see-through meshes hide the sky; a point light's GPU-drawn shadow
+  map is framed as the CPU's; a mesh group that stands still is left as
+  drawn by a motion-blurred frame's later sub-frames (none ever was); a
+  normal-mapped face no longer shadows itself, which was the spots in
+  the GPU-against-CPU comparison.
 
 To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
 in), since none of it can be seen from a container:
@@ -41,14 +48,17 @@ in), since none of it can be seen from a container:
 4. Sky visibility on the card: its cost, and its picture through the
    hardware visibility pass; then whether it is on by default.
 5. The tests on the card: in parallel (the crash in the loader), the four
-   GPU-against-CPU ones with `LAHZA_MOTION_VIS_REPORT=1`, the two tracer
+   GPU-against-CPU ones again (plainly, and with
+   `LAHZA_MOTION_VIS_REPORT=1`): whether surface detail and area lights
+   now pass, as the changes made since should have them, the two tracer
    tests that took whatever denoiser was installed.
 6. Simulation on the card: what skinning and crowds cost the GPU and the
    tracer, with a character of real size; a bake on another kind of CPU
    (both containers were Xeons with FMA).
 7. Slang: both of its points need slangc, which a cloud session cannot
    fetch.
-8. The motion blur benchmark and the shadow maps' frames on the card.
+8. The motion blur benchmarks (shapes, and a still mesh group) and the
+   shadow maps' frames on the card.
 9. NVIDIA's licence for the Ray Reconstruction shim: to read and decide
    (packaging/ngx/README.md).
 
@@ -1191,3 +1201,52 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
   so some of what shading reads is worked out on the GPU). Not fixed. To
   do on the card: run the four with the report, see whether its 8x leaves
   the seams, and look at the normal-mapped face first.
+  Since, both looked into on software Vulkan:
+  - *The spots on the normal-mapped face: found and fixed.* Not the
+    pooled vertex's two rows (what the GPU works out of them is the same
+    over a flat face). They needed a light that casts shadows and the
+    normal map together (the test's scene with one directional light:
+    375 pixels away from edges with shadows, 16 without; 21 after the
+    fix): the shadow lookup was moved along the normal the map had bent,
+    turned over where that pointed from the light, so into the face,
+    which then shadowed itself in a patch a period of the map, on the
+    CPU and on the GPU alike but by other amounts (the GPU's map is
+    drawn by the GPU through the visibility pass, in another frame, the
+    CPU's by the CPU: where a lookup is on the threshold the two fall
+    either way). Shadow maps are now asked along the surface's own
+    normal, before its detail (motion.wgsl `shade_tri`'s `ns`, the same
+    in mesh3d.rs): a real fault in the picture, not only in the
+    comparison. `a_normal_mapped_face_does_not_shadow_itself`: the
+    box's front face under a light that casts shadows against the same
+    light casting none, 1016 px of 7040 darker by more than 2 levels (up
+    to 15) before, none after, on the CPU and through the visibility
+    pass. The report for `gpu_matches_cpu_surface_detail` at 4x: 4376
+    pixels over 3 levels before, 3285 after; away from edges 474 and 227
+    (the box 1811 and 721 with its edges). Every bump and normal map
+    under a shadow-casting light changes a little with this (the ball's
+    and the can's bumps too): the patches were wrong, so no test's
+    numbers were kept for them.
+  - *The seams, at the card's own 8x: they should nearly all go.* From
+    the code: the pass's eight samples are the standard pattern's, in
+    its order, and `mesh3d::SAMPLES` is that pattern, so at 8x a sample
+    is the same point in both and goes to the same triangle; a triangle
+    is then shaded at the middle of the same samples. (At 4x the eight
+    are read from four, `s & 3`, at other points: nearly every pixel on
+    a seam differs, which is what the report here shows.) What is left
+    at 8x is a sample within a rasteriser's grid of an edge: hardware
+    has a triangle's corners on 1 / 256 of a pixel, the CPU as they are.
+    Measured on the CPU alone (`mesh_tests::measure_seams`, `--ignored`:
+    its frame against its frame with the corners on that grid): 16
+    pixels of that scene over 3 levels (406 on 1 / 16). Shading every
+    triangle of a pixel at the pixel's middle instead does not help (17):
+    not done. To make those last agree the CPU would have to round its
+    corners as the device does (its `subPixelPrecisionBits` and its
+    rounding): not done, 16 pixels are within what the test allows (76).
+    So the card's 1089 were not seams. Most likely they were the patches
+    above, on the ball's, the box's and the can's bumps (on the box
+    alone the fix took about 1090 pixels out of the 4x report), since
+    the card draws its own shadow maps where the test's usual run on
+    software Vulkan gives the GPU the CPU's: to be counted again there.
+    The same holds for a shadow's edge in the other three tests: the
+    GPU's directional map is still framed by boxes and balls, a little
+    wider than the CPU's from every point.

@@ -1910,6 +1910,15 @@ impl Batch {
     }
 }
 
+/// A measure of the seams between triangles in the GPU's frame
+/// against the CPU's (`mesh_tests::measure_seams`), on the CPU alone:
+/// triangles' corners on their target moved to the nearest 1 / n of a
+/// pixel, as a hardware rasteriser has them (0: as they are); and each
+/// triangle of a pixel shaded at the pixel's middle, not at the middle of
+/// the samples it won. (For every thread: the CPU draws on all of them.)
+#[cfg(test)]
+pub(crate) static TEST_SEAMS: (std::sync::atomic::AtomicU32, std::sync::atomic::AtomicBool) = (std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicBool::new(false));
+
 const NEAR: f64 = 1.0;
 /// Material flags (row 2, w): unlit, faceted, depth-only occluder.
 pub const FLAG_UNLIT: u32 = 1;
@@ -2630,6 +2639,11 @@ impl Batch {
             // Positions as the rasteriser sees them (f32), so the edge
             // tests and these planes agree.
             let p = ids.map(|i| to_target(self.verts[i as usize].screen).map(|v| v as f32 as f64));
+            #[cfg(test)]
+            let p = {
+                let steps = TEST_SEAMS.0.load(std::sync::atomic::Ordering::Relaxed) as f64;
+                if steps > 0.0 { p.map(|q| q.map(|v| ((v * steps).round() / steps) as f32 as f64)) } else { p }
+            };
             let bbox = [
                 p[0][0].min(p[1][0]).min(p[2][0]) - 0.5,
                 p[0][1].min(p[1][1]).min(p[2][1]) - 0.5,
@@ -3890,6 +3904,9 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     let vid = |k: usize| ids[k].to_bits() as usize;
     let uvs = [0, 1, 2].map(|k| [m[vb + vid(k) * VROWS + 1][3], m[vb + vid(k) * VROWS + 2][3]]);
     let nps = [0, 1, 2].map(|k| f3(m[vb + vid(k) * VROWS + 2]));
+    // (The surface's own normal: shadow maps are asked along this one,
+    // not along what its detail bends it to. See motion.wgsl.)
+    let ns = n;
     let (base, rough_d, nd, rough_mul, metal_mul, emit) = surface_detail(m, images, mb + mat * MAT_ROWS, pos, nps, uvs, b, n, f3(m0));
     n = nd;
     let opacity = m0[3];
@@ -3909,7 +3926,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         for i in 0..m[lb][0] as usize {
             if let Some(sm) = shadow_of(m, lb, i) {
                 let w = fdot(f3(m[lb + 7 + i * LROWS + 1]), [0.2126, 0.7152, 0.0722]);
-                blocked += w * (1.0 - shadow(m, sm, p, n));
+                blocked += w * (1.0 - shadow(m, sm, p, ns));
                 total += w;
             }
         }
@@ -4005,7 +4022,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
             continue;
         }
         let col = match shadow_of(m, lb, i) {
-            Some(sm) => fmul(col, shadow(m, sm, p, n)),
+            Some(sm) => fmul(col, shadow(m, sm, p, ns)),
             None => col,
         };
         if n_l > 0.0 {
@@ -4244,6 +4261,8 @@ pub fn shade_mesh(prim: &Prim, p: [f32; 2], scene: &[f32; 8], m: &[[f32; 4]], bi
             }
         }
         let centroid = [p[0] + q[0] / (16.0 * n), p[1] + q[1] / (16.0 * n)];
+        #[cfg(test)]
+        let centroid = if TEST_SEAMS.1.load(std::sync::atomic::Ordering::Relaxed) { p } else { centroid };
         let c = shade_tri(prim, m, groups, images, tri, centroid, oz);
         for i in 0..4 {
             out[i] += c[i] * n / 8.0;

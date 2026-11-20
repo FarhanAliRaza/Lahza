@@ -2088,6 +2088,11 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
         uvs[k] = vec2<f32>(g.nrm[k].w, g.aux[k].w);
         nps[k] = g.aux[k].xyz;
     }
+    // The surface's own normal, before its detail bends it: shadow maps
+    // are asked along this one. (Along the bent normal a flat face with a
+    // normal map shadowed itself in a patch wherever the map turned the
+    // normal from the light: the lookup was moved into the face.)
+    let ns = n;
     let det = surface_detail(mb + mat * MAT_ROWS, pos, nps, uvs, b, n, m0.xyz);
     n = det.n;
     let base = det.base;
@@ -2103,7 +2108,7 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
             let off = shadow_of(lb, i);
             if off != 0 {
                 let w = dot(b_mesh[lb + 7u + i * LROWS + 1u].xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
-                blocked += w * (1.0 - shadow(u32(i32(lb) + off), p, n));
+                blocked += w * (1.0 - shadow(u32(i32(lb) + off), p, ns));
                 total += w;
             }
         }
@@ -2210,7 +2215,7 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
         let n_ls = dot(n, ls);
         if n_l <= 0.0 && n_ls <= 0.0 { continue; }
         let soff = shadow_of(lb, i);
-        if soff != 0 { col = col * shadow(u32(i32(lb) + soff), p, n); }
+        if soff != 0 { col = col * shadow(u32(i32(lb) + soff), p, ns); }
         if n_l > 0.0 {
             d_light = d_light + diffuse * (col * (n_l * coat));
             if e_sheen > 0.0 {
