@@ -32,6 +32,7 @@ mod launcher_recording;
 mod library;
 mod models;
 mod motion_ui;
+mod motion_agent;
 mod motion_editor;
 mod motion_piece_ui;
 mod motion_timeline;
