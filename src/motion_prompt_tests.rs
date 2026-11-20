@@ -813,6 +813,185 @@ fn prompt_bar_on_a_recording_asks_for_a_piece_on_the_span() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Makes a piece on the recording and places it, as an agent asked for
+/// one would: real tool calls carrying the request's id.
+struct Making {
+    recording: PathBuf,
+    gate: Mutex<Option<Receiver<()>>>,
+}
+
+impl Runner for Making {
+    fn name(&self) -> &'static str {
+        "Making"
+    }
+    fn available(&self) -> Availability {
+        Availability::Ready
+    }
+    fn start(&self, request: Request, events: Sender<Event>) -> Result<Box<dyn Running>, Failure> {
+        let (gate, recording) = (self.gate.lock().unwrap().take(), self.recording.clone());
+        std::thread::spawn(move || {
+            let mut tb = Toolbox::new();
+            tb.request = Some(request.id.clone());
+            tb.cwd = request.cwd.clone();
+            tb.backend = lahza_motion_render::Backend::Cpu;
+            events.send(Event::Started { conversation: "c3".into() }).unwrap();
+            events.send(Event::Step { id: "t1".into(), tool: "project_create".into(), text: "Making a motion piece".into() }).unwrap();
+            if let Some(gate) = gate {
+                let _ = gate.recv_timeout(Duration::from_secs(60));
+            }
+            tb.call("project_create", json!({"path": "card", "recording": recording, "duration": 3})).unwrap();
+            tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1", "background": "#d03734"}, {"op": "add", "id": "word", "kind": "text", "text": "Card", "size": 60}]})).unwrap();
+            tb.call("recording_place", json!({"start": 2.0, "placement": "full"})).unwrap();
+            events.send(Event::StepDone { id: "t1".into(), error: None }).unwrap();
+            events.send(Event::Done { text: "Made a card and placed it at 2 s.".into(), failed: false, cost: None }).unwrap();
+        });
+        Ok(Box::new(Nothing))
+    }
+}
+
+/// On a recording with no piece open: the agent's ghost clip shows on the
+/// Motion lane while it works, the piece it placed comes back on the
+/// timeline, Hold to compare shows the video without it, and Undo takes
+/// it off.
+#[test]
+#[ignore = "requires a display and FFmpeg (can run under Xvfb)"]
+fn a_piece_made_on_a_recording_is_seen_compared_and_undone() {
+    let dir = std::env::temp_dir().join(format!("lahza-motion-prompt-made-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots = std::env::var_os("LAHZA_WORKFLOW_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|| dir.clone());
+    std::fs::create_dir_all(&shots).unwrap();
+    let recording = studio_workflow_tests::fixture(&dir).directory.clone();
+    let (release, gate) = std::sync::mpsc::channel();
+    let runner = Arc::new(Making { recording: recording.clone(), gate: Mutex::new(Some(gate)) });
+    let open = recording.clone();
+    Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+        let handle = open_studio_window(cx, true, |handle, cx| cx.new(|cx| Studio::new(handle, None, None, cx))).unwrap();
+        handle
+            .update(cx, |studio, _, _| {
+                studio.launcher_window = false;
+                studio.load_generation = studio.load_generation.wrapping_add(1);
+                studio.loading = None;
+                studio.open_video_project(open.clone()).unwrap();
+                studio.launcher_active = false;
+                studio.inspector_visible = true;
+                studio.select_inspector_tab(shell_ui::InspectorTab::Motion);
+                studio.motion_agent = MotionAgent::new(runner.clone());
+            })
+            .unwrap();
+        cx.activate(true);
+        cx.spawn(async move |cx| {
+            let wait = |ms| Timer::after(Duration::from_millis(ms));
+            let any: AnyWindowHandle = handle.into();
+            let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+            let shot = |name: &str| studio_workflow_tests::save_display(&shots.join(name), false);
+            wait(300).await;
+            any.update(cx, |_, window, _| {
+                window.activate_window();
+                window.refresh();
+            })
+            .unwrap();
+            wait(1500).await;
+            draw(cx);
+            handle
+                .update(cx, |studio, _, cx| {
+                    assert!(studio.motion_piece_lane_height().is_none(), "no piece, no lane");
+                    studio.video_position = 2.5;
+                    studio.motion_agent.span = Some((2.0, 5.0));
+                    studio.send_motion_prompt("a red card here", cx);
+                })
+                .unwrap();
+            let mut at_work = false;
+            for _ in 0..100 {
+                wait(50).await;
+                draw(cx);
+                at_work = handle.update(cx, |s, _, _| s.motion_agent.requests.last().is_some_and(|r| r.steps.len() == 1)).unwrap();
+                if at_work {
+                    break;
+                }
+            }
+            assert!(at_work, "its step arrived");
+            handle
+                .update(cx, |studio, _, _| {
+                    let (request, a, b) = studio.motion_ghost_on_recording().expect("a ghost clip while it works");
+                    assert_eq!((request.now().as_str(), a, b), ("Making a motion piece", 2.0, 5.0));
+                    assert!(studio.motion_piece_lane_height().is_some(), "a lane for the ghost");
+                })
+                .unwrap();
+            wait(400).await;
+            draw(cx);
+            wait(100).await;
+            shot("made-1-ghost.png");
+            release.send(()).unwrap();
+            // The request ends and the piece it placed is on the timeline.
+            let mut back = false;
+            for _ in 0..400 {
+                wait(50).await;
+                draw(cx);
+                back = handle.update(cx, |s, _, _| !s.motion_agent.busy() && s.motion_pieces.as_ref().is_some_and(|m| m.items.len() == 1)).unwrap();
+                if back {
+                    break;
+                }
+            }
+            assert!(back, "the piece came back on the timeline");
+            let id = handle
+                .update(cx, |studio, _, _| {
+                    assert!(studio.motion_ghost_on_recording().is_none());
+                    let request = studio.motion_agent.proposal().expect("a proposal");
+                    assert!(request.made_piece && request.edits == 1, "{} edits", request.edits);
+                    let pieces = studio.motion_pieces.as_ref().unwrap();
+                    assert_eq!((pieces.items[0].piece.start, pieces.items[0].piece.placement), (2.0, lahza_motion_core::recording::Placement::Full));
+                    assert!(pieces.any_active(2.5, lahza_motion_core::recording::Placement::Full));
+                    request.id.clone()
+                })
+                .unwrap();
+            // Its frame over the video (a software GPU's first takes a
+            // while).
+            let mut drawn = false;
+            for _ in 0..3600 {
+                wait(50).await;
+                draw(cx);
+                drawn = handle.update(cx, |s, _, _| s.motion_pieces.as_ref().is_some_and(|m| !m.frames.is_empty())).unwrap();
+                if drawn {
+                    break;
+                }
+            }
+            assert!(drawn, "the card is drawn over the video");
+            wait(500).await;
+            draw(cx);
+            wait(100).await;
+            shot("made-2-placed.png");
+            // Held: the video as it was, with nothing written.
+            handle
+                .update(cx, |studio, _, cx| {
+                    studio.compare_motion_request(Some(&id), cx);
+                    let pieces = studio.motion_pieces.as_ref().unwrap();
+                    assert!(!pieces.any_active(2.5, lahza_motion_core::recording::Placement::Full), "before: no card ({:?} against {:?}, a piece open: {})", studio.motion_agent.requests[0].about.project, pieces.items[0].dir, studio.motion_doc.is_some());
+                    assert_eq!(lahza_motion_core::recording::read_pieces(&recording).len(), 1, "nothing was written");
+                })
+                .unwrap();
+            wait(1500).await;
+            draw(cx);
+            wait(100).await;
+            draw(cx);
+            wait(100).await;
+            shot("made-3-compared.png");
+            handle
+                .update(cx, |studio, _, cx| {
+                    studio.compare_motion_request(None, cx);
+                    assert!(studio.motion_pieces.as_ref().unwrap().any_active(2.5, lahza_motion_core::recording::Placement::Full), "after: the card");
+                    // Undo takes the piece off the video.
+                    assert!(studio.undo_motion_request(&id, cx));
+                    assert!(lahza_motion_core::recording::read_pieces(&recording).is_empty());
+                })
+                .unwrap();
+            cx.update(|cx| cx.quit()).unwrap();
+        })
+        .detach();
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A scene with bodies: the bar says the simulation is not baked, Bake
 /// bakes it without holding the window, and moving a body says it needs
 /// baking again.

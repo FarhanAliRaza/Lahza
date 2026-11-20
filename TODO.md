@@ -1160,12 +1160,18 @@ Left, each with what it needs:
   the agent (a dropped runner stops its child and sets the loop's stop
   flag: whether GPUI drops the studio on close was not checked); the
   whole of "How it should be used" with a mouse.
-- **A piece made on a recording.** With no piece open the words ask for
-  a new one on the span. Undo now takes back its edits and takes the
-  piece off the video (its folder stays on disk; there is no redo for
-  that). Still: compare needs the piece open, and no ghost clip shows
-  without layer rows, only the bar. With a real agent (above): whether
-  the piece it places comes back on the timeline.
+- **A piece made on a recording, by a real agent.** With no piece open
+  the words ask for a new one on the span; a stand-in that makes the
+  real tool calls (`project_create` with the recording, `edit_apply`,
+  `recording_place`) was followed under Xvfb
+  (`a_piece_made_on_a_recording_is_seen_compared_and_undone`): the ghost
+  clip shows on the Motion lane over the span (or five seconds from the
+  playhead) while it works, the piece comes back on the timeline within
+  half a second of the request ending, Hold to compare shows the video
+  without the piece (it is left out of the preview; nothing is
+  written), and Undo takes it off the video (its folder stays on disk;
+  there is no redo for that). Not seen: the same with Claude Code
+  itself (one more paid request, on the owner's word).
 - **Undo after later edits** to the same things fails with the engine's
   message ("the project changed in a conflicting way"). Left as it is:
   merging a person's later edits into an undo is a decision about what
@@ -1305,12 +1311,22 @@ with a mouse on a real desktop.
   and colours; and adds or removes every effect but `lut`, a gradient
   map with a colour for each stop among them. A text also has its
   alignment, line height and an outline (on or off, its width and
-  colour). A colour is picked from ten swatches or typed as #rrggbb.
-  Left: `lut` (it needs a file chooser for the table), a text's rim
-  light (`edge`), adding or moving a gradient's stops, and a colour
-  picker beyond the swatches (a hue and tone square is a widget the app
-  does not have yet). None needs more than a container; they were not
-  reached.
+  colour) and a rim light (`edge`: on or off, its width, angle and
+  colour). A colour is picked from ten swatches, typed as #rrggbb, or
+  dragged in a picker that opens with the typed field: a square of
+  saturation and value over a strip of hues (two gradients and six, no
+  image to release); the drag shows in the preview as a value's does
+  and is one edit on release, and a colour's alpha is kept. A gradient
+  map's stops are moved (each between its neighbours), added (in the
+  widest gap, the colour between) and taken out (two stay). `lut` is
+  added with its table: one of the project's `.cube` files, or
+  "+ LUT file…" (the desktop's file chooser; the table is copied into
+  `assets/`), and its table can be changed for another of the
+  project's. Seen under Xvfb
+  (`by_hand_a_rim_light_a_lut_gradient_stops_and_the_picker`). Left for
+  a desktop: the file chooser itself (a portal dialog: `add_motion_lut`
+  behind it was run with a path), and the picker under a real pointer
+  (its drag was driven through the code with the laid-out bounds).
 
 ## Slang
 

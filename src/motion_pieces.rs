@@ -107,6 +107,9 @@ pub(crate) struct MotionPieces {
     /// An agent edited the recording since the studio last reloaded it.
     pub agent_edit: bool,
     worker: Worker,
+    /// A piece left out of the preview while a request that made it is
+    /// compared with what was there before (its folder).
+    without: Option<PathBuf>,
     /// Full-screen pieces, drawn over the preview canvas.
     pub frames: Vec<PieceFrame>,
     /// Over-the-video pieces in the recording's own space, for the
@@ -130,6 +133,7 @@ impl MotionPieces {
             agent_revision: 0,
             agent_edit: false,
             worker: Worker::new(),
+            without: None,
             frames: Vec::new(),
             media_frame: None,
             merged: None,
@@ -205,7 +209,19 @@ impl MotionPieces {
     }
 
     pub(crate) fn any_active(&self, t: f64, placement: Placement) -> bool {
-        self.items.iter().any(|p| p.active_at(t) && p.piece.placement == placement)
+        self.items.iter().any(|p| p.active_at(t) && p.piece.placement == placement && !self.left_out(p))
+    }
+
+    fn left_out(&self, piece: &LoadedPiece) -> bool {
+        self.without.as_deref() == Some(piece.dir.as_path())
+    }
+
+    /// Leaves the piece in `dir` out of the preview (None: shows all
+    /// again). Nothing is written. True when that changed what shows.
+    pub(crate) fn show_without(&mut self, dir: Option<PathBuf>) -> bool {
+        let changed = self.without != dir;
+        self.without = dir;
+        changed
     }
 
     /// Asks for the frames at editor time `t`: full-screen pieces `width`
@@ -218,7 +234,7 @@ impl MotionPieces {
         let jobs: Vec<PieceJob> = self
             .items
             .iter()
-            .filter(|p| p.active_at(t) && (p.piece.placement == Placement::Full || media.is_some()))
+            .filter(|p| p.active_at(t) && !self.left_out(p) && (p.piece.placement == Placement::Full || media.is_some()))
             .map(|p| {
                 let scale = match (p.piece.placement, media) {
                     (Placement::Overlay, Some((w, h))) => fit(Placement::Overlay, p.size(), (w as f64, h as f64)).0,

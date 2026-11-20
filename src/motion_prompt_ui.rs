@@ -31,6 +31,22 @@ fn count(n: usize, what: &str) -> String {
     format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
+/// The ghost clip of a request at work, from `left` to `right` px of its
+/// lane: the step it is at and the seconds so far.
+pub(crate) fn ghost_clip(request: &AgentRequest, left: f32, right: f32) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(left))
+        .w(px((right - left).max(24.0)))
+        .rounded(px(4.0))
+        .border_1()
+        .border_dashed()
+        .border_color(theme::accent())
+        .bg(theme::accent().opacity(0.14))
+        .overflow_hidden()
+        .child(div().px_2().pt(px(2.0)).whitespace_nowrap().text_xs().text_color(theme::ink()).child(format!("✦ {} · {:.0} s", request.now(), request.seconds())))
+}
+
 /// Where a project's (or a recording's) requests are kept between runs
 /// of the app.
 const REQUESTS_FILE: &str = "requests.json";
@@ -586,8 +602,16 @@ impl Studio {
             return;
         }
         self.motion_agent.comparing = id.map(str::to_string);
+        // A request that made its piece is compared with the video
+        // without that piece, open or not; any other with its piece as it
+        // was before (which needs it open).
+        let made = id.and_then(|id| self.motion_agent.requests.iter().find(|r| r.id == id)).filter(|r| r.made_piece).and_then(|r| r.about.project.clone());
+        let whole = made.is_some();
+        if let Some(pieces) = self.motion_pieces.as_mut() {
+            pieces.show_without(made);
+        }
         if let Some(editor) = self.motion_editor() {
-            editor.update(cx, |e, _| e.compare(id));
+            editor.update(cx, |e, _| e.compare(id.filter(|_| !whole)));
             self.show_motion_doc(cx);
         }
         cx.notify();
@@ -1149,24 +1173,24 @@ impl Studio {
         if let Some(request) = self.motion_agent.requests.last().filter(|_| self.motion_agent.busy()) {
             let length = self.motion_editor().map_or(self.video_duration, |e| e.read(cx).project().settings.duration);
             let (a, b) = request.about.span.unwrap_or((0.0, length));
-            out.push(
-                div()
-                    .absolute()
-                    .top(px(1.0))
-                    .bottom(px(1.0))
-                    .left(px(x_of(offset + a)))
-                    .w(px((x_of(offset + b) - x_of(offset + a)).max(24.0)))
-                    .rounded(px(4.0))
-                    .border_1()
-                    .border_dashed()
-                    .border_color(theme::accent())
-                    .bg(theme::accent().opacity(0.14))
-                    .overflow_hidden()
-                    .child(div().px_2().pt(px(2.0)).whitespace_nowrap().text_xs().text_color(theme::ink()).child(format!("✦ {} · {:.0} s", request.now(), request.seconds())))
-                    .into_any_element(),
-            );
+            out.push(ghost_clip(request, x_of(offset + a), x_of(offset + b)).top(px(1.0)).bottom(px(1.0)).into_any_element());
         }
         out
+    }
+
+    /// The agent at work on a recording with no piece open: where its
+    /// piece is being made, in the recording's seconds (the marked span,
+    /// or five seconds from the playhead it was asked at).
+    pub(crate) fn motion_ghost_on_recording(&self) -> Option<(&AgentRequest, f64, f64)> {
+        if self.motion_doc.is_some() || self.motion_project.is_some() || !self.motion_agent.busy() {
+            return None;
+        }
+        let request = self.motion_agent.requests.last().filter(|r| r.about.recording.is_some() && (r.about.project.is_none() || r.made_piece))?;
+        let (a, b) = request.about.span.unwrap_or_else(|| {
+            let at = request.about.playhead.map_or(0.0, |(t, _)| t);
+            (at, at + 5.0)
+        });
+        Some((request, a, b))
     }
 }
 

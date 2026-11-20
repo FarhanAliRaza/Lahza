@@ -204,17 +204,27 @@ impl Studio {
 
     /// Height of the "Motion" lane, or None when there are no pieces.
     pub(crate) fn motion_piece_lane_height(&self) -> Option<f32> {
-        let pieces = self.motion_pieces.as_ref().filter(|m| !m.items.is_empty())?;
-        Some(rows(pieces).1 as f32 * ROW_HEIGHT)
+        match self.motion_pieces.as_ref().filter(|m| !m.items.is_empty()) {
+            Some(pieces) => Some(rows(pieces).1 as f32 * ROW_HEIGHT),
+            // No piece yet, and an agent making one: a row for its ghost.
+            None => self.motion_ghost_on_recording().map(|_| ROW_HEIGHT),
+        }
     }
 
     /// The "Motion" lane: one bar per piece.
     pub(crate) fn motion_piece_lane(&self, scroll: f64, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let pieces = self.motion_pieces.as_ref().filter(|m| !m.items.is_empty())?;
         let seconds_per_pixel = self.video_timeline_seconds_per_pixel();
-        let (row_of, count) = rows(pieces);
+        let ghost = self.motion_ghost_on_recording().map(|(request, a, b)| {
+            let x = |t: f64| (t / seconds_per_pixel - scroll) as f32;
+            crate::motion_prompt_ui::ghost_clip(request, x(a), x(b)).top(px(2.0)).h(px(ROW_HEIGHT - 4.0))
+        });
+        let pieces = self.motion_pieces.as_ref().filter(|m| !m.items.is_empty());
+        if pieces.is_none() && ghost.is_none() {
+            return None;
+        }
+        let (row_of, count) = pieces.map_or((Vec::new(), 1), rows);
         let mut lane = div().relative().w_full().flex_none().h(px(count as f32 * ROW_HEIGHT)).overflow_hidden().rounded_lg().bg(crate::theme::control_bg());
-        for (index, p) in pieces.items.iter().enumerate() {
+        for (index, p) in pieces.into_iter().flat_map(|m| m.items.iter().enumerate()) {
             let id = p.piece.id.clone();
             let selected = self.selected_motion_piece.as_deref() == Some(id.as_str());
             let left = (p.piece.start / seconds_per_pixel - scroll) as f32;
@@ -253,7 +263,7 @@ impl Studio {
                     ),
             );
         }
-        Some(lane.into_any_element())
+        Some(lane.children(ghost).into_any_element())
     }
 
     fn begin_piece_drag(&mut self, id: &str, x: Pixels) {
