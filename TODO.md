@@ -107,8 +107,9 @@ in), since none of it can be seen from a container:
    command in "Tests on a hardware GPU" and "Motion renderer".
 6. Simulation on the card: what skinning and crowds (instances and
    pictures were never drawn by the GPU or the tracer) cost there, with a
-   character of real size; a bake on another kind of CPU (both
-   containers were Xeons with FMA).
+   character of real size. (A bake on another kind of CPU was run here:
+   the pins hold with glibc's FMA paths off and on aarch64 under qemu;
+   a real ARM machine was not run.)
 7. Slang: both of its points need slangc, which a cloud session cannot
    fetch.
 8. The motion blur benchmarks (shapes, and a still mesh group) and the
@@ -134,10 +135,12 @@ Not done, and why:
   motion blur, one shadow test a vertex, the CPU's corners on the
   device's grid, a path's or a shader picture's samples under blur, a
   pooled mesh's shadow frame from its points.
-- What the simulation's and the editor's sections name as left after
-  their own work (for example pictures of far agents taking the scene's
-  shadows, a ragdoll that gets up from its back): smaller than the
-  points above, each with its reason where it is named.
+- What the simulation's and the editor's sections still name as left
+  after their own work: each says there whether it needs what a
+  container has not got (a GPU for far agents' pictures in the scene's
+  shadows, a key for the API runner, a desktop and a mouse, the owner's
+  decision on what undo means after later edits) or is a limit with its
+  reason.
 
 ## Motion renderer
 
