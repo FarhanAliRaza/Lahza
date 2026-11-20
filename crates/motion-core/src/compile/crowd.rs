@@ -89,7 +89,7 @@ impl Compiled {
                 };
                 agents.push(AgentInput { id: a.clone(), start: pose, rest, goal: c.goals[k % c.goals.len()], ragdoll, local });
             }
-            input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: false, pool: Vec::new(), local: Vec::new(), speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock });
+            input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: false, pool: Vec::new(), local: Vec::new(), speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0) });
         }
     }
 
@@ -180,7 +180,7 @@ impl Compiled {
                 local: Vec::new(),
             })
             .collect();
-        input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: true, pool, local, speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock });
+        input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: true, pool, local, speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0) });
     }
 }
 

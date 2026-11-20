@@ -679,6 +679,14 @@ pub struct Crowd {
     /// px/s of a body's speed into an agent that knocks it down.
     #[serde(default = "crowd_knock")]
     pub knock: f64,
+    /// Agents find their way round what stands across it (false: they
+    /// only steer off what is near, and a wall holds them).
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub plan: bool,
+    /// Seconds ahead an agent sees a body coming that would knock it
+    /// down, and steps out of its line (0: it does not look).
+    #[serde(default = "crowd_dodge")]
+    pub dodge: f64,
     /// Agents knocked down fall as ragdolls made like this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ragdoll: Option<CrowdRagdoll>,
@@ -705,6 +713,9 @@ pub struct CrowdRagdoll {
     pub max: u32,
 }
 
+fn crowd_dodge() -> f64 {
+    0.6
+}
 fn crowd_full() -> u32 {
     150
 }
@@ -1365,6 +1376,8 @@ pub struct CrowdInput {
     pub clip_at: f64,
     pub facing: [f64; 2],
     pub knock: f64,
+    pub plan: bool,
+    pub dodge: f64,
 }
 
 /// Everything a bake is made from: the document's simulation resolved to
@@ -1577,7 +1590,7 @@ impl SimInput {
         h.u64(self.crowds.len() as u64);
         for c in &self.crowds {
             h.str(&c.id);
-            h.fs(&[c.speed, c.vary, c.radius, c.height, c.stride, c.cycle, c.clip_at, c.knock]);
+            h.fs(&[c.speed, c.vary, c.radius, c.height, c.stride, c.cycle, c.clip_at, c.knock, c.dodge, c.plan as u8 as f64]);
             h.fs(&c.facing);
             h.u64(c.instanced as u64);
             h.u64(c.pool.len() as u64);

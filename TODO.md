@@ -748,8 +748,19 @@ picks by CPU. In the order built:
 7. **Crowds: done, as layers or as instances with impostors.**
    `simulation.crowds`. Once a frame every agent steers: toward its goal
    at its own pace, off agents within three radii (found by a grid), off
-   and round the level outline of any body that stands in its height.
-   Its clip runs by the distance walked. In the world an agent is a
+   and round the nearest point of the level box of any body that stands
+   in its height. Its clip runs by the distance walked.
+   - **A way round** (`plan`, true): when the straight line to its goal
+     is shut, an agent takes the shortest open way (A* over the level in
+     squares of 1.5 radii or more, 192 across at most; shut within a
+     radius of what stands still) and heads for the farthest of its
+     corners it can see. The ground is made again each frame, a way
+     looked for again each second or when its corners are out of sight.
+   - **Stepping aside** (`dodge`, 0.6 s): a body that, flying as it
+     flies, would be on an agent within that time at a speed that would
+     knock it down is stepped out of the line of, at up to 2.2 times the
+     agent's pace (a `dodge` event). One too fast to clear still knocks
+     it down. In the world an agent is a
    moved capsule; one struck at `knock` px/s or more goes down as a limp
    ragdoll placed where the clip had its bones.
    - **As layers** (`agents`): each agent is a comp with a character
@@ -778,11 +789,17 @@ picks by CPU. In the order built:
    - Tested: six agents reach their goals round a pillar and never
      closer than 40 px to each other; the clip turns one cycle a stride;
      a thrown ball knocks one down, whose bones are baked from that
-     sample and end on the floor. Instances walk bit for bit as the same
+     sample and end on the floor; six agents round a wall
+     700 px long across their way, by both ends, none in it, where
+     without a plan the wall holds them, and in a pen with no way out
+     they stay; an agent a ball is thrown at from 900 px is 56 px and
+     more off its line when it passes and walks back, is knocked down by
+     one at 9000 px/s, and does not flinch at one going over or wide.
+     Instances walk bit for bit as the same
      agents as layers do, are drawn where the bake has them at their own
      moment, are meshes for the nearest `full` and image layers with
      their pictures for the rest; one struck takes the pool's first
-     ragdoll; the bake survives its file; three bakes are pinned.
+     ragdoll; the bake survives its file; five bakes are pinned.
      Rendered: 24 agents as 4 meshes and 20 pictures cover the same
      pixels as 24 meshes (within 12 %, under a third differing at all).
      `examples/sim/crowd.py` (12, 100) and `examples/sim/herd.py` (100,
@@ -800,7 +817,9 @@ picks by CPU. In the order built:
      | 5000 | 150 meshes, 4850 pictures | 6.5 s | 19.6 MB | 56.7 s |
 
      (The bakes with instances include a pool of 12 ragdolls, which is
-     most of the 1.3 s.) A frame of 1000: 24 ms to evaluate, 40 ms of
+     most of the 1.3 s. Those were before agents looked for what is
+     thrown and for a way: 5000 now bake in 7.9 s, in 11.9 s with a wall
+     a third of the field long across their way.) A frame of 1000: 24 ms to evaluate, 40 ms of
      display lists, 0.8 s to rasterise; the pictures a frame first needs
      take 1.4 to 2.4 s once. On this character a
      picture is not much cheaper than its 624 points on the CPU (a card
@@ -813,10 +832,14 @@ picks by CPU. In the order built:
      animated light); an agent pops when it changes between mesh and
      picture; the path tracer sees a card, not a body. A fallen agent
      falls with the agent's speed only (its limbs' own swing is
-     dropped), is always limp, and past the pool stands frozen. Steering
-     is local (no path planning: a wall across the way holds an agent);
-     agents do not react to what is thrown. A search controller does not
-     see crowds in its tries. `check` evaluates every agent at every
+     dropped), is always limp, and past the pool stands frozen. A way
+     is planned round what stands still only (its level box: a wall at
+     an angle shuts its whole box), by each agent alone (no lanes, no
+     waiting for a gap: a doorway jams), and not round a body in
+     motion. An agent steps aside and does nothing else: no guard, no
+     duck, no look (it has one clip), and it does not get out of the
+     way of other agents' falls. A search controller does not see
+     crowds in its tries. `check` evaluates every agent at every
      sample it takes, which is slow at thousands.
 
 ## Directing an agent from the editor
