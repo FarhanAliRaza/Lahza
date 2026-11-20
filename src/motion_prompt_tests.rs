@@ -449,3 +449,92 @@ fn prompt_bar_on_a_recording_asks_for_a_piece_on_the_span() {
     });
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A scene with bodies: the bar says the simulation is not baked, Bake
+/// bakes it without holding the window, and moving a body says it needs
+/// baking again.
+#[test]
+#[ignore = "requires a display (can run under Xvfb)"]
+fn a_simulation_is_baked_from_the_bar_and_goes_stale_when_a_body_moves() {
+    let dir = std::env::temp_dir().join(format!("lahza-motion-sim-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots = std::env::var_os("LAHZA_WORKFLOW_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|| dir.clone());
+    std::fs::create_dir_all(&shots).unwrap();
+    let mut tb = Toolbox::new();
+    tb.cwd = dir.clone();
+    tb.call("project_create", json!({"path": "drop", "duration": 2, "width": 640, "height": 360})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1", "simulation": {"ground": {"y": 330}}},
+        {"op": "add", "id": "crate", "kind": "mesh", "mesh": {"type": "box", "size": [60, 60], "depth": 60}, "material": {"preset": "plastic", "color": "#d03734"},
+         "transform": {"position": [320, 60], "rotation": 12}, "body": {"bounce": 0.3}}
+    ]}))
+    .unwrap();
+    let project = dir.join("drop.lahza");
+    let open = project.clone();
+    Application::new().with_assets(Assets { base: asset_directory() }).run(move |cx| {
+        let handle = open_studio_window(cx, true, |handle, cx| {
+            cx.new(|cx| {
+                let mut studio = Studio::new(handle, None, None, cx);
+                studio.open_motion_project(open.clone());
+                studio
+            })
+        })
+        .unwrap();
+        cx.activate(true);
+        cx.spawn(async move |cx| {
+            use crate::motion_editor::SimNeed;
+            let wait = |ms| Timer::after(Duration::from_millis(ms));
+            let any: AnyWindowHandle = handle.into();
+            let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
+            wait(300).await;
+            any.update(cx, |_, window, _| {
+                window.activate_window();
+                window.refresh();
+            })
+            .unwrap();
+            let editor = |cx: &mut gpui::AsyncApp| handle.update(cx, |s, _, _| s.motion_doc.as_ref().map(|d| d.editor.clone())).unwrap();
+            // Waits (up to three minutes: a software GPU's first frame) for
+            // the editor to say `want` of its simulation.
+            let mut until = async |cx: &mut gpui::AsyncApp, what: &str, want: &dyn Fn(&crate::motion_editor::MotionEditor) -> bool| {
+                for _ in 0..3600 {
+                    wait(50).await;
+                    draw(cx);
+                    if editor(cx).is_some_and(|e| e.update(cx, |e, _| want(e)).unwrap()) {
+                        return;
+                    }
+                }
+                panic!("never: {what}");
+            };
+            until(cx, "the missing bake is found", &|e| e.sim_needs() == [SimNeed::Unbaked { scene: "s1".into(), bodies: 1 }] && e.frame_png().is_some()).await;
+            wait(600).await;
+            draw(cx);
+            wait(100).await;
+            studio_workflow_tests::save_display(&shots.join("sim-1-not-baked.png"), false);
+            // One click.
+            handle
+                .update(cx, |studio, _, cx| {
+                    studio.bake_motion_simulation(cx);
+                    assert!(studio.motion_doc.as_ref().unwrap().editor.read(cx).baking(), "the bake runs beside the window");
+                })
+                .unwrap();
+            until(cx, "the bake ends and is loaded", &|e| !e.baking() && e.sim_needs().is_empty() && e.project().bakes.contains_key("s1")).await;
+            assert!(lahza_motion_core::sim::bake_path(&project, "s1").is_file());
+            let said = editor(cx).unwrap().update(cx, |e, _| e.status().to_string()).unwrap();
+            assert!(said.starts_with("Baked s1 (1 bodies"), "{said}");
+            // The body dragged: the simulation needs baking again.
+            editor(cx).unwrap().update(cx, |e, _| e.move_layer("crate", [200.0, 40.0], true)).unwrap();
+            until(cx, "the stale bake is found", &|e| e.sim_needs() == [SimNeed::Stale { scene: "s1".into(), bodies: 1 }]).await;
+            wait(600).await;
+            draw(cx);
+            wait(100).await;
+            studio_workflow_tests::save_display(&shots.join("sim-2-stale.png"), false);
+            // A bake made elsewhere (an agent's `sim_bake`) shows too.
+            crate::motion_editor::bake_simulations(&project).unwrap();
+            until(cx, "a bake made elsewhere is picked up", &|e| e.sim_needs().is_empty()).await;
+            cx.update(|cx| cx.quit()).unwrap();
+        })
+        .detach();
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}

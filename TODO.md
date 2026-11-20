@@ -485,10 +485,12 @@ picks by CPU. In the order built:
      end (unbaked, baked, stale, undo, reopened). `examples/sim/tumble.py`
      builds letters that tumble and a wall hit by a ball on a rope; its
      contact sheets were looked at (CPU renderer).
-   - Left: the motion editor does not reload when only `sim/` changes
-     (its own stamp list, `src/motion_editor.rs`), and has no bake
-     button. (`snapshot` warns of a missing or stale bake and `render`
-     refuses one unless given `unbaked`; `review` says nothing.) A box landing flat at speed tips a degree or
+   - In the editor (done; seen under Xvfb, see "How it should be used"):
+     it reloads when only `sim/` changes, says beside the prompt bar when
+     a bake is missing or stale, and bakes in one click off the UI thread.
+   - `snapshot` warns of a missing or stale bake and `render` refuses one
+     unless given `unbaked`; `review` says nothing.
+   - Left: a box landing flat at speed tips a degree or
      two before settling (rapier's contact solver; more iterations do not
      change it). Ropes are not drawn. Bodies inside instancers are
      refused. Slang-generated meshes cannot be colliders (give a shape).
@@ -769,10 +771,18 @@ and whether the bars now move freely, is not confirmed on a real card.
   | 480 | 3.4 ms | 0.013 ms | 0.66 ms |
   | 1 200 | 22 ms | 0.014 ms | 1.7 ms |
 
-  Left: the tick still compiles every scene (`Compiled::new`, 1.7 ms at
-  1 200 plain layers; more with an imported model of many parts, not
-  timed). Compiling only the scene that changed needs a way into
-  `compile.rs`, which was another branch's file while this was done.
+  Left out on purpose: the tick still compiles every scene
+  (`Compiled::new`, 1.7 ms at 1 200 plain layers; more with an imported
+  model of many parts, not timed). Compiling only the scene that changed
+  was looked at once `compile.rs` was free and not done: one `Compiler`
+  carries what scenes share (every element's window, which `#id.end`
+  references and anchors read across scenes; the Slang linker and the
+  surface program; errors, syncs and events in scene order), so a scene
+  compiled alone is only right when nothing outside it refers into it,
+  and telling that costs a pass of its own. The gain is at most the
+  1.7 ms, and nothing when the layers are in the scene being edited,
+  which is the usual case. To take up again if a project is found where
+  the compile, not the render, holds a drag.
 - **The drop no longer reads the history.** `next_history_number` takes
   the highest file name: 0.6 ms at 2 000 entries, where reading them all
   takes 14 ms (`history_numbers_come_from_file_names -- --nocapture`).
@@ -816,6 +826,17 @@ with a mouse on a real desktop.
   preview set to Traced or Raster + sky too: a drag's frames are the
   raster proxy (`motion_preview::ask`), and the traced picture comes back
   warmed up on release.
+- **A simulation that needs baking says so.** Beside the prompt bar: a
+  pill when a scene's bodies have no bake or changed since it
+  ("Simulation not baked · Bake", "Simulation changed · Bake again"; the
+  tooltip names the scenes), found off the UI thread after each load
+  (`sim_needs`: `check`'s `simulation` issues). One click bakes through
+  the `sim_bake` tool on a thread of its own and reloads; a body dragged
+  afterwards brings the pill back. A scene that cannot be baked shows in
+  red with the engine's reason. Seen under Xvfb
+  (`a_simulation_is_baked_from_the_bar_and_goes_stale_when_a_body_moves`).
+  Left: no progress for a long bake (only "Baking the simulation…"), and
+  no way to stop one.
 - **By hand stays cheap**: the inspector edits a text layer's words (shown
   as typed, saved when the field is left), its font (the bundled ones and
   the font files in the project's `assets/`), colour, size and tracking;

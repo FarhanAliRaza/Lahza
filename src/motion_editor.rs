@@ -402,6 +402,14 @@ pub(crate) struct MotionEditor {
     /// The preview quality the last frame was asked at.
     quality: motion_preview::Quality,
     cannot_trace: bool,
+    /// Scenes whose simulation needs baking, found off the UI thread
+    /// after each load (the newest answer wins).
+    sim_needs: Vec<SimNeed>,
+    sim_generation: u64,
+    sim_inbox: Arc<Mutex<Option<(u64, Vec<SimNeed>)>>>,
+    /// A bake is running; its result arrives here.
+    baking: bool,
+    bake_inbox: Arc<Mutex<Option<Result<String, String>>>>,
     font_names: Vec<String>,
     /// The selected layer as JSON, saved and as the drag shows it: values
     /// are read from these, so a draw does not serialise the layer again.
@@ -432,7 +440,9 @@ pub(crate) fn stamp(dir: &Path) -> SystemTime {
         }
     };
     look(&dir.join("project.json"));
-    for sub in ["scenes", "markers", "shaders"] {
+    // (`sim`: a bake made elsewhere shows without an edit.)
+    for sub in ["scenes", "markers", "shaders", "sim"] {
+        look(&dir.join(sub));
         if let Ok(rd) = std::fs::read_dir(dir.join(sub)) {
             for e in rd.flatten() {
                 look(&e.path());
@@ -463,6 +473,66 @@ fn font_names(dir: &Path) -> Vec<String> {
     files.sort();
     out.extend(files);
     out
+}
+
+/// A scene whose simulation is not what is drawn: `check`'s `simulation`
+/// issues, for the editor.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SimNeed {
+    /// Bodies and no bake: they stand where their keys put them.
+    Unbaked { scene: String, bodies: usize },
+    /// The bake was made from something else: the old simulation is drawn.
+    Stale { scene: String, bodies: usize },
+    /// It cannot be baked as it is.
+    Broken { scene: String, error: String },
+}
+
+impl SimNeed {
+    /// For the person, in a line.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            SimNeed::Unbaked { scene, bodies } => format!("Scene {scene}: {bodies} bodies are not simulated yet (they stand where their keys put them)."),
+            SimNeed::Stale { scene, bodies } => format!("Scene {scene}: its {bodies} bodies or their settings changed since the bake; the old simulation is drawn."),
+            SimNeed::Broken { scene, error } => format!("Scene {scene} cannot be simulated: {error}"),
+        }
+    }
+
+    /// Whether a bake would settle it.
+    pub(crate) fn bakeable(&self) -> bool {
+        !matches!(self, SimNeed::Broken { .. })
+    }
+}
+
+/// What needs baking in a project. Gathers every body (0.3 s at 500
+/// bodies): call it off the UI thread.
+pub(crate) fn sim_needs(compiled: &Compiled, dir: &Path) -> Vec<SimNeed> {
+    use lahza_motion_core::compile::SimStatus;
+    let mut out = Vec::new();
+    for (i, scene) in compiled.scenes.iter().enumerate() {
+        let scene = scene.id.to_string();
+        match compiled.sim_status(i, Some(dir)) {
+            SimStatus::None | SimStatus::Fresh { .. } => {}
+            SimStatus::Unbaked { bodies } => out.push(SimNeed::Unbaked { scene, bodies: bodies as usize }),
+            SimStatus::Stale { bodies } => out.push(SimNeed::Stale { scene, bodies: bodies as usize }),
+            SimStatus::Broken(errors) => out.push(SimNeed::Broken { scene, error: errors.join("; ") }),
+        }
+    }
+    out
+}
+
+/// Bakes every scene that needs it, through the `sim_bake` tool (a
+/// toolbox of its own, so it can run off the UI thread). Says what was
+/// baked.
+pub(crate) fn bake_simulations(dir: &Path) -> Result<String, String> {
+    let out = Toolbox::new().call("sim_bake", json!({"project": dir}))?.json;
+    let baked: Vec<String> = out["scenes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["status"] == "baked")
+        .map(|s| format!("{} ({} bodies, {} frames, {:.2} s)", s["scene"].as_str().unwrap_or(""), s["bodies"], s["frames"], s["seconds"].as_f64().unwrap_or(0.0)))
+        .collect();
+    Ok(if baked.is_empty() { "The simulation was up to date".into() } else { format!("Baked {}", baked.join(", ")) })
 }
 
 fn round(v: f64) -> f64 {
@@ -596,6 +666,11 @@ impl MotionEditor {
             comparing: false,
             quality: motion_preview::quality(),
             cannot_trace: false,
+            sim_needs: Vec::new(),
+            sim_generation: 0,
+            sim_inbox: Arc::default(),
+            baking: false,
+            bake_inbox: Arc::default(),
             font_names: Vec::new(),
             saved_json: RefCell::default(),
             preview_json: RefCell::default(),
@@ -613,6 +688,7 @@ impl MotionEditor {
         let mut editor = editor;
         editor.font_names = font_names(&editor.dir);
         editor.refresh_waves();
+        editor.refresh_sim();
         Ok(editor)
     }
 
@@ -661,6 +737,20 @@ impl MotionEditor {
                 self.waves = Arc::new(waves);
                 changed = true;
             }
+        }
+        let found = self.sim_inbox.lock().unwrap().take();
+        if let Some((generation, needs)) = found {
+            if generation == self.sim_generation && needs != self.sim_needs {
+                self.sim_needs = needs;
+                changed = true;
+            }
+        }
+        let baked = self.bake_inbox.lock().unwrap().take();
+        if let Some(result) = baked {
+            self.baking = false;
+            self.reload();
+            self.status = result.unwrap_or_else(|e| format!("The simulation could not be baked: {e}"));
+            changed = true;
         }
         self.poll_ticks += 1;
         if self.poll_ticks % 30 == 0 && !self.dragging() && stamp(&self.dir) > self.stamp {
@@ -711,6 +801,43 @@ impl MotionEditor {
         self.dirty = false;
     }
 
+    /// Asks, off the UI thread, which scenes' simulations need baking.
+    fn refresh_sim(&mut self) {
+        self.sim_generation += 1;
+        if !(0..self.compiled.scenes.len()).any(|i| self.compiled.has_simulation(i)) {
+            self.sim_needs.clear();
+            return;
+        }
+        let (compiled, dir, inbox, generation) = (self.compiled.clone(), self.dir.clone(), self.sim_inbox.clone(), self.sim_generation);
+        std::thread::spawn(move || {
+            let needs = sim_needs(&compiled, &dir);
+            *inbox.lock().unwrap() = Some((generation, needs));
+        });
+    }
+
+    /// Scenes whose simulation needs baking (as of the last load).
+    pub(crate) fn sim_needs(&self) -> &[SimNeed] {
+        &self.sim_needs
+    }
+
+    pub(crate) fn baking(&self) -> bool {
+        self.baking
+    }
+
+    /// Bakes what needs it, off the UI thread; the result shows when it
+    /// is done (`tick`).
+    pub(crate) fn bake_simulation(&mut self) {
+        if std::mem::replace(&mut self.baking, true) {
+            return;
+        }
+        self.status = "Baking the simulation…".into();
+        let (dir, inbox) = (self.dir.clone(), self.bake_inbox.clone());
+        std::thread::spawn(move || {
+            let result = bake_simulations(&dir);
+            *inbox.lock().unwrap() = Some(result);
+        });
+    }
+
     /// Whether anything is being dragged: on the canvas, or a value, a
     /// layer or a key from the studio (an unsaved preview shows).
     pub(crate) fn dragging(&self) -> bool {
@@ -740,6 +867,7 @@ impl MotionEditor {
                 self.stamp = stamp(&self.dir);
                 self.dirty = true;
                 self.refresh_waves();
+                self.refresh_sim();
                 if self.player.is_some() {
                     self.start_sound();
                 }
@@ -1486,6 +1614,41 @@ mod tests {
         // Trimming shortens fades that no longer fit.
         let short = SoundShape { fade_in: 1.0, fade_out: 0.8, ..shape }.dragged(SoundPart::End, -1.5);
         assert!(short.fade_in + short.fade_out <= short.length + 1e-9);
+    }
+
+    #[test]
+    fn a_missing_or_stale_bake_is_found_and_baked() {
+        let dir = std::env::temp_dir().join(format!("lahza-motion-editor-sim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tb = Toolbox::new();
+        tb.cwd = dir.clone();
+        tb.call("project_create", json!({"path": "drop", "duration": 2, "width": 640, "height": 360})).unwrap();
+        tb.call("edit_apply", json!({"ops": [
+            {"op": "add_scene", "id": "s1", "simulation": {"ground": {"y": 330}}},
+            {"op": "add", "id": "crate", "kind": "mesh", "mesh": {"type": "box", "size": [60, 60], "depth": 60}, "transform": {"position": [320, 60], "rotation": 12}, "body": {"bounce": 0.3}},
+            {"op": "add_scene", "id": "s2", "start": 1},
+            {"op": "add", "scene": "s2", "id": "plain", "kind": "shape", "shape": "rect"}
+        ]}))
+        .unwrap();
+        let project = dir.join("drop.lahza");
+        let needs = |project: &Path| sim_needs(&Compiled::new(&io::load(project).unwrap()), project);
+        assert_eq!(needs(&project), [SimNeed::Unbaked { scene: "s1".into(), bodies: 1 }]);
+        assert!(needs(&project)[0].bakeable() && needs(&project)[0].message().contains("not simulated yet"));
+        // A bake made elsewhere changes what the editor polls.
+        let before = stamp(&project);
+        std::thread::sleep(Duration::from_millis(20));
+        let said = bake_simulations(&project).unwrap();
+        assert!(said.starts_with("Baked s1 (1 bodies, "), "{said}");
+        assert!(stamp(&project) > before, "the editor reloads after a bake");
+        assert!(needs(&project).is_empty());
+        assert_eq!(bake_simulations(&project).unwrap(), "The simulation was up to date");
+        // The body dragged somewhere else: the bake is stale.
+        tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "crate.transform.position", "value": [200, 40]}]})).unwrap();
+        assert_eq!(needs(&project), [SimNeed::Stale { scene: "s1".into(), bodies: 1 }]);
+        bake_simulations(&project).unwrap();
+        assert!(needs(&project).is_empty());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

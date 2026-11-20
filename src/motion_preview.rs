@@ -308,7 +308,7 @@ mod tests {
         let fps = c.fps();
         let traced = ask(Quality::TracedFast, false, false);
         let mut last = None;
-        let mut step = |name: &str, renderer: &mut Renderer, last: &mut Option<Drawn>, frame: i64, scale: f64, now: Ask, expect: History| {
+        let step = |name: &str, renderer: &mut Renderer, last: &mut Option<Drawn>, frame: i64, scale: f64, now: Ask, expect: History| {
             assert_eq!(history(last.as_ref(), &c, fps.time_of(frame), scale, now, false), expect, "{name}");
             let t = std::time::Instant::now();
             let (image, fell_back) = draw(renderer, last, &c, fps.time_of(frame), scale, now, false).unwrap();

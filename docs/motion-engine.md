@@ -147,6 +147,7 @@ inside a recording open from the studio instead:
 - **Sound:** music, narration, effects and footage sound play in sync while playing.
 - **Inspector:** two tabs. Properties: scrubbable transform values (3D values on 3D layers), a text layer's words, font, colour, size and tracking, and each effect's values (numbers, two-part values, colours) with buttons to add and remove effects. Colours are picked from swatches or typed as #rrggbb. AI: what was asked about the layer and what came of it.
 - **Prompt bar:** under the preview (see below).
+- **Simulation:** when a scene's bodies have no bake, or changed since it, a pill beside the prompt bar says so and bakes in one click (off the UI thread); the editor reloads when a bake is made elsewhere.
 - **Shortcuts:** Space plays, arrows step frames, Home/End jump, Delete removes the selected layer, Ctrl+Z / Ctrl+Shift+Z undo and redo, `\` held compares a proposal with what was there before. Any other printable key begins a prompt.
 
 Click a layer in the preview or the timeline and drag it to move it. Drag a value to change it; on an animated property this adds a key at the playhead. Drag a key diamond to retime it; hold Shift to snap it to the nearest beat, which writes `beat:N` so the key stays in sync. Every drag draws the half-size proxy and changes only the dragged layer in a copy of the project; it is saved on release.

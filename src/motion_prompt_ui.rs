@@ -746,6 +746,50 @@ impl Studio {
         chips
     }
 
+    /// Shown when a scene's simulation is not what is drawn: what is
+    /// wrong, and Bake in one click (off the UI thread). Nothing when the
+    /// bakes are up to date.
+    fn motion_sim_state(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let editor = self.motion_editor()?;
+        let (needs, baking) = {
+            let e = editor.read(cx);
+            (e.sim_needs().to_vec(), e.baking())
+        };
+        if needs.is_empty() && !baking {
+            return None;
+        }
+        let pill = |label: String, fill: gpui::Hsla| div().h(px(22.0)).px_2().flex().flex_none().items_center().rounded_full().text_xs().text_color(gpui::white()).bg(fill).child(label);
+        if baking {
+            return Some(pill("Baking the simulation…".into(), theme::accent()).into_any_element());
+        }
+        let detail = needs.iter().map(|n| n.message()).collect::<Vec<_>>().join(" ");
+        if !needs.iter().any(|n| n.bakeable()) {
+            return Some(pill("Simulation cannot be baked".into(), theme::danger()).id("motion-sim-broken").tooltip(crate::timeline_ui::tooltip(detail)).into_any_element());
+        }
+        let stale = needs.iter().any(|n| matches!(n, crate::motion_editor::SimNeed::Stale { .. }));
+        let label = if stale { "Simulation changed · Bake again" } else { "Simulation not baked · Bake" };
+        Some(
+            pill(label.into(), theme::warning())
+                .id("motion-sim-bake")
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .tooltip(crate::timeline_ui::tooltip(detail))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.bake_motion_simulation(cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Bakes the open project's simulations (the pill's click).
+    pub(crate) fn bake_motion_simulation(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.motion_editor() {
+            editor.update(cx, |e, _| e.bake_simulation());
+        }
+        cx.notify();
+    }
+
     /// How the preview is drawn: Raster, Raster + sky or Traced, one
     /// choice for the app; with a note when this GPU cannot do it.
     fn motion_preview_quality(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -873,6 +917,7 @@ impl Studio {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().flex().items_center().gap_1().overflow_hidden().children(self.motion_prompt_chips(cx)))
+                    .children(self.motion_sim_state(cx))
                     .child(self.motion_preview_quality(cx)),
             )
             .child(div().flex().items_center().gap_2().child(div().flex_1().min_w_0().child(self.text_fields.prompt.clone())).child(action))
