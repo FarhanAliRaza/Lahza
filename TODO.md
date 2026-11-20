@@ -54,6 +54,21 @@ plugins were not installed), and seven window tests under Xvfb):
   fail on the card, of a traced frame's lists. (motion-render on that
   branch: 188 pass and 25 are ignored, the whole suite, before the
   catcher change; its 13 fast-mode and catcher tests after it.)
+- Since, a third session on the renderer (each in its section, with its
+  test and its numbers): what a ray of the sky's ends on is lit by what
+  it sees itself, an open ray brings the sky's own light and the lobes
+  go by what is open of them (the room 30.8 dB from the traced frame
+  for 29.7, under the table 34.4 for 32.5); coverage is a ray's weight
+  (a box 0.3 opaque hid nothing of the sky); volumes scatter back what
+  they take of a ray and take the sky themselves, and the rays' march
+  tells volumes apart by instance (it counted every ray from its
+  start); the fast mode's motion blur follows 256 texels a shutter and
+  its circle of confusion 64, a streak has no outline of the thing in
+  it, and a bead out of focus has the lens's light (it had two and a
+  half times as much); `LAHZA_OIDN_WAY` says which way the denoiser's
+  pictures go. The four sections were read through for what each still
+  calls left. (motion-render: XXX_PASS pass and XXX_IGN are ignored, the
+  whole suite, one thread, Mesa's software Vulkan.)
 
 - Since, in the simulation (its own section has each with its test): a
   rope of links, bodies two instancers deep and as an emitter's
@@ -74,17 +89,22 @@ in), since none of it can be seen from a container:
    mouse ("Directing an agent from the editor").
 2. Drag values in the inspector: whether the bars now move freely
    ("Drags that stall").
-3. The fast mode on the card: `fast_tests`, its measure, and Ray
+3. The fast mode on the card: `fast_tests`, its two measures, and Ray
    Reconstruction's picture of what changed (the specular guide, the
-   blur, the reset at cuts); the preview with Traced chosen, for its
-   pacing.
+   blur, the reset at cuts), which also needs the shim from the DLSS
+   SDK; the preview with Traced chosen, for its pacing. The commands
+   are under "To run on the RTX 3060" in the fast mode's section.
 4. Sky visibility on the card: its cost, and its picture through the
-   hardware visibility pass; then whether it is on by default.
+   hardware visibility pass; then whether it is on by default (the
+   commands: "What is left is to run on the RTX 3060" in the lighting
+   section).
 5. The tests on the card: in parallel (the crash in the loader), the four
    GPU-against-CPU ones again (plainly, and with
    `LAHZA_MOTION_VIS_REPORT=1`): whether surface detail and area lights
    now pass, as the changes made since should have them, the two tracer
-   tests that took whatever denoiser was installed.
+   tests that took whatever denoiser was installed, and which way Open
+   Image Denoise's pictures go there (`LAHZA_OIDN_WAY=1`). Each with its
+   command in "Tests on a hardware GPU" and "Motion renderer".
 6. Simulation on the card: what skinning and crowds (instances and
    pictures were never drawn by the GPU or the tracer) cost there, with a
    character of real size; a bake on another kind of CPU (both
@@ -92,35 +112,53 @@ in), since none of it can be seen from a container:
 7. Slang: both of its points need slangc, which a cloud session cannot
    fetch.
 8. The motion blur benchmarks (shapes, and a still mesh group) and the
-   shadow maps' frames on the card.
+   shadow maps' frames on the card ("Motion renderer" has both
+   commands); with the CPU film, the traced render at 16 spp again and
+   where a frame's CPU time goes (`perf`), and whether the desktop
+   stutters while it traces.
 9. NVIDIA's licence for the Ray Reconstruction shim: to read and decide
    (packaging/ngx/README.md).
 
 Not done, and why:
 - A trained policy for ragdolls: a GPU simulator, motion capture and
   days of training. Its interface and the no-training search are there.
-- What each section names as left after its own work (for example
-  volumes in the sky's rays, a third return of its light, pictures of
-  far agents taking the scene's
+- In the renderer's four sections nothing is left that could be done
+  in a container: each line there is done, to run on the RTX 3060 with
+  its command, or one of these. Needing the DLSS SDK: the specular
+  guide against NVIDIA's own polynomial (its doc/ folder), and
+  everything of Ray Reconstruction's own picture. Needing slangc: a
+  Slang surface's coverage in the sky's rays. Needing the owner's film:
+  the display lists' 20 ms a frame, and the look of a catcher's shadow
+  after the export's filter. Not to do, by a measurement or by design
+  (each where it is named): light probes, traced frames' groups under
+  motion blur, one shadow test a vertex, the CPU's corners on the
+  device's grid, a path's or a shader picture's samples under blur, a
+  pooled mesh's shadow frame from its points.
+- What the simulation's and the editor's sections name as left after
+  their own work (for example pictures of far agents taking the scene's
   shadows, a ragdoll that gets up from its back): smaller than the
   points above, each with its reason where it is named.
 
 ## Motion renderer
 
-- **Shadow maps on the GPU: to measure on a real device.** Lists for the
+- **Shadow maps on the GPU: done; their new frames to run on the card.** Lists for the
   hardware visibility pass now leave their shadow maps to the GPU: the
   builder writes each list's casters (transform and pooled mesh) and each
   map's frame, the GPU draws them from the mesh pool into pages of a depth
   atlas (`record_shadows`, `shadow_vertex`) and `shadow_texel` reads them
   there. On 300 glass bubbles under two lights the maps' share of list
   building went from 17 ms (40 before they were built on every core) to
-  0.2 ms. It has only run on Mesa's software Vulkan, through the
-  visibility pass at 4x (a test mode: `TEST_VIS_AT_4X`); on a device's own
-  8x, run `lahza motion snapshot cpu.lahza --at 9.0,10.4 --width 540
-  --profile` and compare the frame against `--backend cpu`. A map's frame
-  comes from its casters' boxes, not from every vertex, so it is a little
-  wider than the CPU's (a single sphere's by up to 1.7 times: softer
-  texels). Run on the RTX 3060 since: see "Tests on a hardware GPU" below.
+  0.2 ms. It first ran on Mesa's software Vulkan only, through the
+  visibility pass at 4x (a test mode: `TEST_VIS_AT_4X`), and on the
+  RTX 3060's own 8x since (`cpu.lahza` at four moments against the
+  CPU's frame: "Tests on a hardware GPU" below). A map's frame came from
+  its casters' boxes, not from every vertex, so it was a little wider
+  than the CPU's (a single sphere's by up to 1.7 times: softer texels);
+  the three changes that follow made the frames the CPU's, and none of
+  them has run on the card. To run on the RTX 3060: `lahza motion
+  snapshot cpu.lahza --at 9.0 --width 540 --profile -o gpu.png`, the
+  same with `--cpu -o cpu.png`, and the two pictures side by side
+  (`cpu.lahza` is the owner's project).
   Since: a directional map's frame takes each caster's span from its box
   and from the ball its points are in (the farthest point from the box's
   middle, kept with the pooled mesh; `CasterBox::span`), whichever is
@@ -153,8 +191,9 @@ Not done, and why:
   case is tested on its own
   (`a_point_lights_frame_holds_its_casters_and_little_more`: a floor
   around the light framed as the CPU frames it; a ball's frame within 5%
-  of its points', its box's a third larger). Not run on the card: the
-  118 pixels there are to be counted again.
+  of its points', its box's a third larger). On the card that test's
+  118 pixels are to be counted again (the command is at this point's
+  end).
   Since, a directional light's map too (`gpu_directional`): each side
   of its frame is taken from the points of the casters that could be its
   outermost (the widest by box and ball first, until the next one's box
@@ -168,36 +207,42 @@ Not done, and why:
   and 15 units wider on two sides). The 300 bubbles' maps still cost
   the list 0.24 ms (2.1 ms with every caster's points walked, which is
   why only the outermost are).
-  As before, and why: a mesh the GPU generates in its pool is framed by
-  its box (the CPU has no points of it, and draws no such mesh: there is
-  no CPU frame to be like; its true bounds would have to be read back
-  from the GPU, a frame late), and the aim of a point light's map is the
-  middle of the boxes as soon as one caster is such a mesh. A caster of
-  more than 16384 triangles is framed by its box and ball. A closed
-  caster around a point light is framed with its faces turned from the
-  light too. To run on the RTX 3060: `LAHZA_SHADOW_FRAMES=1
+  Not to do, each with its reason: a mesh the GPU generates in its pool
+  is framed by its box (the CPU has no points of it, and draws no such
+  mesh: there is no CPU frame to be like; its true bounds would have to
+  be read back from the GPU, a frame late), and the aim of a point
+  light's map is the middle of the boxes as soon as one caster is such a
+  mesh. A caster of more than 16384 triangles is framed by its box and
+  ball (walking every caster's points cost the 300 bubbles' list 2.1 ms
+  for 0.24). A closed caster around a point light is framed with its
+  faces turned from the light too, where the CPU leaves those out: they
+  lie within the bounds of the faces turned to it but for what the
+  light's plane cuts away (`CasterBox::seen_from`), so the frame can be
+  wider only for a caster the light stands inside. To run on the
+  RTX 3060: `LAHZA_SHADOW_FRAMES=1
   LAHZA_MOTION_VIS_REPORT=1 cargo test --release -p lahza-motion-render
   gpu_matches_cpu_area_lights -- --nocapture --test-threads=1`, then the
   same test without the two variables: whether it passes.
-- **Motion blur: what is left.** A frame takes the sub-frames its motion
+- **Motion blur: done but for the card's numbers.** A frame takes the sub-frames its motion
   needs (`motion_px` in motion-render's lib.rs), and a sub-frame does not
   draw again what the one before it left as it needs it: a group whose
   primitives (and the groups they read) are the same (`gpu::same_groups`:
   a blurred backdrop, an effect on a still layer), and a GPU shadow map
   whose casters and lights did not move (`gpu::same_shadows`). Checked
-  only as "frames are what they were" on the Slang reel and the CPU film;
-  no span rendered there has a still group under blur, so the saving is
-  not measured. Not done: traced frames (their sub-frames' groups sit
-  side by side), groups with a mesh when any mesh of the sub-frame moved,
-  and shapes, text and shader pictures that change form (they still take
-  every sample). Since: `benchmark_motion_blur_with_still_groups`
+  at first only as "frames are what they were" on the Slang reel and the
+  CPU film, where no span has a still group under blur. Three things
+  were not done then: traced frames (their sub-frames' groups sit side
+  by side), groups with a mesh when any mesh of the sub-frame moved, and
+  shapes, text and shader pictures that change form (they took every
+  sample). Each is settled below: groups with a mesh and shapes done,
+  the others not to do, with their reasons. `benchmark_motion_blur_with_still_groups`
   (motion-render's tests, `--ignored`) is such a span: a blurred backdrop
   and a glow that stand still behind a bar that moves, against the same
   frame with both drifting. On Mesa's software Vulkan both groups are
   reused in each of the frame's four sub-frames and the frame takes 110 ms
   against 112: within the noise there, where the time is the passes that
-  draw the frame itself. To run on the RTX 3060 (its profile gives the
-  passes' times) before any of the "not done" is worth doing.
+  draw the frame itself. What it saves a card is to run there (the
+  command is below, with the second benchmark's).
   Since, groups with a mesh: per group. `same_groups` goes by what each
   mesh primitive reads (`list::MeshRead`, written as the batch is
   placed: its own rows, the environment's, its lights' shadow maps and
@@ -253,7 +298,7 @@ Not done, and why:
   leaving one as drawn would mean reading another sample's texels; a
   traced frame's time is its rays (486 ms on s01, below) and a 2D
   group's pass is under the noise even in a raster frame (above).
-- **Image memory: what is left.** Textures are held at the size they show
+- **Image memory: done, nothing left.** Textures are held at the size they show
   (`Images::get_sized`), the pool's budget follows the GPU's memory, and
   new texels are added to the GPU's copy (all of it again only after
   `compact` or when its buffer grows). The last pictures decoded are kept
@@ -263,14 +308,17 @@ Not done, and why:
   still fits its pool), in `check` too (`list::frame_image_texels` is
   given the meshes' measures). A picture's whole mip chain is kept, so a
   copy at another size is a run of its levels (`images::Chain`).
-- **Path-traced renders: what is left of the idle GPU.** Measured on s01
+- **Path-traced renders: the idle GPU; what is left needs the film.** Measured on s01
   of the CPU film (`~/Videos/cpu/work_a.lahza`, ~400 scanned-rock layers,
   4-sample motion blur, half size, 16 spp): 486 ms an output frame, of
   which the GPU worked 170. Measured there again at 4 spp (`lahza motion
   render ~/Videos/cpu/work_a.lahza --from 4 --to 7 --pt --spp 4 --scale
   0.5 --profile`): 216 ms a frame before the three changes marked *new*
   below, 153 ms after, the same frames; its first second took 20.6 s and
-  10.8 s. Not measured again at 16 spp. Done:
+  10.8 s. At 16 spp it was not measured again: that needs the owner's
+  film (`lahza motion render ~/Videos/cpu/work_a.lahza --from 4 --to 7
+  --pt --spp 16 --scale 0.5 --profile`, to set beside the 486 ms).
+  Done:
   - Frames overlap: an export pushes frames through the renderer
     (`Renderer::push`/`pop`), up to four on the GPU (one traced, one at
     Open Image Denoise, one composited, one read back), each with its own
@@ -301,14 +349,19 @@ Not done, and why:
     what they read would move: a font atlas started over, an image pool
     packed or outgrown, a mesh pool with no free rows.
   - OIDN ran on the RTX 3060 here with no "copied through the host"
-    warning. (Whether its pictures were shared or its device does not
-    take the tracer's memory at all was not looked at.)
-  Still open:
+    warning. Whether its pictures were shared, or its device does not
+    take the tracer's memory at all (then there is no warning either),
+    is to run on the RTX 3060: `LAHZA_OIDN_WAY=1 lahza motion snapshot
+    cpu.lahza --at 9.0 --pt --width 540` says on stderr which way its
+    pictures go, and why (added for this; run here with Open Image
+    Denoise 2.3.3's CPU device: "copied through the host: its device
+    imports no memory by file descriptor").
+  Needing the owner's film or desktop:
   - **Display lists per sub-frame**: about 20 ms a frame on s01 (by a
     perf call graph, half of it is `Images::get_sized` and
     `MeshCache::trace_instance`, once per layer per sub-frame). The frame
     is now bound by the GPU (trace 55 ms, OIDN beside it), so reusing
-    unchanged layers' rows would not shorten it; not done.
+    unchanged layers' rows would not shorten it.
     Measured since without the film
     (`mesh_tests::benchmark_traced_lists_of_400_layers`, `--ignored`:
     four sub-frames of 400 mesh layers that move, no image maps, four
@@ -322,8 +375,10 @@ Not done, and why:
     lahza motion render ~/Videos/cpu/work_a.lahza --from 4 --to 7 --pt
     --spp 4 --scale 0.5`, and only if the CPU, not the GPU, is then what
     a frame waits for.
-  - If the desktop stutters now that bands are not waited for, see
-    `LAHZA_TRACE_YIELD` (and say so here).
+  - Whether the desktop stutters now that a trace's bands are not waited
+    for: to see on the RTX 3060's desktop while `lahza motion render
+    ~/Videos/cpu/work_a.lahza --pt` runs; if it does,
+    `LAHZA_TRACE_YIELD=1` waits for each band again.
   Measured at the film's own settings (s01, 1080 x 1920, 64 spp, 4
   sub-frames, no `--profile`: it doubles a traced frame's time): 1.54 s a
   frame, the GPU busy throughout; 1.0 s with `LAHZA_DENOISER=builtin`. Open
@@ -402,23 +457,25 @@ nothing below was run on that card.)
     `--ignored`). Seconds a frame after the first, and the last
     frame's dB:
 
-    | | seconds a frame | built-in filter | Open Image Denoise 2.3.3 (CPU) |
-    |---|---|---|---|
-    | usual, 64 paths | 1.99 | 33.9 dB | 34.3 dB |
-    | usual, 16 | 0.51 | 33.4 dB | 33.9 dB |
-    | usual, 4 | 0.18 | 27.5 dB | 27.7 dB |
-    | fast, 8 | 0.32 | 31.8 dB | 32.3 dB |
-    | fast, 4 | 0.19 | 31.0 dB | 31.4 dB |
-    | fast, 2 | 0.11 | 30.6 dB | 31.1 dB |
-    | fast, 1 | 0.10 | 29.8 dB | 30.2 dB |
+    | | seconds a frame, built-in filter | its dB | seconds, Open Image Denoise 2.3.3 (CPU) | its dB |
+    |---|---|---|---|---|
+    | usual, 64 paths | 2.57 | 33.9 | 2.55 | 34.3 |
+    | usual, 16 | 0.70 | 33.4 | 0.73 | 33.9 |
+    | usual, 4 | 0.20 | 27.5 | 0.26 | 27.7 |
+    | fast, 8 | 0.40 | 31.8 | 0.45 | 32.3 |
+    | fast, 4 | 0.23 | 31.0 | 0.27 | 31.4 |
+    | fast, 2 | 0.16 | 30.6 | 0.19 | 31.1 |
+    | fast, 1 | 0.12 | 29.8 | 0.16 | 30.2 |
 
     Four paths: a tenth of the usual trace's time for 2.9 dB less, and
     the time of the usual trace at the same four paths for 3.5 dB more.
-    (The seconds are with the built-in filter and nothing else running;
-    with Open Image Denoise they were only taken while other tests shared
-    the machine, where it was a tenth slower at this size.) Looked at:
-    the fast picture is close to the usual one; the glass ball is the
-    blotchiest part of both.
+    (Both columns of seconds taken again with nothing else running, in
+    another container than the first table's, whose built-in column read
+    1.99, 0.51, 0.18, 0.32, 0.19, 0.11 and 0.10; the dB are the same to
+    the digit. Open Image Denoise costs 0.03 to 0.06 s a frame more than
+    the built-in filter at this size.) Looked at: the fast picture is
+    close to the usual one; the glass ball is the blotchiest part of
+    both.
   - Open Image Denoise is not in Ubuntu 24.04's packages (`apt-cache
     search` has no `libopenimagedenoise`). The release from
     github.com/RenderKit/oidn (2.3.3, x86_64 linux) works unpacked
@@ -450,10 +507,11 @@ nothing below was run on that card.)
   8; only those of its scene) are traced first and thrown away:
   `Renderer::try_render_warm`, which the editor's preview can call after
   a scrub (`forget_history` and consecutive `try_render`s while playing).
-  Run through the CLI here: a 480 x 270 frame with four frames before it
-  in 22 s, the usual trace's single frame at 64 paths in 24 s, the raster
-  in 14 s (all three mostly the process's start and its pipelines, and
-  taken while other tests shared the machine).
+  Run through the CLI here, with nothing else running (`lahza motion
+  snapshot` of the sky tests' room at 480 x 270, software Vulkan; all of
+  them mostly the process's start and its pipelines): the raster 17 s,
+  `--sky` 23 s, `--pt` at 64 paths 30 s, `--fast` with its eight frames
+  before 32 s, `--fast --warm 0` 28 s.
 - **Tests** (`pt_fast_tests.rs`), with a stand-in for Ray Reconstruction
   as Open Image Denoise has one (`Tracer::pass_through_ngx`: the six
   images are read back from their textures, and the picture is the colour
@@ -467,7 +525,9 @@ nothing below was run on that card.)
   a cut, a camera jump and a transition; a frame alone and warmed up. All pass on software Vulkan, with
   the tracer's 40 other tests. The stand-in's picture is noisy and blocky
   (it is not a denoiser): what Ray Reconstruction makes of the same
-  images is not tested by it.
+  images is not tested by it, and cannot be here: it needs the RTX 3060
+  and the shim built from the DLSS SDK (`just ngx`); the commands are
+  under "To run on the RTX 3060", below.
 - **The shim** is still built by hand (`just ngx`); what it needs, and a
   reading of NVIDIA's licence, are in packaging/ngx/README.md
   (`packaging/ngx/check.sh` lists what is missing of the SDK). In short:
@@ -491,15 +551,15 @@ nothing below was run on that card.)
     and that is behind it (`resolve_fast`). A ball crossing a floor is a
     streak of its width and its way; alone over nothing its streak is as
     long as the usual trace's sub-frames make it; a post in front of it
-    keeps its edge. A motion is followed up to 64 texels a shutter. With
-    the stand-in the ball's outline shows faintly inside the streak (the
-    motion has half the picture's size there).
+    keeps its edge. A motion was followed up to 64 texels a shutter, and
+    the ball's outline showed faintly inside the streak: both done, see
+    "The two limits and the outline", below.
   - Depth of field found a blurred thing in front of a sharp one only
     within reach of eight probes. The tiles hold their widest circle of
     confusion too, and a texel looks as far as the widest that reaches
     it: a bead of five px far in front of a sharp wall blurs over the
-    wall as wide as the lens blurs it in the usual trace. A circle is
-    still at most 24 texels.
+    wall as wide as the lens blurs it in the usual trace. A circle was
+    at most 24 texels: now 64, below.
   - A shadow catcher's shadow on what is flat (footage, a card) was the
     visibility pass's four paths a texel: grain. The pass now keeps the
     flat colour and what the catchers let through apart, and that is
@@ -515,31 +575,98 @@ nothing below was run on that card.)
     `a_shadow_catchers_shadow_over_nothing_is_smooth`, with the stand-in
     and without Ray Reconstruction: grain of the coverage 0.5 levels
     where it was 14.9 and 256 paths not denoised have 1.9; the shadow's
-    edge 135 of 255 for the usual trace's 141. Seen on the way: the usual trace's filter widens a
-    catcher's soft shadow a good deal (against the same scene not
-    denoised); not changed (it is the export's look, and narrowing it
-    changes every exported shadow: for the owner to see on a film).
+    edge 135 of 255 for the usual trace's 141. Noted on the way: that
+    the usual trace's filter widens a catcher's soft shadow a good
+    deal. Measured since, and it does not in this scene
+    (`measure_a_catchers_shadow_denoised`, `--ignored`: the px of the
+    row through the shadow between a tenth and nine tenths of its
+    darkest): 10 px at 256 paths not denoised, 10 px at 64 paths
+    denoised, with the built-in filter and with Open Image Denoise
+    2.3.3 alike, the coverage along the edge within 2 of 255. Nothing
+    to change.
   - The specular guide was the surface's F0. It is now what the surface
     mirrors of an even light from where it is seen (the environment BRDF
     of F0 and roughness, by the raster's fit `env_brdf`), which is what
     NVIDIA's integration guide asks for; their own polynomial
     (`EnvBRDFApprox2`) is in the SDK's doc/ folder, which was not at
-    hand, so the two fits are not compared number by number.
+    hand, so the two fits are not compared number by number: that
+    needs the DLSS SDK.
+  - *The two limits and the outline: done.* Every texel looked two
+    tiles round for what might reach it, which is where the 64 texels
+    of a motion and the 24 of a circle came from. Now a second pass
+    over the tiles (`fast_tiles` with `u.denoise.z` 1) says how many
+    tiles round each tile's texels have to look, up to eight
+    (`FAST_REACH`): as far as the farthest tile whose motion or circle
+    reaches it. A texel with nothing fast or blurred near reads its own
+    tile and no other (it read 25), a motion is followed for 256 texels
+    a shutter (`MB_MAX`; up to 64 taps along it) and a circle of
+    confusion is up to 64 texels (`DOF_MAX`; the taps grow with it, 224
+    at the widest). `a_long_motion_is_a_long_streak`: a ball going
+    130 px a frame is a streak of 177 px with the stand-in and 175
+    without Ray Reconstruction, for the usual trace's 168 (cut at 64
+    texels it was about 124). `a_wide_circle_of_confusion_is_as_wide_as_the_lens`:
+    a bead blurred 37 texels each way is 74 px across for the lens's
+    73.
+    *The outline in a streak* was not the stand-in's alone (134 texels
+    of the streak more than 10 levels off the two beside them with it,
+    93 without; up to 66 levels): the trace's motion is of whatever its
+    one sample in a texel hit, and at the ball's edge that may be the
+    floor, so a texel that showed the ball stood still in the streak.
+    A texel's motion is now that of the surface it shows most of (the
+    trace's own where its depth agrees, else that of a texel beside it
+    at that depth, else, for a texel that shows two surfaces, the
+    longest around: `fast_motion_of`). `a_streak_has_no_outline`: no
+    such texel left, the most 9 levels, both ways. Seen: the ring of
+    dots is gone.
+    *And found by looking at the wide circle's picture, which the
+    tests' counts had passed:* the bead out of focus was a bright disc
+    of its circle's size, two and a half times the light the lens
+    gives it (every tap that reached a texel counted alike, and a
+    texel of the bead kept its own colour). Now a tap gives what its
+    share of the reach's disc is of its own circle's area, the texel's
+    own surface gives as one texel of its circle, and what that leaves
+    is what lies behind the surface, the mean of the taps behind it
+    (`dof_fast`). The two bead tests ask for the light too: 0.96 and
+    0.97 of the lens's, at the same width. Seen: a dim soft disc, as
+    the usual trace's.
+    What the passes cost, on software Vulkan at 640 x 480, without Ray
+    Reconstruction (`measure_the_fast_passes`, `--ignored`; a frame is
+    400 to 490 ms there, nearly all of it the trace, so these are the
+    profile's rows over six frames, a frame's share): the tiles' two
+    passes 0.2 ms (2 ms where nothing moves: the first frames'); the
+    resolve 1 ms with a shutter and nothing moving, 4 ms with a ball
+    going 50 px a frame, 6 ms at 130 px; the depth of field 3 ms with
+    the bead's circle of 37 texels. (Before, every texel read 25 tiles
+    and took at most 32 taps along a motion and 64 in a circle; now one
+    tile where nothing is near, and more taps only under a wide circle
+    or a long streak. What they cost a card is among the commands
+    below.)
 
-To run again on the RTX 3060 (nothing above was):
-- `cargo test -p lahza-motion-render fast_tests -- --test-threads=1`, and
-  the measure (`-- --ignored measure_the_fast --nocapture`,
-  `LAHZA_MEASURE=1080,1920,8,256`), with and without `LAHZA_FAST=own`:
-  the table above for a card, and Ray Reconstruction beside it.
-- With Ray Reconstruction itself, looking at: the new specular guide
-  (mirrors and rough metals), the motion blur's streaks at half-size
-  motion, the first frames after a cut now that `reset` is sent there,
-  a camera jump, and a transition between two traced scenes.
-- The time of `fast_tiles`, `fast_catcher` and the new `resolve_fast` at
-  1080 x 1920 (they were about 7 ms for the visibility pass and under a
-  second a film for the depth of field before).
+To run on the RTX 3060 (nothing above was; Ray Reconstruction also needs
+the shim from the DLSS SDK, `just ngx`):
+- `cargo test --release -p lahza-motion-render fast_tests --
+  --test-threads=1`, and the measure: `LAHZA_MEASURE=1080,1920,8,256
+  cargo test --release -p lahza-motion-render -- --ignored --nocapture
+  --test-threads=1 measure_the_fast_mode`, once as it is and once with
+  `LAHZA_FAST=own`: the table above for a card, and Ray Reconstruction
+  beside it.
+- With Ray Reconstruction itself, to look at: `lahza motion render
+  ~/Videos/cpu/work_a.lahza --fast --from 4 --to 7 -o rr.mp4`, and the
+  same with `LAHZA_FAST=own -o own.mp4`: the new specular guide (mirrors
+  and rough metals), the motion blur's streaks (the motion has half the
+  picture's size there), the first frames after a cut now that `reset`
+  is sent there, a camera jump, and a transition between two traced
+  scenes.
+- The time of the passes at 1080 x 1920: the same render with
+  `--profile` (its rows "fast mode tiles", "fast shadow catcher", "fast
+  depth of field", "trace resolve"; they were about 7 ms for the
+  visibility pass and under a second a film for the depth of field
+  before the tiles), and `LAHZA_MEASURE=1080,1920 cargo test --release
+  -p lahza-motion-render -- --ignored --nocapture --test-threads=1
+  measure_the_fast_passes`.
 
-What is missing:
+What is left, all of it to see on the RTX 3060's desktop (`just run`, a
+project with meshes, Traced chosen beside the prompt bar):
 - **The editor's preview takes `fast` (wired; not seen on a card).** A
   choice beside the prompt bar, kept with the app's settings: Raster,
   Raster + sky (`set_sky`), Traced (`fast`). Both preview workers go
@@ -563,7 +690,8 @@ What is missing:
   a second at the 24 ms measured on the RTX 3060, during which the
   worker draws nothing else) is felt, and whether history should survive
   8 dropped frames while playing.
-- **Ray Reconstruction's picture** of all that changed here.
+- **Ray Reconstruction's picture** of all that changed here (the second
+  command above).
 
 ## Lighting between the raster and the traced picture
 
@@ -619,9 +747,15 @@ it). What follows is for a card where it is not quick enough.
     filter pass). By the profile, summed over five frames: the meshes'
     structures 6 ms (built once), the top structure 0.5 ms, the tables
     33 ms on the CPU, and the kernel's pipeline 1.1 s once. Software
-    Vulkan's numbers. In the editor's preview: not run.
-    With motion blur each sub-frame has its own rays (they are not
-    shared as a traced picture's are).
+    Vulkan's numbers. (What a frame costs now is under "What a ray ends
+    on", below.) In the editor's preview it ran through the preview's
+    own renderer at 160 x 90 (a warmed frame 0.23 s against the raster's
+    0.02 s: the fast mode's section); at a window's size, on a card: to
+    run there, below.
+    With motion blur each sub-frame has its own rays, by design: a
+    sub-frame is a raster list of its own with the meshes where they
+    are then, and the rays have to meet them there (a traced picture's
+    sub-frames share one picture, not their rays either).
   - *The CPU path* casts the same rays (`sky_cpu.rs`): a BVH over the
     list's triangles in camera space, built each frame, the same
     directions from the same points, the same light back and the same
@@ -655,7 +789,9 @@ it). What follows is for a card where it is not quick enough.
   it on where it is cheap enough is a decision for after the card's
   numbers.
   Against a traced frame of the same scene (a ball, a box with a slab
-  over it, a floor and a wall; 320 x 180 and 480 x 270, 64 paths):
+  over it, a floor and a wall; 320 x 180 and 480 x 270, 64 paths), as
+  first measured; the numbers after the changes below are in the table
+  under "What a ray ends on":
   - Lit by the environment only: where the ball stands the floor is 0.72
     of the plain raster's (traced: 0.62; the second filter pass softens
     it, 0.69 before), the open floor 0.94 (0.99); the whole picture
@@ -679,16 +815,20 @@ it). What follows is for a card where it is not quick enough.
   from the traced one where the plain raster is 26.0 dB. So the bounce
   is in, from the same rays, as above.
 
-What is left:
+What is left is to run on the RTX 3060, and what was done since:
 - The editor's preview asks for it when Raster + sky is chosen
-  (`src/motion_preview.rs`); not seen on a card.
-- Run on the RTX 3060: `cargo test -p lahza-motion-render sky_tests --
-  --test-threads=1` and its measure (`--ignored`,
-  `LAHZA_MEASURE=1080,1920`): the cost there (rays, filter, the
-  structures of a film's scenes: four rays a texel and two filter passes
-  are what keeps flat things even), and the picture
+  (`src/motion_preview.rs`). To see on the card's desktop: `just run`, a
+  project with meshes, Raster + sky beside the prompt bar.
+- `cargo test --release -p lahza-motion-render sky_tests --
+  --test-threads=1`, then `LAHZA_MEASURE=1080,1920 cargo test --release
+  -p lahza-motion-render -- --ignored --nocapture --test-threads=1
+  measure_sky_visibility measure_against_traced`: the cost there (rays,
+  filter, the structures of a film's scenes: four rays a texel and two
+  filter passes are what keeps flat things even), and the picture
   through the raster's hardware visibility pass, which software Vulkan
   does not have (only the compute raster's shading was run with it).
+  Whether `sky` is then on by default is the owner's to decide from
+  those numbers.
 - **Cards and see-through meshes hide the sky, and see-through meshes
   take it: done**, by a fixed rule, nothing drawn by lot. At first with
   a step at one half (a ray ended on a surface at least half opaque and
@@ -901,7 +1041,11 @@ What is left:
   not open, 29.8 and 33.8 dB; half, as kept, 30.7 and 34.4 dB.
   What is left of the dark floor under the ball (141 for 133) is the
   filter's width, two passes of a 5 x 5 tent at half size: with the
-  second pass even it was 146.
+  second pass even it was 146. Not to do, narrower still: with the
+  second pass falling off over a twentieth of the open part instead of
+  a tenth, the contact in the room without lobes was 118 for 120 (the
+  traced 115) and the wall's blotches 0.45 for 0.39, where the traced
+  wall has 0.37 and the test allows 0.3 over it.
   The cost: on software Vulkan at 480 x 270 a frame takes 137 ms against
   64 without (117 against 66 at the commit before, in this container:
   the trace 119 ms a frame for 78); the CPU at 1080 x 608, four cores,
@@ -1922,9 +2066,11 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
   commits. One thread runs through. Since: objects are named only where
   a tool reads the names (blade's `set_object_name`: with validation or
   capture on, or `LAHZA_VK_NAMES` set), so a run without them does not go
-  through that call at all. Not run on the card (to do: the tests there
-  without `--test-threads=1`); on Mesa's software Vulkan the crash does
-  not show, and four devices at once run a 15 GB container out of memory.
+  through that call at all. To run on the RTX 3060: `cargo test
+  --release -p lahza-motion-render` (no `--test-threads=1`), several
+  times: whether it still crashes. On Mesa's software Vulkan the crash
+  does not show, and four devices at once run a 15 GB container out of
+  memory.
   The app could meet the same crash (a renderer per preview, each with
   its device): the change covers it too.
 - The hardware visibility pass drew wrong pictures there, which no test
@@ -1956,7 +2102,9 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
   whatever was installed), the second is skipped off software Vulkan
   (its stand-in denoiser reads the shared memory as files, which a
   card's driver is taken not to allow: from reading, to be confirmed
-  there). To run there: those two by name.
+  there). To run on the RTX 3060: `cargo test --release -p
+  lahza-motion-render -- --nocapture --test-threads=1
+  frames_in_flight_are_the_frames the_denoiser_works_on_the_tracers`.
   Since, for the four: `LAHZA_MOTION_VIS_REPORT=1` makes every
   GPU-against-CPU comparison say where the two differ instead of failing
   (pixels over 3 levels, how many of them away from an edge and by how
@@ -1969,12 +2117,8 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
   the surface-detail frame they lie along the seams between triangles
   (a pixel two triangles share is shaded for each at the middle of the
   samples it won, and the pass's samples fall otherwise than the CPU's:
-  bumps make that show) and as spots on the face with a normal map (not
-  looked into: the pooled vertex has two rows where the CPU's has four,
-  so some of what shading reads is worked out on the GPU). Not fixed. To
-  do on the card: run the four with the report, see whether its 8x leaves
-  the seams, and look at the normal-mapped face first.
-  Since, both looked into on software Vulkan:
+  bumps make that show) and as spots on the face with a normal map.
+  Both looked into on software Vulkan since:
   - *The spots on the normal-mapped face: found and fixed.* Not the
     pooled vertex's two rows (what the GPU works out of them is the same
     over a flat face). They needed a light that casts shadows and the
@@ -2014,7 +2158,7 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
     triangle of a pixel at the pixel's middle instead does not help (17):
     not done. To make those last agree the CPU would have to round its
     corners as the device does (its `subPixelPrecisionBits` and its
-    rounding): not done, 16 pixels are within what the test allows (76).
+    rounding): not to do, 16 pixels are within what the test allows (76).
     So the card's 1089 were not seams. Most likely they were the patches
     above, on the ball's, the box's and the can's bumps (on the box
     alone the fix took about 1090 pixels out of the 4x report), since
