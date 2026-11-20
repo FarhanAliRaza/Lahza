@@ -20,6 +20,23 @@ fn scene_ragdolls(project: &Project, scene: &str) -> Vec<String> {
 }
 
 impl Toolbox {
+    /// What is drawn wrong for want of a bake: a line per scene whose
+    /// simulation is not baked, stale, or cannot be.
+    pub(super) fn sim_warnings(&mut self, dir: &Path) -> Vec<String> {
+        let compiled = self.compiled(dir);
+        (0..compiled.scenes.len())
+            .filter_map(|i| {
+                let id = &compiled.scenes[i].id;
+                match compiled.sim_status(i, Some(dir)) {
+                    SimStatus::None | SimStatus::Fresh { .. } => None,
+                    SimStatus::Unbaked { bodies } => Some(format!("scene '{id}': its simulation ({bodies} bodies) is not baked: they are drawn where their keys put them (sim_bake)")),
+                    SimStatus::Stale { .. } => Some(format!("scene '{id}': its simulation's bake is stale: what is drawn is the simulation as it was before the last changes (sim_bake)")),
+                    SimStatus::Broken(errors) => Some(format!("scene '{id}': its simulation cannot be baked: {}", errors.join("; "))),
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn sim_bake(&mut self, args: &Value) -> ToolResult {
         let dir = self.dir(args)?;
         let only = get_str(args, "scene").map(str::to_string);

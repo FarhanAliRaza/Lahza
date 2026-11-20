@@ -280,6 +280,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
             description: "Export video (mp4, webm or gif by extension) in the background; poll render_status. quality=draft renders half size without motion blur. pt=true (or settings.renderer \"path\") path-traces meshes on a GPU with ray queries (else rasterised, with a warning).",
             schema: obj(json!({"output": {"type": "string", "description": "default renders/<name>.mp4 in the project"}, "quality": {"type": "string", "enum": ["draft", "final"], "default": "final"},
                 "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
+                "unbaked": {"type": "boolean", "description": "true: render although a scene's simulation is not baked or its bake is stale (refused otherwise; bake with sim_bake)"},
                 "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"},
                 "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"},
                 "fast": {"type": "boolean", "description": "path tracing, fast (default false): with NVIDIA Ray Reconstruction (its shim, `just ngx`) two paths a pixel at half size made the full picture; elsewhere four paths a pixel accumulated over the frames and denoised (a warning says so). Depth of field and motion blur are passes on that picture. samples overrides the paths"},
@@ -1732,7 +1733,10 @@ impl Toolbox {
         if let Some(p) = profiled.as_ref().and_then(|r| r.profile.as_ref()) {
             out["profile"] = p.report();
         }
-        // A GPU failure mid-snapshot is reported, not silent.
+        // A GPU failure mid-snapshot is reported, not silent; nor is a
+        // simulation drawn without its bake, or from a stale one.
+        let mut fell_back = fell_back;
+        fell_back.extend(self.sim_warnings(&dir));
         if !fell_back.is_empty() {
             out["warnings"] = json!(fell_back);
         }
@@ -2226,6 +2230,12 @@ impl Toolbox {
 
     fn render(&mut self, args: &Value) -> ToolResult {
         let dir = self.dir(args)?;
+        // A film whose simulation is not what the document says is not
+        // exported without being asked for ("unbaked": true).
+        let unbaked = self.sim_warnings(&dir);
+        if !unbaked.is_empty() && !args.get("unbaked").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(format!("{}. Bake first (sim_bake; shell: lahza motion bake), or pass \"unbaked\": true to render it as it is", unbaked.join("; ")));
+        }
         let project = self.state(&dir).project.clone();
         let quality = match get_str(args, "quality").unwrap_or("final") {
             "draft" => Quality::Draft,

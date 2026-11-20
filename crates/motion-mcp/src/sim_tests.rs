@@ -30,6 +30,9 @@ fn check_names_a_missing_and_a_stale_bake_and_bake_clears_them() {
     let report = tb.call("check", json!({})).unwrap().json;
     let issues = sim_issues(&report);
     assert!(report["ok"] == false && issues.len() == 1 && issues[0].contains("2 bodies and no bake"), "{report:#}");
+    let shot = tb.call("snapshot", json!({"at": [0.5], "width": 160})).unwrap().json;
+    assert!(shot["warnings"][0].as_str().unwrap().contains("is not baked"), "{shot:#}");
+    assert!(tb.call("render", json!({"quality": "draft", "audio": false})).unwrap_err().contains("not baked"));
     let baked = tb.call("sim_bake", json!({})).unwrap().json;
     let s = &baked["scenes"][0];
     assert_eq!((s["status"].as_str(), s["bodies"].as_u64(), s["tracks"].as_u64(), s["frames"].as_u64()), (Some("baked"), Some(2), Some(2), Some(60)), "{baked:#}");
@@ -37,6 +40,8 @@ fn check_names_a_missing_and_a_stale_bake_and_bake_clears_them() {
     let file = dir.join("drop.lahza/sim/s1.bake");
     let first = std::fs::read(&file).unwrap();
     assert!(sim_issues(&tb.call("check", json!({})).unwrap().json).is_empty());
+    // Fresh, a snapshot has nothing to say about the simulation and a render goes ahead.
+    assert!(tb.call("snapshot", json!({"at": [0.5], "width": 160})).unwrap().json.get("warnings").is_none());
     // Asked again, nothing is stepped; forced, the same bytes come out.
     assert_eq!(tb.call("sim_bake", json!({})).unwrap().json["scenes"][0]["status"], "up to date");
     tb.call("sim_bake", json!({"force": true})).unwrap();
@@ -48,6 +53,14 @@ fn check_names_a_missing_and_a_stale_bake_and_bake_clears_them() {
     tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "crate.body.bounce", "value": 0.8}]})).unwrap();
     let issues = sim_issues(&tb.call("check", json!({})).unwrap().json);
     assert!(issues.len() == 1 && issues[0].contains("its bake is stale"), "{issues:?}");
+    // A snapshot of it says so, and a render is refused unless asked for as it is.
+    let shot = tb.call("snapshot", json!({"at": [0.5], "width": 160})).unwrap().json;
+    assert!(shot["warnings"][0].as_str().unwrap().contains("bake is stale"), "{shot:#}");
+    let refused = tb.call("render", json!({"quality": "draft", "audio": false, "wait": true})).unwrap_err();
+    assert!(refused.contains("scene 's1'") && refused.contains("stale") && refused.contains("sim_bake"), "{refused}");
+    let out = dir.join("stale.mp4");
+    let done = tb.call("render", json!({"quality": "draft", "audio": false, "wait": true, "unbaked": true, "to": 0.2, "output": out.display().to_string()})).unwrap().json;
+    assert!(out.is_file(), "{done:#}");
     assert_eq!(tb.call("sim_bake", json!({})).unwrap().json["scenes"][0]["status"], "baked");
     assert!(sim_issues(&tb.call("check", json!({})).unwrap().json).is_empty());
     assert!(std::fs::read(&file).unwrap() != first);

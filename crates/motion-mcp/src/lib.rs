@@ -35,6 +35,7 @@ Usage:
                     [--frames N [--fps F] [--start K]]   a glTF model (Blender), or a baked sequence with {frame} in the name
   lahza motion bake <project> [--scene ID] [--seed N] [--force]   step the simulation (layers with \"body\") and keep it in sim/<scene>.bake
   lahza motion render <project> [-o out.mp4] [--draft] [--from S] [--to S] [--no-audio] [--cpu|--gpu]
+                    [--unbaked]   render although a simulation is not baked or its bake is stale
                     [--pt|--raster] [--spp N] [--no-denoise]   path-trace meshes (default: the project's settings.renderer)
                     [--fast]   path-trace fast: 2 paths a pixel at half size through NVIDIA Ray Reconstruction (`just ngx`),
                                elsewhere 4 paths a pixel accumulated over the frames and denoised
@@ -446,6 +447,9 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             }
             if has(args, "--no-audio") {
                 a["audio"] = json!(false);
+            }
+            if has(args, "--unbaked") {
+                a["unbaked"] = json!(true);
             }
             if let Some(v) = flag(args, "--scale") {
                 a["scale"] = json!(v.parse::<f64>().map_err(|e| format!("--scale: {e}"))?);

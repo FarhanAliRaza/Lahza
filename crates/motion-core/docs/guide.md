@@ -368,7 +368,8 @@ swing on a rope, do not key it: give the layers a `"body"` and bake.
    sound effect or a cut on one.
 5. **Look**: `snapshot` at a few times, as for any shot. Change a body, a
    key, a joint or `seed` and bake again; `check` fails while a bake is
-   missing or stale.
+   missing or stale, `snapshot` warns of it, and `render` refuses it
+   (`"unbaked": true`, shell `--unbaked`, renders it as it is).
 
 Sizes are real: 100 px is a metre by default (`simulation.unit`), so a
 100 px box falls like a metre-wide crate and a 20 px one like a die. If

@@ -471,8 +471,8 @@ picks by CPU. In the order built:
      contact sheets were looked at (CPU renderer).
    - Left: the motion editor does not reload when only `sim/` changes
      (its own stamp list, `src/motion_editor.rs`), and has no bake
-     button. `snapshot` and `render` draw a stale bake without saying so
-     (only `check` does). A box landing flat at speed tips a degree or
+     button. (`snapshot` warns of a missing or stale bake and `render`
+     refuses one unless given `unbaked`; `review` says nothing.) A box landing flat at speed tips a degree or
      two before settling (rapier's contact solver; more iterations do not
      change it). Ropes are not drawn. Bodies inside instancers are
      refused. Slang-generated meshes cannot be colliders (give a shape).
