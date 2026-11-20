@@ -317,6 +317,29 @@ pub fn catalog_json() -> Value {
         "world_crossfade": "a scene that fades into another: cut on a cause, carry, colour flood or whip",
         "draws_off_frame": "a stroke drawn on with trim whose head lands off the frame while its start is on it"
     });
+    catalog["skin"] = json!({
+        "what": "a glTF mesh layer's \"skin\": {index: which of the file's skins (0), joints: [layer ids, in the skin's joint order]}: its points follow the joints' layers (comps model_import makes of the joint nodes) by the file's weights; key, parent or simulate a joint and the mesh follows; the mesh layer's own transform does not place it",
+        "tools": "model_import writes it (report.skinned); only glTF meshes have skins; morph targets are not read"
+    });
+    catalog["simulation"] = json!({
+        "what": "layers with \"body\" fall, collide, stack and hang from joints; `sim_bake` steps the scene's simulation and keeps each body's place per frame (sim/<scene>.bake), which drawing reads; `check` reports a missing or stale bake",
+        "body": {"type": "dynamic (default) | fixed | kinematic (follows its keys, pushes what it meets)",
+            "shape": "default from the mesh (sphere, box, capsule, cylinder, plane as such; else its hull, or its triangles when not dynamic; a comp: its meshes; rect/circle shapes: a slab or a ball) | {type: box, size: [w, h, d]} | {type: sphere, radius} | {type: capsule|cylinder, radius, height, axis: x|y|z} (+ offset [x, y, z]) | {type: hull} | {type: pieces} (convex pieces: holes and notches stay open) | {type: mesh} (triangles; not dynamic)",
+            "mass": "kg (default: density × volume)", "density": "1 = water", "friction": 0.6, "bounce": 0.1, "damping": "per second", "spin_damping": "per second",
+            "velocity": "px/s [x, y, z] at release", "spin": "degrees/s about [x, y, z] at release", "release": "time reference: follows its keys until then, keeps their speed",
+            "pushes": "[{at: time reference, velocity: [x, y, z] px/s, spin: [x, y, z] deg/s, point: [x, y, z] layer px, dur: s}]", "ccd": "true for small fast bodies"},
+        "scene.simulation": {"unit": "px per metre (100)", "gravity": "m/s² [0, 9.81, 0] (y down)", "start": "time reference (the scene's start)", "end": "time reference (the scene's end)", "rate": "steps per second (240)",
+            "ground": "{y: px, friction, bounce}", "flat": "true: bodies stay in the picture plane", "seed": "another seed is another take", "jitter": "px/s of random speed at release",
+            "joints": "[{id, type: fixed | hinge | ball | slider | rope | spring, a: layer id, b: layer id (none: the world), anchor: [x, y, z] in a's space, anchor_b, axis: [0, 0, 1], limits: [from, to] (hinge degrees, slider px), swing: degrees (ball), twist: [from, to] (ball), length: px (rope, spring), stiffness, damping, motor: {target: degrees or px (animatable), stiffness: 200, damping: 20, max_force}, collide: false}]",
+            "blasts": "[{at: time reference, origin: [x, y, z], speed: px/s, radius: px}]",
+            "ragdolls": "[{id, root: the skeleton's first bone (a layer id), bones: [layer ids] (default: the comps under root that a skin names), release: time reference, rest: time reference (the pose limits are measured from), mass: 70, thickness: 0.22, friction, bounce, limits: [{bone, swing: 40, twist: 20, hinge: [x, y, z]}], shapes: [{bone, shape: {type: box|sphere|capsule|cylinder, …}}], strength: 0..1 (animatable; 0 limp, 1 holds the clip's pose), strengths: [{bone, strength}], hits: [{at, bone, velocity: [x, y, z], dur}], behaviours: [{type: balance|step|guard|reach|protect, from, to, amount, params}]}]"},
+        "crowds": "scene.simulation.crowds: [{id, agents: [comp ids, a character each], goals: [[x, z]] (one for all or per agent), speed: 140 px/s, vary: 0.2, radius: 30, height, stride: px a cycle of the clip covers, cycle: s, clip: time reference, facing: [0, -1], knock: 300 px/s, ragdoll: {mass, thickness, friction, limits, shapes}}]: the bake walks them round each other and round bodies, runs each one's clip by the distance walked, and drops the ones struck as limp ragdolls (a knock event)",
+        "behaviours": {"balance": "params assist (0.25 of its weight), gain (1), limp (0.15)", "step": "params trigger px, length px, time s (0.28); with balance", "guard": "params target (body id or [x, y, z]), hand (left|right|near), within px", "reach": "params hand, hold s (1.5)", "protect": "both hands to the head"},
+        "controller": "a ragdoll's: {type: search, samples: 16, horizon: 0.25 s, every: 0.1 s, spread: 12°} (no training: tries leans ahead in a copy of the simulation, about 40× the bake time) | {type: policy, src: an ONNX file: observation [1, 16 + 11·(bones − 1) + feet] → action [1, 3·(bones − 1)], run once a frame}",
+        "events": "sim_bake returns: touch (a, b, closing speed px/s), fall (a ragdoll), step (a foot)",
+        "tools": "sim_bake {scene, seed, force} (shell: lahza motion bake <project> [--scene ID] [--seed N] [--force]); returns steps, seconds and events (first touches: who, whom, when, closing speed px/s)"
+    });
+    catalog["checks"]["simulation"] = json!("error: a scene with bodies and no bake, or whose bake is stale (bake it: sim_bake), or whose simulation names a body that is not one, or a body with nothing to collide with");
     catalog["component_layer"] = json!("{\"kind\": \"component\", \"component\": <name>, \"params\": {…}} plus the usual transform/time/effects. It expands to ordinary layers, addressed as <id>/<child> (timeline_get lists them): set/key/anchor/remove on a child (\"map/IRN.fill\", \"caps/c3.text\") is kept in `overrides` and survives changes to params; {\"op\": \"detach\", \"id\": <id>} turns it into a comp of plain layers.");
     catalog
 }

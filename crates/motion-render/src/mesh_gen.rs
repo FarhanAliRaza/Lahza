@@ -96,6 +96,8 @@ struct Finish {
     /// A generated mesh subdivided for a deformer (meshsubdivide.wgsl).
     sub_edges: gpu::ComputePipeline,
     sub_split: gpu::ComputePipeline,
+    /// A skinned mesh's points (meshskin.wgsl).
+    skin: gpu::ComputePipeline,
     status: gpu::Buffer,
 }
 
@@ -119,6 +121,9 @@ pub(crate) struct Job {
     /// The subdivisions the deformer asks for of that generated mesh, one
     /// after the other (`meshsubdivide.wgsl`); `weld` is the last's.
     pub levels: Vec<Level>,
+    /// For a skinned mesh: its pose's first row (`before` is its mesh
+    /// before the pose, a `SkinBase`).
+    pub pose: u32,
     pub mesh: Arc<Pooled>,
 }
 
@@ -157,8 +162,22 @@ fn kernel(mesh: &Pooled) -> Option<(&lahza_motion_core::slang_mesh::Kernel, &Arc
     match &mesh.source {
         Source::Generated(params) => params.gpu_generator().and_then(|(s, wgsl)| Some((&**s.gpu.as_ref()?, wgsl, s.function.as_str()))),
         Source::Deformed { params, .. } | Source::DeformedGenerated { params, .. } => params.gpu_deformer().and_then(|(d, wgsl)| Some((&**d.gpu.as_ref()?, wgsl, d.function.as_str()))),
-        Source::Mesh(_) => None,
+        Source::Mesh(_) | Source::Skinned { .. } => None,
     }
+}
+
+/// `SkinPass` in meshskin.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SkinPass {
+    counts: [u32; 4],
+    more: [u32; 4],
+}
+
+#[derive(blade_macros::ShaderData)]
+struct SkinData {
+    u_skin: SkinPass,
+    b_rows: gpu::BufferPiece,
 }
 
 #[derive(Default)]
@@ -184,7 +203,7 @@ pub(crate) fn shape(mesh: &Pooled) -> Option<&SlangShape> {
             MeshShape::Slang(s) => Some(s),
             _ => None,
         },
-        Source::Mesh(_) | Source::Deformed { .. } | Source::DeformedGenerated { .. } => None,
+        Source::Mesh(_) | Source::Deformed { .. } | Source::DeformedGenerated { .. } | Source::Skinned { .. } => None,
     }
 }
 
@@ -220,7 +239,9 @@ impl Generators {
             let weld_layout = <WeldData as gpu::ShaderData>::layout();
             let sub = context.create_shader(gpu::ShaderDesc { source: include_str!("meshsubdivide.wgsl") });
             let sub_layout = <SubData as gpu::ShaderData>::layout();
+            let skin = context.create_shader(gpu::ShaderDesc { source: include_str!("meshskin.wgsl") });
             Finish {
+                skin: context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "skinned mesh points", data_layouts: &[&<SkinData as gpu::ShaderData>::layout()], compute: skin.at("skin_points") }),
                 points: context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "slang mesh points", data_layouts: &[&layout], compute: shader.at("gen_points") }),
                 triangles: context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "slang mesh triangles", data_layouts: &[&layout], compute: shader.at("gen_triangles") }),
                 normals: context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "slang mesh normals", data_layouts: &[&<NormalsData as gpu::ShaderData>::layout()], compute: normals.at("gen_face_normals") }),
@@ -400,6 +421,28 @@ impl Generators {
                     pc.dispatch(groups(g.counts[n]));
                 }
             }
+        }
+        // Skinned meshes: the bind mesh's triangles, and every point moved
+        // by its joints.
+        let skins: Vec<(&Job, u32)> = jobs.iter().filter_map(|j| match &j.mesh.source {
+            Source::Skinned { matrices, .. } => Some((j, matrices.len() as u32)),
+            _ => None,
+        }).collect();
+        if !skins.is_empty() {
+            {
+                let mut pass = encoder.transfer("skinned mesh triangles");
+                for (j, _) in &skins {
+                    let (points, triangles) = (j.mesh.verts, j.mesh.tris);
+                    pass.copy_buffer_to_buffer(pool.at((j.before + points * crate::mesh3d::SROWS as u32) as u64 * 16), pool.at((j.at + points * crate::mesh3d::PROWS as u32) as u64 * 16), triangles as u64 * 16);
+                }
+            }
+            let mut pass = encoder.compute("skinned mesh points");
+            for (j, joints) in &skins {
+                let mut pc = pass.with(&finish.skin);
+                pc.bind(0, &SkinData { u_skin: SkinPass { counts: [j.mesh.verts, j.before, j.at, j.pose], more: [*joints, 0, 0, 0] }, b_rows: pool.into() });
+                pc.dispatch(groups(j.mesh.verts));
+            }
+            self.generated += skins.len() as u64;
         }
         let host = self.spare.pop().unwrap_or_else(|| context.create_buffer(gpu::BufferDesc { name: "slang mesh report", size: STATUS_BYTES, memory: gpu::Memory::Download }));
         encoder.transfer("slang mesh report").copy_buffer_to_buffer(status.into(), host.into(), STATUS_BYTES);
