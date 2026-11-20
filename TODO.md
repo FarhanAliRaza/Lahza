@@ -338,6 +338,79 @@ To settle first:
   seconds to minutes (not measured). The live reload shows it being put
   together; the panel should say what is left where that is known.
 
+## The motion editor: drags that stall, and how it should be used
+
+### Drags that stall
+
+Changing a selected layer's values is slow: the bars stick, as if a
+render had begun. Read in the code and timed apart from the app; the
+editor was not run, so which of these is the one felt is not confirmed.
+
+- **A drag draws at full quality (first to fix).** A drag is meant to
+  draw at half size with no motion blur. `motion_piece_frames`
+  (motion_piece_ui.rs) asks only whether a piece is dragged on the
+  timeline (`motion_piece_drag`); a value dragged in the inspector, a
+  layer moved and a key retimed are `motion_layer_drag`, so every tick
+  asks for a full frame with motion blur. The editor's own
+  `request_frame` (motion_editor.rs) has the same gap: its `drag` is set
+  by the canvas only. Both should ask one question: is anything dragged.
+  To look at on a real card once fixed: whether full frames on the GPU
+  that also draws the window are what holds the bars (the frames are on
+  a worker thread, so the UI thread alone should not stall).
+- **Every tick goes through the whole project.** `preview`
+  (motion_editor.rs) calls `edit::apply`, which turns the whole project
+  into JSON and back, then `Compiled::new` on all of it. Timed in a cloud
+  container on projects of plain shapes and text (a throwaway example,
+  not kept):
+
+  | layers | a tick (apply + compile) | the drop (apply, save, load, 2 compiles) |
+  |---|---|---|
+  | 30 | 0.4 ms | 1.3 ms |
+  | 480 | 7.1 ms | 19 ms |
+  | 1 200 | 19 ms | 52 ms |
+
+  Nearly all of a tick is `apply` (6.0 of 7.1 ms at 480 layers; compile
+  1.1). Past 16 ms on a large project, and sooner with an imported model
+  of many parts. To do: a drag changes the one property in a copy of the
+  project (no JSON) and recompiles only its scene; `apply` stays for the
+  drop.
+- **The drop reads all the history.** `next_history_number` reads and
+  parses every entry to find the last: 2.4 ms at 500 entries, 10.5 ms at
+  2 000, and agents write many. To do: the highest file name.
+- **The inspector asks for each value twice a draw** (`field_state`:
+  `eval` for whether it is keyed, then for the value), each turning the
+  layer into JSON and compiling the property. 0.004 ms for a plain layer;
+  a comp is turned with all its children. To do: once per field, from the
+  compiled layer.
+
+### How it should be used
+
+The rule: select, type, Enter; everything else is by choice. The fewest
+clicks for the common things, the same in the motion editor and on a
+recording's timeline. This is how the parts under "Directing an agent
+from the editor" look.
+
+- **One prompt bar, the same everywhere**, under the preview. It shows
+  what it will act on as chips that can be removed ("Layer: title",
+  "2.1 s to 7.1 s"). Not a modal: that covers what is being talked about.
+- **Typing with something selected begins a prompt** with it attached:
+  "fix this one" is a click, the words, Enter.
+- **A drag on the ruler marks a span**: mark five seconds, type what
+  should be there, Enter. On a recording's timeline what comes back is a
+  motion piece placed there, as pieces already are.
+- **The inspector has two tabs**: Properties (by hand), and AI (what was
+  asked about this layer, and what came of it).
+- **The agent's work is seen and does not block**: a ghost clip over the
+  span being made, with the step it is at; the rest of the editor stays
+  usable (see "Editing while the agent works" above).
+- **What comes back is a proposal**: keep, undo, again, and a key held to
+  compare before and after (the request's entries taken back and put
+  back).
+- **A drag never waits**: the proxy on every drag, the number at once,
+  saved on release.
+- **By hand stays cheap**: a nudge or a retime is quicker than a prompt,
+  so the inspector has to edit text and effects, which it does not.
+
 ## Slang
 
 - **To compile once with slangc.** These were written where slangc could
