@@ -332,6 +332,45 @@ pub(crate) fn assert_gpu_matches_cpu(p: &Project, times: &[f64]) {
     assert_gpu_matches_cpu_within(p, times, 0.0);
 }
 
+/// Where the GPU's frame `a` differs from the CPU's `b`: the pixels more
+/// than 3 levels apart, how many of them are away from an edge (where the
+/// CPU's picture changes by more than 12 levels within a pixel: there the
+/// two differ by how samples fall, not by shading), and those by size.
+fn vis_report(t: f64, a: &image::RgbaImage, b: &image::RgbaImage, vis: bool) {
+    let (w, h) = (a.width(), a.height());
+    let diff = |x: u32, y: u32| (0..4).map(|k| a.get_pixel(x, y).0[k].abs_diff(b.get_pixel(x, y).0[k])).max().unwrap();
+    let edge = |x: u32, y: u32| {
+        let q = b.get_pixel(x, y).0;
+        (-1i32..=1).any(|dy| {
+            (-1i32..=1).any(|dx| {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                nx >= 0 && ny >= 0 && (nx as u32) < w && (ny as u32) < h && (0..4).any(|k| q[k].abs_diff(b.get_pixel(nx as u32, ny as u32).0[k]) > 12)
+            })
+        })
+    };
+    let (mut over, mut inner, mut worst, mut total) = (0, 0, 0u8, 0u64);
+    let mut sizes = [0usize; 6];
+    for y in 0..h {
+        for x in 0..w {
+            let d = diff(x, y);
+            total += d as u64;
+            if d > 3 {
+                over += 1;
+                if !edge(x, y) {
+                    inner += 1;
+                    worst = worst.max(d);
+                    sizes[match d { 4..=6 => 0, 7..=12 => 1, 13..=24 => 2, 25..=48 => 3, 49..=96 => 4, _ => 5 }] += 1;
+                }
+            }
+        }
+    }
+    eprintln!("vis report t={t} {w}x{h} (visibility pass: {vis}): {over} pixels over 3 levels, {inner} of them away from edges (worst {worst}; by 4-6, 7-12, 13-24, 25-48, 49-96, 97+: {sizes:?}), mean {:.4}", total as f64 / (w * h * 4) as f64);
+    if let Ok(dir) = std::env::var("LAHZA_MOTION_DUMP") {
+        a.save(format!("{dir}/gpu-{t}.png")).unwrap();
+        b.save(format!("{dir}/cpu-{t}.png")).unwrap();
+    }
+}
+
 /// `outliers`: fraction of pixels allowed to differ by more than 3 levels
 /// (mesh edges: a sample on a triangle edge can fall either way when the
 /// GPU fuses multiply-adds).
@@ -339,7 +378,20 @@ pub(crate) fn assert_gpu_matches_cpu_within(p: &Project, times: &[f64], outliers
     let c = Compiled::new(p);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    // LAHZA_MOTION_VIS_REPORT: say where the GPU's frame differs from the
+    // CPU's instead of failing, through the hardware visibility pass (the
+    // device's own 8x, or 4x on Mesa's software Vulkan: `vis_report`).
+    let report = std::env::var_os("LAHZA_MOTION_VIS_REPORT").is_some();
+    crate::gpu::TEST_VIS_AT_4X.with(|t| t.set(report));
     let mut gpu = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
+    crate::gpu::TEST_VIS_AT_4X.with(|t| t.set(false));
+    if report && gpu.is_gpu() {
+        let mut cpu = cpu();
+        for &t in times {
+            vis_report(t, &gpu.render(&c, t), &cpu.render(&c, t), gpu.gpu.as_ref().is_some_and(|g| g.has_vis()));
+        }
+        return;
+    }
     if !gpu.is_gpu() {
         // Asked for the GPU (LAHZA_MOTION_SOFTWARE_GPU) and none came up:
         // a shader that does not compile, not a machine without one.
@@ -383,6 +435,55 @@ pub(crate) fn assert_gpu_matches_cpu_within(p: &Project, times: &[f64], outliers
         let mut again = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, ..Default::default() });
         assert_eq!(again.render(&c, t), a);
     }
+}
+
+/// What a motion-blurred frame saves by not drawing again a group that
+/// stands still (`gpu::same_groups`): a blurred backdrop and a glow that
+/// do not move behind a bar that does, against the same frame with both
+/// drifting by a hundredth of a pixel a frame (so every sub-frame draws
+/// them), with where the time went (a real card gives its passes' times;
+/// Mesa's software Vulkan only the wait). `cargo test -p
+/// lahza-motion-render --release -- --ignored --nocapture
+/// benchmark_motion_blur` (with LAHZA_MOTION_SOFTWARE_GPU=1 on Mesa).
+#[test]
+#[ignore]
+fn benchmark_motion_blur_with_still_groups() {
+    let build = |drift: f64| {
+        let at = |x: f64, y: f64| json!({"keys": [{"at": 0, "v": [x, y]}, {"at": 2, "v": [x + drift * 60.0, y]}]});
+        let mut p = Project::new(960, 540, Fps::whole(30), 2.0);
+        p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 8 });
+        p.scenes.push(serde_json::from_value(json!({"id": "s", "layers": [
+            {"id": "backdrop", "kind": "shape", "shape": "circle", "size": [700, 700], "fill": "#7b61ff", "effects": [{"type": "blur", "radius": 40}], "transform": {"position": at(480.0, 270.0)}},
+            {"id": "sign", "kind": "shape", "shape": "ring", "size": [260, 260], "fill": "#ffd23f", "effects": [{"type": "glow", "color": "#ffd23f", "radius": 24, "intensity": 0.8}], "transform": {"position": at(480.0, 270.0)}},
+            {"id": "bar", "kind": "shape", "shape": "capsule", "size": [160, 40], "fill": "#ffffff", "transform": {"position": {"keys": [{"at": 0, "v": [100, 270]}, {"at": 2, "v": [860, 270]}]}}}
+        ]})).unwrap());
+        p
+    };
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mut times = Vec::new();
+    for drift in [0.0, 0.01] {
+        let c = Compiled::new(&build(drift));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, profile: true, ..Default::default() });
+        if !r.is_gpu() {
+            eprintln!("no GPU: {}", r.backend_label());
+            return;
+        }
+        r.render(&c, 0.0);
+        r.profile = Some(Default::default());
+        let frames = 12;
+        let started = std::time::Instant::now();
+        for f in 0..frames {
+            r.render(&c, 0.5 + f as f64 / 30.0);
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!("{}: {ms:.1} ms a frame ({})", if drift == 0.0 { "still groups" } else { "drifting groups" }, r.backend_label());
+        for line in r.profile.as_ref().map(|p| p.summary()).unwrap_or_default() {
+            eprintln!("    {line}");
+        }
+        times.push(ms);
+    }
+    eprintln!("still groups take {:.0}% of the drifting ones' time", times[0] / times[1] * 100.0);
 }
 
 /// Phase 1 target: a 1080p scene with 200 animated shapes and text in real
@@ -754,7 +855,7 @@ fn export_mixes_footage_audio() {
     assert_eq!(clips.len(), 1);
     assert_eq!((clips[0].start, clips[0].trim, clips[0].speed), (0.5, 0.5, 1.5));
     let out = dir.join("out.mp4");
-    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, fast: false, scale: 1.0, every: 1 };
+    let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Draft, range: None, audio: true, render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, scale: 1.0, every: 1, fast: false };
     let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
     assert_eq!(report.frames, 60);
     let info = crate::footage::probe(&out).unwrap();
@@ -778,7 +879,7 @@ fn quick_exports_skip_frames_and_shrink() {
     let c = Compiled::new(&p);
     let out = dir.join("quick.mp4");
     let options = export::ExportOptions { output: out.clone(), quality: export::Quality::Final, range: None, audio: false,
-        render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, fast: false, scale: 0.5, every: 4 };
+        render: RenderOptions { backend: Backend::Cpu, ..Default::default() }, renderer: None, samples: None, denoise: true, scale: 0.5, every: 4, fast: false };
     let report = export::export(&p, &c, &dir, &options, &export::Progress::default()).unwrap();
     assert_eq!(report.frames, 15, "60 frames, every 4th");
     let info = crate::footage::probe(&out).unwrap();

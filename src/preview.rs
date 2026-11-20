@@ -798,6 +798,8 @@ impl Studio {
             };
             let canvas_area = self.canvas_area(video_canvas);
             let timeline = if self.crop_active { div().into_any_element() } else { self.timeline_bar(cx) };
+            // The prompt bar, under the preview, wherever motion is edited.
+            let prompt = self.motion_prompt_visible().then(|| self.motion_prompt_bar(cx));
             let sidebar = (self.inspector_visible && !self.crop_active).then(|| self.sidebar(window.viewport_size().width, cx));
             div()
                 .flex_1()
@@ -811,6 +813,7 @@ impl Studio {
                         .flex()
                         .flex_col()
                         .child(canvas_area)
+                        .children(prompt)
                         .child(timeline),
                 )
                 .when_some(sidebar, |this, sidebar| this.child(sidebar))
@@ -841,6 +844,16 @@ impl Studio {
                 if this.capture_access_prompt.is_some() {
                     cx.stop_propagation();
                     return;
+                }
+                // In the Motion tab: `\` held shows a proposal as it was
+                // before, and typing with a layer selected begins a prompt.
+                if this.motion_prompt_visible() {
+                    let k = &event.keystroke;
+                    if (k.key == "\\" && !k.modifiers.control && this.motion_compare_key(true, cx)) || this.begin_prompt_by_typing(event, window, cx) {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
                 }
                 if this.handle_video_key(event, cx) {
                     cx.stop_propagation();

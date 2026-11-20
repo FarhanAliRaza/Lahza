@@ -14,6 +14,11 @@ use serde_json::{json, Value};
 /// Height of one layer or sound row.
 pub(crate) const LAYER_ROW: f32 = 22.0;
 
+/// A motion project on its own: its timeline's height and its inspector's
+/// width.
+const PROJECT_TIMELINE: f32 = 300.0;
+const PROJECT_INSPECTOR: f32 = 320.0;
+
 /// The piece open for editing on the timeline.
 pub(crate) struct MotionDoc {
     pub piece: String,
@@ -30,6 +35,9 @@ pub(crate) enum LayerDrag {
     /// A layer moved on the preview: the piece point under the pointer at
     /// press, the layer's position then, and the preview canvas.
     Move { layer: String, grab: (f64, f64), origin: [f64; 2], canvas: Bounds<Pixels>, moved: bool },
+    /// A span of time marked on the ruler for a prompt, from `anchor`
+    /// (timeline seconds).
+    Span { anchor: f64 },
 }
 
 impl Studio {
@@ -53,10 +61,12 @@ impl Studio {
         self.motion_doc = None;
         self.motion_layer_drag = None;
         self.motion_scrub = false;
+        self.motion_agent.span = None;
+        self.motion_agent.also.clear();
     }
 
     /// Video time where the open piece starts (0 for a motion project).
-    fn motion_doc_start(&self) -> Option<f64> {
+    pub(crate) fn motion_doc_start(&self) -> Option<f64> {
         if self.motion_project.is_some() {
             return Some(0.0);
         }
@@ -268,9 +278,9 @@ impl Studio {
                 label(format!("♪ {}", wave.name), String::new(), is_sel)
                     .id(("motion-sound-label", i))
                     .when(id.is_some(), |d| d.cursor_pointer())
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        if id.is_some() {
-                            this.select_motion_layer(id.clone(), cx);
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                        if let Some(id) = id.clone() {
+                            this.press_motion_layer(id, e, cx);
                         }
                     })),
             );
@@ -278,16 +288,27 @@ impl Studio {
         for (i, row) in editor.visible_rows().into_iter().enumerate() {
             let id = row.id.clone();
             column = column.child(
-                label(format!("{}{}", "  ".repeat(row.depth), row.id), row.kind.to_string(), selected.as_deref() == Some(row.id.as_str()))
+                label(format!("{}{}", "  ".repeat(row.depth), row.id), row.kind.to_string(), selected.as_deref() == Some(row.id.as_str()) || self.motion_layer_also(&row.id))
                     .id(("motion-layer-label", i))
                     .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.select_motion_layer(Some(id.clone()), cx))),
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.press_motion_layer(id.clone(), e, cx))),
             );
         }
         Some(column.into_any_element())
     }
 
+    /// A press on a row or its name: selects it; with Ctrl or Shift it
+    /// joins (or leaves) the layers a prompt is about.
+    fn press_motion_layer(&mut self, id: String, e: &MouseDownEvent, cx: &mut Context<Self>) {
+        if e.modifiers.control || e.modifiers.platform || e.modifiers.shift {
+            self.toggle_motion_layer_also(id, cx);
+        } else {
+            self.select_motion_layer(Some(id), cx);
+        }
+    }
+
     fn select_motion_layer(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.motion_agent.also.clear();
         if let Some(doc) = &self.motion_doc {
             doc.editor.update(cx, |e, _| e.select(id));
         }
@@ -309,7 +330,7 @@ impl Studio {
         let waves = editor.waves();
         for (ri, row) in rows.iter().enumerate() {
             let top = (waves.len() + ri) as f32 * LAYER_ROW;
-            let is_sel = selected.as_deref() == Some(row.id.as_str());
+            let is_sel = selected.as_deref() == Some(row.id.as_str()) || self.motion_layer_also(&row.id);
             let id = row.id.clone();
             lane = lane.child(
                 div()
@@ -320,7 +341,7 @@ impl Studio {
                     .right_0()
                     .h(px(LAYER_ROW))
                     .when(is_sel, |d| d.bg(theme::selection_fill()))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.select_motion_layer(Some(id.clone()), cx))),
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.press_motion_layer(id.clone(), e, cx))),
             );
             let (x0, x1) = (x_of(row.start), x_of(row.end));
             let colour = match row.kind {
@@ -442,12 +463,18 @@ impl Studio {
             }
             lane = lane.child(bar);
         }
+        // The marked span and the agent's ghost clip, in timeline seconds.
+        let on_timeline = move |t: f64| (t / spp - scroll) as f32;
+        lane = lane.children(self.motion_lane_overlays(&on_timeline, cx));
         Some(lane.into_any_element())
     }
 
     /// Follows a key or sound drag; the preview shows the change live.
     pub(crate) fn update_motion_layer_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
         let x = position.x;
+        if let Some(LayerDrag::Span { anchor }) = &self.motion_layer_drag {
+            return self.update_motion_span(*anchor, x);
+        }
         let Some(editor) = self.motion_doc.as_ref().map(|d| d.editor.clone()) else { return false };
         if let Some(LayerDrag::Move { layer, grab, origin, canvas, .. }) = &self.motion_layer_drag {
             let (layer, grab, origin, canvas) = (layer.clone(), *grab, *origin, *canvas);
@@ -460,9 +487,9 @@ impl Studio {
             return true;
         }
         if let Some(LayerDrag::Value { layer, field, start_x, origin }) = &self.motion_layer_drag {
-            let (layer, field) = (layer.clone(), *field);
+            let (layer, field) = (layer.clone(), field.clone());
             let value = origin + f64::from((x - *start_x) / px(1.0)) * field.step;
-            editor.update(cx, |e, _| e.drag_value(&layer, field, value));
+            editor.update(cx, |e, _| e.drag_value(&layer, &field, value));
             self.show_motion_doc(cx);
             return true;
         }
@@ -479,7 +506,7 @@ impl Studio {
                 *preview = Some(orig.dragged(*part, t - *grab));
                 true
             }
-            Some(LayerDrag::Value { .. } | LayerDrag::Move { .. }) | None => false,
+            Some(LayerDrag::Value { .. } | LayerDrag::Move { .. } | LayerDrag::Span { .. }) | None => false,
         }
     }
 
@@ -487,6 +514,11 @@ impl Studio {
     pub(crate) fn finish_motion_layer_drag(&mut self, position: Point<Pixels>, shift: bool, cx: &mut Context<Self>) -> bool {
         let x = position.x;
         let Some(drag) = self.motion_layer_drag.take() else { return false };
+        if let LayerDrag::Span { anchor } = &drag {
+            self.update_motion_span(*anchor, x);
+            cx.notify();
+            return true;
+        }
         if let LayerDrag::Move { layer, grab, origin, canvas, moved } = &drag {
             let now = self.piece_point_at(position, *canvas);
             let editor = self.motion_doc.as_ref().map(|d| d.editor.clone());
@@ -505,7 +537,7 @@ impl Studio {
         if let LayerDrag::Value { layer, field, start_x, origin } = &drag {
             let moved = (x - *start_x).abs() > px(0.5);
             let value = origin + f64::from((x - *start_x) / px(1.0)) * field.step;
-            editor.update(cx, |e, _| if moved { e.drop_value(layer, *field, value) } else { e.cancel_preview() });
+            editor.update(cx, |e, _| if moved { e.drop_value(layer, field, value) } else { e.cancel_preview() });
             self.show_motion_doc(cx);
             cx.notify();
             return true;
@@ -523,7 +555,7 @@ impl Studio {
                     editor.update(cx, |e, _| e.drop_sound(&id, part, orig, t - grab, moved, 8.0 * spp, shift));
                 }
             }
-            LayerDrag::Value { .. } | LayerDrag::Move { .. } => {}
+            LayerDrag::Value { .. } | LayerDrag::Move { .. } | LayerDrag::Span { .. } => {}
         }
         self.show_motion_doc(cx);
         cx.notify();
@@ -531,7 +563,7 @@ impl Studio {
     }
 
     /// The video preview draws the open piece as the editor has it now.
-    fn show_motion_doc(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn show_motion_doc(&mut self, cx: &mut Context<Self>) {
         let Some(doc) = self.motion_doc.as_ref() else { return };
         let compiled = doc.editor.read(cx).compiled();
         let piece = doc.piece.clone();
@@ -576,10 +608,14 @@ impl Studio {
             .on_click(cx.listener(|this, _, _, cx| this.select_motion_layer(None, cx)));
         let title = |text: String| div().text_sm().font_weight(FontWeight::SEMIBOLD).child(text);
         let note = |text: String| div().text_xs().text_color(theme::muted()).child(text);
-        let mut panel = div().flex().flex_col().gap_3().child(div().flex().child(back));
+        let mut panel = div().flex().flex_col().gap_3().child(div().flex().justify_between().child(back).child(self.motion_inspector_tabs(cx)));
         let status = editor.status().to_string();
         if !status.is_empty() {
             panel = panel.child(note(status));
+        }
+        if self.motion_agent.ai_tab {
+            // What was asked about this layer, and what came of it.
+            return Some(panel.child(title(id.clone())).child(self.motion_agent_log(Some(&id), cx)).into_any_element());
         }
 
         if let Some(clip) = editor.sound(&id).cloned() {
@@ -633,20 +669,87 @@ impl Studio {
             layer.common.blend,
             if layer.common.three_d || layer.kind.name() == "mesh" { " · 3D" } else { "" }
         )));
+        if let lahza_motion_core::document::LayerKind::Text(_) = &layer.kind {
+            // The words: shown as typed, saved when the field is left.
+            panel = panel.child(self.text_fields.layer_text.clone());
+        }
         if let lahza_motion_core::document::LayerKind::Text(t) = &layer.kind {
-            panel = panel.child(div().text_xs().child(format!("“{}”", t.text)));
+            // The font: the bundled ones and the project's font files.
+            let mut fonts = div().flex().flex_wrap().gap_1();
+            for (fi, font) in editor.fonts().iter().enumerate() {
+                let (target, value) = (format!("{id}.font"), font.clone());
+                let label = font.rsplit('/').next().unwrap_or(font).to_string();
+                fonts = fonts.child(
+                    button(("motion-layer-font", fi), label, ButtonKind::Secondary, ButtonSize::Sm)
+                        .selected(&t.font == font)
+                        .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![json!({"op": "set", "target": target, "value": value})], cx))),
+                );
+            }
+            panel = panel.child(fonts);
         }
         let three_d = layer.common.three_d || layer.kind.name() == "mesh";
-        let mut fields = div().flex().flex_col().gap_1();
-        for (i, field) in FIELDS.iter().enumerate() {
-            let depth_only = field.path.contains("_x") || field.path.contains("_y") || field.path.ends_with(".z");
-            if depth_only && !three_d {
-                continue;
+        let (own, effect_values) = crate::motion_editor::extra_values(&layer);
+        // A colour: what it is now (click to type another), and swatches.
+        let color_row = |ci: usize, label: &str, path: &str| {
+            let now = editor.color_state(&id, path);
+            let editing = self.motion_color_edit.as_ref().is_some_and(|(l, p)| l == &id && p == path);
+            let (lid, lpath) = (id.clone(), path.to_string());
+            let mut swatches = div().flex().flex_wrap().gap_1();
+            for (si, hex) in crate::motion_editor::SWATCHES.iter().enumerate() {
+                let (lid, lpath) = (id.clone(), path.to_string());
+                let fill = lahza_motion_core::value::Color::parse(hex).map(|c| gpui::rgba(u32::from_be_bytes(c.0.map(|v| (v * 255.0).round() as u8)))).unwrap_or(gpui::rgba(0));
+                swatches = swatches.child(
+                    div()
+                        .id(SharedString::from(format!("motion-color-{ci}-{si}")))
+                        .size(px(20.0))
+                        .rounded(px(5.0))
+                        .bg(fill)
+                        .border_2()
+                        .border_color(if now.eq_ignore_ascii_case(hex) { theme::accent() } else { theme::line() })
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(editor) = this.motion_doc.as_ref().map(|d| d.editor.clone()) {
+                                editor.update(cx, |e, _| e.set_color(&lid, &lpath, hex));
+                                this.show_motion_doc(cx);
+                            }
+                            cx.notify();
+                        })),
+                );
             }
-            let (value, animated) = editor.field_state(&id, *field);
-            let (lid, f) = (id.clone(), *field);
-            fields = fields.child(
-                div()
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("motion-color-value-{ci}")))
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
+                        .bg(theme::control_bg())
+                        .hover(|s| s.bg(theme::control_hover()))
+                        .cursor_pointer()
+                        .child(div().text_xs().text_color(theme::muted()).child(label.to_string()))
+                        .child(div().text_xs().child(now))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            let target = (lid.clone(), lpath.clone());
+                            this.motion_color_edit = (this.motion_color_edit.as_ref() != Some(&target)).then_some(target);
+                            cx.notify();
+                        })),
+                )
+                .when(editing, |d| d.child(self.text_fields.layer_color.clone()))
+                .child(swatches)
+        };
+        let mut colors = 0;
+        let mut fields = div().flex().flex_col().gap_1();
+        let scrub = |i: usize, field: &Field| {
+            let (value, animated) = editor.field_state(&id, field);
+            let (lid, f, held) = (id.clone(), field.clone(), field.clone());
+            div()
                     .id(("motion-layer-field", i))
                     .flex()
                     .justify_between()
@@ -664,25 +767,62 @@ impl Studio {
                         cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
                             this.pause_video_playback();
-                            let origin = this.motion_doc.as_ref().map(|d| d.editor.read(cx).field_state(&lid, f).0).unwrap_or(0.0);
-                            this.motion_layer_drag = Some(LayerDrag::Value { layer: lid.clone(), field: f, start_x: e.position.x, origin });
+                            let origin = this.motion_doc.as_ref().map(|d| d.editor.read(cx).field_state(&lid, &held).0).unwrap_or(0.0);
+                            this.motion_layer_drag = Some(LayerDrag::Value { layer: lid.clone(), field: held.clone(), start_x: e.position.x, origin });
                         }),
-                    ),
+                    )
+        };
+        let mut n = 0;
+        for (label, path) in &own.colors {
+            panel = panel.child(color_row(colors, label, path));
+            colors += 1;
+        }
+        for field in own.fields.iter().chain(FIELDS) {
+            let depth_only = field.path.contains("_x") || field.path.contains("_y") || field.path.ends_with(".z");
+            if depth_only && !three_d {
+                continue;
+            }
+            fields = fields.child(scrub(n, field));
+            n += 1;
+        }
+        // Effects: each one's values, a way to take it off, and the ones
+        // that can be added.
+        let mut effects = div().flex().flex_col().gap_1().child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child("Effects"));
+        for (ei, values) in effect_values.iter().enumerate() {
+            let target = format!("{id}.effects.{ei}");
+            effects = effects.child(
+                div().flex().justify_between().items_center().child(div().text_xs().child(values.name.clone())).child(
+                    button(SharedString::from(format!("motion-effect-remove-{ei}")), "Remove", ButtonKind::Ghost, ButtonSize::Sm)
+                        .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![json!({"op": "set", "target": target})], cx))),
+                ),
+            );
+            for field in &values.fields {
+                effects = effects.child(scrub(n, field));
+                n += 1;
+            }
+            for (label, path) in &values.colors {
+                effects = effects.child(color_row(colors, label, path));
+                colors += 1;
+            }
+        }
+        let count = effect_values.len();
+        let mut add = div().flex().flex_wrap().gap_1();
+        for (label, effect) in crate::motion_editor::EFFECTS {
+            let effect: Value = serde_json::from_str(effect).unwrap_or_default();
+            // The first effect makes the list; the rest are appended.
+            let op = if count == 0 { json!({"op": "set", "target": format!("{id}.effects"), "value": [effect]}) } else { json!({"op": "set", "target": format!("{id}.effects.{count}"), "value": effect}) };
+            add = add.child(
+                button(SharedString::from(format!("motion-effect-add-{label}")), format!("+ {label}"), ButtonKind::Secondary, ButtonSize::Sm)
+                    .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![op.clone()], cx))),
             );
         }
-        let effects: Vec<String> = serde_json::to_value(&layer.common.effects)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|e| e.get("type").and_then(Value::as_str).map(String::from))
-            .collect();
+        let effects = effects.child(add);
         let keys = editor.rows().iter().find(|r| r.id == id).map_or(0, |r| r.keys.len());
         let remove = id.clone();
         panel = panel
             .child(fields)
             .child(note("Drag a value sideways to change it. Values marked ◆ are animated: a change adds a key at the playhead.".into()))
-            .when(!effects.is_empty(), |d| d.child(note(format!("Effects: {}", effects.join(" · ")))))
+            .child(effects)
             .child(note(format!("{keys} keys")))
             .child(div().flex().justify_end().child(
                 button("motion-layer-delete", "Delete layer", ButtonKind::Danger, ButtonSize::Sm).icon("icons/trash.svg").on_click(cx.listener(move |this, _, _, cx| {
@@ -715,18 +855,31 @@ impl Studio {
         let Some(editor) = self.motion_doc.as_ref().map(|d| d.editor.clone()) else {
             return div().size_full().bg(theme::canvas_well()).into_any_element();
         };
+        self.sync_motion_fields(window, cx);
         // The studio's timeline geometry (seconds per pixel, x → time) runs
         // on the project's length.
         self.video_duration = editor.read(cx).project().settings.duration.max(0.1);
         let top_bar = self.top_bar(cx);
-        let (width, height) = self.canvas_budget(window.viewport_size());
+        // The preview fits what the top bar, the prompt bar, the timeline
+        // and the inspector leave, at the project's shape.
+        let (width, height) = {
+            use crate::shell_ui::{CANVAS_PADDING_X, CANVAS_PADDING_Y, TOP_BAR_HEIGHT};
+            let viewport = window.viewport_size();
+            let s = &editor.read(cx).project().settings;
+            let aspect = s.width as f32 / (s.height as f32).max(1.0);
+            let w = (f32::from(viewport.width) - CANVAS_PADDING_X * 2.0 - if self.inspector_visible { PROJECT_INSPECTOR } else { 0.0 }).max(1.0);
+            let h = (f32::from(viewport.height) - TOP_BAR_HEIGHT - CANVAS_PADDING_Y * 2.0 - PROJECT_TIMELINE - self.motion_prompt_height()).max(1.0);
+            let w = w.min(h * aspect);
+            (px(w), px(w / aspect))
+        };
         let canvas = self.canvas_area(self.motion_isolate_canvas(width, height).unwrap_or_else(|| div().into_any_element()));
         let timeline = self.motion_project_timeline(&editor, cx);
+        let prompt = self.motion_prompt_bar(cx);
         let inspector = self.inspector_visible.then(|| {
             let content = self.motion_layer_inspector(cx).unwrap_or_else(|| self.motion_project_summary(&editor, cx));
             div()
                 .id("motion-project-inspector")
-                .w(px(320.0))
+                .w(px(PROJECT_INSPECTOR))
                 .flex_none()
                 .h_full()
                 .overflow_y_scroll()
@@ -744,7 +897,12 @@ impl Studio {
             .text_color(theme::ink())
             .font_family("Inter")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| this.motion_project_key(e, cx)))
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| this.motion_project_key(e, window, cx)))
+            .on_key_up(cx.listener(|this, e: &gpui::KeyUpEvent, _, cx| {
+                if e.keystroke.key == "\\" {
+                    this.motion_compare_key(false, cx);
+                }
+            }))
             .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
                 if !e.dragging() {
                     return;
@@ -763,7 +921,7 @@ impl Studio {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(canvas).child(timeline))
+                    .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(canvas).child(prompt).child(timeline))
                     .children(inspector),
             )
             .into_any_element()
@@ -781,11 +939,21 @@ impl Studio {
         cx.notify();
     }
 
-    fn motion_project_key(&mut self, e: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+    fn motion_project_key(&mut self, e: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed in the prompt bar or a field are theirs.
+        if self.native_text_focused(window, cx) {
+            return;
+        }
         let Some(editor) = self.motion_doc.as_ref().map(|d| d.editor.clone()) else { return };
         let k = &e.keystroke;
         let command = k.modifiers.control || k.modifiers.platform;
         match k.key.as_str() {
+            // Held: the proposal as it was before.
+            "\\" if !command => {
+                if !self.motion_compare_key(true, cx) {
+                    return;
+                }
+            }
             "space" => editor.update(cx, |e, cx| e.toggle_play(cx)),
             "left" => editor.update(cx, |e, _| e.step(if k.modifiers.shift { -10 } else { -1 })),
             "right" => editor.update(cx, |e, _| e.step(if k.modifiers.shift { 10 } else { 1 })),
@@ -802,7 +970,12 @@ impl Studio {
                 self.select_motion_layer(None, cx);
                 self.motion_commit(vec![json!({"op": "remove", "id": id})], cx);
             }
-            _ => return,
+            // Anything else that is text begins a prompt.
+            _ => {
+                if !self.begin_prompt_by_typing(e, window, cx) {
+                    return;
+                }
+            }
         }
         cx.stop_propagation();
         cx.notify();
@@ -818,7 +991,9 @@ impl Studio {
             .gap_3()
             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(self.motion_doc_name().unwrap_or_default()))
             .child(div().text_xs().text_color(theme::muted()).child(format!("{} × {} · {} fps · {:.2} s · {} scenes", s.width, s.height, s.fps.as_f64(), s.duration, p.scenes.len())))
-            .child(div().text_xs().text_color(theme::muted()).child("Click a layer in the preview or on the timeline to edit it. Space plays; Ctrl+Z undoes."))
+            .child(div().text_xs().text_color(theme::muted()).child("Click a layer in the preview or on the timeline to edit it. Space plays; Ctrl+Z undoes. Type to ask for a change."))
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("AI"))
+            .child(self.motion_agent_log(None, cx))
             .into_any_element()
     }
 
@@ -903,9 +1078,31 @@ impl Studio {
                 .size_full(),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                if e.modifiers.shift {
+                    this.begin_motion_span(e.position.x);
+                    return;
+                }
                 this.motion_scrub = true;
                 this.motion_project_seek(e.position.x, cx);
             }));
+        // Above the ruler: a strip where a drag marks a span to prompt
+        // about (a click clears it).
+        let mut span_band = div()
+            .id("motion-project-span")
+            .relative()
+            .flex_1()
+            .h(px(10.0))
+            .overflow_hidden()
+            .rounded(px(3.0))
+            .bg(theme::control_bg())
+            .cursor_crosshair()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                this.begin_motion_span(e.position.x);
+                cx.notify();
+            }));
+        if let Some((a, b)) = self.motion_agent.span {
+            span_band = span_band.child(div().absolute().top_0().bottom_0().left(px(x_of(a))).w(px((x_of(b) - x_of(a)).max(2.0))).rounded(px(3.0)).bg(theme::accent()));
+        }
         let mut t = (scroll * spp / step).floor() * step;
         while t <= duration + 1e-9 && x_of(t) <= width {
             let x = x_of(t);
@@ -930,7 +1127,7 @@ impl Studio {
         let playhead = LABELS + x_of(time);
         div()
             .relative()
-            .h(px(300.0))
+            .h(px(PROJECT_TIMELINE))
             .flex_none()
             .flex()
             .flex_col()
@@ -938,9 +1135,10 @@ impl Studio {
             .border_color(theme::line())
             .bg(theme::panel())
             .child(transport)
+            .child(div().flex().child(div().w(px(LABELS)).flex_none().pl_3().text_size(px(9.0)).text_color(theme::muted()).child("span")).child(span_band.tooltip(crate::timeline_ui::tooltip("Drag to mark a span to ask about; click to clear"))))
             .child(div().flex().child(div().w(px(LABELS)).flex_none()).child(ruler))
             .child(rows)
-            .child(div().absolute().top(px(44.0)).bottom_0().left(px(playhead - 1.0)).w(px(2.0)).bg(theme::brand()))
+            .child(div().absolute().top(px(54.0)).bottom_0().left(px(playhead - 1.0)).w(px(2.0)).bg(theme::brand()))
             .into_any_element()
     }
 }

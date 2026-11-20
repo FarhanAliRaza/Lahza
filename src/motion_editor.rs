@@ -20,12 +20,14 @@ use lahza_motion_core::compile::{Compiled, Content, LayerState};
 use lahza_motion_core::document::{Layer, Project};
 use lahza_motion_core::property::{compile as compile_prop, Ctx, Property};
 use lahza_motion_core::timeref::TimeRef;
-use lahza_motion_core::value::{Animatable, Vec2};
+use lahza_motion_core::value::{Animatable, Color, Vec2};
 use lahza_motion_core::{edit, io};
 use lahza_motion_mcp::tools::Toolbox;
 use lahza_motion_render::font::Fonts;
 use lahza_motion_render::{RenderOptions, Renderer};
 use serde_json::{json, Value};
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -231,26 +233,120 @@ fn split_offset(text: &str, fps: f64) -> (String, f64) {
 }
 
 /// A scrubbable inspector value: property path and vector component.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct Field {
-    pub path: &'static str,
+    pub path: Cow<'static, str>,
     pub component: Option<usize>,
-    pub label: &'static str,
+    pub label: Cow<'static, str>,
     /// Value change per dragged pixel.
     pub step: f64,
+    /// The value when the layer's JSON has none.
+    pub default: f64,
+}
+
+const fn field(path: &'static str, component: Option<usize>, label: &'static str, step: f64, default: f64) -> Field {
+    Field { path: Cow::Borrowed(path), component, label: Cow::Borrowed(label), step, default }
 }
 
 pub(crate) const FIELDS: &[Field] = &[
-    Field { path: "transform.position", component: Some(0), label: "X", step: 1.0 },
-    Field { path: "transform.position", component: Some(1), label: "Y", step: 1.0 },
-    Field { path: "transform.scale", component: Some(0), label: "Scale X", step: 0.005 },
-    Field { path: "transform.scale", component: Some(1), label: "Scale Y", step: 0.005 },
-    Field { path: "transform.rotation", component: None, label: "Rotation", step: 0.5 },
-    Field { path: "transform.opacity", component: None, label: "Opacity", step: 0.005 },
-    Field { path: "transform.z", component: None, label: "Z", step: 2.0 },
-    Field { path: "transform.rotation_x", component: None, label: "Tilt X", step: 0.5 },
-    Field { path: "transform.rotation_y", component: None, label: "Turn Y", step: 0.5 },
+    field("transform.position", Some(0), "X", 1.0, 0.0),
+    field("transform.position", Some(1), "Y", 1.0, 0.0),
+    field("transform.scale", Some(0), "Scale X", 0.005, 1.0),
+    field("transform.scale", Some(1), "Scale Y", 0.005, 1.0),
+    field("transform.rotation", None, "Rotation", 0.5, 0.0),
+    field("transform.opacity", None, "Opacity", 0.005, 1.0),
+    field("transform.z", None, "Z", 2.0, 0.0),
+    field("transform.rotation_x", None, "Tilt X", 0.5, 0.0),
+    field("transform.rotation_y", None, "Turn Y", 0.5, 0.0),
 ];
+
+/// Effects the inspector can add, with the values they start from (what
+/// is not given takes the format's default). Not here: `gradient_map` and
+/// `lut`, which need a list of stops and a file.
+pub(crate) const EFFECTS: &[(&str, &str)] = &[
+    ("Blur", r#"{"type": "blur", "radius": 8}"#),
+    ("Shadow", r##"{"type": "shadow", "color": "#00000080", "radius": 12, "offset": [0, 8]}"##),
+    ("Glow", r#"{"type": "glow", "radius": 12, "intensity": 1}"#),
+    ("Exposure", r#"{"type": "exposure", "stops": 0.5}"#),
+    ("Contrast", r#"{"type": "brightness_contrast", "brightness": 0, "contrast": 0.2}"#),
+    ("Levels", r#"{"type": "levels"}"#),
+    ("Colour", r#"{"type": "hue_saturation", "hue": 0, "saturation": 0.2, "lightness": 0}"#),
+    ("Tint", r#"{"type": "tint"}"#),
+    ("Fill", r##"{"type": "fill", "color": "#ffffff"}"##),
+    ("Invert", r#"{"type": "invert"}"#),
+    ("Motion blur", r#"{"type": "directional_blur"}"#),
+    ("RGB split", r#"{"type": "rgb_split"}"#),
+    ("Displace", r#"{"type": "displace"}"#),
+    ("Vignette", r#"{"type": "vignette"}"#),
+    ("Grain", r#"{"type": "grain"}"#),
+];
+
+/// Colours offered for a colour value (any other is typed as #rrggbb).
+pub(crate) const SWATCHES: &[&str] = &["#ffffff", "#000000", "#8a8f98", "#ff3355", "#ffc928", "#22b45d", "#22bfc2", "#3678ef", "#8c4ce8", "#ec3d87"];
+
+/// Values of a layer's own kind or of one effect that the inspector edits:
+/// numbers (two-part values as two), and colours by their path.
+#[derive(Default)]
+pub(crate) struct Values {
+    pub name: String,
+    pub fields: Vec<Field>,
+    /// Label and path of each colour.
+    pub colors: Vec<(String, String)>,
+}
+
+/// Reads the editable values under `prefix` out of a JSON object: what is
+/// a number, a pair of numbers or a colour, constant or keyed.
+fn values_in(object: &Value, prefix: &str, name: String) -> Values {
+    // A keyed value is judged by its first key.
+    let shown = |v: &Value| v.get("keys").and_then(|k| k.get(0)).and_then(|k| k.get("v")).cloned().unwrap_or_else(|| v.clone());
+    let mut out = Values { name, ..Default::default() };
+    for (key, value) in object.as_object().into_iter().flatten() {
+        let (path, label) = (format!("{prefix}{key}"), key.replace('_', " "));
+        let step = match key.as_str() {
+            "radius" | "size" | "distance" | "width" | "length" | "offset" => 0.25,
+            "hue" | "angle" => 1.0,
+            "stops" => 0.02,
+            _ => 0.01,
+        };
+        match shown(value) {
+            Value::Number(_) if key != "seed" => out.fields.push(Field { path: path.into(), component: None, label: label.into(), step, default: 0.0 }),
+            Value::Array(pair) if pair.len() == 2 && pair.iter().all(Value::is_number) => {
+                for (c, axis) in ["X", "Y"].into_iter().enumerate() {
+                    out.fields.push(Field { path: path.clone().into(), component: Some(c), label: format!("{label} {axis}").into(), step, default: 0.0 });
+                }
+            }
+            Value::String(text) if text.starts_with('#') => out.colors.push((label, path)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What the inspector edits beyond the transform: a text's size, tracking
+/// and colour, and each effect's values.
+pub(crate) fn extra_values(layer: &Layer) -> (Values, Vec<Values>) {
+    let mut own = Values::default();
+    if let lahza_motion_core::document::LayerKind::Text(_) = &layer.kind {
+        own.fields.push(Field { path: "size".into(), component: None, label: "Size".into(), step: 0.5, default: 96.0 });
+        own.fields.push(Field { path: "tracking".into(), component: None, label: "Tracking".into(), step: 0.1, default: 0.0 });
+        own.colors.push(("Colour".into(), "color".into()));
+    }
+    let json = serde_json::to_value(&layer.common.effects).unwrap_or_default();
+    let effects = json
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, effect)| {
+            let name = effect.get("type").and_then(Value::as_str).unwrap_or("effect").replace('_', " ");
+            let mut values = values_in(effect, &format!("effects.{i}."), name);
+            values.fields.retain(|f| !f.path.ends_with(".type"));
+            values
+        })
+        .collect();
+    (own, effects)
+}
 
 pub(crate) struct KeyMark {
     pub path: String,
@@ -288,6 +384,16 @@ pub(crate) struct MotionEditor {
     selected: Option<String>,
     canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     drag: Option<Drag>,
+    /// The project as a drag shows it (unsaved): a copy made at the drag's
+    /// first tick, in which each tick replaces the one layer it changes.
+    preview_project: Option<Project>,
+    /// The preview shows a request's "before" (`compare`), not a drag.
+    comparing: bool,
+    font_names: Vec<String>,
+    /// The selected layer as JSON, saved and as the drag shows it: values
+    /// are read from these, so a draw does not serialise the layer again.
+    saved_json: RefCell<Option<(String, Value)>>,
+    preview_json: RefCell<Option<(String, Value)>>,
     focus: FocusHandle,
     fonts: Fonts,
     status: String,
@@ -321,6 +427,29 @@ pub(crate) fn stamp(dir: &Path) -> SystemTime {
         }
     }
     latest
+}
+
+/// The bundled fonts, then the project's font files (`assets/` and its
+/// folders), as a text's `font` names them.
+fn font_names(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = lahza_motion_render::font::BUNDLED.iter().map(|f| f.to_string()).collect();
+    let mut files = Vec::new();
+    let mut pending = vec![(dir.join("assets"), 0)];
+    while let Some((folder, depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth < 2 {
+                pending.push((path, depth + 1));
+            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf")) {
+                if let Ok(rel) = path.strip_prefix(dir) {
+                    files.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    files.sort();
+    out.extend(files);
+    out
 }
 
 fn round(v: f64) -> f64 {
@@ -450,6 +579,11 @@ impl MotionEditor {
             selected: None,
             canvas_bounds: Arc::default(),
             drag: None,
+            preview_project: None,
+            comparing: false,
+            font_names: Vec::new(),
+            saved_json: RefCell::default(),
+            preview_json: RefCell::default(),
             focus: cx.focus_handle(),
             status: String::new(),
             poll_ticks: 0,
@@ -462,6 +596,7 @@ impl MotionEditor {
             peaks: PeakCache::default(),
         };
         let mut editor = editor;
+        editor.font_names = font_names(&editor.dir);
         editor.refresh_waves();
         Ok(editor)
     }
@@ -513,7 +648,7 @@ impl MotionEditor {
             }
         }
         self.poll_ticks += 1;
-        if self.poll_ticks % 30 == 0 && self.drag.is_none() && stamp(&self.dir) > self.stamp {
+        if self.poll_ticks % 30 == 0 && !self.dragging() && stamp(&self.dir) > self.stamp {
             self.reload();
             self.status = "Updated from disk".into();
             changed = true;
@@ -544,16 +679,36 @@ impl MotionEditor {
         let (w, h) = (self.project.settings.width as f64, self.project.settings.height as f64);
         let fit = (f64::from(bounds.size.width) / w).min(f64::from(bounds.size.height) / h).min(1.0);
         // Half-size proxy while moving; full preview size when still.
-        let proxy = self.playing || self.drag.is_some();
+        let proxy = self.playing || self.dragging();
         let scale = (fit * if proxy { 0.5 } else { 1.0 }).max(0.05);
         self.request_key += 1;
         self.worker.request(Job { compiled: self.compiled.clone(), t: self.time, scale, blur: !proxy, key: self.request_key });
         self.dirty = false;
     }
 
+    /// Whether anything is being dragged: on the canvas, or a value, a
+    /// layer or a key from the studio (an unsaved preview shows).
+    pub(crate) fn dragging(&self) -> bool {
+        self.drag.is_some() || (self.preview_project.is_some() && !self.comparing)
+    }
+
+    /// The project as it shows now: a drag's unsaved copy, or the saved one.
+    fn shown(&self) -> &Project {
+        self.preview_project.as_ref().unwrap_or(&self.project)
+    }
+
+    fn drop_preview(&mut self) {
+        self.comparing = false;
+        self.preview_project = None;
+        *self.preview_json.borrow_mut() = None;
+    }
+
     fn reload(&mut self) {
         match io::load(&self.dir) {
             Ok(p) => {
+                self.drop_preview();
+                *self.saved_json.borrow_mut() = None;
+                self.font_names = font_names(&self.dir);
                 self.project = p;
                 self.compiled = Arc::new(Compiled::new(&self.project));
                 self.rows = layer_rows(&self.project, &self.compiled);
@@ -586,15 +741,29 @@ impl MotionEditor {
     }
 
     /// Shows ops without saving them (live drags).
+    /// A drag's ticks change one layer's fields: only that layer goes
+    /// through JSON (`edit::apply_to_layer`), into a copy of the project
+    /// made once a drag. Anything else takes `edit::apply`.
     fn preview(&mut self, ops: &[Value]) {
-        if let Ok(a) = edit::apply(&self.project, ops) {
-            self.compiled = Arc::new(Compiled::new(&a.project));
-            self.dirty = true;
+        match edit::apply_to_layer(&self.project, ops) {
+            Some(Ok((_, layer))) => {
+                let copy = self.preview_project.get_or_insert_with(|| self.project.clone());
+                edit::replace_layer(copy, layer);
+            }
+            Some(Err(_)) => return,
+            None => match edit::apply(&self.project, ops) {
+                Ok(a) => self.preview_project = Some(a.project),
+                Err(_) => return,
+            },
         }
+        *self.preview_json.borrow_mut() = None;
+        self.compiled = Arc::new(Compiled::new(self.shown()));
+        self.dirty = true;
     }
 
     fn undo(&mut self, redo: bool) {
-        let args = if redo { json!({"project": self.dir, "redo": true}) } else { json!({"project": self.dir, "undo": 1}) };
+        // An agent's request is one step.
+        let args = if redo { json!({"project": self.dir, "redo": true}) } else { json!({"project": self.dir, "undo": 1, "by_request": true}) };
         match self.toolbox.call("history", args) {
             Ok(_) => self.status = if redo { "Redone".into() } else { "Undone".into() },
             Err(e) => self.status = e,
@@ -648,12 +817,28 @@ impl MotionEditor {
         Some(((x as f64 - ox) / k, (y as f64 - oy) / k))
     }
 
-    fn layer_json(&self, id: &str) -> Option<Value> {
-        find_layer(&self.project, id).and_then(|l| serde_json::to_value(l).ok())
+    /// `path` of layer `id` as JSON, from the saved project or (`shown`)
+    /// from what a drag shows. The layer is serialised once and kept until
+    /// it changes.
+    fn layer_value(&self, id: &str, path: &str, shown: bool) -> Option<Value> {
+        let shown = shown && self.preview_project.is_some();
+        let (cell, project) = if shown { (&self.preview_json, self.shown()) } else { (&self.saved_json, &self.project) };
+        let mut cache = cell.borrow_mut();
+        if cache.as_ref().is_none_or(|(cached, _)| cached != id) {
+            *cache = Some((id.to_string(), serde_json::to_value(find_layer(project, id)?).ok()?));
+        }
+        cache.as_ref()?.1.pointer(&format!("/{}", path.replace('.', "/"))).cloned()
     }
 
+    /// The saved value (what ops are made from).
     fn eval<T: Animatable>(&self, id: &str, path: &str, default: T) -> (T, bool) {
-        let v = self.layer_json(id).and_then(|j| j.pointer(&format!("/{}", path.replace('.', "/"))).cloned());
+        self.eval_in(id, path, default, false)
+    }
+
+    /// `path` at the playhead and whether it is keyed; `shown`: as a drag
+    /// shows it.
+    fn eval_in<T: Animatable>(&self, id: &str, path: &str, default: T, shown: bool) -> (T, bool) {
+        let v = self.layer_value(id, path, shown);
         let Some(v) = v else { return (default, false) };
         let Ok(prop) = serde_json::from_value::<Property<T>>(v) else { return (default, false) };
         let animated = prop.is_animated();
@@ -682,28 +867,17 @@ impl MotionEditor {
         }
     }
 
-    fn field_ops(&self, id: &str, field: Field, value: f64) -> Vec<Value> {
+    fn field_ops(&self, id: &str, field: &Field, value: f64) -> Vec<Value> {
         match field.component {
             Some(c) => {
-                let default = if field.path == "transform.scale" { Vec2::ONE } else { Vec2::ZERO };
-                let (mut v, animated) = self.eval::<Vec2>(id, field.path, default);
+                let (mut v, animated) = self.eval::<Vec2>(id, &field.path, Vec2([field.default; 2]));
                 v.0[c] = value;
-                self.value_ops(id, field.path, json!([round(v.0[0]), round(v.0[1])]), animated)
+                self.value_ops(id, &field.path, json!([round(v.0[0]), round(v.0[1])]), animated)
             }
             None => {
-                let (_, animated) = self.eval::<f64>(id, field.path, 0.0);
-                self.value_ops(id, field.path, json!(round(value)), animated)
+                let (_, animated) = self.eval::<f64>(id, &field.path, field.default);
+                self.value_ops(id, &field.path, json!(round(value)), animated)
             }
-        }
-    }
-
-    fn field_value(&self, id: &str, field: Field) -> f64 {
-        match field.component {
-            Some(c) => {
-                let default = if field.path == "transform.scale" { Vec2::ONE } else { Vec2::ZERO };
-                self.eval::<Vec2>(id, field.path, default).0 .0[c]
-            }
-            None => self.eval::<f64>(id, field.path, if field.path == "transform.opacity" { 1.0 } else { 0.0 }).0,
         }
     }
 
@@ -808,7 +982,7 @@ impl MotionEditor {
             self.commit(ops);
         } else {
             // A click: drop the drag preview.
-            self.compiled = Arc::new(Compiled::new(&self.project));
+            self.cancel_preview();
         }
     }
 
@@ -889,26 +1063,117 @@ impl MotionEditor {
     }
 
     /// `field` of layer `id` at the playhead, and whether it is keyed.
-    pub(crate) fn field_state(&self, id: &str, field: Field) -> (f64, bool) {
-        let animated = if field.component.is_some() { self.eval::<Vec2>(id, field.path, Vec2::ZERO).1 } else { self.eval::<f64>(id, field.path, 0.0).1 };
-        (self.field_value(id, field), animated)
+    /// One evaluation; during a drag, the value the drag shows.
+    pub(crate) fn field_state(&self, id: &str, field: &Field) -> (f64, bool) {
+        match field.component {
+            Some(c) => {
+                let (v, animated) = self.eval_in::<Vec2>(id, &field.path, Vec2([field.default; 2]), true);
+                (v.0[c], animated)
+            }
+            None => self.eval_in::<f64>(id, &field.path, field.default, true),
+        }
     }
 
     /// Shows `field` of `layer` at `value` (unsaved).
-    pub(crate) fn drag_value(&mut self, layer: &str, field: Field, value: f64) {
+    pub(crate) fn drag_value(&mut self, layer: &str, field: &Field, value: f64) {
         let ops = self.field_ops(layer, field, value);
         self.preview(&ops);
     }
 
     /// Saves `field` of `layer` at `value`: a key at the playhead when the
     /// property is animated, otherwise a plain value.
-    pub(crate) fn drop_value(&mut self, layer: &str, field: Field, value: f64) {
+    pub(crate) fn drop_value(&mut self, layer: &str, field: &Field, value: f64) {
         let ops = self.field_ops(layer, field, value);
         self.commit(ops);
     }
 
+    /// The colour at `path` of layer `id` at the playhead, as #rrggbb.
+    pub(crate) fn color_state(&self, id: &str, path: &str) -> String {
+        self.eval_in::<Color>(id, path, Color::WHITE, true).0.to_hex()
+    }
+
+    /// Saves a colour: a key at the playhead when it is animated.
+    pub(crate) fn set_color(&mut self, id: &str, path: &str, hex: &str) {
+        if Color::parse(hex).is_err() {
+            self.status = format!("'{hex}' is not a colour: use #rrggbb");
+            return;
+        }
+        let (_, animated) = self.eval::<Color>(id, path, Color::WHITE);
+        let ops = self.value_ops(id, path, json!(hex), animated);
+        self.commit(ops);
+    }
+
+    /// Fonts a text can take: the bundled ones and the font files in the
+    /// project's assets.
+    pub(crate) fn fonts(&self) -> &[String] {
+        &self.font_names
+    }
+
+    /// Shows edit ops without saving them (text as it is typed).
+    pub(crate) fn preview_ops(&mut self, ops: &[Value]) {
+        self.preview(ops);
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The scene at the playhead.
+    pub(crate) fn scene_at_playhead(&self) -> Option<String> {
+        self.compiled.scene_at(self.time).map(|s| s.id.to_string())
+    }
+
+    /// The frame showing now, as a PNG (what an agent is sent to look at).
+    pub(crate) fn frame_png(&self) -> Option<Vec<u8>> {
+        let frame = self.frame.as_ref()?;
+        let size = frame.size(0);
+        let (w, h) = (size.width.0 as u32, size.height.0 as u32);
+        // The frame is BGRA (GPUI's upload order).
+        let mut pixels = frame.as_bytes(0)?.to_vec();
+        for p in pixels.chunks_exact_mut(4) {
+            p.swap(0, 2);
+        }
+        let mut png = Vec::new();
+        image::RgbaImage::from_raw(w, h, pixels)?.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+        Some(png)
+    }
+
+    /// Takes back every edit made for `request` (one undo; redo puts them
+    /// back).
+    pub(crate) fn undo_request(&mut self, request: &str) -> Result<(), String> {
+        let result = self.toolbox.call("history", json!({"project": self.dir, "undo_request": request})).map(|_| ());
+        self.status = match &result {
+            Ok(()) => "Undone".into(),
+            Err(e) => e.clone(),
+        };
+        self.reload();
+        result
+    }
+
+    /// Before and after: while `request` is given the preview shows the
+    /// project without that request's edits (nothing is saved); None
+    /// shows it as it is.
+    pub(crate) fn compare(&mut self, request: Option<&str>) {
+        let Some(request) = request else {
+            if std::mem::take(&mut self.comparing) {
+                self.cancel_preview();
+            }
+            return;
+        };
+        let Ok(history) = io::read_history(&self.dir) else { return };
+        let ops: Vec<Value> = history.iter().rev().filter(|e| e.request.as_deref() == Some(request) && !e.undone).flat_map(|e| e.inverse.iter().cloned()).collect();
+        if let Ok(before) = edit::apply(&self.project, &ops) {
+            self.preview_project = Some(before.project);
+            *self.preview_json.borrow_mut() = None;
+            self.comparing = true;
+            self.compiled = Arc::new(Compiled::new(self.shown()));
+            self.dirty = true;
+        }
+    }
+
     /// Drops any unsaved drag preview.
     pub(crate) fn cancel_preview(&mut self) {
+        self.drop_preview();
         self.compiled = Arc::new(Compiled::new(&self.project));
         self.dirty = true;
     }
@@ -1194,6 +1459,27 @@ mod tests {
     }
 
     #[test]
+    fn every_effect_offered_is_one_the_format_takes() {
+        use lahza_motion_core::document::Effect;
+        for (label, json) in EFFECTS {
+            let effect: Effect = serde_json::from_str(json).unwrap_or_else(|e| panic!("{label}: {e}"));
+            // And each shows something to change.
+            let values = values_in(&serde_json::to_value(&effect).unwrap(), "effects.0.", label.to_string());
+            assert!(!values.fields.is_empty() || !values.colors.is_empty(), "{label} has no values");
+        }
+        // A shadow: its numbers, its offset as two, its colour by path.
+        let shadow: Effect = serde_json::from_str(EFFECTS[1].1).unwrap();
+        let values = values_in(&serde_json::to_value(&shadow).unwrap(), "effects.2.", "shadow".into());
+        let labels: Vec<(&str, Option<usize>)> = values.fields.iter().map(|f| (&*f.label, f.component)).collect();
+        assert_eq!(labels, [("offset X", Some(0)), ("offset Y", Some(1)), ("radius", None)]);
+        assert_eq!(values.fields[0].path, "effects.2.offset");
+        assert_eq!(values.colors, [("color".to_string(), "effects.2.color".to_string())]);
+        for hex in SWATCHES {
+            Color::parse(hex).unwrap();
+        }
+    }
+
+    #[test]
     fn trimming_an_anchored_sound_keeps_its_anchor() {
         assert_eq!(shift_time(&json!(1.0), 0.25, 30.0), json!(1.25));
         assert_eq!(shift_time(&json!("#card.start"), 0.12, 30.0), json!("#card.start + 0.120"));
@@ -1266,7 +1552,9 @@ mod tests {
                 let any: gpui::AnyWindowHandle = handle.into();
                 let draw = |cx: &mut gpui::AsyncApp| any.update(cx, |_, window, cx| window.draw(cx).clear()).unwrap();
                 let mut framed = false;
-                for _ in 0..200 {
+                // On a software GPU the first frame builds its
+                // pipelines: tens of seconds, cold.
+                for _ in 0..3600 {
                     wait(50).await;
                     draw(cx);
                     framed = handle.update(cx, |editor, _, _| editor.frame.is_some()).unwrap();
@@ -1282,9 +1570,22 @@ mod tests {
                         assert_eq!(editor.hit_at(200.0, 180.0).as_deref(), Some("box"));
                         assert_eq!(editor.hit_at(10.0, 10.0), None);
                         // Scrub the title's opacity (constant → set).
-                        let field = FIELDS[5];
+                        let field = &FIELDS[5];
+                        editor.drag_value("title", field, 0.25);
+                        // Mid-drag: the proxy is on and the number follows.
+                        assert!(editor.dragging(), "a value drag is a drag");
+                        assert!((editor.field_state("title", field).0 - 0.25).abs() < 1e-9, "the number at once");
                         editor.drag_value("title", field, 0.5);
                         editor.drop_value("title", field, 0.5);
+                        assert!(!editor.dragging());
+                        // A keyed value dragged twice leaves one new key, not two.
+                        editor.move_layer("box", [210.0, 190.0], false);
+                        editor.move_layer("box", [220.0, 200.0], false);
+                        assert_eq!(editor.position_of("box").x(), 200.0, "ops are made from the saved project");
+                        let shown = serde_json::to_value(find_layer(editor.shown(), "box").unwrap()).unwrap();
+                        assert_eq!(shown["transform"]["position"]["keys"].as_array().unwrap().len(), 3);
+                        editor.cancel_preview();
+                        assert!(!editor.dragging());
                         assert!((editor.field_state("title", field).0 - 0.5).abs() < 1e-9, "opacity scrubbed to 0.5");
                         // Retime the box's second key onto beat 4 (Shift snaps).
                         editor.drop_key("box", "transform.position", 1, 1.5, 1.95, true);

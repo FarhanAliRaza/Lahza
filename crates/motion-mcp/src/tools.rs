@@ -290,8 +290,9 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef { name: "render_status", description: "Progress and result of render jobs.", schema: json!({"type": "object", "properties": {"job": {"type": "string"}}}), read_only: true },
         ToolDef {
             name: "history",
-            description: "Recent edits by person and agent; undo the last n steps or back to an entry; redo the last undo.",
-            schema: obj(json!({"limit": {"type": "integer", "default": 20}, "undo": {"type": "integer"}, "undo_to": {"type": "integer"}, "redo": {"type": "boolean"}}), &[]),
+            description: "Recent edits by person and agent; undo the last n steps or back to an entry; redo the last undo. Edits made for one request (a prompt sent from the editor) carry its id: undo_request takes them all back, and with by_request a step of undo is a whole request.",
+            schema: obj(json!({"limit": {"type": "integer", "default": 20}, "undo": {"type": "integer"}, "undo_to": {"type": "integer"}, "redo": {"type": "boolean"},
+                "undo_request": {"type": "string", "description": "undo every edit of this request"}, "by_request": {"type": "boolean", "description": "with undo: a request's edits count as one step (default false)"}}), &[]),
             read_only: false,
         },
         ToolDef {
@@ -390,6 +391,8 @@ pub struct Toolbox {
     pub backend: Backend,
     /// Accepts relative paths against this folder.
     pub cwd: PathBuf,
+    /// The request edits made here belong to (see `HistoryEntry::request`).
+    pub request: Option<String>,
 }
 
 impl Default for Toolbox {
@@ -471,6 +474,7 @@ impl Toolbox {
             jobs: Vec::new(),
             backend: Backend::Gpu,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            request: None,
         }
     }
 
@@ -1306,6 +1310,10 @@ impl Toolbox {
         let dir = self.dir(args)?;
         let ops = args.get("ops").and_then(Value::as_array).ok_or("edit_apply needs \"ops\": [...]")?.clone();
         let author = get_str(args, "author").unwrap_or("agent").to_string();
+        // Held from here to the end: another writer's edits are loaded
+        // first, and no two entries take one number.
+        let _lock = io::lock(&dir).map_err(|e| e.to_string())?;
+        self.open(&dir)?;
         let applied = edit::apply(&self.state(&dir).project, &ops).map_err(|e| e.to_string())?;
         let n = io::next_history_number(&dir).map_err(|e| e.to_string())?;
         self.save_markers(&dir, &applied)?;
@@ -1319,6 +1327,7 @@ impl Toolbox {
             inverse: applied.inverse,
             undone: false,
             undoes: Vec::new(),
+            request: get_str(args, "request").map(String::from).or_else(|| self.request.clone()),
         })
         .map_err(|e| e.to_string())?;
         let compiled = self.compiled(&dir);
@@ -2306,10 +2315,19 @@ impl Toolbox {
 
     fn history(&mut self, args: &Value) -> ToolResult {
         let dir = self.dir(args)?;
-        let entries = io::read_history(&dir).map_err(|e| e.to_string())?;
         let undo_n = args.get("undo").and_then(Value::as_u64);
         let undo_to = args.get("undo_to").and_then(Value::as_u64);
-        if args.get("redo").and_then(Value::as_bool).unwrap_or(false) {
+        let undo_request = get_str(args, "undo_request");
+        let redo = args.get("redo").and_then(Value::as_bool).unwrap_or(false);
+        let _lock = if redo || undo_n.is_some() || undo_to.is_some() || undo_request.is_some() {
+            let lock = io::lock(&dir).map_err(|e| e.to_string())?;
+            self.open(&dir)?;
+            Some(lock)
+        } else {
+            None
+        };
+        let entries = io::read_history(&dir).map_err(|e| e.to_string())?;
+        if redo {
             // Redo = revert the most recent undo that is still in effect.
             let undo = entries.iter().rev().find(|e| !e.undoes.is_empty() && !e.undone).ok_or("nothing to redo")?;
             let applied = edit::apply(&self.state(&dir).project, &undo.inverse).map_err(|e| format!("redo failed (the project changed in a conflicting way): {e}"))?;
@@ -2325,11 +2343,26 @@ impl Toolbox {
             }
             return Ok(Output::json(json!({"redone": undo.undoes})));
         }
-        if undo_n.is_some() || undo_to.is_some() {
+        if undo_n.is_some() || undo_to.is_some() || undo_request.is_some() {
             let live: Vec<&HistoryEntry> = entries.iter().filter(|e| !e.undone && e.undoes.is_empty()).collect();
-            let targets: Vec<&HistoryEntry> = match (undo_n, undo_to) {
-                (Some(n), _) => live.iter().rev().take(n as usize).copied().collect(),
-                (None, Some(to)) => live.iter().rev().filter(|e| e.n > to).copied().collect(),
+            let by_request = args.get("by_request").and_then(Value::as_bool).unwrap_or(false);
+            let targets: Vec<&HistoryEntry> = match (undo_request, undo_n, undo_to) {
+                (Some(r), _, _) => live.iter().rev().filter(|e| e.request.as_deref() == Some(r)).copied().collect(),
+                // A step is an entry, or every entry of the request the
+                // newest one belongs to.
+                (None, Some(n), _) if by_request => {
+                    let mut targets: Vec<&HistoryEntry> = Vec::new();
+                    for _ in 0..n {
+                        let Some(next) = live.iter().rev().find(|e| !targets.iter().any(|t| t.n == e.n)).copied() else { break };
+                        match &next.request {
+                            Some(r) => targets.extend(live.iter().rev().filter(|e| e.request.as_ref() == Some(r) && !targets.iter().any(|t| t.n == e.n)).copied().collect::<Vec<_>>()),
+                            None => targets.push(next),
+                        }
+                    }
+                    targets
+                }
+                (None, Some(n), _) => live.iter().rev().take(n as usize).copied().collect(),
+                (None, None, Some(to)) => live.iter().rev().filter(|e| e.n > to).copied().collect(),
                 _ => unreachable!(),
             };
             if targets.is_empty() {
@@ -2354,6 +2387,7 @@ impl Toolbox {
                 inverse: applied.inverse,
                 undone: false,
                 undoes: targets.iter().map(|e| e.n).collect(),
+                request: None,
             })
             .map_err(|e| e.to_string())?;
             return Ok(Output::json(json!({"undone": targets.iter().map(|e| e.n).collect::<Vec<_>>(), "history": n})));
@@ -2363,7 +2397,7 @@ impl Toolbox {
             .iter()
             .rev()
             .take(limit)
-            .map(|e| json!({"n": e.n, "time": e.time, "author": e.author, "summary": e.summary, "undone": e.undone, "undoes": e.undoes}))
+            .map(|e| json!({"n": e.n, "time": e.time, "author": e.author, "summary": e.summary, "undone": e.undone, "undoes": e.undoes, "request": e.request}))
             .collect();
         Ok(Output::json(json!({"entries": list})))
     }

@@ -32,8 +32,10 @@ mod launcher_recording;
 mod library;
 mod models;
 mod motion_ui;
+mod motion_agent;
 mod motion_editor;
 mod motion_piece_ui;
+mod motion_prompt_ui;
 mod motion_timeline;
 mod motion_pieces;
 mod motion_sound;
@@ -558,6 +560,10 @@ struct Studio {
     /// The piece open on the timeline in the Motion tab.
     motion_doc: Option<crate::motion_timeline::MotionDoc>,
     motion_layer_drag: Option<crate::motion_timeline::LayerDrag>,
+    /// The colour being typed in the motion inspector: layer and path.
+    motion_color_edit: Option<(String, String)>,
+    /// The agent directed from the prompt bar, and its requests.
+    motion_agent: crate::motion_prompt_ui::MotionAgent,
     /// The preview shows only the open motion piece.
     motion_isolate: bool,
     /// A motion project opened on its own (`lahza project.lahza`).
@@ -1001,6 +1007,8 @@ impl Studio {
             motion_piece_drag: None,
             motion_doc: None,
             motion_layer_drag: None,
+            motion_color_edit: None,
+            motion_agent: Default::default(),
             motion_isolate: false,
             motion_project: None,
             motion_scrub: false,
@@ -2223,3 +2231,5 @@ mod tests {
 
 #[cfg(test)]
 mod studio_workflow_tests;
+#[cfg(test)]
+mod motion_prompt_tests;

@@ -15,8 +15,17 @@
   --profile` and compare the frame against `--backend cpu`. A map's frame
   comes from its casters' boxes, not from every vertex, so it is a little
   wider than the CPU's (a single sphere's by up to 1.7 times: softer
-  texels); bounding spheres would tighten it. Run on the RTX 3060 since: see
-  "Tests on a hardware GPU" below.
+  texels). Run on the RTX 3060 since: see "Tests on a hardware GPU" below.
+  Since: a directional map's frame takes each caster's span from its box
+  and from the ball its points are in (the farthest point from the box's
+  middle, kept with the pooled mesh; `CasterBox::span`), whichever is
+  less, so a round caster no longer widens it. On the shadow test scene
+  the frame is the floor's and nothing changes (456 and 472 pixels off
+  the CPU's by more than 24 at 4x, before and after): the gain is for
+  round casters with no floor under the light. Still as before: a point
+  light's map (its frame is from the boxes, and a caster with corners on
+  both sides of the light gives the whole view), and meshes the GPU
+  generates (the CPU has no points: their boxes).
 - **Motion blur: what is left.** A frame takes the sub-frames its motion
   needs (`motion_px` in motion-render's lib.rs), and a sub-frame does not
   draw again what the one before it left as it needs it: a group whose
@@ -28,7 +37,14 @@
   not measured. Not done: traced frames (their sub-frames' groups sit
   side by side), groups with a mesh when any mesh of the sub-frame moved,
   and shapes, text and shader pictures that change form (they still take
-  every sample).
+  every sample). Since: `benchmark_motion_blur_with_still_groups`
+  (motion-render's tests, `--ignored`) is such a span: a blurred backdrop
+  and a glow that stand still behind a bar that moves, against the same
+  frame with both drifting. On Mesa's software Vulkan both groups are
+  reused in each of the frame's four sub-frames and the frame takes 110 ms
+  against 112: within the noise there, where the time is the passes that
+  draw the frame itself. To run on the RTX 3060 (its profile gives the
+  passes' times) before any of the "not done" is worth doing.
 - **Image memory: what is left.** Textures are held at the size they show
   (`Images::get_sized`), the pool's budget follows the GPU's memory, and
   new texels are added to the GPU's copy (all of it again only after
@@ -444,126 +460,176 @@ targets are refused), so every part below is new. In the order to build:
 
 ## Directing an agent from the editor
 
-Not started. To say in the editor what is wanted ("add five seconds of …
-here", "this one should look like …", "something is wrong with this one"),
-see the agent at work, and scrub what it made. "Generated" here is motion
-the agent builds with the engine's tools; a clip from a video model would
-be something else to connect.
+Built: to say in the editor what is wanted ("add five seconds of … here",
+"this one should look like …", "something is wrong with this one"), see
+the agent at work, and scrub what it made. "Generated" here is motion the
+agent builds with the engine's tools; a clip from a video model would be
+something else to connect.
 
-Already here:
-- An agent's edits appear live: the editor polls the project's folder
-  (`motion_editor.rs`, every 30 ticks) and reloads.
-- One history: each edit is an entry with its author and its inverse
-  (`io.rs` `HistoryEntry`), so undo works on what an agent did.
-- The editor knows what is pointed at: the selected layer (`selected`),
-  its box (`selection_bounds`) and the playhead.
-- The agent can look: `snapshot`, `review`.
+What was run: the unit tests, and two windows under Xvfb with Mesa's
+software Vulkan (`cargo test --release -p lahza motion_prompt -- --ignored`,
+screenshots looked at; with `LAHZA_MOTION_SOFTWARE_GPU=1` the preview's
+first frame takes tens of seconds and the tests wait for it), with a runner of our own in Claude Code's place
+that makes real edits through a `Toolbox`. **No request was sent to
+Claude Code** (it costs money). Claude Code 2.1.329 was started once
+against an address nothing listens on: it took the flags, started
+`lahza mcp`, listed only its tools (`mcp__lahza__…`) and wrote the stream
+the reader expects, then failed to connect, at no cost. So not seen: a
+real agent calling the tools without being asked for permission
+(`--allowedTools mcp__lahza --permission-mode dontAsk`), reading the
+picture, or its wording when signed out.
 
-To build, in this order (1 to 4 with one selected layer already cover
-"fix this one"):
-1. **A prompt box in the motion editor.** It has no text input; the app
-   has one elsewhere (`text_field.rs`).
-2. **Starting an agent from the app.** First: Claude Code without its
-   terminal, as a child process on `lahza mcp`, its steps read as they
-   come (a stream of JSON). Behind one small interface, so another client
-   or a loop of our own (an API key, the `Toolbox` in process) can take
-   its place. It needs Claude Code installed and signed in: say so where
-   it is not.
-3. **What goes with the words.** The selected layer's id, the playhead,
-   the scene, and a snapshot of the frame as it is, so "this one" needs no
-   describing. A follow-up continues the same conversation.
-4. **A panel for the agent at work.** Each step as it happens (what was
-   added, what was checked, what is being drawn), what it said at the end,
-   and a stop button that ends the child.
-5. **Undo for a whole request.** An agent makes many edits a request and
-   each is its own entry: entries need the request they belong to, and
-   one undo takes them all back.
-6. **More than one thing selected.** A span of time ("five seconds from
-   here") and several layers; the editor holds one layer.
+1. **A prompt box** (`motion_prompt_ui.rs`, the field from
+   `text_field.rs`): under the preview on a motion project and on a
+   recording's Motion tab.
+2. **Starting an agent** (`motion_agent.rs`): `Runner` is the one small
+   interface (available, start, and a `Running` to stop); `ClaudeCode` is
+   the first: `claude -p` with stream-json in and out, `lahza mcp` as its
+   only server and no tools of its own, its lines read as they come.
+   Tested with a stub program that writes the same stream. Not installed
+   (the program is missing) and not signed in (`claude auth status`, or
+   what a failed request says) are said in the bar and in the AI tab.
+3. **What goes with the words** (`compose`): the project, the selected
+   layers and their kinds, the marked span, the playhead and its frame,
+   the scene, and the frame showing as a PNG. A follow-up continues the
+   conversation (`--resume`); a chip that can be removed says so.
+4. **The agent at work**: each step in the bar, in the AI tab and as a
+   ghost clip; what it said at the end; Stop ends the child and the
+   server it started (its process group).
+5. **Undo for a whole request**: `HistoryEntry.request` (the server takes
+   it from `LAHZA_REQUEST`); `history` has `undo_request`, and
+   `by_request` makes a request one step of `undo`, which is what Ctrl+Z
+   in the editor does. Redo puts it all back.
+6. **More than one thing selected**: Ctrl- or Shift-click adds rows to
+   what a prompt is about (the editor still holds one layer, the one the
+   inspector shows); a span is marked on a strip over the ruler, or with
+   Shift on a recording's ruler.
 
-To settle first:
-- **Editing while the agent works.** Nothing was found that keeps the
-  editor and the server from writing the folder at once (both number
-  history entries from what is there). Either the editor only reads while
-  a request runs, or the writes are guarded.
-- **How long it takes.** A scene of five seconds is many calls: tens of
-  seconds to minutes (not measured). The live reload shows it being put
-  together; the panel should say what is left where that is known.
+Settled:
+- **Editing while the agent works: guarded writes.** `io::lock` (`flock`
+  on `<project>/.lock`) is taken by `edit_apply` and by undo and redo;
+  under it the writer loads what the other wrote, then writes. Two
+  writers of 25 edits each lose none and take no number twice
+  (`two_writers_do_not_lose_edits`). The editor stays usable. Not under
+  the lock: tools that write other files (markers, shaders, narration).
+- **How long it takes**: not measured, since no real request was run. The
+  bar and the ghost clip say the step, the seconds so far, and the steps
+  and edits made. What is left is not known to the runner and is not
+  said.
+
+Left:
+- **A real request, on a real desktop.** The first thing to do: send one
+  from the bar and watch for a permission refusal in the stream.
+- **Requests are kept beside the project** (`requests.json` in the
+  project's or the recording's folder: the words, the steps, the outcome
+  and the conversation to continue), so the AI tab and a follow-up
+  survive the app. Read and written in a unit test; not seen across a
+  real restart. A request running when the app closes reads back as
+  stopped, and the agent is not ended with the app unless the window's
+  close drops the studio (not checked).
+- **A piece made on a recording.** With no piece open the words ask for
+  a new one on the span. Undo then takes back the edits inside it, not
+  the piece or its place on the video; compare needs the piece open; and
+  no ghost clip shows, only the bar. Not run with a real agent, so "a
+  piece placed there comes back" is not seen.
+- **Undo after later edits** to the same things fails with the engine's
+  message ("the project changed in a conflicting way").
+- **Another runner** (an API key and the `Toolbox` in process): the
+  interface is there, the second runner is not.
 
 ## The motion editor: drags that stall, and how it should be used
 
 ### Drags that stall
 
-Changing a selected layer's values is slow: the bars stick, as if a
-render had begun. Read in the code and timed apart from the app; the
-editor was not run, so which of these is the one felt is not confirmed.
+Changing a selected layer's values was slow: the bars stuck, as if a
+render had begun. Four causes were read in the code and timed apart from
+the app; all four are fixed. Run under Xvfb with Mesa's software Vulkan
+only (`editor_window_edits_and_reloads`): which of them was the one felt,
+and whether the bars now move freely, is not confirmed on a real card.
 
-- **A drag draws at full quality (first to fix).** A drag is meant to
-  draw at half size with no motion blur. `motion_piece_frames`
-  (motion_piece_ui.rs) asks only whether a piece is dragged on the
-  timeline (`motion_piece_drag`); a value dragged in the inspector, a
-  layer moved and a key retimed are `motion_layer_drag`, so every tick
-  asks for a full frame with motion blur. The editor's own
-  `request_frame` (motion_editor.rs) has the same gap: its `drag` is set
-  by the canvas only. Both should ask one question: is anything dragged.
-  To look at on a real card once fixed: whether full frames on the GPU
-  that also draws the window are what holds the bars (the frames are on
-  a worker thread, so the UI thread alone should not stall).
-- **Every tick goes through the whole project.** `preview`
-  (motion_editor.rs) calls `edit::apply`, which turns the whole project
-  into JSON and back, then `Compiled::new` on all of it. Timed in a cloud
-  container on projects of plain shapes and text (a throwaway example,
-  not kept):
+- **Every drag draws the proxy.** A value dragged in the inspector, a
+  layer moved and a key retimed now draw at half size with no motion
+  blur, as a piece dragged on the timeline did. Both places ask one
+  question: `motion_piece_frames` (motion_piece_ui.rs) whether a piece or
+  anything of the open piece is dragged, the editor's `request_frame`
+  `MotionEditor::dragging` (its canvas drag, or an unsaved preview
+  showing). Left to look at on a real card: whether full frames on the
+  GPU that also draws the window held the bars (the frames are on a
+  worker thread, so the UI thread alone should not stall).
+- **A tick changes one layer.** `preview` (motion_editor.rs) no longer
+  turns the project into JSON: `edit::apply_to_layer` passes only the
+  dragged layer through the same op code, into a copy of the project made
+  once a drag (`preview_project`); `apply` is kept for the drop and for
+  anything that is not `set`, `key` or `anchor` on one layer. The result
+  equals `apply`'s (`a_drag_on_one_layer_equals_apply`). Timed in a cloud
+  container (`cargo test --release -p lahza-motion-core drag_tick_timing
+  -- --ignored --nocapture`):
 
-  | layers | a tick (apply + compile) | the drop (apply, save, load, 2 compiles) |
-  |---|---|---|
-  | 30 | 0.4 ms | 1.3 ms |
-  | 480 | 7.1 ms | 19 ms |
-  | 1 200 | 19 ms | 52 ms |
+  | layers | `apply` (before) | one layer (now) | compile (still every tick) |
+  |---|---|---|---|
+  | 30 | 0.20 ms | 0.012 ms | 0.04 ms |
+  | 480 | 3.4 ms | 0.013 ms | 0.66 ms |
+  | 1 200 | 22 ms | 0.014 ms | 1.7 ms |
 
-  Nearly all of a tick is `apply` (6.0 of 7.1 ms at 480 layers; compile
-  1.1). Past 16 ms on a large project, and sooner with an imported model
-  of many parts. To do: a drag changes the one property in a copy of the
-  project (no JSON) and recompiles only its scene; `apply` stays for the
-  drop.
-- **The drop reads all the history.** `next_history_number` reads and
-  parses every entry to find the last: 2.4 ms at 500 entries, 10.5 ms at
-  2 000, and agents write many. To do: the highest file name.
-- **The inspector asks for each value twice a draw** (`field_state`:
-  `eval` for whether it is keyed, then for the value), each turning the
-  layer into JSON and compiling the property. 0.004 ms for a plain layer;
-  a comp is turned with all its children. To do: once per field, from the
-  compiled layer.
+  Left: the tick still compiles every scene (`Compiled::new`, 1.7 ms at
+  1 200 plain layers; more with an imported model of many parts, not
+  timed). Compiling only the scene that changed needs a way into
+  `compile.rs`, which was another branch's file while this was done.
+- **The drop no longer reads the history.** `next_history_number` takes
+  the highest file name: 0.6 ms at 2 000 entries, where reading them all
+  takes 14 ms (`history_numbers_come_from_file_names -- --nocapture`).
+  Undo and redo still read every entry.
+- **The inspector asks for each value once**, and the layer is turned
+  into JSON once per change, not twice per value per draw
+  (`layer_value` keeps it). During a drag the number shown is the dragged
+  one. X and Y of one property are still two evaluations.
 
 ### How it should be used
 
 The rule: select, type, Enter; everything else is by choice. The fewest
 clicks for the common things, the same in the motion editor and on a
-recording's timeline. This is how the parts under "Directing an agent
-from the editor" look.
+recording's timeline. Built as below and seen in screenshots under Xvfb
+(see "Directing an agent from the editor" for what was run); not used
+with a mouse on a real desktop.
 
-- **One prompt bar, the same everywhere**, under the preview. It shows
-  what it will act on as chips that can be removed ("Layer: title",
-  "2.1 s to 7.1 s"). Not a modal: that covers what is being talked about.
-- **Typing with something selected begins a prompt** with it attached:
-  "fix this one" is a click, the words, Enter.
-- **A drag on the ruler marks a span**: mark five seconds, type what
-  should be there, Enter. On a recording's timeline what comes back is a
-  motion piece placed there, as pieces already are.
-- **The inspector has two tabs**: Properties (by hand), and AI (what was
-  asked about this layer, and what came of it).
-- **The agent's work is seen and does not block**: a ghost clip over the
-  span being made, with the step it is at; the rest of the editor stays
-  usable (see "Editing while the agent works" above).
-- **What comes back is a proposal**: keep, undo, again, and a key held to
-  compare before and after (the request's entries taken back and put
-  back).
-- **A drag never waits**: the proxy on every drag, the number at once,
-  saved on release.
-- **By hand stays cheap**: a nudge or a retime is quicker than a prompt,
-  so the inspector has to edit text and effects, which it does not.
+- **One prompt bar, the same everywhere**, under the preview, with chips
+  that can be removed ("Layer: title", "0.5 s to 2.0 s", "Continues the
+  conversation"). Not a modal.
+- **Typing with something selected begins a prompt.** On a motion
+  project any printable key does, selected or not; on a recording only
+  with a layer selected, because letters are shortcuts there. Space
+  still plays.
+- **A span is marked** by one gesture in both places: a drag along the
+  strip at the top of the ruler (over it on a motion project, its top
+  8 px on a recording; the rest of the ruler still scrubs). A click
+  clears it; Shift-drag anywhere on the ruler does the same. The strip on
+  a recording is seen in a screenshot; its drag was driven through the
+  code, not with a pointer.
+- **The inspector has two tabs**: Properties, and AI (what was asked
+  about this layer, each step, what it said, keep / undo / again). With
+  nothing selected the AI list shows every request.
+- **The agent's work is seen and does not block**: the ghost clip over
+  the span (the whole length without one) with the step it is at; the
+  editor edits meanwhile.
+- **What comes back is a proposal**: Keep, Undo, Again, and Hold to
+  compare (the button, or `\` held). Compare applies the request's
+  inverses in the preview only; nothing is written.
+- **A drag never waits**: see "Drags that stall".
+- **By hand stays cheap**: the inspector edits a text layer's words (shown
+  as typed, saved when the field is left), its font (the bundled ones and
+  the font files in the project's `assets/`), colour, size and tracking;
+  each effect's numbers, two-part values (a shadow's offset as X and Y)
+  and colours; and adds or removes every effect but `gradient_map` and
+  `lut` (a list of stops, a file). A colour is picked from ten swatches or
+  typed as #rrggbb. Left: those two effects, a text's stroke, edge, line
+  height and alignment, and a colour picker beyond the swatches.
 
 ## Slang
+
+Nothing here was run since: slangc cannot be had in a cloud session (its
+releases are on a host the session's network does not allow; a build of
+it from the slangpy wheel's libslang was refused). Both points need the
+machine with slangc.
 
 - **To compile once with slangc.** These were written where slangc could
   not be run, and are checked only as text (`cargo test -p
@@ -625,7 +691,14 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
 - In parallel the test binary segfaults most runs, in the Vulkan
   loader's `vkSetDebugUtilsObjectName` (devices and pipelines being made
   on several threads), with or without the changes of this branch's last
-  commits. One thread runs through.
+  commits. One thread runs through. Since: objects are named only where
+  a tool reads the names (blade's `set_object_name`: with validation or
+  capture on, or `LAHZA_VK_NAMES` set), so a run without them does not go
+  through that call at all. Not run on the card (to do: the tests there
+  without `--test-threads=1`); on Mesa's software Vulkan the crash does
+  not show, and four devices at once run a 15 GB container out of memory.
+  The app could meet the same crash (a renderer per preview, each with
+  its device): the change covers it too.
 - The hardware visibility pass drew wrong pictures there, which no test
   on Mesa's software Vulkan shows (it has no 8x, and the comparisons with
   the CPU run without the pass). Fixed:
@@ -650,3 +723,20 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
   Image Denoise and Mesa's software Vulkan
   (`pt::physics_tests::{frames_in_flight_are_the_frames_drawn_one_at_a_time,
   the_denoiser_works_on_the_tracers_memory_where_it_can}`).
+  Since, for the four: `LAHZA_MOTION_VIS_REPORT=1` makes every
+  GPU-against-CPU comparison say where the two differ instead of failing
+  (pixels over 3 levels, how many of them away from an edge and by how
+  much; `LAHZA_MOTION_DUMP=dir` keeps the frames), through the visibility
+  pass: the card's own 8x, or 4x on Mesa's software Vulkan, where the
+  four show the same kind of difference. Away from edges there, at 4x:
+  meshes 172 and 164 pixels (worst 55), surface detail 474 (worst 30),
+  area lights 13 (worst 5), the instancer's copies 0; of tests that pass
+  on the card, shadows and occluders 3 and principled materials 83. In
+  the surface-detail frame they lie along the seams between triangles
+  (a pixel two triangles share is shaded for each at the middle of the
+  samples it won, and the pass's samples fall otherwise than the CPU's:
+  bumps make that show) and as spots on the face with a normal map (not
+  looked into: the pooled vertex has two rows where the CPU's has four,
+  so some of what shading reads is worked out on the GPU). Not fixed. To
+  do on the card: run the four with the report, see whether its 8x leaves
+  the seams, and look at the normal-mapped face first.

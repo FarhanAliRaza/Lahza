@@ -23,7 +23,7 @@ fn artifact_directory() -> PathBuf {
     path
 }
 
-fn fixture(root: &Path) -> RecordingSession {
+pub(crate) fn fixture(root: &Path) -> RecordingSession {
     let directory = root.join(format!("fixture-{}.lahzarec", Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
     let session = RecordingSession { directory };
@@ -136,7 +136,7 @@ fn own_x11_window(
     target.expect("mapped Lahza test window")
 }
 
-fn save_display(path: &Path, compact: bool) {
+pub(crate) fn save_display(path: &Path, compact: bool) {
     use x11rb::{
         connection::Connection,
         protocol::xproto::{ConnectionExt, ImageFormat, ImageOrder},

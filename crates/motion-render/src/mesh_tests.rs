@@ -1732,3 +1732,67 @@ fn a_ground_that_crosses_the_camera_hides_the_sky_behind_it() {
     let sky_below = (horizon..240).filter(|&y| blue(160, y) || blue(40, y) || blue(280, y)).count();
     assert_eq!(sky_below, 0, "rows of sky under the horizon (row {horizon})");
 }
+
+/// A GPU shadow map's frame takes each caster's span from its box and
+/// from the ball its points are in: never narrower than the points
+/// themselves (whatever turns and stretches the mesh), never wider than
+/// the box, and across a ball's diagonal the ball's own width where the
+/// box alone is √3 times it.
+#[test]
+fn a_casters_span_holds_its_points_and_is_no_wider_than_its_box() {
+    use crate::mesh3d::CasterBox;
+    use lahza_motion_core::space::Mat4;
+    let mut seed = 0x2545f491u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as f64 / u32::MAX as f64
+    };
+    let span = |pts: &[[f64; 3]], mv: &Mat4, d: [f64; 3]| {
+        pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            let q = mv.apply(p[0], p[1], p[2]);
+            let x = q[0] * d[0] + q[1] * d[1] + q[2] * d[2];
+            (lo.min(x), hi.max(x))
+        })
+    };
+    let caster = |pts: &[[f64; 3]], mv: &Mat4, round: bool| {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for p in pts {
+            for k in 0..3 {
+                (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
+            }
+        }
+        let reach = pts.iter().map(|p| (0..3).map(|k| (p[k] - (lo[k] + hi[k]) * 0.5).powi(2)).sum::<f64>()).fold(0.0, f64::max).sqrt();
+        CasterBox::new(lo, hi, round.then_some(reach), mv)
+    };
+    for _ in 0..200 {
+        let pts: Vec<[f64; 3]> = (0..40).map(|_| [next() * 80.0 - 30.0, next() * 20.0 - 5.0, next() * 140.0 - 90.0]).collect();
+        let mv = Mat4::translate(next() * 500.0, next() * 300.0, next() * 900.0)
+            .then(Mat4::rotate_x(next() * 360.0))
+            .then(Mat4::rotate_y(next() * 360.0))
+            .then(Mat4::rotate_z(next() * 360.0))
+            .then(Mat4::scale(0.2 + next() * 3.0, 0.2 + next() * 3.0, if next() < 0.2 { -1.0 } else { 0.2 + next() * 3.0 }));
+        let d = {
+            let v = [next() - 0.5, next() - 0.5, next() - 0.5];
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-9);
+            [v[0] / l, v[1] / l, v[2] / l]
+        };
+        let (truth, with, boxed) = (span(&pts, &mv, d), caster(&pts, &mv, true).span(d), caster(&pts, &mv, false).span(d));
+        assert!(with.0 <= truth.0 + 1e-6 && with.1 >= truth.1 - 1e-6, "the span {with:?} leaves out points of {truth:?}");
+        assert!(with.0 >= boxed.0 - 1e-9 && with.1 <= boxed.1 + 1e-9, "the span {with:?} is wider than the box's {boxed:?}");
+    }
+    // A ball of radius 50 seen across its box's diagonal.
+    let ball: Vec<[f64; 3]> = (0..2000)
+        .map(|_| {
+            let (z, a) = (next() * 2.0 - 1.0, next() * std::f64::consts::TAU);
+            let r = (1.0 - z * z).sqrt();
+            [50.0 * r * a.cos(), 50.0 * r * a.sin(), 50.0 * z]
+        })
+        .collect();
+    let d = [1.0 / 3f64.sqrt(); 3];
+    let width = |s: (f64, f64)| s.1 - s.0;
+    let (with, boxed) = (width(caster(&ball, &Mat4::IDENTITY, true).span(d)), width(caster(&ball, &Mat4::IDENTITY, false).span(d)));
+    assert!((with - 100.0).abs() < 1.0, "a ball of 100 across spans {with}");
+    assert!(boxed > 170.0, "its box alone spans {boxed}");
+}
