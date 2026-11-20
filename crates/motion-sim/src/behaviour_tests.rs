@@ -171,7 +171,9 @@ fn a_hand_goes_to_where_it_was_hit_and_lets_go() {
     assert!(nearest(&bake, 14) > 140.0, "before the hit the hands hang");
     // Within half a second a hand is on the chest, and holds there.
     for k in [30, 36, 45] {
-        assert!(nearest(&bake, k) < 25.0, "a hand is {:.0} px from the hit at sample {k}", nearest(&bake, k));
+        // (On it, not in it: the chest's capsule is 30 px thick there,
+        // and the hand, 42 px long and 9 thick, may point at it.)
+        assert!(nearest(&bake, k) < 62.0, "a hand is {:.0} px from the hit at sample {k}", nearest(&bake, k));
     }
     // One hand: the other still hangs.
     let other = dist(wrist(&bake, "l", 36), chest(&bake, 36)).max(dist(wrist(&bake, "r", 36), chest(&bake, 36)));
@@ -312,7 +314,7 @@ fn it_gets_up_after_a_fall_whichever_way_it_fell() {
     // The same take twice, to the byte.
     let (a, b) = (risen([3200.0, 0.0, 0.0], json!({}), 10.0), risen([3200.0, 0.0, 0.0], json!({}), 10.0));
     assert_eq!(a.to_bytes(), b.to_bytes());
-    assert_eq!(pin(&a), (139438, 3354145111831044034), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(pin(&a), (139438, 10638684219171540933), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
 #[test]
@@ -326,4 +328,86 @@ fn explore_getting_up() {
             println!("push {push:?} help {help} {way}: {:?}\n   hips rise by second: {}", happened(&bake), heights.join(" "));
         }
     }
+}
+
+/// How far an aimed arm's forearm and hand get into the trunk, by what
+/// it does: `cargo test --release -p lahza-motion-sim probe_arms_through -- --ignored --nocapture`.
+fn arms_in_trunk(behaviours: Value, hits: Value, ball: Option<Value>) -> (Bake, Vec<(String, f64)>) {
+    let mut all = vec![json!({"type": "balance"})];
+    all.extend(behaviours.as_array().unwrap().iter().cloned());
+    let doll = json!({"strength": 1, "behaviours": all, "hits": hits,
+        "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [44, 24, 130], "offset": [0, 12, -20]}}],
+        "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}, {"bone": "upper", "swing": 179, "twist": 179}, {"bone": "fore", "swing": 150, "hinge": [1, 0, 0]}]});
+    let mut p = figure_scene(json!({}), doll, json!({"ground": {"y": 809.5, "friction": 0.9}}), 2.5);
+    if let Some(ball) = ball {
+        p.scenes[0].layers.push(serde_json::from_value(ball).unwrap());
+    }
+    let bake = (*baked(&mut p)).clone();
+    p.bakes.clear();
+    let input = lahza_motion_core::Compiled::new(&p).sim_input(0, None).0;
+    let mut worst = Vec::new();
+    for arm in ["fore_l", "hand_l", "fore_r", "hand_r"] {
+        for trunk in ["hips", "spine", "chest", "head"] {
+            let (deep, _) = crate::ragdoll_tests::overlap_of(&bake, &input, arm, trunk);
+            if deep > 0.5 {
+                worst.push((format!("{arm} in {trunk}"), deep));
+            }
+        }
+    }
+    (bake, worst)
+}
+
+fn arm_takes() -> Vec<(&'static str, Value, Value, Option<Value>)> {
+    let ball = |x: f64| json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 20}, "body": {"type": "kinematic"},
+        "transform": {"position": {"keys": [{"at": 0.3, "v": [x + 500.0 * (x - 960.0).signum(), 470]}, {"at": 1.2, "v": [x, 470], "ease": "linear"}]}}});
+    vec![
+        ("protect", json!([{"type": "protect", "from": 0.5, "to": 1.5}]), json!([]), None),
+        ("reach the chest", json!([{"type": "reach"}]), json!([{"at": 0.5, "bone": "chest", "velocity": [-150, 0, 0]}]), None),
+        ("reach the other forearm", json!([{"type": "reach"}]), json!([{"at": 0.5, "bone": "fore_r", "velocity": [0, 0, 150]}]), None),
+        ("reach the far thigh with the left", json!([{"type": "reach", "params": {"hand": "left"}}]), json!([{"at": 0.5, "bone": "thigh_r", "velocity": [0, 0, 100]}]), None),
+        ("guard across with the left", json!([{"type": "guard", "params": {"target": "ball", "hand": "left"}}]), json!([]), Some(ball(1090.0))),
+        ("guard across with the right", json!([{"type": "guard", "params": {"target": "ball", "hand": "right"}}]), json!([]), Some(ball(830.0))),
+    ]
+}
+
+#[test]
+fn aimed_arms_go_round_the_body_not_through_it() {
+    // Six takes of an arm sent somewhere, three of them across the body.
+    // (Before hands were led round: forearms 24 to 30 px into the spine's
+    // capsule in every one, a hand 39 px into the chest it reached for.)
+    let mut pins = Vec::new();
+    for (name, behaviours, hits, ball) in arm_takes() {
+        let (bake, worst) = arms_in_trunk(behaviours, hits, ball);
+        // (The chest is what these arms hang from: an aimed forearm
+        // and hand pass through it alone, and are led round it as round
+        // the rest, so they graze its capsule, which is the fat one that
+        // holds the shoulders. Nothing else is entered.)
+        let deepest = worst.iter().filter(|(w, _)| !w.ends_with("in chest")).map(|(_, d)| *d).fold(0.0, f64::max);
+        let grazed = worst.iter().filter(|(w, _)| w.ends_with("in chest")).map(|(_, d)| *d).fold(0.0, f64::max);
+        assert!(deepest < 4.0 && grazed < 12.0, "{name}: {}", worst.iter().map(|(w, d)| format!("{w} {d:.0} px")).collect::<Vec<_>>().join(", "));
+        // And it gets where it was sent (at 1.5 s; the hit or the ball's stop is before).
+        let k = 45;
+        let reached = match name {
+            "protect" => dist(wrist(&bake, "l", 40), pose(&bake, "head", 40).apply([0.0, -24.0, 0.0])),
+            "reach the chest" => dist(wrist(&bake, "l", k), pose(&bake, "chest", k).apply([0.0, -40.0, 0.0])).min(dist(wrist(&bake, "r", k), pose(&bake, "chest", k).apply([0.0, -40.0, 0.0]))),
+            "reach the other forearm" => dist(wrist(&bake, "l", k), pose(&bake, "fore_r", k).apply([0.0, 35.0, 0.0])),
+            "reach the far thigh with the left" => dist(wrist(&bake, "l", k), pose(&bake, "thigh_r", k).apply([0.0, 55.0, 0.0])),
+            // (The ball has stopped, across the body from the hand.)
+            "guard across with the left" => dist(wrist(&bake, "l", k), [1090.0, 470.0, 0.0]),
+            _ => dist(wrist(&bake, "r", k), [830.0, 470.0, 0.0]),
+        };
+        // (A wrist on the chest is its capsule's 30 px, half the hand's
+        // length and its thickness from its middle. Across the body an
+        // arm's reach ends short of a thigh or a ball on the far side.)
+        let within = match name {
+            "protect" | "reach the other forearm" => 46.0,
+            "reach the chest" => 62.0,
+            _ => 150.0,
+        };
+        eprintln!("{name}: the wrist is {reached:.0} px from where it was sent; deepest in the trunk {deepest:.1} px, in its own chest {grazed:.1} px");
+        assert!(reached < within, "{name}: the wrist is {reached:.0} px from where it was sent");
+        assert!(fell(&bake).is_none(), "{name}: it fell");
+        pins.push(pin(&bake));
+    }
+    assert_eq!(pins, [(36621, 11581137727660598137), (36488, 947309298340335586), (36488, 17833138615412773368), (36488, 16887651574034388283), (36552, 8588104402154634968), (36552, 7065585522355567997)], "the bakes changed: if the simulator or the format did, bakes are stale and these numbers are the new ones");
 }

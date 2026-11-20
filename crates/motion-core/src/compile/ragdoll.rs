@@ -270,6 +270,12 @@ impl Compiled {
             }
             let total: f64 = share.iter().sum();
             let limit = |id: &str| r.limits.iter().find(|l| id.contains(l.bone.as_str()));
+            // A bone's own name: its id without what all the skeleton's
+            // share (the model's id an import puts before each).
+            let shared = (0..bones.len()).map(name).reduce(|a, b| &a[..a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()]).filter(|_| bones.len() > 1).map_or(0, str::len);
+            // The way it faces, in the scene's space, as it stands at rest.
+            let root = (0..bones.len()).find(|&b| parent[b].is_none()).unwrap_or(0);
+            let forward = quat_rotate(rest.get(root).map_or([0.0, 0.0, 0.0, 1.0], |p| p.q), [r.facing[0], 0.0, r.facing[1]]);
             let first_body = input.bodies.len();
             let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), self_collide: r.self_collide, release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone() };
             for b in 0..bones.len() {
@@ -336,16 +342,36 @@ impl Compiled {
                     let t = sim.start + k as f64 / rate + scene.pre_roll;
                     scales.iter().fold(c.strength.at(t), |acc, &s| acc * c.strengths[s].at(t)).clamp(0.0, 1.0)
                 });
-                let l = limit(name(b));
+                // Its limits: given, or a human's by its name, or 40 and 20.
+                let (swing, twist, hinge) = match (limit(name(b)), crate::sim::human_limit(name(b).get(shared..).unwrap_or(""))) {
+                    (Some(l), _) => (l.swing, l.twist, l.hinge),
+                    (None, Some((swing, twist, bend))) => {
+                        // A hinge's axle: across the bone and the way the
+                        // figure faces, turned so that the bone folds
+                        // back (a knee) or forward (an elbow).
+                        let ahead = quat_rotate(rest[b].inverse().q, forward);
+                        let axle = crate::sim::cross(ahead, along);
+                        let hinge = match bend {
+                            crate::sim::Bend::Ball => None,
+                            // (A limb that points the way it faces has no
+                            // such axle: it stays a ball, as wide.)
+                            _ if len(axle) < 0.2 => None,
+                            crate::sim::Bend::Forward => Some(axle),
+                            crate::sim::Bend::Back => Some(axle.map(|v| -v)),
+                        };
+                        (swing, twist, hinge)
+                    }
+                    (None, None) => (crate::sim::default_swing(), crate::sim::default_twist(), None),
+                };
                 out.bones.push(BoneInput {
                     body: first_body + b,
                     parent: parent[b],
                     anchor_parent,
                     along,
                     length,
-                    swing: l.map(|l| l.swing).unwrap_or_else(crate::sim::default_swing),
-                    twist: l.map(|l| l.twist).unwrap_or_else(crate::sim::default_twist),
-                    hinge: l.and_then(|l| l.hinge).filter(|h| len(*h) > 1e-9).map(|h| h.map(|v| v / len(h))),
+                    swing,
+                    twist,
+                    hinge: hinge.filter(|h| len(*h) > 1e-9).map(|h| h.map(|v| v / len(h))),
                     bind,
                     clip,
                     strength: strength.collect(),

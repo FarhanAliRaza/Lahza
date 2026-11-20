@@ -109,7 +109,7 @@ fn instances_of_one_character_walk_as_its_copies_did() {
 #[test]
 fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
     let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
-    let mut p = herd_scene(vec![ball.clone()], json!({"ragdoll": {"mass": 60, "max": 2}}), 1, 12.0);
+    let mut p = herd_scene(vec![ball.clone()], json!({"ragdoll": {"mass": 60, "max": 2, "limits": [{"bone": ""}]}}), 1, 12.0);
     let bake = baked(&mut p);
     let knocks: Vec<_> = bake.events.iter().filter(|e| e.kind == "knock").collect();
     assert_eq!(knocks.len(), 1, "{knocks:?}");
@@ -177,6 +177,9 @@ fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
 /// character's left leg swung in its clip: 30° forward and back a cycle.
 fn struck(ragdoll: Value) -> std::sync::Arc<Bake> {
     let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
+    // (As pinned: every joint 40° and 20°, not a human's by its name.)
+    let mut ragdoll = ragdoll;
+    ragdoll["limits"] = json!([{"bone": ""}]);
     let mut p = herd_scene(vec![ball], json!({"ragdoll": ragdoll, "dodge": 0}), 1, 6.0);
     let mut scene = serde_json::to_value(&p.scenes[0]).unwrap();
     let leg = scene["layers"][1]["layers"][0]["layers"].as_array_mut().unwrap().iter_mut().find(|l| l["id"] == "a0-leg_l").unwrap();

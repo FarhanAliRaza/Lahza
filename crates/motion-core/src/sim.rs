@@ -429,9 +429,19 @@ pub struct Ragdoll {
     #[serde(default, skip_serializing_if = "is_zero_f")]
     pub bounce: f64,
     /// Joint limits by bone id (or a part of it: "arm", "leg"); the first
-    /// that matches. Bones none matches take `swing` 40, `twist` ±20.
+    /// that matches. Bones none matches take a human's by their names
+    /// (`human_limit`: knees and elbows hinges that bend one way, and so
+    /// on; defaults, to be given here where they are wrong), and those no
+    /// name tells take `swing` 40, `twist` ±20. An entry for bone "" is
+    /// for every bone the entries before it leave.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<BoneLimit>,
+    /// The way the figure faces in its root's space as it stands at
+    /// `rest`, [x, z] (default [0, −1]: toward the viewer, as an imported
+    /// glTF character does): knees bend back from it and elbows forward,
+    /// when their hinges come from the bones' names.
+    #[serde(default = "crowd_facing", skip_serializing_if = "is_crowd_facing")]
+    pub facing: [f64; 2],
     /// A bone's collider given outright (px, the bone layer's space),
     /// for where a capsule along the bone is wrong: a foot is a box that
     /// stands flat. By bone id or a part of it; the first that matches.
@@ -463,7 +473,7 @@ pub struct Ragdoll {
 impl Ragdoll {
     /// A limp ragdoll of the skeleton under `root`.
     pub fn of(id: String, root: String, mass: f64, thickness: f64, friction: f64) -> Ragdoll {
-        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None }
+        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), facing: crowd_facing(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None }
     }
 }
 
@@ -523,6 +533,59 @@ pub struct BoneLimit {
     /// space only, `swing` degrees one way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hinge: Option<[f64; 3]>,
+}
+
+/// How a joint bends, from its bone's name.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Bend {
+    /// Any way within `swing`, and `twist` about its length.
+    Ball,
+    /// A hinge that folds the bone back (a knee), `swing` degrees.
+    Back,
+    /// A hinge that folds the bone forward (an elbow).
+    Forward,
+}
+
+/// A human joint's range by the name of the bone it holds (`name`: the
+/// bone's own, without what its skeleton's ids share): degrees of swing
+/// and of twist each way, and how it bends. The names are those of the
+/// usual rigs (Blender's, Mixamo's, Unreal's mannequin, and plain ones:
+/// thigh, shin, upper, fore). Round figures from anatomy's ranges of
+/// motion, on the loose side so a fall looks limp, not stiff; defaults.
+/// None: the name tells nothing.
+pub fn human_limit(name: &str) -> Option<(f64, f64, Bend)> {
+    let n = name.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
+    // (The specific before the general: a forearm before an arm, an
+    // upper leg before a leg, a finger before a hand. A hinge does not
+    // twist: its number is what an entry written by hand has unsaid.)
+    Some(if has(&["thumb", "index", "middle", "ring", "pinky", "finger"]) {
+        (45.0, 5.0, Bend::Ball)
+    } else if has(&["toe", "ball"]) {
+        (30.0, 5.0, Bend::Ball)
+    } else if has(&["head"]) {
+        (35.0, 40.0, Bend::Ball)
+    } else if has(&["neck"]) {
+        (30.0, 35.0, Bend::Ball)
+    } else if has(&["clavicle", "shoulder", "collar"]) {
+        (20.0, 10.0, Bend::Ball)
+    } else if has(&["forearm", "fore_arm", "lowerarm", "lower_arm", "fore", "elbow"]) {
+        (140.0, default_twist(), Bend::Forward)
+    } else if has(&["hand", "wrist"]) {
+        (50.0, 20.0, Bend::Ball)
+    } else if has(&["thigh", "upleg", "up_leg", "upperleg", "upper_leg", "femur"]) {
+        (70.0, 25.0, Bend::Ball)
+    } else if has(&["shin", "calf", "lowerleg", "lower_leg", "knee", "tibia", "leg"]) {
+        (140.0, default_twist(), Bend::Back)
+    } else if has(&["foot", "ankle"]) {
+        (35.0, 10.0, Bend::Ball)
+    } else if has(&["upperarm", "upper_arm", "uparm", "upper", "arm", "humer"]) {
+        (100.0, 60.0, Bend::Ball)
+    } else if has(&["spine", "chest", "torso", "abdomen", "waist", "belly", "back"]) {
+        (25.0, 20.0, Bend::Ball)
+    } else {
+        return None;
+    })
 }
 
 pub fn default_swing() -> f64 {
@@ -748,6 +811,9 @@ fn crowd_fallen() -> u32 {
 }
 fn crowd_facing() -> [f64; 2] {
     [0.0, -1.0]
+}
+fn is_crowd_facing(v: &[f64; 2]) -> bool {
+    *v == crowd_facing()
 }
 fn crowd_speed() -> f64 {
     140.0
@@ -1741,6 +1807,24 @@ mod tests {
         let inv = inverse(m).then(m);
         for k in 0..16 {
             assert!((inv.0[k] - Mat4::IDENTITY.0[k]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_humans_limits_are_told_by_the_usual_rigs_names() {
+        let kind = |n: &str| human_limit(n).map(|(swing, _, bend)| (swing, bend));
+        // Mixamo, Blender's Rigify, Unreal's mannequin, and plain names.
+        for knee in ["mixamorig:LeftLeg", "shin.L", "calf_r", "lower_leg.R", "RightKnee"] {
+            assert_eq!(kind(knee), Some((140.0, Bend::Back)), "{knee}");
+        }
+        for elbow in ["mixamorig:RightForeArm", "forearm.L", "lowerarm_l", "fore_r"] {
+            assert_eq!(kind(elbow), Some((140.0, Bend::Forward)), "{elbow}");
+        }
+        for (name, swing) in [("mixamorig:LeftUpLeg", 70.0), ("thigh.R", 70.0), ("upper_leg.L", 70.0), ("mixamorig:LeftArm", 100.0), ("upper_arm.L", 100.0), ("upperarm_r", 100.0), ("upper_l", 100.0), ("mixamorig:LeftShoulder", 20.0), ("clavicle_l", 20.0), ("mixamorig:LeftHand", 50.0), ("mixamorig:LeftHandIndex1", 45.0), ("thumb_01_l", 45.0), ("mixamorig:LeftToeBase", 30.0), ("ball_l", 30.0), ("mixamorig:LeftFoot", 35.0), ("mixamorig:Spine1", 25.0), ("spine_03", 25.0), ("mixamorig:Neck", 30.0), ("Head", 35.0)] {
+            assert_eq!(kind(name), Some((swing, Bend::Ball)), "{name}");
+        }
+        for unknown in ["pelvis", "mixamorig:Hips", "root", "tail_03", "mid"] {
+            assert_eq!(human_limit(unknown), None, "{unknown}");
         }
     }
 

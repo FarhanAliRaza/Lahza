@@ -122,7 +122,7 @@ fn one_struck_hard_goes_down_as_a_ragdoll_and_the_rest_walk_on() {
     // A heavy ball thrown across the row at a3, arriving as they set off.
     let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
     // (Not looking: one that sees it coming lunges, and is clipped.)
-    let ragdoll = json!({"ragdoll": {"mass": 60}, "dodge": 0});
+    let ragdoll = json!({"ragdoll": {"mass": 60, "limits": [{"bone": ""}]}, "dodge": 0});
     let mut p = crowd_scene(vec![ball.clone()], ragdoll, 1, 12.0);
     let bake = baked(&mut p);
     let knocks: Vec<_> = bake.events.iter().filter(|e| e.kind == "knock").collect();
@@ -238,7 +238,7 @@ fn an_agent_steps_out_of_the_way_of_what_is_thrown() {
     // A ball thrown along the row's line from 900 px off at a3: half a
     // second and more to see it come.
     let ball = |speed: f64| json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [540, 720], "z": -900}, "body": {"mass": 30, "velocity": [0, -120, speed]}});
-    let stay = json!({"goals": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(), "ragdoll": {"mass": 60}});
+    let stay = json!({"goals": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(), "ragdoll": {"mass": 60, "limits": [{"bone": ""}]}});
     let mut c = stay.clone();
     c["dodge"] = json!(0.0);
     let struck = baked(&mut crowd_scene(vec![ball(1500.0)], c, 1, 4.0));

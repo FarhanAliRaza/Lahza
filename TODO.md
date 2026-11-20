@@ -914,17 +914,56 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      thighs). Tested: the limp figure with a hand thrown across it has
      its forearm 21 px and its hand 24 px inside its chest without, and
      no bone more than 2 px inside another with (the forearm lies on the
-     chest), through the fall and at rest; pinned. A bone a behaviour is
-     placing (an aimed arm, the whole body while it gets up) passes
-     through the rest for those steps: arm targets are worked out
-     without the body in the way, and stopped short of the head and of
-     a hit when their arms met the chest on the way.
-   - Left, not done: limits are per bone by hand (no defaults by bone
-     name: a table of human joint ranges keyed on names is guesswork
-     without characters to try it on); a limp figure with the default
-     40° limits falls like a plank, slowly. Arms a behaviour aims do not
-     go round the body, they go through it (going round is planning an
-     arm's path, which nothing here does).
+     chest), through the fall and at rest; pinned. While it gets up the
+     whole body still passes through itself (it is placed pose by pose).
+   - Limits come from the bones' names where none are given
+     (`sim::human_limit`: a table of a human's ranges by the names the
+     usual rigs use, Blender's, Mixamo's, Unreal's and plain ones;
+     knees and elbows hinges of 140° whose axle is across the bone and
+     the way the figure faces, `facing`, so that knees fold back and
+     elbows forward; thighs 70° and 25° of twist, upper arms 100/60,
+     feet 35/10, hands 50/20, a head 35/40, a spine 25/20, and so on). A
+     bone's own name is its id without what the skeleton's ids share
+     (the model's id). They are defaults, round figures on the loose
+     side: an entry in `limits` stands before them, and one for bone ""
+     takes every bone the entries before it leave. A name that tells
+     nothing keeps 40° and 20°. Tried on the test character: with no
+     limits given, `ragdoll.py`'s takes bake to the same bytes as with
+     the limits that were written for it by hand. Tested: the figure's
+     hinges and ranges with none given; thrown hard, no joint past its
+     range, knees back only and elbows forward only, about their axles;
+     limp and shoved at 150 px/s a knee folds to its 140° and the hips
+     are down in 0.9 s (forward) or 1.4 s (back), where 40° joints all
+     round fold it 57° and it comes down as a plank in 2.1 s. Pinned.
+     The takes pinned before say their old limits outright (an entry
+     for ""), so their bytes are as they were.
+   - An aimed arm goes round the body (`Brain::route`): a target inside
+     the trunk is brought out to its surface (a hand goes onto a chest,
+     not into it); while the straight way from the hand passes through
+     the trunk or the head (their capsules, wider by the forearm's
+     thickness) the hand makes for a point beside it there, on the side
+     the way leans to and toward the body's front, and what it makes
+     for is moved out until the forearm clears too; worked out anew
+     each step. The forearm and hand of an aimed arm now meet the body
+     (they passed through all of it), but for the one bone the arm
+     hangs from, whose capsule is the fat one that holds the shoulders:
+     with that met too, on the test character the arms were held up on
+     their own chest. The upper arm still passes. Tested on six takes
+     (arms about the head, a hand to a hit on the chest, to the other
+     forearm, the left to the far thigh, and each hand to a ball across
+     the body): a forearm or hand never more than 4 px into the hips,
+     spine or head and 12 px into its own chest's capsule, where before
+     forearms were 24 to 30 px into the spine in every one and a hand
+     39 px into the chest; each hand gets where it was sent (wrists 25
+     to 53 px from it; the far thigh, 88 px, is past the arm's reach
+     round the hips), and it stands through all six. Pinned. On the
+     test character (`ragdoll.py`'s `brace`) the wrists are 19 to 40 px
+     from the head's joint from 1.2 s to 1.6 s (read off the bake; on
+     the sheet the figure is small).
+   - Left, not done: an arm goes round its trunk and head only, not
+     round its legs, the other arm, or anything outside it; the elbow
+     is where the hinge puts it (no swivel is chosen to keep it clear:
+     the forearm is kept clear by moving what the hand makes for).
 4. **A ragdoll that acts: done, with balance helped.**
    - Motors follow the clip: `strength` 0..1, keyed, per limb with
      `strengths`. A motor is a second joint beside the one with the

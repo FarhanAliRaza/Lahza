@@ -162,7 +162,7 @@ fn trying_ahead_keeps_it_up_where_holding_the_clip_does_not() {
     let (alone, on_one) = pushed(1000.0, json!({"type": "search"}), json!([]), 4.0);
     std::env::remove_var("LAHZA_SIM_THREADS");
     assert!(alone.to_bytes() == stepped.to_bytes() && on_one.search_threads == 1 && on_one.tried_steps == on_all.tried_steps);
-    assert_eq!(crate::behaviour_tests::pin(&stepped), (56950, 17133235751400427189), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&stepped), (57132, 432624273815959055), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // It has its limit too.
     let (lost, _) = pushed(1800.0, json!({"type": "search"}), json!([]), 4.0);
     assert!(drop(&lost) > 150.0);

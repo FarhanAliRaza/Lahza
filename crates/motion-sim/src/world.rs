@@ -72,6 +72,9 @@ pub struct World {
     /// Per ragdoll, per bone: a behaviour is placing it this step, and it
     /// passes through the rest of its body.
     pub(crate) free: Vec<Vec<bool>>,
+    /// Per ragdoll, per bone: the one bone it passes through this step,
+    /// plus one (an aimed forearm: the chest its arm hangs from); 0: none.
+    pub(crate) slip: Vec<Vec<u32>>,
     /// Every body's speed before the last step (what it hit with).
     pub(crate) before: Vec<Vector>,
     /// Pairs of bodies touching after the last step (for first touches).
@@ -222,7 +225,7 @@ impl World {
                 apart.insert((x.min(y), x.max(y)));
             }
         }
-        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, rigs: Vec::new(), touch: Vec::new(), free: Vec::new(), before: Vec::new(), touching: Default::default(), apart, events: Vec::new() };
+        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, rigs: Vec::new(), touch: Vec::new(), free: Vec::new(), slip: Vec::new(), before: Vec::new(), touching: Default::default(), apart, events: Vec::new() };
         for (i, b) in input.bodies.iter().enumerate() {
             if world.released[i] {
                 world.release(input, i, b);
@@ -438,7 +441,7 @@ impl World {
     pub fn step(&mut self, input: &SimInput, t: f64) {
         let before: Vec<Vector> = self.handles.iter().map(|h| self.w.bodies[*h].linvel()).collect();
         self.before = before.clone();
-        self.w.step_with_events(&crate::ragdoll::Groups(&self.touch, &self.free, &self.apart), &());
+        self.w.step_with_events(&crate::ragdoll::Groups(&self.touch, &self.free, &self.apart, &self.slip), &());
         let mut now = std::collections::BTreeSet::new();
         let index = |h: Option<RigidBodyHandle>| h.and_then(|h| self.handles.iter().position(|x| *x == h).map(|i| i as u32 + 1).or((Some(h) == self.ground).then_some(0)));
         for pair in self.w.contact_pairs() {
@@ -483,7 +486,7 @@ impl World {
         w.impulse_joints = self.w.impulse_joints.clone();
         w.multibody_joints = self.w.multibody_joints.clone();
         w.ccd_solver = self.w.ccd_solver.clone();
-        World { w, unit: self.unit, handles: self.handles.clone(), anchor: self.anchor, ground: self.ground, released: self.released.clone(), joints: self.joints.clone(), dt: self.dt, rigs: self.rigs.clone(), touch: self.touch.clone(), free: self.free.clone(), before: self.before.clone(), touching: self.touching.clone(), apart: self.apart.clone(), events: Vec::new() }
+        World { w, unit: self.unit, handles: self.handles.clone(), anchor: self.anchor, ground: self.ground, released: self.released.clone(), joints: self.joints.clone(), dt: self.dt, rigs: self.rigs.clone(), touch: self.touch.clone(), free: self.free.clone(), slip: self.slip.clone(), before: self.before.clone(), touching: self.touching.clone(), apart: self.apart.clone(), events: Vec::new() }
     }
 
     /// Body `i`'s pose now, px.
