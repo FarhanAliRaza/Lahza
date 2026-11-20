@@ -203,7 +203,8 @@ nothing below was run on that card.)
   a scrub (`forget_history` and consecutive `try_render`s while playing).
   Run through the CLI here: a 480 x 270 frame with four frames before it
   in 22 s, the usual trace's single frame at 64 paths in 24 s, the raster
-  in 14 s (all three mostly the process's start and its pipelines).
+  in 14 s (all three mostly the process's start and its pipelines, and
+  taken while other tests shared the machine).
 - **Tests** (`pt_fast_tests.rs`), with a stand-in for Ray Reconstruction
   as Open Image Denoise has one (`Tracer::pass_through_ngx`: the six
   images are read back from their textures, and the picture is the colour
@@ -328,11 +329,12 @@ it). What follows is for a card where it is not quick enough.
     traced list: a mesh's structure once (kept by its parameters; a mesh
     that changes every frame is built every frame, as traced), the
     list's top structure every frame. On software Vulkan, 480 x 270,
-    five meshes (`sky_tests::measure_sky_visibility`, `--ignored`): the
-    meshes' structures 5 ms once, the top one 0.1 ms a frame, the tables
-    7 ms a frame on the CPU, the kernel's pipeline 1.1 s once. The frame
-    itself: 142 ms against 90 ms without (by the GPU's own clock, over
-    five frames, the rays 430 ms and the filter 58 ms). Software Vulkan's
+    five meshes, nothing else running
+    (`sky_tests::measure_sky_visibility`, `--ignored`): a frame takes
+    72 ms against 44 ms without. By the profile, summed over five
+    frames: the rays 16 ms, the filter 4.5 ms, the meshes' structures
+    5.5 ms (built once), the top structure 0.6 ms, the tables 34 ms on
+    the CPU, and the kernel's pipeline 1.1 s once. Software Vulkan's
     numbers. In the editor's preview: not run.
     With motion blur each sub-frame has its own rays (they are not
     shared as a traced picture's are).
