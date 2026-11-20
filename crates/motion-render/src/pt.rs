@@ -2087,7 +2087,7 @@ mod scene_tests {
         let spp = std::env::var("LAHZA_PT_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let Some(mut r) = tracer(spp) else { return };
         if std::env::var_os("LAHZA_PT_RAW").is_some() {
-            r.options.path = Some(super::TraceOptions { spp, bounces: 4, denoise: false, temporal: false });
+            r.options.path = Some(super::TraceOptions { spp, bounces: 4, denoise: false, temporal: false, ..Default::default() });
         }
         let mut p = project(json!([
             {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#c8c2b8"}, "transform": {"position": [480, 235], "rotation_x": 90}},
@@ -2611,7 +2611,7 @@ mod physics_tests {
     fn the_denoiser_smooths_without_blurring_edges() {
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
         let with = |denoise: bool| {
-            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 4, bounces: 4, denoise, temporal: false }), ..Default::default() });
+            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 4, bounces: 4, denoise, temporal: false, ..Default::default() }), ..Default::default() });
             r.can_trace().then_some(r)
         };
         let (Some(mut on), Some(mut off)) = (with(true), with(false)) else { return };
@@ -2647,7 +2647,7 @@ mod physics_tests {
     fn sequences_accumulate_without_ghosts() {
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
         let make = |temporal: bool| {
-            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, motion_blur: false, path: Some(super::TraceOptions { spp: 2, bounces: 3, denoise: true, temporal }), ..Default::default() });
+            let r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, motion_blur: false, path: Some(super::TraceOptions { spp: 2, bounces: 3, denoise: true, temporal, ..Default::default() }), ..Default::default() });
             r.can_trace().then_some(r)
         };
         let (Some(mut on), Some(mut off)) = (make(true), make(false)) else { return };
@@ -2883,7 +2883,7 @@ mod physics_tests {
         }
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
         let mut r = Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow,
-            path: Some(super::TraceOptions { spp: 8, bounces: 4, denoise: false, temporal: false }), ..Default::default() });
+            path: Some(super::TraceOptions { spp: 8, bounces: 4, denoise: false, temporal: false, ..Default::default() }), ..Default::default() });
         let mut p = project(json!([{"id": "v", "kind": "mesh", "mesh": {"type": "box", "size": [300, 170], "depth": 400},
             "material": {"volume": {"density": 0.15, "color": "#ffffff", "anisotropy": 0.3}}, "transform": {"position": [160, 90]}}]));
         p.scenes[0].lights = serde_json::from_value(json!([{"type": "directional", "from": [0.3, -1, 0.2], "intensity": 2, "shadow": true}])).unwrap();
@@ -3016,7 +3016,7 @@ mod physics_tests {
     fn sequence_renderer(denoise: bool, temporal: bool) -> Option<Renderer> {
         tracer(1)?;
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
-        Some(Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 8, bounces: 3, denoise, temporal }), ..Default::default() }))
+        Some(Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 8, bounces: 3, denoise, temporal, ..Default::default() }), ..Default::default() }))
     }
 
     /// Frames pushed through the renderer (the next begun while the GPU

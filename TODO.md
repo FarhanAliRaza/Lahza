@@ -15,8 +15,17 @@
   --profile` and compare the frame against `--backend cpu`. A map's frame
   comes from its casters' boxes, not from every vertex, so it is a little
   wider than the CPU's (a single sphere's by up to 1.7 times: softer
-  texels); bounding spheres would tighten it. Run on the RTX 3060 since: see
-  "Tests on a hardware GPU" below.
+  texels). Run on the RTX 3060 since: see "Tests on a hardware GPU" below.
+  Since: a directional map's frame takes each caster's span from its box
+  and from the ball its points are in (the farthest point from the box's
+  middle, kept with the pooled mesh; `CasterBox::span`), whichever is
+  less, so a round caster no longer widens it. On the shadow test scene
+  the frame is the floor's and nothing changes (456 and 472 pixels off
+  the CPU's by more than 24 at 4x, before and after): the gain is for
+  round casters with no floor under the light. Still as before: a point
+  light's map (its frame is from the boxes, and a caster with corners on
+  both sides of the light gives the whole view), and meshes the GPU
+  generates (the CPU has no points: their boxes).
 - **Motion blur: what is left.** A frame takes the sub-frames its motion
   needs (`motion_px` in motion-render's lib.rs), and a sub-frame does not
   draw again what the one before it left as it needs it: a group whose
@@ -28,7 +37,14 @@
   not measured. Not done: traced frames (their sub-frames' groups sit
   side by side), groups with a mesh when any mesh of the sub-frame moved,
   and shapes, text and shader pictures that change form (they still take
-  every sample).
+  every sample). Since: `benchmark_motion_blur_with_still_groups`
+  (motion-render's tests, `--ignored`) is such a span: a blurred backdrop
+  and a glow that stand still behind a bar that moves, against the same
+  frame with both drifting. On Mesa's software Vulkan both groups are
+  reused in each of the frame's four sub-frames and the frame takes 110 ms
+  against 112: within the noise there, where the time is the passes that
+  draw the frame itself. To run on the RTX 3060 (its profile gives the
+  passes' times) before any of the "not done" is worth doing.
 - **Image memory: what is left.** Textures are held at the size they show
   (`Images::get_sized`), the pool's budget follows the GPU's memory, and
   new texels are added to the GPU's copy (all of it again only after
@@ -451,6 +467,11 @@ with a mouse on a real desktop.
 
 ## Slang
 
+Nothing here was run since: slangc cannot be had in a cloud session (its
+releases are on a host the session's network does not allow; a build of
+it from the slangpy wheel's libslang was refused). Both points need the
+machine with slangc.
+
 - **To compile once with slangc.** These were written where slangc could
   not be run, and are checked only as text (`cargo test -p
   lahza-motion-core slang`): shader layers pass their params in a
@@ -511,7 +532,14 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
 - In parallel the test binary segfaults most runs, in the Vulkan
   loader's `vkSetDebugUtilsObjectName` (devices and pipelines being made
   on several threads), with or without the changes of this branch's last
-  commits. One thread runs through.
+  commits. One thread runs through. Since: objects are named only where
+  a tool reads the names (blade's `set_object_name`: with validation or
+  capture on, or `LAHZA_VK_NAMES` set), so a run without them does not go
+  through that call at all. Not run on the card (to do: the tests there
+  without `--test-threads=1`); on Mesa's software Vulkan the crash does
+  not show, and four devices at once run a 15 GB container out of memory.
+  The app could meet the same crash (a renderer per preview, each with
+  its device): the change covers it too.
 - The hardware visibility pass drew wrong pictures there, which no test
   on Mesa's software Vulkan shows (it has no 8x, and the comparisons with
   the CPU run without the pass). Fixed:
@@ -536,3 +564,20 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
   Image Denoise and Mesa's software Vulkan
   (`pt::physics_tests::{frames_in_flight_are_the_frames_drawn_one_at_a_time,
   the_denoiser_works_on_the_tracers_memory_where_it_can}`).
+  Since, for the four: `LAHZA_MOTION_VIS_REPORT=1` makes every
+  GPU-against-CPU comparison say where the two differ instead of failing
+  (pixels over 3 levels, how many of them away from an edge and by how
+  much; `LAHZA_MOTION_DUMP=dir` keeps the frames), through the visibility
+  pass: the card's own 8x, or 4x on Mesa's software Vulkan, where the
+  four show the same kind of difference. Away from edges there, at 4x:
+  meshes 172 and 164 pixels (worst 55), surface detail 474 (worst 30),
+  area lights 13 (worst 5), the instancer's copies 0; of tests that pass
+  on the card, shadows and occluders 3 and principled materials 83. In
+  the surface-detail frame they lie along the seams between triangles
+  (a pixel two triangles share is shaded for each at the middle of the
+  samples it won, and the pass's samples fall otherwise than the CPU's:
+  bumps make that show) and as spots on the face with a normal map (not
+  looked into: the pooled vertex has two rows where the CPU's has four,
+  so some of what shading reads is worked out on the GPU). Not fixed. To
+  do on the card: run the four with the report, see whether its 8x leaves
+  the seams, and look at the normal-mapped face first.
