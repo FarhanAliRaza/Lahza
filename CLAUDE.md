@@ -54,6 +54,29 @@ gnome-extensions enable lahza-input@com.lahza
 
 Requires logging out and back in so GNOME Shell discovers it.
 
+## Testing without a GPU
+
+CI runs `cargo test --release --locked -- --test-threads=1`. On a machine
+with no GPU (a container), the motion renderer's GPU and path-tracer tests
+run on Mesa's software Vulkan:
+
+```bash
+sudo apt install -y mesa-vulkan-drivers libvulkan-dev xvfb \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+LAHZA_MOTION_SOFTWARE_GPU=1 cargo test --release -p lahza-motion-render -- --test-threads=1
+xvfb-run -a cargo test --release -p lahza -- --ignored --test-threads=1 prompt_bar editor_window
+```
+
+- Without `LAHZA_MOTION_SOFTWARE_GPU=1` the GPU tests return early and
+  pass without testing anything.
+- Keep `--test-threads=1`: several software devices at once exhaust a
+  15 GB machine, and on a real card parallel devices have crashed in the
+  Vulkan loader.
+- The render suite takes about 40 minutes there. Timings on software
+  Vulkan say little about a real card: say which numbers are whose.
+- `LAHZA_MOTION_VIS_REPORT=1` makes the GPU-against-CPU comparisons report
+  where the frames differ instead of failing.
+
 ## Performance
 
 Every editor interaction re-renders on the UI thread, so treat performance

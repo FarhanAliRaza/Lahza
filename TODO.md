@@ -1,5 +1,65 @@
 # TODO
 
+## Where things stand
+
+Every section below was worked through in cloud containers (four cores,
+no GPU: Mesa's software Vulkan, Xvfb, a stand-in for the agent). Each
+section says what was done, what was measured and what is left; this is
+the short of it.
+
+Done and run here (tests pass on the merged tree; pictures looked at):
+- The editor: drags that stalled, the prompt bar and its agent runner,
+  undo of a whole request, guarded writes, the inspector's tabs and hand
+  edits, the preview's choice of raster, sky or traced, the bake pill.
+- Simulation: baked rigid bodies and joints, glTF skinning on the CPU and
+  in the GPU's mesh pool, ragdolls that fall and act, directing takes, a
+  policy's interface and a search controller, crowds.
+- The fast mode: a fast path without NVIDIA, its tests through a stand-in
+  for Ray Reconstruction, `snapshot --fast`, history at cuts, jumps and
+  transitions.
+- Lighting: sky visibility with one bounce in the raster, the same rays
+  on the CPU (the two agree), off unless asked for.
+- The renderer and its tests: a GPU shadow map's frame from its casters'
+  balls, debug names only where a tool reads them, a report of where the
+  GPU's frame leaves the CPU's, a benchmark for motion blur over still
+  groups.
+
+To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
+in), since none of it can be seen from a container:
+1. Send one real request from the prompt bar: whether the tools run
+   without a permission refusal, whether the picture is read, how long a
+   scene takes ("Directing an agent from the editor").
+2. Drag values in the inspector: whether the bars now move freely
+   ("Drags that stall").
+3. The fast mode on the card: `fast_tests`, its measure, and Ray
+   Reconstruction's picture of what changed (the specular guide, the
+   blur, the reset at cuts); the preview with Traced chosen, for its
+   pacing.
+4. Sky visibility on the card: its cost, and its picture through the
+   hardware visibility pass; then whether it is on by default.
+5. The tests on the card: in parallel (the crash in the loader), the four
+   GPU-against-CPU ones with `LAHZA_MOTION_VIS_REPORT=1`, the two tracer
+   tests that took whatever denoiser was installed.
+6. Simulation on the card: what skinning and crowds cost the GPU and the
+   tracer, with a character of real size; a bake on another kind of CPU
+   (both containers were Xeons with FMA).
+7. Slang: both of its points need slangc, which a cloud session cannot
+   fetch.
+8. The motion blur benchmark and the shadow maps' frames on the card.
+9. NVIDIA's licence for the Ray Reconstruction shim: to read and decide
+   (packaging/ngx/README.md).
+
+Not done, and why:
+- A trained policy for ragdolls: a GPU simulator, motion capture and
+  days of training. Its interface and the no-training search are there.
+- Compiling only the edited scene on a drag tick: scenes share a
+  compiler (references across scenes, the Slang linker), for at most
+  1.7 ms at 1 200 layers.
+- A second agent runner (an API key, the tools in process): the
+  interface only.
+- Crowds as instances or impostors, a second bounce of sky light,
+  ragdolls that get up: each named in its section.
+
 ## Motion renderer
 
 - **Shadow maps on the GPU: to measure on a real device.** Lists for the
