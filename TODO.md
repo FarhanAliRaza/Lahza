@@ -755,8 +755,13 @@ coordinating session. In the order built:
      from anchor to anchor, in twelve pieces along the parabola a rope
      of its length hangs in when slack; tested end to end, looked at in
      `tumble.py`'s wall) hangs still: its slack does not swing or
-     whip, and it passes through what is between its ends. Bodies
-     inside instancers are refused. Slang-generated meshes cannot be colliders (give a shape).
+     whip, and it passes through what is between its ends. A layer
+     inside an instancer with a `body` is a body a copy (`<layer>#<n>`
+     in the bake, in joints and in events; tested: a tipped grid of six
+     bricks falls as six and is drawn where the bake has each; pinned);
+     not inside an emitter (its particles come and go) nor two
+     instancers deep, and a ragdoll's or a crowd's layers cannot be
+     copies. Slang-generated meshes cannot be colliders (give a shape).
 2. **Skeletons and skinning: done.**
    - `model_import` keeps a glTF skin: a joint node is a comp like any
      node, and the skinned mesh layer has `"skin": {"index", "joints":

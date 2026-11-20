@@ -17,6 +17,8 @@ pub(super) struct CBody {
     /// Timeline seconds of each of `spec.pushes`.
     pub pushes: Vec<f64>,
     pub bake: Option<(Arc<Bake>, usize)>,
+    /// Inside an instancer: the bake's track of each copy (`<id>#<copy>`).
+    pub copies: Option<(Arc<Bake>, Vec<Option<usize>>)>,
     /// The layer has a `body` (else it is only placed by the bake: a
     /// ragdoll's bone).
     pub declared: bool,
@@ -33,9 +35,18 @@ impl CBody {
     }
 
     /// The layer's world matrix from the bake at content time `t`.
-    pub(super) fn baked(&self, t: f64) -> Option<Mat4> {
-        let (bake, track) = self.bake.as_ref()?;
-        bake.world(*track, t - self.shift)
+    pub(super) fn baked(&self, t: f64, copy: Option<(u32, f64)>) -> Option<Mat4> {
+        match copy {
+            // (A copy plays `delay` later: the bake's time is the timeline's.)
+            Some((k, delay)) => {
+                let (bake, tracks) = self.copies.as_ref()?;
+                bake.world((*tracks.get(k as usize)?)?, t + delay - self.shift)
+            }
+            None => {
+                let (bake, track) = self.bake.as_ref()?;
+                bake.world(*track, t - self.shift)
+            }
+        }
     }
 }
 
@@ -58,11 +69,24 @@ impl<'a> Compiler<'a> {
         let bake = self.bake.as_ref().and_then(|b| Some((b.clone(), b.track(id)?)));
         let Some(spec) = c.body.clone() else {
             // A layer the bake has a track for (a ragdoll's bone).
-            return bake.map(|bake| Box::new(CBody { spec: Body::default(), shift, release: None, pushes: Vec::new(), bake: Some(bake), declared: false }));
+            return bake.map(|bake| Box::new(CBody { spec: Body::default(), shift, release: None, pushes: Vec::new(), bake: Some(bake), copies: None, declared: false }));
         };
+        // Its copies' tracks, when it is inside an instancer.
+        let copies = self.bake.as_ref().and_then(|b| {
+            let prefix = format!("{id}#");
+            let mut tracks: Vec<Option<usize>> = Vec::new();
+            for (n, t) in b.tracks.iter().enumerate() {
+                let Some(k) = t.id.strip_prefix(&prefix).and_then(|k| k.parse::<usize>().ok()) else { continue };
+                if tracks.len() <= k {
+                    tracks.resize(k + 1, None);
+                }
+                tracks[k] = Some(n);
+            }
+            (!tracks.is_empty()).then(|| (b.clone(), tracks))
+        });
         let release = spec.release.as_ref().and_then(|r| self.time(r, id, "body.release")).map(|t| t - shift);
         let pushes = spec.pushes.iter().enumerate().map(|(i, p)| self.time(&p.at, id, &format!("body.pushes.{i}.at")).unwrap_or(0.0) - shift).collect();
-        Some(Box::new(CBody { spec, shift, release, pushes, bake, declared: true }))
+        Some(Box::new(CBody { spec, shift, release, pushes, bake, copies, declared: true }))
     }
 
     /// The scene's simulation settings (the defaults when it only has
@@ -103,13 +127,40 @@ pub(super) fn visit<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, 
     }
 }
 
-/// Bodies among an instancer's copies: `visit` does not reach them.
-fn copied_bodies(layers: &[CLayer], inside: bool, out: &mut Vec<String>) {
+/// `visit`, into instancers' copies too: `f` is also given the copy a
+/// layer is in (a body in copy 3 of an instancer is `<layer>#3`).
+pub(super) fn visit_copies<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, space: &Space, under: Option<usize>, f: &mut dyn FnMut(&'l CLayer, Mat4, f64, Option<usize>, Option<u32>) -> Option<usize>) {
+    let mut cache = vec![None; layers.len()];
+    for i in 0..layers.len() {
+        let l = &layers[i];
+        let world = space.world.then(layer_matrix(layers, i, tc, inherited, space, &mut cache));
+        let step = l.step.or(inherited);
+        let below = f(l, world, clock(step, tc), under, space.copy.map(|c| c.0));
+        match &l.kind {
+            CKind::Comp(children) => visit_copies(children, child_time(l, clock(step, tc), tc, space), step, &Space { world, ..*space }, below, f),
+            CKind::Instancer(n) => {
+                for (k, m, delay) in super::instancer::copy_places(n, layers, i, tc, clock(step, tc), inherited, space, &mut cache) {
+                    visit_copies(&n.layers, tc - delay, step, &Space { world: world.then(m), copy: Some((k as u32, delay)), ..*space }, below, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bodies in copies that cannot be told apart or do not last: inside an
+/// emitter (its particles come and go), or two instancers deep.
+fn copied_bodies(layers: &[CLayer], inside: u32, out: &mut Vec<String>) {
     for l in layers {
-        if inside && l.body.as_ref().is_some_and(|b| b.declared) {
+        if inside >= 2 && l.body.as_ref().is_some_and(|b| b.declared) {
             out.push(l.id.to_string());
         }
-        copied_bodies(l.children(), inside || matches!(l.kind, CKind::Instancer(_)), out);
+        let deeper = match &l.kind {
+            CKind::Instancer(n) if n.is_emitter() => 2,
+            CKind::Instancer(_) => 1,
+            _ => 0,
+        };
+        copied_bodies(l.children(), inside + deeper, out);
     }
 }
 
@@ -223,6 +274,8 @@ fn mesh_collider(params: &Arc<MeshParams>, m: Mat4, dynamic: bool, forced: Optio
 struct Found<'l> {
     layer: &'l CLayer,
     body: &'l CBody,
+    /// The instancer's copy it is in.
+    copy: Option<u32>,
     /// Keyed world matrices: index 0 is one sample before the start.
     worlds: Vec<Mat4>,
     /// The meshes that are its shape: each with its world at the release.
@@ -304,9 +357,9 @@ impl Compiled {
             files: Vec::new(),
         };
         let mut copied = Vec::new();
-        copied_bodies(&scene.layers, false, &mut copied);
+        copied_bodies(&scene.layers, 0, &mut copied);
         for id in copied {
-            errors.push(format!("{id}.body: a layer inside an instancer cannot be a body (its copies share one layer): make the bodies layers of their own"));
+            errors.push(format!("{id}.body: a layer inside an emitter, or inside an instancer in an instancer, cannot be a body (its copies come and go, or cannot be told apart): one instancer of a grid, a ring or a path can hold bodies"));
         }
         if !(set.unit > 0.0) {
             errors.push(format!("{}.simulation.unit must be positive", scene.id));
@@ -320,10 +373,10 @@ impl Compiled {
             let tc = t + scene.pre_roll;
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
-            visit(&scene.layers, tc, None, &space, None, &mut |l, world, _, under| {
+            visit_copies(&scene.layers, tc, None, &space, None, &mut |l, world, _, under, copy| {
                 let Some(body) = l.body.as_deref().filter(|b| b.declared) else { return under };
                 if k == 0 {
-                    found.push(Found { layer: l, body, worlds: Vec::with_capacity(samples as usize + 2), meshes: Vec::new() });
+                    found.push(Found { layer: l, body, copy, worlds: Vec::with_capacity(samples as usize + 2), meshes: Vec::new() });
                 }
                 found[n].worlds.push(world);
                 n += 1;
@@ -342,7 +395,7 @@ impl Compiled {
             let tc = t + scene.pre_roll;
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
-            visit(&scene.layers, tc, None, &space, None, &mut |l, world, clock, under| {
+            visit_copies(&scene.layers, tc, None, &space, None, &mut |l, world, clock, under, _| {
                 let own = l.body.as_ref().is_some_and(|b| b.declared).then(|| {
                     n += 1;
                     n - 1
@@ -358,7 +411,12 @@ impl Compiled {
         }
         let mut files: Vec<String> = Vec::new();
         for (f, &release) in found.iter().zip(&releases) {
-            let (spec, id) = (&f.body.spec, &*f.layer.id);
+            // (A copy's body is `<layer>#<copy>`.)
+            let id = match f.copy {
+                Some(k) => format!("{}#{k}", f.layer.id),
+                None => f.layer.id.to_string(),
+            };
+            let (spec, id) = (&f.body.spec, id.as_str());
             let dynamic = spec.kind == BodyKind::Dynamic;
             let world = f.worlds[release as usize + 1];
             let (pose, rest) = decompose(world);

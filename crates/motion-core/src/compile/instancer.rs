@@ -643,6 +643,41 @@ pub(super) fn particle(e: &crate::document::Emitter, slots: usize, j: usize, tau
 /// instancer's own space; `t` its clock and `tc` the content time its
 /// copies are delayed from.
 #[allow(clippy::too_many_arguments)]
+/// Where each copy stands in the instancer's space and how much later it
+/// plays, as `emit_copies` places them (every copy, seen or not: what a
+/// bake's bodies are found by). None for an emitter's particles.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn copy_places(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, inherited: Option<Step>, space: &Space, cache: &mut [Option<Mat4>]) -> Vec<(usize, Mat4, f64)> {
+    if n.is_emitter() {
+        return Vec::new();
+    }
+    let points = points(n, layers, i, tc, t, inherited, space, cache);
+    let fields: Vec<FieldNow> = n.fields.iter().map(|f| f.now(t)).collect();
+    n.copies
+        .iter()
+        .zip(&points)
+        .enumerate()
+        .map(|(k, (base, &(px, py, angle)))| {
+            let (x, y) = (px + base.jitter.0, py + base.jitter.1);
+            let (mut dx, mut dy, mut scale, mut rotation) = (0.0, 0.0, base.scale, angle + base.rotation);
+            for f in &fields {
+                let w = f.weight(x, y);
+                dx += f.position.0 * w;
+                dy += f.position.1 * w;
+                scale += f.scale * w;
+                rotation += f.rotation * w;
+            }
+            (k, Mat4::translate(x + dx, y + dy, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, scale.abs())), base.delay)
+        })
+        .collect()
+}
+
+impl CInstancer {
+    pub(super) fn is_emitter(&self) -> bool {
+        matches!(self.layout, CLayout::Emitter(_))
+    }
+}
+
 pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, t: f64, step: Option<Step>, inherited: Option<Step>, space: &Space, inner: &Space, opacity: f64, cache: &mut [Option<Mat4>], out: &mut Vec<LayerState>) {
     if let CLayout::Emitter(e) = &n.layout {
         // Particles: each slot's newest live particle; the template plays
@@ -665,7 +700,7 @@ pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, 
     }
     let points = points(n, layers, i, tc, t, inherited, space, cache);
     let fields: Vec<FieldNow> = n.fields.iter().map(|f| f.now(t)).collect();
-    for (base, &(px, py, angle)) in n.copies.iter().zip(&points) {
+    for (k, (base, &(px, py, angle))) in n.copies.iter().zip(&points).enumerate() {
         let (x, y) = (px + base.jitter.0, py + base.jitter.1);
         let (mut dx, mut dy) = (0.0, 0.0);
         let mut scale = base.scale;
@@ -691,7 +726,7 @@ pub(super) fn emit_copies(n: &CInstancer, layers: &[CLayer], i: usize, tc: f64, 
             continue;
         }
         let m = Mat4::translate(x + dx, y + dy, 0.0).then(Mat4::rotate_z(rotation)).then(Mat4::scale(scale, scale, scale.abs()));
-        let copy = Space { world: inner.world.then(m), ..*inner };
+        let copy = Space { world: inner.world.then(m), copy: Some((k as u32, base.delay)), ..*inner };
         let first = out.len();
         emit(&n.layers, tc - base.delay, step, &copy, opacity * alpha, out);
         if let Some((c, a)) = colour {

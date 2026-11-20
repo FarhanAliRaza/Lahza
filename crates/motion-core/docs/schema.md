@@ -645,6 +645,11 @@ bake is missing or stale (anything it was made from changed: a body, its
 shape or keys, a joint, a push, the settings); until it is baked again the
 old motion is what is drawn. A camera, material or light is not part of it.
 
+A layer with a `body` inside an instancer is a body per copy (a wall of
+bricks from one layer and a grid): copy `n`'s body is `<layer>#<n>`, the
+name a joint, an event and the bake know it by. Not inside an emitter,
+nor inside an instancer in an instancer.
+
 Space is the scene's: px, x right, y down, z away. The simulator works in
 metres, `unit` px to the metre (default 100: a 100 px box is a metre
 across and falls as one does).

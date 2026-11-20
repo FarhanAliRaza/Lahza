@@ -1856,7 +1856,7 @@ impl Compiled {
         let (fov, dolly) = (scene.camera_fov.at(tc), scene.camera_dolly.at(tc));
         let shift = scene.camera_shift.at(tc);
         let cam = Camera3::new(w, h, (center.x(), center.y()), zoom, roll, fov, (orbit.x(), orbit.y()), dolly).shifted((shift.x(), shift.y()));
-        let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None, keyed: false };
+        let mut space = Space { world: Mat4::IDENTITY, flat, cam, three_d: false, dof: None, keyed: false, copy: None };
         let aperture = scene.camera_aperture.at(tc);
         if aperture > 0.0 {
             // Depths are view-space z; the point of interest sits at the
@@ -2053,6 +2053,9 @@ struct Space {
     /// Bodies stand where their keys put them (no bake): what a bake is
     /// made from.
     keyed: bool,
+    /// Inside an instancer's copy: which, and how much later it plays.
+    /// (A body in it is the bake's `<layer>#<copy>`.)
+    copy: Option<(u32, f64)>,
 }
 
 /// Depth of field: blur sigma = `per_px` × |view depth − `plane`| canvas px.
@@ -2088,7 +2091,7 @@ fn layer_matrix(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, s
     let t = clock(l.step.or(inherited), tc);
     // A body from its release on: where the bake has it (the scene's
     // space), in this layer list's.
-    if let (false, Some(w)) = (space.keyed, l.body.as_ref().and_then(|b| b.baked(t))) {
+    if let (false, Some(w)) = (space.keyed, l.body.as_ref().and_then(|b| b.baked(t, space.copy))) {
         let m = crate::sim::inverse(space.world).then(w);
         cache[i] = Some(m);
         return m;
