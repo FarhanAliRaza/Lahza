@@ -14,6 +14,7 @@ use crate::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+mod crowd;
 mod instancer;
 mod meshes;
 mod ragdoll;
@@ -2190,7 +2191,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             let (target, opacity) = if group { (&mut kids, 1.0) } else { (&mut *out, parent_opacity * own_opacity) };
             match &l.kind {
                 CKind::Instancer(n) => instancer::emit_copies(n, layers, i, tc, t, step, inherited, space, &inner, opacity, cache, target),
-                _ => emit(l.children(), tc - l.offset, step, &inner, opacity, target),
+                _ => emit(l.children(), sim::child_time(l, t, tc, space), step, &inner, opacity, target),
             }
             if !group {
                 return;

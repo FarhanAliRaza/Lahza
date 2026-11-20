@@ -7,6 +7,7 @@
 //! fixed, and bodies, colliders and joints are made in the input's order.
 
 pub mod behaviour;
+pub mod crowd;
 pub mod policy;
 pub mod ragdoll;
 pub mod search;
@@ -123,11 +124,13 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
             track.samples.push([p.p[0] as f32, p.p[1] as f32, p.p[2] as f32, p.q[0] as f32, p.q[1] as f32, p.q[2] as f32, p.q[3] as f32]);
         }
     };
+    let mut herd = crowd::Herd::new(input, &mut take.world);
     let n = input.substeps as u64;
     let mut steps = 0u64;
     for k in 0..input.samples {
         take.release_due(input, k);
         record(&take.world, &mut tracks);
+        herd.plan(input, &take.world);
         // Once a frame, what sets the motors is asked.
         let t = input.start + k as f64 / input.rate;
         for (rig, mind) in minds.iter_mut().enumerate() {
@@ -146,12 +149,31 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
             }
         }
         for s in 0..n {
+            if !herd.is_empty() {
+                herd.drive(&mut take.world, (s + 1) as f64 / n as f64);
+            }
             take.step(input, k, s);
+            if !herd.is_empty() {
+                herd.knocks(input, &mut take.world, k, input.start + (k as f64 + (s + 1) as f64 / n as f64) / input.rate);
+            }
             steps += 1;
         }
     }
     record(&take.world, &mut tracks);
+    herd.plan(input, &take.world);
     let mut events = std::mem::take(&mut take.world.events);
+    events.append(&mut herd.events);
+    // A crowd's agents, and the bones of those knocked down from when
+    // they were (the others' stay their agents').
+    let (agents, let_go) = herd.finish(input);
+    for (body, at) in let_go {
+        if let Some(track) = dynamic.iter().position(|&i| i == body) {
+            tracks[track].from = at;
+        }
+    }
+    // (Bones never let go have nothing to say: their agents place them.)
+    tracks.retain(|t| t.from != u32::MAX);
+    tracks.extend(agents);
     for b in &mut take.brains {
         events.append(&mut b.events);
     }
@@ -184,6 +206,8 @@ pub fn bake_scene(compiled: &Compiled, scene: usize, dir: Option<&std::path::Pat
 mod behaviour_tests;
 #[cfg(test)]
 mod controller_tests;
+#[cfg(test)]
+mod crowd_tests;
 #[cfg(test)]
 mod ragdoll_tests;
 #[cfg(test)]

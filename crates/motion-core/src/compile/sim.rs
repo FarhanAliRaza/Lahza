@@ -23,6 +23,15 @@ pub(super) struct CBody {
 }
 
 impl CBody {
+    /// For a layer whose children play a clip by the bake (a crowd's
+    /// agent): the children's content time at the layer's content time `t`.
+    pub(super) fn clock(&self, t: f64) -> Option<f64> {
+        let (bake, track) = self.bake.as_ref()?;
+        let tr = bake.tracks.get(*track)?;
+        let x = bake.position(t - self.shift);
+        (x >= tr.from as f64 - 1e-9).then(|| tr.clock_at(x)).flatten().map(|c| c + self.shift)
+    }
+
     /// The layer's world matrix from the bake at content time `t`.
     pub(super) fn baked(&self, t: f64) -> Option<Mat4> {
         let (bake, track) = self.bake.as_ref()?;
@@ -38,6 +47,8 @@ pub struct CSim {
     /// Per joint: the motor's target.
     motors: Vec<Option<Prop<f64>>>,
     blasts: Vec<f64>,
+    /// Per crowd: when its clip starts (timeline seconds).
+    pub(super) crowd_clips: Vec<Option<f64>>,
     pub(super) ragdolls: Vec<super::ragdoll::CRagdoll>,
     pub bake: Option<Arc<Bake>>,
 }
@@ -64,8 +75,16 @@ impl<'a> Compiler<'a> {
         let to = settings.end.as_ref().and_then(|r| self.time(r, id, "simulation.end")).map(|t| t - pre_roll).unwrap_or(end).min(end);
         let motors = settings.joints.iter().enumerate().map(|(i, j)| j.motor.as_ref().map(|m| self.prop(&m.target, id, &format!("simulation.joints.{i}.motor.target"), start, None, pre_roll))).collect();
         let blasts = settings.blasts.iter().enumerate().map(|(i, b)| self.time(&b.at, id, &format!("simulation.blasts.{i}.at")).unwrap_or(0.0) - pre_roll).collect();
-        CSim { settings, start: from, end: to, motors, blasts, ragdolls: self.ragdolls(scene, start, pre_roll), bake: self.bake.clone() }
+        let crowd_clips = settings.crowds.iter().enumerate().map(|(n, c)| c.clip.as_ref().and_then(|r| self.time(r, id, &format!("simulation.crowds.{n}.clip"))).map(|t| t - pre_roll)).collect();
+        CSim { settings, start: from, end: to, motors, blasts, crowd_clips, ragdolls: self.ragdolls(scene, start, pre_roll), bake: self.bake.clone() }
     }
+}
+
+/// The content time a comp's children are at: the comp's, less its
+/// offset; or, for a crowd's agent, what the bake says its clip is at.
+pub(super) fn child_time(l: &CLayer, t: f64, tc: f64, space: &Space) -> f64 {
+    let baked = if space.keyed { None } else { l.body.as_ref().and_then(|b| b.clock(t)) };
+    baked.unwrap_or(tc) - l.offset
 }
 
 /// Calls `f` for every layer under `layers` (comps' children too, not an
@@ -79,7 +98,7 @@ pub(super) fn visit<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, 
         let step = l.step.or(inherited);
         let below = f(l, world, clock(step, tc), under);
         if let CKind::Comp(children) = &l.kind {
-            visit(children, tc - l.offset, step, &Space { world, ..*space }, below, f);
+            visit(children, child_time(l, clock(step, tc), tc, space), step, &Space { world, ..*space }, below, f);
         }
     }
 }
@@ -467,14 +486,12 @@ impl Compiled {
             input.blasts.push(BlastInput { at: *at, origin: b.origin, speed: b.speed, radius: b.radius });
         }
         self.ragdoll_input(i, &mut input, &mut errors);
+        self.crowd_input(i, &mut input, &mut errors);
         // A policy's file is part of what the bake is made from.
         files.extend(set.ragdolls.iter().filter_map(|r| match &r.controller {
             Some(crate::sim::Controller::Policy { src }) => Some(src.clone()),
             _ => None,
         }));
-        if !set.crowds.is_empty() {
-            errors.push(format!("{}.simulation.crowds: crowds are not built yet", scene.id));
-        }
         files.sort();
         files.dedup();
         if let Some(dir) = dir {

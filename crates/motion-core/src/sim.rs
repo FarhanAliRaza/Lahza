@@ -436,6 +436,13 @@ pub struct Ragdoll {
     pub controller: Option<Controller>,
 }
 
+impl Ragdoll {
+    /// A limp ragdoll of the skeleton under `root`.
+    pub fn of(id: String, root: String, mass: f64, thickness: f64, friction: f64) -> Ragdoll {
+        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), controller: None }
+    }
+}
+
 fn ragdoll_mass() -> f64 {
     70.0
 }
@@ -589,46 +596,71 @@ fn search_spread() -> f64 {
     12.0
 }
 
-/// A crowd: `count` copies of the layer `agent` (a comp: a character with
-/// its clip) that walk toward `goal`, round each other and round bodies.
-/// Each is drawn from the bake; one a body hits hard becomes a ragdoll
-/// when its `agent` has a skeleton.
+/// A crowd: agents (comps: a character each, with its clip keyed from
+/// `clip` on) that walk from where they stand to their goals, round each
+/// other and round bodies in their way. The bake places each agent's comp
+/// and runs its clip with the distance it has walked, so feet do not
+/// slide. An agent a body strikes at `knock` px/s or more goes down: a
+/// limp ragdoll from then when the crowd has a `ragdoll`, else it stops.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Crowd {
     pub id: String,
-    /// The instancer that draws the agents (its copies are placed by the
-    /// bake).
-    pub layer: String,
-    pub count: u32,
-    /// Where they start: a box [[x0, z0], [x1, z1]] on the ground (px).
-    pub area: [[f64; 2]; 2],
-    /// Where they go: a point [x, z], or one per agent in turn.
+    /// The agents' layers (comps), each walking on the level (x, z) from
+    /// where its keys have it at the simulation's start.
+    pub agents: Vec<String>,
+    /// Where they go, [x, z] px: one for all, or one per agent in turn.
     pub goals: Vec<[f64; 2]>,
     /// px/s, and how much it differs between agents (0..1).
     #[serde(default = "crowd_speed")]
     pub speed: f64,
     #[serde(default = "crowd_vary")]
     pub vary: f64,
-    /// An agent's radius, px.
+    /// An agent's radius and height, px (height: six radii by default).
     #[serde(default = "crowd_radius")]
     pub radius: f64,
-    /// The ground's height (px, y).
-    #[serde(default)]
-    pub y: f64,
-    /// Seconds of the clip per px walked ÷ its stride: the clip's time
-    /// runs with the distance walked, so feet do not slide. px a cycle of
-    /// the clip covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    /// px a cycle of the clip covers, and seconds the cycle lasts.
     #[serde(default = "crowd_stride")]
     pub stride: f64,
-    /// Seconds a cycle of the clip lasts.
     #[serde(default = "one")]
     pub cycle: f64,
+    /// When the agents' clip starts (default: the simulation's start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip: Option<TimeRef>,
+    /// The way an agent faces in its own space, [x, z] (default [0, −1]:
+    /// toward the viewer, as an imported glTF character does).
+    #[serde(default = "crowd_facing")]
+    pub facing: [f64; 2],
     /// px/s of a body's speed into an agent that knocks it down.
     #[serde(default = "crowd_knock")]
     pub knock: f64,
+    /// Agents knocked down fall as ragdolls made like this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ragdoll: Option<CrowdRagdoll>,
 }
 
+/// How a crowd's agents are made ragdolls (`Ragdoll`'s fields of the same
+/// names; the bones are the comps under each agent that a skin names).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrowdRagdoll {
+    #[serde(default = "ragdoll_mass")]
+    pub mass: f64,
+    #[serde(default = "ragdoll_thickness")]
+    pub thickness: f64,
+    #[serde(default = "friction")]
+    pub friction: f64,
+    #[serde(default)]
+    pub limits: Vec<BoneLimit>,
+    #[serde(default)]
+    pub shapes: Vec<BoneShape>,
+}
+
+fn crowd_facing() -> [f64; 2] {
+    [0.0, -1.0]
+}
 fn crowd_speed() -> f64 {
     140.0
 }
@@ -783,8 +815,8 @@ pub struct Track {
     pub rest: Mat4,
     /// Per sample: position px (x, y, z), then a quaternion (x, y, z, w).
     pub samples: Vec<[f32; 7]>,
-    /// Per sample, for what plays a clip (a crowd's agents): the clip's
-    /// time in seconds. Empty otherwise.
+    /// Per sample, for what plays a clip (a crowd's agent): the timeline
+    /// seconds its children are shown at. Empty otherwise.
     pub clock: Vec<f32>,
 }
 
@@ -839,7 +871,7 @@ impl Track {
         Some(Pose { p: [l(0), l(1), l(2)], q })
     }
 
-    /// The clip's time at sample position `x`.
+    /// The time its children are shown at, at sample position `x`.
     pub fn clock_at(&self, x: f64) -> Option<f64> {
         let last = self.clock.len().checked_sub(1)?;
         let x = x.clamp(0.0, last as f64);
@@ -1143,18 +1175,34 @@ pub struct RagdollInput {
     pub controller: Option<Controller>,
 }
 
+/// A crowd's agent: where it starts and goes, and its skeleton.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentInput {
+    pub id: String,
+    /// Its keyed place at the simulation's start, and its scale and anchor.
+    pub start: Pose,
+    pub rest: Mat4,
+    pub goal: [f64; 2],
+    /// Its ragdoll, in `SimInput::ragdolls`.
+    pub ragdoll: Option<usize>,
+    /// Per bone of that ragdoll, per sample of one cycle of the clip: the
+    /// bone's place in the agent's frame.
+    pub local: Vec<Vec<Pose>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CrowdInput {
     pub id: String,
-    pub count: u32,
-    pub area: [[f64; 2]; 2],
-    pub goals: Vec<[f64; 2]>,
+    pub agents: Vec<AgentInput>,
     pub speed: f64,
     pub vary: f64,
     pub radius: f64,
-    pub y: f64,
+    pub height: f64,
     pub stride: f64,
     pub cycle: f64,
+    /// Timeline seconds the agents' clip starts at.
+    pub clip_at: f64,
+    pub facing: [f64; 2],
     pub knock: f64,
 }
 
@@ -1367,10 +1415,21 @@ impl SimInput {
         h.u64(self.crowds.len() as u64);
         for c in &self.crowds {
             h.str(&c.id);
-            h.fs(&[c.count as f64, c.speed, c.vary, c.radius, c.y, c.stride, c.cycle, c.knock]);
-            h.fs(&[c.area[0][0], c.area[0][1], c.area[1][0], c.area[1][1]]);
-            for g in &c.goals {
-                h.fs(g);
+            h.fs(&[c.speed, c.vary, c.radius, c.height, c.stride, c.cycle, c.clip_at, c.knock]);
+            h.fs(&c.facing);
+            h.u64(c.agents.len() as u64);
+            for a in &c.agents {
+                h.str(&a.id);
+                h.pose(&a.start);
+                h.fs(&a.rest.0);
+                h.fs(&a.goal);
+                h.u64(a.ragdoll.map(|r| r as u64 + 1).unwrap_or(0));
+                for bone in &a.local {
+                    h.u64(bone.len() as u64);
+                    for p in bone {
+                        h.pose(p);
+                    }
+                }
             }
         }
         h.u64(self.files.len() as u64);

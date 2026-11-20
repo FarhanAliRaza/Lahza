@@ -47,10 +47,7 @@ impl Rng {
     pub fn signed(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 52) as f64 - 1.0
     }
-    /// 0..1.
-    pub fn unit(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
+
 }
 
 pub struct World {
@@ -70,6 +67,8 @@ pub struct World {
     pub dt: f64,
     /// One per `SimInput::ragdolls`.
     pub rigs: Vec<crate::ragdoll::Rig>,
+    /// Every body's speed before the last step (what it hit with).
+    pub(crate) before: Vec<Vector>,
     /// Pairs of bodies touching after the last step (for first touches).
     touching: std::collections::BTreeSet<(u32, u32)>,
     pub events: Vec<SimEvent>,
@@ -197,12 +196,16 @@ impl World {
                     c.user_data = b.group as u128;
                     c.set_active_hooks(ActiveHooks::FILTER_CONTACT_PAIRS);
                 }
+                // (A crowd's agent's bones: nothing until it is knocked down.)
+                if b.release == u32::MAX {
+                    c.set_enabled(false);
+                }
                 w.insert_collider(c, Some(h));
             }
             handles.push(h);
             released.push(b.kind == BodyKind::Dynamic && b.release == 0);
         }
-        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, rigs: Vec::new(), touching: Default::default(), events: Vec::new() };
+        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, rigs: Vec::new(), before: Vec::new(), touching: Default::default(), events: Vec::new() };
         for (i, b) in input.bodies.iter().enumerate() {
             if world.released[i] {
                 world.release(input, i, b);
@@ -379,6 +382,7 @@ impl World {
     /// One step, from time `t`; first touches between bodies are noted.
     pub fn step(&mut self, input: &SimInput, t: f64) {
         let before: Vec<Vector> = self.handles.iter().map(|h| self.w.bodies[*h].linvel()).collect();
+        self.before = before.clone();
         self.w.step_with_events(&crate::ragdoll::Groups, &());
         let mut now = std::collections::BTreeSet::new();
         let index = |h: Option<RigidBodyHandle>| h.and_then(|h| self.handles.iter().position(|x| *x == h).map(|i| i as u32 + 1).or((Some(h) == self.ground).then_some(0)));
@@ -422,7 +426,7 @@ impl World {
         w.impulse_joints = self.w.impulse_joints.clone();
         w.multibody_joints = self.w.multibody_joints.clone();
         w.ccd_solver = self.w.ccd_solver.clone();
-        World { w, unit: self.unit, handles: self.handles.clone(), anchor: self.anchor, ground: self.ground, released: self.released.clone(), joints: self.joints.clone(), dt: self.dt, rigs: self.rigs.clone(), touching: self.touching.clone(), events: Vec::new() }
+        World { w, unit: self.unit, handles: self.handles.clone(), anchor: self.anchor, ground: self.ground, released: self.released.clone(), joints: self.joints.clone(), dt: self.dt, rigs: self.rigs.clone(), before: self.before.clone(), touching: self.touching.clone(), events: Vec::new() }
     }
 
     /// Body `i`'s pose now, px.

@@ -48,7 +48,7 @@ impl<'a> Compiler<'a> {
 
 /// The layers as a flat tree: each with the index of the layer it is
 /// inside (comps only).
-fn tree<'l>(layers: &'l [CLayer], inside: Option<usize>, out: &mut Vec<(&'l CLayer, Option<usize>)>) {
+pub(super) fn tree<'l>(layers: &'l [CLayer], inside: Option<usize>, out: &mut Vec<(&'l CLayer, Option<usize>)>) {
     for l in layers {
         out.push((l, inside));
         let me = out.len() - 1;
@@ -102,7 +102,17 @@ impl Compiled {
         let scene = &self.scenes[i];
         let sim = &scene.sim;
         let set = &sim.settings;
-        if set.ragdolls.is_empty() {
+        // The document's ragdolls, then a limp one per agent of a crowd
+        // that has a `ragdoll` (let go when the agent is knocked down).
+        let limp = CRagdoll { release: None, rest: None, strength: Prop::constant(0.0), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new() };
+        let agents: Vec<crate::sim::Ragdoll> = set
+            .crowds
+            .iter()
+            .flat_map(|c| c.ragdoll.iter().flat_map(move |r| c.agents.iter().map(move |a| crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), ..crate::sim::Ragdoll::of(format!("{}/{a}", c.id), a.clone(), r.mass, r.thickness, r.friction) })))
+            .collect();
+        let own = set.ragdolls.len();
+        let specs: Vec<(&crate::sim::Ragdoll, &CRagdoll)> = set.ragdolls.iter().zip(&sim.ragdolls).chain(agents.iter().map(|a| (a, &limp))).collect();
+        if specs.is_empty() {
             return;
         }
         let (rate, samples) = (input.rate, input.samples as usize);
@@ -113,8 +123,8 @@ impl Compiled {
         let index: HashMap<&str, usize> = flat.iter().enumerate().map(|(k, (l, _))| (&*l.id, k)).collect();
         // Each ragdoll's bones, as indices into `flat`, in tree order.
         let mut all: Vec<Vec<usize>> = Vec::new();
-        for (n, r) in set.ragdolls.iter().enumerate() {
-            let what = format!("{}.simulation.ragdolls.{n}", scene.id);
+        for (n, (r, _)) in specs.iter().enumerate() {
+            let what = if n < own { format!("{}.simulation.ragdolls.{n}", scene.id) } else { format!("{}.simulation.crowds: agent '{}'", scene.id, r.root) };
             let Some(&root) = index.get(r.root.as_str()) else {
                 errors.push(format!("{what}.root: no layer '{}' in the scene", r.root));
                 all.push(Vec::new());
@@ -145,6 +155,10 @@ impl Compiled {
                 // No skin names them: every comp under the root is a bone.
                 if named.is_empty() { (0..flat.len()).filter(|&k| under(k) && comp(k)).collect() } else { named }
             };
+            // (A crowd's agent is placed by the crowd: its own comp is no bone.)
+            if n >= own {
+                bones.retain(|&k| k != root);
+            }
             bones.sort_unstable();
             bones.dedup();
             if bones.is_empty() {
@@ -181,8 +195,10 @@ impl Compiled {
             at(sim.start + (k as f64 - 1.0) / rate, &mut |r, b, w| worlds[r][b].push(w));
         }
         let sample_of = |t: f64| (((t - sim.start) * rate).round().max(0.0) as u32).min(samples as u32);
-        for (n, ((r, c), bones)) in set.ragdolls.iter().zip(&sim.ragdolls).zip(&all).enumerate() {
-            let release = c.release.map(sample_of).unwrap_or(0);
+        for (n, ((r, c), bones)) in specs.iter().zip(&all).enumerate() {
+            // (A crowd's are let go by the simulation, if ever.)
+            let puppet = n >= own;
+            let release = if puppet { 0 } else { c.release.map(sample_of).unwrap_or(0) };
             let mut rest: Vec<Pose> = vec![Pose::IDENTITY; bones.len()];
             at(c.rest.unwrap_or(sim.start), &mut |rr, b, w| {
                 if rr == n {
@@ -343,6 +359,17 @@ impl Compiled {
                     params: bh.params.clone(),
                     target_body,
                 });
+            }
+            if puppet {
+                for b in &mut out.bones {
+                    let body = &mut input.bodies[b.body];
+                    body.keyed.truncate(1);
+                    body.before = body.keyed[0];
+                    body.release = u32::MAX;
+                    b.clip = Vec::new();
+                    b.strength = vec![0.0];
+                }
+                out.release = u32::MAX;
             }
             input.ragdolls.push(out);
         }

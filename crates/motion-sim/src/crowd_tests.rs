@@ -1,0 +1,179 @@
+use crate::tests::{baked, project};
+use lahza_motion_core::compile::Content;
+use lahza_motion_core::sim::Bake;
+use lahza_motion_core::space::Mat4;
+use lahza_motion_core::{Compiled, LayerState, Project};
+use serde_json::{json, Value};
+
+/// An agent: a comp at (x, 800) on the floor holding a five-bone figure
+/// (hips, spine, head, two legs) and a marker that its clip moves 100 px
+/// a second from the clip's start.
+fn agent(i: usize, x: f64, z: f64) -> Value {
+    let bone = |id: &str, at: [f64; 2], kids: Vec<Value>| json!({"id": format!("a{i}-{id}"), "kind": "comp", "three_d": true, "transform": {"position": at}, "layers": kids});
+    let skeleton = bone("hips", [0.0, -90.0], vec![bone("spine", [0.0, -40.0], vec![bone("head", [0.0, -30.0], vec![])]), bone("leg_l", [-12.0, 5.0], vec![]), bone("leg_r", [12.0, 5.0], vec![])]);
+    let marker = json!({"id": format!("a{i}-mark"), "kind": "mesh", "mesh": {"type": "sphere", "radius": 5},
+        "transform": {"position": {"keys": [{"at": 0, "v": [0, -200]}, {"at": 1, "v": [100, -200], "ease": "linear"}]}}});
+    json!({"id": format!("a{i}"), "kind": "comp", "three_d": true, "transform": {"position": [x, 800], "z": z}, "layers": [skeleton, marker]})
+}
+
+fn floor() -> Value {
+    json!({"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [6000, 40], "depth": 6000}, "transform": {"position": [960, 820]}, "body": {"type": "fixed"}})
+}
+
+fn crowd_scene(extra: Vec<Value>, crowd: Value, seed: u64, seconds: f64) -> Project {
+    let mut layers = vec![floor()];
+    layers.extend((0..6).map(|i| agent(i, 300.0 + i as f64 * 80.0, 0.0)));
+    layers.extend(extra);
+    let mut c = json!({"id": "walkers", "agents": ["a0", "a1", "a2", "a3", "a4", "a5"], "goals": (0..6).map(|i| json!([1300.0 + i as f64 * 90.0, 260.0])).collect::<Vec<_>>(), "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0});
+    for (k, v) in crowd.as_object().unwrap() {
+        c[k] = v.clone();
+    }
+    project(json!({"id": "s1", "simulation": {"seed": seed, "crowds": [c]}, "layers": layers}), seconds)
+}
+
+fn at(bake: &Bake, id: &str, k: usize) -> [f64; 3] {
+    let s = bake.tracks[bake.track(id).unwrap_or_else(|| panic!("no track for {id}"))].samples[k];
+    [s[0] as f64, s[1] as f64, s[2] as f64]
+}
+
+fn level(a: [f64; 3], b: [f64; 3]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn world(layers: &[LayerState], id: &str) -> Option<Mat4> {
+    for l in layers {
+        match &l.content {
+            Content::Mesh(m) if &*l.id == id => return Some(m.world),
+            Content::Group(g) => {
+                if let Some(m) = world(g, id) {
+                    return Some(m);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[test]
+fn agents_walk_to_their_goals_round_each_other_and_a_pillar() {
+    // A pillar stands on the straight line from the row to the goals.
+    let pillar = json!({"id": "pillar", "kind": "mesh", "mesh": {"type": "box", "size": [90, 300], "depth": 90}, "transform": {"position": [950, 650], "z": 130}, "body": {"type": "fixed"}});
+    let mut p = crowd_scene(vec![pillar], json!({}), 1, 12.0);
+    let bake = baked(&mut p);
+    let n = bake.tracks[bake.track("a0").unwrap()].samples.len();
+    assert_eq!((bake.tracks.len(), n), (6, 361), "an agent a track, and no bone's (none fell)");
+    for i in 0..6 {
+        let id = format!("a{i}");
+        // It starts where its keys have it and ends at its goal, on the floor all the way.
+        assert!(level(at(&bake, &id, 0), [300.0 + i as f64 * 80.0, 800.0, 0.0]) < 1e-3);
+        let end = at(&bake, &id, n - 1);
+        assert!(level(end, [1300.0 + i as f64 * 90.0, 0.0, 260.0]) < 30.0, "{id} ended at {end:?}");
+        assert!((0..n).all(|k| (at(&bake, &id, k)[1] - 800.0).abs() < 1e-3));
+        // Never into the pillar (45 px half across, the agent 30).
+        let nearest = (0..n).map(|k| level(at(&bake, &id, k), [950.0, 0.0, 130.0])).fold(f64::INFINITY, f64::min);
+        assert!(nearest > 70.0, "{id} came within {nearest:.0} px of the pillar's middle");
+        // Nor into each other.
+        for j in 0..i {
+            let apart = (0..n).map(|k| level(at(&bake, &id, k), at(&bake, &format!("a{j}"), k))).fold(f64::INFINITY, f64::min);
+            assert!(apart > 40.0, "a{j} and {id} came within {apart:.0} px");
+        }
+        // No faster than its own speed (160 px/s, a fifth either way).
+        let fastest = (1..n).map(|k| level(at(&bake, &id, k), at(&bake, &id, k - 1)) * 30.0).fold(0.0, f64::max);
+        assert!(fastest < 160.0 * 1.2 + 1.0, "{id} reached {fastest:.0} px/s");
+    }
+    // Some had to go round: a2's path is longer than the straight line.
+    let walked: f64 = (1..n).map(|k| level(at(&bake, "a2", k), at(&bake, "a2", k - 1))).sum();
+    assert!(walked > level(at(&bake, "a2", 0), at(&bake, "a2", n - 1)) + 15.0);
+}
+
+#[test]
+fn the_clip_runs_with_the_distance_walked() {
+    let mut p = crowd_scene(vec![], json!({}), 1, 6.0);
+    let bake = baked(&mut p);
+    let t = &bake.tracks[bake.track("a3").unwrap()];
+    // A cycle of the clip (1 s) for every stride (140 px), wherever in
+    // the cycle the agent started.
+    let (mut walked, mut turned) = (0.0, 0.0);
+    for k in 1..120 {
+        walked += level(at(&bake, "a3", k), at(&bake, "a3", k - 1));
+        let d = t.clock[k] as f64 - t.clock[k - 1] as f64;
+        turned += if d < -0.5 { d + 1.0 } else { d };
+    }
+    assert!(walked > 400.0 && (turned - walked / 140.0).abs() < 0.02, "{walked:.0} px walked, the clip {turned:.2} cycles on");
+    assert!(t.clock.iter().all(|c| (0.0..=1.0).contains(c)));
+    // Drawn: the agent's children are shown at that time of the clip. Its
+    // marker (100 px a second of clip) is that far along in the agent.
+    let c = Compiled::new(&p);
+    for k in [0usize, 31, 77] {
+        let frame = c.frame(k as f64 / 30.0);
+        let mark = world(&frame.layers, "a3-mark").unwrap();
+        let agent = bake.world(bake.track("a3").unwrap(), k as f64 / 30.0).unwrap();
+        let want = agent.apply(100.0 * t.clock[k] as f64, -200.0, 0.0);
+        assert!((mark.0[3] - want[0]).abs() < 0.05 && (mark.0[7] - want[1]).abs() < 0.05 && (mark.0[11] - want[2]).abs() < 0.05, "sample {k}: the marker is at {:?}, the clip's time puts it at {want:?}", [mark.0[3], mark.0[7], mark.0[11]]);
+    }
+    // Agents do not walk in step: they start at different places in the cycle.
+    let other = &bake.tracks[bake.track("a4").unwrap()];
+    assert!((other.clock[0] - t.clock[0]).abs() > 1e-3);
+}
+
+#[test]
+fn one_struck_hard_goes_down_as_a_ragdoll_and_the_rest_walk_on() {
+    // A heavy ball thrown across the row at a3, arriving as they set off.
+    let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
+    let ragdoll = json!({"ragdoll": {"mass": 60}});
+    let mut p = crowd_scene(vec![ball.clone()], ragdoll, 1, 12.0);
+    let bake = baked(&mut p);
+    let knocks: Vec<_> = bake.events.iter().filter(|e| e.kind == "knock").collect();
+    assert_eq!(knocks.len(), 1, "{:?}", knocks);
+    assert_eq!((knocks[0].a.as_str(), knocks[0].b.as_str()), ("a3", "ball"));
+    assert!(knocks[0].speed > 1000.0 && knocks[0].t < 0.3, "{:?}", knocks[0]);
+    let down = (knocks[0].t * 30.0).ceil() as usize;
+    // Its five bones are the simulation's from then, and only its.
+    let bones: Vec<&str> = bake.tracks.iter().map(|t| t.id.as_str()).filter(|id| id.contains('-')).collect();
+    assert_eq!(bones, ["a3-hips", "a3-spine", "a3-head", "a3-leg_l", "a3-leg_r"]);
+    let n = bake.tracks[0].samples.len();
+    for id in &bones {
+        let t = &bake.tracks[bake.track(id).unwrap()];
+        assert!((t.from as usize).abs_diff(down) <= 1, "{id} is baked from sample {} (knocked at {down})", t.from);
+        // It ends lying on the floor (the floor's top is at 800), still.
+        let (end, before) = (at(&bake, id, n - 1), at(&bake, id, n - 16));
+        assert!(end[1] > 740.0 && end[1] < 801.0, "{id} ended at y {}", end[1]);
+        assert!(level(end, before) < 3.0);
+    }
+    // Where the bake takes the bones over they are where the clip had them
+    // in the agent: no jump (within what one frame of falling moves them).
+    let from = bake.tracks[bake.track("a3-head").unwrap()].from as f64;
+    let head = at(&bake, "a3-head", from as usize);
+    let agent = at(&bake, "a3", from as usize);
+    assert!(level(head, agent) < 40.0 && (agent[1] - head[1] - 160.0).abs() < 30.0, "the head at {head:?} over the agent at {agent:?}");
+    // The agent itself stays where it fell; the others reach their goals.
+    assert!(level(at(&bake, "a3", n - 1), at(&bake, "a3", down + 1)) < 1e-6);
+    for i in [0, 1, 2, 4, 5] {
+        assert!(level(at(&bake, &format!("a{i}"), n - 1), [1300.0 + i as f64 * 90.0, 0.0, 260.0]) < 30.0, "a{i}");
+    }
+    // The ball was turned by the body it hit.
+    let ball_end = at(&bake, "ball", n - 1);
+    assert!(ball_end[2] < 2500.0, "the ball ended at {ball_end:?}");
+    // With no ragdoll for the crowd the one struck stops where it stands.
+    let mut plain = crowd_scene(vec![ball], json!({}), 1, 6.0);
+    let b = baked(&mut plain);
+    assert_eq!(b.tracks.len(), 7, "six agents and the ball");
+    assert!(b.events.iter().any(|e| e.kind == "knock" && e.a == "a3"));
+    let m = b.tracks[b.track("a3").unwrap()].samples.len();
+    assert!(level(at(&b, "a3", m - 1), at(&b, "a3", 0)) < 120.0);
+}
+
+#[test]
+fn a_crowd_bakes_to_the_same_bytes_and_a_seed_changes_its_pace() {
+    let (a, b, c) = (baked(&mut crowd_scene(vec![], json!({}), 1, 4.0)).to_bytes(), baked(&mut crowd_scene(vec![], json!({}), 1, 4.0)).to_bytes(), baked(&mut crowd_scene(vec![], json!({}), 2, 4.0)).to_bytes());
+    assert!(a == b && a != c);
+    // What is wrong is named.
+    let errors = |crowd: Value| {
+        let p = crowd_scene(vec![], crowd, 1, 1.0);
+        Compiled::new(&p).sim_input(0, None).1.join("\n")
+    };
+    assert!(errors(json!({"agents": ["a0", "nobody"]})).contains("crowds.0.agents: no layer 'nobody'"));
+    assert!(errors(json!({"agents": ["floor"]})).contains("'floor' is no comp"));
+    assert!(errors(json!({"goals": []})).contains("crowds.0.goals"));
+}
