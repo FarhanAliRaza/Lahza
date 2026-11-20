@@ -4,6 +4,7 @@ use crate::crowd_tests::{agent, at, crowd_scene, floor, level};
 use crate::tests::{baked, project};
 use lahza_motion_core::compile::Content;
 use lahza_motion_core::sim::Bake;
+use lahza_motion_core::space::Mat4;
 use lahza_motion_core::{Compiled, LayerState, Project};
 use serde_json::{json, Value};
 
@@ -262,4 +263,83 @@ fn a_try_ahead_has_the_agents_walk_on() {
         // The take itself is not moved by that: its agents are the crowd's to move.
         assert!(level(place(&take, i), before[i]) < 1e-9);
     }
+}
+
+#[test]
+fn an_agent_raises_its_guard_at_what_is_coming_and_is_drawn_in_it() {
+    // The character with an arm on its spine; at 3.5 s (after its walk's
+    // cycle) its spine is keyed a quarter round: that is its guard's pose. A
+    // ball is thrown along the row's line at instance 3 from 900 px off.
+    let scene = |crowd: Value| {
+        let mut a = agent(0, 300.0, 0.0);
+        let spine = &mut a["layers"][0]["layers"][0];
+        spine["transform"]["rotation"] = json!({"keys": [{"at": 2, "v": 0}, {"at": 3.5, "v": 90, "ease": "linear"}]});
+        spine["layers"].as_array_mut().unwrap().push(json!({"id": "a0-arm", "kind": "mesh", "mesh": {"type": "box", "size": [10, 60], "depth": 10}, "transform": {"position": [0, -30]}}));
+        let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [540, 720], "z": -900}, "body": {"mass": 30, "velocity": [0, -120, 1500]}});
+        let mut c = json!({"id": "walkers", "character": "a0", "starts": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(),
+            "goals": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(), "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0});
+        for (k, v) in crowd.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        project(json!({"id": "s1", "simulation": {"crowds": [c]}, "layers": [floor(), a, ball]}), 4.0)
+    };
+    let guard = json!({"guard": {"pose": 3.5, "ahead": 1.0, "bones": ["a0-spine"]}});
+    let mut p = scene(guard.clone());
+    let bake = baked(&mut p);
+    let h = &bake.herds[0];
+    assert_eq!(h.guard.len(), h.samples.len());
+    let up = |k: usize, sample: usize| h.guard[sample * 6 + k];
+    // The one it is thrown at sees it from the start (0.6 s off, within
+    // the second its guard looks ahead): its guard is up in a sixth of a
+    // second, held while it comes and half a second after, then down.
+    assert!(up(3, 0) == 0.0 && up(3, 6) > 0.99 && up(3, 30) > 0.99, "{:?}", (0..40).map(|s| up(3, s)).collect::<Vec<_>>());
+    let last = h.len() - 1;
+    assert!(up(3, last) == 0.0 && (0..=last).any(|s| up(3, s) > 0.2 && up(3, s) < 0.8 && s > 30));
+    // Those the ball is not coming at keep theirs down.
+    assert!((0..=last).all(|s| up(0, s) == 0.0 && up(5, s) == 0.0));
+    // It walks as it does without a guard (its steps aside are the same),
+    // and the bake comes back from its bytes.
+    let plain = baked(&mut scene(json!({})));
+    assert!(plain.herds[0].samples == h.samples && plain.herds[0].guard.is_empty() && plain.hash != bake.hash);
+    assert_eq!(Bake::from_bytes(&bake.to_bytes()).unwrap(), *bake);
+    // Drawn: its arm stands up as it walks, lies a quarter round with
+    // the guard up, and is between the two on the way; the others' and
+    // what is not under the spine (the marker) are as they walk.
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let arms = |t: f64| -> Vec<Mat4> {
+        let frame = c.frame(t);
+        let mut found = Vec::new();
+        states(&frame.layers, "a0-arm", &mut found);
+        found.iter().map(|l| match &l.content {
+            Content::Mesh(m) => m.world,
+            _ => panic!(),
+        }).collect()
+    };
+    // (The arm's own up, y, in the scene, a column of its world: how
+    // much of it is level, whichever way the agent has turned, and how
+    // much upright.)
+    let lean = |m: &Mat4| (m.0[1].hypot(m.0[9]), m.0[5]);
+    let (before, during) = (arms(0.0), arms(1.0));
+    assert_eq!((before.len(), during.len()), (6, 6));
+    assert!(before.iter().all(|m| lean(m).0.abs() < 1e-9 && (lean(m).1 - 1.0).abs() < 1e-9), "{:?}", before.iter().map(lean).collect::<Vec<_>>());
+    let turned: Vec<&Mat4> = during.iter().filter(|m| lean(m).1.abs() < 1e-6 && (lean(m).0.abs() - 1.0).abs() < 1e-6).collect();
+    assert_eq!(turned.len(), 1, "one arm a quarter round at 1 s: {:?}", during.iter().map(lean).collect::<Vec<_>>());
+    let rising = arms(2.0 / 30.0);
+    assert!(rising.iter().any(|m| lean(m).0.abs() > 0.2 && lean(m).0.abs() < 0.9), "{:?}", rising.iter().map(lean).collect::<Vec<_>>());
+    let mut marks = Vec::new();
+    let (walk, kept) = (Compiled::new(&{ let mut q = scene(json!({})); baked(&mut q); q }).frame(1.0), c.frame(1.0));
+    states(&walk.layers, "a0-mark", &mut marks);
+    let mut guarded_marks = Vec::new();
+    states(&kept.layers, "a0-mark", &mut guarded_marks);
+    assert!(marks.len() == 6 && marks.iter().zip(&guarded_marks).all(|(a, b)| a.matrix == b.matrix));
+    // The pose is a moment of the scene.
+    let e = Compiled::new(&scene(json!({"guard": {"pose": 50.0}}))).sim_input(0, None).1.join("\n");
+    assert!(e.contains("crowds.0.guard.pose: 50 s is outside the scene"), "{e}");
+    // A crowd of layers has no guard, and says why.
+    let mut layered = crowd_scene(vec![], guard, 1, 1.0);
+    let e = Compiled::new(&layered).sim_input(0, None).1.join("\n");
+    assert!(e.contains("crowds.0.guard: only a crowd of instances"), "{e}");
+    layered.bakes.clear();
+    assert_eq!(crate::behaviour_tests::pin(&bake), (18476, 11403343376360516901), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }

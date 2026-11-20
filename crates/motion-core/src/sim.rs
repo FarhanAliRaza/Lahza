@@ -789,6 +789,26 @@ pub struct Crowd {
     /// Agents knocked down fall as ragdolls made like this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ragdoll: Option<CrowdRagdoll>,
+    /// Instances: a second pose of the character that an agent takes
+    /// while something is coming at it (arms up, ducked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<CrowdGuard>,
+}
+
+/// A crowd's guard: the character's pose at `pose` (a time of its own
+/// keys: key the pose there, outside its walk's cycle), blended over an
+/// agent's walk while a body that would knock it down is on its way to
+/// it within `ahead` seconds, and for a moment after.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrowdGuard {
+    pub pose: TimeRef,
+    #[serde(default = "one")]
+    pub ahead: f64,
+    /// The bones the pose takes, and all that hang from them (layer ids;
+    /// default: every bone). Leave the legs out and they walk on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bones: Vec<String>,
 }
 
 /// How a crowd's agents are made ragdolls (`Ragdoll`'s fields of the same
@@ -1055,9 +1075,23 @@ pub struct HerdTrack {
     /// and the ragdoll of the pool it fell as (`u32::MAX`: none).
     pub down: Vec<u32>,
     pub slot: Vec<u32>,
+    /// Per sample, per agent, when the crowd has a guard: how far it has
+    /// taken its guard's pose (0..1). Empty otherwise.
+    pub guard: Vec<f32>,
 }
 
 impl HerdTrack {
+    /// How far agent `k` has its guard up at sample position `x` (0..1).
+    pub fn guard_at(&self, k: usize, x: f64) -> f64 {
+        let n = self.count as usize;
+        let Some(last) = (self.guard.len() / n.max(1)).checked_sub(1) else { return 0.0 };
+        let x = x.clamp(0.0, last as f64);
+        let i = (x.floor() as usize).min(last);
+        let j = (i + 1).min(last);
+        let (a, b) = (self.guard[i * n + k] as f64, self.guard[j * n + k] as f64);
+        a + (b - a) * (x - i as f64)
+    }
+
     pub fn len(&self) -> usize {
         if self.count == 0 { 0 } else { self.samples.len() / self.count as usize }
     }
@@ -1206,6 +1240,14 @@ impl Bake {
                 o.extend_from_slice(&v.to_le_bytes());
             }
         }
+        // (And after them, the guards of the crowds that have one.)
+        for (k, h) in self.herds.iter().enumerate().filter(|(_, h)| !h.guard.is_empty()) {
+            o.extend_from_slice(&(k as u32).to_le_bytes());
+            o.extend_from_slice(&(h.guard.len() as u32).to_le_bytes());
+            for v in &h.guard {
+                o.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         o
     }
 
@@ -1279,7 +1321,13 @@ impl Bake {
                     *m = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
                 }
                 let [down, slot] = marks;
-                herds.push(HerdTrack { id, count, rest: Mat4(f[..16].try_into().unwrap()), y: f[16], q: f[17..21].try_into().unwrap(), samples, down, slot });
+                herds.push(HerdTrack { id, count, rest: Mat4(f[..16].try_into().unwrap()), y: f[16], q: f[17..21].try_into().unwrap(), samples, down, slot, guard: Vec::new() });
+            }
+            while !r.0.is_empty() {
+                let (k, n) = (r.u32()? as usize, r.u32()? as usize);
+                let raw = r.take(n.checked_mul(4).ok_or("the bake is cut short")?)?;
+                let herd = herds.get_mut(k).ok_or("the bake has a guard for no crowd")?;
+                herd.guard = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
             }
         }
         Ok(Bake { hash, start, rate, tracks, events, herds })
@@ -1538,6 +1586,9 @@ pub struct CrowdInput {
     pub knock: f64,
     pub plan: bool,
     pub dodge: f64,
+    /// Seconds ahead an agent raises its guard at what is coming (None:
+    /// it has no guard).
+    pub guard: Option<f64>,
 }
 
 /// Everything a bake is made from: the document's simulation resolved to
@@ -1779,6 +1830,11 @@ impl SimInput {
             h.str(&c.id);
             h.fs(&[c.speed, c.vary, c.radius, c.height, c.stride, c.cycle, c.clip_at, c.knock, c.dodge, c.plan as u8 as f64]);
             h.fs(&c.facing);
+            // (Only where there is one: older bakes keep their hash.)
+            if let Some(ahead) = c.guard {
+                h.str("guard");
+                h.f(ahead);
+            }
             h.u64(c.instanced as u64);
             h.u64(c.pool.len() as u64);
             for r in &c.pool {
@@ -1895,11 +1951,18 @@ mod tests {
         // two agents, three samples; the second turns the short way
         // round through ±π, and its clip wraps without running back.
         let (pi, y) = (std::f32::consts::PI, 800.0);
-        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0] };
+        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0], guard: Vec::new() };
         let with = Bake { herds: vec![herd], ..bake.clone() };
         let bytes = with.to_bytes();
         assert_eq!(Bake::from_bytes(&bytes).unwrap(), with);
         assert!(bytes.len() > bake.to_bytes().len() && Bake::from_bytes(&bytes[..bytes.len() - 3]).is_err());
+        // A crowd's guards come last, when it has one, and are read
+        // between the samples as the rest is.
+        let mut guarded = with.clone();
+        guarded.herds[0].guard = vec![0.0, 0.0, 0.0, 0.5, 0.25, 1.0];
+        let more = guarded.to_bytes();
+        assert_eq!(Bake::from_bytes(&more).unwrap(), guarded);
+        assert!(more.len() == bytes.len() + 8 + 24 && (guarded.herds[0].guard_at(1, 1.5) - 0.75).abs() < 1e-9 && guarded.herds[0].guard_at(0, 1.5) == 0.125 && with.herds[0].guard_at(1, 1.0) == 0.0);
         let h = &with.herds[0];
         assert_eq!(h.len(), 3);
         let (pose, clock, turn) = h.agent(0, 0.5).unwrap();

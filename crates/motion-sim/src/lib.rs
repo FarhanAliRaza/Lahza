@@ -174,6 +174,9 @@ pub fn bake_with(input: &SimInput, meshes: Meshes, files: Files) -> Result<(Bake
                     let action = p.act(&policy::observe(&take.world, input, r, &feet, k as f64)).map_err(|e| format!("ragdoll '{}': {e}", r.id))?;
                     take.turns[rig] = Some(policy::turns(r, &action));
                 }
+                // (Down, it is its behaviours': it lies, and gets up if
+                // it has `get_up`; the search takes it again once it stands.)
+                Some(Mind::Search(_)) if take.brains[rig].fallen.is_some() => take.turns[rig] = None,
                 Some(Mind::Search(s)) => {
                     let (turns, stride) = s.decide(&take, input, rig, k, t);
                     take.turns[rig] = Some(turns);

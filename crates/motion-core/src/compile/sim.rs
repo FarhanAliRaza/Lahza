@@ -61,6 +61,8 @@ pub struct CSim {
     blasts: Vec<f64>,
     /// Per crowd: when its clip starts (timeline seconds).
     pub(super) crowd_clips: Vec<Option<f64>>,
+    /// Per crowd: when the character is in its guard's pose.
+    pub(super) crowd_guards: Vec<Option<f64>>,
     pub(super) ragdolls: Vec<super::ragdoll::CRagdoll>,
     pub bake: Option<Arc<Bake>>,
 }
@@ -104,7 +106,8 @@ impl<'a> Compiler<'a> {
         let motors = settings.joints.iter().enumerate().map(|(i, j)| j.motor.as_ref().map(|m| self.prop(&m.target, id, &format!("simulation.joints.{i}.motor.target"), start, None, pre_roll))).collect();
         let blasts = settings.blasts.iter().enumerate().map(|(i, b)| self.time(&b.at, id, &format!("simulation.blasts.{i}.at")).unwrap_or(0.0) - pre_roll).collect();
         let crowd_clips = settings.crowds.iter().enumerate().map(|(n, c)| c.clip.as_ref().and_then(|r| self.time(r, id, &format!("simulation.crowds.{n}.clip"))).map(|t| t - pre_roll)).collect();
-        CSim { settings, start: from, end: to, motors, blasts, crowd_clips, ragdolls: self.ragdolls(scene, start, pre_roll), bake: self.bake.clone() }
+        let crowd_guards = settings.crowds.iter().enumerate().map(|(n, c)| c.guard.as_ref().and_then(|g| self.time(&g.pose, id, &format!("simulation.crowds.{n}.guard.pose"))).map(|t| t - pre_roll)).collect();
+        CSim { settings, start: from, end: to, motors, blasts, crowd_clips, crowd_guards, ragdolls: self.ragdolls(scene, start, pre_roll), bake: self.bake.clone() }
     }
 }
 

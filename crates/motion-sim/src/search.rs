@@ -4,8 +4,9 @@
 //!
 //! A plan is three leans, each a turn about a level axis: one made at
 //! the ankles, one at the hips, one at the spine; a swing of each upper
-//! arm, the same way (ten numbers: a search over every joint's every axis
-//! would need far more tries than a shot can pay for); and, when its
+//! arm, the same way, and a bend of each elbow (twelve numbers: a search
+//! over every joint's every axis would need far more tries than a shot can
+//! pay for); and, when its
 //! weight is headed past its feet and no step is under way, perhaps a
 //! step: the foot behind, to where it is falling to or past it. The
 //! first try is always the clip as it is, the second the last choice; the
@@ -24,6 +25,10 @@ use crate::world::Rng;
 use crate::Take;
 use lahza_motion_core::sim::{quat_mul, RagdollInput, SimInput};
 
+/// The numbers of a plan: three leans and two arm swings, each about two
+/// level axes, and a bend of each elbow.
+const PLAN: usize = 12;
+
 pub struct Search {
     pub samples: u32,
     pub horizon: f64,
@@ -32,8 +37,8 @@ pub struct Search {
     pub spread: f64,
     next: f64,
     /// The plan chosen last: [ankles, hips, spine, left arm, right arm] ×
-    /// [about x, about z].
-    best: [f64; 10],
+    /// [about x, about z], then each elbow's bend.
+    best: [f64; PLAN],
     stand: Option<Stance>,
     decisions: u64,
     /// Steps taken in tries, and the seconds they took.
@@ -51,12 +56,12 @@ fn turn(axis: [f64; 3], angle: f64) -> [f64; 4] {
 
 impl Search {
     pub fn new(samples: u32, horizon: f64, every: f64, spread_degrees: f64) -> Search {
-        Search { samples: samples.max(1), horizon: horizon.max(0.0), every: every.max(1e-3), spread: spread_degrees.to_radians(), next: f64::NEG_INFINITY, best: [0.0; 10], stand: None, decisions: 0, tried_steps: 0, seconds: 0.0, threads: std::env::var("LAHZA_SIM_THREADS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())) }
+        Search { samples: samples.max(1), horizon: horizon.max(0.0), every: every.max(1e-3), spread: spread_degrees.to_radians(), next: f64::NEG_INFINITY, best: [0.0; PLAN], stand: None, decisions: 0, tried_steps: 0, seconds: 0.0, threads: std::env::var("LAHZA_SIM_THREADS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())) }
     }
 
     /// The leans as turns on top of the clip, per bone, in each bone's
     /// parent's frame as it stands now.
-    fn turns(take: &Take, rig: usize, r: &RagdollInput, feet: &[usize], leans: &[f64; 10]) -> Vec<Option<[f64; 4]>> {
+    fn turns(take: &Take, rig: usize, r: &RagdollInput, feet: &[usize], leans: &[f64; PLAN]) -> Vec<Option<[f64; 4]>> {
         let mut out = vec![None; r.bones.len()];
         let conj = |q: [f64; 4]| [-q[0], -q[1], -q[2], q[3]];
         // A turn about the scene's x and z (level axes), seen from a bone's parent.
@@ -87,6 +92,16 @@ impl Search {
         for (k, upper) in take.brains[rig].upper_arms().into_iter().take(2).enumerate() {
             out[upper] = lean(upper, leans[6 + 2 * k], leans[7 + 2 * k]);
         }
+        // An elbow bends about its own axle (its hinge, else across the
+        // forearm), on top of how it is bent now.
+        for (k, fore) in take.brains[rig].fore_arms().into_iter().take(2).enumerate() {
+            let (b, bend) = (&r.bones[fore], leans[10 + k]);
+            let Some(now) = take.world.bone_turn(r, fore) else { continue };
+            if bend != 0.0 {
+                let axle = b.hinge.unwrap_or([1.0, 0.0, 0.0]);
+                out[fore] = Some(quat_mul(quat_mul(now, turn(axle, bend)), conj(now)));
+            }
+        }
         out
     }
 
@@ -113,12 +128,17 @@ impl Search {
         let may_step = l > 0.05 * stand.height && take.brains[rig].can_step(t);
         let foot_at = |f: usize| crate::behaviour::bone_origin(&take.world, r, f);
         // The plans, drawn before any is tried.
-        let plans: Vec<([f64; 10], Option<Stride>)> = (0..self.samples)
+        let plans: Vec<([f64; PLAN], Option<Stride>)> = (0..self.samples)
             .map(|c| match c {
-                0 => ([0.0; 10], None),
+                0 => ([0.0; PLAN], None),
                 1 => (self.best, None),
                 _ => {
-                    let leans = std::array::from_fn(|a| if a < 6 { (self.best[a] + self.spread * rng.signed()).clamp(-0.6, 0.6) } else { (self.best[a] + 2.0 * self.spread * rng.signed()).clamp(-1.4, 1.4) });
+                    let leans = std::array::from_fn(|a| match a {
+                        0..=5 => (self.best[a] + self.spread * rng.signed()).clamp(-0.6, 0.6),
+                        6..=9 => (self.best[a] + 2.0 * self.spread * rng.signed()).clamp(-1.4, 1.4),
+                        // (An elbow folds one way.)
+                        _ => (self.best[a] + 2.0 * self.spread * rng.signed()).clamp(0.0, 1.4),
+                    });
                     let (past, wanted) = (1.0 + 0.8 * (rng.signed() + 1.0) / 2.0, c % 3 == 2);
                     let stride = (may_step && wanted).then(|| {
                         // The foot behind, to where it is falling to and up to 1.8 times as far.
@@ -142,7 +162,7 @@ impl Search {
             })
             .collect();
         // Each tried in a copy of the world, on every core.
-        let try_one = |(leans, stride): &([f64; 10], Option<Stride>)| -> (f64, u64) {
+        let try_one = |(leans, stride): &([f64; PLAN], Option<Stride>)| -> (f64, u64) {
             let mut trial = take.fork();
             trial.turns[rig] = Some(Self::turns(take, rig, r, &feet, leans));
             if let Some(s) = stride {

@@ -162,8 +162,32 @@ fn trying_ahead_keeps_it_up_where_holding_the_clip_does_not() {
     let (alone, on_one) = pushed(1000.0, json!({"type": "search"}), json!([]), 4.0);
     std::env::remove_var("LAHZA_SIM_THREADS");
     assert!(alone.to_bytes() == stepped.to_bytes() && on_one.search_threads == 1 && on_one.tried_steps == on_all.tried_steps);
-    assert_eq!(crate::behaviour_tests::pin(&stepped), (57132, 432624273815959055), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&stepped), (56831, 7627719729510559245), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // It has its limit too.
     let (lost, _) = pushed(1800.0, json!({"type": "search"}), json!([]), 4.0);
     assert!(drop(&lost) > 150.0);
+}
+
+#[test]
+fn knocked_down_under_the_search_it_gets_up_and_is_kept_up_again() {
+    // Shoved past what trying ahead can hold, with `get_up` and nothing
+    // else: it falls, lies still, rises (as `get_up` does it: helped),
+    // and from then the search has it again.
+    let (bake, stats) = pushed(1800.0, json!({"type": "search"}), json!([{"type": "get_up"}]), 9.0);
+    let events: Vec<(&str, f64)> = bake.events.iter().filter(|e| ["fall", "get_up", "rise"].contains(&e.kind.as_str())).map(|e| (e.kind.as_str(), e.t)).collect();
+    assert!(events.len() == 3 && events[0].0 == "fall" && events[1].0 == "get_up" && events[2].0 == "rise", "{events:?}");
+    let (fell, up) = (events[0].1, events[2].1);
+    assert!(fell < 2.5 && up > fell + 2.0 && up < 7.5, "{events:?}");
+    let hips = |k: usize| pose(&bake, "hips", k).p[1];
+    let lowest = (0..bake.tracks[0].samples.len()).map(hips).fold(f64::MIN, f64::max);
+    assert!(lowest > hips(0) + 150.0, "it was down: its hips at y {lowest:.0}");
+    // Up again, and kept up to the end with no behaviour to balance it.
+    let n = bake.tracks[0].samples.len();
+    for k in [((up + 0.5) * 30.0) as usize, n - 1] {
+        assert!((hips(k) - hips(0)).abs() < 20.0, "at {:.1} s its hips are {:.0} px from where they stood", k as f64 / 30.0, hips(k) - hips(0));
+    }
+    // (While it is down nothing is tried: tries are for the time it stands.)
+    let standing = fell - 0.0 + (9.0 - up);
+    assert!((stats.tried_steps as f64) < 16.0 * 0.5 * 240.0 * 10.0 * (standing + 0.3), "{} steps tried", stats.tried_steps);
+    assert_eq!(crate::behaviour_tests::pin(&bake), (126115, 13679216537685136859), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }

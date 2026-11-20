@@ -8,7 +8,9 @@ round a pillar, each agent at its own moment of the walk. The nearest
 FULL (default 150) are drawn as the character, the rest as pictures of
 it. A ball is thrown through them at 2 s: they step out of its line
 (DODGE=0: they do not look, and whoever it strikes goes down as a
-ragdoll of the pool). WALL=1 stands a wall across their way. Bakes,
+ragdoll of the pool). WALL=1 stands a wall across their way. GUARD=1
+gives the character a second pose, arms up before its face, keyed at
+7.5 s, which an agent takes while the ball is coming at it. Bakes,
 checks (CHECK=1), writes a contact sheet,
 and times the bake and (TIME=1) a second of export on the CPU renderer.
 """
@@ -91,6 +93,14 @@ if os.environ.get("DODGE"):
 apply([{"op": "add_scene", "scene": scene}])
 # One character, where the field's corner is: its level, turn and scale are every agent's.
 run("motion", "model-import", PROJECT, model, "--scene", "s1", "--id", "figure", "--unit", str(UNIT), "--position", f"{W / 2},{FLOOR}", "--z", "0")
+if os.environ.get("GUARD"):
+    # The guard's pose: the arms' bones keyed up at 7.5 s, a moment of the
+    # scene the walk's cycle (its first second) does not use. The crowd
+    # blends it over an agent's walk, on those bones alone: the legs walk on.
+    pose = {"upper": float(os.environ.get("GUARD_UPPER", "-115")), "fore": float(os.environ.get("GUARD_FORE", "-80"))}
+    apply([{"op": "key", "target": f"figure-{bone}_{side_}.transform.rotation_x", "at": 7.5, "v": angle, "ease": "hold"}
+           for bone, angle in pose.items() for side_ in "lr"]
+          + [{"op": "set", "target": "s1.simulation.crowds.0.guard", "value": {"pose": 7.5, "ahead": 1.2, "bones": ["figure-upper_l", "figure-upper_r"]}}])
 began = time.time()
 baked = json.loads(run("motion", "bake", PROJECT))["scenes"][0]
 knocked = [e["a"] for e in baked["events"] if e["kind"] == "knock"]

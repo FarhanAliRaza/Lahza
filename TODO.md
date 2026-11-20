@@ -1084,37 +1084,50 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
    - The no-training route (`search.rs`, `controller: {"type":
      "search"}`): each 0.1 s, 16 tries 0.5 s ahead in copies of the
      world. A try is a plan: three leans (ankles, hips, spine), a swing
-     of each upper arm (ten numbers; a search over every joint would
-     need far more tries), and for a third of them, when its weight is
-     headed off its feet, a step of the foot behind to where it is
-     falling to or up to 1.8 times as far. Scored on falling, weight past
-     the feet, tilt, height, effort and a little for a step. The tries
-     run on every core; the plans are drawn before any is tried and the
-     first of the least cost kept, so the take is the same on one core
-     as on four (tested to the byte, pinned).
+     of each upper arm and a bend of each elbow (twelve numbers; a
+     search over every joint would need far more tries), and for a third
+     of them, when its weight is headed off its feet, a step of the foot
+     behind to where it is falling to or up to 1.8 times as far. Scored
+     on falling, weight past the feet, tilt, height, effort and a little
+     for a step. The tries run on every core; the plans are drawn before
+     any is tried and the first of the least cost kept, so the take is
+     the same on one core as on four (tested to the byte, pinned).
+   - Knocked down, it gets up: with `get_up` among its behaviours (and
+     no `balance`) a figure the search keeps up falls, lies, rises as
+     `get_up` does it (helped, as said in part 4) and is the search's
+     again once it stands; nothing is tried while it is down. Tested:
+     shoved at 1800 px/s it falls, is up again within 7.5 s, and stands
+     to the end of a 9 s take with its hips within 20 px of where they
+     stood; pinned.
    - Measured on the test figure, pushes at the chest in px/s, with no
      force on its body (a step's foot is carried by a force, as the
-     `step` behaviour's is): motors holding the clip fall at 300. Search
-     with a 0.25 s horizon (too short to see a step land) holds 300 and
-     falls at 450, as it did when it only leaned; at the default 0.5 s
-     it holds 1000 with one or two steps and falls at 1400; at 1 s it
-     holds 1400 and falls at 1800; 32 tries hold no more than 16.
-     Against part 4: `balance` with its help (a quarter of body weight
-     on the hips) holds 1400, with steps 1800, at no cost.
+     `step` behaviour's is), with the elbows in the plan: motors holding
+     the clip fall at 300. Search at the default 0.5 s holds 1400 with
+     up to five steps and falls at 1800 (before the elbows it held 1000
+     and fell at 1400); at 1 s the same, 1400 and 1800. With a 0.25 s
+     horizon it now falls at 300 (twelve numbers are more than a quarter
+     second's look ahead can tell apart; it held 300 with ten); 32 tries
+     hold 1000 and fall at 1400, less than 16 do (more tries are not
+     better: the first of the least cost is kept, and a costlier look is
+     not a longer one). Against part 4: `balance` with its help (a
+     quarter of body weight on the hips) holds 1400, with steps 1800, at
+     no cost.
    - What it costs, a 4 s take (0.2 s without): at the defaults 63 104
-     steps tried for 960 taken, 18.9 s on one core, 12.2 s on two, 6.3 s
-     on four (a try's copy of the world is made on its own core; four
-     cores give three times, not four); 1 s ahead, 9 s on four. So the
-     search now buys unhelped balance up to what the helped behaviour
-     holds, at 30 to 45 times the bake on four cores. To decide: whether
-     takes want the unhelped look enough to pay for it.
-   - Left, not done (each is more numbers in the plan, so more tries a
-     decision: time, not a missing machine): a step is the `step`
+     steps tried for 960 taken, 12.5 s on one core, 7.1 s on two, 4.0 s
+     on four; 1 s ahead, 7 s on four. So the search buys unhelped
+     balance up to what the helped behaviour holds without steps, at
+     about 20 times the bake on four cores. To decide: whether takes
+     want the unhelped look enough to pay for it.
+   - Left, and each is more numbers in the plan, so more tries a
+     decision, so a longer look ahead to tell them apart (the quarter
+     second above shows the price of two more): a step is the `step`
      behaviour's (a foot carried, not a leg swung), one at a time, and
-     only toward where it is falling; arms only swing from the shoulder
-     (no elbow, no reach for support); the plan is ten numbers, not a
-     pose; it does not get up. In a try a crowd's agents walk on
-     straight at the speed they had (they do not steer in it).
+     only toward where it is falling; an arm does not reach for
+     support; the plan is twelve numbers, not a pose. In a try a
+     crowd's agents walk on straight at the speed they had (to steer in
+     it every try would copy and step the crowd: 16 crowds ten times a
+     second). These are what a trained policy is for, which is the line
+     above: needing what is not here.
 7. **Crowds: done, as layers or as instances with impostors.**
    `simulation.crowds`. Once a frame every agent steers: toward its goal
    at its own pace, off agents within three radii (found by a grid), off
@@ -1214,16 +1227,36 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      sees a card, not a body. Not measured for the same want: the GPU
      renderer and the path tracer on crowds, and a character of real
      size (none here, and no licence read for one).
-   - Left, not done: an agent has one clip, so it steps aside and does
-     nothing else: no guard, no duck, no look (a second clip a
-     character and a blend an agent in the bake); none knocked down
-     gets up (a ragdoll of the pool has no brain), and past the pool one
-     stands frozen; it does not get out of the way of other agents'
-     falls. A way is planned round what stands still only (its level
-     box: a wall at an angle shuts its whole box), by each agent alone
-     (no lanes, no waiting for a gap: a doorway jams), and not round a
-     body in motion. `check` evaluates every agent at every sample it
-     takes, which is slow at thousands.
+   - A guard (`crowds[].guard`: `pose`, a moment of the scene at which
+     the character is keyed in its second pose; `ahead`, seconds; and
+     `bones`, the bones the pose takes with all that hang from them,
+     the rest walking on). An agent whose knocking down is on its way
+     within `ahead` seconds has its guard up in a sixth of a second,
+     holds it half a second after the last threat and lowers it over
+     half a second. The bake keeps how far each agent's is up per
+     sample (after the herds, only for crowds that have one: other
+     bakes are the bytes they were). `compile` blends the pose over the
+     walk's moment joint by joint, in quarters, and shares each blend
+     among the agents in it; a far agent's picture is of the guard up
+     when its is half up or more. Instances only (a crowd of layers
+     says why not). Tested: the agent a ball is thrown at has its guard
+     up before the ball arrives and down again after, the others never;
+     it walks the same samples as without a guard; drawn, its arm is a
+     quarter round with the guard up, between on the way, and what is
+     not under the pose's bones is as it walks; pinned.
+     `herd.py` with `GUARD=1` (36 agents, arms keyed up at 7.5 s) was
+     looked at: the agents by the ball's line have their arms up as it
+     comes and lower them after.
+   - Left, not done: the guard is one pose, raised at what would knock
+     an agent down: no duck by where the thing comes from, no look; one
+     knocked down with its guard up falls from its walk's pose; none
+     knocked down gets up (a ragdoll of the pool has no brain), and past
+     the pool one stands frozen; it does not get out of the way of other
+     agents' falls. A way is planned round what stands still only (its
+     level box: a wall at an angle shuts its whole box), by each agent
+     alone (no lanes, no waiting for a gap: a doorway jams), and not
+     round a body in motion. `check` evaluates every agent at every
+     sample it takes, which is slow at thousands.
 
 ## Directing an agent from the editor
 

@@ -419,7 +419,9 @@ impl Brain {
             .collect();
         let foot_at = |b: usize| places.iter().find(|(f, _)| *f == b).map(|(_, p)| *p).unwrap_or([0.0; 3]);
         let balance = find(BehaviourKind::Balance);
-        if let (Some(up), false, Some(_)) = (unit(mul(input.gravity, -1.0)), self.feet.is_empty(), balance.or(find(BehaviourKind::Step))) {
+        // (With `get_up` alone too: a figure a controller keeps up falls,
+        // lies and rises as one that balances does.)
+        if let (Some(up), false, Some(_)) = (unit(mul(input.gravity, -1.0)), self.feet.is_empty(), balance.or(find(BehaviourKind::Step)).or(find(BehaviourKind::GetUp))) {
             let flat = |v: V| sub(v, mul(up, dot(v, up)));
             let swinging = self.step.as_ref().map(|s| s.foot);
             let standing: Vec<usize> = self.feet.iter().copied().filter(|f| Some(*f) != swinging || self.feet.len() == 1).collect();
@@ -774,6 +776,11 @@ impl Brain {
     }
 
     /// The upper arms: bones' indices.
+    /// Its forearms, as `upper_arms` has their upper arms.
+    pub fn fore_arms(&self) -> Vec<usize> {
+        self.arms.iter().map(|a| a.fore).collect()
+    }
+
     pub fn upper_arms(&self) -> Vec<usize> {
         self.arms.iter().map(|a| a.upper).collect()
     }

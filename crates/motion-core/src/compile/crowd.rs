@@ -39,6 +39,9 @@ impl Compiled {
                 self.herd_input(i, n, c, character, clip.unwrap_or(sim.start), &flat, &worlds_at, input, errors);
                 continue;
             }
+            if c.guard.is_some() {
+                errors.push(format!("{what}.guard: only a crowd of instances (\"character\") has a guard: its agents share the character's poses, which is what a second pose is blended with"));
+            }
             if c.agents.is_empty() {
                 errors.push(format!("{what}: a crowd needs \"agents\" (comps) or a \"character\" (one comp, with \"starts\" or \"count\" and \"area\")"));
                 continue;
@@ -89,7 +92,7 @@ impl Compiled {
                 };
                 agents.push(AgentInput { id: a.clone(), start: pose, rest, goal: c.goals[k % c.goals.len()], ragdoll, local });
             }
-            input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: false, pool: Vec::new(), local: Vec::new(), speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0) });
+            input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: false, pool: Vec::new(), local: Vec::new(), speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0), guard: None });
         }
     }
 
@@ -142,6 +145,13 @@ impl Compiled {
             (false, None, None) => {}
             (false, _, _) => errors.push(format!("{what}: \"starts\", or \"count\" and \"area\", not both")),
         }
+        // (The guard's pose is the character at a time of the scene:
+        // outside it the character is not there to be posed.)
+        if let Some(at) = scene.sim.crowd_guards.get(n).copied().flatten() {
+            if at < scene.start - 1e-9 || at >= scene.end - 1e-9 {
+                errors.push(format!("{what}.guard.pose: {at} s is outside the scene ({} to {} s): key the pose at a moment of the scene the walk's cycle does not use", scene.start, scene.end));
+            }
+        }
         if c.goals.is_empty() == c.march.is_none() {
             errors.push(format!("{what}: instances go to \"goals\" ([[x, z]]) or \"march\" ([dx, dz] from where each starts), one of them"));
         }
@@ -180,7 +190,7 @@ impl Compiled {
                 local: Vec::new(),
             })
             .collect();
-        input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: true, pool, local, speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0) });
+        input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: true, pool, local, speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0), guard: c.guard.as_ref().map(|g| g.ahead.max(0.0)) });
     }
 }
 
@@ -209,6 +219,12 @@ pub(super) struct CHerd {
     /// Per ragdoll of the pool: the bake's track of each bone's layer.
     slots: Vec<HashMap<String, usize>>,
     palette: OnceLock<Palette>,
+    /// The guard: the content time of its pose, and the bones it takes
+    /// (None: all).
+    guard: Option<(f64, Option<Vec<String>>)>,
+    /// A walk's moment with the guard's pose over it, by how far (in
+    /// quarters): made when first drawn, shared by every agent in it.
+    guarded: std::sync::Mutex<HashMap<(usize, u8), Arc<Vec<LayerState>>>>,
 }
 
 /// The character through one cycle of its clip: its meshes (placed in the
@@ -216,6 +232,9 @@ pub(super) struct CHerd {
 /// sphere that holds it (its centre in that space, its radius).
 struct Palette {
     phases: Vec<Vec<LayerState>>,
+    /// The character in its guard's pose, and per skinned mesh of it
+    /// which joints the pose takes.
+    guard: Option<(Vec<LayerState>, Vec<Vec<bool>>)>,
     centre: [f64; 3],
     /// Half its box, and half the box's diagonal.
     half: [f64; 3],
@@ -261,7 +280,7 @@ pub(super) fn take_pictures(lighting: &dyn Fn() -> Arc<meshes::Lighting>) -> Vec
 /// Binds each crowd of instances the bake has to its character's layer.
 pub(super) fn bind_herds(layers: &mut [CLayer], sim: &super::sim::CSim, shift: f64) {
     let Some(bake) = &sim.bake else { return };
-    for (c, clip) in sim.settings.crowds.iter().zip(&sim.crowd_clips) {
+    for ((c, clip), guard) in sim.settings.crowds.iter().zip(&sim.crowd_clips).zip(&sim.crowd_guards) {
         let (Some(character), Some(herd)) = (&c.character, bake.herds.iter().position(|h| h.id == c.id)) else { continue };
         let Some(l) = layers.iter_mut().find(|l| &*l.id == character.as_str()) else { continue };
         let prefix = format!("{}#", c.id);
@@ -274,7 +293,7 @@ pub(super) fn bind_herds(layers: &mut [CLayer], sim: &super::sim::CSim, shift: f
             }
             slots[slot].insert(bone.to_string(), k);
         }
-        l.herd = Some(Box::new(CHerd { bake: bake.clone(), herd, shift, clip_at: clip.unwrap_or(sim.start), cycle: c.cycle.max(1e-6), full: c.full, near: c.near, slots, palette: OnceLock::new() }));
+        l.herd = Some(Box::new(CHerd { bake: bake.clone(), herd, shift, clip_at: clip.unwrap_or(sim.start), cycle: c.cycle.max(1e-6), full: c.full, near: c.near, slots, palette: OnceLock::new(), guard: guard.map(|t| (t + shift, c.guard.as_ref().filter(|g| !g.bones.is_empty()).map(|g| g.bones.clone()))), guarded: Default::default() }));
     }
 }
 
@@ -346,9 +365,70 @@ impl CHerd {
         let pad = if skinned { 0.1 * (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max) } else { 0.0 };
         let half: [f64; 3] = std::array::from_fn(|k| (hi[k] - lo[k]) / 2.0 + pad);
         let radius = half.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // The guard's pose, and the joints it takes: the bones named and
+        // all under them.
+        let guard = self.guard.as_ref().map(|(at, bones)| {
+            let tc = at - l.offset;
+            let mut out = Vec::new();
+            emit(l.children(), tc, step, &inner, 1.0, &mut out);
+            out.retain(|s| matches!(s.content, Content::Mesh(_)));
+            super::sim::pose_skins_in(l.children(), tc, step, &inner, &mut out);
+            let mut under: HashSet<&str> = HashSet::new();
+            fn gather<'l>(layers: &'l [CLayer], inside: bool, named: &[String], out: &mut HashSet<&'l str>) {
+                for l in layers {
+                    let inside = inside || named.iter().any(|n| n.as_str() == &*l.id);
+                    if inside {
+                        out.insert(&l.id);
+                    }
+                    gather(l.children(), inside, named, out);
+                }
+            }
+            if let Some(bones) = bones {
+                gather(l.children(), false, bones, &mut under);
+            }
+            let takes = out.iter().map(|s| match &s.content {
+                // (A mesh with no skin: whether it is under a bone the pose takes.)
+                Content::Mesh(m) => m.skin.as_ref().map_or(vec![bones.is_none() || under.contains(&*s.id)], |skin| skin.ids.iter().map(|id| bones.is_none() || under.contains(&**id)).collect()),
+                _ => Vec::new(),
+            }).collect();
+            (out, takes)
+        });
         let mut key = crate::sim::Fnv::default();
-        key.str(&format!("{phases:?}"));
-        Palette { phases, centre, half, radius: radius.max(1e-6), key: key.0 }
+        key.str(&format!("{phases:?}{guard:?}"));
+        Palette { phases, guard, centre, half, radius: radius.max(1e-6), key: key.0 }
+    }
+
+    /// The walk's moment `phase` with the guard's pose over it by
+    /// `quarters` quarters.
+    fn guarded(&self, palette: &Palette, phase: usize, quarters: u8) -> Option<Arc<Vec<LayerState>>> {
+        let (pose, takes) = palette.guard.as_ref()?;
+        let mut made = self.guarded.lock().unwrap_or_else(|e| e.into_inner());
+        Some(made.entry((phase, quarters)).or_insert_with(|| {
+            let f = quarters as f64 / 4.0;
+            let between = |a: Mat4, b: Mat4| -> Mat4 {
+                let ((pa, ra), (pb, rb)) = (crate::sim::decompose(a), crate::sim::decompose(b));
+                let s = if (0..4).map(|k| pa.q[k] * pb.q[k]).sum::<f64>() < 0.0 { -1.0 } else { 1.0 };
+                let q: [f64; 4] = std::array::from_fn(|k| pa.q[k] + (s * pb.q[k] - pa.q[k]) * f);
+                let n = q.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
+                let rigid = crate::sim::Pose { p: std::array::from_fn(|k| pa.p[k] + (pb.p[k] - pa.p[k]) * f), q: q.map(|v| v / n) };
+                rigid.matrix().then(Mat4(std::array::from_fn(|k| ra.0[k] + (rb.0[k] - ra.0[k]) * f)))
+            };
+            Arc::new(palette.phases[phase].iter().map(|piece| {
+                let mut piece = piece.clone();
+                let Some(k) = pose.iter().position(|g| g.id == piece.id) else { return piece };
+                let (Content::Mesh(m), Content::Mesh(g)) = (&mut piece.content, &pose[k].content) else { return piece };
+                match (&m.skin, &g.skin) {
+                    (Some(skin), Some(other)) if skin.joints.len() == other.joints.len() => {
+                        let joints = skin.joints.iter().zip(&other.joints).enumerate().map(|(j, (a, b))| if takes[k].get(j).copied().unwrap_or(true) { between(*a, *b) } else { *a }).collect();
+                        m.skin = Some(Arc::new(SkinPose { index: skin.index, blend: skin.blend, ids: skin.ids.clone(), joints }));
+                    }
+                    // (What is not skinned moves as a whole.)
+                    (None, None) if takes[k].first().copied().unwrap_or(false) => m.world = between(m.world, g.world),
+                    _ => {}
+                }
+                piece
+            }).collect())
+        }).clone())
     }
 }
 
@@ -367,6 +447,8 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
             Some((view_depth(space, world), k, world, ((turns - turns.floor()) * phases as f64).round() as usize % phases, turn))
         })
         .collect();
+    // How far each has its guard up, in quarters.
+    let quarters = |k: usize| if palette.guard.is_some() { (herd.guard_at(k, x) * 4.0).round().clamp(0.0, 4.0) as u8 } else { 0 };
     // Far to near.
     agents.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     let lens = space.dof.map(|d| [d.plane, d.per_px]);
@@ -395,9 +477,12 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
             let d = unit([c[0] - eye[0], c[1] - eye[1], c[2] - eye[2]]);
             let step_angle = std::f64::consts::TAU / HEADINGS;
             let round = |a: f64| (a / step_angle).round().rem_euclid(HEADINGS) as i64;
-            let key = (phase * 8 / phases, round(turned), round(crate::dm::atan2(d[0], d[2])), ((crate::dm::asin(d[1].clamp(-1.0, 1.0)) / step_angle).round() as i64).clamp(-3, 3));
+            // (Its guard half up or more: a picture of it with its guard up.)
+            let up = quarters(k) >= 2;
+            let key = (phase * 8 / phases + if up { 8 } else { 0 }, round(turned), round(crate::dm::atan2(d[0], d[2])), ((crate::dm::asin(d[1].clamp(-1.0, 1.0)) / step_angle).round() as i64).clamp(-3, 3));
             let (name, w, hgt) = cards.entry(key).or_insert_with(|| {
                 let (moment, turn, az, el) = key;
+                let (moment, up) = (moment % 8, moment >= 8);
                 // The character at the origin, turned so; a camera far
                 // off along the way it is seen, and a picture as large
                 // as the character's box is from there.
@@ -415,12 +500,13 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
                     }
                 }
                 let (w, hgt) = ((2.0 * reach[0] * per_px).ceil().max(2.0), (2.0 * reach[1] * per_px).ceil().max(2.0));
-                let name: Arc<str> = format!("\0crowd/{}/{}/{moment}/{turn}/{az}/{el}", l.id, herd.id).into();
+                let name: Arc<str> = format!("\0crowd/{}/{}/{moment}{}/{turn}/{az}/{el}", l.id, herd.id, if up { "g" } else { "" }).into();
                 let far = FAR * palette.radius * scale;
                 let view = Mat4::translate(0.0, 0.0, far).then(look(dir)).then(Mat4::translate(-at[0], -at[1], -at[2]));
                 let focal = far * per_px;
                 let cam = crate::space::Camera3 { view, project: Mat4([focal, 0.0, w / 2.0, 0.0, 0.0, focal, hgt / 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]).then(view), focal, centre: (w / 2.0, hgt / 2.0) };
-                let layers = palette.phases[moment * phases / 8]
+                let posed = up.then(|| h.guarded(palette, moment * phases / 8, 4)).flatten();
+                let layers = posed.as_deref().unwrap_or(&palette.phases[moment * phases / 8])
                     .iter()
                     .filter_map(|piece| {
                         let Content::Mesh(m) = &piece.content else { return None };
@@ -439,7 +525,11 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
             out.push(LayerState { id: l.id.clone(), matrix: space.screen(card, true), opacity, blend: Blend::Normal, effects: blur(card), matte: None, content: Content::Image { src: name.clone(), size: Some(Vec2::new(*w, *hgt)) }, view: Some(space.cam.view.then(card)) });
             continue;
         }
-        for piece in &palette.phases[phase] {
+        let posed = match (quarters(k), fallen) {
+            (q @ 1.., None) => h.guarded(palette, phase, q),
+            _ => None,
+        };
+        for piece in posed.as_deref().unwrap_or(&palette.phases[phase]) {
             let Content::Mesh(m) = &piece.content else { continue };
             let mut m = m.clone();
             let w = world.then(m.world);
