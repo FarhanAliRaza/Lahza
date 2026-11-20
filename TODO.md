@@ -7,7 +7,10 @@ no GPU: Mesa's software Vulkan, Xvfb, a stand-in for the agent). Each
 section says what was done, what was measured and what is left; this is
 the short of it.
 
-Done and run here (tests pass on the merged tree; pictures looked at):
+Done and run here (pictures looked at; on the merged tree, one thread,
+Mesa's software Vulkan: motion-render 181 tests pass and 19 are ignored
+(measures), motion-core 133, motion-sim 29, motion-mcp 37 and its
+integration tests, the app 116 and its four window tests under Xvfb):
 - The editor: drags that stalled, the prompt bar and its agent runner,
   undo of a whole request, guarded writes, the inspector's tabs and hand
   edits, the preview's choice of raster, sky or traced, the bake pill.
