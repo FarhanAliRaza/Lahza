@@ -335,6 +335,11 @@ pub struct Joint {
     /// The two bodies collide with each other (default: they do not).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub collide: bool,
+    /// Rope, spring: a layer of the scene (a cylinder, capsule or box
+    /// mesh, its length along y) that is drawn as it: from anchor to
+    /// anchor, a rope in pieces that hang by the slack it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<String>,
 }
 
 fn axis_z() -> [f64; 3] {

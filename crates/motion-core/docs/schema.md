@@ -714,9 +714,18 @@ each other unless `collide`. A `motor` drives a hinge (degrees) or slider
 "simulation": {"joints": [
   {"id": "hinge", "type": "hinge", "a": "door", "anchor": [-100, 0, 0], "axis": [0, 1, 0], "limits": [0, 100],
    "motor": {"target": {"keys": [{"at": "beat:3", "v": 0}, {"at": "beat:5", "v": 80, "ease": "glide"}]}, "stiffness": 400, "damping": 40}},
-  {"type": "rope", "a": "wrecker", "anchor_b": [900, 60, 0], "length": 440}
+  {"type": "rope", "a": "wrecker", "anchor_b": [900, 60, 0], "length": 440, "draw": "cord"}
 ]}
 ```
+
+A rope or spring is not seen unless it has `draw`: the id of a mesh
+layer of the scene itself (a `cylinder`, `capsule` or `box`: its length
+along y is the rope's, its radius the rope's thickness, its material the
+rope's). That layer is drawn from anchor to anchor instead of where it
+lies: a spring and a taut rope as one straight piece, a slack rope as
+twelve along the curve a rope of its `length` hangs in (a parabola, down
+the way gravity points; it does not swing of its own). Its bodies are
+layers of the scene itself too.
 
 #### Ragdolls
 

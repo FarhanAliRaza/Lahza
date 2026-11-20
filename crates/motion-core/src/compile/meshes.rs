@@ -1079,6 +1079,11 @@ fn screen_scale(world: Mat4, camera: &Camera3) -> f64 {
 }
 
 impl CMesh {
+    /// Whether it has a length along y to be stretched by (a rope's layer).
+    pub(super) fn long_way(&self) -> bool {
+        matches!(self.shape, CMeshShape::Cylinder(..) | CMeshShape::Capsule(..) | CMeshShape::Box(..))
+    }
+
     pub(super) fn params_at(&self, t: f64, screen: f64) -> Arc<MeshParams> {
         let path = |(paths, index): &(Vec<Arc<str>>, Prop<f64>)| path_morph(paths, index.at(t));
         let shape = match &self.shape {

@@ -89,7 +89,7 @@ wall = {
     "environment": {"preset": "night", "intensity": 0.8},
     "simulation": {"joints": [
         # The ball hangs from a point above the wall by a rope.
-        {"id": "rope", "type": "rope", "a": "wrecker", "b": None, "anchor_b": [W / 2 - 60, 60, 0], "length": 440},
+        {"id": "rope", "type": "rope", "a": "wrecker", "b": None, "anchor_b": [W / 2 - 60, 60, 0], "length": 440, "draw": "cord"},
     ]},
     "layers": [dict(floor(), id="floor2", material={"preset": "matte", "color": "#2a3040"})] + [
         {"id": f"b{r}-{c}", "kind": "mesh",
@@ -104,6 +104,9 @@ wall = {
          # Held out to the left, on the rope's arc; let go at 5.2 s.
          "transform": {"position": [W / 2 - 60 - 440, 60]},
          "body": {"release": 5.2, "density": 8}},
+        # The rope is drawn with this layer, stretched from the ball to the pin.
+        {"id": "cord", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 4, "height": 100},
+         "material": {"preset": "matte", "color": "#d8c9a8"}},
         {"id": "pin", "kind": "mesh", "mesh": {"type": "sphere", "radius": 10},
          "material": {"preset": "emissive", "color": "#ffffff"}, "transform": {"position": [W / 2 - 60, 60]}},
     ],

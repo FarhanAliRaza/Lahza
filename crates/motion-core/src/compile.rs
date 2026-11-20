@@ -556,6 +556,8 @@ pub struct CLayer {
     body: Option<Box<sim::CBody>>,
     /// A crowd's character: the bake places its instances.
     herd: Option<Box<crowd::CHerd>>,
+    /// Drawn as a rope or spring between two bodies.
+    rope: Option<Box<sim::CRope>>,
 }
 
 /// `follow`: placed on sibling `target`'s path.
@@ -1280,6 +1282,7 @@ impl<'a> Compiler<'a> {
             kind,
             body: self.body(c, id, shift),
             herd: None,
+            rope: None,
         }
     }
 
@@ -1540,6 +1543,7 @@ impl Compiler<'_> {
         let sim = self.simulation(scene, start, end, pre_roll);
         let mut layers = layers;
         crowd::bind_herds(&mut layers, &sim, pre_roll);
+        sim::bind_ropes(&mut layers, &sim, pre_roll);
         let skinned = sim::check_skins(&layers, &mut self.errors);
         let lighting = self.lighting(scene, pre_roll, start);
         let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
@@ -2388,7 +2392,17 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             }),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
-        CKind::Mesh(m) => Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))),
+        CKind::Mesh(m) => match &l.rope {
+            // A rope's layer is drawn along the rope, not where it lies.
+            Some(rope) => {
+                for (k, world) in rope.pieces(layers, tc, inherited, space, cache, &m.state(t, world, space.cam, None)).into_iter().enumerate() {
+                    let matrix = space.screen(world, true);
+                    out.push(LayerState { id: if k == 0 { l.id.clone() } else { format!("{}#{k}", l.id).into() }, matrix, opacity: parent_opacity * own_opacity, blend: l.blend, effects: Vec::new(), matte: None, content: Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))), view: Some(space.cam.view.then(world)) });
+                }
+                return;
+            }
+            None => Content::Mesh(Box::new(m.state(t, world, space.cam, space.dof.map(|d| [d.plane, d.per_px])))),
+        },
         CKind::Image { src, size } => Content::Image { src: src.clone(), size: size.as_ref().map(|s| s.at(t)) },
         CKind::Shader(s) => Content::Shader(ShaderState {
             program: s.program.clone(),

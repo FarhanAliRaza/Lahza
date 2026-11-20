@@ -751,8 +751,12 @@ coordinating session. In the order built:
      refuses one unless given `unbaked`.
    - Left: a box landing flat at speed tips a degree or
      two before settling (rapier's contact solver; more iterations do not
-     change it). Ropes are not drawn. Bodies inside instancers are
-     refused. Slang-generated meshes cannot be colliders (give a shape).
+     change it). A drawn rope (`joints[].draw`: a mesh layer stretched
+     from anchor to anchor, in twelve pieces along the parabola a rope
+     of its length hangs in when slack; tested end to end, looked at in
+     `tumble.py`'s wall) hangs still: its slack does not swing or
+     whip, and it passes through what is between its ends. Bodies
+     inside instancers are refused. Slang-generated meshes cannot be colliders (give a shape).
 2. **Skeletons and skinning: done.**
    - `model_import` keeps a glTF skin: a joint node is a comp like any
      node, and the skinned mesh layer has `"skin": {"index", "joints":
