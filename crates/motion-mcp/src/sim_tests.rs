@@ -156,3 +156,61 @@ fn a_skinned_model_falls_as_a_ragdoll_and_its_mesh_goes_with_it() {
     assert!(top(&fallen) > top(&standing) + 100, "the mesh's top went from row {} to {}", top(&standing), top(&fallen));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Directing: intent written on the timeline through the tools, a bake,
+/// a look at the take, and another seed for another.
+#[test]
+fn a_take_is_directed_baked_read_and_taken_again() {
+    let (mut tb, dir) = toolbox("direct");
+    tb.call("project_create", json!({"path": "shot", "duration": 4, "width": 640, "height": 360})).unwrap();
+    // A figure of bare bones (comps), standing on a floor.
+    let bone = |id: &str, at: [f64; 2], kids: Vec<Value>| json!({"id": id, "kind": "comp", "three_d": true, "transform": {"position": at}, "layers": kids});
+    let leg = |s: &str, x: f64| bone(&format!("thigh_{s}"), [x, 5.0], vec![bone(&format!("shin_{s}"), [0.0, 50.0], vec![bone(&format!("foot_{s}"), [0.0, 48.0], vec![])])]);
+    let arm = |s: &str, x: f64| bone(&format!("upper_{s}"), [x, -30.0], vec![bone(&format!("fore_{s}"), [0.0, 34.0], vec![bone(&format!("hand_{s}"), [0.0, 32.0], vec![])])]);
+    let figure = bone("hips", [320.0, 200.0], vec![bone("spine", [0.0, -14.0], vec![bone("chest", [0.0, -32.0], vec![bone("head", [0.0, -36.0], vec![]), arm("l", -23.0), arm("r", 23.0)])]), leg("l", -11.0), leg("r", 11.0)]);
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}, {"op": "add", "scene": "s1", "layer": figure}]})).unwrap();
+    // "Pushed from the left at 1 s; raises its arms; stumbles; recovers."
+    let doll = json!({"id": "doll", "root": "hips", "strength": 1,
+        "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [20, 11, 60], "offset": [0, 5.5, -9]}}],
+        "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}, {"bone": "upper", "swing": 170, "twist": 170}, {"bone": "fore", "swing": 150, "hinge": [1, 0, 0]}],
+        "hits": [{"at": 1.0, "bone": "chest", "velocity": [700, 0, 0]}],
+        "behaviours": [{"type": "balance"}, {"type": "step"}, {"type": "protect", "from": 0.7, "to": 1.6}]});
+    let sim = |doll: &Value, extra: Value| {
+        let mut s = json!({"unit": 46, "ground": {"y": 314.2, "friction": 0.9}, "ragdolls": [doll]});
+        for (k, v) in extra.as_object().unwrap() {
+            s[k] = v.clone();
+        }
+        json!({"ops": [{"op": "set", "target": "s1.simulation", "value": s}]})
+    };
+    tb.call("edit_apply", sim(&doll, json!({}))).unwrap();
+    let take = tb.call("sim_bake", json!({})).unwrap().json["scenes"][0].clone();
+    // The take, read: it stepped and did not fall.
+    assert_eq!(take["ragdolls"][0]["id"], "doll");
+    assert!(take["ragdolls"][0]["fell"].is_null() && take["ragdolls"][0]["steps"].as_u64().unwrap() >= 1, "{take:#}");
+    assert!(take["events"].as_array().unwrap().iter().any(|e| e["kind"] == "step"), "{take:#}");
+    // Looked at: a sheet across the action.
+    let sheet = tb.call("snapshot", json!({"at": [0.5, 1.0, 1.3, 2.0, 3.5], "sheet": true})).unwrap();
+    assert_eq!(sheet.images.len(), 1);
+    // Redirected: a harder push, no steps. It falls, and the take says when.
+    let mut harder = doll.clone();
+    harder["hits"][0]["velocity"] = json!([1500, 0, 0]);
+    harder["behaviours"] = json!([{"type": "balance"}]);
+    tb.call("edit_apply", sim(&harder, json!({}))).unwrap();
+    assert!(sim_issues(&tb.call("check", json!({})).unwrap().json)[0].contains("stale"));
+    let take = tb.call("sim_bake", json!({})).unwrap().json["scenes"][0].clone();
+    let fell = take["ragdolls"][0]["fell"].as_f64().expect("a fall");
+    assert!(fell > 1.0 && fell < 3.5, "{take:#}");
+    assert_eq!(take["events"][0]["kind"], "fall", "what it did comes before what touched what");
+    // Another seed is another take: with jitter the blow lands differently.
+    tb.call("edit_apply", sim(&harder, json!({"jitter": 120}))).unwrap();
+    let file = dir.join("shot.lahza/sim/s1.bake");
+    tb.call("sim_bake", json!({"seed": 1})).unwrap();
+    let one = std::fs::read(&file).unwrap();
+    let two = tb.call("sim_bake", json!({"seed": 2})).unwrap().json["scenes"][0].clone();
+    assert_eq!(two["seed"], 2);
+    assert!(std::fs::read(&file).unwrap() != one);
+    // And the first take comes back with its seed.
+    tb.call("sim_bake", json!({"seed": 1})).unwrap();
+    assert!(std::fs::read(&file).unwrap() == one);
+    std::fs::remove_dir_all(&dir).ok();
+}

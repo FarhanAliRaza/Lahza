@@ -7,12 +7,16 @@ use lahza_motion_core::mesh::{Mesh, MeshParams, MeshShape};
 pub(super) fn def() -> ToolDef {
     ToolDef {
         name: "sim_bake",
-        description: "Bake a scene's simulation: its bodies (layers with \"body\"), joints, pushes and blasts (the scene's \"simulation\") are stepped at a fixed rate from the simulation's start, and every body's place is kept per frame in sim/<scene>.bake. Drawing reads the bake, so snapshot, review and render show the result and any frame can be asked for in any order. The same project bakes to the same bytes. Bake again after changing a body, its shape or keys, a joint, a push or the settings: `check` reports a scene whose bake is missing or stale (and until then the old motion is what is drawn). Returns per scene what was stepped, how long it took, and the take's events (first touches between bodies with their speed in px/s). `seed` sets the scene's simulation.seed first: another seed is another take.",
+        description: "Bake a scene's simulation: its bodies (layers with \"body\"), joints, pushes and blasts (the scene's \"simulation\") are stepped at a fixed rate from the simulation's start, and every body's place is kept per frame in sim/<scene>.bake. Drawing reads the bake, so snapshot, review and render show the result and any frame can be asked for in any order. The same project bakes to the same bytes. Bake again after changing a body, its shape or keys, a joint, a push or the settings: `check` reports a scene whose bake is missing or stale (and until then the old motion is what is drawn). Returns per scene what was stepped, how long it took, and the take's events (a ragdoll's fall and steps; first touches between bodies with their speed in px/s) with a line per ragdoll (fell at, steps). `seed` sets the scene's simulation.seed first: another seed is another take.",
         schema: obj(json!({"scene": {"type": "string", "description": "the scene to bake (default: every scene that has bodies)"},
             "seed": {"type": "integer", "description": "set the scene's simulation.seed, then bake (another take); needs \"scene\" when several scenes have bodies"},
             "force": {"type": "boolean", "description": "bake even when the bake is up to date (default false)"}}), &[]),
         read_only: false,
     }
+}
+
+fn scene_ragdolls(project: &Project, scene: &str) -> Vec<String> {
+    project.scenes.iter().find(|s| s.id == scene).and_then(|s| s.simulation.as_ref()).map(|s| s.ragdolls.iter().map(|r| r.id.clone()).collect()).unwrap_or_default()
 }
 
 impl Toolbox {
@@ -68,10 +72,20 @@ impl Toolbox {
                     let (bake, stats) = lahza_motion_sim::bake_scene(&compiled, i, Some(&dir), &mut meshes).map_err(|e| format!("scene '{id}': {e}"))?;
                     let bytes = bake.to_bytes().len();
                     lahza_motion_core::sim::save_bake(&dir, &id, &bake).map_err(|e| e.to_string())?;
-                    let shown: Vec<&lahza_motion_core::sim::SimEvent> = bake.events.iter().take(60).collect();
+                    // Falls and steps first: they are what a take is judged by.
+                    let acted = |e: &&lahza_motion_core::sim::SimEvent| e.kind != "touch";
+                    let shown: Vec<&lahza_motion_core::sim::SimEvent> = bake.events.iter().filter(acted).chain(bake.events.iter().filter(|e| !acted(e))).take(60).collect();
+                    let ragdolls: Vec<Value> = scene_ragdolls(&self.state(&dir).project, &id)
+                        .into_iter()
+                        .map(|doll| {
+                            let fell = bake.events.iter().find(|e| e.kind == "fall" && e.a == doll).map(|e| e.t);
+                            json!({"id": doll, "fell": fell, "steps": bake.events.iter().filter(|e| e.kind == "step").count()})
+                        })
+                        .collect();
                     out.push(json!({"scene": id, "status": "baked", "file": format!("sim/{id}.bake"), "bytes": bytes, "tracks": bake.tracks.len(),
                         "bodies": stats.bodies, "joints": stats.joints, "frames": stats.samples, "steps": stats.steps, "seconds": (stats.seconds * 1000.0).round() / 1000.0,
-                        "from": bake.start, "events": shown, "events_total": bake.events.len()}));
+                        "policy_runs": stats.policy_runs, "tried_steps": stats.tried_steps, "search_seconds": (stats.search_seconds * 1000.0).round() / 1000.0,
+                        "from": bake.start, "seed": compiled.scenes[i].sim.settings.seed, "ragdolls": ragdolls, "events": shown, "events_total": bake.events.len()}));
                     baked.push((id, Arc::new(bake)));
                 }
             }

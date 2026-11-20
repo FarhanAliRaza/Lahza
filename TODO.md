@@ -360,23 +360,62 @@ are still refused. In the order built:
      by a force, not a leg that swings; nothing gets up after a fall;
      no behaviour looks where it is going. Feet and hands are found by
      bone name (`foot`, `hand`, `head`).
-5. **Directing it.** What writes the film (an LLM) writes intent on the
-   timeline ("pushed from the left at 2.1 s, tries to stop it with the
-   right hand, stumbles, recovers") as events and behaviours; the bake
-   runs; `snapshot` and `review` look at the take, and another seed is
-   another take. Nothing is in real time, so takes cost only time. This
-   stays the same whatever sets the motors.
-6. **A network that sets the motors**, behind 5: each step it reads the
-   body's state and what it touches or is about to, and gives the
-   motors' targets. Running one is `ort`, already here. Getting one:
-   - a policy trained by reinforcement learning: a simulator run many
-     thousands of times at once on a GPU, motion capture to learn from
-     (its licences to be read), days of training; a policy holds for the
-     simulator and the body it was trained with, so one trained elsewhere
-     may not hold in rapier;
-   - or no training: each step, try many targets a little way ahead in
-     the simulator and keep the best. No data; it costs time a shot.
-   To decide after 4, against what 4's behaviours already do.
+5. **Directing it: done as far as the tools go.** Intent is written on
+   the timeline in the document: `hits`, bodies thrown, `release`,
+   `strength` keys per limb, behaviours over spans, all with time
+   references. `sim_bake` returns the take: per ragdoll whether it fell
+   and when and how many steps it took, then every event (`fall`, `step`,
+   first touches with their speeds). `snapshot` and `review` draw it like
+   any shot. `sim_bake {seed}` sets `simulation.seed` and bakes: with
+   `jitter` each blow and each release differs by seed, and the same seed
+   gives the same bytes back.
+   - Tested through the tools alone (`motion-mcp/src/sim_tests.rs`): a
+     push, arms up, steps, no fall; redirected to a harder push without
+     steps, a fall reported at its time; a stale bake between; two seeds,
+     two takes, the first again.
+   - Left: no LLM was put in the loop here (the test is the calls one
+     would make). A take is judged from events and a sheet; nothing
+     scores it against the intent. `snapshot` does not mark where on the
+     sheet the events fall. Variation by seed is in the blows and
+     releases only, not in how a body reacts.
+6. **A network that sets the motors: the interface and the no-training
+   route are built; no policy was trained.**
+   - The interface (`motion-sim/src/policy.rs`): once a frame an
+     observation of 16 + 11·(bones − 1) + feet numbers (up, the root's
+     velocity and turning in its frame, its height, the nearest foreign
+     body's place and speed, per bone its turn, turning and the clip's
+     turn, per foot whether it touches) and an action of 3·(bones − 1)
+     (a turn per bone on top of the clip's target). `controller:
+     {"type": "policy", "src": …}` runs an ONNX file through `ort` on the
+     runtime bundled for camera matting. Tested with four small files
+     made by `tests/policy/make.py`: zeros leave the clip, a constant
+     turns its joint by that much, a weight on the height observation
+     arrives as 0.5 × 2.25 rad, a file of the wrong size is refused with
+     the counts. The policy's file is in the bake's hash.
+   - Not done, and not doable here: training. It needs a simulator run
+     thousands of times at once on a GPU, motion capture (licences to be
+     read) and days; and a policy trained in another simulator (Isaac,
+     MuJoCo) may not hold in rapier with these capsules and motors. If
+     one is trained, this layout is what it must be trained to.
+   - The no-training route (`search.rs`, `controller: {"type":
+     "search"}`): each 0.1 s, 16 tries 0.25 s ahead in a copy of the
+     world, each try three leans (ankles, hips, spine: six numbers; a
+     search over every joint would need far more tries), scored on
+     falling, weight past the feet, tilt, height and effort.
+   - Measured on the test figure, pushes at the chest in px/s, with no
+     helping force anywhere: motors holding the clip fall at 300; search
+     at the defaults holds 300 and falls at 450, and a 4 s take bakes in
+     7.4 s instead of 0.2 s (32 448 steps tried for 960 taken); 48 tries
+     do no better (21 s); a 0.5 s horizon holds 700 and falls at 1000
+     (14 s). Against part 4: `balance` without help holds 200; with its
+     help (a quarter of body weight on the hips) 1400, with steps 1800,
+     at no cost. So the search buys honest balance (no outside force)
+     over a narrow range at 40 to 70 times the bake; the helped
+     behaviours cover far more for nothing. To decide: whether takes
+     want the unhelped look enough to pay for it.
+   - Left: the search only leans; it does not step or use its arms.
+     Tries run one after the other on one core (they are independent:
+     four cores would cut the time by about four).
 7. **Crowds.** Steering for where each one goes, a clip played per agent,
    a ragdoll only for the ones hit. A skinned agent is a mesh of its own
    every frame (in the tracer an acceleration structure each): how many an

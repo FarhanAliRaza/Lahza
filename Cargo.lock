@@ -3760,8 +3760,10 @@ dependencies = [
 name = "lahza-motion-sim"
 version = "0.1.0"
 dependencies = [
+ "lahza-camera-matting-runtime",
  "lahza-motion-core",
  "libm",
+ "ort",
  "rapier3d",
  "serde",
  "serde_json",

@@ -13,3 +13,8 @@ rapier3d = { version = "=0.36.1", default-features = false, features = ["dim3", 
 libm = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+# Policies run on the ONNX Runtime the app bundles.
+lahza-camera-matting-runtime = { path = "../camera-matting-runtime" }
+ort = { workspace = true }

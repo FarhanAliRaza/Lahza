@@ -467,6 +467,11 @@ impl Compiled {
             input.blasts.push(BlastInput { at: *at, origin: b.origin, speed: b.speed, radius: b.radius });
         }
         self.ragdoll_input(i, &mut input, &mut errors);
+        // A policy's file is part of what the bake is made from.
+        files.extend(set.ragdolls.iter().filter_map(|r| match &r.controller {
+            Some(crate::sim::Controller::Policy { src }) => Some(src.clone()),
+            _ => None,
+        }));
         if !set.crowds.is_empty() {
             errors.push(format!("{}.simulation.crowds: crowds are not built yet", scene.id));
         }

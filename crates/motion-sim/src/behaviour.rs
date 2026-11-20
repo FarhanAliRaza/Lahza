@@ -76,6 +76,7 @@ fn param(b: &BehaviourInput, name: &str, default: f64) -> f64 {
 }
 
 /// An arm: its bones' indices in the ragdoll.
+#[derive(Clone)]
 struct Arm {
     hand: usize,
     fore: usize,
@@ -83,6 +84,7 @@ struct Arm {
     left: bool,
 }
 
+#[derive(Clone)]
 struct Step {
     foot: usize,
     from: V,
@@ -100,6 +102,7 @@ pub struct Drive {
     pub scale: Vec<f64>,
 }
 
+#[derive(Clone)]
 pub struct Brain {
     feet: Vec<usize>,
     arms: Vec<Arm>,
@@ -170,10 +173,20 @@ impl Brain {
 
     /// The targets and strengths for the step from time `t` that ends at
     /// sample position `x`; pushes the body where a behaviour does.
-    pub fn think(&mut self, world: &mut World, input: &SimInput, r: &RagdollInput, x: f64, t: f64) -> Drive {
+    ///
+    /// `turns`: per bone, a turn to make on top of the clip's target (a
+    /// controller's: a policy's action, a search's choice).
+    pub fn think(&mut self, world: &mut World, input: &SimInput, r: &RagdollInput, x: f64, t: f64, turns: Option<&[Option<[f64; 4]>]>) -> Drive {
         let n = r.bones.len();
         let mut drive = Drive { targets: vec![None; n], scale: vec![1.0; n] };
-        if r.behaviours.is_empty() || !world.released[r.bones[0].body] {
+        if let Some(turns) = turns {
+            for (k, turn) in turns.iter().enumerate().take(n) {
+                if let Some(turn) = turn {
+                    drive.targets[k] = Some(quat_mul(*turn, world.clip(r, k, x).unwrap_or(r.bones[k].bind)));
+                }
+            }
+        }
+        if !world.released[r.bones[0].body] {
             return drive;
         }
         let u = world.unit;
@@ -415,6 +428,59 @@ impl Brain {
             }
         }
         drive
+    }
+}
+
+impl Brain {
+    /// The feet: bones' indices.
+    pub fn feet(&self) -> &[usize] {
+        &self.feet
+    }
+}
+
+/// How a ragdoll stands at one moment.
+#[derive(Clone, Copy, Debug)]
+pub struct Stance {
+    /// The height of its weight over its feet (px).
+    pub height: f64,
+    /// How far its weight is headed past the middle of its feet (px,
+    /// level): where it is, carried on by its speed for the time a fall
+    /// from this height takes.
+    pub heading: f64,
+    /// The way its trunk points (the scene's axes).
+    pub trunk: [f64; 3],
+}
+
+impl Stance {
+    pub fn of(world: &World, input: &SimInput, r: &RagdollInput, feet: &[usize]) -> Option<Stance> {
+        let u = world.unit;
+        let up = unit(mul(input.gravity, -1.0))?;
+        if feet.is_empty() {
+            return None;
+        }
+        let (mut mass, mut com, mut vel) = (0.0, [0.0; 3], [0.0; 3]);
+        let centre = |b: usize| {
+            let c = world.w.bodies[world.handles[b]].center_of_mass();
+            [c.x as f64 * u, c.y as f64 * u, c.z as f64 * u]
+        };
+        for b in &r.bones {
+            let rb = &world.w.bodies[world.handles[b.body]];
+            let (m, v) = (rb.mass() as f64, rb.linvel());
+            mass += m;
+            com = add(com, mul(centre(b.body), m));
+            vel = add(vel, mul([v.x as f64, v.y as f64, v.z as f64], m * u));
+        }
+        let (com, vel) = (mul(com, 1.0 / mass.max(1e-9)), mul(vel, 1.0 / mass.max(1e-9)));
+        let support = mul(feet.iter().fold([0.0; 3], |acc, &f| add(acc, centre(r.bones[f].body))), 1.0 / feet.len() as f64);
+        let height = dot(sub(com, support), up);
+        let fall_time = (height.max(1.0) / (len(input.gravity) * u).max(1e-9)).sqrt();
+        let off = sub(add(com, mul(vel, fall_time)), support);
+        Some(Stance { height, heading: len(sub(off, mul(up, dot(off, up)))), trunk: quat_rotate(world.pose(r.bones[0].body).q, r.bones[0].along) })
+    }
+
+    /// Radians its trunk is over from how it pointed in `then`.
+    pub fn tilt(&self, then: &Stance) -> f64 {
+        libm::acos(dot(self.trunk, then.trunk).clamp(-1.0, 1.0))
     }
 }
 

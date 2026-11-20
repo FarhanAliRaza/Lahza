@@ -409,6 +409,22 @@ impl World {
         self.touching = now;
     }
 
+    /// A copy that goes its own way from here (a try ahead).
+    pub fn fork(&self) -> World {
+        let mut w = PhysicsWorld::default();
+        w.gravity = self.w.gravity;
+        w.integration_parameters = self.w.integration_parameters;
+        w.islands = self.w.islands.clone();
+        w.broad_phase = self.w.broad_phase.clone();
+        w.narrow_phase = self.w.narrow_phase.clone();
+        w.bodies = self.w.bodies.clone();
+        w.colliders = self.w.colliders.clone();
+        w.impulse_joints = self.w.impulse_joints.clone();
+        w.multibody_joints = self.w.multibody_joints.clone();
+        w.ccd_solver = self.w.ccd_solver.clone();
+        World { w, unit: self.unit, handles: self.handles.clone(), anchor: self.anchor, ground: self.ground, released: self.released.clone(), joints: self.joints.clone(), dt: self.dt, rigs: self.rigs.clone(), touching: self.touching.clone(), events: Vec::new() }
+    }
+
     /// Body `i`'s pose now, px.
     pub fn pose(&self, i: usize) -> Pose {
         let p = self.w.bodies[self.handles[i]].position();

@@ -768,6 +768,23 @@ Behaviours set the motors' targets on top of the clip, from `from` to
 | `reach` | a hand to where it was last hit (a `hits` entry, or a body striking it at speed), for `hold` seconds (1.5) |
 | `protect` | both hands to the sides of the head |
 
+A ragdoll's `controller` sets its motors' targets too, as turns made on
+top of the clip's (behaviours then act on the result):
+
+- `{"type": "search", "samples": 16, "horizon": 0.25, "every": 0.1,
+  "spread": 12}`: no training. Every `every` seconds it tries `samples`
+  sets of leans (at the ankles, hips and spine, within `spread` degrees of
+  its last choice) `horizon` seconds ahead in a copy of the simulation and
+  keeps the one that leaves it most upright. It costs the steps of every
+  try: the defaults bake about 40 times slower (a 4 s take in 7 s);
+  `sim_bake` reports `tried_steps`.
+- `{"type": "policy", "src": "assets/policy.onnx"}`: a network, run once
+  a frame. Its input is `[1, 16 + 11·(B − 1) + F]` and its first output
+  `[1, 3·(B − 1)]` f32 for a ragdoll of B bones and F feet: the layout is
+  in `crates/motion-sim/src/policy.rs`. Lahza runs one (the bundled ONNX
+  Runtime, Linux x86-64); it does not train one, and a policy holds for
+  the body and simulator it was trained with.
+
 Arms are bones named `hand` with the two above them; the head is the bone
 named `head`. Bakes with ragdolls list `fall` and `step` events with the
 touches.

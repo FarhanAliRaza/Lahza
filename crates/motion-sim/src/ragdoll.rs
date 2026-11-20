@@ -28,6 +28,7 @@ pub const MOST: f64 = 600.0;
 pub const LIMP: f64 = 4.0;
 
 /// A ragdoll's joints in the world.
+#[derive(Clone)]
 pub struct Rig {
     /// Per bone: its joint to its parent, and its motor.
     pub joints: Vec<Option<(ImpulseJointHandle, ImpulseJointHandle)>>,
@@ -170,9 +171,13 @@ impl World {
     }
 
     /// A ragdoll's hits that fall in the step from `t`.
-    pub(crate) fn hit_ragdoll(&mut self, r: &RagdollInput, t: f64) {
+    pub(crate) fn hit_ragdoll(&mut self, input: &SimInput, r: &RagdollInput, t: f64) {
         let dt = self.dt;
-        for (at, bone, velocity, dur) in &r.hits {
+        for (n, (at, bone, velocity, dur)) in r.hits.iter().enumerate() {
+            // Another seed is another take: with `jitter`, each blow lands
+            // a little differently.
+            let mut rng = crate::world::Rng(input.seed ^ (n as u64 + 1).wrapping_mul(0x9fb21c651e98df25) ^ r.bones.len() as u64);
+            let velocity = &velocity.map(|v| v + input.jitter * rng.signed());
             let share = if *dur <= dt {
                 if *at >= t - 1e-9 && *at < t + dt - 1e-9 { 1.0 } else { 0.0 }
             } else {
