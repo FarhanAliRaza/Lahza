@@ -5,7 +5,8 @@
 Imports the test character (character.py) N times (default 12) as the
 agents of a crowd that crosses the floor round a pillar, each playing the
 walk by the distance it covers. A ball is thrown through them at 2 s:
-whoever it strikes goes down as a ragdoll. Bakes, checks, writes a
+they see it coming and step out of its line (DODGE=0: they do not look,
+and whoever it strikes goes down as a ragdoll). Bakes, checks, writes a
 contact sheet, and times the bake and (TIME=1) a second of export on the
 CPU renderer.
 """
@@ -77,6 +78,8 @@ scene = {
          "time": {"start": 1.5}, "body": {"release": 2.0, "mass": 25, "bounce": 0.2}, "allow": ["draws_off_frame"]},
     ],
 }
+if os.environ.get("DODGE"):
+    crowd["dodge"] = float(os.environ["DODGE"])
 apply([{"op": "add_scene", "scene": scene}])
 began = time.time()
 for i, a in enumerate(agents):

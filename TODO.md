@@ -530,7 +530,9 @@ GPU, no trained policy): what each does, what was measured and what is
 left is below. Morph targets are still refused. Across all of it: a bake
 is the same bytes from debug and release builds and on two containers
 (both Intel Xeons with FMA and AVX-512; the hashes are pinned in
-`motion-sim`'s tests). Not checked on a CPU without FMA or on ARM:
+`motion-sim`'s tests; the eight pinned since, for getting up, bones
+meeting, instances, a way round a wall, stepping aside and the search,
+were made on one of them and are to be confirmed on the other). Not checked on a CPU without FMA or on ARM:
 rapier's own maths is software (`enhanced-determinism`) and the
 behaviours use `libm`, but what `compile` feeds the simulator (layer
 rotations to matrices) uses the standard library's sines, which glibc

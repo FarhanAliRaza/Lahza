@@ -6,8 +6,9 @@ Imports the test character (character.py) once and makes it the
 character of a crowd of N (default 1000) that marches across a field
 round a pillar, each agent at its own moment of the walk. The nearest
 FULL (default 150) are drawn as the character, the rest as pictures of
-it. A ball is thrown through them at 2 s: whoever it strikes goes down as
-a ragdoll of the pool. WALL=1 stands a wall across their way. Bakes,
+it. A ball is thrown through them at 2 s: they step out of its line
+(DODGE=0: they do not look, and whoever it strikes goes down as a
+ragdoll of the pool). WALL=1 stands a wall across their way. Bakes,
 checks (CHECK=1), writes a contact sheet,
 and times the bake and (TIME=1) a second of export on the CPU renderer.
 """
@@ -85,6 +86,8 @@ if os.environ.get("WALL"):
         {"id": "wall", "kind": "mesh", "mesh": {"type": "box", "size": [0.4 * side, 2.2 * UNIT], "depth": 0.4 * UNIT},
          "material": {"preset": "plastic", "color": "#8a93a6"}, "transform": {"position": [W / 2 + 0.15 * side, FLOOR - 1.1 * UNIT], "z": -0.62 * side},
          "body": {"type": "fixed"}})
+if os.environ.get("DODGE"):
+    crowd["dodge"] = float(os.environ["DODGE"])
 apply([{"op": "add_scene", "scene": scene}])
 # One character, where the field's corner is: its level, turn and scale are every agent's.
 run("motion", "model-import", PROJECT, model, "--scene", "s1", "--id", "figure", "--unit", str(UNIT), "--position", f"{W / 2},{FLOOR}", "--z", "0")
