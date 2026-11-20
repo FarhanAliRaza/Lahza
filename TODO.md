@@ -342,46 +342,48 @@ To settle first:
 
 ### Drags that stall
 
-Changing a selected layer's values is slow: the bars stick, as if a
-render had begun. Read in the code and timed apart from the app; the
-editor was not run, so which of these is the one felt is not confirmed.
+Changing a selected layer's values was slow: the bars stuck, as if a
+render had begun. Four causes were read in the code and timed apart from
+the app; all four are fixed. Run under Xvfb with Mesa's software Vulkan
+only (`editor_window_edits_and_reloads`): which of them was the one felt,
+and whether the bars now move freely, is not confirmed on a real card.
 
-- **A drag draws at full quality (first to fix).** A drag is meant to
-  draw at half size with no motion blur. `motion_piece_frames`
-  (motion_piece_ui.rs) asks only whether a piece is dragged on the
-  timeline (`motion_piece_drag`); a value dragged in the inspector, a
-  layer moved and a key retimed are `motion_layer_drag`, so every tick
-  asks for a full frame with motion blur. The editor's own
-  `request_frame` (motion_editor.rs) has the same gap: its `drag` is set
-  by the canvas only. Both should ask one question: is anything dragged.
-  To look at on a real card once fixed: whether full frames on the GPU
-  that also draws the window are what holds the bars (the frames are on
-  a worker thread, so the UI thread alone should not stall).
-- **Every tick goes through the whole project.** `preview`
-  (motion_editor.rs) calls `edit::apply`, which turns the whole project
-  into JSON and back, then `Compiled::new` on all of it. Timed in a cloud
-  container on projects of plain shapes and text (a throwaway example,
-  not kept):
+- **Every drag draws the proxy.** A value dragged in the inspector, a
+  layer moved and a key retimed now draw at half size with no motion
+  blur, as a piece dragged on the timeline did. Both places ask one
+  question: `motion_piece_frames` (motion_piece_ui.rs) whether a piece or
+  anything of the open piece is dragged, the editor's `request_frame`
+  `MotionEditor::dragging` (its canvas drag, or an unsaved preview
+  showing). Left to look at on a real card: whether full frames on the
+  GPU that also draws the window held the bars (the frames are on a
+  worker thread, so the UI thread alone should not stall).
+- **A tick changes one layer.** `preview` (motion_editor.rs) no longer
+  turns the project into JSON: `edit::apply_to_layer` passes only the
+  dragged layer through the same op code, into a copy of the project made
+  once a drag (`preview_project`); `apply` is kept for the drop and for
+  anything that is not `set`, `key` or `anchor` on one layer. The result
+  equals `apply`'s (`a_drag_on_one_layer_equals_apply`). Timed in a cloud
+  container (`cargo test --release -p lahza-motion-core drag_tick_timing
+  -- --ignored --nocapture`):
 
-  | layers | a tick (apply + compile) | the drop (apply, save, load, 2 compiles) |
-  |---|---|---|
-  | 30 | 0.4 ms | 1.3 ms |
-  | 480 | 7.1 ms | 19 ms |
-  | 1 200 | 19 ms | 52 ms |
+  | layers | `apply` (before) | one layer (now) | compile (still every tick) |
+  |---|---|---|---|
+  | 30 | 0.20 ms | 0.012 ms | 0.04 ms |
+  | 480 | 3.4 ms | 0.013 ms | 0.66 ms |
+  | 1 200 | 22 ms | 0.014 ms | 1.7 ms |
 
-  Nearly all of a tick is `apply` (6.0 of 7.1 ms at 480 layers; compile
-  1.1). Past 16 ms on a large project, and sooner with an imported model
-  of many parts. To do: a drag changes the one property in a copy of the
-  project (no JSON) and recompiles only its scene; `apply` stays for the
-  drop.
-- **The drop reads all the history.** `next_history_number` reads and
-  parses every entry to find the last: 2.4 ms at 500 entries, 10.5 ms at
-  2 000, and agents write many. To do: the highest file name.
-- **The inspector asks for each value twice a draw** (`field_state`:
-  `eval` for whether it is keyed, then for the value), each turning the
-  layer into JSON and compiling the property. 0.004 ms for a plain layer;
-  a comp is turned with all its children. To do: once per field, from the
-  compiled layer.
+  Left: the tick still compiles every scene (`Compiled::new`, 1.7 ms at
+  1 200 plain layers; more with an imported model of many parts, not
+  timed). Compiling only the scene that changed needs a way into
+  `compile.rs`, which was another branch's file while this was done.
+- **The drop no longer reads the history.** `next_history_number` takes
+  the highest file name: 0.6 ms at 2 000 entries, where reading them all
+  takes 14 ms (`history_numbers_come_from_file_names -- --nocapture`).
+  Undo and redo still read every entry.
+- **The inspector asks for each value once**, and the layer is turned
+  into JSON once per change, not twice per value per draw
+  (`layer_value` keeps it). During a drag the number shown is the dragged
+  one. X and Y of one property are still two evaluations.
 
 ### How it should be used
 

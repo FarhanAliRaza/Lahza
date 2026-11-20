@@ -26,6 +26,7 @@ use lahza_motion_mcp::tools::Toolbox;
 use lahza_motion_render::font::Fonts;
 use lahza_motion_render::{RenderOptions, Renderer};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -288,6 +289,13 @@ pub(crate) struct MotionEditor {
     selected: Option<String>,
     canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     drag: Option<Drag>,
+    /// The project as a drag shows it (unsaved): a copy made at the drag's
+    /// first tick, in which each tick replaces the one layer it changes.
+    preview_project: Option<Project>,
+    /// The selected layer as JSON, saved and as the drag shows it: values
+    /// are read from these, so a draw does not serialise the layer again.
+    saved_json: RefCell<Option<(String, Value)>>,
+    preview_json: RefCell<Option<(String, Value)>>,
     focus: FocusHandle,
     fonts: Fonts,
     status: String,
@@ -450,6 +458,9 @@ impl MotionEditor {
             selected: None,
             canvas_bounds: Arc::default(),
             drag: None,
+            preview_project: None,
+            saved_json: RefCell::default(),
+            preview_json: RefCell::default(),
             focus: cx.focus_handle(),
             status: String::new(),
             poll_ticks: 0,
@@ -513,7 +524,7 @@ impl MotionEditor {
             }
         }
         self.poll_ticks += 1;
-        if self.poll_ticks % 30 == 0 && self.drag.is_none() && stamp(&self.dir) > self.stamp {
+        if self.poll_ticks % 30 == 0 && !self.dragging() && stamp(&self.dir) > self.stamp {
             self.reload();
             self.status = "Updated from disk".into();
             changed = true;
@@ -544,16 +555,34 @@ impl MotionEditor {
         let (w, h) = (self.project.settings.width as f64, self.project.settings.height as f64);
         let fit = (f64::from(bounds.size.width) / w).min(f64::from(bounds.size.height) / h).min(1.0);
         // Half-size proxy while moving; full preview size when still.
-        let proxy = self.playing || self.drag.is_some();
+        let proxy = self.playing || self.dragging();
         let scale = (fit * if proxy { 0.5 } else { 1.0 }).max(0.05);
         self.request_key += 1;
         self.worker.request(Job { compiled: self.compiled.clone(), t: self.time, scale, blur: !proxy, key: self.request_key });
         self.dirty = false;
     }
 
+    /// Whether anything is being dragged: on the canvas, or a value, a
+    /// layer or a key from the studio (an unsaved preview shows).
+    pub(crate) fn dragging(&self) -> bool {
+        self.drag.is_some() || self.preview_project.is_some()
+    }
+
+    /// The project as it shows now: a drag's unsaved copy, or the saved one.
+    fn shown(&self) -> &Project {
+        self.preview_project.as_ref().unwrap_or(&self.project)
+    }
+
+    fn drop_preview(&mut self) {
+        self.preview_project = None;
+        *self.preview_json.borrow_mut() = None;
+    }
+
     fn reload(&mut self) {
         match io::load(&self.dir) {
             Ok(p) => {
+                self.drop_preview();
+                *self.saved_json.borrow_mut() = None;
                 self.project = p;
                 self.compiled = Arc::new(Compiled::new(&self.project));
                 self.rows = layer_rows(&self.project, &self.compiled);
@@ -586,11 +615,24 @@ impl MotionEditor {
     }
 
     /// Shows ops without saving them (live drags).
+    /// A drag's ticks change one layer's fields: only that layer goes
+    /// through JSON (`edit::apply_to_layer`), into a copy of the project
+    /// made once a drag. Anything else takes `edit::apply`.
     fn preview(&mut self, ops: &[Value]) {
-        if let Ok(a) = edit::apply(&self.project, ops) {
-            self.compiled = Arc::new(Compiled::new(&a.project));
-            self.dirty = true;
+        match edit::apply_to_layer(&self.project, ops) {
+            Some(Ok((_, layer))) => {
+                let copy = self.preview_project.get_or_insert_with(|| self.project.clone());
+                edit::replace_layer(copy, layer);
+            }
+            Some(Err(_)) => return,
+            None => match edit::apply(&self.project, ops) {
+                Ok(a) => self.preview_project = Some(a.project),
+                Err(_) => return,
+            },
         }
+        *self.preview_json.borrow_mut() = None;
+        self.compiled = Arc::new(Compiled::new(self.shown()));
+        self.dirty = true;
     }
 
     fn undo(&mut self, redo: bool) {
@@ -648,12 +690,28 @@ impl MotionEditor {
         Some(((x as f64 - ox) / k, (y as f64 - oy) / k))
     }
 
-    fn layer_json(&self, id: &str) -> Option<Value> {
-        find_layer(&self.project, id).and_then(|l| serde_json::to_value(l).ok())
+    /// `path` of layer `id` as JSON, from the saved project or (`shown`)
+    /// from what a drag shows. The layer is serialised once and kept until
+    /// it changes.
+    fn layer_value(&self, id: &str, path: &str, shown: bool) -> Option<Value> {
+        let shown = shown && self.preview_project.is_some();
+        let (cell, project) = if shown { (&self.preview_json, self.shown()) } else { (&self.saved_json, &self.project) };
+        let mut cache = cell.borrow_mut();
+        if cache.as_ref().is_none_or(|(cached, _)| cached != id) {
+            *cache = Some((id.to_string(), serde_json::to_value(find_layer(project, id)?).ok()?));
+        }
+        cache.as_ref()?.1.pointer(&format!("/{}", path.replace('.', "/"))).cloned()
     }
 
+    /// The saved value (what ops are made from).
     fn eval<T: Animatable>(&self, id: &str, path: &str, default: T) -> (T, bool) {
-        let v = self.layer_json(id).and_then(|j| j.pointer(&format!("/{}", path.replace('.', "/"))).cloned());
+        self.eval_in(id, path, default, false)
+    }
+
+    /// `path` at the playhead and whether it is keyed; `shown`: as a drag
+    /// shows it.
+    fn eval_in<T: Animatable>(&self, id: &str, path: &str, default: T, shown: bool) -> (T, bool) {
+        let v = self.layer_value(id, path, shown);
         let Some(v) = v else { return (default, false) };
         let Ok(prop) = serde_json::from_value::<Property<T>>(v) else { return (default, false) };
         let animated = prop.is_animated();
@@ -694,16 +752,6 @@ impl MotionEditor {
                 let (_, animated) = self.eval::<f64>(id, field.path, 0.0);
                 self.value_ops(id, field.path, json!(round(value)), animated)
             }
-        }
-    }
-
-    fn field_value(&self, id: &str, field: Field) -> f64 {
-        match field.component {
-            Some(c) => {
-                let default = if field.path == "transform.scale" { Vec2::ONE } else { Vec2::ZERO };
-                self.eval::<Vec2>(id, field.path, default).0 .0[c]
-            }
-            None => self.eval::<f64>(id, field.path, if field.path == "transform.opacity" { 1.0 } else { 0.0 }).0,
         }
     }
 
@@ -808,7 +856,7 @@ impl MotionEditor {
             self.commit(ops);
         } else {
             // A click: drop the drag preview.
-            self.compiled = Arc::new(Compiled::new(&self.project));
+            self.cancel_preview();
         }
     }
 
@@ -889,9 +937,16 @@ impl MotionEditor {
     }
 
     /// `field` of layer `id` at the playhead, and whether it is keyed.
+    /// One evaluation; during a drag, the value the drag shows.
     pub(crate) fn field_state(&self, id: &str, field: Field) -> (f64, bool) {
-        let animated = if field.component.is_some() { self.eval::<Vec2>(id, field.path, Vec2::ZERO).1 } else { self.eval::<f64>(id, field.path, 0.0).1 };
-        (self.field_value(id, field), animated)
+        match field.component {
+            Some(c) => {
+                let default = if field.path == "transform.scale" { Vec2::ONE } else { Vec2::ZERO };
+                let (v, animated) = self.eval_in::<Vec2>(id, field.path, default, true);
+                (v.0[c], animated)
+            }
+            None => self.eval_in::<f64>(id, field.path, if field.path == "transform.opacity" { 1.0 } else { 0.0 }, true),
+        }
     }
 
     /// Shows `field` of `layer` at `value` (unsaved).
@@ -909,6 +964,7 @@ impl MotionEditor {
 
     /// Drops any unsaved drag preview.
     pub(crate) fn cancel_preview(&mut self) {
+        self.drop_preview();
         self.compiled = Arc::new(Compiled::new(&self.project));
         self.dirty = true;
     }
@@ -1283,8 +1339,21 @@ mod tests {
                         assert_eq!(editor.hit_at(10.0, 10.0), None);
                         // Scrub the title's opacity (constant → set).
                         let field = FIELDS[5];
+                        editor.drag_value("title", field, 0.25);
+                        // Mid-drag: the proxy is on and the number follows.
+                        assert!(editor.dragging(), "a value drag is a drag");
+                        assert!((editor.field_state("title", field).0 - 0.25).abs() < 1e-9, "the number at once");
                         editor.drag_value("title", field, 0.5);
                         editor.drop_value("title", field, 0.5);
+                        assert!(!editor.dragging());
+                        // A keyed value dragged twice leaves one new key, not two.
+                        editor.move_layer("box", [210.0, 190.0], false);
+                        editor.move_layer("box", [220.0, 200.0], false);
+                        assert_eq!(editor.position_of("box").x(), 200.0, "ops are made from the saved project");
+                        let shown = serde_json::to_value(find_layer(editor.shown(), "box").unwrap()).unwrap();
+                        assert_eq!(shown["transform"]["position"]["keys"].as_array().unwrap().len(), 3);
+                        editor.cancel_preview();
+                        assert!(!editor.dragging());
                         assert!((editor.field_state("title", field).0 - 0.5).abs() < 1e-9, "opacity scrubbed to 0.5");
                         // Retime the box's second key onto beat 4 (Shift snaps).
                         editor.drop_key("box", "transform.position", 1, 1.5, 1.95, true);

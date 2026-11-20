@@ -168,8 +168,18 @@ pub fn write_history(dir: &Path, entry: &HistoryEntry) -> Result<()> {
     write_json(&history_dir(dir).join(format!("{:06}.json", entry.n)), entry)
 }
 
+/// One past the highest entry: from the file names (`000042.json`), so no
+/// entry is read.
 pub fn next_history_number(dir: &Path) -> Result<u64> {
-    Ok(read_history(dir)?.last().map(|e| e.n + 1).unwrap_or(1))
+    let mut last = 0;
+    if let Ok(read) = fs::read_dir(history_dir(dir)) {
+        for e in read.flatten() {
+            let name = e.file_name();
+            let n = name.to_str().and_then(|n| n.strip_suffix(".json")).and_then(|n| n.parse::<u64>().ok());
+            last = last.max(n.unwrap_or(0));
+        }
+    }
+    Ok(last + 1)
 }
 
 pub fn now() -> u64 {
@@ -183,6 +193,31 @@ pub fn now() -> u64 {
 mod tests {
     use super::*;
     use crate::time::Fps;
+
+    fn entry(n: u64) -> HistoryEntry {
+        HistoryEntry { n, time: 0, author: "agent".into(), summary: vec!["set a.b".into()], ops: vec![serde_json::json!({"op": "set", "target": "a.b", "value": 1})], inverse: Vec::new(), undone: false, undoes: Vec::new() }
+    }
+
+    /// The next number comes from the file names; prints what reading every
+    /// entry costs beside it (`-- --nocapture`).
+    #[test]
+    fn history_numbers_come_from_file_names() {
+        let dir = std::env::temp_dir().join(format!("lahza-motion-history-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(next_history_number(&dir).unwrap(), 1);
+        for n in 1..=2000 {
+            write_history(&dir, &entry(n)).unwrap();
+        }
+        fs::write(dir.join("history/notes.json"), "not an entry's name").unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(next_history_number(&dir).unwrap(), 2001);
+        let names = t.elapsed();
+        fs::remove_file(dir.join("history/notes.json")).unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(read_history(&dir).unwrap().len(), 2000);
+        println!("2000 entries: next number {:.2} ms from names, {:.2} ms reading them all", names.as_secs_f64() * 1000.0, t.elapsed().as_secs_f64() * 1000.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn save_and_load_round_trip() {
