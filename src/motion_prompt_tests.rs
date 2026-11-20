@@ -496,7 +496,7 @@ fn a_simulation_is_baked_from_the_bar_and_goes_stale_when_a_body_moves() {
             let editor = |cx: &mut gpui::AsyncApp| handle.update(cx, |s, _, _| s.motion_doc.as_ref().map(|d| d.editor.clone())).unwrap();
             // Waits (up to three minutes: a software GPU's first frame) for
             // the editor to say `want` of its simulation.
-            let mut until = async |cx: &mut gpui::AsyncApp, what: &str, want: &dyn Fn(&crate::motion_editor::MotionEditor) -> bool| {
+            let until = async |cx: &mut gpui::AsyncApp, what: &str, want: &dyn Fn(&crate::motion_editor::MotionEditor) -> bool| {
                 for _ in 0..3600 {
                     wait(50).await;
                     draw(cx);

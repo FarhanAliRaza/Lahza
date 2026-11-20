@@ -10,7 +10,7 @@
 //! the editor take the project's lock to write (`io::lock`).
 
 use crate::controls::{button, ButtonKind, ButtonSize};
-use crate::motion_agent::{compose, About, Availability, ClaudeCode, Event, Failure, Request, Runner, Running};
+use crate::motion_agent::{compose, About, Availability, Chosen, Event, Failure, Request, Runner, Running};
 use crate::motion_timeline::LayerDrag;
 use crate::text_field::{EventKind, FieldEvent, Target};
 use crate::theme;
@@ -172,7 +172,7 @@ pub(crate) struct MotionAgent {
 
 impl Default for MotionAgent {
     fn default() -> Self {
-        Self::new(Arc::new(ClaudeCode::default()))
+        Self::new(Arc::new(Chosen::default()))
     }
 }
 
@@ -260,6 +260,18 @@ impl MotionAgent {
         });
     }
 
+    /// The runner's name as last settled ("Claude Code", "Claude API").
+    pub(crate) fn runner_name(&self) -> &'static str {
+        self.runner.name()
+    }
+
+    /// Asks again whether the runner can run (the choice changed).
+    pub(crate) fn reask(&mut self) {
+        self.asked = false;
+        *self.availability.lock().unwrap() = None;
+        self.ask_available();
+    }
+
     /// Why prompts cannot be sent, when they cannot.
     pub(crate) fn missing(&self) -> Option<String> {
         match &*self.availability.lock().unwrap() {
@@ -300,7 +312,7 @@ impl MotionAgent {
     }
 
     fn note(&mut self, failure: Failure) {
-        if matches!(failure, Failure::NotInstalled | Failure::NotSignedIn) {
+        if matches!(failure, Failure::NotInstalled | Failure::NotSignedIn | Failure::NoKey) {
             *self.availability.lock().unwrap() = Some(Availability::Missing(failure));
         }
     }
@@ -851,7 +863,7 @@ impl Studio {
             let edits = request.steps.iter().filter(|s| s.done && s.error.is_none() && s.text.starts_with("Editing")).count();
             status = status
                 .child(div().size(px(8.0)).flex_none().rounded_full().bg(theme::accent()))
-                .child(small(format!("{} · {:.0} s · {} steps, {edits} edits so far. You can keep editing.", request.now(), request.seconds(), request.steps.len())));
+                .child(small(format!("{} · {} · {:.0} s · {} steps, {edits} edits so far. You can keep editing.", agent.runner_name(), request.now(), request.seconds(), request.steps.len())));
         } else if let Some(request) = agent.proposal() {
             let comparing = agent.comparing.is_some();
             let (keep, undo, again, held) = (request.id.clone(), request.id.clone(), request.id.clone(), request.id.clone());
@@ -896,7 +908,7 @@ impl Studio {
             };
             status = status.child(small(text));
         } else {
-            status = status.child(small("Select, type, Enter. Ctrl-click rows for more layers; drag the strip along the top of the ruler to mark a span.".into()));
+            status = status.child(small(format!("{}. Select, type, Enter. Ctrl-click rows for more layers; drag the strip along the top of the ruler to mark a span.", agent.runner_name())));
         }
         div()
             .id("motion-prompt-bar")
@@ -943,8 +955,22 @@ impl Studio {
         let note = |text: String| div().text_xs().text_color(theme::muted()).child(text);
         let mut list = div().flex().flex_col().gap_3();
         let shown: Vec<&AgentRequest> = self.motion_agent.requests.iter().rev().filter(|r| r.concerns(layer)).collect();
-        if let Some(why) = self.motion_agent.missing() {
-            list = list.child(div().text_xs().text_color(theme::danger()).child(why));
+        // Which agent: the choice, and the one in use.
+        let chosen = crate::motion_agent::choice();
+        let mut runners = div().flex().items_center().gap_1().text_xs().child(div().text_color(theme::muted()).child("Agent"));
+        for (i, choice) in crate::motion_agent::Choice::ALL.into_iter().enumerate() {
+            runners = runners.child(
+                button(("motion-agent-choice", i), choice.label(), if choice == chosen { ButtonKind::Secondary } else { ButtonKind::Ghost }, ButtonSize::Sm).selected(choice == chosen).on_click(cx.listener(move |this, _, _, cx| {
+                    crate::motion_agent::set_choice(choice);
+                    this.motion_agent.reask();
+                    cx.notify();
+                })),
+            );
+        }
+        list = list.child(runners);
+        match self.motion_agent.missing() {
+            Some(why) => list = list.child(div().text_xs().text_color(theme::danger()).child(why)),
+            None => list = list.child(note(format!("Using {}.", self.motion_agent.runner_name()))),
         }
         if shown.is_empty() {
             let what = layer.map(|l| format!("Nothing has been asked about {l} yet.")).unwrap_or_else(|| "Nothing has been asked yet.".into());
@@ -1187,7 +1213,7 @@ mod tests {
         assert!(agent.missing().is_some_and(|m| m.contains("Scripted is not signed in")), "and the bar says so from then on");
 
         // Not installed: it cannot start at all.
-        let mut agent = MotionAgent::new(Arc::new(ClaudeCode { program: "/nonexistent/claude".into(), server: "lahza".into() }));
+        let mut agent = MotionAgent::new(Arc::new(crate::motion_agent::ClaudeCode { program: "/nonexistent/claude".into(), server: "lahza".into() }));
         agent.send(About::default(), "a dot", None, "/p".into(), "/".into());
         assert!(!agent.busy());
         assert!(matches!(&agent.requests[0].outcome, Outcome::Failed(why) if why.contains("not installed")));

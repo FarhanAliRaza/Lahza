@@ -73,6 +73,7 @@ rustfft = { workspace = true }
 unicode-segmentation = { workspace = true }
 uuid = { workspace = true }
 x11rb = { workspace = true }
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
 
 [profile.dev]
 debug = 1

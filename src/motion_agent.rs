@@ -51,6 +51,8 @@ pub(crate) enum Event {
 pub(crate) enum Failure {
     NotInstalled,
     NotSignedIn,
+    /// The API runner has no key.
+    NoKey,
     Other(String),
 }
 
@@ -60,6 +62,7 @@ impl Failure {
         match self {
             Failure::NotInstalled => format!("{name} is not installed. Install it (claude.com/claude-code), then try again."),
             Failure::NotSignedIn => format!("{name} is not signed in. Run `claude` in a terminal and sign in, then try again."),
+            Failure::NoKey => format!("{name} has no API key. Set ANTHROPIC_API_KEY, or put the key in {}.", crate::motion_agent_api::key_file().display()),
             Failure::Other(e) => e.clone(),
         }
     }
@@ -86,6 +89,146 @@ pub(crate) trait Runner: Send + Sync {
     fn start(&self, request: Request, events: Sender<Event>) -> Result<Box<dyn Running>, Failure>;
 }
 
+// ------------------------------------------------------------- the choice
+
+/// Which runner prompts go to: kept with the app's settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Choice {
+    /// Claude Code where it is installed and signed in, else the API loop
+    /// where a key is set.
+    #[default]
+    Auto,
+    ClaudeCode,
+    Api,
+}
+
+impl Choice {
+    pub(crate) const ALL: [Choice; 3] = [Choice::Auto, Choice::ClaudeCode, Choice::Api];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Choice::Auto => "Auto",
+            Choice::ClaudeCode => "Claude Code",
+            Choice::Api => "API key",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Choice::Auto => "auto",
+            Choice::ClaudeCode => "claude-code",
+            Choice::Api => "api",
+        }
+    }
+}
+
+static CHOICE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn choice_file() -> PathBuf {
+    crate::recording::presets::config_root().join("motion-agent")
+}
+
+fn read_choice(path: &Path) -> Choice {
+    let kept = std::fs::read_to_string(path).unwrap_or_default();
+    Choice::ALL.into_iter().find(|c| c.name() == kept.trim()).unwrap_or_default()
+}
+
+fn write_choice(path: &Path, choice: Choice) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, choice.name());
+}
+
+pub(crate) fn choice() -> Choice {
+    Choice::ALL[CHOICE.load(Ordering::Relaxed) as usize % 3]
+}
+
+/// Reads the kept choice (at start).
+pub(crate) fn load_choice() {
+    CHOICE.store(read_choice(&choice_file()) as u8, Ordering::Relaxed);
+}
+
+pub(crate) fn set_choice(choice: Choice) {
+    CHOICE.store(choice as u8, Ordering::Relaxed);
+    write_choice(&choice_file(), choice);
+}
+
+/// The runner prompts go to, by the choice: Claude Code, or the loop of
+/// our own on the API. Itself a `Runner`, so the studio holds one.
+pub(crate) struct Chosen {
+    pub claude: Arc<dyn Runner>,
+    pub api: Arc<dyn Runner>,
+    pub choice: Box<dyn Fn() -> Choice + Send + Sync>,
+    /// What `available` last settled on: the choice it was made for, and
+    /// whether it is the API loop.
+    picked: Mutex<Option<(Choice, bool)>>,
+}
+
+impl Default for Chosen {
+    fn default() -> Self {
+        Self::new(Arc::new(ClaudeCode::default()), Arc::new(crate::motion_agent_api::ApiLoop::default()), Box::new(choice))
+    }
+}
+
+impl Chosen {
+    pub(crate) fn new(claude: Arc<dyn Runner>, api: Arc<dyn Runner>, choice: Box<dyn Fn() -> Choice + Send + Sync>) -> Self {
+        Self { claude, api, choice, picked: Mutex::default() }
+    }
+
+    /// The runner for the choice as it is now, and whether it can run.
+    /// (Asks Claude Code whether it is signed in: not for the UI thread.)
+    fn pick(&self) -> (bool, Availability) {
+        let choice = (self.choice)();
+        let (api, availability) = match choice {
+            Choice::ClaudeCode => (false, self.claude.available()),
+            Choice::Api => (true, self.api.available()),
+            Choice::Auto => match self.claude.available() {
+                Availability::Ready => (false, Availability::Ready),
+                Availability::Missing(claude) => match self.api.available() {
+                    Availability::Ready => (true, Availability::Ready),
+                    // Neither: say both, so either can be put right.
+                    Availability::Missing(api) => (false, Availability::Missing(Failure::Other(format!("{} Or: {}", claude.message(self.claude.name()), api.message(self.api.name()))))),
+                },
+            },
+        };
+        *self.picked.lock().unwrap() = Some((choice, api));
+        (api, availability)
+    }
+
+    fn uses_api(&self) -> bool {
+        let picked = *self.picked.lock().unwrap();
+        match picked {
+            Some((choice, api)) if choice == (self.choice)() => api,
+            _ => self.pick().0,
+        }
+    }
+}
+
+impl Runner for Chosen {
+    fn name(&self) -> &'static str {
+        let picked = *self.picked.lock().unwrap();
+        match picked {
+            Some((_, true)) => self.api.name(),
+            Some((_, false)) => self.claude.name(),
+            None => "The agent",
+        }
+    }
+
+    fn available(&self) -> Availability {
+        self.pick().1
+    }
+
+    fn start(&self, mut request: Request, events: Sender<Event>) -> Result<Box<dyn Running>, Failure> {
+        let api = self.uses_api();
+        // A conversation is one runner's: the other starts a new one.
+        if request.conversation.as_deref().is_some_and(|c| c.starts_with("api-") != api) {
+            request.conversation = None;
+        }
+        if api { self.api.start(request, events) } else { self.claude.start(request, events) }
+    }
+}
+
 // ------------------------------------------------------------ Claude Code
 
 /// Claude Code, headless (`claude -p`), with this app's `mcp` server as its
@@ -103,7 +246,7 @@ impl Default for ClaudeCode {
     }
 }
 
-const SYSTEM: &str = "You are working inside the Lahza motion editor, for the person using it. They see each edit you make appear in their preview as you make it, and they can undo everything you do for this request in one step. \
+pub(crate) const SYSTEM: &str = "You are working inside the Lahza motion editor, for the person using it. They see each edit you make appear in their preview as you make it, and they can undo everything you do for this request in one step. \
 Work only with the lahza tools, on the project named in the message. Do what was asked and no more: when it is about one layer, change that layer. \
 Look before and after (snapshot, review, check) rather than guessing. Do not render a video unless asked. \
 End with one or two plain sentences saying what you changed.";
@@ -581,6 +724,76 @@ not json at all
         let (_running, rx) = start(&runner, Request { id: "r".into(), cwd: std::env::temp_dir(), ..Default::default() });
         assert_eq!(collect(&rx), vec![Event::Failed(Failure::NotSignedIn)]);
         std::fs::remove_dir_all(program.parent().unwrap()).ok();
+    }
+
+    /// A runner that can or cannot run, and keeps what it was started with.
+    struct Fake(&'static str, Availability, Mutex<Vec<Request>>);
+
+    struct Nothing;
+
+    impl Running for Nothing {
+        fn stop(&mut self) {}
+    }
+
+    impl Runner for Fake {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn available(&self) -> Availability {
+            self.1.clone()
+        }
+        fn start(&self, request: Request, _: Sender<Event>) -> Result<Box<dyn Running>, Failure> {
+            self.2.lock().unwrap().push(request);
+            Ok(Box::new(Nothing))
+        }
+    }
+
+    #[test]
+    fn the_runner_is_claude_code_where_it_can_run_else_the_api_where_a_key_is_set() {
+        let fake = |name, availability| Arc::new(Fake(name, availability, Mutex::default()));
+        let chosen = |claude: &Arc<Fake>, api: &Arc<Fake>, choice: Choice| Chosen::new(claude.clone(), api.clone(), Box::new(move || choice));
+        let (ready, no_claude, no_key) = (Availability::Ready, Availability::Missing(Failure::NotInstalled), Availability::Missing(Failure::NoKey));
+        let start = |c: &Chosen, conversation: Option<&str>| {
+            let (tx, _rx) = channel();
+            c.start(Request { conversation: conversation.map(String::from), ..Default::default() }, tx).ok().map(|_| ())
+        };
+        // Both can: Claude Code.
+        let (claude, api) = (fake("Claude Code", ready.clone()), fake("Claude API", ready.clone()));
+        let c = chosen(&claude, &api, Choice::Auto);
+        assert_eq!(c.name(), "The agent", "not settled yet");
+        assert_eq!((c.available(), c.name()), (ready.clone(), "Claude Code"));
+        start(&c, Some("api-1")).unwrap();
+        assert_eq!((claude.2.lock().unwrap().len(), api.2.lock().unwrap().len()), (1, 0));
+        assert!(claude.2.lock().unwrap()[0].conversation.is_none(), "the API loop's conversation is not Claude Code's");
+        // Asked for by name.
+        let c = chosen(&claude, &api, Choice::Api);
+        assert_eq!((c.available(), c.name()), (ready.clone(), "Claude API"));
+        start(&c, Some("c0ffee")).unwrap();
+        start(&c, Some("api-1")).unwrap();
+        let asked: Vec<Option<String>> = api.2.lock().unwrap().iter().map(|r| r.conversation.clone()).collect();
+        assert_eq!(asked, [None, Some("api-1".to_string())]);
+        // No Claude Code, a key: the API loop, without being asked first.
+        let (claude, api) = (fake("Claude Code", no_claude.clone()), fake("Claude API", ready.clone()));
+        let c = chosen(&claude, &api, Choice::Auto);
+        start(&c, None).unwrap();
+        assert_eq!((c.name(), api.2.lock().unwrap().len()), ("Claude API", 1));
+        // Neither: both are said, so either can be put right.
+        let (claude, api) = (fake("Claude Code", no_claude.clone()), fake("Claude API", no_key.clone()));
+        let c = chosen(&claude, &api, Choice::Auto);
+        let Availability::Missing(why) = c.available() else { panic!() };
+        let why = why.message(c.name());
+        assert!(why.contains("Claude Code is not installed") && why.contains("Or: Claude API has no API key"), "{why}");
+        // Chosen by name and missing: only that one's reason.
+        assert_eq!(chosen(&claude, &api, Choice::Api).available(), no_key);
+        assert_eq!(chosen(&claude, &api, Choice::ClaudeCode).available(), no_claude);
+        // The choice is kept.
+        let file = std::env::temp_dir().join(format!("lahza-agent-choice-{}", std::process::id())).join("motion-agent");
+        assert_eq!(read_choice(&file), Choice::Auto);
+        for choice in Choice::ALL {
+            write_choice(&file, choice);
+            assert_eq!(read_choice(&file), choice);
+        }
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
     }
 
     #[test]
