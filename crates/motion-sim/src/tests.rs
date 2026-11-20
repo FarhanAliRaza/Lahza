@@ -73,6 +73,20 @@ fn a_box_falls_and_rests_on_the_ground() {
     assert!(touch[0].speed > 300.0 && (touch[0].t - 1.15).abs() < 0.1, "{:?}", touch[0]);
 }
 
+#[test]
+fn a_flat_landing_without_bounce_does_not_tip() {
+    // What tips a box that lands flat is its bounce: the four corners'
+    // rebounds are worked out one after another (see the measure below).
+    // With none, on it and on the ground, it lands as it fell.
+    let tilt = |bounce: f64| {
+        let mut p = project(json!({"id": "s1", "simulation": {"ground": {"y": 900, "bounce": bounce}}, "layers": [boxed("b", 960.0, 200.0, json!({"bounce": bounce}))]}), 3.0);
+        let bake = baked(&mut p);
+        bake.tracks[0].samples.iter().map(|s| 2.0 * (s[6].abs().min(1.0) as f64).acos().to_degrees()).fold(0.0, f64::max)
+    };
+    let (none, some) = (tilt(0.0), tilt(0.1));
+    assert!(none < 0.5 && some > 1.0, "it tips {none:.2}° without bounce, {some:.2}° with the default");
+}
+
 fn chaos(seed: u64, jitter: f64) -> Project {
     let mut layers = vec![json!({"id": "floor", "kind": "mesh", "mesh": {"type": "box", "size": [1600, 40], "depth": 800}, "transform": {"position": [960, 920]}, "body": {"type": "fixed"}})];
     for i in 0..12 {
@@ -630,4 +644,71 @@ fn an_emitters_particles_are_bodies_while_they_live() {
     fixed["layers"][0]["layers"][0]["body"]["type"] = json!("fixed");
     assert!(Compiled::new(&project(fixed, 1.0)).sim_input(0, None).1.join("\n").contains("an emitter's particle is a body the simulation moves"));
     assert_eq!(crate::behaviour_tests::pin(&bake), (23075, 9110451255763848001), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+/// How far a box dropped flat tips after it lands, by the solver's
+/// settings: `cargo test --release -p lahza-motion-sim flat_landing -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_a_flat_landing_by_solver_settings() {
+    use rapier3d::prelude::*;
+    type Set = Box<dyn Fn(&mut PhysicsWorld)>;
+    let p = project(json!({"id": "s1", "simulation": {"ground": {"y": 900}}, "layers": [boxed("b", 960.0, 200.0, json!({}))]}), 3.0);
+    let (input, _) = Compiled::new(&p).sim_input(0, None);
+    let colliders = |w: &mut PhysicsWorld, f: &dyn Fn(&mut Collider)| {
+        let hs: Vec<ColliderHandle> = w.colliders.iter().map(|(h, _)| h).collect();
+        for h in hs {
+            f(&mut w.colliders[h]);
+        }
+    };
+    let cases: Vec<(&str, Set)> = vec![
+        ("as it is", Box::new(|_| {})),
+        ("16 solver passes", Box::new(|w| w.integration_parameters.num_solver_iterations = 16)),
+        ("4 inner PGS passes", Box::new(|w| w.integration_parameters.num_internal_pgs_iterations = 4)),
+        ("4 inner stabilization passes", Box::new(|w| w.integration_parameters.num_internal_stabilization_iterations = 4)),
+        ("16 passes, 4 PGS, 4 stabilization", Box::new(|w| { w.integration_parameters.num_solver_iterations = 16; w.integration_parameters.num_internal_pgs_iterations = 4; w.integration_parameters.num_internal_stabilization_iterations = 4; })),
+        ("no warm start", Box::new(|w| w.integration_parameters.warmstart_coefficient = 0.0)),
+        ("no contact clustering", Box::new(|w| w.integration_parameters.contact_clustering = false)),
+        ("no contact recycling", Box::new(|w| w.integration_parameters.contact_recycling = false)),
+        ("no clustering, no recycling", Box::new(|w| { w.integration_parameters.contact_clustering = false; w.integration_parameters.contact_recycling = false; })),
+        ("friction in the bias pass", Box::new(|w| w.integration_parameters.friction_in_bias_pass = true)),
+        ("Coulomb friction", Box::new(|w| w.integration_parameters.friction_model = FrictionModel::Coulomb)),
+        ("softer contacts (10 Hz)", Box::new(|w| { w.integration_parameters.contact_softness.natural_frequency = 10.0; w.integration_parameters.static_contact_softness.natural_frequency = 10.0; })),
+        ("stiffer contacts (120 Hz)", Box::new(|w| { w.integration_parameters.contact_softness.natural_frequency = 120.0; w.integration_parameters.static_contact_softness.natural_frequency = 120.0; })),
+        ("more damped contacts (ratio 20)", Box::new(|w| { w.integration_parameters.contact_softness.damping_ratio = 20.0; w.integration_parameters.static_contact_softness.damping_ratio = 20.0; })),
+        ("no prediction distance", Box::new(|w| w.integration_parameters.normalized_prediction_distance = 0.0)),
+        ("prediction distance 0.2", Box::new(|w| w.integration_parameters.normalized_prediction_distance = 0.2)),
+        ("a contact skin of 1 cm", Box::new(move |w| colliders(w, &|c| c.set_contact_skin(0.01)))),
+        ("no bounce", Box::new(move |w| colliders(w, &|c| c.set_restitution(0.0)))),
+        ("no friction", Box::new(move |w| colliders(w, &|c| c.set_friction(0.0)))),
+        ("the floor a box, not a half-space", Box::new(|w| {
+            let hs: Vec<ColliderHandle> = w.colliders.iter().filter(|(_, c)| c.shape().as_halfspace().is_some()).map(|(h, _)| h).collect();
+            for h in hs {
+                let c = &mut w.colliders[h];
+                c.set_shape(SharedShape::cuboid(50.0, 1.0, 50.0));
+                c.set_position_wrt_parent(rapier3d::math::Pose::from_translation(Vector::new(0.0, 1.0, 0.0)));
+            }
+        })),
+        ("960 steps a second", Box::new(|w| w.integration_parameters.dt = 1.0 / 960.0)),
+    ];
+    for (name, set) in cases {
+        let mut take = Take::new(&input, &mut core_meshes).unwrap();
+        set(&mut take.world.w);
+        let per = (1.0 / (input.rate * take.world.w.integration_parameters.dt as f64)).round() as u64;
+        let (mut tilt, mut landed, mut end) = (0.0f64, false, [0.0; 3]);
+        for k in 0..input.samples {
+            for s in 0..per {
+                // (Its own count of steps a frame, for the finer step.)
+                let t = input.start + (k as f64 + s as f64 / per as f64) / input.rate;
+                take.world.step(&input, t);
+            }
+            let pose = take.world.pose(0);
+            landed |= pose.p[1] > 845.0;
+            if landed {
+                tilt = tilt.max(2.0 * pose.q[3].abs().min(1.0).acos().to_degrees());
+            }
+            end = pose.p;
+        }
+        eprintln!("{name:36} tips {tilt:5.2}°, ends {:6.1} px to the side, at y {:.1}", (end[0] - 960.0).hypot(end[2]), end[1]);
+    }
 }

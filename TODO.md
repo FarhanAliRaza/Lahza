@@ -803,11 +803,29 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
    - Left, needing what is not here: Slang-generated meshes as
      colliders (their points come from `slangc`, which this machine has
      not; the code path is the hull of a generated mesh, untried).
-   - Left, not done (nothing outside is needed, only the work): a box
-     landing flat at speed tips a degree or two before settling
-     (rapier's contact solver; more iterations do not change it, and
-     another solver was not tried). A ragdoll's or a crowd's layers
-     cannot be copies of an instancer.
+   - A box landing flat at speed tips before it settles (3.7° on the
+     test's box, which falls 6.5 m): looked into, and it is its bounce.
+     The four corners of the face each get their rebound, worked out
+     one after another by rapier's solver, and the first to be served
+     lifts first. Tried on that drop (`measure_a_flat_landing_by_solver_settings`,
+     an ignored test that prints the table): 16 solver passes 1.4°; 4
+     inner PGS passes 2.6°; 4 inner stabilization passes 3.5°; all three
+     3.7°; no warm start 3.7°; contact clustering or recycling off 3.7°;
+     friction in the bias pass 3.2°; Coulomb friction 3.7°; contacts
+     softer (10 Hz) 3.7°, stiffer (120 Hz) 3.7°, more damped 3.7°; no
+     prediction distance 2.2°, ten times it 9.6°; a contact skin 3.3°;
+     no friction 3.6°; a box for a floor 3.7°; 960 steps a second 8.1°.
+     Only one thing takes it away: `"bounce": 0` on the body and on the
+     ground, 0.24° (tested). No setting is changed: none of them mends
+     it, each would change every pinned bake, and the default bounce
+     stays 0.1 because things that land on an edge or a corner should
+     rebound. For a slab that must land dead flat: `bounce` 0.
+   - Left, needing what is not here: a solver that works out a face's
+     contacts together (a block solver) is rapier's to have, not a
+     setting of it; with one, a flat landing could keep its bounce.
+   - Left, not done: a ragdoll's or a crowd's layers cannot be copies
+     of an instancer (a crowd of instances is the way to many of one
+     character).
 2. **Skeletons and skinning: done.**
    - `model_import` keeps a glTF skin: a joint node is a comp like any
      node, and the skinned mesh layer has `"skin": {"index", "joints":
