@@ -437,7 +437,8 @@ it). What follows is for a card where it is not quick enough.
   is in, from the same rays, as above.
 
 What is left:
-- The editor's preview does not ask for it (src/*: `Renderer::set_sky`).
+- The editor's preview asks for it when Raster + sky is chosen
+  (`src/motion_preview.rs`); not seen on a card.
 - Run on the RTX 3060: `cargo test -p lahza-motion-render sky_tests --
   --test-threads=1` and its measure (`--ignored`,
   `LAHZA_MEASURE=1080,1920`): the cost there (rays, filter, the
