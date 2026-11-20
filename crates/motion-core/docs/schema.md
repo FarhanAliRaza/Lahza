@@ -690,6 +690,7 @@ the defaults):
 | `seed`, `jitter` | `jitter` px/s of random speed (and degrees/s of spin) for each body at its release; another `seed` is another take |
 | `joints` | below |
 | `ragdolls` | skeletons simulated bone by bone (below) |
+| `crowds` | many characters walking to goals (below) |
 | `blasts` | `[{"at": time, "origin": [x, y, z], "speed": px/s, "radius": px}]`: every body within `radius` is thrown away from `origin`, less the farther it is |
 
 Joints hold body `a` to body `b`, or to the world when `b` is left out:
@@ -788,6 +789,40 @@ top of the clip's (behaviours then act on the result):
 Arms are bones named `hand` with the two above them; the head is the bone
 named `head`. Bakes with ragdolls list `fall` and `step` events with the
 touches.
+
+#### Crowds
+
+`simulation.crowds` walks many characters at once. Each agent is a comp
+holding a character (a model imported once per agent), standing where its
+keys put it at the simulation's start. The bake places the agents' comps:
+each walks on the level to its goal at its own pace, round the other
+agents and round any body that stands in its height. Its children are
+shown at the time of their clip that the distance walked gives (`stride`
+px a `cycle`), so feet do not slide and agents are out of step.
+
+```json
+"simulation": {"unit": 90, "crowds": [{
+  "id": "walkers", "agents": ["p0", "p1", "p2"], "goals": [[1500, -100], [1500, 0], [1500, 100]],
+  "speed": 144, "radius": 25, "height": 158, "stride": 144, "cycle": 1,
+  "knock": 360, "ragdoll": {"mass": 70, "limits": [{"bone": "shin", "swing": 140, "hinge": [-1, 0, 0]}]}
+}]}
+```
+
+| field | meaning |
+|---|---|
+| `agents` | the agents' comps (layer ids) |
+| `goals` | [x, z] px, one for all or one per agent in turn |
+| `speed`, `vary` | px/s (140) and how much agents differ (0.2: a fifth either way, by `seed`) |
+| `radius`, `height` | an agent's size, px (30; six radii) |
+| `stride`, `cycle` | px one cycle of the clip covers (140) and the seconds it lasts (1) |
+| `clip` | when the agents' clip starts on the timeline (default: the simulation's start); it is looped from there |
+| `facing` | the way a character faces in its own space, [x, z] ([0, −1]: toward the viewer, as imported glTF does); agents turn to the way they walk |
+| `knock` | px/s (300): a body striking an agent at this speed or more knocks it down (a `knock` event) |
+| `ragdoll` | `{mass, thickness, friction, limits, shapes}` as a ragdoll's: an agent knocked down falls as a limp ragdoll of the bones under its comp, from the pose its clip had. Without it the agent stops where it stands |
+
+Bodies bounce off agents (each is a capsule that is moved, not pushed).
+Steering is local: an agent does not plan a path, so a wall across its
+way holds it. A character is a skinned mesh of its own every frame.
 
 A bake also lists what happened, for timing sound and cuts to it: the
 first touches between bodies with their closing speed in px/s (`sim_bake`

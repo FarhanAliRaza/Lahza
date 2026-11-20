@@ -240,8 +240,15 @@ blur away the contact shadows that are what is missing.
 
 ## Simulation: rigid bodies, ragdolls, crowds
 
-Parts 1 to 4 are built; 5 to 7 are below as they stand. Morph targets
-are still refused. In the order built:
+All seven parts are built as far as this machine could take them (no
+GPU, no trained policy): what each does, what was measured and what is
+left is below. Morph targets are still refused. Across all of it: bakes
+are the same bytes on this machine from debug and release builds (pinned
+in tests), not checked on another architecture; the renderer's own test
+build is broken on this branch's base (`pt.rs` and `tests.rs` name
+`TraceOptions` and `ExportOptions` without their new `fast` and `shutter`
+fields), so its suite was run with those two files patched locally and
+not committed. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
@@ -416,11 +423,41 @@ are still refused. In the order built:
    - Left: the search only leans; it does not step or use its arms.
      Tries run one after the other on one core (they are independent:
      four cores would cut the time by about four).
-7. **Crowds.** Steering for where each one goes, a clip played per agent,
-   a ragdoll only for the ones hit. A skinned agent is a mesh of its own
-   every frame (in the tracer an acceleration structure each): how many an
-   export bears is to be measured; thousands would be pictures of agents
-   (impostors), not meshes.
+7. **Crowds: done as layers; impostors not started.**
+   `simulation.crowds`: each agent is a comp with a character (imported
+   once per agent). Once a frame every agent steers: toward its goal at
+   its own pace, off agents within three radii, off and round the level
+   outline of any body that stands in its height. The bake keeps each
+   agent's place and the time its clip is shown at, which runs by the
+   distance walked (`compile` shows a comp's children at that time). In
+   the world an agent is a moved capsule; one struck at `knock` px/s or
+   more goes down, and with a `ragdoll` for the crowd its bones are put
+   where the clip had them and let go limp. Bones of agents still
+   standing are out of the solver.
+   - Tested: six agents reach their goals round a pillar and never
+     closer than 40 px to each other; the clip turns one cycle a stride
+     and the drawn child is at that time; a thrown ball knocks one down,
+     whose five bones are baked from that sample and end on the floor
+     while the rest arrive; the same bytes twice, another seed another
+     pace. `examples/sim/crowd.py` was looked at with 12 and 100.
+   - Measured (four cores; 1280×720; the test character: 16 bones, four
+     skinned meshes, 624 points): an 8 s bake of 12 agents 0.33 s, of 50
+     0.45 s, of 100 0.75 s. A second of export on the CPU renderer: 12
+     agents 11.6 s, 50 agents 24.5 s, 100 agents 29.1 s (0.4 to 1 s a
+     frame). Importing is the slow step: 100 characters one
+     `model-import` at a time took 48 s. Not measured: the GPU renderer
+     and the path tracer (no GPU here; in the tracer each agent's mesh
+     is an acceleration structure built every frame), and a character of
+     real size (tens of thousands of points).
+   - Left: an agent is a copy of the document's layers (100 agents are
+     1700 comps), not an instance, so thousands are out of reach this
+     way: that needs agents as instances with a pose each, and beyond
+     that impostors (pictures of agents), neither started. Steering is
+     local (no path planning: a wall across the way holds an agent);
+     agents do not react to what is thrown, and one knocked down falls
+     with the agent's speed only (its limbs' own swing is dropped).
+     Knocked ragdolls are always limp. A search controller does not see
+     crowds in its tries.
 
 ## Directing an agent from the editor
 

@@ -139,6 +139,10 @@ impl World {
     /// ends at sample position `x`. `targets`: per bone, a turn against
     /// its parent that stands for the clip's (a behaviour's, a search's).
     pub fn drive_ragdoll(&mut self, r: &RagdollInput, rig: usize, x: f64, targets: Option<&[Option<[f64; 4]>]>, scale: Option<&[f64]>) {
+        // (Bones that still follow their keys need no motors.)
+        if !self.released[r.bones[0].body] {
+            return;
+        }
         let dt = self.dt;
         let m = 1.0 / self.unit;
         for (k, b) in r.bones.iter().enumerate() {

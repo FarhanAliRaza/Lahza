@@ -401,6 +401,17 @@ Give knees and elbows `hinge` limits, feet a box `shape`, and set
 Balance is helped by a bounded force on the hips: it is a stand-in for the
 footwork a real body does, not a model of it.
 
+## Crowds
+
+For many walkers, import the character once per agent (`model_import`
+with ids `p0`, `p1`, …, each at its starting place), then name them in
+`simulation.crowds` with their goals and bake. Set `stride` to what one
+cycle of the walk covers at the model's size (measure the feet in a
+snapshot of the clip) and `speed` near `stride / cycle`. Throw a body at
+them and give the crowd a `ragdoll` for the ones it hits. A hundred
+agents bake in under a second; drawing them is what costs (each is a
+skinned mesh a frame: about a second a frame at 720p on four CPU cores).
+
 ## Footage and Blender
 
 - Footage: `media_import` a clip or image sequence, then add a

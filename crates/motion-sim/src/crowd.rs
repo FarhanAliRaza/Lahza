@@ -251,6 +251,7 @@ impl Herd {
                 let here = root.then(&Pose { p: std::array::from_fn(|x| p.p[x] + (q.p[x] - p.p[x]) * f), q: turn });
                 let h = world.handles[bone.body];
                 let rb = &mut world.w.bodies[h];
+                rb.set_enabled(true);
                 rb.set_position(pose(&here, u), true);
                 rb.set_body_type(RigidBodyType::Dynamic, true);
                 // It was walking: every bone has the agent's speed.

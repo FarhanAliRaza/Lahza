@@ -179,7 +179,9 @@ impl World {
             if input.flat {
                 builder = builder.enabled_translations(true, true, false).enabled_rotations(false, false, true);
             }
-            let h = w.insert_body(builder);
+            // (A crowd's agent's bones are out of the world until it is
+            // knocked down.)
+            let h = w.insert_body(builder.enabled(b.release != u32::MAX));
             // Mass: by density, or the mass given shared by volume.
             let mut made = Vec::new();
             for c in &b.colliders {
