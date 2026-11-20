@@ -463,13 +463,16 @@ What is missing:
   `--ignored`, `LAHZA_MOTION_SOFTWARE_GPU=1`): the first still frame
   17 s with its pipelines cold, the next 0.03 s, a warmed frame after a
   drag 0.25 s, with the sky 0.23 s, the raster 0.02 s; the three
-  pictures looked at and they differ as they should. Not run: the
-  window with Traced chosen, any size a person would use, a real card,
-  Ray Reconstruction. Not settled: the pacing (a warm-up of 8 frames
-  blocks the worker for as long as they take; at the 24 ms measured on
-  the RTX 3060 that is a fifth of a second), the fast mode's own motion
-  blur (not asked for: `shutter` stays 0), and whether 8 dropped frames
-  is the right reach for the history while playing.
+  pictures looked at and they differ as they should. A still traced
+  frame takes the scene's motion blur as the fast mode's own (`shutter`,
+  180° being half a frame; `traced`); a playing one does without. What
+  is left needs a real card, since a software GPU's times and noise say
+  nothing of it: the window with Traced chosen at a size a person would
+  use, Ray Reconstruction, the look of the fast mode's motion blur, and
+  two numbers to settle there: whether a warm-up of 8 frames (a fifth of
+  a second at the 24 ms measured on the RTX 3060, during which the
+  worker draws nothing else) is felt, and whether history should survive
+  8 dropped frames while playing.
 - **Ray Reconstruction's picture** of all that changed here.
 
 ## Lighting between the raster and the traced picture
@@ -1048,7 +1051,7 @@ picture, or its wording when signed out.
 2. **Starting an agent** (`motion_agent.rs`): `Runner` is the one small
    interface (available, start, and a `Running` to stop), with two
    runners behind it and a choice between them (`Chosen`; the second,
-   `ApiLoop`, is under "Left" below for what was not run). `ClaudeCode`
+   `ApiLoop`, is described after this list). `ClaudeCode`
    is the first: `claude -p` with stream-json in and out, `lahza mcp` as its
    only server and no tools of its own, its lines read as they come.
    Tested with a stub program that writes the same stream. Not installed
@@ -1072,61 +1075,80 @@ picture, or its wording when signed out.
 
 Settled:
 - **Editing while the agent works: guarded writes.** `io::lock` (`flock`
-  on `<project>/.lock`) is taken by `edit_apply` and by undo and redo;
+  on `<project>/.lock`) is taken by `edit_apply`, by undo and redo, and
+  by the writers of markers, shaders and the narration
+  (`every_writer_of_a_project_waits_for_its_lock`);
   under it the writer loads what the other wrote, then writes. Two
   writers of 25 edits each lose none and take no number twice
-  (`two_writers_do_not_lose_edits`). The editor stays usable. Not under
-  the lock: tools that write other files (markers, shaders, narration).
+  (`two_writers_do_not_lose_edits`). The editor stays usable.
 - **How long it takes**: not measured, since no real request was run. The
   bar and the ghost clip say the step, the seconds so far, and the steps
   and edits made. What is left is not known to the runner and is not
   said.
 
-Left:
-- **A real request, on a real desktop.** The first thing to do: send one
-  from the bar and watch for a permission refusal in the stream.
-- **Requests are kept beside the project** (`requests.json` in the
-  project's or the recording's folder: the words, the steps, the outcome
-  and the conversation to continue), so the AI tab and a follow-up
-  survive the app. Read and written in a unit test; not seen across a
-  real restart. A request running when the app closes reads back as
-  stopped, and the agent is not ended with the app unless the window's
-  close drops the studio (not checked).
+The second runner (`ApiLoop`, `motion_agent_api.rs`) needs only an API
+key: our own loop on the Claude Messages API (raw HTTP through `ureq`,
+the one new dependency; there is no official Rust SDK) with the `Toolbox`
+in process: its own tool definitions, plus `read_doc` for the guide,
+schema and catalog an MCP client reads as resources. `claude-opus-5-5`
+(or `LAHZA_AGENT_MODEL`), `fallbacks: "default"`, the same `compose`d
+words and picture and the same steps as the Claude Code runner.
+- The answer is read as it streams: what the model says and each tool it
+  asks for show as they come; the tools run once the answer is whole, and
+  every result of a turn goes back in one message. A refusal, a cut-off
+  answer, a stream that breaks, and a tool input that is not JSON run
+  nothing half written. No connection, 429, 5xx and an overloaded stream
+  are tried three times. Stop is looked at between events and calls.
+- Its conversations are kept in `<config>/agent-conversations/`, so a
+  follow-up continues after a restart, as Claude Code's do.
+- What a request took shows in the AI tab: tokens in and out for this
+  runner (the API gives no price), dollars for Claude Code (its stream
+  gives them).
+- The key is `ANTHROPIC_API_KEY`, or typed in the AI tab into a masked
+  field (a star a byte, nothing to the clipboard) and kept in
+  `<config>/anthropic-api-key` with mode 0600. It is sent in the
+  `x-api-key` header and nowhere else, and never shown again: only where
+  it is from and its last four characters (tests look for it in the
+  project's files, the kept conversations and what is reported; the
+  field was seen under Xvfb).
+- The runner is a choice in the AI tab (Auto, Claude Code, API key),
+  kept with the settings: Auto is Claude Code where installed and signed
+  in, else the API loop where a key is set, and the bar names the one in
+  use.
+- Tested against a local stub server that streams a tool-use
+  conversation, a refusal, a cut-off answer, a broken stream, an error
+  in the stream, bad tool JSON, 401/400/404/429/500/529, nothing
+  listening, a stop in the middle, and a second run of the app.
+
+Left, each with what it needs:
+- **A real request (the owner's word).** None was sent, by either
+  runner, in any of these sessions: the instruction this work was given
+  says real requests are not to be run because they cost money, and only
+  the owner can change that. `claude auth status` in the container says
+  it is signed in, so one request from the bar would answer what is
+  still unknown: whether the lahza tools run without a permission
+  refusal under `--allowedTools mcp__lahza --permission-mode dontAsk`,
+  whether the picture is read, how long a small request takes, and what
+  it costs. For the API runner the same, with a key: its version header,
+  model id and event shapes are from Anthropic's reference as read in
+  November 2026, not from an answer. To do it: open a project, select a
+  layer, type "make this red", Enter; the AI tab shows the steps, the
+  seconds and the cost.
+- **A real desktop.** Requests kept in `requests.json` read back after a
+  real restart; whether closing the window while a request runs ends
+  the agent (a dropped runner stops its child and sets the loop's stop
+  flag: whether GPUI drops the studio on close was not checked); the
+  whole of "How it should be used" with a mouse.
 - **A piece made on a recording.** With no piece open the words ask for
-  a new one on the span. Undo then takes back the edits inside it, not
-  the piece or its place on the video; compare needs the piece open; and
-  no ghost clip shows, only the bar. Not run with a real agent, so "a
-  piece placed there comes back" is not seen.
+  a new one on the span. Undo now takes back its edits and takes the
+  piece off the video (its folder stays on disk; there is no redo for
+  that). Still: compare needs the piece open, and no ghost clip shows
+  without layer rows, only the bar. With a real agent (above): whether
+  the piece it places comes back on the timeline.
 - **Undo after later edits** to the same things fails with the engine's
-  message ("the project changed in a conflicting way").
-- **The second runner, against the real API.** `ApiLoop`
-  (`motion_agent_api.rs`) needs only an API key: our own loop on the
-  Claude Messages API (raw HTTP through `ureq`, the one new dependency;
-  there is no official Rust SDK) with the `Toolbox` in process: its own
-  tool definitions, plus `read_doc` for the guide, schema and catalog an
-  MCP client reads as resources. `claude-opus-5-5` (or
-  `LAHZA_AGENT_MODEL`), one request a turn, not streamed, with
-  `fallbacks: "default"`; the same `compose`d words and picture and the
-  same steps as the Claude Code runner; every result of a turn goes back
-  in one message; a refusal or a cut-off answer runs none of its tools;
-  no connection, 429 and 5xx are tried three times; Stop is looked at
-  between calls (a request already sent is waited for and then dropped).
-  The key is `ANTHROPIC_API_KEY` or one line in
-  `<config>/anthropic-api-key`, read when a request starts, sent in the
-  `x-api-key` header and nowhere else (a test looks for it in the
-  project's files and in what is reported). The runner is a choice in
-  the AI tab (Auto, Claude Code, API key), kept with the settings: Auto
-  is Claude Code where installed and signed in, else the API loop where
-  a key is set, and the bar names the one in use. Tested against a local
-  stub server that replays a tool-use conversation, a refusal, a cut-off
-  answer, 401/400/404/429/500/529, nothing listening, and a stop in the
-  middle. **No request was sent to the API**: the version header, the
-  model id and the request's shape are from Anthropic's reference as
-  read in November 2026, not from an answer. Left: nowhere in the app to
-  type the key (the field has no masked input: the environment or the
-  file); the loop's conversations are kept in memory only, so after a
-  restart a follow-up starts a new one; `cost` is not reported; no
-  streaming, so a long turn shows nothing until it ends.
+  message ("the project changed in a conflicting way"). Left as it is:
+  merging a person's later edits into an undo is a decision about what
+  undo means, for the owner.
 
 ## The motion editor: drags that stall, and how it should be used
 
@@ -1248,16 +1270,23 @@ with a mouse on a real desktop.
   afterwards brings the pill back. A scene that cannot be baked shows in
   red with the engine's reason. Seen under Xvfb
   (`a_simulation_is_baked_from_the_bar_and_goes_stale_when_a_body_moves`).
-  Left: no progress for a long bake (only "Baking the simulation…"), and
-  no way to stop one.
+  While it bakes the pill counts the seconds. Left: no way to stop a
+  bake, and no share done (`lahza_motion_sim::bake_scene` takes neither a
+  flag to stop on nor a progress callback: both are a change to its step
+  loop, then a Stop on the pill).
 - **By hand stays cheap**: the inspector edits a text layer's words (shown
   as typed, saved when the field is left), its font (the bundled ones and
   the font files in the project's `assets/`), colour, size and tracking;
   each effect's numbers, two-part values (a shadow's offset as X and Y)
-  and colours; and adds or removes every effect but `gradient_map` and
-  `lut` (a list of stops, a file). A colour is picked from ten swatches or
-  typed as #rrggbb. Left: those two effects, a text's stroke, edge, line
-  height and alignment, and a colour picker beyond the swatches.
+  and colours; and adds or removes every effect but `lut`, a gradient
+  map with a colour for each stop among them. A text also has its
+  alignment, line height and an outline (on or off, its width and
+  colour). A colour is picked from ten swatches or typed as #rrggbb.
+  Left: `lut` (it needs a file chooser for the table), a text's rim
+  light (`edge`), adding or moving a gradient's stops, and a colour
+  picker beyond the swatches (a hue and tone square is a widget the app
+  does not have yet). None needs more than a container; they were not
+  reached.
 
 ## Slang
 

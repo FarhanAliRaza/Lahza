@@ -686,6 +686,24 @@ impl Studio {
                 );
             }
             panel = panel.child(fonts);
+            // Alignment, and the outline on or off.
+            let mut row = div().flex().flex_wrap().gap_1();
+            for (ai, (label, align)) in [("Left", lahza_motion_core::document::Align::Left), ("Centre", lahza_motion_core::document::Align::Center), ("Right", lahza_motion_core::document::Align::Right)].into_iter().enumerate() {
+                let target = format!("{id}.align");
+                let value = serde_json::to_value(align).unwrap_or_default();
+                row = row.child(
+                    button(("motion-layer-align", ai), label, ButtonKind::Secondary, ButtonSize::Sm)
+                        .selected(t.align == align)
+                        .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![json!({"op": "set", "target": target, "value": value})], cx))),
+                );
+            }
+            let target = format!("{id}.stroke");
+            let outline = if t.stroke.is_some() { json!({"op": "set", "target": target}) } else { json!({"op": "set", "target": target, "value": {"color": "#000000", "width": 4}}) };
+            row = row.child(
+                button("motion-layer-outline", if t.stroke.is_some() { "Remove outline" } else { "+ Outline" }, ButtonKind::Secondary, ButtonSize::Sm)
+                    .on_click(cx.listener(move |this, _, _, cx| this.motion_commit(vec![outline.clone()], cx))),
+            );
+            panel = panel.child(row);
         }
         let three_d = layer.common.three_d || layer.kind.name() == "mesh";
         let (own, effect_values) = crate::motion_editor::extra_values(&layer);

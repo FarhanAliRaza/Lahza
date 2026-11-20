@@ -65,6 +65,8 @@ struct Kept {
     cost: Option<f64>,
     #[serde(default)]
     tokens: Option<(u64, u64)>,
+    #[serde(default)]
+    made_piece: bool,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -93,6 +95,9 @@ pub(crate) struct AgentRequest {
     /// where it counts them.
     pub cost: Option<f64>,
     pub tokens: Option<(u64, u64)>,
+    /// The request made the piece its project is (asked on a recording
+    /// with none open): undoing it takes the piece off the video too.
+    pub made_piece: bool,
 }
 
 impl AgentRequest {
@@ -242,6 +247,7 @@ impl MotionAgent {
             seconds: Some(k.seconds),
             cost: k.cost,
             tokens: k.tokens,
+            made_piece: k.made_piece,
         });
         // Before a request that is running now, which stays the last.
         self.requests.splice(at..at, old.collect::<Vec<_>>());
@@ -256,7 +262,7 @@ impl MotionAgent {
                 .requests
                 .iter()
                 .filter(|r| r.key == key)
-                .map(|r| Kept { id: r.id.clone(), words: r.words.clone(), about: r.about.clone(), steps: r.steps.clone(), said: r.said.clone(), outcome: r.outcome.clone(), edits: r.edits, seconds: r.seconds(), cost: r.cost, tokens: r.tokens })
+                .map(|r| Kept { id: r.id.clone(), words: r.words.clone(), about: r.about.clone(), steps: r.steps.clone(), said: r.said.clone(), outcome: r.outcome.clone(), edits: r.edits, seconds: r.seconds(), cost: r.cost, tokens: r.tokens, made_piece: r.made_piece })
                 .collect(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&kept) {
@@ -320,7 +326,7 @@ impl MotionAgent {
         let id = format!("r{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
         let about = About { has_picture: picture.is_some(), ..about };
         let request = Request { id: id.clone(), text: compose(&about, words), picture, cwd, conversation: (!self.fresh).then(|| self.conversations.get(&key).cloned()).flatten() };
-        let mut entry = AgentRequest { id, words: words.trim().to_string(), about, key, steps: Vec::new(), said: String::new(), outcome: Outcome::Running, edits: 0, started: Instant::now(), seconds: None, cost: None, tokens: None };
+        let mut entry = AgentRequest { id, words: words.trim().to_string(), about, key, steps: Vec::new(), said: String::new(), outcome: Outcome::Running, edits: 0, started: Instant::now(), seconds: None, cost: None, tokens: None, made_piece: false };
         let (tx, rx) = channel();
         match self.runner.start(request, tx) {
             Ok(running) => self.running = Some((running, rx)),
@@ -382,6 +388,18 @@ impl MotionAgent {
     pub(crate) fn proposal(&self) -> Option<&AgentRequest> {
         self.requests.last().filter(|r| r.decidable())
     }
+}
+
+/// Takes the piece whose project is `dir` off `recording`'s timeline
+/// (its folder is left where it is). False when it was not on it.
+fn take_piece_off(recording: &Path, dir: &Path) -> Result<bool, String> {
+    let pieces = lahza_motion_core::recording::read_pieces(recording);
+    let kept: Vec<_> = pieces.iter().filter(|p| p.dir(recording) != dir).cloned().collect();
+    if kept.len() == pieces.len() {
+        return Ok(false);
+    }
+    lahza_motion_core::recording::write_pieces(recording, &kept)?;
+    Ok(true)
 }
 
 /// Edits of `request` in effect in the project at `dir`.
@@ -486,6 +504,7 @@ impl Studio {
             // Made on a recording with no piece open: find the piece the
             // agent made, by the request its history carries.
             let made = recording.iter().flat_map(|r| lahza_motion_core::recording::read_pieces(r).into_iter().map(move |p| p.dir(r))).find(|dir| request_edits(dir, &request.id) > 0);
+            request.made_piece = made.is_some();
             request.about.project = made;
         }
         request.edits = request.about.project.as_deref().map_or(0, |dir| request_edits(dir, &request.id));
@@ -525,6 +544,13 @@ impl Studio {
             // The piece is not the one open: through a toolbox of its own.
             None => lahza_motion_mcp::tools::Toolbox::new().call("history", json!({"project": dir, "undo_request": id})).map(|_| ()),
         };
+        // A piece the request made goes off the video with its edits
+        // (its folder stays on disk).
+        let made = self.motion_agent.requests.iter().find(|r| r.id == id).filter(|r| r.made_piece).and_then(|r| r.about.recording.clone());
+        let result = result.and_then(|()| match made {
+            Some(recording) => take_piece_off(&recording, &dir).map(|_| ()),
+            None => Ok(()),
+        });
         match result {
             Ok(()) => {
                 if let Some(r) = self.motion_agent.requests.iter_mut().find(|r| r.id == id) {
@@ -798,16 +824,16 @@ impl Studio {
     /// bakes are up to date.
     fn motion_sim_state(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let editor = self.motion_editor()?;
-        let (needs, baking) = {
+        let (needs, baking, seconds) = {
             let e = editor.read(cx);
-            (e.sim_needs().to_vec(), e.baking())
+            (e.sim_needs().to_vec(), e.baking(), e.bake_seconds())
         };
         if needs.is_empty() && !baking {
             return None;
         }
         let pill = |label: String, fill: gpui::Hsla| div().h(px(22.0)).px_2().flex().flex_none().items_center().rounded_full().text_xs().text_color(gpui::white()).bg(fill).child(label);
         if baking {
-            return Some(pill("Baking the simulation…".into(), theme::accent()).into_any_element());
+            return Some(pill(format!("Baking the simulation… {seconds} s"), theme::accent()).into_any_element());
         }
         let detail = needs.iter().map(|n| n.message()).collect::<Vec<_>>().join(" ");
         if !needs.iter().any(|n| n.bakeable()) {
@@ -1195,6 +1221,23 @@ mod tests {
         assert!(runner.asked.lock().unwrap()[2].conversation.is_none() && !agent.fresh);
         let ids: Vec<&str> = agent.requests.iter().map(|r| r.id.as_str()).collect();
         assert!(ids[0] != ids[1] && ids[1] != ids[2], "each request has its own id");
+    }
+
+    #[test]
+    fn a_piece_a_request_made_is_taken_off_the_video() {
+        use lahza_motion_core::recording::{read_pieces, write_pieces, MotionPiece};
+        let rec = std::env::temp_dir().join(format!("lahza-agent-piece-{}.lahzarec", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rec);
+        std::fs::create_dir_all(rec.join("motion/map.lahza")).unwrap();
+        std::fs::write(rec.join("edit.json"), r#"{"formatVersion": 5, "zooms": [1, 2]}"#).unwrap();
+        let piece = |name: &str| MotionPiece { id: name.into(), name: name.into(), folder: format!("motion/{name}.lahza"), start: 2.0, placement: Default::default(), opacity: 1.0, hidden: false };
+        write_pieces(&rec, &[piece("title"), piece("map")]).unwrap();
+        assert_eq!(take_piece_off(&rec, &rec.join("motion/map.lahza")), Ok(true));
+        assert_eq!(read_pieces(&rec).iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["title"]);
+        assert!(rec.join("motion/map.lahza").is_dir(), "its folder stays");
+        assert_eq!(lahza_motion_core::recording::read_edit(&rec)["zooms"], serde_json::json!([1, 2]), "the rest of the edit is as it was");
+        assert_eq!(take_piece_off(&rec, &rec.join("motion/map.lahza")), Ok(false));
+        std::fs::remove_dir_all(&rec).ok();
     }
 
     #[test]

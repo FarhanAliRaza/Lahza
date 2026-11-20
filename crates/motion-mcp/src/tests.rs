@@ -134,6 +134,39 @@ fn a_request_is_undone_and_put_back_as_one() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Markers, shaders and the narration are written under the folder's
+/// lock too: a writer waits while another holds it.
+#[test]
+fn every_writer_of_a_project_waits_for_its_lock() {
+    let (mut tb, dir) = toolbox("locked");
+    tb.call("project_create", json!({"path": "p", "duration": 2})).unwrap();
+    let project = dir.join("p.lahza");
+    for (tool, args) in [
+        ("markers_import", json!({"project": "p.lahza", "kind": "user", "name": "beat", "markers": [0.5, 1.0]})),
+        ("shader_write", json!({"project": "p.lahza", "name": "glow", "source": "float glow(float x) { return x; }"})),
+        ("edit_apply", json!({"project": "p.lahza", "ops": [{"op": "add_scene", "id": "s1"}]})),
+    ] {
+        let held = lahza_motion_core::io::lock(&project).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cwd = dir.clone();
+        let writer = std::thread::spawn(move || {
+            let mut tb = Toolbox::new();
+            tb.cwd = cwd;
+            let result = tb.call(tool, args).map(|_| ());
+            tx.send(()).unwrap();
+            result
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "{tool} waits for the lock");
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or_else(|_| panic!("{tool} runs once the lock is free"));
+        // (A shader may not build here without the Slang compiler: what
+        // matters is that it ran, after the lock.)
+        let _ = writer.join().unwrap();
+    }
+    assert_eq!(lahza_motion_core::io::load_markers(&project).unwrap().get("beat").unwrap().markers.len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Two writers at once (the editor and an agent's server): every edit
 /// lands and every history entry has its own number.
 #[test]

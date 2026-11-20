@@ -1148,6 +1148,10 @@ impl Toolbox {
     fn narration_import(&mut self, args: &Value) -> ToolResult {
         use lahza_motion_core::narration::{self as nar, Manifest, Narration, NarrationClip};
         let dir = self.dir(args)?;
+        // Under the folder's lock, on what the other writer left (as
+        // `edit_apply`).
+        let _lock = io::lock(&dir).map_err(|e| e.to_string())?;
+        self.open(&dir)?;
         let file = self.file_in(&dir, get_str(args, "manifest").ok_or("narration_import needs \"manifest\"")?)?;
         let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
         let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -1262,6 +1266,10 @@ impl Toolbox {
 
     fn markers_import(&mut self, args: &Value) -> ToolResult {
         let dir = self.dir(args)?;
+        // Under the folder's lock, on what the other writer left (as
+        // `edit_apply`).
+        let _lock = io::lock(&dir).map_err(|e| e.to_string())?;
+        self.open(&dir)?;
         let offset = get_f64(args, "offset").unwrap_or(0.0);
         let tracks = match get_str(args, "kind").unwrap_or("") {
             "transcript" => {
@@ -1347,6 +1355,10 @@ impl Toolbox {
 
     fn shader_write(&mut self, args: &Value) -> ToolResult {
         let dir = self.dir(args)?;
+        // Under the folder's lock, on what the other writer left (as
+        // `edit_apply`).
+        let _lock = io::lock(&dir).map_err(|e| e.to_string())?;
+        self.open(&dir)?;
         let name = get_str(args, "name").ok_or("shader_write needs \"name\"")?;
         let source = get_str(args, "source").ok_or("shader_write needs \"source\"")?;
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.starts_with(|c: char| c.is_ascii_digit()) {

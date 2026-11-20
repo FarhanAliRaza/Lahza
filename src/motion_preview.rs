@@ -168,7 +168,7 @@ pub(crate) fn history(last: Option<&Drawn>, compiled: &Arc<Compiled>, t: f64, sc
 pub(crate) fn draw(renderer: &mut Renderer, last: &mut Option<Drawn>, compiled: &Arc<Compiled>, t: f64, scale: f64, now: Ask, playing: bool) -> Result<(image::RgbaImage, bool), String> {
     renderer.set_scale(scale);
     renderer.set_motion_blur(now.blur);
-    renderer.set_path(now.path);
+    renderer.set_path(traced(now, compiled, t));
     renderer.set_sky(now.sky);
     let step = history(last.as_ref(), compiled, t, scale, now, playing);
     let image = match step {
@@ -189,6 +189,15 @@ pub(crate) fn draw(renderer: &mut Renderer, last: &mut Option<Drawn>, compiled: 
             Err(e)
         }
     }
+}
+
+/// The trace options for a frame: a still traced frame takes the scene's
+/// motion blur as the fast mode's own (its shutter in frames: 180° is
+/// half a frame); a playing one does without, as the raster proxy does.
+pub(crate) fn traced(now: Ask, compiled: &Compiled, t: f64) -> Option<TraceOptions> {
+    let path = now.path?;
+    let shutter = if now.proxy { 0.0 } else { compiled.motion_blur_at(t).map_or(0.0, |blur| (blur.shutter / 360.0) as f32) };
+    Some(TraceOptions { shutter, ..path })
 }
 
 /// What to tell the person when the preview could not be drawn as chosen.
@@ -220,6 +229,21 @@ mod tests {
         let traced = ask(Quality::TracedFast, false, false);
         assert!(traced.path.is_some_and(|o| o.fast && o.temporal && o.spp == 0) && !traced.sky && !traced.proxy);
         assert!(ask(Quality::TracedFast, true, false).proxy);
+    }
+
+    #[test]
+    fn a_still_traced_frame_takes_the_scenes_motion_blur() {
+        let mut p = Project::new(64, 36, Fps::whole(30), 4.0);
+        p.scenes.push(lahza_motion_core::document::Scene::new("s1"));
+        let plain = Compiled::new(&p);
+        p.settings.motion_blur = Some(serde_json::from_value(serde_json::json!({"shutter": 180})).unwrap());
+        let blurred = Compiled::new(&p);
+        let still = ask(Quality::TracedFast, false, false);
+        assert_eq!(traced(still, &plain, 1.0).unwrap().shutter, 0.0);
+        assert_eq!(traced(still, &blurred, 1.0).unwrap().shutter, 0.5, "180° is half a frame");
+        assert_eq!(traced(ask(Quality::TracedFast, true, false), &blurred, 1.0).unwrap().shutter, 0.0, "playing: none");
+        assert!(traced(ask(Quality::Raster, false, false), &blurred, 1.0).is_none());
+        assert!(traced(ask(Quality::TracedFast, false, true), &blurred, 1.0).is_none(), "a drag is not traced");
     }
 
     #[test]

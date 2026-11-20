@@ -271,8 +271,8 @@ pub(crate) const FIELDS: &[Field] = &[
 ];
 
 /// Effects the inspector can add, with the values they start from (what
-/// is not given takes the format's default). Not here: `gradient_map` and
-/// `lut`, which need a list of stops and a file.
+/// is not given takes the format's default). Not here:
+/// `lut`, which needs a file.
 pub(crate) const EFFECTS: &[(&str, &str)] = &[
     ("Blur", r#"{"type": "blur", "radius": 8}"#),
     ("Shadow", r##"{"type": "shadow", "color": "#00000080", "radius": 12, "offset": [0, 8]}"##),
@@ -281,6 +281,7 @@ pub(crate) const EFFECTS: &[(&str, &str)] = &[
     ("Contrast", r#"{"type": "brightness_contrast", "brightness": 0, "contrast": 0.2}"#),
     ("Levels", r#"{"type": "levels"}"#),
     ("Colour", r#"{"type": "hue_saturation", "hue": 0, "saturation": 0.2, "lightness": 0}"#),
+    ("Gradient map", r##"{"type": "gradient_map", "stops": [[0, "#101030"], [1, "#ffd27a"]]}"##),
     ("Tint", r#"{"type": "tint"}"#),
     ("Fill", r##"{"type": "fill", "color": "#ffffff"}"##),
     ("Invert", r#"{"type": "invert"}"#),
@@ -326,6 +327,14 @@ fn values_in(object: &Value, prefix: &str, name: String) -> Values {
                 }
             }
             Value::String(text) if text.starts_with('#') => out.colors.push((label, path)),
+            // A gradient's stops: each one's colour.
+            Value::Array(stops) if key == "stops" => {
+                for (i, stop) in stops.iter().enumerate() {
+                    if stop.get(1).and_then(Value::as_str).is_some_and(|c| c.starts_with('#')) {
+                        out.colors.push((format!("stop {} (at {})", i + 1, stop.get(0).and_then(Value::as_f64).unwrap_or(0.0)), format!("{path}.{i}.1")));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -339,7 +348,15 @@ pub(crate) fn extra_values(layer: &Layer) -> (Values, Vec<Values>) {
     if let lahza_motion_core::document::LayerKind::Text(_) = &layer.kind {
         own.fields.push(Field { path: "size".into(), component: None, label: "Size".into(), step: 0.5, default: 96.0 });
         own.fields.push(Field { path: "tracking".into(), component: None, label: "Tracking".into(), step: 0.1, default: 0.0 });
+        own.fields.push(Field { path: "line_height".into(), component: None, label: "Line height".into(), step: 0.005, default: 1.15 });
         own.colors.push(("Colour".into(), "color".into()));
+        // The outline, when it has one: its width and colour.
+        let stroke = serde_json::to_value(layer).ok().and_then(|v| v.get("stroke").cloned()).filter(Value::is_object);
+        if let Some(stroke) = stroke {
+            let outline = values_in(&stroke, "stroke.", String::new());
+            own.fields.extend(outline.fields.into_iter().map(|f| Field { label: format!("Outline {}", f.label).into(), ..f }));
+            own.colors.extend(outline.colors.into_iter().map(|(label, path)| (format!("Outline {label}"), path)));
+        }
     }
     let json = serde_json::to_value(&layer.common.effects).unwrap_or_default();
     let effects = json
@@ -415,6 +432,9 @@ pub(crate) struct MotionEditor {
     sim_inbox: Arc<Mutex<Option<(u64, Vec<SimNeed>)>>>,
     /// A bake is running; its result arrives here.
     baking: bool,
+    bake_started: Option<Instant>,
+    /// Whole seconds of the bake last shown.
+    bake_shown: u64,
     bake_inbox: Arc<Mutex<Option<Result<String, String>>>>,
     font_names: Vec<String>,
     /// The selected layer as JSON, saved and as the drag shows it: values
@@ -678,6 +698,8 @@ impl MotionEditor {
             sim_generation: 0,
             sim_inbox: Arc::default(),
             baking: false,
+            bake_started: None,
+            bake_shown: 0,
             bake_inbox: Arc::default(),
             font_names: Vec::new(),
             saved_json: RefCell::default(),
@@ -754,8 +776,14 @@ impl MotionEditor {
             }
         }
         let baked = self.bake_inbox.lock().unwrap().take();
+        // A running bake: the seconds it has taken, as they pass.
+        if self.baking && self.bake_seconds() != self.bake_shown {
+            self.bake_shown = self.bake_seconds();
+            changed = true;
+        }
         if let Some(result) = baked {
             self.baking = false;
+            self.bake_started = None;
             self.reload();
             self.status = result.unwrap_or_else(|e| format!("The simulation could not be baked: {e}"));
             changed = true;
@@ -832,6 +860,11 @@ impl MotionEditor {
         self.baking
     }
 
+    /// Seconds the running bake has taken so far.
+    pub(crate) fn bake_seconds(&self) -> u64 {
+        self.bake_started.filter(|_| self.baking).map_or(0, |t| t.elapsed().as_secs())
+    }
+
     /// Bakes what needs it, off the UI thread; the result shows when it
     /// is done (`tick`).
     pub(crate) fn bake_simulation(&mut self) {
@@ -839,6 +872,8 @@ impl MotionEditor {
             return;
         }
         self.status = "Baking the simulation…".into();
+        self.bake_started = Some(Instant::now());
+        self.bake_shown = 0;
         let (dir, inbox) = (self.dir.clone(), self.bake_inbox.clone());
         std::thread::spawn(move || {
             let result = bake_simulations(&dir);
@@ -1691,6 +1726,18 @@ mod tests {
         for hex in SWATCHES {
             Color::parse(hex).unwrap();
         }
+        // A gradient map: a colour for each stop, by its place in the list.
+        let map: Effect = serde_json::from_str(EFFECTS.iter().find(|(label, _)| *label == "Gradient map").unwrap().1).unwrap();
+        let values = values_in(&serde_json::to_value(&map).unwrap(), "effects.0.", "gradient map".into());
+        assert_eq!(values.colors.iter().map(|(_, path)| path.as_str()).collect::<Vec<_>>(), ["effects.0.stops.0.1", "effects.0.stops.1.1"]);
+        // A text: its line height, and its outline once it has one.
+        let text: Layer = serde_json::from_value(json!({"id": "t", "kind": "text", "text": "Hi"})).unwrap();
+        let (own, _) = extra_values(&text);
+        assert_eq!(own.fields.iter().map(|f| &*f.label).collect::<Vec<_>>(), ["Size", "Tracking", "Line height"]);
+        let outlined: Layer = serde_json::from_value(json!({"id": "t", "kind": "text", "text": "Hi", "stroke": {"color": "#000000", "width": 4}})).unwrap();
+        let (own, _) = extra_values(&outlined);
+        assert!(own.fields.iter().any(|f| f.label == "Outline width" && f.path == "stroke.width"), "{:?}", own.fields.iter().map(|f| &*f.label).collect::<Vec<_>>());
+        assert!(own.colors.contains(&("Outline color".to_string(), "stroke.color".to_string())));
     }
 
     #[test]
