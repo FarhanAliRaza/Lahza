@@ -303,6 +303,12 @@ impl Herd {
         }
     }
 
+    /// The capsules of the agents that walk, each with its speed to the
+    /// next sample (px/s).
+    pub fn movers(&self, rate: f64) -> Vec<(RigidBodyHandle, [f64; 3])> {
+        self.agents.iter().flatten().filter(|a| a.down.is_none()).map(|a| (a.proxy, std::array::from_fn(|k| (a.next.p[k] - a.now.p[k]) * rate))).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.agents.iter().all(|a| a.is_empty())
     }
@@ -509,7 +515,10 @@ impl Herd {
 
     /// After a step: agents a body struck at speed go down. `k` is the
     /// sample the step is in, `t` its time.
-    pub fn knocks(&mut self, input: &SimInput, world: &mut World, k: u32, t: f64) {
+    /// Returns, for each ragdoll let go, the turns that have its motors
+    /// hold the pose it was let go in.
+    pub fn knocks(&mut self, input: &SimInput, world: &mut World, k: u32, t: f64) -> Vec<(usize, Vec<Option<[f64; 4]>>)> {
+        let mut held = Vec::new();
         let u = world.unit;
         let mut struck: Vec<(usize, usize, usize, f64)> = Vec::new();
         for pair in world.w.contact_pairs() {
@@ -563,6 +572,9 @@ impl Herd {
             let at = (turns - turns.floor()) * cycle;
             let root = world.w.bodies[agent.proxy].position();
             let root = Pose { p: [root.translation.x as f64 * u, root.translation.y as f64 * u, root.translation.z as f64 * u], q: [root.rotation.x as f64, root.rotation.y as f64, root.rotation.z as f64, root.rotation.w as f64] };
+            // Samples of the clip a second, as it was walking.
+            let pace = len2(agent.vel) / c.stride * cycle;
+            let mut placed: Vec<Pose> = Vec::with_capacity(local.len());
             for (bone, local) in input.ragdolls[r].bones.iter().zip(local) {
                 let i = (at.floor() as usize).min(local.len() - 1);
                 let j = (i + 1).min(local.len() - 1);
@@ -573,21 +585,38 @@ impl Herd {
                 let l = turn.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
                 turn = turn.map(|v| v / l);
                 let here = root.then(&Pose { p: std::array::from_fn(|x| p.p[x] + (q.p[x] - p.p[x]) * f), q: turn });
+                placed.push(here);
+                // Its own swing in the clip: how it moves and turns from
+                // this sample of the cycle to the next, at the agent's pace.
+                let swing = lahza_motion_core::sim::quat_rotate(root.q, std::array::from_fn(|x| (q.p[x] - p.p[x]) * pace));
+                let d = lahza_motion_core::sim::quat_mul(q.q.map(|v| v * s), [-p.q[0], -p.q[1], -p.q[2], p.q[3]]);
+                let d = if d[3] < 0.0 { d.map(|v| -v) } else { d };
+                let sine = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let spin = if sine < 1e-12 { [0.0; 3] } else { lahza_motion_core::sim::quat_rotate(root.q, std::array::from_fn(|x| d[x] / sine * 2.0 * libm::atan2(sine, d[3]) * pace)) };
                 let h = world.handles[bone.body];
                 let rb = &mut world.w.bodies[h];
                 rb.set_enabled(true);
                 rb.set_position(pose(&here, u), true);
                 rb.set_body_type(RigidBodyType::Dynamic, true);
-                // It was walking: every bone has the agent's speed.
-                rb.set_linvel(v3([agent.vel[0], 0.0, agent.vel[1]], 1.0 / u), true);
-                rb.set_angvel(Vector::ZERO, true);
+                // It was walking: every bone has the agent's speed and its own in the clip.
+                rb.set_linvel(v3([agent.vel[0] + swing[0], swing[1], agent.vel[1] + swing[2]], 1.0 / u), true);
+                rb.set_angvel(v3(spin, 1.0), true);
                 let colliders: Vec<ColliderHandle> = rb.colliders().to_vec();
                 for ch in colliders {
                     world.w.colliders[ch].set_enabled(true);
                 }
                 world.released[bone.body] = true;
             }
+            // Each bone's turn against its parent as it fell, on top of
+            // how it is bound (what its motors aim for from now).
+            let bones = &input.ragdolls[r].bones;
+            held.push((r, bones.iter().enumerate().map(|(b, bone)| {
+                let parent = placed.get(bone.parent?)?;
+                let against = lahza_motion_core::sim::quat_mul([-parent.q[0], -parent.q[1], -parent.q[2], parent.q[3]], placed.get(b)?.q);
+                Some(lahza_motion_core::sim::quat_mul(against, [-bone.bind[0], -bone.bind[1], -bone.bind[2], bone.bind[3]]))
+            }).collect()));
         }
+        held
     }
 
     /// The agents' tracks (after the last `plan`), and for each bone body

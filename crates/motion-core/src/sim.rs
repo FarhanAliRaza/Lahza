@@ -708,6 +708,9 @@ pub struct CrowdRagdoll {
     pub limits: Vec<BoneLimit>,
     #[serde(default)]
     pub shapes: Vec<BoneShape>,
+    /// How hard one knocked down holds the pose it fell in (0: limp).
+    #[serde(default)]
+    pub strength: f64,
     /// Instances: how many can be down as ragdolls at once in a take (the
     /// ones knocked after that stop where they stand).
     #[serde(default = "crowd_fallen")]

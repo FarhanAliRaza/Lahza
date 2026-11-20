@@ -925,8 +925,9 @@ coordinating session. In the order built:
    - Left: a step is the `step` behaviour's (a foot carried, not a leg
      swung), one at a time, and only toward where it is falling; arms
      only swing from the shoulder (no elbow, no reach for support); the
-     plan is ten numbers, not a pose; it does not get up. A search does
-     not see a crowd in its tries.
+     plan is ten numbers, not a pose; it does not get up. In a try a
+     crowd's agents walk on straight at the speed they had (they do not
+     steer in it).
 7. **Crowds: done, as layers or as instances with impostors.**
    `simulation.crowds`. Once a frame every agent steers: toward its goal
    at its own pace, off agents within three radii (found by a grid), off
@@ -981,7 +982,12 @@ coordinating session. In the order built:
      agents as layers do, are drawn where the bake has them at their own
      moment, are meshes for the nearest `full` and image layers with
      their pictures for the rest; one struck takes the pool's first
-     ragdoll; the bake survives its file; five bakes are pinned.
+     ragdoll, its bones turning as the clip had them (a leg swung 120°/s
+     in the clip leaves at 90 to 180°/s against its hips, the still leg
+     under 25) and, with `ragdoll.strength`, holding the pose it fell in
+     (its spine bends less than half what it does limp); a try ahead
+     moves the agents' capsules where their speed takes them and leaves
+     the take's alone; the bake survives its file; seven bakes are pinned.
      Rendered: 24 agents as 4 meshes and 20 pictures cover the same
      pixels as 24 meshes (within 12 %, under a third differing at all).
      `examples/sim/crowd.py` (12, 100) and `examples/sim/herd.py` (100,
@@ -1013,15 +1019,13 @@ coordinating session. In the order built:
      drawn again whenever the lights change (every frame under an
      animated light); an agent pops when it changes between mesh and
      picture; the path tracer sees a card, not a body. A fallen agent
-     falls with the agent's speed only (its limbs' own swing is
-     dropped), is always limp, and past the pool stands frozen. A way
+     past the pool stands frozen, and none gets up. A way
      is planned round what stands still only (its level box: a wall at
      an angle shuts its whole box), by each agent alone (no lanes, no
      waiting for a gap: a doorway jams), and not round a body in
      motion. An agent steps aside and does nothing else: no guard, no
      duck, no look (it has one clip), and it does not get out of the
-     way of other agents' falls. A search controller does not see
-     crowds in its tries. `check` evaluates every agent at every
+     way of other agents' falls. `check` evaluates every agent at every
      sample it takes, which is slow at thousands.
 
 ## Directing an agent from the editor

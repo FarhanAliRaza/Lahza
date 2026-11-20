@@ -829,7 +829,7 @@ px a `cycle`), so feet do not slide and agents are out of step.
 | `knock` | px/s (300): a body striking an agent at this speed or more knocks it down (a `knock` event) |
 | `plan` | true: when the straight line to its goal is shut by what stands still, an agent takes the shortest way round it. false: it only steers off what is near, and a wall across its way holds it |
 | `dodge` | seconds (0.6) ahead an agent sees a body coming that would knock it down, and steps out of its line at up to 2.2 times its pace (a `dodge` event); 0: it does not look |
-| `ragdoll` | `{mass, thickness, friction, limits, shapes}` as a ragdoll's: an agent knocked down falls as a limp ragdoll of the bones under its comp, from the pose its clip had. Without it the agent stops where it stands |
+| `ragdoll` | `{mass, thickness, friction, limits, shapes}` as a ragdoll's: an agent knocked down falls as a ragdoll of the bones under its comp, from the pose its clip had, each bone moving and turning as it did in the clip. `strength` (0): how hard it holds the pose it fell in (0 limp, 1 goes down as it stood). Without `ragdoll` the agent stops where it stands |
 
 **Instances.** For hundreds or thousands, name one comp as the crowd's
 `character` instead of `agents`: every agent is an instance of it. The
