@@ -2535,12 +2535,124 @@ fn visible(id: vec3<u32>, py: u32, w: u32) {
 }
 
 // What a matte surface facing world direction n gets of the sky, the
-// horizon and the ground (the raster's `env_diffuse`, without the lobes
-// and the image, which `direct` samples).
+// horizon, the ground and the lobes, or of an environment image (the
+// raster's `env_diffuse` in motion.wgsl).
 fn sky_diffuse(n: vec3<f32>) -> vec3<f32> {
+    if b_light[0].z > 0.5 {
+        // An environment image: its diffuse level, as the raster looks
+        // it up (for sky visibility `b_env` holds the raster's rows:
+        // [levels, the diffuse level's offset, its width and height]).
+        let d = b_env[0];
+        let w = u32(d.z);
+        let h = u32(d.w);
+        let at = u32(d.y);
+        if w == 0u || h == 0u || at + w * h > arrayLength(&b_env) { return vec3<f32>(0.0); }
+        let uv = env_uv(n);
+        let x = uv.x * f32(w) - 0.5;
+        let y = clamp(uv.y * f32(h) - 0.5, 0.0, f32(h - 1u));
+        let xf = floor(x);
+        let fx = x - xf;
+        let y0 = u32(floor(y));
+        let y1 = min(y0 + 1u, h - 1u);
+        let fy = y - floor(y);
+        let x0 = u32(i32(xf) + i32(w)) % w;
+        let x1 = (x0 + 1u) % w;
+        let a = mix(b_env[at + y0 * w + x0].xyz, b_env[at + y0 * w + x1].xyz, fx);
+        let b = mix(b_env[at + y1 * w + x0].xyz, b_env[at + y1 * w + x1].xyz, fx);
+        return mix(a, b, fy) * b_light[0].w;
+    }
     let up = -n.y;
-    if up >= 0.0 { return mix(b_light[5].xyz, b_light[4].xyz, smoothstep(0.0, 1.6, up)); }
-    return mix(b_light[5].xyz, b_light[6].xyz, smoothstep(0.0, 1.2, -up));
+    var c: vec3<f32>;
+    if up >= 0.0 {
+        c = mix(b_light[5].xyz, b_light[4].xyz, smoothstep(0.0, 1.6, up));
+    } else {
+        c = mix(b_light[5].xyz, b_light[6].xyz, smoothstep(0.0, 1.2, -up));
+    }
+    let lobes = u32(b_light[0].y);
+    let first = 7u + u32(b_light[0].x) * LROWS;
+    for (var i = 0u; i < lobes; i++) {
+        let l = b_light[first + i * 2u];
+        let lam = 1.0 / max(l.w * l.w, 1e-6);
+        let mu = dot(n, l.xyz);
+        let eml = exp(-lam);
+        let em2l = eml * eml;
+        let rl = 1.0 / lam;
+        let scale = 1.0 + 2.0 * em2l - rl;
+        let bias = (eml - em2l) * rl - em2l;
+        let x = sqrt(max(1.0 - scale, 0.0));
+        let x0 = 0.36 * mu;
+        let x1 = x / (4.0 * 0.36);
+        let nn = x0 + x1;
+        var y = clamp(mu, 0.0, 1.0);
+        if abs(x0) <= x1 { y = nn * nn / max(x, 1e-6); }
+        let e = max(scale * y + bias, 0.0);
+        c = c + b_light[first + i * 2u + 1u].xyz * (e * 2.0 * rl * (1.0 - em2l));
+    }
+    return c;
+}
+
+// Whether a solid mesh stands between `o` and `tmax` along `d`, for the
+// sky's light back (nothing drawn by lot: at least half opaque blocks).
+fn sky_shadowed(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> bool {
+    var rq: ray_query;
+    rayQueryInitialize(&rq, acc, RayDesc(RAY_FLAG_FORCE_NO_OPAQUE | RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0xFFu, 0.0, tmax, o, d));
+    var found = false;
+    while rayQueryProceed(&rq) {
+        let c = rayQueryGetCandidateIntersection(&rq);
+        if c.kind != RAY_QUERY_INTERSECTION_TRIANGLE { continue; }
+        if c.instance_custom_data == u.opts.z { continue; }
+        let inst = c.instance_custom_data * INST_ROWS;
+        if inst + INST_ROWS - 1u >= arrayLength(&b_inst) { continue; }
+        let ti = bitcast<u32>(b_inst[inst].z) + c.primitive_index;
+        if ti >= arrayLength(&b_tag) { continue; }
+        let tag = b_tag[ti];
+        let part = tag & 0xffu;
+        let row = b_inst[inst + 1u + part / 2u];
+        var base: u32;
+        var count: u32;
+        if part % 2u == 0u { base = bitcast<u32>(row.x); count = bitcast<u32>(row.y); } else { base = bitcast<u32>(row.z); count = bitcast<u32>(row.w); }
+        let mat = (base + ((tag >> 8u) & 0xffffu) % max(count, 1u)) * MAT_ROWS;
+        if mat + MAT_ROWS - 1u >= arrayLength(&b_mat) { continue; }
+        let flags = u32(b_mat[mat + 2u].w);
+        if (flags & (FLAG_SHADOW_CATCHER | FLAG_WIRE | FLAG_VOLUME)) != 0u { continue; }
+        if b_mat[mat].w * (1.0 - b_mat[mat + 3u].x) < 0.5 { continue; }
+        rayQueryConfirmIntersection(&rq);
+        found = true;
+    }
+    return found;
+}
+
+// The light a surface the sky's ray ends on sends back: its base colour
+// (less what is metal) under the sky, horizon and ground, the ambient
+// lights and each other light from its middle (a shadow by one ray; an
+// area light as a point), and what it emits. Plain on purpose: the CPU
+// casts the same rays and has to find the same light (sky_cpu.rs).
+fn sky_lit(h: Hit) -> vec3<f32> {
+    var l = sky_diffuse(to_world(h.n));
+    let lights = u32(b_light[0].x);
+    for (var i = 0u; i < lights; i++) {
+        let row = b_light[7u + i * LROWS];
+        let col = b_light[7u + i * LROWS + 1u];
+        let kind = u32(row.w);
+        if kind == 2u {
+            l += col.xyz;
+            continue;
+        }
+        var to = normalize(row.xyz);
+        var dist = 1e30;
+        var window = 1.0;
+        if kind != 0u {
+            let away = row.xyz - h.p;
+            dist = length(away);
+            to = away / max(dist, 1e-6);
+            window = range_window(dist, b_light[7u + i * LROWS + 2u].x);
+        }
+        let facing = dot(h.n, to);
+        if facing <= 0.0 { continue; }
+        if col.w > 0.5 && sky_shadowed(offset(h, to), to, dist * 0.999) { continue; }
+        l += col.xyz * (facing * window);
+    }
+    return b_mat[h.mat].xyz * (1.0 - b_mat[h.mat + 1u].x) * l + b_mat[h.mat + 2u].xyz;
 }
 
 // The camera ray through the middle of texel (x, y).
@@ -2561,7 +2673,7 @@ fn texel_dir(x: f32, y: f32) -> vec3<f32> {
 // picture, whatever was drawn before it, as the raster must.
 // A ray that is not open ends on a surface, and that surface sends light
 // back: its own colour under the lights (their shadows by rays) and under
-// the environment, as the raster would light it. One bounce: without it
+// the environment (`sky_lit`). One bounce: without it
 // every face that looks at another loses the light the environment's
 // ground and horizon stood for, and the picture is darker than traced.
 // Into `b_hdr`: the open rays' directions (camera space) summed, over the
@@ -2619,8 +2731,7 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
                     n += 1.0;
                     continue;
                 }
-                let s = surface(far, -d);
-                back += direct(s, far, -d, &rng) + s.kd * (sky_diffuse(to_world(far.n)) + env_ambient()) + b_mat[far.mat + 2u].xyz * s.emit;
+                back += sky_lit(far);
             }
             back /= f32(rays);
             open = vec4<f32>(sum / f32(rays), dir.z * h.t);

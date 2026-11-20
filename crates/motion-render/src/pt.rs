@@ -420,6 +420,42 @@ const FAST_IMAGES: [(&str, gpu::TextureFormat, u32, u32); 7] = [
     ("ray reconstruction output", gpu::TextureFormat::Rgba32Float, 4, 109),
 ];
 
+/// A camera that turns more than this many degrees from one frame to the
+/// next, or moves the scene's middle by more than this part of the
+/// picture's smaller side, has jumped: the history starts again.
+const JUMP_TURN: f32 = 25.0;
+const JUMP_SHIFT: f32 = 0.5;
+
+/// The inverse of an affine transform (row-major 3 × 4), or None.
+fn affine_inverse(m: &[[f32; 4]; 3]) -> Option<[[f32; 4]; 3]> {
+    let r = [[m[0][0], m[0][1], m[0][2]], [m[1][0], m[1][1], m[1][2]], [m[2][0], m[2][1], m[2][2]]];
+    let c = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let co = [c(r[1], r[2]), c(r[2], r[0]), c(r[0], r[1])];
+    let det = r[0][0] * co[0][0] + r[0][1] * co[0][1] + r[0][2] * co[0][2];
+    if !(det.abs() > 1e-20) {
+        return None;
+    }
+    let mut out = [[0.0f32; 4]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = co[j][i] / det;
+        }
+        out[i][3] = -(out[i][0] * m[0][3] + out[i][1] * m[1][3] + out[i][2] * m[2][3]);
+    }
+    Some(out)
+}
+
+/// a · b for affine transforms (row-major 3 × 4).
+fn affine_mul(a: &[[f32; 4]; 3], b: &[[f32; 4]; 3]) -> [[f32; 4]; 3] {
+    let mut out = [[0.0f32; 4]; 3];
+    for i in 0..3 {
+        for j in 0..4 {
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + if j == 3 { a[i][3] } else { 0.0 };
+        }
+    }
+    out
+}
+
 /// The fast mode's tiles, in texels (pt.wgsl `FAST_TILE`).
 const FAST_TILE: u32 = 16;
 
@@ -661,6 +697,9 @@ struct History {
     /// The list's mesh layers then: a frame with none of them is another
     /// scene (a cut), and starts again without history.
     ids: Vec<Arc<str>>,
+    /// World → camera then (from a layer's two transforms): a camera that
+    /// is somewhere else altogether the next frame has jumped.
+    view: Option<[[f32; 4]; 3]>,
     cam: [f32; 4],
     place: [f32; 4],
     root: [[f32; 4]; 3],
@@ -1216,14 +1255,17 @@ impl Tracer {
         // The environment image: uploaded once while it stays the same.
         let env_buf = match &t.env {
             Some(e) => {
-                let key = Arc::as_ptr(e) as usize;
+                // (Sky visibility looks the raster's diffuse level up, not
+                // the tracer's sharp map: the map's other rows.)
+                let rows = if sky { &e.raster } else { &e.trace };
+                let key = (Arc::as_ptr(e) as usize) ^ sky as usize;
                 if self.env.as_ref().map(|(k, _, _)| *k) != Some(key) {
                     if let Some((_, _, old)) = self.env.take() {
                         self.retire(Retired::Buffer(old));
                     }
-                    let b = context.create_buffer(gpu::BufferDesc { name: "trace environment", size: (e.trace.len() * 16) as u64, memory: gpu::Memory::Shared });
+                    let b = context.create_buffer(gpu::BufferDesc { name: "trace environment", size: (rows.len() * 16).max(16) as u64, memory: gpu::Memory::Shared });
                     // SAFETY: a fresh mapped buffer of exactly this size.
-                    unsafe { std::ptr::copy_nonoverlapping(e.trace.as_ptr() as *const u8, b.data(), e.trace.len() * 16) };
+                    unsafe { std::ptr::copy_nonoverlapping(rows.as_ptr() as *const u8, b.data(), rows.len() * 16) };
                     context.sync_buffer(b);
                     self.env = Some((key, e.clone(), b));
                 }
@@ -1239,6 +1281,27 @@ impl Tracer {
         if temporal {
             self.prev_transforms.extend(next_transforms);
         }
+        let ids: Vec<Arc<str>> = t.instances.iter().map(|i| i.id.clone()).collect();
+        if temporal && !ids.is_empty() {
+            // A list keeps its history when its place among the frame's
+            // traced lists changes (after a transition the scene that
+            // came in is the first list, and was the second): what
+            // another slot holds of these layers comes here, and what was
+            // here goes there.
+            let has = |h: &History| ids.iter().any(|i| h.ids.contains(i));
+            if !self.history.get(&slot).is_some_and(has) {
+                if let Some(other) = self.history.iter().find(|(k, h)| **k != slot && has(h)).map(|(k, _)| *k) {
+                    let (mine, theirs) = (self.history.remove(&slot), self.history.remove(&other));
+                    self.history.extend(theirs.map(|h| (slot, h)));
+                    self.history.extend(mine.map(|h| (other, h)));
+                    let (mine, theirs) = (self.fast.remove(&slot), self.fast.remove(&other));
+                    self.fast.extend(theirs.map(|f| (slot, f)));
+                    self.fast.extend(mine.map(|f| (other, f)));
+                }
+            }
+        }
+        // World → camera, from the first layer that tells it.
+        let view = t.instances.iter().find_map(|i| affine_inverse(&i.world).map(|w| affine_mul(&i.transform, &w)));
         let (hist, prev) = if temporal {
             if self.history.get(&slot).is_none_or(|h| h.size != size) {
                 if let Some(old) = self.history.remove(&slot) {
@@ -1248,19 +1311,34 @@ impl Tracer {
                 }
                 let hist_size = ((size.0 * size.1) as u64 * 48).max(16);
                 let make = || context.create_buffer(gpu::BufferDesc { name: "trace history", size: hist_size, memory: gpu::Memory::Device });
-                self.history.insert(slot, History { size, buffers: [make(), make()], current: 0, ids: Vec::new(), cam: [0.0; 4], place: [0.0; 4], root: [[0.0; 4]; 3] });
+                self.history.insert(slot, History { size, buffers: [make(), make()], current: 0, ids: Vec::new(), view: None, cam: [0.0; 4], place: [0.0; 4], root: [[0.0; 4]; 3] });
             }
+            let centre = t.instances.first().map(|i| [i.transform[0][3], i.transform[1][3], i.transform[2][3]]);
             let h = self.history.get_mut(&slot).unwrap();
             let mut prev = (h.cam, h.place, h.root);
             // A cut: none of the layers traced here last frame. What was
             // accumulated is another scene's (the passes take a camera
             // with w 0 for no frame before this one, and Ray
             // Reconstruction is told to start again).
-            let ids: Vec<Arc<str>> = t.instances.iter().map(|i| i.id.clone()).collect();
             if !h.ids.is_empty() && !ids.is_empty() && !ids.iter().any(|i| h.ids.contains(i)) {
                 prev.0[3] = 0.0;
             }
-            h.ids = ids;
+            // A camera jump within the scene: the camera turned by more
+            // than `JUMP_TURN`, or the scene's middle is more than
+            // `JUMP_SHIFT` of the picture from where it was (a pan that
+            // fast keeps little of the frame before anyway).
+            if let (Some(now), Some(then), Some(c)) = (view, h.view, centre) {
+                let turn = (0..3).map(|k| now[k][0] * then[k][0] + now[k][1] * then[k][1] + now[k][2] * then[k][2]).sum::<f32>();
+                let scale = (now[0][0] * now[0][0] + now[0][1] * now[0][1] + now[0][2] * now[0][2]).max(1e-12);
+                let was = affine_inverse(&now).map(|inv| affine_mul(&then, &inv)).map(|m| [0, 1, 2].map(|k| m[k][0] * c[0] + m[k][1] * c[1] + m[k][2] * c[2] + m[k][3]));
+                let shift = was.filter(|w| w[2] > 1.0 && c[2] > 1.0).map_or(0.0, |w| t.focal * ((c[0] / c[2] - w[0] / w[2]).powi(2) + (c[1] / c[2] - w[1] / w[2]).powi(2)).sqrt());
+                // (cos of the turn, from the trace of now · thenᵀ.)
+                if (turn / scale - 1.0) * 0.5 < JUMP_TURN.to_radians().cos() || shift > JUMP_SHIFT * 2.0 * t.centre[0].min(t.centre[1]) {
+                    prev.0[3] = 0.0;
+                }
+            }
+            h.view = view;
+            h.ids = ids.clone();
             let (read, write) = (h.buffers[h.current], h.buffers[1 - h.current]);
             h.current = 1 - h.current;
             h.cam = [t.focal, t.centre[0], t.centre[1], 1.0];
@@ -1412,6 +1490,15 @@ impl Tracer {
         let shader = context.try_create_shader(gpu::ShaderDesc { source: &specialise(ALL_FEATURES, self.profile) }).expect("the trace shader");
         self.stand_in = Some(context.create_compute_pipeline(gpu::ComputePipelineDesc { name: "ray reconstruction stand-in", data_layouts: &[&TraceData::layout()], compute: shader.at("ngx_stand_in") }));
         self.ngx = Some(Ok(crate::ngx::Ngx::stand_in()));
+    }
+
+    /// Tests: the traced list of each frame the stand-in was given.
+    #[cfg(test)]
+    pub(crate) fn stand_in_slots(&self) -> Vec<u32> {
+        match &self.ngx {
+            Some(Ok(ngx)) => ngx.slots.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// Tests: the fast mode without Ray Reconstruction, wherever run.
@@ -1675,6 +1762,7 @@ impl Tracer {
         #[cfg(test)]
         if let (Some(Ok(ngx)), Some(host), Some(pipeline)) = (self.ngx.as_mut().filter(|n| n.as_ref().is_ok_and(|n| n.is_stand_in())), f.host, self.stand_in.as_ref()) {
             ngx.seen.push((frame.jitter, frame.reset != 0));
+            ngx.slots.push(slot);
             {
                 let mut copy = encoder.transfer("ray reconstruction stand-in images");
                 let mut at = 0u64;

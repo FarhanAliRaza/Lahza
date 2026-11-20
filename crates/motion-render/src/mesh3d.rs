@@ -2836,13 +2836,13 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 }
 
 /// Environment image lookups (mirror motion.wgsl's env_image*).
-fn env_uv(m: &[[f32; 4]], lb: usize, d: F3) -> [f32; 2] {
+pub(crate) fn env_uv(m: &[[f32; 4]], lb: usize, d: F3) -> [f32; 2] {
     let phi = d[0].atan2(d[2]) + m[lb + 4][3];
     let u = 0.5 + phi / (2.0 * std::f32::consts::PI);
     [u - u.floor(), (-d[1]).clamp(-1.0, 1.0).acos() / std::f32::consts::PI]
 }
 
-fn env_tex(m: &[[f32; 4]], at: usize, w: usize, h: usize, uv: [f32; 2]) -> F3 {
+pub(crate) fn env_tex(m: &[[f32; 4]], at: usize, w: usize, h: usize, uv: [f32; 2]) -> F3 {
     let x = uv[0] * w as f32 - 0.5;
     let y = (uv[1] * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
     let xf = x.floor();
@@ -2906,7 +2906,7 @@ fn env(m: &[[f32; 4]], lb: usize, d: F3, r: f32) -> F3 {
 
 /// Irradiance / π from the environment on a matte surface facing world
 /// direction n (mirrors `env_diffuse` in motion.wgsl).
-fn env_diffuse(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
+pub(crate) fn env_diffuse(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
     if m[lb][2] > 0.5 {
         return env_image_diffuse(m, lb, n);
     }
@@ -3801,6 +3801,17 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     let mut d_light = [0.0f32; 3];
     let mut s_light = [0.0f32; 3];
     let mut c_light = [0.0f32; 3];
+    // What the point sees of the sky (motion.wgsl `sky_at`; the group is
+    // named in the light block's two spare floats, 0: none).
+    let sky_size = m[lb + 6][3].to_bits();
+    let sky = (sky_size != 0)
+        .then(|| {
+            let off = prim.stroke[2].to_bits() as usize + m[lb + 3][3].to_bits() as usize;
+            let c = [prim.fill[0] + prim.fill[2] * q[0], prim.fill[1] + prim.fill[3] * q[1]];
+            crate::sky_cpu::at(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16) as i32, c, p[2])
+        })
+        .flatten();
+    let sky_part = sky.map_or(1.0, |s| s.1);
     let lights = m[lb][0] as usize;
     for i in 0..lights {
         let row = m[lb + 7 + i * LROWS];
@@ -3808,7 +3819,7 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         let extra = m[lb + 7 + i * LROWS + 2];
         let kind = row[3] as u32;
         if kind == 2 {
-            d_light = fadd(d_light, fmul3(diffuse, col));
+            d_light = fadd(d_light, fmul(fmul3(diffuse, col), sky_part));
             continue;
         }
         // Specular: toward ls with GGX alpha sa (× spec_norm keeps energy).
@@ -3867,16 +3878,25 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     };
     let r_view = fsub(fmul(rn, 2.0 * fdot(rn, v)), v);
     let rw = to_world(m, lb, r_view);
-    let env_d = env_diffuse(m, lb, nw);
-    d_light = fadd(d_light, fmul(fmul3(diffuse, env_d), coat));
-    let spec_env = fmul3(fmul3(env(m, lb, rw, rough), fadd(fmul(f0, ab[0]), fmul(f82, f90 * ab[1]))), comp);
+    // (Mirrors motion.wgsl: the environment by what is seen of the sky,
+    // and the light that comes back.)
+    let mut env_d = env_diffuse(m, lb, nw);
+    let mut sky_spec = 1.0;
+    let mut sky_back = [0.0f32; 3];
+    if let Some((open, part, back)) = sky {
+        env_d = fmul(env_diffuse(m, lb, to_world(m, lb, fnorm(fmix(open, n, part)))), part);
+        sky_spec = ((n_v + part).powf((-16.0 * rough - 1.0).exp2()) - 1.0 + part).clamp(0.0, 1.0);
+        sky_back = back;
+    }
+    d_light = fadd(d_light, fmul(fmul3(diffuse, fadd(env_d, sky_back)), coat));
+    let spec_env = fmul(fmul3(fmul3(env(m, lb, rw, rough), fadd(fmul(f0, ab[0]), fmul(f82, f90 * ab[1]))), comp), sky_spec);
     s_light = fadd(s_light, fmul(spec_env, coat));
     if e_sheen > 0.0 {
         s_light = fadd(s_light, fmul(fmul3(sheen, env_d), sheen_albedo(n_v, sheen_r) * coat));
     }
     if cc > 0.0 {
         let cr = fsub(fmul(n, 2.0 * fdot(n, v)), v);
-        c_light = fadd(c_light, fmul(env(m, lb, to_world(m, lb, cr), ccr), fc_v * cc));
+        c_light = fadd(c_light, fmul(env(m, lb, to_world(m, lb, cr), ccr), fc_v * cc * sky_spec));
     }
     d_light = fmul3(d_light, coat_tint);
     s_light = fadd(fmul3(s_light, coat_tint), c_light);

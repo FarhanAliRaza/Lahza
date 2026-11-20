@@ -477,3 +477,54 @@ fn measure_the_fast_mode_against_the_usual_trace() {
         eprintln!("{name:>14}: first frame {:6.2} s, then {:6.2} s a frame; the last frame {:.1} dB   {:?}", times[0], rest, psnr(&img, &reference), r.warnings());
     }
 }
+
+/// A camera that is somewhere else altogether from one frame to the next
+/// has jumped: the history starts again there (Ray Reconstruction is told
+/// so), and a camera that only turns a little keeps it.
+#[test]
+fn a_camera_jump_starts_the_history_again() {
+    let Some(mut r) = fast(Way::StandIn, 2, false) else { return };
+    let mut p = still_life();
+    p.settings.fps = lahza_motion_core::time::Fps::whole(10);
+    p.settings.duration = 1.0;
+    // Four degrees a frame, then eighty in one.
+    p.scenes[0].camera = serde_json::from_value(json!({"orbit": {"keys": [{"at": 0, "v": [0, 20]}, {"at": 0.4, "v": [16, 20], "ease": "linear"}, {"at": 0.5, "v": [96, 20], "ease": "linear"}, {"at": 1, "v": [116, 20], "ease": "linear"}]}})).unwrap();
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    for k in 2..8 {
+        let img = r.render(&c, k as f64 / 10.0);
+        if k == 4 || k == 5 {
+            keep(&format!("jump-{k}"), &img);
+        }
+    }
+    let (seen, _, _) = r.gpu.as_ref().unwrap().stand_in_saw(0);
+    assert_eq!(seen.iter().map(|s| s.1).collect::<Vec<_>>(), [true, false, false, true, false, false], "frames 2 to 7; the camera jumps at frame 5");
+}
+
+/// Through a transition two scenes are traced at once, and after it the
+/// one that came in is the frame's first traced list where it was the
+/// second: it keeps its own history (Ray Reconstruction is told to start
+/// again once for each scene, not again when the transition ends).
+#[test]
+fn a_transition_keeps_each_scenes_history() {
+    let Some(mut r) = fast(Way::StandIn, 2, false) else { return };
+    let mut p = two_scenes();
+    p.scenes[1].transition = Some(serde_json::from_value(json!({"type": "fade", "dur": 0.4, "ease": "linear"})).unwrap());
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    // The cut is at 0.5 s: the fade runs from 0.3 to 0.7.
+    for k in 1..10 {
+        let img = r.render(&c, k as f64 / 10.0);
+        if k == 5 {
+            keep("transition", &img);
+        }
+    }
+    let g = r.gpu.as_ref().unwrap();
+    let (seen, _, _) = g.stand_in_saw(0);
+    let slots = g.stand_in_slots();
+    let resets: Vec<(u32, bool)> = slots.iter().copied().zip(seen.iter().map(|s| s.1)).collect();
+    eprintln!("the traced lists and their resets: {resets:?}");
+    assert!(slots.contains(&1), "two scenes are traced at once in the fade: {resets:?}");
+    assert_eq!(resets.iter().filter(|r| r.1).count(), 2, "one start for each scene: {resets:?}");
+    assert!(!resets.last().unwrap().1 && resets.last().unwrap().0 == 0);
+}

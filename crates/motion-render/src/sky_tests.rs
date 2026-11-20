@@ -115,9 +115,23 @@ fn the_sky_is_seen_less_where_things_touch() {
     with.render(&c, 0.5);
     with.last_invalidate();
     assert_eq!(with.render(&c, 0.0), a, "the same frame is the same picture");
-    // The CPU has no rays: as without.
+    // The CPU casts the same rays itself: its frame against the GPU's,
+    // as the other GPU-against-CPU tests measure it (px more than three
+    // levels apart), beside the same two frames without sky visibility.
     let mut on_cpu = Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() });
-    assert_eq!(on_cpu.render(&c, 0.0), cpu().render(&c, 0.0));
+    let started = std::time::Instant::now();
+    let ours = on_cpu.render(&c, 0.0);
+    let took = started.elapsed();
+    keep("env-cpu", &ours);
+    let plain = cpu().render(&c, 0.0);
+    assert_ne!(ours, plain);
+    let apart = |x: &RgbaImage, y: &RgbaImage| {
+        let d: Vec<u8> = x.pixels().zip(y.pixels()).map(|(p, q)| (0..4).map(|k| p.0[k].abs_diff(q.0[k])).max().unwrap()).collect();
+        (d.iter().filter(|v| **v > 3).count() as f64 / d.len() as f64, *d.iter().max().unwrap())
+    };
+    let (with_sky, without) = (apart(&a, &ours), apart(&b, &plain));
+    eprintln!("GPU against CPU: {:.2}% of px more than 3 levels apart with sky visibility (most {}), {:.2}% without (most {}); the CPU's frame took {:.0} ms", with_sky.0 * 100.0, with_sky.1, without.0 * 100.0, without.1, took.as_secs_f64() * 1000.0);
+    assert!(with_sky.0 < without.0 + 0.01, "{with_sky:?} against {without:?}");
 }
 
 /// Not a test (`--ignored --nocapture`): the default lights' scene with
@@ -135,7 +149,7 @@ fn measure_sky_visibility() {
     p.settings.height = *v.get(1).unwrap_or(&270);
     let c = Compiled::new(&p);
     let (mut with, mut without, mut traced) = (raster(true, true), raster(false, true), tracer(64).unwrap());
-    let mut time = |r: &mut Renderer, name: &str| {
+    let time = |r: &mut Renderer, name: &str| {
         let mut img = r.render(&c, 0.0);
         let started = std::time::Instant::now();
         for k in 1..=4 {
@@ -152,6 +166,16 @@ fn measure_sky_visibility() {
         img
     };
     let (a, b) = (time(&mut with, "with sky visibility"), time(&mut without, "without"));
+    // The CPU's own rays (a BVH a frame, every core), with and without.
+    for sky in [true, false] {
+        let mut r = Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky, ..Default::default() });
+        r.render(&c, 0.0);
+        let started = std::time::Instant::now();
+        for k in 1..=4 {
+            r.render(&c, k as f64 / 30.0);
+        }
+        eprintln!("the CPU, sky visibility {sky}: {:.0} ms a frame", started.elapsed().as_secs_f64() * 250.0);
+    }
     let t = traced.render(&c, 4.0 / 30.0);
     keep("lit-with", &a);
     keep("lit-without", &b);
@@ -188,4 +212,56 @@ fn measure_under_a_table() {
     let (at, _) = (110..210i32).flat_map(|x| (100..150i32).map(move |y| (x, y))).map(|at| (at, around(&t, at.0, at.1, 4))).fold(((0, 0), f64::MAX), |m, v| if v.1 < m.1 { v } else { m });
     eprintln!("under the table at {at:?}: {:.0} with sky visibility, {:.0} plain, {:.0} traced; the open floor {:.0}, {:.0}, {:.0}", around(&a, at.0, at.1, 4), around(&b, at.0, at.1, 4), around(&t, at.0, at.1, 4), around(&a, 40, 165, 4), around(&b, 40, 165, 4), around(&t, 40, 165, 4));
     eprintln!("against the traced picture: {:.1} dB with sky visibility, {:.1} dB without", psnr(&a, &t), psnr(&b, &t));
+}
+
+/// Not a test (`--ignored --nocapture`, LAHZA_SKY_TIMES=1 for its
+/// stages): the CPU's frame with and without its sky rays at
+/// $LAHZA_MEASURE (default the preview's 1080 x 608).
+#[test]
+#[ignore]
+fn measure_the_cpus_rays() {
+    let v: Vec<u32> = std::env::var("LAHZA_MEASURE").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let mut p = room(None);
+    p.settings.width = *v.first().unwrap_or(&1080);
+    p.settings.height = *v.get(1).unwrap_or(&608);
+    let c = Compiled::new(&p);
+    for sky in [true, false] {
+        let mut r = Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky, ..Default::default() });
+        r.render(&c, 0.0);
+        let started = std::time::Instant::now();
+        for k in 1..=4 {
+            r.render(&c, k as f64 / 30.0);
+        }
+        eprintln!("the CPU, sky visibility {sky}: {:.0} ms a frame", started.elapsed().as_secs_f64() * 250.0);
+    }
+}
+
+/// With an environment image the light that comes back is the image's
+/// too (its diffuse level, looked up at what a ray hits), on the GPU and
+/// on the CPU alike.
+#[test]
+fn the_light_back_is_an_environment_images_too() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("lahza-sky-env-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("sky.hdr");
+    crate::envmap::tests::write_hdr(&image, 0.0);
+    let mut p = room(Some(json!([{"type": "ambient", "intensity": 0}])));
+    p.scenes[0].environment = Some(serde_json::from_value(json!({"image": image.to_str().unwrap()})).unwrap());
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let (a, b) = (raster(true, false).render(&c, 0.0), raster(false, false).render(&c, 0.0));
+    let ours = Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() }).render(&c, 0.0);
+    keep("image-with", &a);
+    keep("image-without", &b);
+    let _ = std::fs::remove_dir_all(&dir);
+    let apart = a.pixels().zip(ours.pixels()).filter(|(p, q)| (0..4).any(|k| p.0[k].abs_diff(q.0[k]) > 3)).count() as f64 / (a.width() * a.height()) as f64;
+    // The wall behind sees the floor for half its sky: without the
+    // image's light back from there it would have half its light.
+    let wall = around(&a, 40, 25, 4) / around(&b, 40, 25, 4);
+    eprintln!("an environment image: the wall {wall:.2} of the plain raster's; GPU against CPU {:.2}% of px more than 3 levels apart", apart * 100.0);
+    assert!(wall > 0.7 && wall < 1.3, "{wall:.2}");
+    assert!(apart < 0.01, "{apart}");
 }

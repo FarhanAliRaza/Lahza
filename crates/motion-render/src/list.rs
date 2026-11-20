@@ -633,9 +633,12 @@ impl Builder<'_> {
         }
         let m = first.filter(|_| !instances.is_empty())?;
         let mut lights = m.lighting.as_ref().map(|l| crate::mesh3d::light_rows(l, &m)).unwrap_or_default();
+        let env = m.lighting.as_ref().and_then(|l| self.meshes.env_map(l));
         if let (Some(l), false) = (&m.lighting, lights.is_empty()) {
-            // (No environment image here: the sky, horizon and ground.)
-            lights[0][2] = 0.0;
+            if env.is_none() {
+                // No image (or it did not load): the environment is dark.
+                lights[0][2] = 0.0;
+            }
             // Which lights cast shadows on what the rays hit.
             for (i, light) in l.lights.iter().enumerate() {
                 lights[7 + i * crate::mesh3d::LROWS + 1][3] = if light.shadow { 1.0 } else { 0.0 };
@@ -663,7 +666,7 @@ impl Builder<'_> {
             factor: [2.0, 2.0],
             options: crate::pt::TraceOptions { spp: crate::pt::SKY_RAYS, bounces: 1, denoise: false, temporal: false, fast: false, shutter: 0.0, sky: true },
             seed: 0,
-            env: None,
+            env,
             lens: [0.0; 2],
             surfaces: None,
         });
