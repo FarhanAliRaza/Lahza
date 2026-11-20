@@ -437,6 +437,55 @@ pub(crate) fn assert_gpu_matches_cpu_within(p: &Project, times: &[f64], outliers
     }
 }
 
+/// What a motion-blurred frame saves by not drawing again a group that
+/// stands still (`gpu::same_groups`): a blurred backdrop and a glow that
+/// do not move behind a bar that does, against the same frame with both
+/// drifting by a hundredth of a pixel a frame (so every sub-frame draws
+/// them), with where the time went (a real card gives its passes' times;
+/// Mesa's software Vulkan only the wait). `cargo test -p
+/// lahza-motion-render --release -- --ignored --nocapture
+/// benchmark_motion_blur` (with LAHZA_MOTION_SOFTWARE_GPU=1 on Mesa).
+#[test]
+#[ignore]
+fn benchmark_motion_blur_with_still_groups() {
+    let build = |drift: f64| {
+        let at = |x: f64, y: f64| json!({"keys": [{"at": 0, "v": [x, y]}, {"at": 2, "v": [x + drift * 60.0, y]}]});
+        let mut p = Project::new(960, 540, Fps::whole(30), 2.0);
+        p.settings.motion_blur = Some(lahza_motion_core::document::MotionBlur { shutter: 180.0, samples: 8 });
+        p.scenes.push(serde_json::from_value(json!({"id": "s", "layers": [
+            {"id": "backdrop", "kind": "shape", "shape": "circle", "size": [700, 700], "fill": "#7b61ff", "effects": [{"type": "blur", "radius": 40}], "transform": {"position": at(480.0, 270.0)}},
+            {"id": "sign", "kind": "shape", "shape": "ring", "size": [260, 260], "fill": "#ffd23f", "effects": [{"type": "glow", "color": "#ffd23f", "radius": 24, "intensity": 0.8}], "transform": {"position": at(480.0, 270.0)}},
+            {"id": "bar", "kind": "shape", "shape": "capsule", "size": [160, 40], "fill": "#ffffff", "transform": {"position": {"keys": [{"at": 0, "v": [100, 270]}, {"at": 2, "v": [860, 270]}]}}}
+        ]})).unwrap());
+        p
+    };
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mut times = Vec::new();
+    for drift in [0.0, 0.01] {
+        let c = Compiled::new(&build(drift));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, profile: true, ..Default::default() });
+        if !r.is_gpu() {
+            eprintln!("no GPU: {}", r.backend_label());
+            return;
+        }
+        r.render(&c, 0.0);
+        r.profile = Some(Default::default());
+        let frames = 12;
+        let started = std::time::Instant::now();
+        for f in 0..frames {
+            r.render(&c, 0.5 + f as f64 / 30.0);
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!("{}: {ms:.1} ms a frame ({})", if drift == 0.0 { "still groups" } else { "drifting groups" }, r.backend_label());
+        for line in r.profile.as_ref().map(|p| p.summary()).unwrap_or_default() {
+            eprintln!("    {line}");
+        }
+        times.push(ms);
+    }
+    eprintln!("still groups take {:.0}% of the drifting ones' time", times[0] / times[1] * 100.0);
+}
+
 /// Phase 1 target: a 1080p scene with 200 animated shapes and text in real
 /// time. `cargo test -p lahza-motion-render --release -- --ignored --nocapture benchmark`
 #[test]
