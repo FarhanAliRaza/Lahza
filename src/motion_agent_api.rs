@@ -2,9 +2,12 @@
 //! Messages API with the engine's `Toolbox` in process, for a machine
 //! without Claude Code. Raw HTTP (there is no official SDK for Rust).
 //!
-//! One request to the model per turn; the tools it asks for run here, in
-//! this process, and their results go back in one message. Stop is looked
-//! at between calls. The key is read from the environment or the app's
+//! One request to the model per turn, its answer read as it streams (so
+//! what it says and the tools it asks for show as they come); the tools
+//! run here, in this process, once the answer is whole, and their results
+//! go back in one message. Stop is looked at between events and calls.
+//! Conversations are kept in the app's settings folder, so a follow-up
+//! continues one after a restart. The key is read from the environment or the app's
 //! settings when a request starts and goes nowhere but the `x-api-key`
 //! header: not into a project, a log, an error or `requests.json`.
 
@@ -13,6 +16,7 @@ use base64::Engine;
 use lahza_motion_mcp::tools::{tool_defs, Toolbox};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -52,9 +56,11 @@ pub(crate) struct ApiLoop {
     pub model: String,
     /// Reads the key when a request starts (never kept).
     pub key: Arc<dyn Fn() -> Option<String> + Send + Sync>,
-    /// The conversations of this run of the app, by id: what a follow-up
-    /// continues. In memory only.
+    /// The conversations, by id: what a follow-up continues.
     conversations: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// Where they are kept between runs of the app (`<id>.json` each;
+    /// None: in memory only). Never inside a project.
+    pub store: Option<PathBuf>,
     /// Waits between tries (tests shorten it).
     pub backoff: Duration,
     /// What the tools draw with (None: the toolbox's own choice, as for
@@ -64,17 +70,19 @@ pub(crate) struct ApiLoop {
 
 impl Default for ApiLoop {
     fn default() -> Self {
-        Self::new(
+        let mut api = Self::new(
             std::env::var("ANTHROPIC_BASE_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "https://api.anthropic.com".into()),
             Arc::new(|| key_from(std::env::var("ANTHROPIC_API_KEY").ok(), &key_file())),
-        )
+        );
+        api.store = Some(crate::recording::presets::config_root().join("agent-conversations"));
+        api
     }
 }
 
 impl ApiLoop {
     pub(crate) fn new(base_url: String, key: Arc<dyn Fn() -> Option<String> + Send + Sync>) -> Self {
         let model = std::env::var("LAHZA_AGENT_MODEL").ok().filter(|m| !m.is_empty()).unwrap_or_else(|| MODEL.into());
-        Self { base_url, model, key, conversations: Arc::default(), backoff: Duration::from_secs(2), backend: None }
+        Self { base_url, model, key, conversations: Arc::default(), store: None, backoff: Duration::from_secs(2), backend: None }
     }
 }
 
@@ -98,7 +106,8 @@ fn tools() -> Vec<Value> {
 fn body(model: &str, messages: &[Value]) -> Value {
     json!({
         "model": model,
-        "max_tokens": 16000,
+        "max_tokens": 64000,
+        "stream": true,
         "system": [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
         "tools": tools(),
         "fallbacks": "default",
@@ -127,8 +136,73 @@ struct Refused {
     said: String,
 }
 
-/// Sends one request. The key is in a header and in nothing this returns.
-fn post(agent: &ureq::Agent, base_url: &str, key: &str, body: &Value) -> Result<Value, Refused> {
+/// One event of the answer's stream folded into the message so far: the
+/// message as a request without `stream` would have returned it. Returns
+/// the block an event completed.
+fn fold(message: &mut Value, partial: &mut HashMap<u64, String>, event: &Value) -> Result<Option<Value>, Refused> {
+    let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+    match event.get("type").and_then(Value::as_str).unwrap_or("") {
+        "message_start" => *message = event.get("message").cloned().unwrap_or_else(|| json!({"content": []})),
+        "content_block_start" => {
+            let blocks = message.get_mut("content").and_then(Value::as_array_mut).ok_or(Refused { again: false, said: "The API's answer could not be read.".into() })?;
+            blocks.resize(blocks.len().max(index as usize + 1), Value::Null);
+            blocks[index as usize] = event.get("content_block").cloned().unwrap_or(Value::Null);
+        }
+        "content_block_delta" => {
+            let (Some(block), Some(delta)) = (message.pointer_mut(&format!("/content/{index}")), event.get("delta")) else { return Ok(None) };
+            let piece = |key: &str| delta.get(key).and_then(Value::as_str).unwrap_or("");
+            let append = |block: &mut Value, key: &str| {
+                let now = format!("{}{}", block.get(key).and_then(Value::as_str).unwrap_or(""), piece(key));
+                block[key] = Value::String(now);
+            };
+            match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+                "text_delta" => append(block, "text"),
+                "thinking_delta" => append(block, "thinking"),
+                "signature_delta" => block["signature"] = Value::String(piece("signature").to_string()),
+                "input_json_delta" => partial.entry(index).or_default().push_str(piece("partial_json")),
+                _ => {}
+            }
+        }
+        "content_block_stop" => {
+            let Some(block) = message.pointer_mut(&format!("/content/{index}")) else { return Ok(None) };
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                // The input arrived in pieces: strictly parsed, and what
+                // does not parse is kept to be handed back as an error.
+                let text = partial.remove(&index).unwrap_or_default();
+                match serde_json::from_str::<Value>(if text.trim().is_empty() { "{}" } else { &text }) {
+                    Ok(input) => block["input"] = input,
+                    Err(_) => block["input"] = json!({INVALID: text}),
+                }
+            }
+            return Ok(Some(block.clone()));
+        }
+        "message_delta" => {
+            for (key, value) in event.get("delta").and_then(Value::as_object).into_iter().flatten() {
+                message[key] = value.clone();
+            }
+            for (key, value) in event.get("usage").and_then(Value::as_object).into_iter().flatten() {
+                message["usage"][key] = value.clone();
+            }
+        }
+        "error" => {
+            let kind = event.pointer("/error/type").and_then(Value::as_str).unwrap_or("");
+            let said = event.pointer("/error/message").and_then(Value::as_str).unwrap_or("an error");
+            return Err(Refused { again: matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error"), said: format!("The API stopped the answer: {said}") });
+        }
+        // `ping`, `message_stop`, and whatever is added later.
+        _ => {}
+    }
+    Ok(None)
+}
+
+/// A tool input that was not JSON, kept under this key until it is handed
+/// back to the model as an error.
+const INVALID: &str = "INVALID_JSON";
+
+/// Sends one request and reads its answer as it streams; `seen` gets each
+/// block as it completes and says whether to go on (false: stopped). The
+/// key is in a header and in nothing this returns.
+fn post(agent: &ureq::Agent, base_url: &str, key: &str, body: &Value, seen: &mut dyn FnMut(&Value) -> bool) -> Result<Option<Value>, Refused> {
     let sent = agent
         .post(&format!("{}/v1/messages", base_url.trim_end_matches('/')))
         .set("content-type", "application/json")
@@ -137,7 +211,25 @@ fn post(agent: &ureq::Agent, base_url: &str, key: &str, body: &Value) -> Result<
         .set("anthropic-beta", FALLBACK_BETA)
         .send_string(&body.to_string());
     match sent {
-        Ok(response) => response.into_string().ok().and_then(|text| serde_json::from_str(&text).ok()).ok_or(Refused { again: true, said: "The API's answer could not be read.".into() }),
+        Ok(response) => {
+            let (mut message, mut partial, mut ended) = (Value::Null, HashMap::new(), false);
+            for line in std::io::BufReader::new(response.into_reader()).lines() {
+                let line = line.map_err(|_| Refused { again: false, said: "The API's answer broke off.".into() })?;
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let Ok(event) = serde_json::from_str::<Value>(data.trim()) else { continue };
+                ended |= event.get("type").and_then(Value::as_str) == Some("message_stop");
+                if let Some(block) = fold(&mut message, &mut partial, &event)? {
+                    if !seen(&block) {
+                        return Ok(None);
+                    }
+                }
+            }
+            // (Parts of it may have been shown: it is not asked again.)
+            if !ended || !message.is_object() {
+                return Err(Refused { again: false, said: "The API's answer broke off.".into() });
+            }
+            Ok(Some(message))
+        }
         Err(ureq::Error::Status(code, response)) => {
             // (`x-should-retry: false`: the API says trying again will not help.)
             let no_retry = response.header("x-should-retry") == Some("false");
@@ -154,6 +246,22 @@ fn post(agent: &ureq::Agent, base_url: &str, key: &str, body: &Value) -> Result<
             Err(Refused { again: !no_retry && (code == 429 || code >= 500), said: said.trim().to_string() })
         }
         Err(ureq::Error::Transport(e)) => Err(Refused { again: true, said: format!("The API could not be reached: {}", e.kind()) }),
+    }
+}
+
+/// A conversation as it is kept between runs of the app.
+fn kept(store: &Option<PathBuf>, id: &str) -> Option<Vec<Value>> {
+    // (An id is ours: `api-` and hex. Anything else names no file.)
+    if !id.strip_prefix("api-").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit())) {
+        return None;
+    }
+    serde_json::from_slice(&std::fs::read(store.as_ref()?.join(format!("{id}.json"))).ok()?).ok()
+}
+
+fn keep(store: &Option<PathBuf>, id: &str, messages: &[Value]) {
+    let Some(dir) = store else { return };
+    if let Ok(text) = serde_json::to_vec(messages) {
+        let _ = lahza_motion_core::io::write_atomic(&dir.join(format!("{id}.json")), &text);
     }
 }
 
@@ -180,13 +288,14 @@ impl Runner for ApiLoop {
     fn start(&self, request: Request, events: Sender<Event>) -> Result<Box<dyn Running>, Failure> {
         let key = (self.key)().ok_or(Failure::NoKey)?;
         let stopped: Arc<AtomicBool> = Arc::default();
-        let (flag, base_url, model, conversations, backoff, backend) = (stopped.clone(), self.base_url.clone(), self.model.clone(), self.conversations.clone(), self.backoff, self.backend);
+        let (flag, base_url, model, conversations, backoff, backend, store) = (stopped.clone(), self.base_url.clone(), self.model.clone(), self.conversations.clone(), self.backoff, self.backend, self.store.clone());
         std::thread::Builder::new()
             .name("lahza-agent-api".into())
             .spawn(move || {
-                // A follow-up continues what this run of the app remembers.
-                let id = request.conversation.clone().filter(|c| conversations.lock().unwrap().contains_key(c)).unwrap_or_else(|| format!("api-{}", uuid::Uuid::new_v4().simple()));
-                let mut messages = conversations.lock().unwrap().get(&id).cloned().unwrap_or_default();
+                // A follow-up continues a conversation of this run of the
+                // app, or one kept from an earlier run.
+                let before = request.conversation.as_ref().and_then(|c| conversations.lock().unwrap().get(c).cloned().or_else(|| kept(&store, c)).map(|m| (c.clone(), m)));
+                let (id, mut messages) = before.unwrap_or_else(|| (format!("api-{}", uuid::Uuid::new_v4().simple()), Vec::new()));
                 let mut content = vec![json!({"type": "text", "text": request.text})];
                 if let Some(png) = &request.picture {
                     content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64::engine::general_purpose::STANDARD.encode(png)}}));
@@ -207,14 +316,45 @@ impl Runner for ApiLoop {
                 let end = |event: Event| {
                     let _ = events.send(event);
                 };
+                // Tokens in and out, over every turn.
+                let mut used = [0u64; 2];
                 for _ in 0..MAX_TURNS {
                     if flag.load(Ordering::SeqCst) {
                         return;
                     }
+                    // The answer as it streams: what it says, and each tool
+                    // it asks for (shown now, run when the answer is whole).
+                    let mut said = String::new();
+                    let mut shown: Vec<String> = Vec::new();
+                    let mut seen = |block: &Value| {
+                        // Stopped: nothing more of the answer is shown.
+                        if flag.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                let text = block.get("text").and_then(Value::as_str).unwrap_or("").trim();
+                                if !text.is_empty() {
+                                    said = text.to_string();
+                                    let _ = events.send(Event::Said(said.clone()));
+                                }
+                            }
+                            Some("tool_use") => {
+                                let (call_id, name) = (block.get("id").and_then(Value::as_str).unwrap_or(""), block.get("name").and_then(Value::as_str).unwrap_or(""));
+                                shown.push(call_id.to_string());
+                                let _ = events.send(Event::Step { id: call_id.to_string(), tool: name.to_string(), text: describe(name, block.get("input").unwrap_or(&Value::Null)) });
+                            }
+                            _ => {}
+                        }
+                        !flag.load(Ordering::SeqCst)
+                    };
                     let mut answer = None;
                     for attempt in 1..=TRIES {
-                        match post(&agent, &base_url, &key, &body(&model, &messages)) {
-                            Ok(v) => {
+                        match post(&agent, &base_url, &key, &body(&model, &messages), &mut seen) {
+                            // Stopped while the model was answering:
+                            // nothing of the answer is acted on.
+                            Ok(None) => return,
+                            Ok(Some(v)) => {
                                 answer = Some(Ok(v));
                                 break;
                             }
@@ -235,30 +375,33 @@ impl Runner for ApiLoop {
                         Some(Err(said)) => return end(Event::Failed(Failure::Other(said))),
                         None => return end(Event::Failed(Failure::Other("The API could not be reached.".into()))),
                     };
-                    // Stopped while the model was answering: nothing of the
-                    // answer is acted on.
                     if flag.load(Ordering::SeqCst) {
                         return;
                     }
                     let blocks = answer.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
                     let stop = answer.get("stop_reason").and_then(Value::as_str).unwrap_or("");
-                    let mut said = String::new();
-                    for block in &blocks {
-                        if block.get("type").and_then(Value::as_str) == Some("text") {
-                            let text = block.get("text").and_then(Value::as_str).unwrap_or("").trim();
-                            if !text.is_empty() {
-                                said = text.to_string();
-                                let _ = events.send(Event::Said(said.clone()));
-                            }
-                        }
+                    // What it used: every kind of token the answer counts.
+                    for (key, sum) in [("input_tokens", 0), ("cache_creation_input_tokens", 0), ("cache_read_input_tokens", 0), ("output_tokens", 1)] {
+                        used[sum] += answer.pointer(&format!("/usage/{key}")).and_then(Value::as_u64).unwrap_or(0);
                     }
+                    // The steps shown for an answer that is not acted on
+                    // are closed as not run.
+                    let not_run = |events: &Sender<Event>, why: &str| {
+                        for id in &shown {
+                            let _ = events.send(Event::StepDone { id: id.clone(), error: Some(why.to_string()) });
+                        }
+                    };
                     // A refusal or a cut-off answer: its tool calls may be
                     // half written, so none of them runs.
                     if stop == "refusal" {
+                        not_run(&events, "not run: the model declined");
+                        let _ = events.send(Event::Usage { input: used[0], output: used[1] });
                         let category = answer.pointer("/stop_details/category").and_then(Value::as_str).map(|c| format!(" ({c})")).unwrap_or_default();
                         return end(Event::Done { text: format!("The model declined this request{category}."), failed: true, cost: None });
                     }
                     if stop == "max_tokens" {
+                        not_run(&events, "not run: the answer was cut off");
+                        let _ = events.send(Event::Usage { input: used[0], output: used[1] });
                         return end(Event::Done { text: "The model's answer was cut off (it ran out of room): ask for less at a time.".into(), failed: true, cost: None });
                     }
                     // The whole answer goes back as it came (thinking blocks
@@ -269,7 +412,9 @@ impl Runner for ApiLoop {
                         if stop == "pause_turn" {
                             continue;
                         }
+                        keep(&store, &id, &messages);
                         conversations.lock().unwrap().insert(id.clone(), messages);
+                        let _ = events.send(Event::Usage { input: used[0], output: used[1] });
                         return end(Event::Done { text: said, failed: false, cost: None });
                     }
                     let mut results = Vec::new();
@@ -280,10 +425,9 @@ impl Runner for ApiLoop {
                         if flag.load(Ordering::SeqCst) {
                             return;
                         }
-                        if events.send(Event::Step { id: call_id.to_string(), tool: name.to_string(), text: describe(name, &input) }).is_err() {
-                            return;
-                        }
                         let result = match name {
+                            // Its input was not JSON: handed back as it came.
+                            _ if input.get(INVALID).is_some() => Err(input.to_string()),
                             "read_doc" => input
                                 .get("uri")
                                 .and_then(Value::as_str)
@@ -299,6 +443,7 @@ impl Runner for ApiLoop {
                     }
                     messages.push(json!({"role": "user", "content": results}));
                 }
+                let _ = events.send(Event::Usage { input: used[0], output: used[1] });
                 end(Event::Done { text: format!("Stopped after {MAX_TURNS} turns without finishing."), failed: true, cost: None });
             })
             .map_err(|e| Failure::Other(e.to_string()))?;
@@ -350,11 +495,70 @@ mod tests {
                 kept.lock().unwrap().push((head, serde_json::from_slice(&body).unwrap_or(Value::Null)));
                 let (code, answer, wait) = answers.next().unwrap_or((500, json!({"type": "error", "error": {"type": "api_error", "message": "the stub has no more answers"}}), 0));
                 std::thread::sleep(Duration::from_millis(wait));
-                let text = answer.to_string();
-                let _ = write!(stream, "HTTP/1.1 {code} Stub\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}", text.len());
+                // A message is streamed as the API streams one; an error
+                // is plain JSON.
+                let (kind, text) = if code == 200 { ("text/event-stream", sse(&answer)) } else { ("application/json", answer.to_string()) };
+                let _ = write!(stream, "HTTP/1.1 {code} Stub\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}", text.len());
             }
         });
         Stub { url, seen }
+    }
+
+    /// A message as the events of its stream: text and tool inputs in two
+    /// pieces each, with pings between. `"broken": true` ends it early,
+    /// `"stream_error"` puts an error event in it.
+    fn sse(message: &Value) -> String {
+        let mut out = String::new();
+        let mut event = |v: Value| out.push_str(&format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()));
+        let mut start = message.clone();
+        start["content"] = json!([]);
+        start["stop_reason"] = Value::Null;
+        start.as_object_mut().unwrap().remove("stop_details");
+        start["usage"]["output_tokens"] = json!(1);
+        event(json!({"type": "message_start", "message": start}));
+        event(json!({"type": "ping"}));
+        let halves = |text: &str| {
+            let mid = (0..=text.len() / 2).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+            [text[..mid].to_string(), text[mid..].to_string()]
+        };
+        for (index, block) in message["content"].as_array().unwrap().iter().enumerate() {
+            match block["type"].as_str().unwrap() {
+                "text" => {
+                    event(json!({"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}));
+                    for piece in halves(block["text"].as_str().unwrap()) {
+                        event(json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": piece}}));
+                    }
+                }
+                "tool_use" => {
+                    event(json!({"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}}));
+                    let raw = block.get("raw_input").and_then(Value::as_str).map(String::from).unwrap_or_else(|| block["input"].to_string());
+                    for piece in halves(&raw) {
+                        event(json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": piece}}));
+                    }
+                }
+                "thinking" => {
+                    event(json!({"type": "content_block_start", "index": index, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}));
+                    event(json!({"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": block["thinking"]}}));
+                    event(json!({"type": "content_block_delta", "index": index, "delta": {"type": "signature_delta", "signature": block["signature"]}}));
+                }
+                _ => event(json!({"type": "content_block_start", "index": index, "content_block": block})),
+            }
+            event(json!({"type": "content_block_stop", "index": index}));
+            if message.get("stream_error").is_some() {
+                event(json!({"type": "error", "error": message["stream_error"]}));
+                return out;
+            }
+        }
+        if message.get("broken").is_some() {
+            return out;
+        }
+        let mut delta = json!({"stop_reason": message["stop_reason"]});
+        if let Some(details) = message.get("stop_details") {
+            delta["stop_details"] = details.clone();
+        }
+        event(json!({"type": "message_delta", "delta": delta, "usage": {"output_tokens": message["usage"]["output_tokens"]}}));
+        event(json!({"type": "message_stop"}));
+        out
     }
 
     fn runner(url: &str) -> ApiLoop {
@@ -432,6 +636,11 @@ mod tests {
         assert_eq!(ended.len(), 4);
         assert!(ended[..3].iter().all(Option::is_none) && ended[3].is_some_and(|e| e.contains("nope")), "{ended:?}");
         assert_eq!(events.last(), Some(&Event::Done { text: "Moved the title down.".into(), failed: false, cost: None }));
+        // What it took: both turns' tokens (10 in and 5 out each).
+        assert_eq!(events[events.len() - 2], Event::Usage { input: 20, output: 10 });
+        // Every tool was shown as the answer streamed, before any ran.
+        let first_done = events.iter().position(|e| matches!(e, Event::StepDone { .. })).unwrap();
+        assert_eq!(events[..first_done].iter().filter(|e| matches!(e, Event::Step { .. })).count(), 4);
         // The edit was made here, and carries the request.
         assert_eq!(title_y(&p), 60.0);
         let history = lahza_motion_core::io::read_history(&p).unwrap();
@@ -446,7 +655,8 @@ mod tests {
         for line in [format!("x-api-key: {}", KEY.to_lowercase()), "anthropic-version: 2026-10-21".into(), "anthropic-beta: server-side-fallback-2026-07-01".into(), "content-type: application/json".into()] {
             assert!(head.contains(&line), "{line} in {head}");
         }
-        assert_eq!((body["model"].as_str(), body["max_tokens"].as_u64(), body["fallbacks"].as_str()), (Some("claude-opus-5-5"), Some(16000), Some("default")));
+        assert_eq!((body["model"].as_str(), body["max_tokens"].as_u64(), body["fallbacks"].as_str()), (Some("claude-opus-5-5"), Some(64000), Some("default")));
+        assert_eq!(body["stream"], true);
         assert!(body.get("thinking").is_none() && body.get("temperature").is_none() && body.get("tool_choice").is_none());
         let names: Vec<&str> = body["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names.len(), tool_defs().len() + 1);
@@ -509,7 +719,8 @@ mod tests {
             let _running = runner(&server.url).start(Request { id: "r".into(), text: "x".into(), cwd: dir.clone(), ..Default::default() }, tx).unwrap();
             let events = collect(&rx);
             assert_eq!(events.last(), Some(&Event::Done { text: expect.into(), failed: true, cost: None }), "{stop}");
-            assert!(!events.iter().any(|e| matches!(e, Event::Step { .. })), "{stop}: {events:?}");
+            // Its tool was shown as it streamed, and closed as not run.
+            assert!(events.iter().any(|e| matches!(e, Event::StepDone { id, error: Some(why) } if id == "t1" && why.starts_with("not run"))), "{stop}: {events:?}");
             assert_eq!((title_y(&p), server.seen.lock().unwrap().len()), (30.0, 1), "{stop}: nothing ran, nothing was asked again");
         }
         std::fs::remove_dir_all(dir).ok();
@@ -587,6 +798,68 @@ mod tests {
         running.stop();
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_err());
         assert_eq!(title_y(&p), 60.0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_conversation_is_kept_for_the_next_run_of_the_app() {
+        let (dir, _) = project("kept");
+        let store = dir.join("conversations");
+        let server = stub(vec![(200, message("end_turn", json!([{"type": "text", "text": "One."}])), 0), (200, message("end_turn", json!([{"type": "text", "text": "Two."}])), 0), (200, message("end_turn", json!([{"type": "text", "text": "Three."}])), 0)]);
+        let ask = |api: &ApiLoop, words: &str, conversation: Option<String>| {
+            let (tx, rx) = channel();
+            let _running = api.start(Request { id: "r".into(), text: words.into(), cwd: dir.clone(), conversation, ..Default::default() }, tx).unwrap();
+            let events = collect(&rx);
+            let Event::Started { conversation } = &events[0] else { panic!() };
+            conversation.clone()
+        };
+        let mut first = runner(&server.url);
+        first.store = Some(store.clone());
+        let id = ask(&first, "one", None);
+        // Another run of the app: a new loop, the same folder.
+        let mut second = runner(&server.url);
+        second.store = Some(store.clone());
+        assert_eq!(ask(&second, "two", Some(id.clone())), id);
+        assert_eq!(server.seen.lock().unwrap()[1].1["messages"].as_array().unwrap().len(), 3, "what was said before, then the new words");
+        // An id that is not one of ours names no file; nor does the key
+        // reach the folder.
+        assert_ne!(ask(&second, "three", Some("../../etc/passwd".into())), "../../etc/passwd");
+        for entry in std::fs::read_dir(&store).unwrap().flatten() {
+            assert!(!std::fs::read_to_string(entry.path()).unwrap().contains(KEY));
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_stream_that_breaks_or_carries_an_error_or_bad_json_is_handled() {
+        let (dir, p) = project("stream");
+        let ask = |server: &Stub| {
+            let (tx, rx) = channel();
+            let _running = runner(&server.url).start(Request { id: "r".into(), text: "x".into(), cwd: dir.clone(), ..Default::default() }, tx).unwrap();
+            collect(&rx)
+        };
+        // It ends before its end: nothing of it runs.
+        let mut broken = message("tool_use", json!([{"type": "text", "text": "Starting."}, set("t1", &p, 5.0)]));
+        broken["broken"] = json!(true);
+        let server = stub(vec![(200, broken, 0)]);
+        assert_eq!(ask(&server).last(), Some(&Event::Failed(Failure::Other("The API's answer broke off.".into()))));
+        assert_eq!((title_y(&p), server.seen.lock().unwrap().len()), (30.0, 1));
+        // An error event in the stream, of the passing kind: asked again.
+        let mut overloaded = message("end_turn", json!([{"type": "text", "text": "Start"}]));
+        overloaded["stream_error"] = json!({"type": "overloaded_error", "message": "Overloaded"});
+        let server = stub(vec![(200, overloaded, 0), (200, message("end_turn", json!([{"type": "text", "text": "Done."}])), 0)]);
+        assert_eq!(ask(&server).last(), Some(&Event::Done { text: "Done.".into(), failed: false, cost: None }));
+        // A tool input that is not JSON is not run: it goes back as an
+        // error for the model to write again.
+        let server = stub(vec![
+            (200, message("tool_use", json!([{"type": "tool_use", "id": "t1", "name": "edit_apply", "input": {}, "raw_input": "{\"ops\": [oops"}])), 0),
+            (200, message("end_turn", json!([{"type": "text", "text": "Sorry."}])), 0),
+        ]);
+        let events = ask(&server);
+        assert!(events.iter().any(|e| matches!(e, Event::StepDone { id, error: Some(_) } if id == "t1")), "{events:?}");
+        let result = server.seen.lock().unwrap()[1].1["messages"][2]["content"][0].clone();
+        assert!(result["is_error"] == true && result["content"].as_str().unwrap().contains("INVALID_JSON") && result["content"].as_str().unwrap().contains("oops"), "{result}");
+        assert_eq!(title_y(&p), 30.0);
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -41,7 +41,11 @@ pub(crate) enum Event {
     StepDone { id: String, error: Option<String> },
     /// Words between steps.
     Said(String),
-    /// The end of the request: what it said last.
+    /// Tokens the request took in and gave out, where the runner knows
+    /// (sent before `Done`).
+    Usage { input: u64, output: u64 },
+    /// The end of the request: what it said last, and what it cost in
+    /// dollars where the runner is told.
     Done { text: String, failed: bool, cost: Option<f64> },
     /// It could not run or stopped short.
     Failed(Failure),

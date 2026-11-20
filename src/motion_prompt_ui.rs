@@ -61,6 +61,10 @@ struct Kept {
     outcome: Outcome,
     edits: usize,
     seconds: f64,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    tokens: Option<(u64, u64)>,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -85,9 +89,24 @@ pub(crate) struct AgentRequest {
     pub edits: usize,
     started: Instant,
     seconds: Option<f64>,
+    /// What it cost: dollars where the runner is told, tokens in and out
+    /// where it counts them.
+    pub cost: Option<f64>,
+    pub tokens: Option<(u64, u64)>,
 }
 
 impl AgentRequest {
+    /// What the request took, for the AI tab ("$0.012", "12.3k tokens in,
+    /// 0.8k out"); empty when the runner did not say.
+    pub(crate) fn spent(&self) -> String {
+        let k = |n: u64| if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() };
+        match (self.cost, self.tokens) {
+            (Some(cost), _) => format!(" · ${cost:.3}"),
+            (None, Some((input, output))) => format!(" · {} tokens in, {} out", k(input), k(output)),
+            (None, None) => String::new(),
+        }
+    }
+
     pub(crate) fn seconds(&self) -> f64 {
         self.seconds.unwrap_or_else(|| self.started.elapsed().as_secs_f64())
     }
@@ -125,7 +144,9 @@ impl AgentRequest {
                 }
             }
             Event::Said(text) => self.said = text.clone(),
-            Event::Done { text, failed, .. } => {
+            Event::Usage { input, output } => self.tokens = Some((*input, *output)),
+            Event::Done { text, failed, cost } => {
+                self.cost = cost.or(self.cost);
                 if !text.is_empty() {
                     self.said = text.clone();
                 }
@@ -219,6 +240,8 @@ impl MotionAgent {
             edits: k.edits,
             started: Instant::now(),
             seconds: Some(k.seconds),
+            cost: k.cost,
+            tokens: k.tokens,
         });
         // Before a request that is running now, which stays the last.
         self.requests.splice(at..at, old.collect::<Vec<_>>());
@@ -233,7 +256,7 @@ impl MotionAgent {
                 .requests
                 .iter()
                 .filter(|r| r.key == key)
-                .map(|r| Kept { id: r.id.clone(), words: r.words.clone(), about: r.about.clone(), steps: r.steps.clone(), said: r.said.clone(), outcome: r.outcome.clone(), edits: r.edits, seconds: r.seconds() })
+                .map(|r| Kept { id: r.id.clone(), words: r.words.clone(), about: r.about.clone(), steps: r.steps.clone(), said: r.said.clone(), outcome: r.outcome.clone(), edits: r.edits, seconds: r.seconds(), cost: r.cost, tokens: r.tokens })
                 .collect(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&kept) {
@@ -297,7 +320,7 @@ impl MotionAgent {
         let id = format!("r{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
         let about = About { has_picture: picture.is_some(), ..about };
         let request = Request { id: id.clone(), text: compose(&about, words), picture, cwd, conversation: (!self.fresh).then(|| self.conversations.get(&key).cloned()).flatten() };
-        let mut entry = AgentRequest { id, words: words.trim().to_string(), about, key, steps: Vec::new(), said: String::new(), outcome: Outcome::Running, edits: 0, started: Instant::now(), seconds: None };
+        let mut entry = AgentRequest { id, words: words.trim().to_string(), about, key, steps: Vec::new(), said: String::new(), outcome: Outcome::Running, edits: 0, started: Instant::now(), seconds: None, cost: None, tokens: None };
         let (tx, rx) = channel();
         match self.runner.start(request, tx) {
             Ok(running) => self.running = Some((running, rx)),
@@ -979,8 +1002,8 @@ impl Studio {
         for request in shown {
             let state = match &request.outcome {
                 Outcome::Running => format!("Working · {:.0} s", request.seconds()),
-                Outcome::Proposal => format!("Proposed · {} edits", request.edits),
-                Outcome::Kept if request.edits > 0 => format!("Kept · {} edits", request.edits),
+                Outcome::Proposal => format!("Proposed · {} edits{}", request.edits, request.spent()),
+                Outcome::Kept if request.edits > 0 => format!("Kept · {} edits{}", request.edits, request.spent()),
                 Outcome::Kept => "Answered".into(),
                 Outcome::Undone => "Undone".into(),
                 Outcome::Stopped => "Stopped".into(),
