@@ -157,23 +157,26 @@ nothing below was run on that card.)
     past a metal box and a glass ball while the camera turns, the last
     frame against 512 paths not denoised
     (`pt::fast_tests::measure_the_fast_mode_against_the_usual_trace`,
-    `--ignored`). Seconds a frame after the first, and dB:
+    `--ignored`). Seconds a frame after the first, and the last
+    frame's dB:
 
-    | | built-in filter | Open Image Denoise 2.3.3 (CPU) |
-    |---|---|---|
-    | usual, 64 paths | 3.95 s, 33.9 dB | 4.04 s, 34.3 dB |
-    | usual, 16 | 1.31 s, 33.4 dB | 1.39 s, 33.9 dB |
-    | usual, 4 | 0.36 s, 27.5 dB | 0.43 s, 27.7 dB |
-    | fast, 8 | 0.51 s, 31.8 dB | 0.52 s, 32.3 dB |
-    | fast, 4 | 0.25 s, 31.0 dB | 0.28 s, 31.4 dB |
-    | fast, 2 | 0.16 s, 30.6 dB | 0.23 s, 31.1 dB |
-    | fast, 1 | 0.11 s, 29.8 dB | 0.13 s, 30.2 dB |
+    | | seconds a frame | built-in filter | Open Image Denoise 2.3.3 (CPU) |
+    |---|---|---|---|
+    | usual, 64 paths | 1.99 | 33.9 dB | 34.3 dB |
+    | usual, 16 | 0.51 | 33.4 dB | 33.9 dB |
+    | usual, 4 | 0.18 | 27.5 dB | 27.7 dB |
+    | fast, 8 | 0.32 | 31.8 dB | 32.3 dB |
+    | fast, 4 | 0.19 | 31.0 dB | 31.4 dB |
+    | fast, 2 | 0.11 | 30.6 dB | 31.1 dB |
+    | fast, 1 | 0.10 | 29.8 dB | 30.2 dB |
 
-    Four paths: a sixteenth of the usual trace's time for 2.9 dB less, and
-    3.5 dB over the usual trace at the same four paths. (Other test runs
-    shared the machine: the times are within a tenth or so; the dB are
-    not touched by that.) Looked at: the fast picture is close to the
-    usual one; the glass ball is the blotchiest part of both.
+    Four paths: a tenth of the usual trace's time for 2.9 dB less, and
+    the time of the usual trace at the same four paths for 3.5 dB more.
+    (The seconds are with the built-in filter and nothing else running;
+    with Open Image Denoise they were only taken while other tests shared
+    the machine, where it was a tenth slower at this size.) Looked at:
+    the fast picture is close to the usual one; the glass ball is the
+    blotchiest part of both.
   - Open Image Denoise is not in Ubuntu 24.04's packages (`apt-cache
     search` has no `libopenimagedenoise`). The release from
     github.com/RenderKit/oidn (2.3.3, x86_64 linux) works unpacked
