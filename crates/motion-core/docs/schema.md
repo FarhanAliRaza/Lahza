@@ -748,6 +748,7 @@ The skinned mesh follows the bones as always.
 | `thickness` | a capsule's radius as a fraction of its bone's length (0.22) |
 | `limits` | per bone (its id, or text its id contains; the first that matches): `swing` degrees it may bend (40) and `twist` degrees about its length (20); with `hinge` [x, y, z] (an axis in the bone's space) it bends about that axis only, 0 to `swing` (knees, elbows: flip the axis to bend the other way). The limits must allow what the clip does |
 | `shapes` | per bone, a collider in place of the capsule (`box`, `sphere`, `capsule`, `cylinder`, px in the bone's space): a foot is a box that stands flat |
+| `self_collide` | true: its limbs meet its trunk and each other (all bones but those jointed together and those whose shapes overlap as it stands at `rest`). false: they pass through. A bone a behaviour is placing (an aimed arm, a body getting up) passes through meanwhile |
 | `strength` | 0..1, animatable: how hard the motors hold the pose the clip has at each moment. 0 is limp (it only falls); 1 holds the pose like a statue, which topples as one unless a behaviour keeps it up |
 | `strengths` | per bone and what hangs from it, a strength (animatable) times the body's: a leg that was hit bears no weight |
 | `hits` | `[{"at": time, "bone": id, "velocity": [x, y, z] px/s, "dur": seconds}]`: a blow on a bone |

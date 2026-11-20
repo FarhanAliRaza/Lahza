@@ -73,6 +73,7 @@ impl Take {
         for (rig, r) in input.ragdolls.iter().enumerate() {
             let drive = self.brains[rig].think(&mut self.world, input, r, x, t, self.turns[rig].as_deref());
             self.world.drive_ragdoll(r, rig, x, Some(&drive.targets), Some(&drive.scale));
+            self.world.free[rig] = drive.pass;
             self.world.hit_ragdoll(input, r, t);
         }
         self.world.step(input, t);

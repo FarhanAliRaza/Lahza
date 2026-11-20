@@ -425,6 +425,11 @@ pub struct Ragdoll {
     pub strength: Property<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strengths: Vec<BoneStrength>,
+    /// Its limbs meet its body and each other (true by default; false:
+    /// they pass through, as bones jointed together and bones whose
+    /// shapes overlap at rest always do).
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub self_collide: bool,
     /// What sets the motors' targets on top of the clip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behaviours: Vec<Behaviour>,
@@ -439,8 +444,15 @@ pub struct Ragdoll {
 impl Ragdoll {
     /// A limp ragdoll of the skeleton under `root`.
     pub fn of(id: String, root: String, mass: f64, thickness: f64, friction: f64) -> Ragdoll {
-        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), controller: None }
+        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None }
     }
+}
+
+fn yes() -> bool {
+    true
+}
+fn is_yes(v: &bool) -> bool {
+    *v
 }
 
 fn ragdoll_mass() -> f64 {
@@ -1307,6 +1319,9 @@ pub struct BehaviourInput {
 pub struct RagdollInput {
     pub id: String,
     pub bones: Vec<BoneInput>,
+    /// Its bones collide with each other (but for the jointed and the
+    /// ones that overlap at rest).
+    pub self_collide: bool,
     pub release: u32,
     pub behaviours: Vec<BehaviourInput>,
     /// (seconds, bone index, px/s, seconds it lasts).
@@ -1551,6 +1566,7 @@ impl SimInput {
                 h.str(&serde_json::to_string(&b.params).unwrap_or_default());
                 h.u64(b.target_body.map(|p| p as u64 + 1).unwrap_or(0));
             }
+            h.u64(r.self_collide as u64);
             h.u64(r.hits.len() as u64);
             for (t, bone, v, dur) in &r.hits {
                 h.fs(&[*t, *bone as f64, *dur]);

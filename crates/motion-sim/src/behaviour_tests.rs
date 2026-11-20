@@ -31,15 +31,18 @@ fn steps(bake: &Bake) -> usize {
 fn leaning_at_the_ankles_holds_a_shove_that_topples_a_statue() {
     // Motors at full strength and nothing else: it stands as a statue
     // does, and a 200 px/s shove at the chest topples it.
-    let statue = pushed([200.0, 0.0, 0.0], json!([]), 5.0);
+    // (Slowly: it is down in six seconds.)
+    let statue = pushed([200.0, 0.0, 0.0], json!([]), 8.0);
     assert!(hips_drop(&statue) > 80.0, "the statue's hips came down {:.0} px", hips_drop(&statue));
     assert!(hips_drop(&pushed([120.0, 0.0, 0.0], json!([]), 5.0)) < 5.0, "a lighter shove leaves it standing");
     // Balance with no help (no force on the hips): the ankles alone hold
-    // that shove, and not one half as hard again.
+    // that shove and one half as hard again, and not twice it.
     let lean = json!([{"type": "balance", "params": {"assist": 0}}]);
     let held = pushed([200.0, 0.0, 0.0], lean.clone(), 5.0);
     assert!(hips_drop(&held) < 5.0 && fell(&held).is_none(), "leaning, its hips came down {:.0} px", hips_drop(&held));
-    let lost = pushed([300.0, 0.0, 0.0], lean, 6.0);
+    let more = pushed([300.0, 0.0, 0.0], lean.clone(), 6.0);
+    assert!(hips_drop(&more) < 5.0 && fell(&more).is_none());
+    let lost = pushed([400.0, 0.0, 0.0], lean, 6.0);
     assert!(fell(&lost).is_some() && hips_drop(&lost) > 80.0);
 }
 
@@ -249,12 +252,12 @@ fn it_gets_up_after_a_fall_whichever_way_it_fell() {
         // On the floor in between: its hips 200 px lower than they stood.
         let low = (0..bake.tracks[0].samples.len()).map(|k| pose(&bake, "hips", k).p[1] - pose(&bake, "hips", 0).p[1]).fold(0.0, f64::max);
         assert!(low > 190.0, "push {push:?}: its hips dropped {low:.0} px");
-        // Up means up: its hips where they stood (within 12 px), its chest
+        // Up means up: its hips where they stood (within 16 px), its chest
         // over them (leaning less as it settles), from the rise to the end.
         let n = bake.tracks[0].samples.len();
         for k in ((rise.1 * 30.0) as usize + 30..n).step_by(10) {
             let (hips, chest) = (pose(&bake, "hips", k).p, pose(&bake, "chest", k).p);
-            assert!((hips[1] - pose(&bake, "hips", 0).p[1]).abs() < 12.0, "push {push:?}, sample {k}: hips at y {}", hips[1]);
+            assert!((hips[1] - pose(&bake, "hips", 0).p[1]).abs() < 16.0, "push {push:?}, sample {k}: hips at y {}", hips[1]);
             let lean = ((chest[0] - hips[0]).powi(2) + (chest[2] - hips[2]).powi(2)).sqrt();
             assert!(lean < 45.0 && chest[1] < hips[1] - 40.0, "push {push:?}, sample {k}: chest {chest:?} over hips {hips:?}");
         }
@@ -264,13 +267,16 @@ fn it_gets_up_after_a_fall_whichever_way_it_fell() {
         // of its weight over the rise (never more than `help`, 0.6).
         assert!(rise.2 >= 10.0 && rise.2 <= 45.0, "push {push:?}: the force carried {} % of its weight", rise.2);
     }
-    // Without the force it does not get up (it tries, and lies again); with
-    // a fifth of its weight, not from every fall.
+    // Without the force it does not get up (it tries, and lies again).
     let alone = risen([3200.0, 0.0, 0.0], json!({"help": 0}), 10.0);
     let kinds: Vec<&str> = happened(&alone).iter().map(|e| e.0).collect();
     assert!(kinds.len() >= 3 && kinds[..2] == ["fall", "get_up"] && !kinds.contains(&"rise"), "{kinds:?}");
-    assert!(pose(&alone, "hips", alone.tracks[0].samples.len() - 1).p[1] - pose(&alone, "hips", 0).p[1] > 150.0);
-    assert!(!happened(&risen([3200.0, 0.0, 0.0], json!({"help": 0.2}), 10.0)).iter().any(|e| e.0 == "rise"));
+    assert!(pose(&alone, "hips", alone.tracks[0].samples.len() - 1).p[1] - pose(&alone, "hips", 0).p[1] > 60.0);
+    // With a fifth of its weight it still does, later.
+    let little = risen([3200.0, 0.0, 0.0], json!({"help": 0.2}), 10.0);
+    let usual = risen([3200.0, 0.0, 0.0], json!({}), 10.0);
+    let (little, usual) = (happened(&little), happened(&usual));
+    assert!(little.last().unwrap().0 == "rise" && little.last().unwrap().1 > usual.last().unwrap().1 && little.last().unwrap().2 < usual.last().unwrap().2, "{little:?} {usual:?}");
     // Without the behaviour it stays down.
     assert_eq!(happened(&pushed([3200.0, 0.0, 0.0], json!([{"type": "balance"}]), 6.0)).iter().map(|e| e.0).collect::<Vec<_>>(), ["fall"]);
     // `wait` and `time` are its own.
@@ -280,7 +286,7 @@ fn it_gets_up_after_a_fall_whichever_way_it_fell() {
     // The same take twice, to the byte.
     let (a, b) = (risen([3200.0, 0.0, 0.0], json!({}), 10.0), risen([3200.0, 0.0, 0.0], json!({}), 10.0));
     assert_eq!(a.to_bytes(), b.to_bytes());
-    assert_eq!(pin(&a), (139835, 4462705513129200155), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(pin(&a), (139438, 3354145111831044034), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
 #[test]

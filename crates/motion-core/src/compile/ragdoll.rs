@@ -269,7 +269,7 @@ impl Compiled {
             let total: f64 = share.iter().sum();
             let limit = |id: &str| r.limits.iter().find(|l| id.contains(l.bone.as_str()));
             let first_body = input.bodies.len();
-            let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone() };
+            let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), self_collide: r.self_collide, release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone() };
             for b in 0..bones.len() {
                 let poses: Vec<Pose> = worlds[n][b].iter().map(|w| decompose(*w).0).collect();
                 let (along, length, radius) = shape[b];

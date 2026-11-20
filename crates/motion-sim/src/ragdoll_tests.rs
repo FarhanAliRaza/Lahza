@@ -187,7 +187,7 @@ fn a_ragdoll_bakes_to_the_same_bytes() {
     assert!(a == b, "two bakes of one ragdoll differ");
     let mut h = lahza_motion_core::sim::Fnv::default();
     h.bytes(&a);
-    assert_eq!((a.len(), h.0), (30237, 0xf179add661f3dd20), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!((a.len(), h.0), (30034, 0x4a5f23dd0d1fe89e), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
 #[test]
@@ -258,5 +258,96 @@ fn probe() {
             }
         }
         println!("{line}");
+    }
+}
+
+/// The least distance between two segments.
+fn between(p1: [f64; 3], q1: [f64; 3], p2: [f64; 3], q2: [f64; 3]) -> f64 {
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let (d1, d2, r) = (sub(q1, p1), sub(q2, p2), sub(p1, p2));
+    let (a, e, f) = (dot(d1, d1), dot(d2, d2), dot(d2, r));
+    let (b, c) = (dot(d1, d2), dot(d1, r));
+    let denom = a * e - b * b;
+    let mut s = if denom > 1e-12 { ((b * f - c * e) / denom).clamp(0.0, 1.0) } else { 0.0 };
+    let mut t = if e > 1e-12 { (b * s + f) / e } else { 0.0 };
+    if t < 0.0 {
+        (t, s) = (0.0, if a > 1e-12 { (-c / a).clamp(0.0, 1.0) } else { 0.0 });
+    } else if t > 1.0 {
+        (t, s) = (1.0, if a > 1e-12 { ((b - c) / a).clamp(0.0, 1.0) } else { 0.0 });
+    }
+    let gap = sub([p1[0] + d1[0] * s, p1[1] + d1[1] * s, p1[2] + d1[2] * s], [p2[0] + d2[0] * t, p2[1] + d2[1] * t, p2[2] + d2[2] * t]);
+    dot(gap, gap).sqrt()
+}
+
+/// The limp figure, its left hand thrown across its chest as it is let go.
+fn arm_thrown(self_collide: bool) -> (Bake, lahza_motion_core::sim::SimInput) {
+    let doll = json!({"self_collide": self_collide, "hits": [{"at": 0.05, "bone": "hand_l", "velocity": [-900, -500, 0], "dur": 0.1}], "limits": [{"bone": "upper", "swing": 170, "twist": 90}, {"bone": "fore", "swing": 150, "hinge": [1, 0, 0]}]});
+    let mut p = figure_scene(json!({}), doll, json!({"ground": {"y": 809.5}}), 7.0);
+    let bake = (*baked(&mut p)).clone();
+    p.bakes.clear();
+    (bake, Compiled::new(&p).sim_input(0, None).0)
+}
+
+/// How far the two bones' capsules are into each other at their worst
+/// over the take (px; negative: they never touch), and when.
+fn overlap(bake: &Bake, input: &lahza_motion_core::sim::SimInput, a: &str, b: &str) -> (f64, usize) {
+    let capsule = |id: &str, k: usize| {
+        let body = input.bodies.iter().find(|x| x.id == id).unwrap();
+        let lahza_motion_core::sim::ShapeInput::Capsule { radius, half } = body.colliders[0].shape else { panic!("{id} is no capsule") };
+        let m = body.colliders[0].local;
+        let p = pose(bake, id, k);
+        let end = |s: f64| p.apply([m.0[3] + m.0[1] * half * s, m.0[7] + m.0[5] * half * s, m.0[11] + m.0[9] * half * s]);
+        (end(-1.0), end(1.0), radius)
+    };
+    (0..bake.tracks[0].samples.len())
+        .map(|k| {
+            let ((p1, q1, r1), (p2, q2, r2)) = (capsule(a, k), capsule(b, k));
+            (r1 + r2 - between(p1, q1, p2, q2), k)
+        })
+        .fold((f64::NEG_INFINITY, 0), |best, x| if x.0 > best.0 { x } else { best })
+}
+
+#[test]
+fn an_arm_does_not_pass_through_the_trunk() {
+    // Its bones passing through each other, as they did: in the fall the
+    // forearm (15 px thick) is 21 px into the chest, the hand (9 px) 24.
+    let (through, input) = arm_thrown(false);
+    let (fore, hand) = (overlap(&through, &input, "fore_l", "chest"), overlap(&through, &input, "hand_l", "chest"));
+    assert!(fore.0 > 15.0 && hand.0 > 15.0, "without: the forearm {:.1} px into the chest (sample {}), the hand {:.1} px (sample {})", fore.0, fore.1, hand.0, hand.1);
+    // Meeting each other: thrown the same, the arm lies on the chest and
+    // stays out of it through the fall and on the floor, as every bone
+    // does of every other (to 2 px: what a contact gives).
+    let (stopped, input) = arm_thrown(true);
+    for (a, b) in [("fore_l", "chest"), ("hand_l", "chest"), ("hand_l", "spine"), ("fore_l", "spine"), ("fore_l", "hips"), ("hand_l", "head"), ("fore_r", "chest"), ("hand_r", "chest"), ("shin_l", "shin_r"), ("foot_l", "foot_r"), ("hand_l", "thigh_r")] {
+        let (deep, when) = overlap(&stopped, &input, a, b);
+        assert!(deep < 2.0, "{a} is {deep:.1} px into {b} at sample {when}");
+    }
+    // It did strike it: at its nearest the forearm is on the chest.
+    assert!(overlap(&stopped, &input, "fore_l", "chest").0 > -2.0, "the forearm came no nearer the chest than {:.1} px", -overlap(&stopped, &input, "fore_l", "chest").0);
+    // Bones jointed together, and those that overlap as it stands (the
+    // chest's capsule holds the shoulders), still do not meet.
+    assert!(overlap(&stopped, &input, "upper_l", "chest").0 > 5.0);
+    // Still one piece, at rest on the floor.
+    let n = stopped.tracks[0].samples.len();
+    let (last, before) = (pose(&stopped, "hips", n - 1), pose(&stopped, "hips", n - 16));
+    assert!((0..3).map(|i| (last.p[i] - before.p[i]).abs()).fold(0.0, f64::max) < 2.0 && last.p[1] > 740.0, "its hips at {:?}, half a second before at {:?}", last.p, before.p);
+    assert_eq!(crate::behaviour_tests::pin(&stopped), (98968, 13773532622150955129), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+#[ignore]
+fn probe_touch() {
+    let p = figure_scene(json!({}), json!({"strength": 1}), json!({"ground": {"y": 809.5}}), 1.0);
+    let c = lahza_motion_core::Compiled::new(&p);
+    let (input, errors) = c.sim_input(0, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    let world = crate::World::new(&input, &mut crate::core_meshes).unwrap();
+    let r = &input.ragdolls[0];
+    let n = r.bones.len();
+    for i in 0..n {
+        let b = &input.bodies[r.bones[i].body];
+        let with: Vec<&str> = (0..n).filter(|&j| world.touch[0][i * n + j]).map(|j| input.bodies[r.bones[j].body].id.as_str()).collect();
+        println!("{} {:?} len {:.0}: meets {with:?}", b.id, b.colliders[0].shape, r.bones[i].length);
     }
 }

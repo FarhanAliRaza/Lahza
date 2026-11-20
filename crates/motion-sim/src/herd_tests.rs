@@ -139,7 +139,7 @@ fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
     for i in [0, 1, 2, 4, 5] {
         assert!(level(place(i, n - 1), [1300.0 + i as f64 * 90.0, 0.0, 260.0]) < 30.0, "agent {i}");
     }
-    assert_eq!(crate::behaviour_tests::pin(&bake), (97293, 15291254770378900992), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (97293, 7371155526819221505), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // Still drawn six times after the fall.
     let frame = Compiled::new(&p).frame(6.0);
     let mut marks = Vec::new();

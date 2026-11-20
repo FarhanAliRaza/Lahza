@@ -625,9 +625,22 @@ picks by CPU. In the order built:
    - Found on the way: a pelvis far lighter than the legs it joins tore
      its joint (162° past a 40° limit), hence the mass rule and 12 solver
      iterations for scenes with ragdolls.
-   - Left: no self-collision (an arm passes through the trunk); limits
-     are per bone by hand (no defaults by bone name); a limp figure with
-     the default 40° limits falls like a plank, slowly.
+   - Its bones meet each other (`self_collide`, true by default): all
+     but those jointed together and those whose shapes are within 2 cm
+     of each other as the skeleton stands at rest (worked out once from
+     the bind pose: a chest's capsule holds its shoulders, a hip's its
+     thighs). Tested: the limp figure with a hand thrown across it has
+     its forearm 21 px and its hand 24 px inside its chest without, and
+     no bone more than 2 px inside another with (the forearm lies on the
+     chest), through the fall and at rest; pinned. A bone a behaviour is
+     placing (an aimed arm, the whole body while it gets up) passes
+     through the rest for those steps: arm targets are worked out
+     without the body in the way, and stopped short of the head and of
+     a hit when their arms met the chest on the way.
+   - Left: limits are per bone by hand (no defaults by bone name); a
+     limp figure with the default 40° limits falls like a plank,
+     slowly. Arms a behaviour aims do not go round the body, they go
+     through it.
 4. **A ragdoll that acts: done, with balance helped.**
    - Motors follow the clip: `strength` 0..1, keyed, per limb with
      `strengths`. A motor is a second joint beside the one with the
@@ -648,20 +661,22 @@ picks by CPU. In the order built:
      what lifts and rights the body is a force on the hips capped at
      `help` (0.6) of its weight, and a torque capped at what that force
      would make at hip height. The `rise` event carries the percent of
-     its weight the force bore over the rise: 21 to 39 on the test
-     figure by the way it fell. With `help` 0.4 it still rises from all
-     four falls, with 0.2 from one of four, with 0 from none (it folds,
-     pushes, and lies again).
-   - Measured on the test figure (70 kg, pushes at the chest, px/s): a
-     statue (motors only) falls at 200; ankle lean alone holds 200 and
-     falls at 300; with the default help balance holds 1400 and falls at
-     1800; with steps it holds 1800 (four steps, 320 px) and falls at
-     2400. Steps without the help do not recover it (it falls at 700).
+     its weight the force bore over the rise: 23 to 35 on the test
+     figure by the way it fell. With `help` 0.2 it still rises from all
+     four falls (the force bearing 15 %; one of them on its second
+     try), with 0 from none (it folds, pushes, and lies again).
+   - Measured on the test figure (70 kg, pushes at the chest, px/s; its
+     bones meeting each other, which made it sturdier: its legs no
+     longer cross): a statue (motors only) holds 120 and falls at 200;
+     ankle lean alone holds 300 and falls at 400; with the default help
+     balance holds 1400 and falls at 1800; with steps it holds 1800 (six
+     steps, 370 px) and falls at 2400. Steps without the help hold 700
+     (eleven steps) and fall at 1000.
    - Tested: each of those thresholds, soft after a fall, hands at the
      head within 48 px and down again, a hand on the hit within 25 px in
      half a second and the other arm for a hit arm, a hand up to a ball
      that comes; knocked flat from four sides it is up
-     again (hips within 12 px of where they stood, chest over them) and
+     again (hips within 16 px of where they stood, chest over them) and
      stays up, not without the force, the same bytes twice (pinned).
      `examples/sim/ragdoll.py` (limp, held, braced, rise) was looked at:
      the rise reads as a get-up (on its back, over, hands and knees, up),
@@ -787,7 +802,7 @@ picks by CPU. In the order built:
      (The bakes with instances include a pool of 12 ragdolls, which is
      most of the 1.3 s.) A frame of 1000: 24 ms to evaluate, 40 ms of
      display lists, 0.8 s to rasterise; the pictures a frame first needs
-     (about a hundred) take 1.4 to 1.8 s once. On this character a
+     take 1.4 to 2.4 s once. On this character a
      picture is not much cheaper than its 624 points on the CPU (a card
      is a blended image layer): the gain is two fifths at 1000, and
      5000 are drawn at all. Not measured: the GPU renderer and the path

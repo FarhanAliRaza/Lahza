@@ -123,12 +123,19 @@ struct Rise {
     lifted: f64,
 }
 
+fn arms_aimed(drive: &Drive, aimed: &[Option<[f64; 4]>], bone: usize) -> bool {
+    drive.targets[bone].is_some() || aimed[bone].is_some()
+}
+
 /// What a step asks of the motors.
 pub struct Drive {
     /// Per bone: its turn against its parent to aim for (None: the clip's).
     pub targets: Vec<Option<[f64; 4]>>,
     /// Per bone: its strength, times the document's.
     pub scale: Vec<f64>,
+    /// Per bone: placed by a behaviour this step (an arm aimed, a body
+    /// getting up): it passes through the rest of its body.
+    pub pass: Vec<bool>,
 }
 
 #[derive(Clone)]
@@ -211,7 +218,7 @@ impl Brain {
     /// controller's: a policy's action, a search's choice).
     pub fn think(&mut self, world: &mut World, input: &SimInput, r: &RagdollInput, x: f64, t: f64, turns: Option<&[Option<[f64; 4]>]>) -> Drive {
         let n = r.bones.len();
-        let mut drive = Drive { targets: vec![None; n], scale: vec![1.0; n] };
+        let mut drive = Drive { targets: vec![None; n], scale: vec![1.0; n], pass: vec![false; n] };
         if let Some(turns) = turns {
             for (k, turn) in turns.iter().enumerate().take(n) {
                 if let Some(turn) = turn {
@@ -318,6 +325,7 @@ impl Brain {
                     }
                     Some((b, amount)) => {
                         let mut rise = self.rising.take().unwrap();
+                        drive.pass.iter_mut().for_each(|p| *p = true);
                         let time = param(b, "time", 2.4).max(0.5);
                         let help = param(b, "help", 0.6) * amount;
                         let f = (t - rise.start) / time;
@@ -553,6 +561,14 @@ impl Brain {
             for (bone, want) in [(arm.upper, upper), (arm.fore, fore)] {
                 let clip = world.clip(r, bone, x).unwrap_or(r.bones[bone].bind);
                 drive.targets[bone] = Some(blend(clip, want, amount.clamp(0.0, 1.0)));
+            }
+        }
+        // An arm that is aimed, or on its way back, passes through its body.
+        for arm in &self.arms {
+            if [arm.upper, arm.fore].iter().any(|&b| arms_aimed(&drive, &self.aimed, b)) {
+                for b in [arm.upper, arm.fore, arm.hand] {
+                    drive.pass[b] = true;
+                }
             }
         }
         // Targets ease to what is asked, and back to the clip when a
