@@ -376,6 +376,7 @@ impl Compiled {
             gravity: set.gravity,
             seed: set.seed,
             jitter: set.jitter,
+            vary: set.vary.clamp(0.0, 1.0),
             flat: set.flat,
             ground: set.ground.clone(),
             bodies: Vec::new(),

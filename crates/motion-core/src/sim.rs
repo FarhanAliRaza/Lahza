@@ -51,6 +51,12 @@ pub struct Simulation {
     /// each body at its release.
     #[serde(default, skip_serializing_if = "is_zero_f")]
     pub jitter: f64,
+    /// How much a ragdoll's reactions differ from take to take, 0..1 (by
+    /// the seed: how soon an arm comes up, how far and how readily it
+    /// steps, how hard it balances; at 1 by up to a quarter, and a sixth
+    /// of a second). 0: only `jitter` tells takes apart.
+    #[serde(default, skip_serializing_if = "is_zero_f")]
+    pub vary: f64,
     /// Bodies stay in the picture plane: no movement in z, turning about z
     /// only (flat layers as bodies).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -104,7 +110,7 @@ fn is_zero3(v: &[f64; 3]) -> bool {
 
 impl Default for Simulation {
     fn default() -> Self {
-        Self { unit: unit(), gravity: gravity(), start: None, end: None, rate: rate(), seed: 0, jitter: 0.0, flat: false, ground: None, joints: Vec::new(), blasts: Vec::new(), ragdolls: Vec::new(), crowds: Vec::new() }
+        Self { unit: unit(), gravity: gravity(), start: None, end: None, rate: rate(), seed: 0, jitter: 0.0, vary: 0.0, flat: false, ground: None, joints: Vec::new(), blasts: Vec::new(), ragdolls: Vec::new(), crowds: Vec::new() }
     }
 }
 
@@ -468,12 +474,21 @@ pub struct Ragdoll {
     /// What sets the motors (default: the clip and the behaviours).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<Controller>,
+    /// The bones behaviours stand on, reach with and shield (layer ids).
+    /// Default: by name, bones called foot (or a last toe), hand, head.
+    /// A hand's arm is the two bones it hangs from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feet: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
 }
 
 impl Ragdoll {
     /// A limp ragdoll of the skeleton under `root`.
     pub fn of(id: String, root: String, mass: f64, thickness: f64, friction: f64) -> Ragdoll {
-        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), facing: crowd_facing(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None }
+        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), facing: crowd_facing(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None, feet: Vec::new(), hands: Vec::new(), head: None }
     }
 }
 
@@ -1477,6 +1492,12 @@ pub struct RagdollInput {
     /// (seconds, bone index, px/s, seconds it lasts).
     pub hits: Vec<(f64, usize, [f64; 3], f64)>,
     pub controller: Option<Controller>,
+    /// Its feet, hands (each `true` when it is the left) and head, as
+    /// bone indices, when the document names them (else behaviours find
+    /// them by the bones' names).
+    pub feet: Option<Vec<usize>>,
+    pub hands: Option<Vec<(usize, bool)>>,
+    pub head: Option<usize>,
 }
 
 /// A crowd's agent: where it starts and goes, and its skeleton.
@@ -1535,6 +1556,8 @@ pub struct SimInput {
     pub gravity: [f64; 3],
     pub seed: u64,
     pub jitter: f64,
+    /// How much ragdolls' reactions differ by the seed (0..1).
+    pub vary: f64,
     pub flat: bool,
     pub ground: Option<Ground>,
     pub bodies: Vec<BodyInput>,
@@ -1615,6 +1638,11 @@ impl SimInput {
         h.fs(&[self.start, self.rate, self.samples as f64, self.substeps as f64, self.unit, self.jitter]);
         h.fs(&self.gravity);
         h.u64(self.seed);
+        // (Only where there is any: older bakes keep their hash.)
+        if self.vary != 0.0 {
+            h.str("vary");
+            h.f(self.vary);
+        }
         h.u64(self.flat as u64);
         h.opt(self.ground.as_ref().map(|g| [g.y, g.friction, g.bounce]).as_ref().map(|v| &v[..]));
         h.u64(self.bodies.len() as u64);
@@ -1738,6 +1766,13 @@ impl SimInput {
                 h.fs(v);
             }
             h.str(&r.controller.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()).unwrap_or_default());
+            // (Only where the document names them: older bakes keep their hash.)
+            if r.feet.is_some() || r.hands.is_some() || r.head.is_some() {
+                h.str("parts");
+                h.opt(r.feet.as_ref().map(|f| f.iter().map(|&b| b as f64).collect::<Vec<_>>()).as_deref());
+                h.opt(r.hands.as_ref().map(|f| f.iter().flat_map(|&(b, left)| [b as f64, left as u8 as f64]).collect::<Vec<_>>()).as_deref());
+                h.u64(r.head.map(|b| b as u64 + 1).unwrap_or(0));
+            }
         }
         h.u64(self.crowds.len() as u64);
         for c in &self.crowds {

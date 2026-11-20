@@ -1018,8 +1018,15 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      force, not a body that finds its feet (its feet stay where they lay
      and it is drawn over them; it does not step to them); no behaviour
      looks where it is going.
-   - Left, not done: feet and hands are found by bone name (`foot`,
-     `hand`, `head`), not given in the document.
+   - Feet, hands and a head can be named in the document (`feet`,
+     `hands`, `head` on a ragdoll: bone layer ids; a hand's arm is the
+     two bones it hangs from, and it is the left one when it is on the
+     figure's left as it faces); without them they are found by name
+     (`foot`, a last `toe`, `hand`, `head`) as before. Tested: said as
+     the names have them the take is the same sample for sample; one
+     hand said, only that arm shields; the chest said to be the head,
+     the hands go to it; what is no bone, or hangs from fewer than two,
+     is refused by name.
 5. **Directing it: done as far as the tools go.** Intent is written on
    the timeline in the document: `hits`, bodies thrown, `release`,
    `strength` keys per limb, behaviours over spans, all with time
@@ -1037,9 +1044,24 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      calls one would make; a model to make them is outside this
      machine), and with it anything that scores a take against the
      intent, which is that model's judgement of the sheet.
-   - Left, not done: `snapshot` does not mark where on the sheet the
-     events fall. Variation by seed is in the blows and releases only,
-     not in how a body reacts.
+   - `snapshot` says what happened by each frame since the frame before
+     it in its scene (`frames[].events`, from the bake), and a sheet
+     marks it over the foot of the frame: what a figure did by name
+     (`fall 1.20`, `step ×2`), the hardest touches, and how many more.
+     Tested through the tools: every event of the take up to the last
+     frame is listed once, none on a frame before the push, and the
+     marks are on the sheet (looked at).
+   - Takes differ by seed in how a body reacts too, when asked:
+     `simulation.vary` (0..1) gives each ragdoll a turn of mind for the
+     take, drawn from the seed: its arms answer up to a sixth of a
+     second late (`reach`, `protect`), its steps are up to a quarter
+     longer or shorter and as much readier or slower to come (`step`,
+     and how near a thing a `guard` waits for), its balance's gain up to
+     15 % more or less. At 0 (the default) nothing is drawn on and
+     bakes are as they were. Tested: with no jitter, six seeds of one
+     pushed figure raise their arms between 0.73 and 0.80 s and end
+     with the leading foot from x 1130 to 1183; all six step and stay
+     up; the same seed is the same bytes; pinned.
 6. **A network that sets the motors: the interface and the no-training
    route are built; no policy was trained.**
    - The interface (`motion-sim/src/policy.rs`): once a frame an

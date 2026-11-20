@@ -411,3 +411,72 @@ fn aimed_arms_go_round_the_body_not_through_it() {
     }
     assert_eq!(pins, [(36621, 11581137727660598137), (36488, 947309298340335586), (36488, 17833138615412773368), (36488, 16887651574034388283), (36552, 8588104402154634968), (36552, 7065585522355567997)], "the bakes changed: if the simulator or the format did, bakes are stale and these numbers are the new ones");
 }
+
+#[test]
+fn feet_hands_and_head_can_be_named_in_the_document() {
+    // Arms about the head, with what behaviours stand on, reach with and
+    // shield found by the bones' names, or said.
+    let take = |parts: Value| {
+        let mut doll = json!({"strength": 1, "behaviours": [{"type": "balance"}, {"type": "protect", "from": 0.5, "to": 1.5}],
+            "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [44, 24, 130], "offset": [0, 12, -20]}}],
+            "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}, {"bone": "upper", "swing": 179, "twist": 179}, {"bone": "fore", "swing": 150, "hinge": [1, 0, 0]}]});
+        for (k, v) in parts.as_object().unwrap() {
+            doll[k] = v.clone();
+        }
+        figure_scene(json!({}), doll, json!({"ground": {"y": 809.5, "friction": 0.9}}), 2.0)
+    };
+    let by_name = (*baked(&mut take(json!({})))).clone();
+    // Said as the names have them: the same take, sample for sample
+    // (its hash is another: the document says more).
+    let said = (*baked(&mut take(json!({"feet": ["foot_l", "foot_r"], "hands": ["hand_l", "hand_r"], "head": "head"})))).clone();
+    assert!(said.tracks == by_name.tracks && said.hash != by_name.hash);
+    // One hand said: only that arm goes up.
+    let one = (*baked(&mut take(json!({"hands": ["hand_r"]})))).clone();
+    let head = |b: &Bake, k: usize| pose(b, "head", k).apply([0.0, -24.0, 0.0]);
+    assert!(dist(wrist(&one, "r", 36), head(&one, 36)) < 48.0 && dist(wrist(&one, "l", 36), head(&one, 36)) > 190.0);
+    // The chest said to be the head: the hands go to its sides instead.
+    let chest = (*baked(&mut take(json!({"head": "chest"})))).clone();
+    let at = pose(&chest, "chest", 36).apply([0.0, -40.0, 0.0]);
+    assert!(dist(wrist(&chest, "l", 36), at) < 90.0 && dist(wrist(&chest, "l", 36), head(&chest, 36)) > 70.0, "{:.0} px from the chest, {:.0} from the head", dist(wrist(&chest, "l", 36), at), dist(wrist(&chest, "l", 36), head(&chest, 36)));
+    // What is no bone, or no hand, is said.
+    let errors = |parts: Value| lahza_motion_core::Compiled::new(&take(parts)).sim_input(0, None).1.join("\n");
+    assert!(errors(json!({"feet": ["toe_l"]})).contains("ragdolls.0.feet: 'toe_l' is no bone of it"));
+    assert!(errors(json!({"hands": ["spine"]})).contains("ragdolls.0.hands: 'spine' hangs from fewer than two bones"));
+}
+
+#[test]
+fn another_seed_reacts_another_way_when_asked_to() {
+    // Pushed, it steps, with its arms about its head from 0.4 s: the same
+    // blow every take (no jitter), told apart by `vary` alone.
+    let take = |seed: u64, vary: f64| {
+        let doll = json!({"strength": 1, "behaviours": [{"type": "balance"}, {"type": "step"}, {"type": "protect", "from": 0.4, "to": 1.4}],
+            "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [44, 24, 130], "offset": [0, 12, -20]}}],
+            "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}, {"bone": "upper", "swing": 179, "twist": 179}, {"bone": "fore", "swing": 150, "hinge": [1, 0, 0]}],
+            "hits": [{"at": 0.5, "bone": "chest", "velocity": [1500, 0, 0]}]});
+        let mut p = figure_scene(json!({}), doll, json!({"ground": {"y": 809.5, "friction": 0.9}, "seed": seed, "vary": vary}), 4.0);
+        (*baked(&mut p)).clone()
+    };
+    // Without it the seed changes nothing here.
+    let (a, b) = (take(1, 0.0), take(2, 0.0));
+    assert!(a.tracks == b.tracks);
+    // With it: the same seed the same take, another seed another.
+    let takes: Vec<Bake> = (1..=6).map(|seed| take(seed, 1.0)).collect();
+    assert!(take(3, 1.0).to_bytes() == takes[2].to_bytes());
+    let head = |b: &Bake, k: usize| pose(b, "head", k).apply([0.0, -24.0, 0.0]);
+    // When the left hand is first within 60 px of the head, and where the
+    // first step lands.
+    let up = |b: &Bake| (0..b.tracks[0].samples.len()).find(|&k| dist(wrist(b, "l", k), head(b, k)) < 60.0).map_or(f64::NAN, |k| k as f64 / 30.0);
+    let stepped = |b: &Bake| b.events.iter().find(|e| e.kind == "step").map(|e| e.t);
+    let foot = |b: &Bake| pose(b, "foot_l", 119).p[0].max(pose(b, "foot_r", 119).p[0]);
+    let (ups, feet): (Vec<f64>, Vec<f64>) = (takes.iter().map(up).collect(), takes.iter().map(foot).collect());
+    let spread = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max) - v.iter().copied().fold(f64::MAX, f64::min);
+    eprintln!("arms up at {ups:?} s; first steps at {:?} s; the leading foot ends at x {feet:?}", takes.iter().map(stepped).collect::<Vec<_>>());
+    // (The arms answer up to a sixth of a second late; the feet end tens of px apart.)
+    assert!(spread(&ups) >= 0.066 && spread(&ups) < 0.3, "arms come up at {ups:?} s");
+    assert!(spread(&feet) > 15.0, "the leading foot ends at x {feet:?}");
+    // And every one of them is a take of the same direction: it steps, and stays up.
+    for (k, b) in takes.iter().enumerate() {
+        assert!(fell(b).is_none() && steps(b) >= 1 && up(b) < 1.2, "seed {}: fell {:?}, {} steps, arms up at {}", k + 1, fell(b), steps(b), up(b));
+    }
+    assert_eq!(pin(&takes[0]), (57021, 6885115440864738725), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}

@@ -277,7 +277,36 @@ impl Compiled {
             let root = (0..bones.len()).find(|&b| parent[b].is_none()).unwrap_or(0);
             let forward = quat_rotate(rest.get(root).map_or([0.0, 0.0, 0.0, 1.0], |p| p.q), [r.facing[0], 0.0, r.facing[1]]);
             let first_body = input.bodies.len();
-            let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), self_collide: r.self_collide, release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone() };
+            // Its feet, hands and head, where the document names them.
+            let what = format!("{}.simulation.ragdolls.{n}", scene.id);
+            let mut named = |ids: &[String], part: &str| -> Vec<usize> {
+                ids.iter().filter_map(|id| match (0..bones.len()).find(|&b| name(b) == id.as_str()) {
+                    Some(b) => Some(b),
+                    None => {
+                        errors.push(format!("{what}.{part}: '{id}' is no bone of it (it has {})", (0..bones.len()).map(name).collect::<Vec<_>>().join(", ")));
+                        None
+                    }
+                }).collect()
+            };
+            let feet = (!r.feet.is_empty()).then(|| named(&r.feet, "feet"));
+            let hands = (!r.hands.is_empty()).then(|| named(&r.hands, "hands"));
+            let head = r.head.as_ref().and_then(|h| named(std::slice::from_ref(h), "head").first().copied());
+            // (A hand is the left one when it is on the figure's left: to
+            // the right of its root as seen from the front it faces.)
+            let hands = hands.map(|hands| {
+                let side = crate::sim::cross([0.0, 1.0, 0.0], forward);
+                let at = |b: usize| dot(sub(rest[b].p, rest[root].p), side);
+                let middle = hands.iter().map(|&b| at(b)).sum::<f64>() / hands.len().max(1) as f64;
+                hands.iter().map(|&b| (b, if hands.len() > 1 { at(b) > middle } else { at(b) > 0.0 })).collect::<Vec<_>>()
+            });
+            if let Some(hands) = &hands {
+                for &(b, _) in hands {
+                    if parent[b].and_then(|p| parent[p]).is_none() {
+                        errors.push(format!("{what}.hands: '{}' hangs from fewer than two bones (a hand's arm is the two before it)", name(b)));
+                    }
+                }
+            }
+            let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), self_collide: r.self_collide, release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone(), feet, hands, head };
             for b in 0..bones.len() {
                 let poses: Vec<Pose> = worlds[n][b].iter().map(|w| decompose(*w).0).collect();
                 let (along, length, radius) = shape[b];

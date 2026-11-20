@@ -173,7 +173,19 @@ pub struct Brain {
     /// Per bone: its capsule in its own frame (its ends, its radius), for
     /// the bones that are capsules.
     caps: Vec<Option<(V, V, f64)>>,
+    /// This take's turn of mind (`simulation.vary`, by the seed): seconds
+    /// before an arm answers, and what its steps' length, its readiness
+    /// to step and its balance's gain are times.
+    quirk: Quirk,
     pub events: Vec<SimEvent>,
+}
+
+#[derive(Clone, Copy)]
+struct Quirk {
+    late: f64,
+    stride: f64,
+    ready: f64,
+    gain: f64,
 }
 
 /// The nearest points of segments `p1 q1` and `p2 q2`: how far along
@@ -201,13 +213,19 @@ impl Brain {
         let name = |b: usize| input.bodies[r.bones[b].body].id.to_lowercase();
         let has = |b: usize, part: &str| name(b).rsplit(['-', '/']).next().is_some_and(|n| n.contains(part));
         let leaf = |b: usize| !r.bones.iter().any(|x| x.parent == Some(b));
-        let feet: Vec<usize> = (0..r.bones.len()).filter(|&b| has(b, "foot") || has(b, "toe") && leaf(b)).collect();
+        // Its feet, hands and head: as the document names them, else by
+        // the bones' names.
+        let feet: Vec<usize> = r.feet.clone().unwrap_or_else(|| (0..r.bones.len()).filter(|&b| has(b, "foot") || has(b, "toe") && leaf(b)).collect());
+        let hands: Vec<(usize, bool)> = r.hands.clone().unwrap_or_else(|| {
+            (0..r.bones.len()).filter(|&b| has(b, "hand")).map(|hand| {
+                let n = name(hand);
+                (hand, n.ends_with("_l") || n.ends_with(".l") || n.contains("left"))
+            }).collect()
+        });
         let mut arms = Vec::new();
-        for hand in (0..r.bones.len()).filter(|&b| has(b, "hand")) {
+        for (hand, left) in hands {
             let Some(fore) = r.bones[hand].parent else { continue };
             let Some(upper) = r.bones[fore].parent else { continue };
-            let n = name(hand);
-            let left = n.ends_with("_l") || n.ends_with(".l") || n.contains("left");
             arms.push(Arm { hand, fore, upper, left });
         }
         let caps = r.bones.iter().map(|b| match input.bodies[b.body].colliders.first() {
@@ -218,7 +236,12 @@ impl Brain {
             }
             _ => None,
         }).collect();
-        Brain { caps, feet, arms, head: (0..r.bones.len()).find(|&b| has(b, "head")), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
+        // (Drawn once a ragdoll a take, whether used or not.)
+        let which = input.ragdolls.iter().position(|x| std::ptr::eq(x, r)).unwrap_or(0) as u64;
+        let mut rng = crate::world::Rng(input.seed ^ (which + 1).wrapping_mul(0x8cb92ba72f3d8dd7) ^ 0x7175_6972_6b);
+        let v = input.vary.clamp(0.0, 1.0);
+        let quirk = Quirk { late: v * (rng.signed() + 1.0) / 12.0, stride: 1.0 + v * 0.25 * rng.signed(), ready: 1.0 + v * 0.25 * rng.signed(), gain: 1.0 + v * 0.15 * rng.signed() };
+        Brain { quirk, caps, feet, arms, head: r.head.or_else(|| (0..r.bones.len()).find(|&b| has(b, "head"))), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
     }
 
     /// A bone's joint targets that point arm `arm` at `target` (px): the
@@ -556,7 +579,7 @@ impl Brain {
                 let fall_time = (height.max(1.0) / (g * u).max(1e-9)).sqrt();
                 let error = flat(sub(add(com, mul(vel, fall_time)), support));
                 if let Some((b, amount)) = balance {
-                    let (gain, assist) = (param(b, "gain", 1.0), param(b, "assist", 0.25) * amount);
+                    let (gain, assist) = (param(b, "gain", 1.0) * self.quirk.gain, param(b, "assist", 0.25) * amount);
                     // Lean at the ankles: toes pressed down toward the way it tips.
                     if let Some(way) = unit(error) {
                         let angle = (gain * len(error) / height.max(1.0)).min(0.35) * amount;
@@ -584,13 +607,13 @@ impl Brain {
                     }
                 }
                 if let Some((b, _)) = find(BehaviourKind::Step) {
-                    let trigger = param(b, "trigger", 0.12 * stand);
+                    let trigger = param(b, "trigger", 0.12 * stand) * self.quirk.ready;
                     if self.step.is_none() && t >= self.step_ready && len(error) > trigger && self.feet.len() >= 2 {
                         // The foot behind, to past where it is falling to.
                         if let Some(way) = unit(error) {
                             let foot = *self.feet.iter().min_by(|a, b| dot(sub(foot_at(**a), support), way).total_cmp(&dot(sub(foot_at(**b), support), way))).unwrap();
                             let from = foot_at(foot);
-                            let reach = param(b, "length", 0.5 * stand);
+                            let reach = param(b, "length", 0.5 * stand) * self.quirk.stride;
                             let aim = add(support, mul(error, 1.4));
                             let to = add(from, capped(flat(sub(aim, from)), reach));
                             self.step = Some(Step { foot, from, to, start: t, dur: param(b, "time", 0.28).max(0.05), lift: 0.12 * stand });
@@ -652,7 +675,7 @@ impl Brain {
                     let away = len(sub(target, world.pose(r.bones[arm.upper].body).p));
                     let within = param(b, "within", 4.0 * reach);
                     // Comes up as the thing comes within reach of `within`.
-                    let near = ((within - away) / (0.3 * within).max(1.0)).clamp(0.0, 1.0);
+                    let near = ((within * (2.0 - self.quirk.ready) - away) / (0.3 * within).max(1.0)).clamp(0.0, 1.0);
                     if near > 0.0 {
                         arms[k] = Some((target, amount * near));
                         (self.taken[i], using[i]) = (Some(k), true);
@@ -661,7 +684,9 @@ impl Brain {
                 BehaviourKind::Reach => {
                     let Some((bone, at)) = self.hit else { continue };
                     let hold = param(b, "hold", 1.5);
-                    if t - at > hold {
+                    // (It answers a little late, by its turn of mind.)
+                    let at = at + self.quirk.late;
+                    if t - at > hold || self.quirk.late > 0.0 && t < at {
                         continue;
                     }
                     let target = world.pose(r.bones[bone].body).apply(mul(r.bones[bone].along, r.bones[bone].length * 0.5));
@@ -674,6 +699,9 @@ impl Brain {
                 }
                 BehaviourKind::Protect => {
                     let Some(head) = self.head else { continue };
+                    if self.quirk.late > 0.0 && t < b.from + self.quirk.late {
+                        continue;
+                    }
                     let h = &r.bones[head];
                     let centre = world.pose(h.body).apply(mul(h.along, h.length * 0.5));
                     for (k, arm) in self.arms.iter().enumerate() {

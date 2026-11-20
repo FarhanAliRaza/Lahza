@@ -245,6 +245,24 @@ fn a_take_is_directed_baked_read_and_taken_again() {
     // Looked at: a sheet across the action.
     let sheet = tb.call("snapshot", json!({"at": [0.5, 1.0, 1.3, 2.0, 3.5], "sheet": true})).unwrap();
     assert_eq!(sheet.images.len(), 1);
+    // Each frame says what happened by it since the frame before: nothing
+    // by 0.5 s, the steps after the push at 1 s; every event once.
+    let frames = sheet.json["frames"].as_array().unwrap();
+    assert!(frames[0].get("events").is_none(), "{:#}", sheet.json);
+    let kinds = |k: usize| frames[k]["events"].as_array().map(|e| e.iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect::<Vec<_>>()).unwrap_or_default();
+    let stepped: usize = (0..5).map(|k| kinds(k).iter().filter(|x| *x == "step").count()).sum();
+    assert_eq!(stepped as u64, take["ragdolls"][0]["steps"].as_u64().unwrap(), "{:#}", sheet.json);
+    assert!(kinds(2).contains(&"step".to_string()) || kinds(3).contains(&"step".to_string()));
+    let listed: usize = (0..5).map(|k| kinds(k).len()).sum();
+    assert_eq!(listed, take["events"].as_array().unwrap().iter().filter(|e| e["t"].as_f64().unwrap() <= 3.5).count());
+    // And the sheet marks them on those frames (amber, over the frame's foot).
+    let amber = |png: &[u8]| image::load_from_memory(png).unwrap().to_rgba8().pixels().filter(|p| p.0[0] > 200 && p.0[1] > 160 && p.0[2] < 150 && p.0[0] > p.0[2] + 80).count();
+    assert!(amber(&sheet.images[0]) > 40, "{} amber pixels", amber(&sheet.images[0]));
+    let quiet = tb.call("snapshot", json!({"at": [0.2, 0.5], "sheet": true})).unwrap();
+    assert_eq!(amber(&quiet.images[0]), 0);
+    if let Ok(out) = std::env::var("LAHZA_SIM_OUT") {
+        std::fs::write(format!("{out}/marked.png"), &sheet.images[0]).unwrap();
+    }
     // Redirected: a harder push, no steps. It falls, and the take says when.
     let mut harder = doll.clone();
     harder["hits"][0]["velocity"] = json!([1500, 0, 0]);

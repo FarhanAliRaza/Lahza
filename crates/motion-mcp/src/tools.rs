@@ -1722,6 +1722,18 @@ impl Toolbox {
             listed.push(json!({"at": label, "t": round(ft), "frame": n}));
             frames.push((format!("{label} · {ft:.2}s · f{n}"), image));
         }
+        // What happened in a baked take by each frame, since the frame
+        // before it in the scene: listed, and marked on a sheet's frames.
+        let happened = sim::events_by_frame(&compiled, &listed.iter().map(|f| f["t"].as_f64().unwrap_or(0.0)).collect::<Vec<_>>());
+        for ((frame, entry), events) in frames.iter_mut().zip(listed.iter_mut()).zip(happened) {
+            if events.is_empty() {
+                continue;
+            }
+            if sheet {
+                frame.0 = format!("{}\n{}", frame.0, sim::mark(&events, (width / 7.2) as usize));
+            }
+            entry["events"] = json!(events);
+        }
         // (With profiling: what the GPU timed and has not handed over yet.)
         renderer.flush_profile();
         let backend = renderer.backend_label();
