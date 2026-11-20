@@ -2087,7 +2087,7 @@ mod scene_tests {
         let spp = std::env::var("LAHZA_PT_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let Some(mut r) = tracer(spp) else { return };
         if std::env::var_os("LAHZA_PT_RAW").is_some() {
-            r.options.path = Some(super::TraceOptions { spp, bounces: 4, denoise: false, temporal: false });
+            r.options.path = Some(super::TraceOptions { spp, bounces: 4, denoise: false, temporal: false, ..Default::default() });
         }
         let mut p = project(json!([
             {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [3000, 3000]}, "material": {"preset": "matte", "color": "#c8c2b8"}, "transform": {"position": [480, 235], "rotation_x": 90}},
@@ -3016,7 +3016,7 @@ mod physics_tests {
     fn sequence_renderer(denoise: bool, temporal: bool) -> Option<Renderer> {
         tracer(1)?;
         let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
-        Some(Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 8, bounces: 3, denoise, temporal }), ..Default::default() }))
+        Some(Renderer::new(None, RenderOptions { backend: crate::Backend::Gpu, allow_software_gpu: allow, path: Some(super::TraceOptions { spp: 8, bounces: 3, denoise, temporal, ..Default::default() }), ..Default::default() }))
     }
 
     /// Frames pushed through the renderer (the next begun while the GPU
