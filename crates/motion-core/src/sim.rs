@@ -394,6 +394,11 @@ pub struct Ragdoll {
     /// then keeps the pose and speed they gave it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<TimeRef>,
+    /// The time whose pose is the joints' zero: `limits` are measured from
+    /// it (default: the simulation's start; pick a moment it stands
+    /// straight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest: Option<TimeRef>,
     /// kg, shared among the bones by their volume.
     #[serde(default = "ragdoll_mass", skip_serializing_if = "is_ragdoll_mass")]
     pub mass: f64,
@@ -408,6 +413,11 @@ pub struct Ragdoll {
     /// that matches. Bones none matches take `swing` 40, `twist` ±20.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<BoneLimit>,
+    /// A bone's collider given outright (px, the bone layer's space),
+    /// for where a capsule along the bone is wrong: a foot is a box that
+    /// stands flat. By bone id or a part of it; the first that matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<BoneShape>,
     /// How hard the motors hold the clip's pose: 0 is limp (it only
     /// falls), 1 holds the pose as a body would. Keyed; `strengths` scale
     /// it per bone.
@@ -449,6 +459,14 @@ fn one_prop() -> Property<f64> {
 }
 fn is_one_prop(p: &Property<f64>) -> bool {
     *p == one_prop()
+}
+
+/// A bone's collider, in place of its capsule.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoneShape {
+    pub bone: String,
+    pub shape: BodyShape,
 }
 
 /// Limits of the joint that holds a bone to its parent.

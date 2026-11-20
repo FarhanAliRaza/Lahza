@@ -68,6 +68,8 @@ pub struct World {
     pub joints: Vec<ImpulseJointHandle>,
     /// Seconds per step.
     pub dt: f64,
+    /// One per `SimInput::ragdolls`.
+    pub rigs: Vec<crate::ragdoll::Rig>,
     /// Pairs of bodies touching after the last step (for first touches).
     touching: std::collections::BTreeSet<(u32, u32)>,
     pub events: Vec<SimEvent>,
@@ -152,6 +154,10 @@ impl World {
         let mut w = PhysicsWorld::default();
         w.gravity = v3(input.gravity, 1.0);
         w.integration_parameters.dt = dt as f32;
+        // Chains of joints (a spine, a leg) want more passes to hold.
+        if !input.ragdolls.is_empty() {
+            w.integration_parameters.num_solver_iterations = 12;
+        }
         let anchor = w.insert_body(RigidBodyBuilder::fixed());
         let ground = input.ground.as_ref().map(|g| {
             let (h, _) = w.insert(
@@ -189,13 +195,14 @@ impl World {
                 c.set_density(density);
                 if b.group != 0 {
                     c.user_data = b.group as u128;
+                    c.set_active_hooks(ActiveHooks::FILTER_CONTACT_PAIRS);
                 }
                 w.insert_collider(c, Some(h));
             }
             handles.push(h);
             released.push(b.kind == BodyKind::Dynamic && b.release == 0);
         }
-        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, touching: Default::default(), events: Vec::new() };
+        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, rigs: Vec::new(), touching: Default::default(), events: Vec::new() };
         for (i, b) in input.bodies.iter().enumerate() {
             if world.released[i] {
                 world.release(input, i, b);
@@ -205,6 +212,7 @@ impl World {
             let h = world.joint(input, j);
             world.joints.push(h);
         }
+        world.add_ragdolls(input);
         Ok(world)
     }
 
@@ -371,7 +379,7 @@ impl World {
     /// One step, from time `t`; first touches between bodies are noted.
     pub fn step(&mut self, input: &SimInput, t: f64) {
         let before: Vec<Vector> = self.handles.iter().map(|h| self.w.bodies[*h].linvel()).collect();
-        self.w.step();
+        self.w.step_with_events(&crate::ragdoll::Groups, &());
         let mut now = std::collections::BTreeSet::new();
         let index = |h: Option<RigidBodyHandle>| h.and_then(|h| self.handles.iter().position(|x| *x == h).map(|i| i as u32 + 1).or((Some(h) == self.ground).then_some(0)));
         for pair in self.w.contact_pairs() {
@@ -380,7 +388,8 @@ impl World {
             }
             let (a, b) = (index(self.w.colliders[pair.collider1].parent()), index(self.w.colliders[pair.collider2].parent()));
             if let (Some(a), Some(b)) = (a, b) {
-                if a != b {
+                let group = |i: u32| if i == 0 { 0 } else { input.bodies[i as usize - 1].group };
+                if a != b && (group(a) == 0 || group(a) != group(b)) {
                     now.insert((a.min(b), a.max(b)));
                 }
             }

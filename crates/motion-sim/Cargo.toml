@@ -9,5 +9,7 @@ description = "Motion engine simulation: rigid bodies, joints and ragdolls stepp
 lahza-motion-core = { path = "../motion-core" }
 # The same result on every machine: no SIMD, no threads, libm's maths.
 rapier3d = { version = "=0.36.1", default-features = false, features = ["dim3", "f32", "std", "enhanced-determinism"] }
+# The same sines on every machine.
+libm = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }

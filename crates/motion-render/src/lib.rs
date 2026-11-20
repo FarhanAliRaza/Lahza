@@ -762,3 +762,6 @@ mod tests;
 
 #[cfg(test)]
 mod mesh_tests;
+
+#[cfg(test)]
+mod skin_tests;

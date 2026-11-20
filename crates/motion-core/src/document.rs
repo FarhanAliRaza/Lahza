@@ -2372,6 +2372,21 @@ pub struct MeshLayer {
     /// (`docs/slang/geometry.md`), after displacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deform: Option<Deform>,
+    /// A glTF mesh's skin: its points follow the joints, which are layers
+    /// (`model_import` writes it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skin: Option<Skin>,
+}
+
+/// A skin: which of the file's skins (`index`) and, in that skin's joint
+/// order, the layers that are its joints (the comps of the joint nodes).
+/// The joints' transforms, keyed or baked, pose the mesh.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Skin {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub index: u32,
+    pub joints: Vec<String>,
 }
 
 /// A Slang deformer: `float3 <function>(float3 p, float3 n, float t)`

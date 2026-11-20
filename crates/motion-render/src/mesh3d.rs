@@ -58,6 +58,9 @@ pub struct MeshCache {
     /// Meshes readied for deformers the GPU runs, by the key of the mesh
     /// before the move, with the frame that last asked for each.
     deform_bases: HashMap<Vec<u8>, (Arc<DeformBase>, u64)>,
+    /// Skinned meshes before their pose, with their skins, by the key of
+    /// the mesh and the skin's index (None: the file has no such skin).
+    skin_bases: HashMap<Vec<u8>, Option<Arc<SkinBase>>>,
     /// Whether the GPU generates the Slang meshes it can (not with
     /// `LAHZA_SLANG_MESH_CPU=1`: the CPU then generates them all, to
     /// compare).
@@ -460,7 +463,7 @@ impl MeshCache {
     pub(crate) fn trace_instance(&mut self, id: Arc<str>, m: &MeshState, opacity: f64, scale: f64) -> Option<crate::pt::TraceInstance> {
         let key = self.key_of(m);
         // A Slang mesh the GPU generates in its pool is traced from there.
-        let mesh = if self.gpu_geometry && (m.params.gpu_generator().is_some() || m.params.gpu_deformer().is_some()) { crate::pt::TraceMesh::Pool(self.pooled(m)?, u32::MAX) } else { crate::pt::TraceMesh::Cpu(self.get_keyed(m, &key)?) };
+        let mesh = if self.gpu_geometry && (m.params.gpu_generator().is_some() || m.params.gpu_deformer().is_some() || m.skin.as_ref().is_some_and(|s| !s.joints.is_empty())) { crate::pt::TraceMesh::Pool(self.pooled(m)?, u32::MAX) } else { crate::pt::TraceMesh::Cpu(self.get_keyed(m, &key)?) };
         let mv = m.camera.view.then(m.world).0;
         let transform = [0, 1, 2].map(|r| [mv[r * 4] as f32, mv[r * 4 + 1] as f32, mv[r * 4 + 2] as f32, mv[r * 4 + 3] as f32]);
         let w = m.world.0;
@@ -588,12 +591,26 @@ impl MeshCache {
                 }
             }
         }
+        // A skinned mesh: the GPU moves the bind mesh's points by the
+        // frame's pose (`meshskin.wgsl`).
+        if let (true, Some(pose)) = (self.gpu_geometry, m.skin.as_ref().filter(|s| !s.joints.is_empty())) {
+            let key = self.key_of(m);
+            if let Some((p, used)) = self.generated.get_mut(&key) {
+                *used = self.frame;
+                return Some(p.clone());
+            }
+            let base = self.skin_base(m)?;
+            let matrices = Arc::new(lahza_motion_core::skin::matrices(&base.data, &pose.joints));
+            let p = Arc::new(Pooled::skinned(key.clone().into(), base, matrices)?);
+            self.generated.insert(key, (p.clone(), self.frame));
+            return Some(p);
+        }
         let mesh = self.get(m)?;
         let at = Arc::as_ptr(&mesh) as usize;
         if let Some(p) = self.pooled.get(&at) {
             return Some(p.clone());
         }
-        let p = Arc::new(Pooled::new(m.params.key().into(), mesh, m.params.animated()));
+        let p = Arc::new(Pooled::new(self.key_of(m).into(), mesh, m.params.animated() || m.skin.is_some()));
         self.pooled.insert(at, p.clone());
         Some(p)
     }
@@ -617,29 +634,93 @@ impl MeshCache {
         Some(base)
     }
 
+    /// `m`'s mesh before its pose, with its skin. None (said once): the
+    /// file has no such skin, or it is not this mesh's.
+    fn skin_base(&mut self, m: &MeshState) -> Option<Arc<SkinBase>> {
+        let pose = m.skin.as_ref()?;
+        let plain = m.params.key();
+        let mut key = plain.clone();
+        key.extend_from_slice(&pose.index.to_le_bytes());
+        key.extend_from_slice(b"before skin");
+        if let Some(base) = self.skin_bases.get(&key) {
+            return base.clone();
+        }
+        let bind = MeshState { skin: None, ..m.clone() };
+        let mesh = self.get_keyed(&bind, &plain);
+        let base = mesh.and_then(|mesh| {
+            let mesh::MeshShape::Gltf { src, mesh: index, primitive, unit, .. } = &m.params.shape else { return None };
+            let started = std::time::Instant::now();
+            let data = crate::model::load_skin(&mut self.gltf_files, self.root.as_deref(), src, *index, *primitive, pose.index, *unit).and_then(|data| {
+                if data.joints.len() != mesh.positions.len() {
+                    return Err(format!("{src}: mesh {index} has {} points and joints for {}", mesh.positions.len(), data.joints.len()));
+                }
+                if data.inverse_bind.len() != pose.ids.len() {
+                    return Err(format!("{src}: skin {} has {} joints, the layer's skin names {}", pose.index, data.inverse_bind.len(), pose.ids.len()));
+                }
+                Ok(data)
+            });
+            self.busy += started.elapsed();
+            match data {
+                Ok(data) => Some(Arc::new(SkinBase { key: key.clone().into(), boxes: lahza_motion_core::skin::joint_boxes(&mesh, &data), mesh, data })),
+                Err(e) => {
+                    if !self.dropped.contains(&e) {
+                        self.dropped.push(e);
+                    }
+                    None
+                }
+            }
+        });
+        if self.skin_bases.len() > 256 {
+            self.skin_bases.clear();
+        }
+        self.skin_bases.insert(key, base.clone());
+        base
+    }
+
     fn get(&mut self, m: &MeshState) -> Option<Arc<Mesh>> {
         let key = self.key_of(m);
         self.get_keyed(m, &key)
     }
 
-    /// `m.params.key()`, built once for lookups that follow each other.
+    /// The key of `m`'s mesh (`m.params.key()`, and a skinned mesh's pose),
+    /// built once for lookups that follow each other.
     fn key_of(&mut self, m: &MeshState) -> Vec<u8> {
-        let at = Arc::as_ptr(&m.params) as usize;
+        // (By the addresses of what it is made from.)
+        let at = Arc::as_ptr(&m.params) as usize ^ m.skin.as_ref().map_or(0, |s| (Arc::as_ptr(s) as usize).rotate_left(17));
         match &self.last_key {
             Some((p, key)) if *p == at => key.clone(),
             _ => {
-                let key = m.params.key();
+                let mut key = m.params.key();
+                if let Some(s) = &m.skin {
+                    key.extend_from_slice(b"skin");
+                    key.extend_from_slice(&s.index.to_le_bytes());
+                    for j in &s.joints {
+                        for v in &j.0[..12] {
+                            key.extend_from_slice(&(*v as f32).to_bits().to_le_bytes());
+                        }
+                    }
+                }
                 self.last_key = Some((at, key.clone()));
                 key
             }
         }
     }
 
-    /// `get`, with the mesh's `params.key()` already in hand.
+    /// `get`, with the mesh's key (`key_of`) already in hand.
     fn get_keyed(&mut self, m: &MeshState, key: &[u8]) -> Option<Arc<Mesh>> {
         if let Some((mesh, used, _)) = self.meshes.get_mut(key) {
             *used = self.frame;
             return Some(mesh.clone());
+        }
+        // A skinned mesh: the bind mesh moved by the pose, kept while the
+        // pose is drawn.
+        if let Some(pose) = m.skin.as_ref().filter(|s| !s.joints.is_empty()) {
+            let base = self.skin_base(m)?;
+            let started = std::time::Instant::now();
+            let mesh = Arc::new(lahza_motion_core::skin::skin(&base.mesh, &base.data, &lahza_motion_core::skin::matrices(&base.data, &pose.joints)));
+            self.busy += started.elapsed();
+            self.meshes.insert(key.to_vec(), (mesh.clone(), self.frame, true));
+            return Some(mesh);
         }
         let started = std::time::Instant::now();
         let mut generated = match &m.params.shape {
@@ -731,6 +812,45 @@ pub(crate) enum Source {
     /// deformer asks for (`slang_mesh::gpu_subdivided`; the last are the
     /// moved mesh's).
     DeformedGenerated { generated: Arc<Pooled>, params: Arc<mesh::MeshParams>, levels: Vec<(u32, u32)> },
+    /// The GPU moves the points of `base` by its joints (`meshskin.wgsl`):
+    /// `base` is uploaded once and kept in the pool, and a frame sends the
+    /// pose (`skin::matrices`).
+    Skinned { base: Arc<SkinBase>, matrices: Arc<Vec<[[f32; 4]; 3]>> },
+}
+
+/// A skinned mesh before its pose, with its skin, as the pool holds it.
+/// Never drawn.
+pub(crate) struct SkinBase {
+    pub key: Arc<[u8]>,
+    pub mesh: Arc<Mesh>,
+    pub data: lahza_motion_core::skin::SkinData,
+    /// Per joint: the box of the points it carries.
+    boxes: Vec<Option<([f32; 3], [f32; 3])>>,
+}
+
+/// Pool rows per vertex of a `SkinBase`: [position, u], [normal, v], [its
+/// joints], [their weights].
+pub(crate) const SROWS: usize = 4;
+
+impl SkinBase {
+    pub(crate) fn rows(&self) -> usize {
+        self.mesh.positions.len() * SROWS + self.mesh.tris.len()
+    }
+
+    /// Its pool rows: the points', then the triangles' records as
+    /// `Pooled::write` makes them.
+    pub(crate) fn write(&self, out: &mut Vec<[f32; 4]>) {
+        let m = &self.mesh;
+        for (i, p) in m.positions.iter().enumerate() {
+            let n = m.normals.get(i).copied().unwrap_or([0.0; 3]);
+            let uv = m.uvs.get(i).copied().unwrap_or([0.0; 2]);
+            out.push([p[0], p[1], p[2], uv[0]]);
+            out.push([n[0], n[1], n[2], uv[1]]);
+            out.push(self.data.joints[i].map(|j| f32::from_bits(j as u32)));
+            out.push(self.data.weights[i]);
+        }
+        Pooled::write_triangles(m, out);
+    }
 }
 
 /// A mesh readied for a deformer the GPU runs (subdivided, with the
@@ -819,6 +939,22 @@ impl Pooled {
         }
         let (verts, tris, animated) = (m.positions.len() as u32, m.tris.len() as u32, params.animated());
         Ok((verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Deformed { base, params }, lo, hi, segments, animated }))
+    }
+
+    /// A mesh whose points the GPU moves by its joints: `base` has its
+    /// points before the pose. Its box is around what each joint carries
+    /// (`skin::extent`), without the CPU skinning a point.
+    fn skinned(key: Arc<[u8]>, base: Arc<SkinBase>, matrices: Arc<Vec<[[f32; 4]; 3]>>) -> Option<Self> {
+        let (lo, hi) = lahza_motion_core::skin::extent(&base.boxes, &matrices)?;
+        let m = &base.mesh;
+        let mut segments = [0u32; PARTS];
+        for k in 0..m.tris.len() {
+            let tag = m.tags.get(k).copied().unwrap_or(0);
+            let part = (mesh::tag_part(tag) as usize).min(PARTS - 1);
+            segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
+        }
+        let (verts, tris) = (m.positions.len() as u32, m.tris.len() as u32);
+        (verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Skinned { base, matrices }, lo, hi, segments, animated: true })
     }
 
     /// A mesh the GPU generates (`generated`) and moves by the layer's

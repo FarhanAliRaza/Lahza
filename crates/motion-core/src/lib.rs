@@ -25,6 +25,7 @@ pub mod path;
 pub mod property;
 pub mod recording;
 pub mod sim;
+pub mod skin;
 pub mod slang;
 pub mod slang_layer;
 pub mod slang_mesh;

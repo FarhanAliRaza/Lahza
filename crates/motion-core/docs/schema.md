@@ -343,6 +343,17 @@ Geometry (numbers animatable unless noted):
 | `revolve` | `profile` path in (x = distance from the axis, y = along it), `angles`, `axis`: `y` (standing, default) \| `z` (facing the camera) |
 | `sweep` | `d` path in the layer plane, `radius` (10), `profile`: `circle` \| `square` \| `ribbon`, `width` (ribbon, 40), `trim` [from, to] (0..1), `caps`: `round` (default) \| `flat`, `head` (radius of a leading ball) |
 
+A glTF mesh with a skin follows its skeleton: `"skin": {"index": 0,
+"joints": ["hero-hips", "hero-spine", …]}` names, in the order of the
+file's skin, the layers that are its joints (`model_import` writes it: a
+joint node is a comp like any node). Each point goes where its joints
+carry it by its weights (up to four a point), from the file's bind pose.
+A joint is an ordinary layer: its keys (the file's animation, or yours),
+a parent, or a simulation's bake pose the mesh, and the mesh's own layer
+transform does not (glTF's rule). The CPU and GPU skin alike (the GPU in
+its mesh pool, a pose a frame); the path tracer traces the skinned mesh.
+Morph targets are not read.
+
 A torus faces the camera like a `ring` shape; tilt it with `rotation_x`.
 Rings and revolves name their faces by the way they face: `front`
 (toward −axis: the camera for rings, the top for standing revolves),

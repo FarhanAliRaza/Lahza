@@ -336,6 +336,17 @@ reference.
                "rotation": {"keys": [{"at": 0, "v": 0}, {"at": 4, "v": 90}]}}}
 ```
 
+## Characters: skinned models
+
+`model_import` brings a rigged glTF (Blender: export the armature with
+the mesh, as .glb) in as layers: one comp per node, the skeleton's joints
+among them, and the skinned mesh with `"skin"` naming its joints. The
+file's animation arrives as keys on the joints (rotations as the three
+layer angles, linear between the file's keys). To change the acting, key
+a joint like any layer (`hero-arm_L.transform.rotation`), or shift and
+retime its keys; the mesh follows. Do not move the mesh layer itself:
+its joints place it (move the model's root comp).
+
 ## Simulation: things that fall, collide and hang
 
 When something should drop, tumble, stack, knock into something else or

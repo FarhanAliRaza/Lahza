@@ -3761,6 +3761,7 @@ name = "lahza-motion-sim"
 version = "0.1.0"
 dependencies = [
  "lahza-motion-core",
+ "libm",
  "rapier3d",
  "serde",
  "serde_json",

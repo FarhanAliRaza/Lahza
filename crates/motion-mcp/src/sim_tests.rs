@@ -111,3 +111,24 @@ fn a_snapshot_shows_the_baked_frame_whatever_was_asked_before() {
     assert!(shot(&mut tb, 1.5) == late && shot(&mut tb, 0.2) == early);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_skinned_model_is_imported_with_its_joints_and_bends_with_them() {
+    let (mut tb, dir) = toolbox("skin");
+    let model = lahza_motion_render::model::write_test_arm(&dir.join("src")).unwrap();
+    tb.call("project_create", json!({"path": "arm", "duration": 2, "width": 480, "height": 360})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1", "background": "#101014"}]})).unwrap();
+    let out = tb.call("model_import", json!({"path": model.display().to_string(), "scene": "s1", "position": [240, 320]})).unwrap().json;
+    assert_eq!((out["report"]["skinned"].as_u64(), out["report"]["animated_nodes"].as_u64()), (Some(1), Some(1)), "{out:#}");
+    let report = tb.call("check", json!({})).unwrap().json;
+    assert_eq!(report["errors"], 0, "{report:#}");
+    let shot = |tb: &mut Toolbox, t: f64| image::load_from_memory(&tb.call("snapshot", json!({"at": [t], "width": 480})).unwrap().images[0]).unwrap().to_rgba8();
+    let left = |img: &image::RgbaImage| img.enumerate_pixels().filter(|(_, _, p)| p.0[0] > 120).map(|(x, _, _)| x).min().unwrap();
+    // The file's animation turns the middle joint: the arm's tip swings left.
+    let (rest, bent) = (shot(&mut tb, 0.0), shot(&mut tb, 1.0));
+    assert!(left(&bent) + 50 < left(&rest), "left edge {} → {}", left(&rest), left(&bent));
+    // A joint is a layer: keyed by an edit, the mesh follows.
+    tb.call("edit_apply", json!({"ops": [{"op": "set", "target": "arm-mid.transform.rotation", "value": 0}]})).unwrap();
+    assert_eq!(left(&shot(&mut tb, 1.0)), left(&rest));
+    std::fs::remove_dir_all(&dir).ok();
+}

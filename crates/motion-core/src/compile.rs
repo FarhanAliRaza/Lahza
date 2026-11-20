@@ -16,12 +16,13 @@ use std::sync::Arc;
 
 mod instancer;
 mod meshes;
+mod ragdoll;
 mod sim;
 
 pub use sim::{CSim, SimStatus};
 pub use meshes::frame_path;
 use instancer::CInstancer;
-pub use meshes::{srgb_to_linear, EnvState, LightState, Lighting, Lobe, MaterialState, MeshState};
+pub use meshes::{srgb_to_linear, EnvState, LightState, Lighting, Lobe, MaterialState, MeshState, SkinPose};
 use meshes::{CLighting, CMesh};
 
 /// 2D affine transform: (x, y) → (a·x + c·y + e, b·x + d·y + f).
@@ -446,6 +447,8 @@ pub struct CScene {
     pub layers: Vec<CLayer>,
     /// The scene's simulation (the defaults when it has none).
     pub sim: CSim,
+    /// Some mesh of the scene has a skin (its joints are placed per frame).
+    skinned: bool,
 }
 
 enum CFocus {
@@ -1511,6 +1514,7 @@ impl Compiled {
             c.bake = project.bakes.get(id).cloned();
             let layers = c.layers(&scene.layers, step, pre_roll);
             let sim = c.simulation(scene, start, end, pre_roll);
+            let skinned = sim::check_skins(&layers, &mut c.errors);
             let lighting = c.lighting(scene, pre_roll, start);
             let bloom = scene.look.as_ref().or(project.settings.look.as_ref()).and_then(|l| l.bloom.as_ref()).map(|b| {
                 (c.prop(&b.threshold, id, "look.bloom.threshold", start, None, pre_roll), c.prop(&b.radius, id, "look.bloom.radius", start, None, pre_roll), c.prop(&b.intensity, id, "look.bloom.intensity", start, None, pre_roll))
@@ -1542,6 +1546,7 @@ impl Compiled {
                 transition,
                 layers,
                 sim,
+                skinned,
             });
         }
         // The Slang functions the properties asked for, built into one
@@ -1726,6 +1731,9 @@ impl Compiled {
         if has_meshes(&out[first..]) {
             let lighting = Arc::new(scene.lighting.at(tc));
             meshes::light_meshes(&mut out[first..], &lighting);
+            if scene.skinned {
+                sim::pose_skins(scene, tc, &self.camera(scene, tc), &mut out[first..]);
+            }
         }
         // Bloom: the scene's layers as one group that blooms.
         if let Some((threshold, radius, intensity)) = &scene.bloom {

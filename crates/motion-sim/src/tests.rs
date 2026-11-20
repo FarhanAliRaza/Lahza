@@ -93,7 +93,7 @@ fn the_same_project_bakes_to_the_same_bytes() {
         h.bytes(&a);
         h.0
     };
-    assert_eq!((a.len(), h), (53179, 0x77a0c3b232b0973c), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!((a.len(), h), (52663, 0x9eaeafe84a8029c5), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // Another seed is another take (with jitter); the same seed the same.
     let (j1, j1b, j2) = (baked(&mut chaos(1, 30.0)).to_bytes(), baked(&mut chaos(1, 30.0)).to_bytes(), baked(&mut chaos(2, 30.0)).to_bytes());
     assert!(j1 == j1b && j1 != j2 && j1 != a);

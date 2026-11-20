@@ -6,6 +6,8 @@
 //! `enhanced-determinism` (no SIMD, no threads, libm's maths), the step is
 //! fixed, and bodies, colliders and joints are made in the input's order.
 
+pub mod behaviour;
+pub mod ragdoll;
 mod world;
 
 pub use world::{core_meshes, Meshes, World};
@@ -43,6 +45,7 @@ pub fn bake(input: &SimInput, meshes: Meshes) -> Result<(Bake, Stats), String> {
             track.samples.push([p.p[0] as f32, p.p[1] as f32, p.p[2] as f32, p.q[0] as f32, p.q[1] as f32, p.q[2] as f32, p.q[3] as f32]);
         }
     };
+    let mut brains: Vec<behaviour::Brain> = input.ragdolls.iter().map(|r| behaviour::Brain::new(input, r)).collect();
     let n = input.substeps as u64;
     let mut steps = 0u64;
     for k in 0..input.samples {
@@ -57,14 +60,23 @@ pub fn bake(input: &SimInput, meshes: Meshes) -> Result<(Bake, Stats), String> {
         record(&world, &mut tracks);
         for s in 0..n {
             let t = input.start + (k as f64 + s as f64 / n as f64) / input.rate;
-            world.drive(input, k as f64 + (s + 1) as f64 / n as f64);
+            let x = k as f64 + (s + 1) as f64 / n as f64;
+            world.drive(input, x);
             world.push(input, t);
+            for (rig, r) in input.ragdolls.iter().enumerate() {
+                let drive = brains[rig].think(&mut world, input, r, x, t);
+                world.drive_ragdoll(r, rig, x, Some(&drive.targets), Some(&drive.scale));
+                world.hit_ragdoll(r, t);
+            }
             world.step(input, t);
             steps += 1;
         }
     }
     record(&world, &mut tracks);
     let mut events = std::mem::take(&mut world.events);
+    for b in &mut brains {
+        events.append(&mut b.events);
+    }
     events.sort_by(|a, b| a.t.total_cmp(&b.t).then_with(|| a.a.cmp(&b.a)).then_with(|| a.b.cmp(&b.b)));
     let stats = Stats { bodies: input.bodies.len(), joints: input.joints.len(), samples: input.samples, steps, seconds: began.elapsed().as_secs_f64() };
     Ok((Bake { hash: input.hash(), start: input.start, rate: input.rate, tracks, events }, stats))
@@ -81,5 +93,9 @@ pub fn bake_scene(compiled: &Compiled, scene: usize, dir: Option<&std::path::Pat
     bake(&input, meshes)
 }
 
+#[cfg(test)]
+mod behaviour_tests;
+#[cfg(test)]
+mod ragdoll_tests;
 #[cfg(test)]
 mod tests;

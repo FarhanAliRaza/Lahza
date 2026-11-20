@@ -317,6 +317,10 @@ pub fn catalog_json() -> Value {
         "world_crossfade": "a scene that fades into another: cut on a cause, carry, colour flood or whip",
         "draws_off_frame": "a stroke drawn on with trim whose head lands off the frame while its start is on it"
     });
+    catalog["skin"] = json!({
+        "what": "a glTF mesh layer's \"skin\": {index: which of the file's skins (0), joints: [layer ids, in the skin's joint order]}: its points follow the joints' layers (comps model_import makes of the joint nodes) by the file's weights; key, parent or simulate a joint and the mesh follows; the mesh layer's own transform does not place it",
+        "tools": "model_import writes it (report.skinned); only glTF meshes have skins; morph targets are not read"
+    });
     catalog["simulation"] = json!({
         "what": "layers with \"body\" fall, collide, stack and hang from joints; `sim_bake` steps the scene's simulation and keeps each body's place per frame (sim/<scene>.bake), which drawing reads; `check` reports a missing or stale bake",
         "body": {"type": "dynamic (default) | fixed | kinematic (follows its keys, pushes what it meets)",

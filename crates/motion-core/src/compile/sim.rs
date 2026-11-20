@@ -17,6 +17,9 @@ pub(super) struct CBody {
     /// Timeline seconds of each of `spec.pushes`.
     pub pushes: Vec<f64>,
     pub bake: Option<(Arc<Bake>, usize)>,
+    /// The layer has a `body` (else it is only placed by the bake: a
+    /// ragdoll's bone).
+    pub declared: bool,
 }
 
 impl CBody {
@@ -35,16 +38,20 @@ pub struct CSim {
     /// Per joint: the motor's target.
     motors: Vec<Option<Prop<f64>>>,
     blasts: Vec<f64>,
+    pub(super) ragdolls: Vec<super::ragdoll::CRagdoll>,
     pub bake: Option<Arc<Bake>>,
 }
 
 impl<'a> Compiler<'a> {
     pub(super) fn body(&mut self, c: &Common, id: &str, shift: f64) -> Option<Box<CBody>> {
-        let spec = c.body.clone()?;
+        let bake = self.bake.as_ref().and_then(|b| Some((b.clone(), b.track(id)?)));
+        let Some(spec) = c.body.clone() else {
+            // A layer the bake has a track for (a ragdoll's bone).
+            return bake.map(|bake| Box::new(CBody { spec: Body::default(), shift, release: None, pushes: Vec::new(), bake: Some(bake), declared: false }));
+        };
         let release = spec.release.as_ref().and_then(|r| self.time(r, id, "body.release")).map(|t| t - shift);
         let pushes = spec.pushes.iter().enumerate().map(|(i, p)| self.time(&p.at, id, &format!("body.pushes.{i}.at")).unwrap_or(0.0) - shift).collect();
-        let bake = self.bake.as_ref().and_then(|b| Some((b.clone(), b.track(id)?)));
-        Some(Box::new(CBody { spec, shift, release, pushes, bake }))
+        Some(Box::new(CBody { spec, shift, release, pushes, bake, declared: true }))
     }
 
     /// The scene's simulation settings (the defaults when it only has
@@ -57,14 +64,14 @@ impl<'a> Compiler<'a> {
         let to = settings.end.as_ref().and_then(|r| self.time(r, id, "simulation.end")).map(|t| t - pre_roll).unwrap_or(end).min(end);
         let motors = settings.joints.iter().enumerate().map(|(i, j)| j.motor.as_ref().map(|m| self.prop(&m.target, id, &format!("simulation.joints.{i}.motor.target"), start, None, pre_roll))).collect();
         let blasts = settings.blasts.iter().enumerate().map(|(i, b)| self.time(&b.at, id, &format!("simulation.blasts.{i}.at")).unwrap_or(0.0) - pre_roll).collect();
-        CSim { settings, start: from, end: to, motors, blasts, bake: self.bake.clone() }
+        CSim { settings, start: from, end: to, motors, blasts, ragdolls: self.ragdolls(scene, start, pre_roll), bake: self.bake.clone() }
     }
 }
 
 /// Calls `f` for every layer under `layers` (comps' children too, not an
 /// instancer's copies) with its world matrix as its keys place it at
 /// content time `tc`, and its own clock.
-fn visit<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, space: &Space, under: Option<usize>, f: &mut dyn FnMut(&'l CLayer, Mat4, f64, Option<usize>) -> Option<usize>) {
+pub(super) fn visit<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, space: &Space, under: Option<usize>, f: &mut dyn FnMut(&'l CLayer, Mat4, f64, Option<usize>) -> Option<usize>) {
     let mut cache = vec![None; layers.len()];
     for i in 0..layers.len() {
         let l = &layers[i];
@@ -80,7 +87,7 @@ fn visit<'l>(layers: &'l [CLayer], tc: f64, inherited: Option<Step>, space: &Spa
 /// Bodies among an instancer's copies: `visit` does not reach them.
 fn copied_bodies(layers: &[CLayer], inside: bool, out: &mut Vec<String>) {
     for l in layers {
-        if inside && l.body.is_some() {
+        if inside && l.body.as_ref().is_some_and(|b| b.declared) {
             out.push(l.id.to_string());
         }
         copied_bodies(l.children(), inside || matches!(l.kind, CKind::Instancer(_)), out);
@@ -102,7 +109,7 @@ pub enum SimStatus {
 }
 
 fn has_bodies(layers: &[CLayer]) -> bool {
-    layers.iter().any(|l| l.body.is_some() || has_bodies(l.children()))
+    layers.iter().any(|l| l.body.as_ref().is_some_and(|b| b.declared) || has_bodies(l.children()))
 }
 
 fn dir3(m: &Mat4, v: [f64; 3]) -> [f64; 3] {
@@ -146,6 +153,25 @@ fn place(shape: ShapeInput, m: Mat4) -> Option<ColliderInput> {
     Some(ColliderInput { shape, local: pose.matrix() })
 }
 
+/// A collider given outright (`BodyShape`'s round and box kinds) on a
+/// layer whose scale and anchor are `rest` (the layer's space → the
+/// body's frame).
+pub(super) fn given_shape(shape: &BodyShape, rest: Mat4) -> Option<ColliderInput> {
+    let given = |shape: ShapeInput, offset: &[f64; 3], turn: Mat4| place(shape, rest.then(Mat4::translate(offset[0], offset[1], offset[2])).then(turn));
+    let lay = |axis: &Axis| match axis {
+        Axis::X => Mat4::rotate_z(-90.0),
+        Axis::Y => Mat4::IDENTITY,
+        Axis::Z => Mat4::rotate_x(-90.0),
+    };
+    match shape {
+        BodyShape::Box { size, offset } => given(ShapeInput::Box { half: [size[0] / 2.0, size[1] / 2.0, size[2] / 2.0] }, offset, Mat4::IDENTITY),
+        BodyShape::Sphere { radius, offset } => given(ShapeInput::Ball { radius: *radius }, offset, Mat4::IDENTITY),
+        BodyShape::Capsule { radius, height, axis, offset } => given(ShapeInput::Capsule { radius: *radius, half: (height / 2.0 - radius).max(0.0) }, offset, lay(axis)),
+        BodyShape::Cylinder { radius, height, axis, offset } => given(ShapeInput::Cylinder { radius: *radius, half: height / 2.0 }, offset, lay(axis)),
+        BodyShape::Hull | BodyShape::Pieces | BodyShape::Mesh => None,
+    }
+}
+
 /// The collider a mesh is by itself: a round or box shape when the mesh
 /// is one, else its hull (or its triangles when it does not move).
 fn mesh_collider(params: &Arc<MeshParams>, m: Mat4, dynamic: bool, forced: Option<&BodyShape>) -> ColliderInput {
@@ -187,7 +213,7 @@ struct Found<'l> {
 impl Compiled {
     /// Whether scene `i` has anything to simulate.
     pub fn has_simulation(&self, i: usize) -> bool {
-        self.scenes.get(i).is_some_and(|s| has_bodies(&s.layers) || !s.sim.settings.crowds.is_empty())
+        self.scenes.get(i).is_some_and(|s| has_bodies(&s.layers) || !s.sim.settings.crowds.is_empty() || !s.sim.settings.ragdolls.is_empty())
     }
 
     /// Scene `i`'s simulation against the bake it was compiled with.
@@ -276,7 +302,7 @@ impl Compiled {
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
             visit(&scene.layers, tc, None, &space, None, &mut |l, world, _, under| {
-                let Some(body) = l.body.as_deref() else { return under };
+                let Some(body) = l.body.as_deref().filter(|b| b.declared) else { return under };
                 if k == 0 {
                     found.push(Found { layer: l, body, worlds: Vec::with_capacity(samples as usize + 2), meshes: Vec::new() });
                 }
@@ -298,7 +324,7 @@ impl Compiled {
             let space = Space { keyed: true, ..self.camera(scene, tc) };
             let mut n = 0;
             visit(&scene.layers, tc, None, &space, None, &mut |l, world, clock, under| {
-                let own = l.body.is_some().then(|| {
+                let own = l.body.as_ref().is_some_and(|b| b.declared).then(|| {
                     n += 1;
                     n - 1
                 });
@@ -319,17 +345,8 @@ impl Compiled {
             let (pose, rest) = decompose(world);
             let to_body = inverse(pose.matrix());
             let mut colliders = Vec::new();
-            let given = |shape: ShapeInput, offset: &[f64; 3], turn: Mat4| place(shape, rest.then(Mat4::translate(offset[0], offset[1], offset[2])).then(turn));
-            let lay = |axis: &Axis| match axis {
-                Axis::X => Mat4::rotate_z(-90.0),
-                Axis::Y => Mat4::IDENTITY,
-                Axis::Z => Mat4::rotate_x(-90.0),
-            };
             match &spec.shape {
-                Some(BodyShape::Box { size, offset }) => colliders.extend(given(ShapeInput::Box { half: [size[0] / 2.0, size[1] / 2.0, size[2] / 2.0] }, offset, Mat4::IDENTITY)),
-                Some(BodyShape::Sphere { radius, offset }) => colliders.extend(given(ShapeInput::Ball { radius: *radius }, offset, Mat4::IDENTITY)),
-                Some(BodyShape::Capsule { radius, height, axis, offset }) => colliders.extend(given(ShapeInput::Capsule { radius: *radius, half: (height / 2.0 - radius).max(0.0) }, offset, lay(axis))),
-                Some(BodyShape::Cylinder { radius, height, axis, offset }) => colliders.extend(given(ShapeInput::Cylinder { radius: *radius, half: height / 2.0 }, offset, lay(axis))),
+                Some(shape @ (BodyShape::Box { .. } | BodyShape::Sphere { .. } | BodyShape::Capsule { .. } | BodyShape::Cylinder { .. })) => colliders.extend(given_shape(shape, rest)),
                 forced => {
                     if matches!(forced, Some(BodyShape::Mesh)) && dynamic {
                         errors.push(format!("{id}.body.shape: \"mesh\" (the triangles themselves) is for bodies that do not move by the simulation: use \"hull\", or type \"fixed\" or \"kinematic\""));
@@ -449,9 +466,7 @@ impl Compiled {
         for (b, at) in set.blasts.iter().zip(&sim.blasts) {
             input.blasts.push(BlastInput { at: *at, origin: b.origin, speed: b.speed, radius: b.radius });
         }
-        if !set.ragdolls.is_empty() {
-            errors.push(format!("{}.simulation.ragdolls: ragdolls are not built yet", scene.id));
-        }
+        self.ragdoll_input(i, &mut input, &mut errors);
         if !set.crowds.is_empty() {
             errors.push(format!("{}.simulation.crowds: crowds are not built yet", scene.id));
         }
@@ -464,4 +479,71 @@ impl Compiled {
         }
         (input, errors)
     }
+}
+
+// ---------------------------------------------------------------- skins
+
+fn skinned_meshes<'l>(layers: &'l [CLayer], out: &mut Vec<(&'l CLayer, &'l [Arc<str>])>, ids: &mut HashSet<&'l str>) {
+    for l in layers {
+        ids.insert(&l.id);
+        if let CKind::Mesh(m) = &l.kind {
+            if let Some((_, joints)) = &m.skin {
+                out.push((l, joints));
+            }
+        }
+        skinned_meshes(l.children(), out, ids);
+    }
+}
+
+/// Whether the scene has skinned meshes; joints that are no layer of the
+/// scene are errors.
+pub(super) fn check_skins(layers: &[CLayer], errors: &mut Vec<String>) -> bool {
+    let (mut meshes, mut ids) = (Vec::new(), HashSet::new());
+    skinned_meshes(layers, &mut meshes, &mut ids);
+    for (l, joints) in &meshes {
+        let missing: Vec<&str> = joints.iter().map(|j| &**j).filter(|j| !ids.contains(j)).collect();
+        if let Some(first) = missing.first() {
+            errors.push(format!("{}.skin.joints: '{first}' is no layer of the scene{}", l.id, if missing.len() > 1 { format!(" (nor are {} more)", missing.len() - 1) } else { String::new() }));
+        }
+    }
+    !meshes.is_empty()
+}
+
+/// Gives every skinned mesh of a frame its joints' places: each joint
+/// layer's space → the mesh layer's, as keys, parents and bakes have them.
+pub(super) fn pose_skins(scene: &CScene, tc: f64, space: &Space, layers: &mut [LayerState]) {
+    fn each(layers: &mut [LayerState], f: &mut dyn FnMut(&mut MeshState)) {
+        for l in layers {
+            match &mut l.content {
+                Content::Mesh(m) if m.skin.is_some() => f(m),
+                Content::Group(children) => each(children, f),
+                _ => {}
+            }
+            if let Some(src) = l.matte.as_mut().and_then(|m| m.source.as_mut()) {
+                each(std::slice::from_mut(src), f);
+            }
+        }
+    }
+    let mut wanted: HashSet<Arc<str>> = HashSet::new();
+    each(layers, &mut |m| {
+        if let Some(s) = &m.skin {
+            wanted.extend(s.ids.iter().cloned());
+        }
+    });
+    if wanted.is_empty() {
+        return;
+    }
+    let mut worlds: HashMap<Arc<str>, Mat4> = HashMap::with_capacity(wanted.len());
+    visit(&scene.layers, tc, None, space, None, &mut |l, world, _, _| {
+        if wanted.contains(&l.id) {
+            worlds.insert(l.id.clone(), world);
+        }
+        None
+    });
+    each(layers, &mut |m| {
+        let Some(s) = &m.skin else { return };
+        let to_mesh = inverse(m.world);
+        let joints = s.ids.iter().map(|id| worlds.get(id).map(|w| to_mesh.then(*w)).unwrap_or(Mat4::IDENTITY)).collect();
+        m.skin = Some(Arc::new(SkinPose { index: s.index, ids: s.ids.clone(), joints }));
+    });
 }
