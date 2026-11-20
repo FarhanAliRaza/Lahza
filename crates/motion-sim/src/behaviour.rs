@@ -8,6 +8,13 @@
 //! of at most `assist` × the body's weight (and as much torque as that
 //! force would make at the height of its weight) holds it up. A push
 //! past that topples it, and it then goes soft (`limp`).
+//!
+//! Getting up is helped more. The motors shape it (arms pushed straight
+//! under the shoulders, hips and knees folded, then all of it back to
+//! the clip), but what lifts and rights the body is a force on its hips
+//! of at most `help` × its weight (0.6 by default) and the torque that
+//! would make: its `rise` event says what share of its weight that force
+//! carried over the rise.
 
 use crate::ragdoll::sampled;
 use crate::world::{v3, World};
@@ -94,6 +101,28 @@ struct Step {
     lift: f64,
 }
 
+/// How it stood when it was let go: its hips' height over its feet, their
+/// turn, and its front (the way its feet point) in the hips' frame.
+#[derive(Clone, Copy)]
+struct Stood {
+    hips: f64,
+    q: [f64; 4],
+    front: V,
+}
+
+/// A rise in progress.
+#[derive(Clone)]
+struct Rise {
+    start: f64,
+    /// How its hips were turned and how high when it began.
+    q: [f64; 4],
+    low: f64,
+    /// Upright, facing the way its head lay.
+    up: [f64; 4],
+    /// Newton-seconds the outside force has pushed up with so far.
+    lifted: f64,
+}
+
 /// What a step asks of the motors.
 pub struct Drive {
     /// Per bone: its turn against its parent to aim for (None: the clip's).
@@ -113,6 +142,10 @@ pub struct Brain {
     /// When it fell, if it has.
     pub fallen: Option<f64>,
     down_since: Option<f64>,
+    /// How it stood when let go; since when it has lain still; its rise.
+    stood: Option<Stood>,
+    still_since: Option<f64>,
+    rising: Option<Rise>,
     step: Option<Step>,
     step_ready: f64,
     /// The bone last hit, and when.
@@ -145,7 +178,7 @@ impl Brain {
             let left = n.ends_with("_l") || n.ends_with(".l") || n.contains("left");
             arms.push(Arm { hand, fore, upper, left });
         }
-        Brain { feet, arms, head: (0..r.bones.len()).find(|&b| has(b, "head")), stand: None, fallen: None, down_since: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
+        Brain { feet, arms, head: (0..r.bones.len()).find(|&b| has(b, "head")), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
     }
 
     /// A bone's joint targets that point arm `arm` at `target` (px): the
@@ -239,6 +272,12 @@ impl Brain {
             let height = dot(sub(com, support), up);
             let trunk = quat_rotate(world.pose(r.bones[0].body).q, r.bones[0].along);
             let (stand, upright) = *self.stand.get_or_insert((height.max(1.0), trunk));
+            let hips = world.pose(r.bones[0].body);
+            let stood = *self.stood.get_or_insert_with(|| {
+                let toes = self.feet.iter().fold([0.0; 3], |acc, &f| add(acc, quat_rotate(world.pose(r.bones[f].body).q, r.bones[f].along)));
+                let front = unit(flat(toes)).unwrap_or_else(|| unit(flat(cross(up, trunk))).unwrap_or([0.0, 0.0, -1.0]));
+                Stood { hips: dot(sub(hips.p, support), up).max(1.0), q: hips.q, front: quat_rotate(conj(hips.q), front) }
+            });
             // Fallen: its weight low over its feet, or its trunk far over,
             // for a tenth of a second. It does not get up.
             let tilt = libm::acos(dot(trunk, upright).clamp(-1.0, 1.0));
@@ -259,6 +298,115 @@ impl Brain {
                 let limp = balance.map(|(b, _)| param(b, "limp", 0.15)).unwrap_or(0.15);
                 let f = ((t - at) / 0.2).clamp(0.0, 1.0);
                 drive.scale.iter_mut().for_each(|s| *s = 1.0 + (limp - 1.0) * f);
+                let weight = mass * g;
+                match find(BehaviourKind::GetUp) {
+                    None => (self.rising, self.still_since) = (None, None),
+                    // Lying: it starts once it has been still for `wait`.
+                    Some((b, _)) if self.rising.is_none() => {
+                        if len(vel) < 0.3 * stand {
+                            let since = *self.still_since.get_or_insert(t);
+                            if t - since >= param(b, "wait", 0.8) {
+                                // Up again it faces the way its head lies.
+                                let lying = unit(flat(trunk)).unwrap_or(quat_rotate(stood.q, stood.front));
+                                let faced = unit(flat(quat_rotate(stood.q, stood.front))).unwrap_or(lying);
+                                self.rising = Some(Rise { start: t, q: hips.q, low: dot(sub(hips.p, support), up), up: quat_mul(arc(faced, lying), stood.q), lifted: 0.0 });
+                                self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "get_up".into(), a: r.id.clone(), b: String::new(), speed: 0.0 });
+                            }
+                        } else {
+                            self.still_since = None;
+                        }
+                    }
+                    Some((b, amount)) => {
+                        let mut rise = self.rising.take().unwrap();
+                        let time = param(b, "time", 2.4).max(0.5);
+                        let help = param(b, "help", 0.6) * amount;
+                        let f = (t - rise.start) / time;
+                        let smooth = |x: f64| {
+                            let x = x.clamp(0.0, 1.0);
+                            x * x * (3.0 - 2.0 * x)
+                        };
+                        // Stiff again (over a fifth of a second).
+                        let stiff = (f * time / 0.2).clamp(0.0, 1.0);
+                        drive.scale.iter_mut().for_each(|s| *s = limp + (1.0 - limp) * stiff);
+                        let down = mul(up, -1.0);
+                        let front = quat_rotate(hips.q, stood.front);
+                        // Onto its front first (a quarter of the time at most).
+                        let rolling = f < 0.25 && dot(front, down) < 0.6 && dot(trunk, up).abs() < 0.7;
+                        // Then: pushed up and folded by 0.6, standing by 1.
+                        let (push, stand_up) = if rolling { (0.0, 0.0) } else { (smooth((f - 0.2) / 0.35), smooth((f - 0.55) / 0.45)) };
+                        let rb = &mut world.w.bodies[world.handles[r.bones[0].body]];
+                        let w = rb.angvel();
+                        let spin = [w.x as f64, w.y as f64, w.z as f64];
+                        let lever = stood.hips / u;
+                        let inertia = mass * lever * lever * 0.2;
+                        let torque = if rolling {
+                            // About its length, the short way round to face down.
+                            let way = dot(cross(front, down), trunk);
+                            let side = if way.abs() < 0.05 && dot(front, down) < 0.0 { 1.0 } else { way.signum() };
+                            mul(trunk, (side * 14.0 - dot(spin, trunk) * 4.0) * inertia)
+                        } else {
+                            // Toward upright by the time it stands.
+                            let want = blend(rise.q, rise.up, smooth((f - 0.25) / 0.6));
+                            let d = quat_mul(want, conj(hips.q));
+                            let d = if d[3] < 0.0 { d.map(|v| -v) } else { d };
+                            let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                            let turn = if s < 1e-9 { [0.0; 3] } else { mul([d[0] / s, d[1] / s, d[2] / s], 2.0 * libm::atan2(s, d[3])) };
+                            mul(sub(mul(turn, 90.0), mul(spin, 14.0)), inertia)
+                        };
+                        rb.apply_torque_impulse(v3(capped(torque, help * weight * lever), dt), true);
+                        if !rolling {
+                            // Its hips up to where they were, and over its feet.
+                            let high = rise.low + (0.5 * stood.hips - rise.low).max(0.0) * push + (stood.hips - rise.low.max(0.5 * stood.hips)) * stand_up;
+                            let v = rb.linvel();
+                            let moving = [v.x as f64 * u, v.y as f64 * u, v.z as f64 * u];
+                            let off = sub(hips.p, support);
+                            let lift = (high - dot(off, up)) * 70.0 - dot(moving, up) * 14.0;
+                            let over = sub(mul(flat(off), -18.0 * stand_up), mul(flat(moving), 6.0 * stand_up));
+                            let force = capped(mul(add(mul(up, lift), over), mass / u), help * weight);
+                            rb.apply_impulse(v3(force, dt), true);
+                            rise.lifted += dot(force, up).max(0.0) * dt;
+                            // Arms: hands pressed down under the shoulders
+                            // while it pushes up, let go as it stands.
+                            let press = push * (1.0 - stand_up);
+                            if press > 0.0 {
+                                for arm in &self.arms {
+                                    let reach = r.bones[arm.upper].length + r.bones[arm.fore].length;
+                                    let shoulder = world.pose(r.bones[arm.upper].body).p;
+                                    let Some((upper, fore)) = self.aim(world, r, arm, add(shoulder, mul(down, reach * (0.45 + 0.5 * push)))) else { continue };
+                                    for (bone, want) in [(arm.upper, upper), (arm.fore, fore)] {
+                                        let clip = world.clip(r, bone, x).unwrap_or(r.bones[bone].bind);
+                                        drive.targets[bone] = Some(blend(clip, want, press));
+                                    }
+                                }
+                            }
+                            // Legs: folded at the hips and knees (a knee
+                            // bends about its `hinge`), then straightened.
+                            let fold = push * (1.0 - stand_up);
+                            if fold > 0.0 {
+                                for &foot in &self.feet {
+                                    let Some(shin) = r.bones[foot].parent else { continue };
+                                    let (Some(thigh), Some(hinge)) = (r.bones[shin].parent, r.bones[shin].hinge) else { continue };
+                                    let knee = (2.0 * fold).min(r.bones[shin].swing.to_radians());
+                                    let across = quat_rotate(r.bones[shin].bind, hinge);
+                                    drive.targets[shin] = Some(quat_mul(world.clip(r, shin, x).unwrap_or(r.bones[shin].bind), turn(hinge, knee)));
+                                    drive.targets[thigh] = Some(quat_mul(world.clip(r, thigh, x).unwrap_or(r.bones[thigh].bind), turn(across, -(1.5 * fold).min(r.bones[thigh].swing.to_radians()))));
+                                }
+                            }
+                        }
+                        let tilt = libm::acos(dot(trunk, upright).clamp(-1.0, 1.0));
+                        let share = rise.lifted / (weight * (t - rise.start)).max(1e-9);
+                        self.rising = Some(rise);
+                        if f >= 1.0 && height > 0.85 * stand && tilt < 0.35 {
+                            // Up: what share of its weight the force carried.
+                            self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "rise".into(), a: r.id.clone(), b: String::new(), speed: (share * 100.0).round() });
+                            (self.fallen, self.down_since, self.rising, self.still_since) = (None, None, None, None);
+                        } else if f >= 1.6 {
+                            // Not up: it lies again, and tries again.
+                            (self.rising, self.still_since) = (None, None);
+                            self.fallen = Some(t);
+                        }
+                    }
+                }
             } else {
                 // Where it is falling to: its weight's place, carried on
                 // by its speed for the time a fall from this height takes.
@@ -390,7 +538,7 @@ impl Brain {
                         arms[k] = Some((add(centre, mul(unit(across).unwrap_or(side), h.length * 0.7)), *amount));
                     }
                 }
-                BehaviourKind::Balance | BehaviourKind::Step => {}
+                BehaviourKind::Balance | BehaviourKind::Step | BehaviourKind::GetUp => {}
             }
         }
         for (i, used) in using.iter().enumerate() {

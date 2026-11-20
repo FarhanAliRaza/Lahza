@@ -57,6 +57,7 @@ fn instances_of_one_character_walk_as_its_copies_did() {
     let bytes = bake.to_bytes();
     assert_eq!(Bake::from_bytes(&bytes).unwrap(), *bake);
     assert!(bytes == baked(&mut p).to_bytes());
+    assert_eq!(crate::behaviour_tests::pin(&bake), (17657, 11143674950103157318), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // Drawn: the character is there six times, each at its agent's place
     // and its own moment of the clip (the marker is 100 px a second of
     // clip along), and not once more where its keys have it.
@@ -138,6 +139,7 @@ fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
     for i in [0, 1, 2, 4, 5] {
         assert!(level(place(i, n - 1), [1300.0 + i as f64 * 90.0, 0.0, 260.0]) < 30.0, "agent {i}");
     }
+    assert_eq!(crate::behaviour_tests::pin(&bake), (97293, 15291254770378900992), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // Still drawn six times after the fall.
     let frame = Compiled::new(&p).frame(6.0);
     let mut marks = Vec::new();

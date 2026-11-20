@@ -217,3 +217,81 @@ fn probe_arms() {
         }
     }
 }
+
+/// The figure knocked over at 0.5 s, with balance and get_up.
+fn risen(push: [f64; 3], params: Value, seconds: f64) -> Bake {
+    pushed(push, json!([{"type": "balance"}, {"type": "get_up", "params": params}]), seconds)
+}
+
+/// (len, FNV) of a bake's bytes.
+pub(crate) fn pin(bake: &Bake) -> (usize, u64) {
+    let bytes = bake.to_bytes();
+    let mut h = lahza_motion_core::sim::Fnv::default();
+    h.bytes(&bytes);
+    (bytes.len(), h.0)
+}
+
+fn happened(bake: &Bake) -> Vec<(&str, f64, f64)> {
+    bake.events.iter().filter(|e| ["fall", "get_up", "rise"].contains(&e.kind.as_str())).map(|e| (e.kind.as_str(), e.t, e.speed)).collect()
+}
+
+#[test]
+fn it_gets_up_after_a_fall_whichever_way_it_fell() {
+    // Knocked flat from the left, the right, the front and the back.
+    for push in [[3200.0, 0.0, 0.0], [-3200.0, 0.0, 0.0], [0.0, 0.0, 3200.0], [0.0, 0.0, -3200.0]] {
+        let bake = risen(push, json!({}), 10.0);
+        let events = happened(&bake);
+        let kinds: Vec<&str> = events.iter().map(|e| e.0).collect();
+        assert_eq!(kinds, ["fall", "get_up", "rise"], "push {push:?}: {events:?}");
+        let (fall, start, rise) = (events[0], events[1], events[2]);
+        // It lies there first (0.8 s still), and is up 2.4 s or so later.
+        assert!(start.1 - fall.1 > 0.8 && rise.1 - start.1 >= 2.39 && rise.1 - start.1 < 3.9, "push {push:?}: {events:?}");
+        // On the floor in between: its hips 200 px lower than they stood.
+        let low = (0..bake.tracks[0].samples.len()).map(|k| pose(&bake, "hips", k).p[1] - pose(&bake, "hips", 0).p[1]).fold(0.0, f64::max);
+        assert!(low > 190.0, "push {push:?}: its hips dropped {low:.0} px");
+        // Up means up: its hips where they stood (within 12 px), its chest
+        // over them (leaning less as it settles), from the rise to the end.
+        let n = bake.tracks[0].samples.len();
+        for k in ((rise.1 * 30.0) as usize + 30..n).step_by(10) {
+            let (hips, chest) = (pose(&bake, "hips", k).p, pose(&bake, "chest", k).p);
+            assert!((hips[1] - pose(&bake, "hips", 0).p[1]).abs() < 12.0, "push {push:?}, sample {k}: hips at y {}", hips[1]);
+            let lean = ((chest[0] - hips[0]).powi(2) + (chest[2] - hips[2]).powi(2)).sqrt();
+            assert!(lean < 45.0 && chest[1] < hips[1] - 40.0, "push {push:?}, sample {k}: chest {chest:?} over hips {hips:?}");
+        }
+        let sway = dist(pose(&bake, "hips", n - 1).p, pose(&bake, "hips", n - 31).p);
+        assert!(sway < 12.0, "push {push:?}: its hips moved {sway:.1} px in the last second");
+        // What lifted it: the outside force carried a fifth to two fifths
+        // of its weight over the rise (never more than `help`, 0.6).
+        assert!(rise.2 >= 10.0 && rise.2 <= 45.0, "push {push:?}: the force carried {} % of its weight", rise.2);
+    }
+    // Without the force it does not get up (it tries, and lies again); with
+    // a fifth of its weight, not from every fall.
+    let alone = risen([3200.0, 0.0, 0.0], json!({"help": 0}), 10.0);
+    let kinds: Vec<&str> = happened(&alone).iter().map(|e| e.0).collect();
+    assert!(kinds.len() >= 3 && kinds[..2] == ["fall", "get_up"] && !kinds.contains(&"rise"), "{kinds:?}");
+    assert!(pose(&alone, "hips", alone.tracks[0].samples.len() - 1).p[1] - pose(&alone, "hips", 0).p[1] > 150.0);
+    assert!(!happened(&risen([3200.0, 0.0, 0.0], json!({"help": 0.2}), 10.0)).iter().any(|e| e.0 == "rise"));
+    // Without the behaviour it stays down.
+    assert_eq!(happened(&pushed([3200.0, 0.0, 0.0], json!([{"type": "balance"}]), 6.0)).iter().map(|e| e.0).collect::<Vec<_>>(), ["fall"]);
+    // `wait` and `time` are its own.
+    let slow = risen([3200.0, 0.0, 0.0], json!({"wait": 2.0, "time": 3.5}), 12.0);
+    let slow = happened(&slow);
+    assert!(slow.len() == 3 && slow[1].1 - slow[0].1 > 2.0 && slow[2].1 - slow[1].1 >= 3.49, "{slow:?}");
+    // The same take twice, to the byte.
+    let (a, b) = (risen([3200.0, 0.0, 0.0], json!({}), 10.0), risen([3200.0, 0.0, 0.0], json!({}), 10.0));
+    assert_eq!(a.to_bytes(), b.to_bytes());
+    assert_eq!(pin(&a), (139835, 4462705513129200155), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+#[ignore]
+fn explore_getting_up() {
+    for push in [[3200.0, 0.0, 0.0], [-3200.0, 0.0, 0.0], [0.0, 0.0, 3200.0], [0.0, 0.0, -3200.0]] {
+        for help in [1.0, 0.6, 0.4, 0.2, 0.0] {
+            let bake = risen(push, json!({"help": help}), 12.0);
+            let n = bake.tracks[0].samples.len();
+            let heights: Vec<String> = (0..n).step_by(30).map(|k| format!("{:.0}", pose(&bake, "hips", 0).p[1] - pose(&bake, "hips", k).p[1])).collect();
+            println!("push {push:?} help {help}: {:?}\n   hips rise by second: {}", happened(&bake), heights.join(" "));
+        }
+    }
+}

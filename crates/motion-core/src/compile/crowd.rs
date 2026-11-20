@@ -217,15 +217,17 @@ pub(super) struct CHerd {
 struct Palette {
     phases: Vec<Vec<LayerState>>,
     centre: [f64; 3],
+    /// Half its box, and half the box's diagonal.
+    half: [f64; 3],
     radius: f64,
     /// A hash of what it is made of.
     key: u64,
 }
 
 /// Headings and view directions a picture of an agent stands for, to a
-/// turn; and its side, px.
+/// turn; and px across the character's box, corner to corner.
 const HEADINGS: f64 = 16.0;
-const CELL: u32 = 128;
+const CELL: u32 = 160;
 /// The pictures' camera stands this many of the character's radii away.
 const FAR: f64 = 40.0;
 
@@ -304,6 +306,7 @@ impl CHerd {
         let count = ((self.cycle * self.bake.rate * 2.0).round() as usize).clamp(16, 128);
         let inner = Space { world: Mat4::IDENTITY, three_d: space.three_d || l.three_d, dof: None, keyed: true, ..*space };
         let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        let mut skinned = false;
         let phases: Vec<Vec<LayerState>> = (0..count)
             .map(|j| {
                 let tc = self.clip_at + self.shift + j as f64 / count as f64 * self.cycle - l.offset;
@@ -313,12 +316,22 @@ impl CHerd {
                 super::sim::pose_skins_in(l.children(), tc, step, &inner, &mut out);
                 for s in &out {
                     let Content::Mesh(m) = &s.content else { continue };
-                    let Some((a, b)) = m.local_bounds() else { continue };
-                    for corner in 0..8 {
-                        let p = m.world.apply(if corner & 1 == 0 { a[0] } else { b[0] }, if corner & 2 == 0 { a[1] } else { b[1] }, if corner & 4 == 0 { a[2] } else { b[2] });
+                    let mut point = |x: f64, y: f64, z: f64| {
+                        let p = m.world.apply(x, y, z);
                         for k in 0..3 {
                             lo[k] = lo[k].min(p[k]);
                             hi[k] = hi[k].max(p[k]);
+                        }
+                    };
+                    // A skinned mesh is about its joints (padded below); another, its box.
+                    match m.skin.as_ref().filter(|s| !s.joints.is_empty()) {
+                        Some(skin) => {
+                            skinned = true;
+                            skin.joints.iter().for_each(|j| point(j.0[3], j.0[7], j.0[11]));
+                        }
+                        None => {
+                            let Some((a, b)) = m.params.local_bounds() else { continue };
+                            (0..8).for_each(|c| point(if c & 1 == 0 { a[0] } else { b[0] }, if c & 2 == 0 { a[1] } else { b[1] }, if c & 4 == 0 { a[2] } else { b[2] }));
                         }
                     }
                 }
@@ -329,10 +342,13 @@ impl CHerd {
             (lo, hi) = ([-1.0; 3], [1.0; 3]);
         }
         let centre = std::array::from_fn(|k| (lo[k] + hi[k]) / 2.0);
-        let radius = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt() / 2.0;
+        // (Flesh about the outermost joints: a tenth of its height more each way.)
+        let pad = if skinned { 0.1 * (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max) } else { 0.0 };
+        let half: [f64; 3] = std::array::from_fn(|k| (hi[k] - lo[k]) / 2.0 + pad);
+        let radius = half.iter().map(|v| v * v).sum::<f64>().sqrt();
         let mut key = crate::sim::Fnv::default();
         key.str(&format!("{phases:?}"));
-        Palette { phases, centre, radius: radius.max(1e-6), key: key.0 }
+        Palette { phases, centre, half, radius: radius.max(1e-6), key: key.0 }
     }
 }
 
@@ -362,7 +378,10 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
     };
     let eye = crate::sim::inverse(space.cam.view).apply(0.0, 0.0, 0.0);
     let scale = (0..3).map(|k| (0..3).map(|r| herd.rest.0[r * 4 + k].powi(2)).sum::<f64>().sqrt()).fold(0.0, f64::max);
-    let size = 2.2 * palette.radius * scale;
+    // Pictures: px a px of the scene (the character's box is CELL px
+    // corner to corner), and the ones this frame shows so far.
+    let per_px = CELL as f64 / (2.0 * palette.radius * scale);
+    let mut cards: HashMap<(usize, i64, i64, i64), (Arc<str>, f64, f64)> = HashMap::new();
     let first_full = agents.len().saturating_sub(h.full as usize);
     for (rank, &(depth, k, world, phase, turned)) in agents.iter().enumerate() {
         let fallen = (x >= herd.down[k] as f64 && herd.slot[k] != u32::MAX).then(|| h.slots.get(herd.slot[k] as usize)).flatten();
@@ -376,27 +395,31 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
             let d = unit([c[0] - eye[0], c[1] - eye[1], c[2] - eye[2]]);
             let step_angle = std::f64::consts::TAU / HEADINGS;
             let round = |a: f64| (a / step_angle).round().rem_euclid(HEADINGS) as i64;
-            let (az, el) = (round(f64::atan2(d[0], d[2])), ((d[1].clamp(-1.0, 1.0).asin() / step_angle).round() as i64).clamp(-3, 3));
-            let turn = round(turned);
-            let moment = phase * 8 / phases;
-            let name: Arc<str> = format!("\0crowd/{}/{}/{moment}/{turn}/{az}/{el}", l.id, herd.id).into();
-            PENDING.with(|p| {
-                let mut p = p.borrow_mut();
-                if p.iter().any(|x| x.name == name) {
-                    return;
-                }
+            let key = (phase * 8 / phases, round(turned), round(f64::atan2(d[0], d[2])), ((d[1].clamp(-1.0, 1.0).asin() / step_angle).round() as i64).clamp(-3, 3));
+            let (name, w, hgt) = cards.entry(key).or_insert_with(|| {
+                let (moment, turn, az, el) = key;
                 // The character at the origin, turned so; a camera far
-                // off along the way it is seen.
+                // off along the way it is seen, and a picture as large
+                // as the character's box is from there.
                 let (ta, aa, ea) = (turn as f64 * step_angle, az as f64 * step_angle, el as f64 * step_angle);
                 let q = crate::sim::quat_mul([0.0, (ta / 2.0).sin(), 0.0, (ta / 2.0).cos()], herd.q);
                 let stand = Pose { p: [0.0; 3], q }.matrix().then(herd.rest);
                 let at = stand.apply(palette.centre[0], palette.centre[1], palette.centre[2]);
-                let dir = [(aa).sin() * (ea).cos(), (ea).sin(), (aa).cos() * (ea).cos()];
+                let dir = [aa.sin() * ea.cos(), ea.sin(), aa.cos() * ea.cos()];
+                let turned = look(dir).then(stand);
+                let mut reach = [0.0f64; 2];
+                for corner in 0..8 {
+                    let half: [f64; 3] = std::array::from_fn(|a| if corner >> a & 1 == 0 { -palette.half[a] } else { palette.half[a] });
+                    for (a, r) in reach.iter_mut().enumerate() {
+                        *r = r.max((0..3).map(|b| turned.0[a * 4 + b] * half[b]).sum::<f64>().abs());
+                    }
+                }
+                let (w, hgt) = ((2.0 * reach[0] * per_px).ceil().max(2.0), (2.0 * reach[1] * per_px).ceil().max(2.0));
+                let name: Arc<str> = format!("\0crowd/{}/{}/{moment}/{turn}/{az}/{el}", l.id, herd.id).into();
                 let far = FAR * palette.radius * scale;
                 let view = Mat4::translate(0.0, 0.0, far).then(look(dir)).then(Mat4::translate(-at[0], -at[1], -at[2]));
-                let focal = far * CELL as f64 / size;
-                let half = CELL as f64 / 2.0;
-                let cam = crate::space::Camera3 { view, project: Mat4([focal, 0.0, half, 0.0, 0.0, focal, half, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]).then(view), focal, centre: (half, half) };
+                let focal = far * per_px;
+                let cam = crate::space::Camera3 { view, project: Mat4([focal, 0.0, w / 2.0, 0.0, 0.0, focal, hgt / 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]).then(view), focal, centre: (w / 2.0, hgt / 2.0) };
                 let layers = palette.phases[moment * phases / 8]
                     .iter()
                     .filter_map(|piece| {
@@ -408,11 +431,12 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
                         Some(LayerState { id: piece.id.clone(), matrix: cam.project.then(m.world).plane(), opacity: piece.opacity, blend: Blend::Normal, effects: Vec::new(), matte: None, view: Some(cam.view.then(m.world)), content: Content::Mesh(m) })
                     })
                     .collect();
-                p.push(Picture { name: name.clone(), key: palette.key, width: CELL, height: CELL, layers });
+                PENDING.with(|p| p.borrow_mut().push(Picture { name: name.clone(), key: palette.key, width: w as u32, height: hgt as u32, layers }));
+                (name, w, hgt)
             });
             // A card across the way it is seen from, about its middle.
-            let card = Mat4::translate(c[0], c[1], c[2]).then(transpose3(look(d))).then(Mat4::scale(size / CELL as f64, size / CELL as f64, 1.0));
-            out.push(LayerState { id: l.id.clone(), matrix: space.screen(card, true), opacity, blend: Blend::Normal, effects: blur(card), matte: None, content: Content::Image { src: name, size: Some(Vec2::new(CELL as f64, CELL as f64)) }, view: Some(space.cam.view.then(card)) });
+            let card = Mat4::translate(c[0], c[1], c[2]).then(transpose3(look(d))).then(Mat4::scale(1.0 / per_px, 1.0 / per_px, 1.0));
+            out.push(LayerState { id: l.id.clone(), matrix: space.screen(card, true), opacity, blend: Blend::Normal, effects: blur(card), matte: None, content: Content::Image { src: name.clone(), size: Some(Vec2::new(*w, *hgt)) }, view: Some(space.cam.view.then(card)) });
             continue;
         }
         for piece in &palette.phases[phase] {

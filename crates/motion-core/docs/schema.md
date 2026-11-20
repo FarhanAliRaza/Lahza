@@ -763,7 +763,8 @@ Behaviours set the motors' targets on top of the clip, from `from` to
 
 | `type` | what it does; `params` |
 |---|---|
-| `balance` | keeps its weight over its feet: leans at the ankles, and is helped by a force on the hips of at most `assist` (0.25) of its weight and the torque that would make. A push past that topples it; it then goes soft (to `limp`, 0.15, of its strength) and stays down (a `fall` event). `gain` (1): how far it leans. Needs feet (bones named `foot`) |
+| `balance` | keeps its weight over its feet: leans at the ankles, and is helped by a force on the hips of at most `assist` (0.25) of its weight and the torque that would make. A push past that topples it; it then goes soft (to `limp`, 0.15, of its strength) and stays down (a `fall` event) unless it has `get_up`. `gain` (1): how far it leans. Needs feet (bones named `foot`) |
+| `get_up` | with `balance`: once fallen and still for `wait` seconds (0.8) it rolls onto its front, pushes its hands down under its shoulders, folds its hips and knees under it and stands, in `time` seconds (2.4), facing the way its head lay; then it balances and follows its clip again (`get_up` and `rise` events). Its motors shape this, but what lifts and rights it is a force on its hips of at most `help` (0.6) of its weight and the torque that would make: a `rise` event's `speed` is the percent of its weight that force carried over the rise (a fifth to two fifths on the test figure; with `help` 0.2 it mostly fails, with 0 always). Knees fold only where the shin's limit has a `hinge`. One that fails lies again and tries again |
 | `step` | with `balance`: when its weight is headed past its feet by `trigger` px it steps the foot behind to where it is falling to, at most `length` px, in `time` seconds (0.28); a `step` event each. The foot is carried there by a force, its leg soft |
 | `guard` | the nearer hand (or `hand`: `left` \| `right`) to `target` (a body's layer id, or [x, y, z]) as it comes within `within` px |
 | `reach` | a hand to where it was last hit (a `hits` entry, or a body striking it at speed), for `hold` seconds (1.5) |
@@ -810,7 +811,7 @@ px a `cycle`), so feet do not slide and agents are out of step.
 
 | field | meaning |
 |---|---|
-| `agents` | the agents' comps (layer ids) |
+| `agents` | the agents' comps (layer ids); or `character` (below) |
 | `goals` | [x, z] px, one for all or one per agent in turn |
 | `speed`, `vary` | px/s (140) and how much agents differ (0.2: a fifth either way, by `seed`) |
 | `radius`, `height` | an agent's size, px (30; six radii) |
@@ -819,6 +820,38 @@ px a `cycle`), so feet do not slide and agents are out of step.
 | `facing` | the way a character faces in its own space, [x, z] ([0, −1]: toward the viewer, as imported glTF does); agents turn to the way they walk |
 | `knock` | px/s (300): a body striking an agent at this speed or more knocks it down (a `knock` event) |
 | `ragdoll` | `{mass, thickness, friction, limits, shapes}` as a ragdoll's: an agent knocked down falls as a limp ragdoll of the bones under its comp, from the pose its clip had. Without it the agent stops where it stands |
+
+**Instances.** For hundreds or thousands, name one comp as the crowd's
+`character` instead of `agents`: every agent is an instance of it. The
+layer is imported once and is not drawn itself; its keys give every
+agent's level (y), turn and scale, and its clip is the walk.
+
+```json
+"simulation": {"unit": 90, "crowds": [{
+  "id": "walkers", "character": "figure", "count": 1000, "area": [-2000, -2000, 2000, 2000],
+  "march": [900, 0], "full": 150, "speed": 144, "radius": 25, "stride": 144, "cycle": 1,
+  "ragdoll": {"mass": 70, "max": 12}
+}]}
+```
+
+| field | meaning |
+|---|---|
+| `character` | the one comp (a layer of the scene itself) holding the character: meshes and the comps of its skeleton, nothing else |
+| `starts` | where the agents start, [[x, z]] px; or |
+| `count`, `area` | that many spread over [x0, z0, x1, z1] by `seed` (an error names how many fit) |
+| `goals` or `march` | where they go: [[x, z]] as above, or [dx, dz] from where each starts |
+| `full` | how many are drawn as the character's meshes, nearest the camera first (150); the rest are pictures of it |
+| `near` | a depth from the camera (px) past which every agent is a picture |
+| `ragdoll.max` | how many can be down as ragdolls in one take (24); one knocked after that stops where it stands |
+
+The bake keeps four numbers an agent a frame (place, turn, the moment of
+its clip), not a layer's track. An agent is drawn in one of 60 or so
+poses of the clip's cycle, which agents share (one skinned mesh a pose,
+however many agents). A picture is the character seen from the camera's
+side at one of eight moments, sixteen turns and sixteen directions, drawn
+once on the CPU when a frame first needs it and kept (when the lights
+change, again); pictures cast and take no shadows. `knock` events name
+the agent `<crowd>#<n>`.
 
 Bodies bounce off agents (each is a capsule that is moved, not pushed).
 Steering is local: an agent does not plan a path, so a wall across its

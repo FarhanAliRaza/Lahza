@@ -558,6 +558,12 @@ pub enum BehaviourKind {
     Reach,
     /// Both arms up about the head. No params.
     Protect,
+    /// With `balance`: once it has fallen and lain still for `wait`
+    /// seconds it rolls onto its front, pushes up, draws its legs under
+    /// it and stands, in `time` seconds. An outside force on its hips of
+    /// at most `help` × its weight (and the torque that would make)
+    /// lifts and rights it. Params: `wait`, `time`, `help`.
+    GetUp,
 }
 
 /// What sets a ragdoll's motors instead of the clip and behaviours.
@@ -1647,9 +1653,26 @@ mod tests {
             rate: 30.0,
             tracks: vec![Track { id: "box".into(), from: 1, rest: Mat4::scale(2.0, 2.0, 2.0), samples: vec![[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [20.0, 4.0, 0.0, 0.0, 0.0, half, half]], clock: vec![0.0, 0.5, 1.0] }],
             events: vec![SimEvent { t: 1.2, kind: "touch".into(), a: "box".into(), b: "floor".into(), speed: 120.0 }],
+            herds: Vec::new(),
         };
         let back = Bake::from_bytes(&bake.to_bytes()).unwrap();
         assert_eq!(back, bake);
+        // A crowd of instances comes after the rest, when there is one:
+        // two agents, three samples; the second turns the short way
+        // round through ±π, and its clip wraps without running back.
+        let (pi, y) = (std::f32::consts::PI, 800.0);
+        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0] };
+        let with = Bake { herds: vec![herd], ..bake.clone() };
+        let bytes = with.to_bytes();
+        assert_eq!(Bake::from_bytes(&bytes).unwrap(), with);
+        assert!(bytes.len() > bake.to_bytes().len() && Bake::from_bytes(&bytes[..bytes.len() - 3]).is_err());
+        let h = &with.herds[0];
+        assert_eq!(h.len(), 3);
+        let (pose, clock, turn) = h.agent(0, 0.5).unwrap();
+        assert!(pose.p == [5.0, 800.0, 0.0] && (clock - 0.25).abs() < 1e-6 && turn == 0.0);
+        let (pose, clock, turn) = h.agent(1, 0.5).unwrap();
+        assert!((pose.p[2] - 7.0).abs() < 1e-9 && (clock - 0.9).abs() < 1e-6 && (turn.abs() - std::f64::consts::PI).abs() < 1e-6, "{pose:?} {clock} {turn}");
+        assert!(h.agent(1, 9.0).unwrap().0.p[2] == 13.0);
         assert!(Bake::from_bytes(&bake.to_bytes()[..40]).is_err());
         // Before the release the keys stand; after the last sample it holds.
         assert!(bake.world(0, 1.0).is_none());

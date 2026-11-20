@@ -227,3 +227,49 @@ fn a_take_is_directed_baked_read_and_taken_again() {
     assert!(std::fs::read(&file).unwrap() == one);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A crowd of 24 instances of a two-mesh character walking away over a
+/// field, `full` of them drawn as meshes.
+fn herd_shot(name: &str, full: u32) -> (image::RgbaImage, Value) {
+    let (mut tb, _) = toolbox(name);
+    tb.call("project_create", json!({"path": "herd", "duration": 3, "width": 640, "height": 360})).unwrap();
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1", "background": "#101014", "camera": {"orbit": [20, 25], "dolly": -500},
+         "lights": [{"from": [-0.5, -1, -0.6], "intensity": 1.2}, {"type": "ambient", "intensity": 0.4}],
+         "simulation": {"crowds": [{"id": "walkers", "character": "fig", "count": 24, "area": [-200, -300, 840, 900], "march": [60, 400], "full": full, "radius": 28, "speed": 120, "stride": 120}]}},
+        {"op": "add", "id": "fig", "kind": "comp", "three_d": true, "transform": {"position": [320, 300]}, "layers": [
+            {"id": "fig-body", "kind": "mesh", "mesh": {"type": "box", "size": [44, 110], "depth": 26}, "material": {"color": "#3b8cff"}, "transform": {"position": [0, -55]}},
+            {"id": "fig-head", "kind": "mesh", "mesh": {"type": "sphere", "radius": 20}, "material": {"color": "#ffd9b0"}, "transform": {"position": [0, -132]}}
+        ]}
+    ]}))
+    .unwrap();
+    let baked = tb.call("sim_bake", json!({})).unwrap().json;
+    assert_eq!(baked["scenes"][0]["status"], "baked", "{baked:#}");
+    let report = tb.call("check", json!({})).unwrap().json;
+    assert!(sim_issues(&report).is_empty(), "{report:#}");
+    let shot = tb.call("snapshot", json!({"at": [1.5], "width": 640})).unwrap();
+    assert!(shot.json.get("warnings").is_none(), "{:#}", shot.json);
+    (image::load_from_memory(&shot.images[0]).unwrap().to_rgba8(), baked)
+}
+
+#[test]
+fn far_agents_of_a_crowd_are_pictures_that_look_like_the_character() {
+    let (meshes, baked) = herd_shot("herd-meshes", 24);
+    let (cards, _) = herd_shot("herd-cards", 4);
+    // The bake has no track per agent.
+    assert_eq!(baked["scenes"][0]["tracks"], 0, "{baked:#}");
+    assert_eq!(baked["scenes"][0]["agents"], 24, "{baked:#}");
+    // Both show the crowd: about as much of the frame is not background…
+    let drawn = |img: &image::RgbaImage| img.pixels().filter(|p| p[0] as i32 + p[1] as i32 + p[2] as i32 > 3 * 0x14 + 40).count() as f64;
+    let (a, b) = (drawn(&meshes), drawn(&cards));
+    assert!(a > 6000.0, "{a} px of crowd");
+    assert!((b / a - 1.0).abs() < 0.12, "{a} px drawn as meshes, {b} as 4 meshes and 20 pictures");
+    // …in the same places: what one shows and the other does not is a
+    // small part of it (the pictures' turns and moments are rounded, and
+    // they cast no shadows on each other).
+    let differ = meshes.pixels().zip(cards.pixels()).filter(|(p, q)| (0..3).map(|c| (p[c] as i32 - q[c] as i32).abs()).sum::<i32>() > 90).count() as f64;
+    assert!(differ < 0.3 * a, "{differ} px differ of {a} drawn");
+    // And not the same picture: twenty of them are cards.
+    assert!(differ > 0.0);
+    if let Ok(d) = std::env::var("LAHZA_TEST_OUT") { meshes.save(format!("{d}/herd-meshes.png")).unwrap(); cards.save(format!("{d}/herd-cards.png")).unwrap(); eprintln!("drawn {a} {b} differ {differ}"); }
+}
