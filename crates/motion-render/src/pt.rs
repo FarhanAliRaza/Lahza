@@ -33,8 +33,9 @@ pub struct TraceOptions {
     /// motion): for sequences rendered in order, such as an export.
     pub temporal: bool,
     /// The fast mode: few samples at half size, made a clean picture at
-    /// full size by NVIDIA's Ray Reconstruction (`ngx`); without motion
-    /// blur or depth of field. As usual where that is not at hand.
+    /// full size by NVIDIA's Ray Reconstruction (`ngx`). Depth of field
+    /// and motion blur are passes on that picture (`dof_fast`,
+    /// `resolve_fast`), not samples. As usual where that is not at hand.
     pub fast: bool,
     /// The fast mode's motion blur: the shutter, in frames (0: none).
     pub shutter: f32,

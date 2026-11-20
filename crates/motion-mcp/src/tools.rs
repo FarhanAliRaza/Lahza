@@ -277,7 +277,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "from": {"type": "number"}, "to": {"type": "number"}, "audio": {"type": "boolean", "default": true}, "wait": {"type": "boolean"},
                 "pt": {"type": "boolean", "description": "true: path-trace meshes; false: rasterise them; default the project's settings.renderer"}, "samples": {"type": "integer", "description": "path tracing: paths per pixel (default the project's samples, else 64; drafts trace a quarter)"},
                 "denoise": {"type": "boolean", "description": "path tracing: filter the noise (default true; frames also build on the previous ones)"},
-                "fast": {"type": "boolean", "description": "path tracing, fast: two paths a pixel at half size, made the full picture by NVIDIA Ray Reconstruction (needs its shim, `just ngx`; no motion blur or depth of field; default false)"},
+                "fast": {"type": "boolean", "description": "path tracing, fast: two paths a pixel at half size, made the full picture by NVIDIA Ray Reconstruction (needs its shim, `just ngx`), with depth of field and motion blur as passes on that picture; default false"},
                 "profile": {"type": "boolean", "description": "report where the time goes: CPU stages, GPU passes, path tracer work per layer (in the render report)"},
                 "scale": {"type": "number", "description": "output size relative to the project (default 1; e.g. 0.25 for a quick check)"},
                 "every": {"type": "integer", "description": "render every Nth frame only, played at fps/N (default 1): quick checks of long shots"}}), &[]),
