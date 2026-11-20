@@ -723,9 +723,12 @@ impl Renderer {
                 // Sky visibility: the CPU's own rays (a traced picture
                 // is not drawn here: such lists are built rasterised).
                 if let Some(t) = g.trace.and_then(|i| list.traces.get(i as usize)).filter(|t| t.options.sky) {
-                    let (w, h) = (g.target.width as usize, g.target.height as usize / 2);
-                    if let Some(out) = groups.get_mut(g.offset as usize..g.offset as usize + w * h * 2) {
-                        sky_cpu::fill(t, w, h, out, self.threads);
+                    let (w, h) = (g.target.width as usize, g.target.height as usize / 3);
+                    // (Its cards' pictures are groups before it.)
+                    let at = (g.offset as usize).min(groups.len());
+                    let (before, rest) = groups.split_at_mut(at);
+                    if let Some(out) = rest.get_mut(..w * h * 3) {
+                        sky_cpu::fill(t, before, w, h, out, self.threads);
                     }
                     continue;
                 }

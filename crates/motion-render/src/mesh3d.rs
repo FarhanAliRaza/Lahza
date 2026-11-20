@@ -40,6 +40,10 @@ pub struct MeshCache {
     /// group (from the list's texel base) and the group's size. The
     /// list's batches take it (`Batch::set_sky`).
     pub(crate) sky: Option<(u32, u32, u32)>,
+    /// The cards of that list whose pictures its sky visibility already
+    /// made (by their layers' places in the list): `card_item` takes them
+    /// instead of drawing each picture a second time.
+    pub(crate) sky_cards: Vec<(usize, CardPicture)>,
     /// Parsed glTF files (meshes from Blender).
     gltf_files: crate::model::Files,
     /// By key: the mesh, the frame that last used it, and whether it is
@@ -159,6 +163,17 @@ pub(crate) fn see_through(layer: &lahza_motion_core::compile::LayerState) -> boo
         || m.materials.iter().any(|x| x.slang.as_ref().is_some_and(|s| s.see_through))
 }
 
+/// Whether a mesh layer is in the sky visibility's rays (`list.rs`
+/// `sky_list`): not one that blends otherwise than over what is behind it
+/// (a glow hides nothing), a volume (it needs the tracer's marching) or
+/// one whose coverage a Slang surface works out. What is in them hides
+/// the sky where it is at least half opaque (pt.wgsl `sky_blocks`).
+pub(crate) fn in_sky(layer: &lahza_motion_core::compile::LayerState) -> bool {
+    use lahza_motion_core::compile::Content;
+    let Content::Mesh(m) = &layer.content else { return false };
+    layer.blend == lahza_motion_core::document::Blend::Normal && !m.materials.iter().any(|x| x.volume.is_some() || x.slang.as_ref().is_some_and(|s| s.see_through))
+}
+
 impl MeshCache {
     /// `root`: the project folder.
     pub fn new(root: Option<&std::path::Path>) -> Self {
@@ -172,6 +187,10 @@ impl MeshCache {
         self.frame += 1;
         self.batches.clear();
         self.runs.clear();
+        // (A list's runs are numbered from one in every list: two
+        // sub-frames' lists whose layers stand still are then the same
+        // primitives, tags and all: `gpu::same_groups`.)
+        self.serial = 0;
         self.placed.clear();
         self.textures.clear();
         self.last_key = None;
@@ -363,7 +382,15 @@ impl MeshCache {
                 }
                 let b = f32::from_bits;
                 casters.rows.push([b(0), b(0), b(pooled.tris), b(if det < 0.0 { INST_MIRRORED } else { 0 })]);
-                boxes.push(CasterBox::new(pooled.lo, pooled.hi, pooled.reach, &mv));
+                let mut caster = CasterBox::new(pooled.lo, pooled.hi, pooled.reach, &mv);
+                if let Source::Mesh(mesh) = &pooled.source {
+                    caster.points = (mesh.tris.len() <= FRAME_TRIS).then(|| (mesh.clone(), mv));
+                }
+                caster.mean = pooled.mean.map(|m| {
+                    let q = mv.apply(m[0], m[1], m[2]);
+                    ([q[0], q[1], q[2]], pooled.verts as f64)
+                });
+                boxes.push(caster);
                 casters.meshes.push(pooled);
             }
             let casters = Arc::new(casters);
@@ -790,6 +817,10 @@ pub(crate) struct Pooled {
     /// to √3 times the ball: a shadow map's frame takes the lesser). None
     /// where the CPU has no points.
     reach: Option<f64>,
+    /// The mean of its points (a point light's GPU-drawn shadow map is
+    /// aimed at the mean of its casters' points, as the CPU's is). None
+    /// where the CPU has no points.
+    mean: Option<[f64; 3]>,
     /// Per part: the segments its triangles use (highest + 1; 0: none), so
     /// a layer writes materials only for the parts and colours it shows.
     segments: [u32; PARTS],
@@ -910,7 +941,8 @@ impl Pooled {
         }
         let mid: [f64; 3] = std::array::from_fn(|k| (lo[k] + hi[k]) * 0.5);
         let reach = mesh.positions.iter().map(|p| (0..3).map(|k| (p[k] as f64 - mid[k]).powi(2)).sum::<f64>()).fold(0.0, f64::max).sqrt();
-        Self { key, verts: mesh.positions.len() as u32, tris: mesh.tris.len() as u32, source: Source::Mesh(mesh), lo, hi, reach: Some(reach), segments, animated }
+        let mean = (!mesh.positions.is_empty()).then(|| mesh.positions.iter().fold([0.0f64; 3], |m, p| [m[0] + p[0] as f64, m[1] + p[1] as f64, m[2] + p[2] as f64]).map(|v| v / mesh.positions.len() as f64));
+        Self { key, verts: mesh.positions.len() as u32, tris: mesh.tris.len() as u32, source: Source::Mesh(mesh), lo, hi, reach: Some(reach), mean, segments, animated }
     }
 
     /// A Slang mesh the GPU generates (`MeshParams::gpu_generator`): its
@@ -924,7 +956,7 @@ impl Pooled {
         // `_segment` picks is the GPU's to know: all the layer has.
         segments[mesh::PART_FRONT as usize] = if s.outputs.segments { 1 << 16 } else { 1 };
         let (verts, tris, animated) = (s.vertices, s.triangles, params.animated());
-        Some(Self { key, verts, tris, source: Source::Generated(params), lo, hi, reach: None, segments, animated })
+        Some(Self { key, verts, tris, source: Source::Generated(params), lo, hi, reach: None, mean: None, segments, animated })
     }
 
     /// A mesh whose points the GPU moves by the layer's deformer
@@ -944,7 +976,7 @@ impl Pooled {
             segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
         }
         let (verts, tris, animated) = (m.positions.len() as u32, m.tris.len() as u32, params.animated());
-        Ok((verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Deformed { base, params }, lo, hi, reach: None, segments, animated }))
+        Ok((verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Deformed { base, params }, lo, hi, reach: None, mean: None, segments, animated }))
     }
 
     /// A mesh whose points the GPU moves by its joints: `base` has its
@@ -960,7 +992,7 @@ impl Pooled {
             segments[part] = segments[part].max(mesh::tag_segment(tag) + 1);
         }
         let (verts, tris) = (m.positions.len() as u32, m.tris.len() as u32);
-        (verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Skinned { base, matrices }, lo, hi, reach: None, segments, animated: true })
+        (verts > 0 && tris > 0).then_some(Self { key, verts, tris, source: Source::Skinned { base, matrices }, lo, hi, reach: None, mean: None, segments, animated: true })
     }
 
     /// A mesh the GPU generates (`generated`) and moves by the layer's
@@ -971,7 +1003,7 @@ impl Pooled {
         let levels = lahza_motion_core::slang_mesh::gpu_subdivided(generated.verts, generated.tris, params.deform.as_ref()?.subdivide);
         let (verts, tris) = levels.last().copied().unwrap_or((generated.verts, generated.tris));
         let (segments, animated) = (generated.segments, params.animated());
-        Some(Self { key, verts, tris, source: Source::DeformedGenerated { generated, params, levels }, lo, hi, reach: None, segments, animated })
+        Some(Self { key, verts, tris, source: Source::DeformedGenerated { generated, params, levels }, lo, hi, reach: None, mean: None, segments, animated })
     }
 
     /// Rows the mesh takes in the pool.
@@ -1322,6 +1354,12 @@ pub struct Backdrop {
     pub factor: [f64; 2],
 }
 
+/// A flat 3D layer's picture and the quad it lies on (`list.rs`
+/// `card_picture`): the quad in camera space and on the canvas, the
+/// picture's group, its rect. Err: it can't be a card; Ok(None): nothing
+/// to draw.
+pub(crate) type CardPicture = Result<Option<([[f64; 3]; 4], [[f64; 2]; 4], Backdrop, [f64; 4])>, ()>;
+
 /// Whether a mesh layer refracts (some part is glass).
 pub(crate) fn refracts(m: &MeshState) -> bool {
     m.materials.iter().any(|x| x.transmission > 0.0 && !x.unlit && !x.shadow_catcher)
@@ -1371,7 +1409,19 @@ pub struct ShadowJob {
 pub(crate) struct CasterBox {
     pub corners: [[f64; 3]; 8],
     pub round: Option<([f64; 3], [[f64; 3]; 3])>,
+    /// Its points, where the CPU has them and they are few
+    /// (`FRAME_TRIS`), with what places them: a point light's map frames
+    /// a caster that is around the light from these (`seen_from`).
+    pub points: Option<(Arc<Mesh>, lahza_motion_core::space::Mat4)>,
+    /// The mean of its points (camera space) and how many they are
+    /// (None where the CPU has none): where a point light's map is aimed.
+    pub mean: Option<([f64; 3], f64)>,
 }
+
+/// The most triangles of a caster around a point light that its map's
+/// frame is taken from one by one (a floor, a wall, a room's box: few);
+/// one with more is framed by its box cut at the light's plane.
+pub(crate) const FRAME_TRIS: usize = 4096;
 
 impl CasterBox {
     /// Of a mesh with box `lo`..`hi` and `reach`, placed by `mv`.
@@ -1383,7 +1433,84 @@ impl CasterBox {
         let corners = std::array::from_fn(|k| at([if k & 1 != 0 { hi[0] } else { lo[0] }, if k & 2 != 0 { hi[1] } else { lo[1] }, if k & 4 != 0 { hi[2] } else { lo[2] }]));
         let a = mv.0;
         let round = reach.filter(|r| r.is_finite()).map(|r| (at(std::array::from_fn(|k| (lo[k] + hi[k]) * 0.5)), std::array::from_fn(|i| std::array::from_fn(|j| a[i * 4 + j] * r))));
-        Self { corners, round }
+        Self { corners, round, points: None, mean: None }
+    }
+
+    /// Its bounds in a point light's view: x / z and y / z along `u` and
+    /// `v`, z along `axis`, from `pos`, within the view ([-3, 3] each
+    /// way). None: nothing of it is in front of the light.
+    /// With corners on both sides of the light's plane it is framed as
+    /// the CPU's map frames it (`ShadowMap::build`): from its triangles
+    /// that are wholly in front (one with a point behind the light is
+    /// left out there too; the CPU also leaves out a closed surface's
+    /// faces turned from the light, which are within the others' bounds
+    /// but for what is cut away). Where its points are not at hand, from
+    /// its box cut at the light's plane. It was the whole view: a floor
+    /// under any point light, so every such map had texels of 6 / size.
+    pub(crate) fn seen_from(&self, pos: [f64; 3], axis: [f64; 3], u: [f64; 3], v: [f64; 3]) -> Option<[f64; 4]> {
+        let at = |p: [f64; 3]| {
+            let q = sub(p, pos);
+            [dot(q, u), dot(q, v), dot(q, axis)]
+        };
+        fn take(b: &mut [f64; 4], q: [f64; 3]) {
+            let (x, y) = ((q[0] / q[2]).clamp(-3.0, 3.0), (q[1] / q[2]).clamp(-3.0, 3.0));
+            *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+        }
+        let c = self.corners.map(at);
+        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        if c.iter().all(|q| q[2] < 1.0) {
+            return None;
+        }
+        if c.iter().all(|q| q[2] >= 1.0) {
+            for q in c {
+                take(&mut b, q);
+            }
+            // No wider than its ellipsoid is seen (as `span`): the planes
+            // through the light that touch it. One with normal u − t·axis
+            // touches where (m · c)² = |Aᵀ m|²: a quadratic in t = x / z.
+            if let Some((mid, a)) = &self.round {
+                let c = at(*mid);
+                let turned = |d: [f64; 3]| -> [f64; 3] { std::array::from_fn(|j| a[0][j] * d[0] + a[1][j] * d[1] + a[2][j] * d[2]) };
+                let depth = turned(axis);
+                let k = c[2] * c[2] - dot(depth, depth);
+                if c[2] - len3(depth) >= 1.0 && k > 1e-9 {
+                    for (i, d) in [u, v].into_iter().enumerate() {
+                        let side = turned(d);
+                        let (half, last) = (c[i] * c[2] - dot(side, depth), c[i] * c[i] - dot(side, side));
+                        let root = (half * half - k * last).max(0.0).sqrt();
+                        b[i] = b[i].max(((half - root) / k).clamp(-3.0, 3.0));
+                        b[i + 2] = b[i + 2].min(((half + root) / k).clamp(-3.0, 3.0));
+                    }
+                }
+            }
+            return Some(b);
+        }
+        if let Some((mesh, mv)) = &self.points {
+            let seen: Vec<[f64; 3]> = mesh.positions.iter().map(|p| at({
+                let q = mv.apply(p[0] as f64, p[1] as f64, p[2] as f64);
+                [q[0], q[1], q[2]]
+            })).collect();
+            for t in &mesh.tris {
+                let Some(t) = t.iter().map(|k| seen.get(*k as usize).copied().filter(|q| q[2] >= 1.0)).collect::<Option<Vec<_>>>() else { continue };
+                for q in t {
+                    take(&mut b, q);
+                }
+            }
+            return (b[2] >= b[0]).then_some(b);
+        }
+        // The box's corners in front, and where its edges cross the plane.
+        for (i, a) in c.iter().enumerate() {
+            if a[2] >= 1.0 {
+                take(&mut b, *a);
+            }
+            for j in [i ^ 1, i ^ 2, i ^ 4] {
+                if j > i && (a[2] >= 1.0) != (c[j][2] >= 1.0) {
+                    let s = (1.0 - a[2]) / (c[j][2] - a[2]);
+                    take(&mut b, [a[0] + (c[j][0] - a[0]) * s, a[1] + (c[j][1] - a[1]) * s, 1.0]);
+                }
+            }
+        }
+        Some(b)
     }
 
     /// How far it reaches along the unit direction `d`, from and to: its
@@ -1597,6 +1724,9 @@ impl ShadowMap {
         if !(b[2] > b[0] && b[3] > b[1]) {
             return None;
         }
+        if kind == 1 && std::env::var_os("LAHZA_SHADOW_FRAMES").is_some() {
+            eprintln!("shadow frame (CPU, point): {b:?}");
+        }
         let n = size as f64;
         // A two-texel margin all round.
         let (pu, pv) = ((b[2] - b[0]) * 2.0 / n, (b[3] - b[1]) * 2.0 / n);
@@ -1740,32 +1870,35 @@ impl ShadowMap {
         Self::gpu(casters, b, near - pad, far - near + 2.0 * pad, size, softness, 0, l, [0.0; 3], u, v)
     }
 
-    /// A point light's map for the GPU, aimed at the middle of the casters.
+    /// A point light's map for the GPU, aimed as the CPU's (`point`) at
+    /// the mean of the casters' points (each caster's own mean, by how
+    /// many points it has); at the middle of their boxes where a caster's
+    /// points are not at hand. Its frame: `CasterBox::seen_from`.
     fn gpu_point(casters: &Arc<Casters>, boxes: &[CasterBox], pos: [f64; 3], size: usize, softness: f64) -> Option<ShadowMap> {
         let mut m = [0.0; 3];
-        for p in boxes.iter().flat_map(|b| &b.corners) {
-            m = add(m, *p);
+        let mut n = 0.0;
+        if boxes.iter().all(|b| b.mean.is_some()) {
+            for (mean, count) in boxes.iter().filter_map(|b| b.mean) {
+                m = add(m, [mean[0] * count, mean[1] * count, mean[2] * count]);
+                n += count;
+            }
+        } else {
+            for p in boxes.iter().flat_map(|b| &b.corners) {
+                m = add(m, *p);
+            }
+            n = (boxes.len() * 8) as f64;
         }
-        let n = (boxes.len() * 8).max(1) as f64;
+        let n = n.max(1.0);
         let axis = unit3(sub([m[0] / n, m[1] / n, m[2] / n], pos));
         let (u, v) = basis(axis);
         let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-        for corners in boxes.iter().map(|b| &b.corners) {
-            let z: [f64; 8] = std::array::from_fn(|k| dot(sub(corners[k], pos), axis));
-            if z.iter().all(|z| *z < 1.0) {
-                // Behind the light.
-                continue;
-            }
-            if z.iter().any(|z| *z < 1.0) {
-                // Around the light: anywhere in its view.
-                b = [-3.0, -3.0, 3.0, 3.0];
-                continue;
-            }
-            for (p, z) in corners.iter().zip(z) {
-                let q = sub(*p, pos);
-                let (x, y) = ((dot(q, u) / z).clamp(-3.0, 3.0), (dot(q, v) / z).clamp(-3.0, 3.0));
-                b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
-            }
+        for c in boxes.iter().filter_map(|caster| caster.seen_from(pos, axis, u, v)) {
+            b = [b[0].min(c[0]), b[1].min(c[1]), b[2].max(c[2]), b[3].max(c[3])];
+        }
+        // LAHZA_SHADOW_FRAMES: a point map's frame on stderr, here and
+        // in the CPU's `build`, to set the two side by side.
+        if std::env::var_os("LAHZA_SHADOW_FRAMES").is_some() {
+            eprintln!("shadow frame (GPU, point): {b:?}");
         }
         Self::gpu(casters, b, 0.0, 1.0, size, softness, 1, axis, pos, u, v)
     }
@@ -2065,11 +2198,14 @@ impl Batch {
     /// Where the batch's lighting finds how much of the sky a point sees
     /// (motion.wgsl `sky_at`): in the light block's two spare floats, the
     /// group's offset from the list's texel base and its width and height
-    /// (16 bits each; 0: none, the whole sky as before).
-    pub(crate) fn set_sky(&mut self, sky: Option<(u32, u32, u32)>) {
+    /// (16 and 15 bits; 0: none, the whole sky as before). `own` (the top
+    /// bit), for a see-through batch: only texels of its own surfaces,
+    /// which it has where it is at least half opaque; where the texels
+    /// are of what is behind it, the whole sky as before.
+    pub(crate) fn set_sky(&mut self, sky: Option<(u32, u32, u32)>, own: bool) {
         if let (Some((offset, w, h)), true) = (sky, self.light_rows.len() > 6) {
             self.light_rows[3][3] = f32::from_bits(offset);
-            self.light_rows[6][3] = f32::from_bits(w.min(0xffff) | h.min(0xffff) << 16);
+            self.light_rows[6][3] = f32::from_bits(w.min(0xffff) | h.min(0x7fff) << 16 | (own as u32) << 31);
         }
     }
 
@@ -2685,6 +2821,30 @@ impl Batch {
         };
         let mat_base = vert_base + (VROWS * self.verts.len()) as u32;
         (vert_base, mat_base, mat_base + self.materials.len() as u32)
+    }
+
+    /// The stretches of the list's mesh rows `write_shared` wrote for this
+    /// batch or linked it to (from, to): its own, the environment's, each
+    /// shadow map's and its casters' (`list::MeshRead`).
+    pub(crate) fn reads(&self, placed: &HashMap<usize, u32>, compact: bool) -> Vec<[u32; 2]> {
+        let mut out = Vec::new();
+        let mut span = |key: usize, rows: usize| {
+            if let Some(&at) = placed.get(&key) {
+                out.push([at, at + rows as u32]);
+            }
+        };
+        let own = VROWS * self.verts.len() + self.materials.len() + self.light_rows.len() + if compact { self.tris.len() + self.instances.iter().map(|i| i.rows.len()).sum::<usize>() } else { 0 };
+        span(self as *const Self as usize, own);
+        if let Some(env) = &self.env {
+            span(Arc::as_ptr(env) as usize, env.raster.len());
+        }
+        for map in self.shadows.iter().flatten() {
+            span(Arc::as_ptr(map) as usize, map.rows.len());
+            if let Some((_, casters)) = &map.gpu {
+                span(Arc::as_ptr(casters) as usize, casters.rows.len());
+            }
+        }
+        out
     }
 
     /// The batch's primitive on a target whose pixel (x, y) is canvas
@@ -3603,7 +3763,7 @@ fn encode(x: f32) -> f32 {
 }
 
 /// Premultiplied sRGB colour of triangle `tri` at target point `q`.
-fn srgb_decode(x: f32) -> f32 {
+pub(crate) fn srgb_decode(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     if x <= 0.04045 {
         x / 12.92
@@ -3808,7 +3968,11 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
         .then(|| {
             let off = prim.stroke[2].to_bits() as usize + m[lb + 3][3].to_bits() as usize;
             let c = [prim.fill[0] + prim.fill[2] * q[0], prim.fill[1] + prim.fill[3] * q[1]];
-            crate::sky_cpu::at(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16) as i32, c, p[2])
+            let mut g = fnorm(fcross(fsub(pos[1], pos[0]), fsub(pos[2], pos[0])));
+            if fdot(g, p) > 0.0 {
+                g = fmul(g, -1.0);
+            }
+            crate::sky_cpu::at(groups, off, (sky_size & 0xffff) as i32, (sky_size >> 16 & 0x7fff) as i32, sky_size >> 31 != 0, c, p, g)
         })
         .flatten();
     let sky_part = sky.map_or(1.0, |s| s.1);

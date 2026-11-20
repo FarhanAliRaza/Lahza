@@ -486,6 +486,44 @@ fn benchmark_motion_blur_with_still_groups() {
     eprintln!("still groups take {:.0}% of the drifting ones' time", times[0] / times[1] * 100.0);
 }
 
+/// The same for a mesh (`mesh_tests::still_mesh_beside_a_mover`): a comp
+/// with a mesh under a glow that stands still beside a mesh that moves,
+/// against the same frame with the comp's mesh turning a little (so every
+/// sub-frame draws its groups), and against the still one with no group
+/// reused. `--ignored --nocapture benchmark_motion_blur`.
+#[test]
+#[ignore]
+fn benchmark_motion_blur_with_a_still_mesh_group() {
+    let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
+    let mut times = Vec::new();
+    for (name, turn, off) in [("a still mesh group", 0.0, false), ("the same, every group drawn", 0.0, true), ("a turning mesh group", 2.0, false)] {
+        let c = Compiled::new(&crate::mesh_tests::still_mesh_beside_a_mover(960, 540, 8, turn));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, profile: true, ..Default::default() });
+        if !r.is_gpu() {
+            eprintln!("no GPU: {}", r.backend_label());
+            return;
+        }
+        r.render(&c, 0.0);
+        r.profile = Some(Default::default());
+        let frames = 12;
+        crate::gpu::TEST_STILL.with(|t| t.set((off, 0)));
+        let started = std::time::Instant::now();
+        for f in 0..frames {
+            crate::gpu::TEST_STILL.with(|t| t.set((off, t.get().1)));
+            r.render(&c, 0.5 + f as f64 / 30.0);
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        let reused = crate::gpu::TEST_STILL.with(|t| t.replace((false, 0))).1;
+        eprintln!("{name}: {ms:.1} ms a frame, {:.1} groups a frame left as drawn ({})", reused as f64 / frames as f64, r.backend_label());
+        for line in r.profile.as_ref().map(|p| p.summary()).unwrap_or_default() {
+            eprintln!("    {line}");
+        }
+        times.push(ms);
+    }
+    eprintln!("the still mesh group takes {:.0}% of the time with every group drawn, {:.0}% of the turning one's", times[0] / times[1] * 100.0, times[0] / times[2] * 100.0);
+}
+
 /// Phase 1 target: a 1080p scene with 200 animated shapes and text in real
 /// time. `cargo test -p lahza-motion-render --release -- --ignored --nocapture benchmark`
 #[test]

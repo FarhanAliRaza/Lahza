@@ -85,10 +85,38 @@ Not done, and why:
   less, so a round caster no longer widens it. On the shadow test scene
   the frame is the floor's and nothing changes (456 and 472 pixels off
   the CPU's by more than 24 at 4x, before and after): the gain is for
-  round casters with no floor under the light. Still as before: a point
-  light's map (its frame is from the boxes, and a caster with corners on
-  both sides of the light gives the whole view), and meshes the GPU
-  generates (the CPU has no points: their boxes).
+  round casters with no floor under the light.
+  Since, a point light's map (`ShadowMap::gpu_point`,
+  `CasterBox::seen_from`; an area light's is one too): it is aimed as
+  the CPU's is, at the mean of the casters' points (each pooled mesh
+  keeps its own mean; it was the middle of the boxes' corners, another
+  axis and so another frame), and a caster in front of the light is seen
+  no wider than its ball is (the planes through the light that touch its
+  ellipsoid). One with corners on both sides of the light's plane no
+  longer gives the whole view ([-3, 3] each way): it is framed from its
+  triangles wholly in front, as the CPU leaves out one with a point
+  behind the light, where its points are at hand and few (4096
+  triangles: a floor, a wall); else from its box cut at that plane.
+  `gpu_matches_cpu_area_lights` on software Vulkan through the
+  visibility pass at 4x (`LAHZA_MOTION_VIS_REPORT=1`,
+  `LAHZA_SHADOW_FRAMES=1` prints both frames): the CPU's frame is
+  [-0.1350, -0.1964, 0.3989, 0.1300]; the GPU's was [-0.352, -0.164,
+  0.219, 0.292] (1.07 and 1.40 times as wide, about another axis) and is
+  [-0.1351, -0.1964, 0.3989, 0.1302]. Pixels over 3 levels: 699 before,
+  609 after (the rest are the 4x pass's edges); away from edges 13
+  (worst 5) and 7 (worst 4). Seen in the difference picture: the dotted
+  ring along the ball's and the cube's shadows is gone. What that test
+  showed was this, not a caster around the light: its floor crosses the
+  camera and casts nothing, so no caster there is on both sides. That
+  case is tested on its own
+  (`a_point_lights_frame_holds_its_casters_and_little_more`: a floor
+  around the light framed as the CPU frames it; a ball's frame within 5%
+  of its points', its box's a third larger). Not run on the card: the
+  118 pixels there are to be counted again. Still as before: meshes the
+  GPU generates (the CPU has no points: their boxes, and the boxes'
+  middle for the aim as soon as one caster has none), and a closed
+  caster around the light is framed with its faces turned from the light
+  (the CPU leaves those out).
 - **Motion blur: what is left.** A frame takes the sub-frames its motion
   needs (`motion_px` in motion-render's lib.rs), and a sub-frame does not
   draw again what the one before it left as it needs it: a group whose
@@ -108,6 +136,36 @@ Not done, and why:
   against 112: within the noise there, where the time is the passes that
   draw the frame itself. To run on the RTX 3060 (its profile gives the
   passes' times) before any of the "not done" is worth doing.
+  Since, groups with a mesh: per group. `same_groups` goes by what each
+  mesh primitive reads (`list::MeshRead`, written as the batch is
+  placed: its own rows, the environment's, its lights' shadow maps and
+  their casters, its triangles on the target, its tile bins; and the
+  pooled meshes and shadow jobs in those rows), not by the list's mesh
+  rows whole. And it found that no group with a mesh had ever been left
+  as drawn, even with every mesh still: a mesh primitive carries its
+  layer list's number, which went on counting from one sub-frame's list
+  to the next, so the primitives were never the same. The number now
+  starts again in every list (`MeshCache::begin`). Tested through the
+  compute raster and the visibility pass at 4x
+  (`a_still_mesh_group_is_not_drawn_again_beside_a_moving_mesh`: a comp
+  with a mesh under a glow beside a mesh that moves is left as drawn,
+  the frame is bit for bit the one with every group drawn, and a comp
+  whose mesh turns is drawn each time). A mesh under an effect in the
+  same layer list as the moving mesh is still drawn each time, rightly:
+  it reads the list's shadow maps and has the mover as an occluder.
+  `benchmark_motion_blur_with_a_still_mesh_group` (`--ignored`, 960 x
+  540, 8 sub-frames) on Mesa's software Vulkan, the compute raster: 677
+  ms a frame with the group left as drawn (4 groups a frame), 679 with
+  every group drawn, 682 with the comp's mesh turning (657, 676 and 650
+  in another run): within the noise. The wait for the GPU is 10 to 18 ms
+  shorter and telling the stretches apart costs 8 ms of CPU (the two
+  512 x 512 CPU-drawn shadow maps are rows of the list and are compared
+  whole; a list for the visibility pass has no such rows). Nothing is
+  claimed for a card: to run there. Not done: traced frames' groups (a
+  traced group is never the same: its picture is new each sub-frame, and
+  where samples share traces nothing is compared at all), and a mesh
+  primitive still counts as reading the groups before it, so one
+  earlier group that moved has it drawn again.
 - **Image memory: what is left.** Textures are held at the size they show
   (`Images::get_sized`), the pool's budget follows the GPU's memory, and
   new texels are added to the GPU's copy (all of it again only after
@@ -510,12 +568,69 @@ What is left:
   are what keeps flat things even), and the picture
   through the raster's hardware visibility pass, which software Vulkan
   does not have (only the compute raster's shading was run with it).
-- Only solid meshes are in the rays: what is see-through, cards, wires,
-  volumes and shadow catchers neither hide the sky nor take it (they are
-  lit as before).
-- At an edge between near and far the lookup takes the texel nearest in
-  depth, at half the picture's size: steps of two px show there (seen
-  under the slab's front edge).
+- **Cards and see-through meshes hide the sky, and see-through meshes
+  take it: done**, by a fixed rule, nothing drawn by lot. A ray ends on
+  a surface that is at least half opaque (its material's opacity times
+  what it does not let through: pt.wgsl `sky_blocks`, the rule the
+  light's shadow rays had) and on a card where its picture covers more
+  than half; anything less it goes through. So a mesh 0.7 opaque hides
+  the sky as a solid one and one 0.3 opaque hides none of it: a step at
+  one half, where coverage as a ray's weight would be even (a ray going
+  on through each thing it meets: not done, it costs rays).
+  - The sky's list has the list's cards as a traced list has them (the
+    flat 3D layers `emit_run` draws among the meshes; `list.rs`
+    `sky_list` makes their pictures before the group the rays fill, and
+    `card_item` takes those instead of drawing each a second time) and
+    its see-through meshes (`mesh3d::in_sky`).
+  - A card's colour comes back as it is (a card is a flat picture, not
+    lit, in the raster and traced alike: so it has no sky to take, and
+    the camera's ray goes through cards to the surface behind, which
+    keeps its texel).
+  - A see-through batch reads the group for its own surfaces only: it
+    has texels where it is at least half opaque (the camera's ray stops
+    there); where the texels are of what is behind it, it is lit as
+    before (`Batch::set_sky`'s `own`). What is behind a see-through mesh
+    that took the texel reads the nearest plane, as at an edge.
+  - The CPU's BVH has the cards' quads, and reads their pictures from
+    the groups drawn before the sky's (`sky_cpu.rs`).
+  Measured (`sky_tests::cards_and_see_through_meshes_hide_the_sky`,
+  320 x 180, lit by the environment, software Vulkan): the floor under a
+  card lying over it 182 of 255 where it is 212 without the card, and it
+  takes the card's blue as the traced picture does; beside a box 0.7
+  opaque 195 for 208, beside one 0.3 opaque 208; a box 0.99 opaque is
+  lit as a solid one where sky visibility darkens that most (206 and
+  206, 224 without). GPU against CPU: no pixel over 3 levels in the
+  three. Seen: the card's shadow on the floor against the traced one
+  (the traced is grainier at its edge, the same size and tint).
+  Left, lit as before and hiding nothing: volumes (they need the
+  tracer's marching), wires and shadow catchers (now gone through by
+  every ray: before, one that met a catcher first counted as open),
+  meshes that blend otherwise than over what is behind them, meshes
+  whose coverage a Slang surface works out, opacity from a map (the rule
+  reads the material's own), and flat layers under 0.999 opaque (they
+  are not cards). The cost of cards in the rays (their pictures read at
+  each crossing) was not measured.
+- **The two-px steps at an edge between two surfaces: done.** The
+  lookup told surfaces apart by depth alone, so two at nearly one depth
+  mixed, a texel at a time (a crease, a slab's front over the gap under
+  it). The group now has a third row of texels, each surface's own plane
+  (its true normal as two numbers, and where it lies: `sky` had it for
+  the filter), and `sky_at` takes a texel for the shaded point's surface
+  when the point lies in its plane (within 0.01 z + 0.5, the filter's
+  own rule) and it faces as the triangle does (the triangle's true
+  normal: 0.9 and over whole, none under 0.8); with none, the texel
+  whose plane is nearest. A floor seen at a glancing angle is in its
+  texels' plane at every depth, which a tighter depth test was not. The
+  same in `sky_cpu::at`. Measured on a box with a slab over a gap and a
+  block (`sky_tests::an_edge_at_one_depth_has_no_steps`, 320 x 180,
+  software Vulkan and the CPU alike): neighbours on one flat face more
+  than 6 levels apart, 53 before (up to 15 levels), 1 after (9 levels,
+  at the gap's end where three faces meet within a texel); GPU against
+  CPU no pixel over 3 levels. Seen: the staircase under the slab's
+  front edge is a straight dark line. The room's numbers moved a little
+  with it (the contact 0.74 of the plain raster's for 0.72, 29.7 dB
+  from traced for 29.5). The group is half again as large (three rows
+  for two); its cost was not measured again.
 - **The light's second return** is in, from the same rays and no more
   of them: where the picture shows the surface a ray ended on (the texel
   its end is seen in, at its depth), that texel's own first light back,
@@ -528,21 +643,9 @@ What is left:
   third return. Anything mirrored of other things: not done. The fast
   mode has all of it.
 - Not done, with what each needs:
-  - *What is see-through, cards, wires and shadow catchers hiding the
-    sky by their coverage and taking it.* The rays would have to meet
-    cards' pictures and opacities without drawing lots (a fixed
-    threshold, or coverage as a weight on the ray), on the GPU (the
-    cards' structure and pictures given to the sky's list, as a traced
-    list has them) and in the CPU's BVH (the card's quad and its group's
-    texels), and the batches of see-through meshes would read the group
-    at their own depth. Volumes need the tracer's marching: left.
-  - *The two-px steps at an edge between near and far.* The lookup
-    tells surfaces apart by depth alone, and two surfaces at nearly one
-    depth (a slab's front over a box's) mix. It needs each texel's
-    plane against the shaded point's: either the target's focal length
-    in the light block (its two spare floats are used) or the texel's
-    normal in the group (a third row of texels). Tightening the depth
-    test instead makes a floor seen at a glancing angle blocky.
+  - *Wires, shadow catchers and volumes hiding the sky and taking it,
+    and coverage as a ray's weight* in place of the step at one half
+    (above). Volumes need the tracer's marching.
   - *Meshes the GPU generates in its pool* are not in the CPU's rays.
     Their bounds as a stand-in were not added: the CPU's frame does not
     draw such a mesh at all, and a box hiding the sky from the rest
