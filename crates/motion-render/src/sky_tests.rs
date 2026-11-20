@@ -157,6 +157,8 @@ fn measure_sky_visibility() {
         let mut img = r.render(&c, 0.0);
         let started = std::time::Instant::now();
         for k in 1..=4 {
+            // (A still scene's frames are the same lists: drawn each time.)
+            r.last_invalidate();
             img = r.render(&c, k as f64 / 30.0);
         }
         eprintln!("{name}: {:.0} ms a frame ({})", started.elapsed().as_secs_f64() * 250.0, r.backend_label());
@@ -176,6 +178,7 @@ fn measure_sky_visibility() {
         r.render(&c, 0.0);
         let started = std::time::Instant::now();
         for k in 1..=4 {
+            r.last_invalidate();
             r.render(&c, k as f64 / 30.0);
         }
         eprintln!("the CPU, sky visibility {sky}: {:.0} ms a frame", started.elapsed().as_secs_f64() * 250.0);
@@ -234,6 +237,7 @@ fn measure_the_cpus_rays() {
         r.render(&c, 0.0);
         let started = std::time::Instant::now();
         for k in 1..=4 {
+            r.last_invalidate();
             r.render(&c, k as f64 / 30.0);
         }
         eprintln!("the CPU, sky visibility {sky}: {:.0} ms a frame", started.elapsed().as_secs_f64() * 250.0);
