@@ -55,6 +55,7 @@ lahza-motion-audio = { path = "crates/motion-audio" }
 lahza-motion-core = { path = "crates/motion-core" }
 lahza-motion-mcp = { path = "crates/motion-mcp" }
 lahza-motion-render = { path = "crates/motion-render" }
+lahza-motion-sim = { path = "crates/motion-sim" }
 ashpd = { workspace = true }
 async-io = { workspace = true }
 base64 = { workspace = true }

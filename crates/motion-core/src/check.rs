@@ -216,6 +216,17 @@ pub fn check(project: &Project, compiled: &Compiled, options: &Options) -> Repor
             Ok(_) => {}
         }
     }
+    // Simulations: a bake made from what the document now says.
+    for (i, scene) in compiled.scenes.iter().enumerate() {
+        use crate::compile::SimStatus;
+        let id = &*scene.id;
+        match compiled.sim_status(i, options.dir) {
+            SimStatus::None | SimStatus::Fresh { .. } => {}
+            SimStatus::Broken(errors) => issues.extend(errors.into_iter().map(|e| Issue { severity: Severity::Error, kind: "simulation", element: e.split(['.', ':']).next().map(String::from), at: None, message: e })),
+            SimStatus::Unbaked { bodies } => issues.push(issue(Severity::Error, "simulation", Some(id), Some(scene.start), format!("scene '{id}' has {bodies} bodies and no bake: they stand where their keys put them. Bake it (`sim_bake`, or `lahza motion bake`)"))),
+            SimStatus::Stale { bodies } => issues.push(issue(Severity::Error, "simulation", Some(id), Some(scene.start), format!("scene '{id}': its bake is stale (the {bodies} bodies, their shapes or keys, the joints, pushes or settings changed since): what is drawn is the old simulation. Bake it again (`sim_bake`, or `lahza motion bake`)"))),
+        }
+    }
     let fps = compiled.fps();
     let f = fps.as_f64();
     // Uncovered timeline.

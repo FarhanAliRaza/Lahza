@@ -336,6 +336,82 @@ reference.
                "rotation": {"keys": [{"at": 0, "v": 0}, {"at": 4, "v": 90}]}}}
 ```
 
+## Characters: skinned models
+
+`model_import` brings a rigged glTF (Blender: export the armature with
+the mesh, as .glb) in as layers: one comp per node, the skeleton's joints
+among them, and the skinned mesh with `"skin"` naming its joints. The
+file's animation arrives as keys on the joints (rotations as the three
+layer angles, linear between the file's keys). To change the acting, key
+a joint like any layer (`hero-arm_L.transform.rotation`), or shift and
+retime its keys; the mesh follows. Do not move the mesh layer itself:
+its joints place it (move the model's root comp).
+
+## Simulation: things that fall, collide and hang
+
+When something should drop, tumble, stack, knock into something else or
+swing on a rope, do not key it: give the layers a `"body"` and bake.
+
+1. **Bodies.** `"body": {}` on a mesh makes it fall and collide by its
+   shape. What stands still is `"type": "fixed"` (a floor mesh, or the
+   scene's `"simulation": {"ground": {"y": 900}}`). What you key and that
+   pushes other things is `"type": "kinematic"`.
+2. **Start from animation.** A body follows its keys until its `release`
+   and leaves them with the speed they gave it: key a ball in from the
+   side, `"release": "beat:9"`, and it flies on from there. `velocity` and
+   `spin` add to that. `pushes` and the scene's `blasts` kick bodies at
+   times (time references, as keys take them).
+3. **Joints.** `hinge`, `ball`, `slider`, `rope`, `spring`, `fixed` in the
+   scene's `simulation.joints`; leave `b` out to hold a body to the world.
+4. **Bake**: `sim_bake` (shell: `lahza motion bake project.lahza`). It
+   returns the take's events (who touched whom, when, how fast): put a
+   sound effect or a cut on one.
+5. **Look**: `snapshot` at a few times, as for any shot. Change a body, a
+   key, a joint or `seed` and bake again; `check` fails while a bake is
+   missing or stale.
+
+Sizes are real: 100 px is a metre by default (`simulation.unit`), so a
+100 px box falls like a metre-wide crate and a 20 px one like a die. If
+motion reads as slow and heavy, the things are big: raise `unit` or
+`gravity`. Letters and logos with holes or notches collide by their hull
+unless `"shape": {"type": "pieces"}`. Thin fast things that pass through
+each other want `"ccd": true`.
+
+## Directing a body: ragdolls
+
+A character that is hit, falls, stumbles or braces is not keyed: its
+skeleton is a ragdoll (`simulation.ragdolls`, see the schema) and you
+write what happens to it and what it tries to do, on the timeline:
+
+- **What happens**: `hits` on bones at times, bodies thrown at it, the
+  floor. `release` is when physics takes over from the clip.
+- **What it does**: `strength` (0 limp, 1 holding the clip's pose), keyed
+  over time and per limb (`strengths`: the struck leg gives way), and
+  `behaviours` over spans: `balance`, `step`, `guard`, `reach`, `protect`.
+  "Pushed from the left at 2.1 s, raises its arms, stumbles, recovers" is
+  a hit at 2.1, `protect` from 1.8 to 2.6, `balance` and `step` throughout.
+- **A take**: `sim_bake`, then `snapshot` a sheet across the action.
+  The bake's events say what happened (`fall` at 2.9 s, `step` ×3, who
+  touched whom): if it fell and should not have, raise `balance`'s
+  `assist` or soften the hit; if it stood like a post, lower `strength`.
+  `sim_bake {"seed": n}` is another take.
+
+Give knees and elbows `hinge` limits, feet a box `shape`, and set
+`simulation.unit` to the model's px per metre so it weighs what it looks.
+Balance is helped by a bounded force on the hips: it is a stand-in for the
+footwork a real body does, not a model of it.
+
+## Crowds
+
+For many walkers, import the character once per agent (`model_import`
+with ids `p0`, `p1`, …, each at its starting place), then name them in
+`simulation.crowds` with their goals and bake. Set `stride` to what one
+cycle of the walk covers at the model's size (measure the feet in a
+snapshot of the clip) and `speed` near `stride / cycle`. Throw a body at
+them and give the crowd a `ragdoll` for the ones it hits. A hundred
+agents bake in under a second; drawing them is what costs (each is a
+skinned mesh a frame: about a second a frame at 720p on four CPU cores).
+
 ## Footage and Blender
 
 - Footage: `media_import` a clip or image sequence, then add a

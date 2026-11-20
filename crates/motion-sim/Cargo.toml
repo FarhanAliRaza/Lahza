@@ -1,0 +1,20 @@
+[package]
+name = "lahza-motion-sim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Motion engine simulation: rigid bodies, joints and ragdolls stepped with rapier and baked per frame"
+
+[dependencies]
+lahza-motion-core = { path = "../motion-core" }
+# The same result on every machine: no SIMD, no threads, libm's maths.
+rapier3d = { version = "=0.36.1", default-features = false, features = ["dim3", "f32", "std", "enhanced-determinism"] }
+# The same sines on every machine.
+libm = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+# Policies run on the ONNX Runtime the app bundles.
+lahza-camera-matting-runtime = { path = "../camera-matting-runtime" }
+ort = { workspace = true }

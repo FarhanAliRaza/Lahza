@@ -92,6 +92,50 @@ pub fn load_mesh(files: &mut Files, root: Option<&Path>, src: &str, mesh: u32, p
     Ok(Mesh { positions, normals, tris, tags: vec![tag(PART_SIDE, 0); count], edges: vec![0b111; count], uvs })
 }
 
+/// Skin `skin` of `src` as primitive `primitive` of `mesh` takes it: each
+/// point's joints and weights, and the joints' inverse bind matrices in
+/// the layer's axes and px (C · B · C⁻¹ for C = `to_layer`).
+pub fn load_skin(files: &mut Files, root: Option<&Path>, src: &str, mesh: u32, primitive: u32, skin: u32, unit: f64) -> Result<lahza_motion_core::skin::SkinData, String> {
+    use lahza_motion_core::space::Mat4;
+    let path = resolve(root, src);
+    let file = files.get(&path)?;
+    let m = file.document.meshes().nth(mesh as usize).ok_or_else(|| format!("{src}: no mesh {mesh}"))?;
+    let p = m.primitives().nth(primitive as usize).ok_or_else(|| format!("{src}: mesh {mesh} has no primitive {primitive}"))?;
+    let reader = p.reader(|b| file.buffers.get(b.index()).map(|d| &d.0[..]));
+    let joints: Vec<[u16; 4]> = reader.read_joints(0).ok_or_else(|| format!("{src}: mesh {mesh} has no joints (JOINTS_0): it is not skinned"))?.into_u16().collect();
+    let mut weights: Vec<[f32; 4]> = reader.read_weights(0).ok_or_else(|| format!("{src}: mesh {mesh} has no weights (WEIGHTS_0)"))?.into_f32().collect();
+    for w in &mut weights {
+        let sum: f32 = w.iter().sum();
+        if sum > 0.0 {
+            *w = w.map(|v| v / sum);
+        }
+    }
+    let s = file.document.skins().nth(skin as usize).ok_or_else(|| format!("{src}: no skin {skin}"))?;
+    let count = s.joints().count();
+    let sreader = s.reader(|b| file.buffers.get(b.index()).map(|d| &d.0[..]));
+    let sign = [1.0, -1.0, -1.0];
+    let inverse_bind: Vec<Mat4> = match sreader.read_inverse_bind_matrices() {
+        // glTF's matrices are columns: g[c][r].
+        Some(ms) => ms
+            .map(|g| {
+                let mut out = Mat4::IDENTITY;
+                for r in 0..3 {
+                    for c in 0..3 {
+                        out.0[r * 4 + c] = sign[r] * g[c][r] as f64 * sign[c];
+                    }
+                    out.0[r * 4 + 3] = sign[r] * g[3][r] as f64 * unit;
+                }
+                out
+            })
+            .collect(),
+        None => vec![Mat4::IDENTITY; count],
+    };
+    if inverse_bind.len() != count {
+        return Err(format!("{src}: skin {skin} has {count} joints and {} inverse bind matrices", inverse_bind.len()));
+    }
+    Ok(lahza_motion_core::skin::SkinData { joints, weights, inverse_bind })
+}
+
 /// Per-vertex normals from the faces around each vertex.
 fn smooth_normals(p: &[[f32; 3]], tris: &[[u32; 3]]) -> Vec<[f32; 3]> {
     let mut acc = vec![[0.0f32; 3]; p.len()];
@@ -167,6 +211,8 @@ pub struct ImportReport {
     pub meshes: usize,
     pub textures: Vec<String>,
     pub animated_nodes: usize,
+    /// Skinned meshes: their points follow the joints' layers.
+    pub skinned: usize,
     /// Cameras and lights in the file (not imported yet: set the scene's
     /// camera and lights to match).
     pub cameras: Vec<String>,
@@ -243,8 +289,10 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
         file: &'c File,
         o: &'c Import<'c>,
         channels: &'c HashMap<(usize, &'static str), (Vec<f32>, Vec<Vec<f32>>, bool)>,
+        /// Layer ids by node, as the nodes are reached.
+        ids: std::cell::RefCell<HashMap<usize, String>>,
     }
-    let ctx = Ctx { file, o, channels: &channels };
+    let ctx = Ctx { file, o, channels: &channels, ids: Default::default() };
     fn texture(ctx: &Ctx, tex: gltf::texture::Texture, textures: &mut HashMap<usize, String>, report: &mut ImportReport) -> Option<String> {
         let image = tex.source();
         if let Some(p) = textures.get(&image.index()) {
@@ -329,6 +377,7 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
         let o = ctx.o;
         report.nodes += 1;
         let id = unique(format!("{}-{}", o.id, n.name().map(str::to_string).unwrap_or_else(|| format!("node{}", n.index()))));
+        ctx.ids.borrow_mut().insert(n.index(), id.clone());
         let (t, r, s) = n.transform().decomposed();
         let u = o.unit;
         let mut tr = serde_json::Map::new();
@@ -391,8 +440,15 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
                     let last = first + frames.saturating_sub(1);
                     mesh["frame"] = json!({"keys": [{"at": round(o.at), "v": first}, {"at": round(o.at + frames.saturating_sub(1) as f64 / fps), "v": last as f64 + 0.999, "ease": "linear"}]});
                 }
-                children.push(json!({"id": unique(format!("{id}-p{}", p.index())), "kind": "mesh", "mesh": mesh,
-                                     "material": material(ctx, p.material(), textures, report)}));
+                let mut layer = json!({"id": unique(format!("{id}-p{}", p.index())), "kind": "mesh", "mesh": mesh,
+                                       "material": material(ctx, p.material(), textures, report)});
+                // A skin: its joints' nodes for now, their layers once
+                // every node has its id.
+                if let (Some(skin), true) = (n.skin(), p.get(&gltf::Semantic::Joints(0)).is_some()) {
+                    report.skinned += 1;
+                    layer["skin"] = json!({"index": skin.index(), "joints": skin.joints().map(|j| j.index()).collect::<Vec<_>>()});
+                }
+                children.push(layer);
             }
         }
         if let Some(c) = n.camera() {
@@ -414,6 +470,30 @@ pub fn to_layers(file: &File, o: &Import) -> Result<(serde_json::Value, ImportRe
     let mut roots = Vec::new();
     for n in scene.nodes() {
         roots.push(node(&ctx, n, &mut unique, &mut textures, &mut report));
+    }
+    // Skins name their joints' layers.
+    fn name_joints(v: &mut serde_json::Value, ids: &HashMap<usize, String>, missing: &mut bool) {
+        if let Some(joints) = v.get_mut("skin").and_then(|s| s.get_mut("joints")).and_then(serde_json::Value::as_array_mut) {
+            for j in joints {
+                match j.as_u64().and_then(|i| ids.get(&(i as usize))) {
+                    Some(id) => *j = json!(id),
+                    None => *missing = true,
+                }
+            }
+        }
+        if let Some(layers) = v.get_mut("layers").and_then(serde_json::Value::as_array_mut) {
+            for l in layers {
+                name_joints(l, ids, missing);
+            }
+        }
+    }
+    let mut missing = false;
+    let ids = ctx.ids.into_inner();
+    for r in &mut roots {
+        name_joints(r, &ids, &mut missing);
+    }
+    if missing {
+        return Err("a skin's joints are outside the file's scene: export the armature with the mesh".into());
     }
     Ok((json!({"id": o.id, "kind": "comp", "three_d": true, "layers": roots}), report))
 }
@@ -446,4 +526,126 @@ mod tests {
             }
         }
     }
+}
+
+/// A skinned test model written to `dir/arm.gltf` (its buffer inside): a square
+/// column 2 m tall on three joints in a chain (at y = 0, 1 and 2 above a
+/// root at (0.5, 0.2, 0)), its points weighted smoothly from joint to
+/// joint, with an animation that turns the middle joint a quarter about z
+/// over one second. The mesh's own node is moved 0.3 m aside (glTF says a
+/// skinned mesh's node does not place it). For tests and examples: there
+/// is nothing to download.
+#[doc(hidden)]
+pub fn write_test_arm(dir: &Path) -> Result<PathBuf, String> {
+    use serde_json::json;
+    let (root, half, rings) = ([0.5f32, 0.2, 0.0], 0.15f32, 17usize);
+    let mut pos: Vec<[f32; 3]> = Vec::new();
+    let mut nor: Vec<[f32; 3]> = Vec::new();
+    let mut idx: Vec<u32> = Vec::new();
+    // Four faces, each a strip of its own (flat shading).
+    let corners = [[-1.0f32, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+    for f in 0..4 {
+        let (a, b) = (corners[f], corners[(f + 1) % 4]);
+        let n = [(a[0] + b[0]) / 2.0, 0.0, (a[1] + b[1]) / 2.0];
+        let first = pos.len() as u32;
+        for r in 0..rings {
+            let y = 2.0 * r as f32 / (rings - 1) as f32;
+            for c in [a, b] {
+                pos.push([root[0] + c[0] * half, root[1] + y, root[2] + c[1] * half]);
+                nor.push(n);
+            }
+        }
+        for r in 0..rings as u32 - 1 {
+            let k = first + r * 2;
+            // Outward as glTF winds (counter-clockwise seen from outside).
+            idx.extend_from_slice(&[k, k + 2, k + 1, k + 1, k + 2, k + 3]);
+        }
+    }
+    for (y, n, flip) in [(0.0f32, [0.0f32, -1.0, 0.0], false), (2.0, [0.0, 1.0, 0.0], true)] {
+        let first = pos.len() as u32;
+        for c in corners {
+            pos.push([root[0] + c[0] * half, root[1] + y, root[2] + c[1] * half]);
+            nor.push(n);
+        }
+        idx.extend_from_slice(&if flip { [first, first + 2, first + 1, first, first + 3, first + 2] } else { [first, first + 1, first + 2, first, first + 2, first + 3] });
+    }
+    // Joints at heights 0, 1, 2: a point's weight slides from one to the
+    // next over the half metre around the joint between them.
+    let mut joints: Vec<[u16; 4]> = Vec::new();
+    let mut weights: Vec<[f32; 4]> = Vec::new();
+    for p in &pos {
+        let y = p[1] - root[1];
+        let (j, t) = if y < 1.5 { (0u16, ((y - 0.75) / 0.5).clamp(0.0, 1.0)) } else { (1u16, ((y - 1.75) / 0.25).clamp(0.0, 1.0)) };
+        joints.push([j, j + 1, 0, 0]);
+        weights.push([1.0 - t, t, 0.0, 0.0]);
+    }
+    // Inverse binds (columns): each joint's world is a translation.
+    let ibm: Vec<[f32; 16]> = (0..3).map(|j| [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -root[0], -(root[1] + j as f32), -root[2], 1.0]).collect();
+    let times = [0.0f32, 0.5, 1.0];
+    let turns: Vec<[f32; 4]> = [0.0f32, 45.0, 90.0].iter().map(|d| [0.0, 0.0, (d.to_radians() / 2.0).sin(), (d.to_radians() / 2.0).cos()]).collect();
+    let mut bin: Vec<u8> = Vec::new();
+    let mut views = Vec::new();
+    let mut view = |bytes: &[u8], bin: &mut Vec<u8>| {
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        views.push(json!({"buffer": 0, "byteOffset": bin.len(), "byteLength": bytes.len()}));
+        bin.extend_from_slice(bytes);
+        views.len() - 1
+    };
+    let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let v_pos = view(&f32s(&pos.concat()), &mut bin);
+    let v_nor = view(&f32s(&nor.concat()), &mut bin);
+    let v_joints = view(&joints.concat().iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(), &mut bin);
+    let v_weights = view(&f32s(&weights.concat()), &mut bin);
+    let v_idx = view(&idx.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(), &mut bin);
+    let v_ibm = view(&f32s(&ibm.concat()), &mut bin);
+    let v_times = view(&f32s(&times), &mut bin);
+    let v_turns = view(&f32s(&turns.concat()), &mut bin);
+    let n = pos.len();
+    let lo: Vec<f32> = (0..3).map(|k| pos.iter().map(|p| p[k]).fold(f32::INFINITY, f32::min)).collect();
+    let hi: Vec<f32> = (0..3).map(|k| pos.iter().map(|p| p[k]).fold(f32::NEG_INFINITY, f32::max)).collect();
+    let doc = json!({
+        "asset": {"version": "2.0", "generator": "lahza test arm"},
+        "scene": 0,
+        "scenes": [{"nodes": [0, 3]}],
+        "nodes": [
+            {"name": "root", "translation": root, "children": [1]},
+            {"name": "mid", "translation": [0, 1, 0], "children": [2]},
+            {"name": "tip", "translation": [0, 1, 0]},
+            {"name": "arm", "mesh": 0, "skin": 0, "translation": [0.3, 0, 0]}
+        ],
+        "skins": [{"joints": [0, 1, 2], "inverseBindMatrices": 5, "skeleton": 0}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "JOINTS_0": 2, "WEIGHTS_0": 3}, "indices": 4, "material": 0}]}],
+        "materials": [{"name": "skin", "pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.55, 0.35, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.6}}],
+        "animations": [{"name": "bend", "samplers": [{"input": 6, "output": 7, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 1, "path": "rotation"}}]}],
+        "buffers": [{"uri": format!("data:application/octet-stream;base64,{}", base64(&bin)), "byteLength": bin.len()}],
+        "bufferViews": views,
+        "accessors": [
+            {"bufferView": v_pos, "componentType": 5126, "count": n, "type": "VEC3", "min": lo, "max": hi},
+            {"bufferView": v_nor, "componentType": 5126, "count": n, "type": "VEC3"},
+            {"bufferView": v_joints, "componentType": 5123, "count": n, "type": "VEC4"},
+            {"bufferView": v_weights, "componentType": 5126, "count": n, "type": "VEC4"},
+            {"bufferView": v_idx, "componentType": 5125, "count": idx.len(), "type": "SCALAR"},
+            {"bufferView": v_ibm, "componentType": 5126, "count": 3, "type": "MAT4"},
+            {"bufferView": v_times, "componentType": 5126, "count": 3, "type": "SCALAR", "min": [0.0], "max": [1.0]},
+            {"bufferView": v_turns, "componentType": 5126, "count": 3, "type": "VEC4"}
+        ]
+    });
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join("arm.gltf");
+    std::fs::write(&path, serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for k in 0..4 {
+            out.push(if k <= c.len() { T[(n >> (18 - 6 * k) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
 }

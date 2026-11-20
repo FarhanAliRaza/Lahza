@@ -23,6 +23,21 @@ pub struct MeshState {
     pub lighting: Option<Arc<Lighting>>,
     /// Depth of field: [focus depth (camera z), blur px per px of depth].
     pub lens: Option<[f64; 2]>,
+    /// A skinned mesh's pose (set for every skinned mesh of a frame).
+    pub skin: Option<Arc<SkinPose>>,
+}
+
+/// Where a skinned mesh's joints are at one moment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkinPose {
+    /// Which of the file's skins.
+    pub index: u32,
+    /// The joints' layers, in the skin's order.
+    pub ids: Arc<[Arc<str>]>,
+    /// Per joint: its layer's space → the mesh layer's. Empty until the
+    /// frame's joints are placed; a joint that is no layer of the scene
+    /// keeps the mesh's own space.
+    pub joints: Vec<Mat4>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -512,6 +527,8 @@ pub(super) struct CMesh {
     detail: f64,
     displace: Option<(crate::noise::NoiseKind, Prop<f64>, u32, u32, Prop<f64>, [f64; 3], Option<String>)>,
     deform: Option<CSlang>,
+    /// The skin's index in its file and its joints' layers.
+    pub(super) skin: Option<(u32, Arc<[Arc<str>]>)>,
     /// Last parameters, so unchanged frames share one `Arc` (and one
     /// cached mesh in the renderer).
     last: std::sync::Mutex<Option<Arc<MeshParams>>>,
@@ -825,7 +842,11 @@ impl Compiler<'_> {
                 reach: if d.reach.is_finite() { d.reach.abs() } else { 0.0 },
             }
         });
+        if m.skin.is_some() && !matches!(m.mesh, MeshDef::Gltf { .. }) {
+            self.errors.push(format!("{id}.skin: only a glTF mesh has a skin"));
+        }
         CMesh {
+            skin: m.skin.as_ref().filter(|_| matches!(m.mesh, MeshDef::Gltf { .. })).map(|s| (s.index, s.joints.iter().map(|j| Arc::<str>::from(j.as_str())).collect())),
             displace,
             deform,
             shape,
@@ -1149,14 +1170,33 @@ impl CMesh {
             own_color: self.own_color,
             part_colors: std::array::from_fn(|i| self.part_colors[i].iter().map(|c| clamp_color(c.at(t))).collect()),
             lighting: None,
+            skin: self.skin.as_ref().map(|(index, ids)| Arc::new(SkinPose { index: *index, ids: ids.clone(), joints: Vec::new() })),
         }
     }
 }
 
 impl MeshState {
+    /// The mesh's box in its layer's space. A skinned mesh's is around its
+    /// joints, padded by the size it was bound at (no point is farther
+    /// from its joints than that), wherever the pose has carried it.
+    pub fn local_bounds(&self) -> Option<([f64; 3], [f64; 3])> {
+        let (lo, hi) = self.params.local_bounds()?;
+        let Some(skin) = self.skin.as_ref().filter(|s| !s.joints.is_empty()) else { return Some((lo, hi)) };
+        let pad = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+        let (mut a, mut b) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for j in &skin.joints {
+            for k in 0..3 {
+                let v = j.0[k * 4 + 3];
+                a[k] = a[k].min(v - pad);
+                b[k] = b[k].max(v + pad);
+            }
+        }
+        Some((a, b))
+    }
+
     /// Canvas bounds of the mesh's local box (None when it crosses the camera).
     pub fn screen_bounds(&self) -> Option<[f64; 4]> {
-        let (lo, hi) = self.params.local_bounds()?;
+        let (lo, hi) = self.local_bounds()?;
         let m = self.camera.project.then(self.world);
         let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for k in 0..8 {

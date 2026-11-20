@@ -161,7 +161,8 @@ impl MeshPool {
                 // A Slang mesh the GPU was to generate, when its kernel is
                 // not one this GPU takes: from the CPU after all.
                 let mut fallback: Option<lahza_motion_core::mesh::Mesh> = None;
-                if !matches!(r.mesh.source, Source::Mesh(_)) {
+                // (Skinning is Lahza's own kernel: always there.)
+                if !matches!(r.mesh.source, Source::Mesh(_) | Source::Skinned { .. }) {
                     let mut ready = self.generators.ready(context, &r.mesh, id).unwrap_or_else(|e| {
                         self.notes.push(e);
                         false
@@ -184,7 +185,7 @@ impl MeshPool {
                                 (Source::Generated(plain), Some(d)) => lahza_motion_core::mesh::generate(plain).and_then(|mut m| lahza_motion_core::slang_mesh::deform(&mut m, d).map(|_| m)),
                                 _ => continue,
                             },
-                            Source::Mesh(_) => continue,
+                            Source::Mesh(_) | Source::Skinned { .. } => continue,
                         };
                         match made {
                             // (The GPU's subdivided mesh keeps more points
@@ -223,6 +224,39 @@ impl MeshPool {
                         }
                     };
                 }
+                // A skinned mesh: its mesh before the pose in the pool once,
+                // and this frame's pose (three rows a joint) beside it.
+                let mut pose = 0;
+                if let Source::Skinned { base, matrices } = &r.mesh.source {
+                    before = match self.entries.get_mut(&base.key) {
+                        Some(e) => {
+                            e.used = frame;
+                            e.at
+                        }
+                        None => {
+                            let n = base.rows() as u32;
+                            let Some(at) = self.alloc(n, id) else {
+                                self.warning = Some("mesh memory budget reached; some meshes are not drawn".into());
+                                continue;
+                            };
+                            copies.push((rows.len(), at, n));
+                            base.write(&mut rows);
+                            self.uploads += 1;
+                            self.entries.insert(base.key.clone(), Entry { at, rows: n, used: frame, animated: false });
+                            at
+                        }
+                    };
+                    let n = (matrices.len() * 3) as u32;
+                    let Some(at) = self.alloc(n.max(1), id) else {
+                        self.warning = Some("mesh memory budget reached; some meshes are not drawn".into());
+                        continue;
+                    };
+                    copies.push((rows.len(), at, n));
+                    rows.extend(matrices.iter().flatten().copied());
+                    let posed: Arc<[u8]> = r.mesh.key.iter().copied().chain(*b" pose").collect::<Vec<u8>>().into();
+                    self.entries.insert(posed, Entry { at, rows: n.max(1), used: frame, animated: true });
+                    pose = at;
+                }
                 // A mesh the GPU generates and a deformer moves: the
                 // generated mesh in the pool as any other, and room for it
                 // readied for the deformer (this frame's only).
@@ -240,7 +274,7 @@ impl MeshPool {
                                 self.warning = Some("mesh memory budget reached; some meshes are not drawn".into());
                                 continue;
                             };
-                            jobs.push(Job { at, before: 0, weld: None, levels: Vec::new(), mesh: generated.clone() });
+                            jobs.push(Job { at, before: 0, weld: None, levels: Vec::new(), pose: 0, mesh: generated.clone() });
                             self.entries.insert(generated.key.clone(), Entry { at, rows: n, used: frame, animated: generated.animated });
                             at
                         }
@@ -274,7 +308,7 @@ impl MeshPool {
                 };
                 let from_cpu: Option<&lahza_motion_core::mesh::Mesh> = match &r.mesh.source {
                     Source::Mesh(m) => Some(m),
-                    Source::Generated(_) | Source::Deformed { .. } | Source::DeformedGenerated { .. } => fallback.as_ref(),
+                    Source::Generated(_) | Source::Deformed { .. } | Source::DeformedGenerated { .. } | Source::Skinned { .. } => fallback.as_ref(),
                 };
                 match from_cpu {
                     Some(m) => {
@@ -282,7 +316,7 @@ impl MeshPool {
                         Pooled::write_padded(m, r.mesh.verts as usize, &mut rows);
                         self.uploads += 1;
                     }
-                    None => jobs.push(Job { at, before, weld, levels, mesh: r.mesh.clone() }),
+                    None => jobs.push(Job { at, before, weld, levels, pose, mesh: r.mesh.clone() }),
                 }
                 self.entries.insert(r.mesh.key.clone(), Entry { at, rows: n, used: frame, animated: r.mesh.animated });
             }
@@ -385,6 +419,13 @@ impl MeshPool {
                 }
                 rows.extend(levels.iter().map(|(v, t)| v * PROWS as u32 + t));
                 rows.push(m.verts * crate::mesh3d::BROWS as u32 + m.tris);
+            }
+            // A skinned mesh: its mesh before the pose (once), and the pose.
+            if let Source::Skinned { base, matrices } = &m.source {
+                if !self.entries.contains_key(&base.key) && seen.insert(&base.key) {
+                    rows.push(base.rows() as u32);
+                }
+                rows.push((matrices.len() as u32 * 3).max(1));
             }
         }
         rows

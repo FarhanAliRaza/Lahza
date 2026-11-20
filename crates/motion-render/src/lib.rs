@@ -818,3 +818,6 @@ mod mesh_tests;
 
 #[cfg(test)]
 mod sky_tests;
+
+#[cfg(test)]
+mod skin_tests;
