@@ -101,16 +101,20 @@ fn the_sky_is_seen_less_where_things_touch() {
     eprintln!("against the traced picture: {:.1} dB with sky visibility, {:.1} dB without; mean brightness {:.1}, {:.1} without, {:.1} traced", psnr(&a, &t), psnr(&b, &t), mean(&a), mean(&b), mean(&t));
     assert!(psnr(&a, &t) > 23.0 && (mean(&a) / mean(&t) - 1.0).abs() < 0.08, "{:.1} dB, {:.1} for {:.1}", psnr(&a, &t), mean(&a), mean(&t));
     // Large flat things stay even: the wall and the open floor are not
-    // blotchy (the spread of their brightness, in levels; some of it is
-    // the light's own slope, as in the traced picture).
-    let spread = |img: &RgbaImage, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| {
-        let v: Vec<f64> = ys.flat_map(|y| xs.clone().map(move |x| (x, y))).map(|(x, y)| { let p = img.get_pixel(x, y).0; (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.0 }).collect();
-        let m = v.iter().sum::<f64>() / v.len() as f64;
-        (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+    // blotchy. What is left of their brightness, in levels, once its
+    // slope is taken away (each px against the mean of the 33 x 33 around
+    // it: the light's own slope is in the traced picture too).
+    let spread = |img: &RgbaImage, xs: std::ops::Range<i32>, ys: std::ops::Range<i32>| {
+        let l = |x: i32, y: i32| {
+            let p = img.get_pixel(x.clamp(0, img.width() as i32 - 1) as u32, y.clamp(0, img.height() as i32 - 1) as u32).0;
+            (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.0
+        };
+        let v: Vec<f64> = ys.flat_map(|y| xs.clone().map(move |x| (x, y))).map(|(x, y)| l(x, y) - (-16..=16).flat_map(|dy| (-16..=16).map(move |dx| (dx, dy))).map(|(dx, dy)| l(x + dx, y + dy)).sum::<f64>() / 1089.0).collect();
+        (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt()
     };
-    let (wall, floor) = (|img: &RgbaImage| spread(img, 15..95, 8..50), |img: &RgbaImage| spread(img, 15..300, 150..175));
-    eprintln!("the wall's spread {:.2} (plain {:.2}, traced {:.2}), the open floor's {:.2} (plain {:.2}, traced {:.2})", wall(&a), wall(&b), wall(&t), floor(&a), floor(&b), floor(&t));
-    assert!(wall(&a) < wall(&t) + 0.5 && floor(&a) < floor(&t) + 0.5, "blotches: wall {:.2}, floor {:.2}", wall(&a), floor(&a));
+    let (wall, floor) = (|img: &RgbaImage| spread(img, 30..80, 20..40), |img: &RgbaImage| spread(img, 30..290, 158..168));
+    eprintln!("blotches: the wall {:.2} (plain {:.2}, traced {:.2}), the open floor {:.2} (plain {:.2}, traced {:.2})", wall(&a), wall(&b), wall(&t), floor(&a), floor(&b), floor(&t));
+    assert!(wall(&a) < wall(&t) + 0.3 && floor(&a) < floor(&t) + 0.3, "blotches: wall {:.2}, floor {:.2}", wall(&a), floor(&a));
     // Another frame, then this one again.
     with.render(&c, 0.5);
     with.last_invalidate();

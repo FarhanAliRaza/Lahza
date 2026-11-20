@@ -2655,6 +2655,37 @@ fn sky_lit(h: Hit) -> vec3<f32> {
     return b_mat[h.mat].xyz * (1.0 - b_mat[h.mat + 1u].x) * l + b_mat[h.mat + 2u].xyz;
 }
 
+// The texel of the sky's group that camera-space point p is seen in, and
+// one more (0: outside the picture, or behind the camera).
+fn sky_texel(p: vec3<f32>) -> u32 {
+    if p.z <= 1e-3 { return 0u; }
+    let c = vec3<f32>(u.cam.x * p.x / p.z + u.cam.y, u.cam.x * p.y / p.z + u.cam.z, 1.0);
+    let tq = vec3<f32>(dot(u.root0.xyz, c), dot(u.root1.xyz, c), dot(u.root2.xyz, c));
+    let x = floor((tq.x / tq.z - u.place.x) / u.place.z);
+    let y = floor((tq.y / tq.z - u.place.y) / u.place.w);
+    if x < 0.0 || y < 0.0 || x >= f32(u.size.x) || y >= f32(u.size.y) { return 0u; }
+    return u32(y) * u.size.x + u32(x) + 1u;
+}
+
+// The light that comes back a second time: what the surfaces a texel's
+// rays ended on themselves get back from their surroundings, where the
+// picture shows them (the texel the ray's end is seen in, at its depth:
+// `sky` left both, and the mean base colour of what the rays hit). It is
+// that texel's own first light back, as `sky` found it.
+fn sky_second(j: u32) -> vec3<f32> {
+    let kd = b_guides[j * 4u + 2u].xyz;
+    let at = b_guides[j * 4u + 3u];
+    let deep = b_tmp[j * 2u + 1u];
+    var sum = vec3<f32>(0.0);
+    for (var k = 0u; k < 4u; k++) {
+        if at[k] < 0.5 { continue; }
+        let t = u32(at[k]) - 1u;
+        if abs(b_hdr[t * 2u].w - deep[k]) > 0.02 * deep[k] + 0.5 { continue; }
+        sum += b_tmp[t * 2u].xyz;
+    }
+    return kd * sum / f32(max(u.size.w, 1u));
+}
+
 // The camera ray through the middle of texel (x, y).
 fn texel_dir(x: f32, y: f32) -> vec3<f32> {
     let tp = vec3<f32>(u.place.x + u.place.z * (x + 0.5), u.place.y + u.place.w * (y + 0.5), 1.0);
@@ -2705,6 +2736,9 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
     var open = vec4<f32>(0.0);
     var plane = vec4<f32>(0.0);
     var back = vec3<f32>(0.0);
+    var mean_kd = vec3<f32>(0.0);
+    var ends = vec4<f32>(0.0);
+    var deep = vec4<f32>(0.0);
     if h.found && !h.card {
         let flags = u32(b_mat[h.mat + 2u].w);
         if (flags & (FLAG_SHADOW_CATCHER | FLAG_WIRE | FLAG_VOLUME)) == 0u {
@@ -2715,6 +2749,7 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
             let o = offset(h, h.g);
             var sum = vec3<f32>(0.0);
             var n = 0.0;
+            var kd = vec4<f32>(0.0);
             for (var k = 0u; k < rays; k++) {
                 let j = f32(k * 16u + place);
                 let u1 = (j + 0.5) / total;
@@ -2732,8 +2767,15 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
                     continue;
                 }
                 back += sky_lit(far);
+                // (For the second time the light comes back: `sky_second`.)
+                kd += vec4<f32>(b_mat[far.mat].xyz * (1.0 - b_mat[far.mat + 1u].x), 1.0);
+                if k < 4u {
+                    ends[k] = f32(sky_texel(far.p));
+                    deep[k] = far.p.z;
+                }
             }
             back /= f32(rays);
+            if kd.w > 0.0 { mean_kd = kd.xyz / kd.w; }
             open = vec4<f32>(sum / f32(rays), dir.z * h.t);
             plane = vec4<f32>(oct_encode(h.g), dot(h.g, h.p), n / f32(rays));
         }
@@ -2741,6 +2783,9 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
     b_hdr[i * 2u] = open;
     b_hdr[i * 2u + 1u] = plane;
     b_tmp[i * 2u] = vec4<f32>(back, 0.0);
+    b_tmp[i * 2u + 1u] = deep;
+    b_guides[i * 4u + 2u] = vec4<f32>(mean_kd, 0.0);
+    b_guides[i * 4u + 3u] = ends;
 }
 
 // The sixteen texels of `sky` that together have every ray's point, as
@@ -2799,7 +2844,7 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             let place = (u32(y) % 4u) * 4u + u32(x) % 4u;
             sums[place] += vec4<f32>(cj.xyz, gj.w) * wt;
-            backs[place] += b_tmp[j * 2u].xyz * wt;
+            backs[place] += (b_tmp[j * 2u].xyz + sky_second(j)) * wt;
             weights[place] += wt;
         }
     }

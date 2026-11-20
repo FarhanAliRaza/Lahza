@@ -480,18 +480,19 @@ it). What follows is for a card where it is not quick enough.
   - Lit by the environment only: where the ball stands the floor is 0.72
     of the plain raster's (traced: 0.62; the second filter pass softens
     it, 0.69 before), the open floor 0.94 (0.99); the whole picture
-    27.6 dB from the traced one (26.0 dB without sky visibility), 4%
-    darker than traced, one bounce being less than all of them.
+    29.5 dB from the traced one (26.0 dB without sky visibility), 3%
+    darker than traced (27.6 dB and 4% before the light's second
+    return, below).
   - With the default lights: 33.6 dB from the traced picture, 27.3 dB
     without (480 x 270, with the first rule for the light back; at
     1080 x 608 with `sky_lit`, 38.4 dB and 32.5 dB). Seen: the wall takes the floor's light, the ball's underside
     is lit from below, the gap under the slab is dark, as traced.
   - Under a table (a top on four legs, the default lights;
     `sky_tests::measure_under_a_table`): the floor between the legs is
-    170 of 255 where the traced picture has 184 and the plain raster
-    226: 8% darker than traced, the light that comes back a second time
+    173 of 255 where the traced picture has 184 and the plain raster
+    226: 6% darker than traced (170 and 8% before the second return), the light that comes back a second time
     off the floor, the legs and the top's underside missing. The whole
-    picture: 31.1 dB from the traced one, 25.6 dB without.
+    picture: 32.5 dB from the traced one, 25.6 dB without.
 - **One bounce of diffuse light** was to come only if visibility alone
   still looked flat. It did worse than that: every face that looks at
   another lost the light the environment's ground and horizon stood for
@@ -515,8 +516,37 @@ What is left:
 - At an edge between near and far the lookup takes the texel nearest in
   depth, at half the picture's size: steps of two px show there (seen
   under the slab's front edge).
-- A second bounce (the 6%, and 8% under a table), and anything mirrored
-  of other things: not done. The fast mode has them.
+- **The light's second return** is in, from the same rays and no more
+  of them: where the picture shows the surface a ray ended on (the texel
+  its end is seen in, at its depth), that texel's own first light back,
+  times the mean base colour of what the rays hit, is added (pt.wgsl
+  `sky_second`, the same in `sky_cpu.rs`; GPU and CPU still within a
+  level). It closes about a third of the gap (4% to 3%, 8% to 6% under
+  the table). What is left: surfaces the picture does not show send
+  nothing back a second time, the environment at what a ray hits is
+  taken whole (not by what that point sees of it), and there is no
+  third return. Anything mirrored of other things: not done. The fast
+  mode has all of it.
+- Not done, with what each needs:
+  - *What is see-through, cards, wires and shadow catchers hiding the
+    sky by their coverage and taking it.* The rays would have to meet
+    cards' pictures and opacities without drawing lots (a fixed
+    threshold, or coverage as a weight on the ray), on the GPU (the
+    cards' structure and pictures given to the sky's list, as a traced
+    list has them) and in the CPU's BVH (the card's quad and its group's
+    texels), and the batches of see-through meshes would read the group
+    at their own depth. Volumes need the tracer's marching: left.
+  - *The two-px steps at an edge between near and far.* The lookup
+    tells surfaces apart by depth alone, and two surfaces at nearly one
+    depth (a slab's front over a box's) mix. It needs each texel's
+    plane against the shaded point's: either the target's focal length
+    in the light block (its two spare floats are used) or the texel's
+    normal in the group (a third row of texels). Tightening the depth
+    test instead makes a floor seen at a glancing angle blocky.
+  - *Meshes the GPU generates in its pool* are not in the CPU's rays.
+    Their bounds as a stand-in were not added: the CPU's frame does not
+    draw such a mesh at all, and a box hiding the sky from the rest
+    where nothing is drawn would be wrong another way.
 
 Not to do: light probes placed through the scene (irradiance volumes,
 DDGI). They suit large scenes that stand still; these are small and
