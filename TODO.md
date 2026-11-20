@@ -323,14 +323,19 @@ it). What follows is for a card where it is not quick enough.
   `--sky`; off unless asked). A rasterised list with meshes also gives
   its solid meshes to the tracer (`list.rs` `sky_list`: a `Trace` with
   `TraceOptions::sky`, and a group of half the target's size). For each
-  texel the tracer finds the surface it shows and sends two rays from it
+  texel the tracer finds the surface it shows and sends four rays from it
   (`SKY_RAYS`), spread by the cosine, toward points of one fixed set: a
   texel has those of its place in a 4 x 4 tile, so sixteen texels
-  together have 32 directions (pt.wgsl `sky`). An open ray adds its
+  together have 64 directions (pt.wgsl `sky`). An open ray adds its
   direction; one that ends on a surface adds that surface's light: its
   colour under the lights (shadows by rays) and under the sky, horizon
   and ground. `sky_filter` makes the sixteen one value over the texels on
-  the same plane, each place of the tile weighing the same. The group
+  the same plane, each place of the tile weighing the same, and smooths
+  that once more two texels apart: each texel has every direction but
+  each from another point near it, and its value went in steps that
+  showed as blotches on large flat things (two rays and one pass: a
+  wall's brightness spread 1.3 levels where the traced picture's has
+  0.8; now 0.7, and the test holds it there). The group
   holds, a texel, the mean open direction, the open part and the depth,
   and the light that comes back. The raster's shading reads it by depth
   (motion.wgsl `sky_at`): `env_diffuse` along the open direction times
@@ -347,11 +352,11 @@ it). What follows is for a card where it is not quick enough.
     list's top structure every frame. On software Vulkan, 480 x 270,
     five meshes, nothing else running
     (`sky_tests::measure_sky_visibility`, `--ignored`): a frame takes
-    72 ms against 44 ms without. By the profile, summed over five
-    frames: the rays 16 ms, the filter 4.5 ms, the meshes' structures
-    5.5 ms (built once), the top structure 0.6 ms, the tables 34 ms on
-    the CPU, and the kernel's pipeline 1.1 s once. Software Vulkan's
-    numbers. In the editor's preview: not run.
+    87 ms against 47 ms without (72 ms at two rays a texel and one
+    filter pass). By the profile, summed over five frames: the meshes'
+    structures 6 ms (built once), the top structure 0.5 ms, the tables
+    33 ms on the CPU, and the kernel's pipeline 1.1 s once. Software
+    Vulkan's numbers. In the editor's preview: not run.
     With motion blur each sub-frame has its own rays (they are not
     shared as a traced picture's are).
   - *The CPU path.* Not done: the CPU draws as without (tested), so with
@@ -367,15 +372,21 @@ it). What follows is for a card where it is not quick enough.
     builder only asks for sky visibility where the GPU traces.
   Against a traced frame of the same scene (a ball, a box with a slab
   over it, a floor and a wall; 320 x 180 and 480 x 270, 64 paths):
-  - Lit by the environment only: where the ball stands the floor is 0.69
-    of the plain raster's (traced: 0.62), the open floor 0.94 (0.99); the
-    whole picture 25.4 dB from the traced one (26.0 dB without sky
-    visibility: the contacts are there now, but the picture is 6% darker
-    than traced, one bounce being less than all of them, and the light
-    that comes back is blotchy at two rays a texel).
+  - Lit by the environment only: where the ball stands the floor is 0.72
+    of the plain raster's (traced: 0.62; the second filter pass softens
+    it, 0.69 before), the open floor 0.94 (0.99); the whole picture
+    25.8 dB from the traced one (26.0 dB without sky visibility: the
+    contacts are there now, but the picture is 6% darker than traced,
+    one bounce being less than all of them).
   - With the default lights: 33.6 dB from the traced picture, 27.3 dB
     without. Seen: the wall takes the floor's light, the ball's underside
     is lit from below, the gap under the slab is dark, as traced.
+  - Under a table (a top on four legs, the default lights;
+    `sky_tests::measure_under_a_table`): the floor between the legs is
+    169 of 255 where the traced picture has 184 and the plain raster
+    226: 8% darker than traced, the light that comes back a second time
+    off the floor, the legs and the top's underside missing. The whole
+    picture: 30.2 dB from the traced one, 25.6 dB without.
 - **One bounce of diffuse light** was to come only if visibility alone
   still looked flat. It did worse than that: every face that looks at
   another lost the light the environment's ground and horizon stood for
@@ -389,8 +400,8 @@ What is left:
 - Run on the RTX 3060: `cargo test -p lahza-motion-render sky_tests --
   --test-threads=1` and its measure (`--ignored`,
   `LAHZA_MEASURE=1080,1920`): the cost there (rays, filter, the
-  structures of a film's scenes), whether four rays a texel (`SKY_RAYS`)
-  are affordable (they would halve the blotches), and the picture
+  structures of a film's scenes: four rays a texel and two filter passes
+  are what keeps flat things even), and the picture
   through the raster's hardware visibility pass, which software Vulkan
   does not have (only the compute raster's shading was run with it).
 - Only solid meshes are in the rays: what is see-through, cards, wires,
@@ -398,8 +409,8 @@ What is left:
   lit as before).
 - With an environment image the light that comes back is the lights'
   only (the image is not looked up at what the rays hit).
-- A second bounce (the 6%), and anything mirrored of other things: not
-  done. The fast mode has them.
+- A second bounce (the 6%, and 8% under a table), and anything mirrored
+  of other things: not done. The fast mode has them.
 
 Not to do: light probes placed through the scene (irradiance volumes,
 DDGI). They suit large scenes that stand still; these are small and
@@ -719,10 +730,16 @@ Run on the RTX 3060 (`cargo test -p lahza-motion-render -- --test-threads=1`).
   (215 pixels, 103 allowed), `gpu_matches_cpu_surface_detail` (1089, 76:
   the bumps' shading), `gpu_matches_cpu_area_lights` (118, 23: a shadow's
   edge, from the GPU's wider shadow map frame),
-  `defocused_instancer_copies_keep_their_depth` (3, 0). Two assume no Open
+  `defocused_instancer_copies_keep_their_depth` (3, 0). Two assumed no Open
   Image Denoise and Mesa's software Vulkan
   (`pt::physics_tests::{frames_in_flight_are_the_frames_drawn_one_at_a_time,
-  the_denoiser_works_on_the_tracers_memory_where_it_can}`).
+  the_denoiser_works_on_the_tracers_memory_where_it_can}`). Changed, not
+  run on the card: the first now names its denoiser either way (the
+  built-in filter through `Tracer::built_in_denoiser` where it used
+  whatever was installed), the second is skipped off software Vulkan
+  (its stand-in denoiser reads the shared memory as files, which a
+  card's driver is taken not to allow: from reading, to be confirmed
+  there). To run there: those two by name.
   Since, for the four: `LAHZA_MOTION_VIS_REPORT=1` makes every
   GPU-against-CPU comparison say where the two differ instead of failing
   (pixels over 3 levels, how many of them away from an edge and by how

@@ -2637,9 +2637,14 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
 // this texel's plane, facing alike), each place in the 4 × 4 tile
 // weighing the same however many of its texels are among them (at an
 // edge, or on a thin thing, they are not all there: places left out
-// would show as bands). Into the group: the mean open direction (as two
-// numbers), the open part, and the camera depth (0: no surface); and, in
-// as many texels after those, the light that comes back.
+// would show as bands). Each texel then has all the directions, but each
+// from another point near it, and its value goes in steps as a ray's
+// answer changes from one point to the next: on a large flat thing these
+// show as blotches. So the first pass leaves its values in `b_guides`, and
+// a second (`u.denoise.x` texels apart, the same tent on the same plane)
+// smooths them. Into the group: the mean open direction (as two numbers),
+// the open part, and the camera depth (0: no surface); and, in as many
+// texels after those, the light that comes back.
 @compute @workgroup_size(8, 8, 1)
 fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     let w = u.size.x;
@@ -2648,9 +2653,12 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.y * w + id.x;
     let c = b_hdr[i * 2u];
     let g = b_hdr[i * 2u + 1u];
+    let step = i32(u.denoise.x);
     if c.w <= 0.0 {
-        b_groups[u.size.z + i] = vec4<f32>(0.0);
-        b_groups[u.size.z + w * h + i] = vec4<f32>(0.0);
+        if step > 0 {
+            b_groups[u.size.z + i] = vec4<f32>(0.0);
+            b_groups[u.size.z + w * h + i] = vec4<f32>(0.0);
+        }
         return;
     }
     let n0 = oct_decode(g.xy);
@@ -2659,8 +2667,8 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     var weights: array<f32, 16>;
     for (var dy = -2; dy <= 2; dy++) {
         for (var dx = -2; dx <= 2; dx++) {
-            let x = i32(id.x) + dx;
-            let y = i32(id.y) + dy;
+            let x = i32(id.x) + dx * max(step, 1);
+            let y = i32(id.y) + dy * max(step, 1);
             if x < 0 || y < 0 || x >= i32(w) || y >= i32(h) { continue; }
             let j = u32(y) * w + u32(x);
             let cj = b_hdr[j * 2u];
@@ -2672,6 +2680,12 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
             var wt = 1.0;
             if abs(dx) == 2 { wt *= 0.5; }
             if abs(dy) == 2 { wt *= 0.5; }
+            if step > 0 {
+                sums[0] += b_guides[j * 4u] * wt;
+                backs[0] += b_guides[j * 4u + 1u].xyz * wt;
+                weights[0] += wt;
+                continue;
+            }
             let place = (u32(y) % 4u) * 4u + u32(x) % 4u;
             sums[place] += vec4<f32>(cj.xyz, gj.w) * wt;
             backs[place] += b_tmp[j * 2u].xyz * wt;
@@ -2687,6 +2701,11 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
             back += backs[k] / weights[k];
             weight += 1.0;
         }
+    }
+    if step == 0 {
+        b_guides[i * 4u] = sum / max(weight, 1e-6);
+        b_guides[i * 4u + 1u] = vec4<f32>(back / max(weight, 1e-6), 0.0);
+        return;
     }
     b_groups[u.size.z + w * h + i] = vec4<f32>(back / max(weight, 1e-6), 0.0);
     var toward = n0;

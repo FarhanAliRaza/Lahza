@@ -100,6 +100,17 @@ fn the_sky_is_seen_less_where_things_touch() {
     let mean = |img: &RgbaImage| img.pixels().map(|p| p.0[0] as f64 + p.0[1] as f64 + p.0[2] as f64).sum::<f64>() / (img.width() * img.height() * 3) as f64;
     eprintln!("against the traced picture: {:.1} dB with sky visibility, {:.1} dB without; mean brightness {:.1}, {:.1} without, {:.1} traced", psnr(&a, &t), psnr(&b, &t), mean(&a), mean(&b), mean(&t));
     assert!(psnr(&a, &t) > 23.0 && (mean(&a) / mean(&t) - 1.0).abs() < 0.08, "{:.1} dB, {:.1} for {:.1}", psnr(&a, &t), mean(&a), mean(&t));
+    // Large flat things stay even: the wall and the open floor are not
+    // blotchy (the spread of their brightness, in levels; some of it is
+    // the light's own slope, as in the traced picture).
+    let spread = |img: &RgbaImage, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| {
+        let v: Vec<f64> = ys.flat_map(|y| xs.clone().map(move |x| (x, y))).map(|(x, y)| { let p = img.get_pixel(x, y).0; (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.0 }).collect();
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+    };
+    let (wall, floor) = (|img: &RgbaImage| spread(img, 15..95, 8..50), |img: &RgbaImage| spread(img, 15..300, 150..175));
+    eprintln!("the wall's spread {:.2} (plain {:.2}, traced {:.2}), the open floor's {:.2} (plain {:.2}, traced {:.2})", wall(&a), wall(&b), wall(&t), floor(&a), floor(&b), floor(&t));
+    assert!(wall(&a) < wall(&t) + 0.5 && floor(&a) < floor(&t) + 0.5, "blotches: wall {:.2}, floor {:.2}", wall(&a), floor(&a));
     // Another frame, then this one again.
     with.render(&c, 0.5);
     with.last_invalidate();
@@ -145,5 +156,36 @@ fn measure_sky_visibility() {
     keep("lit-with", &a);
     keep("lit-without", &b);
     keep("lit-traced", &t);
+    eprintln!("against the traced picture: {:.1} dB with sky visibility, {:.1} dB without", psnr(&a, &t), psnr(&b, &t));
+}
+
+/// Not a test (`--ignored --nocapture`): under a table (a top on four
+/// legs over the floor, the default lights), where the traced picture has
+/// the light that comes back off the floor and the legs more than once:
+/// how dark the floor under it is with sky visibility, plain and traced.
+#[test]
+#[ignore]
+fn measure_under_a_table() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let leg = |id: &str, x: i32, z: i32| json!({"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [8, 50], "depth": 8}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [x, 105], "z": z}});
+    let mut p = project(json!([
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 900]}, "material": {"preset": "matte", "color": "#d8d0c0"}, "transform": {"position": [160, 130], "rotation_x": 90}},
+        {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 500]}, "material": {"preset": "matte", "color": "#c8d0d8"}, "transform": {"position": [160, 0], "z": 160}},
+        {"id": "top", "kind": "mesh", "mesh": {"type": "box", "size": [150, 8], "depth": 90}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [160, 76]}},
+        leg("a", 92, -38), leg("b", 228, -38), leg("c", 92, 38), leg("d", 228, 38)
+    ]));
+    p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12]})).unwrap();
+    p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let (a, b, t) = (raster(true, false).render(&c, 0.0), raster(false, false).render(&c, 0.0), tracer(64).unwrap().render(&c, 0.0));
+    keep("table-with", &a);
+    keep("table-without", &b);
+    keep("table-traced", &t);
+    // The darkest 9 x 9 px of the traced floor between the legs, and the same place in the others.
+    let (at, _) = (110..210i32).flat_map(|x| (100..150i32).map(move |y| (x, y))).map(|at| (at, around(&t, at.0, at.1, 4))).fold(((0, 0), f64::MAX), |m, v| if v.1 < m.1 { v } else { m });
+    eprintln!("under the table at {at:?}: {:.0} with sky visibility, {:.0} plain, {:.0} traced; the open floor {:.0}, {:.0}, {:.0}", around(&a, at.0, at.1, 4), around(&b, at.0, at.1, 4), around(&t, at.0, at.1, 4), around(&a, 40, 165, 4), around(&b, 40, 165, 4), around(&t, 40, 165, 4));
     eprintln!("against the traced picture: {:.1} dB with sky visibility, {:.1} dB without", psnr(&a, &t), psnr(&b, &t));
 }

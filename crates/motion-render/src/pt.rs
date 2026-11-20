@@ -68,7 +68,7 @@ fn band_rows(width: u32, spp: u32) -> u32 {
 
 /// Rays a texel of the raster's sky visibility (`TraceOptions::sky`):
 /// sixteen texels together have sixteen times as many directions.
-pub const SKY_RAYS: u32 = 2;
+pub const SKY_RAYS: u32 = 4;
 
 /// The fast mode's paths a texel where none are asked for (`spp` 0): with
 /// Ray Reconstruction (of a quarter of the texels), and without.
@@ -1441,6 +1441,12 @@ impl Tracer {
         self.oidn = Some(Ok(crate::oidn::Denoiser::pass_through()));
     }
 
+    /// Tests: the built-in filter, whatever denoiser is installed.
+    #[cfg(test)]
+    pub(crate) fn built_in_denoiser(&mut self) {
+        self.oidn = Some(Err("left out (a test)".into()));
+    }
+
     /// Tests: pictures the denoiser was given.
     #[cfg(test)]
     pub(crate) fn oidn_runs(&self) -> u64 {
@@ -1800,13 +1806,16 @@ impl Tracer {
         let (guides, hdr) = self.work(context, slot, texels);
         let groups_x = [state.size.0.div_ceil(8), state.size.1.div_ceil(8), 1];
         if state.sky {
-            // The texels' rays as one value each, into the group.
-            for &offset in offsets {
-                state.uniforms.size[2] = offset;
-                let mut pass = encoder.compute("sky visibility filter");
-                let mut pc = pass.with(&self.sky_filter);
-                pc.bind(0, &state.data(state.uniforms, groups, images, guides, hdr[0], hdr[1]));
-                pc.dispatch(groups_x);
+            // The texels' rays as one value each, then smoothed into
+            // the group (two texels apart).
+            for (step, offsets) in [(0, &[0][..]), (2, offsets)] {
+                for &offset in offsets {
+                    let u = Uniforms { size: [state.size.0, state.size.1, offset, state.uniforms.size[3]], denoise: [step, 0, 4, 0], ..state.uniforms };
+                    let mut pass = encoder.compute("sky visibility filter");
+                    let mut pc = pass.with(&self.sky_filter);
+                    pc.bind(0, &state.data(u, groups, images, guides, hdr[0], hdr[1]));
+                    pc.dispatch(groups_x);
+                }
             }
             return;
         }
@@ -3263,9 +3272,14 @@ mod physics_tests {
     fn frames_in_flight_are_the_frames_drawn_one_at_a_time() {
         for (blur, oidn) in [(0u32, false), (4, false), (0, true), (4, true)] {
             let (Some(mut one), Some(mut many)) = (sequence_renderer(true, true), sequence_renderer(true, true)) else { return };
-            if oidn {
-                for r in [&mut one, &mut many] {
-                    r.gpu.as_mut().unwrap().tracer_for_tests().unwrap().pass_through_oidn();
+            // (Said either way: a machine with Open Image Denoise would
+            // otherwise use it where the built-in filter is meant.)
+            for r in [&mut one, &mut many] {
+                let tracer = r.gpu.as_mut().unwrap().tracer_for_tests().unwrap();
+                if oidn {
+                    tracer.pass_through_oidn();
+                } else {
+                    tracer.built_in_denoiser();
                 }
             }
             let mut p = rolling();
@@ -3324,6 +3338,12 @@ mod physics_tests {
         let (Some(mut copied), Some(mut shared)) = (sequence_renderer(true, true), sequence_renderer(true, true)) else { return };
         if !shared.gpu.as_ref().unwrap().exports_memory() {
             eprintln!("skipping: the device does not export memory");
+            return;
+        }
+        // The stand-in reads and writes the shared memories as files,
+        // which Mesa's software Vulkan allows and a card's driver does not.
+        if !shared.backend_label().contains("llvmpipe") {
+            eprintln!("skipping: the stand-in denoiser shares memory with software Vulkan only");
             return;
         }
         copied.gpu.as_mut().unwrap().tracer_for_tests().unwrap().pass_through_oidn();
