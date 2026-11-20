@@ -101,6 +101,31 @@ fn instances_of_one_character_walk_as_its_copies_did() {
     }
     // The cards are the farther ones.
     let depth = |l: &LayerState| l.view.unwrap().apply(0.0, 0.0, 0.0)[2];
+    // None changes from the character to its picture in a frame: within
+    // the last tenth of `near` an agent is the character coming in over
+    // its picture (both drawn, the character part see-through, more of
+    // it the nearer); nearer than that it is all there, and past `near`
+    // none of it. (The six are within a twentieth of each other's depth.)
+    {
+        let far = cards.iter().map(|c| depth(c)).fold(f64::INFINITY, f64::min);
+        let drawn = |near: f64| {
+            let mut q = p.clone();
+            let crowd = &mut q.scenes[0].simulation.as_mut().unwrap().crowds[0];
+            (crowd.full, crowd.near) = (6, Some(near));
+            let frame = Compiled::new(&q).frame(1.0);
+            let (mut marks, mut cards) = (Vec::new(), Vec::new());
+            states(&frame.layers, "a0-mark", &mut marks);
+            states(&frame.layers, "a0", &mut cards);
+            assert!(cards.iter().all(|c| c.opacity == 1.0));
+            let mut by_depth: Vec<(f64, f64)> = marks.iter().map(|m| (depth(m), m.opacity)).collect();
+            by_depth.sort_by(|a, b| a.0.total_cmp(&b.0));
+            (by_depth.iter().map(|m| m.1).collect::<Vec<f64>>(), cards.len())
+        };
+        let (coming, under) = drawn(far * 1.04);
+        assert!(coming.len() == 6 && under == 6 && coming.iter().all(|o| *o > 0.0 && *o < 1.0), "{coming:?} over {under} pictures");
+        assert_eq!(drawn(far * 2.0), (vec![1.0; 6], 0));
+        assert_eq!(drawn(far * 0.5), (vec![], 6));
+    }
     let nearest_card = cards.iter().map(|c| depth(c)).fold(f64::INFINITY, f64::min);
     assert!(marks.iter().all(|m| depth(m) < nearest_card + 250.0));
     // The same frame asked for twice names the same pictures.
@@ -342,4 +367,59 @@ fn an_agent_raises_its_guard_at_what_is_coming_and_is_drawn_in_it() {
     assert!(e.contains("crowds.0.guard: only a crowd of instances"), "{e}");
     layered.bakes.clear();
     assert_eq!(crate::behaviour_tests::pin(&bake), (18476, 11403343376360516901), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn a_light_that_moves_makes_new_pictures_a_step_not_a_frame() {
+    // Six instances standing where they are, all as pictures, under a
+    // sun that drifts some eight degrees and brightens by a tenth in a
+    // second (and one that swings a quarter round and half as bright
+    // again in that second).
+    let scene = |lights: Value| {
+        let mut c = json!({"id": "walkers", "character": "a0", "starts": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(),
+            "goals": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(), "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0, "full": 0});
+        c["dodge"] = json!(0);
+        project(json!({"id": "s1", "lights": lights, "simulation": {"crowds": [c]}, "layers": [floor(), agent(0, 300.0, 0.0)]}), 1.0)
+    };
+    // How many makings the frames of the second ask for: a picture is
+    // made anew when its key is not the one it was last made with.
+    let makings = |p: &mut Project| {
+        baked(p);
+        let c = Compiled::new(p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let mut held: std::collections::HashMap<std::sync::Arc<str>, u64> = Default::default();
+        let (mut made, mut shown) = (0, 0);
+        for k in 0..30 {
+            for picture in &c.frame(k as f64 / 30.0).pictures {
+                shown += 1;
+                if held.insert(picture.name.clone(), picture.key) != Some(picture.key) {
+                    made += 1;
+                }
+            }
+        }
+        (made, shown)
+    };
+    let still = json!([{"from": [-0.5, -1.0, -0.8], "intensity": 1.2}, {"type": "ambient", "intensity": 0.3}]);
+    let sun = |to: [f64; 3], brighter: f64| json!([{"from": {"keys": [{"at": 0, "v": [-0.5, -1.0, -0.8]}, {"at": 1, "v": to, "ease": "linear"}]}, "intensity": {"keys": [{"at": 0, "v": 1.0}, {"at": 1, "v": brighter, "ease": "linear"}]}}, {"type": "ambient", "intensity": 0.3}]);
+    let moving = sun([-0.3, -1.0, -0.8], 1.1);
+    let (once, shown) = makings(&mut scene(still));
+    let (stepped, shown_moving) = makings(&mut scene(moving.clone()));
+    let (fast, _) = makings(&mut scene(sun([0.8, -1.0, -0.5], 1.5)));
+    eprintln!("{once} makings of {shown} showings under a still light; {stepped} of {shown_moving} under one that drifts; {fast} under one that swings");
+    // Still: each picture made once (they stand: one moment each).
+    assert!(once <= 6 && shown >= 30);
+    // Drifting: before, every showing was a making (its lights were part
+    // of its key to the last bit). Now one a step of the light: its
+    // eight degrees are two or three steps, its tenth brighter two.
+    assert!(stepped <= shown_moving / 4 && stepped > once, "{stepped} makings of {shown_moving} showings");
+    // (A light that swings a quarter round in a second takes a step
+    // nearly every frame: that one is still a making a frame.)
+    assert!(fast > shown_moving / 2);
+    // A picture is what its key says: the same frame asked for first or
+    // last carries the same pictures.
+    let mut p = scene(moving);
+    baked(&mut p);
+    let (a, b) = (Compiled::new(&p), Compiled::new(&p));
+    b.frame(0.2);
+    assert_eq!(a.frame(0.7).pictures, b.frame(0.7).pictures);
 }

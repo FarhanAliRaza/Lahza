@@ -262,8 +262,12 @@ pub(super) fn take_pictures(lighting: &dyn Fn() -> Arc<meshes::Lighting>) -> Vec
     if pictures.is_empty() {
         return Vec::new();
     }
-    let lighting = lighting();
-    // (Its lights are part of what a picture is.)
+    // Its lights are part of what a picture is, to a step: a picture is
+    // lit by the scene's lights as they are to the nearest step of
+    // `stepped`, so a light that moves or dims a little is the same
+    // picture, and one that is animated makes a new one a step, not a
+    // frame.
+    let lighting = Arc::new(stepped(&lighting()));
     let mut lit = crate::sim::Fnv::default();
     lit.str(&format!("{lighting:?}"));
     let lit = lit.0;
@@ -275,6 +279,42 @@ pub(super) fn take_pictures(lighting: &dyn Fn() -> Arc<meshes::Lighting>) -> Vec
             Arc::new(p)
         })
         .collect()
+}
+
+/// `lighting` to the nearest step: a direction to a sixteenth in each
+/// part (under four degrees), a light's colour, the sky's and the
+/// exposure to a sixteenth of a stop (four in a hundred), a light's
+/// place and size to a sixteenth of how far off it is.
+fn stepped(lighting: &meshes::Lighting) -> meshes::Lighting {
+    let level = |v: f64| if v > 1e-9 { crate::dm::exp2((crate::dm::log2(v) * 16.0).round() / 16.0) } else { 0.0 };
+    let colour = |c: [f64; 3]| c.map(level);
+    let way = |d: [f64; 3]| {
+        let q = d.map(|v| (v * 16.0).round() / 16.0);
+        let l = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt();
+        if l > 1e-9 { q.map(|v| v / l) } else { d }
+    };
+    let place = |p: [f64; 3], by: f64| p.map(|v| (v / by).round() * by);
+    let mut out = lighting.clone();
+    for l in &mut out.lights {
+        l.color = colour(l.color);
+        match l.kind {
+            crate::document::LightKind::Directional => l.vector = way(l.vector),
+            _ => {
+                let by = ((l.vector[0] * l.vector[0] + l.vector[1] * l.vector[1] + l.vector[2] * l.vector[2]).sqrt() / 16.0).max(1.0);
+                let by = crate::dm::exp2(crate::dm::log2(by).ceil());
+                (l.vector, l.u, l.v, l.range) = (place(l.vector, by), place(l.u, by / 4.0), place(l.v, by / 4.0), (l.range / by).round() * by);
+            }
+        }
+        l.softness = (l.softness * 16.0).round() / 16.0;
+    }
+    (out.env.sky, out.env.horizon, out.env.ground) = (colour(out.env.sky), colour(out.env.horizon), colour(out.env.ground));
+    for lobe in &mut out.env.lobes {
+        (lobe.dir, lobe.color, lobe.size) = (way(lobe.dir), colour(lobe.color), (lobe.size * 64.0).round() / 64.0);
+    }
+    out.env.image_intensity = level(out.env.image_intensity);
+    out.env.image_rotation = (out.env.image_rotation * 32.0).round() / 32.0;
+    out.exposure = level(out.exposure);
+    out
 }
 
 /// Binds each crowd of instances the bake has to its character's layer.
@@ -465,9 +505,20 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
     let per_px = CELL as f64 / (2.0 * palette.radius * scale);
     let mut cards: HashMap<(usize, i64, i64, i64), (Arc<str>, f64, f64)> = HashMap::new();
     let first_full = agents.len().saturating_sub(h.full as usize);
+    // The farthest of those drawn as the character come in over its
+    // picture: the first of them a little of the character on all of the
+    // picture, and so on (an eighth of them, twelve at most; and the last
+    // tenth of `near`), so none changes from one to the other in a frame.
+    let band = if first_full > 0 { (h.full as usize / 8).min(12) } else { 0 };
+    let shown = |rank: usize, depth: f64| -> f64 {
+        let by_rank = if rank < first_full { 0.0 } else if rank < first_full + band { (rank - first_full + 1) as f64 / (band + 1) as f64 } else { 1.0 };
+        let by_depth = h.near.map_or(1.0, |d| ((d - depth) / (0.1 * d).max(1e-9)).clamp(0.0, 1.0));
+        by_rank.min(by_depth)
+    };
     for (rank, &(depth, k, world, phase, turned)) in agents.iter().enumerate() {
         let fallen = (x >= herd.down[k] as f64 && herd.slot[k] != u32::MAX).then(|| h.slots.get(herd.slot[k] as usize)).flatten();
-        if fallen.is_none() && !(rank >= first_full && h.near.is_none_or(|d| depth <= d)) {
+        let solid = if fallen.is_some() { 1.0 } else { shown(rank, depth) };
+        if solid < 1.0 {
             // A picture of it: the character seen from where the camera
             // is, as it is turned, at one of eight moments of its clip.
             if depth <= 1.0 {
@@ -523,7 +574,9 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
             // A card across the way it is seen from, about its middle.
             let card = Mat4::translate(c[0], c[1], c[2]).then(transpose3(look(d))).then(Mat4::scale(1.0 / per_px, 1.0 / per_px, 1.0));
             out.push(LayerState { id: l.id.clone(), matrix: space.screen(card, true), opacity, blend: Blend::Normal, effects: blur(card), matte: None, content: Content::Image { src: name.clone(), size: Some(Vec2::new(*w, *hgt)) }, view: Some(space.cam.view.then(card)) });
-            continue;
+            if solid <= 0.0 {
+                continue;
+            }
         }
         let posed = match (quarters(k), fallen) {
             (q @ 1.., None) => h.guarded(palette, phase, q),
@@ -542,7 +595,7 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
             m.world = w;
             m.camera = space.cam;
             m.lens = lens;
-            out.push(LayerState { id: piece.id.clone(), matrix: space.screen(w, true), opacity: opacity * piece.opacity, blend: piece.blend, effects: blur(w), matte: None, view: Some(space.cam.view.then(w)), content: Content::Mesh(m) });
+            out.push(LayerState { id: piece.id.clone(), matrix: space.screen(w, true), opacity: opacity * piece.opacity * solid, blend: piece.blend, effects: blur(w), matte: None, view: Some(space.cam.view.then(w)), content: Content::Mesh(m) });
         }
     }
 }
