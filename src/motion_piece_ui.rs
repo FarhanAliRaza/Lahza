@@ -180,7 +180,8 @@ impl Studio {
         let time = self.timeline_display_time();
         // One question for every drag: a piece on the timeline, or a value,
         // a layer or a key of the open piece.
-        let proxy = self.video_playing || self.motion_piece_drag.is_some() || self.motion_layer_drag.is_some();
+        let (playing, dragging) = (self.video_playing, self.motion_piece_drag.is_some() || self.motion_layer_drag.is_some());
+        let proxy = playing || dragging;
         let media = self.media_dimensions().map(|(w, h)| {
             let s = (canvas.0 / w as f64).min(canvas.1 / h as f64).min(1.0) * if proxy { 0.5 } else { 1.0 };
             (((w as f64 * s).round() as u32).max(2), ((h as f64 * s).round() as u32).max(2))
@@ -189,7 +190,7 @@ impl Studio {
         let old = pieces.take_frames();
         self.retired_images.extend(old);
         let pieces = self.motion_pieces.as_mut().unwrap();
-        pieces.request(time, canvas.0, media, proxy);
+        pieces.request(time, canvas.0, media, playing, dragging);
         if !pieces.any_active(time, Placement::Full) {
             return Vec::new();
         }

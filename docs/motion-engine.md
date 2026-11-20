@@ -142,7 +142,7 @@ picks the change up live.
 
 `lahza project.lahza` opens a standalone motion project in the editor; pieces
 inside a recording open from the studio instead:
-- **Preview:** rendered on a worker thread (GPU when available), with a half-size proxy while playing or dragging.
+- **Preview:** rendered on a worker thread (GPU when available), with a half-size proxy while playing or dragging. Beside the prompt bar: Raster, Raster + sky, or Traced (the fast path-traced mode; both need a GPU with ray queries and say so when there is none). Traced builds up while playing and warms up after a scrub or an edit; a drag always draws the raster proxy.
 - **Timeline:** the ruler, beat/bar/hit and word markers, the sound's waveform, scenes, and layer bars with key diamonds.
 - **Sound:** music, narration, effects and footage sound play in sync while playing.
 - **Inspector:** two tabs. Properties: scrubbable transform values (3D values on 3D layers), a text layer's words, font, colour, size and tracking, and each effect's values (numbers, two-part values, colours) with buttons to add and remove effects. Colours are picked from swatches or typed as #rrggbb. AI: what was asked about the layer and what came of it.

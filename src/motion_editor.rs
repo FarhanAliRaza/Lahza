@@ -10,6 +10,7 @@
 //! render a half-size proxy, a paused frame renders at full preview size
 //! with motion blur. GPU images are released with `Window::drop_image`.
 
+use crate::motion_preview::{self, Ask};
 use crate::motion_sound::{self, PeakCache, Player, Wave};
 use crate::theme;
 use gpui::{
@@ -40,7 +41,9 @@ struct Job {
     compiled: Arc<Compiled>,
     t: f64,
     scale: f64,
-    blur: bool,
+    /// Rasterised, with the sky, or traced fast (`motion_preview`).
+    ask: Ask,
+    playing: bool,
     key: u64,
 }
 
@@ -50,6 +53,8 @@ struct Mailbox {
     done: Option<(u64, Arc<RenderImage>)>,
     /// Why the last frame could not render (a missing or failed GPU).
     error: Option<String>,
+    /// The last frame was asked traced on a GPU that cannot.
+    cannot_trace: bool,
     label: String,
     quit: bool,
 }
@@ -70,6 +75,8 @@ impl Worker {
             .spawn(move || {
                 let mut renderer = Renderer::new(Some(&dir), RenderOptions { backend: lahza_motion_render::Backend::Auto, ..Default::default() });
                 inner.0.lock().unwrap().label = renderer.backend_label();
+                // The last frame drawn: what a traced frame builds on.
+                let mut last = None;
                 loop {
                     let job = {
                         let mut mailbox = inner.0.lock().unwrap();
@@ -81,10 +88,8 @@ impl Worker {
                         }
                         mailbox.job.take().unwrap()
                     };
-                    renderer.set_scale(job.scale);
-                    renderer.set_motion_blur(job.blur);
-                    let mut pixels = match renderer.try_render(&job.compiled, job.t) {
-                        Ok(pixels) => pixels,
+                    let (mut pixels, cannot_trace) = match motion_preview::draw(&mut renderer, &mut last, &job.compiled, job.t, job.scale, job.ask, job.playing) {
+                        Ok(drawn) => drawn,
                         Err(e) => {
                             inner.0.lock().unwrap().error = Some(e);
                             continue;
@@ -98,6 +103,7 @@ impl Worker {
                     let mut mailbox = inner.0.lock().unwrap();
                     mailbox.done = Some((job.key, image));
                     mailbox.error = None;
+                    mailbox.cannot_trace = cannot_trace;
                 }
             })
             .expect("preview thread");
@@ -115,6 +121,10 @@ impl Worker {
 
     fn error(&self) -> Option<String> {
         self.shared.0.lock().unwrap().error.clone()
+    }
+
+    fn cannot_trace(&self) -> bool {
+        self.shared.0.lock().unwrap().cannot_trace
     }
 
 }
@@ -389,6 +399,9 @@ pub(crate) struct MotionEditor {
     preview_project: Option<Project>,
     /// The preview shows a request's "before" (`compare`), not a drag.
     comparing: bool,
+    /// The preview quality the last frame was asked at.
+    quality: motion_preview::Quality,
+    cannot_trace: bool,
     font_names: Vec<String>,
     /// The selected layer as JSON, saved and as the drag shows it: values
     /// are read from these, so a draw does not serialise the layer again.
@@ -581,6 +594,8 @@ impl MotionEditor {
             drag: None,
             preview_project: None,
             comparing: false,
+            quality: motion_preview::quality(),
+            cannot_trace: false,
             font_names: Vec::new(),
             saved_json: RefCell::default(),
             preview_json: RefCell::default(),
@@ -653,8 +668,16 @@ impl MotionEditor {
             self.status = "Updated from disk".into();
             changed = true;
         }
+        if self.quality != motion_preview::quality() {
+            self.dirty = true;
+        }
         if self.dirty {
             self.request_frame();
+        }
+        let cannot_trace = self.worker.cannot_trace();
+        if cannot_trace != self.cannot_trace {
+            self.cannot_trace = cannot_trace;
+            changed = true;
         }
         let error = self.worker.error();
         if error != self.render_error {
@@ -678,11 +701,13 @@ impl MotionEditor {
         let Some(bounds) = *self.canvas_bounds.lock().unwrap() else { return };
         let (w, h) = (self.project.settings.width as f64, self.project.settings.height as f64);
         let fit = (f64::from(bounds.size.width) / w).min(f64::from(bounds.size.height) / h).min(1.0);
-        // Half-size proxy while moving; full preview size when still.
-        let proxy = self.playing || self.dragging();
-        let scale = (fit * if proxy { 0.5 } else { 1.0 }).max(0.05);
+        // Half-size proxy while moving; full preview size when still, drawn
+        // as the preview's quality says. A drag is always the raster proxy.
+        self.quality = motion_preview::quality();
+        let ask = motion_preview::ask(self.quality, self.playing, self.dragging());
+        let scale = (fit * if ask.proxy { 0.5 } else { 1.0 }).max(0.05);
         self.request_key += 1;
-        self.worker.request(Job { compiled: self.compiled.clone(), t: self.time, scale, blur: !proxy, key: self.request_key });
+        self.worker.request(Job { compiled: self.compiled.clone(), t: self.time, scale, ask, playing: self.playing, key: self.request_key });
         self.dirty = false;
     }
 
@@ -1116,6 +1141,11 @@ impl MotionEditor {
 
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The preview was asked traced (or with the sky) on a GPU that cannot.
+    pub(crate) fn cannot_trace(&self) -> bool {
+        self.cannot_trace
     }
 
     /// The scene at the playhead.

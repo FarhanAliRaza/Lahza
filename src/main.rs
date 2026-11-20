@@ -35,6 +35,7 @@ mod motion_ui;
 mod motion_agent;
 mod motion_editor;
 mod motion_piece_ui;
+mod motion_preview;
 mod motion_prompt_ui;
 mod motion_timeline;
 mod motion_pieces;
@@ -1964,6 +1965,7 @@ fn main() {
                 .add_fonts(INTERFACE_FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect())
                 .expect("failed to load bundled Inter font");
             theme::load_theme_preference();
+            motion_preview::load_quality();
             theme::set_appearance(cx.window_appearance());
             if let Some(dir) = initial_motion.clone() {
                 if let Err(e) = lahza_motion_core::io::load(&dir) {

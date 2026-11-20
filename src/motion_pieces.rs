@@ -116,6 +116,8 @@ pub(crate) struct MotionPieces {
     merged: Option<((u64, u64), Arc<RgbaImage>)>,
     last_request: u64,
     request_key: u64,
+    /// The preview was asked traced (or with the sky) on a GPU that cannot.
+    pub cannot_trace: bool,
 }
 
 impl MotionPieces {
@@ -133,6 +135,7 @@ impl MotionPieces {
             merged: None,
             last_request: 0,
             request_key: 0,
+            cannot_trace: false,
         };
         pieces.reload();
         pieces.agent_edit = false;
@@ -208,7 +211,10 @@ impl MotionPieces {
     /// Asks for the frames at editor time `t`: full-screen pieces `width`
     /// pixels across the preview canvas, over-the-video pieces into a
     /// `media` sized layer. A no-op when nothing changed.
-    pub(crate) fn request(&mut self, t: f64, width: f64, media: Option<(u32, u32)>, proxy: bool) {
+    pub(crate) fn request(&mut self, t: f64, width: f64, media: Option<(u32, u32)>, playing: bool, dragging: bool) {
+        let quality = crate::motion_preview::quality();
+        let ask = crate::motion_preview::ask(quality, playing, dragging);
+        let proxy = ask.proxy;
         let jobs: Vec<PieceJob> = self
             .items
             .iter()
@@ -226,13 +232,15 @@ impl MotionPieces {
                     opacity: p.piece.opacity as f32,
                     placement: p.piece.placement,
                     background: rgba8(p.project.settings.background),
-                    blur: !proxy,
+                    blur: ask.blur,
                     path: None,
+                    preview: Some((ask, playing)),
                 }
             })
             .collect();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         media.hash(&mut hasher);
+        (quality, playing, dragging).hash(&mut hasher);
         for j in &jobs {
             j.dir.hash(&mut hasher);
             (Arc::as_ptr(&j.compiled) as usize).hash(&mut hasher);
@@ -259,6 +267,7 @@ impl MotionPieces {
     pub(crate) fn take_frames(&mut self) -> Vec<Arc<RenderImage>> {
         match self.worker.take() {
             Some(done) if done.key <= self.request_key => {
+                self.cannot_trace = done.cannot_trace;
                 self.media_frame = done.media.map(|m| (done.key, Arc::new(m)));
                 std::mem::replace(&mut self.frames, done.canvas).into_iter().map(|f| f.image).collect()
             }
@@ -384,8 +393,11 @@ struct PieceJob {
     background: [u8; 4],
     blur: bool,
     /// Path-trace meshes (the final export of a piece whose project asks
-    /// for it); the preview always rasterises.
+    /// for it).
     path: Option<TraceOptions>,
+    /// A preview frame: how it is drawn (`motion_preview`) and whether
+    /// the preview plays. None for an export, which takes `path`.
+    preview: Option<(crate::motion_preview::Ask, bool)>,
 }
 
 struct Request {
@@ -398,6 +410,8 @@ struct Done {
     key: u64,
     canvas: Vec<PieceFrame>,
     media: Option<RgbaImage>,
+    /// A piece was asked traced on a GPU that cannot.
+    cannot_trace: bool,
 }
 
 #[derive(Default)]
@@ -419,7 +433,7 @@ impl Worker {
         std::thread::Builder::new()
             .name("lahza-motion-pieces".into())
             .spawn(move || {
-                let mut renderers: HashMap<PathBuf, Renderer> = HashMap::new();
+                let mut renderers: Renderers = HashMap::new();
                 loop {
                     let request = {
                         let mut mailbox = inner.0.lock().unwrap();
@@ -433,8 +447,10 @@ impl Worker {
                     };
                     let mut canvas = Vec::new();
                     let mut media = request.media.map(|(w, h)| RgbaImage::new(w, h));
+                    let mut cannot_trace = false;
                     for job in &request.jobs {
-                        let mut pixels = render_piece(&mut renderers, job);
+                        let (mut pixels, could_not) = render_piece(&mut renderers, job);
+                        cannot_trace |= could_not;
                         match (job.placement, media.as_mut()) {
                             (Placement::Overlay, Some(layer)) => {
                                 let x = (layer.width() as i64 - pixels.width() as i64) / 2;
@@ -451,7 +467,7 @@ impl Worker {
                         }
                     }
                     let any_media = request.jobs.iter().any(|j| j.placement == Placement::Overlay);
-                    inner.0.lock().unwrap().done = Some(Done { key: request.key, canvas, media: media.filter(|_| any_media) });
+                    inner.0.lock().unwrap().done = Some(Done { key: request.key, canvas, media: media.filter(|_| any_media), cannot_trace });
                 }
             })
             .expect("motion pieces thread");
@@ -481,14 +497,27 @@ impl Drop for Worker {
 
 /// Renders one piece: straight RGBA, opacity applied; a full-frame piece
 /// sits on its opaque background (black when the background is clear).
-fn render_piece(renderers: &mut HashMap<PathBuf, Renderer>, job: &PieceJob) -> RgbaImage {
+/// A renderer per piece folder, with the last frame it drew for the
+/// preview (what a traced frame builds on).
+type Renderers = HashMap<PathBuf, (Renderer, Option<crate::motion_preview::Drawn>)>;
+
+/// The second value: the frame was asked traced on a GPU that cannot.
+fn render_piece(renderers: &mut Renderers, job: &PieceJob) -> (RgbaImage, bool) {
     // (The GPU when there is one, else the CPU: a machine without Vulkan
     // still shows and exports its pieces.)
-    let renderer = renderers.entry(job.dir.clone()).or_insert_with(|| Renderer::new(Some(&job.dir), RenderOptions { backend: lahza_motion_render::Backend::Auto, ..Default::default() }));
-    renderer.set_scale(job.scale);
-    renderer.set_motion_blur(job.blur);
-    renderer.set_path(job.path);
-    let mut pixels = renderer.render(&job.compiled, job.t);
+    let (renderer, last) = renderers.entry(job.dir.clone()).or_insert_with(|| (Renderer::new(Some(&job.dir), RenderOptions { backend: lahza_motion_render::Backend::Auto, ..Default::default() }), None));
+    let (mut pixels, cannot_trace) = match job.preview {
+        // The preview: rasterised, with the sky, or traced fast, building
+        // on the last frame or warming up.
+        Some((ask, playing)) => crate::motion_preview::draw(renderer, last, &job.compiled, job.t, job.scale, ask, playing).unwrap_or_else(|e| panic!("{e}")),
+        None => {
+            renderer.set_scale(job.scale);
+            renderer.set_motion_blur(job.blur);
+            renderer.set_path(job.path);
+            renderer.set_sky(false);
+            (renderer.render(&job.compiled, job.t), false)
+        }
+    };
     if job.placement == Placement::Full {
         let [br, bg, bb, ba] = job.background;
         let bg = if ba == 255 { [br, bg, bb] } else { [0, 0, 0] };
@@ -506,7 +535,7 @@ fn render_piece(renderers: &mut HashMap<PathBuf, Renderer>, job: &PieceJob) -> R
             p[3] = (p[3] as f32 * o).round() as u8;
         }
     }
-    pixels
+    (pixels, cannot_trace)
 }
 
 /// Straight-alpha `src` over `dst` at (x, y), clipped.
@@ -560,7 +589,7 @@ fn export_thread(items: Vec<LoadedPiece>, width: u32, height: u32) -> (mpsc::Sen
     std::thread::Builder::new()
         .name("lahza-motion-export".into())
         .spawn(move || {
-            let mut renderers: HashMap<PathBuf, Renderer> = HashMap::new();
+            let mut renderers: Renderers = HashMap::new();
             for t in asked {
                 let active: Vec<&LoadedPiece> = items.iter().filter(|p| p.active_at(t)).collect();
                 if active.is_empty() {
@@ -585,8 +614,9 @@ fn export_thread(items: Vec<LoadedPiece>, width: u32, height: u32) -> (mpsc::Sen
                         // last one's samples, as in a motion export.
                         path: export::trace_options(&p.project.settings, Quality::Final, None, None)
                             .map(|o| TraceOptions { temporal: true, ..o }),
+                        preview: None,
                     };
-                    let frame = render_piece(&mut renderers, &job);
+                    let (frame, _) = render_piece(&mut renderers, &job);
                     over(&mut layer, &frame, x.round() as i64, y.round() as i64, p.piece.opacity as f32);
                 }
                 if answer.send(Some(layer)).is_err() {
