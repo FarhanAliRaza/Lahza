@@ -310,13 +310,23 @@ fn offset(h: &Hit, toward: V3) -> V3 {
 
 /// pt.wgsl `sky_lit`: the light a surface the sky's ray ends on sends
 /// back.
-fn sky_lit(scene: &Scene, lights: &[[f32; 4]], h: &Hit) -> V3 {
+fn sky_lit(scene: &Scene, t: &Trace, h: &Hit) -> V3 {
+    let lights = &t.lights[..];
     let row = |i: usize| lights.get(i).copied().unwrap_or([0.0; 4]);
     let xyz = |r: [f32; 4]| [r[0], r[1], r[2]];
     let world = [dot(xyz(row(1)), h.n), dot(xyz(row(2)), h.n), dot(xyz(row(3)), h.n)];
-    // (The sky, horizon, ground and lobes, as the raster's own shading
-    // takes them; the sky's list has no image.)
-    let mut l = if lights.len() > 6 { crate::mesh3d::env_diffuse(lights, 0, world) } else { [0.0; 3] };
+    // The sky, horizon, ground and lobes as the raster's own shading
+    // takes them, or an environment image's diffuse level.
+    let mut l = if lights.len() <= 6 {
+        [0.0; 3]
+    } else if lights[0][2] > 0.5 {
+        match t.env.as_ref().map(|e| (&e.raster, e.raster.first().copied().unwrap_or([0.0; 4]))) {
+            Some((rows, d)) if d[2] >= 1.0 && d[3] >= 1.0 && d[1] as usize + d[2] as usize * d[3] as usize <= rows.len() => mul(crate::mesh3d::env_tex(rows, d[1] as usize, d[2] as usize, d[3] as usize, crate::mesh3d::env_uv(lights, 0, world)), lights[0][3]),
+            _ => [0.0; 3],
+        }
+    } else {
+        crate::mesh3d::env_diffuse(lights, 0, world)
+    };
     for i in 0..row(0)[0] as usize {
         let (r, col, extra) = (row(7 + i * LROWS), row(7 + i * LROWS + 1), row(7 + i * LROWS + 2));
         let kind = r[3] as u32;
@@ -365,7 +375,18 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
     if out.len() < w * h * 2 || w == 0 || h == 0 {
         return;
     }
+    // LAHZA_SKY_TIMES: where the time goes (the structure, the rays, the
+    // two filter passes), on stderr.
+    let times = std::env::var_os("LAHZA_SKY_TIMES").is_some();
+    let mut clock = std::time::Instant::now();
+    let mut lap = |what: &str| {
+        if times {
+            eprintln!("sky visibility, {w} x {h}: {what} {:.1} ms", clock.elapsed().as_secs_f64() * 1000.0);
+        }
+        clock = std::time::Instant::now();
+    };
     let scene = Scene::new(t);
+    lap(&format!("a BVH over {} triangles", scene.tris.len()));
     let inv = t.inv_root;
     let dir = |x: f32, y: f32| {
         let tp = [t.origin[0] + t.factor[0] * (x + 0.5), t.origin[1] + t.factor[1] * (y + 0.5), 1.0];
@@ -400,7 +421,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
                     sum = add(sum, ray);
                     n += 1.0;
                 }
-                Some(far) => back = add(back, sky_lit(&scene, &t.lights, &far)),
+                Some(far) => back = add(back, sky_lit(&scene, t, &far)),
             }
         }
         let e = oct_encode(hit.g);
@@ -430,6 +451,11 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         },
         &mut raw,
     );
+    lap("the rays");
+    // (Each texel's ray and true normal once, not once a tap: the same
+    // numbers the filter would work out.)
+    let dirs: Vec<V3> = (0..w * h).map(|i| dir((i % w) as f32, (i / w) as f32)).collect();
+    let normals: Vec<V3> = raw.iter().map(|r| if r.open[3] > 0.0 { oct_decode([r.plane[0], r.plane[1]]) } else { [0.0; 3] }).collect();
     // pt.wgsl `sky_filter`: the tile's sixteen places as one value (step
     // 0), then smoothed two texels apart.
     let filter = |from: &[Raw], values: Option<&[Raw]>, step: i32, x: usize, y: usize| -> Raw {
@@ -437,7 +463,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         if c.open[3] <= 0.0 {
             return Raw::default();
         }
-        let n0 = oct_decode([c.plane[0], c.plane[1]]);
+        let n0 = normals[y * w + x];
         let (mut sums, mut backs, mut weights) = ([[0.0f32; 4]; 16], [[0.0f32; 3]; 16], [0.0f32; 16]);
         for dy in -2i32..=2 {
             for dx in -2i32..=2 {
@@ -450,9 +476,9 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
                 if cj.open[3] <= 0.0 {
                     continue;
                 }
-                let dj = dir(px as f32, py as f32);
+                let dj = dirs[j];
                 let pj = mul(dj, cj.open[3] / dj[2]);
-                if (dot(n0, pj) - c.plane[2]).abs() > 0.01 * c.open[3] + 0.5 || dot(n0, oct_decode([cj.plane[0], cj.plane[1]])) < 0.9 {
+                if (dot(n0, pj) - c.plane[2]).abs() > 0.01 * c.open[3] + 0.5 || dot(n0, normals[j]) < 0.9 {
                     continue;
                 }
                 let mut wt = 1.0;
@@ -506,6 +532,7 @@ pub(crate) fn fill(t: &Trace, w: usize, h: usize, out: &mut [[f32; 4]], threads:
         },
         &mut twice,
     );
+    lap("the filter's two passes");
     for i in 0..w * h {
         let (c, v) = (raw[i], twice[i]);
         if c.open[3] <= 0.0 {

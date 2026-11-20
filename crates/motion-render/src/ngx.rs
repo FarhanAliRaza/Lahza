@@ -45,6 +45,9 @@ pub(crate) struct Ngx {
     /// Tests: each frame the stand-in was given (its jitter and `reset`).
     #[cfg(test)]
     pub(crate) seen: Vec<([f32; 2], bool)>,
+    /// And the traced list each was of.
+    #[cfg(test)]
+    pub(crate) slots: Vec<u32>,
     device: u64,
     create: unsafe extern "C" fn(u64, u64, u32, u32, u32, u32) -> *mut c_void,
     evaluate: unsafe extern "C" fn(u64, *mut c_void, *const Frame) -> i32,
@@ -89,6 +92,8 @@ impl Ngx {
                 _lib: Some(lib),
                 #[cfg(test)]
                 seen: Vec::new(),
+                #[cfg(test)]
+                slots: Vec::new(),
             };
             match init(handles[0], handles[1], handles[2], handles[3] as *const c_void, handles[4] as *const c_void, dir.as_ptr()) {
                 0 => Ok(ngx),
@@ -111,7 +116,7 @@ impl Ngx {
         }
         unsafe extern "C" fn release(_: *mut c_void) {}
         unsafe extern "C" fn shutdown(_: u64) {}
-        Ngx { _lib: None, seen: Vec::new(), device: 0, create, evaluate, release, shutdown }
+        Ngx { _lib: None, seen: Vec::new(), slots: Vec::new(), device: 0, create, evaluate, release, shutdown }
     }
 
     /// Whether this is the tests' stand-in.

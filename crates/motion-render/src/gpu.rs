@@ -1313,6 +1313,11 @@ impl Gpu {
     }
 
     #[cfg(test)]
+    pub(crate) fn stand_in_slots(&self) -> Vec<u32> {
+        self.tracer.as_ref().map(|t| t.stand_in_slots()).unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub(crate) fn stand_in_saw(&self, slot: u32) -> (Vec<([f32; 2], bool)>, Vec<f32>, (u32, u32)) {
         self.tracer.as_ref().map(|t| t.stand_in_saw(&self.context, slot)).unwrap_or_default()
     }

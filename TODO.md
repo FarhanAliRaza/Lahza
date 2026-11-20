@@ -207,11 +207,18 @@ nothing below was run on that card.)
   traced in that list the frame before starts again: the tracer's own
   accumulation (the usual trace's too) and, through `reset`, Ray
   Reconstruction's. `Renderer::forget_history` does the same on demand.
-  Not covered: a camera that jumps within a scene (the layers are the
-  same; what was accumulated is tested texel by texel against depth and
-  normal, as before), and a transition between two scenes, during which
-  the two are traced lists 0 and 1 and after which the second becomes
-  list 0 and starts again though it had a history.
+  Two more cases, tested through the stand-in:
+  - A camera that jumps within a scene (the layers are the same) starts
+    the history again: the camera, from a layer's two transforms, turned
+    more than 25 degrees since the frame before, or the scene's middle
+    moved more than half the picture's smaller side (`JUMP_TURN`,
+    `JUMP_SHIFT` in pt.rs). A whip pan that fast is taken for a jump
+    too; little of the frame before is left in the picture then.
+  - Through a transition two scenes are traced lists 0 and 1, and after
+    it the one that came in is list 0. A list now takes with it the
+    history another slot holds of its layers (the tracer's and Ray
+    Reconstruction's), so each scene starts once and not again when the
+    transition ends.
 - **`snapshot` takes `fast`** (and the CLI's `snapshot --fast [--warm N]`).
   A frame alone has no history, so up to `warm` frames before it (default
   8; only those of its scene) are traced first and thrown away:
@@ -231,7 +238,7 @@ nothing below was run on that card.)
   the picture against the usual trace; flat things' exact colours and
   edges; depth of field lit and unlit; motion blur over a floor, over
   nothing and past a thing that stands still; a shadow catcher's shadow;
-  a cut; a frame alone and warmed up. All pass on software Vulkan, with
+  a cut, a camera jump and a transition; a frame alone and warmed up. All pass on software Vulkan, with
   the tracer's 40 other tests. The stand-in's picture is noisy and blocky
   (it is not a denoiser): what Ray Reconstruction makes of the same
   images is not tested by it.
@@ -292,7 +299,7 @@ To run again on the RTX 3060 (nothing above was):
 - With Ray Reconstruction itself, looking at: the new specular guide
   (mirrors and rough metals), the motion blur's streaks at half-size
   motion, the first frames after a cut now that `reset` is sent there,
-  and a transition between two traced scenes.
+  a camera jump, and a transition between two traced scenes.
 - The time of `fast_tiles`, `fast_catcher` and the new `resolve_fast` at
   1080 x 1920 (they were about 7 ms for the visibility pass and under a
   second a film for the depth of field before).
@@ -302,7 +309,6 @@ What is missing:
   What it needs is there (`Renderer::set_path` with `fast`,
   `try_render_warm` after a scrub); src/* is to call it. To settle there:
   the preview's own size and pacing.
-- **Transitions and camera jumps** keep or lose the history as above.
 - **Ray Reconstruction's picture** of all that changed here.
 
 ## Lighting between the raster and the traced picture
@@ -328,8 +334,8 @@ it). What follows is for a card where it is not quick enough.
   texel has those of its place in a 4 x 4 tile, so sixteen texels
   together have 64 directions (pt.wgsl `sky`). An open ray adds its
   direction; one that ends on a surface adds that surface's light: its
-  colour under the lights (shadows by rays) and under the sky, horizon
-  and ground. `sky_filter` makes the sixteen one value over the texels on
+  colour under the lights (shadows by rays) and under the environment
+  (its sky, horizon, ground and lobes, or its image's diffuse level). `sky_filter` makes the sixteen one value over the texels on
   the same plane, each place of the tile weighing the same, and smooths
   that once more two texels apart: each texel has every direction but
   each from another point near it, and its value went in steps that
@@ -359,34 +365,54 @@ it). What follows is for a card where it is not quick enough.
     Vulkan's numbers. In the editor's preview: not run.
     With motion blur each sub-frame has its own rays (they are not
     shared as a traced picture's are).
-  - *The CPU path.* Not done: the CPU draws as without (tested), so with
-    `sky` on the GPU's and the CPU's pictures differ, which is why it is
-    off unless asked and the tests that compare the two run without it.
-    A GPU that fails in the middle of an export falls back to the CPU
-    and the lighting changes there. The rays are a fixed set with no
-    history so that the CPU can cast the same: it needs a BVH over the
-    list's triangles in camera space, the same directions, the hit's
-    lighting (its shadow maps would stand in for the shadow rays, so not
-    quite the same) and the same filter.
-  - *Without hardware ray tracing* the frame is drawn as today: the
-    builder only asks for sky visibility where the GPU traces.
+  - *The CPU path* casts the same rays (`sky_cpu.rs`): a BVH over the
+    list's triangles in camera space, built each frame, the same
+    directions from the same points, the same light back and the same
+    two filter passes, all in f32 as the shader, and the CPU's shading
+    reads the group as `sky_at` does. For the two to find the same light
+    back, that light is one plain rule on both sides (`sky_lit`: the
+    surface's base colour, less what is metal, under the environment
+    with its lobes or its image, the ambient lights, and each other
+    light from its middle with a shadow by one ray; an area light as a
+    point), not the tracer's full material and soft lights as at first.
+    GPU against CPU on software Vulkan, as the other tests of the two
+    measure it: no pixel more than one level apart in the test's scene
+    (lit by the environment, and with an environment image). A mesh the
+    GPU makes in its pool (Slang) is not in the CPU's rays, as it is not
+    in the CPU's frame.
+    What it costs the CPU at the preview's size (1080 x 608, four cores,
+    `sky_tests::measure_the_cpus_rays`, `LAHZA_SKY_TIMES=1`): a frame
+    takes 260 to 360 ms against 95 to 125 ms without (two runs). The
+    rays 129 ms (164 000 texels, about five million rays a second a
+    core), the two filter passes 22 to 29 ms, the BVH 0.3 ms (652
+    triangles: a film's scene has many times that), the rest the
+    shading's lookups. Nothing of it runs with `sky` off.
+  - *Without hardware ray tracing* a GPU draws the frame as today (the
+    builder asks for sky visibility where the GPU traces, or where the
+    CPU draws).
+  So `sky` is still off unless asked, now for what it costs and no
+  longer because the two renderers would differ: on the CPU it nearly
+  triples a preview frame, and what it costs a card is not known (on
+  software Vulkan at 1080 x 608, 165 ms a frame against 104 ms). To turn
+  it on where it is cheap enough is a decision for after the card's
+  numbers.
   Against a traced frame of the same scene (a ball, a box with a slab
   over it, a floor and a wall; 320 x 180 and 480 x 270, 64 paths):
   - Lit by the environment only: where the ball stands the floor is 0.72
     of the plain raster's (traced: 0.62; the second filter pass softens
     it, 0.69 before), the open floor 0.94 (0.99); the whole picture
-    25.8 dB from the traced one (26.0 dB without sky visibility: the
-    contacts are there now, but the picture is 6% darker than traced,
-    one bounce being less than all of them).
+    27.6 dB from the traced one (26.0 dB without sky visibility), 4%
+    darker than traced, one bounce being less than all of them.
   - With the default lights: 33.6 dB from the traced picture, 27.3 dB
-    without. Seen: the wall takes the floor's light, the ball's underside
+    without (480 x 270, with the first rule for the light back; at
+    1080 x 608 with `sky_lit`, 38.4 dB and 32.5 dB). Seen: the wall takes the floor's light, the ball's underside
     is lit from below, the gap under the slab is dark, as traced.
   - Under a table (a top on four legs, the default lights;
     `sky_tests::measure_under_a_table`): the floor between the legs is
-    169 of 255 where the traced picture has 184 and the plain raster
+    170 of 255 where the traced picture has 184 and the plain raster
     226: 8% darker than traced, the light that comes back a second time
     off the floor, the legs and the top's underside missing. The whole
-    picture: 30.2 dB from the traced one, 25.6 dB without.
+    picture: 31.1 dB from the traced one, 25.6 dB without.
 - **One bounce of diffuse light** was to come only if visibility alone
   still looked flat. It did worse than that: every face that looks at
   another lost the light the environment's ground and horizon stood for
@@ -395,7 +421,6 @@ it). What follows is for a card where it is not quick enough.
   is in, from the same rays, as above.
 
 What is left:
-- The CPU's rays, as above; until then `sky` stays off by default.
 - The editor's preview does not ask for it (src/*: `Renderer::set_sky`).
 - Run on the RTX 3060: `cargo test -p lahza-motion-render sky_tests --
   --test-threads=1` and its measure (`--ignored`,
@@ -407,8 +432,9 @@ What is left:
 - Only solid meshes are in the rays: what is see-through, cards, wires,
   volumes and shadow catchers neither hide the sky nor take it (they are
   lit as before).
-- With an environment image the light that comes back is the lights'
-  only (the image is not looked up at what the rays hit).
+- At an edge between near and far the lookup takes the texel nearest in
+  depth, at half the picture's size: steps of two px show there (seen
+  under the slab's front edge).
 - A second bounce (the 6%, and 8% under a table), and anything mirrored
   of other things: not done. The fast mode has them.
 

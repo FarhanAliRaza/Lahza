@@ -2836,13 +2836,13 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 }
 
 /// Environment image lookups (mirror motion.wgsl's env_image*).
-fn env_uv(m: &[[f32; 4]], lb: usize, d: F3) -> [f32; 2] {
+pub(crate) fn env_uv(m: &[[f32; 4]], lb: usize, d: F3) -> [f32; 2] {
     let phi = d[0].atan2(d[2]) + m[lb + 4][3];
     let u = 0.5 + phi / (2.0 * std::f32::consts::PI);
     [u - u.floor(), (-d[1]).clamp(-1.0, 1.0).acos() / std::f32::consts::PI]
 }
 
-fn env_tex(m: &[[f32; 4]], at: usize, w: usize, h: usize, uv: [f32; 2]) -> F3 {
+pub(crate) fn env_tex(m: &[[f32; 4]], at: usize, w: usize, h: usize, uv: [f32; 2]) -> F3 {
     let x = uv[0] * w as f32 - 0.5;
     let y = (uv[1] * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
     let xf = x.floor();

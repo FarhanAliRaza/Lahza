@@ -2535,9 +2535,32 @@ fn visible(id: vec3<u32>, py: u32, w: u32) {
 }
 
 // What a matte surface facing world direction n gets of the sky, the
-// horizon, the ground and the lobes (the raster's `env_diffuse` in
-// motion.wgsl, without the image).
+// horizon, the ground and the lobes, or of an environment image (the
+// raster's `env_diffuse` in motion.wgsl).
 fn sky_diffuse(n: vec3<f32>) -> vec3<f32> {
+    if b_light[0].z > 0.5 {
+        // An environment image: its diffuse level, as the raster looks
+        // it up (for sky visibility `b_env` holds the raster's rows:
+        // [levels, the diffuse level's offset, its width and height]).
+        let d = b_env[0];
+        let w = u32(d.z);
+        let h = u32(d.w);
+        let at = u32(d.y);
+        if w == 0u || h == 0u || at + w * h > arrayLength(&b_env) { return vec3<f32>(0.0); }
+        let uv = env_uv(n);
+        let x = uv.x * f32(w) - 0.5;
+        let y = clamp(uv.y * f32(h) - 0.5, 0.0, f32(h - 1u));
+        let xf = floor(x);
+        let fx = x - xf;
+        let y0 = u32(floor(y));
+        let y1 = min(y0 + 1u, h - 1u);
+        let fy = y - floor(y);
+        let x0 = u32(i32(xf) + i32(w)) % w;
+        let x1 = (x0 + 1u) % w;
+        let a = mix(b_env[at + y0 * w + x0].xyz, b_env[at + y0 * w + x1].xyz, fx);
+        let b = mix(b_env[at + y1 * w + x0].xyz, b_env[at + y1 * w + x1].xyz, fx);
+        return mix(a, b, fy) * b_light[0].w;
+    }
     let up = -n.y;
     var c: vec3<f32>;
     if up >= 0.0 {
