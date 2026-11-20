@@ -67,8 +67,9 @@ plugins were not installed), and seven window tests under Xvfb):
   it, and a bead out of focus has the lens's light (it had two and a
   half times as much); `LAHZA_OIDN_WAY` says which way the denoiser's
   pictures go. The four sections were read through for what each still
-  calls left. (motion-render: XXX_PASS pass and XXX_IGN are ignored, the
-  whole suite, one thread, Mesa's software Vulkan.)
+  calls left. (motion-render: 198 pass and 29 are ignored, the
+  whole suite, one thread, Mesa's software Vulkan, 99 minutes;
+  motion-mcp 40 and its integration tests.)
 
 - Since, in the simulation (its own section has each with its test): a
   rope of links, bodies two instancers deep and as an emitter's
